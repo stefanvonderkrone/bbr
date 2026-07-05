@@ -33,6 +33,11 @@ from repeating past mistakes. The version-pinned API catalog bbr relies on lives
   `.response_writer = &aw.writer` with `aw: std.Io.Writer.Allocating = .init(alloc)`, then
   `aw.toOwnedSlice()`. The client is a plain struct: `.{ .allocator = gpa, .io = io }`. Classify
   with `status.class()`.
+- **`std.ArrayList` in 0.16: default `.{}` init is deprecated — use `.empty`.** Both a managed
+  variant (`init(gpa)`, `append(item)`) and an unmanaged one (methods take `gpa`: `append(gpa, item)`,
+  `deinit(gpa)`, `toOwnedSlice(gpa)`) live in `std/array_list.zig`. Before using, confirm which one
+  bare `std.ArrayList(T)` aliases to in the installed stdlib (recent Zig points it at the unmanaged
+  struct) so you know whether your calls pass `gpa` — don't assume from memory.
 - **You can't read env vars inside a `test` block.** The env API flows through `Init`/`Io` and the
   test runner hands tests neither (`Environ.Block.global` is wasi/freestanding-only). Keep tests
   hermetic (fakes + `@embedFile` fixtures); put credential/network work in an executable step that
