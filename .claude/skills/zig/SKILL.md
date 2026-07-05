@@ -33,11 +33,12 @@ from repeating past mistakes. The version-pinned API catalog bbr relies on lives
   `.response_writer = &aw.writer` with `aw: std.Io.Writer.Allocating = .init(alloc)`, then
   `aw.toOwnedSlice()`. The client is a plain struct: `.{ .allocator = gpa, .io = io }`. Classify
   with `status.class()`.
-- **`std.ArrayList` in 0.16: default `.{}` init is deprecated — use `.empty`.** Both a managed
-  variant (`init(gpa)`, `append(item)`) and an unmanaged one (methods take `gpa`: `append(gpa, item)`,
-  `deinit(gpa)`, `toOwnedSlice(gpa)`) live in `std/array_list.zig`. Before using, confirm which one
-  bare `std.ArrayList(T)` aliases to in the installed stdlib (recent Zig points it at the unmanaged
-  struct) so you know whether your calls pass `gpa` — don't assume from memory.
+- **`std.ArrayList(T)` is the UNMANAGED list; its methods take `gpa`.** Confirmed in the installed
+  stdlib: `std.zig:49` defines `ArrayList(T) = array_list.Aligned(T, null)`, and `Aligned`
+  (`array_list.zig:570`) is the unmanaged struct. So: init `var list: std.ArrayList(T) = .empty;`
+  (default `.{}` deprecated), then `list.append(gpa, item)`, `list.deinit(gpa)`,
+  `list.toOwnedSlice(gpa)`. The managed variant with `gpa`-free methods is `array_list.Managed(T)`;
+  `ArrayListUnmanaged` is now a deprecated alias *to* `ArrayList`.
 - **You can't read env vars inside a `test` block.** The env API flows through `Init`/`Io` and the
   test runner hands tests neither (`Environ.Block.global` is wasi/freestanding-only). Keep tests
   hermetic (fakes + `@embedFile` fixtures); put credential/network work in an executable step that
