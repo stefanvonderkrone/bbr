@@ -52,6 +52,41 @@ pub const Client = struct {
         try classify(res.status);
         return parsePullRequest(allocator, res.body);
     }
+
+    /// GET /repositories/{workspace}/{repo}/pullrequests/{id}/diff.
+    /// Returns the raw unified diff text (owned by `allocator`) exactly as
+    /// Bitbucket serves it — the authoritative line model (ADR-0001). Feed it to
+    /// `diff.parse`; this adapter deliberately does not parse, so the same text
+    /// path serves both remote and (later) local review.
+    pub fn getDiff(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        id: u64,
+    ) ![]u8 {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/pullrequests/{d}/diff",
+            .{ base_url, self.cred.workspace, repo_slug, id },
+        );
+        defer allocator.free(url);
+
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+
+        const res = try self.http.send(allocator, .{
+            .method = .GET,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "text/plain" },
+            },
+        });
+        errdefer allocator.free(res.body);
+
+        try classify(res.status);
+        return res.body;
+    }
 };
 
 /// Map HTTP status to an `ApiError`; return normally on 2xx.
@@ -170,4 +205,55 @@ test "malformed 2xx body is a MalformedResponse" {
     var fake: FakeHttpClient = .{ .status = 200, .body = "{ not json" };
     const bb = Client.init(fake.httpClient(), testCredential());
     try testing.expectError(error.MalformedResponse, bb.getPullRequest(a, "myrepo", 1));
+}
+
+const sample_diff =
+    \\diff --git a/a.txt b/a.txt
+    \\--- a/a.txt
+    \\+++ b/a.txt
+    \\@@ -1,2 +1,2 @@
+    \\ keep
+    \\-old
+    \\+new
+    \\
+;
+
+test "getDiff returns the raw diff text at the right URL" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body = sample_diff };
+    const bb = Client.init(fake.httpClient(), testCredential());
+
+    const raw = try bb.getDiff(a, "myrepo", 42);
+    defer a.free(raw);
+
+    try testing.expectEqualStrings(sample_diff, raw);
+    try testing.expectEqual(httpc.Method.GET, fake.last_method.?);
+    try testing.expectEqualStrings(
+        "https://api.bitbucket.org/2.0/repositories/check24/myrepo/pullrequests/42/diff",
+        fake.lastUrl().?,
+    );
+}
+
+test "getDiff surfaces ApiError on non-2xx and leaks nothing" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 404, .body = "not found" };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    try testing.expectError(error.NotFound, bb.getDiff(a, "myrepo", 1));
+}
+
+test "getDiff output feeds the parser end to end" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body = sample_diff };
+    const bb = Client.init(fake.httpClient(), testCredential());
+
+    const raw = try bb.getDiff(a, "myrepo", 42);
+    defer a.free(raw);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const parsed = try @import("../diff/parser.zig").parse(arena.allocator(), raw);
+
+    try testing.expectEqual(@as(usize, 1), parsed.files.len);
+    try testing.expectEqualStrings("a.txt", parsed.files[0].new_path);
+    try testing.expectEqual(@as(usize, 3), parsed.files[0].hunks[0].lines.len);
 }

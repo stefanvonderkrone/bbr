@@ -15,10 +15,10 @@ Sizes are relative effort (S/M/L), not calendar estimates. Dependencies noted pe
 - [x] Test: FakeHttpClient fixture → parsed PullRequest; 401/429/5xx → correct `ApiError`. (8/8 pass)
 
 ## M1 — Diff model & parser (pure, no UI)  ·  S/M  ·  needs M0
-- [ ] Bitbucket: `getDiff`, `getDiffStat` (paginated).
-- [ ] Diff parser: RawDiff → `Diff`/`File`/`Hunk`/`Line` (Bitbucket line numbers authoritative).
-- [ ] `File` status (added/modified/removed/renamed); full old/new blob capture.
-- [ ] Tests: table-driven fixtures — hunk boundaries, line numbering, renames, edge cases. **No UI.**
+- [x] Bitbucket: `getDiff` (raw unified text). ✅ done · `getDiffStat` (paginated file list) deferred to M2 (viewer needs the file list, not the parser).
+- [x] Diff parser: RawDiff → `Diff`/`File`/`Hunk`/`Line` (Bitbucket line numbers authoritative). ✅ done — `src/diff/parser.zig`, zero-copy over the raw text.
+- [x] `File` status (added/modified/removed/renamed). ✅ done. Full old/new blob capture deferred — needed only for `WholeFile` scope (M5), and Bitbucket serves blobs from a separate endpoint.
+- [x] Tests: fixtures — hunk boundaries, line numbering, adds/removes, `\ No newline`, count-omitted ranges, malformed headers, end-to-end getDiff→parse. **No UI.** ✅ 8 diff tests + 3 getDiff tests (19 total green).
 
 ## M2 — Unified diff viewer (open by id)  ·  M  ·  needs M1
 - [ ] `Theme` abstraction + one default (diff colors need it); plain light/dark.

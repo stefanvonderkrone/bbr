@@ -9,6 +9,18 @@ pub const http = struct {
     pub const FakeHttpClient = @import("http/fake_client.zig").FakeHttpClient;
 };
 
+pub const diff = struct {
+    pub const model = @import("diff/model.zig");
+    pub const parser = @import("diff/parser.zig");
+    pub const parse = parser.parse;
+    pub const Diff = model.Diff;
+    pub const File = model.File;
+    pub const FileStatus = model.FileStatus;
+    pub const Hunk = model.Hunk;
+    pub const Line = model.Line;
+    pub const LineKind = model.LineKind;
+};
+
 pub const bitbucket = struct {
     const client_mod = @import("bitbucket/client.zig");
     pub const Client = client_mod.Client;
@@ -27,4 +39,6 @@ test {
     _ = @import("bitbucket/credential.zig");
     _ = @import("bitbucket/client.zig");
     _ = @import("bitbucket/types.zig");
+    _ = @import("diff/model.zig");
+    _ = @import("diff/parser.zig");
 }
