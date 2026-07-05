@@ -49,11 +49,40 @@ const io: std.Io = threaded.io();
 network results are marshalled back to it as custom events. UI state is still mutated only on
 the main thread; the Epoch token still guards against stale results.
 
+## 2.5 Process entry: `main(init)` and reading the environment
+
+**Verified by building bbr's M0.** 0.16 changed how a program starts and how it reads env vars.
+
+- **`main` can take a `std.process.Init`** (or `Init.Minimal`). The runtime constructs and hands
+  you everything:
+  ```zig
+  pub fn main(init: std.process.Init) !void {
+      const gpa = init.gpa;            // thread-safe GPA (leak-checked in debug)
+      const io = init.io;              // Io backed by std.Io.Threaded — already built for you
+      const arena = init.arena;        // *std.heap.ArenaAllocator, process-lifetime
+      const env = init.environ_map;    // *std.process.Environ.Map
+      var it = init.minimal.args.iterate(); // Args iterator; first item is exe name
+  }
+  ```
+  **Consequence:** for the default runtime you do **not** construct `std.Io.Threaded` yourself —
+  `init.io` already is one. (Build your own only to override `async_limit` etc.)
+- **`std.process.getEnvVarOwned` is GONE.** Read env vars from the map: `env.get("KEY") ?[]const u8`
+  (borrows for process lifetime; no free). `Environ.Map` also has `.contains`. `Map.get` asserts the
+  key is valid (no `=`/NUL). In tests, build one with `std.process.Environ.Map.init(alloc)` + `.put`.
+
 ## 3. `std.http.Client` (`std/http/Client.zig`)
 
-- Constructed with an allocator and an `Io`; `io: Io` field at line 30.
+- **It's a plain struct**, not an `init()` — construct with a literal:
+  `var c: std.http.Client = .{ .allocator = gpa, .io = io };` then `defer c.deinit()`.
 - **Request API:** `client.request(method: http.Method, uri: Uri, options: RequestOptions) !Request`
   (line 1681). Convenience: `client.fetch(FetchOptions) !FetchResult` (line 1801).
+- **`fetch` returns only `{ status: http.Status }`** — the body is *not* returned. To capture it,
+  pass `.response_writer = &aw.writer` where `aw` is a `std.Io.Writer.Allocating` (`.init(alloc)`,
+  then `aw.toOwnedSlice()` / `aw.written()`). Set `.method`, `.payload`, `.extra_headers`
+  (`[]const http.Header`), and `.location = .{ .url = "…" }`. Classify with `status.class()` →
+  `enum { informational, success, redirect, client_error, server_error }`.
+- **`initDefaultProxies(&client, arena, environ_map)`** takes the `*const Environ.Map` directly —
+  pairs cleanly with `init.environ_map`.
 - **TLS** is built in (own `ca_bundle`); no external OpenSSL needed.
 - **Proxy support** (see also `docs/adr/0003`):
   - Fields `http_proxy: ?*Proxy` / `https_proxy: ?*Proxy`.
@@ -98,6 +127,10 @@ the main thread; the Epoch token still guards against stale results.
 ---
 
 ## Re-verification checklist (on any Zig upgrade)
+- [ ] `std.process.Init` shape (`gpa`/`arena`/`io`/`environ_map`/`minimal.args`) unchanged?
+- [ ] `Environ.Map.get`/`.put` and `main(init)` entry still the way to read env?
+- [ ] `std.http.Client` still a plain struct; `fetch` still body-via-`response_writer`?
+- [ ] `std.Io.Writer.Allocating` (`init`/`toOwnedSlice`/`written`) unchanged?
 - [ ] `std.http.Client.request` / `fetch` signatures unchanged?
 - [ ] `initDefaultProxies` + `Proxy` struct shape unchanged?
 - [ ] `std.Io.Threaded.init` options (esp. `async_limit`) unchanged?

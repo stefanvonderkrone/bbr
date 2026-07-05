@@ -24,6 +24,15 @@ from repeating past mistakes. The version-pinned API catalog bbr relies on lives
 
 ## Known corrections (mistakes already made — do not repeat)
 
+- **`main` takes `std.process.Init`; env vars come from it, not `getEnvVarOwned`.** 0.16 removed
+  `std.process.getEnvVarOwned`. Write `pub fn main(init: std.process.Init) !void` and the runtime
+  hands you `init.gpa`, `init.arena`, `init.io`, `init.environ_map` (`*Environ.Map`, use
+  `.get("KEY")`), and `init.minimal.args` (`.iterate()`). **`init.io` is already backed by
+  `std.Io.Threaded`** — don't build your own for the default runtime.
+- **`std.http.Client.fetch` returns only the status; the body is streamed to a writer.** Pass
+  `.response_writer = &aw.writer` with `aw: std.Io.Writer.Allocating = .init(alloc)`, then
+  `aw.toOwnedSlice()`. The client is a plain struct: `.{ .allocator = gpa, .io = io }`. Classify
+  with `status.class()`.
 - **Concurrency is `std.Io` / `std.Io.Threaded`, NOT `std.Thread.Pool`.** 0.16 centralizes I/O and
   concurrency behind the `std.Io` interface. `std.http.Client` has an `io: Io` field and *requires*
   an `Io`, so you do not hand-roll a thread pool for network work. Build one `std.Io.Threaded`
