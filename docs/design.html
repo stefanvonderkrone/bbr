@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bbr — Design Document</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --border: #2a2f3a;
+    --fg: #d7dbe3; --muted: #8b93a3; --accent: #6ea8fe; --accent-2: #b28dff;
+    --added-bg: #143823; --added-em: #1c6b3c; --removed-bg: #3a1a1f; --removed-em: #7a2731;
+    --context: #11131a; --warn: #ffcc66; --ok: #7ee2a8; --bad: #ff8a8a;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f0f2f5; --border: #d9dee6;
+      --fg: #1c2430; --muted: #5b6472; --accent: #2c62d6; --accent-2: #7c4dff;
+      --added-bg: #e4f6ea; --added-em: #a7e6bd; --removed-bg: #fbe4e7; --removed-em: #f3b0b8;
+      --context: #f7f8fa; --warn: #9a6b00; --ok: #157a44; --bad: #b3261e;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: var(--sans); line-height: 1.6; font-size: 16px;
+  }
+  .wrap { display: grid; grid-template-columns: 260px 1fr; max-width: 1200px; margin: 0 auto; }
+  nav {
+    position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto;
+    padding: 28px 18px; border-right: 1px solid var(--border); font-size: 14px;
+  }
+  nav h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 20px 0 8px; }
+  nav a { display: block; color: var(--muted); text-decoration: none; padding: 3px 8px; border-radius: 6px; }
+  nav a:hover { color: var(--fg); background: var(--panel-2); }
+  main { padding: 40px 48px 120px; min-width: 0; }
+  header.title { border-bottom: 1px solid var(--border); padding-bottom: 24px; margin-bottom: 8px; }
+  header.title h1 { font-size: 34px; margin: 0 0 4px; letter-spacing: -.02em; }
+  header.title .sub { color: var(--muted); font-size: 17px; }
+  .meta-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+  .chip { background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px; padding: 4px 12px; font-size: 13px; color: var(--muted); }
+  .chip b { color: var(--fg); font-weight: 600; }
+  h2.section { font-size: 25px; margin: 48px 0 12px; padding-top: 12px; letter-spacing: -.01em; }
+  h3 { font-size: 19px; margin: 28px 0 8px; }
+  h4 { font-size: 16px; margin: 20px 0 6px; color: var(--accent); }
+  p, li { color: var(--fg); }
+  code { font-family: var(--mono); background: var(--panel-2); padding: 1px 6px; border-radius: 5px; font-size: 90%; }
+  pre { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; overflow-x: auto; }
+  pre code { background: none; padding: 0; font-size: 13.5px; line-height: 1.5; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px 22px; margin: 16px 0; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .callout { border-left: 4px solid var(--accent); background: var(--panel); border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 16px 0; }
+  .callout.warn { border-left-color: var(--warn); }
+  .callout.decision { border-left-color: var(--ok); }
+  .callout .label { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; font-weight: 700; color: var(--muted); }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 14.5px; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: var(--panel-2); font-weight: 600; }
+  tr:nth-child(even) td { background: var(--panel); }
+  .tag { font-size: 12px; padding: 2px 8px; border-radius: 6px; font-weight: 600; }
+  .tag.no { background: var(--removed-bg); color: var(--bad); }
+  .tag.yes { background: var(--added-bg); color: var(--ok); }
+  .diffdemo { font-family: var(--mono); font-size: 13px; border-radius: 10px; overflow: hidden; border: 1px solid var(--border); margin: 14px 0; }
+  .diffdemo .ln { display: grid; grid-template-columns: 44px 44px 1fr; }
+  .diffdemo .ln > span { padding: 2px 10px; white-space: pre; }
+  .diffdemo .gutter { color: var(--muted); text-align: right; background: var(--panel-2); user-select: none; }
+  .diffdemo .ctx { background: var(--context); }
+  .diffdemo .add { background: var(--added-bg); }
+  .diffdemo .add em { background: var(--added-em); font-style: normal; border-radius: 3px; }
+  .diffdemo .del { background: var(--removed-bg); }
+  .diffdemo .del em { background: var(--removed-em); font-style: normal; border-radius: 3px; }
+  .flow { display: flex; flex-wrap: wrap; gap: 10px; align-items: stretch; margin: 16px 0; }
+  .box { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; font-size: 14px; flex: 1; min-width: 150px; }
+  .box .k { font-size: 12px; color: var(--muted); }
+  .arrow { align-self: center; color: var(--muted); font-size: 20px; }
+  .legend { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: middle; margin-right: 6px; }
+  ul.tight { margin: 8px 0; } ul.tight li { margin: 3px 0; }
+  .seam { font-family: var(--mono); color: var(--accent-2); }
+  footer { color: var(--muted); font-size: 13px; border-top: 1px solid var(--border); margin-top: 60px; padding-top: 16px; }
+  @media (max-width: 860px) { .wrap { grid-template-columns: 1fr; } nav { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--border); } main { padding: 24px; } .grid2 { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <strong>bbr</strong><br><span style="color:var(--muted);font-size:13px">Design Document</span>
+  <h2>Contents</h2>
+  <a href="#overview">1 · Overview</a>
+  <a href="#goals">2 · Goals &amp; Non-Goals</a>
+  <a href="#constraints">3 · Target &amp; Constraints</a>
+  <a href="#arch">4 · Architecture</a>
+  <a href="#seams">5 · Seams</a>
+  <a href="#domain">6 · Domain Model</a>
+  <a href="#diff">7 · Diff &amp; Rendering</a>
+  <a href="#highlight">8 · Syntax Highlighting</a>
+  <a href="#review">9 · Comments &amp; Pending Review</a>
+  <a href="#modes">9b · Review Modes &amp; Anchors</a>
+  <a href="#concurrency">10 · Concurrency</a>
+  <a href="#memory">11 · Memory Model</a>
+  <a href="#auth">12 · Auth &amp; Security</a>
+  <a href="#testing">13 · Testing (TDD)</a>
+  <a href="#milestones">14 · Milestones</a>
+  <a href="#open">15 · Open Questions</a>
+</nav>
+<main>
+<header class="title">
+  <h1>bbr — Bitbucket Reviewer</h1>
+  <div class="sub">A Zig terminal UI for reviewing Bitbucket&nbsp;Cloud pull requests.</div>
+  <div class="meta-row">
+    <span class="chip"><b>Status</b> · Design</span>
+    <span class="chip"><b>Zig</b> · 0.16.0</span>
+    <span class="chip"><b>TUI</b> · libvaxis 0.6.0</span>
+    <span class="chip"><b>Target</b> · Bitbucket Cloud (workspace <code>check24</code>)</span>
+    <span class="chip"><b>Reference</b> · ghostty</span>
+  </div>
+</header>
+
+<section id="overview">
+  <h2 class="section">1 · Overview</h2>
+  <p><b>bbr</b> lets you review a Bitbucket Cloud pull request without leaving the terminal:
+  open a PR by id or URL, browse its files in a sidebar, read the diff with proper coloring,
+  view existing comment threads, and compose a batch of comments, replies, and suggestions
+  that stay <em>pending locally</em> until you submit them together — after which they are
+  published to Bitbucket via its REST API.</p>
+  <p>The design is shaped by three principles: <b>deep modules behind narrow seams</b> (so
+  external dependencies and hard choices stay swappable and testable), <b>correctness of
+  comment anchoring by construction</b> (never by luck), and a <b>walking-skeleton delivery</b>
+  that is runnable end-to-end from the first milestone.</p>
+</section>
+
+<section id="goals">
+  <h2 class="section">2 · Goals &amp; Non-Goals</h2>
+  <div class="grid2">
+    <div class="card">
+      <h4 style="margin-top:0">Goals</h4>
+      <ul class="tight">
+        <li>Open a PR by id or Bitbucket URL; fuzzy-switch between PRs.</li>
+        <li>File sidebar with change status and comment/draft counts.</li>
+        <li>Diff with neutral / green / red line backgrounds and emphasized intra-line changes.</li>
+        <li>Unified <em>and</em> side-by-side layout; changes-only <em>and</em> whole-file scope.</li>
+        <li>Read comment threads &amp; replies inline on the diff.</li>
+        <li>Compose comments, replies, and suggestions as local drafts.</li>
+        <li>Submit drafts as one batch, with robust failure handling.</li>
+        <li>Show outdated &amp; resolved comments — never hide them behind bare markers.</li>
+        <li><b>Local / offline review</b> of a branch vs a base ref, no Bitbucket needed; git-worktree aware; open the adjacent PR from a checkout.</li>
+        <li>Vim motions (with numeric counts) alongside arrow keys.</li>
+        <li>Selectable themes (catppuccin / gruvbox / solarized / light / dark).</li>
+        <li>Syntax highlighting via tree-sitter (post-MVP).</li>
+        <li>Overlay windows (keybinding help, PR picker, composer).</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4 style="margin-top:0">Non-Goals</h4>
+      <ul class="tight">
+        <li>Bitbucket <em>Server / Data Center</em> support (different API).</li>
+        <li>Approving / merging / declining PRs (initially).</li>
+        <li><em>Applying</em> suggestions — Cloud has no such endpoint; done in the web UI.</li>
+        <li>Editing files or running the code under review.</li>
+        <li>A general git client; bbr reads branches &amp; diffs, it does not manage them.</li>
+        <li>Dirty working-tree diffs in local mode (MVP is committed refs only; deferred).</li>
+        <li>NTLM/Kerberos proxy auth in the first HTTP implementation (see §12).</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="constraints">
+  <h2 class="section">3 · Target &amp; Constraints</h2>
+  <table>
+    <tr><th>Concern</th><th>Decision</th><th>Why</th></tr>
+    <tr><td>Bitbucket product</td><td><b>Cloud</b> — <code>api.bitbucket.org/2.0</code>, workspace <code>check24</code></td><td>Confirmed from environment config. Different API surface from Data Center.</td></tr>
+    <tr><td>Auth</td><td>HTTP Basic — Atlassian account email + <b>API token</b> (<code>ATATT…</code>), from env</td><td>App passwords are deprecated; API token is the current path and matches the existing setup.</td></tr>
+    <tr><td>Language / toolchain</td><td><b>Zig 0.16.0</b></td><td>Installed version; post-"writergate" <code>std.Io</code> reader/writer interfaces.</td></tr>
+    <tr><td>TUI library</td><td><b>libvaxis</b> 0.6.0 (pinned <code>main</code> commit)</td><td>Mature Zig TUI; <code>minimum_zig_version = 0.16.0</code> confirmed. Same lib ghostty vendors.</td></tr>
+    <tr><td>Fuzzy finder</td><td><b>zf</b></td><td>Zig-native, in-process, zero-alloc. Chosen over <code>fff</code> (a Rust/C-FFI daemon built for 500k-file corpora — wrong scale, wrong toolchain here).</td></tr>
+    <tr><td>Local git</td><td><b>shell out to <code>git</code></b> behind a <span class="seam">GitClient</span> seam</td><td>No libgit2 C dep; fakeable in tests. Powers local/offline review (ADR-0004).</td></tr>
+    <tr><td>Persistence</td><td><b>SQLite / libSQL</b> at <code>~/.local/state/bbr/…</code></td><td>Durable pending reviews across crashes and PR switches.</td></tr>
+    <tr><td>HTTP client</td><td><code>std.http.Client</code> behind a seam</td><td>Zero C deps; covers common proxies; libcurl swappable later (see ADR-0003).</td></tr>
+    <tr><td>Highlighting</td><td>tree-sitter via Zig bindings, behind a seam (post-MVP)</td><td>Accurate coloring; kept off the critical path.</td></tr>
+  </table>
+</section>
+
+<section id="arch">
+  <h2 class="section">4 · Architecture</h2>
+  <p>bbr is split into five bounded contexts. Dependencies point inward toward the domain;
+  the two contexts that touch the outside world (Bitbucket, and the SQLite side of Review) do
+  so only through seams. The full glossary lives in each context's <code>CONTEXT.md</code>;
+  the <code>CONTEXT-MAP.md</code> at the repo root records their relationships.</p>
+
+  <div class="flow">
+    <div class="box"><b>Presentation</b><div class="k">libvaxis · panes, sidebar, overlays, picker, composer, input</div></div>
+  </div>
+  <div class="flow">
+    <div class="box"><b>Diff</b><div class="k">Diff · File · Hunk · Line · Buffer · Layout × Scope</div></div>
+    <div class="box"><b>Review</b><div class="k">Thread · Draft · PendingReview · Submission · Anchor</div></div>
+    <div class="box"><b>Highlighting</b><div class="k">Highlighter · Grammar · Span · Theme</div></div>
+  </div>
+  <div class="flow">
+    <div class="box"><b>Bitbucket</b> <span class="seam">(anti-corruption layer)</span><div class="k">PullRequest · RawDiff · ApiError · Credential</div></div>
+    <div class="box"><b>Git</b><div class="k">GitClient · Worktree · Ref · BaseRef · AdjacentPullRequest</div></div>
+  </div>
+  <div class="flow">
+    <div class="box" style="background:var(--panel)"><span class="seam">HttpClient</span> seam<div class="k">std.http.Client → libcurl</div></div>
+    <div class="box" style="background:var(--panel)"><span class="seam">GitClient</span> seam<div class="k">git CLI → fake</div></div>
+    <div class="box" style="background:var(--panel)"><span class="seam">PendingReviewStore</span> seam<div class="k">SQLite → fake</div></div>
+    <div class="box" style="background:var(--panel)"><span class="seam">Highlighter</span> seam<div class="k">plain → tree-sitter</div></div>
+  </div>
+  <div class="callout"><span class="label">Two review modes, one pipeline</span>
+    A <b>DiffSource</b> unifies input: Bitbucket's <code>RawDiff</code> and local <code>git diff</code>
+    both yield unified diff text, so the parser, renderer, and comment UI are mode-agnostic.
+    <b>Remote review</b> (a PullRequest) syncs comments and submits Drafts; <b>local review</b>
+    (branch vs base ref) keeps comments in SQLite and never submits. See ADR-0004.</div>
+
+  <h3>Data flow for opening a PR</h3>
+  <div class="flow">
+    <div class="box">Picker / URL<div class="k">PullRequestId</div></div><div class="arrow">→</div>
+    <div class="box">Bitbucket<div class="k">metadata, RawDiff, blobs, comments</div></div><div class="arrow">→</div>
+    <div class="box">Diff<div class="k">parse → Files/Hunks/Lines</div></div><div class="arrow">→</div>
+    <div class="box">Review<div class="k">build Threads; load Drafts</div></div><div class="arrow">→</div>
+    <div class="box">Presentation<div class="k">render(Buffer, Layout, Scope)</div></div>
+  </div>
+  <p>Network work runs on a background thread pool and returns to the UI thread as events
+  (§10). Each load is stamped with an <b>Epoch</b>; switching PRs bumps the epoch and stale
+  results are discarded on arrival.</p>
+</section>
+
+<section id="seams">
+  <h2 class="section">5 · Seams</h2>
+  <p>Three dependencies are accessed only through a narrow vtable interface — the same
+  type-erasure idiom as <code>std.mem.Allocator</code>. This keeps hard-to-reverse technology
+  choices swappable and, crucially, makes the domain testable with fakes (see ADR-0003).</p>
+<pre><code>// http/client.zig — the networking seam. The Bitbucket adapter depends only on this.
+pub const HttpClient = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+    pub const VTable = struct {
+        send:   *const fn (ptr: *anyopaque, a: Allocator, req: Request) anyerror!Response,
+        deinit: *const fn (ptr: *anyopaque) void,
+    };
+    pub fn send(self: HttpClient, a: Allocator, r: Request) !Response {
+        return self.vtable.send(self.ptr, a, r);
+    }
+};
+// Implementations: StdHttpClient (now) · CurlHttpClient (later) · FakeHttpClient (tests)</code></pre>
+  <table>
+    <tr><th>Seam</th><th>Now</th><th>Later</th><th>Test fake</th></tr>
+    <tr><td><span class="seam">HttpClient</span></td><td><code>std.http.Client</code></td><td>libcurl (NTLM/MITM proxies)</td><td>canned JSON fixtures</td></tr>
+    <tr><td><span class="seam">GitClient</span></td><td>shell out to <code>git</code></td><td>libgit2 (only if needed)</td><td>fixture command outputs</td></tr>
+    <tr><td><span class="seam">PendingReviewStore</span></td><td>SQLite / libSQL</td><td>—</td><td>in-memory map</td></tr>
+    <tr><td><span class="seam">Highlighter</span></td><td>Plain (no-op)</td><td>tree-sitter grammars</td><td>plain / stub spans</td></tr>
+  </table>
+</section>
+
+<section id="domain">
+  <h2 class="section">6 · Domain Model</h2>
+  <p>The core aggregate is a <b>Diff</b> for one <b>PullRequest</b>, whose line numbers come
+  straight from Bitbucket (ADR-0001). Comments hang off those lines via an <b>Anchor</b>.</p>
+<pre><code>Diff
+└── File { path, status, old_blob, new_blob }
+    └── Hunk { old_start, new_start }
+        └── Line { old_no: ?u32, new_no: ?u32, kind, in_hunk, segments: []IntraLineSegment }
+
+LineKind      = enum { context, added, removed };   // "context" = unchanged
+IntraLineSegment = struct { start: u32, len: u32, changed: bool };  // cosmetic emphasis
+
+Anchor = struct { path: []const u8, commit: Hash,   // the commit it was authored on
+                  from: ?u32, to: ?u32,             // old line / new line
+                  start_from: ?u32, start_to: ?u32,  // multi-line range start
+                  context: []const []const u8 };     // captured lines, for outdated display
+
+AnchorState  = enum { current, moved, outdated };    // resolved vs the viewed diff
+CommentTarget = enum { bitbucket, local };           // syncs+submits vs SQLite-only
+Thread = struct { root: Comment, replies: []Comment, resolved: bool };
+
+Draft = struct { local_id: TempId, kind: DraftKind, target: CommentTarget, anchor: ?Anchor,
+                 parent: ?union{ draft: TempId, comment: CommentId },
+                 body: []const u8, state: DraftState };
+DraftKind  = enum { top_level, inline_comment, reply, suggestion };
+DraftState = union(enum){ draft, submitting, posted: CommentId, failed: ApiError };</code></pre>
+  <div class="callout decision"><span class="label">Key modeling decision</span>
+    A <code>Reply</code>'s parent may be another <em>Draft</em> that has no server id yet. This
+    is what forces topological ordering at submission time (§9).</div>
+</section>
+
+<section id="diff">
+  <h2 class="section">7 · Diff &amp; Rendering</h2>
+  <p>Bitbucket's unified diff is the <b>authoritative</b> line model — we never recompute line
+  numbers locally, because that would risk anchoring comments to the wrong line (ADR-0001). The
+  only thing we compute ourselves is the <b>intra-line</b> word diff over adjacent
+  removed/added pairs, purely to emphasize the changed characters.</p>
+
+  <h3>Coloring</h3>
+  <p><span class="legend" style="background:var(--context)"></span>context (neutral) ·
+     <span class="legend" style="background:var(--added-bg)"></span>added (green) ·
+     <span class="legend" style="background:var(--removed-bg)"></span>removed (red) ·
+     with a <b>stronger</b> shade on the exact changed span.</p>
+  <div class="diffdemo">
+    <div class="ln"><span class="gutter">12</span><span class="gutter">12</span><span class="ctx">  const timeout = 30;</span></div>
+    <div class="ln"><span class="gutter">13</span><span class="gutter"></span><span class="del">- fetch(url, <em>{ retries: 3 }</em>);</span></div>
+    <div class="ln"><span class="gutter"></span><span class="gutter">13</span><span class="add">+ fetch(url, <em>{ retries: 5, backoff: true }</em>);</span></div>
+    <div class="ln"><span class="gutter">14</span><span class="gutter">14</span><span class="ctx">  return result;</span></div>
+  </div>
+
+  <h3>Two orthogonal view axes</h3>
+  <p>The same <b>Buffer</b> is projected through a 2×2 matrix — no second data source, so
+  switching any axis is instant (no refetch, no reparse).</p>
+  <table>
+    <tr><th></th><th>Layout: Unified</th><th>Layout: SideBySide</th></tr>
+    <tr><th>Scope: Changes</th><td>Hunks + context inline, far context <b>folded</b> (expandable).</td><td>Old left / new right, hunks only.</td></tr>
+    <tr><th>Scope: WholeFile</th><td>Entire file, changes shown inline.</td><td>Entire old file left / entire new file right.</td></tr>
+  </table>
+  <p>A <b>Fold</b> collapses long runs of far-from-change context in <code>Changes</code> scope;
+  expanding it reveals already-loaded lines and never refetches.</p>
+</section>
+
+<section id="highlight">
+  <h2 class="section">8 · Syntax Highlighting</h2>
+  <p><b>Post-MVP, behind the <span class="seam">Highlighter</span> seam.</b> The MVP renders
+  plain text so the diff viewer works end-to-end on day one.</p>
+  <div class="callout"><span class="label">Non-obvious constraint</span>
+    You cannot reliably highlight a raw diff — hunks are fragments. We highlight the
+    <em>complete</em> old and new file blobs (which we already fetch), then map per-token
+    colors back onto diff lines. Highlighting produces <b>foreground</b> color only; the diff
+    <b>background</b> is composed over it per cell. Two independent layers.</div>
+  <p>Engine: tree-sitter via Zig bindings. Initial grammar set: <b>TS/JS + React (tsx/jsx),
+  CSS, Go, Bash, JSON, YAML</b>. Grammar delivery (build-time vendored vs. neovim-style
+  runtime auto-fetch, which needs a <code>cc</code>) is a deferred decision — both live behind
+  the same seam.</p>
+</section>
+
+<section id="review">
+  <h2 class="section">9 · Comments &amp; Pending Review</h2>
+  <p>Bitbucket Cloud publishes comments immediately — it has <b>no native draft/pending</b>
+  concept. bbr therefore batches entirely client-side (ADR-0002): drafts accumulate in a
+  <b>PendingReview</b> persisted to SQLite, and are published together on <b>Submission</b>.</p>
+
+  <h3>Submission algorithm</h3>
+  <ol>
+    <li><b>Topologically order</b> drafts — a reply is posted only after its parent, because it
+      needs the parent's server-assigned <code>CommentId</code>.</li>
+    <li>POST each draft; <b>remap</b> local temp id → server id as responses return.</li>
+    <li>On per-item validation failure, keep that draft <em>and its reply-descendants</em>
+      pending; continue with the independent ones.</li>
+    <li>Report a per-item summary: <em>N posted · M failed (with reason) · retry?</em></li>
+  </ol>
+
+  <h3>Failure model</h3>
+  <p>The Bitbucket adapter classifies every failure (transport error <em>or</em> non-2xx +
+  parsed error JSON) into a typed <code>ApiError</code>; the classification, not the status
+  code, drives the measure.</p>
+  <table>
+    <tr><th>Class</th><th>Retryable</th><th>Measure</th></tr>
+    <tr><td><code>network</code>, <code>server</code> (5xx)</td><td><span class="tag yes">yes</span></td><td>Exponential backoff + jitter, capped attempts.</td></tr>
+    <tr><td><code>rate_limited</code> (429)</td><td><span class="tag yes">yes</span></td><td>Honor <code>Retry-After</code> before retrying.</td></tr>
+    <tr><td><code>unauthorized</code> / <code>forbidden</code></td><td><span class="tag no">no</span></td><td><b>Abort the whole batch</b>; keep everything pending; surface token/scope error.</td></tr>
+    <tr><td><code>bad_request</code> (400/422)</td><td><span class="tag no">no</span></td><td>Item-level fail with server message; skip its descendants; continue.</td></tr>
+    <tr><td><code>not_found</code> (404) / <code>conflict</code> (409)</td><td><span class="tag no">no</span></td><td>Item-level fail, surfaced with message.</td></tr>
+  </table>
+  <div class="callout warn"><span class="label">Two sharp edges</span>
+    <b>Duplicates:</b> if a POST succeeds but the response is lost, an auto-retry could
+    double-post — Cloud has no idempotency key. Guard: before re-POSTing after an
+    <em>ambiguous</em> failure, GET the PR comments and skip if one already matches
+    (path, line, content-hash).<br>
+    <b>Stale anchors:</b> if the PR gets new commits after we loaded it, anchor lines may no
+    longer exist (→ 400). Guard: capture the <b>SourceCommit</b> on load; re-check the PR head
+    before submit and warn if it changed.</div>
+</section>
+
+<section id="modes">
+  <h2 class="section">9b · Review Modes &amp; Anchor Lifecycle</h2>
+
+  <h3>Two modes over one pipeline</h3>
+  <table>
+    <tr><th></th><th>Remote review</th><th>Local review</th></tr>
+    <tr><th>Source</th><td>Bitbucket <code>RawDiff</code> + blobs</td><td><code>git diff &lt;base&gt;..&lt;branch&gt;</code> via GitClient</td></tr>
+    <tr><th>Comments</th><td>sync from Bitbucket; Drafts <b>submit</b> as a batch</td><td>persist in SQLite; <b>never submit</b> (<code>target = local</code>)</td></tr>
+    <tr><th>Anchoring</th><td>Bitbucket line numbers authoritative</td><td>commit + line, mapped locally</td></tr>
+    <tr><th>Entry</th><td>PR id / URL / picker / <b>auto-detect from CWD branch</b></td><td>current branch/worktree; or the no-PR chooser</td></tr>
+  </table>
+  <p>From a checkout, <b>Git</b> reads the current branch (worktree-aware) and finds the
+  <b>AdjacentPullRequest</b> (open PR whose source branch matches) — so you can jump from a
+  local branch straight into its remote review, or review the branch offline. MVP local mode
+  diffs <b>committed refs only</b>, so every anchor binds to a stable commit + line.</p>
+
+  <h3>Startup resolution (run <code>bbr</code> in your repo)</h3>
+  <ol>
+    <li><b>Explicit arg</b> — <code>bbr &lt;pr-id&gt;</code> or <code>bbr &lt;url&gt;</code> opens it directly (overrides detection).</li>
+    <li><b>Else inspect CWD via GitClient</b> — if it's a git repo/worktree, read the <b>current branch</b> <em>and</em> the tracking <b>Remote</b>, parsed to <code>(workspace, repo_slug)</code>. The parser handles SSH and HTTPS forms plus this machine's <code>url.insteadof</code> rewrites.</li>
+    <li><b>Query Bitbucket</b> for open PRs whose source branch matches, in that repo:
+      <ul class="tight">
+        <li><b>exactly one</b> → open its remote review;</li>
+        <li><b>multiple</b> → the PR Picker, <b>pre-filtered</b> to those;</li>
+        <li><b>none</b> → the <b>no-PR chooser</b>: <em>Pick a PR · Review branch locally · Quit</em>.</li>
+      </ul></li>
+    <li><b>Not a git repo</b> → the PR Picker (choose a repo first).</li>
+  </ol>
+  <p>So startup detection needs a <b>minimal, read-only GitClient</b> (branch + Remote) available
+  at <b>M4</b> — earlier than the diffing GitClient that local review needs at <b>M11</b>.</p>
+
+  <h3>Anchor lifecycle (answering "what about changes after the fact?")</h3>
+  <p>Every Anchor binds to a <b>commit + line</b> (plus captured context lines). Against the
+  currently-viewed diff a comment resolves to one of three <b>AnchorState</b>s:</p>
+  <div class="flow">
+    <div class="box"><b>current</b><div class="k">line unchanged → inline</div></div>
+    <div class="box"><b>moved</b><div class="k">line shifted by nearby edits → inline + marker</div></div>
+    <div class="box"><b>outdated</b><div class="k">line gone → per-file "Outdated (N)" collapsible, using captured context</div></div>
+  </div>
+  <div class="callout decision"><span class="label">Who computes it (ADR-0005)</span>
+    <b>Remote comments:</b> display Bitbucket's own outdated verdict + original hunk — Bitbucket
+    is authoritative for its comments (consistent with ADR-0001).<br>
+    <b>Local comments &amp; pending drafts:</b> no server, so we compute the state ourselves by
+    <b>diff-walking</b> — <code>git diff &lt;anchor_commit&gt; &lt;current_ref&gt; -- &lt;path&gt;</code>
+    maps the old line forward.</div>
+  <p><b>Outdated and resolved comments are never hidden.</b> Resolved Threads sit behind a toggle
+  that reveals the <em>entire</em> thread (comment + replies) — not a bare "a resolved comment
+  exists here" marker.</p>
+
+  <h3>Navigation &amp; themes</h3>
+  <p>A <b>Keymap</b> layer supports <b>vim motions with numeric counts</b> (<code>hjkl</code>,
+  <code>ctrl-d</code>/<code>ctrl-u</code>, <code>gg</code>/<code>G</code>, <code>zz</code>,
+  <code>5j</code>) alongside arrow keys; it is config-driven and feeds the help overlay. The
+  <b>Theme</b> (§8) is the single place color lives, so selectable palettes — catppuccin,
+  gruvbox, solarized, plain light/dark — are a data change, not new render paths.</p>
+</section>
+
+<section id="concurrency">
+  <h2 class="section">10 · Concurrency</h2>
+  <ul class="tight">
+    <li><b>Main thread</b> owns the vaxis event loop, all rendering, and all mutable UI state — single-threaded UI, no UI locks.</li>
+    <li>Background work runs on <b><code>std.Io.Threaded</code></b> (0.16's threaded runtime; <code>async_limit</code> defaults to CPU-count−1). This is the same <code>Io</code> that backs <code>std.http.Client</code>, so we don't hand-roll a thread pool.</li>
+    <li>Workers deliver results by <b>posting custom events into vaxis's event queue</b>, so responses are handled in the same loop as keypresses — the model is mutated only on the main thread.</li>
+    <li><b>Epoch cancellation:</b> each load carries a generation token; on PR switch we bump the epoch and drop stale results (and free their arena) on arrival.</li>
+  </ul>
+  <p>In 0.16, <code>std.http.Client</code> <em>requires</em> an <code>Io</code> (it has an
+  <code>io: Io</code> field), so <code>std.Io.Threaded</code> is the natural background runtime rather
+  than a separate <code>std.Thread.Pool</code>. Everything network-facing still sits behind the
+  <span class="seam">HttpClient</span> seam. See <code>ZIG.md</code> §2. </p>
+</section>
+
+<section id="memory">
+  <h2 class="section">11 · Memory Model</h2>
+  <p>Allocation is tiered by <b>lifetime</b>. Arenas are reset and reused, so switching files
+  reuses backing pages instead of re-mapping them.</p>
+  <table>
+    <tr><th>Tier</th><th>Allocator</th><th>Holds</th><th>Reset on</th></tr>
+    <tr><td>Global</td><td>GPA / c_allocator</td><td>config, HttpClient, SQLite handle, tree-sitter parsers</td><td>process exit</td></tr>
+    <tr><td>PR-scoped</td><td>arena</td><td>PR metadata, file list, comment threads, drafts cache</td><td>PR switch</td></tr>
+    <tr><td>Buffer-scoped</td><td>arena (<code>.retain_capacity</code>)</td><td>one File's rendered model: lines, folds, segments, wrapping, spans</td><td>file switch (reused)</td></tr>
+  </table>
+  <div class="callout"><span class="label">Two edges</span>
+    <b>Multi-file view</b> needs several buffers alive at once, so the buffer tier is an
+    <b>arena pool / ring</b> (one arena per visible slot, LRU-recycled) — not a single arena.<br>
+    <b>Threads:</b> arenas aren't thread-safe, so a worker parses into its <em>own fresh
+    arena</em> and hands the whole arena + model to the main thread as the result event; the
+    main thread swaps it into the buffer slot and destroys the previous arena. Arenas double as
+    the unit of ownership transfer <em>and</em> epoch-cancellation cleanup.</div>
+</section>
+
+<section id="auth">
+  <h2 class="section">12 · Auth &amp; Security</h2>
+  <ul class="tight">
+    <li>Auth = HTTP Basic, <code>Authorization: Basic base64(email:api_token)</code>, read from
+      <code>BITBUCKET_USERNAME</code> / <code>BITBUCKET_TOKEN</code> / <code>BITBUCKET_WORKSPACE</code>.</li>
+    <li>The token is <b>never logged and never persisted</b> — not in SQLite, not in state files.</li>
+    <li><b>Proxy support:</b> <code>std.http.Client</code> auto-reads <code>HTTPS_PROXY</code>/<code>ALL_PROXY</code>,
+      does CONNECT tunneling, and supports Basic-auth proxies. It does <b>not</b> support
+      NTLM/Kerberos or TLS-intercepting proxies — if check24's network needs those, we swap in
+      libcurl behind the <span class="seam">HttpClient</span> seam (ADR-0003).</li>
+    <li>No <code>NO_PROXY</code> support in std; irrelevant for a single external host.</li>
+  </ul>
+</section>
+
+<section id="testing">
+  <h2 class="section">13 · Testing (TDD)</h2>
+  <p>The seams exist partly so the domain is testable without network, disk, or a C toolchain.
+  Red-green-refactor targets the pure logic first:</p>
+  <ul class="tight">
+    <li><b>Diff parsing</b> — feed <code>FakeHttpClient</code> canned unified-diff fixtures; assert the Line model, hunk boundaries, and line numbering.</li>
+    <li><b>Intra-line diff</b> — table-driven cases over removed/added pairs → expected segments.</li>
+    <li><b>Thread building</b> — flat comment list (with parents) → nested Threads.</li>
+    <li><b>Submission ordering</b> — a draft graph → asserted POST order and temp-id remapping.</li>
+    <li><b>Failure handling</b> — <code>FakeHttpClient</code> returns 401/429/400/5xx → assert abort vs. retry vs. mark-and-continue, and the dedupe guard.</li>
+    <li><b>Store</b> — property-style round-trips through the in-memory <span class="seam">PendingReviewStore</span>, then the SQLite one.</li>
+  </ul>
+  <p>Rendering is verified against a headless vaxis test surface (assert cell colors for a known Buffer).</p>
+</section>
+
+<section id="milestones">
+  <h2 class="section">14 · Milestones</h2>
+  <p>Vertical slices — a thin runnable spine first, then widen. Small, coherent milestones:
+  read-only precedes commenting (correct anchoring is a prerequisite for correct comments), and
+  the pure diff parser and comment submission are each isolated so their risk is contained.
+  Sizes are relative effort (S/M/L), not calendar estimates.</p>
+  <table>
+    <tr><th>#</th><th>Milestone</th><th>Size</th><th>Needs</th><th>Delivers</th></tr>
+    <tr><td>M0</td><td>Walking skeleton</td><td>S</td><td>—</td><td><code>build.zig</code>, HttpClient (std + fake), env auth, vaxis boots, fetch &amp; render one PR's metadata.</td></tr>
+    <tr><td>M1</td><td>Diff model &amp; parser</td><td>S/M</td><td>M0</td><td>RawDiff → Diff/File/Hunk/Line, from fixtures. Pure logic, fully unit-tested, <b>no UI</b>.</td></tr>
+    <tr><td>M2</td><td>Unified diff viewer</td><td>M</td><td>M1</td><td>Sidebar + unified DiffPane with colors, <code>Theme</code> abstraction, buffer arena, background runtime, Epoch, basic motions. Open by id.</td></tr>
+    <tr><td>M3</td><td>Comments (read)</td><td>M</td><td>M2</td><td>Threads &amp; replies, resolved toggle, anchor-state display (remote), outdated collapsible, suggestions.</td></tr>
+    <tr><td>M4</td><td>PR discovery &amp; switching</td><td>M</td><td>M2</td><td>Minimal GitClient (branch + remote), startup auto-detect + no-PR chooser, PR picker (zf), URL, switching.</td></tr>
+    <tr><td>M5</td><td>Diff polish</td><td>M</td><td>M2</td><td>Side-by-side layout, intra-line emphasis, Changes/WholeFile scope with folds, multi-file arena pool.</td></tr>
+    <tr><td>M6</td><td>Pending review: authoring</td><td>M</td><td>M3</td><td>PendingReviewStore (SQLite + fake), Composer, drafts (incl. reply-to-draft), persistence + resume.</td></tr>
+    <tr><td>M7</td><td>Pending review: submission</td><td>M</td><td>M6</td><td>Topological Submission + temp-id remap, failure model, dedupe guard, stale-anchor check, per-item summary.</td></tr>
+    <tr><td>M8</td><td>Keymap &amp; motions</td><td>S/M</td><td>M2</td><td>Full vim motions + numeric counts, configurable Keymap, keybinding-help overlay.</td></tr>
+    <tr><td>M9</td><td>Themes &amp; config</td><td>S</td><td>M2</td><td>Built-in catppuccin/gruvbox/solarized + light/dark; TOML config.</td></tr>
+    <tr><td>M10</td><td>Syntax highlighting</td><td>L</td><td>M2</td><td>tree-sitter behind the seam; initial grammar set; compose over diff background.</td></tr>
+    <tr><td>M11</td><td>Local / offline review</td><td>M/L</td><td>M6</td><td>GitClient diffing subset, DiffSource, local comments in SQLite, local anchor diff-walking (committed refs).</td></tr>
+  </table>
+  <p><small><b>MVP line:</b> M0–M3 = a usable read-only reviewer; M4 makes it ergonomic; M6+M7
+  make it write-capable (the headline). M5/M8/M9/M10 are parallelizable polish once M2 lands.
+  M11 (the largest standalone feature) needs read + authoring (M6), <em>not</em> submission (M7).</small></p>
+</section>
+
+<section id="open">
+  <h2 class="section">15 · Open Questions &amp; Deferred Decisions</h2>
+  <ul class="tight">
+    <li><b>Grammar delivery</b> — build-time vendored (fixed set, no runtime <code>cc</code>) vs. neovim-style runtime auto-fetch+compile (needs <code>cc</code>). Deferred to M10.</li>
+    <li><b>Corporate proxy type</b> at check24 — determines whether libcurl is ever needed. Seam is ready either way.</li>
+    <li><b>Bitbucket rate limits</b> — exact thresholds; tune pool size &amp; backoff against observed <code>429</code>s.</li>
+    <li><b>Config format &amp; location</b> — likely TOML at <code>~/.config/bbr/</code>; finalize at M9.</li>
+    <li><b>Approve / merge / decline</b> — currently a non-goal; revisit after M7.</li>
+    <li><b>PR-head re-check UX</b> — reload vs. submit-anyway when the SourceCommit changed.</li>
+    <li><b>Dirty working-tree diffs</b> (local mode) — deferred; needs fuzzy content-based anchoring. MVP is committed refs only.</li>
+    <li><b>Adjacent-PR ambiguity</b> — behavior when a branch has multiple or zero open PRs.</li>
+  </ul>
+  <p><small>Resolved during design: <b>"changes after the fact"</b> → the AnchorState lifecycle
+  (§9b, ADR-0005); <b>outdated comments</b> → kept and shown, never hidden.</small></p>
+</section>
+
+<footer>
+  bbr design document · companions: <code>CONTEXT-MAP.md</code>, per-context <code>CONTEXT.md</code>,
+  <code>docs/adr/0001–0005</code>, <code>ZIG.md</code>, <code>FEATURES.md</code>, <code>TODO.md</code>. Reference codebase: ghostty.
+</footer>
+</main>
+</div>
+</body>
+</html>

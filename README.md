@@ -1,0 +1,66 @@
+# bbr — Bitbucket Reviewer
+
+A Zig terminal UI for reviewing **Bitbucket Cloud** pull requests: browse the diff with proper
+coloring and syntax highlighting, read comment threads, and compose comments, replies, and
+suggestions that stay **pending locally** until you submit them as a batch.
+
+> Status: **design phase**. No code yet — this repo currently holds the design, domain model,
+> and roadmap. Implementation follows the milestones below.
+
+## Documentation map
+
+| Document | What it is |
+|---|---|
+| [`docs/design.html`](docs/design.html) | The design document — architecture, seams, diff/rendering, pending review, concurrency, memory, milestones. **Start here.** |
+| [`CONTEXT-MAP.md`](CONTEXT-MAP.md) | Bounded contexts and how they relate. |
+| `src/*/CONTEXT.md` | Per-context glossary (ubiquitous language). Pure vocabulary, no implementation. |
+| [`docs/adr/`](docs/adr/) | Architecture Decision Records for the hard-to-reverse choices. |
+| [`ZIG.md`](ZIG.md) | Zig 0.16.0 feature/API notes this project depends on. |
+| [`FEATURES.md`](FEATURES.md) | Feature set by area, tagged with delivering milestone. |
+| [`TODO.md`](TODO.md) | Near-term actionable work, per milestone. |
+
+## Key decisions at a glance
+
+- **Target:** Bitbucket Cloud (`api.bitbucket.org/2.0`), workspace `check24`; HTTP Basic with an
+  Atlassian API token from the environment.
+- **Stack:** Zig 0.16.0, libvaxis (TUI), zf (fuzzy find), SQLite/libSQL (pending reviews),
+  tree-sitter (highlighting, post-MVP).
+- **Pending review is client-side** — Bitbucket Cloud has no native draft concept
+  ([ADR-0002](docs/adr/0002-client-side-pending-review-batch.md)).
+- **Bitbucket's diff is the authoritative line model** so comment anchors are correct by
+  construction ([ADR-0001](docs/adr/0001-bitbucket-diff-is-authoritative-line-model.md)).
+- **External deps sit behind swappable seams** (`HttpClient`, `GitClient`, `PendingReviewStore`,
+  `Highlighter`) — which is also what makes the domain testable
+  ([ADR-0003](docs/adr/0003-swappable-seams-std-http-sqlite-treesitter.md)).
+- **Two review modes over one pipeline** — remote (Bitbucket PR) and local (branch vs base ref,
+  offline, comments in SQLite), unified by a `DiffSource`
+  ([ADR-0004](docs/adr/0004-local-offline-review-via-diffsource-and-git-shell-out.md)).
+- **Comments have an anchor lifecycle** — current / moved / outdated; outdated and resolved
+  comments are shown, never hidden
+  ([ADR-0005](docs/adr/0005-comment-anchor-lifecycle.md)).
+
+## Milestones
+
+Small vertical slices (sizes are relative effort, not dates):
+
+`M0` walking skeleton → `M1` diff model & parser (pure, tested) → `M2` unified viewer →
+`M3` comments (read) → `M4` PR discovery & switching → `M5` diff polish →
+`M6` pending review: authoring → `M7` pending review: submission → `M8` keymap & motions →
+`M9` themes & config → `M10` syntax highlighting → `M11` local / offline review.
+
+**MVP line:** M0–M3 (usable read-only), M4 (ergonomic), M6–M7 (write-capable — the headline).
+Full breakdown with dependencies in `docs/design.html` §14 and `TODO.md`.
+
+## Building (once code lands)
+
+```sh
+zig build          # build the bbr executable
+zig build test     # run unit tests (no network/disk needed — seams are faked)
+```
+
+Requires env: `BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, `BITBUCKET_WORKSPACE`.
+
+## Reference
+
+High-quality Zig codebase used as a reference for structure and idioms:
+[`ghostty`](https://github.com/ghostty-org/ghostty).
