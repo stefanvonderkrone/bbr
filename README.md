@@ -4,8 +4,9 @@ A Zig terminal UI for reviewing **Bitbucket Cloud** pull requests: browse the di
 coloring and syntax highlighting, read comment threads, and compose comments, replies, and
 suggestions that stay **pending locally** until you submit them as a batch.
 
-> Status: **design phase**. No code yet — this repo currently holds the design, domain model,
-> and roadmap. Implementation follows the milestones below.
+> Status: **M0 (walking skeleton) complete** — `zig build` produces a `bbr` binary that fetches a
+> PR and renders its header in vaxis; the network-free core (credential, HTTP seam, Bitbucket
+> adapter) is tested (`zig build test`, 8/8). Implementation continues through the milestones below.
 
 ## Documentation map
 

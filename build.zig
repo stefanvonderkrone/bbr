@@ -4,11 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // The network-free core, exposed as the `bbr` module.
+    // The network-free core, exposed as the `bbr` module (no TUI deps → testable).
     const mod = b.addModule("bbr", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
+
+    const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
 
     const exe = b.addExecutable(.{
         .name = "bbr",
@@ -18,6 +20,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "bbr", .module = mod },
+                .{ .name = "vaxis", .module = vaxis.module("vaxis") },
             },
         }),
     });

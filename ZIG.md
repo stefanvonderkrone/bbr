@@ -124,6 +124,26 @@ the main thread; the Epoch token still guards against stale results.
 - Our TDD relies on the seams' **fakes** (FakeHttpClient, in-memory store, plain highlighter)
   so domain tests need no network, disk, or C toolchain.
 
+## 7. libvaxis (TUI) — 0.16 integration facts
+
+**Verified by building bbr's M0** against pinned commit `ca781b3` (`vaxis-0.6.0`).
+
+- **`vaxis.init(io, alloc, env_map, opts)`** takes the runtime `Io` and a `*std.process.Environ.Map`
+  — pass `init.io` and `init.environ_map` straight through. `opts` is `.{}` for defaults.
+- **Everything writes to a `*std.Io.Writer`.** Get it from the tty:
+  `var tty = try vaxis.Tty.init(io, &buf); const w = tty.writer();` (a `[]u8` write buffer you own).
+  `vx.deinit(alloc, w)`, `enterAltScreen(w)`, `render(w)`, `resize(alloc, w, ws)` all take it.
+- **Event loop:** `var loop: vaxis.Loop(vaxis.Event) = .init(io, &tty, &vx); try loop.start();`
+  then `loop.nextEvent()`. Using `vaxis.Event` as the loop's type guarantees every field the loop
+  posts unconditionally (`focus_in`, `mouse`, …) exists. A custom event union must be a **superset**
+  of `vaxis.Event`'s field names.
+- **Keys:** `key.matches('q', .{})`, `key.matches('c', .{ .ctrl = true })`.
+- **Cells borrow text.** `Cell.Character.grapheme` is `[]const u8`; text handed to `printSegment`
+  must stay valid until `render()`. Keep per-line buffers in scope across the whole draw+render, or
+  reuse one buffer and you'll corrupt earlier cells.
+- Module wiring: `b.dependency("vaxis", .{...}).module("vaxis")`; the core `bbr` module stays
+  vaxis-free so its tests need no TUI.
+
 ---
 
 ## Re-verification checklist (on any Zig upgrade)

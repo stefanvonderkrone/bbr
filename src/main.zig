@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const bbr = @import("bbr");
+const app = @import("tui/app.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -33,10 +34,7 @@ pub fn main(init: std.process.Init) !void {
     const pr = try bb.getPullRequest(gpa, repo, id);
     defer bbr.bitbucket.deinitPullRequest(gpa, pr);
 
-    std.debug.print(
-        "#{d} [{s}] {s}\n  {s}\n  {s} -> {s}\n",
-        .{ pr.id, pr.state, pr.title, pr.author_display_name, pr.source_branch, pr.destination_branch },
-    );
+    try app.run(init.io, gpa, init.environ_map, pr);
 }
 
 fn usage() void {

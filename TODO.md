@@ -5,14 +5,14 @@ small enough to land in one focused change with tests where the seam allows.
 
 Sizes are relative effort (S/M/L), not calendar estimates. Dependencies noted per milestone.
 
-## M0 — Walking skeleton  ·  S
-- [ ] `build.zig` + `build.zig.zon`: pin libvaxis (`main` commit, min zig 0.16.0) and zf.
-- [ ] `Credential` from env (`BITBUCKET_USERNAME` / `BITBUCKET_TOKEN` / `BITBUCKET_WORKSPACE`); fail clearly if missing.
-- [ ] `HttpClient` vtable seam + `StdHttpClient` (std.http.Client) + `FakeHttpClient`.
-- [ ] `initDefaultProxies` wired from env in `StdHttpClient`.
-- [ ] Bitbucket adapter: `getPullRequest(id)` → typed `PullRequest`; classify `ApiError`.
-- [ ] vaxis boots, alt-screen, quit key; render one PR's title/author/branches.
-- [ ] Test: FakeHttpClient fixture → parsed PullRequest; 401/429/5xx → correct `ApiError`.
+## M0 — Walking skeleton  ·  S  ·  ✅ done
+- [x] `build.zig` + `build.zig.zon`: pin libvaxis (`ca781b3`, min zig 0.16.0) and zf (`c35c421`).
+- [x] `Credential` from env (`BITBUCKET_USERNAME` / `BITBUCKET_TOKEN` / `BITBUCKET_WORKSPACE`); fail clearly if missing.
+- [x] `HttpClient` vtable seam + `StdHttpClient` (std.http.Client) + `FakeHttpClient`.
+- [x] `initDefaultProxies` wired from env in `StdHttpClient`.
+- [x] Bitbucket adapter: `getPullRequest(id)` → typed `PullRequest`; classify `ApiError`.
+- [x] vaxis boots, alt-screen, quit key; render one PR's title/author/branches.
+- [x] Test: FakeHttpClient fixture → parsed PullRequest; 401/429/5xx → correct `ApiError`. (8/8 pass)
 
 ## M1 — Diff model & parser (pure, no UI)  ·  S/M  ·  needs M0
 - [ ] Bitbucket: `getDiff`, `getDiffStat` (paginated).
