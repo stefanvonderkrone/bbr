@@ -123,6 +123,11 @@ the main thread; the Epoch token still guards against stale results.
 - `std.testing.allocator` detects leaks per test — pair every `alloc` with `defer free`.
 - Our TDD relies on the seams' **fakes** (FakeHttpClient, in-memory store, plain highlighter)
   so domain tests need no network, disk, or C toolchain.
+- **You can't cleanly read env vars inside a `test` block in 0.16.** The env API flows through
+  `Init`/`Io`, and the test runner hands tests neither; `Environ.Block.global` exists only on
+  wasi/freestanding, not posix. So keep `test` blocks **hermetic** (fakes + `@embedFile` fixtures)
+  and put anything that needs real credentials in an executable step instead (bbr uses
+  `zig build check`, which reads `Init.environ_map` in `main`).
 
 ## 7. libvaxis (TUI) — 0.16 integration facts
 

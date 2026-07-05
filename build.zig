@@ -32,6 +32,15 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run bbr");
     run_step.dependOn(&run_cmd.step);
 
+    // Live smoke check against real Bitbucket (opt-in; needs BITBUCKET_* env):
+    //   zig build check -- <repo-slug> <pr-id>
+    const check_cmd = b.addRunArtifact(exe);
+    check_cmd.step.dependOn(b.getInstallStep());
+    check_cmd.addArg("check");
+    if (b.args) |args| check_cmd.addArgs(args);
+    const check_step = b.step("check", "Live smoke check against Bitbucket: zig build check -- <repo> <id>");
+    check_step.dependOn(&check_cmd.step);
+
     // `zig build test` runs the core module's tests and the exe module's tests.
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);

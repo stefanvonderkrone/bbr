@@ -3,5 +3,8 @@ zig-out/
 .zig-cache/
 zig-pkg/
 
+# Local secrets — never commit. Source into your shell: set -a; source .env; set +a
+.env
+
 # Editor / OS
 .DS_Store

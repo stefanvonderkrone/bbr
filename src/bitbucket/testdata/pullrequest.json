@@ -1,0 +1,39 @@
+{
+  "type": "pullrequest",
+  "id": 42,
+  "title": "Add diff parser",
+  "description": "Parses the raw unified diff into the domain model.",
+  "state": "OPEN",
+  "author": {
+    "type": "user",
+    "display_name": "Ada Lovelace",
+    "uuid": "{00000000-0000-0000-0000-000000000000}",
+    "account_id": "aaaaaaaaaaaaaaaaaaaaaaaa",
+    "nickname": "ada"
+  },
+  "source": {
+    "branch": { "name": "feature/diff" },
+    "commit": { "hash": "abc123def456", "type": "commit" },
+    "repository": { "type": "repository", "name": "bbr", "full_name": "check24/bbr" }
+  },
+  "destination": {
+    "branch": { "name": "main" },
+    "commit": { "hash": "0011223344ff", "type": "commit" },
+    "repository": { "type": "repository", "name": "bbr", "full_name": "check24/bbr" }
+  },
+  "comment_count": 3,
+  "task_count": 0,
+  "close_source_branch": true,
+  "created_on": "2026-07-01T09:00:00.000000+00:00",
+  "updated_on": "2026-07-03T12:34:56.000000+00:00",
+  "links": {
+    "self": { "href": "https://api.bitbucket.org/2.0/repositories/check24/bbr/pullrequests/42" },
+    "html": { "href": "https://bitbucket.org/check24/bbr/pull-requests/42" }
+  },
+  "summary": {
+    "type": "rendered",
+    "raw": "Parses the raw unified diff into the domain model.",
+    "markup": "markdown",
+    "html": "<p>Parses the raw unified diff into the domain model.</p>"
+  }
+}

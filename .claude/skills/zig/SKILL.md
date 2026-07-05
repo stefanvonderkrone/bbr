@@ -33,6 +33,10 @@ from repeating past mistakes. The version-pinned API catalog bbr relies on lives
   `.response_writer = &aw.writer` with `aw: std.Io.Writer.Allocating = .init(alloc)`, then
   `aw.toOwnedSlice()`. The client is a plain struct: `.{ .allocator = gpa, .io = io }`. Classify
   with `status.class()`.
+- **You can't read env vars inside a `test` block.** The env API flows through `Init`/`Io` and the
+  test runner hands tests neither (`Environ.Block.global` is wasi/freestanding-only). Keep tests
+  hermetic (fakes + `@embedFile` fixtures); put credential/network work in an executable step that
+  reads `Init.environ_map` in `main`.
 - **Concurrency is `std.Io` / `std.Io.Threaded`, NOT `std.Thread.Pool`.** 0.16 centralizes I/O and
   concurrency behind the `std.Io` interface. `std.http.Client` has an `io: Io` field and *requires*
   an `Io`, so you do not hand-roll a thread pool for network work. Build one `std.Io.Threaded`

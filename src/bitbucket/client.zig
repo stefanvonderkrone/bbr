@@ -109,17 +109,9 @@ pub fn deinitPullRequest(allocator: Allocator, pr: PullRequest) void {
 const testing = std.testing;
 const FakeHttpClient = @import("../http/fake_client.zig").FakeHttpClient;
 
-const fixture_pr =
-    \\{
-    \\  "id": 42,
-    \\  "title": "Add diff parser",
-    \\  "state": "OPEN",
-    \\  "author": { "display_name": "Ada Lovelace" },
-    \\  "source": { "branch": { "name": "feature/diff" } },
-    \\  "destination": { "branch": { "name": "main" } },
-    \\  "extra_field_we_ignore": 123
-    \\}
-;
+// A schema-representative Bitbucket PR response (many fields our model ignores).
+// Replace with a real captured response via `zig build check` when convenient.
+const fixture_pr = @embedFile("testdata/pullrequest.json");
 
 fn testCredential() Credential {
     return .{ .username = "u", .token = "t", .workspace = "check24" };

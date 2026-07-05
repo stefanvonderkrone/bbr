@@ -22,7 +22,14 @@ pub fn main(init: std.process.Init) !void {
 
     var it = init.minimal.args.iterate();
     _ = it.next(); // executable name
-    const repo = it.next() orelse return usage();
+    var first = it.next() orelse return usage();
+
+    // `check` is a live smoke test: fetch and print, no TUI. Exits non-zero on
+    // any failure (missing creds, network, HTTP status), so it is scriptable.
+    const check_mode = std.mem.eql(u8, first, "check");
+    if (check_mode) first = it.next() orelse return usage();
+
+    const repo = first;
     const id_str = it.next() orelse return usage();
     const id = std.fmt.parseInt(u64, id_str, 10) catch return usage();
 
@@ -34,9 +41,24 @@ pub fn main(init: std.process.Init) !void {
     const pr = try bb.getPullRequest(gpa, repo, id);
     defer bbr.bitbucket.deinitPullRequest(gpa, pr);
 
+    if (check_mode) {
+        std.debug.print(
+            "ok: fetched PR from Bitbucket\n#{d} [{s}] {s}\n  author: {s}\n  {s} -> {s}\n",
+            .{ pr.id, pr.state, pr.title, pr.author_display_name, pr.source_branch, pr.destination_branch },
+        );
+        return;
+    }
+
     try app.run(init.io, gpa, init.environ_map, pr);
 }
 
 fn usage() void {
-    std.debug.print("usage: bbr <repo-slug> <pr-id>\n", .{});
+    std.debug.print(
+        \\usage:
+        \\  bbr <repo-slug> <pr-id>          open the PR in the TUI
+        \\  bbr check <repo-slug> <pr-id>    live smoke check (fetch + print, no TUI)
+        \\
+        \\requires BITBUCKET_USERNAME, BITBUCKET_TOKEN, BITBUCKET_WORKSPACE in the environment.
+        \\
+    , .{});
 }

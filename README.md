@@ -55,11 +55,17 @@ Full breakdown with dependencies in `docs/design.html` §14 and `TODO.md`.
 ## Building (once code lands)
 
 ```sh
-zig build          # build the bbr executable
-zig build test     # run unit tests (no network/disk needed — seams are faked)
+zig build                        # build the bbr executable
+zig build test                   # unit tests — hermetic, no network/disk (seams are faked)
+zig build check -- <repo> <id>   # live smoke check against real Bitbucket (needs creds)
 ```
 
-Requires env: `BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, `BITBUCKET_WORKSPACE`.
+`zig build test` is hermetic and CI-safe. `zig build check` is the opt-in live tier: it hits real
+Bitbucket, so it needs credentials and is never part of `test`.
+
+Credentials come from the environment only (never a config file, never persisted):
+`BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, `BITBUCKET_WORKSPACE`. For local runs, keep them in a
+gitignored `.env` and source it: `set -a; source .env; set +a`.
 
 ## Reference
 
