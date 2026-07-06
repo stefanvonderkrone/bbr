@@ -59,7 +59,10 @@ pub const bitbucket = struct {
     pub const PullRequest = types.PullRequest;
     pub const PullRequestSummary = types.PullRequestSummary;
     pub const ApiError = types.ApiError;
+    pub const url = @import("bitbucket/url.zig");
 };
+
+pub const startup = @import("startup.zig");
 
 test {
     _ = @import("http/client.zig");
@@ -75,4 +78,6 @@ test {
     _ = @import("review/thread.zig");
     _ = @import("git/remote.zig");
     _ = @import("git/client.zig");
+    _ = @import("bitbucket/url.zig");
+    _ = @import("startup.zig");
 }
