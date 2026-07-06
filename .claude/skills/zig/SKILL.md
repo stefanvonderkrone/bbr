@@ -75,6 +75,25 @@ from repeating past mistakes. The version-pinned API catalog bbr relies on lives
   `zig test src/root.zig` under a `sleep N; kill $PID` guard — it prints `N/M name...` live, no
   `--listen` protocol in the way. And **don't `pkill -9` a live `zig build`** — it can orphan the
   cache manager and make later builds block on the lock.
+- **A source file may belong to only ONE module.** From an exe-module file, `@import`ing a file the
+  library module already owns (`../http/fake_client.zig`) errors: `file exists in modules 'bbr' and
+  'root'`. Reach shared decls **through the module API** (`bbr.http.Canned`), never by path. Bites
+  cross-module test code pulling a library fixture/helper.
+- **`std.Io.concurrent(fn, args)` copies the args tuple by value.** A `[]const u8` copies only the
+  header — pass a fixed `[N]u8` for strings you don't own, or ensure the pointee outlives the task.
+  It returns `std.Io.Future(Ret)`; `future.await(io)` (mutating) reclaims it. **Await every future
+  before destroying state a worker still touches** (e.g. the vaxis loop's queue), or a late
+  `postEvent` is a use-after-free. There is **no `std.heap.ThreadSafeAllocator`** in this build:
+  give workers the stateless `std.heap.page_allocator`, keep `gpa` main-thread-only, and pass
+  ownership across the boundary via the event.
+- **`vaxis.Loop(T)` is generic over YOUR event union.** Add a variant (`load_done: …`) and
+  `loop.postEvent(...)` it from a worker; the tty reader only posts variants it recognises (guards
+  with `@hasField`). A `union(enum)` switch with every case handled must have **no `else =>`**
+  (compile error: "unreachable else prong").
+- **Unmanaged `std.ArrayList(u8)` has no `.writer()`.** Use `list.print(gpa, fmt, args)` and
+  `list.appendSlice(gpa, bytes)` (the managed variant's `.writer()`/`.print()` take no allocator —
+  don't confuse them). `std.process.run(gpa, io, .{.argv,.cwd})` → `RunResult{term,stdout,stderr}`;
+  `Term` is `union(enum){exited:u8,…}`, `Cwd` is `union(enum){inherit,dir,path}`.
 
 ## Idioms that are correct here (not hacks)
 

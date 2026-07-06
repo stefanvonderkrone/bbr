@@ -35,12 +35,14 @@ Sizes are relative effort (S/M/L), not calendar estimates. Dependencies noted pe
 - [x] AnchorState display (current/moved/outdated from Bitbucket verdict); per-file Outdated collapsible. ✅ outdated threads grouped in a per-file "Outdated (N)" section and **never hidden** (even when resolved). Outdated is derived from each comment's `links.code` revision vs the PR's current source/destination commits — the list endpoint omits `inline.outdated` and it can't be recomputed from line numbers (see `bitbucket/CONTEXT.md`). Verified live on PR 1726 (8 outdated roots). `moved` isn't produced remotely; local diff-walk for `moved` is M6. The Outdated group is always expanded — fold/collapse deferred to M5 (`Fold`s).
 - [x] Tests: thread nesting, resolved toggle, outdated grouping. ✅ thread nesting/orphan/out-of-order (`thread.zig`), weaving + resolved toggle + outdated grouping (`buffer.zig`), headless comment/suggestion render (`render.zig`), paginated `getComments` (`client.zig`). Suite green 62/62.
 
-## M4 — PR discovery & switching  ·  M  ·  needs M2
-- [ ] Minimal read-only `GitClient`: current branch + tracking Remote (SSH/HTTPS + `url.insteadof`).
-- [ ] Bitbucket: list open PRs filtered by source branch.
-- [ ] Startup resolution: arg → CWD auto-detect → picker; no-PR chooser; pre-filtered picker on multiple.
-- [ ] PR Picker overlay (zf); URL parser; switch PRs with Epoch cancellation.
-- [ ] Tests: remote URL parsing, branch detection (fake GitClient), resolution branches.
+## M4 — PR discovery & switching  ·  M  ·  ✅ done
+- [x] Minimal read-only `GitClient`: current branch + tracking Remote (SSH/HTTPS + `url.insteadof`). ✅ `src/git/remote.zig` (pure, allocation-free URL→workspace/repo parser handling scp/ssh/https forms and longest-alias insteadof rewrites) + `src/git/client.zig` (`GitClient` seam; `ShellGitClient` shells out via `std.process.run` reading `git config --get-regexp url\..*\.insteadof`; `FakeGitClient` for tests). Detached HEAD / no origin / non-repo each map to a distinct `GitError`.
+- [x] Bitbucket: list open PRs filtered by source branch. ✅ `Client.listPullRequests` follows `next` pagination, returns `[]PullRequestSummary`; optional `source_branch` filter via the `q` query language (`source.branch.name="…"`, percent-encoded). Verified live: paged through 71 open PRs of `pr-webapp`.
+- [x] Startup resolution: arg → CWD auto-detect → picker; no-PR chooser; pre-filtered picker on multiple. ✅ `src/startup.zig` `resolve`: URL → explicit repo+id → auto-detect (repo from remote, adjacent PRs on the branch: 1 opens, >1 pre-filtered picker, 0 → all-open picker; empty repo → `empty`). Detached HEAD skips the branch filter.
+- [x] PR Picker overlay (zf); URL parser; switch PRs with Epoch cancellation. ✅ `src/tui/picker.zig` (pure zf-ranked, navigable state machine), `src/bitbucket/url.zig` (web+API PR URL parser), and an async switch: `p` opens the picker, Enter bumps an Epoch and spawns a load worker (`std.Io.concurrent`) that builds the new `Session` off `page_allocator` and posts a `load_done` event; only the current epoch's result is applied (stale discarded). Futures are awaited before teardown.
+- [x] Tests: remote URL parsing, branch detection (fake GitClient), resolution branches. ✅ remote parser (8), GitClient fakes (4), url parser (6), listPullRequests (4), resolution branches (7), picker (6), session loader over fake http (2), picker-overlay headless render (1). Suite green. `bbr detect [<repo>]` prints the resolution without the TUI (scriptable live check).
+
+_Deferred:_ SideBySide + folds (M5), moved-anchor local diff-walk (M6). The Picker lists **all** open PRs on open (not re-filtered to the current branch); PR-list fetch on picker-open is synchronous (one request) while the *switch load* is async — listing could go async later if it ever feels slow.
 
 ## M5 — Diff polish  ·  M  ·  needs M2
 - [ ] SideBySide layout projection over the same Buffer.

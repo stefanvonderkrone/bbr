@@ -49,6 +49,25 @@ const io: std.Io = threaded.io();
 network results are marshalled back to it as custom events. UI state is still mutated only on
 the main thread; the Epoch token still guards against stale results.
 
+**Concrete async pattern (M4, verified against a running TUI):**
+- `std.Io.concurrent(fn, args_tuple)` returns `std.Io.Future(Ret)` (or `ConcurrencyUnavailable`).
+  The **args tuple is copied by value** into the task — a `[]const u8` copies only the slice
+  header, so pass a fixed `[N]u8` for strings whose backing you don't control, or ensure the
+  pointee outlives the task. `future.await(io)` (mutating; takes `*Future`) reclaims the task;
+  **await every future before tearing down any state a worker still touches** (e.g. a vaxis
+  loop's event queue), or a late `postEvent` hits freed memory.
+- `vaxis.Loop(T)` is generic over **your own** event union: add a variant (`load_done: …`) and
+  post it from a worker thread with `loop.postEvent(...)`. The tty reader thread only posts
+  variants whose field names it recognises (it guards with `@hasField`), so custom variants are
+  yours alone. A `union(enum)` with every case handled must **not** carry an `else =>` prong
+  (compile error: "unreachable else prong").
+- **No `std.heap.ThreadSafeAllocator` in this 0.16 build.** Don't share one allocator across
+  threads: give worker threads the stateless `std.heap.page_allocator` and keep the main
+  allocator (gpa) main-thread-only. Hand ownership across the thread boundary via the event.
+- Shelling out: `std.process.run(gpa, io, .{ .argv, .cwd })` → `RunResult{ term, stdout, stderr }`
+  (caller owns stdout/stderr). `Term` is `union(enum){ exited: u8, signal, stopped, unknown }`;
+  `Cwd` is `union(enum){ inherit, dir: Io.Dir, path: []const u8 }`.
+
 ## 2.5 Process entry: `main(init)` and reading the environment
 
 **Verified by building bbr's M0.** 0.16 changed how a program starts and how it reads env vars.
@@ -115,6 +134,11 @@ the main thread; the Epoch token still guards against stale results.
   `b.dependency(name, .{})` or `b.lazyDependency(name, .{})` (libvaxis uses lazy deps).
 - `minimum_zig_version` in `build.zig.zon` guards the toolchain.
 - Pin exact dependency commits (libvaxis `main`, zf) — no floating refs.
+- **A source file may belong to only one module.** If a file in the exe module (`root`)
+  `@import`s a file that the `bbr` module already owns (e.g. `../http/fake_client.zig`), the
+  compiler errors `file exists in modules 'bbr' and 'root'`. Reach shared decls **through the
+  module's public API** (`bbr.http.Canned`), never by direct path. This bites most often in
+  cross-module *test* code pulling a fixture/helper from the library.
 
 ## 6. Testing
 
