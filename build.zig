@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
+    const zf = b.dependency("zf", .{ .target = target, .optimize = optimize });
 
     const exe = b.addExecutable(.{
         .name = "bbr",
@@ -21,6 +22,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "bbr", .module = mod },
                 .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+                .{ .name = "zf", .module = zf.module("zf") },
             },
         }),
     });

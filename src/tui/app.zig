@@ -203,4 +203,5 @@ test {
     _ = @import("render.zig");
     _ = @import("theme.zig");
     _ = @import("nav.zig");
+    _ = @import("picker.zig");
 }
