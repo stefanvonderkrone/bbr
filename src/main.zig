@@ -28,6 +28,40 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
 
+    // `raw-comments <repo> <pr>`: dump the first page of the comments list raw.
+    if (std.mem.eql(u8, first, "raw-comments")) {
+        const repo = it.next() orelse return usage();
+        const pr_id = std.fmt.parseInt(u64, it.next() orelse return usage(), 10) catch return usage();
+
+        var client = bbr.http.StdHttpClient.init(gpa, init.io);
+        defer client.deinit();
+        try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
+        const bb = bbr.bitbucket.Client.init(client.httpClient(), cred);
+
+        const raw = try bb.getCommentsRaw(gpa, repo, pr_id);
+        defer gpa.free(raw);
+        std.debug.print("{s}\n", .{raw});
+        return;
+    }
+
+    // `raw-comment <repo> <pr> <comment-id>`: dump one comment's JSON so we can
+    // inspect the real wire shape. Debug aid, no parsing.
+    if (std.mem.eql(u8, first, "raw-comment")) {
+        const repo = it.next() orelse return usage();
+        const pr_id = std.fmt.parseInt(u64, it.next() orelse return usage(), 10) catch return usage();
+        const cid = std.fmt.parseInt(u64, it.next() orelse return usage(), 10) catch return usage();
+
+        var client = bbr.http.StdHttpClient.init(gpa, init.io);
+        defer client.deinit();
+        try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
+        const bb = bbr.bitbucket.Client.init(client.httpClient(), cred);
+
+        const raw = try bb.getCommentRaw(gpa, repo, pr_id, cid);
+        defer gpa.free(raw);
+        std.debug.print("{s}\n", .{raw});
+        return;
+    }
+
     // `check` is a live smoke test: fetch and print, no TUI. Exits non-zero on
     // any failure (missing creds, network, HTTP status), so it is scriptable.
     const check_mode = std.mem.eql(u8, first, "check");
@@ -56,7 +90,10 @@ pub fn main(init: std.process.Init) !void {
         // against the API offline).
         var carena = std.heap.ArenaAllocator.init(gpa);
         defer carena.deinit();
-        const comments = try bb.getComments(carena.allocator(), repo, id);
+        const comments = try bb.getComments(carena.allocator(), repo, id, .{
+            .source = pr.source_commit,
+            .destination = pr.destination_commit,
+        });
         const threads = try bbr.review.buildThreads(carena.allocator(), comments);
 
         var inline_n: usize = 0;
@@ -90,7 +127,10 @@ pub fn main(init: std.process.Init) !void {
 
     // Comments and their threads live in the same PR-scoped arena (the rows woven
     // into the buffer borrow both the comments and the diff).
-    const comments = try bb.getComments(diff_arena.allocator(), repo, id);
+    const comments = try bb.getComments(diff_arena.allocator(), repo, id, .{
+        .source = pr.source_commit,
+        .destination = pr.destination_commit,
+    });
     const threads = try bbr.review.buildThreads(diff_arena.allocator(), comments);
 
     try app.run(init.io, gpa, init.environ_map, pr, diff, threads);
@@ -165,6 +205,8 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
         .author_display_name = "Author",
         .source_branch = "feature/timeout",
         .destination_branch = "main",
+        .source_commit = "democ0ffee",
+        .destination_commit = "demodeadbeef",
     };
 
     try app.run(io, gpa, env_map, pr, diff, threads);

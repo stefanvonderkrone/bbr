@@ -10,6 +10,19 @@ pub const PullRequest = struct {
     author_display_name: []const u8,
     source_branch: []const u8,
     destination_branch: []const u8,
+    /// Head commit of the source branch as we loaded it. Combined with
+    /// `destination_commit` it identifies the PR's *current* diff revision; a
+    /// comment anchored against a different revision is outdated (ADR-0001).
+    source_commit: []const u8,
+    /// Head commit of the destination branch as we loaded it.
+    destination_commit: []const u8,
+};
+
+/// The commit pair identifying a PR's current diff revision. A comment whose
+/// anchored `links.code` range differs from this is outdated.
+pub const HeadCommits = struct {
+    source: []const u8 = "",
+    destination: []const u8 = "",
 };
 
 /// Classified API failures. The adapter maps HTTP status → one of these so the

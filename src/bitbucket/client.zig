@@ -9,6 +9,7 @@ const HttpClient = httpc.HttpClient;
 const Credential = @import("credential.zig").Credential;
 const types = @import("types.zig");
 const PullRequest = types.PullRequest;
+const HeadCommits = types.HeadCommits;
 const ApiError = types.ApiError;
 const review = @import("../review/comment.zig");
 const Comment = review.Comment;
@@ -91,16 +92,85 @@ pub const Client = struct {
         return res.body;
     }
 
+    /// GET the first page of the comments *list* raw (debug aid), so we can see
+    /// how the list endpoint shapes a comment vs. the single-comment endpoint.
+    pub fn getCommentsRaw(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        id: u64,
+    ) ![]u8 {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/pullrequests/{d}/comments?pagelen=100",
+            .{ base_url, self.cred.workspace, repo_slug, id },
+        );
+        defer allocator.free(url);
+
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+
+        const res = try self.http.send(allocator, .{
+            .method = .GET,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "application/json" },
+            },
+        });
+        errdefer allocator.free(res.body);
+        try classify(res.status);
+        return res.body;
+    }
+
+    /// GET a single comment's raw JSON (debug aid): /pullrequests/{id}/comments/{comment_id}.
+    /// Returns the body verbatim, owned by `allocator`, so we can inspect the real
+    /// wire shape (e.g. how Bitbucket flags an outdated comment).
+    pub fn getCommentRaw(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        id: u64,
+        comment_id: u64,
+    ) ![]u8 {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/pullrequests/{d}/comments/{d}",
+            .{ base_url, self.cred.workspace, repo_slug, id, comment_id },
+        );
+        defer allocator.free(url);
+
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+
+        const res = try self.http.send(allocator, .{
+            .method = .GET,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "application/json" },
+            },
+        });
+        errdefer allocator.free(res.body);
+        try classify(res.status);
+        return res.body;
+    }
+
     /// GET /repositories/{workspace}/{repo}/pullrequests/{id}/comments, following
     /// Bitbucket's `next` links until the last page. Returns every non-deleted
     /// comment flat (thread nesting is the review context's job, `buildThreads`).
     /// Each `Comment` and its strings are owned by `allocator`; free the batch
     /// with `deinitComments`. Callers should pass a PR-scoped arena.
+    /// `head` is the PR's current source/destination commits: a comment whose
+    /// anchored `links.code` revision differs is flagged outdated (the list
+    /// endpoint does not expose the verdict directly). Pass `.{}` to skip this
+    /// (then only an explicit `inline.outdated` marks a comment outdated).
     pub fn getComments(
         self: Client,
         allocator: Allocator,
         repo_slug: []const u8,
         id: u64,
+        head: HeadCommits,
     ) ![]Comment {
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
@@ -137,7 +207,7 @@ pub const Client = struct {
 
             for (parsed.value.values) |cj| {
                 if (cj.deleted) continue;
-                try out.append(allocator, try dupeComment(allocator, cj));
+                try out.append(allocator, try dupeComment(allocator, cj, head));
             }
 
             const next = parsed.value.next orelse break;
@@ -167,8 +237,8 @@ const PrJson = struct {
     title: []const u8,
     state: []const u8,
     author: struct { display_name: []const u8 },
-    source: struct { branch: struct { name: []const u8 } },
-    destination: struct { branch: struct { name: []const u8 } },
+    source: struct { branch: struct { name: []const u8 }, commit: struct { hash: []const u8 } },
+    destination: struct { branch: struct { name: []const u8 }, commit: struct { hash: []const u8 } },
 };
 
 fn parsePullRequest(allocator: Allocator, body: []const u8) !PullRequest {
@@ -186,6 +256,8 @@ fn parsePullRequest(allocator: Allocator, body: []const u8) !PullRequest {
         .author_display_name = try allocator.dupe(u8, v.author.display_name),
         .source_branch = try allocator.dupe(u8, v.source.branch.name),
         .destination_branch = try allocator.dupe(u8, v.destination.branch.name),
+        .source_commit = try allocator.dupe(u8, v.source.commit.hash),
+        .destination_commit = try allocator.dupe(u8, v.destination.commit.hash),
     };
 }
 
@@ -209,6 +281,10 @@ const CommentJson = struct {
     } = null,
     /// Present (an object) when the thread is resolved; null/absent otherwise.
     resolution: ?struct {} = null,
+    /// `links.code.href` embeds the diff revision the comment is anchored to,
+    /// e.g. ".../diff/ws/repo:<src>..<dst>?path=…". Comparing that revision to
+    /// the PR's current one is how we detect outdated (the list omits the flag).
+    links: ?struct { code: ?struct { href: ?[]const u8 = null } = null } = null,
 };
 
 const CommentsPage = struct {
@@ -217,8 +293,9 @@ const CommentsPage = struct {
     next: ?[]const u8 = null,
 };
 
-/// Copy one wire comment into a domain `Comment` owned by `allocator`.
-fn dupeComment(allocator: Allocator, cj: CommentJson) !Comment {
+/// Copy one wire comment into a domain `Comment` owned by `allocator`. `head`
+/// is the PR's current revision, used to detect outdated inline comments.
+fn dupeComment(allocator: Allocator, cj: CommentJson, head: HeadCommits) !Comment {
     const author = if (cj.user) |u| (u.display_name orelse "") else "";
     const raw = if (cj.content) |c| (c.raw orelse "") else "";
 
@@ -243,11 +320,49 @@ fn dupeComment(allocator: Allocator, cj: CommentJson) !Comment {
         .body = body_owned,
         .anchor = anchor,
         .resolved = cj.resolution != null,
-        .state = if (cj.@"inline") |inl|
-            (if (inl.outdated orelse false) .outdated else .current)
-        else
-            .current,
+        .state = commentState(cj, head),
     };
+}
+
+/// Resolve a comment's `AnchorState`. Trust an explicit `inline.outdated` if
+/// present (the single-comment endpoint sets it); otherwise — for list results,
+/// which omit it — compare the comment's anchored revision (from `links.code`)
+/// to the PR's current one. A mismatch means the diff moved under it: outdated.
+fn commentState(cj: CommentJson, head: HeadCommits) review.AnchorState {
+    const inl = cj.@"inline" orelse return .current; // PR-level: never outdated
+    if (inl.outdated) |o| return if (o) .outdated else .current;
+
+    // No explicit verdict: fall back to the revision comparison, but only when
+    // we know both the PR head and the comment's anchored range.
+    if (head.source.len == 0 or head.destination.len == 0) return .current;
+    const href = (if (cj.links) |l| (if (l.code) |c| c.href else null) else null) orelse return .current;
+    const rev = parseCodeRevision(href) orelse return .current;
+    const matches = hashMatches(rev.src, head.source) and hashMatches(rev.dst, head.destination);
+    return if (matches) .current else .outdated;
+}
+
+/// The `<src>..<dst>` commit pair from a `links.code` href of the form
+/// ".../diff/{ws}/{repo}:{src}..{dst}?path=…". Null if it doesn't parse.
+fn parseCodeRevision(href: []const u8) ?struct { src: []const u8, dst: []const u8 } {
+    // The revision range sits between the last ':' and the '?' (or end).
+    const colon = std.mem.lastIndexOfScalar(u8, href, ':') orelse return null;
+    var rest = href[colon + 1 ..];
+    if (std.mem.indexOfScalar(u8, rest, '?')) |q| rest = rest[0..q];
+    const sep = std.mem.indexOf(u8, rest, "..") orelse return null;
+    const src = rest[0..sep];
+    const dst = rest[sep + 2 ..];
+    if (src.len == 0 or dst.len == 0) return null;
+    return .{ .src = src, .dst = dst };
+}
+
+/// Compare two commit hashes tolerant of abbreviation (Bitbucket may hand back
+/// 12-char hashes in one place and full 40-char in another): equal if the
+/// shorter is a prefix of the longer.
+fn hashMatches(a: []const u8, b: []const u8) bool {
+    if (a.len == 0 or b.len == 0) return false;
+    const shorter = if (a.len <= b.len) a else b;
+    const longer = if (a.len <= b.len) b else a;
+    return std.mem.startsWith(u8, longer, shorter);
 }
 
 /// Free a batch returned by `getComments` (each comment's strings, then the
@@ -267,6 +382,8 @@ pub fn deinitPullRequest(allocator: Allocator, pr: PullRequest) void {
     allocator.free(pr.author_display_name);
     allocator.free(pr.source_branch);
     allocator.free(pr.destination_branch);
+    allocator.free(pr.source_commit);
+    allocator.free(pr.destination_commit);
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +414,8 @@ test "getPullRequest parses a well-formed fixture" {
     try testing.expectEqualStrings("Ada Lovelace", pr.author_display_name);
     try testing.expectEqualStrings("feature/diff", pr.source_branch);
     try testing.expectEqualStrings("main", pr.destination_branch);
+    try testing.expectEqualStrings("abc123def456", pr.source_commit);
+    try testing.expectEqualStrings("0011223344ff", pr.destination_commit);
 }
 
 test "getPullRequest builds the correct URL" {
@@ -408,7 +527,7 @@ test "getComments follows next links and returns non-deleted comments" {
     var fake: FakeHttpClient = .{ .responses = &pages };
     const bb = Client.init(fake.httpClient(), testCredential());
 
-    const comments = try bb.getComments(a, "myrepo", 7);
+    const comments = try bb.getComments(a, "myrepo", 7, .{});
     defer @import("client.zig").deinitComments(a, comments);
 
     // 5 wire comments, one deleted → 4 kept, across two pages.
@@ -432,6 +551,98 @@ test "getComments follows next links and returns non-deleted comments" {
     try testing.expectEqual(@as(?u32, 10), comments[3].anchor.?.from);
 }
 
+// A real single-comment shape captured from PR 1726 (comment 811927613): an
+// inline suggestion Bitbucket flags outdated. `from` is JSON null, `to` set.
+const outdated_comment_page =
+    \\{ "values": [
+    \\  { "id": 811927613, "deleted": false, "pending": false,
+    \\    "content": { "raw": "```suggestion\n        : phpOrigin;\n```\n\nyou already fall back" },
+    \\    "user": { "display_name": "Stefan von der Krone" },
+    \\    "inline": { "from": null, "to": 38, "path": "app/routes/rpc/$.ts",
+    \\                "start_from": null, "start_to": null, "outdated": true, "base_rev": null } }
+    \\] }
+;
+
+test "an inline.outdated comment parses to AnchorState.outdated" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body = outdated_comment_page };
+    const bb = Client.init(fake.httpClient(), testCredential());
+
+    const comments = try bb.getComments(a, "pr-webapp", 1726, .{});
+    defer @import("client.zig").deinitComments(a, comments);
+
+    try testing.expectEqual(@as(usize, 1), comments.len);
+    try testing.expectEqual(review.AnchorState.outdated, comments[0].state);
+    try testing.expectEqual(@as(?u32, 38), comments[0].anchor.?.to);
+    try testing.expect(comments[0].anchor.?.from == null);
+    try testing.expect(comments[0].suggestion() != null);
+}
+
+// A list page as the *list* endpoint actually shapes it (no inline.outdated),
+// with two comments: one anchored to the PR's current revision, one to an older
+// one. Mirrors PR 1726: outdated is derived from links.code, not a flag.
+const list_with_revisions =
+    \\{ "values": [
+    \\  { "id": 1, "deleted": false,
+    \\    "content": { "raw": "current one" }, "user": { "display_name": "Ada" },
+    \\    "inline": { "from": null, "to": 30, "path": "app/utility/env.ts" },
+    \\    "links": { "code": { "href":
+    \\      "https://api.bitbucket.org/2.0/repositories/check24/pr-webapp/diff/check24/pr-webapp:f6180208c871..41739df6fc7f?path=app%2Futility%2Fenv.ts" } } },
+    \\  { "id": 2, "deleted": false,
+    \\    "content": { "raw": "stale one" }, "user": { "display_name": "Ada" },
+    \\    "inline": { "from": null, "to": 38, "path": "app/routes/rpc/$.ts" },
+    \\    "links": { "code": { "href":
+    \\      "https://api.bitbucket.org/2.0/repositories/check24/pr-webapp/diff/check24/pr-webapp:c034a30e082c..826e08904076?path=app%2Froutes%2Frpc%2F%24.ts" } } }
+    \\] }
+;
+
+test "outdated is derived from links.code revision vs PR head" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body = list_with_revisions };
+    const bb = Client.init(fake.httpClient(), testCredential());
+
+    // PR head as captured for 1726.
+    const comments = try bb.getComments(a, "pr-webapp", 1726, .{
+        .source = "f6180208c871",
+        .destination = "41739df6fc7f",
+    });
+    defer @import("client.zig").deinitComments(a, comments);
+
+    try testing.expectEqual(@as(usize, 2), comments.len);
+    // #1 anchored to source..dest == current head → current.
+    try testing.expectEqual(review.AnchorState.current, comments[0].state);
+    // #2 anchored to an older revision → outdated.
+    try testing.expectEqual(review.AnchorState.outdated, comments[1].state);
+}
+
+test "without PR head, list comments default to current (no false outdated)" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body = list_with_revisions };
+    const bb = Client.init(fake.httpClient(), testCredential());
+
+    const comments = try bb.getComments(a, "pr-webapp", 1726, .{}); // no head
+    defer @import("client.zig").deinitComments(a, comments);
+
+    try testing.expectEqual(review.AnchorState.current, comments[0].state);
+    try testing.expectEqual(review.AnchorState.current, comments[1].state);
+}
+
+test "parseCodeRevision extracts the src..dst pair" {
+    const rev = parseCodeRevision(
+        "https://api.bitbucket.org/2.0/repositories/check24/pr-webapp/diff/check24/pr-webapp:aaaa..bbbb?path=x",
+    ).?;
+    try testing.expectEqualStrings("aaaa", rev.src);
+    try testing.expectEqualStrings("bbbb", rev.dst);
+    try testing.expect(parseCodeRevision("no colon or range here") == null);
+}
+
+test "hashMatches tolerates abbreviation" {
+    try testing.expect(hashMatches("f6180208c871", "f6180208c871abcd1234"));
+    try testing.expect(hashMatches("f6180208c871abcd1234", "f6180208c871"));
+    try testing.expect(!hashMatches("f6180208c871", "c034a30e082c"));
+    try testing.expect(!hashMatches("", "abc"));
+}
+
 test "getComments builds the correct first-page URL" {
     const a = testing.allocator;
     var fake: FakeHttpClient = .{ .status = 200, .body =
@@ -439,7 +650,7 @@ test "getComments builds the correct first-page URL" {
     };
     const bb = Client.init(fake.httpClient(), testCredential());
 
-    const comments = try bb.getComments(a, "myrepo", 7);
+    const comments = try bb.getComments(a, "myrepo", 7, .{});
     defer @import("client.zig").deinitComments(a, comments);
 
     try testing.expectEqualStrings(
@@ -452,7 +663,7 @@ test "getComments surfaces ApiError on non-2xx" {
     const a = testing.allocator;
     var fake: FakeHttpClient = .{ .status = 403, .body = "nope" };
     const bb = Client.init(fake.httpClient(), testCredential());
-    try testing.expectError(error.Forbidden, bb.getComments(a, "myrepo", 7));
+    try testing.expectError(error.Forbidden, bb.getComments(a, "myrepo", 7, .{}));
 }
 
 // A single-page body (no `next`) so the pagination loop terminates after one GET.
@@ -477,7 +688,7 @@ test "getComments end to end feeds the thread builder" {
 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const comments = try bb.getComments(arena.allocator(), "myrepo", 7);
+    const comments = try bb.getComments(arena.allocator(), "myrepo", 7, .{});
     const threads = try @import("../review/thread.zig").build(arena.allocator(), comments);
 
     // root #1 with reply #2, and inline root #4.
