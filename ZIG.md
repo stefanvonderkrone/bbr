@@ -178,6 +178,10 @@ the main thread; the Epoch token still guards against stale results.
 - **Never `pkill -9` a running `zig build`** — it can orphan the cache manager mid-write and leave
   later builds blocking on the lock. Prefer letting it finish or time out; if you must kill, target
   the specific PIDs and verify the cache still builds afterward.
+- **`i2`/`u3`/… are reserved primitive types, not free identifiers.** Any `iN`/`uN` (arbitrary-width
+  integers) is a builtin type name, so a local named `i2` or `u8` fails to compile with
+  "name shadows primitive 'i2'". Loop/scratch variables that would naturally be `i2`, `j2`, `u1`
+  must be renamed (`oi`, `ni`, …) or written `@"i2"`.
 
 ## 7. libvaxis (TUI) — 0.16 integration facts
 

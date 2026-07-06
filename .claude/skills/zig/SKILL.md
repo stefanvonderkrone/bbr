@@ -39,6 +39,9 @@ from repeating past mistakes. The version-pinned API catalog bbr relies on lives
   (default `.{}` deprecated), then `list.append(gpa, item)`, `list.deinit(gpa)`,
   `list.toOwnedSlice(gpa)`. The managed variant with `gpa`-free methods is `array_list.Managed(T)`;
   `ArrayListUnmanaged` is now a deprecated alias *to* `ArrayList`.
+- **`iN`/`uN` are reserved primitive types — a local named `i2` won't compile.** Any arbitrary-width
+  integer name (`i2`, `u3`, `u8`, …) is a builtin type, so `var i2: usize = 0;` errors with
+  "name shadows primitive 'i2'". Rename scratch/loop vars (`oi`/`ni` instead of `i2`/`j2`).
 - **You can't read env vars inside a `test` block.** The env API flows through `Init`/`Io` and the
   test runner hands tests neither (`Environ.Block.global` is wasi/freestanding-only). Keep tests
   hermetic (fakes + `@embedFile` fixtures); put credential/network work in an executable step that

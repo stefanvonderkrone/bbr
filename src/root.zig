@@ -14,6 +14,7 @@ pub const diff = struct {
     pub const model = @import("diff/model.zig");
     pub const parser = @import("diff/parser.zig");
     pub const buffer = @import("diff/buffer.zig");
+    pub const intraline = @import("diff/intraline.zig");
     pub const parse = parser.parse;
     pub const Buffer = buffer.Buffer;
     pub const Layout = buffer.Layout;
@@ -75,6 +76,7 @@ test {
     _ = @import("diff/model.zig");
     _ = @import("diff/parser.zig");
     _ = @import("diff/buffer.zig");
+    _ = @import("diff/intraline.zig");
     _ = @import("review/comment.zig");
     _ = @import("review/thread.zig");
     _ = @import("git/remote.zig");
