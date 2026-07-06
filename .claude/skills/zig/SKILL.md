@@ -66,6 +66,15 @@ from repeating past mistakes. The version-pinned API catalog bbr relies on lives
   iteration's text on every row, or garbage. Use static string literals for fixed glyphs (status
   chars, markers) and a per-frame **arena** (reset *after* render) for synthesized text. Long-lived
   borrowed text (e.g. diff line bodies) is fine.
+- **A replaying fake + a `next`-following client = infinite loop.** `FakeHttpClient` returns the
+  same body every `send` unless given a scripted `responses` sequence. If that body carries a
+  pagination `next` link and the client loops until `next` is absent, it re-fetches the same page
+  forever — `zig build test` hangs and `ps` shows the `.../test --listen=-` **binary** (not the
+  compiler) stuck for minutes. Fix the fixture, not the client: use a `responses` sequence whose
+  last page omits `next`, or a single-page body with no `next`. To find *which* test wedged, run
+  `zig test src/root.zig` under a `sleep N; kill $PID` guard — it prints `N/M name...` live, no
+  `--listen` protocol in the way. And **don't `pkill -9` a live `zig build`** — it can orphan the
+  cache manager and make later builds block on the lock.
 
 ## Idioms that are correct here (not hacks)
 

@@ -39,6 +39,7 @@ pub const bitbucket = struct {
     const client_mod = @import("bitbucket/client.zig");
     pub const Client = client_mod.Client;
     pub const deinitPullRequest = client_mod.deinitPullRequest;
+    pub const deinitComments = client_mod.deinitComments;
     pub const base_url = client_mod.base_url;
     pub const Credential = @import("bitbucket/credential.zig").Credential;
     pub const types = @import("bitbucket/types.zig");

@@ -11,11 +11,21 @@ const HttpClient = client.HttpClient;
 const Request = client.Request;
 const Response = client.Response;
 
-pub const FakeHttpClient = struct {
-    /// Status returned by the next `send`.
+/// One canned response in a scripted sequence.
+pub const Canned = struct {
     status: u16 = 200,
-    /// Body returned by the next `send` (copied into the caller's allocator).
     body: []const u8 = "",
+};
+
+pub const FakeHttpClient = struct {
+    /// Status returned by `send` (when `responses` is null).
+    status: u16 = 200,
+    /// Body returned by `send` (copied into the caller's allocator).
+    body: []const u8 = "",
+    /// Optional scripted sequence: the Nth `send` returns `responses[N]`, so a
+    /// paginated fetch can be driven page by page. Falls back to `status`/`body`
+    /// once exhausted (or when null).
+    responses: ?[]const Canned = null,
 
     /// Snapshot of the most recent request.
     last_method: ?client.Method = null,
@@ -40,10 +50,16 @@ pub const FakeHttpClient = struct {
         self.last_method = req.method;
         self.url_len = @min(req.url.len, self.url_buf.len);
         @memcpy(self.url_buf[0..self.url_len], req.url[0..self.url_len]);
+
+        const canned: Canned = if (self.responses) |seq|
+            (if (self.call_count < seq.len) seq[self.call_count] else .{ .status = self.status, .body = self.body })
+        else
+            .{ .status = self.status, .body = self.body };
+
         self.call_count += 1;
         return .{
-            .status = self.status,
-            .body = try allocator.dupe(u8, self.body),
+            .status = canned.status,
+            .body = try allocator.dupe(u8, canned.body),
         };
     }
 };

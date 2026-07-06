@@ -136,6 +136,18 @@ the main thread; the Epoch token still guards against stale results.
   **not** run any `src/tui/*` tests until `main.zig` gained `test { _ = @import("tui/app.zig"); }`
   (which then chains to render/theme/nav). This silently hid a real rendering bug — always confirm
   the per-step test **count** goes up (`--summary all`), not just that the suite is green.
+- **A replaying fake + a client that follows `next` links = infinite loop.** `FakeHttpClient`
+  returns the *same* body on every `send` unless given a scripted `responses` sequence. If that
+  body carries a pagination `next` URL, a client that loops until `next` is absent never
+  terminates — it re-fetches the same page forever. The hang shows up as a `zig build test` that
+  never returns; `ps` reveals the `.../test --listen=-` **binary** (not the compiler) stuck for
+  minutes. Fix the *fixture*: either drive pages with a `responses` sequence (last page has no
+  `next`) or use a single-page body with no `next`. When a `zig build test` hangs, run
+  `zig test src/root.zig` directly under a `sleep N; kill` guard — it prints `N/M name...` live so
+  you see exactly which test wedged, without the build system's `--listen` protocol in the way.
+- **Never `pkill -9` a running `zig build`** — it can orphan the cache manager mid-write and leave
+  later builds blocking on the lock. Prefer letting it finish or time out; if you must kill, target
+  the specific PIDs and verify the cache still builds afterward.
 
 ## 7. libvaxis (TUI) — 0.16 integration facts
 
