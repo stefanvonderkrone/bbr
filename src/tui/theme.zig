@@ -30,6 +30,8 @@ pub const Theme = struct {
     file_header: Style,
     /// `@@ … @@` hunk headers.
     hunk_header: Style,
+    /// A collapsed-context fold row ("⋯ N unchanged lines ⋯").
+    fold: Style,
     /// A file row in the sidebar.
     sidebar_item: Style,
     /// The currently selected sidebar file.
@@ -103,6 +105,7 @@ pub const dark: Theme = .{
     .gutter = .{ .fg = rgb(0x80_80_80) },
     .file_header = .{ .fg = rgb(0xd0_d0_d0), .bold = true },
     .hunk_header = .{ .fg = rgb(0x6c_9c_d0) },
+    .fold = .{ .fg = rgb(0x70_70_80), .bg = rgb(0x1a_1a_22) },
     .sidebar_item = .{},
     .sidebar_selected = .{ .bg = rgb(0x30_30_40), .bold = true },
     .status_added = rgb(0x8c_c8_5a),

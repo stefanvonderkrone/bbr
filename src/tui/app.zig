@@ -91,7 +91,13 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
 
     var show_resolved = false;
     var layout: bbr.diff.Layout = .unified;
-    var buf = try bbr.diff.buffer.buildWithComments(buf_arena.allocator(), current.diff, layout, current.threads, .{ .show_resolved = show_resolved });
+    // Diff scope: fold long context runs by default (the "Changes" scope). `f`
+    // flips to whole-file; `expanded` holds individually-revealed folds (their
+    // ids are Line pointers into the *current* session, cleared on a PR switch).
+    var scope_fold = true;
+    var expanded: std.ArrayList(*const bbr.diff.Line) = .empty;
+    defer expanded.deinit(gpa);
+    var buf = try bbr.diff.buffer.buildWithComments(buf_arena.allocator(), current.diff, layout, current.threads, buildOpts(show_resolved, scope_fold, expanded.items));
 
     // Per-frame arena for synthesized gutter/overlay text; reset after render.
     var frame_arena = std.heap.ArenaAllocator.init(gpa);
@@ -172,12 +178,25 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
                         };
                     } else if (key.matches('R', .{})) {
                         show_resolved = !show_resolved;
-                        buf = rebuild(&buf_arena, current, layout, show_resolved) catch buf;
+                        buf = rebuild(&buf_arena, current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
                         nav.setRowCount(buf.rows.len);
                     } else if (key.matches('s', .{})) {
                         layout = if (layout == .unified) .side_by_side else .unified;
-                        buf = rebuild(&buf_arena, current, layout, show_resolved) catch buf;
+                        buf = rebuild(&buf_arena, current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
                         nav.setRowCount(buf.rows.len);
+                    } else if (key.matches('f', .{})) {
+                        // Toggle the diff scope: fold long context vs. whole file.
+                        scope_fold = !scope_fold;
+                        expanded.clearRetainingCapacity();
+                        buf = rebuild(&buf_arena, current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
+                        nav.setRowCount(buf.rows.len);
+                    } else if (key.matches(vaxis.Key.enter, .{})) {
+                        // Expand the fold under the cursor, if any.
+                        if (nav.cursor < buf.rows.len and buf.rows[nav.cursor] == .fold) {
+                            expanded.append(gpa, buf.rows[nav.cursor].fold.id) catch {};
+                            buf = rebuild(&buf_arena, current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
+                            nav.setRowCount(buf.rows.len);
+                        }
                     } else if (handleKey(&nav, &pending_g, key)) |_| {}
                 }
             },
@@ -196,7 +215,9 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
                         .ok => |s| {
                             current.destroy();
                             current = s;
-                            buf = rebuild(&buf_arena, current, layout, show_resolved) catch buf;
+                            // Expanded-fold ids pointed into the old session's diff.
+                            expanded.clearRetainingCapacity();
+                            buf = rebuild(&buf_arena, current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
                             nav = Nav.init(buf.rows.len, vx.window().height);
                             pending_g = false;
                             status_msg = null;
@@ -212,7 +233,7 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
         const win = vx.window();
         const frame = frame_arena.allocator();
         render.draw(frame, win, current.diff, buf, active_theme, nav, selected_file);
-        drawStatus(frame, win, current.pr, nav, buf, layout, show_resolved, loading, status_msg);
+        drawStatus(frame, win, current.pr, nav, buf, layout, scope_fold, show_resolved, loading, status_msg);
         if (picker) |*p| render.drawPicker(frame, win, p, active_theme);
         try vx.render(writer);
         _ = frame_arena.reset(.retain_capacity);
@@ -221,9 +242,13 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
 
 /// Rebuild the row buffer for `s` against the resolved toggle. Rows borrow the
 /// session's diff/threads (not `buf_arena`), so resetting the arena is safe.
-fn rebuild(buf_arena: *std.heap.ArenaAllocator, s: *const Session, layout: bbr.diff.Layout, show_resolved: bool) !bbr.diff.Buffer {
+fn buildOpts(show_resolved: bool, scope_fold: bool, expanded: []const *const bbr.diff.Line) bbr.diff.BuildOptions {
+    return .{ .show_resolved = show_resolved, .fold_context = scope_fold, .expanded = expanded };
+}
+
+fn rebuild(buf_arena: *std.heap.ArenaAllocator, s: *const Session, layout: bbr.diff.Layout, opts: bbr.diff.BuildOptions) !bbr.diff.Buffer {
     _ = buf_arena.reset(.retain_capacity);
-    return bbr.diff.buffer.buildWithComments(buf_arena.allocator(), s.diff, layout, s.threads, .{ .show_resolved = show_resolved });
+    return bbr.diff.buffer.buildWithComments(buf_arena.allocator(), s.diff, layout, s.threads, opts);
 }
 
 /// Fetch the repo's open PRs (synchronously — one request) and open the Picker
@@ -350,6 +375,7 @@ fn drawStatus(
     nav: Nav,
     buf: bbr.diff.Buffer,
     layout: bbr.diff.Layout,
+    scope_fold: bool,
     show_resolved: bool,
     loading: bool,
     status_msg: ?[]const u8,
@@ -357,10 +383,11 @@ fn drawStatus(
     if (win.height == 0) return;
     const row = win.height - 1;
     const layout_hint: []const u8 = if (layout == .unified) "s split" else "s unified";
+    const scope_hint: []const u8 = if (scope_fold) "f whole" else "f changes";
     const resolved_hint: []const u8 = if (show_resolved) "R hide resolved" else "R show resolved";
     // A transient message (error) or the loading indicator takes the tail slot.
     const tail: []const u8 = if (status_msg) |m| m else if (loading) "loading…" else "p switch  ·  q quit";
-    const text = std.fmt.allocPrint(frame, " #{d} {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s}  ·  {s} ", .{
+    const text = std.fmt.allocPrint(frame, " #{d} {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s}  ·  {s}  ·  {s} ", .{
         pr.id,
         pr.title,
         pr.source_branch,
@@ -368,6 +395,7 @@ fn drawStatus(
         @min(nav.cursor + 1, buf.rows.len),
         buf.rows.len,
         layout_hint,
+        scope_hint,
         resolved_hint,
         tail,
     }) catch " q quit ";

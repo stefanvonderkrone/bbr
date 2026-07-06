@@ -28,7 +28,7 @@ const emphasis_threshold: f64 = 0.5;
 /// `side_by_side` is the other axis (design §11) and lands later.
 pub const Layout = enum { unified, side_by_side };
 
-pub const RowKind = enum { file_header, hunk_header, line, line_pair, comment, section };
+pub const RowKind = enum { file_header, hunk_header, line, line_pair, fold, comment, section };
 
 /// A diff body line plus any intra-line emphasis. `emphasis` is empty for
 /// context lines and for changed lines with no modified counterpart (pure
@@ -77,15 +77,39 @@ pub const Row = union(RowKind) {
     hunk_header: *const model.Hunk,
     line: LineRow,
     line_pair: LinePair,
+    fold: Fold,
     comment: CommentRow,
     section: Section,
 };
 
-/// How comments are woven in. `show_resolved` reveals resolved (but current)
-/// threads that are otherwise hidden behind the toggle; outdated threads are
-/// never hidden regardless (design §9b).
-pub const CommentOptions = struct {
+/// A collapsed run of context lines (the "Changes" scope hides long unchanged
+/// stretches behind a fold). The hidden lines are already in the model, so
+/// expanding is free — no refetch.
+pub const Fold = struct {
+    /// Stable identity across rebuilds: the first hidden line. The app keys its
+    /// expanded-set on this pointer to reveal an individual fold.
+    id: *const model.Line,
+    /// The hidden context lines — a subslice of the hunk's `lines`.
+    lines: []const model.Line,
+};
+
+/// Options for a build: comment weaving plus diff scope/folding.
+///
+/// `show_resolved` reveals resolved (but current) threads otherwise hidden
+/// behind the toggle; outdated threads are never hidden regardless (design §9b).
+///
+/// `fold_context` is the "Changes" scope: context runs longer than
+/// `2*context_margin + min_fold` collapse into a `Fold`, keeping `context_margin`
+/// lines next to each change. `false` is the "whole-file" scope over the fetched
+/// diff — every fetched line shown, no folds. (True whole-file, including
+/// unchanged regions *outside* the fetched hunks, needs the file blob and is
+/// deferred.) Folds whose `id` is in `expanded` are shown in full.
+pub const BuildOptions = struct {
     show_resolved: bool = false,
+    fold_context: bool = false,
+    context_margin: usize = 3,
+    min_fold: usize = 2,
+    expanded: []const *const model.Line = &.{},
 };
 
 pub const Buffer = struct {
@@ -114,7 +138,7 @@ pub fn buildWithComments(
     diff: model.Diff,
     layout: Layout,
     threads: []const Thread,
-    opts: CommentOptions,
+    opts: BuildOptions,
 ) BuildError!Buffer {
     var rows: std.ArrayList(Row) = .empty;
 
@@ -133,9 +157,10 @@ pub fn buildWithComments(
         for (file.hunks) |*hunk| {
             try rows.append(allocator, .{ .hunk_header = hunk });
             const emphasis = try computeEmphasis(allocator, hunk.lines);
+            const folds = try computeFolds(allocator, hunk.lines, opts);
             switch (layout) {
-                .unified => try emitUnifiedHunk(allocator, &rows, threads, file, hunk.lines, emphasis, opts),
-                .side_by_side => try emitSideBySideHunk(allocator, &rows, threads, file, hunk.lines, emphasis, opts),
+                .unified => try emitUnifiedHunk(allocator, &rows, threads, file, hunk.lines, emphasis, folds, opts),
+                .side_by_side => try emitSideBySideHunk(allocator, &rows, threads, file, hunk.lines, emphasis, folds, opts),
             }
         }
 
@@ -169,11 +194,19 @@ fn emitUnifiedHunk(
     file: *const model.File,
     lines: []const model.Line,
     emphasis: []const []const Segment,
-    opts: CommentOptions,
+    folds: []const Fold,
+    opts: BuildOptions,
 ) !void {
-    for (lines, 0..) |*ln, li| {
-        try rows.append(allocator, .{ .line = .{ .line = ln, .emphasis = emphasis[li] } });
-        try weaveInline(allocator, rows, threads, file, ln, opts);
+    var i: usize = 0;
+    while (i < lines.len) {
+        if (foldStartingAt(folds, &lines[i])) |f| {
+            try rows.append(allocator, .{ .fold = f });
+            i += f.lines.len;
+            continue;
+        }
+        try rows.append(allocator, .{ .line = .{ .line = &lines[i], .emphasis = emphasis[i] } });
+        try weaveInline(allocator, rows, threads, file, &lines[i], opts);
+        i += 1;
     }
 }
 
@@ -188,10 +221,16 @@ fn emitSideBySideHunk(
     file: *const model.File,
     lines: []const model.Line,
     emphasis: []const []const Segment,
-    opts: CommentOptions,
+    folds: []const Fold,
+    opts: BuildOptions,
 ) !void {
     var i: usize = 0;
     while (i < lines.len) {
+        if (foldStartingAt(folds, &lines[i])) |f| {
+            try rows.append(allocator, .{ .fold = f });
+            i += f.lines.len;
+            continue;
+        }
         switch (lines[i].kind) {
             .context => {
                 const both: LineRow = .{ .line = &lines[i] };
@@ -248,7 +287,7 @@ fn weaveInline(
     threads: []const Thread,
     file: *const model.File,
     ln: *const model.Line,
-    opts: CommentOptions,
+    opts: BuildOptions,
 ) !void {
     for (threads) |*t| {
         const anc = t.root.anchor orelse continue;
@@ -257,6 +296,54 @@ fn weaveInline(
         if (!inlineVisible(t.*, opts)) continue;
         if (anchorMatchesLine(anc, ln)) try emitThread(allocator, rows, t);
     }
+}
+
+/// Compute the folds for one hunk under the current scope. A maximal run of
+/// context lines keeps `context_margin` lines next to each adjacent change and
+/// folds the rest, provided at least `min_fold` lines would be hidden. Returns
+/// no folds when `fold_context` is off (whole-file scope) or when an individual
+/// fold's id is in `opts.expanded`. Fold ranges never overlap a change, so they
+/// never split a modified pair in the side-by-side layout.
+fn computeFolds(allocator: std.mem.Allocator, lines: []const model.Line, opts: BuildOptions) ![]const Fold {
+    var folds: std.ArrayList(Fold) = .empty;
+    if (!opts.fold_context) return folds.toOwnedSlice(allocator);
+
+    var i: usize = 0;
+    while (i < lines.len) {
+        if (lines[i].kind != .context) {
+            i += 1;
+            continue;
+        }
+        const s = i;
+        while (i < lines.len and lines[i].kind == .context) i += 1;
+        const e = i; // context run [s, e)
+
+        const keep_top: usize = if (s > 0) opts.context_margin else 0;
+        const keep_bottom: usize = if (e < lines.len) opts.context_margin else 0;
+        const run = e - s;
+        if (run < keep_top + keep_bottom) continue;
+        if (run - keep_top - keep_bottom < opts.min_fold) continue;
+
+        const fold_start = s + keep_top;
+        const fold_end = e - keep_bottom;
+        if (isExpanded(opts.expanded, &lines[fold_start])) continue;
+        try folds.append(allocator, .{ .id = &lines[fold_start], .lines = lines[fold_start..fold_end] });
+    }
+    return folds.toOwnedSlice(allocator);
+}
+
+fn foldStartingAt(folds: []const Fold, line_ptr: *const model.Line) ?Fold {
+    for (folds) |f| {
+        if (f.id == line_ptr) return f;
+    }
+    return null;
+}
+
+fn isExpanded(expanded: []const *const model.Line, id: *const model.Line) bool {
+    for (expanded) |e| {
+        if (e == id) return true;
+    }
+    return false;
 }
 
 /// Compute intra-line emphasis for every line in a hunk. Returns a slice
@@ -301,7 +388,7 @@ fn isPrLevel(t: Thread) bool {
 }
 
 /// A current/moved thread is visible unless it's resolved and the toggle is off.
-fn inlineVisible(t: Thread, opts: CommentOptions) bool {
+fn inlineVisible(t: Thread, opts: BuildOptions) bool {
     return opts.show_resolved or !t.resolved;
 }
 
@@ -318,7 +405,7 @@ fn fileOutdatedCount(threads: []const Thread, path: []const u8) usize {
     return n;
 }
 
-fn countWhere(threads: []const Thread, pred: fn (Thread) bool, opts: CommentOptions) usize {
+fn countWhere(threads: []const Thread, pred: fn (Thread) bool, opts: BuildOptions) usize {
     var n: usize = 0;
     for (threads) |*t| {
         if (pred(t.*) and inlineVisible(t.*, opts)) n += 1;
@@ -529,6 +616,83 @@ fn countKind(buf: Buffer, kind: RowKind) usize {
         if (r == kind) n += 1;
     }
     return n;
+}
+
+// A hunk with a long unchanged middle: change, 10 context lines, change.
+const long_context_diff =
+    \\diff --git a/a.txt b/a.txt
+    \\--- a/a.txt
+    \\+++ b/a.txt
+    \\@@ -1,12 +1,12 @@
+    \\-a
+    \\+A
+    \\ c1
+    \\ c2
+    \\ c3
+    \\ c4
+    \\ c5
+    \\ c6
+    \\ c7
+    \\ c8
+    \\ c9
+    \\ c10
+    \\-b
+    \\+B
+    \\
+;
+
+test "the changes scope folds a long context run, keeping a margin each side" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, long_context_diff);
+
+    // Whole-file scope (the default): no folding.
+    const whole = try build(a, diff, .unified);
+    try testing.expectEqual(@as(usize, 0), countKind(whole, .fold));
+
+    // Changes scope: the 10-line context run keeps 3 lines each side and folds
+    // the remaining 4 into a single fold row.
+    const folded = try buildWithComments(a, diff, .unified, &.{}, .{ .fold_context = true });
+    try testing.expectEqual(@as(usize, 1), countKind(folded, .fold));
+    var fold_id: *const model.Line = undefined;
+    for (folded.rows) |r| {
+        if (r == .fold) {
+            try testing.expectEqual(@as(usize, 4), r.fold.lines.len);
+            fold_id = r.fold.id;
+        }
+    }
+
+    // Expanding that fold (by id) reveals all lines, with no fold row left.
+    const expanded = try buildWithComments(a, diff, .unified, &.{}, .{
+        .fold_context = true,
+        .expanded = &.{fold_id},
+    });
+    try testing.expectEqual(@as(usize, 0), countKind(expanded, .fold));
+    // The expanded buffer has exactly the fold's hidden lines more than the folded one.
+    try testing.expectEqual(folded.rows.len + 4 - 1, expanded.rows.len);
+}
+
+test "a short context run is never folded" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // anchor_diff has only one context line — nothing to fold.
+    const diff = try parse(a, anchor_diff);
+    const buf = try buildWithComments(a, diff, .unified, &.{}, .{ .fold_context = true });
+    try testing.expectEqual(@as(usize, 0), countKind(buf, .fold));
+}
+
+test "folds apply in the side-by-side layout too" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, long_context_diff);
+    const buf = try buildWithComments(a, diff, .side_by_side, &.{}, .{ .fold_context = true });
+    try testing.expectEqual(@as(usize, 1), countKind(buf, .fold));
 }
 
 test "an inline thread is woven right under its anchored line, replies indented" {

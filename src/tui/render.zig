@@ -119,6 +119,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, them
             }
         },
         .line_pair => |pair| drawLinePair(scratch, win, r, pair, theme, is_cursor),
+        .fold => |f| drawFold(scratch, win, r, f, theme, is_cursor),
         .comment => |cr| drawComment(scratch, win, r, cr, theme, is_cursor),
         .section => |sec| drawSection(scratch, win, r, sec, theme),
     }
@@ -215,6 +216,14 @@ fn drawComment(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, cr: Commen
     const text = std.fmt.allocPrint(scratch, "{s} {s}: {s}{s}", .{ marker, c.author, fl.text, ellipsis }) catch c.author;
     _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = col, .wrap = .none });
 
+    if (is_cursor) win.writeCell(0, r, .{ .char = .{ .grapheme = "▌", .width = 1 }, .style = .{ .fg = .{ .index = 6 } } });
+}
+
+/// A collapsed-context fold: "  ⋯ N unchanged lines · enter to expand ⋯".
+fn drawFold(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, f: bbr.diff.Fold, theme: Theme, is_cursor: bool) void {
+    fillRow(win, r, theme.fold);
+    const text = std.fmt.allocPrint(scratch, "  ⋯ {d} unchanged lines · enter to expand ⋯", .{f.lines.len}) catch "  ⋯ folded ⋯";
+    _ = win.printSegment(.{ .text = text, .style = theme.fold }, .{ .row_offset = r, .col_offset = gutter_cols, .wrap = .none });
     if (is_cursor) win.writeCell(0, r, .{ .char = .{ .grapheme = "▌", .width = 1 }, .style = .{ .fg = .{ .index = 6 } } });
 }
 
@@ -424,6 +433,54 @@ test "side-by-side draws old on the left, new on the right" {
     // Context row (2): both halves are neutral.
     try testing.expect(win.readCell(body_l, 2).?.style.bg == .default);
     try testing.expect(win.readCell(body_r, 2).?.style.bg == .default);
+}
+
+test "a folded context run renders as a fold row" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const raw =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,12 +1,12 @@
+        \\-a
+        \\+A
+        \\ c1
+        \\ c2
+        \\ c3
+        \\ c4
+        \\ c5
+        \\ c6
+        \\ c7
+        \\ c8
+        \\ c9
+        \\ c10
+        \\-b
+        \\+B
+        \\
+    ;
+    const diff = try bbr.diff.parse(a, raw);
+    const buf = try bbr.diff.buffer.buildWithComments(a, diff, .unified, &.{}, .{ .fold_context = true });
+
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    const nav = Nav.init(buf.rows.len, 24);
+    draw(a, win, diff, buf, theme_dark, nav, 0);
+
+    // Find the fold row's screen position by scanning the buffer.
+    var fold_row: ?u16 = null;
+    for (buf.rows, 0..) |row, idx| {
+        if (row == .fold) fold_row = @intCast(idx);
+    }
+    const fr = fold_row.?;
+    const px = sidebar_width + 1;
+    try testing.expectEqual(theme_dark.fold.bg, win.readCell(px + gutter_cols, fr).?.style.bg);
+    // "  ⋯ …" — the ellipsis sits two columns into the body.
+    try testing.expectEqualStrings("⋯", win.readCell(px + gutter_cols + 2, fr).?.char.grapheme);
 }
 
 test "sidebar highlights the selected file" {
