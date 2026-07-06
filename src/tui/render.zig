@@ -19,6 +19,7 @@ const Row = bbr.diff.buffer.Row;
 const CommentRow = bbr.diff.buffer.CommentRow;
 const Section = bbr.diff.buffer.Section;
 const FileStatus = bbr.diff.FileStatus;
+const Picker = @import("picker.zig").Picker;
 
 pub const sidebar_width: u16 = 28;
 
@@ -156,6 +157,50 @@ fn drawSection(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, sec: Secti
     _ = win.printSegment(.{ .text = text, .style = theme.section }, .{ .row_offset = r, .wrap = .none });
 }
 
+/// Draw the PR Picker as a centered modal over the current frame. Shows a
+/// query/prompt line, then the ranked matches (best first), the selected one
+/// highlighted, scrolled to keep the cursor visible. `scratch` outlives render.
+pub fn drawPicker(scratch: std.mem.Allocator, win: vaxis.Window, picker: *const Picker, theme: Theme) void {
+    // Modal geometry: centered, up to 60 cols × 16 rows, but bounded by the win.
+    const w: u16 = @min(@as(u16, 60), win.width);
+    const h: u16 = @min(@as(u16, 16), win.height);
+    if (w == 0 or h == 0) return;
+    const x = (win.width - w) / 2;
+    const y = (win.height - h) / 2;
+    const modal = win.child(.{ .x_off = x, .y_off = y, .width = w, .height = h });
+
+    // Row 0: prompt + query. Rows 1..h-1: matches.
+    fillRow(modal, 0, theme.picker_query);
+    const prompt = std.fmt.allocPrint(scratch, "› {s}", .{picker.query()}) catch "›";
+    _ = modal.printSegment(.{ .text = prompt, .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
+
+    const list_rows: u16 = h - 1;
+    const matches = picker.matches();
+
+    // Scroll so the selected row stays on screen.
+    var top: usize = 0;
+    if (picker.selected >= list_rows) top = picker.selected - list_rows + 1;
+
+    var r: u16 = 1;
+    while (r <= list_rows) : (r += 1) {
+        const mi = top + (r - 1);
+        if (mi >= matches.len) {
+            fillRow(modal, r, theme.picker);
+            continue;
+        }
+        const selected = mi == picker.selected;
+        const style = if (selected) theme.picker_selected else theme.picker;
+        fillRow(modal, r, style);
+
+        const pr = picker.prs[matches[mi]];
+        const marker: []const u8 = if (selected) "▸ " else "  ";
+        const text = std.fmt.allocPrint(scratch, "{s}#{d}  {s}  ({s})", .{
+            marker, pr.id, pr.title, pr.source_branch,
+        }) catch pr.title;
+        _ = modal.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .wrap = .none });
+    }
+}
+
 /// Render an optional line number right-justified in 4 columns (blank if absent).
 fn numCol(scratch: std.mem.Allocator, no: ?u32) []const u8 {
     const n = no orelse return "    ";
@@ -269,6 +314,39 @@ test "sidebar highlights the selected file" {
 }
 
 const theme_dark = @import("theme.zig").dark;
+
+test "picker overlay draws the query line and highlights the selection" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const prs = [_]bbr.bitbucket.PullRequestSummary{
+        .{ .id = 10, .title = "Add diff parser", .state = "OPEN", .author_display_name = "Ada", .source_branch = "feature/diff", .destination_branch = "main" },
+        .{ .id = 11, .title = "Fix navigation", .state = "OPEN", .author_display_name = "Grace", .source_branch = "feature/nav", .destination_branch = "main" },
+    };
+    var picker = try Picker.init(a, &prs);
+    defer picker.deinit();
+    picker.moveDown(); // select the second entry
+
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    drawPicker(a, win, &picker, theme_dark);
+
+    // Modal geometry: 60×16, centered on 80×24 → origin (10, 4).
+    const mx: u16 = 10;
+    const my: u16 = 4;
+    // Row 0 of the modal is the query prompt "› …".
+    try testing.expectEqualStrings("›", win.readCell(mx, my).?.char.grapheme);
+    try testing.expectEqual(theme_dark.picker_query.bg, win.readCell(mx, my).?.style.bg);
+    // Match rows follow. The selected (second) entry carries the ▸ marker and the
+    // selected background; the first entry does not.
+    try testing.expectEqualStrings("▸", win.readCell(mx, my + 2).?.char.grapheme);
+    try testing.expectEqual(theme_dark.picker_selected.bg, win.readCell(mx, my + 2).?.style.bg);
+    try testing.expectEqual(theme_dark.picker.bg, win.readCell(mx, my + 1).?.style.bg);
+}
+
 
 test "sidebar prefix shows selection marker and status, borrowing no stack" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

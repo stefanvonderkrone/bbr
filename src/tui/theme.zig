@@ -38,6 +38,12 @@ pub const Theme = struct {
     suggestion: Style,
     /// A section divider (PR comments / Outdated).
     section: Style,
+    /// The PR picker overlay's background rows.
+    picker: Style,
+    /// The picker's highlighted (selected) row.
+    picker_selected: Style,
+    /// The picker's query/prompt line.
+    picker_query: Style,
 
     /// Style for a diff body line of the given kind.
     pub fn lineStyle(self: Theme, kind: LineKind) Style {
@@ -68,6 +74,9 @@ pub const dark: Theme = .{
     .comment_reply = .{ .bg = rgb(0x18_18_22), .fg = rgb(0xb0_b0_c0) },
     .suggestion = .{ .bg = rgb(0x14_28_28), .fg = rgb(0x9c_d0_c0) },
     .section = .{ .fg = rgb(0x88_88_a0), .bold = true },
+    .picker = .{ .bg = rgb(0x20_20_2c), .fg = rgb(0xc8_c8_d8) },
+    .picker_selected = .{ .bg = rgb(0x3a_3a_52), .fg = rgb(0xff_ff_ff), .bold = true },
+    .picker_query = .{ .bg = rgb(0x28_28_36), .fg = rgb(0xff_ff_ff) },
 };
 
 // ---------------------------------------------------------------------------

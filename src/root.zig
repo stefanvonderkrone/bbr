@@ -7,6 +7,7 @@ pub const http = struct {
     pub const HttpClient = client.HttpClient;
     pub const StdHttpClient = @import("http/std_client.zig").StdHttpClient;
     pub const FakeHttpClient = @import("http/fake_client.zig").FakeHttpClient;
+    pub const Canned = @import("http/fake_client.zig").Canned;
 };
 
 pub const diff = struct {
