@@ -59,7 +59,17 @@ _Deferred:_ true **whole-file** scope (unchanged regions *outside* the fetched h
 - [ ] `DraftState` + `CommentTarget` persistence; resume on launch; render drafts distinctly.
 - [ ] Tests: store round-trip (fake + SQLite), draft graph construction.
 
-## M7 — Pending review: submission & failures  ·  M  ·  needs M6
+## M7 — Responsiveness (non-blocking loads)  ·  M  ·  needs M2, M4
+- [ ] Async picker open: `p` shows the picker overlay instantly in a loading state; the `listPullRequests` fetch runs off-thread and populates the rows when it returns. Today `openPicker` blocks the render loop synchronously inside the key handler (`app.zig:258`) — this is the "takes long until the overlay appears" lag. Generalize the existing epoch/worker/`load_done` machinery to carry a summaries result (or add a sibling event) and let the Picker exist with no items yet.
+- [ ] Boot the TUI immediately with a static "Loading PR #N…" view instead of blocking on `session.load` before `enterAltScreen` (`main.zig:100`). Kick the initial load through the existing `spawnLoad` path; populate on the first `load_done`. `run` holds `current: ?*Session` and dispatches once per frame — loading view vs. viewer — so `render.draw`/`drawStatus` keep their non-optional session args; `buf`/`nav` become lazy (`?Buffer`, built on the first session).
+- [ ] Parallelize the initial fetches in `loadWith` (`session.zig:58`): `getPullRequest` ∥ `getDiff` (both need only repo+id), `getComments` after the PR (needs its commit hashes). Critical path drops from PR+diff+comments to PR+comments, with the diff overlapping for free.
+  - [ ] Investigate whether `getComments` needs the commit hashes to *fetch* or only to *anchor*; if only to anchor, all three fan out (critical path → max of the three).
+  - [ ] Investigate HTTP keep-alive / connection reuse across the three requests (a fresh `StdHttpClient` per load may pay a TLS handshake 3×); reuse may beat fan-out on cost.
+- [ ] Tests: async picker open (loading → populated over a fake), boot loading-view render, `loadWith` fan-out ordering + result parity with the sequential path.
+
+_Deferred:_ animated spinner — the vaxis `Loop` has no timer (`nextEvent` blocks on real events), so animation needs a tick thread posting via `postEvent`; static "Loading…" text delivers most of the perceived win at no concurrency cost. Revisit if the static frame feels dead.
+
+## M8 — Pending review: submission & failures  ·  M  ·  needs M6
 - [ ] `Submission`: topological order, temp-id → CommentId remap.
 - [ ] Failure model: retry (network/429/5xx), abort-on-auth, mark-and-continue (validation).
 - [ ] Duplicate guard (GET-and-dedupe on ambiguous failure).
@@ -67,22 +77,22 @@ _Deferred:_ true **whole-file** scope (unchanged regions *outside* the fetched h
 - [ ] Per-item summary + selective retry of failed subtrees.
 - [ ] Tests: submission ordering, remap, each failure class, dedupe.
 
-## M8 — Keymap & motions  ·  S/M  ·  needs M2
+## M9 — Keymap & motions  ·  S/M  ·  needs M2
 - [ ] Full vim motion set + numeric Count register (`5j`, `zz`, …); arrows side by side.
 - [ ] Configurable `Keymap` from config.
 - [ ] Keybinding-help Overlay (reads Keymap).
 
-## M9 — Themes & config  ·  S  ·  needs M2
+## M10 — Themes & config  ·  S  ·  needs M2
 - [ ] Config file (TOML at `~/.config/bbr/`).
 - [ ] Built-in themes: catppuccin, gruvbox, solarized (+ light/dark); selection in config.
 
-## M10 — Syntax highlighting  ·  L  ·  needs M2
+## M11 — Syntax highlighting  ·  L  ·  needs M2
 - [ ] `Highlighter` seam + `PlainHighlighter`.
 - [ ] tree-sitter Zig bindings; decide grammar delivery (build-time vs runtime).
 - [ ] Grammars: tsx/jsx, css, go, bash, json, yaml + highlight queries.
 - [ ] Compose syntax foreground over diff background per cell; wire into `Theme`.
 
-## M11 — Local / offline review  ·  M/L  ·  needs M6 (not M7)
+## M12 — Local / offline review  ·  M/L  ·  needs M6 (not M8)
 - [ ] Extend `GitClient` with diffing subset: worktree list, ref resolution, `diff` between refs, blob at ref.
 - [ ] `DiffSource` abstraction; local `git diff <base>..<branch>` → same Diff parser.
 - [ ] Local `CommentTarget` in SQLite (no submission path).
@@ -100,15 +110,16 @@ _Deferred:_ true **whole-file** scope (unchanged regions *outside* the fetched h
 ## Sequencing at a glance
 
 ```
-M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M7
+M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M8    (authoring → submission)
               ├─ M4              (PR discovery)
               ├─ M5              (diff polish)
-              ├─ M8              (keymap)
-              ├─ M9              (themes/config)
-              ├─ M10             (highlighting)
-              └─ M3 ─ M6 ─ M11   (local review; needs authoring, not submission)
+              ├─ M4 ─ M7         (responsiveness / non-blocking loads)
+              ├─ M9              (keymap)
+              ├─ M10             (themes/config)
+              ├─ M11             (highlighting)
+              └─ M3 ─ M6 ─ M12   (local review; needs authoring, not submission)
 ```
 
-**MVP line:** M0–M3 gives a usable read-only reviewer; M4 makes it ergonomic; M6+M7 make it
-write-capable (the headline). M5/M8/M9/M10 are parallelizable polish once M2 lands; M11 is the
+**MVP line:** M0–M3 gives a usable read-only reviewer; M4 makes it ergonomic; M6+M8 make it
+write-capable (the headline). M5/M7/M9/M10/M11 are parallelizable polish once M2 lands; M12 is the
 largest standalone feature and depends only on read + authoring, not submission.

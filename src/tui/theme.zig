@@ -1,6 +1,6 @@
 //! Theme — the palette the renderer consults for every cell. Presentation owns
 //! it (it speaks in vaxis styles). One `dark` default ships now; selectable
-//! themes (catppuccin / gruvbox / solarized / light) are M9.
+//! themes (catppuccin / gruvbox / solarized / light) are M10.
 //!
 //! Diff lines get the classic neutral / green / red *backgrounds* (design §2),
 //! so the emphasis reads as bands across the pane, not just colored text.
