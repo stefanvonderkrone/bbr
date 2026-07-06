@@ -24,6 +24,17 @@ pub const diff = struct {
     pub const LineKind = model.LineKind;
 };
 
+pub const review = struct {
+    pub const comment = @import("review/comment.zig");
+    pub const thread = @import("review/thread.zig");
+    pub const Comment = comment.Comment;
+    pub const CommentId = comment.CommentId;
+    pub const Anchor = comment.Anchor;
+    pub const AnchorState = comment.AnchorState;
+    pub const Thread = thread.Thread;
+    pub const buildThreads = thread.build;
+};
+
 pub const bitbucket = struct {
     const client_mod = @import("bitbucket/client.zig");
     pub const Client = client_mod.Client;
@@ -45,4 +56,6 @@ test {
     _ = @import("diff/model.zig");
     _ = @import("diff/parser.zig");
     _ = @import("diff/buffer.zig");
+    _ = @import("review/comment.zig");
+    _ = @import("review/thread.zig");
 }
