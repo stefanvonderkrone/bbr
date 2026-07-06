@@ -110,7 +110,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, them
                 numCol(scratch, ln.new_no),
             }) catch "";
             _ = win.printSegment(.{ .text = gutter, .style = theme.gutter }, .{ .row_offset = r, .wrap = .none });
-            drawLineBody(scratch, win, r, lr, theme, style);
+            drawLineBody(scratch, win, r, gutter_cols, lr, theme, style);
 
             if (is_cursor) {
                 // A cursor marker in column 0, over the gutter, without disturbing
@@ -118,29 +118,74 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, them
                 win.writeCell(0, r, .{ .char = .{ .grapheme = "▌", .width = 1 }, .style = .{ .fg = .{ .index = 6 } } });
             }
         },
+        .line_pair => |pair| drawLinePair(scratch, win, r, pair, theme, is_cursor),
         .comment => |cr| drawComment(scratch, win, r, cr, theme, is_cursor),
         .section => |sec| drawSection(scratch, win, r, sec, theme),
     }
 }
 
+/// Side-by-side gutter: one 4-wide line-number column plus a trailing space.
+const side_gutter: u16 = 5;
+
+/// Draw one side-by-side row: the old line in the left half, the new line in the
+/// right half, split by a one-column divider. Each half is a 1-row child window
+/// so a long line is clipped at the divider instead of bleeding into the other
+/// pane. An absent side is drawn as a neutral empty half.
+fn drawLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, pair: bbr.diff.buffer.LinePair, theme: Theme, is_cursor: bool) void {
+    const half = win.width / 2;
+    if (half == 0) return;
+    const right_x = half + 1; // divider column sits at `half`
+    const right_w = if (win.width > right_x) win.width - right_x else 0;
+
+    const left = win.child(.{ .x_off = 0, .y_off = r, .width = half, .height = 1 });
+    drawHalf(scratch, left, pair.left, theme, .old);
+    if (right_w > 0) {
+        const right = win.child(.{ .x_off = right_x, .y_off = r, .width = right_w, .height = 1 });
+        drawHalf(scratch, right, pair.right, theme, .new);
+    }
+
+    if (is_cursor) win.writeCell(0, r, .{ .char = .{ .grapheme = "▌", .width = 1 }, .style = .{ .fg = .{ .index = 6 } } });
+}
+
+/// Which line number a side shows: old for the left pane, new for the right.
+const Side = enum { old, new };
+
+/// Draw one half of a side-by-side row into its 1-row child window: band fill,
+/// a single line-number gutter, then the (optionally emphasized) body. A null
+/// side leaves a neutral empty half.
+fn drawHalf(scratch: std.mem.Allocator, win: vaxis.Window, side_row: ?LineRow, theme: Theme, side: Side) void {
+    const lr = side_row orelse {
+        fillRow(win, 0, theme.context);
+        return;
+    };
+    const style = theme.lineStyle(lr.line.kind);
+    fillRow(win, 0, style);
+    const no = switch (side) {
+        .old => lr.line.old_no,
+        .new => lr.line.new_no,
+    };
+    _ = win.printSegment(.{ .text = numCol(scratch, no), .style = theme.gutter }, .{ .row_offset = 0, .wrap = .none });
+    drawLineBody(scratch, win, 0, side_gutter, lr, theme, style);
+}
+
 /// Draw a diff line's body after the gutter. Without intra-line emphasis the
 /// whole line prints in its band `style`; with emphasis, the line is drawn as a
 /// run of styled segments so only the changed runs get the brighter band.
-fn drawLineBody(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, lr: LineRow, theme: Theme, style: vaxis.Style) void {
+fn drawLineBody(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, body_col: u16, lr: LineRow, theme: Theme, style: vaxis.Style) void {
     if (lr.emphasis.len == 0) {
-        _ = win.printSegment(.{ .text = lr.line.text, .style = style }, .{ .row_offset = r, .col_offset = gutter_cols, .wrap = .none });
+        _ = win.printSegment(.{ .text = lr.line.text, .style = style }, .{ .row_offset = r, .col_offset = body_col, .wrap = .none });
         return;
     }
 
     const emph = theme.emphasisStyle(lr.line.kind);
     const segs = scratch.alloc(vaxis.Segment, lr.emphasis.len) catch {
-        _ = win.printSegment(.{ .text = lr.line.text, .style = style }, .{ .row_offset = r, .col_offset = gutter_cols, .wrap = .none });
+        _ = win.printSegment(.{ .text = lr.line.text, .style = style }, .{ .row_offset = r, .col_offset = body_col, .wrap = .none });
         return;
     };
     for (lr.emphasis, 0..) |seg, i| {
         segs[i] = .{ .text = seg.text, .style = if (seg.emphasis) emph else style };
     }
-    _ = win.print(segs, .{ .row_offset = r, .col_offset = gutter_cols, .wrap = .none });
+    _ = win.print(segs, .{ .row_offset = r, .col_offset = body_col, .wrap = .none });
 }
 
 /// First line of a body (comment bodies may be multi-line; one row shows the
@@ -335,6 +380,50 @@ test "a modified line paints only its changed run with the emphasis band" {
     try testing.expectEqual(theme_dark.removed_emphasis.bg, win.readCell(body_x + 12, 2).?.style.bg);
     // Same on the added side for "2".
     try testing.expectEqual(theme_dark.added_emphasis.bg, win.readCell(body_x + 12, 3).?.style.bg);
+}
+
+test "side-by-side draws old on the left, new on the right" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const raw =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,2 +1,2 @@
+        \\ keep
+        \\-let x = 1;
+        \\+let x = 2;
+        \\
+    ;
+    const diff = try bbr.diff.parse(a, raw);
+    const buf = try bbr.diff.buffer.build(a, diff, .side_by_side);
+
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    const nav = Nav.init(buf.rows.len, 24);
+    draw(a, win, diff, buf, theme_dark, nav, 0);
+
+    // Pane starts at sidebar_width+1. Rows: 0 header, 1 hunk, 2 ctx, 3 modified.
+    // Read the first body cell of each half (after its line-number gutter) — the
+    // gutter cells and the col-0 cursor marker carry their own styles.
+    const px = sidebar_width + 1;
+    const pane_w = 80 - px;
+    const half = pane_w / 2;
+    const body_l = px + side_gutter;
+    const body_r = px + (half + 1) + side_gutter;
+
+    // Modified row (3): the common leading run keeps the base band — removed on
+    // the left, added on the right.
+    try testing.expectEqual(theme_dark.removed.bg, win.readCell(body_l, 3).?.style.bg);
+    try testing.expectEqual(theme_dark.added.bg, win.readCell(body_r, 3).?.style.bg);
+
+    // Context row (2): both halves are neutral.
+    try testing.expect(win.readCell(body_l, 2).?.style.bg == .default);
+    try testing.expect(win.readCell(body_r, 2).?.style.bg == .default);
 }
 
 test "sidebar highlights the selected file" {

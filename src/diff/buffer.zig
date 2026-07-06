@@ -28,7 +28,7 @@ const emphasis_threshold: f64 = 0.5;
 /// `side_by_side` is the other axis (design §11) and lands later.
 pub const Layout = enum { unified, side_by_side };
 
-pub const RowKind = enum { file_header, hunk_header, line, comment, section };
+pub const RowKind = enum { file_header, hunk_header, line, line_pair, comment, section };
 
 /// A diff body line plus any intra-line emphasis. `emphasis` is empty for
 /// context lines and for changed lines with no modified counterpart (pure
@@ -38,6 +38,16 @@ pub const RowKind = enum { file_header, hunk_header, line, comment, section };
 pub const LineRow = struct {
     line: *const model.Line,
     emphasis: []const Segment = &.{},
+};
+
+/// One row of the side-by-side layout: the old line on the left, the new line
+/// on the right. A context line fills both (the same `*Line`); a removed line
+/// fills only `left`, an added line only `right`. A modified pair fills both
+/// with distinct lines aligned on the row. An absent side (`null`) is drawn as
+/// an empty gutter — the classic "missing line" filler.
+pub const LinePair = struct {
+    left: ?LineRow = null,
+    right: ?LineRow = null,
 };
 
 /// A comment woven into the diff: the comment itself plus whether it's a reply
@@ -66,6 +76,7 @@ pub const Row = union(RowKind) {
     file_header: *const model.File,
     hunk_header: *const model.Hunk,
     line: LineRow,
+    line_pair: LinePair,
     comment: CommentRow,
     section: Section,
 };
@@ -105,8 +116,6 @@ pub fn buildWithComments(
     threads: []const Thread,
     opts: CommentOptions,
 ) BuildError!Buffer {
-    if (layout != .unified) return BuildError.LayoutUnsupported;
-
     var rows: std.ArrayList(Row) = .empty;
 
     // 1. PR-level comments (no anchor), respecting the resolved toggle.
@@ -124,15 +133,9 @@ pub fn buildWithComments(
         for (file.hunks) |*hunk| {
             try rows.append(allocator, .{ .hunk_header = hunk });
             const emphasis = try computeEmphasis(allocator, hunk.lines);
-            for (hunk.lines, 0..) |*ln, li| {
-                try rows.append(allocator, .{ .line = .{ .line = ln, .emphasis = emphasis[li] } });
-                for (threads) |*t| {
-                    const anc = t.root.anchor orelse continue;
-                    if (t.root.state == .outdated) continue; // grouped below
-                    if (!std.mem.eql(u8, anc.path, file.new_path)) continue;
-                    if (!inlineVisible(t.*, opts)) continue;
-                    if (anchorMatchesLine(anc, ln)) try emitThread(allocator, &rows, t);
-                }
+            switch (layout) {
+                .unified => try emitUnifiedHunk(allocator, &rows, threads, file, hunk.lines, emphasis, opts),
+                .side_by_side => try emitSideBySideHunk(allocator, &rows, threads, file, hunk.lines, emphasis, opts),
             }
         }
 
@@ -154,6 +157,105 @@ fn emitThread(allocator: std.mem.Allocator, rows: *std.ArrayList(Row), t: *const
     try rows.append(allocator, .{ .comment = .{ .comment = t.root, .is_reply = false } });
     for (t.replies) |reply| {
         try rows.append(allocator, .{ .comment = .{ .comment = reply, .is_reply = true } });
+    }
+}
+
+/// Emit a hunk's lines in unified layout: one row per line, each followed by
+/// any inline threads anchored to it.
+fn emitUnifiedHunk(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(Row),
+    threads: []const Thread,
+    file: *const model.File,
+    lines: []const model.Line,
+    emphasis: []const []const Segment,
+    opts: CommentOptions,
+) !void {
+    for (lines, 0..) |*ln, li| {
+        try rows.append(allocator, .{ .line = .{ .line = ln, .emphasis = emphasis[li] } });
+        try weaveInline(allocator, rows, threads, file, ln, opts);
+    }
+}
+
+/// Emit a hunk's lines in side-by-side layout: old on the left, new on the
+/// right, modified pairs aligned on one row. Inline threads are woven after the
+/// pair that carries their anchored line (once per underlying line, so a
+/// context line — present on both sides — doesn't double-emit).
+fn emitSideBySideHunk(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(Row),
+    threads: []const Thread,
+    file: *const model.File,
+    lines: []const model.Line,
+    emphasis: []const []const Segment,
+    opts: CommentOptions,
+) !void {
+    var i: usize = 0;
+    while (i < lines.len) {
+        switch (lines[i].kind) {
+            .context => {
+                const both: LineRow = .{ .line = &lines[i] };
+                try rows.append(allocator, .{ .line_pair = .{ .left = both, .right = both } });
+                try weaveInline(allocator, rows, threads, file, &lines[i], opts);
+                i += 1;
+            },
+            .added => {
+                // An added run with no preceding removed: right side only.
+                const start = i;
+                while (i < lines.len and lines[i].kind == .added) i += 1;
+                var p = start;
+                while (p < i) : (p += 1) {
+                    try rows.append(allocator, .{ .line_pair = .{ .right = .{ .line = &lines[p], .emphasis = emphasis[p] } } });
+                    try weaveInline(allocator, rows, threads, file, &lines[p], opts);
+                }
+            },
+            .removed => {
+                const rem_start = i;
+                while (i < lines.len and lines[i].kind == .removed) i += 1;
+                const rem_end = i;
+                var add_start = i;
+                var add_end = i;
+                if (i < lines.len and lines[i].kind == .added) {
+                    add_start = i;
+                    while (i < lines.len and lines[i].kind == .added) i += 1;
+                    add_end = i;
+                }
+                const rn = rem_end - rem_start;
+                const an = add_end - add_start;
+                var p: usize = 0;
+                while (p < @max(rn, an)) : (p += 1) {
+                    const left: ?LineRow = if (p < rn) .{ .line = &lines[rem_start + p], .emphasis = emphasis[rem_start + p] } else null;
+                    const right: ?LineRow = if (p < an) .{ .line = &lines[add_start + p], .emphasis = emphasis[add_start + p] } else null;
+                    try rows.append(allocator, .{ .line_pair = .{ .left = left, .right = right } });
+                    if (right) |rr| try weaveInline(allocator, rows, threads, file, rr.line, opts);
+                    if (left) |ll| {
+                        // Only weave the old line separately when it isn't the
+                        // same line already woven on the right.
+                        if (right == null or ll.line != right.?.line)
+                            try weaveInline(allocator, rows, threads, file, ll.line, opts);
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// Append any current/moved inline threads anchored to `ln` in `file`,
+/// respecting the resolved toggle. Outdated threads are grouped separately.
+fn weaveInline(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(Row),
+    threads: []const Thread,
+    file: *const model.File,
+    ln: *const model.Line,
+    opts: CommentOptions,
+) !void {
+    for (threads) |*t| {
+        const anc = t.root.anchor orelse continue;
+        if (t.root.state == .outdated) continue; // grouped below
+        if (!std.mem.eql(u8, anc.path, file.new_path)) continue;
+        if (!inlineVisible(t.*, opts)) continue;
+        if (anchorMatchesLine(anc, ln)) try emitThread(allocator, rows, t);
     }
 }
 
@@ -340,10 +442,71 @@ test "empty diff yields no rows" {
     try testing.expectEqual(@as(usize, 0), buf.rows.len);
 }
 
-test "side_by_side is not yet supported" {
+test "side_by_side pairs context, aligns a modification, and fills add/remove" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    try testing.expectError(BuildError.LayoutUnsupported, build(arena.allocator(), .{ .files = &.{} }, .side_by_side));
+    const a = arena.allocator();
+
+    // ctx, then a modified pair (old/new), then a pure add, then a pure remove.
+    const raw =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,4 +1,4 @@
+        \\ ctx
+        \\-let x = 1;
+        \\+let x = 2;
+        \\+brand new
+        \\-goodbye
+        \\
+    ;
+    const diff = try parse(a, raw);
+    const buf = try build(a, diff, .side_by_side);
+    try testing.expectEqual(Layout.side_by_side, buf.layout);
+
+    // Rows: file_header, hunk_header, then 4 line_pairs.
+    try testing.expect(buf.rows[0] == .file_header);
+    try testing.expect(buf.rows[1] == .hunk_header);
+
+    // Context: both sides show the same line.
+    const ctx = buf.rows[2].line_pair;
+    try testing.expect(ctx.left != null and ctx.right != null);
+    try testing.expectEqual(ctx.left.?.line, ctx.right.?.line);
+
+    // Modification: left removed, right added, aligned on one row, both emphasized.
+    const mod = buf.rows[3].line_pair;
+    try testing.expectEqual(model.LineKind.removed, mod.left.?.line.kind);
+    try testing.expectEqual(model.LineKind.added, mod.right.?.line.kind);
+    try testing.expect(mod.left.?.emphasis.len > 0);
+
+    // Pure add: right only.
+    const add = buf.rows[4].line_pair;
+    try testing.expect(add.left == null);
+    try testing.expectEqual(model.LineKind.added, add.right.?.line.kind);
+
+    // Pure remove: left only.
+    const rem = buf.rows[5].line_pair;
+    try testing.expectEqual(model.LineKind.removed, rem.left.?.line.kind);
+    try testing.expect(rem.right == null);
+
+    try testing.expectEqual(@as(usize, 6), buf.rows.len);
+}
+
+test "side_by_side weaves an inline thread once, under its anchored pair" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, anchor_diff);
+    // anchor_diff new-side line 2 is "+new"; comment anchors there.
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "why?", .anchor = .{ .path = "a.txt", .to = 2 } },
+    };
+    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const buf = try buildWithComments(a, diff, .side_by_side, threads, .{});
+
+    // Exactly one comment row (not double-woven across the two panes).
+    try testing.expectEqual(@as(usize, 1), countKind(buf, .comment));
 }
 
 // --- Comment weaving --------------------------------------------------------

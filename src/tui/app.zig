@@ -90,7 +90,8 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
     defer buf_arena.deinit();
 
     var show_resolved = false;
-    var buf = try bbr.diff.buffer.buildWithComments(buf_arena.allocator(), current.diff, .unified, current.threads, .{ .show_resolved = show_resolved });
+    var layout: bbr.diff.Layout = .unified;
+    var buf = try bbr.diff.buffer.buildWithComments(buf_arena.allocator(), current.diff, layout, current.threads, .{ .show_resolved = show_resolved });
 
     // Per-frame arena for synthesized gutter/overlay text; reset after render.
     var frame_arena = std.heap.ArenaAllocator.init(gpa);
@@ -171,7 +172,11 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
                         };
                     } else if (key.matches('R', .{})) {
                         show_resolved = !show_resolved;
-                        buf = rebuild(&buf_arena, current, show_resolved) catch buf;
+                        buf = rebuild(&buf_arena, current, layout, show_resolved) catch buf;
+                        nav.setRowCount(buf.rows.len);
+                    } else if (key.matches('s', .{})) {
+                        layout = if (layout == .unified) .side_by_side else .unified;
+                        buf = rebuild(&buf_arena, current, layout, show_resolved) catch buf;
                         nav.setRowCount(buf.rows.len);
                     } else if (handleKey(&nav, &pending_g, key)) |_| {}
                 }
@@ -191,7 +196,7 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
                         .ok => |s| {
                             current.destroy();
                             current = s;
-                            buf = rebuild(&buf_arena, current, show_resolved) catch buf;
+                            buf = rebuild(&buf_arena, current, layout, show_resolved) catch buf;
                             nav = Nav.init(buf.rows.len, vx.window().height);
                             pending_g = false;
                             status_msg = null;
@@ -207,7 +212,7 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
         const win = vx.window();
         const frame = frame_arena.allocator();
         render.draw(frame, win, current.diff, buf, active_theme, nav, selected_file);
-        drawStatus(frame, win, current.pr, nav, buf, show_resolved, loading, status_msg);
+        drawStatus(frame, win, current.pr, nav, buf, layout, show_resolved, loading, status_msg);
         if (picker) |*p| render.drawPicker(frame, win, p, active_theme);
         try vx.render(writer);
         _ = frame_arena.reset(.retain_capacity);
@@ -216,9 +221,9 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
 
 /// Rebuild the row buffer for `s` against the resolved toggle. Rows borrow the
 /// session's diff/threads (not `buf_arena`), so resetting the arena is safe.
-fn rebuild(buf_arena: *std.heap.ArenaAllocator, s: *const Session, show_resolved: bool) !bbr.diff.Buffer {
+fn rebuild(buf_arena: *std.heap.ArenaAllocator, s: *const Session, layout: bbr.diff.Layout, show_resolved: bool) !bbr.diff.Buffer {
     _ = buf_arena.reset(.retain_capacity);
-    return bbr.diff.buffer.buildWithComments(buf_arena.allocator(), s.diff, .unified, s.threads, .{ .show_resolved = show_resolved });
+    return bbr.diff.buffer.buildWithComments(buf_arena.allocator(), s.diff, layout, s.threads, .{ .show_resolved = show_resolved });
 }
 
 /// Fetch the repo's open PRs (synchronously — one request) and open the Picker
@@ -344,22 +349,25 @@ fn drawStatus(
     pr: bbr.bitbucket.PullRequest,
     nav: Nav,
     buf: bbr.diff.Buffer,
+    layout: bbr.diff.Layout,
     show_resolved: bool,
     loading: bool,
     status_msg: ?[]const u8,
 ) void {
     if (win.height == 0) return;
     const row = win.height - 1;
+    const layout_hint: []const u8 = if (layout == .unified) "s split" else "s unified";
     const resolved_hint: []const u8 = if (show_resolved) "R hide resolved" else "R show resolved";
     // A transient message (error) or the loading indicator takes the tail slot.
     const tail: []const u8 = if (status_msg) |m| m else if (loading) "loading…" else "p switch  ·  q quit";
-    const text = std.fmt.allocPrint(frame, " #{d} {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s} ", .{
+    const text = std.fmt.allocPrint(frame, " #{d} {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s}  ·  {s} ", .{
         pr.id,
         pr.title,
         pr.source_branch,
         pr.destination_branch,
         @min(nav.cursor + 1, buf.rows.len),
         buf.rows.len,
+        layout_hint,
         resolved_hint,
         tail,
     }) catch " q quit ";
