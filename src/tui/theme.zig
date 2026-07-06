@@ -20,6 +20,10 @@ pub const Theme = struct {
     added: Style,
     /// Removed lines — red band.
     removed: Style,
+    /// The changed run *within* an added line — a brighter green band.
+    added_emphasis: Style,
+    /// The changed run *within* a removed line — a brighter red band.
+    removed_emphasis: Style,
     /// The line-number gutter.
     gutter: Style,
     /// `diff --git` file separator rows.
@@ -62,6 +66,16 @@ pub const Theme = struct {
         };
     }
 
+    /// Style for the emphasized (changed) run within an added/removed line.
+    /// Context lines have no emphasis, so they fall back to their base band.
+    pub fn emphasisStyle(self: Theme, kind: LineKind) Style {
+        return switch (kind) {
+            .context => self.context,
+            .added => self.added_emphasis,
+            .removed => self.removed_emphasis,
+        };
+    }
+
     /// File-list name color for a change status: green add, yellow modify, red
     /// remove, violet rename.
     pub fn statusColor(self: Theme, status: bbr.diff.FileStatus) Color {
@@ -84,6 +98,8 @@ pub const dark: Theme = .{
     .context = .{},
     .added = .{ .bg = rgb(0x18_32_18) },
     .removed = .{ .bg = rgb(0x3a_18_18) },
+    .added_emphasis = .{ .bg = rgb(0x2c_5c_2c) },
+    .removed_emphasis = .{ .bg = rgb(0x6c_28_28) },
     .gutter = .{ .fg = rgb(0x80_80_80) },
     .file_header = .{ .fg = rgb(0xd0_d0_d0), .bold = true },
     .hunk_header = .{ .fg = rgb(0x6c_9c_d0) },

@@ -16,6 +16,7 @@ const Theme = @import("theme.zig").Theme;
 const Nav = @import("nav.zig").Nav;
 const Buffer = bbr.diff.buffer.Buffer;
 const Row = bbr.diff.buffer.Row;
+const LineRow = bbr.diff.buffer.LineRow;
 const CommentRow = bbr.diff.buffer.CommentRow;
 const Section = bbr.diff.buffer.Section;
 const FileStatus = bbr.diff.FileStatus;
@@ -99,7 +100,8 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, them
             fillRow(win, r, theme.hunk_header);
             _ = win.printSegment(.{ .text = hunk.header, .style = theme.hunk_header }, .{ .row_offset = r, .wrap = .none });
         },
-        .line => |ln| {
+        .line => |lr| {
+            const ln = lr.line;
             const style = theme.lineStyle(ln.kind);
             fillRow(win, r, style);
 
@@ -108,7 +110,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, them
                 numCol(scratch, ln.new_no),
             }) catch "";
             _ = win.printSegment(.{ .text = gutter, .style = theme.gutter }, .{ .row_offset = r, .wrap = .none });
-            _ = win.printSegment(.{ .text = ln.text, .style = style }, .{ .row_offset = r, .col_offset = gutter_cols, .wrap = .none });
+            drawLineBody(scratch, win, r, lr, theme, style);
 
             if (is_cursor) {
                 // A cursor marker in column 0, over the gutter, without disturbing
@@ -119,6 +121,26 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, them
         .comment => |cr| drawComment(scratch, win, r, cr, theme, is_cursor),
         .section => |sec| drawSection(scratch, win, r, sec, theme),
     }
+}
+
+/// Draw a diff line's body after the gutter. Without intra-line emphasis the
+/// whole line prints in its band `style`; with emphasis, the line is drawn as a
+/// run of styled segments so only the changed runs get the brighter band.
+fn drawLineBody(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, lr: LineRow, theme: Theme, style: vaxis.Style) void {
+    if (lr.emphasis.len == 0) {
+        _ = win.printSegment(.{ .text = lr.line.text, .style = style }, .{ .row_offset = r, .col_offset = gutter_cols, .wrap = .none });
+        return;
+    }
+
+    const emph = theme.emphasisStyle(lr.line.kind);
+    const segs = scratch.alloc(vaxis.Segment, lr.emphasis.len) catch {
+        _ = win.printSegment(.{ .text = lr.line.text, .style = style }, .{ .row_offset = r, .col_offset = gutter_cols, .wrap = .none });
+        return;
+    };
+    for (lr.emphasis, 0..) |seg, i| {
+        segs[i] = .{ .text = seg.text, .style = if (seg.emphasis) emph else style };
+    }
+    _ = win.print(segs, .{ .row_offset = r, .col_offset = gutter_cols, .wrap = .none });
 }
 
 /// First line of a body (comment bodies may be multi-line; one row shows the
@@ -277,6 +299,42 @@ test "diff lines render with their band background at the text cells" {
     // Context line keeps the neutral (default) background.
     const context_cell = win.readCell(body_x, 2).?;
     try testing.expect(context_cell.style.bg == .default);
+}
+
+test "a modified line paints only its changed run with the emphasis band" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const raw =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-let value = 1;
+        \\+let value = 2;
+        \\
+    ;
+    const diff = try bbr.diff.parse(a, raw);
+    const buf = try bbr.diff.buffer.build(a, diff, .unified);
+
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    const nav = Nav.init(buf.rows.len, 24);
+    draw(a, win, diff, buf, theme_dark, nav, 0);
+
+    // Pane rows: 0 header, 1 hunk, 2 removed, 3 added. Body starts after gutter.
+    const px = sidebar_width + 1;
+    const body_x = px + gutter_cols;
+    // "let value = " is common (base band); the digit at the end is emphasized.
+    // Column of the common prefix keeps the base removed band...
+    try testing.expectEqual(theme_dark.removed.bg, win.readCell(body_x, 2).?.style.bg);
+    // ...while the changed "1" (13 chars in: "let value = " is 12) gets the brighter band.
+    try testing.expectEqual(theme_dark.removed_emphasis.bg, win.readCell(body_x + 12, 2).?.style.bg);
+    // Same on the added side for "2".
+    try testing.expectEqual(theme_dark.added_emphasis.bg, win.readCell(body_x + 12, 3).?.style.bg);
 }
 
 test "sidebar highlights the selected file" {

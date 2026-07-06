@@ -11,15 +11,34 @@
 
 const std = @import("std");
 const model = @import("model.zig");
+const intraline = @import("intraline.zig");
 const review = @import("../review/comment.zig");
 const Thread = @import("../review/thread.zig").Thread;
 const Comment = review.Comment;
+
+/// Re-export so the renderer can name the segment type without reaching into
+/// `intraline` directly.
+pub const Segment = intraline.Segment;
+
+/// Below this common-byte fraction a removed/added pair is treated as two
+/// unrelated lines rather than an edit, so no intra-line emphasis is attached.
+const emphasis_threshold: f64 = 0.5;
 
 /// How a `Buffer` is arranged on screen. Only `unified` is built today;
 /// `side_by_side` is the other axis (design §11) and lands later.
 pub const Layout = enum { unified, side_by_side };
 
 pub const RowKind = enum { file_header, hunk_header, line, comment, section };
+
+/// A diff body line plus any intra-line emphasis. `emphasis` is empty for
+/// context lines and for changed lines with no modified counterpart (pure
+/// add/remove); when present it partitions `line.text` into common/changed runs
+/// (the same side of an `intraline.Pair`), so the renderer paints only the
+/// changed runs with a brighter band.
+pub const LineRow = struct {
+    line: *const model.Line,
+    emphasis: []const Segment = &.{},
+};
 
 /// A comment woven into the diff: the comment itself plus whether it's a reply
 /// (so the renderer can indent it under its root).
@@ -46,7 +65,7 @@ pub const Section = struct {
 pub const Row = union(RowKind) {
     file_header: *const model.File,
     hunk_header: *const model.Hunk,
-    line: *const model.Line,
+    line: LineRow,
     comment: CommentRow,
     section: Section,
 };
@@ -104,8 +123,9 @@ pub fn buildWithComments(
         try rows.append(allocator, .{ .file_header = file });
         for (file.hunks) |*hunk| {
             try rows.append(allocator, .{ .hunk_header = hunk });
-            for (hunk.lines) |*ln| {
-                try rows.append(allocator, .{ .line = ln });
+            const emphasis = try computeEmphasis(allocator, hunk.lines);
+            for (hunk.lines, 0..) |*ln, li| {
+                try rows.append(allocator, .{ .line = .{ .line = ln, .emphasis = emphasis[li] } });
                 for (threads) |*t| {
                     const anc = t.root.anchor orelse continue;
                     if (t.root.state == .outdated) continue; // grouped below
@@ -135,6 +155,43 @@ fn emitThread(allocator: std.mem.Allocator, rows: *std.ArrayList(Row), t: *const
     for (t.replies) |reply| {
         try rows.append(allocator, .{ .comment = .{ .comment = reply, .is_reply = true } });
     }
+}
+
+/// Compute intra-line emphasis for every line in a hunk. Returns a slice
+/// index-aligned with `lines`; entries default to empty. A maximal run of
+/// removed lines immediately followed by a run of added lines is treated as a
+/// modification: removed[k] is word-diffed against added[k] (paired by index),
+/// and if the two are similar enough both lines get their emphasis segments.
+/// Pure adds, pure removes, and context stay empty (whole-line band).
+fn computeEmphasis(allocator: std.mem.Allocator, lines: []const model.Line) ![]const []const Segment {
+    const out = try allocator.alloc([]const Segment, lines.len);
+    for (out) |*e| e.* = &.{};
+
+    var i: usize = 0;
+    while (i < lines.len) {
+        if (lines[i].kind != .removed) {
+            i += 1;
+            continue;
+        }
+        const rem_start = i;
+        while (i < lines.len and lines[i].kind == .removed) i += 1;
+        const rem_end = i;
+        if (i >= lines.len or lines[i].kind != .added) continue;
+        const add_start = i;
+        while (i < lines.len and lines[i].kind == .added) i += 1;
+        const add_end = i;
+
+        const pairs = @min(rem_end - rem_start, add_end - add_start);
+        var k: usize = 0;
+        while (k < pairs) : (k += 1) {
+            const pair = try intraline.diff(allocator, lines[rem_start + k].text, lines[add_start + k].text);
+            if (intraline.similarity(pair) >= emphasis_threshold) {
+                out[rem_start + k] = pair.old;
+                out[add_start + k] = pair.new;
+            }
+        }
+    }
+    return out;
 }
 
 fn isPrLevel(t: Thread) bool {
@@ -215,15 +272,52 @@ test "build flattens files → hunks → lines in order" {
     try testing.expectEqualStrings("a.txt", buf.rows[0].file_header.new_path);
     try testing.expect(buf.rows[1] == .hunk_header);
     try testing.expect(buf.rows[2] == .line);
-    try testing.expectEqual(model.LineKind.context, buf.rows[2].line.kind);
-    try testing.expectEqual(model.LineKind.removed, buf.rows[3].line.kind);
-    try testing.expectEqual(model.LineKind.added, buf.rows[4].line.kind);
+    try testing.expectEqual(model.LineKind.context, buf.rows[2].line.line.kind);
+    try testing.expectEqual(model.LineKind.removed, buf.rows[3].line.line.kind);
+    try testing.expectEqual(model.LineKind.added, buf.rows[4].line.line.kind);
 
     try testing.expect(buf.rows[5] == .file_header);
     try testing.expectEqualStrings("b.txt", buf.rows[5].file_header.new_path);
     try testing.expect(buf.rows[6] == .hunk_header);
-    try testing.expectEqual(model.LineKind.context, buf.rows[7].line.kind);
-    try testing.expectEqual(model.LineKind.added, buf.rows[8].line.kind);
+    try testing.expectEqual(model.LineKind.context, buf.rows[7].line.line.kind);
+    try testing.expectEqual(model.LineKind.added, buf.rows[8].line.line.kind);
+}
+
+test "a modified line pair carries intra-line emphasis; unrelated lines do not" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // First hunk: a genuine edit (one word changes). Second: a wholesale
+    // replacement (nothing in common) — those must not be emphasized.
+    const raw =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,4 +1,4 @@
+        \\ ctx
+        \\-let value = 1;
+        \\+let value = 2;
+        \\ tail
+        \\-aaaaaaaa
+        \\+zzzzzzzz
+        \\
+    ;
+    const diff = try parse(a, raw);
+    const buf = try build(a, diff, .unified);
+
+    // Rows: header, hunk, ctx, -edit, +edit, tail, -aaaa, +zzzz.
+    const removed_edit = buf.rows[3].line;
+    const added_edit = buf.rows[4].line;
+    try testing.expectEqual(model.LineKind.removed, removed_edit.line.kind);
+    try testing.expect(removed_edit.emphasis.len > 0);
+    try testing.expect(added_edit.emphasis.len > 0);
+    // The common prefix "let value = " is not emphasized; only "1"/"2" is.
+    try testing.expect(!removed_edit.emphasis[0].emphasis);
+
+    // The wholesale replacement shares nothing → treated as unrelated, no emphasis.
+    try testing.expectEqual(@as(usize, 0), buf.rows[6].line.emphasis.len);
+    try testing.expectEqual(@as(usize, 0), buf.rows[7].line.emphasis.len);
 }
 
 test "rows borrow the diff (pointer identity, not copies)" {
@@ -235,7 +329,7 @@ test "rows borrow the diff (pointer identity, not copies)" {
     const buf = try build(a, diff, .unified);
 
     try testing.expectEqual(&diff.files[0], buf.rows[0].file_header);
-    try testing.expectEqual(&diff.files[0].hunks[0].lines[0], buf.rows[2].line);
+    try testing.expectEqual(&diff.files[0].hunks[0].lines[0], buf.rows[2].line.line);
 }
 
 test "empty diff yields no rows" {
@@ -292,7 +386,7 @@ test "an inline thread is woven right under its anchored line, replies indented"
     //       comment(root), comment(reply).
     try testing.expectEqual(@as(usize, 7), buf.rows.len);
     try testing.expect(buf.rows[4] == .line);
-    try testing.expectEqual(@as(?u32, 2), buf.rows[4].line.new_no);
+    try testing.expectEqual(@as(?u32, 2), buf.rows[4].line.line.new_no);
     try testing.expect(buf.rows[5] == .comment);
     try testing.expect(!buf.rows[5].comment.is_reply);
     try testing.expectEqual(@as(review.CommentId, 1), buf.rows[5].comment.comment.id);
