@@ -9,6 +9,7 @@ const HttpClient = httpc.HttpClient;
 const Credential = @import("credential.zig").Credential;
 const types = @import("types.zig");
 const PullRequest = types.PullRequest;
+const PullRequestSummary = types.PullRequestSummary;
 const HeadCommits = types.HeadCommits;
 const ApiError = types.ApiError;
 const review = @import("../review/comment.zig");
@@ -55,6 +56,82 @@ pub const Client = struct {
 
         try classify(res.status);
         return parsePullRequest(allocator, res.body);
+    }
+
+    /// GET /repositories/{workspace}/{repo}/pullrequests, following `next`
+    /// links, optionally filtered to one source branch. Returns a flat slice of
+    /// `PullRequestSummary` owned by `allocator` (free with `deinitSummaries`,
+    /// or pass an arena). `opts.state` defaults to OPEN; pass an explicit branch
+    /// via `opts.source_branch` to find the AdjacentPullRequest(s).
+    pub fn listPullRequests(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        opts: ListOptions,
+    ) ![]PullRequestSummary {
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+
+        var out: std.ArrayList(PullRequestSummary) = .empty;
+        errdefer {
+            for (out.items) |s| deinitSummary(allocator, s);
+            out.deinit(allocator);
+        }
+
+        var url = try self.firstPageUrl(allocator, repo_slug, opts);
+        while (true) {
+            const res = try self.http.send(allocator, .{
+                .method = .GET,
+                .url = url,
+                .headers = &.{
+                    .{ .name = "authorization", .value = auth },
+                    .{ .name = "accept", .value = "application/json" },
+                },
+            });
+            allocator.free(url); // request sent; slice free to reuse.
+            defer allocator.free(res.body);
+
+            try classify(res.status);
+
+            const parsed = std.json.parseFromSlice(PrListPage, allocator, res.body, .{
+                .ignore_unknown_fields = true,
+            }) catch return error.MalformedResponse;
+            defer parsed.deinit();
+
+            for (parsed.value.values) |pj| {
+                try out.append(allocator, try dupeSummary(allocator, pj));
+            }
+
+            const next = parsed.value.next orelse break;
+            url = try allocator.dupe(u8, next);
+        }
+
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Build the first-page listing URL. The optional source-branch filter goes
+    /// through Bitbucket's `q` query language (`source.branch.name="<branch>"`),
+    /// percent-encoded; `state` is a plain query param.
+    fn firstPageUrl(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        opts: ListOptions,
+    ) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        try buf.print(allocator,
+            "{s}/repositories/{s}/{s}/pullrequests?pagelen=50&state={s}",
+            .{ base_url, self.cred.workspace, repo_slug, opts.state },
+        );
+        if (opts.source_branch) |branch| {
+            try buf.appendSlice(allocator, "&q=");
+            try percentEncodeInto(allocator, &buf, "source.branch.name=\"");
+            try percentEncodeInto(allocator, &buf, branch);
+            try percentEncodeInto(allocator, &buf, "\"");
+        }
+        return buf.toOwnedSlice(allocator);
     }
 
     /// GET /repositories/{workspace}/{repo}/pullrequests/{id}/diff.
@@ -229,6 +306,79 @@ fn classify(status: u16) ApiError!void {
         500...599 => error.ServerError,
         else => error.UnexpectedStatus,
     };
+}
+
+/// Filter for `listPullRequests`. `state` is a Bitbucket PR state string
+/// (OPEN, MERGED, DECLINED, SUPERSEDED); `source_branch` restricts to PRs
+/// opened from that branch (the AdjacentPullRequest lookup).
+pub const ListOptions = struct {
+    state: []const u8 = "OPEN",
+    source_branch: ?[]const u8 = null,
+};
+
+/// Percent-encode `raw` into `buf`, escaping everything outside the RFC 3986
+/// unreserved set. Keeps the `q` filter (with its `=`, quotes, spaces) safe as
+/// a single query-parameter value.
+fn percentEncodeInto(allocator: Allocator, buf: *std.ArrayList(u8), raw: []const u8) !void {
+    for (raw) |c| {
+        if (isUnreserved(c)) {
+            try buf.append(allocator, c);
+        } else {
+            const hex = "0123456789ABCDEF";
+            try buf.append(allocator, '%');
+            try buf.append(allocator, hex[c >> 4]);
+            try buf.append(allocator, hex[c & 0x0f]);
+        }
+    }
+}
+
+fn isUnreserved(c: u8) bool {
+    return switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~' => true,
+        else => false,
+    };
+}
+
+/// The subset of a PR list entry we surface. Commit hashes are absent from the
+/// list endpoint, so they are not modeled here (see `PullRequestSummary`).
+const PrSummaryJson = struct {
+    id: u64,
+    title: []const u8,
+    state: []const u8,
+    author: ?struct { display_name: ?[]const u8 = null } = null,
+    source: struct { branch: struct { name: []const u8 } },
+    destination: struct { branch: struct { name: []const u8 } },
+};
+
+const PrListPage = struct {
+    values: []PrSummaryJson,
+    next: ?[]const u8 = null,
+};
+
+fn dupeSummary(allocator: Allocator, pj: PrSummaryJson) !PullRequestSummary {
+    const author = if (pj.author) |a| (a.display_name orelse "") else "";
+    return .{
+        .id = pj.id,
+        .title = try allocator.dupe(u8, pj.title),
+        .state = try allocator.dupe(u8, pj.state),
+        .author_display_name = try allocator.dupe(u8, author),
+        .source_branch = try allocator.dupe(u8, pj.source.branch.name),
+        .destination_branch = try allocator.dupe(u8, pj.destination.branch.name),
+    };
+}
+
+fn deinitSummary(allocator: Allocator, s: PullRequestSummary) void {
+    allocator.free(s.title);
+    allocator.free(s.state);
+    allocator.free(s.author_display_name);
+    allocator.free(s.source_branch);
+    allocator.free(s.destination_branch);
+}
+
+/// Free a batch returned by `listPullRequests`.
+pub fn deinitSummaries(allocator: Allocator, summaries: []PullRequestSummary) void {
+    for (summaries) |s| deinitSummary(allocator, s);
+    allocator.free(summaries);
 }
 
 /// JSON shape we read from Bitbucket. `ignore_unknown_fields` skips the rest.
@@ -455,6 +605,94 @@ test "malformed 2xx body is a MalformedResponse" {
     var fake: FakeHttpClient = .{ .status = 200, .body = "{ not json" };
     const bb = Client.init(fake.httpClient(), testCredential());
     try testing.expectError(error.MalformedResponse, bb.getPullRequest(a, "myrepo", 1));
+}
+
+// A two-entry PR list page (no `next`: single page). Only fields our summary
+// reads are asserted; the rest exercise `ignore_unknown_fields`.
+const fixture_pr_list =
+    \\{ "values": [
+    \\  { "id": 42, "title": "Add diff parser", "state": "OPEN",
+    \\    "author": { "display_name": "Ada Lovelace" },
+    \\    "source": { "branch": { "name": "feature/diff" } },
+    \\    "destination": { "branch": { "name": "main" } } },
+    \\  { "id": 43, "title": "Fix nav", "state": "OPEN",
+    \\    "author": { "display_name": "Grace Hopper" },
+    \\    "source": { "branch": { "name": "feature/nav" } },
+    \\    "destination": { "branch": { "name": "main" } } }
+    \\] }
+;
+
+test "listPullRequests parses summaries" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body = fixture_pr_list };
+    const bb = Client.init(fake.httpClient(), testCredential());
+
+    const prs = try bb.listPullRequests(a, "myrepo", .{});
+    defer deinitSummaries(a, prs);
+
+    try testing.expectEqual(@as(usize, 2), prs.len);
+    try testing.expectEqual(@as(u64, 42), prs[0].id);
+    try testing.expectEqualStrings("Add diff parser", prs[0].title);
+    try testing.expectEqualStrings("Ada Lovelace", prs[0].author_display_name);
+    try testing.expectEqualStrings("feature/diff", prs[0].source_branch);
+    try testing.expectEqualStrings("main", prs[0].destination_branch);
+    try testing.expectEqualStrings("feature/nav", prs[1].source_branch);
+}
+
+test "listPullRequests builds a filtered, percent-encoded URL" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body = fixture_pr_list };
+    const bb = Client.init(fake.httpClient(), testCredential());
+
+    const prs = try bb.listPullRequests(a, "myrepo", .{ .source_branch = "feature/x y" });
+    defer deinitSummaries(a, prs);
+
+    // state is a plain param; the branch filter is `source.branch.name="..."`
+    // percent-encoded as a single q value (space→%20, quote→%22, slash→%2F).
+    try testing.expectEqualStrings(
+        "https://api.bitbucket.org/2.0/repositories/check24/myrepo/pullrequests" ++
+            "?pagelen=50&state=OPEN&q=source.branch.name%3D%22feature%2Fx%20y%22",
+        fake.lastUrl().?,
+    );
+}
+
+test "listPullRequests follows next links across pages" {
+    const a = testing.allocator;
+    const page1 =
+        \\{ "values": [
+        \\  { "id": 1, "title": "one", "state": "OPEN",
+        \\    "source": { "branch": { "name": "b1" } },
+        \\    "destination": { "branch": { "name": "main" } } } ],
+        \\  "next": "https://api.bitbucket.org/2.0/repositories/check24/myrepo/pullrequests?page=2" }
+    ;
+    const page2 =
+        \\{ "values": [
+        \\  { "id": 2, "title": "two", "state": "OPEN",
+        \\    "source": { "branch": { "name": "b2" } },
+        \\    "destination": { "branch": { "name": "main" } } } ] }
+    ;
+    const Canned = @import("../http/fake_client.zig").Canned;
+    const responses = [_]Canned{
+        .{ .status = 200, .body = page1 },
+        .{ .status = 200, .body = page2 },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), testCredential());
+
+    const prs = try bb.listPullRequests(a, "myrepo", .{});
+    defer deinitSummaries(a, prs);
+
+    try testing.expectEqual(@as(usize, 2), prs.len);
+    try testing.expectEqual(@as(u64, 1), prs[0].id);
+    try testing.expectEqual(@as(u64, 2), prs[1].id);
+    try testing.expectEqual(@as(usize, 2), fake.call_count);
+}
+
+test "listPullRequests surfaces ApiError" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 401, .body = "" };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    try testing.expectError(error.Unauthorized, bb.listPullRequests(a, "myrepo", .{}));
 }
 
 const sample_diff =

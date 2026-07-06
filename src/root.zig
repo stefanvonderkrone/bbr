@@ -51,10 +51,13 @@ pub const bitbucket = struct {
     pub const Client = client_mod.Client;
     pub const deinitPullRequest = client_mod.deinitPullRequest;
     pub const deinitComments = client_mod.deinitComments;
+    pub const deinitSummaries = client_mod.deinitSummaries;
+    pub const ListOptions = client_mod.ListOptions;
     pub const base_url = client_mod.base_url;
     pub const Credential = @import("bitbucket/credential.zig").Credential;
     pub const types = @import("bitbucket/types.zig");
     pub const PullRequest = types.PullRequest;
+    pub const PullRequestSummary = types.PullRequestSummary;
     pub const ApiError = types.ApiError;
 };
 

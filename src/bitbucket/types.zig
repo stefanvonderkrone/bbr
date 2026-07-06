@@ -18,6 +18,19 @@ pub const PullRequest = struct {
     destination_commit: []const u8,
 };
 
+/// A pull request as it appears in a *list* result — enough to populate the
+/// picker and decide the startup entry. The list endpoint omits the commit
+/// hashes, so those live only on the full `PullRequest` (fetched on open). All
+/// slices are owned by the allocator that produced the summary.
+pub const PullRequestSummary = struct {
+    id: u64,
+    title: []const u8,
+    state: []const u8,
+    author_display_name: []const u8,
+    source_branch: []const u8,
+    destination_branch: []const u8,
+};
+
 /// The commit pair identifying a PR's current diff revision. A comment whose
 /// anchored `links.code` range differs from this is outdated.
 pub const HeadCommits = struct {
