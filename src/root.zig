@@ -12,7 +12,10 @@ pub const http = struct {
 pub const diff = struct {
     pub const model = @import("diff/model.zig");
     pub const parser = @import("diff/parser.zig");
+    pub const buffer = @import("diff/buffer.zig");
     pub const parse = parser.parse;
+    pub const Buffer = buffer.Buffer;
+    pub const Layout = buffer.Layout;
     pub const Diff = model.Diff;
     pub const File = model.File;
     pub const FileStatus = model.FileStatus;
@@ -41,4 +44,5 @@ test {
     _ = @import("bitbucket/types.zig");
     _ = @import("diff/model.zig");
     _ = @import("diff/parser.zig");
+    _ = @import("diff/buffer.zig");
 }

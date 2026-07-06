@@ -49,7 +49,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    try app.run(init.io, gpa, init.environ_map, pr);
+    // Fetch and parse the diff into a session-lived arena. The parsed `Diff`
+    // borrows this raw text, so the arena must outlive the TUI.
+    var diff_arena = std.heap.ArenaAllocator.init(gpa);
+    defer diff_arena.deinit();
+    const raw_diff = try bb.getDiff(diff_arena.allocator(), repo, id);
+    const diff = try bbr.diff.parse(diff_arena.allocator(), raw_diff);
+
+    try app.run(init.io, gpa, init.environ_map, pr, diff);
 }
 
 fn usage() void {
@@ -61,4 +68,12 @@ fn usage() void {
         \\requires BITBUCKET_USERNAME, BITBUCKET_TOKEN, BITBUCKET_WORKSPACE in the environment.
         \\
     , .{});
+}
+
+// Test discovery only follows `_ = @import(...)` chains rooted in the *test
+// root* file's test blocks — merely calling `app.run` above pulls app's code
+// but NOT its tests. This block roots the exe module's TUI test tree (app →
+// render → theme → nav); the core `bbr` module's tests run via src/root.zig.
+test {
+    _ = @import("tui/app.zig");
 }

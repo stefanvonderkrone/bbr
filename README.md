@@ -4,10 +4,11 @@ A Zig terminal UI for reviewing **Bitbucket Cloud** pull requests: browse the di
 coloring and syntax highlighting, read comment threads, and compose comments, replies, and
 suggestions that stay **pending locally** until you submit them as a batch.
 
-> Status: **M1 (diff model & parser) complete** — on top of the M0 skeleton, the pure unified-diff
-> parser turns Bitbucket's authoritative diff into the `Diff`/`File`/`Hunk`/`Line` model, and the
-> Bitbucket adapter can fetch the raw diff (`getDiff`). The network-free core is tested
-> (`zig build test`, 19/19, hermetic). Implementation continues through the milestones below.
+> Status: **M2 (unified diff viewer) complete** — `bbr <repo> <id>` opens a PR, fetches and parses
+> its diff, and renders a file sidebar + unified diff pane with neutral/green/red line bands and
+> line-number gutter, navigable with vim motions (`j`/`k`, `ctrl-d`/`ctrl-u`, `gg`/`G`, numeric
+> counts) and arrows. Diff parsing, row flattening, navigation, and cell colors are all tested
+> hermetically (`zig build test`). Implementation continues through the milestones below.
 
 ## Documentation map
 

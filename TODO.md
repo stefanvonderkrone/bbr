@@ -21,11 +21,11 @@ Sizes are relative effort (S/M/L), not calendar estimates. Dependencies noted pe
 - [x] Tests: fixtures — hunk boundaries, line numbering, adds/removes, `\ No newline`, count-omitted ranges, malformed headers, end-to-end getDiff→parse. **No UI.** ✅ 8 diff tests + 3 getDiff tests (19 total green).
 
 ## M2 — Unified diff viewer (open by id)  ·  M  ·  needs M1
-- [ ] `Theme` abstraction + one default (diff colors need it); plain light/dark.
-- [ ] Presentation: Sidebar (files) + DiffPane (unified) with neutral/green/red backgrounds.
-- [ ] Buffer-scoped arena; background runtime (`std.Io.Threaded`) + event-queue delivery + Epoch.
-- [ ] Basic navigation: arrows + core motions (`j`/`k`, `ctrl-d`/`ctrl-u`, `gg`/`G`).
-- [ ] Test: headless surface asserts cell colors for a known Buffer.
+- [x] `Theme` abstraction + one default. ✅ `src/tui/theme.zig` — `dark`; selectable themes are M9.
+- [x] Presentation: Sidebar (files) + DiffPane (unified) with neutral/green/red backgrounds. ✅ `src/diff/buffer.zig` (pure flatten → rows) + `src/tui/render.zig` (full-width bands, gutter line numbers, sidebar highlight).
+- [x] Buffer-scoped arena. ✅ in `app.run` (buffer arena + per-frame gutter arena, reset after render). — Background runtime + event-queue + Epoch **deferred to M4**: nothing to cancel until PRs can be *switched*; M2 fetches synchronously in `main`.
+- [x] Basic navigation: arrows + core motions (`j`/`k`, `ctrl-d`/`ctrl-u`, `gg`/`G`, numeric Count). ✅ `src/tui/nav.zig` (pure) wired in `app.run`.
+- [x] Test: headless surface asserts cell colors for a known Buffer. ✅ `render.zig` builds a detached Window over `Screen.init` and asserts band bg + sidebar highlight via `readCell`; nav math + buffer flatten unit-tested. Suite green.
 
 ## M3 — Comments (read)  ·  M  ·  needs M2
 - [ ] Bitbucket: `getComments` (paginated), incl. resolved state + outdated verdict.
