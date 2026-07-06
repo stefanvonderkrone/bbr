@@ -209,6 +209,14 @@ the main thread; the Epoch token still guards against stale results.
   `printSegment`/`writeCell`/`fill`, then assert with `win.readCell(col, row) ?Cell` (inspect
   `.style.bg`/`.fg`, `.char.grapheme`). `Window.print` uses only free functions (grapheme iterator +
   `wcwidth` table), so no `Vaxis.init` is needed. This is how M2 asserts diff band colors hermetically.
+- **`Window.print(segments, opts)` draws a run of independently-styled `Segment`s** (`{ text, style,
+  link }`) in one call and returns `PrintResult{ col, row, overflow }`; `printSegment` is the single-
+  segment form. To style *parts* of a line differently (e.g. intra-line diff emphasis), build a
+  `[]vaxis.Segment` in a per-frame arena and hand the slice to `print` — no manual column arithmetic.
+- **Clip a line to a sub-region with a 1-row child window.** `printSegment`/`print` with `.wrap = .none`
+  do not clip at an arbitrary column — text runs to the window's own width. For split panes
+  (side-by-side), carve a per-row child (`win.child(.{ .x_off, .y_off = r, .width = half, .height = 1 })`)
+  and draw into it; content is clipped at the child's width instead of bleeding across the divider.
 - **`vaxis.Cell.Color.rgbFromUint(0xRRGGBB)`** builds an rgb `Color`; `Color` is a
   `union(enum){ default, index: u8, rgb: [3]u8 }`, so `std.meta.eql` / `== .default` compare cleanly
   in assertions. Cell text passed to `printSegment` is borrowed until `render`, so per-frame synthesized
