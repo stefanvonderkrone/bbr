@@ -54,6 +54,18 @@ from repeating past mistakes. The version-pinned API catalog bbr relies on lives
 - **`ArenaAllocator.reset` takes a `ResetMode` union**, not a bool:
   `union(enum){ free_all, retain_capacity, /* shrink-to-N */ }`. `reset(.retain_capacity)` keeps
   backing pages — the cheap-reuse path for buffer-scoped arenas.
+- **Tests only run if reachable via `_ = @import` chains from the test-root file's `test` blocks.**
+  Calling a function in another file compiles that file but does **not** run its `test` blocks. If a
+  file's tests aren't chained in (root has `test { _ = @import("child.zig"); }`, child chains
+  onward), they silently never run and the suite still passes green. After adding tests in a new
+  file, confirm the per-step **count** rose with `zig build test --summary all` — a green run proves
+  nothing if the count didn't move. (This once hid a real vaxis rendering bug in bbr.)
+- **vaxis cells borrow their text until `render` — never hand `printSegment`/`writeCell` a stack
+  buffer that dies first.** A `var buf: [N]u8` filled inside a draw loop (or a helper that returns
+  before `render`) leaves every cell pointing at freed/overwritten bytes; you'll see the *last*
+  iteration's text on every row, or garbage. Use static string literals for fixed glyphs (status
+  chars, markers) and a per-frame **arena** (reset *after* render) for synthesized text. Long-lived
+  borrowed text (e.g. diff line bodies) is fine.
 
 ## Idioms that are correct here (not hacks)
 

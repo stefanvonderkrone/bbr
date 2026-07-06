@@ -128,6 +128,14 @@ the main thread; the Epoch token still guards against stale results.
   wasi/freestanding, not posix. So keep `test` blocks **hermetic** (fakes + `@embedFile` fixtures)
   and put anything that needs real credentials in an executable step instead (bbr uses
   `zig build check`, which reads `Init.environ_map` in `main`).
+- **Test discovery follows `_ = @import(...)` chains from the test-root file's own `test` blocks —
+  NOT normal references.** `zig build test` on a module compiles code reachable from the root, but
+  only *runs* `test` blocks in files reached by a chain of `test { _ = @import("child.zig"); }`
+  starting in the root file. **Merely `@import`ing a file and calling its functions pulls its code
+  but silently drops its tests.** bbr's exe root is `src/main.zig`; it calls `app.run` but that did
+  **not** run any `src/tui/*` tests until `main.zig` gained `test { _ = @import("tui/app.zig"); }`
+  (which then chains to render/theme/nav). This silently hid a real rendering bug — always confirm
+  the per-step test **count** goes up (`--summary all`), not just that the suite is green.
 
 ## 7. libvaxis (TUI) — 0.16 integration facts
 
@@ -148,6 +156,17 @@ the main thread; the Epoch token still guards against stale results.
   reuse one buffer and you'll corrupt earlier cells.
 - Module wiring: `b.dependency("vaxis", .{...}).module("vaxis")`; the core `bbr` module stays
   vaxis-free so its tests need no TUI.
+- **Headless rendering for tests (no tty):** `vaxis.Screen.init(alloc, .{ .rows, .cols, .x_pixel,
+  .y_pixel })` allocates a cell buffer; build a detached root `vaxis.Window` literal over it
+  (`.{ .x_off=0, .y_off=0, .parent_x_off=0, .parent_y_off=0, .width=screen.width,
+  .height=screen.height, .screen=&screen }`) — the same shape `Vaxis.window()` returns. Draw with
+  `printSegment`/`writeCell`/`fill`, then assert with `win.readCell(col, row) ?Cell` (inspect
+  `.style.bg`/`.fg`, `.char.grapheme`). `Window.print` uses only free functions (grapheme iterator +
+  `wcwidth` table), so no `Vaxis.init` is needed. This is how M2 asserts diff band colors hermetically.
+- **`vaxis.Cell.Color.rgbFromUint(0xRRGGBB)`** builds an rgb `Color`; `Color` is a
+  `union(enum){ default, index: u8, rgb: [3]u8 }`, so `std.meta.eql` / `== .default` compare cleanly
+  in assertions. Cell text passed to `printSegment` is borrowed until `render`, so per-frame synthesized
+  text (line-number gutter) must come from an arena that outlives the render/readCell — reset it *after*.
 
 ---
 
