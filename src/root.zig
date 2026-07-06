@@ -39,6 +39,11 @@ pub const git = struct {
     pub const remote = @import("git/remote.zig");
     pub const Remote = remote.Remote;
     pub const Rewrite = remote.Rewrite;
+    const client_mod = @import("git/client.zig");
+    pub const GitClient = client_mod.GitClient;
+    pub const ShellGitClient = client_mod.ShellGitClient;
+    pub const FakeGitClient = client_mod.FakeGitClient;
+    pub const GitError = client_mod.GitError;
 };
 
 pub const bitbucket = struct {
@@ -66,4 +71,5 @@ test {
     _ = @import("review/comment.zig");
     _ = @import("review/thread.zig");
     _ = @import("git/remote.zig");
+    _ = @import("git/client.zig");
 }
