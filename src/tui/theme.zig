@@ -26,6 +26,14 @@ pub const Theme = struct {
     removed_emphasis: Style,
     /// The line-number gutter.
     gutter: Style,
+    /// Background for the line under the cursor when it has no diff band (a
+    /// context/neutral row): the TUI "cursorline" tint.
+    cursor_line: Color,
+    /// Signed per-channel nudge applied to a row that *does* carry an rgb band
+    /// (added/removed/comment/…) when it's under the cursor, so the band color is
+    /// preserved but the row still reads as current. Positive lightens (a dark
+    /// theme); a light theme would use a negative value.
+    cursor_line_shift: i16,
     /// `diff --git` file separator rows.
     file_header: Style,
     /// `@@ … @@` hunk headers.
@@ -78,6 +86,20 @@ pub const Theme = struct {
         };
     }
 
+    /// Highlighted background for a cell on the cursor row. A cell with an rgb
+    /// background (a diff band) keeps its hue, nudged by `cursor_line_shift`; a
+    /// cell on the terminal-default (or palette) background takes `cursor_line`.
+    pub fn cursorBg(self: Theme, base: Color) Color {
+        return switch (base) {
+            .rgb => |ch| .{ .rgb = .{
+                shiftChannel(ch[0], self.cursor_line_shift),
+                shiftChannel(ch[1], self.cursor_line_shift),
+                shiftChannel(ch[2], self.cursor_line_shift),
+            } },
+            else => self.cursor_line,
+        };
+    }
+
     /// File-list name color for a change status: green add, yellow modify, red
     /// remove, violet rename.
     pub fn statusColor(self: Theme, status: bbr.diff.FileStatus) Color {
@@ -94,6 +116,11 @@ fn rgb(hex: u24) Color {
     return Color.rgbFromUint(hex);
 }
 
+/// Nudge one 0–255 channel by a signed delta, clamped to the byte range.
+fn shiftChannel(v: u8, delta: i16) u8 {
+    return @intCast(std.math.clamp(@as(i16, v) + delta, 0, 255));
+}
+
 /// The default dark theme. Backgrounds are muted so foreground text stays
 /// readable; foregrounds are left `default` except where contrast needs it.
 pub const dark: Theme = .{
@@ -103,6 +130,8 @@ pub const dark: Theme = .{
     .added_emphasis = .{ .bg = rgb(0x2c_5c_2c) },
     .removed_emphasis = .{ .bg = rgb(0x6c_28_28) },
     .gutter = .{ .fg = rgb(0x80_80_80) },
+    .cursor_line = rgb(0x2c_2c_38),
+    .cursor_line_shift = 0x1c,
     .file_header = .{ .fg = rgb(0xd0_d0_d0), .bold = true },
     .hunk_header = .{ .fg = rgb(0x6c_9c_d0) },
     .fold = .{ .fg = rgb(0x70_70_80), .bg = rgb(0x1a_1a_22) },
@@ -136,6 +165,22 @@ test "statusColor maps each change kind to its own color" {
     for (colors, 0..) |c1, i| {
         for (colors[i + 1 ..]) |c2| try testing.expect(!std.meta.eql(c1, c2));
     }
+}
+
+test "cursorBg tints a neutral row and nudges a banded one, keeping its hue" {
+    // A context/neutral cell (default bg) takes the cursor_line tint outright.
+    try testing.expectEqual(dark.cursor_line, dark.cursorBg(.default));
+
+    // A banded (rgb) cell keeps its channels, shifted by cursor_line_shift.
+    const added_bg = dark.added.bg; // rgb
+    const lit = dark.cursorBg(added_bg);
+    try testing.expect(lit == .rgb and added_bg == .rgb);
+    // Each channel moved by the shift (all well within range here).
+    inline for (0..3) |i| {
+        try testing.expectEqual(added_bg.rgb[i] + @as(u8, 0x1c), lit.rgb[i]);
+    }
+    // Still distinct from the un-highlighted band.
+    try testing.expect(!std.meta.eql(added_bg, lit));
 }
 
 test "lineStyle maps each kind to its band" {

@@ -82,14 +82,31 @@ fn drawPane(scratch: std.mem.Allocator, win: vaxis.Window, buf: Buffer, theme: T
     while (r < win.height) : (r += 1) {
         const idx = nav.scroll + r;
         if (idx >= buf.rows.len) break;
-        drawRow(scratch, win, r, buf.rows[idx], theme, idx == nav.cursor);
+        drawRow(scratch, win, r, buf.rows[idx], theme);
+        if (idx == nav.cursor) highlightCursorRow(win, r, theme);
+    }
+}
+
+/// Highlight the whole cursor row (TUI "cursorline" convention): re-tint every
+/// cell's background after the row is drawn, so the diff band colors show
+/// through — a context row gets the neutral cursor tint, a banded row keeps its
+/// hue nudged lighter. Runs after `drawRow` so it also covers a `line_pair`'s
+/// two halves and the divider gap.
+fn highlightCursorRow(win: vaxis.Window, r: u16, theme: Theme) void {
+    var c: u16 = 0;
+    while (c < win.width) : (c += 1) {
+        if (win.readCell(c, r)) |cell| {
+            var lit = cell;
+            lit.style.bg = theme.cursorBg(cell.style.bg);
+            win.writeCell(c, r, lit);
+        }
     }
 }
 
 /// Gutter is two 4-wide line-number columns; body text starts after it.
 const gutter_cols: u16 = 10;
 
-fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, theme: Theme, is_cursor: bool) void {
+fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, theme: Theme) void {
     switch (row) {
         .file_header => |file| {
             fillRow(win, r, theme.file_header);
@@ -111,16 +128,10 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, them
             }) catch "";
             _ = win.printSegment(.{ .text = gutter, .style = theme.gutter }, .{ .row_offset = r, .wrap = .none });
             drawLineBody(scratch, win, r, gutter_cols, lr, theme, style);
-
-            if (is_cursor) {
-                // A cursor marker in column 0, over the gutter, without disturbing
-                // the band background elsewhere on the row.
-                win.writeCell(0, r, .{ .char = .{ .grapheme = "▌", .width = 1 }, .style = .{ .fg = .{ .index = 6 } } });
-            }
         },
-        .line_pair => |pair| drawLinePair(scratch, win, r, pair, theme, is_cursor),
-        .fold => |f| drawFold(scratch, win, r, f, theme, is_cursor),
-        .comment => |cr| drawComment(scratch, win, r, cr, theme, is_cursor),
+        .line_pair => |pair| drawLinePair(scratch, win, r, pair, theme),
+        .fold => |f| drawFold(scratch, win, r, f, theme),
+        .comment => |cr| drawComment(scratch, win, r, cr, theme),
         .section => |sec| drawSection(scratch, win, r, sec, theme),
     }
 }
@@ -132,7 +143,7 @@ const side_gutter: u16 = 5;
 /// right half, split by a one-column divider. Each half is a 1-row child window
 /// so a long line is clipped at the divider instead of bleeding into the other
 /// pane. An absent side is drawn as a neutral empty half.
-fn drawLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, pair: bbr.diff.buffer.LinePair, theme: Theme, is_cursor: bool) void {
+fn drawLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, pair: bbr.diff.buffer.LinePair, theme: Theme) void {
     const half = win.width / 2;
     if (half == 0) return;
     const right_x = half + 1; // divider column sits at `half`
@@ -144,8 +155,6 @@ fn drawLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, pair: bbr
         const right = win.child(.{ .x_off = right_x, .y_off = r, .width = right_w, .height = 1 });
         drawHalf(scratch, right, pair.right, theme, .new);
     }
-
-    if (is_cursor) win.writeCell(0, r, .{ .char = .{ .grapheme = "▌", .width = 1 }, .style = .{ .fg = .{ .index = 6 } } });
 }
 
 /// Which line number a side shows: old for the left pane, new for the right.
@@ -200,7 +209,7 @@ fn firstLine(body: []const u8) struct { text: []const u8, more: bool } {
 
 /// A woven comment. Root at col 2, reply indented to col 6. A ```suggestion
 /// gets the suggestion style and a `±` marker so it reads distinctly.
-fn drawComment(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, cr: CommentRow, theme: Theme, is_cursor: bool) void {
+fn drawComment(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, cr: CommentRow, theme: Theme) void {
     const c = cr.comment;
     const is_suggestion = c.suggestion() != null;
     const style = if (is_suggestion) theme.suggestion else if (cr.is_reply) theme.comment_reply else theme.comment;
@@ -215,16 +224,13 @@ fn drawComment(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, cr: Commen
     const ellipsis: []const u8 = if (fl.more) " …" else "";
     const text = std.fmt.allocPrint(scratch, "{s} {s}: {s}{s}", .{ marker, c.author, fl.text, ellipsis }) catch c.author;
     _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = col, .wrap = .none });
-
-    if (is_cursor) win.writeCell(0, r, .{ .char = .{ .grapheme = "▌", .width = 1 }, .style = .{ .fg = .{ .index = 6 } } });
 }
 
 /// A collapsed-context fold: "  ⋯ N unchanged lines · enter to expand ⋯".
-fn drawFold(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, f: bbr.diff.Fold, theme: Theme, is_cursor: bool) void {
+fn drawFold(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, f: bbr.diff.Fold, theme: Theme) void {
     fillRow(win, r, theme.fold);
     const text = std.fmt.allocPrint(scratch, "  ⋯ {d} unchanged lines · enter to expand ⋯", .{f.lines.len}) catch "  ⋯ folded ⋯";
     _ = win.printSegment(.{ .text = text, .style = theme.fold }, .{ .row_offset = r, .col_offset = gutter_cols, .wrap = .none });
-    if (is_cursor) win.writeCell(0, r, .{ .char = .{ .grapheme = "▌", .width = 1 }, .style = .{ .fg = .{ .index = 6 } } });
 }
 
 /// A section divider: "── PR comments (N) ──" or "── Outdated · path (N) ──".
@@ -433,6 +439,50 @@ test "side-by-side draws old on the left, new on the right" {
     // Context row (2): both halves are neutral.
     try testing.expect(win.readCell(body_l, 2).?.style.bg == .default);
     try testing.expect(win.readCell(body_r, 2).?.style.bg == .default);
+}
+
+test "the cursor row is highlighted across its whole width, keeping band hue" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const raw =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,2 +1,2 @@
+        \\ keep
+        \\-old
+        \\+new
+        \\
+    ;
+    const diff = try bbr.diff.parse(a, raw);
+    const buf = try bbr.diff.buffer.build(a, diff, .unified);
+
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    // Put the cursor on the removed line (pane row 3).
+    var nav = Nav.init(buf.rows.len, 24);
+    nav.cursor = 3;
+    draw(a, win, diff, buf, theme_dark, nav, 0);
+
+    const px = sidebar_width + 1;
+    const body_x = px + gutter_cols;
+
+    // The removed band keeps its hue but is nudged to the cursor variant.
+    const expected = theme_dark.cursorBg(theme_dark.removed.bg);
+    try testing.expectEqual(expected, win.readCell(body_x, 3).?.style.bg);
+    // The tint reaches the far edge of the row (whole-line highlight).
+    try testing.expectEqual(expected, win.readCell(79, 3).?.style.bg);
+
+    // A neutral cell on the cursor row (the gutter, default bg) takes the plain
+    // cursor_line tint.
+    try testing.expectEqual(theme_dark.cursor_line, win.readCell(px, 3).?.style.bg);
+
+    // An off-cursor line keeps its untinted band.
+    try testing.expectEqual(theme_dark.added.bg, win.readCell(body_x, 4).?.style.bg);
 }
 
 test "a folded context run renders as a fold row" {
