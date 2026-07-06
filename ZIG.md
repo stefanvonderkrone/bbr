@@ -103,6 +103,12 @@ the main thread; the Epoch token still guards against stale results.
 - **`initDefaultProxies(&client, arena, environ_map)`** takes the `*const Environ.Map` directly —
   pairs cleanly with `init.environ_map`.
 - **TLS** is built in (own `ca_bundle`); no external OpenSSL needed.
+- **Don't hand-roll URL parsing — `std.Uri.parse(text) !Uri` exists** (`std/Uri.zig`), splitting
+  `scheme` / `host` / `port` / `path` / `query` / `fragment`. It **requires a scheme** (a bare
+  `host/path` errors). `host`/`path`/… are `std.Uri.Component = union(enum){ raw, percent_encoded }`;
+  both variants hold a `[]const u8`, so `switch (c) { .raw, .percent_encoded => |s| s }` gets the
+  string (or `component.toRawMaybeAlloc(arena)` to decode `%xx`). Used in `bitbucket/url.zig` for the
+  scheme/host/path decomposition; only the domain-specific segment logic is hand-written.
 - **Proxy support** (see also `docs/adr/0003`):
   - Fields `http_proxy: ?*Proxy` / `https_proxy: ?*Proxy`.
   - `initDefaultProxies(arena, environ_map)` auto-reads `http_proxy`/`HTTP_PROXY`/`all_proxy`/

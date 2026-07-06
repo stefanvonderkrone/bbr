@@ -6,6 +6,10 @@
 //!   https://api.bitbucket.org/2.0/repositories/{ws}/{repo}/pullrequests/{id}
 //!
 //! so a reviewer can paste whatever they copied.
+//!
+//! `std.Uri` does the scheme/host/path/query/fragment decomposition (it requires
+//! a scheme, which a pasted PR URL always has); the Bitbucket-specific bit — the
+//! `pull-requests/<id>` marker and the two path segments before it — is ours.
 
 const std = @import("std");
 
@@ -27,19 +31,14 @@ pub const ParseError = error{
 /// marker. Any trailing segments (`/diff`, `/commits`), `?query`, or `#frag`
 /// are ignored.
 pub fn parse(url: []const u8) ParseError!PrRef {
-    // Strip scheme + host so we work on the path only, and validate the host.
-    var rest = url;
-    if (std.mem.indexOf(u8, rest, "://")) |s| {
-        rest = rest[s + 3 ..];
-    }
-    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.NotABitbucketPrUrl;
-    const hostname = rest[0..slash];
-    if (!isBitbucketHost(hostname)) return error.NotABitbucketPrUrl;
-    var path = rest[slash + 1 ..];
+    const uri = std.Uri.parse(url) catch return error.MalformedUrl;
 
-    // Drop query/fragment.
-    if (std.mem.indexOfScalar(u8, path, '?')) |q| path = path[0..q];
-    if (std.mem.indexOfScalar(u8, path, '#')) |h| path = path[0..h];
+    const host = uri.host orelse return error.NotABitbucketPrUrl;
+    if (!isBitbucketHost(componentStr(host))) return error.NotABitbucketPrUrl;
+
+    // std.Uri already split off query/fragment; the path is percent-encoded but
+    // the segments we read (slugs, marker, id) are plain ASCII.
+    const path = componentStr(uri.path);
 
     // Split into non-empty segments (up to a small fixed number — a PR URL is
     // shallow). Find the marker; workspace/repo precede it, id follows.
@@ -68,6 +67,14 @@ pub fn parse(url: []const u8) ParseError!PrRef {
 
 fn isBitbucketHost(h: []const u8) bool {
     return std.mem.eql(u8, h, "bitbucket.org") or std.mem.eql(u8, h, "api.bitbucket.org");
+}
+
+/// The borrowed string behind a `std.Uri.Component` (either variant). We don't
+/// decode percent-escapes: the host and the path segments we read are ASCII.
+fn componentStr(c: std.Uri.Component) []const u8 {
+    return switch (c) {
+        .raw, .percent_encoded => |s| s,
+    };
 }
 
 const testing = std.testing;
@@ -104,4 +111,15 @@ test "missing or malformed id" {
 
 test "url without a PR marker is rejected" {
     try testing.expectError(error.NotABitbucketPrUrl, parse("https://bitbucket.org/check24/pr-webapp"));
+}
+
+test "userinfo and an explicit port are tolerated (std.Uri handles them)" {
+    const r = try parse("https://user@bitbucket.org:443/check24/pr-webapp/pull-requests/9");
+    try testing.expectEqualStrings("check24", r.workspace);
+    try testing.expectEqual(@as(u64, 9), r.id);
+}
+
+test "a schemeless paste is rejected (std.Uri requires a scheme)" {
+    // PR URLs people copy always carry https://; a bare host does not parse.
+    try testing.expectError(error.MalformedUrl, parse("bitbucket.org/check24/pr-webapp/pull-requests/9"));
 }
