@@ -32,10 +32,12 @@ pub const Theme = struct {
     sidebar_selected: Style,
     /// File-list name color for an added file (green).
     status_added: Color,
-    /// File-list name color for a modified / renamed file (yellow).
+    /// File-list name color for a modified file (yellow).
     status_modified: Color,
     /// File-list name color for a removed file (red).
     status_removed: Color,
+    /// File-list name color for a renamed file (violet).
+    status_renamed: Color,
     /// A woven comment (root).
     comment: Style,
     /// A reply, indented under its root.
@@ -60,13 +62,14 @@ pub const Theme = struct {
         };
     }
 
-    /// File-list name color for a change status: green add, yellow modify /
-    /// rename, red remove.
+    /// File-list name color for a change status: green add, yellow modify, red
+    /// remove, violet rename.
     pub fn statusColor(self: Theme, status: bbr.diff.FileStatus) Color {
         return switch (status) {
             .added => self.status_added,
-            .modified, .renamed => self.status_modified,
+            .modified => self.status_modified,
             .removed => self.status_removed,
+            .renamed => self.status_renamed,
         };
     }
 };
@@ -89,6 +92,7 @@ pub const dark: Theme = .{
     .status_added = rgb(0x8c_c8_5a),
     .status_modified = rgb(0xd7_af_5f),
     .status_removed = rgb(0xd0_6c_6c),
+    .status_renamed = rgb(0xb0_88_e0),
     .comment = .{ .bg = rgb(0x1c_1c_28), .fg = rgb(0xc8_c8_d8) },
     .comment_reply = .{ .bg = rgb(0x18_18_22), .fg = rgb(0xb0_b0_c0) },
     .suggestion = .{ .bg = rgb(0x14_28_28), .fg = rgb(0x9c_d0_c0) },
@@ -103,15 +107,16 @@ pub const dark: Theme = .{
 // ---------------------------------------------------------------------------
 const testing = std.testing;
 
-test "statusColor maps add/modify/remove to distinct colors" {
+test "statusColor maps each change kind to its own color" {
     try testing.expectEqual(dark.status_added, dark.statusColor(.added));
     try testing.expectEqual(dark.status_modified, dark.statusColor(.modified));
-    // A rename reads as a change (yellow), same as modified.
-    try testing.expectEqual(dark.status_modified, dark.statusColor(.renamed));
     try testing.expectEqual(dark.status_removed, dark.statusColor(.removed));
-    // The three change kinds are visually distinct.
-    try testing.expect(!std.meta.eql(dark.status_added, dark.status_removed));
-    try testing.expect(!std.meta.eql(dark.status_added, dark.status_modified));
+    try testing.expectEqual(dark.status_renamed, dark.statusColor(.renamed));
+    // All four change kinds are visually distinct.
+    const colors = [_]Color{ dark.status_added, dark.status_modified, dark.status_removed, dark.status_renamed };
+    for (colors, 0..) |c1, i| {
+        for (colors[i + 1 ..]) |c2| try testing.expect(!std.meta.eql(c1, c2));
+    }
 }
 
 test "lineStyle maps each kind to its band" {
