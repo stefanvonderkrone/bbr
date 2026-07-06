@@ -35,6 +35,12 @@ pub const review = struct {
     pub const buildThreads = thread.build;
 };
 
+pub const git = struct {
+    pub const remote = @import("git/remote.zig");
+    pub const Remote = remote.Remote;
+    pub const Rewrite = remote.Rewrite;
+};
+
 pub const bitbucket = struct {
     const client_mod = @import("bitbucket/client.zig");
     pub const Client = client_mod.Client;
@@ -59,4 +65,5 @@ test {
     _ = @import("diff/buffer.zig");
     _ = @import("review/comment.zig");
     _ = @import("review/thread.zig");
+    _ = @import("git/remote.zig");
 }
