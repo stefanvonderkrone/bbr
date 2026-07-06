@@ -27,13 +27,13 @@ Sizes are relative effort (S/M/L), not calendar estimates. Dependencies noted pe
 - [x] Basic navigation: arrows + core motions (`j`/`k`, `ctrl-d`/`ctrl-u`, `gg`/`G`, numeric Count). ✅ `src/tui/nav.zig` (pure) wired in `app.run`.
 - [x] Test: headless surface asserts cell colors for a known Buffer. ✅ `render.zig` builds a detached Window over `Screen.init` and asserts band bg + sidebar highlight via `readCell`; nav math + buffer flatten unit-tested. Suite green.
 
-## M3 — Comments (read)  ·  M  ·  needs M2
-- [ ] Bitbucket: `getComments` (paginated), incl. resolved state + outdated verdict.
-- [ ] Thread builder: flat comments → nested `Thread`s (by `parent.id`).
-- [ ] ThreadPane: inline threads + PR-level comments; render ```suggestion``` blocks distinctly.
-- [ ] `resolved` state + reveal-resolved toggle (whole thread).
-- [ ] AnchorState display (current/moved/outdated from Bitbucket verdict); per-file Outdated collapsible.
-- [ ] Tests: thread nesting, resolved toggle, outdated grouping.
+## M3 — Comments (read)  ·  M  ·  ✅ done
+- [x] Bitbucket: `getComments` (paginated), incl. resolved state + outdated verdict. ✅ `Client.getComments` follows `next` links; anchors carry path + old/new line; `resolved` from the resolution object; `AnchorState` honors Bitbucket's `inline.outdated`. `FakeHttpClient` gained a `responses` sequence for hermetic pagination tests.
+- [x] Thread builder: flat comments → nested `Thread`s (by `parent.id`). ✅ `src/review/thread.zig` — resolves each comment to its ultimate root, buckets replies in creation order, promotes orphans, handles out-of-order input. Zero-copy over the comment slice.
+- [x] ThreadPane: inline threads + PR-level comments; render ```suggestion``` blocks distinctly. ✅ woven in `buffer.buildWithComments` (PR-level section at top; inline threads under their anchored line; root/reply rows) and drawn in `render.zig` (`▸` root, `↳` reply, `±` suggestion with its own band). Multi-line bodies show the lead line + `…` (full markdown rendering is M8).
+- [x] `resolved` state + reveal-resolved toggle (whole thread). ✅ resolved-but-current threads hidden by default; `R` flips `show_resolved` and rebuilds the buffer, revealing the *whole* thread. Status bar shows the toggle state.
+- [x] AnchorState display (current/moved/outdated from Bitbucket verdict); per-file Outdated collapsible. ✅ outdated threads grouped in a per-file "Outdated (N)" section and **never hidden** (even when resolved). `moved` isn't produced remotely (Bitbucket gives only current/outdated); local diff-walk for `moved` is M6. The Outdated group is always expanded — fold/collapse interaction deferred to M5 (`Fold`s).
+- [x] Tests: thread nesting, resolved toggle, outdated grouping. ✅ thread nesting/orphan/out-of-order (`thread.zig`), weaving + resolved toggle + outdated grouping (`buffer.zig`), headless comment/suggestion render (`render.zig`), paginated `getComments` (`client.zig`). Suite green 62/62.
 
 ## M4 — PR discovery & switching  ·  M  ·  needs M2
 - [ ] Minimal read-only `GitClient`: current branch + tracking Remote (SSH/HTTPS + `url.insteadof`).

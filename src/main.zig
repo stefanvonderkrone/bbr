@@ -56,7 +56,12 @@ pub fn main(init: std.process.Init) !void {
     const raw_diff = try bb.getDiff(diff_arena.allocator(), repo, id);
     const diff = try bbr.diff.parse(diff_arena.allocator(), raw_diff);
 
-    try app.run(init.io, gpa, init.environ_map, pr, diff);
+    // Comments and their threads live in the same PR-scoped arena (the rows woven
+    // into the buffer borrow both the comments and the diff).
+    const comments = try bb.getComments(diff_arena.allocator(), repo, id);
+    const threads = try bbr.review.buildThreads(diff_arena.allocator(), comments);
+
+    try app.run(init.io, gpa, init.environ_map, pr, diff, threads);
 }
 
 fn usage() void {

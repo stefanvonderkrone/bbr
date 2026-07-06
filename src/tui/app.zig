@@ -27,11 +27,15 @@ pub fn run(
     env_map: *std.process.Environ.Map,
     pr: PullRequest,
     diff: bbr.diff.Diff,
+    threads: []const bbr.review.Thread,
 ) !void {
-    // Buffer-scoped arena: the flattened rows live here for the whole view.
+    // Buffer-scoped arena: the flattened rows live here for the whole view. It
+    // is reset and rebuilt whenever the resolved toggle flips.
     var buf_arena = std.heap.ArenaAllocator.init(gpa);
     defer buf_arena.deinit();
-    const buf = try bbr.diff.buffer.build(buf_arena.allocator(), diff, .unified);
+
+    var show_resolved = false;
+    var buf = try bbr.diff.buffer.buildWithComments(buf_arena.allocator(), diff, .unified, threads, .{ .show_resolved = show_resolved });
 
     // Per-frame arena for synthesized gutter text; reset after each render.
     var frame_arena = std.heap.ArenaAllocator.init(gpa);
@@ -62,7 +66,14 @@ pub fn run(
             .key_press => |key| {
                 if (key.matches('q', .{}) or key.matches('c', .{ .ctrl = true })) break;
 
-                if (handleKey(&nav, &pending_g, key)) |_| {} // motions mutate nav in place
+                if (key.matches('R', .{})) {
+                    // Toggle resolved threads: rebuild the buffer in place. Rows
+                    // borrow diff/threads, not buf_arena, so a reset is safe.
+                    show_resolved = !show_resolved;
+                    _ = buf_arena.reset(.retain_capacity);
+                    buf = try bbr.diff.buffer.buildWithComments(buf_arena.allocator(), diff, .unified, threads, .{ .show_resolved = show_resolved });
+                    nav.setRowCount(buf.rows.len);
+                } else if (handleKey(&nav, &pending_g, key)) |_| {} // motions mutate nav in place
             },
             .winsize => |ws| {
                 try vx.resize(gpa, writer, ws);
@@ -76,7 +87,7 @@ pub fn run(
         const win = vx.window();
         const frame = frame_arena.allocator();
         render.draw(frame, win, diff, buf, active_theme, nav, selected_file);
-        drawStatus(frame, win, pr, nav, buf);
+        drawStatus(frame, win, pr, nav, buf, show_resolved);
         try vx.render(writer);
         _ = frame_arena.reset(.retain_capacity);
     }
@@ -132,16 +143,18 @@ fn fileIndexForRow(buf: bbr.diff.Buffer, cursor: usize) usize {
 
 /// A one-line status bar across the bottom row. `frame` is the per-frame arena
 /// (outlives render); a stack buffer would dangle since cells borrow the text.
-fn drawStatus(frame: std.mem.Allocator, win: vaxis.Window, pr: PullRequest, nav: Nav, buf: bbr.diff.Buffer) void {
+fn drawStatus(frame: std.mem.Allocator, win: vaxis.Window, pr: PullRequest, nav: Nav, buf: bbr.diff.Buffer, show_resolved: bool) void {
     if (win.height == 0) return;
     const row = win.height - 1;
-    const text = std.fmt.allocPrint(frame, " #{d} {s}  ·  {s} → {s}  ·  {d}/{d}  ·  q quit ", .{
+    const resolved_hint: []const u8 = if (show_resolved) "R hide resolved" else "R show resolved";
+    const text = std.fmt.allocPrint(frame, " #{d} {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  q quit ", .{
         pr.id,
         pr.title,
         pr.source_branch,
         pr.destination_branch,
         @min(nav.cursor + 1, buf.rows.len),
         buf.rows.len,
+        resolved_hint,
     }) catch " q quit ";
     const style: vaxis.Style = .{ .fg = .{ .index = 0 }, .bg = .{ .index = 7 } };
     var c: u16 = 0;

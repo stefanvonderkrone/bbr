@@ -11,18 +11,51 @@
 
 const std = @import("std");
 const model = @import("model.zig");
+const review = @import("../review/comment.zig");
+const Thread = @import("../review/thread.zig").Thread;
+const Comment = review.Comment;
 
 /// How a `Buffer` is arranged on screen. Only `unified` is built today;
 /// `side_by_side` is the other axis (design §11) and lands later.
 pub const Layout = enum { unified, side_by_side };
 
-pub const RowKind = enum { file_header, hunk_header, line };
+pub const RowKind = enum { file_header, hunk_header, line, comment, section };
 
-/// One drawable row. Borrows the diff node it projects.
+/// A comment woven into the diff: the comment itself plus whether it's a reply
+/// (so the renderer can indent it under its root).
+pub const CommentRow = struct {
+    comment: *const Comment,
+    is_reply: bool,
+};
+
+pub const SectionKind = enum {
+    /// PR-level comments (no anchor), shown once at the top.
+    pr_comments,
+    /// A per-file "Outdated (N)" group. `path` names the file.
+    outdated,
+};
+
+/// A section divider introducing a run of comment rows.
+pub const Section = struct {
+    kind: SectionKind,
+    count: usize,
+    path: []const u8 = "",
+};
+
+/// One drawable row. Borrows the diff node (or comment) it projects.
 pub const Row = union(RowKind) {
     file_header: *const model.File,
     hunk_header: *const model.Hunk,
     line: *const model.Line,
+    comment: CommentRow,
+    section: Section,
+};
+
+/// How comments are woven in. `show_resolved` reveals resolved (but current)
+/// threads that are otherwise hidden behind the toggle; outdated threads are
+/// never hidden regardless (design §9b).
+pub const CommentOptions = struct {
+    show_resolved: bool = false,
 };
 
 pub const Buffer = struct {
@@ -35,22 +68,111 @@ pub const BuildError = error{
     LayoutUnsupported,
 } || std.mem.Allocator.Error;
 
-/// Flatten `diff` into rows for `layout`. `allocator` should be the
-/// buffer-scoped arena; the returned rows borrow `diff`.
+/// Flatten `diff` into rows for `layout`, with no comments. `allocator` should
+/// be the buffer-scoped arena; the returned rows borrow `diff`.
 pub fn build(allocator: std.mem.Allocator, diff: model.Diff, layout: Layout) BuildError!Buffer {
+    return buildWithComments(allocator, diff, layout, &.{}, .{});
+}
+
+/// Flatten `diff` and weave `threads` in: PR-level comments as a section at the
+/// top; each current/moved inline thread right under the diff line it anchors
+/// to; each file's outdated threads in a per-file "Outdated" section after its
+/// hunks. Resolved-but-current threads are hidden unless `opts.show_resolved`.
+/// Rows borrow both `diff` and `threads` (and the comments they point at).
+pub fn buildWithComments(
+    allocator: std.mem.Allocator,
+    diff: model.Diff,
+    layout: Layout,
+    threads: []const Thread,
+    opts: CommentOptions,
+) BuildError!Buffer {
     if (layout != .unified) return BuildError.LayoutUnsupported;
 
     var rows: std.ArrayList(Row) = .empty;
+
+    // 1. PR-level comments (no anchor), respecting the resolved toggle.
+    const pr_count = countWhere(threads, isPrLevel, opts);
+    if (pr_count > 0) {
+        try rows.append(allocator, .{ .section = .{ .kind = .pr_comments, .count = pr_count } });
+        for (threads) |*t| {
+            if (isPrLevel(t.*) and inlineVisible(t.*, opts)) try emitThread(allocator, &rows, t);
+        }
+    }
+
+    // 2. Files, with inline threads under their lines and an outdated section.
     for (diff.files) |*file| {
         try rows.append(allocator, .{ .file_header = file });
         for (file.hunks) |*hunk| {
             try rows.append(allocator, .{ .hunk_header = hunk });
             for (hunk.lines) |*ln| {
                 try rows.append(allocator, .{ .line = ln });
+                for (threads) |*t| {
+                    const anc = t.root.anchor orelse continue;
+                    if (t.root.state == .outdated) continue; // grouped below
+                    if (!std.mem.eql(u8, anc.path, file.new_path)) continue;
+                    if (!inlineVisible(t.*, opts)) continue;
+                    if (anchorMatchesLine(anc, ln)) try emitThread(allocator, &rows, t);
+                }
+            }
+        }
+
+        // Per-file outdated section — never hidden (design §9b).
+        const od_count = fileOutdatedCount(threads, file.new_path);
+        if (od_count > 0) {
+            try rows.append(allocator, .{ .section = .{ .kind = .outdated, .count = od_count, .path = file.new_path } });
+            for (threads) |*t| {
+                if (isFileOutdated(t.*, file.new_path)) try emitThread(allocator, &rows, t);
             }
         }
     }
+
     return .{ .rows = try rows.toOwnedSlice(allocator), .layout = layout };
+}
+
+/// Append a thread's rows: root first, then its replies (indented).
+fn emitThread(allocator: std.mem.Allocator, rows: *std.ArrayList(Row), t: *const Thread) !void {
+    try rows.append(allocator, .{ .comment = .{ .comment = t.root, .is_reply = false } });
+    for (t.replies) |reply| {
+        try rows.append(allocator, .{ .comment = .{ .comment = reply, .is_reply = true } });
+    }
+}
+
+fn isPrLevel(t: Thread) bool {
+    return t.root.anchor == null;
+}
+
+/// A current/moved thread is visible unless it's resolved and the toggle is off.
+fn inlineVisible(t: Thread, opts: CommentOptions) bool {
+    return opts.show_resolved or !t.resolved;
+}
+
+fn isFileOutdated(t: Thread, path: []const u8) bool {
+    const anc = t.root.anchor orelse return false;
+    return t.root.state == .outdated and std.mem.eql(u8, anc.path, path);
+}
+
+fn fileOutdatedCount(threads: []const Thread, path: []const u8) usize {
+    var n: usize = 0;
+    for (threads) |*t| {
+        if (isFileOutdated(t.*, path)) n += 1;
+    }
+    return n;
+}
+
+fn countWhere(threads: []const Thread, pred: fn (Thread) bool, opts: CommentOptions) usize {
+    var n: usize = 0;
+    for (threads) |*t| {
+        if (pred(t.*) and inlineVisible(t.*, opts)) n += 1;
+    }
+    return n;
+}
+
+/// Does `anchor` bind to this diff line? Prefer the new side (`to` ↔ `new_no`),
+/// falling back to the old side (`from` ↔ `old_no`).
+fn anchorMatchesLine(anchor: review.Anchor, ln: *const model.Line) bool {
+    if (anchor.to) |to| return ln.new_no != null and ln.new_no.? == to;
+    if (anchor.from) |from| return ln.old_no != null and ln.old_no.? == from;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,4 +250,135 @@ test "side_by_side is not yet supported" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(BuildError.LayoutUnsupported, build(arena.allocator(), .{ .files = &.{} }, .side_by_side));
+}
+
+// --- Comment weaving --------------------------------------------------------
+
+/// A one-file diff whose new-side lines are 1 (keep), 1→gone, 2 (new).
+const anchor_diff =
+    \\diff --git a/a.txt b/a.txt
+    \\--- a/a.txt
+    \\+++ b/a.txt
+    \\@@ -1,2 +1,2 @@
+    \\ keep
+    \\-old
+    \\+new
+    \\
+;
+
+fn countKind(buf: Buffer, kind: RowKind) usize {
+    var n: usize = 0;
+    for (buf.rows) |r| {
+        if (r == kind) n += 1;
+    }
+    return n;
+}
+
+test "an inline thread is woven right under its anchored line, replies indented" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, anchor_diff);
+    // Anchor to new line 2 (the "+new" line).
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "why?", .anchor = .{ .path = "a.txt", .to = 2 } },
+        .{ .id = 2, .parent_id = 1, .author = "Bo", .body = "because" },
+    };
+    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const buf = try buildWithComments(a, diff, .unified, threads, .{});
+
+    // Rows: file_header, hunk_header, line(keep), line(old), line(new),
+    //       comment(root), comment(reply).
+    try testing.expectEqual(@as(usize, 7), buf.rows.len);
+    try testing.expect(buf.rows[4] == .line);
+    try testing.expectEqual(@as(?u32, 2), buf.rows[4].line.new_no);
+    try testing.expect(buf.rows[5] == .comment);
+    try testing.expect(!buf.rows[5].comment.is_reply);
+    try testing.expectEqual(@as(review.CommentId, 1), buf.rows[5].comment.comment.id);
+    try testing.expect(buf.rows[6] == .comment);
+    try testing.expect(buf.rows[6].comment.is_reply);
+}
+
+test "PR-level comments get a section at the top" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, anchor_diff);
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "overall LGTM" }, // no anchor
+    };
+    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const buf = try buildWithComments(a, diff, .unified, threads, .{});
+
+    try testing.expect(buf.rows[0] == .section);
+    try testing.expectEqual(SectionKind.pr_comments, buf.rows[0].section.kind);
+    try testing.expectEqual(@as(usize, 1), buf.rows[0].section.count);
+    try testing.expect(buf.rows[1] == .comment);
+}
+
+test "resolved threads hide behind the toggle, whole thread revealed when on" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, anchor_diff);
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "nit", .resolved = true, .anchor = .{ .path = "a.txt", .to = 2 } },
+        .{ .id = 2, .parent_id = 1, .author = "Bo", .body = "fixed" },
+    };
+    const threads = try @import("../review/thread.zig").build(a, &comments);
+
+    // Hidden by default: no comment rows.
+    const hidden = try buildWithComments(a, diff, .unified, threads, .{});
+    try testing.expectEqual(@as(usize, 0), countKind(hidden, .comment));
+
+    // Revealed: the whole thread (root + reply) appears.
+    const shown = try buildWithComments(a, diff, .unified, threads, .{ .show_resolved = true });
+    try testing.expectEqual(@as(usize, 2), countKind(shown, .comment));
+}
+
+test "outdated threads go in a per-file section and are never hidden" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, anchor_diff);
+    const comments = [_]Comment{
+        // Outdated AND resolved — still shown (outdated wins).
+        .{ .id = 1, .author = "Ada", .body = "stale note", .resolved = true, .state = .outdated, .anchor = .{ .path = "a.txt", .from = 99 } },
+    };
+    const threads = try @import("../review/thread.zig").build(a, &comments);
+
+    // Even with the resolved toggle off, the outdated section shows.
+    const buf = try buildWithComments(a, diff, .unified, threads, .{});
+    try testing.expectEqual(@as(usize, 1), countKind(buf, .section));
+    var found = false;
+    for (buf.rows) |r| {
+        if (r == .section and r.section.kind == .outdated) {
+            found = true;
+            try testing.expectEqual(@as(usize, 1), r.section.count);
+            try testing.expectEqualStrings("a.txt", r.section.path);
+        }
+    }
+    try testing.expect(found);
+    try testing.expectEqual(@as(usize, 1), countKind(buf, .comment));
+}
+
+test "an inline thread anchored to a missing current line is not lost silently" {
+    // Anchored to new line 999 (not in the diff) but marked current → it simply
+    // doesn't attach anywhere. This documents the known gap (Bitbucket would
+    // normally mark such a comment outdated); guard so the count stays 0.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, anchor_diff);
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "ghost", .anchor = .{ .path = "a.txt", .to = 999 } },
+    };
+    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const buf = try buildWithComments(a, diff, .unified, threads, .{});
+    try testing.expectEqual(@as(usize, 0), countKind(buf, .comment));
 }

@@ -16,6 +16,8 @@ const Theme = @import("theme.zig").Theme;
 const Nav = @import("nav.zig").Nav;
 const Buffer = bbr.diff.buffer.Buffer;
 const Row = bbr.diff.buffer.Row;
+const CommentRow = bbr.diff.buffer.CommentRow;
+const Section = bbr.diff.buffer.Section;
 const FileStatus = bbr.diff.FileStatus;
 
 pub const sidebar_width: u16 = 28;
@@ -109,7 +111,49 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, them
                 win.writeCell(0, r, .{ .char = .{ .grapheme = "▌", .width = 1 }, .style = .{ .fg = .{ .index = 6 } } });
             }
         },
+        .comment => |cr| drawComment(scratch, win, r, cr, theme, is_cursor),
+        .section => |sec| drawSection(scratch, win, r, sec, theme),
     }
+}
+
+/// First line of a body (comment bodies may be multi-line; one row shows the
+/// lead line, with `…` appended when there's more). Borrows `body`.
+fn firstLine(body: []const u8) struct { text: []const u8, more: bool } {
+    if (std.mem.indexOfScalar(u8, body, '\n')) |nl| {
+        return .{ .text = body[0..nl], .more = true };
+    }
+    return .{ .text = body, .more = false };
+}
+
+/// A woven comment. Root at col 2, reply indented to col 6. A ```suggestion
+/// gets the suggestion style and a `±` marker so it reads distinctly.
+fn drawComment(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, cr: CommentRow, theme: Theme, is_cursor: bool) void {
+    const c = cr.comment;
+    const is_suggestion = c.suggestion() != null;
+    const style = if (is_suggestion) theme.suggestion else if (cr.is_reply) theme.comment_reply else theme.comment;
+    fillRow(win, r, style);
+
+    const col: u16 = if (cr.is_reply) 6 else 2;
+    const marker: []const u8 = if (is_suggestion) "±" else if (cr.is_reply) "↳" else "▸";
+
+    // Prefer the suggestion body when present, else the comment prose.
+    const shown = if (is_suggestion) c.suggestion().? else c.body;
+    const fl = firstLine(shown);
+    const ellipsis: []const u8 = if (fl.more) " …" else "";
+    const text = std.fmt.allocPrint(scratch, "{s} {s}: {s}{s}", .{ marker, c.author, fl.text, ellipsis }) catch c.author;
+    _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = col, .wrap = .none });
+
+    if (is_cursor) win.writeCell(0, r, .{ .char = .{ .grapheme = "▌", .width = 1 }, .style = .{ .fg = .{ .index = 6 } } });
+}
+
+/// A section divider: "── PR comments (N) ──" or "── Outdated · path (N) ──".
+fn drawSection(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, sec: Section, theme: Theme) void {
+    fillRow(win, r, .{});
+    const text = switch (sec.kind) {
+        .pr_comments => std.fmt.allocPrint(scratch, "── PR comments ({d}) ──", .{sec.count}) catch "── PR comments ──",
+        .outdated => std.fmt.allocPrint(scratch, "── Outdated · {s} ({d}) ──", .{ sec.path, sec.count }) catch "── Outdated ──",
+    };
+    _ = win.printSegment(.{ .text = text, .style = theme.section }, .{ .row_offset = r, .wrap = .none });
 }
 
 /// Render an optional line number right-justified in 4 columns (blank if absent).
@@ -264,4 +308,44 @@ test "sidebar prefix shows selection marker and status, borrowing no stack" {
     // Row 1: not selected → " ", deleted → "D".
     try testing.expectEqualStrings(" ", win.readCell(0, 1).?.char.grapheme);
     try testing.expectEqualStrings("D", win.readCell(2, 1).?.char.grapheme);
+}
+
+test "a woven comment renders with its marker and style; a suggestion is distinct" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const raw =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\
+    ;
+    const diff = try bbr.diff.parse(a, raw);
+    const comments = [_]bbr.review.Comment{
+        .{ .id = 1, .author = "Ada", .body = "please rename", .anchor = .{ .path = "a.txt", .to = 1 } },
+        .{ .id = 2, .parent_id = 1, .author = "Bo", .body = "```suggestion\nrenamed\n```" },
+    };
+    const threads = try bbr.review.buildThreads(a, &comments);
+    const buf = try bbr.diff.buffer.buildWithComments(a, diff, .unified, threads, .{});
+
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    const nav = Nav.init(buf.rows.len, 24);
+    draw(a, win, diff, buf, theme_dark, nav, 0);
+
+    // Pane rows: 0 file_header, 1 hunk_header, 2 line(old), 3 line(new),
+    // 4 comment(root), 5 comment(reply=suggestion). Pane x = sidebar_width + 1.
+    const px = sidebar_width + 1;
+    // Root comment marker "▸" at its indent (col 2 within the pane).
+    try testing.expectEqualStrings("▸", win.readCell(px + 2, 4).?.char.grapheme);
+    try testing.expectEqual(theme_dark.comment.bg, win.readCell(px + 2, 4).?.style.bg);
+    // The reply is a suggestion → "±" marker and the suggestion band.
+    try testing.expectEqualStrings("±", win.readCell(px + 6, 5).?.char.grapheme);
+    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 6, 5).?.style.bg);
 }

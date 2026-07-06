@@ -30,6 +30,14 @@ pub const Theme = struct {
     sidebar_item: Style,
     /// The currently selected sidebar file.
     sidebar_selected: Style,
+    /// A woven comment (root).
+    comment: Style,
+    /// A reply, indented under its root.
+    comment_reply: Style,
+    /// A ```suggestion block, called out distinctly.
+    suggestion: Style,
+    /// A section divider (PR comments / Outdated).
+    section: Style,
 
     /// Style for a diff body line of the given kind.
     pub fn lineStyle(self: Theme, kind: LineKind) Style {
@@ -56,6 +64,10 @@ pub const dark: Theme = .{
     .hunk_header = .{ .fg = rgb(0x6c_9c_d0) },
     .sidebar_item = .{},
     .sidebar_selected = .{ .bg = rgb(0x30_30_40), .bold = true },
+    .comment = .{ .bg = rgb(0x1c_1c_28), .fg = rgb(0xc8_c8_d8) },
+    .comment_reply = .{ .bg = rgb(0x18_18_22), .fg = rgb(0xb0_b0_c0) },
+    .suggestion = .{ .bg = rgb(0x14_28_28), .fg = rgb(0x9c_d0_c0) },
+    .section = .{ .fg = rgb(0x88_88_a0), .bold = true },
 };
 
 // ---------------------------------------------------------------------------
