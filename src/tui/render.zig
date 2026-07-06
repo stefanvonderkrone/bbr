@@ -64,10 +64,14 @@ fn drawSidebar(win: vaxis.Window, diff: bbr.diff.Diff, theme: Theme, selected_fi
         const style = if (selected) theme.sidebar_selected else theme.sidebar_item;
         fillRow(win, row, style);
 
+        // The status letter and file name are colored by change kind (green add,
+        // yellow modify/rename, red remove) while keeping the row's background.
+        const name_style: vaxis.Style = .{ .fg = theme.statusColor(file.status), .bg = style.bg, .bold = style.bold };
+
         // Prefix cells use static graphemes so nothing is borrowed from the stack.
         win.writeCell(0, row, .{ .char = .{ .grapheme = if (selected) ">" else " ", .width = 1 }, .style = style });
-        win.writeCell(2, row, .{ .char = .{ .grapheme = statusChar(file.status), .width = 1 }, .style = style });
-        _ = win.printSegment(.{ .text = file.new_path, .style = style }, .{ .row_offset = row, .col_offset = 4, .wrap = .none });
+        win.writeCell(2, row, .{ .char = .{ .grapheme = statusChar(file.status), .width = 1 }, .style = name_style });
+        _ = win.printSegment(.{ .text = file.displayPath(), .style = name_style }, .{ .row_offset = row, .col_offset = 4, .wrap = .none });
         row += 1;
     }
 }
@@ -88,7 +92,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, them
     switch (row) {
         .file_header => |file| {
             fillRow(win, r, theme.file_header);
-            const text = std.fmt.allocPrint(scratch, "{s} {s}", .{ statusChar(file.status), file.new_path }) catch file.new_path;
+            const text = std.fmt.allocPrint(scratch, "{s} {s}", .{ statusChar(file.status), file.displayPath() }) catch file.displayPath();
             _ = win.printSegment(.{ .text = text, .style = theme.file_header }, .{ .row_offset = r, .wrap = .none });
         },
         .hunk_header => |hunk| {
@@ -386,6 +390,13 @@ test "sidebar prefix shows selection marker and status, borrowing no stack" {
     // Row 1: not selected → " ", deleted → "D".
     try testing.expectEqualStrings(" ", win.readCell(0, 1).?.char.grapheme);
     try testing.expectEqualStrings("D", win.readCell(2, 1).?.char.grapheme);
+
+    // A deleted file shows its real name, NOT the diff's `/dev/null` new side.
+    try testing.expectEqualStrings("g", win.readCell(4, 1).?.char.grapheme);
+
+    // The name is colored by change kind: modified → yellow, removed → red.
+    try testing.expectEqual(theme_dark.status_modified, win.readCell(4, 0).?.style.fg);
+    try testing.expectEqual(theme_dark.status_removed, win.readCell(4, 1).?.style.fg);
 }
 
 test "a woven comment renders with its marker and style; a suggestion is distinct" {

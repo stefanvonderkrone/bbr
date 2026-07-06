@@ -48,9 +48,29 @@ pub const File = struct {
     new_path: []const u8,
     status: FileStatus,
     hunks: []const Hunk,
+
+    /// The path to show a reviewer. For a removed file the new side is
+    /// `/dev/null`, so the real name lives on `old_path`; every other status
+    /// (add / modify / rename) names the file by its new path.
+    pub fn displayPath(self: File) []const u8 {
+        return if (self.status == .removed) self.old_path else self.new_path;
+    }
 };
 
 /// The complete set of changed files from one `DiffSource`.
 pub const Diff = struct {
     files: []const File,
 };
+
+const std = @import("std");
+
+test "displayPath uses the real name for a removed file, not /dev/null" {
+    const removed: File = .{ .old_path = "src/gone.zig", .new_path = "/dev/null", .status = .removed, .hunks = &.{} };
+    try std.testing.expectEqualStrings("src/gone.zig", removed.displayPath());
+
+    const added: File = .{ .old_path = "/dev/null", .new_path = "src/new.zig", .status = .added, .hunks = &.{} };
+    try std.testing.expectEqualStrings("src/new.zig", added.displayPath());
+
+    const modified: File = .{ .old_path = "src/a.zig", .new_path = "src/a.zig", .status = .modified, .hunks = &.{} };
+    try std.testing.expectEqualStrings("src/a.zig", modified.displayPath());
+}

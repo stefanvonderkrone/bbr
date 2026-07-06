@@ -30,6 +30,12 @@ pub const Theme = struct {
     sidebar_item: Style,
     /// The currently selected sidebar file.
     sidebar_selected: Style,
+    /// File-list name color for an added file (green).
+    status_added: Color,
+    /// File-list name color for a modified / renamed file (yellow).
+    status_modified: Color,
+    /// File-list name color for a removed file (red).
+    status_removed: Color,
     /// A woven comment (root).
     comment: Style,
     /// A reply, indented under its root.
@@ -53,6 +59,16 @@ pub const Theme = struct {
             .removed => self.removed,
         };
     }
+
+    /// File-list name color for a change status: green add, yellow modify /
+    /// rename, red remove.
+    pub fn statusColor(self: Theme, status: bbr.diff.FileStatus) Color {
+        return switch (status) {
+            .added => self.status_added,
+            .modified, .renamed => self.status_modified,
+            .removed => self.status_removed,
+        };
+    }
 };
 
 fn rgb(hex: u24) Color {
@@ -70,6 +86,9 @@ pub const dark: Theme = .{
     .hunk_header = .{ .fg = rgb(0x6c_9c_d0) },
     .sidebar_item = .{},
     .sidebar_selected = .{ .bg = rgb(0x30_30_40), .bold = true },
+    .status_added = rgb(0x8c_c8_5a),
+    .status_modified = rgb(0xd7_af_5f),
+    .status_removed = rgb(0xd0_6c_6c),
     .comment = .{ .bg = rgb(0x1c_1c_28), .fg = rgb(0xc8_c8_d8) },
     .comment_reply = .{ .bg = rgb(0x18_18_22), .fg = rgb(0xb0_b0_c0) },
     .suggestion = .{ .bg = rgb(0x14_28_28), .fg = rgb(0x9c_d0_c0) },
@@ -83,6 +102,17 @@ pub const dark: Theme = .{
 // Tests
 // ---------------------------------------------------------------------------
 const testing = std.testing;
+
+test "statusColor maps add/modify/remove to distinct colors" {
+    try testing.expectEqual(dark.status_added, dark.statusColor(.added));
+    try testing.expectEqual(dark.status_modified, dark.statusColor(.modified));
+    // A rename reads as a change (yellow), same as modified.
+    try testing.expectEqual(dark.status_modified, dark.statusColor(.renamed));
+    try testing.expectEqual(dark.status_removed, dark.statusColor(.removed));
+    // The three change kinds are visually distinct.
+    try testing.expect(!std.meta.eql(dark.status_added, dark.status_removed));
+    try testing.expect(!std.meta.eql(dark.status_added, dark.status_modified));
+}
 
 test "lineStyle maps each kind to its band" {
     try testing.expect(dark.lineStyle(.context).bg == .default);
