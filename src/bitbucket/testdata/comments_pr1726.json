@@ -1,0 +1,635 @@
+{
+  "values": [
+    {
+      "id": 808101171,
+      "deleted": false,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": null,
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "sanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": null,
+        "to": null,
+        "path": "src/file_lmrvy2.ts",
+        "start_from": null,
+        "start_to": null
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:f6180208c871..41739df6fc7f"
+        }
+      }
+    },
+    {
+      "id": 808106089,
+      "deleted": false,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": null,
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "sanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": null,
+        "to": 357,
+        "path": "src/file_yxbwl3.ts",
+        "start_from": null,
+        "start_to": null
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:6345625f451c..0f0faf0e763f"
+        }
+      }
+    },
+    {
+      "id": 808106204,
+      "deleted": false,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": null,
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "sanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": null,
+        "to": 37,
+        "path": "src/file_yxbwl2.ts",
+        "start_from": null,
+        "start_to": null
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:6345625f451c..0f0faf0e763f"
+        }
+      }
+    },
+    {
+      "id": 811927311,
+      "deleted": false,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": null,
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "```suggestion\n    sanitizedReplacement();\n```\n\nsanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": null,
+        "to": 131,
+        "path": "src/file_yxbwl3.ts",
+        "start_from": null,
+        "start_to": null
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:c034a30e082c..826e08904076"
+        }
+      }
+    },
+    {
+      "id": 811927613,
+      "deleted": false,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": null,
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "```suggestion\n    sanitizedReplacement();\n```\n\nsanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": null,
+        "to": 38,
+        "path": "src/file_yxbwl3.ts",
+        "start_from": null,
+        "start_to": null
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:c034a30e082c..826e08904076"
+        }
+      }
+    },
+    {
+      "id": 811937865,
+      "deleted": false,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": null,
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "sanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": 16,
+        "to": null,
+        "path": "src/file_yxbwl3.ts",
+        "start_from": 13,
+        "start_to": null
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:c034a30e082c..826e08904076"
+        }
+      }
+    },
+    {
+      "id": 811938586,
+      "deleted": false,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": null,
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "sanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": null,
+        "to": 38,
+        "path": "src/file_yxbwl3.ts",
+        "start_from": null,
+        "start_to": 36
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:c034a30e082c..826e08904076"
+        }
+      }
+    },
+    {
+      "id": 811938830,
+      "deleted": false,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": null,
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "sanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": null,
+        "to": 131,
+        "path": "src/file_yxbwl3.ts",
+        "start_from": null,
+        "start_to": 129
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:c034a30e082c..826e08904076"
+        }
+      }
+    },
+    {
+      "id": 811942262,
+      "deleted": false,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": null,
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "sanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": null,
+        "to": 30,
+        "path": "src/file_yxbwl3.ts",
+        "start_from": null,
+        "start_to": null
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:5dee91d0b611..826e08904076"
+        }
+      }
+    },
+    {
+      "id": 813915507,
+      "deleted": false,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": {
+        "id": 811942262
+      },
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "sanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": null,
+        "to": 30,
+        "path": "src/file_yxbwl3.ts",
+        "start_from": null,
+        "start_to": null
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:5dee91d0b611..826e08904076"
+        }
+      }
+    },
+    {
+      "id": 816552513,
+      "deleted": true,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": {
+        "id": 808106089
+      },
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "sanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": null,
+        "to": 357,
+        "path": "src/file_yxbwl3.ts",
+        "start_from": null,
+        "start_to": null
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:6345625f451c..0f0faf0e763f"
+        }
+      }
+    },
+    {
+      "id": 816552532,
+      "deleted": true,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": {
+        "id": 808106204
+      },
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "sanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": null,
+        "to": 37,
+        "path": "src/file_yxbwl2.ts",
+        "start_from": null,
+        "start_to": null
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:6345625f451c..0f0faf0e763f"
+        }
+      }
+    },
+    {
+      "id": 816552545,
+      "deleted": true,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": {
+        "id": 808101171
+      },
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "sanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": null,
+        "to": null,
+        "path": "src/file_lmrvy2.ts",
+        "start_from": null,
+        "start_to": null
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:f6180208c871..41739df6fc7f"
+        }
+      }
+    },
+    {
+      "id": 816552552,
+      "deleted": true,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": {
+        "id": 811927311
+      },
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "sanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": null,
+        "to": 131,
+        "path": "src/file_yxbwl3.ts",
+        "start_from": null,
+        "start_to": null
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:c034a30e082c..826e08904076"
+        }
+      }
+    },
+    {
+      "id": 816552569,
+      "deleted": true,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": {
+        "id": 811927613
+      },
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "sanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": null,
+        "to": 38,
+        "path": "src/file_yxbwl3.ts",
+        "start_from": null,
+        "start_to": null
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:c034a30e082c..826e08904076"
+        }
+      }
+    },
+    {
+      "id": 816552593,
+      "deleted": true,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": {
+        "id": 811937865
+      },
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "sanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": 16,
+        "to": null,
+        "path": "src/file_yxbwl3.ts",
+        "start_from": 13,
+        "start_to": null
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:c034a30e082c..826e08904076"
+        }
+      }
+    },
+    {
+      "id": 816552606,
+      "deleted": true,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": {
+        "id": 811938586
+      },
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "sanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": null,
+        "to": 38,
+        "path": "src/file_yxbwl3.ts",
+        "start_from": null,
+        "start_to": 36
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:c034a30e082c..826e08904076"
+        }
+      }
+    },
+    {
+      "id": 816552621,
+      "deleted": true,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": {
+        "id": 811938830
+      },
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "sanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": null,
+        "to": 131,
+        "path": "src/file_yxbwl3.ts",
+        "start_from": null,
+        "start_to": 129
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:c034a30e082c..826e08904076"
+        }
+      }
+    },
+    {
+      "id": 816552642,
+      "deleted": true,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "parent": {
+        "id": 811942262
+      },
+      "content": {
+        "type": "rendered",
+        "markup": "markdown",
+        "raw": "sanitized review comment",
+        "html": "<p>sanitized</p>"
+      },
+      "user": {
+        "display_name": "Reviewer",
+        "type": "user",
+        "nickname": "reviewer",
+        "uuid": "{00000000-0000-0000-0000-000000000000}",
+        "account_id": "000000000000"
+      },
+      "inline": {
+        "from": null,
+        "to": 30,
+        "path": "src/file_yxbwl3.ts",
+        "start_from": null,
+        "start_to": null
+      },
+      "links": {
+        "code": {
+          "href": "https://api.example.com/2.0/repositories/ws/repo/diff/ws/repo:5dee91d0b611..826e08904076"
+        }
+      }
+    }
+  ],
+  "pagelen": 100,
+  "size": 19,
+  "page": 1
+}

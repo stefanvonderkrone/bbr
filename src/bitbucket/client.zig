@@ -636,6 +636,51 @@ test "parseCodeRevision extracts the src..dst pair" {
     try testing.expect(parseCodeRevision("no colon or range here") == null);
 }
 
+// A full comments-list page captured live from PR 1726, then sanitized (author
+// names, prose, suggestion code, file paths, and workspace scrubbed; comment
+// ids and the links.code commit ranges kept, since outdated detection rides on
+// them). Guards the real wire shape against schema drift.
+const fixture_comments_1726 = @embedFile("testdata/comments_pr1726.json");
+
+test "sanitized PR 1726 fixture: shape, deleted-skip, and outdated detection" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body = fixture_comments_1726 };
+    const bb = Client.init(fake.httpClient(), testCredential());
+
+    // PR 1726's real head (the "current" comment anchors exactly this range).
+    const comments = try bb.getComments(a, "pr-webapp", 1726, .{
+        .source = "f6180208c871",
+        .destination = "41739df6fc7f",
+    });
+    defer @import("client.zig").deinitComments(a, comments);
+
+    // 19 on the wire, 9 deleted → 10 kept.
+    try testing.expectEqual(@as(usize, 10), comments.len);
+
+    var outdated: usize = 0;
+    var suggestions: usize = 0;
+    for (comments) |c| {
+        if (c.state == .outdated) outdated += 1;
+        if (c.suggestion() != null) suggestions += 1;
+    }
+    // Every comment but the one anchored to the current head is outdated.
+    try testing.expectEqual(@as(usize, 9), outdated);
+    try testing.expectEqual(@as(usize, 2), suggestions);
+
+    // Threaded: 9 roots + 1 reply, and 8 outdated thread roots (the reply's
+    // outdated-ness doesn't count as a root) — matching the live `check`.
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const threads = try @import("../review/thread.zig").build(arena.allocator(), comments);
+    try testing.expectEqual(@as(usize, 9), threads.len);
+
+    var outdated_roots: usize = 0;
+    for (threads) |t| {
+        if (t.root.state == .outdated) outdated_roots += 1;
+    }
+    try testing.expectEqual(@as(usize, 8), outdated_roots);
+}
+
 test "hashMatches tolerates abbreviation" {
     try testing.expect(hashMatches("f6180208c871", "f6180208c871abcd1234"));
     try testing.expect(hashMatches("f6180208c871abcd1234", "f6180208c871"));
