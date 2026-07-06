@@ -23,6 +23,7 @@ const theme = @import("theme.zig");
 const Nav = @import("nav.zig").Nav;
 const Picker = @import("picker.zig").Picker;
 const session = @import("session.zig");
+const ArenaRing = @import("arena_ring.zig").ArenaRing;
 const Session = session.Session;
 
 const Credential = bbr.bitbucket.Credential;
@@ -84,10 +85,12 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
     var current: *Session = initial;
     defer current.destroy();
 
-    // Buffer-scoped arena: the flattened rows for the *current* session. Reset
-    // and rebuilt when the resolved toggle flips or the session switches.
-    var buf_arena = std.heap.ArenaAllocator.init(gpa);
-    defer buf_arena.deinit();
+    // Buffer-scoped arenas: the flattened rows for the *current* session, rebuilt
+    // whenever the layout, scope, resolved toggle, or a fold changes (and on a PR
+    // switch). A ring of 2 double-buffers the rebuild — the displayed buffer stays
+    // valid while the next one is built in the other arena.
+    var ring = ArenaRing(2).init(gpa);
+    defer ring.deinit();
 
     var show_resolved = false;
     var layout: bbr.diff.Layout = .unified;
@@ -97,7 +100,7 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
     var scope_fold = true;
     var expanded: std.ArrayList(*const bbr.diff.Line) = .empty;
     defer expanded.deinit(gpa);
-    var buf = try bbr.diff.buffer.buildWithComments(buf_arena.allocator(), current.diff, layout, current.threads, buildOpts(show_resolved, scope_fold, expanded.items));
+    var buf = try bbr.diff.buffer.buildWithComments(ring.next(), current.diff, layout, current.threads, buildOpts(show_resolved, scope_fold, expanded.items));
 
     // Per-frame arena for synthesized gutter/overlay text; reset after render.
     var frame_arena = std.heap.ArenaAllocator.init(gpa);
@@ -178,23 +181,23 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
                         };
                     } else if (key.matches('R', .{})) {
                         show_resolved = !show_resolved;
-                        buf = rebuild(&buf_arena, current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
+                        buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
                         nav.setRowCount(buf.rows.len);
                     } else if (key.matches('s', .{})) {
                         layout = if (layout == .unified) .side_by_side else .unified;
-                        buf = rebuild(&buf_arena, current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
+                        buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
                         nav.setRowCount(buf.rows.len);
                     } else if (key.matches('f', .{})) {
                         // Toggle the diff scope: fold long context vs. whole file.
                         scope_fold = !scope_fold;
                         expanded.clearRetainingCapacity();
-                        buf = rebuild(&buf_arena, current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
+                        buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
                         nav.setRowCount(buf.rows.len);
                     } else if (key.matches(vaxis.Key.enter, .{})) {
                         // Expand the fold under the cursor, if any.
                         if (nav.cursor < buf.rows.len and buf.rows[nav.cursor] == .fold) {
                             expanded.append(gpa, buf.rows[nav.cursor].fold.id) catch {};
-                            buf = rebuild(&buf_arena, current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
+                            buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
                             nav.setRowCount(buf.rows.len);
                         }
                     } else if (handleKey(&nav, &pending_g, key)) |_| {}
@@ -217,7 +220,7 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
                             current = s;
                             // Expanded-fold ids pointed into the old session's diff.
                             expanded.clearRetainingCapacity();
-                            buf = rebuild(&buf_arena, current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
+                            buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
                             nav = Nav.init(buf.rows.len, vx.window().height);
                             pending_g = false;
                             status_msg = null;
@@ -246,9 +249,8 @@ fn buildOpts(show_resolved: bool, scope_fold: bool, expanded: []const *const bbr
     return .{ .show_resolved = show_resolved, .fold_context = scope_fold, .expanded = expanded };
 }
 
-fn rebuild(buf_arena: *std.heap.ArenaAllocator, s: *const Session, layout: bbr.diff.Layout, opts: bbr.diff.BuildOptions) !bbr.diff.Buffer {
-    _ = buf_arena.reset(.retain_capacity);
-    return bbr.diff.buffer.buildWithComments(buf_arena.allocator(), s.diff, layout, s.threads, opts);
+fn rebuild(alloc: std.mem.Allocator, s: *const Session, layout: bbr.diff.Layout, opts: bbr.diff.BuildOptions) !bbr.diff.Buffer {
+    return bbr.diff.buffer.buildWithComments(alloc, s.diff, layout, s.threads, opts);
 }
 
 /// Fetch the repo's open PRs (synchronously — one request) and open the Picker
@@ -448,4 +450,5 @@ test {
     _ = @import("nav.zig");
     _ = @import("picker.zig");
     _ = @import("session.zig");
+    _ = @import("arena_ring.zig");
 }
