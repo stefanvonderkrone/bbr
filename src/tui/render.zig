@@ -649,6 +649,30 @@ test "sidebar highlights the selected file" {
 
 const theme_dark = @import("theme.zig").dark;
 
+test "the composer modal draws its header and typed body" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var composer = Composer.init(a, .{ .kind = .top_level, .label = "New comment" });
+    try composer.insert("looks good");
+
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    drawComposer(a, win, &composer, theme_dark);
+
+    // Modal geometry: 72×14 centered on 80×24 → origin (4, 5). Header row 0.
+    const mx: u16 = (80 - 72) / 2;
+    const my: u16 = (24 - 14) / 2;
+    try testing.expectEqualStrings("✎", win.readCell(mx, my).?.char.grapheme);
+    try testing.expectEqual(theme_dark.picker_query.bg, win.readCell(mx, my).?.style.bg);
+    // The body's first line sits one column in on the first body row.
+    try testing.expectEqualStrings("l", win.readCell(mx + 1, my + 1).?.char.grapheme);
+    try testing.expectEqual(theme_dark.picker.bg, win.readCell(mx + 1, my + 1).?.style.bg);
+}
+
 test "a pending draft renders in the draft band with its marker" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
