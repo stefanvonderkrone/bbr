@@ -1014,6 +1014,10 @@ fn submitWorker(
     defer req.destroy();
     const page = std.heap.page_allocator;
 
+    // Backs the http client (its connection pool + proxy config) and every
+    // per-request allocation for the whole batch. Never reset mid-batch — the
+    // client holds live buffers here — so it grows with the batch; a review is a
+    // handful of Drafts, so that's bounded and freed when the worker returns.
     var scratch = std.heap.ArenaAllocator.init(page);
     defer scratch.deinit();
 
@@ -1031,7 +1035,6 @@ fn submitWorker(
             return;
         }
     } else |_| {}
-    _ = scratch.reset(.retain_capacity);
 
     var sub = bbr.review.Submission.init(page, &req.review) catch {
         loop.postEvent(.{ .submit_done = .{ .epoch = req.epoch, .pr_id = req.pr_id, .posted = 0, .failed = 0, .skipped = 0, .aborted = error.OutOfMemory, .stale = false } }) catch {};
@@ -1055,7 +1058,6 @@ fn submitWorker(
         emitProgress(loop, req, &sub, emitted);
         switch (step) {
             .post => |ps| {
-                _ = scratch.reset(.retain_capacity);
                 const d = req.review.getConst(ps.temp_id).?;
                 // On an ambiguous retry, dedupe first (GET-and-match) so a
                 // lost-response POST isn't sent twice (§9 "Duplicates").
