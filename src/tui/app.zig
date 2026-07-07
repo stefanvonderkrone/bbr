@@ -219,7 +219,8 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
     const active_theme = theme.dark;
     var nav = Nav.init(buf.rows.len, vx.window().height);
     var pending_g = false; // saw the first `g` of a `gg`
-    var loading = false; // a switch is in flight for the current epoch
+    var loading = false; // a load is in flight for the current epoch
+    var loading_id: u64 = initial_id; // PR the in-flight load targets (for the loading view)
     var status_msg: ?[]const u8 = null; // transient error/status (static string)
 
     // Boot the initial PR through the same worker path as a switch, so the
@@ -279,6 +280,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                             };
                             if (loads.items.len > 0) {
                                 loading = true;
+                                loading_id = s.id;
                                 status_msg = null;
                             }
                         }
@@ -404,12 +406,15 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
 
         const win = vx.window();
         const frame = frame_arena.allocator();
-        if (current) |cur| {
+        // A load in flight (initial boot or a switch) shows the "Loading PR #N…"
+        // frame — the same prominent cue in both cases, not just a status hint.
+        if (loading or current == null) {
+            render.drawLoading(frame, win, loading_id, active_theme, status_msg);
+        } else {
+            const cur = current.?;
             const selected_file = fileIndexForRow(buf, nav.cursor);
             render.draw(frame, win, cur.diff, buf, active_theme, nav, selected_file, cur.threads, review.drafts.items);
             drawStatus(frame, win, cur.pr, nav, buf, layout, scope_fold, show_resolved, loading, status_msg);
-        } else {
-            render.drawLoading(frame, win, initial_id, active_theme, status_msg);
         }
         if (picker) |*p| render.drawPicker(frame, win, p, active_theme);
         if (composer) |*comp| render.drawComposer(frame, win, comp, active_theme);
