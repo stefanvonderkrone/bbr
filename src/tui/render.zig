@@ -18,6 +18,7 @@ const Buffer = bbr.diff.buffer.Buffer;
 const Row = bbr.diff.buffer.Row;
 const LineRow = bbr.diff.buffer.LineRow;
 const CommentRow = bbr.diff.buffer.CommentRow;
+const DraftRow = bbr.diff.buffer.DraftRow;
 const Section = bbr.diff.buffer.Section;
 const FileStatus = bbr.diff.FileStatus;
 const Picker = @import("picker.zig").Picker;
@@ -132,6 +133,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, them
         .line_pair => |pair| drawLinePair(scratch, win, r, pair, theme),
         .fold => |f| drawFold(scratch, win, r, f, theme),
         .comment => |cr| drawComment(scratch, win, r, cr, theme),
+        .draft => |dr| drawDraft(scratch, win, r, dr, theme),
         .section => |sec| drawSection(scratch, win, r, sec, theme),
     }
 }
@@ -226,6 +228,25 @@ fn drawComment(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, cr: Commen
     _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = col, .wrap = .none });
 }
 
+/// A pending Draft — the reviewer's own unsent comment. Marked `✎` (root) or
+/// `↳` (reply) in the draft band so it never reads as already-published. A
+/// suggestion Draft shows its `±` marker. Multi-line bodies show the lead line.
+fn drawDraft(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, dr: DraftRow, theme: Theme) void {
+    const d = dr.draft;
+    const style = if (dr.is_reply) theme.draft_reply else theme.draft;
+    fillRow(win, r, style);
+
+    const col: u16 = if (dr.is_reply) 6 else 2;
+    const marker: []const u8 = switch (d.kind) {
+        .suggestion => "±",
+        else => if (dr.is_reply) "↳" else "✎",
+    };
+    const fl = firstLine(d.body);
+    const ellipsis: []const u8 = if (fl.more) " …" else "";
+    const text = std.fmt.allocPrint(scratch, "{s} draft: {s}{s}", .{ marker, fl.text, ellipsis }) catch "✎ draft";
+    _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = col, .wrap = .none });
+}
+
 /// A collapsed-context fold: "  ⋯ N unchanged lines · enter to expand ⋯".
 fn drawFold(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, f: bbr.diff.Fold, theme: Theme) void {
     fillRow(win, r, theme.fold);
@@ -238,6 +259,7 @@ fn drawSection(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, sec: Secti
     fillRow(win, r, .{});
     const text = switch (sec.kind) {
         .pr_comments => std.fmt.allocPrint(scratch, "── PR comments ({d}) ──", .{sec.count}) catch "── PR comments ──",
+        .pending => std.fmt.allocPrint(scratch, "── Pending ({d}) ──", .{sec.count}) catch "── Pending ──",
         .outdated => std.fmt.allocPrint(scratch, "── Outdated · {s} ({d}) ──", .{ sec.path, sec.count }) catch "── Outdated ──",
     };
     _ = win.printSegment(.{ .text = text, .style = theme.section }, .{ .row_offset = r, .wrap = .none });
@@ -573,6 +595,44 @@ test "sidebar highlights the selected file" {
 
 const theme_dark = @import("theme.zig").dark;
 
+test "a pending draft renders in the draft band with its marker" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const raw =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\
+    ;
+    const diff = try bbr.diff.parse(a, raw);
+    const drafts = [_]bbr.review.Draft{
+        .{ .local_id = 1, .kind = .inline_comment, .body = "author it", .anchor = .{ .path = "a.txt", .to = 1, .commit = "c0" } },
+    };
+    const buf = try bbr.diff.buffer.buildWithComments(a, diff, .unified, &.{}, .{ .drafts = &drafts });
+
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    const nav = Nav.init(buf.rows.len, 24);
+    draw(a, win, diff, buf, theme_dark, nav, 0);
+
+    // Find the draft row's screen position.
+    var draft_row: ?u16 = null;
+    for (buf.rows, 0..) |row, idx| {
+        if (row == .draft) draft_row = @intCast(idx);
+    }
+    const dr = draft_row.?;
+    const px = sidebar_width + 1;
+    try testing.expectEqualStrings("✎", win.readCell(px + 2, dr).?.char.grapheme);
+    try testing.expectEqual(theme_dark.draft.bg, win.readCell(px + 2, dr).?.style.bg);
+}
+
 test "picker overlay draws the query line and highlights the selection" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -604,7 +664,6 @@ test "picker overlay draws the query line and highlights the selection" {
     try testing.expectEqual(theme_dark.picker_selected.bg, win.readCell(mx, my + 2).?.style.bg);
     try testing.expectEqual(theme_dark.picker.bg, win.readCell(mx, my + 1).?.style.bg);
 }
-
 
 test "sidebar prefix shows selection marker and status, borrowing no stack" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

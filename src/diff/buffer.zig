@@ -15,6 +15,7 @@ const intraline = @import("intraline.zig");
 const review = @import("../review/comment.zig");
 const Thread = @import("../review/thread.zig").Thread;
 const Comment = review.Comment;
+const Draft = @import("../review/draft.zig").Draft;
 
 /// Re-export so the renderer can name the segment type without reaching into
 /// `intraline` directly.
@@ -28,7 +29,7 @@ const emphasis_threshold: f64 = 0.5;
 /// `side_by_side` is the other axis (design §11) and lands later.
 pub const Layout = enum { unified, side_by_side };
 
-pub const RowKind = enum { file_header, hunk_header, line, line_pair, fold, comment, section };
+pub const RowKind = enum { file_header, hunk_header, line, line_pair, fold, comment, draft, section };
 
 /// A diff body line plus any intra-line emphasis. `emphasis` is empty for
 /// context lines and for changed lines with no modified counterpart (pure
@@ -57,9 +58,19 @@ pub const CommentRow = struct {
     is_reply: bool,
 };
 
+/// A pending Draft woven into the diff: the Draft itself plus whether it's a
+/// reply (indented under whatever it replies to), so the renderer can mark it
+/// distinctly from a published comment.
+pub const DraftRow = struct {
+    draft: *const Draft,
+    is_reply: bool,
+};
+
 pub const SectionKind = enum {
     /// PR-level comments (no anchor), shown once at the top.
     pr_comments,
+    /// PR-level pending Drafts (no anchor), shown once near the top.
+    pending,
     /// A per-file "Outdated (N)" group. `path` names the file.
     outdated,
 };
@@ -79,6 +90,7 @@ pub const Row = union(RowKind) {
     line_pair: LinePair,
     fold: Fold,
     comment: CommentRow,
+    draft: DraftRow,
     section: Section,
 };
 
@@ -110,6 +122,10 @@ pub const BuildOptions = struct {
     context_margin: usize = 3,
     min_fold: usize = 2,
     expanded: []const *const model.Line = &.{},
+    /// Pending Drafts to weave in: anchored Drafts appear under their diff line
+    /// (after any published comments there); unanchored ones in a "Pending"
+    /// section near the top. Borrowed — must outlive the Buffer.
+    drafts: []const Draft = &.{},
 };
 
 pub const Buffer = struct {
@@ -151,6 +167,15 @@ pub fn buildWithComments(
         }
     }
 
+    // 1b. PR-level pending Drafts (no anchor) — the reviewer's own unsent work.
+    const pending_count = countUnanchoredDrafts(opts.drafts);
+    if (pending_count > 0) {
+        try rows.append(allocator, .{ .section = .{ .kind = .pending, .count = pending_count } });
+        for (opts.drafts) |*d| {
+            if (d.anchor == null) try emitDraft(allocator, &rows, d);
+        }
+    }
+
     // 2. Files, with inline threads under their lines and an outdated section.
     for (diff.files) |*file| {
         try rows.append(allocator, .{ .file_header = file });
@@ -183,6 +208,11 @@ fn emitThread(allocator: std.mem.Allocator, rows: *std.ArrayList(Row), t: *const
     for (t.replies) |reply| {
         try rows.append(allocator, .{ .comment = .{ .comment = reply, .is_reply = true } });
     }
+}
+
+/// Append one Draft row. A reply Draft is indented under whatever it replies to.
+fn emitDraft(allocator: std.mem.Allocator, rows: *std.ArrayList(Row), d: *const Draft) !void {
+    try rows.append(allocator, .{ .draft = .{ .draft = d, .is_reply = d.parent != null } });
 }
 
 /// Emit a hunk's lines in unified layout: one row per line, each followed by
@@ -296,6 +326,12 @@ fn weaveInline(
         if (!inlineVisible(t.*, opts)) continue;
         if (anchorMatchesLine(anc, ln)) try emitThread(allocator, rows, t);
     }
+    // Pending anchored Drafts hang off the same line, after any published thread.
+    for (opts.drafts) |*d| {
+        const anc = d.anchor orelse continue;
+        if (!std.mem.eql(u8, anc.path, file.new_path)) continue;
+        if (anchorMatchesLine(anc, ln)) try emitDraft(allocator, rows, d);
+    }
 }
 
 /// Compute the folds for one hunk under the current scope. A maximal run of
@@ -401,6 +437,14 @@ fn fileOutdatedCount(threads: []const Thread, path: []const u8) usize {
     var n: usize = 0;
     for (threads) |*t| {
         if (isFileOutdated(t.*, path)) n += 1;
+    }
+    return n;
+}
+
+fn countUnanchoredDrafts(drafts: []const Draft) usize {
+    var n: usize = 0;
+    for (drafts) |*d| {
+        if (d.anchor == null) n += 1;
     }
     return n;
 }
@@ -785,6 +829,52 @@ test "outdated threads go in a per-file section and are never hidden" {
     }
     try testing.expect(found);
     try testing.expectEqual(@as(usize, 1), countKind(buf, .comment));
+}
+
+test "an anchored draft is woven under its line; a PR-level draft gets a pending section" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, anchor_diff);
+    const drafts = [_]Draft{
+        .{ .local_id = 1, .kind = .top_level, .body = "overall: needs tests" }, // no anchor
+        .{ .local_id = 2, .kind = .inline_comment, .body = "why new?", .anchor = .{ .path = "a.txt", .to = 2, .commit = "c0" } },
+    };
+    const buf = try buildWithComments(a, diff, .unified, &.{}, .{ .drafts = &drafts });
+
+    // A pending section at the very top, then the PR-level draft row.
+    try testing.expect(buf.rows[0] == .section);
+    try testing.expectEqual(SectionKind.pending, buf.rows[0].section.kind);
+    try testing.expectEqual(@as(usize, 1), buf.rows[0].section.count);
+    try testing.expect(buf.rows[1] == .draft);
+    try testing.expectEqual(@as(u64, 1), buf.rows[1].draft.draft.local_id);
+
+    // Exactly two draft rows total (one pending, one inline), and the inline one
+    // sits right after the "+new" line (new_no == 2).
+    try testing.expectEqual(@as(usize, 2), countKind(buf, .draft));
+    for (buf.rows, 0..) |r, i| {
+        if (r == .draft and r.draft.draft.local_id == 2) {
+            try testing.expect(buf.rows[i - 1] == .line);
+            try testing.expectEqual(@as(?u32, 2), buf.rows[i - 1].line.line.new_no);
+        }
+    }
+}
+
+test "a reply draft carries the reply flag for indentation" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, anchor_diff);
+    const drafts = [_]Draft{
+        .{ .local_id = 1, .kind = .reply, .body = "re", .parent = .{ .comment = 5 } },
+    };
+    const buf = try buildWithComments(a, diff, .unified, &.{}, .{ .drafts = &drafts });
+    try testing.expectEqual(@as(usize, 1), countKind(buf, .draft));
+    for (buf.rows) |r| {
+        if (r == .draft) try testing.expect(r.draft.is_reply);
+    }
 }
 
 test "an inline thread anchored to a missing current line is not lost silently" {

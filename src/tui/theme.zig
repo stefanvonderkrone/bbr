@@ -58,7 +58,12 @@ pub const Theme = struct {
     comment_reply: Style,
     /// A ```suggestion block, called out distinctly.
     suggestion: Style,
-    /// A section divider (PR comments / Outdated).
+    /// A pending Draft (the reviewer's own unsent comment) — a distinct band so
+    /// it never reads as already-published.
+    draft: Style,
+    /// A reply Draft, indented under whatever it replies to.
+    draft_reply: Style,
+    /// A section divider (PR comments / Pending / Outdated).
     section: Style,
     /// The PR picker overlay's background rows.
     picker: Style,
@@ -144,6 +149,8 @@ pub const dark: Theme = .{
     .comment = .{ .bg = rgb(0x1c_1c_28), .fg = rgb(0xc8_c8_d8) },
     .comment_reply = .{ .bg = rgb(0x18_18_22), .fg = rgb(0xb0_b0_c0) },
     .suggestion = .{ .bg = rgb(0x14_28_28), .fg = rgb(0x9c_d0_c0) },
+    .draft = .{ .bg = rgb(0x2c_24_10), .fg = rgb(0xe0_c8_88), .bold = true },
+    .draft_reply = .{ .bg = rgb(0x24_1e_0c), .fg = rgb(0xc8_b0_78) },
     .section = .{ .fg = rgb(0x88_88_a0), .bold = true },
     .picker = .{ .bg = rgb(0x20_20_2c), .fg = rgb(0xc8_c8_d8) },
     .picker_selected = .{ .bg = rgb(0x3a_3a_52), .fg = rgb(0xff_ff_ff), .bold = true },

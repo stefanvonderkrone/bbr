@@ -451,4 +451,5 @@ test {
     _ = @import("picker.zig");
     _ = @import("session.zig");
     _ = @import("arena_ring.zig");
+    _ = @import("composer.zig");
 }
