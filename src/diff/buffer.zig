@@ -127,6 +127,12 @@ pub const BuildOptions = struct {
     /// (after any published comments there); unanchored ones in a "Pending"
     /// section near the top. Borrowed — must outlive the Buffer.
     drafts: []const Draft = &.{},
+    /// Isolate view: when set, project only `diff.files[only_file]` — its header,
+    /// hunks (with woven inline threads/drafts), and its outdated section. The
+    /// PR-level comment and pending sections are suppressed (they belong to no
+    /// single File), as are the other files' rows and stranded Drafts. `null`
+    /// flattens the whole Diff (the continuous all-files scroll).
+    only_file: ?usize = null,
 };
 
 pub const Buffer = struct {
@@ -176,8 +182,9 @@ pub fn buildWithComments(
         .opts = opts,
     };
 
-    // 1. PR-level comments (no anchor), respecting the resolved toggle.
-    const pr_count = countWhere(threads, isPrLevel, opts);
+    // 1. PR-level comments (no anchor), respecting the resolved toggle. Skipped
+    // in the isolate view — PR-level comments belong to no single File.
+    const pr_count = if (opts.only_file == null) countWhere(threads, isPrLevel, opts) else 0;
     if (pr_count > 0) {
         try rows.append(allocator, .{ .section = .{ .kind = .pr_comments, .count = pr_count } });
         for (threads) |*t| {
@@ -188,7 +195,7 @@ pub fn buildWithComments(
     // 1b. PR-level pending Drafts: root Drafts with no anchor — the reviewer's
     // own unsent top-level work. Reply Drafts are placed under their parent (in
     // emitThread / emitDraft), not here.
-    const pending_count = countPendingRoots(opts.drafts);
+    const pending_count = if (opts.only_file == null) countPendingRoots(opts.drafts) else 0;
     if (pending_count > 0) {
         try rows.append(allocator, .{ .section = .{ .kind = .pending, .count = pending_count } });
         for (opts.drafts, 0..) |*d, i| {
@@ -197,7 +204,11 @@ pub fn buildWithComments(
     }
 
     // 2. Files, with inline threads under their lines and an outdated section.
-    for (diff.files) |*file| {
+    // In the isolate view only the focused file is emitted.
+    for (diff.files, 0..) |*file, fi| {
+        if (opts.only_file) |only| {
+            if (fi != only) continue;
+        }
         try rows.append(allocator, .{ .file_header = file });
         for (file.hunks) |*hunk| {
             try rows.append(allocator, .{ .hunk_header = hunk });
@@ -226,12 +237,12 @@ pub fn buildWithComments(
     // in a trailing pending section (with its own reply subtree) rather than lost.
     var stranded: usize = 0;
     for (opts.drafts, 0..) |*d, i| {
-        if (!emitted[i] and d.parent == null) stranded += 1;
+        if (!emitted[i] and d.parent == null and draftInScope(d, diff, opts.only_file)) stranded += 1;
     }
     if (stranded > 0) {
         try rows.append(allocator, .{ .section = .{ .kind = .pending, .count = stranded } });
         for (opts.drafts, 0..) |*d, i| {
-            if (!emitted[i] and d.parent == null) try w.emitDraft(i);
+            if (!emitted[i] and d.parent == null and draftInScope(d, diff, opts.only_file)) try w.emitDraft(i);
         }
     }
 
@@ -506,6 +517,17 @@ fn fileOutdatedCount(threads: []const Thread, path: []const u8) usize {
         if (isFileOutdated(t.*, path)) n += 1;
     }
     return n;
+}
+
+/// Whether a Draft belongs to the current file scope. In the all-files view
+/// (`only_file == null`) every Draft is in scope; in the isolate view only a
+/// Draft anchored to the focused file is — so a stranded PR-level or other-file
+/// Draft never leaks into a single-file projection.
+fn draftInScope(d: *const Draft, diff: model.Diff, only_file: ?usize) bool {
+    const only = only_file orelse return true;
+    if (only >= diff.files.len) return false;
+    const anc = d.anchor orelse return false;
+    return std.mem.eql(u8, anc.path, diff.files[only].new_path);
 }
 
 /// Root Drafts (not replies) with no anchor — the PR-level "Pending" section.
@@ -1046,6 +1068,63 @@ test "a reply-to-draft chain nests under its root draft" {
             try testing.expect(buf.rows[i + 1].draft.is_reply);
         }
     }
+}
+
+test "only_file projects a single file's rows, nothing else" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, two_file_diff);
+
+    // Isolate the second file (b.txt): exactly one file_header, and it's b.txt.
+    const only_b = try buildWithComments(a, diff, .unified, &.{}, .{ .only_file = 1 });
+    try testing.expectEqual(@as(usize, 1), countKind(only_b, .file_header));
+    for (only_b.rows) |r| {
+        if (r == .file_header) try testing.expectEqualStrings("b.txt", r.file_header.new_path);
+    }
+    // b.txt alone: header + hunk header + 2 lines = 4 rows.
+    try testing.expectEqual(@as(usize, 4), only_b.rows.len);
+
+    // Isolating the first file yields a's rows and none of b's.
+    const only_a = try buildWithComments(a, diff, .unified, &.{}, .{ .only_file = 0 });
+    for (only_a.rows) |r| {
+        if (r == .file_header) try testing.expectEqualStrings("a.txt", r.file_header.new_path);
+    }
+    try testing.expectEqual(@as(usize, 5), only_a.rows.len);
+}
+
+test "the isolate view suppresses PR-level and other-file rows" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, two_file_diff);
+    // A PR-level comment, plus an inline comment on each file.
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "overall LGTM" }, // PR-level
+        .{ .id = 2, .author = "Bo", .body = "on a", .anchor = .{ .path = "a.txt", .to = 1 } },
+        .{ .id = 3, .author = "Cy", .body = "on b", .anchor = .{ .path = "b.txt", .to = 5 } },
+    };
+    const threads = try @import("../review/thread.zig").build(a, &comments);
+    // A PR-level draft and one anchored to the other file.
+    const drafts = [_]Draft{
+        .{ .local_id = 1, .kind = .top_level, .body = "needs tests" }, // PR-level
+        .{ .local_id = 2, .kind = .inline_comment, .body = "on b", .anchor = .{ .path = "b.txt", .to = 5, .commit = "c0" } },
+    };
+
+    // Isolate a.txt: no PR-level comment/pending sections, no b.txt comment/draft.
+    const buf = try buildWithComments(a, diff, .unified, threads, .{ .only_file = 0, .drafts = &drafts });
+    for (buf.rows) |r| {
+        if (r == .section) try testing.expect(r.section.kind != .pr_comments and r.section.kind != .pending);
+    }
+    // Exactly the one inline comment that anchors to a.txt; b's comment is gone.
+    try testing.expectEqual(@as(usize, 1), countKind(buf, .comment));
+    for (buf.rows) |r| {
+        if (r == .comment) try testing.expectEqual(@as(review.CommentId, 2), r.comment.comment.id);
+    }
+    // The PR-level draft and the b.txt draft are both suppressed.
+    try testing.expectEqual(@as(usize, 0), countKind(buf, .draft));
 }
 
 test "an inline thread anchored to a missing current line is not lost silently" {

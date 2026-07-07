@@ -38,7 +38,7 @@ A collapsed run of far-from-change `context` Lines in `Changes` scope, shown as 
 _Avoid_: collapse, gap, hidden region.
 
 **Buffer**:
-The loaded, rendered model of exactly one File — parsed Lines, folds, intra-line segments, wrapping, and (later) highlight spans. Lives in the buffer-scoped arena and is reset/reused on file switch.
+The flattened, ordered rows the DiffPane walks. By default it projects the whole Diff — every File in one continuous scroll — but the **isolate** view (`only_file`) projects exactly one File: its header, hunks, folds, intra-line segments, and anchored threads/drafts, and nothing PR-level. The single-File projection is the canonical review unit; the all-files scroll is a navigation convenience. Lives in the buffer-scoped arena and is rebuilt on any view change or PR switch.
 _Avoid_: file (that's the domain entity), view, page.
 
 **Layout**:
