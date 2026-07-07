@@ -108,6 +108,12 @@ _Deferred:_ animated spinner — the vaxis `Loop` has no timer (`nextEvent` bloc
 - [ ] Local anchor lifecycle via diff-walking (`git diff <anchor_commit> <ref>`); committed refs only.
 - [ ] Tests: worktree detection, DiffSource parity, local anchor mapping (current/moved/outdated).
 
+## M14 — Polish  ·  S/M  ·  needs M2 (resolved indicator needs M3/M6)
+Small feature and layout refinements once the core flow works.
+- [ ] Resolved threads: show a collapsed **indicator** in place (not just hide-behind-toggle), e.g. `✓ resolved · N replies`, that expands the whole Thread on demand. **Note:** this reverses the current domain rule — the Thread entry in `src/review/CONTEXT.md` explicitly says "never a bare 'a resolved comment exists' marker". Confirm and update that glossary entry (and the `show_resolved` behaviour in `buffer.zig`) as part of this item. Reply count comes from `Thread.replies.len`.
+- [ ] Layout polish: borders/separators around panes and overlays (sidebar ↔ diff, the composer modal, section dividers). Today panes are separated by spacing only (`src/tui/render.zig`); add box-drawing borders styled via the active `Theme`.
+- [ ] Sidebar: the per-file comment/draft counts should be **right-aligned and always visible**, and the file name **truncated with an ellipsis** when the row is too narrow. Today the counts are printed immediately after the name using the name segment's `PrintResult.col` (`drawSidebar` in `render.zig`), so a long name pushes them off-screen. Reserve a fixed right-hand column for the counts, then truncate the name to fill the remaining width.
+
 ## Cross-cutting / tech debt
 - [ ] Decide libcurl fallback trigger (once proxy type at check24 is known).
 - [ ] Rotate the API token currently in plaintext in `opencode.jsonc`; move to keychain.
@@ -127,6 +133,7 @@ M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M9    (authoring → submission)
               ├─ M10             (keymap)
               ├─ M11             (themes/config)
               ├─ M12             (highlighting)
+              ├─ M14             (polish: resolved indicator, borders, sidebar)
               └─ M3 ─ M6 ─ M13   (local review; needs authoring, not submission)
 ```
 
