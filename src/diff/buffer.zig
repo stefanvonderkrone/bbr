@@ -133,6 +133,16 @@ pub const BuildOptions = struct {
     /// single File), as are the other files' rows and stranded Drafts. `null`
     /// flattens the whole Diff (the continuous all-files scroll).
     only_file: ?usize = null,
+    /// True-whole-file scope (M9): splice each file's fetched Hunk lines into the
+    /// unchanged lines of its blob (`blobs`) so the *entire* file shows, not just
+    /// the fetched hunks + context. A file with no blob loaded (or a removed file,
+    /// which has no new side) falls back to the fetched rendering. Implies no
+    /// folding. `false` keeps the Changes/fetched behaviour driven by
+    /// `fold_context`.
+    whole_file: bool = false,
+    /// Per-file blobs for the whole-file splice, index-aligned with `diff.files`
+    /// (a shorter/empty slice just means "not loaded" for the missing files).
+    blobs: []const model.FileBlob = &.{},
 };
 
 pub const Buffer = struct {
@@ -210,7 +220,20 @@ pub fn buildWithComments(
             if (fi != only) continue;
         }
         try rows.append(allocator, .{ .file_header = file });
-        for (file.hunks) |*hunk| {
+
+        // True-whole-file: splice the fetched Hunk lines into the blob's
+        // unchanged lines and emit the file as one continuous sequence (no hunk
+        // headers, no folds). Falls back to the per-hunk path when the blob is
+        // absent or the file has no new side (removed).
+        if (opts.whole_file and wholeFileBlob(opts.blobs, fi, file.*) != null) {
+            const blob = wholeFileBlob(opts.blobs, fi, file.*).?;
+            const lines = try spliceNewSide(allocator, file.*, blob);
+            const emphasis = try computeEmphasis(allocator, lines);
+            switch (layout) {
+                .unified => try w.emitUnifiedHunk(file, lines, emphasis, &.{}),
+                .side_by_side => try w.emitSideBySideHunk(file, lines, emphasis, &.{}),
+            }
+        } else for (file.hunks) |*hunk| {
             try rows.append(allocator, .{ .hunk_header = hunk });
             const emphasis = try computeEmphasis(allocator, hunk.lines);
             const folds = try computeFolds(allocator, hunk.lines, opts);
@@ -386,6 +409,9 @@ const Weave = struct {
     /// (respecting the resolved toggle), then any root Drafts anchored there.
     /// Outdated threads are grouped separately; reply Drafts follow their parent.
     fn weaveInline(w: *Weave, file: *const model.File, ln: *const model.Line) !void {
+        // Blob-synthesized context lines (whole-file gaps) carry no diff anchor —
+        // only Hunk lines bind comments/Drafts (M9 anchor safety).
+        if (!ln.in_hunk) return;
         for (w.threads) |*t| {
             const anc = t.root.anchor orelse continue;
             if (t.root.state == .outdated) continue; // grouped below
@@ -410,6 +436,95 @@ fn parentEql(a: Parent, b: Parent) bool {
         .draft => |x| b == .draft and b.draft == x,
         .comment => |x| b == .comment and b.comment == x,
     };
+}
+
+/// The blob to splice for file `fi` in the whole-file view, or null when there's
+/// nothing to splice: no blob loaded, an empty blob, or a removed file (its new
+/// side is `/dev/null`, so there's no full-file text to fill from — it falls
+/// back to the fetched rendering). The old-side splice for removed files is
+/// deferred; whole-file review of a deletion adds little over the hunks.
+fn wholeFileBlob(blobs: []const model.FileBlob, fi: usize, file: model.File) ?[]const u8 {
+    if (file.status == .removed) return null;
+    if (fi >= blobs.len) return null;
+    const new = blobs[fi].new orelse return null;
+    return if (new.len == 0) null else new;
+}
+
+/// Splice a file's fetched Hunk lines into the unchanged lines of its new-side
+/// `blob`, producing the whole file as one `Line` sequence. Gaps before, between,
+/// and after the hunks are filled with `.context` lines drawn from the blob and
+/// flagged `in_hunk = false` (so they never anchor). Hunk lines are copied
+/// verbatim (keeping their kind, numbers, and `in_hunk = true`), and Bitbucket's
+/// hunk line numbers stay authoritative (ADR-0001): the gaps are computed from
+/// them, never the other way round. A blob shorter than the hunks expect just
+/// yields fewer gap lines — it degrades, it never misplaces a Hunk line.
+fn spliceNewSide(allocator: std.mem.Allocator, file: model.File, blob: []const u8) ![]const model.Line {
+    var lines = try splitBlobLines(allocator, blob);
+    defer lines.deinit(allocator);
+
+    var out: std.ArrayList(model.Line) = .empty;
+    // `new_cursor` is the next new-file line number (1-based) not yet emitted;
+    // `old_off` maps an unchanged new line to its old number: old = new + old_off.
+    var new_cursor: u32 = 1;
+    var old_off: i64 = 0;
+
+    for (file.hunks) |hunk| {
+        // Gap: blob lines from the cursor up to (but not including) the hunk.
+        while (new_cursor < hunk.new_start) : (new_cursor += 1) {
+            const text = blobLine(lines.items, new_cursor) orelse break;
+            try out.append(allocator, .{
+                .old_no = offsetOldNo(new_cursor, old_off),
+                .new_no = new_cursor,
+                .kind = .context,
+                .text = text,
+                .in_hunk = false,
+            });
+        }
+        // The hunk's own lines, verbatim (removed lines included).
+        try out.appendSlice(allocator, hunk.lines);
+        // Advance past the hunk's new-side span and fold its net line delta in.
+        new_cursor = hunk.new_start + hunk.new_count;
+        old_off -= @as(i64, hunk.new_count) - @as(i64, hunk.old_count);
+    }
+
+    // Trailing gap after the last hunk.
+    while (blobLine(lines.items, new_cursor)) |text| : (new_cursor += 1) {
+        try out.append(allocator, .{
+            .old_no = offsetOldNo(new_cursor, old_off),
+            .new_no = new_cursor,
+            .kind = .context,
+            .text = text,
+            .in_hunk = false,
+        });
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// old_no for an unchanged new line, clamped to a non-negative u32 (a mismatched
+/// blob could in theory drive it negative; a wrong gutter number beats a crash).
+fn offsetOldNo(new_no: u32, old_off: i64) ?u32 {
+    const v = @as(i64, new_no) + old_off;
+    return if (v < 1) null else @intCast(v);
+}
+
+/// The 1-based `n`th line of a blob already split into lines, or null if out of
+/// range (so gap loops stop cleanly at end-of-file).
+fn blobLine(lines: []const []const u8, n: u32) ?[]const u8 {
+    if (n == 0 or n > lines.len) return null;
+    return lines[n - 1];
+}
+
+/// Split a blob into its lines, borrowing slices of `blob` (zero-copy). A single
+/// trailing newline is not treated as an extra empty line, matching how editors
+/// count lines; interior blank lines are preserved.
+fn splitBlobLines(allocator: std.mem.Allocator, blob: []const u8) !std.ArrayList([]const u8) {
+    var lines: std.ArrayList([]const u8) = .empty;
+    errdefer lines.deinit(allocator);
+    const body = if (blob.len > 0 and blob[blob.len - 1] == '\n') blob[0 .. blob.len - 1] else blob;
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |line| try lines.append(allocator, line);
+    return lines;
 }
 
 /// Compute the folds for one hunk under the current scope. A maximal run of
@@ -1125,6 +1240,90 @@ test "the isolate view suppresses PR-level and other-file rows" {
     }
     // The PR-level draft and the b.txt draft are both suppressed.
     try testing.expectEqual(@as(usize, 0), countKind(buf, .draft));
+}
+
+// A one-file modification whose hunk covers only new lines 2-4; the full file
+// is five lines. Line 1 ("a") and line 5 ("e") live only in the blob.
+const whole_file_diff =
+    \\diff --git a/a.txt b/a.txt
+    \\--- a/a.txt
+    \\+++ b/a.txt
+    \\@@ -2,3 +2,3 @@
+    \\ b
+    \\-c
+    \\+CHANGED
+    \\ d
+    \\
+;
+const whole_file_blob = "a\nb\nCHANGED\nd\ne\n";
+
+test "whole_file splices blob gaps around the hunk, hunk lines preserved" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, whole_file_diff);
+    const blobs = [_]model.FileBlob{.{ .new = whole_file_blob }};
+    const buf = try buildWithComments(a, diff, .unified, &.{}, .{ .whole_file = true, .blobs = &blobs });
+
+    // Continuous file: a header and no hunk headers.
+    try testing.expectEqual(@as(usize, 1), countKind(buf, .file_header));
+    try testing.expectEqual(@as(usize, 0), countKind(buf, .hunk_header));
+
+    // Rows: file_header, then 6 lines — a(gap) b c CHANGED d e(gap).
+    try testing.expectEqual(@as(usize, 7), buf.rows.len);
+    const first = buf.rows[1].line;
+    try testing.expectEqualStrings("a", first.line.text);
+    try testing.expectEqual(@as(?u32, 1), first.line.new_no);
+    try testing.expect(!first.line.in_hunk); // blob-sourced gap line
+
+    // The hunk's context "b" is a real Hunk line.
+    try testing.expectEqualStrings("b", buf.rows[2].line.line.text);
+    try testing.expect(buf.rows[2].line.line.in_hunk);
+
+    // The change is present with its kinds.
+    try testing.expectEqual(model.LineKind.removed, buf.rows[3].line.line.kind);
+    try testing.expectEqual(model.LineKind.added, buf.rows[4].line.line.kind);
+
+    // The trailing gap line "e" comes from the blob.
+    const last = buf.rows[6].line;
+    try testing.expectEqualStrings("e", last.line.text);
+    try testing.expectEqual(@as(?u32, 5), last.line.new_no);
+    try testing.expect(!last.line.in_hunk);
+}
+
+test "whole_file with no blob falls back to the fetched per-hunk rendering" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, whole_file_diff);
+    // whole_file on, but no blobs loaded → per-hunk path (hunk header present).
+    const buf = try buildWithComments(a, diff, .unified, &.{}, .{ .whole_file = true });
+    try testing.expectEqual(@as(usize, 1), countKind(buf, .hunk_header));
+    // Only the fetched lines (b, c, CHANGED, d) — no blob gap lines.
+    try testing.expectEqual(@as(usize, 4), countKind(buf, .line));
+}
+
+test "whole_file anchors bind only to hunk lines, never blob gaps" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, whole_file_diff);
+    const blobs = [_]model.FileBlob{.{ .new = whole_file_blob }};
+
+    // A comment on new line 1 (a blob gap) must not attach; one on new line 3
+    // (the added "CHANGED", a real Hunk line) must.
+    const on_gap = [_]Comment{.{ .id = 1, .author = "Ada", .body = "gap?", .anchor = .{ .path = "a.txt", .to = 1 } }};
+    const gap_threads = try @import("../review/thread.zig").build(a, &on_gap);
+    const gap_buf = try buildWithComments(a, diff, .unified, gap_threads, .{ .whole_file = true, .blobs = &blobs });
+    try testing.expectEqual(@as(usize, 0), countKind(gap_buf, .comment));
+
+    const on_hunk = [_]Comment{.{ .id = 1, .author = "Ada", .body = "here", .anchor = .{ .path = "a.txt", .to = 3 } }};
+    const hunk_threads = try @import("../review/thread.zig").build(a, &on_hunk);
+    const hunk_buf = try buildWithComments(a, diff, .unified, hunk_threads, .{ .whole_file = true, .blobs = &blobs });
+    try testing.expectEqual(@as(usize, 1), countKind(hunk_buf, .comment));
 }
 
 test "an inline thread anchored to a missing current line is not lost silently" {

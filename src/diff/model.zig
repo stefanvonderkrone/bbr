@@ -21,6 +21,12 @@ pub const Line = struct {
     /// Text content with the diff prefix (` `/`+`/`-`) stripped, borrowed from
     /// the raw diff. Excludes the trailing newline.
     text: []const u8,
+    /// True for a line that came from the fetched diff (a Hunk line), false for a
+    /// `context` line synthesized from the file blob to fill the gaps between
+    /// hunks in the true-whole-file view. Anchors bind only to Hunk lines, so a
+    /// blob-sourced line never captures a comment or Draft (M9). Defaults true so
+    /// the parser and every existing construction stay Hunk lines.
+    in_hunk: bool = true,
 };
 
 /// A contiguous region of change plus surrounding context, as delimited by the
@@ -60,6 +66,16 @@ pub const File = struct {
 /// The complete set of changed files from one `DiffSource`.
 pub const Diff = struct {
     files: []const File,
+};
+
+/// A file's fetched full-text blobs, used by the true-whole-file view (M9) to
+/// fill the unchanged regions the diff omits. `new` is the file at the PR's
+/// source commit, `old` at the destination — either may stay `null` until the
+/// lazy per-file fetch returns. Held index-aligned with `Diff.files` (a Session
+/// side table), not on `File`, because they arrive after the diff is parsed.
+pub const FileBlob = struct {
+    old: ?[]const u8 = null,
+    new: ?[]const u8 = null,
 };
 
 const std = @import("std");

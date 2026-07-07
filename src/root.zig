@@ -22,6 +22,7 @@ pub const diff = struct {
     pub const Fold = buffer.Fold;
     pub const Diff = model.Diff;
     pub const File = model.File;
+    pub const FileBlob = model.FileBlob;
     pub const FileStatus = model.FileStatus;
     pub const Hunk = model.Hunk;
     pub const Line = model.Line;
