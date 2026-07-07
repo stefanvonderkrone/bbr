@@ -14,7 +14,7 @@ The complete set of changed Files from one DiffSource. The aggregate the whole U
 _Avoid_: changeset, patch.
 
 **File**:
-One changed path within a Diff, carrying its change status (added / modified / removed / renamed) and its Hunks. Also holds the full old and new blobs used for WholeFile scope and highlighting.
+One changed path within a Diff, carrying its change status (added / modified / removed / renamed) and its Hunks. Its full old/new file text (the blobs used for the WholeFile scope and, later, highlighting) is fetched lazily and held in a Session-side table index-aligned with the files, not on `File` itself — it arrives after the diff is parsed.
 _Avoid_: buffer (that's the render-side term), document, blob.
 
 **Hunk**:
@@ -22,7 +22,7 @@ A contiguous region of change plus its surrounding context lines, as delimited b
 _Avoid_: chunk, block, section.
 
 **Line**:
-A single row of the model: `{ old_no, new_no, kind, in_hunk, segments }`. Either `old_no` or `new_no` is absent depending on `kind`. The unit that Anchors point at.
+A single row of the model: `{ old_no, new_no, kind, text, in_hunk }`. Either `old_no` or `new_no` is absent depending on `kind`. `in_hunk` is true for a Line from the fetched diff (a Hunk line) and false for a `context` line synthesized from the file blob to fill the gaps in the WholeFile view — **only Hunk lines are Anchor targets**, so a blob-sourced line never captures a comment or Draft.
 _Avoid_: row (that's a screen coordinate).
 
 **LineKind**:
@@ -46,5 +46,5 @@ How a Buffer is arranged on screen: `Unified` (one column, removed above added) 
 _Avoid_: mode, split, inline.
 
 **Scope**:
-How much of a File a Buffer shows: `Changes` (hunks + context, with Folds) or `WholeFile` (every line, changes inline). The other orthogonal view axis.
+How much of a File a Buffer shows: `Changes` (hunks + context, with Folds) or `WholeFile` (every line of the file, changes inline — the hunks spliced into the file blob). The other orthogonal view axis. The UI cycles a third intermediate — *fetched-whole*, every fetched line with no folds — which is `Changes` unfolded; it's a rendering stop on the way to `WholeFile`, not a distinct model state, and `WholeFile` falls back to it until the blob loads.
 _Avoid_: view mode, filter, range.
