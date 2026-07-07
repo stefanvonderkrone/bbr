@@ -86,13 +86,15 @@ Today's `WholeFile` scope shows every *fetched* diff line but not the unchanged 
 
 _Deferred:_ the **removed-file** old-side splice — a deletion's whole-file view would show the entire old file as removed; low value over the hunks, and it needs the old blob at the destination commit (a second fetch side). The splice handles new-side files (added/modified/renamed); removed files fall back to the fetched rendering. Also: whole-file currently splices only the *focused* file's blob (the isolate trigger); scrolling across files in whole-file scope without isolating fetches each file as it gains focus.
 
-## M10 — Pending review: submission & failures  ·  M  ·  needs M6
-- [ ] `Submission`: topological order, temp-id → CommentId remap.
-- [ ] Failure model: retry (network/429/5xx), abort-on-auth, mark-and-continue (validation).
-- [ ] Duplicate guard (GET-and-dedupe on ambiguous failure).
-- [ ] Stale-anchor check: capture SourceCommit on load, re-check head before submit.
-- [ ] Per-item summary + selective retry of failed subtrees.
-- [ ] Tests: submission ordering, remap, each failure class, dedupe.
+## M10 — Pending review: submission & failures  ·  M  ·  ✅ done (rich per-item overlay & Retry-After deferred)
+- [x] `Submission`: topological order, temp-id → CommentId remap. ✅ `src/review/submission.zig` — a pure, clock-free state machine (`advance` returns the next action as data — post/wait/done/aborted — `report` feeds outcomes back). Reply parents remap to the parent's freshly-posted `CommentId` (or a `Parent.comment`'s existing id). The network is the new `CommentPoster` ptr+vtable seam (`Poster` in `src/bitbucket/poster.zig` implements it; `Client.createComment` POSTs).
+- [x] Failure model: retry (network/429/5xx), abort-on-auth, mark-and-continue (validation). ✅ retryable → capped exponential backoff (`.wait` step; 429 honors an explicit `Retry-After` param); auth (401/403) → `aborted`, everything kept pending; validation (400/404/malformed) → item `failed`, its reply-descendants `skipped` (a missing parent id blocks them naturally). Retries exhaust into an item failure after `max_attempts`.
+- [x] Duplicate guard (GET-and-dedupe on ambiguous failure). ✅ a transport failure is a distinct `ambiguous` outcome; the retry sets a `dedupe` flag and the worker `findExisting`s (GET-and-match on anchor + body) before re-POSTing.
+- [x] Stale-anchor check: capture SourceCommit on load, re-check head before submit. ✅ the submit worker re-fetches the PR head and, if `headChanged` vs the loaded source commit, refuses the batch (`stale`) with a "reopen the PR" message. _A force-submit-anyway path is deferred — reload is the remedy for now._
+- [x] Per-item summary + selective retry of failed subtrees. ✅ each item's fate streams back (`submit_progress`, persisted as it lands — ADR-0007 crash-safety) and rolls up into a status-bar summary (`N posted · M failed · K skipped`); a clean batch deletes its published Drafts, a partial one keeps failures pending so `X` again is selective retry (posted Drafts skipped). _A richer per-item overlay (list each Draft's status/reason) is deferred to M15 polish._
+- [x] Tests: submission ordering, remap, each failure class, dedupe. ✅ 15 engine tests (ordering, remap, abort, skip-descendants, backoff schedule + Retry-After, dedupe-on-ambiguous, retry exhaustion, selective retry, `headChanged`, driver-through-seam) + `createComment` URL/body/id/error tests + `Poster` posted/rejected/ambiguous mapping + dedupe hit/miss. Suite green.
+
+_Deferred:_ the async submit worker glue (event wiring, worker loop) isn't unit-tested — same posture as the M7/M9 workers; the pure engine and adapter carry the logic. `Retry-After` is plumbed through `report` but the `Poster` doesn't yet surface the header, so live 429s use computed backoff. Submission is single-batch-at-a-time (a second `X` while one runs is refused). No idempotency key exists on Bitbucket, so the duplicate guard is best-effort (anchor + exact-body match).
 
 ## M11 — Keymap & motions  ·  S/M  ·  needs M2
 - [ ] Full vim motion set + numeric Count register (`5j`, `zz`, …); arrows side by side.

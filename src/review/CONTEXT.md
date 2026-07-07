@@ -51,5 +51,14 @@ The whole graph of Drafts for one PullRequest, persisted via the PendingReviewSt
 _Avoid_: batch (that's the act), queue, staging.
 
 **Submission**:
-The act of publishing a PendingReview: topologically order Drafts (parents before Replies), POST each, remap temp ids to server CommentIds, and continue-on-item-failure while stopping the batch on auth failure.
+The act of publishing a PendingReview: topologically order Drafts (parents before Replies), POST each, remap temp ids to server CommentIds, and continue-on-item-failure while stopping the batch on auth failure. A retryable failure (rate-limit, server, network) is retried with backoff; a validation failure fails that Draft and *skips its reply-descendants* (they have no valid parent to attach to); an auth failure aborts the whole batch with everything kept pending. Modeled as a clock-free state machine that emits the next action as data, so its policy is pure; the network is the **CommentPoster** seam.
 _Avoid_: submit, flush, push, sync.
+
+**Selective retry**:
+Re-running Submission over a PendingReview that already has posted Drafts: those are recognized (their transient `posted` state) and skipped, so only the still-pending failures and their descendants are re-attempted. The user's remedy for a partial batch.
+
+**Stale-anchor guard**:
+A pre-Submission check that the PR's SourceCommit has not moved since load. If it has, the diff shifted under the Drafts' Anchors and their lines may no longer exist, so the batch is refused rather than posting to wrong lines.
+
+**Duplicate guard**:
+The defense against double-posting when a POST's response is lost (an *ambiguous* outcome — the comment may or may not have been created). Before retrying such a POST, fetch the PR's comments and skip if one already matches the Draft's anchor and body; Bitbucket has no idempotency key.
