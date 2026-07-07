@@ -319,6 +319,16 @@ pub fn drawPicker(scratch: std.mem.Allocator, win: vaxis.Window, picker: *const 
     const list_rows: u16 = h - 1;
     const matches = picker.matches();
 
+    // Before the summaries fetch returns (async open) show a placeholder in the
+    // list area; an empty repo after loading gets a distinct "none" line.
+    if (picker.loading or picker.prs.len == 0) {
+        var r: u16 = 1;
+        while (r <= list_rows) : (r += 1) fillRow(modal, r, theme.picker);
+        const msg: []const u8 = if (picker.loading) "  loading…" else "  no open pull requests";
+        _ = modal.printSegment(.{ .text = msg, .style = theme.picker }, .{ .row_offset = 1, .wrap = .none });
+        return;
+    }
+
     // Scroll so the selected row stays on screen.
     var top: usize = 0;
     if (picker.selected >= list_rows) top = picker.selected - list_rows + 1;

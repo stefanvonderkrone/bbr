@@ -10,6 +10,11 @@
 //! results from superseded switches are discarded (Epoch cancellation). Workers
 //! allocate from the stateless `page_allocator`, never the main thread's `gpa`.
 //!
+//! Opening the Picker uses the same pattern for its summaries fetch: `p` shows
+//! the overlay instantly in a loading state and a worker posts `picker_done`,
+//! stamped with a separate `picker_epoch` so a stale fetch can't populate a
+//! Picker that was closed and reopened.
+//!
 //! Lifetime: vaxis cells borrow their text until `render`. A Session owns its
 //! diff/threads for as long as it is current; per-frame gutter/overlay text is
 //! synthesized into `frame_arena`, reset *after* render.
@@ -48,11 +53,13 @@ pub const RunCtx = struct {
 };
 
 /// The event type our vaxis loop carries: the terminal events we consume plus
-/// `load_done`, posted by a background load worker.
+/// two background-worker completions — `load_done` (a Session switch) and
+/// `picker_done` (the PR summaries for an async Picker open).
 const AppEvent = union(enum) {
     key_press: vaxis.Key,
     winsize: vaxis.Winsize,
     load_done: LoadDone,
+    picker_done: PickerDone,
 };
 
 const LoadOutcome = union(enum) {
@@ -63,6 +70,37 @@ const LoadOutcome = union(enum) {
 const LoadDone = struct {
     epoch: u64,
     outcome: LoadOutcome,
+};
+
+/// The PR summaries a Picker load fetched, owned by their own arena so the
+/// worker can hand them across threads. The main thread copies what it needs
+/// into `picker_arena` and calls `destroy` — mirroring `Session`.
+const Summaries = struct {
+    arena: std.heap.ArenaAllocator,
+    prs: []const PullRequestSummary,
+
+    fn destroy(self: *Summaries) void {
+        const backing = self.arena.child_allocator;
+        self.arena.deinit();
+        backing.destroy(self);
+    }
+};
+
+const PickerOutcome = union(enum) {
+    ok: *Summaries,
+    err: anyerror,
+};
+
+const PickerDone = struct {
+    epoch: u64,
+    outcome: PickerOutcome,
+};
+
+/// Request handed to a Picker load worker (`repo` copied by value, as `LoadReq`).
+const PickerReq = struct {
+    repo: [256]u8,
+    repo_len: usize,
+    epoch: u64,
 };
 
 const Loop = vaxis.Loop(AppEvent);
@@ -153,6 +191,16 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
         loads.deinit(gpa);
     }
 
+    // In-flight Picker summary loads, tracked separately from Session loads:
+    // they carry their own generation (`picker_epoch`) so a stale fetch can't
+    // populate a Picker that was closed and reopened. Awaited before teardown.
+    var picker_epoch: u64 = 0;
+    var picker_loads: std.ArrayList(Load) = .empty;
+    defer {
+        for (picker_loads.items) |*l| _ = l.future.await(io);
+        picker_loads.deinit(gpa);
+    }
+
     try loop.installResizeHandler();
     try vx.enterAltScreen(writer);
 
@@ -223,7 +271,7 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
                     if (key.matches('q', .{}) or key.matches('c', .{ .ctrl = true })) break;
 
                     if (key.matches('p', .{}) and ctx.online) {
-                        openPicker(ctx, &picker, &picker_arena) catch |err| {
+                        openPicker(ctx, &picker, &picker_arena, &loop, &picker_loads, &picker_epoch, gpa) catch |err| {
                             status_msg = @errorName(err);
                         };
                     } else if (key.matches('R', .{})) {
@@ -293,6 +341,33 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
                     }
                 }
             },
+            .picker_done => |done| {
+                reap(&picker_loads, io, done.epoch);
+                // Apply only if this is the current open and the Picker is still
+                // up (not closed, not superseded by a reopen). Otherwise discard.
+                if (done.epoch != picker_epoch or picker == null) {
+                    if (done.outcome == .ok) done.outcome.ok.destroy();
+                } else switch (done.outcome) {
+                    .ok => |sums| {
+                        defer sums.destroy();
+                        // Copy the summaries into the Picker's own arena; the
+                        // worker's arena dies with `sums` on return.
+                        if (dupeSummaries(picker_arena.allocator(), sums.prs)) |copied| {
+                            if (picker) |*p| p.populate(copied) catch |err| {
+                                status_msg = @errorName(err);
+                                picker = null;
+                            };
+                        } else |err| {
+                            status_msg = @errorName(err);
+                            picker = null;
+                        }
+                    },
+                    .err => |e| {
+                        status_msg = @errorName(e);
+                        picker = null;
+                    },
+                }
+            },
         }
 
         const selected_file = fileIndexForRow(buf, nav.cursor);
@@ -319,19 +394,39 @@ fn rebuild(alloc: std.mem.Allocator, s: *const Session, layout: bbr.diff.Layout,
     return bbr.diff.buffer.buildWithComments(alloc, s.diff, layout, s.threads, opts);
 }
 
-/// Fetch the repo's open PRs (synchronously — one request) and open the Picker
-/// over them. Summaries and picker state live in `picker_arena`, reset per open.
-fn openPicker(ctx: RunCtx, picker: *?Picker, picker_arena: *std.heap.ArenaAllocator) !void {
+/// Open the Picker immediately in a loading state and kick the summaries fetch
+/// onto a worker thread; `picker_done` populates it when the list returns. The
+/// picker state (and the copied summaries) live in `picker_arena`, reset per
+/// open. If the spawn fails we leave the Picker closed and surface the error.
+fn openPicker(
+    ctx: RunCtx,
+    picker: *?Picker,
+    picker_arena: *std.heap.ArenaAllocator,
+    loop: *Loop,
+    picker_loads: *std.ArrayList(Load),
+    picker_epoch: *u64,
+    gpa: std.mem.Allocator,
+) !void {
     _ = picker_arena.reset(.retain_capacity);
-    const a = picker_arena.allocator();
+    try spawnPickerLoad(ctx, loop, picker_loads, picker_epoch, gpa);
+    picker.* = Picker.initLoading(picker_arena.allocator());
+}
 
-    var http = bbr.http.StdHttpClient.init(a, ctx.io);
-    defer http.deinit();
-    try http.initDefaultProxies(a, ctx.env_map);
-    const bb = bbr.bitbucket.Client.init(http.httpClient(), ctx.cred);
-
-    const prs = try bb.listPullRequests(a, ctx.repo, .{});
-    picker.* = try Picker.init(a, prs);
+/// Deep-copy PR summaries into `a` (the Picker's arena) so they outlive the
+/// worker's arena. The set is small — the open PRs of one repo.
+fn dupeSummaries(a: std.mem.Allocator, prs: []const PullRequestSummary) ![]PullRequestSummary {
+    const out = try a.alloc(PullRequestSummary, prs.len);
+    for (prs, out) |src, *dst| {
+        dst.* = .{
+            .id = src.id,
+            .title = try a.dupe(u8, src.title),
+            .state = try a.dupe(u8, src.state),
+            .author_display_name = try a.dupe(u8, src.author_display_name),
+            .source_branch = try a.dupe(u8, src.source_branch),
+            .destination_branch = try a.dupe(u8, src.destination_branch),
+        };
+    }
+    return out;
 }
 
 /// Open the Composer with a ready-made Request (a static label). Resets the
@@ -432,6 +527,68 @@ fn spawnLoad(
 
     const fut = try ctx.io.concurrent(loadWorker, .{ loop, ctx.io, ctx.env_map, ctx.cred, req });
     try loads.append(gpa, .{ .epoch = epoch.*, .future = fut });
+}
+
+/// Launch a background Picker summaries fetch, bumping `picker_epoch`. The
+/// worker posts a `picker_done` stamped with this epoch; only a result matching
+/// the current epoch (and an open Picker) is applied.
+fn spawnPickerLoad(
+    ctx: RunCtx,
+    loop: *Loop,
+    picker_loads: *std.ArrayList(Load),
+    picker_epoch: *u64,
+    gpa: std.mem.Allocator,
+) !void {
+    picker_epoch.* += 1;
+    var req: PickerReq = .{ .repo = undefined, .repo_len = @min(ctx.repo.len, 256), .epoch = picker_epoch.* };
+    @memcpy(req.repo[0..req.repo_len], ctx.repo[0..req.repo_len]);
+
+    const fut = try ctx.io.concurrent(pickerWorker, .{ loop, ctx.io, ctx.env_map, ctx.cred, req });
+    try picker_loads.append(gpa, .{ .epoch = picker_epoch.*, .future = fut });
+}
+
+/// Runs on a worker thread. Fetches the repo's open-PR summaries off the page
+/// allocator and posts them back. Frees the result if the hand-off fails.
+fn pickerWorker(
+    loop: *Loop,
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+    cred: Credential,
+    req: PickerReq,
+) void {
+    const repo = req.repo[0..req.repo_len];
+    const outcome: PickerOutcome = if (fetchSummaries(io, env_map, cred, repo)) |s|
+        .{ .ok = s }
+    else |err|
+        .{ .err = err };
+
+    loop.postEvent(.{ .picker_done = .{ .epoch = req.epoch, .outcome = outcome } }) catch {
+        if (outcome == .ok) outcome.ok.destroy();
+    };
+}
+
+/// Fetch the repo's open-PR summaries into a self-owned `Summaries` on the page
+/// allocator (thread-safe, so the worker never races the main thread's gpa).
+fn fetchSummaries(
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+    cred: Credential,
+    repo: []const u8,
+) !*Summaries {
+    const page = std.heap.page_allocator;
+    const s = try page.create(Summaries);
+    errdefer page.destroy(s);
+    s.arena = std.heap.ArenaAllocator.init(page);
+    errdefer s.arena.deinit();
+    const a = s.arena.allocator();
+
+    var http = bbr.http.StdHttpClient.init(a, io);
+    defer http.deinit();
+    try http.initDefaultProxies(a, env_map);
+    const bb = bbr.bitbucket.Client.init(http.httpClient(), cred);
+
+    s.prs = try bb.listPullRequests(a, repo, .{});
+    return s;
 }
 
 /// Await and drop the tracked load with `epoch` (its result has arrived). The

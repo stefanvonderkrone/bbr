@@ -35,40 +35,71 @@ pub const Picker = struct {
     query_buf: [256]u8 = undefined,
     query_len: usize = 0,
 
+    /// True until the background summaries fetch arrives (async open, app.zig).
+    /// A loading Picker shows a placeholder; it still accepts query input, which
+    /// is applied against the list the moment `populate` runs.
+    loading: bool = false,
+    /// Whether `haystacks`/`match_buf`/`score_buf` are heap allocations we own.
+    /// A loading Picker that is never populated owns nothing to free.
+    populated: bool = false,
+
+    /// A ready Picker over `prs` (the synchronous path; also used by tests).
     pub fn init(allocator: std.mem.Allocator, prs: []const PullRequestSummary) !Picker {
-        const haystacks = try allocator.alloc([]const u8, prs.len);
-        errdefer allocator.free(haystacks);
+        var self = initLoading(allocator);
+        try self.populate(prs);
+        return self;
+    }
+
+    /// An empty Picker in the loading state — no allocation, so it cannot fail.
+    /// `populate` fills it once the summaries fetch returns.
+    pub fn initLoading(allocator: std.mem.Allocator) Picker {
+        return .{
+            .allocator = allocator,
+            .prs = &.{},
+            .haystacks = &.{},
+            .match_buf = &.{},
+            .score_buf = &.{},
+            .match_count = 0,
+            .loading = true,
+        };
+    }
+
+    /// Fill a (loading) Picker with the fetched summaries: build the haystacks
+    /// and match buffers, clear the loading flag, and re-filter with any query
+    /// the reviewer typed while it was loading. `prs` must outlive the Picker.
+    pub fn populate(self: *Picker, prs: []const PullRequestSummary) !void {
+        const haystacks = try self.allocator.alloc([]const u8, prs.len);
+        errdefer self.allocator.free(haystacks);
         var built: usize = 0;
-        errdefer for (haystacks[0..built]) |h| allocator.free(h);
+        errdefer for (haystacks[0..built]) |h| self.allocator.free(h);
         for (prs, 0..) |pr, i| {
-            haystacks[i] = try std.fmt.allocPrint(allocator, "#{d} {s} {s} {s}", .{
+            haystacks[i] = try std.fmt.allocPrint(self.allocator, "#{d} {s} {s} {s}", .{
                 pr.id, pr.title, pr.source_branch, pr.author_display_name,
             });
             built += 1;
         }
 
-        const match_buf = try allocator.alloc(usize, prs.len);
-        errdefer allocator.free(match_buf);
-        const score_buf = try allocator.alloc(f64, prs.len);
-        errdefer allocator.free(score_buf);
+        const match_buf = try self.allocator.alloc(usize, prs.len);
+        errdefer self.allocator.free(match_buf);
+        const score_buf = try self.allocator.alloc(f64, prs.len);
+        errdefer self.allocator.free(score_buf);
 
-        var self: Picker = .{
-            .allocator = allocator,
-            .prs = prs,
-            .haystacks = haystacks,
-            .match_buf = match_buf,
-            .score_buf = score_buf,
-            .match_count = 0,
-        };
+        self.prs = prs;
+        self.haystacks = haystacks;
+        self.match_buf = match_buf;
+        self.score_buf = score_buf;
+        self.populated = true;
+        self.loading = false;
         self.refilter();
-        return self;
     }
 
     pub fn deinit(self: *Picker) void {
-        for (self.haystacks) |h| self.allocator.free(h);
-        self.allocator.free(self.haystacks);
-        self.allocator.free(self.match_buf);
-        self.allocator.free(self.score_buf);
+        if (self.populated) {
+            for (self.haystacks) |h| self.allocator.free(h);
+            self.allocator.free(self.haystacks);
+            self.allocator.free(self.match_buf);
+            self.allocator.free(self.score_buf);
+        }
         self.* = undefined;
     }
 
@@ -231,6 +262,32 @@ test "navigation clamps at both ends" {
     p.moveDown();
     p.moveDown(); // clamps at 2 (three matches)
     try testing.expectEqual(@as(usize, 2), p.selected);
+}
+
+test "a loading picker has no matches until populated" {
+    var p = Picker.initLoading(testing.allocator);
+    defer p.deinit();
+    try testing.expect(p.loading);
+    try testing.expectEqual(@as(usize, 0), p.matches().len);
+    try testing.expect(p.selection() == null);
+
+    // A query typed while loading is retained and applied on populate.
+    p.insert("nav");
+    try testing.expectEqual(@as(usize, 0), p.matches().len);
+
+    try p.populate(samplePrs());
+    try testing.expect(!p.loading);
+    try testing.expectEqual(@as(usize, 1), p.matches().len);
+    try testing.expectEqual(@as(u64, 11), p.selection().?.id);
+}
+
+test "populate with an empty list leaves a ready, empty picker" {
+    var p = Picker.initLoading(testing.allocator);
+    defer p.deinit();
+    try p.populate(&.{});
+    try testing.expect(!p.loading);
+    try testing.expectEqual(@as(usize, 0), p.matches().len);
+    try testing.expect(p.selection() == null);
 }
 
 test "selection is clamped when the query shrinks the match set" {
