@@ -338,6 +338,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
 // tests run via src/root.zig.
 test {
     _ = @import("tui/app.zig");
+    _ = @import("persist/sqlite_store.zig");
 }
 
 // The demo is our offline validation surface, so guard that its synthetic data

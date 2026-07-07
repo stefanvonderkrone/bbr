@@ -13,19 +13,23 @@ pub fn build(b: *std.Build) void {
     const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
     const zf = b.dependency("zf", .{ .target = target, .optimize = optimize });
 
-    const exe = b.addExecutable(.{
-        .name = "bbr",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "bbr", .module = mod },
-                .{ .name = "vaxis", .module = vaxis.module("vaxis") },
-                .{ .name = "zf", .module = zf.module("zf") },
-            },
-        }),
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        // The vendored SQLite amalgamation is compiled into the executable (it
+        // needs libc). The pure `bbr` module stays C-free so its tests run with
+        // no C toolchain — the persistence seam is faked there (ADR-0003, 0006).
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "bbr", .module = mod },
+            .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+            .{ .name = "zf", .module = zf.module("zf") },
+        },
     });
+    addSqlite(b, exe_mod);
+
+    const exe = b.addExecutable(.{ .name = "bbr", .root_module = exe_mod });
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -52,4 +56,19 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+}
+
+/// Compile the vendored SQLite amalgamation into `mod`. Flags harden and trim
+/// the build: single-threaded (bbr touches the store only on the main thread,
+/// design §10), no double-quoted string literals, no runtime extension loading.
+fn addSqlite(b: *std.Build, mod: *std.Build.Module) void {
+    const sqlite_flags = [_][]const u8{
+        "-DSQLITE_THREADSAFE=0",
+        "-DSQLITE_DQS=0",
+        "-DSQLITE_OMIT_LOAD_EXTENSION",
+        "-DSQLITE_OMIT_DEPRECATED",
+        "-DSQLITE_DEFAULT_MEMSTATUS=0",
+    };
+    mod.addIncludePath(b.path("vendors/sqlite"));
+    mod.addCSourceFile(.{ .file = b.path("vendors/sqlite/sqlite3.c"), .flags = &sqlite_flags });
 }

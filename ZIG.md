@@ -145,6 +145,13 @@ the main thread; the Epoch token still guards against stale results.
   compiler errors `file exists in modules 'bbr' and 'root'`. Reach shared decls **through the
   module's public API** (`bbr.http.Canned`), never by direct path. This bites most often in
   cross-module *test* code pulling a fixture/helper from the library.
+- **Vendored C (SQLite amalgamation) attaches to a module, and only that module needs libc.**
+  `mod.addIncludePath(b.path("vendors/sqlite"))` + `mod.addCSourceFile(.{ .file = …, .flags = &.{…} })`,
+  and set `.link_libc = true` in that module's `createModule` options. bbr attaches SQLite to the
+  **exe module only**, so the pure `bbr` library module (and its tests) stay C-free — the store is
+  reached through the `PendingReviewStore` seam and faked in domain tests (ADR-0003, ADR-0006).
+  `@cImport({ @cInclude("sqlite3.h"); })` then works from a file in that module. The C flags reach
+  the compiler as `-cflags … --` (visible in the failing-command dump).
 
 ## 6. Testing
 

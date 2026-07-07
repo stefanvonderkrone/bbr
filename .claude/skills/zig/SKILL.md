@@ -57,6 +57,18 @@ from repeating past mistakes. The version-pinned API catalog bbr relies on lives
 - **`ArenaAllocator.reset` takes a `ResetMode` union**, not a bool:
   `union(enum){ free_all, retain_capacity, /* shrink-to-N */ }`. `reset(.retain_capacity)` keeps
   backing pages — the cheap-reuse path for buffer-scoped arenas.
+- **`@ptrFromInt` to a *function-pointer* type fails the alignment check** ("pointer type … requires
+  aligned address") because fn pointers carry an alignment and an arbitrary int like `maxInt(usize)`
+  or `-1` isn't aligned. This blocks the classic `SQLITE_TRANSIENT = (sqlite3_destructor_type)-1`
+  trick. When the bound buffer outlives the call that reads it (bbr binds a Draft's borrowed slices,
+  then `sqlite3_step`s, then finalizes — all before returning), pass `null` (`SQLITE_STATIC`)
+  instead: SQLite won't copy, and the slice is still valid through `step`.
+- **`std.Io.Dir` has no `realpathAlloc` in 0.16.** `std.testing.tmpDir(.{})` returns
+  `TmpDir{ dir: Io.Dir, parent_dir: Io.Dir, sub_path: [N]u8 }` created at `.zig-cache/tmp/<sub_path>`
+  relative to cwd. To hand a C API (SQLite) a filesystem path, build the *relative* path from
+  `tmp.sub_path` — `".zig-cache/tmp/{s}/pending.db"` with `&tmp.sub_path` — rather than resolving an
+  absolute one; `tmp.cleanup()` removes the subtree. Make a NUL-terminated path with
+  `std.fmt.allocPrintSentinel(a, fmt, args, 0)` (returns `[:0]u8`); `allocPrintZ` is gone.
 - **Tests only run if reachable via `_ = @import` chains from the test-root file's `test` blocks.**
   Calling a function in another file compiles that file but does **not** run its `test` blocks. If a
   file's tests aren't chained in (root has `test { _ = @import("child.zig"); }`, child chains
