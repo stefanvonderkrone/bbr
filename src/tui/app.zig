@@ -23,6 +23,14 @@
 //! pattern (`blob_done`, keyed by PR id + file index): the frame renders the
 //! fetched lines immediately and re-weaves when the blob arrives (M9).
 //!
+//! `X` submits the pending review (M10): a worker snapshots the Drafts, then
+//! drives the pure `Submission` engine — POSTing each in topological order,
+//! remapping reply parents to their new ids, retrying with backoff, aborting on
+//! auth — and streams each item's fate back as `submit_progress` (persisted as
+//! it lands) plus a final `submit_done`. A clean batch deletes its now-published
+//! Drafts (ADR-0007); a partial one keeps the failures pending for a retry (`X`
+//! again is selective retry — already-posted Drafts are skipped).
+//!
 //! Lifetime: vaxis cells borrow their text until `render`. A Session owns its
 //! diff/threads for as long as it is current; per-frame gutter/overlay text is
 //! synthesized into `frame_arena`, reset *after* render.
@@ -69,6 +77,8 @@ const AppEvent = union(enum) {
     load_done: LoadDone,
     picker_done: PickerDone,
     blob_done: BlobDone,
+    submit_progress: SubmitProgress,
+    submit_done: SubmitDone,
 };
 
 const LoadOutcome = union(enum) {
@@ -159,6 +169,49 @@ const BlobReq = struct {
 const InflightBlob = struct {
     pr_id: u64,
     file_idx: usize,
+};
+
+/// One item's fate as the submission worker decides it, posted back so the main
+/// thread can persist the Draft's new state (ADR-0007) as the batch runs. Carries
+/// only plain values, so it crosses the thread boundary freely.
+const SubmitProgress = struct {
+    epoch: u64,
+    pr_id: u64,
+    item: bbr.review.ItemResult,
+};
+
+/// The terminal result of a submission batch. `stale` means the PR head moved
+/// since load so nothing was posted (§9 stale-anchor guard); `aborted` carries
+/// an auth failure that stopped the batch. Otherwise the roll-up counts describe
+/// what happened, and a clean batch (`failed == 0 and skipped == 0`) triggers the
+/// delete-on-batch-success step.
+const SubmitDone = struct {
+    epoch: u64,
+    pr_id: u64,
+    posted: usize,
+    failed: usize,
+    skipped: usize,
+    aborted: ?anyerror,
+    stale: bool,
+};
+
+/// A submission request handed to the worker: a self-owned snapshot of the PR's
+/// pending Drafts (deep-copied into `arena` so the worker never touches
+/// main-thread memory), plus the repo, PR id, and the source commit we loaded
+/// against (for the stale-anchor check). The worker owns it and `destroy`s it.
+const Submit = struct {
+    arena: std.heap.ArenaAllocator,
+    review: PendingReview,
+    repo: []const u8,
+    pr_id: u64,
+    loaded_commit: []const u8,
+    epoch: u64,
+
+    fn destroy(self: *Submit) void {
+        const backing = self.arena.child_allocator;
+        self.arena.deinit();
+        backing.destroy(self);
+    }
 };
 
 const Loop = vaxis.Loop(AppEvent);
@@ -287,6 +340,20 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
     }
     var blob_inflight: std.ArrayList(InflightBlob) = .empty;
     defer blob_inflight.deinit(gpa);
+
+    // In-flight submission batch (M10), tracked like the loads above so the
+    // worker is awaited before teardown. `submit_epoch` discards submit events
+    // from a batch superseded by a PR switch; only one batch runs at a time.
+    var submit_epoch: u64 = 0;
+    var submit_loads: std.ArrayList(Load) = .empty;
+    defer {
+        for (submit_loads.items) |*l| _ = l.future.await(io);
+        submit_loads.deinit(gpa);
+    }
+    var submitting = false;
+    // Durable backing for a submit summary/error message (status_msg borrows it
+    // across frames; a frame-arena string would dangle after the reset).
+    var status_buf: [192]u8 = undefined;
 
     try loop.installResizeHandler();
     try vx.enterAltScreen(writer);
@@ -448,6 +515,21 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                 buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                 nav.setRowCount(buf.rows.len);
                             }
+                        } else if (key.matches('X', .{})) {
+                            // Submit the pending review to Bitbucket (M10). Runs
+                            // on a worker; results stream back as submit events.
+                            if (!ctx.online) {
+                                status_msg = "offline: cannot submit";
+                            } else if (submitting) {
+                                status_msg = "already submitting…";
+                            } else if (review.drafts.items.len == 0) {
+                                status_msg = "no pending drafts to submit";
+                            } else if (spawnSubmit(ctx, &loop, &submit_loads, &submit_epoch, gpa, &review, cur.pr.id, cur.pr.source_commit)) |_| {
+                                submitting = true;
+                                status_msg = null;
+                            } else |err| {
+                                status_msg = @errorName(err);
+                            }
                         } else if (handleKey(&nav, &pending_g, key)) |_| {}
                     }
                 }
@@ -477,6 +559,9 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                             // (still tracked in blob_loads) will be discarded on
                             // arrival by the PR-id check.
                             blob_inflight.clearRetainingCapacity();
+                            // A submission targeting the old PR is now stale; its
+                            // events are discarded by the epoch/pr-id guards.
+                            submitting = false;
                             // Load the new PR's pending Drafts into a fresh arena.
                             _ = review_arena.reset(.retain_capacity);
                             review = ctx.store.loadReview(review_arena.allocator(), s.pr.id) catch PendingReview.init(s.pr.id);
@@ -544,6 +629,53 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                     },
                 }
             },
+            .submit_progress => |p| {
+                // Persist each item's new state as the batch runs, so a crash
+                // mid-submit resumes correctly (ADR-0007). Only for the live
+                // batch and the PR it targeted; a `skipped` item was never tried,
+                // so it stays a plain draft for a later selective retry.
+                if (p.epoch == submit_epoch) {
+                    if (current) |c| if (c.pr.id == p.pr_id) {
+                        const new_state: ?bbr.review.DraftState = switch (p.item.status) {
+                            .posted => .{ .posted = p.item.id.? },
+                            .failed => .{ .failed = p.item.reason orelse error.ServerError },
+                            .skipped => null,
+                        };
+                        if (new_state) |st| if (review.get(p.item.temp_id)) |d| {
+                            d.state = st;
+                            ctx.store.put(c.pr.id, d.*) catch |err| {
+                                status_msg = @errorName(err);
+                            };
+                        };
+                    };
+                }
+            },
+            .submit_done => |done| {
+                reap(&submit_loads, io, done.epoch);
+                if (done.epoch == submit_epoch) {
+                    submitting = false;
+                    if (done.stale) {
+                        status_msg = "PR head changed since load — reopen the PR before submitting";
+                    } else if (done.aborted) |e| {
+                        status_msg = std.fmt.bufPrint(&status_buf, "submit aborted: {s} (all kept pending)", .{@errorName(e)}) catch @errorName(e);
+                    } else {
+                        status_msg = std.fmt.bufPrint(&status_buf, "submitted: {d} posted · {d} failed · {d} skipped", .{ done.posted, done.failed, done.skipped }) catch "submitted";
+                        // Delete-on-batch-success (ADR-0007): a clean batch owns no
+                        // lingering posted rows — the comments live on the server.
+                        if (done.failed == 0 and done.skipped == 0) {
+                            if (current) |cur| {
+                                for (review.drafts.items) |d| ctx.store.remove(cur.pr.id, d.local_id) catch {};
+                                review.drafts.clearRetainingCapacity();
+                            }
+                        }
+                    }
+                    // Reflect the new draft states (or their removal) in the pane.
+                    if (current) |cur| {
+                        buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                        nav.setRowCount(buf.rows.len);
+                    }
+                }
+            },
         }
 
         // Lazily fetch the focused file's blob for the whole-file scope — off the
@@ -568,7 +700,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
             // otherwise it follows the cursor across the all-files buffer.
             const selected_file = isolate_file orelse fileIndexForRow(buf, nav.cursor);
             render.draw(frame, win, cur.diff, buf, active_theme, nav, selected_file, cur.threads, review.drafts.items);
-            drawStatus(frame, win, cur.pr, nav, buf, layout, scope, show_resolved, isolate_file != null, loading, status_msg);
+            drawStatus(frame, win, cur.pr, nav, buf, layout, scope, show_resolved, isolate_file != null, loading, submitting, review.drafts.items.len, status_msg);
         }
         if (picker) |*p| render.drawPicker(frame, win, p, active_theme);
         if (composer) |*comp| render.drawComposer(frame, win, comp, active_theme);
@@ -815,6 +947,168 @@ fn fetchSummaries(
 
     s.prs = try bb.listPullRequests(a, repo, .{});
     return s;
+}
+
+/// Launch a background submission of the current PR's pending review, bumping
+/// `submit_epoch`. Snapshots the Drafts into a self-owned request so the worker
+/// never touches main-thread memory, then hands it off; the worker owns and
+/// destroys the snapshot. Results arrive as `submit_progress`/`submit_done`.
+fn spawnSubmit(
+    ctx: RunCtx,
+    loop: *Loop,
+    submit_loads: *std.ArrayList(Load),
+    submit_epoch: *u64,
+    gpa: std.mem.Allocator,
+    review: *const PendingReview,
+    pr_id: u64,
+    loaded_commit: []const u8,
+) !void {
+    submit_epoch.* += 1;
+    const s = try buildSubmit(ctx, review, pr_id, loaded_commit, submit_epoch.*);
+    const fut = ctx.io.concurrent(submitWorker, .{ loop, ctx.io, ctx.env_map, ctx.cred, s }) catch |err| {
+        s.destroy(); // worker never started; we still own the snapshot
+        return err;
+    };
+    try submit_loads.append(gpa, .{ .epoch = submit_epoch.*, .future = fut });
+}
+
+/// Build a self-owned submission request: deep-copy the review's Drafts into a
+/// page-allocator arena (so they cross the thread boundary), plus the repo, PR
+/// id, and the source commit we loaded against. Freed via `Submit.destroy`.
+fn buildSubmit(
+    ctx: RunCtx,
+    review: *const PendingReview,
+    pr_id: u64,
+    loaded_commit: []const u8,
+    epoch: u64,
+) !*Submit {
+    const page = std.heap.page_allocator;
+    const s = try page.create(Submit);
+    errdefer page.destroy(s);
+    s.arena = std.heap.ArenaAllocator.init(page);
+    errdefer s.arena.deinit();
+    const a = s.arena.allocator();
+
+    s.review = PendingReview.init(pr_id);
+    for (review.drafts.items) |d| {
+        try s.review.addExisting(a, try bbr.review.store.dupeDraft(a, d));
+    }
+    s.repo = try a.dupe(u8, ctx.repo);
+    s.pr_id = pr_id;
+    s.loaded_commit = try a.dupe(u8, loaded_commit);
+    s.epoch = epoch;
+    return s;
+}
+
+/// Runs on a worker thread. Drives the pure `Submission` engine over the snapshot
+/// review, POSTing each step through a Bitbucket `Poster` and sleeping on retry
+/// backoff. Posts each item's decided state as `submit_progress`, then a final
+/// `submit_done`. First re-checks the PR head and bails (stale) if it moved.
+fn submitWorker(
+    loop: *Loop,
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+    cred: Credential,
+    req: *Submit,
+) void {
+    defer req.destroy();
+    const page = std.heap.page_allocator;
+
+    var scratch = std.heap.ArenaAllocator.init(page);
+    defer scratch.deinit();
+
+    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
+    defer http.deinit();
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
+
+    // Stale-anchor guard (§9): if the source head moved since load, anchors may
+    // no longer resolve — don't post anything. A failed head check itself is not
+    // grounds to block; only a confirmed change is.
+    if (client.getPullRequest(scratch.allocator(), req.repo, req.pr_id)) |pr| {
+        if (bbr.review.headChanged(req.loaded_commit, pr.source_commit)) {
+            loop.postEvent(.{ .submit_done = .{ .epoch = req.epoch, .pr_id = req.pr_id, .posted = 0, .failed = 0, .skipped = 0, .aborted = null, .stale = true } }) catch {};
+            return;
+        }
+    } else |_| {}
+    _ = scratch.reset(.retain_capacity);
+
+    var sub = bbr.review.Submission.init(page, &req.review) catch {
+        loop.postEvent(.{ .submit_done = .{ .epoch = req.epoch, .pr_id = req.pr_id, .posted = 0, .failed = 0, .skipped = 0, .aborted = error.OutOfMemory, .stale = false } }) catch {};
+        return;
+    };
+    defer sub.deinit();
+
+    var poster = bbr.bitbucket.Poster{ .client = client, .allocator = scratch.allocator(), .repo_slug = req.repo, .pr_id = req.pr_id };
+    const cp = poster.poster();
+
+    // Tracks which results we've already posted as progress. On the (rare) OOM
+    // we fall back to an empty slice: `emitProgress` then no-ops, but the batch
+    // still runs and the final `submit_done` still lands.
+    var no_emit = [_]bool{};
+    const emitted: []bool = page.alloc(bool, sub.results.len) catch no_emit[0..];
+    defer if (emitted.len > 0) page.free(emitted);
+    @memset(emitted, false);
+
+    while (true) {
+        const step = sub.advance();
+        emitProgress(loop, req, &sub, emitted);
+        switch (step) {
+            .post => |ps| {
+                _ = scratch.reset(.retain_capacity);
+                const d = req.review.getConst(ps.temp_id).?;
+                // On an ambiguous retry, dedupe first (GET-and-match) so a
+                // lost-response POST isn't sent twice (§9 "Duplicates").
+                var outcome: bbr.review.PostOutcome = undefined;
+                if (ps.dedupe) {
+                    if (cp.findExisting(d.*) catch null) |existing| {
+                        outcome = .{ .posted = existing };
+                    } else {
+                        outcome = cp.post(d.*, ps.parent) catch .ambiguous;
+                    }
+                } else {
+                    outcome = cp.post(d.*, ps.parent) catch .ambiguous;
+                }
+                sub.report(outcome, null);
+                emitProgress(loop, req, &sub, emitted);
+            },
+            .wait => |w| io.sleep(std.Io.Duration.fromMilliseconds(@intCast(w.ms)), .awake) catch {},
+            .done, .aborted => break,
+        }
+    }
+    emitProgress(loop, req, &sub, emitted);
+
+    var posted: usize = 0;
+    var failed: usize = 0;
+    var skipped: usize = 0;
+    for (sub.results) |maybe| {
+        const r = maybe orelse continue;
+        switch (r.status) {
+            .posted => posted += 1,
+            .failed => failed += 1,
+            .skipped => skipped += 1,
+        }
+    }
+    loop.postEvent(.{ .submit_done = .{
+        .epoch = req.epoch,
+        .pr_id = req.pr_id,
+        .posted = posted,
+        .failed = failed,
+        .skipped = skipped,
+        .aborted = sub.aborted_reason,
+        .stale = false,
+    } }) catch {};
+}
+
+/// Post a `submit_progress` for every item decided since the last call (both the
+/// items `report` resolved and the ones `advance` skipped), marking them emitted.
+fn emitProgress(loop: *Loop, req: *Submit, sub: *bbr.review.Submission, emitted: []bool) void {
+    for (sub.results, 0..) |maybe, i| {
+        if (i >= emitted.len or emitted[i]) continue;
+        const r = maybe orelse continue;
+        emitted[i] = true;
+        loop.postEvent(.{ .submit_progress = .{ .epoch = req.epoch, .pr_id = req.pr_id, .item = r } }) catch {};
+    }
 }
 
 /// Ensure the focused file's whole-file blob is being fetched. No-op offline,
@@ -1067,6 +1361,8 @@ fn drawStatus(
     show_resolved: bool,
     isolate: bool,
     loading: bool,
+    submitting: bool,
+    draft_count: usize,
     status_msg: ?[]const u8,
 ) void {
     if (win.height == 0) return;
@@ -1080,8 +1376,13 @@ fn drawStatus(
     };
     const file_hint: []const u8 = if (isolate) "o all files" else "o isolate";
     const resolved_hint: []const u8 = if (show_resolved) "R hide resolved" else "R show resolved";
-    // A transient message (error) or the loading indicator takes the tail slot.
-    const tail: []const u8 = if (status_msg) |m| m else if (loading) "loading…" else "[ ] file  ·  c/i comment  ·  p switch  ·  q quit";
+    // A transient message (error/summary) or an in-progress indicator takes the
+    // tail slot; otherwise the key hints, with the pending-draft count on `X`.
+    const default_tail: []const u8 = if (draft_count > 0)
+        (std.fmt.allocPrint(frame, "X submit {d}  ·  c/i comment  ·  [ ] file  ·  p switch  ·  q quit", .{draft_count}) catch "q quit")
+    else
+        "c/i comment  ·  [ ] file  ·  p switch  ·  q quit";
+    const tail: []const u8 = if (status_msg) |m| m else if (submitting) "submitting…" else if (loading) "loading…" else default_tail;
     const text = std.fmt.allocPrint(frame, " #{d} {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s}  ·  {s}  ·  {s}  ·  {s} ", .{
         pr.id,
         pr.title,
