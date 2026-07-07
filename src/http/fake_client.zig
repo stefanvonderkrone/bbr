@@ -26,6 +26,10 @@ pub const FakeHttpClient = struct {
     /// paginated fetch can be driven page by page. Falls back to `status`/`body`
     /// once exhausted (or when null).
     responses: ?[]const Canned = null,
+    /// When set, `send` returns this error instead of a response — simulating a
+    /// transport failure (connection reset, timeout) so callers can exercise the
+    /// "did it post or not?" ambiguous path.
+    send_error: ?anyerror = null,
 
     /// Snapshot of the most recent request.
     last_method: ?client.Method = null,
@@ -50,6 +54,11 @@ pub const FakeHttpClient = struct {
         self.last_method = req.method;
         self.url_len = @min(req.url.len, self.url_buf.len);
         @memcpy(self.url_buf[0..self.url_len], req.url[0..self.url_len]);
+
+        if (self.send_error) |e| {
+            self.call_count += 1;
+            return e;
+        }
 
         const canned: Canned = if (self.responses) |seq|
             (if (self.call_count < seq.len) seq[self.call_count] else .{ .status = self.status, .body = self.body })

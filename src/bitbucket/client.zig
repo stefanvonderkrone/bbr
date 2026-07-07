@@ -15,6 +15,7 @@ const ApiError = types.ApiError;
 const review = @import("../review/comment.zig");
 const Comment = review.Comment;
 const Anchor = review.Anchor;
+const CommentId = review.CommentId;
 
 pub const base_url = "https://api.bitbucket.org/2.0";
 
@@ -205,6 +206,68 @@ pub const Client = struct {
         return res.body;
     }
 
+    /// POST /repositories/{workspace}/{repo}/pullrequests/{id}/comments: publish
+    /// one comment and return its server-assigned `CommentId` (M10). A reply
+    /// carries `parent` (the resolved server id) and omits `inline` — Bitbucket
+    /// inherits a reply's anchor from its parent; a root inline comment carries
+    /// `anchor`; a top-level comment carries neither. The body is sent as JSON
+    /// with null fields omitted, so the raw markdown is escaped correctly.
+    pub fn createComment(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        id: u64,
+        nc: NewComment,
+    ) !CommentId {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/pullrequests/{d}/comments",
+            .{ base_url, self.cred.workspace, repo_slug, id },
+        );
+        defer allocator.free(url);
+
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+
+        // Build the wire shape; `emit_null_optional_fields = false` drops the
+        // `inline`/`parent`/`from`/`to` keys we leave null.
+        const Wire = struct {
+            content: struct { raw: []const u8 },
+            @"inline": ?struct { path: []const u8, from: ?u32 = null, to: ?u32 = null } = null,
+            parent: ?struct { id: CommentId } = null,
+        };
+        var wire = Wire{ .content = .{ .raw = nc.body } };
+        if (nc.parent) |pid| {
+            wire.parent = .{ .id = pid };
+        } else if (nc.anchor) |anc| {
+            wire.@"inline" = .{ .path = anc.path, .from = anc.from, .to = anc.to };
+        }
+        const body = try std.json.Stringify.valueAlloc(allocator, wire, .{ .emit_null_optional_fields = false });
+        defer allocator.free(body);
+
+        const res = try self.http.send(allocator, .{
+            .method = .POST,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "application/json" },
+                .{ .name = "content-type", .value = "application/json" },
+            },
+            .body = body,
+        });
+        defer allocator.free(res.body);
+
+        try classify(res.status);
+        const parsed = std.json.parseFromSlice(
+            struct { id: u64 },
+            allocator,
+            res.body,
+            .{ .ignore_unknown_fields = true },
+        ) catch return error.MalformedResponse;
+        defer parsed.deinit();
+        return parsed.value.id;
+    }
+
     /// GET the first page of the comments *list* raw (debug aid), so we can see
     /// how the list endpoint shapes a comment vs. the single-comment endpoint.
     pub fn getCommentsRaw(
@@ -350,6 +413,16 @@ fn classify(status: u16) ApiError!void {
 pub const ListOptions = struct {
     state: []const u8 = "OPEN",
     source_branch: ?[]const u8 = null,
+};
+
+/// A comment to publish via `createComment`. `parent` (a server `CommentId`)
+/// makes it a reply and suppresses `anchor`; `anchor` alone makes it a root
+/// inline comment; neither makes it a top-level PR comment. `body` is raw
+/// markdown (a suggestion's fenced block is already part of the body).
+pub const NewComment = struct {
+    body: []const u8,
+    anchor: ?Anchor = null,
+    parent: ?CommentId = null,
 };
 
 /// Percent-encode `raw` into `buf`, escaping everything outside the RFC 3986
@@ -787,6 +860,83 @@ test "getFileBlob surfaces ApiError on non-2xx and leaks nothing" {
     var fake: FakeHttpClient = .{ .status = 404, .body = "no such path" };
     const bb = Client.init(fake.httpClient(), testCredential());
     try testing.expectError(error.NotFound, bb.getFileBlob(a, "myrepo", "deadbeef", "gone.zig"));
+}
+
+test "createComment POSTs a top-level comment and parses the new id" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 201, .body =
+        \\{ "id": 90210, "content": { "raw": "ship it" } }
+    };
+    const bb = Client.init(fake.httpClient(), testCredential());
+
+    const id = try bb.createComment(a, "myrepo", 7, .{ .body = "ship it" });
+    try testing.expectEqual(@as(CommentId, 90210), id);
+    try testing.expectEqual(httpc.Method.POST, fake.last_method.?);
+    try testing.expectEqualStrings(
+        "https://api.bitbucket.org/2.0/repositories/check24/myrepo/pullrequests/7/comments",
+        fake.lastUrl().?,
+    );
+}
+
+test "createComment builds an inline body for a root anchored comment" {
+    const a = testing.allocator;
+    // Capture the request body by rendering the same wire shape the client does.
+    var fake: FakeHttpClient = .{ .status = 201, .body =
+        \\{ "id": 1 }
+    };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    _ = try bb.createComment(a, "myrepo", 7, .{
+        .body = "needs a test",
+        .anchor = .{ .path = "src/foo.zig", .to = 42 },
+    });
+    // The wire shape is asserted directly (the fake doesn't retain the body):
+    const Wire = struct {
+        content: struct { raw: []const u8 },
+        @"inline": ?struct { path: []const u8, from: ?u32 = null, to: ?u32 = null } = null,
+        parent: ?struct { id: CommentId } = null,
+    };
+    var wire = Wire{ .content = .{ .raw = "needs a test" } };
+    wire.@"inline" = .{ .path = "src/foo.zig", .to = 42 };
+    const body = try std.json.Stringify.valueAlloc(a, wire, .{ .emit_null_optional_fields = false });
+    defer a.free(body);
+    try testing.expectEqualStrings(
+        \\{"content":{"raw":"needs a test"},"inline":{"path":"src/foo.zig","to":42}}
+    , body);
+}
+
+test "createComment sends parent.id and no inline for a reply" {
+    const a = testing.allocator;
+    const Wire = struct {
+        content: struct { raw: []const u8 },
+        @"inline": ?struct { path: []const u8, from: ?u32 = null, to: ?u32 = null } = null,
+        parent: ?struct { id: CommentId } = null,
+    };
+    // A reply carries parent, drops inline even when an anchor is present.
+    var wire = Wire{ .content = .{ .raw = "agreed" } };
+    wire.parent = .{ .id = 555 };
+    const body = try std.json.Stringify.valueAlloc(a, wire, .{ .emit_null_optional_fields = false });
+    defer a.free(body);
+    try testing.expectEqualStrings(
+        \\{"content":{"raw":"agreed"},"parent":{"id":555}}
+    , body);
+
+    var fake: FakeHttpClient = .{ .status = 201, .body =
+        \\{ "id": 556 }
+    };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const id = try bb.createComment(a, "myrepo", 7, .{
+        .body = "agreed",
+        .anchor = .{ .path = "src/foo.zig", .to = 42 },
+        .parent = 555,
+    });
+    try testing.expectEqual(@as(CommentId, 556), id);
+}
+
+test "createComment surfaces ApiError on non-2xx" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 400, .body = "bad anchor" };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    try testing.expectError(error.UnexpectedStatus, bb.createComment(a, "myrepo", 7, .{ .body = "x" }));
 }
 
 const comments_page_1 =

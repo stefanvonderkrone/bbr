@@ -74,6 +74,8 @@ pub const git = struct {
 pub const bitbucket = struct {
     const client_mod = @import("bitbucket/client.zig");
     pub const Client = client_mod.Client;
+    pub const NewComment = client_mod.NewComment;
+    pub const Poster = @import("bitbucket/poster.zig").Poster;
     pub const deinitPullRequest = client_mod.deinitPullRequest;
     pub const deinitComments = client_mod.deinitComments;
     pub const deinitSummaries = client_mod.deinitSummaries;
@@ -95,6 +97,7 @@ test {
     _ = @import("http/std_client.zig");
     _ = @import("bitbucket/credential.zig");
     _ = @import("bitbucket/client.zig");
+    _ = @import("bitbucket/poster.zig");
     _ = @import("bitbucket/types.zig");
     _ = @import("diff/model.zig");
     _ = @import("diff/parser.zig");
