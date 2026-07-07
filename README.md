@@ -49,10 +49,11 @@ Small vertical slices (sizes are relative effort, not dates):
 `M0` walking skeleton → `M1` diff model & parser (pure, tested) → `M2` unified viewer →
 `M3` comments (read) → `M4` PR discovery & switching → `M5` diff polish →
 `M6` pending review: authoring → `M7` responsiveness (non-blocking loads) →
-`M8` pending review: submission → `M9` keymap & motions → `M10` themes & config →
-`M11` syntax highlighting → `M12` local / offline review.
+`M8` file view scope (single-file) → `M9` pending review: submission →
+`M10` keymap & motions → `M11` themes & config → `M12` syntax highlighting →
+`M13` local / offline review.
 
-**MVP line:** M0–M3 (usable read-only), M4 (ergonomic), M6+M8 (write-capable — the headline).
+**MVP line:** M0–M3 (usable read-only), M4 (ergonomic), M6+M9 (write-capable — the headline).
 Full breakdown with dependencies in `docs/design.html` §14 and `TODO.md`.
 
 ## Building (once code lands)

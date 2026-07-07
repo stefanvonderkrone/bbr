@@ -21,7 +21,7 @@ Sizes are relative effort (S/M/L), not calendar estimates. Dependencies noted pe
 - [x] Tests: fixtures — hunk boundaries, line numbering, adds/removes, `\ No newline`, count-omitted ranges, malformed headers, end-to-end getDiff→parse. **No UI.** ✅ 8 diff tests + 3 getDiff tests (19 total green).
 
 ## M2 — Unified diff viewer (open by id)  ·  M  ·  needs M1
-- [x] `Theme` abstraction + one default. ✅ `src/tui/theme.zig` — `dark`; selectable themes are M9.
+- [x] `Theme` abstraction + one default. ✅ `src/tui/theme.zig` — `dark`; selectable themes are M11.
 - [x] Presentation: Sidebar (files) + DiffPane (unified) with neutral/green/red backgrounds. ✅ `src/diff/buffer.zig` (pure flatten → rows) + `src/tui/render.zig` (full-width bands, gutter line numbers, sidebar highlight).
 - [x] Buffer-scoped arena. ✅ in `app.run` (buffer arena + per-frame gutter arena, reset after render). — Background runtime + event-queue + Epoch **deferred to M4**: nothing to cancel until PRs can be *switched*; M2 fetches synchronously in `main`.
 - [x] Basic navigation: arrows + core motions (`j`/`k`, `ctrl-d`/`ctrl-u`, `gg`/`G`, numeric Count). ✅ `src/tui/nav.zig` (pure) wired in `app.run`.
@@ -30,7 +30,7 @@ Sizes are relative effort (S/M/L), not calendar estimates. Dependencies noted pe
 ## M3 — Comments (read)  ·  M  ·  ✅ done
 - [x] Bitbucket: `getComments` (paginated), incl. resolved state + outdated verdict. ✅ `Client.getComments` follows `next` links; anchors carry path + old/new line; `resolved` from the resolution object; `AnchorState` honors Bitbucket's `inline.outdated`. `FakeHttpClient` gained a `responses` sequence for hermetic pagination tests.
 - [x] Thread builder: flat comments → nested `Thread`s (by `parent.id`). ✅ `src/review/thread.zig` — resolves each comment to its ultimate root, buckets replies in creation order, promotes orphans, handles out-of-order input. Zero-copy over the comment slice.
-- [x] ThreadPane: inline threads + PR-level comments; render ```suggestion``` blocks distinctly. ✅ woven in `buffer.buildWithComments` (PR-level section at top; inline threads under their anchored line; root/reply rows) and drawn in `render.zig` (`▸` root, `↳` reply, `±` suggestion with its own band). Multi-line bodies show the lead line + `…` (full markdown rendering is M8).
+- [x] ThreadPane: inline threads + PR-level comments; render ```suggestion``` blocks distinctly. ✅ woven in `buffer.buildWithComments` (PR-level section at top; inline threads under their anchored line; root/reply rows) and drawn in `render.zig` (`▸` root, `↳` reply, `±` suggestion with its own band). Multi-line bodies show the lead line + `…` (full markdown rendering is M10).
 - [x] `resolved` state + reveal-resolved toggle (whole thread). ✅ resolved-but-current threads hidden by default; `R` flips `show_resolved` and rebuilds the buffer, revealing the *whole* thread. Status bar shows the toggle state.
 - [x] AnchorState display (current/moved/outdated from Bitbucket verdict); per-file Outdated collapsible. ✅ outdated threads grouped in a per-file "Outdated (N)" section and **never hidden** (even when resolved). Outdated is derived from each comment's `links.code` revision vs the PR's current source/destination commits — the list endpoint omits `inline.outdated` and it can't be recomputed from line numbers (see `bitbucket/CONTEXT.md`). Verified live on PR 1726 (8 outdated roots). `moved` isn't produced remotely; local diff-walk for `moved` is M6. The Outdated group is always expanded — fold/collapse deferred to M5 (`Fold`s).
 - [x] Tests: thread nesting, resolved toggle, outdated grouping. ✅ thread nesting/orphan/out-of-order (`thread.zig`), weaving + resolved toggle + outdated grouping (`buffer.zig`), headless comment/suggestion render (`render.zig`), paginated `getComments` (`client.zig`). Suite green 62/62.
@@ -69,7 +69,14 @@ _Deferred:_ true **whole-file** scope (unchanged regions *outside* the fetched h
 
 _Deferred:_ animated spinner — the vaxis `Loop` has no timer (`nextEvent` blocks on real events), so animation needs a tick thread posting via `postEvent`; static "Loading…" text delivers most of the perceived win at no concurrency cost. Revisit if the static frame feels dead.
 
-## M8 — Pending review: submission & failures  ·  M  ·  needs M6
+## M8 — File view scope (single-file)  ·  S/M  ·  needs M2
+- [ ] `only_file` scope in `BuildOptions`: project the Buffer to a single File's rows. Reconciles the code with the domain language — `buffer.zig` currently flattens the *whole* diff into one continuous scroll (file_header separators), but a Buffer is defined as "the loaded, rendered model of exactly one File … reset/reused on file switch" (`src/diff/CONTEXT.md`).
+- [ ] Make the Sidebar a selector, not just a position indicator: a key focuses a File and (in isolate mode) drives `only_file`. `fileIndexForRow` (`app.zig:359`) already maps cursor → File for the reverse direction; the Sidebar has no selection input today.
+- [ ] Jump-to-file motion: scroll the pane to a File's header within the all-files buffer — cheap navigation, independent of isolate mode. The two readings of "single-file view" (jump vs. isolate) are both offered.
+- [ ] Optional: treat a File focus as an Epoch-stamped load, matching the "each PR/File load" language, so a future per-file lazy fetch/highlight can hang off the same seam.
+- [ ] Tests: `only_file` projection (one File's rows, nothing else), sidebar selection state, jump-to-file cursor math.
+
+## M9 — Pending review: submission & failures  ·  M  ·  needs M6
 - [ ] `Submission`: topological order, temp-id → CommentId remap.
 - [ ] Failure model: retry (network/429/5xx), abort-on-auth, mark-and-continue (validation).
 - [ ] Duplicate guard (GET-and-dedupe on ambiguous failure).
@@ -77,22 +84,22 @@ _Deferred:_ animated spinner — the vaxis `Loop` has no timer (`nextEvent` bloc
 - [ ] Per-item summary + selective retry of failed subtrees.
 - [ ] Tests: submission ordering, remap, each failure class, dedupe.
 
-## M9 — Keymap & motions  ·  S/M  ·  needs M2
+## M10 — Keymap & motions  ·  S/M  ·  needs M2
 - [ ] Full vim motion set + numeric Count register (`5j`, `zz`, …); arrows side by side.
 - [ ] Configurable `Keymap` from config.
 - [ ] Keybinding-help Overlay (reads Keymap).
 
-## M10 — Themes & config  ·  S  ·  needs M2
+## M11 — Themes & config  ·  S  ·  needs M2
 - [ ] Config file (TOML at `~/.config/bbr/`).
 - [ ] Built-in themes: catppuccin, gruvbox, solarized (+ light/dark); selection in config.
 
-## M11 — Syntax highlighting  ·  L  ·  needs M2
+## M12 — Syntax highlighting  ·  L  ·  needs M2
 - [ ] `Highlighter` seam + `PlainHighlighter`.
 - [ ] tree-sitter Zig bindings; decide grammar delivery (build-time vs runtime).
 - [ ] Grammars: tsx/jsx, css, go, bash, json, yaml + highlight queries.
 - [ ] Compose syntax foreground over diff background per cell; wire into `Theme`.
 
-## M12 — Local / offline review  ·  M/L  ·  needs M6 (not M8)
+## M13 — Local / offline review  ·  M/L  ·  needs M6 (not M9)
 - [ ] Extend `GitClient` with diffing subset: worktree list, ref resolution, `diff` between refs, blob at ref.
 - [ ] `DiffSource` abstraction; local `git diff <base>..<branch>` → same Diff parser.
 - [ ] Local `CommentTarget` in SQLite (no submission path).
@@ -110,16 +117,17 @@ _Deferred:_ animated spinner — the vaxis `Loop` has no timer (`nextEvent` bloc
 ## Sequencing at a glance
 
 ```
-M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M8    (authoring → submission)
+M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M9    (authoring → submission)
               ├─ M4              (PR discovery)
               ├─ M5              (diff polish)
               ├─ M4 ─ M7         (responsiveness / non-blocking loads)
-              ├─ M9              (keymap)
-              ├─ M10             (themes/config)
-              ├─ M11             (highlighting)
-              └─ M3 ─ M6 ─ M12   (local review; needs authoring, not submission)
+              ├─ M8              (file view scope / single-file)
+              ├─ M10             (keymap)
+              ├─ M11             (themes/config)
+              ├─ M12             (highlighting)
+              └─ M3 ─ M6 ─ M13   (local review; needs authoring, not submission)
 ```
 
-**MVP line:** M0–M3 gives a usable read-only reviewer; M4 makes it ergonomic; M6+M8 make it
-write-capable (the headline). M5/M7/M9/M10/M11 are parallelizable polish once M2 lands; M12 is the
+**MVP line:** M0–M3 gives a usable read-only reviewer; M4 makes it ergonomic; M6+M9 make it
+write-capable (the headline). M5/M7/M8/M10/M11/M12 are parallelizable polish once M2 lands; M13 is the
 largest standalone feature and depends only on read + authoring, not submission.

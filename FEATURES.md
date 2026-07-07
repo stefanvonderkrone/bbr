@@ -21,7 +21,9 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [ ] **Intra-line emphasis** — stronger background on the changed characters. `M5`
 - [ ] **Scope: Changes** — hunks + context with expandable Folds. `M5`
 - [ ] **Scope: WholeFile** — entire file with changes inline. `M5`
-- [ ] **Syntax highlighting** — tree-sitter foreground over diff background. `M11`
+- [ ] **Single-file view** — isolate the DiffPane to one File (`only_file`); Sidebar selects it. `M8`
+- [ ] **Jump-to-file** — motion to scroll the pane to a File's header. `M8`
+- [ ] **Syntax highlighting** — tree-sitter foreground over diff background. `M12`
 
 ## Comments (read)
 - [ ] **View Threads** — root comments + replies, inline on the diff. `M3`
@@ -30,14 +32,14 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [ ] **Resolved toggle** — reveal whole resolved Threads (comment + replies), not bare markers. `M3`
 
 ## Comment anchoring
-- [ ] **Anchor state** — render comments as current / moved / outdated. `M3` (remote) · `M12` (local)
+- [ ] **Anchor state** — render comments as current / moved / outdated. `M3` (remote) · `M13` (local)
 - [ ] **Show outdated comments** — never hidden; per-file collapsible with captured context. `M3`
-- [ ] **Stale-anchor warning** — detect SourceCommit change before submit. `M8`
+- [ ] **Stale-anchor warning** — detect SourceCommit change before submit. `M9`
 
 ## Navigation & input
 - [ ] **Basic motions** — arrows + `j`/`k`, `ctrl-d`/`ctrl-u`, `gg`/`G`. `M2`
-- [ ] **Full vim motions** — `zz` and numeric Count (`5j`), complete set. `M9`
-- [ ] **Configurable Keymap** — bindings from config; drives the help overlay. `M9`
+- [ ] **Full vim motions** — `zz` and numeric Count (`5j`), complete set. `M10`
+- [ ] **Configurable Keymap** — bindings from config; drives the help overlay. `M10`
 
 ## Pending Review (write)
 - [ ] **Draft top-level comment** `M6`
@@ -45,15 +47,15 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [ ] **Draft reply** — including replies to other pending Drafts. `M6`
 - [ ] **Author suggestion** — compose a ```suggestion``` block. `M6`
 - [ ] **Persist PendingReview** — SQLite, survives crash / quit / PR switch. `M6`
-- [ ] **Submit batch** — topological POST + temp-id remap. `M8`
-- [ ] **Failure handling** — retry / abort-on-auth / mark-and-continue + dedupe guard. `M8`
+- [ ] **Submit batch** — topological POST + temp-id remap. `M9`
+- [ ] **Failure handling** — retry / abort-on-auth / mark-and-continue + dedupe guard. `M9`
 
 ## Local & offline review
-- [ ] **Detect current branch/worktree** — read the WorkingCopy's branch. `M4` (branch+remote) · `M12` (worktree/diff)
+- [ ] **Detect current branch/worktree** — read the WorkingCopy's branch. `M4` (branch+remote) · `M13` (worktree/diff)
 - [ ] **Parse tracking remote** — `origin` → `(workspace, repo_slug)`, SSH + HTTPS + `url.insteadof`. `M4`
-- [ ] **Local branch diff** — review a branch against a BaseRef with no Bitbucket. `M12`
-- [ ] **Local comments** — persist to SQLite with `CommentTarget = local`; never submit. `M12`
-- [ ] **git worktree support** — each worktree reviews its own branch. `M12`
+- [ ] **Local branch diff** — review a branch against a BaseRef with no Bitbucket. `M13`
+- [ ] **Local comments** — persist to SQLite with `CommentTarget = local`; never submit. `M13`
+- [ ] **git worktree support** — each worktree reviews its own branch. `M13`
 - [ ] *(deferred)* dirty working-tree diffs with fuzzy content-based anchoring. `later`
 
 ## Shell & UX
@@ -61,9 +63,9 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [ ] **Non-blocking startup** — boot the TUI with a "Loading PR #N…" view; fetch the initial Session off-thread. `M7`
 - [ ] **Non-blocking picker** — `p` opens the picker instantly; the PR list loads off-thread and fills in. `M7`
 - [ ] **Parallel Session fetch** — overlap the PR / diff / comment requests on load. `M7`
-- [ ] **Overlay: keybinding help** `M9`
-- [ ] **Config file** — TOML at `~/.config/bbr/`. `M10`
-- [ ] **Themes** — built-in catppuccin / gruvbox / solarized + plain light/dark; the `Theme` seam exists from `M2`, extra themes at `M10`.
+- [ ] **Overlay: keybinding help** `M10`
+- [ ] **Config file** — TOML at `~/.config/bbr/`. `M11`
+- [ ] **Themes** — built-in catppuccin / gruvbox / solarized + plain light/dark; the `Theme` seam exists from `M2`, extra themes at `M11`.
 
 ## Explicit non-features (for now)
 - Bitbucket Server / Data Center · approve/merge/decline · applying suggestions ·
