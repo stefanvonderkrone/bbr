@@ -32,5 +32,5 @@ So the deletion is on **batch** success, not per-item success.
   double-representation window is confined to an in-progress (or crashed-mid-) Submission.
 - The render path needs `CommentId` dedup **only** for that transient window, not on every
   normal launch.
-- Submission (M9) owns the delete-on-batch-success step; the `PendingReviewStore` already
+- Submission (M10) owns the delete-on-batch-success step; the `PendingReviewStore` already
   supports it via per-Draft `remove`.

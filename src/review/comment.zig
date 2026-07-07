@@ -46,7 +46,7 @@ pub const Comment = struct {
     /// The comment this one replies to, or null for a root comment.
     parent_id: ?CommentId = null,
     author: []const u8,
-    /// Raw markdown body, as authored. Not rendered as markdown yet (M10).
+    /// Raw markdown body, as authored. Not rendered as markdown yet (M11).
     body: []const u8,
     /// The diff anchor, or null for a PR-level comment.
     anchor: ?Anchor = null,

@@ -4,7 +4,7 @@
 //! the `PendingReviewStore` so it survives a crash / quit / PR switch.
 //!
 //! Bitbucket Cloud has no native draft concept (ADR-0002), so this batching is
-//! entirely ours: Drafts accumulate here and publish together at Submission (M9).
+//! entirely ours: Drafts accumulate here and publish together at Submission (M10).
 //! A Reply's parent may be *another Draft* that has no server id yet — this is
 //! what forces the topological ordering that submission relies on (design §9).
 //!
@@ -29,7 +29,7 @@ pub const TempId = u64;
 pub const DraftKind = enum { top_level, inline_comment, reply, suggestion };
 
 /// Where a Draft lives: `bitbucket` submits on Submission; `local` persists only
-/// in SQLite and is never submitted (the offline review mode, M13).
+/// in SQLite and is never submitted (the offline review mode, M14).
 pub const CommentTarget = enum { bitbucket, local };
 
 /// A Draft's lifecycle. `posted` carries the server-assigned id (so a resumed

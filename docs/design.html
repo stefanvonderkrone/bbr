@@ -397,7 +397,7 @@ DraftState = union(enum){ draft, submitting, posted: CommentId, failed: ApiError
     <li><b>Not a git repo</b> → the PR Picker (choose a repo first).</li>
   </ol>
   <p>So startup detection needs a <b>minimal, read-only GitClient</b> (branch + Remote) available
-  at <b>M4</b> — earlier than the diffing GitClient that local review needs at <b>M13</b>.</p>
+  at <b>M4</b> — earlier than the diffing GitClient that local review needs at <b>M14</b>.</p>
 
   <h3>Anchor lifecycle (answering "what about changes after the fact?")</h3>
   <p>Every Anchor binds to a <b>commit + line</b> (plus captured context lines). Against the
@@ -504,25 +504,26 @@ DraftState = union(enum){ draft, submitting, posted: CommentId, failed: ApiError
     <tr><td>M6</td><td>Pending review: authoring</td><td>M</td><td>M3</td><td>PendingReviewStore (SQLite + fake), Composer, drafts (incl. reply-to-draft), persistence + resume.</td></tr>
     <tr><td>M7</td><td>Responsiveness (non-blocking loads)</td><td>M</td><td>M2, M4</td><td>Boot into a loading view (load the Session off-thread); async picker open; parallelize the PR/diff/comment fetches. Reuses the Epoch/worker machinery.</td></tr>
     <tr><td>M8</td><td>File view scope (single-file)</td><td>S/M</td><td>M2</td><td>only_file Buffer projection (one File at a time), Sidebar as selector, jump-to-file motion. Reconciles the Buffer with its "exactly one File" definition.</td></tr>
-    <tr><td>M9</td><td>Pending review: submission</td><td>M</td><td>M6</td><td>Topological Submission + temp-id remap, failure model, dedupe guard, stale-anchor check, per-item summary.</td></tr>
-    <tr><td>M10</td><td>Keymap &amp; motions</td><td>S/M</td><td>M2</td><td>Full vim motions + numeric counts, configurable Keymap, keybinding-help overlay.</td></tr>
-    <tr><td>M11</td><td>Themes &amp; config</td><td>S</td><td>M2</td><td>Built-in catppuccin/gruvbox/solarized + light/dark; TOML config.</td></tr>
-    <tr><td>M12</td><td>Syntax highlighting</td><td>L</td><td>M2</td><td>tree-sitter behind the seam; initial grammar set; compose over diff background.</td></tr>
-    <tr><td>M13</td><td>Local / offline review</td><td>M/L</td><td>M6</td><td>GitClient diffing subset, DiffSource, local comments in SQLite, local anchor diff-walking (committed refs).</td></tr>
+    <tr><td>M9</td><td>True whole-file view (blobs)</td><td>M</td><td>M2, M8</td><td>Fetch the file's old/new blob from Bitbucket's src endpoint; splice fetched hunk Lines into the blob's unchanged lines so full-file context shows (not just fetched hunks). Lazy per-file — the isolate view triggers it, the first real per-file load.</td></tr>
+    <tr><td>M10</td><td>Pending review: submission</td><td>M</td><td>M6</td><td>Topological Submission + temp-id remap, failure model, dedupe guard, stale-anchor check, per-item summary.</td></tr>
+    <tr><td>M11</td><td>Keymap &amp; motions</td><td>S/M</td><td>M2</td><td>Full vim motions + numeric counts, configurable Keymap, keybinding-help overlay.</td></tr>
+    <tr><td>M12</td><td>Themes &amp; config</td><td>S</td><td>M2</td><td>Built-in catppuccin/gruvbox/solarized + light/dark; TOML config.</td></tr>
+    <tr><td>M13</td><td>Syntax highlighting</td><td>L</td><td>M2</td><td>tree-sitter behind the seam; initial grammar set; compose over diff background.</td></tr>
+    <tr><td>M14</td><td>Local / offline review</td><td>M/L</td><td>M6</td><td>GitClient diffing subset, DiffSource, local comments in SQLite, local anchor diff-walking (committed refs).</td></tr>
   </table>
-  <p><small><b>MVP line:</b> M0–M3 = a usable read-only reviewer; M4 makes it ergonomic; M6+M9
-  make it write-capable (the headline). M5/M7/M8/M10/M11/M12 are parallelizable polish once M2 lands.
-  M13 (the largest standalone feature) needs read + authoring (M6), <em>not</em> submission (M9).</small></p>
+  <p><small><b>MVP line:</b> M0–M3 = a usable read-only reviewer; M4 makes it ergonomic; M6+M10
+  make it write-capable (the headline). M5/M7/M8/M9/M11/M12/M13 are parallelizable polish once M2 lands.
+  M14 (the largest standalone feature) needs read + authoring (M6), <em>not</em> submission (M10).</small></p>
 </section>
 
 <section id="open">
   <h2 class="section">15 · Open Questions &amp; Deferred Decisions</h2>
   <ul class="tight">
-    <li><b>Grammar delivery</b> — build-time vendored (fixed set, no runtime <code>cc</code>) vs. neovim-style runtime auto-fetch+compile (needs <code>cc</code>). Deferred to M12.</li>
+    <li><b>Grammar delivery</b> — build-time vendored (fixed set, no runtime <code>cc</code>) vs. neovim-style runtime auto-fetch+compile (needs <code>cc</code>). Deferred to M13.</li>
     <li><b>Corporate proxy type</b> at check24 — determines whether libcurl is ever needed. Seam is ready either way.</li>
     <li><b>Bitbucket rate limits</b> — exact thresholds; tune pool size &amp; backoff against observed <code>429</code>s.</li>
-    <li><b>Config format &amp; location</b> — likely TOML at <code>~/.config/bbr/</code>; finalize at M11.</li>
-    <li><b>Approve / merge / decline</b> — currently a non-goal; revisit after M9.</li>
+    <li><b>Config format &amp; location</b> — likely TOML at <code>~/.config/bbr/</code>; finalize at M12.</li>
+    <li><b>Approve / merge / decline</b> — currently a non-goal; revisit after M10.</li>
     <li><b>PR-head re-check UX</b> — reload vs. submit-anyway when the SourceCommit changed.</li>
     <li><b>Dirty working-tree diffs</b> (local mode) — deferred; needs fuzzy content-based anchoring. MVP is committed refs only.</li>
     <li><b>Adjacent-PR ambiguity</b> — behavior when a branch has multiple or zero open PRs.</li>
