@@ -31,12 +31,20 @@ pub const diff = struct {
 pub const review = struct {
     pub const comment = @import("review/comment.zig");
     pub const thread = @import("review/thread.zig");
+    pub const draft = @import("review/draft.zig");
     pub const Comment = comment.Comment;
     pub const CommentId = comment.CommentId;
     pub const Anchor = comment.Anchor;
     pub const AnchorState = comment.AnchorState;
     pub const Thread = thread.Thread;
     pub const buildThreads = thread.build;
+    pub const Draft = draft.Draft;
+    pub const DraftKind = draft.DraftKind;
+    pub const DraftState = draft.DraftState;
+    pub const CommentTarget = draft.CommentTarget;
+    pub const TempId = draft.TempId;
+    pub const NewDraft = draft.NewDraft;
+    pub const PendingReview = draft.PendingReview;
 };
 
 pub const git = struct {
@@ -81,6 +89,7 @@ test {
     _ = @import("diff/intraline.zig");
     _ = @import("review/comment.zig");
     _ = @import("review/thread.zig");
+    _ = @import("review/draft.zig");
     _ = @import("git/remote.zig");
     _ = @import("git/client.zig");
     _ = @import("bitbucket/url.zig");

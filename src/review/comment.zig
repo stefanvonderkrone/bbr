@@ -27,6 +27,10 @@ pub const Anchor = struct {
     from: ?u32 = null,
     /// New-file (right) line number, 1-based.
     to: ?u32 = null,
+    /// The source commit this anchor was authored against, or null for a remote
+    /// comment (Bitbucket owns its verdict, ADR-0001). A local Draft records it
+    /// so its AnchorState can be recomputed by diff-walking later (ADR-0005).
+    commit: ?[]const u8 = null,
 
     /// The line this anchor renders against in the unified diff, preferring the
     /// new side (where an added/context comment lives) then the old side.
