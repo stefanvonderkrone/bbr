@@ -169,6 +169,42 @@ pub const Client = struct {
         return res.body;
     }
 
+    /// GET /repositories/{workspace}/{repo}/src/{commit}/{path}: a file's full
+    /// text at a given commit. Used by the true-whole-file view (M9) to fill the
+    /// unchanged regions the diff omits. Returns the raw bytes owned by
+    /// `allocator`, exactly as served (same contract as `getDiff`). `path` is the
+    /// repo-relative file path; `commit` is a full or abbreviated hash.
+    pub fn getFileBlob(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        commit: []const u8,
+        path: []const u8,
+    ) ![]u8 {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/src/{s}/{s}",
+            .{ base_url, self.cred.workspace, repo_slug, commit, path },
+        );
+        defer allocator.free(url);
+
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+
+        const res = try self.http.send(allocator, .{
+            .method = .GET,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "text/plain" },
+            },
+        });
+        errdefer allocator.free(res.body);
+
+        try classify(res.status);
+        return res.body;
+    }
+
     /// GET the first page of the comments *list* raw (debug aid), so we can see
     /// how the list endpoint shapes a comment vs. the single-comment endpoint.
     pub fn getCommentsRaw(
@@ -727,6 +763,30 @@ test "getDiff surfaces ApiError on non-2xx and leaks nothing" {
     var fake: FakeHttpClient = .{ .status = 404, .body = "not found" };
     const bb = Client.init(fake.httpClient(), testCredential());
     try testing.expectError(error.NotFound, bb.getDiff(a, "myrepo", 1));
+}
+
+test "getFileBlob returns the raw file text at the right URL" {
+    const a = testing.allocator;
+    const contents = "line1\nline2\nline3\n";
+    var fake: FakeHttpClient = .{ .status = 200, .body = contents };
+    const bb = Client.init(fake.httpClient(), testCredential());
+
+    const blob = try bb.getFileBlob(a, "myrepo", "abc123", "src/foo.zig");
+    defer a.free(blob);
+
+    try testing.expectEqualStrings(contents, blob);
+    try testing.expectEqual(httpc.Method.GET, fake.last_method.?);
+    try testing.expectEqualStrings(
+        "https://api.bitbucket.org/2.0/repositories/check24/myrepo/src/abc123/src/foo.zig",
+        fake.lastUrl().?,
+    );
+}
+
+test "getFileBlob surfaces ApiError on non-2xx and leaks nothing" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 404, .body = "no such path" };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    try testing.expectError(error.NotFound, bb.getFileBlob(a, "myrepo", "deadbeef", "gone.zig"));
 }
 
 const comments_page_1 =
