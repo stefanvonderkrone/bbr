@@ -24,6 +24,10 @@ pub const Session = struct {
     pr: PullRequest,
     diff: bbr.diff.Diff,
     threads: []const bbr.review.Thread,
+    /// Per-file whole-file blobs, index-aligned with `diff.files` (M9). All null
+    /// after load; the lazy per-file fetch (app.zig) fills a slot on demand and
+    /// the blob text lives in this arena. Empty for a Session with no diff yet.
+    blobs: []bbr.diff.FileBlob = &.{},
 
     /// Free the Session and everything it owns. Reclaims both the arena and the
     /// Session struct itself (both came from the same backing allocator).
@@ -41,6 +45,7 @@ pub fn create(backing: Allocator) !*Session {
     const s = try backing.create(Session);
     s.arena = std.heap.ArenaAllocator.init(backing);
     s.threads = &.{};
+    s.blobs = &.{};
     return s;
 }
 
@@ -63,6 +68,11 @@ pub fn loadWith(backing: Allocator, bb: Client, repo: []const u8, id: u64) !*Ses
         .destination = s.pr.destination_commit,
     });
     s.threads = try bbr.review.buildThreads(a, comments);
+
+    // One (empty) blob slot per file; the whole-file view fills them lazily.
+    const blobs = try a.alloc(bbr.diff.FileBlob, s.diff.files.len);
+    @memset(blobs, .{});
+    s.blobs = blobs;
     return s;
 }
 
@@ -127,6 +137,10 @@ test "loadWith builds a session in order and owns everything" {
     try testing.expectEqual(@as(usize, 1), s.diff.files.len);
     try testing.expectEqual(@as(usize, 1), s.threads.len);
     try testing.expectEqual(@as(usize, 3), fake.call_count);
+
+    // One empty whole-file blob slot per file, filled lazily later (M9).
+    try testing.expectEqual(@as(usize, 1), s.blobs.len);
+    try testing.expect(s.blobs[0].new == null);
 }
 
 test "loadWith surfaces an error and leaks nothing" {

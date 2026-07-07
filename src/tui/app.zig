@@ -18,6 +18,11 @@
 //! stamped with a separate `picker_epoch` so a stale fetch can't populate a
 //! Picker that was closed and reopened.
 //!
+//! `f` cycles the diff scope Changes → fetched-whole → whole-file. The whole-file
+//! scope needs the focused file's full text, fetched lazily on the same worker
+//! pattern (`blob_done`, keyed by PR id + file index): the frame renders the
+//! fetched lines immediately and re-weaves when the blob arrives (M9).
+//!
 //! Lifetime: vaxis cells borrow their text until `render`. A Session owns its
 //! diff/threads for as long as it is current; per-frame gutter/overlay text is
 //! synthesized into `frame_arena`, reset *after* render.
@@ -63,6 +68,7 @@ const AppEvent = union(enum) {
     winsize: vaxis.Winsize,
     load_done: LoadDone,
     picker_done: PickerDone,
+    blob_done: BlobDone,
 };
 
 const LoadOutcome = union(enum) {
@@ -106,6 +112,55 @@ const PickerReq = struct {
     epoch: u64,
 };
 
+/// A fetched file blob, owned by its own arena so the worker can hand it across
+/// threads; the main thread copies the text into the Session arena and calls
+/// `destroy` (mirroring `Summaries`).
+const Blob = struct {
+    arena: std.heap.ArenaAllocator,
+    text: []const u8,
+
+    fn destroy(self: *Blob) void {
+        const backing = self.arena.child_allocator;
+        self.arena.deinit();
+        backing.destroy(self);
+    }
+};
+
+const BlobOutcome = union(enum) {
+    ok: *Blob,
+    err: anyerror,
+};
+
+/// A whole-file blob fetch result, tagged with the PR and file it targeted so a
+/// result for a superseded PR (or an already-filled slot) is discarded.
+const BlobDone = struct {
+    epoch: u64,
+    pr_id: u64,
+    file_idx: usize,
+    outcome: BlobOutcome,
+};
+
+/// Request handed to a blob worker. `repo`/`commit`/`path` are copied by value
+/// (fixed buffers) so the worker holds no reference to caller slices.
+const BlobReq = struct {
+    repo: [256]u8,
+    repo_len: usize,
+    commit: [64]u8,
+    commit_len: usize,
+    path: [512]u8,
+    path_len: usize,
+    pr_id: u64,
+    file_idx: usize,
+    epoch: u64,
+};
+
+/// A blob fetch in flight, keyed by PR + file so `ensureBlob` never double-fetches
+/// and a stale result (old PR) can't cancel a live entry.
+const InflightBlob = struct {
+    pr_id: u64,
+    file_idx: usize,
+};
+
 const Loop = vaxis.Loop(AppEvent);
 
 /// A background load and the epoch it was launched under. We keep the future so
@@ -145,10 +200,11 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
 
     var show_resolved = false;
     var layout: bbr.diff.Layout = .unified;
-    // Diff scope: fold long context runs by default (the "Changes" scope). `f`
-    // flips to whole-file; `expanded` holds individually-revealed folds (their
-    // ids are Line pointers into the *current* session, cleared on a PR switch).
-    var scope_fold = true;
+    // Diff scope, cycled by `f`: Changes (long context folded) → fetched-whole
+    // (every fetched line, no folds) → whole-file (the real full file, blob
+    // spliced in — M9). `expanded` holds individually-revealed folds (their ids
+    // are Line pointers into the *current* session, cleared on a PR switch).
+    var scope: Scope = .changes;
     var expanded: std.ArrayList(*const bbr.diff.Line) = .empty;
     defer expanded.deinit(gpa);
 
@@ -170,7 +226,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
         PendingReview.init(0);
 
     var buf: bbr.diff.Buffer = if (current) |c|
-        try bbr.diff.buffer.buildWithComments(ring.next(), c.diff, layout, c.threads, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file))
+        try bbr.diff.buffer.buildWithComments(ring.next(), c.diff, layout, c.threads, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, c.blobs))
     else
         .{ .rows = &.{}, .layout = layout };
 
@@ -220,6 +276,18 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
         picker_loads.deinit(gpa);
     }
 
+    // In-flight whole-file blob fetches (M9), tracked like the loads above so
+    // every worker is awaited before teardown. `blob_inflight` dedupes fetches
+    // per (PR, file) so `ensureBlob` fires each file's fetch at most once.
+    var blob_epoch: u64 = 0;
+    var blob_loads: std.ArrayList(Load) = .empty;
+    defer {
+        for (blob_loads.items) |*l| _ = l.future.await(io);
+        blob_loads.deinit(gpa);
+    }
+    var blob_inflight: std.ArrayList(InflightBlob) = .empty;
+    defer blob_inflight.deinit(gpa);
+
     try loop.installResizeHandler();
     try vx.enterAltScreen(writer);
 
@@ -257,7 +325,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                 commitDraft(ctx.store, &review, review_arena.allocator(), cur.pr.id, comp) catch |err| {
                                     status_msg = @errorName(err);
                                 };
-                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
+                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                 nav.setRowCount(buf.rows.len);
                             }
                         }
@@ -314,17 +382,18 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                     } else if (current) |cur| {
                         if (key.matches('R', .{})) {
                             show_resolved = !show_resolved;
-                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
+                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                             nav.setRowCount(buf.rows.len);
                         } else if (key.matches('s', .{})) {
                             layout = if (layout == .unified) .side_by_side else .unified;
-                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
+                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                             nav.setRowCount(buf.rows.len);
                         } else if (key.matches('f', .{})) {
-                            // Toggle the diff scope: fold long context vs. whole file.
-                            scope_fold = !scope_fold;
+                            // Cycle the diff scope: Changes → fetched-whole → whole-file.
+                            // The whole-file blob is fetched lazily below the loop.
+                            scope = scope.next();
                             expanded.clearRetainingCapacity();
-                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
+                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                             nav.setRowCount(buf.rows.len);
                         } else if (key.matches('c', .{})) {
                             // Author a PR-level (top-level) comment.
@@ -340,13 +409,13 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                             // Toggle the isolate view over the focused file.
                             if (isolate_file) |only| {
                                 isolate_file = null;
-                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
+                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                 nav.setRowCount(buf.rows.len);
                                 // Land the cursor back on the file we were isolating.
                                 if (fileHeaderRow(buf, only)) |hr| nav.jumpTo(hr);
                             } else {
                                 isolate_file = fileIndexForRow(buf, nav.cursor);
-                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
+                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                 nav = Nav.init(buf.rows.len, vx.window().height);
                             }
                         } else if (key.matches(']', .{})) {
@@ -354,7 +423,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                             if (isolate_file) |only| {
                                 if (only + 1 < cur.diff.files.len) {
                                     isolate_file = only + 1;
-                                    buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
+                                    buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                     nav = Nav.init(buf.rows.len, vx.window().height);
                                 }
                             } else if (nextFileHeaderRow(buf, nav.cursor)) |hr| nav.jumpTo(hr);
@@ -363,7 +432,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                             if (isolate_file) |only| {
                                 if (only > 0) {
                                     isolate_file = only - 1;
-                                    buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
+                                    buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                     nav = Nav.init(buf.rows.len, vx.window().height);
                                 }
                             } else if (prevFileHeaderRow(buf, nav.cursor)) |hr| nav.jumpTo(hr);
@@ -376,7 +445,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                             // Expand the fold under the cursor, if any.
                             if (nav.cursor < buf.rows.len and buf.rows[nav.cursor] == .fold) {
                                 expanded.append(gpa, buf.rows[nav.cursor].fold.id) catch {};
-                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
+                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                 nav.setRowCount(buf.rows.len);
                             }
                         } else if (handleKey(&nav, &pending_g, key)) |_| {}
@@ -404,10 +473,14 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                             // the old session's diff.
                             expanded.clearRetainingCapacity();
                             isolate_file = null;
+                            // Blobs belong to the old session; its in-flight fetches
+                            // (still tracked in blob_loads) will be discarded on
+                            // arrival by the PR-id check.
+                            blob_inflight.clearRetainingCapacity();
                             // Load the new PR's pending Drafts into a fresh arena.
                             _ = review_arena.reset(.retain_capacity);
                             review = ctx.store.loadReview(review_arena.allocator(), s.pr.id) catch PendingReview.init(s.pr.id);
-                            buf = rebuild(ring.next(), s, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
+                            buf = rebuild(ring.next(), s, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, s.blobs)) catch buf;
                             nav = Nav.init(buf.rows.len, vx.window().height);
                             pending_g = false;
                             status_msg = null;
@@ -443,6 +516,44 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                     },
                 }
             },
+            .blob_done => |done| {
+                reap(&blob_loads, io, done.epoch);
+                removeInflight(&blob_inflight, done.pr_id, done.file_idx);
+                // Apply only if the PR it targeted is still current and the slot
+                // is still empty; otherwise the fetch was superseded — discard.
+                const applies = if (current) |c|
+                    c.pr.id == done.pr_id and done.file_idx < c.blobs.len and c.blobs[done.file_idx].new == null
+                else
+                    false;
+                switch (done.outcome) {
+                    .ok => |blob| {
+                        defer blob.destroy();
+                        if (applies) {
+                            const cur = current.?;
+                            if (cur.arena.allocator().dupe(u8, blob.text)) |owned| {
+                                cur.blobs[done.file_idx].new = owned;
+                                // Re-weave so the just-arrived blob shows if we're
+                                // still in the whole-file scope.
+                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                nav.setRowCount(buf.rows.len);
+                            } else |err| status_msg = @errorName(err);
+                        }
+                    },
+                    .err => |e| if (applies) {
+                        status_msg = @errorName(e);
+                    },
+                }
+            },
+        }
+
+        // Lazily fetch the focused file's blob for the whole-file scope — off the
+        // UI thread, at most once per (PR, file). The result arrives as a
+        // `blob_done` event and re-weaves the buffer.
+        if (scope == .whole) {
+            if (current) |curp| {
+                const focused = isolate_file orelse fileIndexForRow(buf, nav.cursor);
+                ensureBlob(ctx, &loop, curp, focused, &blob_loads, &blob_inflight, &blob_epoch, gpa);
+            }
         }
 
         const win = vx.window();
@@ -457,7 +568,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
             // otherwise it follows the cursor across the all-files buffer.
             const selected_file = isolate_file orelse fileIndexForRow(buf, nav.cursor);
             render.draw(frame, win, cur.diff, buf, active_theme, nav, selected_file, cur.threads, review.drafts.items);
-            drawStatus(frame, win, cur.pr, nav, buf, layout, scope_fold, show_resolved, isolate_file != null, loading, status_msg);
+            drawStatus(frame, win, cur.pr, nav, buf, layout, scope, show_resolved, isolate_file != null, loading, status_msg);
         }
         if (picker) |*p| render.drawPicker(frame, win, p, active_theme);
         if (composer) |*comp| render.drawComposer(frame, win, comp, active_theme);
@@ -469,8 +580,40 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
 /// Assemble the buffer build options from the current toggles, the revealed
 /// folds, and the pending Drafts. Rows borrow the session's diff/threads and the
 /// review arena's drafts (not the buffer arena), so resetting it is safe.
-fn buildOpts(show_resolved: bool, scope_fold: bool, expanded: []const *const bbr.diff.Line, drafts: []const Draft, only_file: ?usize) bbr.diff.BuildOptions {
-    return .{ .show_resolved = show_resolved, .fold_context = scope_fold, .expanded = expanded, .drafts = drafts, .only_file = only_file };
+/// Diff scope cycled by `f` (M9). Changes folds long context; fetched shows
+/// every fetched line without folding; whole splices the file blob for the true
+/// full file (falling back to the fetched rendering until the blob arrives).
+const Scope = enum {
+    changes,
+    fetched,
+    whole,
+
+    fn next(self: Scope) Scope {
+        return switch (self) {
+            .changes => .fetched,
+            .fetched => .whole,
+            .whole => .changes,
+        };
+    }
+};
+
+fn buildOpts(
+    show_resolved: bool,
+    scope: Scope,
+    expanded: []const *const bbr.diff.Line,
+    drafts: []const Draft,
+    only_file: ?usize,
+    blobs: []const bbr.diff.FileBlob,
+) bbr.diff.BuildOptions {
+    return .{
+        .show_resolved = show_resolved,
+        .fold_context = scope == .changes,
+        .whole_file = scope == .whole,
+        .expanded = expanded,
+        .drafts = drafts,
+        .only_file = only_file,
+        .blobs = blobs,
+    };
 }
 
 fn rebuild(alloc: std.mem.Allocator, s: *const Session, layout: bbr.diff.Layout, opts: bbr.diff.BuildOptions) !bbr.diff.Buffer {
@@ -674,6 +817,128 @@ fn fetchSummaries(
     return s;
 }
 
+/// Ensure the focused file's whole-file blob is being fetched. No-op offline,
+/// when there's no session, when the file is out of range or removed (no new
+/// side), when the blob is already loaded, or when a fetch for it is already in
+/// flight. Otherwise spawn a worker and record the in-flight entry.
+fn ensureBlob(
+    ctx: RunCtx,
+    loop: *Loop,
+    current: *Session,
+    focused: usize,
+    blob_loads: *std.ArrayList(Load),
+    blob_inflight: *std.ArrayList(InflightBlob),
+    blob_epoch: *u64,
+    gpa: std.mem.Allocator,
+) void {
+    if (!ctx.online) return;
+    if (focused >= current.diff.files.len or focused >= current.blobs.len) return;
+    if (current.blobs[focused].new != null) return; // already loaded
+    const file = current.diff.files[focused];
+    if (file.status == .removed) return; // no new-side blob to fetch
+    for (blob_inflight.items) |b| {
+        if (b.pr_id == current.pr.id and b.file_idx == focused) return; // in flight
+    }
+    spawnBlobLoad(ctx, loop, blob_loads, blob_epoch, gpa, current.pr.id, focused, current.pr.source_commit, file.new_path) catch return;
+    blob_inflight.append(gpa, .{ .pr_id = current.pr.id, .file_idx = focused }) catch {};
+}
+
+/// Drop the in-flight record for (`pr_id`, `file_idx`) once its result arrives.
+fn removeInflight(blob_inflight: *std.ArrayList(InflightBlob), pr_id: u64, file_idx: usize) void {
+    for (blob_inflight.items, 0..) |b, i| {
+        if (b.pr_id == pr_id and b.file_idx == file_idx) {
+            _ = blob_inflight.swapRemove(i);
+            return;
+        }
+    }
+}
+
+/// Launch a background blob fetch for one file, bumping `blob_epoch`. The worker
+/// posts a `blob_done` stamped with the epoch, PR id, and file index.
+fn spawnBlobLoad(
+    ctx: RunCtx,
+    loop: *Loop,
+    blob_loads: *std.ArrayList(Load),
+    blob_epoch: *u64,
+    gpa: std.mem.Allocator,
+    pr_id: u64,
+    file_idx: usize,
+    commit: []const u8,
+    path: []const u8,
+) !void {
+    blob_epoch.* += 1;
+    var req: BlobReq = .{
+        .repo = undefined,
+        .repo_len = @min(ctx.repo.len, 256),
+        .commit = undefined,
+        .commit_len = @min(commit.len, 64),
+        .path = undefined,
+        .path_len = @min(path.len, 512),
+        .pr_id = pr_id,
+        .file_idx = file_idx,
+        .epoch = blob_epoch.*,
+    };
+    @memcpy(req.repo[0..req.repo_len], ctx.repo[0..req.repo_len]);
+    @memcpy(req.commit[0..req.commit_len], commit[0..req.commit_len]);
+    @memcpy(req.path[0..req.path_len], path[0..req.path_len]);
+
+    const fut = try ctx.io.concurrent(blobWorker, .{ loop, ctx.io, ctx.env_map, ctx.cred, req });
+    try blob_loads.append(gpa, .{ .epoch = blob_epoch.*, .future = fut });
+}
+
+/// Runs on a worker thread. Fetches one file's blob off the page allocator and
+/// posts it back; frees the result if the hand-off fails (shutting down).
+fn blobWorker(
+    loop: *Loop,
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+    cred: Credential,
+    req: BlobReq,
+) void {
+    const repo = req.repo[0..req.repo_len];
+    const commit = req.commit[0..req.commit_len];
+    const path = req.path[0..req.path_len];
+    const outcome: BlobOutcome = if (fetchBlob(io, env_map, cred, repo, commit, path)) |b|
+        .{ .ok = b }
+    else |err|
+        .{ .err = err };
+
+    loop.postEvent(.{ .blob_done = .{
+        .epoch = req.epoch,
+        .pr_id = req.pr_id,
+        .file_idx = req.file_idx,
+        .outcome = outcome,
+    } }) catch {
+        if (outcome == .ok) outcome.ok.destroy();
+    };
+}
+
+/// Fetch one file's blob into a self-owned `Blob` on the page allocator (thread
+/// safe, so the worker never races the main thread's gpa).
+fn fetchBlob(
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+    cred: Credential,
+    repo: []const u8,
+    commit: []const u8,
+    path: []const u8,
+) !*Blob {
+    const page = std.heap.page_allocator;
+    const b = try page.create(Blob);
+    errdefer page.destroy(b);
+    b.arena = std.heap.ArenaAllocator.init(page);
+    errdefer b.arena.deinit();
+    const a = b.arena.allocator();
+
+    var http = bbr.http.StdHttpClient.init(a, io);
+    defer http.deinit();
+    try http.initDefaultProxies(a, env_map);
+    const bb = bbr.bitbucket.Client.init(http.httpClient(), cred);
+
+    b.text = try bb.getFileBlob(a, repo, commit, path);
+    return b;
+}
+
 /// Await and drop the tracked load with `epoch` (its result has arrived). The
 /// worker returns right after posting, so the await completes promptly.
 fn reap(loads: *std.ArrayList(Load), io: std.Io, epoch: u64) void {
@@ -798,7 +1063,7 @@ fn drawStatus(
     nav: Nav,
     buf: bbr.diff.Buffer,
     layout: bbr.diff.Layout,
-    scope_fold: bool,
+    scope: Scope,
     show_resolved: bool,
     isolate: bool,
     loading: bool,
@@ -807,7 +1072,12 @@ fn drawStatus(
     if (win.height == 0) return;
     const row = win.height - 1;
     const layout_hint: []const u8 = if (layout == .unified) "s split" else "s unified";
-    const scope_hint: []const u8 = if (scope_fold) "f whole" else "f changes";
+    // Names the *current* scope; `f` cycles Changes → fetched → whole.
+    const scope_hint: []const u8 = switch (scope) {
+        .changes => "f: changes",
+        .fetched => "f: fetched",
+        .whole => "f: whole",
+    };
     const file_hint: []const u8 = if (isolate) "o all files" else "o isolate";
     const resolved_hint: []const u8 = if (show_resolved) "R hide resolved" else "R show resolved";
     // A transient message (error) or the loading indicator takes the tail slot.
