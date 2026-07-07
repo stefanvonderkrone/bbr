@@ -299,7 +299,7 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
 
         const win = vx.window();
         const frame = frame_arena.allocator();
-        render.draw(frame, win, current.diff, buf, active_theme, nav, selected_file);
+        render.draw(frame, win, current.diff, buf, active_theme, nav, selected_file, current.threads, review.drafts.items);
         drawStatus(frame, win, current.pr, nav, buf, layout, scope_fold, show_resolved, loading, status_msg);
         if (picker) |*p| render.drawPicker(frame, win, p, active_theme);
         if (composer) |*comp| render.drawComposer(frame, win, comp, active_theme);

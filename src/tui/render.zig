@@ -21,12 +21,15 @@ const CommentRow = bbr.diff.buffer.CommentRow;
 const DraftRow = bbr.diff.buffer.DraftRow;
 const Section = bbr.diff.buffer.Section;
 const FileStatus = bbr.diff.FileStatus;
+const Thread = bbr.review.Thread;
+const Draft = bbr.review.Draft;
 const Picker = @import("picker.zig").Picker;
 const Composer = @import("composer.zig").Composer;
 
 pub const sidebar_width: u16 = 28;
 
-/// Draw one frame. `selected_file` indexes `diff.files` for sidebar highlight.
+/// Draw one frame. `selected_file` indexes `diff.files` for sidebar highlight;
+/// `threads` and `drafts` feed the per-file comment / pending-draft counts.
 pub fn draw(
     scratch: std.mem.Allocator,
     win: vaxis.Window,
@@ -35,6 +38,8 @@ pub fn draw(
     theme: Theme,
     nav: Nav,
     selected_file: usize,
+    threads: []const Thread,
+    drafts: []const Draft,
 ) void {
     win.clear();
 
@@ -44,7 +49,7 @@ pub fn draw(
     const pane_x = @min(sb_w + 1, win.width);
     const pane = win.child(.{ .x_off = pane_x, .y_off = 0, .width = win.width - pane_x, .height = win.height });
 
-    drawSidebar(sidebar, diff, theme, selected_file);
+    drawSidebar(scratch, sidebar, diff, theme, selected_file, threads, drafts);
     drawPane(scratch, pane, buf, theme, nav);
 }
 
@@ -59,7 +64,7 @@ fn statusChar(status: FileStatus) []const u8 {
     };
 }
 
-fn drawSidebar(win: vaxis.Window, diff: bbr.diff.Diff, theme: Theme, selected_file: usize) void {
+fn drawSidebar(scratch: std.mem.Allocator, win: vaxis.Window, diff: bbr.diff.Diff, theme: Theme, selected_file: usize, threads: []const Thread, drafts: []const Draft) void {
     var row: u16 = 0;
     for (diff.files, 0..) |file, i| {
         if (row >= win.height) break;
@@ -74,9 +79,37 @@ fn drawSidebar(win: vaxis.Window, diff: bbr.diff.Diff, theme: Theme, selected_fi
         // Prefix cells use static graphemes so nothing is borrowed from the stack.
         win.writeCell(0, row, .{ .char = .{ .grapheme = if (selected) ">" else " ", .width = 1 }, .style = style });
         win.writeCell(2, row, .{ .char = .{ .grapheme = statusChar(file.status), .width = 1 }, .style = name_style });
-        _ = win.printSegment(.{ .text = file.displayPath(), .style = name_style }, .{ .row_offset = row, .col_offset = 4, .wrap = .none });
+        var res = win.printSegment(.{ .text = file.displayPath(), .style = name_style }, .{ .row_offset = row, .col_offset = 4, .wrap = .none });
+
+        // Tallies trail the name, each hidden at zero: 🗨 published comments,
+        // ✎ the reviewer's own pending drafts on this file.
+        const comments = fileAnchoredCount(Thread, threads, file);
+        if (comments > 0) {
+            const s: vaxis.Style = .{ .fg = theme.comment.fg, .bg = style.bg };
+            const t = std.fmt.allocPrint(scratch, " 🗨 {d}", .{comments}) catch " 🗨";
+            res = win.printSegment(.{ .text = t, .style = s }, .{ .row_offset = row, .col_offset = res.col, .wrap = .none });
+        }
+        const draft_n = fileAnchoredCount(Draft, drafts, file);
+        if (draft_n > 0) {
+            const s: vaxis.Style = .{ .fg = theme.draft.fg, .bg = style.bg };
+            const t = std.fmt.allocPrint(scratch, " ✎ {d}", .{draft_n}) catch " ✎";
+            _ = win.printSegment(.{ .text = t, .style = s }, .{ .row_offset = row, .col_offset = res.col, .wrap = .none });
+        }
         row += 1;
     }
+}
+
+/// How many `items` (comment `Thread`s or `Draft`s) are anchored to this file —
+/// a sidebar tally. Matches an anchor against either side of the path so a
+/// removed file (whose display name is its old path) still counts. `T` must
+/// expose its anchor: a Thread via `root.anchor`, a Draft via `anchor`.
+fn fileAnchoredCount(comptime T: type, items: []const T, file: bbr.diff.File) usize {
+    var n: usize = 0;
+    for (items) |*it| {
+        const anc = (if (T == Thread) it.root.anchor else it.anchor) orelse continue;
+        if (std.mem.eql(u8, anc.path, file.new_path) or std.mem.eql(u8, anc.path, file.displayPath())) n += 1;
+    }
+    return n;
 }
 
 fn drawPane(scratch: std.mem.Allocator, win: vaxis.Window, buf: Buffer, theme: Theme, nav: Nav) void {
@@ -419,7 +452,7 @@ test "diff lines render with their band background at the text cells" {
     const win = headlessWindow(&screen);
 
     const nav = Nav.init(buf.rows.len, 24);
-    draw(a, win, diff, buf, theme_dark, nav, 0);
+    draw(a, win, diff, buf, theme_dark, nav, 0, &.{}, &.{});
 
     // Row layout in the pane: 0 file_header, 1 hunk_header, 2 context(keep),
     // 3 removed(old), 4 added(new). Pane starts at x = sidebar_width + 1.
@@ -459,7 +492,7 @@ test "a modified line paints only its changed run with the emphasis band" {
     const win = headlessWindow(&screen);
 
     const nav = Nav.init(buf.rows.len, 24);
-    draw(a, win, diff, buf, theme_dark, nav, 0);
+    draw(a, win, diff, buf, theme_dark, nav, 0, &.{}, &.{});
 
     // Pane rows: 0 header, 1 hunk, 2 removed, 3 added. Body starts after gutter.
     const px = sidebar_width + 1;
@@ -496,7 +529,7 @@ test "side-by-side draws old on the left, new on the right" {
     const win = headlessWindow(&screen);
 
     const nav = Nav.init(buf.rows.len, 24);
-    draw(a, win, diff, buf, theme_dark, nav, 0);
+    draw(a, win, diff, buf, theme_dark, nav, 0, &.{}, &.{});
 
     // Pane starts at sidebar_width+1. Rows: 0 header, 1 hunk, 2 ctx, 3 modified.
     // Read the first body cell of each half (after its line-number gutter) — the
@@ -542,7 +575,7 @@ test "the cursor row is highlighted across its whole width, keeping band hue" {
     // Put the cursor on the removed line (pane row 3).
     var nav = Nav.init(buf.rows.len, 24);
     nav.cursor = 3;
-    draw(a, win, diff, buf, theme_dark, nav, 0);
+    draw(a, win, diff, buf, theme_dark, nav, 0, &.{}, &.{});
 
     const px = sidebar_width + 1;
     const body_x = px + gutter_cols;
@@ -595,7 +628,7 @@ test "a folded context run renders as a fold row" {
     const win = headlessWindow(&screen);
 
     const nav = Nav.init(buf.rows.len, 24);
-    draw(a, win, diff, buf, theme_dark, nav, 0);
+    draw(a, win, diff, buf, theme_dark, nav, 0, &.{}, &.{});
 
     // Find the fold row's screen position by scanning the buffer.
     var fold_row: ?u16 = null;
@@ -637,7 +670,7 @@ test "sidebar highlights the selected file" {
     const win = headlessWindow(&screen);
 
     const nav = Nav.init(buf.rows.len, 24);
-    draw(a, win, diff, buf, theme_dark, nav, 1); // select second file
+    draw(a, win, diff, buf, theme_dark, nav, 1, &.{}, &.{}); // select second file
 
     // Selected row (sidebar row 1) carries the selected background.
     const sel = win.readCell(0, 1).?;
@@ -648,6 +681,67 @@ test "sidebar highlights the selected file" {
 }
 
 const theme_dark = @import("theme.zig").dark;
+
+test "the sidebar tallies comments per file and hides a zero count" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const raw =
+        \\diff --git a/one.txt b/one.txt
+        \\--- a/one.txt
+        \\+++ b/one.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\diff --git a/two.txt b/two.txt
+        \\--- a/two.txt
+        \\+++ b/two.txt
+        \\@@ -1 +1 @@
+        \\-c
+        \\+d
+        \\
+    ;
+    const diff = try bbr.diff.parse(a, raw);
+    const buf = try bbr.diff.buffer.build(a, diff, .unified);
+
+    // Two comments on one.txt, none on two.txt.
+    const comments = [_]bbr.review.Comment{
+        .{ .id = 1, .author = "Ada", .body = "x", .anchor = .{ .path = "one.txt", .to = 1 } },
+        .{ .id = 2, .author = "Bo", .body = "y", .anchor = .{ .path = "one.txt", .to = 1 } },
+    };
+    const threads = try bbr.review.buildThreads(a, &comments);
+    // One pending draft on two.txt.
+    const drafts = [_]bbr.review.Draft{
+        .{ .local_id = 1, .kind = .inline_comment, .body = "wip", .anchor = .{ .path = "two.txt", .to = 1 } },
+    };
+
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    const nav = Nav.init(buf.rows.len, 24);
+    draw(a, win, diff, buf, theme_dark, nav, 0, threads, &drafts);
+
+    // Row 0 (one.txt) shows the comment tally bubble and the count "2", no drafts.
+    try testing.expect(rowHasGrapheme(win, 0, "🗨"));
+    try testing.expect(rowHasGrapheme(win, 0, "2"));
+    try testing.expect(!rowHasGrapheme(win, 0, "✎"));
+    // Row 1 (two.txt) has no comments (no bubble) but one draft (✎).
+    try testing.expect(!rowHasGrapheme(win, 1, "🗨"));
+    try testing.expect(rowHasGrapheme(win, 1, "✎"));
+}
+
+/// True if any cell in sidebar-width row `r` renders `g`.
+fn rowHasGrapheme(win: vaxis.Window, r: u16, g: []const u8) bool {
+    var c: u16 = 0;
+    while (c < sidebar_width) : (c += 1) {
+        if (win.readCell(c, r)) |cell| {
+            if (std.mem.eql(u8, cell.char.grapheme, g)) return true;
+        }
+    }
+    return false;
+}
 
 test "the composer modal draws its header and typed body" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -698,7 +792,7 @@ test "a pending draft renders in the draft band with its marker" {
     const win = headlessWindow(&screen);
 
     const nav = Nav.init(buf.rows.len, 24);
-    draw(a, win, diff, buf, theme_dark, nav, 0);
+    draw(a, win, diff, buf, theme_dark, nav, 0, &.{}, &.{});
 
     // Find the draft row's screen position.
     var draft_row: ?u16 = null;
@@ -771,7 +865,7 @@ test "sidebar prefix shows selection marker and status, borrowing no stack" {
     const win = headlessWindow(&screen);
 
     const nav = Nav.init(buf.rows.len, 24);
-    draw(a, win, diff, buf, theme_dark, nav, 0); // first file selected
+    draw(a, win, diff, buf, theme_dark, nav, 0, &.{}, &.{}); // first file selected
 
     // Row 0: selected → ">", modified → "M". Read back after draw (the bug this
     // guards against was borrowing a per-iteration stack buffer, which showed
@@ -817,7 +911,7 @@ test "a woven comment renders with its marker and style; a suggestion is distinc
     const win = headlessWindow(&screen);
 
     const nav = Nav.init(buf.rows.len, 24);
-    draw(a, win, diff, buf, theme_dark, nav, 0);
+    draw(a, win, diff, buf, theme_dark, nav, 0, &.{}, &.{});
 
     // Pane rows: 0 file_header, 1 hunk_header, 2 line(old), 3 line(new),
     // 4 comment(root), 5 comment(reply=suggestion). Pane x = sidebar_width + 1.
