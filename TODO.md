@@ -53,11 +53,13 @@ _Deferred:_ SideBySide + folds (M5), moved-anchor local diff-walk (M6). The Pick
 
 _Deferred:_ true **whole-file** scope (unchanged regions *outside* the fetched hunks) needs the file blob from a separate Bitbucket endpoint — the current whole-file scope shows every *fetched* line. Fold re-collapse is one-way (revealed folds stay revealed until the scope toggles). Side-by-side pairs removed[k]↔added[k] by index (no LCS line-matching across a block).
 
-## M6 — Pending review: authoring & persistence  ·  M  ·  needs M3
-- [ ] `PendingReviewStore` seam + in-memory fake + SQLite implementation (schema + migrations).
-- [ ] Composer overlay; create `Draft` (top_level / inline / reply / suggestion), incl. reply-to-draft.
-- [ ] `DraftState` + `CommentTarget` persistence; resume on launch; render drafts distinctly.
-- [ ] Tests: store round-trip (fake + SQLite), draft graph construction.
+## M6 — Pending review: authoring & persistence  ·  M  ·  ✅ done
+- [x] `PendingReviewStore` seam + in-memory fake + SQLite implementation (schema + migrations). ✅ `src/review/store.zig` (ptr+vtable seam mirroring `HttpClient`, `InMemoryStore` fake) + `src/persist/sqlite_store.zig` (vendored amalgamation, `vendors/sqlite`, compiled into the exe only so the pure module stays C-free — ADR-0006). One row per Draft keyed `(pr_id, local_id)`; `PRAGMA user_version` migrations.
+- [x] Composer overlay; create `Draft` (top_level / inline / reply / suggestion), incl. reply-to-draft. ✅ `src/tui/composer.zig` (pure state machine); viewer keys `c` (top-level), `i` (inline on cursor line), `S` (suggestion), `r` (reply to the comment/draft under the cursor — records the parent for M9 ordering, co-locates via the parent's anchor). ^D submits, esc cancels.
+- [x] `DraftState` + `CommentTarget` persistence; resume on launch; render drafts distinctly. ✅ all four DraftStates + parent + anchor (with authored-against commit, ADR-0005) round-trip through SQLite; `app.run` loads the PR's Drafts on entry and re-loads on each PR switch (PR-scoped review arena). Drafts weave into the buffer (anchored under their line, unanchored in a "Pending" section) and render in a distinct amber band (`✎`/`↳`/`±`).
+- [x] Tests: store round-trip (fake + SQLite), draft graph construction. ✅ draft graph (add/topological-order/remove), fake + SQLite round-trip (fields/anchor/parent/state, replace, scoped remove, close-reopen durability), buffer draft weaving, headless composer + draft-row render, `commitDraft` round-trip. Suite green 155.
+
+_Deferred:_ `AnchorState.moved` via local diff-walk (needs the GitClient diffing subset — M13). Side-by-side draft weaving works (via `weaveInline`), but a draft anchored to a *removed-only* line pairs on the old side only. The Composer is append-only (no mid-text cursor); full editing is post-MVP.
 
 ## M7 — Responsiveness (non-blocking loads)  ·  M  ·  needs M2, M4
 - [ ] Async picker open: `p` shows the picker overlay instantly in a loading state; the `listPullRequests` fetch runs off-thread and populates the rows when it returns. Today `openPicker` blocks the render loop synchronously inside the key handler (`app.zig:258`) — this is the "takes long until the overlay appears" lag. Generalize the existing epoch/worker/`load_done` machinery to carry a summaries result (or add a sibling event) and let the Picker exist with no items yet.
