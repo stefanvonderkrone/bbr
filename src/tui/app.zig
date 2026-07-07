@@ -374,20 +374,17 @@ fn openInline(
 /// drives submission ordering — a reply to a pending Draft posts after it (M9).
 fn openReply(composer: *?Composer, arena: *std.heap.ArenaAllocator, buf: bbr.diff.Buffer, cursor: usize) !void {
     if (cursor >= buf.rows.len) return error.NoReplyTarget;
-    const Target = struct { parent: bbr.review.draft.Parent, anchor: ?bbr.review.Anchor };
-    const target: Target = switch (buf.rows[cursor]) {
-        .comment => |cr| .{ .parent = .{ .comment = cr.comment.id }, .anchor = cr.comment.anchor },
-        .draft => |dr| .{ .parent = .{ .draft = dr.draft.local_id }, .anchor = dr.draft.anchor },
+    // A reply is placed under its parent (the `parent` link drives rendering and
+    // submission order), so it needs no anchor of its own — the parent already
+    // carries the diff location.
+    const parent: bbr.review.draft.Parent = switch (buf.rows[cursor]) {
+        .comment => |cr| .{ .comment = cr.comment.id },
+        .draft => |dr| .{ .draft = dr.draft.local_id },
         else => return error.NoReplyTarget,
     };
     _ = arena.reset(.retain_capacity);
     const a = arena.allocator();
-    var anchor = target.anchor;
-    if (anchor) |*anc| {
-        anc.path = try a.dupe(u8, anc.path);
-        if (anc.commit) |cm| anc.commit = try a.dupe(u8, cm);
-    }
-    composer.* = Composer.init(a, .{ .kind = .reply, .anchor = anchor, .parent = target.parent, .label = "Reply" });
+    composer.* = Composer.init(a, .{ .kind = .reply, .parent = parent, .label = "Reply" });
 }
 
 /// Persist a composed Draft: dupe its body (fencing a suggestion) and anchor

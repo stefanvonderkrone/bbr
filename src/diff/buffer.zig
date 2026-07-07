@@ -16,6 +16,7 @@ const review = @import("../review/comment.zig");
 const Thread = @import("../review/thread.zig").Thread;
 const Comment = review.Comment;
 const Draft = @import("../review/draft.zig").Draft;
+const Parent = @import("../review/draft.zig").Parent;
 
 /// Re-export so the renderer can name the segment type without reaching into
 /// `intraline` directly.
@@ -158,21 +159,40 @@ pub fn buildWithComments(
 ) BuildError!Buffer {
     var rows: std.ArrayList(Row) = .empty;
 
+    // A Draft is placed exactly once: a root Draft by its anchor (inline line, or
+    // the PR-level "Pending" section); a reply Draft after its parent's row (a
+    // published Comment or another Draft), following the `parent` link — never by
+    // anchor. The `emitted` guard makes "exactly once" enforceable and lets an
+    // orphaned reply (parent hidden or absent) surface at the end rather than
+    // vanish.
+    const emitted = try allocator.alloc(bool, opts.drafts.len);
+    @memset(emitted, false);
+    var w: Weave = .{
+        .a = allocator,
+        .rows = &rows,
+        .threads = threads,
+        .drafts = opts.drafts,
+        .emitted = emitted,
+        .opts = opts,
+    };
+
     // 1. PR-level comments (no anchor), respecting the resolved toggle.
     const pr_count = countWhere(threads, isPrLevel, opts);
     if (pr_count > 0) {
         try rows.append(allocator, .{ .section = .{ .kind = .pr_comments, .count = pr_count } });
         for (threads) |*t| {
-            if (isPrLevel(t.*) and inlineVisible(t.*, opts)) try emitThread(allocator, &rows, t);
+            if (isPrLevel(t.*) and inlineVisible(t.*, opts)) try w.emitThread(t);
         }
     }
 
-    // 1b. PR-level pending Drafts (no anchor) — the reviewer's own unsent work.
-    const pending_count = countUnanchoredDrafts(opts.drafts);
+    // 1b. PR-level pending Drafts: root Drafts with no anchor — the reviewer's
+    // own unsent top-level work. Reply Drafts are placed under their parent (in
+    // emitThread / emitDraft), not here.
+    const pending_count = countPendingRoots(opts.drafts);
     if (pending_count > 0) {
         try rows.append(allocator, .{ .section = .{ .kind = .pending, .count = pending_count } });
-        for (opts.drafts) |*d| {
-            if (d.anchor == null) try emitDraft(allocator, &rows, d);
+        for (opts.drafts, 0..) |*d, i| {
+            if (d.parent == null and d.anchor == null) try w.emitDraft(i);
         }
     }
 
@@ -184,8 +204,8 @@ pub fn buildWithComments(
             const emphasis = try computeEmphasis(allocator, hunk.lines);
             const folds = try computeFolds(allocator, hunk.lines, opts);
             switch (layout) {
-                .unified => try emitUnifiedHunk(allocator, &rows, threads, file, hunk.lines, emphasis, folds, opts),
-                .side_by_side => try emitSideBySideHunk(allocator, &rows, threads, file, hunk.lines, emphasis, folds, opts),
+                .unified => try w.emitUnifiedHunk(file, hunk.lines, emphasis, folds),
+                .side_by_side => try w.emitSideBySideHunk(file, hunk.lines, emphasis, folds),
             }
         }
 
@@ -194,144 +214,191 @@ pub fn buildWithComments(
         if (od_count > 0) {
             try rows.append(allocator, .{ .section = .{ .kind = .outdated, .count = od_count, .path = file.new_path } });
             for (threads) |*t| {
-                if (isFileOutdated(t.*, file.new_path)) try emitThread(allocator, &rows, t);
+                if (isFileOutdated(t.*, file.new_path)) try w.emitThread(t);
             }
+        }
+    }
+
+    // 3. A reply Draft shares its parent's visibility: when the parent thread is
+    // hidden (resolved, toggle off), the reply hides with it — so an un-emitted
+    // reply is deliberately left out here. A *root* Draft has no parent to hide
+    // behind, so an anchored one whose line isn't currently visible is surfaced
+    // in a trailing pending section (with its own reply subtree) rather than lost.
+    var stranded: usize = 0;
+    for (opts.drafts, 0..) |*d, i| {
+        if (!emitted[i] and d.parent == null) stranded += 1;
+    }
+    if (stranded > 0) {
+        try rows.append(allocator, .{ .section = .{ .kind = .pending, .count = stranded } });
+        for (opts.drafts, 0..) |*d, i| {
+            if (!emitted[i] and d.parent == null) try w.emitDraft(i);
         }
     }
 
     return .{ .rows = try rows.toOwnedSlice(allocator), .layout = layout };
 }
 
-/// Append a thread's rows: root first, then its replies (indented).
-fn emitThread(allocator: std.mem.Allocator, rows: *std.ArrayList(Row), t: *const Thread) !void {
-    try rows.append(allocator, .{ .comment = .{ .comment = t.root, .is_reply = false } });
-    for (t.replies) |reply| {
-        try rows.append(allocator, .{ .comment = .{ .comment = reply, .is_reply = true } });
-    }
-}
-
-/// Append one Draft row. A reply Draft is indented under whatever it replies to.
-fn emitDraft(allocator: std.mem.Allocator, rows: *std.ArrayList(Row), d: *const Draft) !void {
-    try rows.append(allocator, .{ .draft = .{ .draft = d, .is_reply = d.parent != null } });
-}
-
-/// Emit a hunk's lines in unified layout: one row per line, each followed by
-/// any inline threads anchored to it.
-fn emitUnifiedHunk(
-    allocator: std.mem.Allocator,
+/// Mutable weaving context shared by the emit helpers: the row sink plus the
+/// threads/Drafts being placed and a per-Draft `emitted` guard. Reply Drafts are
+/// placed relative to their parent, so the guard keeps each Draft to a single
+/// row; root Drafts are placed by anchor.
+const Weave = struct {
+    a: std.mem.Allocator,
     rows: *std.ArrayList(Row),
     threads: []const Thread,
-    file: *const model.File,
-    lines: []const model.Line,
-    emphasis: []const []const Segment,
-    folds: []const Fold,
+    drafts: []const Draft,
+    /// Index-aligned with `drafts`; set once the Draft has been placed.
+    emitted: []bool,
     opts: BuildOptions,
-) !void {
-    var i: usize = 0;
-    while (i < lines.len) {
-        if (foldStartingAt(folds, &lines[i])) |f| {
-            try rows.append(allocator, .{ .fold = f });
-            i += f.lines.len;
-            continue;
-        }
-        try rows.append(allocator, .{ .line = .{ .line = &lines[i], .emphasis = emphasis[i] } });
-        try weaveInline(allocator, rows, threads, file, &lines[i], opts);
-        i += 1;
-    }
-}
 
-/// Emit a hunk's lines in side-by-side layout: old on the left, new on the
-/// right, modified pairs aligned on one row. Inline threads are woven after the
-/// pair that carries their anchored line (once per underlying line, so a
-/// context line — present on both sides — doesn't double-emit).
-fn emitSideBySideHunk(
-    allocator: std.mem.Allocator,
-    rows: *std.ArrayList(Row),
-    threads: []const Thread,
-    file: *const model.File,
-    lines: []const model.Line,
-    emphasis: []const []const Segment,
-    folds: []const Fold,
-    opts: BuildOptions,
-) !void {
-    var i: usize = 0;
-    while (i < lines.len) {
-        if (foldStartingAt(folds, &lines[i])) |f| {
-            try rows.append(allocator, .{ .fold = f });
-            i += f.lines.len;
-            continue;
+    /// Append a thread's rows: root, then any pending reply-Drafts to the root,
+    /// then each published reply followed by its own pending reply-Drafts.
+    fn emitThread(w: *Weave, t: *const Thread) !void {
+        try w.rows.append(w.a, .{ .comment = .{ .comment = t.root, .is_reply = false } });
+        try w.emitRepliesTo(.{ .comment = t.root.id });
+        for (t.replies) |reply| {
+            try w.rows.append(w.a, .{ .comment = .{ .comment = reply, .is_reply = true } });
+            try w.emitRepliesTo(.{ .comment = reply.id });
         }
-        switch (lines[i].kind) {
-            .context => {
-                const both: LineRow = .{ .line = &lines[i] };
-                try rows.append(allocator, .{ .line_pair = .{ .left = both, .right = both } });
-                try weaveInline(allocator, rows, threads, file, &lines[i], opts);
-                i += 1;
-            },
-            .added => {
-                // An added run with no preceding removed: right side only.
-                const start = i;
-                while (i < lines.len and lines[i].kind == .added) i += 1;
-                var p = start;
-                while (p < i) : (p += 1) {
-                    try rows.append(allocator, .{ .line_pair = .{ .right = .{ .line = &lines[p], .emphasis = emphasis[p] } } });
-                    try weaveInline(allocator, rows, threads, file, &lines[p], opts);
-                }
-            },
-            .removed => {
-                const rem_start = i;
-                while (i < lines.len and lines[i].kind == .removed) i += 1;
-                const rem_end = i;
-                var add_start = i;
-                var add_end = i;
-                if (i < lines.len and lines[i].kind == .added) {
-                    add_start = i;
+    }
+
+    /// Append one Draft row (marking it emitted), then cascade its own pending
+    /// reply-Drafts right after it, so a reply chain nests under its root.
+    fn emitDraft(w: *Weave, i: usize) std.mem.Allocator.Error!void {
+        if (w.emitted[i]) return;
+        w.emitted[i] = true;
+        const d = &w.drafts[i];
+        try w.rows.append(w.a, .{ .draft = .{ .draft = d, .is_reply = d.parent != null } });
+        try w.emitRepliesTo(.{ .draft = d.local_id });
+    }
+
+    /// Emit every not-yet-placed reply Draft whose parent is `parent`, recursively
+    /// (so a reply-to-a-reply-Draft nests correctly). The `emitted` guard bounds
+    /// the recursion even if the parent graph contains a cycle.
+    fn emitRepliesTo(w: *Weave, parent: Parent) std.mem.Allocator.Error!void {
+        for (w.drafts, 0..) |*d, i| {
+            if (w.emitted[i]) continue;
+            const p = d.parent orelse continue;
+            if (parentEql(p, parent)) try w.emitDraft(i);
+        }
+    }
+
+    /// Emit a hunk's lines in unified layout: one row per line, each followed by
+    /// any inline threads and root Drafts anchored to it.
+    fn emitUnifiedHunk(
+        w: *Weave,
+        file: *const model.File,
+        lines: []const model.Line,
+        emphasis: []const []const Segment,
+        folds: []const Fold,
+    ) !void {
+        var i: usize = 0;
+        while (i < lines.len) {
+            if (foldStartingAt(folds, &lines[i])) |f| {
+                try w.rows.append(w.a, .{ .fold = f });
+                i += f.lines.len;
+                continue;
+            }
+            try w.rows.append(w.a, .{ .line = .{ .line = &lines[i], .emphasis = emphasis[i] } });
+            try w.weaveInline(file, &lines[i]);
+            i += 1;
+        }
+    }
+
+    /// Emit a hunk's lines in side-by-side layout: old on the left, new on the
+    /// right, modified pairs aligned on one row. Inline threads are woven after
+    /// the pair that carries their anchored line (once per underlying line, so a
+    /// context line — present on both sides — doesn't double-emit).
+    fn emitSideBySideHunk(
+        w: *Weave,
+        file: *const model.File,
+        lines: []const model.Line,
+        emphasis: []const []const Segment,
+        folds: []const Fold,
+    ) !void {
+        var i: usize = 0;
+        while (i < lines.len) {
+            if (foldStartingAt(folds, &lines[i])) |f| {
+                try w.rows.append(w.a, .{ .fold = f });
+                i += f.lines.len;
+                continue;
+            }
+            switch (lines[i].kind) {
+                .context => {
+                    const both: LineRow = .{ .line = &lines[i] };
+                    try w.rows.append(w.a, .{ .line_pair = .{ .left = both, .right = both } });
+                    try w.weaveInline(file, &lines[i]);
+                    i += 1;
+                },
+                .added => {
+                    // An added run with no preceding removed: right side only.
+                    const start = i;
                     while (i < lines.len and lines[i].kind == .added) i += 1;
-                    add_end = i;
-                }
-                const rn = rem_end - rem_start;
-                const an = add_end - add_start;
-                var p: usize = 0;
-                while (p < @max(rn, an)) : (p += 1) {
-                    const left: ?LineRow = if (p < rn) .{ .line = &lines[rem_start + p], .emphasis = emphasis[rem_start + p] } else null;
-                    const right: ?LineRow = if (p < an) .{ .line = &lines[add_start + p], .emphasis = emphasis[add_start + p] } else null;
-                    try rows.append(allocator, .{ .line_pair = .{ .left = left, .right = right } });
-                    if (right) |rr| try weaveInline(allocator, rows, threads, file, rr.line, opts);
-                    if (left) |ll| {
-                        // Only weave the old line separately when it isn't the
-                        // same line already woven on the right.
-                        if (right == null or ll.line != right.?.line)
-                            try weaveInline(allocator, rows, threads, file, ll.line, opts);
+                    var p = start;
+                    while (p < i) : (p += 1) {
+                        try w.rows.append(w.a, .{ .line_pair = .{ .right = .{ .line = &lines[p], .emphasis = emphasis[p] } } });
+                        try w.weaveInline(file, &lines[p]);
                     }
-                }
-            },
+                },
+                .removed => {
+                    const rem_start = i;
+                    while (i < lines.len and lines[i].kind == .removed) i += 1;
+                    const rem_end = i;
+                    var add_start = i;
+                    var add_end = i;
+                    if (i < lines.len and lines[i].kind == .added) {
+                        add_start = i;
+                        while (i < lines.len and lines[i].kind == .added) i += 1;
+                        add_end = i;
+                    }
+                    const rn = rem_end - rem_start;
+                    const an = add_end - add_start;
+                    var p: usize = 0;
+                    while (p < @max(rn, an)) : (p += 1) {
+                        const left: ?LineRow = if (p < rn) .{ .line = &lines[rem_start + p], .emphasis = emphasis[rem_start + p] } else null;
+                        const right: ?LineRow = if (p < an) .{ .line = &lines[add_start + p], .emphasis = emphasis[add_start + p] } else null;
+                        try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
+                        if (right) |rr| try w.weaveInline(file, rr.line);
+                        if (left) |ll| {
+                            // Only weave the old line separately when it isn't the
+                            // same line already woven on the right.
+                            if (right == null or ll.line != right.?.line)
+                                try w.weaveInline(file, ll.line);
+                        }
+                    }
+                },
+            }
         }
     }
-}
 
-/// Append any current/moved inline threads anchored to `ln` in `file`,
-/// respecting the resolved toggle. Outdated threads are grouped separately.
-fn weaveInline(
-    allocator: std.mem.Allocator,
-    rows: *std.ArrayList(Row),
-    threads: []const Thread,
-    file: *const model.File,
-    ln: *const model.Line,
-    opts: BuildOptions,
-) !void {
-    for (threads) |*t| {
-        const anc = t.root.anchor orelse continue;
-        if (t.root.state == .outdated) continue; // grouped below
-        if (!std.mem.eql(u8, anc.path, file.new_path)) continue;
-        if (!inlineVisible(t.*, opts)) continue;
-        if (anchorMatchesLine(anc, ln)) try emitThread(allocator, rows, t);
+    /// Append any current/moved inline threads anchored to `ln` in `file`
+    /// (respecting the resolved toggle), then any root Drafts anchored there.
+    /// Outdated threads are grouped separately; reply Drafts follow their parent.
+    fn weaveInline(w: *Weave, file: *const model.File, ln: *const model.Line) !void {
+        for (w.threads) |*t| {
+            const anc = t.root.anchor orelse continue;
+            if (t.root.state == .outdated) continue; // grouped below
+            if (!std.mem.eql(u8, anc.path, file.new_path)) continue;
+            if (!inlineVisible(t.*, w.opts)) continue;
+            if (anchorMatchesLine(anc, ln)) try w.emitThread(t);
+        }
+        // Root anchored Drafts hang off the same line, after any published
+        // thread. Reply Drafts are placed under their parent, not by anchor.
+        for (w.drafts, 0..) |*d, i| {
+            if (d.parent != null) continue;
+            const anc = d.anchor orelse continue;
+            if (!std.mem.eql(u8, anc.path, file.new_path)) continue;
+            if (anchorMatchesLine(anc, ln)) try w.emitDraft(i);
+        }
     }
-    // Pending anchored Drafts hang off the same line, after any published thread.
-    for (opts.drafts) |*d| {
-        const anc = d.anchor orelse continue;
-        if (!std.mem.eql(u8, anc.path, file.new_path)) continue;
-        if (anchorMatchesLine(anc, ln)) try emitDraft(allocator, rows, d);
-    }
+};
+
+/// True when two `Parent` references name the same target.
+fn parentEql(a: Parent, b: Parent) bool {
+    return switch (a) {
+        .draft => |x| b == .draft and b.draft == x,
+        .comment => |x| b == .comment and b.comment == x,
+    };
 }
 
 /// Compute the folds for one hunk under the current scope. A maximal run of
@@ -441,10 +508,11 @@ fn fileOutdatedCount(threads: []const Thread, path: []const u8) usize {
     return n;
 }
 
-fn countUnanchoredDrafts(drafts: []const Draft) usize {
+/// Root Drafts (not replies) with no anchor — the PR-level "Pending" section.
+fn countPendingRoots(drafts: []const Draft) usize {
     var n: usize = 0;
     for (drafts) |*d| {
-        if (d.anchor == null) n += 1;
+        if (d.parent == null and d.anchor == null) n += 1;
     }
     return n;
 }
@@ -861,19 +929,122 @@ test "an anchored draft is woven under its line; a PR-level draft gets a pending
     }
 }
 
-test "a reply draft carries the reply flag for indentation" {
+test "a reply draft whose parent is absent stays hidden (shares parent visibility)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     const diff = try parse(a, anchor_diff);
     const drafts = [_]Draft{
+        // Parent comment 5 isn't present, so the reply has nothing to nest under.
+        // A reply is never surfaced as a root, so it stays hidden — it still
+        // persists and submits, but it doesn't float free in the diff.
         .{ .local_id = 1, .kind = .reply, .body = "re", .parent = .{ .comment = 5 } },
     };
     const buf = try buildWithComments(a, diff, .unified, &.{}, .{ .drafts = &drafts });
-    try testing.expectEqual(@as(usize, 1), countKind(buf, .draft));
-    for (buf.rows) |r| {
+    try testing.expectEqual(@as(usize, 0), countKind(buf, .draft));
+}
+
+test "a reply draft to a resolved thread hides and reveals with its parent" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, anchor_diff);
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "nit", .resolved = true, .anchor = .{ .path = "a.txt", .to = 2 } },
+        .{ .id = 2, .parent_id = 1, .author = "Bo", .body = "fixed" },
+    };
+    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const drafts = [_]Draft{
+        .{ .local_id = 1, .kind = .reply, .body = "actually, reopen", .parent = .{ .comment = 1 } },
+    };
+
+    // Toggle off: the resolved thread is hidden, and so is the reply to it.
+    const hidden = try buildWithComments(a, diff, .unified, threads, .{ .drafts = &drafts });
+    try testing.expectEqual(@as(usize, 0), countKind(hidden, .draft));
+    try testing.expectEqual(@as(usize, 0), countKind(hidden, .comment));
+
+    // Toggle on: the whole thread reveals, with the reply draft nested under it.
+    const shown = try buildWithComments(a, diff, .unified, threads, .{ .drafts = &drafts, .show_resolved = true });
+    try testing.expectEqual(@as(usize, 1), countKind(shown, .draft));
+    for (shown.rows) |r| {
         if (r == .draft) try testing.expect(r.draft.is_reply);
+    }
+}
+
+test "a reply draft to a PR-level comment nests under it, not in the pending section" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, anchor_diff);
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "overall looks good" }, // PR-level (no anchor)
+    };
+    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const drafts = [_]Draft{
+        .{ .local_id = 1, .kind = .reply, .body = "one nit though", .parent = .{ .comment = 1 } },
+    };
+    const buf = try buildWithComments(a, diff, .unified, threads, .{ .drafts = &drafts });
+
+    // Row 0: the PR-comments section. Row 1: the comment. Row 2: the reply draft,
+    // sitting directly under the comment it answers — not in a pending section.
+    try testing.expectEqual(SectionKind.pr_comments, buf.rows[0].section.kind);
+    try testing.expect(buf.rows[1] == .comment and buf.rows[1].comment.comment.id == 1);
+    try testing.expect(buf.rows[2] == .draft and buf.rows[2].draft.is_reply);
+    try testing.expectEqual(@as(usize, 1), countKind(buf, .draft));
+    // No pending section was emitted for the reply.
+    for (buf.rows) |r| {
+        if (r == .section) try testing.expect(r.section.kind != .pending);
+    }
+}
+
+test "a reply draft to an inline thread nests right after the thread" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, anchor_diff);
+    const comments = [_]Comment{
+        .{ .id = 7, .author = "Ada", .body = "why?", .anchor = .{ .path = "a.txt", .to = 2 } },
+    };
+    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const drafts = [_]Draft{
+        .{ .local_id = 1, .kind = .reply, .body = "because X", .parent = .{ .comment = 7 } },
+    };
+    const buf = try buildWithComments(a, diff, .unified, threads, .{ .drafts = &drafts });
+
+    // The reply draft immediately follows the published comment it answers.
+    for (buf.rows, 0..) |r, i| {
+        if (r == .comment and r.comment.comment.id == 7) {
+            try testing.expect(buf.rows[i + 1] == .draft);
+            try testing.expect(buf.rows[i + 1].draft.is_reply);
+        }
+    }
+    // Placed inline, so no pending section at the top.
+    try testing.expect(buf.rows[0] != .section or buf.rows[0].section.kind != .pending);
+}
+
+test "a reply-to-draft chain nests under its root draft" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, anchor_diff);
+    const drafts = [_]Draft{
+        .{ .local_id = 1, .kind = .inline_comment, .body = "root", .anchor = .{ .path = "a.txt", .to = 2, .commit = "c0" } },
+        .{ .local_id = 2, .kind = .reply, .body = "reply to my own draft", .parent = .{ .draft = 1 } },
+    };
+    const buf = try buildWithComments(a, diff, .unified, &.{}, .{ .drafts = &drafts });
+
+    try testing.expectEqual(@as(usize, 2), countKind(buf, .draft));
+    for (buf.rows, 0..) |r, i| {
+        if (r == .draft and r.draft.draft.local_id == 1) {
+            try testing.expect(buf.rows[i + 1] == .draft);
+            try testing.expectEqual(@as(u64, 2), buf.rows[i + 1].draft.draft.local_id);
+            try testing.expect(buf.rows[i + 1].draft.is_reply);
+        }
     }
 }
 

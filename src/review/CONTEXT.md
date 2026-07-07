@@ -39,11 +39,11 @@ A Comment whose body contains a fenced ```suggestion``` block proposing replacem
 _Avoid_: patch, fix, edit, proposal.
 
 **Draft**:
-An authored-but-unpublished Comment/Reply/Suggestion held locally. Carries a local temp id, its Anchor, and its DraftState. The atom of a Pending Review.
+An authored-but-unpublished Comment/Reply/Suggestion held locally. Carries a local temp id, its DraftState, and — for a root Draft — an Anchor. A *reply* Draft carries no Anchor of its own: its location comes from its parent. The parent link (not a copied Anchor) is the single expression of that relationship — it drives both rendering placement and Submission ordering. A reply therefore shares its parent's visibility: hide the parent thread (resolved, toggle off) and the reply hides with it. The atom of a Pending Review.
 _Avoid_: pending comment, unsent, staged.
 
 **DraftState**:
-A Draft's lifecycle: `draft` → `submitting` → `posted` (carries the server-assigned CommentId) or `failed` (carries the ApiError reason). Persisted, so a crash resumes mid-review.
+A Draft's lifecycle: `draft` → `submitting` → `posted` (carries the server-assigned CommentId) or `failed` (carries the ApiError reason). Persisted, so a crash resumes mid-Submission. `posted` is a *transient reconciliation* state, not a permanent record: it exists to survive a crash mid-batch, and the Draft's row is deleted once the whole Submission batch succeeds — thereafter the published Comment lives only on Bitbucket (ADR-0007).
 _Avoid_: status, phase.
 
 **PendingReview**:
