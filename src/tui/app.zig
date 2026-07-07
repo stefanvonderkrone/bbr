@@ -184,6 +184,10 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
                         composer = null;
                     } else if (key.matches(vaxis.Key.enter, .{})) {
                         comp.newline() catch {};
+                    } else if (key.matches('w', .{ .ctrl = true })) {
+                        comp.deleteWord(); // vim insert-mode ^W
+                    } else if (key.matches('u', .{ .ctrl = true })) {
+                        comp.deleteToLineStart(); // vim insert-mode ^U
                     } else if (key.matches(vaxis.Key.backspace, .{})) {
                         comp.backspace();
                     } else if (key.text) |t| {

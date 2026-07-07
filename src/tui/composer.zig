@@ -68,6 +68,30 @@ pub const Composer = struct {
         if (self.body_buf.items.len > 0) self.body_buf.items.len -= 1;
     }
 
+    /// Delete the word before the end (vim insert-mode `ctrl-w`): drop trailing
+    /// spaces/tabs, then the run of word bytes. At the start of a line (only a
+    /// newline behind), remove that newline so it joins onto the previous line.
+    pub fn deleteWord(self: *Composer) void {
+        const items = self.body_buf.items;
+        var i = items.len;
+        while (i > 0 and (items[i - 1] == ' ' or items[i - 1] == '\t')) i -= 1;
+        if (i > 0 and items[i - 1] == '\n') {
+            self.body_buf.items.len = i - 1;
+            return;
+        }
+        while (i > 0 and items[i - 1] != ' ' and items[i - 1] != '\t' and items[i - 1] != '\n') i -= 1;
+        self.body_buf.items.len = i;
+    }
+
+    /// Delete back to the start of the current line (vim insert-mode `ctrl-u`):
+    /// everything after the last newline. On the first line, clears it.
+    pub fn deleteToLineStart(self: *Composer) void {
+        const items = self.body_buf.items;
+        var i = items.len;
+        while (i > 0 and items[i - 1] != '\n') i -= 1;
+        self.body_buf.items.len = i;
+    }
+
     /// The Draft to create from the current body. The body slice borrows the
     /// composer's buffer, so the caller must dupe it into durable storage before
     /// tearing the composer down.
@@ -133,4 +157,38 @@ test "backspace on an empty body is a no-op" {
     defer comp.deinit();
     comp.backspace();
     try testing.expectEqual(@as(usize, 0), comp.body().len);
+}
+
+test "deleteWord drops trailing spaces then the last word" {
+    var comp = Composer.init(testing.allocator, .{ .kind = .top_level, .label = "x" });
+    defer comp.deinit();
+    try comp.insert("hello world  ");
+    comp.deleteWord();
+    try testing.expectEqualStrings("hello ", comp.body());
+    comp.deleteWord();
+    try testing.expectEqualStrings("", comp.body());
+    comp.deleteWord(); // no-op on empty
+    try testing.expectEqualStrings("", comp.body());
+}
+
+test "deleteWord at a line start joins to the previous line" {
+    var comp = Composer.init(testing.allocator, .{ .kind = .top_level, .label = "x" });
+    defer comp.deinit();
+    try comp.insert("first");
+    try comp.newline();
+    comp.deleteWord(); // only a newline behind → remove it
+    try testing.expectEqualStrings("first", comp.body());
+}
+
+test "deleteToLineStart clears the current line, keeping earlier ones" {
+    var comp = Composer.init(testing.allocator, .{ .kind = .top_level, .label = "x" });
+    defer comp.deinit();
+    try comp.insert("line one");
+    try comp.newline();
+    try comp.insert("line two text");
+    comp.deleteToLineStart();
+    try testing.expectEqualStrings("line one\n", comp.body());
+    // Again: nothing after the newline, so it's a no-op (does not cross lines).
+    comp.deleteToLineStart();
+    try testing.expectEqualStrings("line one\n", comp.body());
 }

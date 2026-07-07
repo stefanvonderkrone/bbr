@@ -330,7 +330,7 @@ pub fn drawComposer(scratch: std.mem.Allocator, win: vaxis.Window, composer: *co
     const hint_row = h - 1;
     fillRow(modal, hint_row, theme.picker_query);
     _ = modal.printSegment(
-        .{ .text = "^D submit · enter newline · esc cancel", .style = theme.picker_query },
+        .{ .text = "^D submit · ^W del word · ^U del line · esc cancel", .style = theme.picker_query },
         .{ .row_offset = hint_row, .wrap = .none },
     );
 
