@@ -22,21 +22,28 @@ const render = @import("render.zig");
 const theme = @import("theme.zig");
 const Nav = @import("nav.zig").Nav;
 const Picker = @import("picker.zig").Picker;
+const composer_mod = @import("composer.zig");
+const Composer = composer_mod.Composer;
 const session = @import("session.zig");
 const ArenaRing = @import("arena_ring.zig").ArenaRing;
 const Session = session.Session;
 
 const Credential = bbr.bitbucket.Credential;
 const PullRequestSummary = bbr.bitbucket.PullRequestSummary;
+const PendingReview = bbr.review.PendingReview;
+const PendingReviewStore = bbr.review.PendingReviewStore;
+const Draft = bbr.review.Draft;
 
 /// Everything `run` needs to fetch and switch PRs. `online` is false for the
-/// offline `demo`, which disables the network-backed Picker.
+/// offline `demo`, which disables the network-backed Picker. `store` persists
+/// the reviewer's pending Drafts (SQLite in production, `:memory:` for demo).
 pub const RunCtx = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
     env_map: *std.process.Environ.Map,
     cred: Credential,
     repo: []const u8,
+    store: PendingReviewStore,
     online: bool = true,
 };
 
@@ -100,7 +107,15 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
     var scope_fold = true;
     var expanded: std.ArrayList(*const bbr.diff.Line) = .empty;
     defer expanded.deinit(gpa);
-    var buf = try bbr.diff.buffer.buildWithComments(ring.next(), current.diff, layout, current.threads, buildOpts(show_resolved, scope_fold, expanded.items));
+
+    // PR-scoped: the reviewer's pending Drafts for the current PR, loaded from
+    // the store on entry and reloaded on a PR switch (design §11 "drafts cache").
+    // Draft bodies and anchor strings live in this arena.
+    var review_arena = std.heap.ArenaAllocator.init(gpa);
+    defer review_arena.deinit();
+    var review = ctx.store.loadReview(review_arena.allocator(), current.pr.id) catch PendingReview.init(current.pr.id);
+
+    var buf = try bbr.diff.buffer.buildWithComments(ring.next(), current.diff, layout, current.threads, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items));
 
     // Per-frame arena for synthesized gutter/overlay text; reset after render.
     var frame_arena = std.heap.ArenaAllocator.init(gpa);
@@ -110,6 +125,11 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
     var picker_arena = std.heap.ArenaAllocator.init(gpa);
     defer picker_arena.deinit();
     var picker: ?Picker = null;
+
+    // Composer overlay + its own arena (the label + body text live here while open).
+    var composer_arena = std.heap.ArenaAllocator.init(gpa);
+    defer composer_arena.deinit();
+    var composer: ?Composer = null;
 
     var write_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &write_buf);
@@ -146,7 +166,30 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
         const event = try loop.nextEvent();
         switch (event) {
             .key_press => |key| {
-                if (picker) |*p| {
+                if (composer) |*comp| {
+                    // --- Composer mode: keys edit the draft body. ---
+                    if (key.matches(vaxis.Key.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
+                        comp.deinit();
+                        composer = null;
+                    } else if (key.matches('d', .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) {
+                        // Submit: persist the Draft, then close and re-weave.
+                        if (!comp.isBlank()) {
+                            commitDraft(ctx.store, &review, review_arena.allocator(), current.pr.id, comp) catch |err| {
+                                status_msg = @errorName(err);
+                            };
+                            buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
+                            nav.setRowCount(buf.rows.len);
+                        }
+                        comp.deinit();
+                        composer = null;
+                    } else if (key.matches(vaxis.Key.enter, .{})) {
+                        comp.newline() catch {};
+                    } else if (key.matches(vaxis.Key.backspace, .{})) {
+                        comp.backspace();
+                    } else if (key.text) |t| {
+                        comp.insert(t) catch {};
+                    }
+                } else if (picker) |*p| {
                     // --- Picker mode: keys drive the overlay. ---
                     if (key.matches(vaxis.Key.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
                         picker = null;
@@ -181,23 +224,37 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
                         };
                     } else if (key.matches('R', .{})) {
                         show_resolved = !show_resolved;
-                        buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
+                        buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
                         nav.setRowCount(buf.rows.len);
                     } else if (key.matches('s', .{})) {
                         layout = if (layout == .unified) .side_by_side else .unified;
-                        buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
+                        buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
                         nav.setRowCount(buf.rows.len);
                     } else if (key.matches('f', .{})) {
                         // Toggle the diff scope: fold long context vs. whole file.
                         scope_fold = !scope_fold;
                         expanded.clearRetainingCapacity();
-                        buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
+                        buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
                         nav.setRowCount(buf.rows.len);
+                    } else if (key.matches('c', .{})) {
+                        // Author a PR-level (top-level) comment.
+                        openComposer(&composer, &composer_arena, .{ .kind = .top_level, .label = "New comment" });
+                    } else if (key.matches('i', .{}) or key.matches('S', .{})) {
+                        // Author an inline comment / suggestion on the cursor's line.
+                        const kind: bbr.review.DraftKind = if (key.matches('S', .{})) .suggestion else .inline_comment;
+                        openInline(&composer, &composer_arena, current, buf, nav.cursor, kind) catch |err| {
+                            status_msg = @errorName(err);
+                        };
+                    } else if (key.matches('r', .{})) {
+                        // Reply to the comment or draft under the cursor.
+                        openReply(&composer, &composer_arena, buf, nav.cursor) catch |err| {
+                            status_msg = @errorName(err);
+                        };
                     } else if (key.matches(vaxis.Key.enter, .{})) {
                         // Expand the fold under the cursor, if any.
                         if (nav.cursor < buf.rows.len and buf.rows[nav.cursor] == .fold) {
                             expanded.append(gpa, buf.rows[nav.cursor].fold.id) catch {};
-                            buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
+                            buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
                             nav.setRowCount(buf.rows.len);
                         }
                     } else if (handleKey(&nav, &pending_g, key)) |_| {}
@@ -220,7 +277,10 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
                             current = s;
                             // Expanded-fold ids pointed into the old session's diff.
                             expanded.clearRetainingCapacity();
-                            buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items)) catch buf;
+                            // Load the new PR's pending Drafts into a fresh arena.
+                            _ = review_arena.reset(.retain_capacity);
+                            review = ctx.store.loadReview(review_arena.allocator(), current.pr.id) catch PendingReview.init(current.pr.id);
+                            buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
                             nav = Nav.init(buf.rows.len, vx.window().height);
                             pending_g = false;
                             status_msg = null;
@@ -238,15 +298,17 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
         render.draw(frame, win, current.diff, buf, active_theme, nav, selected_file);
         drawStatus(frame, win, current.pr, nav, buf, layout, scope_fold, show_resolved, loading, status_msg);
         if (picker) |*p| render.drawPicker(frame, win, p, active_theme);
+        if (composer) |*comp| render.drawComposer(frame, win, comp, active_theme);
         try vx.render(writer);
         _ = frame_arena.reset(.retain_capacity);
     }
 }
 
-/// Rebuild the row buffer for `s` against the resolved toggle. Rows borrow the
-/// session's diff/threads (not `buf_arena`), so resetting the arena is safe.
-fn buildOpts(show_resolved: bool, scope_fold: bool, expanded: []const *const bbr.diff.Line) bbr.diff.BuildOptions {
-    return .{ .show_resolved = show_resolved, .fold_context = scope_fold, .expanded = expanded };
+/// Assemble the buffer build options from the current toggles, the revealed
+/// folds, and the pending Drafts. Rows borrow the session's diff/threads and the
+/// review arena's drafts (not the buffer arena), so resetting it is safe.
+fn buildOpts(show_resolved: bool, scope_fold: bool, expanded: []const *const bbr.diff.Line, drafts: []const Draft) bbr.diff.BuildOptions {
+    return .{ .show_resolved = show_resolved, .fold_context = scope_fold, .expanded = expanded, .drafts = drafts };
 }
 
 fn rebuild(alloc: std.mem.Allocator, s: *const Session, layout: bbr.diff.Layout, opts: bbr.diff.BuildOptions) !bbr.diff.Buffer {
@@ -266,6 +328,90 @@ fn openPicker(ctx: RunCtx, picker: *?Picker, picker_arena: *std.heap.ArenaAlloca
 
     const prs = try bb.listPullRequests(a, ctx.repo, .{});
     picker.* = try Picker.init(a, prs);
+}
+
+/// Open the Composer with a ready-made Request (a static label). Resets the
+/// composer arena, which backs the body text while open.
+fn openComposer(composer: *?Composer, arena: *std.heap.ArenaAllocator, request: composer_mod.Request) void {
+    _ = arena.reset(.retain_capacity);
+    composer.* = Composer.init(arena.allocator(), request);
+}
+
+/// Open the Composer for an inline comment/suggestion anchored to the cursor's
+/// diff line. Fails if the cursor isn't on a line. The anchor's path/commit are
+/// duped into the composer arena so they survive a PR switch mid-compose.
+fn openInline(
+    composer: *?Composer,
+    arena: *std.heap.ArenaAllocator,
+    s: *const Session,
+    buf: bbr.diff.Buffer,
+    cursor: usize,
+    kind: bbr.review.DraftKind,
+) !void {
+    const ln = lineAtCursor(buf, cursor) orelse return error.NotOnALine;
+    _ = arena.reset(.retain_capacity);
+    const a = arena.allocator();
+
+    const file_idx = fileIndexForRow(buf, cursor);
+    const path = if (file_idx < s.diff.files.len) s.diff.files[file_idx].new_path else "";
+    const anchor: bbr.review.Anchor = .{
+        .path = try a.dupe(u8, path),
+        .from = if (ln.new_no == null) ln.old_no else null,
+        .to = ln.new_no,
+        .commit = try a.dupe(u8, s.pr.source_commit),
+    };
+    const noun: []const u8 = if (kind == .suggestion) "Suggest on" else "Comment on";
+    const label = std.fmt.allocPrint(a, "{s} {s}:{d}", .{ noun, path, ln.new_no orelse ln.old_no orelse 0 }) catch "Comment";
+    composer.* = Composer.init(a, .{ .kind = kind, .anchor = anchor, .label = label });
+}
+
+/// Open the Composer as a reply to the comment or draft under the cursor. The
+/// reply co-locates with its parent (copying the parent's anchor); its `parent`
+/// drives submission ordering — a reply to a pending Draft posts after it (M9).
+fn openReply(composer: *?Composer, arena: *std.heap.ArenaAllocator, buf: bbr.diff.Buffer, cursor: usize) !void {
+    if (cursor >= buf.rows.len) return error.NoReplyTarget;
+    const Target = struct { parent: bbr.review.draft.Parent, anchor: ?bbr.review.Anchor };
+    const target: Target = switch (buf.rows[cursor]) {
+        .comment => |cr| .{ .parent = .{ .comment = cr.comment.id }, .anchor = cr.comment.anchor },
+        .draft => |dr| .{ .parent = .{ .draft = dr.draft.local_id }, .anchor = dr.draft.anchor },
+        else => return error.NoReplyTarget,
+    };
+    _ = arena.reset(.retain_capacity);
+    const a = arena.allocator();
+    var anchor = target.anchor;
+    if (anchor) |*anc| {
+        anc.path = try a.dupe(u8, anc.path);
+        if (anc.commit) |cm| anc.commit = try a.dupe(u8, cm);
+    }
+    composer.* = Composer.init(a, .{ .kind = .reply, .anchor = anchor, .parent = target.parent, .label = "Reply" });
+}
+
+/// Persist a composed Draft: dupe its body (fencing a suggestion) and anchor
+/// strings into the review arena, add it to the PendingReview, and write it
+/// through the store so it survives a crash / quit / PR switch.
+fn commitDraft(store: PendingReviewStore, review: *PendingReview, a: std.mem.Allocator, pr_id: u64, comp: *const Composer) !void {
+    var nd = comp.toNewDraft();
+    nd.body = if (nd.kind == .suggestion)
+        try std.fmt.allocPrint(a, "```suggestion\n{s}\n```", .{comp.body()})
+    else
+        try a.dupe(u8, comp.body());
+    if (nd.anchor) |*anc| {
+        anc.path = try a.dupe(u8, anc.path);
+        if (anc.commit) |cm| anc.commit = try a.dupe(u8, cm);
+    }
+    const id = try review.add(a, nd);
+    if (review.get(id)) |d| try store.put(pr_id, d.*);
+}
+
+/// The diff line under the cursor (a unified `.line` or either side of a
+/// side-by-side `.line_pair`), or null when the row isn't a line.
+fn lineAtCursor(buf: bbr.diff.Buffer, cursor: usize) ?*const bbr.diff.Line {
+    if (cursor >= buf.rows.len) return null;
+    return switch (buf.rows[cursor]) {
+        .line => |lr| lr.line,
+        .line_pair => |p| if (p.right) |rr| rr.line else if (p.left) |ll| ll.line else null,
+        else => null,
+    };
 }
 
 /// Launch a background load for `id`, bumping the epoch. The worker posts a
@@ -388,7 +534,7 @@ fn drawStatus(
     const scope_hint: []const u8 = if (scope_fold) "f whole" else "f changes";
     const resolved_hint: []const u8 = if (show_resolved) "R hide resolved" else "R show resolved";
     // A transient message (error) or the loading indicator takes the tail slot.
-    const tail: []const u8 = if (status_msg) |m| m else if (loading) "loading…" else "p switch  ·  q quit";
+    const tail: []const u8 = if (status_msg) |m| m else if (loading) "loading…" else "c/i comment  ·  r reply  ·  p switch  ·  q quit";
     const text = std.fmt.allocPrint(frame, " #{d} {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s}  ·  {s}  ·  {s} ", .{
         pr.id,
         pr.title,
@@ -441,6 +587,54 @@ test "fileIndexForRow tracks which file a row belongs to" {
     // File two: rows 4..7.
     try testing.expectEqual(@as(usize, 1), fileIndexForRow(buf, 4));
     try testing.expectEqual(@as(usize, 1), fileIndexForRow(buf, 7));
+}
+
+test "lineAtCursor returns the diff line under the cursor, null elsewhere" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try bbr.diff.parse(a, "diff --git a/f.zig b/f.zig\n--- a/f.zig\n+++ b/f.zig\n@@ -1 +1 @@\n-x\n+y\n");
+    const buf = try bbr.diff.buffer.build(a, diff, .unified);
+
+    // Rows: 0 file_header, 1 hunk_header, 2 line(-x), 3 line(+y).
+    try testing.expect(lineAtCursor(buf, 0) == null); // header
+    try testing.expect(lineAtCursor(buf, 2) != null); // removed line
+    try testing.expectEqual(@as(?u32, 1), lineAtCursor(buf, 3).?.new_no); // added line's new number
+}
+
+test "commitDraft fences a suggestion, adds it to the review, and persists it" {
+    var mem = bbr.review.InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+
+    var review_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer review_arena.deinit();
+    var review = PendingReview.init(42);
+
+    var comp = Composer.init(testing.allocator, .{
+        .kind = .suggestion,
+        .anchor = .{ .path = "f.zig", .to = 3, .commit = "c0" },
+        .label = "Suggest on f.zig:3",
+    });
+    defer comp.deinit();
+    try comp.insert("do it this way");
+
+    try commitDraft(store, &review, review_arena.allocator(), 42, &comp);
+
+    // Added to the in-memory review, with the suggestion body fenced.
+    try testing.expectEqual(@as(usize, 1), review.drafts.items.len);
+    const d = review.drafts.items[0];
+    try testing.expect(d.kind == .suggestion);
+    try testing.expectEqualStrings("```suggestion\ndo it this way\n```", d.body);
+
+    // Persisted through the store: a fresh load round-trips it.
+    var load_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer load_arena.deinit();
+    const loaded = try store.load(load_arena.allocator(), 42);
+    try testing.expectEqual(@as(usize, 1), loaded.len);
+    try testing.expectEqualStrings("f.zig", loaded[0].anchor.?.path);
+    try testing.expectEqualStrings("c0", loaded[0].anchor.?.commit.?);
 }
 
 // Force the presentation modules' tests into the exe test binary.

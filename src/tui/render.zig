@@ -22,6 +22,7 @@ const DraftRow = bbr.diff.buffer.DraftRow;
 const Section = bbr.diff.buffer.Section;
 const FileStatus = bbr.diff.FileStatus;
 const Picker = @import("picker.zig").Picker;
+const Composer = @import("composer.zig").Composer;
 
 pub const sidebar_width: u16 = 28;
 
@@ -306,6 +307,59 @@ pub fn drawPicker(scratch: std.mem.Allocator, win: vaxis.Window, picker: *const 
             marker, pr.id, pr.title, pr.source_branch,
         }) catch pr.title;
         _ = modal.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .wrap = .none });
+    }
+}
+
+/// Draw the Composer as a centered modal: a header naming what's being authored,
+/// the body typed so far (scrolled to the tail with a cursor block), and a hint
+/// line. Borrowed text (the label, the body) outlives render via the composer's
+/// own arena. `scratch` outlives render for the synthesized header/hint.
+pub fn drawComposer(scratch: std.mem.Allocator, win: vaxis.Window, composer: *const Composer, theme: Theme) void {
+    const w: u16 = @min(@as(u16, 72), win.width);
+    const h: u16 = @min(@as(u16, 14), win.height);
+    if (w == 0 or h == 0) return;
+    const x = (win.width - w) / 2;
+    const y = (win.height - h) / 2;
+    const modal = win.child(.{ .x_off = x, .y_off = y, .width = w, .height = h });
+
+    // Header (row 0) and hint (last row).
+    fillRow(modal, 0, theme.picker_query);
+    const header = std.fmt.allocPrint(scratch, "✎ {s}", .{composer.request.label}) catch "✎ compose";
+    _ = modal.printSegment(.{ .text = header, .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
+
+    const hint_row = h - 1;
+    fillRow(modal, hint_row, theme.picker_query);
+    _ = modal.printSegment(
+        .{ .text = "^D submit · enter newline · esc cancel", .style = theme.picker_query },
+        .{ .row_offset = hint_row, .wrap = .none },
+    );
+
+    // Body region: rows 1..hint_row-1. Split the body into lines, scroll so the
+    // tail (where the cursor is) stays visible, and mark the end with a block.
+    const body_rows: u16 = if (hint_row > 1) hint_row - 1 else 0;
+    var r: u16 = 1;
+    while (r < hint_row) : (r += 1) fillRow(modal, r, theme.picker);
+
+    const body = composer.body();
+    var total: u16 = 1; // one line, plus one per newline
+    for (body) |ch| {
+        if (ch == '\n') total += 1;
+    }
+    const first_visible: u16 = if (total > body_rows) total - body_rows else 0;
+
+    var li: u16 = 0;
+    var out_row: u16 = 1;
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |line| : (li += 1) {
+        if (li < first_visible) continue;
+        if (out_row >= hint_row) break;
+        const is_last = it.peek() == null;
+        const text = if (is_last)
+            std.fmt.allocPrint(scratch, "{s}▌", .{line}) catch line
+        else
+            line;
+        _ = modal.printSegment(.{ .text = text, .style = theme.picker }, .{ .row_offset = out_row, .col_offset = 1, .wrap = .none });
+        out_row += 1;
     }
 }
 

@@ -11,6 +11,7 @@ const std = @import("std");
 const bbr = @import("bbr");
 const app = @import("tui/app.zig");
 const session = @import("tui/session.zig");
+const persist = @import("persist/sqlite_store.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -109,13 +110,43 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
     const repo_len = @min(target.repo.len, repo_buf.len);
     @memcpy(repo_buf[0..repo_len], target.repo[0..repo_len]);
 
+    // Global-tier pending-review store (design §11): opened once, lives until exit.
+    var store = openStore(gpa, init.io, init.environ_map);
+    defer store.deinit();
+
     try app.run(.{
         .io = init.io,
         .gpa = gpa,
         .env_map = init.environ_map,
         .cred = cred,
         .repo = repo_buf[0..repo_len],
+        .store = store.store(),
     }, initial);
+}
+
+/// Open the pending-review store at `~/.local/state/bbr/pending.db`, creating the
+/// directory. Falls back to an in-memory (non-durable) store when HOME is unset
+/// or the file can't be prepared, so the reviewer can still author this session.
+fn openStore(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map) persist.SqliteStore {
+    if (statePath(gpa, io, env_map)) |path| {
+        defer gpa.free(path);
+        if (persist.SqliteStore.open(path)) |s| {
+            return s;
+        } else |err| {
+            std.debug.print("bbr: could not open {s} ({s}); drafts won't persist this session\n", .{ path, @errorName(err) });
+        }
+    } else |_| {}
+    return persist.SqliteStore.open(":memory:") catch @panic("sqlite :memory: open failed");
+}
+
+/// Build the state DB path, creating `~/.local/state/bbr`. Caller frees.
+fn statePath(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map) ![:0]u8 {
+    const home = env_map.get("HOME") orelse return error.NoHome;
+    const dir = try std.fmt.allocPrint(gpa, "{s}/.local/state/bbr", .{home});
+    defer gpa.free(dir);
+    var d = try std.Io.Dir.cwd().createDirPathOpen(io, dir, .{});
+    d.close(io);
+    return std.fmt.allocPrintSentinel(gpa, "{s}/pending.db", .{dir}, 0);
 }
 
 fn looksLikeUrl(s: []const u8) bool {
@@ -322,12 +353,17 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
         .destination_commit = "demodeadbeef",
     };
 
+    // Ephemeral in-memory store: the demo authors drafts but persists nothing.
+    var store = persist.SqliteStore.open(":memory:") catch @panic("sqlite :memory: open failed");
+    defer store.deinit();
+
     try app.run(.{
         .io = io,
         .gpa = gpa,
         .env_map = env_map,
         .cred = .{ .username = "", .token = "", .workspace = "" },
         .repo = "",
+        .store = store.store(),
         .online = false,
     }, s);
 }
