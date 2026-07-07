@@ -411,6 +411,9 @@ pub fn drawComposer(scratch: std.mem.Allocator, win: vaxis.Window, composer: *co
 /// outlives render for the synthesized text.
 pub fn drawLoading(scratch: std.mem.Allocator, win: vaxis.Window, id: u64, theme: Theme, status_msg: ?[]const u8) void {
     if (win.height == 0 or win.width == 0) return;
+    // Blank the whole window first: on a switch the previous viewer frame is
+    // still in the screen buffer, and we paint only the one centered line.
+    win.clear();
     const text: []const u8 = if (status_msg) |m|
         std.fmt.allocPrint(scratch, "PR #{d}: {s}", .{ id, m }) catch m
     else
