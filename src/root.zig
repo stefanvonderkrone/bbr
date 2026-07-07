@@ -34,6 +34,7 @@ pub const review = struct {
     pub const thread = @import("review/thread.zig");
     pub const draft = @import("review/draft.zig");
     pub const store = @import("review/store.zig");
+    pub const submission = @import("review/submission.zig");
     pub const Comment = comment.Comment;
     pub const CommentId = comment.CommentId;
     pub const Anchor = comment.Anchor;
@@ -49,6 +50,14 @@ pub const review = struct {
     pub const PendingReview = draft.PendingReview;
     pub const PendingReviewStore = store.PendingReviewStore;
     pub const InMemoryStore = store.InMemoryStore;
+    pub const Submission = submission.Submission;
+    pub const CommentPoster = submission.CommentPoster;
+    pub const PostOutcome = submission.PostOutcome;
+    pub const SubmissionStep = submission.Step;
+    pub const SubmissionSummary = submission.Summary;
+    pub const ItemResult = submission.ItemResult;
+    pub const ItemStatus = submission.ItemStatus;
+    pub const headChanged = submission.headChanged;
 };
 
 pub const git = struct {
@@ -95,6 +104,7 @@ test {
     _ = @import("review/thread.zig");
     _ = @import("review/draft.zig");
     _ = @import("review/store.zig");
+    _ = @import("review/submission.zig");
     _ = @import("git/remote.zig");
     _ = @import("git/client.zig");
     _ = @import("bitbucket/url.zig");

@@ -135,6 +135,15 @@ pub const PendingReview = struct {
         return null;
     }
 
+    /// Read-only lookup — for callers that hold a `*const PendingReview` (e.g.
+    /// the Submission engine, which never mutates the review).
+    pub fn getConst(self: *const PendingReview, id: TempId) ?*const Draft {
+        for (self.drafts.items) |*d| {
+            if (d.local_id == id) return d;
+        }
+        return null;
+    }
+
     /// Advance a Draft's lifecycle state. No-op if the id is unknown.
     pub fn setState(self: *PendingReview, id: TempId, state: DraftState) void {
         if (self.get(id)) |d| d.state = state;
