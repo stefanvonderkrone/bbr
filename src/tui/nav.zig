@@ -71,6 +71,13 @@ pub const Nav = struct {
         self.moveTo(if (step >= self.cursor) 0 else self.cursor - @max(step, 1));
     }
 
+    /// Jump straight to `target` (clamped), clearing any pending Count. Used for
+    /// absolute moves that aren't `gg`/`G` — e.g. jump-to-file-header.
+    pub fn jumpTo(self: *Nav, target: usize) void {
+        self.count = 0;
+        self.moveTo(target);
+    }
+
     /// `gg` — first row (or line N with a Count, 1-based).
     pub fn toTop(self: *Nav) void {
         const c = self.count;
@@ -187,6 +194,19 @@ test "setViewport and setRowCount re-clamp" {
     try testing.expectEqual(@as(usize, 10), nav.scroll);
     nav.setViewport(20); // viewport now covers everything → scroll 0
     try testing.expectEqual(@as(usize, 0), nav.scroll);
+}
+
+test "jumpTo moves to an absolute row, clears Count, and scrolls it into view" {
+    var nav = Nav.init(100, 10);
+    nav.pushDigit(5); // a pending Count must not affect an absolute jump
+    nav.jumpTo(50);
+    try testing.expectEqual(@as(usize, 50), nav.cursor);
+    try testing.expectEqual(@as(usize, 0), nav.count);
+    // Scroll clamped so row 50 is visible (bottom of the viewport).
+    try testing.expectEqual(@as(usize, 41), nav.scroll);
+    // Past the end clamps to the last row.
+    nav.jumpTo(999);
+    try testing.expectEqual(@as(usize, 99), nav.cursor);
 }
 
 test "empty buffer keeps cursor at 0" {

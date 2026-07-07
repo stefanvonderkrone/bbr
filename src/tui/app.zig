@@ -1,6 +1,8 @@
 //! The TUI: a unified diff viewer for one PR at a time, with a fuzzy PR Picker
 //! (`p`) for switching. Boots vaxis on the alt-screen, renders a file Sidebar +
 //! unified DiffPane over the current `Session`, and navigates with vim motions.
+//! `[`/`]` jump between files; `o` isolates the focused file (the single-File
+//! Buffer of the domain model) and then `[`/`]` step which file is isolated.
 //!
 //! Concurrency (design §10): the initial PR *and* every switch load their
 //! Session on a worker thread (`std.Io.concurrent`) so the UI never blocks —
@@ -150,6 +152,11 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
     var expanded: std.ArrayList(*const bbr.diff.Line) = .empty;
     defer expanded.deinit(gpa);
 
+    // Isolate view: when set, the pane shows only this file (index into
+    // `diff.files`); `o` toggles it, `[`/`]` change which file. `null` is the
+    // all-files scroll. Cleared on a PR switch (indices belong to that diff).
+    var isolate_file: ?usize = null;
+
     // PR-scoped: the reviewer's pending Drafts for the current PR, loaded from
     // the store on entry and reloaded on a PR switch (design §11 "drafts cache").
     // Draft bodies and anchor strings live in this arena.
@@ -163,7 +170,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
         PendingReview.init(0);
 
     var buf: bbr.diff.Buffer = if (current) |c|
-        try bbr.diff.buffer.buildWithComments(ring.next(), c.diff, layout, c.threads, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items))
+        try bbr.diff.buffer.buildWithComments(ring.next(), c.diff, layout, c.threads, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file))
     else
         .{ .rows = &.{}, .layout = layout };
 
@@ -250,7 +257,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                 commitDraft(ctx.store, &review, review_arena.allocator(), cur.pr.id, comp) catch |err| {
                                     status_msg = @errorName(err);
                                 };
-                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
+                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
                                 nav.setRowCount(buf.rows.len);
                             }
                         }
@@ -307,17 +314,17 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                     } else if (current) |cur| {
                         if (key.matches('R', .{})) {
                             show_resolved = !show_resolved;
-                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
+                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
                             nav.setRowCount(buf.rows.len);
                         } else if (key.matches('s', .{})) {
                             layout = if (layout == .unified) .side_by_side else .unified;
-                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
+                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
                             nav.setRowCount(buf.rows.len);
                         } else if (key.matches('f', .{})) {
                             // Toggle the diff scope: fold long context vs. whole file.
                             scope_fold = !scope_fold;
                             expanded.clearRetainingCapacity();
-                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
+                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
                             nav.setRowCount(buf.rows.len);
                         } else if (key.matches('c', .{})) {
                             // Author a PR-level (top-level) comment.
@@ -325,9 +332,41 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                         } else if (key.matches('i', .{}) or key.matches('S', .{})) {
                             // Author an inline comment / suggestion on the cursor's line.
                             const kind: bbr.review.DraftKind = if (key.matches('S', .{})) .suggestion else .inline_comment;
-                            openInline(&composer, &composer_arena, cur, buf, nav.cursor, kind) catch |err| {
+                            const active_file = isolate_file orelse fileIndexForRow(buf, nav.cursor);
+                            openInline(&composer, &composer_arena, cur, buf, nav.cursor, active_file, kind) catch |err| {
                                 status_msg = @errorName(err);
                             };
+                        } else if (key.matches('o', .{})) {
+                            // Toggle the isolate view over the focused file.
+                            if (isolate_file) |only| {
+                                isolate_file = null;
+                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
+                                nav.setRowCount(buf.rows.len);
+                                // Land the cursor back on the file we were isolating.
+                                if (fileHeaderRow(buf, only)) |hr| nav.jumpTo(hr);
+                            } else {
+                                isolate_file = fileIndexForRow(buf, nav.cursor);
+                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
+                                nav = Nav.init(buf.rows.len, vx.window().height);
+                            }
+                        } else if (key.matches(']', .{})) {
+                            // Next file: jump the cursor forward, or (isolated) show it.
+                            if (isolate_file) |only| {
+                                if (only + 1 < cur.diff.files.len) {
+                                    isolate_file = only + 1;
+                                    buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
+                                    nav = Nav.init(buf.rows.len, vx.window().height);
+                                }
+                            } else if (nextFileHeaderRow(buf, nav.cursor)) |hr| nav.jumpTo(hr);
+                        } else if (key.matches('[', .{})) {
+                            // Previous file: symmetric with `]`.
+                            if (isolate_file) |only| {
+                                if (only > 0) {
+                                    isolate_file = only - 1;
+                                    buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
+                                    nav = Nav.init(buf.rows.len, vx.window().height);
+                                }
+                            } else if (prevFileHeaderRow(buf, nav.cursor)) |hr| nav.jumpTo(hr);
                         } else if (key.matches('r', .{})) {
                             // Reply to the comment or draft under the cursor.
                             openReply(&composer, &composer_arena, buf, nav.cursor) catch |err| {
@@ -337,7 +376,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                             // Expand the fold under the cursor, if any.
                             if (nav.cursor < buf.rows.len and buf.rows[nav.cursor] == .fold) {
                                 expanded.append(gpa, buf.rows[nav.cursor].fold.id) catch {};
-                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
+                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
                                 nav.setRowCount(buf.rows.len);
                             }
                         } else if (handleKey(&nav, &pending_g, key)) |_| {}
@@ -361,12 +400,14 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                             // it's the outgoing Session we now replace.
                             if (current) |c| c.destroy();
                             current = s;
-                            // Expanded-fold ids pointed into the old session's diff.
+                            // Expanded-fold ids and the isolate index pointed into
+                            // the old session's diff.
                             expanded.clearRetainingCapacity();
+                            isolate_file = null;
                             // Load the new PR's pending Drafts into a fresh arena.
                             _ = review_arena.reset(.retain_capacity);
                             review = ctx.store.loadReview(review_arena.allocator(), s.pr.id) catch PendingReview.init(s.pr.id);
-                            buf = rebuild(ring.next(), s, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
+                            buf = rebuild(ring.next(), s, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items, isolate_file)) catch buf;
                             nav = Nav.init(buf.rows.len, vx.window().height);
                             pending_g = false;
                             status_msg = null;
@@ -412,9 +453,11 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
             render.drawLoading(frame, win, loading_id, active_theme, status_msg);
         } else {
             const cur = current.?;
-            const selected_file = fileIndexForRow(buf, nav.cursor);
+            // In the isolate view the sidebar tracks the focused file directly;
+            // otherwise it follows the cursor across the all-files buffer.
+            const selected_file = isolate_file orelse fileIndexForRow(buf, nav.cursor);
             render.draw(frame, win, cur.diff, buf, active_theme, nav, selected_file, cur.threads, review.drafts.items);
-            drawStatus(frame, win, cur.pr, nav, buf, layout, scope_fold, show_resolved, loading, status_msg);
+            drawStatus(frame, win, cur.pr, nav, buf, layout, scope_fold, show_resolved, isolate_file != null, loading, status_msg);
         }
         if (picker) |*p| render.drawPicker(frame, win, p, active_theme);
         if (composer) |*comp| render.drawComposer(frame, win, comp, active_theme);
@@ -426,8 +469,8 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
 /// Assemble the buffer build options from the current toggles, the revealed
 /// folds, and the pending Drafts. Rows borrow the session's diff/threads and the
 /// review arena's drafts (not the buffer arena), so resetting it is safe.
-fn buildOpts(show_resolved: bool, scope_fold: bool, expanded: []const *const bbr.diff.Line, drafts: []const Draft) bbr.diff.BuildOptions {
-    return .{ .show_resolved = show_resolved, .fold_context = scope_fold, .expanded = expanded, .drafts = drafts };
+fn buildOpts(show_resolved: bool, scope_fold: bool, expanded: []const *const bbr.diff.Line, drafts: []const Draft, only_file: ?usize) bbr.diff.BuildOptions {
+    return .{ .show_resolved = show_resolved, .fold_context = scope_fold, .expanded = expanded, .drafts = drafts, .only_file = only_file };
 }
 
 fn rebuild(alloc: std.mem.Allocator, s: *const Session, layout: bbr.diff.Layout, opts: bbr.diff.BuildOptions) !bbr.diff.Buffer {
@@ -485,13 +528,13 @@ fn openInline(
     s: *const Session,
     buf: bbr.diff.Buffer,
     cursor: usize,
+    file_idx: usize,
     kind: bbr.review.DraftKind,
 ) !void {
     const ln = lineAtCursor(buf, cursor) orelse return error.NotOnALine;
     _ = arena.reset(.retain_capacity);
     const a = arena.allocator();
 
-    const file_idx = fileIndexForRow(buf, cursor);
     const path = if (file_idx < s.diff.files.len) s.diff.files[file_idx].new_path else "";
     const anchor: bbr.review.Anchor = .{
         .path = try a.dupe(u8, path),
@@ -506,7 +549,7 @@ fn openInline(
 
 /// Open the Composer as a reply to the comment or draft under the cursor. The
 /// reply co-locates with its parent (copying the parent's anchor); its `parent`
-/// drives submission ordering — a reply to a pending Draft posts after it (M9).
+/// drives submission ordering — a reply to a pending Draft posts after it (M10).
 fn openReply(composer: *?Composer, arena: *std.heap.ArenaAllocator, buf: bbr.diff.Buffer, cursor: usize) !void {
     if (cursor >= buf.rows.len) return error.NoReplyTarget;
     // A reply is placed under its parent (the `parent` link drives rendering and
@@ -712,6 +755,40 @@ fn fileIndexForRow(buf: bbr.diff.Buffer, cursor: usize) usize {
     return idx;
 }
 
+/// Row of the first file header strictly after `cursor` (jump-to-next-file), or
+/// null when the cursor is already in/after the last file.
+fn nextFileHeaderRow(buf: bbr.diff.Buffer, cursor: usize) ?usize {
+    var i: usize = cursor + 1;
+    while (i < buf.rows.len) : (i += 1) {
+        if (buf.rows[i] == .file_header) return i;
+    }
+    return null;
+}
+
+/// Row of the last file header strictly before `cursor` (jump-to-previous-file),
+/// or null when the cursor is in/before the first file.
+fn prevFileHeaderRow(buf: bbr.diff.Buffer, cursor: usize) ?usize {
+    var i: usize = cursor;
+    while (i > 0) {
+        i -= 1;
+        if (buf.rows[i] == .file_header) return i;
+    }
+    return null;
+}
+
+/// Row of the `file_idx`-th file header (0-based), or null if out of range —
+/// used to land the cursor on a file when leaving the isolate view.
+fn fileHeaderRow(buf: bbr.diff.Buffer, file_idx: usize) ?usize {
+    var n: usize = 0;
+    for (buf.rows, 0..) |row, i| {
+        if (row == .file_header) {
+            if (n == file_idx) return i;
+            n += 1;
+        }
+    }
+    return null;
+}
+
 /// A one-line status bar across the bottom row. `frame` is the per-frame arena
 /// (outlives render); a stack buffer would dangle since cells borrow the text.
 fn drawStatus(
@@ -723,6 +800,7 @@ fn drawStatus(
     layout: bbr.diff.Layout,
     scope_fold: bool,
     show_resolved: bool,
+    isolate: bool,
     loading: bool,
     status_msg: ?[]const u8,
 ) void {
@@ -730,10 +808,11 @@ fn drawStatus(
     const row = win.height - 1;
     const layout_hint: []const u8 = if (layout == .unified) "s split" else "s unified";
     const scope_hint: []const u8 = if (scope_fold) "f whole" else "f changes";
+    const file_hint: []const u8 = if (isolate) "o all files" else "o isolate";
     const resolved_hint: []const u8 = if (show_resolved) "R hide resolved" else "R show resolved";
     // A transient message (error) or the loading indicator takes the tail slot.
-    const tail: []const u8 = if (status_msg) |m| m else if (loading) "loading…" else "c/i comment  ·  r reply  ·  p switch  ·  q quit";
-    const text = std.fmt.allocPrint(frame, " #{d} {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s}  ·  {s}  ·  {s} ", .{
+    const tail: []const u8 = if (status_msg) |m| m else if (loading) "loading…" else "[ ] file  ·  c/i comment  ·  p switch  ·  q quit";
+    const text = std.fmt.allocPrint(frame, " #{d} {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s}  ·  {s}  ·  {s}  ·  {s} ", .{
         pr.id,
         pr.title,
         pr.source_branch,
@@ -742,6 +821,7 @@ fn drawStatus(
         buf.rows.len,
         layout_hint,
         scope_hint,
+        file_hint,
         resolved_hint,
         tail,
     }) catch " q quit ";
@@ -785,6 +865,47 @@ test "fileIndexForRow tracks which file a row belongs to" {
     // File two: rows 4..7.
     try testing.expectEqual(@as(usize, 1), fileIndexForRow(buf, 4));
     try testing.expectEqual(@as(usize, 1), fileIndexForRow(buf, 7));
+}
+
+test "file-header helpers drive jump-to-file and isolate landing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const raw =
+        \\diff --git a/one.txt b/one.txt
+        \\--- a/one.txt
+        \\+++ b/one.txt
+        \\@@ -1 +1 @@
+        \\-a
+        \\+b
+        \\diff --git a/two.txt b/two.txt
+        \\--- a/two.txt
+        \\+++ b/two.txt
+        \\@@ -1 +1 @@
+        \\-c
+        \\+d
+        \\
+    ;
+    const diff = try bbr.diff.parse(a, raw);
+    const buf = try bbr.diff.buffer.build(a, diff, .unified);
+    // Rows: 0..3 = file one (header, hunk, -, +); 4..7 = file two.
+
+    // Next-file from within file one lands on file two's header (row 4).
+    try testing.expectEqual(@as(?usize, 4), nextFileHeaderRow(buf, 0));
+    try testing.expectEqual(@as(?usize, 4), nextFileHeaderRow(buf, 3));
+    // No file after the last one.
+    try testing.expectEqual(@as(?usize, null), nextFileHeaderRow(buf, 5));
+
+    // Previous-file from within file two lands on its own header, then file one.
+    try testing.expectEqual(@as(?usize, 4), prevFileHeaderRow(buf, 5));
+    try testing.expectEqual(@as(?usize, 0), prevFileHeaderRow(buf, 4));
+    try testing.expectEqual(@as(?usize, null), prevFileHeaderRow(buf, 0));
+
+    // fileHeaderRow maps a file index to its header row (isolate-exit landing).
+    try testing.expectEqual(@as(?usize, 0), fileHeaderRow(buf, 0));
+    try testing.expectEqual(@as(?usize, 4), fileHeaderRow(buf, 1));
+    try testing.expectEqual(@as(?usize, null), fileHeaderRow(buf, 2));
 }
 
 test "lineAtCursor returns the diff line under the cursor, null elsewhere" {
