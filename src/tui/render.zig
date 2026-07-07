@@ -406,6 +406,20 @@ pub fn drawComposer(scratch: std.mem.Allocator, win: vaxis.Window, composer: *co
     }
 }
 
+/// The boot frame shown until the first Session arrives: a centered
+/// "Loading PR #N…" (or the error, if the initial fetch failed). `scratch`
+/// outlives render for the synthesized text.
+pub fn drawLoading(scratch: std.mem.Allocator, win: vaxis.Window, id: u64, theme: Theme, status_msg: ?[]const u8) void {
+    if (win.height == 0 or win.width == 0) return;
+    const text: []const u8 = if (status_msg) |m|
+        std.fmt.allocPrint(scratch, "PR #{d}: {s}", .{ id, m }) catch m
+    else
+        std.fmt.allocPrint(scratch, "Loading PR #{d}…", .{id}) catch "Loading…";
+    const row = win.height / 2;
+    const col: u16 = if (text.len < win.width) @intCast((win.width - text.len) / 2) else 0;
+    _ = win.printSegment(.{ .text = text, .style = theme.hunk_header }, .{ .row_offset = row, .col_offset = col, .wrap = .none });
+}
+
 /// Render an optional line number right-justified in 4 columns (blank if absent).
 fn numCol(scratch: std.mem.Allocator, no: ?u32) []const u8 {
     const n = no orelse return "    ";
@@ -845,6 +859,53 @@ test "picker overlay draws the query line and highlights the selection" {
     try testing.expectEqualStrings("▸", win.readCell(mx, my + 2).?.char.grapheme);
     try testing.expectEqual(theme_dark.picker_selected.bg, win.readCell(mx, my + 2).?.style.bg);
     try testing.expectEqual(theme_dark.picker.bg, win.readCell(mx, my + 1).?.style.bg);
+}
+
+test "a loading picker shows a placeholder instead of matches" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var picker = Picker.initLoading(a);
+    defer picker.deinit();
+
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    drawPicker(a, win, &picker, theme_dark);
+
+    // Modal at (10, 4); row 1 of the modal carries "  loading…".
+    const mx: u16 = 10;
+    const my: u16 = 4;
+    try testing.expectEqualStrings("l", win.readCell(mx + 2, my + 1).?.char.grapheme);
+}
+
+test "the boot loading view centers a Loading PR line" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    drawLoading(a, win, 42, theme_dark, null);
+
+    // "Loading PR #42…" is 15 columns, centered on 80 → col 32, mid row 12.
+    const text = "Loading PR #42…";
+    const col: u16 = @intCast((80 - text.len) / 2);
+    try testing.expectEqualStrings("L", win.readCell(col, 12).?.char.grapheme);
+    try testing.expectEqualStrings("#", win.readCell(col + 11, 12).?.char.grapheme);
+
+    // With a status message the id-prefixed error takes its place.
+    var screen2 = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen2.deinit(a);
+    const win2 = headlessWindow(&screen2);
+    drawLoading(a, win2, 42, theme_dark, "NotFound");
+    const err_text = "PR #42: NotFound";
+    const ecol: u16 = @intCast((80 - err_text.len) / 2);
+    try testing.expectEqualStrings("P", win2.readCell(ecol, 12).?.char.grapheme);
 }
 
 test "sidebar prefix shows selection marker and status, borrowing no stack" {

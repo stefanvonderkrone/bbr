@@ -2,9 +2,10 @@
 //! (`p`) for switching. Boots vaxis on the alt-screen, renders a file Sidebar +
 //! unified DiffPane over the current `Session`, and navigates with vim motions.
 //!
-//! Concurrency (design §10): the initial Session is loaded before we get here;
-//! switching PRs loads the new Session on a worker thread (`std.Io.concurrent`)
-//! so the UI stays live. Each switch bumps an Epoch; the worker stamps its
+//! Concurrency (design §10): the initial PR *and* every switch load their
+//! Session on a worker thread (`std.Io.concurrent`) so the UI never blocks —
+//! the alt-screen shows a "Loading PR #N…" frame until the first one arrives.
+//! Each load bumps an Epoch; the worker stamps its
 //! result with the epoch it was launched under and posts it back as a custom
 //! `load_done` event. Only the result whose epoch is still current is applied —
 //! results from superseded switches are discarded (Epoch cancellation). Workers
@@ -121,14 +122,17 @@ const LoadReq = struct {
     epoch: u64,
 };
 
-/// Run the viewer. Takes ownership of `initial` and destroys it (and any PR it
-/// later switches to) before returning.
-pub fn run(ctx: RunCtx, initial: *Session) !void {
+/// Run the viewer. `initial` is a pre-built Session (the offline demo) or null,
+/// in which case PR `initial_id` is loaded on a worker thread while a "Loading
+/// PR #N…" frame shows — the TUI never blocks the alt-screen on the first fetch.
+/// Takes ownership of the current Session and destroys it (and any it switches
+/// to) before returning.
+pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
     const gpa = ctx.gpa;
     const io = ctx.io;
 
-    var current: *Session = initial;
-    defer current.destroy();
+    var current: ?*Session = initial;
+    defer if (current) |c| c.destroy();
 
     // Buffer-scoped arenas: the flattened rows for the *current* session, rebuilt
     // whenever the layout, scope, resolved toggle, or a fold changes (and on a PR
@@ -151,9 +155,17 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
     // Draft bodies and anchor strings live in this arena.
     var review_arena = std.heap.ArenaAllocator.init(gpa);
     defer review_arena.deinit();
-    var review = ctx.store.loadReview(review_arena.allocator(), current.pr.id) catch PendingReview.init(current.pr.id);
+    // Empty until the first Session arrives; the initial-load path (below) fills
+    // both `review` and `buf` on `load_done`.
+    var review = if (current) |c|
+        ctx.store.loadReview(review_arena.allocator(), c.pr.id) catch PendingReview.init(c.pr.id)
+    else
+        PendingReview.init(0);
 
-    var buf = try bbr.diff.buffer.buildWithComments(ring.next(), current.diff, layout, current.threads, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items));
+    var buf: bbr.diff.Buffer = if (current) |c|
+        try bbr.diff.buffer.buildWithComments(ring.next(), c.diff, layout, c.threads, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items))
+    else
+        .{ .rows = &.{}, .layout = layout };
 
     // Per-frame arena for synthesized gutter/overlay text; reset after render.
     var frame_arena = std.heap.ArenaAllocator.init(gpa);
@@ -210,6 +222,16 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
     var loading = false; // a switch is in flight for the current epoch
     var status_msg: ?[]const u8 = null; // transient error/status (static string)
 
+    // Boot the initial PR through the same worker path as a switch, so the
+    // alt-screen shows a "Loading PR #N…" frame instead of blocking on the
+    // first fetch. `initial != null` is the demo, already built — nothing to do.
+    if (current == null) {
+        spawnLoad(ctx, &loop, &loads, &epoch, gpa, initial_id) catch |err| {
+            status_msg = @errorName(err);
+        };
+        if (loads.items.len > 0) loading = true;
+    }
+
     while (true) {
         const event = try loop.nextEvent();
         switch (event) {
@@ -220,13 +242,16 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
                         comp.deinit();
                         composer = null;
                     } else if (key.matches('d', .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) {
-                        // Submit: persist the Draft, then close and re-weave.
+                        // Submit: persist the Draft, then close and re-weave. The
+                        // Composer can only open over a loaded Session.
                         if (!comp.isBlank()) {
-                            commitDraft(ctx.store, &review, review_arena.allocator(), current.pr.id, comp) catch |err| {
-                                status_msg = @errorName(err);
-                            };
-                            buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
-                            nav.setRowCount(buf.rows.len);
+                            if (current) |cur| {
+                                commitDraft(ctx.store, &review, review_arena.allocator(), cur.pr.id, comp) catch |err| {
+                                    status_msg = @errorName(err);
+                                };
+                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
+                                nav.setRowCount(buf.rows.len);
+                            }
                         }
                         comp.deinit();
                         composer = null;
@@ -270,46 +295,51 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
                     // --- Viewer mode. ---
                     if (key.matches('q', .{}) or key.matches('c', .{ .ctrl = true })) break;
 
+                    // `p` opens the Picker even while the initial PR is still
+                    // loading — it needs no Session. Everything else acts on the
+                    // current Session/Buffer, so it waits until one is loaded.
                     if (key.matches('p', .{}) and ctx.online) {
                         openPicker(ctx, &picker, &picker_arena, &loop, &picker_loads, &picker_epoch, gpa) catch |err| {
                             status_msg = @errorName(err);
                         };
-                    } else if (key.matches('R', .{})) {
-                        show_resolved = !show_resolved;
-                        buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
-                        nav.setRowCount(buf.rows.len);
-                    } else if (key.matches('s', .{})) {
-                        layout = if (layout == .unified) .side_by_side else .unified;
-                        buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
-                        nav.setRowCount(buf.rows.len);
-                    } else if (key.matches('f', .{})) {
-                        // Toggle the diff scope: fold long context vs. whole file.
-                        scope_fold = !scope_fold;
-                        expanded.clearRetainingCapacity();
-                        buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
-                        nav.setRowCount(buf.rows.len);
-                    } else if (key.matches('c', .{})) {
-                        // Author a PR-level (top-level) comment.
-                        openComposer(&composer, &composer_arena, .{ .kind = .top_level, .label = "New comment" });
-                    } else if (key.matches('i', .{}) or key.matches('S', .{})) {
-                        // Author an inline comment / suggestion on the cursor's line.
-                        const kind: bbr.review.DraftKind = if (key.matches('S', .{})) .suggestion else .inline_comment;
-                        openInline(&composer, &composer_arena, current, buf, nav.cursor, kind) catch |err| {
-                            status_msg = @errorName(err);
-                        };
-                    } else if (key.matches('r', .{})) {
-                        // Reply to the comment or draft under the cursor.
-                        openReply(&composer, &composer_arena, buf, nav.cursor) catch |err| {
-                            status_msg = @errorName(err);
-                        };
-                    } else if (key.matches(vaxis.Key.enter, .{})) {
-                        // Expand the fold under the cursor, if any.
-                        if (nav.cursor < buf.rows.len and buf.rows[nav.cursor] == .fold) {
-                            expanded.append(gpa, buf.rows[nav.cursor].fold.id) catch {};
-                            buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
+                    } else if (current) |cur| {
+                        if (key.matches('R', .{})) {
+                            show_resolved = !show_resolved;
+                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
                             nav.setRowCount(buf.rows.len);
-                        }
-                    } else if (handleKey(&nav, &pending_g, key)) |_| {}
+                        } else if (key.matches('s', .{})) {
+                            layout = if (layout == .unified) .side_by_side else .unified;
+                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
+                            nav.setRowCount(buf.rows.len);
+                        } else if (key.matches('f', .{})) {
+                            // Toggle the diff scope: fold long context vs. whole file.
+                            scope_fold = !scope_fold;
+                            expanded.clearRetainingCapacity();
+                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
+                            nav.setRowCount(buf.rows.len);
+                        } else if (key.matches('c', .{})) {
+                            // Author a PR-level (top-level) comment.
+                            openComposer(&composer, &composer_arena, .{ .kind = .top_level, .label = "New comment" });
+                        } else if (key.matches('i', .{}) or key.matches('S', .{})) {
+                            // Author an inline comment / suggestion on the cursor's line.
+                            const kind: bbr.review.DraftKind = if (key.matches('S', .{})) .suggestion else .inline_comment;
+                            openInline(&composer, &composer_arena, cur, buf, nav.cursor, kind) catch |err| {
+                                status_msg = @errorName(err);
+                            };
+                        } else if (key.matches('r', .{})) {
+                            // Reply to the comment or draft under the cursor.
+                            openReply(&composer, &composer_arena, buf, nav.cursor) catch |err| {
+                                status_msg = @errorName(err);
+                            };
+                        } else if (key.matches(vaxis.Key.enter, .{})) {
+                            // Expand the fold under the cursor, if any.
+                            if (nav.cursor < buf.rows.len and buf.rows[nav.cursor] == .fold) {
+                                expanded.append(gpa, buf.rows[nav.cursor].fold.id) catch {};
+                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
+                                nav.setRowCount(buf.rows.len);
+                            }
+                        } else if (handleKey(&nav, &pending_g, key)) |_| {}
+                    }
                 }
             },
             .winsize => |ws| {
@@ -325,14 +355,16 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
                     loading = false;
                     switch (done.outcome) {
                         .ok => |s| {
-                            current.destroy();
+                            // On the initial boot `current` is null; on a switch
+                            // it's the outgoing Session we now replace.
+                            if (current) |c| c.destroy();
                             current = s;
                             // Expanded-fold ids pointed into the old session's diff.
                             expanded.clearRetainingCapacity();
                             // Load the new PR's pending Drafts into a fresh arena.
                             _ = review_arena.reset(.retain_capacity);
-                            review = ctx.store.loadReview(review_arena.allocator(), current.pr.id) catch PendingReview.init(current.pr.id);
-                            buf = rebuild(ring.next(), current, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
+                            review = ctx.store.loadReview(review_arena.allocator(), s.pr.id) catch PendingReview.init(s.pr.id);
+                            buf = rebuild(ring.next(), s, layout, buildOpts(show_resolved, scope_fold, expanded.items, review.drafts.items)) catch buf;
                             nav = Nav.init(buf.rows.len, vx.window().height);
                             pending_g = false;
                             status_msg = null;
@@ -370,12 +402,15 @@ pub fn run(ctx: RunCtx, initial: *Session) !void {
             },
         }
 
-        const selected_file = fileIndexForRow(buf, nav.cursor);
-
         const win = vx.window();
         const frame = frame_arena.allocator();
-        render.draw(frame, win, current.diff, buf, active_theme, nav, selected_file, current.threads, review.drafts.items);
-        drawStatus(frame, win, current.pr, nav, buf, layout, scope_fold, show_resolved, loading, status_msg);
+        if (current) |cur| {
+            const selected_file = fileIndexForRow(buf, nav.cursor);
+            render.draw(frame, win, cur.diff, buf, active_theme, nav, selected_file, cur.threads, review.drafts.items);
+            drawStatus(frame, win, cur.pr, nav, buf, layout, scope_fold, show_resolved, loading, status_msg);
+        } else {
+            render.drawLoading(frame, win, initial_id, active_theme, status_msg);
+        }
         if (picker) |*p| render.drawPicker(frame, win, p, active_theme);
         if (composer) |*comp| render.drawComposer(frame, win, comp, active_theme);
         try vx.render(writer);

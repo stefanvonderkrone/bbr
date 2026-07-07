@@ -95,13 +95,9 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         },
     };
 
-    // Load the initial session (blocking, on the main thread). It — and any PR
-    // switched to later — is backed by the page allocator so `app.run` can
-    // destroy it uniformly and worker threads can allocate without racing.
-    const initial = session.load(init.io, std.heap.page_allocator, init.environ_map, cred, target.repo, target.id) catch |err| {
-        std.debug.print("bbr: failed to load PR #{d} in {s}: {s}\n", .{ target.id, target.repo, @errorName(err) });
-        return;
-    };
+    // The initial PR is loaded on a worker thread inside `app.run` (it shows a
+    // "Loading PR #N…" frame meanwhile), so we don't block here — `run` is told
+    // which id to open and passes `initial = null`.
 
     // `repo` must outlive the TUI (worker loads copy it), so dupe it into a
     // buffer the run owns via the session-independent gpa arena above… but that
@@ -121,7 +117,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .cred = cred,
         .repo = repo_buf[0..repo_len],
         .store = store.store(),
-    }, initial);
+    }, null, target.id);
 }
 
 /// Open the pending-review store at `~/.local/state/bbr/pending.db`, creating the
@@ -365,7 +361,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
         .repo = "",
         .store = store.store(),
         .online = false,
-    }, s);
+    }, s, s.pr.id);
 }
 
 // Test discovery only follows `_ = @import(...)` chains rooted in the *test
