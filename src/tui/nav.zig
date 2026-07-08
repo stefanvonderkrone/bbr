@@ -106,6 +106,68 @@ pub const Nav = struct {
         self.moveTo(if (step >= self.cursor) 0 else self.cursor - @max(step, 1));
     }
 
+    /// `ctrl-f` — down a full viewport (times Count).
+    pub fn pageDown(self: *Nav) void {
+        self.moveTo(self.cursor +| self.viewport *| self.takeCount());
+    }
+
+    /// `ctrl-b` — up a full viewport (times Count).
+    pub fn pageUp(self: *Nav) void {
+        const step = self.viewport *| self.takeCount();
+        self.moveTo(if (step >= self.cursor) 0 else self.cursor - step);
+    }
+
+    // --- scroll positioning (cursor stays; the viewport moves) ---------------
+    // These set `scroll` directly; the cursor is left where it is and stays
+    // visible by construction, so `clampScroll`'s keep-visible branches don't
+    // fire — only its end-of-content cap applies (so `zz` near EOF can't center,
+    // matching vim). Count is not meaningful, so it's cleared.
+
+    /// `zz` — center the cursor line in the viewport.
+    pub fn center(self: *Nav) void {
+        self.count = 0;
+        const half = self.viewport / 2;
+        self.scroll = if (self.cursor > half) self.cursor - half else 0;
+        self.clampScroll();
+    }
+
+    /// `zt` — scroll so the cursor line sits at the top of the viewport.
+    pub fn scrollCursorTop(self: *Nav) void {
+        self.count = 0;
+        self.scroll = self.cursor;
+        self.clampScroll();
+    }
+
+    /// `zb` — scroll so the cursor line sits at the bottom of the viewport.
+    pub fn scrollCursorBottom(self: *Nav) void {
+        self.count = 0;
+        self.scroll = if (self.cursor + 1 > self.viewport) self.cursor + 1 - self.viewport else 0;
+        self.clampScroll();
+    }
+
+    // --- viewport-relative cursor jumps (the viewport stays; the cursor moves) -
+    // `H`/`M`/`L`: land the cursor on the row at the top / middle / bottom of the
+    // current viewport. The target is already visible, so `moveTo`'s clampScroll
+    // leaves `scroll` untouched. Count is cleared.
+
+    /// `H` — cursor to the top visible row.
+    pub fn cursorToViewTop(self: *Nav) void {
+        self.count = 0;
+        self.moveTo(self.scroll);
+    }
+
+    /// `M` — cursor to the middle visible row.
+    pub fn cursorToViewMiddle(self: *Nav) void {
+        self.count = 0;
+        self.moveTo(self.scroll + self.viewport / 2);
+    }
+
+    /// `L` — cursor to the bottom visible row.
+    pub fn cursorToViewBottom(self: *Nav) void {
+        self.count = 0;
+        self.moveTo(self.scroll +| self.viewport -| 1);
+    }
+
     /// Jump straight to `target` (clamped), clearing any pending Count. Used for
     /// absolute moves that aren't `gg`/`G` — e.g. jump-to-file-header.
     pub fn jumpTo(self: *Nav, target: usize) void {
@@ -284,6 +346,54 @@ test "setRowCount drops the selection" {
     try testing.expect(nav.hasSelection());
     nav.setRowCount(50);
     try testing.expect(!nav.hasSelection());
+}
+
+test "full-page down/up steps by a whole viewport" {
+    var nav = Nav.init(100, 10);
+    nav.pageDown();
+    try testing.expectEqual(@as(usize, 10), nav.cursor);
+    nav.pageDown();
+    try testing.expectEqual(@as(usize, 20), nav.cursor);
+    nav.pageUp();
+    try testing.expectEqual(@as(usize, 10), nav.cursor);
+    nav.pushDigit(2);
+    nav.pageUp(); // 2 pages up, clamps at 0
+    try testing.expectEqual(@as(usize, 0), nav.cursor);
+}
+
+test "zz/zt/zb reposition the viewport, leaving the cursor line" {
+    var nav = Nav.init(100, 10);
+    nav.jumpTo(50); // cursor 50, scroll 41
+    nav.center();
+    try testing.expectEqual(@as(usize, 50), nav.cursor); // cursor unchanged
+    try testing.expectEqual(@as(usize, 45), nav.scroll); // 50 - 10/2
+    nav.scrollCursorTop();
+    try testing.expectEqual(@as(usize, 50), nav.scroll);
+    nav.scrollCursorBottom();
+    try testing.expectEqual(@as(usize, 41), nav.scroll); // 50 + 1 - 10
+    try testing.expectEqual(@as(usize, 50), nav.cursor);
+}
+
+test "zz near EOF cannot center past the last page" {
+    var nav = Nav.init(100, 10);
+    nav.toBottom(); // cursor 99, scroll 90
+    nav.center();
+    try testing.expectEqual(@as(usize, 99), nav.cursor);
+    try testing.expectEqual(@as(usize, 90), nav.scroll); // capped at last page, not 94
+}
+
+test "H/M/L land the cursor within the current viewport" {
+    var nav = Nav.init(100, 10);
+    nav.jumpTo(50); // scroll 41 → visible rows 41..50
+    nav.cursorToViewTop();
+    try testing.expectEqual(@as(usize, 41), nav.cursor);
+    try testing.expectEqual(@as(usize, 41), nav.scroll); // scroll unchanged
+    nav.cursorToViewBottom();
+    try testing.expectEqual(@as(usize, 50), nav.cursor);
+    try testing.expectEqual(@as(usize, 41), nav.scroll);
+    nav.cursorToViewMiddle();
+    try testing.expectEqual(@as(usize, 46), nav.cursor); // 41 + 10/2
+    try testing.expectEqual(@as(usize, 41), nav.scroll);
 }
 
 test "empty buffer keeps cursor at 0" {

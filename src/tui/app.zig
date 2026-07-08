@@ -42,6 +42,7 @@ const bbr = @import("bbr");
 const render = @import("render.zig");
 const theme = @import("theme.zig");
 const Nav = @import("nav.zig").Nav;
+const keymap = @import("keymap.zig");
 const Picker = @import("picker.zig").Picker;
 const composer_mod = @import("composer.zig");
 const Composer = composer_mod.Composer;
@@ -373,7 +374,8 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
 
     const active_theme = theme.dark;
     var nav = Nav.init(buf.rows.len, vx.window().height);
-    var pending_g = false; // saw the first `g` of a `gg`
+    const km = keymap.Keymap.default; // M12 will overlay config here
+    var resolver = keymap.Resolver{}; // tracks the leader across keypresses
     var loading = false; // a load is in flight for the current epoch
     var loading_id: u64 = initial_id; // PR the in-flight load targets (for the loading view)
     var status_msg: ?[]const u8 = null; // transient error/status (static string)
@@ -452,112 +454,156 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                         p.insert(t);
                     }
                 } else {
-                    // --- Viewer mode. ---
-                    if (key.matches('q', .{}) or key.matches('c', .{ .ctrl = true })) break;
-
-                    // `p` opens the Picker even while the initial PR is still
-                    // loading — it needs no Session. Everything else acts on the
-                    // current Session/Buffer, so it waits until one is loaded.
-                    if (key.matches('p', .{}) and ctx.online) {
-                        openPicker(ctx, &picker, &picker_arena, &loop, &picker_loads, &picker_epoch, gpa) catch |err| {
-                            status_msg = @errorName(err);
-                        };
-                    } else if (current) |cur| {
-                        if (key.matches('R', .{})) {
-                            show_resolved = !show_resolved;
-                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
-                            nav.setRowCount(buf.rows.len);
-                        } else if (key.matches('s', .{})) {
-                            layout = if (layout == .unified) .side_by_side else .unified;
-                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
-                            nav.setRowCount(buf.rows.len);
-                        } else if (key.matches('f', .{})) {
-                            // Cycle the diff scope: Changes → fetched-whole → whole-file.
-                            // The whole-file blob is fetched lazily below the loop.
-                            scope = scope.next();
-                            expanded.clearRetainingCapacity();
-                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
-                            nav.setRowCount(buf.rows.len);
-                        } else if (key.matches('c', .{})) {
-                            // Author a PR-level (top-level) comment.
-                            openComposer(&composer, &composer_arena, .{ .kind = .top_level, .label = "New comment" });
-                        } else if (key.matches('v', .{})) {
-                            // Toggle a visual line selection at the cursor.
-                            nav.toggleMark();
-                        } else if (key.matches(vaxis.Key.escape, .{})) {
-                            // Drop any active selection.
-                            nav.clearMark();
-                        } else if (key.matches('i', .{}) or key.matches('S', .{})) {
-                            // Author an inline comment / suggestion on the cursor's
-                            // line, or over the visual selection's range if one is active.
-                            const kind: bbr.review.DraftKind = if (key.matches('S', .{})) .suggestion else .inline_comment;
-                            const active_file = isolate_file orelse fileIndexForRow(buf, nav.cursor);
-                            if (openInline(&composer, &composer_arena, cur, buf, nav.cursor, active_file, kind, nav.selection())) |_| {
-                                nav.clearMark(); // selection consumed
-                            } else |err| {
-                                status_msg = @errorName(err); // refused: keep the selection to retry
-                            }
-                        } else if (key.matches('o', .{})) {
-                            // Toggle the isolate view over the focused file.
-                            if (isolate_file) |only| {
-                                isolate_file = null;
-                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
-                                nav.setRowCount(buf.rows.len);
-                                // Land the cursor back on the file we were isolating.
-                                if (fileHeaderRow(buf, only)) |hr| nav.jumpTo(hr);
-                            } else {
-                                isolate_file = fileIndexForRow(buf, nav.cursor);
-                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
-                                nav = Nav.init(buf.rows.len, vx.window().height);
-                            }
-                        } else if (key.matches(']', .{})) {
-                            // Next file: jump the cursor forward, or (isolated) show it.
-                            if (isolate_file) |only| {
-                                if (only + 1 < cur.diff.files.len) {
-                                    isolate_file = only + 1;
+                    // --- Viewer mode. Resolve the key through the Keymap; the
+                    // Resolver threads the leader grammar (gg/zz) and surfaces
+                    // Count digits, and the resolved Action drives one switch. ---
+                    switch (resolver.feed(km, key)) {
+                        .none => {},
+                        // A Count digit only matters over a loaded Session.
+                        .digit => |d| if (current != null) nav.pushDigit(d),
+                        .action => |act| switch (act) {
+                            // Quit needs no Session.
+                            .quit => break,
+                            // `p` opens the Picker even while the initial PR is
+                            // still loading — it needs no Session.
+                            .open_picker => if (ctx.online) {
+                                openPicker(ctx, &picker, &picker_arena, &loop, &picker_loads, &picker_epoch, gpa) catch |err| {
+                                    status_msg = @errorName(err);
+                                };
+                            },
+                            // Everything else acts on the current Session/Buffer,
+                            // so it waits until one is loaded.
+                            else => if (current) |cur| switch (act) {
+                                .quit, .open_picker => unreachable, // handled above
+                                // --- motions ---
+                                .down => nav.down(),
+                                .up => nav.up(),
+                                .half_page_down => nav.halfPageDown(),
+                                .half_page_up => nav.halfPageUp(),
+                                .page_down => nav.pageDown(),
+                                .page_up => nav.pageUp(),
+                                .to_top => nav.toTop(),
+                                .to_bottom => nav.toBottom(),
+                                .center => nav.center(),
+                                .scroll_cursor_top => nav.scrollCursorTop(),
+                                .scroll_cursor_bottom => nav.scrollCursorBottom(),
+                                .cursor_view_top => nav.cursorToViewTop(),
+                                .cursor_view_middle => nav.cursorToViewMiddle(),
+                                .cursor_view_bottom => nav.cursorToViewBottom(),
+                                // Shift+arrow: start (or extend) a selection, then
+                                // move. Plain motions leave `mark` untouched, so
+                                // they extend an already-active selection.
+                                .select_down => {
+                                    nav.ensureMark();
+                                    nav.down();
+                                },
+                                .select_up => {
+                                    nav.ensureMark();
+                                    nav.up();
+                                },
+                                // --- commands ---
+                                .toggle_resolved => {
+                                    show_resolved = !show_resolved;
                                     buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
-                                    nav = Nav.init(buf.rows.len, vx.window().height);
-                                }
-                            } else if (nextFileHeaderRow(buf, nav.cursor)) |hr| nav.jumpTo(hr);
-                        } else if (key.matches('[', .{})) {
-                            // Previous file: symmetric with `]`.
-                            if (isolate_file) |only| {
-                                if (only > 0) {
-                                    isolate_file = only - 1;
+                                    nav.setRowCount(buf.rows.len);
+                                },
+                                .toggle_layout => {
+                                    layout = if (layout == .unified) .side_by_side else .unified;
                                     buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
-                                    nav = Nav.init(buf.rows.len, vx.window().height);
-                                }
-                            } else if (prevFileHeaderRow(buf, nav.cursor)) |hr| nav.jumpTo(hr);
-                        } else if (key.matches('r', .{})) {
-                            // Reply to the comment or draft under the cursor.
-                            openReply(&composer, &composer_arena, buf, nav.cursor) catch |err| {
-                                status_msg = @errorName(err);
-                            };
-                        } else if (key.matches(vaxis.Key.enter, .{})) {
-                            // Expand the fold under the cursor, if any.
-                            if (nav.cursor < buf.rows.len and buf.rows[nav.cursor] == .fold) {
-                                expanded.append(gpa, buf.rows[nav.cursor].fold.id) catch {};
-                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
-                                nav.setRowCount(buf.rows.len);
-                            }
-                        } else if (key.matches('X', .{})) {
-                            // Submit the pending review to Bitbucket (M10). Runs
-                            // on a worker; results stream back as submit events.
-                            if (!ctx.online) {
-                                status_msg = "offline: cannot submit";
-                            } else if (submitting) {
-                                status_msg = "already submitting…";
-                            } else if (review.drafts.items.len == 0) {
-                                status_msg = "no pending drafts to submit";
-                            } else if (spawnSubmit(ctx, &loop, &submit_loads, &submit_epoch, gpa, &review, cur.pr.id, cur.pr.source_commit)) |_| {
-                                submitting = true;
-                                submit_total = review.drafts.items.len;
-                                submit_seen = 0;
-                                status_msg = null;
-                            } else |err| {
-                                status_msg = @errorName(err);
-                            }
-                        } else if (handleKey(&nav, &pending_g, key)) |_| {}
+                                    nav.setRowCount(buf.rows.len);
+                                },
+                                .cycle_scope => {
+                                    // Cycle the diff scope: Changes → fetched-whole
+                                    // → whole-file. The whole-file blob is fetched
+                                    // lazily below the loop.
+                                    scope = scope.next();
+                                    expanded.clearRetainingCapacity();
+                                    buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                    nav.setRowCount(buf.rows.len);
+                                },
+                                .comment => openComposer(&composer, &composer_arena, .{ .kind = .top_level, .label = "New comment" }),
+                                .toggle_select => nav.toggleMark(),
+                                .clear_selection => nav.clearMark(),
+                                .inline_comment, .suggest => {
+                                    // Author an inline comment / suggestion on the
+                                    // cursor's line, or over the visual selection's
+                                    // range if one is active.
+                                    const kind: bbr.review.DraftKind = if (act == .suggest) .suggestion else .inline_comment;
+                                    const active_file = isolate_file orelse fileIndexForRow(buf, nav.cursor);
+                                    if (openInline(&composer, &composer_arena, cur, buf, nav.cursor, active_file, kind, nav.selection())) |_| {
+                                        nav.clearMark(); // selection consumed
+                                    } else |err| {
+                                        status_msg = @errorName(err); // refused: keep the selection to retry
+                                    }
+                                },
+                                .isolate => {
+                                    // Toggle the isolate view over the focused file.
+                                    if (isolate_file) |only| {
+                                        isolate_file = null;
+                                        buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                        nav.setRowCount(buf.rows.len);
+                                        // Land the cursor back on the file we were isolating.
+                                        if (fileHeaderRow(buf, only)) |hr| nav.jumpTo(hr);
+                                    } else {
+                                        isolate_file = fileIndexForRow(buf, nav.cursor);
+                                        buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                        nav = Nav.init(buf.rows.len, vx.window().height);
+                                    }
+                                },
+                                .next_file => {
+                                    // Next file: jump the cursor forward, or (isolated) show it.
+                                    if (isolate_file) |only| {
+                                        if (only + 1 < cur.diff.files.len) {
+                                            isolate_file = only + 1;
+                                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                            nav = Nav.init(buf.rows.len, vx.window().height);
+                                        }
+                                    } else if (nextFileHeaderRow(buf, nav.cursor)) |hr| nav.jumpTo(hr);
+                                },
+                                .prev_file => {
+                                    // Previous file: symmetric with next.
+                                    if (isolate_file) |only| {
+                                        if (only > 0) {
+                                            isolate_file = only - 1;
+                                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                            nav = Nav.init(buf.rows.len, vx.window().height);
+                                        }
+                                    } else if (prevFileHeaderRow(buf, nav.cursor)) |hr| nav.jumpTo(hr);
+                                },
+                                .reply => {
+                                    // Reply to the comment or draft under the cursor.
+                                    openReply(&composer, &composer_arena, buf, nav.cursor) catch |err| {
+                                        status_msg = @errorName(err);
+                                    };
+                                },
+                                .expand_fold => {
+                                    // Expand the fold under the cursor, if any.
+                                    if (nav.cursor < buf.rows.len and buf.rows[nav.cursor] == .fold) {
+                                        expanded.append(gpa, buf.rows[nav.cursor].fold.id) catch {};
+                                        buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                        nav.setRowCount(buf.rows.len);
+                                    }
+                                },
+                                .submit => {
+                                    // Submit the pending review to Bitbucket (M10).
+                                    // Runs on a worker; results stream back as events.
+                                    if (!ctx.online) {
+                                        status_msg = "offline: cannot submit";
+                                    } else if (submitting) {
+                                        status_msg = "already submitting…";
+                                    } else if (review.drafts.items.len == 0) {
+                                        status_msg = "no pending drafts to submit";
+                                    } else if (spawnSubmit(ctx, &loop, &submit_loads, &submit_epoch, gpa, &review, cur.pr.id, cur.pr.source_commit)) |_| {
+                                        submitting = true;
+                                        submit_total = review.drafts.items.len;
+                                        submit_seen = 0;
+                                        status_msg = null;
+                                    } else |err| {
+                                        status_msg = @errorName(err);
+                                    }
+                                },
+                            },
+                        },
                     }
                 }
             },
@@ -595,7 +641,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                             review = ctx.store.loadReview(review_arena.allocator(), s.pr.id) catch PendingReview.init(s.pr.id);
                             buf = rebuild(ring.next(), s, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, s.blobs)) catch buf;
                             nav = Nav.init(buf.rows.len, vx.window().height);
-                            pending_g = false;
+                            resolver = .{}; // drop any half-typed leader
                             status_msg = null;
                         },
                         .err => |e| status_msg = @errorName(e),
@@ -1434,48 +1480,6 @@ fn loadWorker(
     };
 }
 
-/// Apply a key to `nav`. Returns non-null when the key was a recognized motion.
-fn handleKey(nav: *Nav, pending_g: *bool, key: vaxis.Key) ?void {
-    // `gg` is a two-key motion: the first `g` arms, the second fires.
-    if (pending_g.*) {
-        pending_g.* = false;
-        if (key.matches('g', .{})) {
-            nav.toTop();
-            return {};
-        }
-        // Any other key after a lone `g` just falls through to normal handling.
-    }
-
-    // Shift+arrow starts (or extends) a visual selection, then moves. Plain
-    // motions leave `mark` untouched, so they extend a selection that's already
-    // active (vim visual mode) and just move when none is.
-    if (key.matches(vaxis.Key.down, .{ .shift = true })) {
-        nav.ensureMark();
-        nav.down();
-    } else if (key.matches(vaxis.Key.up, .{ .shift = true })) {
-        nav.ensureMark();
-        nav.up();
-    } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-        nav.down();
-    } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-        nav.up();
-    } else if (key.matches('d', .{ .ctrl = true }) or key.matches(vaxis.Key.page_down, .{})) {
-        nav.halfPageDown();
-    } else if (key.matches('u', .{ .ctrl = true }) or key.matches(vaxis.Key.page_up, .{})) {
-        nav.halfPageUp();
-    } else if (key.matches('G', .{}) or key.matches(vaxis.Key.end, .{})) {
-        nav.toBottom();
-    } else if (key.matches('g', .{}) or key.matches(vaxis.Key.home, .{})) {
-        pending_g.* = true;
-    } else if (key.text) |t| {
-        // Numeric Count prefix (5j, 42G, …).
-        if (t.len == 1 and t[0] >= '0' and t[0] <= '9') {
-            nav.pushDigit(t[0] - '0');
-        } else return null;
-    } else return null;
-    return {};
-}
-
 /// Which file (index into `diff.files`) the row at `cursor` belongs to, so the
 /// sidebar highlight tracks the diff pane. Counts file headers up to the cursor.
 fn fileIndexForRow(buf: bbr.diff.Buffer, cursor: usize) usize {
@@ -1752,6 +1756,7 @@ test {
     _ = @import("render.zig");
     _ = @import("theme.zig");
     _ = @import("nav.zig");
+    _ = @import("keymap.zig");
     _ = @import("picker.zig");
     _ = @import("session.zig");
     _ = @import("arena_ring.zig");

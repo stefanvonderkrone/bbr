@@ -40,3 +40,11 @@ _Avoid_: movement, command, action (an action is the broader term).
 **Count**:
 The pending numeric prefix applied to the next Motion (e.g. `5j`). Held in a register and cleared after the Motion runs.
 _Avoid_: repeat, multiplier, prefix.
+
+**Action**:
+What a key resolves to in the Keymap: a Motion or a command (quit, reply, submit, toggle a view…). The unit the Keymap binds and dispatch acts on; the broader term Motion specializes.
+_Avoid_: command, handler, event.
+
+**Leader**:
+A prefix key that arms a two-key Motion — the `g` of `gg`, the `z` of `zz`/`zt`/`zb`. A Leader has no Action of its own; the following key completes the binding, and an unrecognized follow-up is dropped. Distinct from the Count, which the engine accumulates separately.
+_Avoid_: prefix, modifier, chord.
