@@ -85,6 +85,15 @@ pub const SqliteStore = struct {
             try self.exec(schema_v1);
             try self.exec("PRAGMA user_version = 1;");
         }
+        // v2 (M10b): multi-line anchors. Add the range's top-line columns. They
+        // append at the end of the row, so v1 column indices are unaffected.
+        if (try self.userVersion() < 2) {
+            try self.exec(
+                \\ALTER TABLE drafts ADD COLUMN anchor_start_from INTEGER;
+                \\ALTER TABLE drafts ADD COLUMN anchor_start_to   INTEGER;
+            );
+            try self.exec("PRAGMA user_version = 2;");
+        }
     }
 
     fn userVersion(self: *SqliteStore) SqliteError!i64 {
@@ -116,8 +125,9 @@ pub const SqliteStore = struct {
             \\INSERT OR REPLACE INTO drafts
             \\ (pr_id, local_id, kind, target, parent_kind, parent_id,
             \\  anchor_path, anchor_from, anchor_to, anchor_commit,
-            \\  body, state_kind, state_id, state_err)
-            \\ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?);
+            \\  body, state_kind, state_id, state_err,
+            \\  anchor_start_from, anchor_start_to)
+            \\ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
         ;
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
@@ -143,17 +153,22 @@ pub const SqliteStore = struct {
             bindNull(stmt, 6);
         }
 
-        // anchor: NULL path means no anchor.
+        // anchor: NULL path means no anchor. Range top lines (15/16) append
+        // after the state columns, matching the v2 ALTER TABLE order.
         if (d.anchor) |a| {
             bindText(stmt, 7, a.path);
             bindOptU32(stmt, 8, a.from);
             bindOptU32(stmt, 9, a.to);
             bindOptText(stmt, 10, a.commit);
+            bindOptU32(stmt, 15, a.start_from);
+            bindOptU32(stmt, 16, a.start_to);
         } else {
             bindNull(stmt, 7);
             bindNull(stmt, 8);
             bindNull(stmt, 9);
             bindNull(stmt, 10);
+            bindNull(stmt, 15);
+            bindNull(stmt, 16);
         }
 
         bindText(stmt, 11, d.body);
@@ -201,7 +216,8 @@ pub const SqliteStore = struct {
         const sql =
             \\SELECT local_id, kind, target, parent_kind, parent_id,
             \\ anchor_path, anchor_from, anchor_to, anchor_commit,
-            \\ body, state_kind, state_id, state_err
+            \\ body, state_kind, state_id, state_err,
+            \\ anchor_start_from, anchor_start_to
             \\ FROM drafts WHERE pr_id=? ORDER BY local_id;
         ;
         var stmt: ?*c.sqlite3_stmt = null;
@@ -236,6 +252,8 @@ pub const SqliteStore = struct {
                 .from = columnOptU32(stmt, 6),
                 .to = columnOptU32(stmt, 7),
                 .commit = try columnTextDup(allocator, stmt, 8),
+                .start_from = columnOptU32(stmt, 13),
+                .start_to = columnOptU32(stmt, 14),
             };
         }
 
@@ -328,7 +346,7 @@ test "in-memory round-trip preserves fields, anchor, parent, and state" {
         .local_id = 1,
         .kind = .inline_comment,
         .target = .bitbucket,
-        .anchor = .{ .path = "src/f.zig", .from = 3, .to = 12, .commit = "deadbeef" },
+        .anchor = .{ .path = "src/f.zig", .from = 3, .to = 12, .start_to = 9, .commit = "deadbeef" },
         .body = "needs a test",
         .state = .{ .posted = 555 },
     });
@@ -350,6 +368,9 @@ test "in-memory round-trip preserves fields, anchor, parent, and state" {
     try testing.expectEqualStrings("src/f.zig", d0.anchor.?.path);
     try testing.expectEqual(@as(?u32, 3), d0.anchor.?.from);
     try testing.expectEqual(@as(?u32, 12), d0.anchor.?.to);
+    try testing.expectEqual(@as(?u32, 9), d0.anchor.?.start_to); // range top round-trips
+    try testing.expect(d0.anchor.?.start_from == null);
+    try testing.expect(d0.anchor.?.isRange());
     try testing.expectEqualStrings("deadbeef", d0.anchor.?.commit.?);
     try testing.expectEqualStrings("needs a test", d0.body);
     try testing.expectEqual(@as(CommentId, 555), d0.state.posted);

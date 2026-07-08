@@ -83,11 +83,15 @@ pub const Poster = struct {
     }
 };
 
-/// Two anchors match if both are absent, or both name the same path and lines.
+/// Two anchors match if both are absent, or both name the same path and the
+/// same span — bottom (`from`/`to`) *and* top (`start_from`/`start_to`), so a
+/// ranged draft doesn't dedupe against a single-line comment on its end line.
 fn anchorsMatch(a: ?Anchor, b: ?Anchor) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
-    return std.mem.eql(u8, a.?.path, b.?.path) and a.?.from == b.?.from and a.?.to == b.?.to;
+    return std.mem.eql(u8, a.?.path, b.?.path) and
+        a.?.from == b.?.from and a.?.to == b.?.to and
+        a.?.start_from == b.?.start_from and a.?.start_to == b.?.start_to;
 }
 
 // ---------------------------------------------------------------------------

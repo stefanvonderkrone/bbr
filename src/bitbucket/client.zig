@@ -230,17 +230,31 @@ pub const Client = struct {
         defer allocator.free(auth);
 
         // Build the wire shape; `emit_null_optional_fields = false` drops the
-        // `inline`/`parent`/`from`/`to` keys we leave null.
+        // `inline`/`parent`/`from`/`to`/`start_*` keys we leave null. A range
+        // sends `start_to`/`start_from` alongside `to`/`from` (the top of the
+        // span); a single-line anchor leaves them null and they're omitted.
         const Wire = struct {
             content: struct { raw: []const u8 },
-            @"inline": ?struct { path: []const u8, from: ?u32 = null, to: ?u32 = null } = null,
+            @"inline": ?struct {
+                path: []const u8,
+                from: ?u32 = null,
+                to: ?u32 = null,
+                start_from: ?u32 = null,
+                start_to: ?u32 = null,
+            } = null,
             parent: ?struct { id: CommentId } = null,
         };
         var wire = Wire{ .content = .{ .raw = nc.body } };
         if (nc.parent) |pid| {
             wire.parent = .{ .id = pid };
         } else if (nc.anchor) |anc| {
-            wire.@"inline" = .{ .path = anc.path, .from = anc.from, .to = anc.to };
+            wire.@"inline" = .{
+                .path = anc.path,
+                .from = anc.from,
+                .to = anc.to,
+                .start_from = anc.start_from,
+                .start_to = anc.start_to,
+            };
         }
         const body = try std.json.Stringify.valueAlloc(allocator, wire, .{ .emit_null_optional_fields = false });
         defer allocator.free(body);
@@ -534,6 +548,9 @@ const CommentJson = struct {
         path: []const u8,
         from: ?u32 = null,
         to: ?u32 = null,
+        /// Top of a multi-line range; null for a single-line anchor.
+        start_from: ?u32 = null,
+        start_to: ?u32 = null,
         /// Bitbucket's own outdated verdict for this anchor (ADR-0001). Absent on
         /// current comments; treat missing as `current`.
         outdated: ?bool = null,
@@ -569,6 +586,8 @@ fn dupeComment(allocator: Allocator, cj: CommentJson, head: HeadCommits) !Commen
             .path = try allocator.dupe(u8, inl.path),
             .from = inl.from,
             .to = inl.to,
+            .start_from = inl.start_from,
+            .start_to = inl.start_to,
         };
     }
 
@@ -904,6 +923,37 @@ test "createComment builds an inline body for a root anchored comment" {
     , body);
 }
 
+test "createComment sends start_to alongside to for a new-side range" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 201, .body =
+        \\{ "id": 1 }
+    };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    _ = try bb.createComment(a, "myrepo", 7, .{
+        .body = "spans three lines",
+        .anchor = .{ .path = "src/foo.zig", .start_to = 67, .to = 69 },
+    });
+    // Render the same wire shape the client builds; null `from`/`start_from`
+    // are dropped, `to`/`start_to` survive as the range's bottom/top.
+    const Wire = struct {
+        content: struct { raw: []const u8 },
+        @"inline": ?struct {
+            path: []const u8,
+            from: ?u32 = null,
+            to: ?u32 = null,
+            start_from: ?u32 = null,
+            start_to: ?u32 = null,
+        } = null,
+    };
+    var wire = Wire{ .content = .{ .raw = "spans three lines" } };
+    wire.@"inline" = .{ .path = "src/foo.zig", .to = 69, .start_to = 67 };
+    const body = try std.json.Stringify.valueAlloc(a, wire, .{ .emit_null_optional_fields = false });
+    defer a.free(body);
+    try testing.expectEqualStrings(
+        \\{"content":{"raw":"spans three lines"},"inline":{"path":"src/foo.zig","to":69,"start_to":67}}
+    , body);
+}
+
 test "createComment sends parent.id and no inline for a reply" {
     const a = testing.allocator;
     const Wire = struct {
@@ -1024,6 +1074,34 @@ test "an inline.outdated comment parses to AnchorState.outdated" {
     try testing.expectEqual(@as(?u32, 38), comments[0].anchor.?.to);
     try testing.expect(comments[0].anchor.?.from == null);
     try testing.expect(comments[0].suggestion() != null);
+}
+
+// A multi-line-anchored comment as Bitbucket returns it (captured from a probe
+// on PR 1856): a new-side range spans start_to..to, old side null.
+const range_comment_page =
+    \\{ "values": [
+    \\  { "id": 822941278, "deleted": false,
+    \\    "content": { "raw": "spans three lines" }, "user": { "display_name": "Ada" },
+    \\    "inline": { "from": null, "to": 69, "path": ".storybook/main.ts",
+    \\                "start_from": null, "start_to": 67, "outdated": false } }
+    \\] }
+;
+
+test "a multi-line-anchored comment parses start_to and to into a range" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body = range_comment_page };
+    const bb = Client.init(fake.httpClient(), testCredential());
+
+    const comments = try bb.getComments(a, "pr-webapp", 1856, .{});
+    defer @import("client.zig").deinitComments(a, comments);
+
+    try testing.expectEqual(@as(usize, 1), comments.len);
+    const anc = comments[0].anchor.?;
+    try testing.expect(anc.isRange());
+    try testing.expectEqual(@as(?u32, 67), anc.start_to);
+    try testing.expectEqual(@as(?u32, 69), anc.to);
+    try testing.expect(anc.start_from == null and anc.from == null);
+    try testing.expectEqual(@as(?u32, 69), anc.line()); // renders on the bottom line
 }
 
 // A list page as the *list* endpoint actually shapes it (no inline.outdated),

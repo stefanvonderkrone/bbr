@@ -18,24 +18,38 @@ pub const CommentId = u64;
 /// parsed remote comment is `current` or `outdated`.
 pub const AnchorState = enum { current, moved, outdated };
 
-/// The diff location a Comment attaches to. Exactly one of `from`/`to` is set
-/// for a single-sided comment: `from` is an old-file line, `to` a new-file line.
-/// `start_*` bound a multi-line range (deferred to authoring, M5+).
+/// The diff location a Comment attaches to. `from`/`to` are the anchor line
+/// itself: `from` is an old-file (left) line, `to` a new-file (right) line — a
+/// single-sided comment sets exactly one. `start_from`/`start_to` are the *top*
+/// of a multi-line range whose bottom is `from`/`to` on the same side (the shape
+/// Bitbucket returns and accepts: `{start_to, to}` for a new-side range,
+/// `{start_from, from}` for an old-side one). A single-line anchor leaves the
+/// `start_*` fields null.
 pub const Anchor = struct {
     path: []const u8,
-    /// Old-file (left) line number, 1-based.
+    /// Old-file (left) line number, 1-based — the bottom of an old-side range.
     from: ?u32 = null,
-    /// New-file (right) line number, 1-based.
+    /// New-file (right) line number, 1-based — the bottom of a new-side range.
     to: ?u32 = null,
+    /// Old-file (left) top line of a multi-line range; null for a single line.
+    start_from: ?u32 = null,
+    /// New-file (right) top line of a multi-line range; null for a single line.
+    start_to: ?u32 = null,
     /// The source commit this anchor was authored against, or null for a remote
     /// comment (Bitbucket owns its verdict, ADR-0001). A local Draft records it
     /// so its AnchorState can be recomputed by diff-walking later (ADR-0005).
     commit: ?[]const u8 = null,
 
     /// The line this anchor renders against in the unified diff, preferring the
-    /// new side (where an added/context comment lives) then the old side.
+    /// new side (where an added/context comment lives) then the old side. For a
+    /// range this is the bottom line (`from`/`to`), matching Bitbucket.
     pub fn line(self: Anchor) ?u32 {
         return self.to orelse self.from;
+    }
+
+    /// True when this anchor spans more than one line (a `start_*` is set).
+    pub fn isRange(self: Anchor) bool {
+        return self.start_to != null or self.start_from != null;
     }
 };
 
@@ -107,6 +121,19 @@ test "anchor line prefers the new side" {
     try testing.expectEqual(@as(?u32, 10), (Anchor{ .path = "f", .to = 10, .from = 3 }).line());
     try testing.expectEqual(@as(?u32, 3), (Anchor{ .path = "f", .from = 3 }).line());
     try testing.expectEqual(@as(?u32, null), (Anchor{ .path = "f" }).line());
+}
+
+test "anchor isRange reflects a start_* bound; line stays the bottom" {
+    const single = Anchor{ .path = "f", .to = 69 };
+    try testing.expect(!single.isRange());
+
+    const new_range = Anchor{ .path = "f", .start_to = 67, .to = 69 };
+    try testing.expect(new_range.isRange());
+    try testing.expectEqual(@as(?u32, 69), new_range.line());
+
+    const old_range = Anchor{ .path = "f", .start_from = 3, .from = 19 };
+    try testing.expect(old_range.isRange());
+    try testing.expectEqual(@as(?u32, 19), old_range.line());
 }
 
 test "suggestion extracts the fenced block body" {
