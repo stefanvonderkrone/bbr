@@ -53,18 +53,27 @@ pub const LinePair = struct {
 };
 
 /// A comment woven into the diff: the comment itself plus whether it's a reply
-/// (so the renderer can indent it under its root).
+/// (so the renderer can indent it under its root). A multi-line body emits one
+/// CommentRow per visual line (M11 option A2), all sharing `comment`, so the
+/// buffer keeps its one-Row-per-screen-line invariant and `Nav`/scroll are
+/// untouched. `line` is that row's visual line (zero-copy into `comment.body`);
+/// `is_first` marks the header row that carries the marker + author.
 pub const CommentRow = struct {
     comment: *const Comment,
     is_reply: bool,
+    line: []const u8 = "",
+    is_first: bool = true,
 };
 
 /// A pending Draft woven into the diff: the Draft itself plus whether it's a
 /// reply (indented under whatever it replies to), so the renderer can mark it
-/// distinctly from a published comment.
+/// distinctly from a published comment. Multi-line bodies emit one DraftRow per
+/// visual line, mirroring CommentRow (see above).
 pub const DraftRow = struct {
     draft: *const Draft,
     is_reply: bool,
+    line: []const u8 = "",
+    is_first: bool = true,
 };
 
 pub const SectionKind = enum {
@@ -288,11 +297,27 @@ const Weave = struct {
     /// Append a thread's rows: root, then any pending reply-Drafts to the root,
     /// then each published reply followed by its own pending reply-Drafts.
     fn emitThread(w: *Weave, t: *const Thread) !void {
-        try w.rows.append(w.a, .{ .comment = .{ .comment = t.root, .is_reply = false } });
+        try w.emitComment(t.root, false);
         try w.emitRepliesTo(.{ .comment = t.root.id });
         for (t.replies) |reply| {
-            try w.rows.append(w.a, .{ .comment = .{ .comment = reply, .is_reply = true } });
+            try w.emitComment(reply, true);
             try w.emitRepliesTo(.{ .comment = reply.id });
+        }
+    }
+
+    /// Emit one CommentRow per visual line of the body (verbatim, fences and
+    /// all — M11 §Q5-A), the first carrying the marker + author. `splitScalar`
+    /// always yields at least one line, so an empty body still shows its header.
+    fn emitComment(w: *Weave, c: *const Comment, is_reply: bool) !void {
+        var it = std.mem.splitScalar(u8, trimTrailingNewline(c.body), '\n');
+        var first = true;
+        while (it.next()) |ln| : (first = false) {
+            try w.rows.append(w.a, .{ .comment = .{
+                .comment = c,
+                .is_reply = is_reply,
+                .line = ln,
+                .is_first = first,
+            } });
         }
     }
 
@@ -312,7 +337,16 @@ const Weave = struct {
             else => false,
         };
         if (!published) {
-            try w.rows.append(w.a, .{ .draft = .{ .draft = d, .is_reply = d.parent != null } });
+            var it = std.mem.splitScalar(u8, trimTrailingNewline(d.body), '\n');
+            var first = true;
+            while (it.next()) |ln| : (first = false) {
+                try w.rows.append(w.a, .{ .draft = .{
+                    .draft = d,
+                    .is_reply = d.parent != null,
+                    .line = ln,
+                    .is_first = first,
+                } });
+            }
         }
         try w.emitRepliesTo(.{ .draft = d.local_id });
     }
@@ -510,6 +544,12 @@ fn spliceNewSide(allocator: std.mem.Allocator, file: model.File, blob: []const u
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+/// Drop a single trailing newline so a body ending in `\n` doesn't emit a
+/// spurious blank last row; interior blank lines are preserved.
+fn trimTrailingNewline(s: []const u8) []const u8 {
+    return if (s.len > 0 and s[s.len - 1] == '\n') s[0 .. s.len - 1] else s;
 }
 
 /// old_no for an unchanged new line, clamped to a non-negative u32 (a mismatched
@@ -1374,4 +1414,67 @@ test "an inline thread anchored to a missing current line is not lost silently" 
     const threads = try @import("../review/thread.zig").build(a, &comments);
     const buf = try buildWithComments(a, diff, .unified, threads, .{});
     try testing.expectEqual(@as(usize, 0), countKind(buf, .comment));
+}
+
+test "a multi-line body emits one row per visual line, sharing one owner, is_first on the header only" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, anchor_diff);
+    // A 3-line comment body and a 2-line pending Draft, both anchored on new line 2.
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "line one\nline two\nline three", .anchor = .{ .path = "a.txt", .to = 2 } },
+    };
+    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const drafts = [_]Draft{
+        .{ .local_id = 1, .kind = .inline_comment, .body = "draft a\ndraft b", .anchor = .{ .path = "a.txt", .to = 2, .commit = "c0" } },
+    };
+    const buf = try buildWithComments(a, diff, .unified, threads, .{ .drafts = &drafts });
+
+    // Three comment rows, all pointing at the same Comment; is_first only first.
+    var comment_rows: usize = 0;
+    var first_rows: usize = 0;
+    for (buf.rows) |r| {
+        if (r != .comment) continue;
+        comment_rows += 1;
+        try testing.expectEqual(&comments[0], r.comment.comment);
+        if (r.comment.is_first) {
+            first_rows += 1;
+            try testing.expectEqualStrings("line one", r.comment.line);
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), comment_rows);
+    try testing.expectEqual(@as(usize, 1), first_rows);
+
+    // Two draft rows for the 2-line body; only the header is_first.
+    var draft_rows: usize = 0;
+    var draft_first: usize = 0;
+    for (buf.rows) |r| {
+        if (r != .draft) continue;
+        draft_rows += 1;
+        if (r.draft.is_first) {
+            draft_first += 1;
+            try testing.expectEqualStrings("draft a", r.draft.line);
+        } else {
+            try testing.expectEqualStrings("draft b", r.draft.line);
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), draft_rows);
+    try testing.expectEqual(@as(usize, 1), draft_first);
+}
+
+test "a trailing newline does not emit a spurious blank last row" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, anchor_diff);
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "solo\n", .anchor = .{ .path = "a.txt", .to = 2 } },
+    };
+    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const buf = try buildWithComments(a, diff, .unified, threads, .{});
+    // "solo\n" trims to one line, not two.
+    try testing.expectEqual(@as(usize, 1), countKind(buf, .comment));
 }

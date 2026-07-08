@@ -110,7 +110,9 @@ _Deferred:_ editing a prefilled/multi-line suggestion is append-only (revise fro
 - [ ] Full vim motion set + numeric Count register (`5j`, `zz`, …); arrows side by side.
 - [ ] Configurable `Keymap` from config.
 - [ ] Keybinding-help Overlay (reads Keymap).
-- [ ] **Multi-line comment/draft/suggestion body rendering.** Today a comment/Draft is one Row showing the lead line + `…` (M3 deferral). Render the full body across multiple rows — a suggestion showing its whole fenced block — which means breaking the one-Row-per-screen-line model the buffer/Nav rely on: emit N body rows per comment, cap/fold long bodies, and keep the suggestion band spanning them. Grew more visible once M10b let us author multi-line suggestions. Pairs with markdown rendering.
+- [x] **Multi-line comment/draft/suggestion body rendering.** ✅ Kept the one-Row-per-screen-line invariant (so `Nav`/scroll are untouched): a multi-line body emits one `CommentRow`/`DraftRow` per visual line, all sharing the owner pointer, `is_first` marking the header row (option A2). `r`/reply resolves from any line for free (every row carries the owner). Bodies render **verbatim**, fences and all (§Q5-A) — the `±` marker + suggestion band still signal a suggestion; fence-aware styling waits for markdown. Full body, **no cap** — the pane already scrolls; capping/folding is a deferred follow-up (layers cleanly on A2). Continuation rows hang-indent two columns; a single trailing newline is trimmed so it emits no blank row.
+
+  _Deferred:_ markdown rendering (headings/bold, fence-aware suggestion styling — item (B) above); a length cap/fold for pathological bodies.
 
 ## M12 — Themes & config  ·  S  ·  needs M2
 - [ ] Config file (TOML at `~/.config/bbr/`).

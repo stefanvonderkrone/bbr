@@ -400,7 +400,9 @@ test "demo data weaves through the real pipeline" {
     var hidden_comments: usize = 0;
     var outdated_sections: usize = 0;
     for (hidden.rows) |r| {
-        if (r == .comment) hidden_comments += 1;
+        // A multi-line body emits one row per visual line (M11); count the
+        // header (`is_first`) rows to tally distinct comments woven.
+        if (r == .comment and r.comment.is_first) hidden_comments += 1;
         if (r == .section and r.section.kind == .outdated) outdated_sections += 1;
     }
     // PR-level (#1) + inline root (#2) + suggestion reply (#4) + outdated (#7) = 4;
@@ -412,7 +414,7 @@ test "demo data weaves through the real pipeline" {
     const shown = try bbr.diff.buffer.buildWithComments(a, diff, .unified, threads, .{ .show_resolved = true });
     var shown_comments: usize = 0;
     for (shown.rows) |r| {
-        if (r == .comment) shown_comments += 1;
+        if (r == .comment and r.comment.is_first) shown_comments += 1;
     }
     try testing.expectEqual(@as(usize, 5), shown_comments);
 }

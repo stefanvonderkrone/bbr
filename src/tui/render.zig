@@ -241,16 +241,11 @@ fn drawLineBody(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, body_col:
 }
 
 /// First line of a body (comment bodies may be multi-line; one row shows the
-/// lead line, with `…` appended when there's more). Borrows `body`.
-fn firstLine(body: []const u8) struct { text: []const u8, more: bool } {
-    if (std.mem.indexOfScalar(u8, body, '\n')) |nl| {
-        return .{ .text = body[0..nl], .more = true };
-    }
-    return .{ .text = body, .more = false };
-}
-
-/// A woven comment. Root at col 2, reply indented to col 6. A ```suggestion
-/// gets the suggestion style and a `±` marker so it reads distinctly.
+/// A woven comment, one visual line per row (M11 A2). The `is_first` row carries
+/// the marker + author; continuation rows hang-indent the body two columns in.
+/// Root at col 2, reply at col 6. A ```suggestion gets the suggestion style and
+/// a `±` marker so it reads distinctly; the body is drawn verbatim (fences and
+/// all — markdown rendering is a later follow-up).
 fn drawComment(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, cr: CommentRow, theme: Theme) void {
     const c = cr.comment;
     const is_suggestion = c.suggestion() != null;
@@ -258,33 +253,35 @@ fn drawComment(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, cr: Commen
     fillRow(win, r, style);
 
     const col: u16 = if (cr.is_reply) 6 else 2;
-    const marker: []const u8 = if (is_suggestion) "±" else if (cr.is_reply) "↳" else "▸";
-
-    // Prefer the suggestion body when present, else the comment prose.
-    const shown = if (is_suggestion) c.suggestion().? else c.body;
-    const fl = firstLine(shown);
-    const ellipsis: []const u8 = if (fl.more) " …" else "";
-    const text = std.fmt.allocPrint(scratch, "{s} {s}: {s}{s}", .{ marker, c.author, fl.text, ellipsis }) catch c.author;
-    _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = col, .wrap = .none });
+    if (cr.is_first) {
+        const marker: []const u8 = if (is_suggestion) "±" else if (cr.is_reply) "↳" else "▸";
+        const text = std.fmt.allocPrint(scratch, "{s} {s}: {s}", .{ marker, c.author, cr.line }) catch c.author;
+        _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = col, .wrap = .none });
+    } else {
+        _ = win.printSegment(.{ .text = cr.line, .style = style }, .{ .row_offset = r, .col_offset = col + 2, .wrap = .none });
+    }
 }
 
-/// A pending Draft — the reviewer's own unsent comment. Marked `✎` (root) or
-/// `↳` (reply) in the draft band so it never reads as already-published. A
-/// suggestion Draft shows its `±` marker. Multi-line bodies show the lead line.
+/// A pending Draft — the reviewer's own unsent comment, one visual line per row.
+/// Marked `✎` (root) or `↳` (reply) in the draft band so it never reads as
+/// already-published; a suggestion Draft shows its `±` marker. Continuation rows
+/// hang-indent like a comment. The body is drawn verbatim.
 fn drawDraft(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, dr: DraftRow, theme: Theme) void {
     const d = dr.draft;
     const style = if (dr.is_reply) theme.draft_reply else theme.draft;
     fillRow(win, r, style);
 
     const col: u16 = if (dr.is_reply) 6 else 2;
-    const marker: []const u8 = switch (d.kind) {
-        .suggestion => "±",
-        else => if (dr.is_reply) "↳" else "✎",
-    };
-    const fl = firstLine(d.body);
-    const ellipsis: []const u8 = if (fl.more) " …" else "";
-    const text = std.fmt.allocPrint(scratch, "{s} draft: {s}{s}", .{ marker, fl.text, ellipsis }) catch "✎ draft";
-    _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = col, .wrap = .none });
+    if (dr.is_first) {
+        const marker: []const u8 = switch (d.kind) {
+            .suggestion => "±",
+            else => if (dr.is_reply) "↳" else "✎",
+        };
+        const text = std.fmt.allocPrint(scratch, "{s} draft: {s}", .{ marker, dr.line }) catch "✎ draft";
+        _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = col, .wrap = .none });
+    } else {
+        _ = win.printSegment(.{ .text = dr.line, .style = style }, .{ .row_offset = r, .col_offset = col + 2, .wrap = .none });
+    }
 }
 
 /// A collapsed-context fold: "  ⋯ N unchanged lines · enter to expand ⋯".
@@ -1059,12 +1056,20 @@ test "a woven comment renders with its marker and style; a suggestion is distinc
     draw(a, win, diff, buf, theme_dark, nav, 0, &.{}, &.{});
 
     // Pane rows: 0 file_header, 1 hunk_header, 2 line(old), 3 line(new),
-    // 4 comment(root), 5 comment(reply=suggestion). Pane x = sidebar_width + 1.
+    // 4 comment(root), then the 3-line suggestion reply verbatim (M11): 5 the
+    // "± Bo: ```suggestion" header, 6 "renamed", 7 the closing "```". Pane x =
+    // sidebar_width + 1.
     const px = sidebar_width + 1;
     // Root comment marker "▸" at its indent (col 2 within the pane).
     try testing.expectEqualStrings("▸", win.readCell(px + 2, 4).?.char.grapheme);
     try testing.expectEqual(theme_dark.comment.bg, win.readCell(px + 2, 4).?.style.bg);
-    // The reply is a suggestion → "±" marker and the suggestion band.
+    // The reply is a suggestion → "±" marker and the suggestion band on the
+    // header row (reply indent, col 6).
     try testing.expectEqualStrings("±", win.readCell(px + 6, 5).?.char.grapheme);
     try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 6, 5).?.style.bg);
+    // Continuation rows render the body verbatim (fences and all), hang-indented
+    // two columns past the marker (col 8), keeping the suggestion band.
+    try testing.expectEqualStrings("r", win.readCell(px + 8, 6).?.char.grapheme);
+    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 8, 6).?.style.bg);
+    try testing.expectEqualStrings("`", win.readCell(px + 8, 7).?.char.grapheme);
 }
