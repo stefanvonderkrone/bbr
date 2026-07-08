@@ -367,6 +367,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
     var submit_total: usize = 0; // items in the running batch (for the modal)
     var submit_seen: usize = 0; // items reported so far (posted/failed/skipped)
     var submit_result: ?SubmitResult = null; // finished outcome, shown until dismissed
+    var show_help = false; // the keybinding-help Overlay is up
     var reconciling = false; // a post-submit re-fetch is in flight (keep the result dialog, not the loading frame)
 
     try loop.installResizeHandler();
@@ -397,6 +398,9 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                 if (submit_result != null) {
                     // --- Submit result dialog: any key dismisses it. ---
                     submit_result = null;
+                } else if (show_help) {
+                    // --- Help Overlay: any key dismisses it. ---
+                    show_help = false;
                 } else if (composer) |*comp| {
                     // --- Composer mode: keys edit the draft body. ---
                     if (key.matches(vaxis.Key.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
@@ -471,10 +475,12 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                     status_msg = @errorName(err);
                                 };
                             },
+                            // The help Overlay needs no Session — it reads the Keymap.
+                            .help => show_help = true,
                             // Everything else acts on the current Session/Buffer,
                             // so it waits until one is loaded.
                             else => if (current) |cur| switch (act) {
-                                .quit, .open_picker => unreachable, // handled above
+                                .quit, .open_picker, .help => unreachable, // handled above
                                 // --- motions ---
                                 .down => nav.down(),
                                 .up => nav.up(),
@@ -808,6 +814,8 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
         } else if (submit_result) |res| {
             render.drawSubmitResult(frame, win, active_theme, res.posted, res.failed, res.skipped, res.aborted, res.stale);
         }
+        // The help Overlay floats above everything else, over any Session state.
+        if (show_help) render.drawHelp(frame, win, active_theme, km);
         try vx.render(writer);
         _ = frame_arena.reset(.retain_capacity);
     }
@@ -1559,9 +1567,9 @@ fn drawStatus(
     // A transient message (error/summary) or an in-progress indicator takes the
     // tail slot; otherwise the key hints, with the pending-draft count on `X`.
     const default_tail: []const u8 = if (draft_count > 0)
-        (std.fmt.allocPrint(frame, "X submit {d}  ·  c/i comment  ·  [ ] file  ·  p switch  ·  q quit", .{draft_count}) catch "q quit")
+        (std.fmt.allocPrint(frame, "X submit {d}  ·  c/i comment  ·  [ ] file  ·  p switch  ·  ? help  ·  q quit", .{draft_count}) catch "q quit")
     else
-        "c/i comment  ·  [ ] file  ·  p switch  ·  q quit";
+        "c/i comment  ·  [ ] file  ·  p switch  ·  ? help  ·  q quit";
     const tail: []const u8 = if (status_msg) |m| m else if (submitting) "submitting…" else if (loading) "loading…" else default_tail;
     const text = std.fmt.allocPrint(frame, " #{d} {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s}  ·  {s}  ·  {s}  ·  {s} ", .{
         pr.id,

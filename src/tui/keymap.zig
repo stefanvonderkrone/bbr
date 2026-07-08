@@ -58,7 +58,34 @@ pub const Action = enum {
     reply,
     expand_fold,
     submit,
+    help,
 };
+
+/// Is this Action a Motion (movement within a Pane) rather than a command? The
+/// help overlay groups the two; `select_down`/`select_up` count as motions since
+/// they move the cursor (while extending the selection).
+pub fn isMotion(a: Action) bool {
+    return switch (a) {
+        .down,
+        .up,
+        .half_page_down,
+        .half_page_up,
+        .page_down,
+        .page_up,
+        .to_top,
+        .to_bottom,
+        .center,
+        .scroll_cursor_top,
+        .scroll_cursor_bottom,
+        .cursor_view_top,
+        .cursor_view_middle,
+        .cursor_view_bottom,
+        .select_down,
+        .select_up,
+        => true,
+        else => false,
+    };
+}
 
 /// A key chord: a codepoint + modifiers, optionally preceded by a `leader` key.
 /// `leader == null` is a single keypress; otherwise the binding fires only when
@@ -120,6 +147,7 @@ pub const default_bindings = [_]Binding{
     .{ .chord = .{ .cp = 'r' }, .action = .reply, .help = "reply" },
     .{ .chord = .{ .cp = vaxis.Key.enter }, .action = .expand_fold, .help = "expand fold" },
     .{ .chord = .{ .cp = 'X' }, .action = .submit, .help = "submit review" },
+    .{ .chord = .{ .cp = '?' }, .action = .help, .help = "toggle this help" },
 };
 
 pub const Keymap = struct {
@@ -211,6 +239,15 @@ test "single-key actions and motions resolve" {
     try testing.expectEqual(Action.to_bottom, res.feed(km, plain('G')).action);
     try testing.expectEqual(Action.cursor_view_middle, res.feed(km, plain('M')).action);
     try testing.expectEqual(Action.reply, res.feed(km, plain('r')).action);
+    try testing.expectEqual(Action.help, res.feed(km, .{ .codepoint = '?', .text = "?" }).action);
+}
+
+test "isMotion separates movement from commands" {
+    try testing.expect(isMotion(.down));
+    try testing.expect(isMotion(.center));
+    try testing.expect(isMotion(.select_up));
+    try testing.expect(!isMotion(.reply));
+    try testing.expect(!isMotion(.help));
 }
 
 test "ctrl chords resolve and don't collide with their plain letters" {

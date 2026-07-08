@@ -25,6 +25,7 @@ const Thread = bbr.review.Thread;
 const Draft = bbr.review.Draft;
 const Picker = @import("picker.zig").Picker;
 const Composer = @import("composer.zig").Composer;
+const keymap = @import("keymap.zig");
 
 pub const sidebar_width: u16 = 28;
 
@@ -473,6 +474,93 @@ pub fn drawSubmitResult(
         fillRow(modal, hint_row, theme.picker_query);
         _ = modal.printSegment(.{ .text = " press any key to dismiss", .style = theme.picker_query }, .{ .row_offset = hint_row, .wrap = .none });
     }
+}
+
+/// A short display label for a key codepoint: named for the special keys,
+/// otherwise the codepoint's own utf8. `scratch` outlives render.
+fn keyName(scratch: std.mem.Allocator, cp: u21) []const u8 {
+    return switch (cp) {
+        vaxis.Key.enter => "⏎",
+        vaxis.Key.escape => "esc",
+        vaxis.Key.up => "↑",
+        vaxis.Key.down => "↓",
+        vaxis.Key.home => "home",
+        vaxis.Key.end => "end",
+        vaxis.Key.page_up => "pgup",
+        vaxis.Key.page_down => "pgdn",
+        else => blk: {
+            var b: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(cp, &b) catch break :blk "?";
+            break :blk scratch.dupe(u8, b[0..n]) catch "?";
+        },
+    };
+}
+
+/// Format a Chord for the help overlay: "j", "^d", "⇧↓", "gg", "zt", "⏎".
+fn chordLabel(scratch: std.mem.Allocator, c: keymap.Chord) []const u8 {
+    const base = keyName(scratch, c.cp);
+    const with_mods = if (c.mods.ctrl)
+        std.fmt.allocPrint(scratch, "^{s}", .{base}) catch base
+    else if (c.mods.shift)
+        std.fmt.allocPrint(scratch, "⇧{s}", .{base}) catch base
+    else
+        base;
+    if (c.leader) |ld| {
+        return std.fmt.allocPrint(scratch, "{s}{s}", .{ keyName(scratch, ld), with_mods }) catch with_mods;
+    }
+    return with_mods;
+}
+
+/// Coalesce the Keymap into two help columns — Motions and commands — one line
+/// per Action ("keys  label"), merging the (adjacent) alternate bindings of an
+/// Action into one "j ↓"-style key list.
+const HelpRows = struct { motions: [][]const u8, commands: [][]const u8 };
+fn buildHelpRows(scratch: std.mem.Allocator, km: keymap.Keymap) HelpRows {
+    var motions: std.ArrayList([]const u8) = .empty;
+    var commands: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (i < km.bindings.len) {
+        const act = km.bindings[i].action;
+        const help = km.bindings[i].help;
+        var keys: std.ArrayList(u8) = .empty;
+        while (i < km.bindings.len and km.bindings[i].action == act) : (i += 1) {
+            if (keys.items.len > 0) keys.append(scratch, ' ') catch {};
+            keys.appendSlice(scratch, chordLabel(scratch, km.bindings[i].chord)) catch {};
+        }
+        const line = std.fmt.allocPrint(scratch, "{s:<8}{s}", .{ keys.items, help }) catch help;
+        (if (keymap.isMotion(act)) &motions else &commands).append(scratch, line) catch {};
+    }
+    return .{ .motions = motions.items, .commands = commands.items };
+}
+
+/// Draw the keybinding-help Overlay: a centered modal with Motions in the left
+/// column and commands in the right, read straight from the Keymap so it can
+/// never drift from the live bindings. Dismissed by any key. `scratch` outlives
+/// render for the synthesized rows.
+pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, km: keymap.Keymap) void {
+    const rows = buildHelpRows(scratch, km);
+    const n = @max(rows.motions.len, rows.commands.len);
+    const want_h: u16 = @intCast(@min(n + 3, 255));
+    const modal = centeredModal(win, 74, want_h) orelse return;
+    var r: u16 = 0;
+    while (r < modal.height) : (r += 1) fillRow(modal, r, theme.picker);
+
+    fillRow(modal, 0, theme.picker_query);
+    _ = modal.printSegment(.{ .text = " Keybindings", .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
+
+    const col_right: u16 = modal.width / 2 + 1;
+    var i: usize = 0;
+    while (i < n and 1 + i + 1 < modal.height) : (i += 1) {
+        const rr: u16 = 1 + @as(u16, @intCast(i));
+        if (i < rows.motions.len)
+            _ = modal.printSegment(.{ .text = rows.motions[i], .style = theme.picker }, .{ .row_offset = rr, .col_offset = 2, .wrap = .none });
+        if (i < rows.commands.len)
+            _ = modal.printSegment(.{ .text = rows.commands[i], .style = theme.picker }, .{ .row_offset = rr, .col_offset = col_right, .wrap = .none });
+    }
+
+    const hint_row = modal.height - 1;
+    fillRow(modal, hint_row, theme.picker_query);
+    _ = modal.printSegment(.{ .text = " press any key to dismiss", .style = theme.picker_query }, .{ .row_offset = hint_row, .wrap = .none });
 }
 
 /// The boot/switch frame shown until a Session arrives: a centered floating
@@ -1072,4 +1160,23 @@ test "a woven comment renders with its marker and style; a suggestion is distinc
     try testing.expectEqualStrings("r", win.readCell(px + 8, 6).?.char.grapheme);
     try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 8, 6).?.style.bg);
     try testing.expectEqualStrings("`", win.readCell(px + 8, 7).?.char.grapheme);
+}
+
+test "the help overlay floats a centered Keybindings modal from the Keymap" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    drawHelp(a, win, theme_dark, keymap.Keymap.default);
+
+    // Modal is 74×20 centered on 80×24 → x_off 3, y_off 2. Title " Keybindings"
+    // puts 'K' at modal (1,0) → screen (4,2).
+    try testing.expectEqualStrings("K", win.readCell(4, 2).?.char.grapheme);
+    // First motion row (modal row 1 → screen row 3) starts at col_offset 2 →
+    // screen col 5, and the first motion binding is `j`/`↓` → down.
+    try testing.expectEqualStrings("j", win.readCell(5, 3).?.char.grapheme);
 }
