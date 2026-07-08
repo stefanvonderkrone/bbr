@@ -351,6 +351,8 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
         submit_loads.deinit(gpa);
     }
     var submitting = false;
+    var submit_total: usize = 0; // items in the running batch (for the modal)
+    var submit_seen: usize = 0; // items reported so far (posted/failed/skipped)
     // Durable backing for a submit summary/error message (status_msg borrows it
     // across frames; a frame-arena string would dangle after the reset).
     var status_buf: [192]u8 = undefined;
@@ -535,6 +537,8 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                 status_msg = "no pending drafts to submit";
                             } else if (spawnSubmit(ctx, &loop, &submit_loads, &submit_epoch, gpa, &review, cur.pr.id, cur.pr.source_commit)) |_| {
                                 submitting = true;
+                                submit_total = review.drafts.items.len;
+                                submit_seen = 0;
                                 status_msg = null;
                             } else |err| {
                                 status_msg = @errorName(err);
@@ -644,6 +648,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                 // batch and the PR it targeted; a `skipped` item was never tried,
                 // so it stays a plain draft for a later selective retry.
                 if (p.epoch == submit_epoch) {
+                    submit_seen += 1; // advance the "n / total" modal
                     if (current) |c| if (c.pr.id == p.pr_id) {
                         const new_state: ?bbr.review.DraftState = switch (p.item.status) {
                             .posted => .{ .posted = p.item.id.? },
@@ -729,6 +734,9 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
         }
         if (picker) |*p| render.drawPicker(frame, win, p, active_theme);
         if (composer) |*comp| render.drawComposer(frame, win, comp, active_theme);
+        // The submit modal floats over the viewer while a batch runs; the
+        // post-submit re-fetch then shows the loading frame (drawn above).
+        if (submitting) render.drawSubmit(frame, win, active_theme, submit_seen, submit_total);
         try vx.render(writer);
         _ = frame_arena.reset(.retain_capacity);
     }

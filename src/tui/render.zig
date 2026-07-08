@@ -308,14 +308,19 @@ fn drawSection(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, sec: Secti
 /// Draw the PR Picker as a centered modal over the current frame. Shows a
 /// query/prompt line, then the ranked matches (best first), the selected one
 /// highlighted, scrolled to keep the cursor visible. `scratch` outlives render.
+/// Center a modal box of up to `max_w`×`max_h` over `win`, bounded by it.
+/// Returns null when there's no room. The shared geometry behind every overlay.
+fn centeredModal(win: vaxis.Window, max_w: u16, max_h: u16) ?vaxis.Window {
+    const w: u16 = @min(max_w, win.width);
+    const h: u16 = @min(max_h, win.height);
+    if (w == 0 or h == 0) return null;
+    return win.child(.{ .x_off = (win.width - w) / 2, .y_off = (win.height - h) / 2, .width = w, .height = h });
+}
+
 pub fn drawPicker(scratch: std.mem.Allocator, win: vaxis.Window, picker: *const Picker, theme: Theme) void {
     // Modal geometry: centered, up to 60 cols × 16 rows, but bounded by the win.
-    const w: u16 = @min(@as(u16, 60), win.width);
-    const h: u16 = @min(@as(u16, 16), win.height);
-    if (w == 0 or h == 0) return;
-    const x = (win.width - w) / 2;
-    const y = (win.height - h) / 2;
-    const modal = win.child(.{ .x_off = x, .y_off = y, .width = w, .height = h });
+    const modal = centeredModal(win, 60, 16) orelse return;
+    const h = modal.height;
 
     // Row 0: prompt + query. Rows 1..h-1: matches.
     fillRow(modal, 0, theme.picker_query);
@@ -364,12 +369,8 @@ pub fn drawPicker(scratch: std.mem.Allocator, win: vaxis.Window, picker: *const 
 /// line. Borrowed text (the label, the body) outlives render via the composer's
 /// own arena. `scratch` outlives render for the synthesized header/hint.
 pub fn drawComposer(scratch: std.mem.Allocator, win: vaxis.Window, composer: *const Composer, theme: Theme) void {
-    const w: u16 = @min(@as(u16, 72), win.width);
-    const h: u16 = @min(@as(u16, 14), win.height);
-    if (w == 0 or h == 0) return;
-    const x = (win.width - w) / 2;
-    const y = (win.height - h) / 2;
-    const modal = win.child(.{ .x_off = x, .y_off = y, .width = w, .height = h });
+    const modal = centeredModal(win, 72, 14) orelse return;
+    const h = modal.height;
 
     // Header (row 0) and hint (last row).
     fillRow(modal, 0, theme.picker_query);
@@ -409,6 +410,28 @@ pub fn drawComposer(scratch: std.mem.Allocator, win: vaxis.Window, composer: *co
             line;
         _ = modal.printSegment(.{ .text = text, .style = theme.picker }, .{ .row_offset = out_row, .col_offset = 1, .wrap = .none });
         out_row += 1;
+    }
+}
+
+/// Draw the "Submitting review" progress modal over the viewer while a batch
+/// runs (M10b). A small centered box: a title, an `n / total posted` line, and
+/// a note that it can't be interrupted. `scratch` outlives render.
+pub fn drawSubmit(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, seen: usize, total: usize) void {
+    const modal = centeredModal(win, 40, 5) orelse return;
+    var r: u16 = 0;
+    while (r < modal.height) : (r += 1) fillRow(modal, r, theme.picker);
+
+    fillRow(modal, 0, theme.picker_query);
+    _ = modal.printSegment(.{ .text = " Submitting review", .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
+
+    if (modal.height > 2) {
+        const line = std.fmt.allocPrint(scratch, "  {d} / {d} items", .{ seen, total }) catch "  submitting…";
+        _ = modal.printSegment(.{ .text = line, .style = theme.picker }, .{ .row_offset = 2, .wrap = .none });
+    }
+    const hint_row = modal.height - 1;
+    if (hint_row >= 3) {
+        fillRow(modal, hint_row, theme.picker_query);
+        _ = modal.printSegment(.{ .text = " publishing to Bitbucket…", .style = theme.picker_query }, .{ .row_offset = hint_row, .wrap = .none });
     }
 }
 
