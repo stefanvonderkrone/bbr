@@ -58,6 +58,14 @@ pub const Composer = struct {
         try self.body_buf.appendSlice(self.allocator, bytes);
     }
 
+    /// Replace the whole body with initial text — a prefill seed, e.g. the
+    /// source lines a suggestion proposes to rewrite (M10b). The planned
+    /// `$EDITOR` handoff will write its result back through this same seam.
+    pub fn seed(self: *Composer, text: []const u8) !void {
+        self.body_buf.clearRetainingCapacity();
+        try self.body_buf.appendSlice(self.allocator, text);
+    }
+
     /// Insert a newline (Enter inside the composer edits, it does not submit).
     pub fn newline(self: *Composer) !void {
         try self.body_buf.append(self.allocator, '\n');
@@ -124,6 +132,20 @@ test "typing, newline, and backspace build the body" {
 
     comp.backspace();
     try testing.expectEqualStrings("hello\nworl", comp.body());
+}
+
+test "seed prefills the body and can then be edited from the end" {
+    var comp = Composer.init(testing.allocator, .{ .kind = .suggestion, .label = "Suggest" });
+    defer comp.deinit();
+
+    try comp.seed("const a = 1;\nconst b = 2;");
+    try testing.expectEqualStrings("const a = 1;\nconst b = 2;", comp.body());
+    // Seeding twice replaces rather than appends.
+    try comp.seed("just one line");
+    try testing.expectEqualStrings("just one line", comp.body());
+    // The prefill is editable at the tail (append-only composer).
+    try comp.insert(" more");
+    try testing.expectEqualStrings("just one line more", comp.body());
 }
 
 test "blank detection ignores whitespace-only bodies" {

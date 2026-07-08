@@ -845,6 +845,18 @@ fn openInline(
     else
         std.fmt.allocPrint(a, "{s} {s}:{d}", .{ noun, path, bottom })) catch "Comment";
     composer.* = Composer.init(a, .{ .kind = kind, .anchor = anchor, .label = label });
+
+    // Feature 1: seed a suggestion with the source lines it proposes to rewrite,
+    // so the reviewer edits real code inside the fence. A plain comment stays
+    // empty — you're remarking, not replacing.
+    if (kind == .suggestion and lines.items.len > 0) {
+        var seed_buf: std.ArrayList(u8) = .empty;
+        for (lines.items, 0..) |ln, i| {
+            if (i > 0) try seed_buf.append(a, '\n');
+            try seed_buf.appendSlice(a, ln.text);
+        }
+        try composer.*.?.seed(seed_buf.items);
+    }
 }
 
 /// Open the Composer as a reply to the comment or draft under the cursor. The
