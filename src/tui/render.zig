@@ -435,21 +435,66 @@ pub fn drawSubmit(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, s
     }
 }
 
-/// The boot frame shown until the first Session arrives: a centered
-/// "Loading PR #N…" (or the error, if the initial fetch failed). `scratch`
-/// outlives render for the synthesized text.
+/// Draw the finished-Submission result dialog (M10b): a title reflecting the
+/// terminal state (submitted / aborted / stale) and the tallies, held up until
+/// the reviewer dismisses it. Takes over from `drawSubmit` when the batch ends.
+pub fn drawSubmitResult(
+    scratch: std.mem.Allocator,
+    win: vaxis.Window,
+    theme: Theme,
+    posted: usize,
+    failed: usize,
+    skipped: usize,
+    aborted: ?[]const u8,
+    stale: bool,
+) void {
+    const modal = centeredModal(win, 48, 6) orelse return;
+    var r: u16 = 0;
+    while (r < modal.height) : (r += 1) fillRow(modal, r, theme.picker);
+
+    fillRow(modal, 0, theme.picker_query);
+    const title: []const u8 = if (stale)
+        " Submit refused — PR moved"
+    else if (aborted != null)
+        " Submit aborted"
+    else
+        " Review submitted";
+    _ = modal.printSegment(.{ .text = title, .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
+
+    if (modal.height > 2) {
+        const line: []const u8 = if (stale)
+            "  reopen the PR before submitting"
+        else if (aborted) |name|
+            std.fmt.allocPrint(scratch, "  {s} — all kept pending", .{name}) catch "  aborted"
+        else
+            std.fmt.allocPrint(scratch, "  {d} posted · {d} failed · {d} skipped", .{ posted, failed, skipped }) catch "  done";
+        _ = modal.printSegment(.{ .text = line, .style = theme.picker }, .{ .row_offset = 2, .wrap = .none });
+    }
+
+    const hint_row = modal.height - 1;
+    if (hint_row >= 3) {
+        fillRow(modal, hint_row, theme.picker_query);
+        _ = modal.printSegment(.{ .text = " press any key to dismiss", .style = theme.picker_query }, .{ .row_offset = hint_row, .wrap = .none });
+    }
+}
+
+/// The boot/switch frame shown until a Session arrives: a centered floating
+/// "Loading PR #N…" dialog (or the error, if the fetch failed), over a cleared
+/// backdrop. `scratch` outlives render for the synthesized text.
 pub fn drawLoading(scratch: std.mem.Allocator, win: vaxis.Window, id: u64, theme: Theme, status_msg: ?[]const u8) void {
     if (win.height == 0 or win.width == 0) return;
     // Blank the whole window first: on a switch the previous viewer frame is
-    // still in the screen buffer, and we paint only the one centered line.
+    // still in the screen buffer behind the dialog.
     win.clear();
+    const modal = centeredModal(win, 48, 3) orelse return;
+    var r: u16 = 0;
+    while (r < modal.height) : (r += 1) fillRow(modal, r, theme.picker);
     const text: []const u8 = if (status_msg) |m|
-        std.fmt.allocPrint(scratch, "PR #{d}: {s}", .{ id, m }) catch m
+        std.fmt.allocPrint(scratch, " PR #{d}: {s}", .{ id, m }) catch m
     else
-        std.fmt.allocPrint(scratch, "Loading PR #{d}…", .{id}) catch "Loading…";
-    const row = win.height / 2;
-    const col: u16 = if (text.len < win.width) @intCast((win.width - text.len) / 2) else 0;
-    _ = win.printSegment(.{ .text = text, .style = theme.hunk_header }, .{ .row_offset = row, .col_offset = col, .wrap = .none });
+        std.fmt.allocPrint(scratch, " Loading PR #{d}…", .{id}) catch "Loading…";
+    const row = modal.height / 2;
+    _ = modal.printSegment(.{ .text = text, .style = theme.picker_query }, .{ .row_offset = row, .wrap = .none });
 }
 
 /// Render an optional line number right-justified in 4 columns (blank if absent).
@@ -913,7 +958,7 @@ test "a loading picker shows a placeholder instead of matches" {
     try testing.expectEqualStrings("l", win.readCell(mx + 2, my + 1).?.char.grapheme);
 }
 
-test "the boot loading view centers a Loading PR line" {
+test "the boot loading view floats a Loading PR dialog" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -924,20 +969,17 @@ test "the boot loading view centers a Loading PR line" {
 
     drawLoading(a, win, 42, theme_dark, null);
 
-    // "Loading PR #42…" is 15 columns, centered on 80 → col 32, mid row 12.
-    const text = "Loading PR #42…";
-    const col: u16 = @intCast((80 - text.len) / 2);
-    try testing.expectEqualStrings("L", win.readCell(col, 12).?.char.grapheme);
-    try testing.expectEqualStrings("#", win.readCell(col + 11, 12).?.char.grapheme);
+    // Dialog: 48×3 centered on 80×24 → x=16, y=10; text on the middle row (11),
+    // one leading space, so 'L' of "Loading" is at col 17.
+    try testing.expectEqualStrings("L", win.readCell(17, 11).?.char.grapheme);
+    try testing.expectEqualStrings("#", win.readCell(28, 11).?.char.grapheme);
 
     // With a status message the id-prefixed error takes its place.
     var screen2 = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen2.deinit(a);
     const win2 = headlessWindow(&screen2);
     drawLoading(a, win2, 42, theme_dark, "NotFound");
-    const err_text = "PR #42: NotFound";
-    const ecol: u16 = @intCast((80 - err_text.len) / 2);
-    try testing.expectEqualStrings("P", win2.readCell(ecol, 12).?.char.grapheme);
+    try testing.expectEqualStrings("P", win2.readCell(17, 11).?.char.grapheme);
 }
 
 test "sidebar prefix shows selection marker and status, borrowing no stack" {

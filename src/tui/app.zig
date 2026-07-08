@@ -195,6 +195,18 @@ const SubmitDone = struct {
     stale: bool,
 };
 
+/// The outcome of a finished Submission, shown in a floating result dialog until
+/// the reviewer dismisses it. `aborted`/`stale` name the terminal condition; a
+/// normal finish just carries the tallies. Held in run-scoped state, not an
+/// event, so it survives frames while the post-submit re-fetch runs behind it.
+const SubmitResult = struct {
+    posted: usize,
+    failed: usize,
+    skipped: usize,
+    aborted: ?[]const u8 = null, // @errorName is static — safe to borrow
+    stale: bool = false,
+};
+
 /// A submission request handed to the worker: a self-owned snapshot of the PR's
 /// pending Drafts (deep-copied into `arena` so the worker never touches
 /// main-thread memory), plus the repo, PR id, and the source commit we loaded
@@ -353,9 +365,8 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
     var submitting = false;
     var submit_total: usize = 0; // items in the running batch (for the modal)
     var submit_seen: usize = 0; // items reported so far (posted/failed/skipped)
-    // Durable backing for a submit summary/error message (status_msg borrows it
-    // across frames; a frame-arena string would dangle after the reset).
-    var status_buf: [192]u8 = undefined;
+    var submit_result: ?SubmitResult = null; // finished outcome, shown until dismissed
+    var reconciling = false; // a post-submit re-fetch is in flight (keep the result dialog, not the loading frame)
 
     try loop.installResizeHandler();
     try vx.enterAltScreen(writer);
@@ -381,7 +392,10 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
         const event = try loop.nextEvent();
         switch (event) {
             .key_press => |key| {
-                if (composer) |*comp| {
+                if (submit_result != null) {
+                    // --- Submit result dialog: any key dismisses it. ---
+                    submit_result = null;
+                } else if (composer) |*comp| {
                     // --- Composer mode: keys edit the draft body. ---
                     if (key.matches(vaxis.Key.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
                         comp.deinit();
@@ -558,6 +572,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                     if (done.outcome == .ok) done.outcome.ok.destroy();
                 } else {
                     loading = false;
+                    reconciling = false; // a post-submit re-fetch (if any) has landed
                     switch (done.outcome) {
                         .ok => |s| {
                             // On the initial boot `current` is null; on a switch
@@ -668,19 +683,21 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                 reap(&submit_loads, io, done.epoch);
                 if (done.epoch == submit_epoch) {
                     submitting = false;
-                    if (done.stale) {
-                        status_msg = "PR head changed since load — reopen the PR before submitting";
-                    } else if (done.aborted) |e| {
-                        status_msg = std.fmt.bufPrint(&status_buf, "submit aborted: {s} (all kept pending)", .{@errorName(e)}) catch @errorName(e);
-                    } else {
-                        status_msg = std.fmt.bufPrint(&status_buf, "submitted: {d} posted · {d} failed · {d} skipped", .{ done.posted, done.failed, done.skipped }) catch "submitted";
-                        // Delete-on-batch-success (ADR-0007): a clean batch owns no
-                        // lingering posted rows — the comments live on the server.
-                        if (done.failed == 0 and done.skipped == 0) {
-                            if (current) |cur| {
-                                for (review.drafts.items) |d| ctx.store.remove(cur.pr.id, d.local_id) catch {};
-                                review.drafts.clearRetainingCapacity();
-                            }
+                    // The outcome is shown in a floating result dialog (below),
+                    // not the status bar, so it stays put until dismissed.
+                    submit_result = .{
+                        .posted = done.posted,
+                        .failed = done.failed,
+                        .skipped = done.skipped,
+                        .aborted = if (done.aborted) |e| @errorName(e) else null,
+                        .stale = done.stale,
+                    };
+                    // Delete-on-batch-success (ADR-0007): a clean batch owns no
+                    // lingering posted rows — the comments live on the server.
+                    if (!done.stale and done.aborted == null and done.failed == 0 and done.skipped == 0) {
+                        if (current) |cur| {
+                            for (review.drafts.items) |d| ctx.store.remove(cur.pr.id, d.local_id) catch {};
+                            review.drafts.clearRetainingCapacity();
                         }
                     }
                     // Reflect the new draft states (or their removal) in the pane.
@@ -691,15 +708,17 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                     // Reconcile with the server (M10b): a batch that posted anything
                     // means those comments now live on Bitbucket, which is
                     // authoritative (ADR-0001). Re-fetch the PR so they reappear —
-                    // the just-deleted drafts are replaced by the real Comments. The
-                    // submit modal stays up until this load lands.
+                    // the just-deleted drafts are replaced by the real Comments. This
+                    // runs behind the result dialog (`reconciling`, not the loading
+                    // frame), so it never flashes a fullscreen "Loading" over the
+                    // summary the reviewer is reading.
                     if (done.posted > 0) {
                         if (current) |cur| {
                             spawnLoad(ctx, &loop, &loads, &epoch, gpa, cur.pr.id) catch |err| {
                                 status_msg = @errorName(err);
                             };
                             if (loads.items.len > 0) {
-                                loading = true;
+                                reconciling = true;
                                 loading_id = cur.pr.id;
                             }
                         }
@@ -721,8 +740,9 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
         const win = vx.window();
         const frame = frame_arena.allocator();
         // A load in flight (initial boot or a switch) shows the "Loading PR #N…"
-        // frame — the same prominent cue in both cases, not just a status hint.
-        if (loading or current == null) {
+        // dialog. A post-submit reconcile (`reconciling`) is deliberately excluded:
+        // it runs behind the submit result dialog, over the still-shown review.
+        if ((loading and !reconciling) or current == null) {
             render.drawLoading(frame, win, loading_id, active_theme, status_msg);
         } else {
             const cur = current.?;
@@ -734,9 +754,14 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
         }
         if (picker) |*p| render.drawPicker(frame, win, p, active_theme);
         if (composer) |*comp| render.drawComposer(frame, win, comp, active_theme);
-        // The submit modal floats over the viewer while a batch runs; the
-        // post-submit re-fetch then shows the loading frame (drawn above).
-        if (submitting) render.drawSubmit(frame, win, active_theme, submit_seen, submit_total);
+        // The progress modal floats over the viewer while a batch runs; when it
+        // finishes the result dialog takes its place (and stays up, over the
+        // reconcile re-fetch, until the reviewer dismisses it).
+        if (submitting) {
+            render.drawSubmit(frame, win, active_theme, submit_seen, submit_total);
+        } else if (submit_result) |res| {
+            render.drawSubmitResult(frame, win, active_theme, res.posted, res.failed, res.skipped, res.aborted, res.stale);
+        }
         try vx.render(writer);
         _ = frame_arena.reset(.retain_capacity);
     }
