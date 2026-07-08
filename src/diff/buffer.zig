@@ -302,7 +302,18 @@ const Weave = struct {
         if (w.emitted[i]) return;
         w.emitted[i] = true;
         const d = &w.drafts[i];
-        try w.rows.append(w.a, .{ .draft = .{ .draft = d, .is_reply = d.parent != null } });
+        // A posted/submitting Draft is represented by the server Comment once the
+        // post-submit re-fetch lands; hide its own row so it doesn't double up
+        // with that Comment (the transient reconciliation window, ADR-0007). Its
+        // pending descendants are still placed, so a failed reply under a posted
+        // parent stays visible for a selective retry.
+        const published = switch (d.state) {
+            .posted, .submitting => true,
+            else => false,
+        };
+        if (!published) {
+            try w.rows.append(w.a, .{ .draft = .{ .draft = d, .is_reply = d.parent != null } });
+        }
         try w.emitRepliesTo(.{ .draft = d.local_id });
     }
 
@@ -1182,6 +1193,28 @@ test "a reply-to-draft chain nests under its root draft" {
             try testing.expectEqual(@as(u64, 2), buf.rows[i + 1].draft.draft.local_id);
             try testing.expect(buf.rows[i + 1].draft.is_reply);
         }
+    }
+}
+
+test "a posted draft's row is hidden but its pending reply is still placed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const diff = try parse(a, anchor_diff);
+    // A partial batch: the root posted (now owned by the server after re-fetch),
+    // its reply failed and stays pending for a selective retry.
+    const drafts = [_]Draft{
+        .{ .local_id = 1, .kind = .inline_comment, .body = "root", .anchor = .{ .path = "a.txt", .to = 2, .commit = "c0" }, .state = .{ .posted = 999 } },
+        .{ .local_id = 2, .kind = .reply, .body = "still pending", .parent = .{ .draft = 1 }, .state = .{ .failed = error.ServerError } },
+    };
+    const buf = try buildWithComments(a, diff, .unified, &.{}, .{ .drafts = &drafts });
+
+    // The posted root is hidden (the server Comment represents it); only the
+    // pending reply renders as a draft row.
+    try testing.expectEqual(@as(usize, 1), countKind(buf, .draft));
+    for (buf.rows) |r| {
+        if (r == .draft) try testing.expectEqual(@as(u64, 2), r.draft.draft.local_id);
     }
 }
 

@@ -683,6 +683,22 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                         buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                         nav.setRowCount(buf.rows.len);
                     }
+                    // Reconcile with the server (M10b): a batch that posted anything
+                    // means those comments now live on Bitbucket, which is
+                    // authoritative (ADR-0001). Re-fetch the PR so they reappear —
+                    // the just-deleted drafts are replaced by the real Comments. The
+                    // submit modal stays up until this load lands.
+                    if (done.posted > 0) {
+                        if (current) |cur| {
+                            spawnLoad(ctx, &loop, &loads, &epoch, gpa, cur.pr.id) catch |err| {
+                                status_msg = @errorName(err);
+                            };
+                            if (loads.items.len > 0) {
+                                loading = true;
+                                loading_id = cur.pr.id;
+                            }
+                        }
+                    }
                 }
             },
         }
