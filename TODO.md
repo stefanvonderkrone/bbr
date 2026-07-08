@@ -110,6 +110,7 @@ _Deferred:_ editing a prefilled/multi-line suggestion is append-only (revise fro
 - [ ] Full vim motion set + numeric Count register (`5j`, `zz`, …); arrows side by side.
 - [ ] Configurable `Keymap` from config.
 - [ ] Keybinding-help Overlay (reads Keymap).
+- [ ] **Multi-line comment/draft/suggestion body rendering.** Today a comment/Draft is one Row showing the lead line + `…` (M3 deferral). Render the full body across multiple rows — a suggestion showing its whole fenced block — which means breaking the one-Row-per-screen-line model the buffer/Nav rely on: emit N body rows per comment, cap/fold long bodies, and keep the suggestion band spanning them. Grew more visible once M10b let us author multi-line suggestions. Pairs with markdown rendering.
 
 ## M12 — Themes & config  ·  S  ·  needs M2
 - [ ] Config file (TOML at `~/.config/bbr/`).
