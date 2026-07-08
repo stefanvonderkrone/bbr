@@ -113,11 +113,17 @@ fn fileAnchoredCount(comptime T: type, items: []const T, file: bbr.diff.File) us
 }
 
 fn drawPane(scratch: std.mem.Allocator, win: vaxis.Window, buf: Buffer, theme: Theme, nav: Nav) void {
+    const sel = nav.selection();
     var r: u16 = 0;
     while (r < win.height) : (r += 1) {
         const idx = nav.scroll + r;
         if (idx >= buf.rows.len) break;
         drawRow(scratch, win, r, buf.rows[idx], theme);
+        // Tint the whole visual-selection band; the cursor row takes the tint a
+        // second time so it stays distinguishable within the band.
+        if (sel) |s| {
+            if (idx >= s[0] and idx <= s[1]) highlightCursorRow(win, r, theme);
+        }
         if (idx == nav.cursor) highlightCursorRow(win, r, theme);
     }
 }

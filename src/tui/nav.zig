@@ -15,6 +15,11 @@ pub const Nav = struct {
     scroll: usize = 0,
     /// Pending numeric prefix (Count) for the next Motion; 0 means "none".
     count: usize = 0,
+    /// The other end of a visual selection, or null when nothing is selected.
+    /// The selection is the inclusive row range between `mark` and `cursor`.
+    /// Motions leave it untouched — the event loop starts/extends/clears it
+    /// (via `v`, shift+arrow, Esc), so both input styles share one model.
+    mark: ?usize = null,
 
     row_count: usize,
     /// Visible rows in the pane; at least 1 so paging always advances.
@@ -44,10 +49,40 @@ pub const Nav = struct {
     }
 
     /// Re-clamp against a new row count (e.g. after loading a different file).
+    /// A selection doesn't survive a content change — the rows it named are gone.
     pub fn setRowCount(self: *Nav, row_count: usize) void {
         self.row_count = row_count;
         if (self.cursor >= row_count) self.cursor = if (row_count == 0) 0 else row_count - 1;
+        self.mark = null;
         self.clampScroll();
+    }
+
+    // --- visual selection ---------------------------------------------------
+
+    /// `v` — toggle a selection: start one at the cursor, or clear the current.
+    pub fn toggleMark(self: *Nav) void {
+        self.mark = if (self.mark == null) self.cursor else null;
+    }
+
+    /// Begin a selection at the cursor if none is active (the shift+arrow entry).
+    pub fn ensureMark(self: *Nav) void {
+        if (self.mark == null) self.mark = self.cursor;
+    }
+
+    /// Drop any active selection (Esc, or once an action consumes it).
+    pub fn clearMark(self: *Nav) void {
+        self.mark = null;
+    }
+
+    pub fn hasSelection(self: Nav) bool {
+        return self.mark != null;
+    }
+
+    /// The selected inclusive row range `.{ lo, hi }`, ordered, or null when
+    /// nothing is selected. A single-row selection has `lo == hi`.
+    pub fn selection(self: Nav) ?[2]usize {
+        const m = self.mark orelse return null;
+        return .{ @min(m, self.cursor), @max(m, self.cursor) };
     }
 
     pub fn down(self: *Nav) void {
@@ -207,6 +242,48 @@ test "jumpTo moves to an absolute row, clears Count, and scrolls it into view" {
     // Past the end clamps to the last row.
     nav.jumpTo(999);
     try testing.expectEqual(@as(usize, 99), nav.cursor);
+}
+
+test "visual selection: toggle, extend by motion, order, and clear" {
+    var nav = Nav.init(100, 10);
+    try testing.expect(!nav.hasSelection());
+    try testing.expect(nav.selection() == null);
+
+    nav.down(); // cursor 1
+    nav.toggleMark(); // start selecting at 1
+    try testing.expect(nav.hasSelection());
+    nav.pushDigit(3);
+    nav.down(); // cursor 4, mark still 1
+    try testing.expectEqual([2]usize{ 1, 4 }, nav.selection().?);
+
+    // Extending upward past the mark keeps the range ordered.
+    nav.pushDigit(3);
+    nav.up(); // cursor 1
+    nav.up(); // cursor 0, mark 1
+    try testing.expectEqual([2]usize{ 0, 1 }, nav.selection().?);
+
+    nav.toggleMark(); // v again clears it
+    try testing.expect(!nav.hasSelection());
+}
+
+test "ensureMark starts a selection only when none is active" {
+    var nav = Nav.init(100, 10);
+    nav.jumpTo(5);
+    nav.ensureMark(); // shift+arrow entry: anchor at 5
+    nav.down(); // cursor 6
+    nav.ensureMark(); // no-op, mark stays at 5
+    try testing.expectEqual([2]usize{ 5, 6 }, nav.selection().?);
+    nav.clearMark();
+    try testing.expect(nav.selection() == null);
+}
+
+test "setRowCount drops the selection" {
+    var nav = Nav.init(100, 10);
+    nav.toggleMark();
+    nav.down();
+    try testing.expect(nav.hasSelection());
+    nav.setRowCount(50);
+    try testing.expect(!nav.hasSelection());
 }
 
 test "empty buffer keeps cursor at 0" {

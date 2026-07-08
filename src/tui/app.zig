@@ -465,13 +465,22 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                         } else if (key.matches('c', .{})) {
                             // Author a PR-level (top-level) comment.
                             openComposer(&composer, &composer_arena, .{ .kind = .top_level, .label = "New comment" });
+                        } else if (key.matches('v', .{})) {
+                            // Toggle a visual line selection at the cursor.
+                            nav.toggleMark();
+                        } else if (key.matches(vaxis.Key.escape, .{})) {
+                            // Drop any active selection.
+                            nav.clearMark();
                         } else if (key.matches('i', .{}) or key.matches('S', .{})) {
-                            // Author an inline comment / suggestion on the cursor's line.
+                            // Author an inline comment / suggestion on the cursor's
+                            // line, or over the visual selection's range if one is active.
                             const kind: bbr.review.DraftKind = if (key.matches('S', .{})) .suggestion else .inline_comment;
                             const active_file = isolate_file orelse fileIndexForRow(buf, nav.cursor);
-                            openInline(&composer, &composer_arena, cur, buf, nav.cursor, active_file, kind) catch |err| {
-                                status_msg = @errorName(err);
-                            };
+                            if (openInline(&composer, &composer_arena, cur, buf, nav.cursor, active_file, kind, nav.selection())) |_| {
+                                nav.clearMark(); // selection consumed
+                            } else |err| {
+                                status_msg = @errorName(err); // refused: keep the selection to retry
+                            }
                         } else if (key.matches('o', .{})) {
                             // Toggle the isolate view over the focused file.
                             if (isolate_file) |only| {
@@ -805,20 +814,36 @@ fn openInline(
     cursor: usize,
     file_idx: usize,
     kind: bbr.review.DraftKind,
+    sel: ?[2]usize,
 ) !void {
-    const ln = lineAtCursor(buf, cursor) orelse return error.NotOnALine;
     _ = arena.reset(.retain_capacity);
     const a = arena.allocator();
+
+    // Gather the anchored line(s): a visual selection's range, else the cursor.
+    var lines: std.ArrayList(*const bbr.diff.Line) = .empty;
+    if (sel) |r| {
+        try collectSelectedLines(buf, r[0], r[1], &lines, a);
+    } else if (lineAtCursor(buf, cursor)) |ln| {
+        try lines.append(a, ln);
+    }
+    const span = try spanFromLines(lines.items, kind == .suggestion);
 
     const path = if (file_idx < s.diff.files.len) s.diff.files[file_idx].new_path else "";
     const anchor: bbr.review.Anchor = .{
         .path = try a.dupe(u8, path),
-        .from = if (ln.new_no == null) ln.old_no else null,
-        .to = ln.new_no,
+        .from = span.from,
+        .to = span.to,
+        .start_from = span.start_from,
+        .start_to = span.start_to,
         .commit = try a.dupe(u8, s.pr.source_commit),
     };
     const noun: []const u8 = if (kind == .suggestion) "Suggest on" else "Comment on";
-    const label = std.fmt.allocPrint(a, "{s} {s}:{d}", .{ noun, path, ln.new_no orelse ln.old_no orelse 0 }) catch "Comment";
+    const bottom = span.to orelse span.from orelse 0;
+    const top = span.start_to orelse span.start_from;
+    const label = (if (top) |t|
+        std.fmt.allocPrint(a, "{s} {s}:{d}-{d}", .{ noun, path, t, bottom })
+    else
+        std.fmt.allocPrint(a, "{s} {s}:{d}", .{ noun, path, bottom })) catch "Comment";
     composer.* = Composer.init(a, .{ .kind = kind, .anchor = anchor, .label = label });
 }
 
@@ -861,11 +886,90 @@ fn commitDraft(store: PendingReviewStore, review: *PendingReview, a: std.mem.All
 /// side-by-side `.line_pair`), or null when the row isn't a line.
 fn lineAtCursor(buf: bbr.diff.Buffer, cursor: usize) ?*const bbr.diff.Line {
     if (cursor >= buf.rows.len) return null;
-    return switch (buf.rows[cursor]) {
+    return lineAtRow(buf, cursor);
+}
+
+fn lineAtRow(buf: bbr.diff.Buffer, row: usize) ?*const bbr.diff.Line {
+    return switch (buf.rows[row]) {
         .line => |lr| lr.line,
         .line_pair => |p| if (p.right) |rr| rr.line else if (p.left) |ll| ll.line else null,
         else => null,
     };
+}
+
+/// The line coordinates an anchor should carry — the M10b range shape.
+const AnchorSpan = struct {
+    from: ?u32 = null,
+    to: ?u32 = null,
+    start_from: ?u32 = null,
+    start_to: ?u32 = null,
+};
+
+const RangeError = error{
+    /// The selection contained no diff line at all.
+    NotOnALine,
+    /// The selection mixes added and removed lines — no coherent single side.
+    MixedSides,
+    /// The selected lines aren't a contiguous run (a hunk gap or a file border).
+    NonContiguous,
+    /// A suggestion was asked for over removed lines — Bitbucket can't apply it.
+    SuggestionOnRemoved,
+};
+
+/// Map a run of selected diff lines (top→bottom) to an anchor span, per the
+/// verified Bitbucket rules: a new-side range (all lines present in the new
+/// file) is `{start_to, to}`; an old-side range (a removed line present) is
+/// `{start_from, from}` and can't carry a suggestion. A single line yields a
+/// single-sided anchor with no `start_*`. Pure, so it's unit-tested directly.
+fn spanFromLines(lines: []const *const bbr.diff.Line, is_suggestion: bool) RangeError!AnchorSpan {
+    if (lines.len == 0) return error.NotOnALine;
+
+    var all_new = true;
+    var all_old = true;
+    for (lines) |ln| {
+        if (ln.new_no == null) all_new = false;
+        if (ln.old_no == null) all_old = false;
+    }
+    if (!all_new and !all_old) return error.MixedSides;
+
+    // Prefer the new side (where suggestions apply and most comments live).
+    if (all_new) {
+        var i: usize = 1;
+        while (i < lines.len) : (i += 1) {
+            if (lines[i].new_no.? != lines[i - 1].new_no.? + 1) return error.NonContiguous;
+        }
+        const bottom = lines[lines.len - 1].new_no.?;
+        if (lines.len == 1) return .{ .to = bottom };
+        return .{ .to = bottom, .start_to = lines[0].new_no.? };
+    }
+
+    // Old side: the run includes a removed line. Suggestions are refused —
+    // Bitbucket returns "You can't apply suggestions on removed lines".
+    if (is_suggestion) return error.SuggestionOnRemoved;
+    var i: usize = 1;
+    while (i < lines.len) : (i += 1) {
+        if (lines[i].old_no.? != lines[i - 1].old_no.? + 1) return error.NonContiguous;
+    }
+    const bottom = lines[lines.len - 1].old_no.?;
+    if (lines.len == 1) return .{ .from = bottom };
+    return .{ .from = bottom, .start_from = lines[0].old_no.? };
+}
+
+/// Collect the diff lines the selection `[lo, hi]` covers, refusing a selection
+/// that crosses a file boundary. Non-line rows (hunk headers, comments, folds)
+/// are skipped; a hunk gap surfaces later as `NonContiguous` in `spanFromLines`.
+fn collectSelectedLines(
+    buf: bbr.diff.Buffer,
+    lo: usize,
+    hi: usize,
+    out: *std.ArrayList(*const bbr.diff.Line),
+    a: std.mem.Allocator,
+) !void {
+    var row = lo;
+    while (row <= hi and row < buf.rows.len) : (row += 1) {
+        if (buf.rows[row] == .file_header) return error.NonContiguous; // spans files
+        if (lineAtRow(buf, row)) |ln| try out.append(a, ln);
+    }
 }
 
 /// Launch a background load for `id`, bumping the epoch. The worker posts a
@@ -1281,7 +1385,16 @@ fn handleKey(nav: *Nav, pending_g: *bool, key: vaxis.Key) ?void {
         // Any other key after a lone `g` just falls through to normal handling.
     }
 
-    if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+    // Shift+arrow starts (or extends) a visual selection, then moves. Plain
+    // motions leave `mark` untouched, so they extend a selection that's already
+    // active (vim visual mode) and just move when none is.
+    if (key.matches(vaxis.Key.down, .{ .shift = true })) {
+        nav.ensureMark();
+        nav.down();
+    } else if (key.matches(vaxis.Key.up, .{ .shift = true })) {
+        nav.ensureMark();
+        nav.up();
+    } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
         nav.down();
     } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
         nav.up();
@@ -1493,6 +1606,50 @@ test "lineAtCursor returns the diff line under the cursor, null elsewhere" {
     try testing.expect(lineAtCursor(buf, 0) == null); // header
     try testing.expect(lineAtCursor(buf, 2) != null); // removed line
     try testing.expectEqual(@as(?u32, 1), lineAtCursor(buf, 3).?.new_no); // added line's new number
+}
+
+test "spanFromLines: single line yields a single-sided anchor" {
+    const added = bbr.diff.Line{ .old_no = null, .new_no = 42, .kind = .added, .text = "x" };
+    const removed = bbr.diff.Line{ .old_no = 7, .new_no = null, .kind = .removed, .text = "x" };
+
+    const new_span = try spanFromLines(&.{&added}, false);
+    try testing.expectEqual(@as(?u32, 42), new_span.to);
+    try testing.expect(new_span.start_to == null and new_span.from == null);
+
+    const old_span = try spanFromLines(&.{&removed}, false);
+    try testing.expectEqual(@as(?u32, 7), old_span.from);
+    try testing.expect(old_span.start_from == null and old_span.to == null);
+}
+
+test "spanFromLines: contiguous new-side range spans start_to..to" {
+    const l0 = bbr.diff.Line{ .old_no = null, .new_no = 67, .kind = .context, .text = "a" };
+    const l1 = bbr.diff.Line{ .old_no = null, .new_no = 68, .kind = .added, .text = "b" };
+    const l2 = bbr.diff.Line{ .old_no = null, .new_no = 69, .kind = .added, .text = "c" };
+    const span = try spanFromLines(&.{ &l0, &l1, &l2 }, true); // suggestion OK on new side
+    try testing.expectEqual(@as(?u32, 67), span.start_to);
+    try testing.expectEqual(@as(?u32, 69), span.to);
+    try testing.expect(span.start_from == null and span.from == null);
+}
+
+test "spanFromLines: old-side range refuses a suggestion but allows a comment" {
+    const l0 = bbr.diff.Line{ .old_no = 3, .new_no = null, .kind = .removed, .text = "a" };
+    const l1 = bbr.diff.Line{ .old_no = 4, .new_no = null, .kind = .removed, .text = "b" };
+    try testing.expectError(error.SuggestionOnRemoved, spanFromLines(&.{ &l0, &l1 }, true));
+    const span = try spanFromLines(&.{ &l0, &l1 }, false);
+    try testing.expectEqual(@as(?u32, 3), span.start_from);
+    try testing.expectEqual(@as(?u32, 4), span.from);
+}
+
+test "spanFromLines: mixed sides and gaps are refused" {
+    const added = bbr.diff.Line{ .old_no = null, .new_no = 10, .kind = .added, .text = "x" };
+    const removed = bbr.diff.Line{ .old_no = 20, .new_no = null, .kind = .removed, .text = "x" };
+    try testing.expectError(error.MixedSides, spanFromLines(&.{ &added, &removed }, false));
+
+    const a0 = bbr.diff.Line{ .old_no = null, .new_no = 10, .kind = .added, .text = "x" };
+    const a2 = bbr.diff.Line{ .old_no = null, .new_no = 12, .kind = .added, .text = "x" }; // gap: 11 missing
+    try testing.expectError(error.NonContiguous, spanFromLines(&.{ &a0, &a2 }, false));
+
+    try testing.expectError(error.NotOnALine, spanFromLines(&.{}, false));
 }
 
 test "commitDraft fences a suggestion, adds it to the review, and persists it" {
