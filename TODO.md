@@ -96,6 +96,16 @@ _Deferred:_ the **removed-file** old-side splice — a deletion's whole-file vie
 
 _Deferred:_ the async submit worker glue (event wiring, worker loop) isn't unit-tested — same posture as the M7/M9 workers; the pure engine and adapter carry the logic. `Retry-After` is plumbed through `report` but the `Poster` doesn't yet surface the header, so live 429s use computed backoff. Submission is single-batch-at-a-time (a second `X` while one runs is refused). No idempotency key exists on Bitbucket, so the duplicate guard is best-effort (anchor + exact-body match).
 
+## M10b — Multi-line anchors, suggestion prefill & post-submit reconcile  ·  M  ·  ✅ done ($EDITOR handoff deferred)
+- [x] Multi-line anchors: thread `start_from`/`start_to` through the `Anchor` model, the client (send null-omitted + parse back), the `Poster` dedupe, and the SQLite store (v2 migration). ✅ Field names/roles verified by live probes on PR 1856 (`{start_to, to}` new-side, `{start_from, from}` old-side; start_* = range top).
+- [x] Visual line selection: `Nav.mark` + `v` toggle and shift+arrow start/extend (one sticky model; plain motions extend, Esc clears); selection band tinted in the pane. ✅ shift+arrow is terminal-dependent so `v` is the robust primary — both drive the same state.
+- [x] Selection → anchor mapping (`spanFromLines`, pure/tested): new-side range for additions+context, old-side for deletions, single line stays single-sided; refuse mixed sides / hunk gaps / file borders / a suggestion over removed lines. ✅ `i`/`S` act on the selection when active, else the cursor line.
+- [x] Suggestion prefill: seed the composer with the anchored source lines so the reviewer edits real code in the fence (`Composer.seed`). ✅ plain comments stay empty.
+- [x] Post-submit reconciliation: re-fetch the PR after a batch that posted anything, so published Comments reappear (ADR-0001); hide a posted/submitting Draft's row (the fetched Comment represents it) while keeping its pending descendants (ADR-0007 render-path dedup). ✅
+- [x] Submit modal: float a "Submitting review — n/total" overlay over the viewer during a batch, then the loading frame covers the re-fetch. ✅ shared `centeredModal` helper extracted; picker/composer/submit all route through it.
+
+_Deferred:_ editing a prefilled/multi-line suggestion is append-only (revise from the tail); the real multi-line editor is an `$EDITOR` handoff (spawn `$EDITOR` on a temp file, read the result back through the same `Composer.seed` seam) — recorded, not built. Old-side (deletion) ranges are supported for comments but were only lightly probed; the apply-replaces-N-lines behavior of a multi-line suggestion is Bitbucket UI behavior we don't control (our POST contract is verified). No test drives the shift+arrow/selection glue through vaxis (same posture as the worker glue); the pure `spanFromLines`/`Nav` selection logic carries the rules.
+
 ## M11 — Keymap & motions  ·  S/M  ·  needs M2
 - [ ] Full vim motion set + numeric Count register (`5j`, `zz`, …); arrows side by side.
 - [ ] Configurable `Keymap` from config.

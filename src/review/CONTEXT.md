@@ -35,8 +35,12 @@ A non-root Comment whose parent is another Comment (which may itself still be a 
 _Avoid_: child, response, answer.
 
 **Suggestion**:
-A Comment whose body contains a fenced ```suggestion``` block proposing replacement lines. We can author suggestions; *applying* them stays in the Bitbucket web UI.
+A Comment whose body contains a fenced ```suggestion``` block proposing replacement lines. Authoring one prefills the composer with the current source of the anchored line(s), so the reviewer edits real code inside the fence rather than retyping it. A Suggestion is only meaningful over new-file lines — Bitbucket refuses to *apply* a suggestion anchored to removed lines — so authoring one over an old-side (deletion) range is refused. *Applying* a Suggestion stays in the Bitbucket web UI.
 _Avoid_: patch, fix, edit, proposal.
+
+**Selection**:
+A contiguous run of diff lines the reviewer marks (via `v` or shift+arrow) to anchor a multi-line Comment or Suggestion. Maps to a **ranged Anchor**: a new-side selection (lines present in the new file) yields `{ start_to, to }`, an old-side one (a removed line) yields `{ start_from, from }`. A selection that mixes sides, crosses a hunk gap, or spans files is refused rather than anchored to the wrong lines — the same "refuse over guess" stance as the Stale-anchor guard.
+_Avoid_: highlight, mark, region.
 
 **Draft**:
 An authored-but-unpublished Comment/Reply/Suggestion held locally. Carries a local temp id, its DraftState, and — for a root Draft — an Anchor. A *reply* Draft carries no Anchor of its own: its location comes from its parent. The parent link (not a copied Anchor) is the single expression of that relationship — it drives both rendering placement and Submission ordering. A reply therefore shares its parent's visibility: hide the parent thread (resolved, toggle off) and the reply hides with it. The atom of a Pending Review.
@@ -51,8 +55,12 @@ The whole graph of Drafts for one PullRequest, persisted via the PendingReviewSt
 _Avoid_: batch (that's the act), queue, staging.
 
 **Submission**:
-The act of publishing a PendingReview: topologically order Drafts (parents before Replies), POST each, remap temp ids to server CommentIds, and continue-on-item-failure while stopping the batch on auth failure. A retryable failure (rate-limit, server, network) is retried with backoff; a validation failure fails that Draft and *skips its reply-descendants* (they have no valid parent to attach to); an auth failure aborts the whole batch with everything kept pending. Modeled as a clock-free state machine that emits the next action as data, so its policy is pure; the network is the **CommentPoster** seam.
+The act of publishing a PendingReview: topologically order Drafts (parents before Replies), POST each, remap temp ids to server CommentIds, and continue-on-item-failure while stopping the batch on auth failure. A retryable failure (rate-limit, server, network) is retried with backoff; a validation failure fails that Draft and *skips its reply-descendants* (they have no valid parent to attach to); an auth failure aborts the whole batch with everything kept pending. Modeled as a clock-free state machine that emits the next action as data, so its policy is pure; the network is the **CommentPoster** seam. After a batch that posts anything, the PR is re-fetched so the freshly published Comments reappear (see Reconciliation) — Bitbucket, not the deleted Drafts, is now their home.
 _Avoid_: submit, flush, push, sync.
+
+**Reconciliation**:
+The step after a Submission that posted at least one Comment: re-fetch the PR so the just-published Comments (now owned by Bitbucket, ADR-0001) reappear in place of the Drafts that were deleted on a clean batch. During the transient window of a *partial* batch, a still-pending Draft under a now-posted parent stays visible while the posted parent's own row is hidden (the fetched Comment represents it) — the render-path dedup ADR-0007 anticipates.
+_Avoid_: refresh, sync, merge.
 
 **Selective retry**:
 Re-running Submission over a PendingReview that already has posted Drafts: those are recognized (their transient `posted` state) and skipped, so only the still-pending failures and their descendants are re-attempted. The user's remedy for a partial batch.
