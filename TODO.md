@@ -106,7 +106,7 @@ _Deferred:_ the async submit worker glue (event wiring, worker loop) isn't unit-
 
 _Deferred:_ editing a prefilled/multi-line suggestion is append-only (revise from the tail); the real multi-line editor is an `$EDITOR` handoff (spawn `$EDITOR` on a temp file, read the result back through the same `Composer.seed` seam) — recorded, not built. Old-side (deletion) ranges are supported for comments but were only lightly probed; the apply-replaces-N-lines behavior of a multi-line suggestion is Bitbucket UI behavior we don't control (our POST contract is verified). No test drives the shift+arrow/selection glue through vaxis (same posture as the worker glue); the pure `spanFromLines`/`Nav` selection logic carries the rules.
 
-## M11 — Keymap & motions  ·  S/M  ·  needs M2
+## M11 — Keymap & motions  ·  S/M  ·  ✅ done (config-file loading → M12; markdown → follow-up)
 - [x] Full vim motion set + numeric Count register (`5j`, `zz`, …); arrows side by side. ✅ Added `ctrl-f`/`ctrl-b` (full page), `zz`/`zt`/`zb` (center / cursor-to-top / cursor-to-bottom scroll positioning), and `H`/`M`/`L` (cursor to viewport top/middle/bottom) as pure `Nav` methods; the existing `hjkl`/arrows/`ctrl-d`/`ctrl-u`/`gg`/`G`/Count/shift-select carry over. Skipped search/paragraph/operator-pending (no meaning in a diff viewer). `PageUp`/`PageDown` stay half-page (unchanged); `ctrl-f`/`ctrl-b` are the full-page keys.
 - [x] Configurable `Keymap` from config. ✅ Vim-aligned: one `(chord)→Action` table (`src/tui/keymap.zig`) where motions and commands are both bindings, so dispatch and the help overlay read one source of truth. The Count and the multi-key **Leader** (`g`/`z`) stay in the engine (`Nav` + `Resolver`), not the table — matching how vim keeps that grammar above its mapping table. The 15-arm `key.matches` viewer chain became one `switch (Action)`. _Loading overrides from a config file is deferred to **M12** (which introduces the TOML config); M11 ships the defaults + the seam (`Keymap.default`, overlaid at the `km` binding in `app.run`)._
 - [x] Keybinding-help Overlay (reads Keymap). ✅ `?` floats a centered "Keybindings" modal (`render.drawHelp`) built straight from `Keymap.default` — Motions in the left column, commands in the right, adjacent alternate bindings coalesced (`j ↓`), so it can't drift from the live table. Any key dismisses it (captures input while open); a `? help` hint sits in the status bar for discoverability.
@@ -117,6 +117,7 @@ _Deferred:_ editing a prefilled/multi-line suggestion is append-only (revise fro
 ## M12 — Themes & config  ·  S  ·  needs M2
 - [ ] Config file (TOML at `~/.config/bbr/`).
 - [ ] Built-in themes: catppuccin, gruvbox, solarized (+ light/dark); selection in config.
+- [ ] **Keymap overrides from config** (deferred here from M11). The `Keymap` abstraction, defaults, and dispatch already exist (`src/tui/keymap.zig`); this parses a `[keymap]` section into `Chord`/`Action` overrides and overlays them on `Keymap.default` at the `km` binding in `app.run`.
 
 ## M13 — Syntax highlighting  ·  L  ·  needs M2
 - [ ] `Highlighter` seam + `PlainHighlighter`.
