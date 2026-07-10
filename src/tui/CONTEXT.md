@@ -46,5 +46,5 @@ What a key resolves to in the Keymap: a Motion or a command (quit, reply, submit
 _Avoid_: command, handler, event.
 
 **Leader**:
-A prefix key that arms a two-key Motion — the `g` of `gg`, the `z` of `zz`/`zt`/`zb`. A Leader has no Action of its own; the following key completes the binding, and an unrecognized follow-up is dropped. Distinct from the Count, which the engine accumulates separately.
+A key that begins a multi-chord Action — the first `g` of `gg`, or the first chord of a longer configured sequence. A Leader has no Action of its own; input continues until the sequence resolves or becomes unrecognized. Distinct from the Count, which the engine accumulates separately.
 _Avoid_: prefix, modifier, chord.

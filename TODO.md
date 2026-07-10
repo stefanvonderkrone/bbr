@@ -115,9 +115,9 @@ _Deferred:_ editing a prefilled/multi-line suggestion is append-only (revise fro
   _Deferred:_ markdown rendering (headings/bold, fence-aware suggestion styling — item (B) above); a length cap/fold for pathological bodies.
 
 ## M12 — Themes & config  ·  S  ·  needs M2
-- [ ] Config file (TOML at `~/.config/bbr/`).
-- [ ] Built-in themes: catppuccin, gruvbox, solarized (+ light/dark); selection in config.
-- [ ] **Keymap overrides from config** (deferred here from M11). The `Keymap` abstraction, defaults, and dispatch already exist (`src/tui/keymap.zig`); this parses a `[keymap]` section into `Chord`/`Action` overrides and overlays them on `Keymap.default` at the `km` binding in `app.run`.
+- [x] Config file. ✅ Strict, allocation-light TOML subset at `$XDG_CONFIG_HOME/bbr/config.toml` (fallback `$HOME/.config/bbr/config.toml`); a missing file uses defaults, while malformed/unknown entries produce collected path + line/column diagnostics before the TUI starts.
+- [x] Built-in Themes. ✅ Default `system` follows terminal colors; fixed plain light/dark, all four Catppuccin flavors, and light/dark Gruvbox and Solarized variants resolve inside the Theme module.
+- [x] **Keymap overrides from config.** ✅ `[keymap]` maps one-to-eight chord sequences to Actions (or `none`), canonicalizes modifier aliases, preserves Count, rejects prefix conflicts, and materializes one Keymap shared by dispatch and the help Overlay.
 
 ## M13 — Syntax highlighting  ·  L  ·  needs M2
 - [ ] `Highlighter` seam + `PlainHighlighter`.

@@ -496,19 +496,21 @@ fn keyName(scratch: std.mem.Allocator, cp: u21) []const u8 {
     };
 }
 
-/// Format a Chord for the help overlay: "j", "^d", "⇧↓", "gg", "zt", "⏎".
+/// Format a Chord for the help overlay, including configured multi-chord Actions.
 fn chordLabel(scratch: std.mem.Allocator, c: keymap.Chord) []const u8 {
-    const base = keyName(scratch, c.cp);
-    const with_mods = if (c.mods.ctrl)
-        std.fmt.allocPrint(scratch, "^{s}", .{base}) catch base
-    else if (c.mods.shift)
-        std.fmt.allocPrint(scratch, "⇧{s}", .{base}) catch base
-    else
-        base;
-    if (c.leader) |ld| {
-        return std.fmt.allocPrint(scratch, "{s}{s}", .{ keyName(scratch, ld), with_mods }) catch with_mods;
+    var out: []const u8 = "";
+    for (0..c.len()) |i| {
+        const stroke = c.at(i);
+        var label = keyName(scratch, stroke.cp);
+        if (stroke.mods.shift) label = std.fmt.allocPrint(scratch, "shift-{s}", .{label}) catch label;
+        if (stroke.mods.alt) label = std.fmt.allocPrint(scratch, "alt-{s}", .{label}) catch label;
+        if (stroke.mods.ctrl) label = std.fmt.allocPrint(scratch, "ctrl-{s}", .{label}) catch label;
+        if (stroke.mods.super) label = std.fmt.allocPrint(scratch, "super-{s}", .{label}) catch label;
+        if (stroke.mods.hyper) label = std.fmt.allocPrint(scratch, "hyper-{s}", .{label}) catch label;
+        if (stroke.mods.meta) label = std.fmt.allocPrint(scratch, "meta-{s}", .{label}) catch label;
+        out = std.fmt.allocPrint(scratch, "{s}{s}{s}", .{ out, if (i == 0) "" else " ", label }) catch label;
     }
-    return with_mods;
+    return out;
 }
 
 /// Coalesce the Keymap into two help columns — Motions and commands — one line

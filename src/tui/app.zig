@@ -66,6 +66,8 @@ pub const RunCtx = struct {
     cred: Credential,
     repo: []const u8,
     store: PendingReviewStore,
+    active_theme: theme.Theme,
+    keymap: keymap.Keymap,
     online: bool = true,
 };
 
@@ -373,9 +375,9 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
     try loop.installResizeHandler();
     try vx.enterAltScreen(writer);
 
-    const active_theme = theme.dark;
+    const active_theme = ctx.active_theme;
     var nav = Nav.init(buf.rows.len, vx.window().height);
-    const km = keymap.Keymap.default; // M12 will overlay config here
+    const km = ctx.keymap;
     var resolver = keymap.Resolver{}; // tracks the leader across keypresses
     var loading = false; // a load is in flight for the current epoch
     var loading_id: u64 = initial_id; // PR the in-flight load targets (for the loading view)

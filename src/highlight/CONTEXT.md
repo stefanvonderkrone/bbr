@@ -19,5 +19,5 @@ A range of a Line assigned a highlight capture (e.g. keyword, string, comment) t
 _Avoid_: token, segment (reserved for diff), highlight, region.
 
 **Theme**:
-A named, selectable mapping from highlight captures to foreground colors *and* the neutral/green/red diff backgrounds — the single place color decisions live. Ships built-in variants (catppuccin, gruvbox, solarized, and plain light/dark) and honors light/dark preference.
+A named, selectable mapping from highlight captures to foreground colors *and* the neutral/green/red diff backgrounds — the single place color decisions live. The default `system` Theme uses the terminal's foreground, background, and ANSI palette; fixed-color built-ins are plain light/dark, Catppuccin Latte/Frappé/Macchiato/Mocha, and light/dark variants of Gruvbox and Solarized.
 _Avoid_: palette, colorscheme, style.

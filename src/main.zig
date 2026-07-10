@@ -12,6 +12,7 @@ const bbr = @import("bbr");
 const app = @import("tui/app.zig");
 const session = @import("tui/session.zig");
 const persist = @import("persist/sqlite_store.zig");
+const config = @import("tui/config.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -23,7 +24,11 @@ pub fn main(init: std.process.Init) !void {
     // `demo` needs no credentials: it feeds synthetic data through the real
     // buffer/renderer so the comment UI can be exercised entirely offline.
     if (first) |f| {
-        if (std.mem.eql(u8, f, "demo")) return demoRun(init.io, gpa, init.environ_map);
+        if (std.mem.eql(u8, f, "demo")) {
+            var configuration = loadConfiguration(gpa, init.io, init.environ_map) catch return;
+            defer configuration.deinit(gpa);
+            return demoRun(init.io, gpa, init.environ_map, &configuration);
+        }
     }
 
     const cred = bbr.bitbucket.Credential.fromEnv(init.environ_map) catch |err| {
@@ -57,13 +62,15 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    try openTui(init, gpa, cred, input);
+    var configuration = loadConfiguration(gpa, init.io, init.environ_map) catch return;
+    defer configuration.deinit(gpa);
+    try openTui(init, gpa, cred, input, &configuration);
 }
 
 /// Resolve the startup entry and hand off to the TUI. Uses a real GitClient and
 /// a StdHttpClient for resolution; the loaded PR (and any switch) get their own
 /// clients inside `app.run`.
-fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, input: bbr.startup.Input) !void {
+fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, input: bbr.startup.Input, configuration: *const config.Configuration) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -117,7 +124,34 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .cred = cred,
         .repo = repo_buf[0..repo_len],
         .store = store.store(),
+        .active_theme = configuration.active_theme,
+        .keymap = configuration.keymap.keymap(),
     }, null, target.id);
+}
+
+fn loadConfiguration(gpa: std.mem.Allocator, io: std.Io, env_map: *const std.process.Environ.Map) !config.Configuration {
+    const config_path = (try config.path(gpa, env_map)) orelse return config.defaults(gpa);
+    defer gpa.free(config_path);
+    const source = std.Io.Dir.cwd().readFileAlloc(io, config_path, gpa, .limited(64 * 1024 + 1)) catch |err| switch (err) {
+        error.FileNotFound => return config.defaults(gpa),
+        else => {
+            std.debug.print("bbr: could not read configuration {s}: {s}\n", .{ config_path, @errorName(err) });
+            return error.InvalidConfiguration;
+        },
+    };
+    defer gpa.free(source);
+    var parsed = try config.parse(gpa, source);
+    switch (parsed) {
+        .ok => |configuration| return configuration,
+        .invalid => |diagnostics| {
+            defer parsed.deinit(gpa);
+            for (diagnostics) |diagnostic| {
+                std.debug.print("{s}:{d}:{d}: {s}\n", .{ config_path, diagnostic.line, diagnostic.column, diagnostic.message });
+                if (diagnostic.hint) |hint| std.debug.print("  help: {s}\n", .{hint});
+            }
+            return error.InvalidConfiguration;
+        },
+    }
 }
 
 /// Open the pending-review store at `~/.local/state/bbr/pending.db`, creating the
@@ -319,7 +353,7 @@ const demo_diff =
 /// a PR-level comment, an inline root + reply, a suggestion, a resolved thread
 /// (hidden until `R`), and an outdated thread (in the per-file section). The
 /// Picker is disabled (`online = false`): there is no repo to list.
-fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map) !void {
+fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map, configuration: *const config.Configuration) !void {
     // Build the session on the page allocator so app.run can destroy it uniformly.
     const s = try session.create(std.heap.page_allocator);
     const a = s.arena.allocator();
@@ -360,6 +394,8 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
         .cred = .{ .username = "", .token = "", .workspace = "" },
         .repo = "",
         .store = store.store(),
+        .active_theme = configuration.active_theme,
+        .keymap = configuration.keymap.keymap(),
         .online = false,
     }, s, s.pr.id);
 }
@@ -370,6 +406,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
 // tests run via src/root.zig.
 test {
     _ = @import("tui/app.zig");
+    _ = @import("tui/config.zig");
     _ = @import("persist/sqlite_store.zig");
 }
 

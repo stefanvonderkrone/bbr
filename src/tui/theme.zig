@@ -101,6 +101,11 @@ pub const Theme = struct {
                 shiftChannel(ch[1], self.cursor_line_shift),
                 shiftChannel(ch[2], self.cursor_line_shift),
             } },
+            .index => |index| switch (index) {
+                1 => .{ .index = 9 },
+                2 => .{ .index = 10 },
+                else => self.cursor_line,
+            },
             else => self.cursor_line,
         };
     }
@@ -157,6 +162,97 @@ pub const dark: Theme = .{
     .picker_query = .{ .bg = rgb(0x28_28_36), .fg = rgb(0xff_ff_ff) },
 };
 
+fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24, muted: u24, green: u24, red: u24, yellow: u24, blue: u24, violet: u24, teal: u24, light: bool }) Theme {
+    return .{
+        .context = .{ .fg = rgb(p.fg), .bg = rgb(p.bg) },
+        .added = .{ .fg = rgb(p.fg), .bg = rgb(if (p.light) 0xd8_ef_d0 else 0x1f_3a_28) },
+        .removed = .{ .fg = rgb(p.fg), .bg = rgb(if (p.light) 0xf4_d4_d4 else 0x45_20_28) },
+        .added_emphasis = .{ .fg = rgb(p.fg), .bg = rgb(if (p.light) 0xb8_df_aa else 0x32_5a_3c) },
+        .removed_emphasis = .{ .fg = rgb(p.fg), .bg = rgb(if (p.light) 0xe9_b0_b0 else 0x6a_30_3a) },
+        .gutter = .{ .fg = rgb(p.muted), .bg = rgb(p.bg) },
+        .cursor_line = rgb(p.surface2),
+        .cursor_line_shift = if (p.light) -18 else 18,
+        .file_header = .{ .fg = rgb(p.fg), .bg = rgb(p.bg), .bold = true },
+        .hunk_header = .{ .fg = rgb(p.blue), .bg = rgb(p.bg) },
+        .fold = .{ .fg = rgb(p.muted), .bg = rgb(p.surface) },
+        .sidebar_item = .{ .fg = rgb(p.fg), .bg = rgb(p.bg) },
+        .sidebar_selected = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2), .bold = true },
+        .status_added = rgb(p.green),
+        .status_modified = rgb(p.yellow),
+        .status_removed = rgb(p.red),
+        .status_renamed = rgb(p.violet),
+        .comment = .{ .fg = rgb(p.fg), .bg = rgb(p.surface) },
+        .comment_reply = .{ .fg = rgb(p.muted), .bg = rgb(p.surface) },
+        .suggestion = .{ .fg = rgb(p.teal), .bg = rgb(p.surface) },
+        .draft = .{ .fg = rgb(p.yellow), .bg = rgb(p.surface), .bold = true },
+        .draft_reply = .{ .fg = rgb(p.yellow), .bg = rgb(p.surface) },
+        .section = .{ .fg = rgb(p.muted), .bg = rgb(p.bg), .bold = true },
+        .picker = .{ .fg = rgb(p.fg), .bg = rgb(p.surface) },
+        .picker_selected = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2), .bold = true },
+        .picker_query = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2) },
+    };
+}
+
+pub const system: Theme = .{
+    .context = .{},
+    .added = .{ .bg = .{ .index = 2 } },
+    .removed = .{ .bg = .{ .index = 1 } },
+    .added_emphasis = .{ .bg = .{ .index = 10 } },
+    .removed_emphasis = .{ .bg = .{ .index = 9 } },
+    .gutter = .{ .fg = .{ .index = 8 } },
+    .cursor_line = .{ .index = 8 },
+    .cursor_line_shift = 0,
+    .file_header = .{ .bold = true },
+    .hunk_header = .{ .fg = .{ .index = 4 } },
+    .fold = .{ .fg = .{ .index = 8 } },
+    .sidebar_item = .{},
+    .sidebar_selected = .{ .reverse = true, .bold = true },
+    .status_added = .{ .index = 2 },
+    .status_modified = .{ .index = 3 },
+    .status_removed = .{ .index = 1 },
+    .status_renamed = .{ .index = 5 },
+    .comment = .{ .fg = .{ .index = 6 } },
+    .comment_reply = .{ .fg = .{ .index = 8 } },
+    .suggestion = .{ .fg = .{ .index = 6 } },
+    .draft = .{ .fg = .{ .index = 3 }, .bold = true },
+    .draft_reply = .{ .fg = .{ .index = 3 } },
+    .section = .{ .fg = .{ .index = 8 }, .bold = true },
+    .picker = .{},
+    .picker_selected = .{ .reverse = true, .bold = true },
+    .picker_query = .{ .reverse = true },
+};
+
+pub const light = fixedTheme(.{ .bg = 0xfa_fa_f8, .fg = 0x24_24_24, .surface = 0xee_ee_ea, .surface2 = 0xdd_dd_d8, .muted = 0x72_72_72, .green = 0x2f_7d_32, .red = 0xb3_26_1e, .yellow = 0x8a_62_00, .blue = 0x1d_5f_a7, .violet = 0x73_3f_9b, .teal = 0x0c_72_72, .light = true });
+pub const catppuccin_latte = fixedTheme(.{ .bg = 0xef_f1_f5, .fg = 0x4c_4f_69, .surface = 0xe6_e9_ef, .surface2 = 0xcc_d0_da, .muted = 0x8c_8f_a1, .green = 0x40_a0_2b, .red = 0xd2_0f_39, .yellow = 0xdf_8e_1d, .blue = 0x1e_66_f5, .violet = 0x88_39_ef, .teal = 0x17_92_99, .light = true });
+pub const catppuccin_frappe = fixedTheme(.{ .bg = 0x30_34_46, .fg = 0xc6_d0_f5, .surface = 0x41_45_59, .surface2 = 0x51_57_6d, .muted = 0x83_8b_a7, .green = 0xa6_d1_89, .red = 0xe7_82_84, .yellow = 0xe5_c8_90, .blue = 0x8c_aa_ee, .violet = 0xca_9e_e6, .teal = 0x81_c8_be, .light = false });
+pub const catppuccin_macchiato = fixedTheme(.{ .bg = 0x24_27_3a, .fg = 0xca_d3_f5, .surface = 0x36_3a_4f, .surface2 = 0x49_4d_64, .muted = 0x80_88_a6, .green = 0xa6_da_95, .red = 0xed_87_96, .yellow = 0xee_d4_9f, .blue = 0x8a_ad_f4, .violet = 0xc6_a0_f6, .teal = 0x8b_d5_ca, .light = false });
+pub const catppuccin_mocha = fixedTheme(.{ .bg = 0x1e_1e_2e, .fg = 0xcd_d6_f4, .surface = 0x31_32_44, .surface2 = 0x45_47_5a, .muted = 0x7f_84_a2, .green = 0xa6_e3_a1, .red = 0xf3_8b_a8, .yellow = 0xf9_e2_af, .blue = 0x89_b4_fa, .violet = 0xcb_a6_f7, .teal = 0x94_e2_d5, .light = false });
+pub const gruvbox_light = fixedTheme(.{ .bg = 0xfb_f1_c7, .fg = 0x3c_38_36, .surface = 0xeb_db_b2, .surface2 = 0xd5_c4_a1, .muted = 0x7c_6f_64, .green = 0x79_74_0e, .red = 0x9d_00_06, .yellow = 0xb5_76_14, .blue = 0x07_66_78, .violet = 0x8f_3f_71, .teal = 0x42_7b_58, .light = true });
+pub const gruvbox_dark = fixedTheme(.{ .bg = 0x28_28_28, .fg = 0xeb_db_b2, .surface = 0x3c_38_36, .surface2 = 0x50_49_45, .muted = 0x92_83_74, .green = 0xb8_bb_26, .red = 0xfb_49_34, .yellow = 0xfa_bd_2f, .blue = 0x83_a5_98, .violet = 0xd3_86_9b, .teal = 0x8e_c0_7c, .light = false });
+pub const solarized_light = fixedTheme(.{ .bg = 0xfd_f6_e3, .fg = 0x65_7b_83, .surface = 0xee_e8_d5, .surface2 = 0xd8_d2_c0, .muted = 0x93_a1_a1, .green = 0x85_99_00, .red = 0xdc_32_2f, .yellow = 0xb5_89_00, .blue = 0x26_8b_d2, .violet = 0x6c_71_c4, .teal = 0x2a_a1_98, .light = true });
+pub const solarized_dark = fixedTheme(.{ .bg = 0x00_2b_36, .fg = 0x83_94_96, .surface = 0x07_36_42, .surface2 = 0x0d_47_54, .muted = 0x58_6e_75, .green = 0x85_99_00, .red = 0xdc_32_2f, .yellow = 0xb5_89_00, .blue = 0x26_8b_d2, .violet = 0x6c_71_c4, .teal = 0x2a_a1_98, .light = false });
+
+pub const Builtin = struct { name: []const u8, value: Theme };
+
+pub const builtins = [_]Builtin{
+    .{ .name = "system", .value = system },
+    .{ .name = "dark", .value = dark },
+    .{ .name = "light", .value = light },
+    .{ .name = "catppuccin-latte", .value = catppuccin_latte },
+    .{ .name = "catppuccin-frappe", .value = catppuccin_frappe },
+    .{ .name = "catppuccin-macchiato", .value = catppuccin_macchiato },
+    .{ .name = "catppuccin-mocha", .value = catppuccin_mocha },
+    .{ .name = "gruvbox-light", .value = gruvbox_light },
+    .{ .name = "gruvbox-dark", .value = gruvbox_dark },
+    .{ .name = "solarized-light", .value = solarized_light },
+    .{ .name = "solarized-dark", .value = solarized_dark },
+};
+
+pub fn byName(name: []const u8) ?Theme {
+    inline for (builtins) |entry| if (std.mem.eql(u8, name, entry.name)) return entry.value;
+    return null;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -196,4 +292,13 @@ test "lineStyle maps each kind to its band" {
     try testing.expectEqual(dark.removed.bg, dark.lineStyle(.removed).bg);
     // added and removed are distinguishable bands.
     try testing.expect(!std.meta.eql(dark.added.bg, dark.removed.bg));
+}
+
+test "every built-in Theme resolves by its exact name and keeps diff bands distinct" {
+    for (builtins) |builtin| {
+        const selected = byName(builtin.name).?;
+        try testing.expect(!std.meta.eql(selected.added.bg, selected.removed.bg));
+        try testing.expect(!std.meta.eql(selected.status_added, selected.status_removed));
+    }
+    try testing.expect(byName("catppuccin") == null);
 }

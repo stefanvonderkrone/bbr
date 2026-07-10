@@ -6,8 +6,8 @@
 //! the engine, not the bindings — exactly as vim keeps the Count and multi-key
 //! prefix resolution above its mapping table:
 //!   * the numeric **Count** prefix (`5j`) is accumulated by `Nav`, and
-//!   * a **leader** (the `g` in `gg`, the `z` in `zz`) is a one-key prefix the
-//!     `Resolver` tracks; a leader has no standalone binding.
+//!   * a **Leader** begins a configured multi-chord sequence the `Resolver`
+//!     tracks; a Leader has no standalone binding.
 //!
 //! Bindings are matched against a live event with the smart `vaxis.Key.matches`,
 //! so `S` = shift+`s`, text-vs-codepoint, and caps-lock all resolve the vaxis
@@ -87,13 +87,43 @@ pub fn isMotion(a: Action) bool {
     };
 }
 
-/// A key chord: a codepoint + modifiers, optionally preceded by a `leader` key.
-/// `leader == null` is a single keypress; otherwise the binding fires only when
-/// `leader` was pressed immediately before (`gg`, `zz`, `zt`, `zb`).
+/// One bounded sequence of key strokes. Single-key and multi-chord Actions use
+/// the same representation.
 pub const Chord = struct {
+    strokes: [8]Stroke,
+    count: u4,
+
+    pub fn one(cp: u21) Chord {
+        var strokes: [8]Stroke = undefined;
+        strokes[0] = .{ .cp = cp };
+        return .{ .strokes = strokes, .count = 1 };
+    }
+
+    pub fn modified(cp: u21, mods: vaxis.Key.Modifiers) Chord {
+        var chord = one(cp);
+        chord.strokes[0].mods = mods;
+        return chord;
+    }
+
+    pub fn two(first: u21, second: u21) Chord {
+        var strokes: [8]Stroke = undefined;
+        strokes[0] = .{ .cp = first };
+        strokes[1] = .{ .cp = second };
+        return .{ .strokes = strokes, .count = 2 };
+    }
+
+    pub fn len(self: Chord) usize {
+        return self.count;
+    }
+
+    pub fn at(self: Chord, index: usize) Stroke {
+        return self.strokes[index];
+    }
+};
+
+pub const Stroke = struct {
     cp: u21,
     mods: vaxis.Key.Modifiers = .{},
-    leader: ?u21 = null,
 };
 
 pub const Binding = struct {
@@ -107,47 +137,47 @@ pub const Binding = struct {
 /// grouping; dispatch resolution is unambiguous (no key maps to two actions).
 pub const default_bindings = [_]Binding{
     // --- motions ---
-    .{ .chord = .{ .cp = 'j' }, .action = .down, .help = "down" },
-    .{ .chord = .{ .cp = vaxis.Key.down }, .action = .down, .help = "down" },
-    .{ .chord = .{ .cp = 'k' }, .action = .up, .help = "up" },
-    .{ .chord = .{ .cp = vaxis.Key.up }, .action = .up, .help = "up" },
-    .{ .chord = .{ .cp = 'd', .mods = .{ .ctrl = true } }, .action = .half_page_down, .help = "half page down" },
-    .{ .chord = .{ .cp = vaxis.Key.page_down }, .action = .half_page_down, .help = "half page down" },
-    .{ .chord = .{ .cp = 'u', .mods = .{ .ctrl = true } }, .action = .half_page_up, .help = "half page up" },
-    .{ .chord = .{ .cp = vaxis.Key.page_up }, .action = .half_page_up, .help = "half page up" },
-    .{ .chord = .{ .cp = 'f', .mods = .{ .ctrl = true } }, .action = .page_down, .help = "page down" },
-    .{ .chord = .{ .cp = 'b', .mods = .{ .ctrl = true } }, .action = .page_up, .help = "page up" },
-    .{ .chord = .{ .cp = 'g', .leader = 'g' }, .action = .to_top, .help = "go to top" },
-    .{ .chord = .{ .cp = vaxis.Key.home }, .action = .to_top, .help = "go to top" },
-    .{ .chord = .{ .cp = 'G' }, .action = .to_bottom, .help = "go to bottom" },
-    .{ .chord = .{ .cp = vaxis.Key.end }, .action = .to_bottom, .help = "go to bottom" },
-    .{ .chord = .{ .cp = 'z', .leader = 'z' }, .action = .center, .help = "center cursor" },
-    .{ .chord = .{ .cp = 't', .leader = 'z' }, .action = .scroll_cursor_top, .help = "cursor to viewport top" },
-    .{ .chord = .{ .cp = 'b', .leader = 'z' }, .action = .scroll_cursor_bottom, .help = "cursor to viewport bottom" },
-    .{ .chord = .{ .cp = 'H' }, .action = .cursor_view_top, .help = "top of viewport" },
-    .{ .chord = .{ .cp = 'M' }, .action = .cursor_view_middle, .help = "middle of viewport" },
-    .{ .chord = .{ .cp = 'L' }, .action = .cursor_view_bottom, .help = "bottom of viewport" },
-    .{ .chord = .{ .cp = vaxis.Key.down, .mods = .{ .shift = true } }, .action = .select_down, .help = "extend selection down" },
-    .{ .chord = .{ .cp = vaxis.Key.up, .mods = .{ .shift = true } }, .action = .select_up, .help = "extend selection up" },
+    .{ .chord = Chord.one('j'), .action = .down, .help = "down" },
+    .{ .chord = Chord.one(vaxis.Key.down), .action = .down, .help = "down" },
+    .{ .chord = Chord.one('k'), .action = .up, .help = "up" },
+    .{ .chord = Chord.one(vaxis.Key.up), .action = .up, .help = "up" },
+    .{ .chord = Chord.modified('d', .{ .ctrl = true }), .action = .half_page_down, .help = "half page down" },
+    .{ .chord = Chord.one(vaxis.Key.page_down), .action = .half_page_down, .help = "half page down" },
+    .{ .chord = Chord.modified('u', .{ .ctrl = true }), .action = .half_page_up, .help = "half page up" },
+    .{ .chord = Chord.one(vaxis.Key.page_up), .action = .half_page_up, .help = "half page up" },
+    .{ .chord = Chord.modified('f', .{ .ctrl = true }), .action = .page_down, .help = "page down" },
+    .{ .chord = Chord.modified('b', .{ .ctrl = true }), .action = .page_up, .help = "page up" },
+    .{ .chord = Chord.two('g', 'g'), .action = .to_top, .help = "go to top" },
+    .{ .chord = Chord.one(vaxis.Key.home), .action = .to_top, .help = "go to top" },
+    .{ .chord = Chord.one('G'), .action = .to_bottom, .help = "go to bottom" },
+    .{ .chord = Chord.one(vaxis.Key.end), .action = .to_bottom, .help = "go to bottom" },
+    .{ .chord = Chord.two('z', 'z'), .action = .center, .help = "center cursor" },
+    .{ .chord = Chord.two('z', 't'), .action = .scroll_cursor_top, .help = "cursor to viewport top" },
+    .{ .chord = Chord.two('z', 'b'), .action = .scroll_cursor_bottom, .help = "cursor to viewport bottom" },
+    .{ .chord = Chord.one('H'), .action = .cursor_view_top, .help = "top of viewport" },
+    .{ .chord = Chord.one('M'), .action = .cursor_view_middle, .help = "middle of viewport" },
+    .{ .chord = Chord.one('L'), .action = .cursor_view_bottom, .help = "bottom of viewport" },
+    .{ .chord = Chord.modified(vaxis.Key.down, .{ .shift = true }), .action = .select_down, .help = "extend selection down" },
+    .{ .chord = Chord.modified(vaxis.Key.up, .{ .shift = true }), .action = .select_up, .help = "extend selection up" },
     // --- commands ---
-    .{ .chord = .{ .cp = 'q' }, .action = .quit, .help = "quit" },
-    .{ .chord = .{ .cp = 'c', .mods = .{ .ctrl = true } }, .action = .quit, .help = "quit" },
-    .{ .chord = .{ .cp = 'p' }, .action = .open_picker, .help = "open PR picker" },
-    .{ .chord = .{ .cp = 'R' }, .action = .toggle_resolved, .help = "toggle resolved threads" },
-    .{ .chord = .{ .cp = 's' }, .action = .toggle_layout, .help = "toggle unified / side-by-side" },
-    .{ .chord = .{ .cp = 'f' }, .action = .cycle_scope, .help = "cycle diff scope" },
-    .{ .chord = .{ .cp = 'c' }, .action = .comment, .help = "new PR comment" },
-    .{ .chord = .{ .cp = 'v' }, .action = .toggle_select, .help = "toggle visual selection" },
-    .{ .chord = .{ .cp = vaxis.Key.escape }, .action = .clear_selection, .help = "clear selection" },
-    .{ .chord = .{ .cp = 'i' }, .action = .inline_comment, .help = "inline comment" },
-    .{ .chord = .{ .cp = 'S' }, .action = .suggest, .help = "suggestion" },
-    .{ .chord = .{ .cp = 'o' }, .action = .isolate, .help = "isolate / exit file" },
-    .{ .chord = .{ .cp = ']' }, .action = .next_file, .help = "next file" },
-    .{ .chord = .{ .cp = '[' }, .action = .prev_file, .help = "previous file" },
-    .{ .chord = .{ .cp = 'r' }, .action = .reply, .help = "reply" },
-    .{ .chord = .{ .cp = vaxis.Key.enter }, .action = .expand_fold, .help = "expand fold" },
-    .{ .chord = .{ .cp = 'X' }, .action = .submit, .help = "submit review" },
-    .{ .chord = .{ .cp = '?' }, .action = .help, .help = "toggle this help" },
+    .{ .chord = Chord.one('q'), .action = .quit, .help = "quit" },
+    .{ .chord = Chord.modified('c', .{ .ctrl = true }), .action = .quit, .help = "quit" },
+    .{ .chord = Chord.one('p'), .action = .open_picker, .help = "open PR picker" },
+    .{ .chord = Chord.one('R'), .action = .toggle_resolved, .help = "toggle resolved threads" },
+    .{ .chord = Chord.one('s'), .action = .toggle_layout, .help = "toggle unified / side-by-side" },
+    .{ .chord = Chord.one('f'), .action = .cycle_scope, .help = "cycle diff scope" },
+    .{ .chord = Chord.one('c'), .action = .comment, .help = "new PR comment" },
+    .{ .chord = Chord.one('v'), .action = .toggle_select, .help = "toggle visual selection" },
+    .{ .chord = Chord.one(vaxis.Key.escape), .action = .clear_selection, .help = "clear selection" },
+    .{ .chord = Chord.one('i'), .action = .inline_comment, .help = "inline comment" },
+    .{ .chord = Chord.one('S'), .action = .suggest, .help = "suggestion" },
+    .{ .chord = Chord.one('o'), .action = .isolate, .help = "isolate / exit file" },
+    .{ .chord = Chord.one(']'), .action = .next_file, .help = "next file" },
+    .{ .chord = Chord.one('['), .action = .prev_file, .help = "previous file" },
+    .{ .chord = Chord.one('r'), .action = .reply, .help = "reply" },
+    .{ .chord = Chord.one(vaxis.Key.enter), .action = .expand_fold, .help = "expand fold" },
+    .{ .chord = Chord.one('X'), .action = .submit, .help = "submit review" },
+    .{ .chord = Chord.one('?'), .action = .help, .help = "toggle this help" },
 };
 
 pub const Keymap = struct {
@@ -155,41 +185,169 @@ pub const Keymap = struct {
 
     pub const default = Keymap{ .bindings = &default_bindings };
 
-    /// If `key` is a leader (the first key of a two-key motion), return its
-    /// codepoint. A leader has no standalone binding, so this never shadows a
-    /// real single-key action.
-    pub fn leaderOf(self: Keymap, key: vaxis.Key) ?u21 {
-        for (self.bindings) |b| {
-            if (b.chord.leader) |ld| {
-                if (key.matches(ld, .{})) return ld;
+    pub fn fromOverrides(allocator: std.mem.Allocator, overrides: []const Override) !OwnedKeymap {
+        var bindings: std.ArrayList(Binding) = .empty;
+        errdefer bindings.deinit(allocator);
+        try bindings.appendSlice(allocator, &default_bindings);
+
+        for (overrides) |override| {
+            const chord = try parseSequence(override.sequence);
+            const found = findChord(bindings.items, chord);
+            if (std.mem.eql(u8, override.action, "none")) {
+                if (found) |index| _ = bindings.orderedRemove(index);
+                continue;
             }
+            const action = actionFromName(override.action) orelse return error.UnknownAction;
+            const binding: Binding = .{ .chord = chord, .action = action, .help = helpFor(action) };
+            if (found) |index| bindings.items[index] = binding else try bindings.append(allocator, binding);
         }
-        return null;
-    }
-
-    /// Resolve a single (leaderless) chord to its action.
-    pub fn lookup(self: Keymap, key: vaxis.Key) ?Action {
-        for (self.bindings) |b| {
-            if (b.chord.leader != null) continue;
-            if (key.matches(b.chord.cp, b.chord.mods)) return b.action;
-        }
-        return null;
-    }
-
-    /// Resolve the key pressed after `leader`.
-    pub fn lookupAfter(self: Keymap, leader: u21, key: vaxis.Key) ?Action {
-        for (self.bindings) |b| {
-            const ld = b.chord.leader orelse continue;
-            if (ld == leader and key.matches(b.chord.cp, b.chord.mods)) return b.action;
-        }
-        return null;
+        try validatePrefixes(bindings.items);
+        return .{ .bindings = try bindings.toOwnedSlice(allocator) };
     }
 };
 
-/// Threads the leader grammar across keypresses. Owned by the event loop; one
-/// per viewer. `Nav` owns the Count, so the resolver only tracks the leader.
+pub const Override = struct {
+    sequence: []const u8,
+    action: []const u8,
+};
+
+pub fn validateOverride(override: Override) !void {
+    _ = try parseSequence(override.sequence);
+    if (!std.mem.eql(u8, override.action, "none") and actionFromName(override.action) == null) return error.UnknownAction;
+}
+
+pub const SequenceConflict = enum { duplicate, prefix };
+
+pub fn sequenceConflict(a_text: []const u8, b_text: []const u8) !?SequenceConflict {
+    const a = try parseSequence(a_text);
+    const b = try parseSequence(b_text);
+    if (sameChord(a, b)) return .duplicate;
+    const shorter, const longer = if (a.len() < b.len()) .{ a, b } else .{ b, a };
+    if (shorter.len() == longer.len()) return null;
+    for (0..shorter.len()) |i| if (!sameStroke(shorter.at(i), longer.at(i))) return null;
+    return .prefix;
+}
+
+pub const OwnedKeymap = struct {
+    bindings: []Binding,
+
+    pub fn deinit(self: *OwnedKeymap, allocator: std.mem.Allocator) void {
+        allocator.free(self.bindings);
+        self.* = undefined;
+    }
+
+    pub fn keymap(self: *const OwnedKeymap) Keymap {
+        return .{ .bindings = self.bindings };
+    }
+};
+
+fn parseSequence(text: []const u8) !Chord {
+    var strokes: [8]Stroke = undefined;
+    var count: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, text, ' ');
+    while (it.next()) |token| {
+        if (count == strokes.len) return error.SequenceTooLong;
+        strokes[count] = try parseStroke(token);
+        count += 1;
+    }
+    if (count == 0) return error.EmptySequence;
+    if (strokes[0].cp >= '0' and strokes[0].cp <= '9') return error.CountConflict;
+    return .{ .strokes = strokes, .count = @intCast(count) };
+}
+
+fn parseStroke(text: []const u8) !Stroke {
+    var rest = text;
+    var mods: vaxis.Key.Modifiers = .{};
+    while (true) {
+        const dash = std.mem.indexOfScalar(u8, rest, '-') orelse break;
+        const part = rest[0..dash];
+        if (modifier(part, &mods)) {
+            rest = rest[dash + 1 ..];
+        } else break;
+    }
+    if (rest.len == 0) return error.MissingKey;
+    const cp = keyCode(rest) orelse return error.UnknownKey;
+    return .{ .cp = cp, .mods = mods };
+}
+
+fn modifier(name: []const u8, mods: *vaxis.Key.Modifiers) bool {
+    if (std.mem.eql(u8, name, "shift")) mods.shift = true else if (std.mem.eql(u8, name, "alt") or std.mem.eql(u8, name, "option")) mods.alt = true else if (std.mem.eql(u8, name, "ctrl") or std.mem.eql(u8, name, "control")) mods.ctrl = true else if (std.mem.eql(u8, name, "super") or std.mem.eql(u8, name, "cmd") or std.mem.eql(u8, name, "command")) mods.super = true else if (std.mem.eql(u8, name, "hyper")) mods.hyper = true else if (std.mem.eql(u8, name, "meta")) mods.meta = true else return false;
+    return true;
+}
+
+fn keyCode(name: []const u8) ?u21 {
+    if (name.len == 1) {
+        if (std.ascii.isUpper(name[0])) return null;
+        return name[0];
+    }
+    const names = .{
+        .{ "space", @as(u21, ' ') },           .{ "enter", vaxis.Key.enter },         .{ "escape", vaxis.Key.escape },
+        .{ "up", vaxis.Key.up },               .{ "down", vaxis.Key.down },           .{ "left", vaxis.Key.left },
+        .{ "right", vaxis.Key.right },         .{ "home", vaxis.Key.home },           .{ "end", vaxis.Key.end },
+        .{ "page-up", vaxis.Key.page_up },     .{ "page-down", vaxis.Key.page_down }, .{ "tab", vaxis.Key.tab },
+        .{ "backspace", vaxis.Key.backspace }, .{ "delete", vaxis.Key.delete },       .{ "insert", vaxis.Key.insert },
+    };
+    inline for (names) |entry| if (std.mem.eql(u8, name, entry[0])) return entry[1];
+    if (name.len >= 2 and name[0] == 'f') {
+        const n = std.fmt.parseInt(u8, name[1..], 10) catch return null;
+        if (n >= 1 and n <= 35) return vaxis.Key.f1 + n - 1;
+    }
+    return null;
+}
+
+fn actionFromName(name: []const u8) ?Action {
+    inline for (std.meta.fields(Action)) |field| {
+        if (canonicalNameEqual(name, field.name)) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
+fn canonicalNameEqual(configured: []const u8, tag: []const u8) bool {
+    if (configured.len != tag.len) return false;
+    for (configured, tag) |a, b| if (a != (if (b == '_') '-' else b)) return false;
+    return true;
+}
+
+fn helpFor(action: Action) []const u8 {
+    for (default_bindings) |binding| if (binding.action == action) return binding.help;
+    return @tagName(action);
+}
+
+fn sameStroke(a: Stroke, b: Stroke) bool {
+    return a.cp == b.cp and a.mods.eql(b.mods);
+}
+
+fn sameChord(a: Chord, b: Chord) bool {
+    if (a.len() != b.len()) return false;
+    for (0..a.len()) |i| if (!sameStroke(a.at(i), b.at(i))) return false;
+    return true;
+}
+
+fn findChord(bindings: []const Binding, chord: Chord) ?usize {
+    for (bindings, 0..) |binding, i| if (sameChord(binding.chord, chord)) return i;
+    return null;
+}
+
+fn validatePrefixes(bindings: []const Binding) !void {
+    for (bindings, 0..) |a, i| for (bindings[i + 1 ..]) |b| {
+        const shorter, const longer = if (a.chord.len() < b.chord.len()) .{ a.chord, b.chord } else .{ b.chord, a.chord };
+        if (shorter.len() == longer.len()) continue;
+        var prefix = true;
+        for (0..shorter.len()) |j| if (!sameStroke(shorter.at(j), longer.at(j))) {
+            prefix = false;
+            break;
+        };
+        if (prefix) return error.PrefixConflict;
+    };
+}
+
+/// Threads multi-chord Action grammar across keypresses. Owned by the event
+/// loop; one per viewer. `Nav` owns the Count, so the resolver only tracks the
+/// pending Keymap sequence.
 pub const Resolver = struct {
     leader: ?u21 = null,
+    pending: [8]Stroke = undefined,
+    pending_len: u4 = 0,
 
     pub const Result = union(enum) {
         /// Consumed with nothing to do yet (leader armed) or an unbound key.
@@ -201,23 +359,46 @@ pub const Resolver = struct {
     };
 
     pub fn feed(self: *Resolver, km: Keymap, key: vaxis.Key) Result {
-        // A leader is armed: this key completes (or aborts) the two-key motion.
-        if (self.leader) |ld| {
+        if (self.pending_len > 0 and key.matches(vaxis.Key.escape, .{})) {
+            self.pending_len = 0;
             self.leader = null;
-            if (km.lookupAfter(ld, key)) |a| return .{ .action = a };
-            return .none; // an invalid leader combo is dropped, vim-style
-        }
-        // Arm a leader.
-        if (km.leaderOf(key)) |ld| {
-            self.leader = ld;
             return .none;
         }
         // A numeric Count prefix.
-        if (key.text) |t| {
+        if (self.pending_len == 0) if (key.text) |t| {
             if (t.len == 1 and t[0] >= '0' and t[0] <= '9') return .{ .digit = t[0] - '0' };
+        };
+        var has_prefix = false;
+        var matched_stroke: Stroke = undefined;
+        for (km.bindings) |binding| {
+            if (self.pending_len >= binding.chord.len()) continue;
+            var matches = true;
+            for (0..self.pending_len) |i| {
+                const expected = binding.chord.at(i);
+                if (!sameStroke(self.pending[i], expected)) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (!matches) continue;
+            const expected = binding.chord.at(self.pending_len);
+            if (!key.matches(expected.cp, expected.mods)) continue;
+            if (self.pending_len + 1 == binding.chord.len()) {
+                self.pending_len = 0;
+                self.leader = null;
+                return .{ .action = binding.action };
+            }
+            has_prefix = true;
+            matched_stroke = expected;
         }
-        // A single-key action.
-        if (km.lookup(key)) |a| return .{ .action = a };
+        if (has_prefix) {
+            self.pending[self.pending_len] = matched_stroke;
+            self.pending_len += 1;
+            self.leader = self.pending[0].cp;
+            return .none;
+        }
+        self.pending_len = 0;
+        self.leader = null;
         return .none;
     }
 };
@@ -310,4 +491,34 @@ test "an unbound key resolves to none" {
     const km = Keymap.default;
     var res = Resolver{};
     try testing.expect(res.feed(km, plain('Z')) == .none);
+}
+
+test "configured sequences replace, remove, and resolve beyond two chords" {
+    const overrides = [_]Override{
+        .{ .sequence = "ctrl-d", .action = "page-down" },
+        .{ .sequence = "q", .action = "none" },
+        .{ .sequence = "space r c", .action = "comment" },
+    };
+    var configured = try Keymap.fromOverrides(testing.allocator, &overrides);
+    defer configured.deinit(testing.allocator);
+
+    var resolver = Resolver{};
+    try testing.expectEqual(Action.page_down, resolver.feed(configured.keymap(), .{ .codepoint = 'd', .mods = .{ .ctrl = true } }).action);
+    try testing.expect(resolver.feed(configured.keymap(), plain('q')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), plain(' ')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), plain('r')) == .none);
+    try testing.expectEqual(Action.comment, resolver.feed(configured.keymap(), plain('c')).action);
+}
+
+test "Escape cancels a pending sequence and aliases normalize before conflict checks" {
+    const overrides = [_]Override{.{ .sequence = "space r c", .action = "comment" }};
+    var configured = try Keymap.fromOverrides(testing.allocator, &overrides);
+    defer configured.deinit(testing.allocator);
+    var resolver = Resolver{};
+    try testing.expect(resolver.feed(configured.keymap(), plain(' ')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), plain(vaxis.Key.escape)) == .none);
+    try testing.expectEqual(Action.reply, resolver.feed(configured.keymap(), plain('r')).action);
+
+    try testing.expectEqual(SequenceConflict.duplicate, (try sequenceConflict("ctrl-d", "control-d")).?);
+    try testing.expectEqual(SequenceConflict.prefix, (try sequenceConflict("space r", "space r c")).?);
 }

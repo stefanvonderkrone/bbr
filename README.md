@@ -71,6 +71,30 @@ Credentials come from the environment only (never a config file, never persisted
 `BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, `BITBUCKET_WORKSPACE`. For local runs, keep them in a
 gitignored `.env` and source it: `set -a; source .env; set +a`.
 
+## Configuration
+
+The TUI reads `$XDG_CONFIG_HOME/bbr/config.toml`, falling back to
+`$HOME/.config/bbr/config.toml`. A missing file uses defaults; an existing invalid file reports
+all detected diagnostics and stops before entering the alternate screen.
+
+```toml
+theme = "system"
+
+[keymap]
+"ctrl-d" = "page-down"
+"q" = "none"
+"space r c" = "comment"
+```
+
+`system` is the default Theme and uses the terminal foreground, background, and ANSI palette.
+Fixed Themes are `dark`, `light`, all four `catppuccin-*` flavors, `gruvbox-light`,
+`gruvbox-dark`, `solarized-light`, and `solarized-dark`.
+
+Keymap entries map one-to-eight space-separated chords to kebab-case Action names. Modifiers are
+`shift`, `alt`, `ctrl`, `super`, `hyper`, and `meta`; `option`, `control`, `cmd`, and `command`
+are accepted aliases. Assign `none` to remove a default binding. Count digits remain reserved at
+the start of a sequence, and no complete binding may be a Leader for a longer binding.
+
 ## Reference
 
 High-quality Zig codebase used as a reference for structure and idioms:
