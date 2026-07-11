@@ -29,6 +29,22 @@ pub const diff = struct {
     pub const LineKind = model.LineKind;
 };
 
+pub const highlight = struct {
+    pub const highlighter = @import("highlight/highlighter.zig");
+    pub const decoration = @import("highlight/decoration.zig");
+    pub const Highlighter = highlighter.Highlighter;
+    pub const PlainHighlighter = highlighter.PlainHighlighter;
+    pub const Capture = highlighter.Capture;
+    pub const Span = highlighter.Span;
+    pub const HighlightResult = highlighter.Result;
+    pub const FileHighlights = highlighter.FileHighlights;
+    pub const SideState = highlighter.SideState;
+    pub const FileHighlightStatus = highlighter.FileHighlightStatus;
+    pub const LineDecoration = decoration.LineDecoration;
+    pub const DecorationRun = decoration.Run;
+    pub const decorate = decoration.decorate;
+};
+
 pub const review = struct {
     pub const comment = @import("review/comment.zig");
     pub const thread = @import("review/thread.zig");
@@ -103,6 +119,8 @@ test {
     _ = @import("diff/parser.zig");
     _ = @import("diff/buffer.zig");
     _ = @import("diff/intraline.zig");
+    _ = @import("highlight/highlighter.zig");
+    _ = @import("highlight/decoration.zig");
     _ = @import("review/comment.zig");
     _ = @import("review/thread.zig");
     _ = @import("review/draft.zig");

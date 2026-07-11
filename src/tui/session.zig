@@ -20,6 +20,7 @@ const Client = bbr.bitbucket.Client;
 const Credential = bbr.bitbucket.Credential;
 
 pub const Session = struct {
+    pub const HighlightErrors = struct { old: ?anyerror = null, new: ?anyerror = null };
     arena: std.heap.ArenaAllocator,
     pr: PullRequest,
     diff: bbr.diff.Diff,
@@ -28,6 +29,12 @@ pub const Session = struct {
     /// after load; the lazy per-file fetch (app.zig) fills a slot on demand and
     /// the blob text lives in this arena. Empty for a Session with no diff yet.
     blobs: []bbr.diff.FileBlob = &.{},
+    /// Per-file old/new Highlighting results, index-aligned with `diff.files`.
+    /// Results survive Buffer rebuilds and borrow Capture names from the
+    /// process-lifetime Highlighter registry.
+    highlights: []bbr.highlight.FileHighlights = &.{},
+    highlight_status: []bbr.highlight.FileHighlightStatus = &.{},
+    highlight_errors: []HighlightErrors = &.{},
 
     /// Free the Session and everything it owns. Reclaims both the arena and the
     /// Session struct itself (both came from the same backing allocator).
@@ -46,6 +53,9 @@ pub fn create(backing: Allocator) !*Session {
     s.arena = std.heap.ArenaAllocator.init(backing);
     s.threads = &.{};
     s.blobs = &.{};
+    s.highlights = &.{};
+    s.highlight_status = &.{};
+    s.highlight_errors = &.{};
     return s;
 }
 
@@ -73,6 +83,20 @@ pub fn loadWith(backing: Allocator, bb: Client, repo: []const u8, id: u64) !*Ses
     const blobs = try a.alloc(bbr.diff.FileBlob, s.diff.files.len);
     @memset(blobs, .{});
     s.blobs = blobs;
+    const highlights = try a.alloc(bbr.highlight.FileHighlights, s.diff.files.len);
+    @memset(highlights, .{});
+    s.highlights = highlights;
+    const highlight_status = try a.alloc(bbr.highlight.FileHighlightStatus, s.diff.files.len);
+    for (s.diff.files, 0..) |file, i| {
+        highlight_status[i] = .{
+            .old = if (file.status == .added) .absent else .pending,
+            .new = if (file.status == .removed) .absent else .pending,
+        };
+    }
+    s.highlight_status = highlight_status;
+    const highlight_errors = try a.alloc(Session.HighlightErrors, s.diff.files.len);
+    @memset(highlight_errors, .{});
+    s.highlight_errors = highlight_errors;
     return s;
 }
 
@@ -141,6 +165,11 @@ test "loadWith builds a session in order and owns everything" {
     // One empty whole-file blob slot per file, filled lazily later (M9).
     try testing.expectEqual(@as(usize, 1), s.blobs.len);
     try testing.expect(s.blobs[0].new == null);
+    try testing.expectEqual(@as(usize, 1), s.highlights.len);
+    try testing.expectEqual(@as(usize, 1), s.highlight_status.len);
+    try testing.expectEqual(@as(usize, 1), s.highlight_errors.len);
+    try testing.expect(s.highlight_status[0].old == .pending);
+    try testing.expect(s.highlight_status[0].new == .pending);
 }
 
 test "loadWith surfaces an error and leaks nothing" {

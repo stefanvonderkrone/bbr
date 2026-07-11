@@ -17,9 +17,12 @@ const Diagnostic = struct {
 };
 
 pub const Configuration = struct {
+    pub const default_highlight_max_file_bytes: usize = 2 * 1024 * 1024;
+
     theme_name: []const u8,
     active_theme: theme.Theme,
     keymap: keymap.OwnedKeymap,
+    highlight_max_file_bytes: usize,
 
     pub fn deinit(self: *Configuration, allocator: std.mem.Allocator) void {
         allocator.free(self.theme_name);
@@ -81,6 +84,7 @@ fn defaults(allocator: std.mem.Allocator) !Configuration {
         .theme_name = try allocator.dupe(u8, "system"),
         .active_theme = theme.system,
         .keymap = try keymap.Keymap.fromOverrides(allocator, &.{}),
+        .highlight_max_file_bytes = Configuration.default_highlight_max_file_bytes,
     };
 }
 
@@ -130,7 +134,9 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
     defer override_lines.deinit(allocator);
     var theme_name: []const u8 = "system";
     var theme_seen = false;
-    var section: enum { root, keymap, unknown } = .root;
+    var highlight_max_file_bytes = Configuration.default_highlight_max_file_bytes;
+    var highlight_limit_seen = false;
+    var section: enum { root, keymap, highlight, unknown } = .root;
 
     var lines = std.mem.splitScalar(u8, source, '\n');
     var line_number: usize = 0;
@@ -141,15 +147,15 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
         if (parser.done() or parser.peek() == '#') continue;
         if (parser.peek() == '[') {
             const parsed_section = parser.section() catch {
-                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "malformed table header", .hint = "use [keymap]" });
+                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "malformed table header", .hint = "use [keymap] or [highlight]" });
                 section = .unknown;
                 continue;
             };
             parser.space();
             if (!parser.trailing()) try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "unexpected text after table header" });
-            if (std.mem.eql(u8, parsed_section, "keymap")) section = .keymap else {
+            if (std.mem.eql(u8, parsed_section, "keymap")) section = .keymap else if (std.mem.eql(u8, parsed_section, "highlight")) section = .highlight else {
                 section = .unknown;
-                try diagnostics.append(allocator, .{ .line = line_number, .column = 2, .message = "unknown table", .hint = "the only table is [keymap]" });
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 2, .message = "unknown table", .hint = "use [keymap] or [highlight]" });
             }
             continue;
         }
@@ -164,7 +170,10 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
             continue;
         }
         parser.space();
-        const value = parser.quoted() catch {
+        const value: []const u8 = if (section == .highlight) parser.unsigned() catch {
+            try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a non-negative integer byte count" });
+            continue;
+        } else parser.quoted() catch {
             try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a quoted string value" });
             continue;
         };
@@ -215,6 +224,18 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
                 try overrides.append(allocator, override);
                 try override_lines.append(allocator, line_number);
             },
+            .highlight => if (!std.mem.eql(u8, key, "max_file_bytes")) {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown Highlighting key", .hint = "use max_file_bytes" });
+            } else if (highlight_limit_seen) {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'max_file_bytes' key", .hint = "keep exactly one Highlighting limit" });
+            } else {
+                highlight_max_file_bytes = std.fmt.parseInt(usize, value, 10) catch {
+                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "Highlighting byte limit is too large" });
+                    highlight_limit_seen = true;
+                    continue;
+                };
+                highlight_limit_seen = true;
+            },
             .unknown => {},
         }
     }
@@ -231,7 +252,12 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
         owned_keymap.deinit(allocator);
         return .{ .invalid = try diagnostics.toOwnedSlice(allocator) };
     }
-    return .{ .ok = .{ .theme_name = try allocator.dupe(u8, theme_name), .active_theme = theme.byName(theme_name).?, .keymap = owned_keymap } };
+    return .{ .ok = .{
+        .theme_name = try allocator.dupe(u8, theme_name),
+        .active_theme = theme.byName(theme_name).?,
+        .keymap = owned_keymap,
+        .highlight_max_file_bytes = highlight_max_file_bytes,
+    } };
 }
 
 fn tooLargeDiagnostics(allocator: std.mem.Allocator) ![]Diagnostic {
@@ -327,6 +353,13 @@ const LineParser = struct {
         self.pos += 1;
         return value;
     }
+
+    fn unsigned(self: *LineParser) ![]const u8 {
+        const start = self.pos;
+        while (!self.done() and std.ascii.isDigit(self.peek())) self.pos += 1;
+        if (self.pos == start) return error.ExpectedUnsigned;
+        return self.text[start..self.pos];
+    }
 };
 
 test "configuration resolves theme and keymap while collecting independent diagnostics" {
@@ -352,6 +385,27 @@ test "configuration resolves theme and keymap while collecting independent diagn
     try testing.expect(invalid == .invalid);
     try testing.expectEqual(@as(usize, 3), invalid.invalid.len);
     try testing.expectEqual(@as(usize, 1), invalid.invalid[0].line);
+}
+
+test "Highlighting size limit defaults to 2 MiB and accepts zero as unlimited" {
+    var default_result = try parse(testing.allocator, "");
+    defer default_result.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2 * 1024 * 1024), default_result.ok.highlight_max_file_bytes);
+
+    var configured = try parse(testing.allocator,
+        \\[highlight]
+        \\max_file_bytes = 0
+    );
+    defer configured.deinit(testing.allocator);
+    try testing.expect(configured == .ok);
+    try testing.expectEqual(@as(usize, 0), configured.ok.highlight_max_file_bytes);
+
+    var invalid = try parse(testing.allocator,
+        \\[highlight]
+        \\max_file_bytes = -1
+    );
+    defer invalid.deinit(testing.allocator);
+    try testing.expect(invalid == .invalid);
 }
 
 test "configuration path prefers XDG and falls back to HOME" {

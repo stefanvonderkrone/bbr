@@ -84,6 +84,9 @@ theme = "system"
 "ctrl-d" = "page-down"
 "q" = "none"
 "space r c" = "comment"
+
+[highlight]
+max_file_bytes = 2097152
 ```
 
 `system` is the default Theme and uses the terminal foreground, background, and ANSI palette.
@@ -94,6 +97,10 @@ Keymap entries map one-to-eight space-separated chords to kebab-case Action name
 `shift`, `alt`, `ctrl`, `super`, `hyper`, and `meta`; `option`, `control`, `cmd`, and `command`
 are accepted aliases. Assign `none` to remove a default binding. Count digits remain reserved at
 the start of a sequence, and no complete binding may be a Leader for a longer binding.
+
+Syntax highlighting is loaded lazily for the focused File. `max_file_bytes` limits each old/new
+file side independently; the 2 MiB default avoids expensive parsing of generated or minified
+files. Set it to `0` for no limit. Files above the limit remain readable as plain text.
 
 ## Reference
 

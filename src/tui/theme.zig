@@ -71,6 +71,17 @@ pub const Theme = struct {
     picker_selected: Style,
     /// The picker's query/prompt line.
     picker_query: Style,
+    /// Syntax foregrounds. Diff and emphasis continue to own backgrounds.
+    syntax_comment: Color,
+    syntax_string: Color,
+    syntax_keyword: Color,
+    syntax_function: Color,
+    syntax_type: Color,
+    syntax_constant: Color,
+    syntax_variable: Color,
+    syntax_property: Color,
+    syntax_punctuation: Color,
+    syntax_tag: Color,
 
     /// Style for a diff body line of the given kind.
     pub fn lineStyle(self: Theme, kind: LineKind) Style {
@@ -120,6 +131,24 @@ pub const Theme = struct {
             .renamed => self.status_renamed,
         };
     }
+
+    /// Resolve a hierarchical Capture by its general root. Unknown Captures
+    /// preserve the line style's existing foreground.
+    pub fn captureColor(self: Theme, capture: bbr.highlight.Capture) ?Color {
+        const dot = std.mem.indexOfScalar(u8, capture.name, '.') orelse capture.name.len;
+        const root = capture.name[0..dot];
+        if (std.mem.eql(u8, root, "comment")) return self.syntax_comment;
+        if (std.mem.eql(u8, root, "string")) return self.syntax_string;
+        if (std.mem.eql(u8, root, "keyword") or std.mem.eql(u8, root, "operator")) return self.syntax_keyword;
+        if (std.mem.eql(u8, root, "function") or std.mem.eql(u8, root, "method") or std.mem.eql(u8, root, "constructor")) return self.syntax_function;
+        if (std.mem.eql(u8, root, "type")) return self.syntax_type;
+        if (std.mem.eql(u8, root, "constant") or std.mem.eql(u8, root, "number") or std.mem.eql(u8, root, "boolean")) return self.syntax_constant;
+        if (std.mem.eql(u8, root, "variable") or std.mem.eql(u8, root, "label")) return self.syntax_variable;
+        if (std.mem.eql(u8, root, "property") or std.mem.eql(u8, root, "attribute")) return self.syntax_property;
+        if (std.mem.eql(u8, root, "punctuation")) return self.syntax_punctuation;
+        if (std.mem.eql(u8, root, "tag")) return self.syntax_tag;
+        return null;
+    }
 };
 
 fn rgb(hex: u24) Color {
@@ -160,6 +189,16 @@ pub const dark: Theme = .{
     .picker = .{ .bg = rgb(0x20_20_2c), .fg = rgb(0xc8_c8_d8) },
     .picker_selected = .{ .bg = rgb(0x3a_3a_52), .fg = rgb(0xff_ff_ff), .bold = true },
     .picker_query = .{ .bg = rgb(0x28_28_36), .fg = rgb(0xff_ff_ff) },
+    .syntax_comment = rgb(0x78_78_78),
+    .syntax_string = rgb(0x98_c3_79),
+    .syntax_keyword = rgb(0xc5_86_c0),
+    .syntax_function = rgb(0x61_af_ef),
+    .syntax_type = rgb(0xe5_c0_7b),
+    .syntax_constant = rgb(0xd1_9a_66),
+    .syntax_variable = rgb(0xd4_d4_d4),
+    .syntax_property = rgb(0x9c_dc_fe),
+    .syntax_punctuation = rgb(0xab_ab_ab),
+    .syntax_tag = rgb(0x56_b6_c2),
 };
 
 fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24, muted: u24, green: u24, red: u24, yellow: u24, blue: u24, violet: u24, teal: u24, light: bool }) Theme {
@@ -190,6 +229,16 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
         .picker = .{ .fg = rgb(p.fg), .bg = rgb(p.surface) },
         .picker_selected = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2), .bold = true },
         .picker_query = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2) },
+        .syntax_comment = rgb(p.muted),
+        .syntax_string = rgb(p.green),
+        .syntax_keyword = rgb(p.violet),
+        .syntax_function = rgb(p.blue),
+        .syntax_type = rgb(p.yellow),
+        .syntax_constant = rgb(p.yellow),
+        .syntax_variable = rgb(p.fg),
+        .syntax_property = rgb(p.teal),
+        .syntax_punctuation = rgb(p.muted),
+        .syntax_tag = rgb(p.red),
     };
 }
 
@@ -220,6 +269,16 @@ pub const system: Theme = .{
     .picker = .{},
     .picker_selected = .{ .reverse = true, .bold = true },
     .picker_query = .{ .reverse = true },
+    .syntax_comment = .{ .index = 8 },
+    .syntax_string = .{ .index = 2 },
+    .syntax_keyword = .{ .index = 5 },
+    .syntax_function = .{ .index = 4 },
+    .syntax_type = .{ .index = 3 },
+    .syntax_constant = .{ .index = 3 },
+    .syntax_variable = .default,
+    .syntax_property = .{ .index = 6 },
+    .syntax_punctuation = .{ .index = 8 },
+    .syntax_tag = .{ .index = 1 },
 };
 
 pub const light = fixedTheme(.{ .bg = 0xfa_fa_f8, .fg = 0x24_24_24, .surface = 0xee_ee_ea, .surface2 = 0xdd_dd_d8, .muted = 0x72_72_72, .green = 0x2f_7d_32, .red = 0xb3_26_1e, .yellow = 0x8a_62_00, .blue = 0x1d_5f_a7, .violet = 0x73_3f_9b, .teal = 0x0c_72_72, .light = true });
@@ -301,4 +360,10 @@ test "every built-in Theme resolves by its exact name and keeps diff bands disti
         try testing.expect(!std.meta.eql(selected.status_added, selected.status_removed));
     }
     try testing.expect(byName("catppuccin") == null);
+}
+
+test "Capture colors resolve hierarchical names and preserve unknown foregrounds" {
+    try testing.expectEqual(dark.syntax_function, dark.captureColor(.{ .name = "function.call.builtin" }).?);
+    try testing.expectEqual(dark.syntax_keyword, dark.captureColor(.{ .name = "operator" }).?);
+    try testing.expect(dark.captureColor(.{ .name = "unrecognized.future.capture" }) == null);
 }

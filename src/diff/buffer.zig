@@ -12,6 +12,7 @@
 const std = @import("std");
 const model = @import("model.zig");
 const intraline = @import("intraline.zig");
+const decoration = @import("../highlight/decoration.zig");
 const review = @import("../review/comment.zig");
 const Thread = @import("../review/thread.zig").Thread;
 const Comment = review.Comment;
@@ -39,7 +40,7 @@ pub const RowKind = enum { file_header, hunk_header, line, line_pair, fold, comm
 /// changed runs with a brighter band.
 pub const LineRow = struct {
     line: *const model.Line,
-    emphasis: []const Segment = &.{},
+    decoration: decoration.LineDecoration,
 };
 
 /// One row of the side-by-side layout: the old line on the left, the new line
@@ -152,6 +153,8 @@ pub const BuildOptions = struct {
     /// Per-file blobs for the whole-file splice, index-aligned with `diff.files`
     /// (a shorter/empty slice just means "not loaded" for the missing files).
     blobs: []const model.FileBlob = &.{},
+    /// Side-specific Highlighting results, index-aligned with `diff.files`.
+    highlights: []const @import("../highlight/highlighter.zig").FileHighlights = &.{},
 };
 
 pub const Buffer = struct {
@@ -162,7 +165,7 @@ pub const Buffer = struct {
 pub const BuildError = error{
     /// The requested `Layout` is not implemented yet.
     LayoutUnsupported,
-} || std.mem.Allocator.Error;
+} || decoration.Error;
 
 /// Flatten `diff` into rows for `layout`, with no comments. `allocator` should
 /// be the buffer-scoped arena; the returned rows borrow `diff`.
@@ -239,16 +242,16 @@ pub fn buildWithComments(
             const lines = try spliceNewSide(allocator, file.*, blob);
             const emphasis = try computeEmphasis(allocator, lines);
             switch (layout) {
-                .unified => try w.emitUnifiedHunk(file, lines, emphasis, &.{}),
-                .side_by_side => try w.emitSideBySideHunk(file, lines, emphasis, &.{}),
+                .unified => try w.emitUnifiedHunk(fi, file, lines, emphasis, &.{}),
+                .side_by_side => try w.emitSideBySideHunk(fi, file, lines, emphasis, &.{}),
             }
         } else for (file.hunks) |*hunk| {
             try rows.append(allocator, .{ .hunk_header = hunk });
             const emphasis = try computeEmphasis(allocator, hunk.lines);
             const folds = try computeFolds(allocator, hunk.lines, opts);
             switch (layout) {
-                .unified => try w.emitUnifiedHunk(file, hunk.lines, emphasis, folds),
-                .side_by_side => try w.emitSideBySideHunk(file, hunk.lines, emphasis, folds),
+                .unified => try w.emitUnifiedHunk(fi, file, hunk.lines, emphasis, folds),
+                .side_by_side => try w.emitSideBySideHunk(fi, file, hunk.lines, emphasis, folds),
             }
         }
 
@@ -366,6 +369,7 @@ const Weave = struct {
     /// any inline threads and root Drafts anchored to it.
     fn emitUnifiedHunk(
         w: *Weave,
+        file_idx: usize,
         file: *const model.File,
         lines: []const model.Line,
         emphasis: []const []const Segment,
@@ -378,7 +382,7 @@ const Weave = struct {
                 i += f.lines.len;
                 continue;
             }
-            try w.rows.append(w.a, .{ .line = .{ .line = &lines[i], .emphasis = emphasis[i] } });
+            try w.rows.append(w.a, .{ .line = try decoratedLine(w.a, &lines[i], lineSpans(w.opts.highlights, file_idx, lines[i]), emphasis[i]) });
             try w.weaveInline(file, &lines[i]);
             i += 1;
         }
@@ -390,6 +394,7 @@ const Weave = struct {
     /// context line — present on both sides — doesn't double-emit).
     fn emitSideBySideHunk(
         w: *Weave,
+        file_idx: usize,
         file: *const model.File,
         lines: []const model.Line,
         emphasis: []const []const Segment,
@@ -404,7 +409,7 @@ const Weave = struct {
             }
             switch (lines[i].kind) {
                 .context => {
-                    const both: LineRow = .{ .line = &lines[i] };
+                    const both = try decoratedLine(w.a, &lines[i], lineSpans(w.opts.highlights, file_idx, lines[i]), emphasis[i]);
                     try w.rows.append(w.a, .{ .line_pair = .{ .left = both, .right = both } });
                     try w.weaveInline(file, &lines[i]);
                     i += 1;
@@ -415,7 +420,7 @@ const Weave = struct {
                     while (i < lines.len and lines[i].kind == .added) i += 1;
                     var p = start;
                     while (p < i) : (p += 1) {
-                        try w.rows.append(w.a, .{ .line_pair = .{ .right = .{ .line = &lines[p], .emphasis = emphasis[p] } } });
+                        try w.rows.append(w.a, .{ .line_pair = .{ .right = try decoratedLine(w.a, &lines[p], lineSpans(w.opts.highlights, file_idx, lines[p]), emphasis[p]) } });
                         try w.weaveInline(file, &lines[p]);
                     }
                 },
@@ -434,8 +439,8 @@ const Weave = struct {
                     const an = add_end - add_start;
                     var p: usize = 0;
                     while (p < @max(rn, an)) : (p += 1) {
-                        const left: ?LineRow = if (p < rn) .{ .line = &lines[rem_start + p], .emphasis = emphasis[rem_start + p] } else null;
-                        const right: ?LineRow = if (p < an) .{ .line = &lines[add_start + p], .emphasis = emphasis[add_start + p] } else null;
+                        const left: ?LineRow = if (p < rn) try decoratedLine(w.a, &lines[rem_start + p], lineSpans(w.opts.highlights, file_idx, lines[rem_start + p]), emphasis[rem_start + p]) else null;
+                        const right: ?LineRow = if (p < an) try decoratedLine(w.a, &lines[add_start + p], lineSpans(w.opts.highlights, file_idx, lines[add_start + p]), emphasis[add_start + p]) else null;
                         try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
                         if (right) |rr| try w.weaveInline(file, rr.line);
                         if (left) |ll| {
@@ -481,6 +486,32 @@ fn parentEql(a: Parent, b: Parent) bool {
         .draft => |x| b == .draft and b.draft == x,
         .comment => |x| b == .comment and b.comment == x,
     };
+}
+
+fn decoratedLine(allocator: std.mem.Allocator, line: *const model.Line, spans: []const decoration.Span, emphasis: []const Segment) decoration.Error!LineRow {
+    return .{ .line = line, .decoration = try decoration.decorate(allocator, line.text, spans, emphasis) };
+}
+
+/// Select the agreed file side, then return only the ordered Spans for `line`.
+fn lineSpans(highlights: []const @import("../highlight/highlighter.zig").FileHighlights, file_idx: usize, line: model.Line) []const decoration.Span {
+    if (file_idx >= highlights.len) return &.{};
+    const file = highlights[file_idx];
+    const selected = switch (line.kind) {
+        .removed => file.old,
+        .added => file.new,
+        .context => file.new orelse file.old,
+    } orelse return &.{};
+    const number = switch (line.kind) {
+        .removed => line.old_no,
+        .added => line.new_no,
+        .context => if (file.new != null) line.new_no else line.old_no,
+    } orelse return &.{};
+
+    var first: usize = 0;
+    while (first < selected.spans.len and selected.spans[first].line < number) first += 1;
+    var end = first;
+    while (end < selected.spans.len and selected.spans[end].line == number) end += 1;
+    return selected.spans[first..end];
 }
 
 /// The blob to splice for file `fi` in the whole-file view, or null when there's
@@ -799,14 +830,14 @@ test "a modified line pair carries intra-line emphasis; unrelated lines do not" 
     const removed_edit = buf.rows[3].line;
     const added_edit = buf.rows[4].line;
     try testing.expectEqual(model.LineKind.removed, removed_edit.line.kind);
-    try testing.expect(removed_edit.emphasis.len > 0);
-    try testing.expect(added_edit.emphasis.len > 0);
+    try testing.expect(removed_edit.decoration.runs.len > 1);
+    try testing.expect(added_edit.decoration.runs.len > 1);
     // The common prefix "let value = " is not emphasized; only "1"/"2" is.
-    try testing.expect(!removed_edit.emphasis[0].emphasis);
+    try testing.expect(!removed_edit.decoration.runs[0].emphasis);
 
     // The wholesale replacement shares nothing → treated as unrelated, no emphasis.
-    try testing.expectEqual(@as(usize, 0), buf.rows[6].line.emphasis.len);
-    try testing.expectEqual(@as(usize, 0), buf.rows[7].line.emphasis.len);
+    try testing.expectEqual(@as(usize, 1), buf.rows[6].line.decoration.runs.len);
+    try testing.expectEqual(@as(usize, 1), buf.rows[7].line.decoration.runs.len);
 }
 
 test "rows borrow the diff (pointer identity, not copies)" {
@@ -864,7 +895,7 @@ test "side_by_side pairs context, aligns a modification, and fills add/remove" {
     const mod = buf.rows[3].line_pair;
     try testing.expectEqual(model.LineKind.removed, mod.left.?.line.kind);
     try testing.expectEqual(model.LineKind.added, mod.right.?.line.kind);
-    try testing.expect(mod.left.?.emphasis.len > 0);
+    try testing.expect(mod.left.?.decoration.runs.len > 1);
 
     // Pure add: right only.
     const add = buf.rows[4].line_pair;
@@ -1477,4 +1508,23 @@ test "a trailing newline does not emit a spurious blank last row" {
     const buf = try buildWithComments(a, diff, .unified, threads, .{});
     // "solo\n" trims to one line, not two.
     try testing.expectEqual(@as(usize, 1), countKind(buf, .comment));
+}
+
+test "Line decoration selects old Spans for removed and new Spans for added and context Lines" {
+    const old_spans = [_]decoration.Span{.{ .line = 4, .start = 0, .end = 3, .capture = .{ .name = "old.capture" } }};
+    const new_spans = [_]decoration.Span{
+        .{ .line = 7, .start = 0, .end = 3, .capture = .{ .name = "new.added" } },
+        .{ .line = 8, .start = 0, .end = 3, .capture = .{ .name = "new.context" } },
+    };
+    const highlights = [_]@import("../highlight/highlighter.zig").FileHighlights{.{
+        .old = .{ .spans = &old_spans },
+        .new = .{ .spans = &new_spans },
+    }};
+
+    const removed: model.Line = .{ .old_no = 4, .new_no = null, .kind = .removed, .text = "old" };
+    const added: model.Line = .{ .old_no = null, .new_no = 7, .kind = .added, .text = "new" };
+    const context: model.Line = .{ .old_no = 6, .new_no = 8, .kind = .context, .text = "ctx" };
+    try testing.expectEqualStrings("old.capture", lineSpans(&highlights, 0, removed)[0].capture.name);
+    try testing.expectEqualStrings("new.added", lineSpans(&highlights, 0, added)[0].capture.name);
+    try testing.expectEqualStrings("new.context", lineSpans(&highlights, 0, context)[0].capture.name);
 }

@@ -28,6 +28,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     addSqlite(b, exe_mod);
+    addTreeSitter(b, exe_mod);
 
     const exe = b.addExecutable(.{ .name = "bbr", .root_module = exe_mod });
     b.installArtifact(exe);
@@ -56,6 +57,33 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+}
+
+fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addAnonymousImport("javascript_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/javascript/queries/highlights.scm") });
+    mod.addAnonymousImport("typescript_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/typescript/queries/highlights.scm") });
+    mod.addAnonymousImport("tsx_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/tsx/queries/highlights.scm") });
+    mod.addAnonymousImport("css_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/css/queries/highlights.scm") });
+    mod.addAnonymousImport("go_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/go/queries/highlights.scm") });
+    mod.addAnonymousImport("bash_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/bash/queries/highlights.scm") });
+    mod.addAnonymousImport("json_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/json/queries/highlights.scm") });
+    mod.addAnonymousImport("yaml_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/yaml/queries/highlights.scm") });
+    mod.addIncludePath(b.path("vendors/tree-sitter/runtime/include"));
+    mod.addIncludePath(b.path("vendors/tree-sitter/runtime/src"));
+    mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/runtime/src/lib.c"), .flags = &.{ "-std=c11", "-fno-sanitize=undefined" } });
+
+    inline for (.{ "javascript", "typescript", "tsx" }) |grammar| {
+        mod.addIncludePath(b.path("vendors/tree-sitter/" ++ grammar ++ "/src"));
+        mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/" ++ grammar ++ "/src/parser.c"), .flags = &.{"-std=c11"} });
+        mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/" ++ grammar ++ "/src/scanner.c"), .flags = &.{"-std=c11"} });
+    }
+    inline for (.{ "css", "go", "bash", "json", "yaml" }) |grammar| {
+        mod.addIncludePath(b.path("vendors/tree-sitter/" ++ grammar ++ "/src"));
+        mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/" ++ grammar ++ "/src/parser.c"), .flags = &.{"-std=c11"} });
+    }
+    inline for (.{ "css", "bash", "yaml" }) |grammar| {
+        mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/" ++ grammar ++ "/src/scanner.c"), .flags = &.{"-std=c11"} });
+    }
 }
 
 /// Compile the vendored SQLite amalgamation into `mod`. Flags harden and trim

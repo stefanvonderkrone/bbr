@@ -1,0 +1,66 @@
+.{
+    .runtime = .{
+        .repository = "https://github.com/tree-sitter/tree-sitter",
+        .commit = "7f534862c3ec939c3a6ee147f7600ef5c1bf900f",
+        .tag = "v0.26.9",
+        .lib_c_sha256 = "4e28f87edb86e5134d36ff7ba7e09a964ba9966a4b620c2735e3572b53c157d3",
+    },
+    .grammars = .{
+        .javascript = .{
+            .repository = "https://github.com/tree-sitter/tree-sitter-javascript",
+            .commit = "58404d8cf191d69f2674a8fd507bd5776f46cb11",
+            .parser_sha256 = "67209ca7ef6e1a4f74e29e48b5928455f892fe1821a3960fbcd62f4e972f7384",
+            .query_sha256 = "d3630ae6dc9b2b27b230b5f8bb92b05cd491fb12bff353dae62a0a6d780461ee",
+            .matches = .{ ".js", ".jsx", ".mjs", ".cjs" },
+        },
+        .typescript = .{
+            .repository = "https://github.com/tree-sitter/tree-sitter-typescript",
+            .commit = "75b3874edb2dc714fb1fd77a32013d0f8699989f",
+            .parser_sha256 = "74fe453edd70f4eae9af0a1050cbd7943d8971d59165b6aaebbaa0a0b716d1aa",
+            .query_sha256 = "e0c35adb819127bfd4f853fac5419e7d8ba44760246201d04a4a5ce0228a10c5",
+            .matches = .{ ".ts", ".mts", ".cts" },
+        },
+        .tsx = .{
+            .repository = "https://github.com/tree-sitter/tree-sitter-typescript",
+            .commit = "75b3874edb2dc714fb1fd77a32013d0f8699989f",
+            .parser_sha256 = "1902cb53fa7ff5179df89b2eea863165e84c8cc866226419dc26921d8c055885",
+            .query_sha256 = "e0c35adb819127bfd4f853fac5419e7d8ba44760246201d04a4a5ce0228a10c5",
+            .matches = .{ ".tsx" },
+        },
+        .css = .{
+            .repository = "https://github.com/tree-sitter/tree-sitter-css",
+            .commit = "dda5cfc5722c429eaba1c910ca32c2c0c5bb1a3f",
+            .parser_sha256 = "2e5150071220012ee635ac9e2119f4f3a93e0b51a7a3b69ab0cd87c18cf5e51e",
+            .query_sha256 = "23f7948a3817a0d06d7120158c3bee4ec5b58daa77e524985a4738b364db17b2",
+            .matches = .{ ".css" },
+        },
+        .go = .{
+            .repository = "https://github.com/tree-sitter/tree-sitter-go",
+            .commit = "2346a3ab1bb3857b48b29d779a1ef9799a248cd7",
+            .parser_sha256 = "3dbf6ed1238b5dfcf2be4d2f2d4cb27a14d34f34d7784eccccbfd532fd4a6d85",
+            .query_sha256 = "81182c986547eba7fa6316e82dfd621fb13b8fc89efac85432aee51a48ed0896",
+            .matches = .{ ".go" },
+        },
+        .bash = .{
+            .repository = "https://github.com/tree-sitter/tree-sitter-bash",
+            .commit = "a06c2e4415e9bc0346c6b86d401879ffb44058f7",
+            .parser_sha256 = "5ad30bb1a260c76df5397490b8bd97e272e62ed9c99be36fa53da959d7667e7f",
+            .query_sha256 = "b74220d954f485b7626d2b2b61f37b522e12eb1830803e388e57dd797dc99f11",
+            .matches = .{ ".sh", ".bash" },
+        },
+        .json = .{
+            .repository = "https://github.com/tree-sitter/tree-sitter-json",
+            .commit = "001c28d7a29832b06b0e831ec77845553c89b56d",
+            .parser_sha256 = "e8e1ff5df0d73e3b82574129724e68ef4fa0faf1b8c43dd3f5c1a84839f830ab",
+            .query_sha256 = "0511524465b56aed122580792254e68b6abbbfde7119f1d02b135acbe278233f",
+            .matches = .{ ".json" },
+        },
+        .yaml = .{
+            .repository = "https://github.com/tree-sitter-grammars/tree-sitter-yaml",
+            .commit = "a1c4812a73ec5e089de8e441fdea3a921e8d5079",
+            .parser_sha256 = "02c5d32e95fa018a3c3ba7d7134d84bb7d5595c8874aa7ae6582745d9b40dede",
+            .query_sha256 = "2fbfbbd5ca0928d0a7e09e59f8f2964b14a328a7ee0ce799270d9013dcce49a0",
+            .matches = .{ ".yaml", ".yml" },
+        },
+    },
+}

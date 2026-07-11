@@ -13,6 +13,7 @@ const app = @import("tui/app.zig");
 const session = @import("tui/session.zig");
 const persist = @import("persist/sqlite_store.zig");
 const config = @import("tui/config.zig");
+const TreeSitterHighlighter = @import("highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter;
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -122,6 +123,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
     // Global-tier pending-review store (design §11): opened once, lives until exit.
     var store = openStore(gpa, init.io, init.environ_map);
     defer store.deinit();
+    var tree_sitter_highlighter: TreeSitterHighlighter = .{};
 
     try app.run(.{
         .io = init.io,
@@ -132,6 +134,8 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .store = store.store(),
         .active_theme = configuration.active_theme,
         .keymap = configuration.keymap.keymap(),
+        .highlighter = tree_sitter_highlighter.highlighter(),
+        .highlight_max_file_bytes = configuration.highlight_max_file_bytes,
     }, null, target.id);
 }
 
@@ -367,6 +371,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
     // Ephemeral in-memory store: the demo authors drafts but persists nothing.
     var store = persist.SqliteStore.open(":memory:") catch @panic("sqlite :memory: open failed");
     defer store.deinit();
+    var plain_highlighter: bbr.highlight.PlainHighlighter = .{};
 
     try app.run(.{
         .io = io,
@@ -377,6 +382,8 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
         .store = store.store(),
         .active_theme = configuration.active_theme,
         .keymap = configuration.keymap.keymap(),
+        .highlighter = plain_highlighter.highlighter(),
+        .highlight_max_file_bytes = configuration.highlight_max_file_bytes,
         .online = false,
     }, s, s.pr.id);
 }
@@ -386,6 +393,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
 // (app → render → theme → nav → picker → session); the core `bbr` module's
 // tests run via src/root.zig.
 test {
+    _ = @import("highlight/tree_sitter_highlighter.zig");
     _ = @import("tui/app.zig");
     _ = @import("tui/config.zig");
     _ = @import("persist/sqlite_store.zig");

@@ -120,10 +120,12 @@ _Deferred:_ editing a prefilled/multi-line suggestion is append-only (revise fro
 - [x] **Keymap overrides from config.** ✅ `[keymap]` maps one-to-eight chord sequences to Actions (or `none`), canonicalizes modifier aliases, preserves Count, rejects prefix conflicts, and materializes one Keymap shared by dispatch and the help Overlay.
 
 ## M13 — Syntax highlighting  ·  L  ·  needs M2
-- [ ] `Highlighter` seam + `PlainHighlighter`.
-- [ ] tree-sitter Zig bindings; decide grammar delivery (build-time vs runtime).
-- [ ] Grammars: tsx/jsx, css, go, bash, json, yaml + highlight queries.
-- [ ] Compose syntax foreground over diff background per cell; wire into `Theme`.
+- [x] `Highlighter` seam + `PlainHighlighter`. ✅ C-free ptr/vtable seam; ordered line-relative `Span`s and zero-copy `LineDecoration` live in the core module.
+- [x] tree-sitter Zig bindings; decide grammar delivery (build-time vs runtime). ✅ C runtime and copied, pinned Grammar sources compile into the executable; no submodules or build-time downloads (ADR-0009). Grammar selection remains private to the adapter so later `UserGrammar` installation does not change the public seam.
+- [x] Grammars: tsx/jsx, css, go, bash, json, yaml + highlight queries. ✅ JavaScript/TypeScript/TSX, CSS, Go, Bash, JSON, and YAML are vendored with commits/checksums and fixture tests; unsupported Files stay plain.
+- [x] Compose syntax foreground over diff background per cell; wire into `Theme`. ✅ Buffer constructs `LineDecoration`s from side-specific Spans + intra-line emphasis; Presentation maps Capture foregrounds while retaining diff/emphasis/cursor backgrounds.
+
+_Delivery notes:_ focused Files enrich lazily off-thread in one old/new pipeline; partial side failures remain usable and report context in the status bar. `[highlight].max_file_bytes` defaults to 2 MiB per side (`0` = unlimited). Conditional query patterns are currently applied conservatively only when they have no predicates; predicate evaluation is a follow-up for richer built-in classifications, not a correctness dependency for parsing or rendering.
 
 ## M14 — Local / offline review  ·  M/L  ·  needs M6 (not M10)
 - [ ] Extend `GitClient` with diffing subset: worktree list, ref resolution, `diff` between refs, blob at ref.

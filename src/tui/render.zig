@@ -225,18 +225,17 @@ fn drawHalf(scratch: std.mem.Allocator, win: vaxis.Window, side_row: ?LineRow, t
 /// whole line prints in its band `style`; with emphasis, the line is drawn as a
 /// run of styled segments so only the changed runs get the brighter band.
 fn drawLineBody(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, body_col: u16, lr: LineRow, theme: Theme, style: vaxis.Style) void {
-    if (lr.emphasis.len == 0) {
-        _ = win.printSegment(.{ .text = lr.line.text, .style = style }, .{ .row_offset = r, .col_offset = body_col, .wrap = .none });
-        return;
-    }
-
     const emph = theme.emphasisStyle(lr.line.kind);
-    const segs = scratch.alloc(vaxis.Segment, lr.emphasis.len) catch {
+    const segs = scratch.alloc(vaxis.Segment, lr.decoration.runs.len) catch {
         _ = win.printSegment(.{ .text = lr.line.text, .style = style }, .{ .row_offset = r, .col_offset = body_col, .wrap = .none });
         return;
     };
-    for (lr.emphasis, 0..) |seg, i| {
-        segs[i] = .{ .text = seg.text, .style = if (seg.emphasis) emph else style };
+    for (lr.decoration.runs, 0..) |run, i| {
+        var run_style = if (run.emphasis) emph else style;
+        if (run.capture) |capture| {
+            if (theme.captureColor(capture)) |fg| run_style.fg = fg;
+        }
+        segs[i] = .{ .text = run.text, .style = run_style };
     }
     _ = win.print(segs, .{ .row_offset = r, .col_offset = body_col, .wrap = .none });
 }
@@ -656,6 +655,34 @@ test "diff lines render with their band background at the text cells" {
     // Context line keeps the neutral (default) background.
     const context_cell = win.readCell(body_x, 2).?;
     try testing.expect(context_cell.style.bg == .default);
+}
+
+test "syntax foreground composes over an added Line background" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw =
+        \\diff --git a/a.js b/a.js
+        \\--- a/a.js
+        \\+++ b/a.js
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\
+    ;
+    const diff = try bbr.diff.parse(a, raw);
+    const spans = [_]bbr.highlight.Span{.{ .line = 1, .start = 0, .end = 3, .capture = .{ .name = "keyword" } }};
+    const highlights = [_]bbr.highlight.FileHighlights{.{ .new = .{ .spans = &spans } }};
+    const buf = try bbr.diff.buffer.buildWithComments(a, diff, .unified, &.{}, .{ .highlights = &highlights });
+
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    draw(a, win, diff, buf, theme_dark, Nav.init(buf.rows.len, 24), 0, &.{}, &.{});
+
+    const cell = win.readCell(sidebar_width + 1 + gutter_cols, 3).?;
+    try testing.expectEqual(theme_dark.syntax_keyword, cell.style.fg);
+    try testing.expectEqual(theme_dark.added.bg, cell.style.bg);
 }
 
 test "a modified line paints only its changed run with the emphasis band" {

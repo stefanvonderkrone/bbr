@@ -20,7 +20,7 @@
 //!
 //! `f` cycles the diff scope Changes → fetched-whole → whole-file. The whole-file
 //! scope needs the focused file's full text, fetched lazily on the same worker
-//! pattern (`blob_done`, keyed by PR id + file index): the frame renders the
+//! pattern (`enrichment_done`, keyed by PR id + file index): the frame renders the
 //! fetched lines immediately and re-weaves when the blob arrives (M9).
 //!
 //! `X` submits the pending review (M10): a worker snapshots the Drafts, then
@@ -68,6 +68,8 @@ pub const RunCtx = struct {
     store: PendingReviewStore,
     active_theme: theme.Theme,
     keymap: keymap.Keymap,
+    highlighter: bbr.highlight.Highlighter,
+    highlight_max_file_bytes: usize,
     online: bool = true,
 };
 
@@ -79,7 +81,7 @@ const AppEvent = union(enum) {
     winsize: vaxis.Winsize,
     load_done: LoadDone,
     picker_done: PickerDone,
-    blob_done: BlobDone,
+    enrichment_done: EnrichmentDone,
     submit_progress: SubmitProgress,
     submit_done: SubmitDone,
 };
@@ -128,48 +130,71 @@ const PickerReq = struct {
 /// A fetched file blob, owned by its own arena so the worker can hand it across
 /// threads; the main thread copies the text into the Session arena and calls
 /// `destroy` (mirroring `Summaries`).
-const Blob = struct {
+const FileEnrichment = struct {
     arena: std.heap.ArenaAllocator,
-    text: []const u8,
+    old: SideOutcome = .absent,
+    new: SideOutcome = .absent,
 
-    fn destroy(self: *Blob) void {
+    fn destroy(self: *FileEnrichment) void {
         const backing = self.arena.child_allocator;
         self.arena.deinit();
         backing.destroy(self);
     }
 };
 
-const BlobOutcome = union(enum) {
-    ok: *Blob,
+const EnrichedSide = struct {
+    text: []const u8,
+    highlights: bbr.highlight.HighlightResult,
+    skipped_too_large: bool = false,
+};
+
+const SideFailure = struct {
+    stage: enum { fetch, highlight },
+    cause: anyerror,
+};
+
+const SideOutcome = union(enum) {
+    absent,
+    ok: EnrichedSide,
+    err: SideFailure,
+};
+
+const EnrichmentOutcome = union(enum) {
+    ok: *FileEnrichment,
     err: anyerror,
 };
 
-/// A whole-file blob fetch result, tagged with the PR and file it targeted so a
+/// A per-File enrichment result, tagged with the PR and file it targeted so a
 /// result for a superseded PR (or an already-filled slot) is discarded.
-const BlobDone = struct {
+const EnrichmentDone = struct {
     epoch: u64,
     pr_id: u64,
     file_idx: usize,
-    outcome: BlobOutcome,
+    outcome: EnrichmentOutcome,
 };
 
-/// Request handed to a blob worker. `repo`/`commit`/`path` are copied by value
+/// Request handed to an enrichment worker. Repository, commit, and path values are copied
 /// (fixed buffers) so the worker holds no reference to caller slices.
-const BlobReq = struct {
+const EnrichmentReq = struct {
     repo: [256]u8,
     repo_len: usize,
-    commit: [64]u8,
-    commit_len: usize,
-    path: [512]u8,
-    path_len: usize,
+    source_commit: [64]u8,
+    source_commit_len: usize,
+    destination_commit: [64]u8,
+    destination_commit_len: usize,
+    old_path: [512]u8,
+    old_path_len: usize,
+    new_path: [512]u8,
+    new_path_len: usize,
+    status: bbr.diff.FileStatus,
     pr_id: u64,
     file_idx: usize,
     epoch: u64,
 };
 
-/// A blob fetch in flight, keyed by PR + file so `ensureBlob` never double-fetches
+/// A File enrichment in flight, keyed by PR + file so `ensureEnrichment` never double-runs
 /// and a stale result (old PR) can't cancel a live entry.
-const InflightBlob = struct {
+const InflightEnrichment = struct {
     pr_id: u64,
     file_idx: usize,
 };
@@ -344,17 +369,17 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
         picker_loads.deinit(gpa);
     }
 
-    // In-flight whole-file blob fetches (M9), tracked like the loads above so
-    // every worker is awaited before teardown. `blob_inflight` dedupes fetches
-    // per (PR, file) so `ensureBlob` fires each file's fetch at most once.
-    var blob_epoch: u64 = 0;
-    var blob_loads: std.ArrayList(Load) = .empty;
+    // In-flight per-File enrichments, tracked like the loads above so every
+    // worker is awaited before teardown. `enrichment_inflight` dedupes work
+    // per (PR, file) so `ensureEnrichment` fires each file's fetch at most once.
+    var enrichment_epoch: u64 = 0;
+    var enrichment_loads: std.ArrayList(Load) = .empty;
     defer {
-        for (blob_loads.items) |*l| _ = l.future.await(io);
-        blob_loads.deinit(gpa);
+        for (enrichment_loads.items) |*l| _ = l.future.await(io);
+        enrichment_loads.deinit(gpa);
     }
-    var blob_inflight: std.ArrayList(InflightBlob) = .empty;
-    defer blob_inflight.deinit(gpa);
+    var enrichment_inflight: std.ArrayList(InflightEnrichment) = .empty;
+    defer enrichment_inflight.deinit(gpa);
 
     // In-flight submission batch (M10), tracked like the loads above so the
     // worker is awaited before teardown. `submit_epoch` discards submit events
@@ -638,9 +663,9 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                             expanded.clearRetainingCapacity();
                             isolate_file = null;
                             // Blobs belong to the old session; its in-flight fetches
-                            // (still tracked in blob_loads) will be discarded on
+                            // (still tracked in enrichment_loads) will be discarded on
                             // arrival by the PR-id check.
-                            blob_inflight.clearRetainingCapacity();
+                            enrichment_inflight.clearRetainingCapacity();
                             // A submission targeting the old PR is now stale; its
                             // events are discarded by the epoch/pr-id guards.
                             submitting = false;
@@ -683,13 +708,13 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                     },
                 }
             },
-            .blob_done => |done| {
-                reap(&blob_loads, io, done.epoch);
-                removeInflight(&blob_inflight, done.pr_id, done.file_idx);
-                // Apply only if the PR it targeted is still current and the slot
-                // is still empty; otherwise the fetch was superseded — discard.
+            .enrichment_done => |done| {
+                reap(&enrichment_loads, io, done.epoch);
+                removeInflight(&enrichment_inflight, done.pr_id, done.file_idx);
+                // Apply only if the PR it targeted is still current; otherwise
+                // this per-File enrichment was superseded — discard.
                 const applies = if (current) |c|
-                    c.pr.id == done.pr_id and done.file_idx < c.blobs.len and c.blobs[done.file_idx].new == null
+                    c.pr.id == done.pr_id and done.file_idx < c.blobs.len and done.file_idx < c.highlights.len and done.file_idx < c.highlight_status.len and done.file_idx < c.highlight_errors.len
                 else
                     false;
                 switch (done.outcome) {
@@ -697,10 +722,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                         defer blob.destroy();
                         if (applies) {
                             const cur = current.?;
-                            if (cur.arena.allocator().dupe(u8, blob.text)) |owned| {
-                                cur.blobs[done.file_idx].new = owned;
-                                // Re-weave so the just-arrived blob shows if we're
-                                // still in the whole-file scope.
+                            if (acceptEnrichment(cur, done.file_idx, blob.old, blob.new)) {
                                 buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                 nav.setRowCount(buf.rows.len);
                             } else |err| status_msg = @errorName(err);
@@ -781,14 +803,12 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
             },
         }
 
-        // Lazily fetch the focused file's blob for the whole-file scope — off the
-        // UI thread, at most once per (PR, file). The result arrives as a
-        // `blob_done` event and re-weaves the buffer.
-        if (scope == .whole) {
-            if (current) |curp| {
-                const focused = isolate_file orelse fileIndexForRow(buf, nav.cursor);
-                ensureBlob(ctx, &loop, curp, focused, &blob_loads, &blob_inflight, &blob_epoch, gpa);
-            }
+        // Lazily enrich the focused File off-thread. One job fetches every
+        // required side, runs the Highlighter, then posts one Epoch-stamped
+        // result; plain rendering remains visible until it arrives.
+        if (current) |curp| {
+            const focused = isolate_file orelse fileIndexForRow(buf, nav.cursor);
+            ensureEnrichment(ctx, &loop, curp, focused, &enrichment_loads, &enrichment_inflight, &enrichment_epoch, gpa);
         }
 
         const win = vx.window();
@@ -804,7 +824,8 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
             // otherwise it follows the cursor across the all-files buffer.
             const selected_file = isolate_file orelse fileIndexForRow(buf, nav.cursor);
             render.draw(frame, win, cur.diff, buf, active_theme, nav, selected_file, cur.threads, review.drafts.items);
-            drawStatus(frame, win, cur.pr, nav, buf, layout, scope, show_resolved, isolate_file != null, loading, submitting, review.drafts.items.len, status_msg);
+            const visible_status = status_msg orelse highlightingStatus(frame, cur, selected_file);
+            drawStatus(frame, win, cur.pr, nav, buf, layout, scope, show_resolved, isolate_file != null, loading, submitting, review.drafts.items.len, visible_status);
         }
         if (picker) |*p| render.drawPicker(frame, win, p, active_theme);
         if (composer) |*comp| render.drawComposer(frame, win, comp, active_theme);
@@ -821,6 +842,28 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
         try vx.render(writer);
         _ = frame_arena.reset(.retain_capacity);
     }
+}
+
+fn highlightingStatus(allocator: std.mem.Allocator, current: *const Session, file_idx: usize) ?[]const u8 {
+    if (file_idx >= current.highlight_status.len) return null;
+    const status = current.highlight_status[file_idx];
+    if (status.old == .loading or status.new == .loading) return "highlighting…";
+    if (status.old == .skipped_too_large or status.new == .skipped_too_large)
+        return "highlighting skipped: file side exceeds max_file_bytes";
+    const errors = if (file_idx < current.highlight_errors.len) current.highlight_errors[file_idx] else Session.HighlightErrors{};
+    if (sideStatusMessage(allocator, "old", status.old, errors.old)) |message| return message;
+    if (sideStatusMessage(allocator, "new", status.new, errors.new)) |message| return message;
+    return null;
+}
+
+fn sideStatusMessage(allocator: std.mem.Allocator, side: []const u8, state: bbr.highlight.SideState, maybe_error: ?anyerror) ?[]const u8 {
+    const stage: []const u8 = switch (state) {
+        .fetch_failed => "file fetch",
+        .highlight_failed => "Grammar",
+        else => return null,
+    };
+    const cause = if (maybe_error) |err| @errorName(err) else "unknown error";
+    return std.fmt.allocPrint(allocator, "{s}-side highlighting unavailable: {s} {s} · showing plain text", .{ side, stage, cause }) catch "highlighting unavailable · showing plain text";
 }
 
 /// Assemble the buffer build options from the current toggles, the revealed
@@ -863,7 +906,9 @@ fn buildOpts(
 }
 
 fn rebuild(alloc: std.mem.Allocator, s: *const Session, layout: bbr.diff.Layout, opts: bbr.diff.BuildOptions) !bbr.diff.Buffer {
-    return bbr.diff.buffer.buildWithComments(alloc, s.diff, layout, s.threads, opts);
+    var enriched = opts;
+    enriched.highlights = s.highlights;
+    return bbr.diff.buffer.buildWithComments(alloc, s.diff, layout, s.threads, enriched);
 }
 
 /// Open the Picker immediately in a loading state and kick the summaries fetch
@@ -1334,93 +1379,147 @@ fn emitProgress(loop: *Loop, req: *Submit, sub: *bbr.review.Submission, emitted:
     }
 }
 
-/// Ensure the focused file's whole-file blob is being fetched. No-op offline,
-/// when there's no session, when the file is out of range or removed (no new
-/// side), when the blob is already loaded, or when a fetch for it is already in
-/// flight. Otherwise spawn a worker and record the in-flight entry.
-fn ensureBlob(
+/// Ensure the focused File is being enriched. No-op offline, out of range,
+/// already terminal on both sides, or already in flight. Otherwise one worker
+/// fetches every required side and highlights it before posting one result.
+fn ensureEnrichment(
     ctx: RunCtx,
     loop: *Loop,
     current: *Session,
     focused: usize,
-    blob_loads: *std.ArrayList(Load),
-    blob_inflight: *std.ArrayList(InflightBlob),
-    blob_epoch: *u64,
+    enrichment_loads: *std.ArrayList(Load),
+    enrichment_inflight: *std.ArrayList(InflightEnrichment),
+    enrichment_epoch: *u64,
     gpa: std.mem.Allocator,
 ) void {
     if (!ctx.online) return;
     if (focused >= current.diff.files.len or focused >= current.blobs.len) return;
-    if (current.blobs[focused].new != null) return; // already loaded
     const file = current.diff.files[focused];
-    if (file.status == .removed) return; // no new-side blob to fetch
-    for (blob_inflight.items) |b| {
+    if (focused >= current.highlight_status.len) return;
+    const old_ready = sideFinished(current.highlight_status[focused].old);
+    const new_ready = sideFinished(current.highlight_status[focused].new);
+    if (old_ready and new_ready) return;
+    for (enrichment_inflight.items) |b| {
         if (b.pr_id == current.pr.id and b.file_idx == focused) return; // in flight
     }
-    spawnBlobLoad(ctx, loop, blob_loads, blob_epoch, gpa, current.pr.id, focused, current.pr.source_commit, file.new_path) catch return;
-    blob_inflight.append(gpa, .{ .pr_id = current.pr.id, .file_idx = focused }) catch {};
+    spawnEnrichment(ctx, loop, enrichment_loads, enrichment_epoch, gpa, current.pr.id, focused, current.pr.source_commit, current.pr.destination_commit, file) catch return;
+    if (current.highlight_status[focused].old == .pending) current.highlight_status[focused].old = .loading;
+    if (current.highlight_status[focused].new == .pending) current.highlight_status[focused].new = .loading;
+    enrichment_inflight.append(gpa, .{ .pr_id = current.pr.id, .file_idx = focused }) catch {};
+}
+
+fn sideFinished(state: bbr.highlight.SideState) bool {
+    return switch (state) {
+        .pending, .loading => false,
+        .absent, .ready, .skipped_too_large, .fetch_failed, .highlight_failed => true,
+    };
+}
+
+/// Copy one worker-owned enrichment into the Session arena. Each side is
+/// independent: a fetch/highlight failure leaves that side plain while the
+/// other side is still accepted.
+fn acceptEnrichment(current: *Session, file_idx: usize, old: SideOutcome, new: SideOutcome) !void {
+    const a = current.arena.allocator();
+    try acceptSide(a, &current.blobs[file_idx].old, &current.highlights[file_idx].old, &current.highlight_status[file_idx].old, &current.highlight_errors[file_idx].old, old);
+    try acceptSide(a, &current.blobs[file_idx].new, &current.highlights[file_idx].new, &current.highlight_status[file_idx].new, &current.highlight_errors[file_idx].new, new);
+}
+
+fn acceptSide(
+    allocator: std.mem.Allocator,
+    blob_slot: *?[]const u8,
+    highlight_slot: *?bbr.highlight.HighlightResult,
+    state: *bbr.highlight.SideState,
+    error_slot: *?anyerror,
+    outcome: SideOutcome,
+) !void {
+    switch (outcome) {
+        .absent => state.* = .absent,
+        .err => |failure| {
+            state.* = if (failure.stage == .fetch) .fetch_failed else .highlight_failed;
+            error_slot.* = failure.cause;
+        },
+        .ok => |side| {
+            blob_slot.* = try allocator.dupe(u8, side.text);
+            const spans = try allocator.alloc(bbr.highlight.Span, side.highlights.spans.len);
+            for (side.highlights.spans, 0..) |span, i| {
+                spans[i] = span;
+                spans[i].capture.name = try allocator.dupe(u8, span.capture.name);
+            }
+            highlight_slot.* = .{ .spans = spans };
+            state.* = if (side.skipped_too_large) .skipped_too_large else .ready;
+        },
+    }
 }
 
 /// Drop the in-flight record for (`pr_id`, `file_idx`) once its result arrives.
-fn removeInflight(blob_inflight: *std.ArrayList(InflightBlob), pr_id: u64, file_idx: usize) void {
-    for (blob_inflight.items, 0..) |b, i| {
+fn removeInflight(enrichment_inflight: *std.ArrayList(InflightEnrichment), pr_id: u64, file_idx: usize) void {
+    for (enrichment_inflight.items, 0..) |b, i| {
         if (b.pr_id == pr_id and b.file_idx == file_idx) {
-            _ = blob_inflight.swapRemove(i);
+            _ = enrichment_inflight.swapRemove(i);
             return;
         }
     }
 }
 
-/// Launch a background blob fetch for one file, bumping `blob_epoch`. The worker
-/// posts a `blob_done` stamped with the epoch, PR id, and file index.
-fn spawnBlobLoad(
+/// Launch one background File enrichment, bumping `enrichment_epoch`. The
+/// worker posts `enrichment_done` stamped with epoch, PR id, and file index.
+fn spawnEnrichment(
     ctx: RunCtx,
     loop: *Loop,
-    blob_loads: *std.ArrayList(Load),
-    blob_epoch: *u64,
+    enrichment_loads: *std.ArrayList(Load),
+    enrichment_epoch: *u64,
     gpa: std.mem.Allocator,
     pr_id: u64,
     file_idx: usize,
-    commit: []const u8,
-    path: []const u8,
+    source_commit: []const u8,
+    destination_commit: []const u8,
+    file: bbr.diff.File,
 ) !void {
-    blob_epoch.* += 1;
-    var req: BlobReq = .{
+    enrichment_epoch.* += 1;
+    var req: EnrichmentReq = .{
         .repo = undefined,
         .repo_len = @min(ctx.repo.len, 256),
-        .commit = undefined,
-        .commit_len = @min(commit.len, 64),
-        .path = undefined,
-        .path_len = @min(path.len, 512),
+        .source_commit = undefined,
+        .source_commit_len = @min(source_commit.len, 64),
+        .destination_commit = undefined,
+        .destination_commit_len = @min(destination_commit.len, 64),
+        .old_path = undefined,
+        .old_path_len = @min(file.old_path.len, 512),
+        .new_path = undefined,
+        .new_path_len = @min(file.new_path.len, 512),
+        .status = file.status,
         .pr_id = pr_id,
         .file_idx = file_idx,
-        .epoch = blob_epoch.*,
+        .epoch = enrichment_epoch.*,
     };
     @memcpy(req.repo[0..req.repo_len], ctx.repo[0..req.repo_len]);
-    @memcpy(req.commit[0..req.commit_len], commit[0..req.commit_len]);
-    @memcpy(req.path[0..req.path_len], path[0..req.path_len]);
+    @memcpy(req.source_commit[0..req.source_commit_len], source_commit[0..req.source_commit_len]);
+    @memcpy(req.destination_commit[0..req.destination_commit_len], destination_commit[0..req.destination_commit_len]);
+    @memcpy(req.old_path[0..req.old_path_len], file.old_path[0..req.old_path_len]);
+    @memcpy(req.new_path[0..req.new_path_len], file.new_path[0..req.new_path_len]);
 
-    const fut = try ctx.io.concurrent(blobWorker, .{ loop, ctx.io, ctx.env_map, ctx.cred, req });
-    try blob_loads.append(gpa, .{ .epoch = blob_epoch.*, .future = fut });
+    const fut = try ctx.io.concurrent(enrichmentWorker, .{ loop, ctx.io, ctx.env_map, ctx.cred, ctx.highlighter, ctx.highlight_max_file_bytes, req });
+    try enrichment_loads.append(gpa, .{ .epoch = enrichment_epoch.*, .future = fut });
 }
 
 /// Runs on a worker thread. Fetches one file's blob off the page allocator and
 /// posts it back; frees the result if the hand-off fails (shutting down).
-fn blobWorker(
+fn enrichmentWorker(
     loop: *Loop,
     io: std.Io,
     env_map: *std.process.Environ.Map,
     cred: Credential,
-    req: BlobReq,
+    highlighter: bbr.highlight.Highlighter,
+    max_file_bytes: usize,
+    req: EnrichmentReq,
 ) void {
     const repo = req.repo[0..req.repo_len];
-    const commit = req.commit[0..req.commit_len];
-    const path = req.path[0..req.path_len];
-    const outcome: BlobOutcome = if (fetchBlob(io, env_map, cred, repo, commit, path)) |b|
+    const outcome: EnrichmentOutcome = if (fetchEnrichment(io, env_map, cred, highlighter, max_file_bytes, repo, req)) |b|
         .{ .ok = b }
     else |err|
         .{ .err = err };
 
-    loop.postEvent(.{ .blob_done = .{
+    loop.postEvent(.{ .enrichment_done = .{
         .epoch = req.epoch,
         .pr_id = req.pr_id,
         .file_idx = req.file_idx,
@@ -1430,21 +1529,20 @@ fn blobWorker(
     };
 }
 
-/// Fetch one file's blob into a self-owned `Blob` on the page allocator (thread
-/// safe, so the worker never races the main thread's gpa).
-fn fetchBlob(
+/// Fetch and highlight one File into a self-owned result on the page allocator
+/// (thread safe, so the worker never races the main thread's gpa).
+fn fetchEnrichment(
     io: std.Io,
     env_map: *std.process.Environ.Map,
     cred: Credential,
+    highlighter: bbr.highlight.Highlighter,
+    max_file_bytes: usize,
     repo: []const u8,
-    commit: []const u8,
-    path: []const u8,
-) !*Blob {
+    req: EnrichmentReq,
+) !*FileEnrichment {
     const page = std.heap.page_allocator;
-    const b = try page.create(Blob);
-    errdefer page.destroy(b);
-    b.arena = std.heap.ArenaAllocator.init(page);
-    errdefer b.arena.deinit();
+    const b = try createEnrichment(page);
+    errdefer b.destroy();
     const a = b.arena.allocator();
 
     var http = bbr.http.StdHttpClient.init(a, io);
@@ -1452,8 +1550,52 @@ fn fetchBlob(
     try http.initDefaultProxies(a, env_map);
     const bb = bbr.bitbucket.Client.init(http.httpClient(), cred);
 
-    b.text = try bb.getFileBlob(a, repo, commit, path);
+    if (req.status != .added) {
+        b.old = fetchAndHighlight(
+            a,
+            bb,
+            highlighter,
+            max_file_bytes,
+            repo,
+            req.destination_commit[0..req.destination_commit_len],
+            req.old_path[0..req.old_path_len],
+        );
+    }
+    if (req.status != .removed) {
+        b.new = fetchAndHighlight(
+            a,
+            bb,
+            highlighter,
+            max_file_bytes,
+            repo,
+            req.source_commit[0..req.source_commit_len],
+            req.new_path[0..req.new_path_len],
+        );
+    }
     return b;
+}
+
+fn createEnrichment(backing: std.mem.Allocator) !*FileEnrichment {
+    const enrichment = try backing.create(FileEnrichment);
+    enrichment.* = .{ .arena = std.heap.ArenaAllocator.init(backing) };
+    return enrichment;
+}
+
+fn fetchAndHighlight(
+    allocator: std.mem.Allocator,
+    bb: bbr.bitbucket.Client,
+    highlighter: bbr.highlight.Highlighter,
+    max_file_bytes: usize,
+    repo: []const u8,
+    commit: []const u8,
+    path: []const u8,
+) SideOutcome {
+    const text = bb.getFileBlob(allocator, repo, commit, path) catch |err| return .{ .err = .{ .stage = .fetch, .cause = err } };
+    if (max_file_bytes != 0 and text.len > max_file_bytes) {
+        return .{ .ok = .{ .text = text, .highlights = .{ .spans = &.{} }, .skipped_too_large = true } };
+    }
+    const result = highlighter.highlight(allocator, path, text) catch |err| return .{ .err = .{ .stage = .highlight, .cause = err } };
+    return .{ .ok = .{ .text = text, .highlights = result } };
 }
 
 /// Await and drop the tracked load with `epoch` (its result has arrived). The
@@ -1725,6 +1867,15 @@ test "spanFromLines: mixed sides and gaps are refused" {
     try testing.expectError(error.NonContiguous, spanFromLines(&.{ &a0, &a2 }, false));
 
     try testing.expectError(error.NotOnALine, spanFromLines(&.{}, false));
+}
+
+test "a new File enrichment starts with both sides absent" {
+    var poisoned: [4096]u8 align(@alignOf(FileEnrichment)) = @splat(0xaa);
+    var fixed = std.heap.FixedBufferAllocator.init(&poisoned);
+    const enrichment = try createEnrichment(fixed.allocator());
+    defer enrichment.destroy();
+    try testing.expect(enrichment.old == .absent);
+    try testing.expect(enrichment.new == .absent);
 }
 
 test "commitDraft fences a suggestion, adds it to the review, and persists it" {
