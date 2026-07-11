@@ -24,11 +24,12 @@ pub fn ArenaRing(comptime n: usize) type {
 
         arenas: [n]std.heap.ArenaAllocator,
         idx: usize = 0,
+        staging_idx: ?usize = null,
 
         /// Build a ring of `n` arenas over `backing`. Safe to move the returned
-        /// value into its final home before the first `next()`.
+        /// value into its final home before the first `begin()`.
         pub fn init(backing: Allocator) Self {
-            var self: Self = .{ .arenas = undefined, .idx = 0 };
+            var self: Self = .{ .arenas = undefined, .idx = 0, .staging_idx = null };
             for (&self.arenas) |*a| a.* = std.heap.ArenaAllocator.init(backing);
             return self;
         }
@@ -38,13 +39,25 @@ pub fn ArenaRing(comptime n: usize) type {
             self.* = undefined;
         }
 
-        /// Rotate to the next arena, reset it (keeping its capacity), and return
-        /// its allocator. The allocation handed out last call (from a different
-        /// arena, when `n > 1`) stays valid.
-        pub fn next(self: *Self) Allocator {
-            self.idx = (self.idx + 1) % n;
-            _ = self.arenas[self.idx].reset(.retain_capacity);
-            return self.arenas[self.idx].allocator();
+        /// Reset the arena after the active one and return it for a speculative
+        /// build. `commit` makes that arena active; `abort` leaves the current
+        /// arena active so a failed build can never invalidate its allocations.
+        pub fn begin(self: *Self) Allocator {
+            std.debug.assert(self.staging_idx == null);
+            const next_idx = (self.idx + 1) % n;
+            _ = self.arenas[next_idx].reset(.retain_capacity);
+            self.staging_idx = next_idx;
+            return self.arenas[next_idx].allocator();
+        }
+
+        pub fn commit(self: *Self) void {
+            self.idx = self.staging_idx orelse unreachable;
+            self.staging_idx = null;
+        }
+
+        pub fn abort(self: *Self) void {
+            std.debug.assert(self.staging_idx != null);
+            self.staging_idx = null;
         }
     };
 }
@@ -58,19 +71,22 @@ test "a ring of 2 keeps the previous generation's allocation alive" {
     var ring = ArenaRing(2).init(testing.allocator);
     defer ring.deinit();
 
-    const a0 = ring.next();
+    const a0 = ring.begin();
     const first = try a0.alloc(u8, 8);
     @memset(first, 0xAB);
+    ring.commit();
 
-    // Next generation uses a different arena — `first` must still be readable.
-    const a1 = ring.next();
+    // The staging generation uses a different arena — `first` remains readable.
+    const a1 = ring.begin();
     const second = try a1.alloc(u8, 8);
     @memset(second, 0xCD);
     for (first) |b| try testing.expectEqual(@as(u8, 0xAB), b);
+    ring.commit();
 
     // Two generations on, we rotate back to the first arena and reset it.
-    _ = ring.next();
+    _ = ring.begin();
     for (second) |b| try testing.expectEqual(@as(u8, 0xCD), b);
+    ring.abort();
 }
 
 test "rotation cycles through all arenas and retains capacity" {
@@ -81,17 +97,36 @@ test "rotation cycles through all arenas and retains capacity" {
     // (testing.allocator would flag a leak on deinit otherwise).
     var round: usize = 0;
     while (round < 9) : (round += 1) {
-        const a = ring.next();
+        const a = ring.begin();
         _ = try a.alloc(u8, 4096);
+        ring.commit();
     }
 }
 
 test "a ring of 1 degrades to a single reset-reuse arena" {
     var ring = ArenaRing(1).init(testing.allocator);
     defer ring.deinit();
-    const a = ring.next();
+    const a = ring.begin();
     _ = try a.alloc(u8, 16);
+    ring.commit();
     // Same arena next time; the prior allocation is gone after reset.
-    const b = ring.next();
+    const b = ring.begin();
     _ = try b.alloc(u8, 16);
+    ring.commit();
+}
+
+test "aborted builds keep staging separate from the active arena" {
+    var ring = ArenaRing(2).init(testing.allocator);
+    defer ring.deinit();
+
+    const active = try ring.begin().alloc(u8, 8);
+    @memset(active, 0xAB);
+    ring.commit();
+
+    _ = try ring.begin().alloc(u8, 8);
+    ring.abort();
+    _ = try ring.begin().alloc(u8, 8);
+    ring.abort();
+
+    for (active) |byte| try testing.expectEqual(@as(u8, 0xAB), byte);
 }

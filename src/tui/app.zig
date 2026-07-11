@@ -319,7 +319,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
         PendingReview.init(0);
 
     var buf: bbr.diff.Buffer = if (current) |c|
-        try bbr.diff.buffer.buildWithComments(ring.next(), c.diff, layout, c.threads, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, c.blobs))
+        try rebuildBuffered(&ring, c, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, c.blobs))
     else
         .{ .rows = &.{}, .layout = layout };
 
@@ -441,7 +441,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                 commitDraft(ctx.store, &review, review_arena.allocator(), cur.pr.id, comp) catch |err| {
                                     status_msg = @errorName(err);
                                 };
-                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                 nav.setRowCount(buf.rows.len);
                             }
                         }
@@ -537,12 +537,12 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                 // --- commands ---
                                 .toggle_resolved => {
                                     show_resolved = !show_resolved;
-                                    buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                    buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                     nav.setRowCount(buf.rows.len);
                                 },
                                 .toggle_layout => {
                                     layout = if (layout == .unified) .side_by_side else .unified;
-                                    buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                    buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                     nav.setRowCount(buf.rows.len);
                                 },
                                 .cycle_scope => {
@@ -551,7 +551,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                     // lazily below the loop.
                                     scope = scope.next();
                                     expanded.clearRetainingCapacity();
-                                    buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                    buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                     nav.setRowCount(buf.rows.len);
                                 },
                                 .comment => openComposer(&composer, &composer_arena, .{ .kind = .top_level, .label = "New comment" }),
@@ -573,13 +573,13 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                     // Toggle the isolate view over the focused file.
                                     if (isolate_file) |only| {
                                         isolate_file = null;
-                                        buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                        buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                         nav.setRowCount(buf.rows.len);
                                         // Land the cursor back on the file we were isolating.
                                         if (fileHeaderRow(buf, only)) |hr| nav.jumpTo(hr);
                                     } else {
                                         isolate_file = fileIndexForRow(buf, nav.cursor);
-                                        buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                        buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                         nav = Nav.init(buf.rows.len, vx.window().height);
                                     }
                                 },
@@ -588,7 +588,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                     if (isolate_file) |only| {
                                         if (only + 1 < cur.diff.files.len) {
                                             isolate_file = only + 1;
-                                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                            buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                             nav = Nav.init(buf.rows.len, vx.window().height);
                                         }
                                     } else if (nextFileHeaderRow(buf, nav.cursor)) |hr| nav.jumpTo(hr);
@@ -598,7 +598,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                     if (isolate_file) |only| {
                                         if (only > 0) {
                                             isolate_file = only - 1;
-                                            buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                            buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                             nav = Nav.init(buf.rows.len, vx.window().height);
                                         }
                                     } else if (prevFileHeaderRow(buf, nav.cursor)) |hr| nav.jumpTo(hr);
@@ -613,7 +613,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                     // Expand the fold under the cursor, if any.
                                     if (nav.cursor < buf.rows.len and buf.rows[nav.cursor] == .fold) {
                                         expanded.append(gpa, buf.rows[nav.cursor].fold.id) catch {};
-                                        buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                        buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                         nav.setRowCount(buf.rows.len);
                                     }
                                 },
@@ -672,7 +672,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                             // Load the new PR's pending Drafts into a fresh arena.
                             _ = review_arena.reset(.retain_capacity);
                             review = ctx.store.loadReview(review_arena.allocator(), s.pr.id) catch PendingReview.init(s.pr.id);
-                            buf = rebuild(ring.next(), s, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, s.blobs)) catch buf;
+                            buf = rebuildBuffered(&ring, s, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, s.blobs)) catch buf;
                             nav = Nav.init(buf.rows.len, vx.window().height);
                             resolver = .{}; // drop any half-typed leader
                             status_msg = null;
@@ -723,7 +723,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                         if (applies) {
                             const cur = current.?;
                             if (acceptEnrichment(cur, done.file_idx, blob.old, blob.new)) {
-                                buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                                 nav.setRowCount(buf.rows.len);
                             } else |err| status_msg = @errorName(err);
                         }
@@ -778,7 +778,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                     }
                     // Reflect the new draft states (or their removal) in the pane.
                     if (current) |cur| {
-                        buf = rebuild(ring.next(), cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                        buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
                         nav.setRowCount(buf.rows.len);
                     }
                     // Reconcile with the server (M10b): a batch that posted anything
@@ -905,10 +905,14 @@ fn buildOpts(
     };
 }
 
-fn rebuild(alloc: std.mem.Allocator, s: *const Session, layout: bbr.diff.Layout, opts: bbr.diff.BuildOptions) !bbr.diff.Buffer {
+fn rebuildBuffered(ring: *ArenaRing(2), s: *const Session, layout: bbr.diff.Layout, opts: bbr.diff.BuildOptions) !bbr.diff.Buffer {
+    const alloc = ring.begin();
+    errdefer ring.abort();
     var enriched = opts;
     enriched.highlights = s.highlights;
-    return bbr.diff.buffer.buildWithComments(alloc, s.diff, layout, s.threads, enriched);
+    const buffer = try bbr.diff.buffer.buildWithComments(alloc, s.diff, layout, s.threads, enriched);
+    ring.commit();
+    return buffer;
 }
 
 /// Open the Picker immediately in a loading state and kick the summaries fetch

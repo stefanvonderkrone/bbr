@@ -489,7 +489,16 @@ fn parentEql(a: Parent, b: Parent) bool {
 }
 
 fn decoratedLine(allocator: std.mem.Allocator, line: *const model.Line, spans: []const decoration.Span, emphasis: []const Segment) decoration.Error!LineRow {
-    return .{ .line = line, .decoration = try decoration.decorate(allocator, line.text, spans, emphasis) };
+    const decorated = decoration.decorate(allocator, line.text, spans, emphasis) catch |err| switch (err) {
+        // Bitbucket's diff is authoritative and can differ slightly from the
+        // fetched blob used for highlighting (for example around normalized
+        // whitespace). Keep that one line plain instead of rejecting the whole
+        // Buffer and losing highlighting for every subsequent File.
+        error.InvalidSpan => try decoration.decorate(allocator, line.text, &.{}, emphasis),
+        error.InvalidEmphasis => return error.InvalidEmphasis,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    return .{ .line = line, .decoration = decorated };
 }
 
 /// Select the agreed file side, then return only the ordered Spans for `line`.
@@ -1527,4 +1536,22 @@ test "Line decoration selects old Spans for removed and new Spans for added and 
     try testing.expectEqualStrings("old.capture", lineSpans(&highlights, 0, removed)[0].capture.name);
     try testing.expectEqualStrings("new.added", lineSpans(&highlights, 0, added)[0].capture.name);
     try testing.expectEqualStrings("new.context", lineSpans(&highlights, 0, context)[0].capture.name);
+}
+
+test "an incompatible blob Span leaves only that diff Line plain" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const line: model.Line = .{ .old_no = null, .new_no = 52, .kind = .added, .text = "short" };
+    const incompatible = [_]decoration.Span{.{
+        .line = 52,
+        .start = 5,
+        .end = 6,
+        .capture = .{ .name = "punctuation.bracket" },
+    }};
+
+    const row = try decoratedLine(arena.allocator(), &line, &incompatible, &.{});
+    try testing.expectEqual(@as(usize, 1), row.decoration.runs.len);
+    try testing.expect(row.decoration.runs[0].capture == null);
+    try testing.expectEqualStrings("short", row.decoration.runs[0].text);
 }

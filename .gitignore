@@ -5,6 +5,7 @@ zig-pkg/
 
 # Local secrets — never commit. Source into your shell: set -a; source .env; set +a
 .env
+test.sh
 
 # Editor / OS
 .DS_Store
