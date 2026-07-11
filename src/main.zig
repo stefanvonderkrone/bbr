@@ -25,9 +25,12 @@ pub fn main(init: std.process.Init) !void {
     // buffer/renderer so the comment UI can be exercised entirely offline.
     if (first) |f| {
         if (std.mem.eql(u8, f, "demo")) {
-            var configuration = loadConfiguration(gpa, init.io, init.environ_map) catch return;
-            defer configuration.deinit(gpa);
-            return demoRun(init.io, gpa, init.environ_map, &configuration);
+            var loaded = try config.load(gpa, init.io, init.environ_map);
+            defer loaded.deinit(gpa);
+            return switch (loaded) {
+                .ok => |*configuration| demoRun(init.io, gpa, init.environ_map, configuration),
+                .invalid => |failure| failure.report(),
+            };
         }
     }
 
@@ -62,9 +65,12 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    var configuration = loadConfiguration(gpa, init.io, init.environ_map) catch return;
-    defer configuration.deinit(gpa);
-    try openTui(init, gpa, cred, input, &configuration);
+    var loaded = try config.load(gpa, init.io, init.environ_map);
+    defer loaded.deinit(gpa);
+    switch (loaded) {
+        .ok => |*configuration| try openTui(init, gpa, cred, input, configuration),
+        .invalid => |failure| failure.report(),
+    }
 }
 
 /// Resolve the startup entry and hand off to the TUI. Uses a real GitClient and
@@ -127,31 +133,6 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .active_theme = configuration.active_theme,
         .keymap = configuration.keymap.keymap(),
     }, null, target.id);
-}
-
-fn loadConfiguration(gpa: std.mem.Allocator, io: std.Io, env_map: *const std.process.Environ.Map) !config.Configuration {
-    const config_path = (try config.path(gpa, env_map)) orelse return config.defaults(gpa);
-    defer gpa.free(config_path);
-    const source = std.Io.Dir.cwd().readFileAlloc(io, config_path, gpa, .limited(64 * 1024 + 1)) catch |err| switch (err) {
-        error.FileNotFound => return config.defaults(gpa),
-        else => {
-            std.debug.print("bbr: could not read configuration {s}: {s}\n", .{ config_path, @errorName(err) });
-            return error.InvalidConfiguration;
-        },
-    };
-    defer gpa.free(source);
-    var parsed = try config.parse(gpa, source);
-    switch (parsed) {
-        .ok => |configuration| return configuration,
-        .invalid => |diagnostics| {
-            defer parsed.deinit(gpa);
-            for (diagnostics) |diagnostic| {
-                std.debug.print("{s}:{d}:{d}: {s}\n", .{ config_path, diagnostic.line, diagnostic.column, diagnostic.message });
-                if (diagnostic.hint) |hint| std.debug.print("  help: {s}\n", .{hint});
-            }
-            return error.InvalidConfiguration;
-        },
-    }
 }
 
 /// Open the pending-review store at `~/.local/state/bbr/pending.db`, creating the

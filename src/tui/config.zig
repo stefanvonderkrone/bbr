@@ -1,10 +1,15 @@
+//! Configuration intake owns the complete startup path: XDG/HOME discovery,
+//! missing-file defaults, bounded file I/O, parsing, semantic validation,
+//! diagnostics, and materialization of the runtime Theme and Keymap. Callers
+//! cross one seam (`load`) and never learn TOML or selection rules.
+
 const std = @import("std");
 const keymap = @import("keymap.zig");
 const theme = @import("theme.zig");
 
 const testing = std.testing;
 
-pub const Diagnostic = struct {
+const Diagnostic = struct {
     line: usize,
     column: usize,
     message: []const u8,
@@ -22,7 +27,7 @@ pub const Configuration = struct {
     }
 };
 
-pub const Result = union(enum) {
+const Result = union(enum) {
     ok: Configuration,
     invalid: []Diagnostic,
 
@@ -35,7 +40,43 @@ pub const Result = union(enum) {
     }
 };
 
-pub fn defaults(allocator: std.mem.Allocator) !Configuration {
+pub const Failure = struct {
+    path: []u8,
+    diagnostics: []Diagnostic = &.{},
+    read_error: ?anyerror = null,
+
+    fn deinit(self: *Failure, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        if (self.diagnostics.len > 0) allocator.free(self.diagnostics);
+        self.* = undefined;
+    }
+
+    pub fn report(self: Failure) void {
+        if (self.read_error) |err| {
+            std.debug.print("bbr: could not read configuration {s}: {s}\n", .{ self.path, @errorName(err) });
+            return;
+        }
+        for (self.diagnostics) |diagnostic| {
+            std.debug.print("{s}:{d}:{d}: {s}\n", .{ self.path, diagnostic.line, diagnostic.column, diagnostic.message });
+            if (diagnostic.hint) |hint| std.debug.print("  help: {s}\n", .{hint});
+        }
+    }
+};
+
+pub const LoadResult = union(enum) {
+    ok: Configuration,
+    invalid: Failure,
+
+    pub fn deinit(self: *LoadResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .ok => |*configuration| configuration.deinit(allocator),
+            .invalid => |*failure| failure.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
+fn defaults(allocator: std.mem.Allocator) !Configuration {
     return .{
         .theme_name = try allocator.dupe(u8, "system"),
         .active_theme = theme.system,
@@ -43,17 +84,42 @@ pub fn defaults(allocator: std.mem.Allocator) !Configuration {
     };
 }
 
-pub fn path(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]u8 {
+fn path(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]u8 {
     if (env.get("XDG_CONFIG_HOME")) |base| return try std.fmt.allocPrint(allocator, "{s}/bbr/config.toml", .{base});
     if (env.get("HOME")) |home| return try std.fmt.allocPrint(allocator, "{s}/.config/bbr/config.toml", .{home});
     return null;
 }
 
-pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
+pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !LoadResult {
+    const config_path = (try path(allocator, env)) orelse return .{ .ok = try defaults(allocator) };
+    errdefer allocator.free(config_path);
+    const source = std.Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(64 * 1024 + 1)) catch |err| switch (err) {
+        error.FileNotFound => {
+            const configuration = try defaults(allocator);
+            allocator.free(config_path);
+            return .{ .ok = configuration };
+        },
+        error.StreamTooLong => {
+            const diagnostics = try tooLargeDiagnostics(allocator);
+            return .{ .invalid = .{ .path = config_path, .diagnostics = diagnostics } };
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .invalid = .{ .path = config_path, .read_error = err } },
+    };
+    defer allocator.free(source);
+    const parsed = try parse(allocator, source);
+    return switch (parsed) {
+        .ok => |configuration| blk: {
+            allocator.free(config_path);
+            break :blk .{ .ok = configuration };
+        },
+        .invalid => |diagnostics| .{ .invalid = .{ .path = config_path, .diagnostics = diagnostics } },
+    };
+}
+
+fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
     if (source.len > 64 * 1024) {
-        const diagnostics = try allocator.alloc(Diagnostic, 1);
-        diagnostics[0] = .{ .line = 1, .column = 1, .message = "configuration exceeds 64 KiB", .hint = "remove unused entries or comments" };
-        return .{ .invalid = diagnostics };
+        return .{ .invalid = try tooLargeDiagnostics(allocator) };
     }
 
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
@@ -166,6 +232,12 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
         return .{ .invalid = try diagnostics.toOwnedSlice(allocator) };
     }
     return .{ .ok = .{ .theme_name = try allocator.dupe(u8, theme_name), .active_theme = theme.byName(theme_name).?, .keymap = owned_keymap } };
+}
+
+fn tooLargeDiagnostics(allocator: std.mem.Allocator) ![]Diagnostic {
+    const diagnostics = try allocator.alloc(Diagnostic, 1);
+    diagnostics[0] = .{ .line = 1, .column = 1, .message = "configuration exceeds 64 KiB", .hint = "remove unused entries or comments" };
+    return diagnostics;
 }
 
 test "strict configuration rejects duplicate keys and sequence prefixes together" {
@@ -294,4 +366,63 @@ test "configuration path prefers XDG and falls back to HOME" {
     const xdg_path = (try path(testing.allocator, &env)).?;
     defer testing.allocator.free(xdg_path);
     try testing.expectEqualStrings("/cfg/bbr/config.toml", xdg_path);
+}
+
+test "configuration intake owns missing valid malformed and unreadable file states" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer testing.allocator.free(base);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", base);
+
+    var missing = try load(testing.allocator, io, &env);
+    defer missing.deinit(testing.allocator);
+    try testing.expect(missing == .ok);
+    try testing.expectEqualStrings("system", missing.ok.theme_name);
+
+    var bbr_dir = try tmp.dir.createDirPathOpen(io, "bbr", .{});
+    defer bbr_dir.close(io);
+    var file = try bbr_dir.createFile(io, "config.toml", .{});
+    try file.writeStreamingAll(io,
+        \\theme = "gruvbox-light"
+        \\[keymap]
+        \\"ctrl-d" = "page-down"
+    );
+    file.close(io);
+    var valid = try load(testing.allocator, io, &env);
+    defer valid.deinit(testing.allocator);
+    try testing.expect(valid == .ok);
+    try testing.expectEqualStrings("gruvbox-light", valid.ok.theme_name);
+    try testing.expect(std.meta.eql(theme.gruvbox_light, valid.ok.active_theme));
+    var resolver = keymap.Resolver{};
+    try testing.expectEqual(keymap.Action.page_down, resolver.feed(valid.ok.keymap.keymap(), .{ .codepoint = 'd', .mods = .{ .ctrl = true } }).action);
+
+    file = try bbr_dir.createFile(io, "config.toml", .{ .truncate = true });
+    try file.writeStreamingAll(io, "theem = \"dark\"\n");
+    file.close(io);
+    var malformed = try load(testing.allocator, io, &env);
+    defer malformed.deinit(testing.allocator);
+    try testing.expect(malformed == .invalid);
+    try testing.expectEqual(@as(usize, 1), malformed.invalid.diagnostics.len);
+
+    file = try bbr_dir.createFile(io, "config.toml", .{ .truncate = true });
+    const oversized = try testing.allocator.alloc(u8, 64 * 1024 + 2);
+    defer testing.allocator.free(oversized);
+    @memset(oversized, ' ');
+    try file.writeStreamingAll(io, oversized);
+    file.close(io);
+    var too_large = try load(testing.allocator, io, &env);
+    defer too_large.deinit(testing.allocator);
+    try testing.expect(too_large == .invalid);
+    try testing.expectEqualStrings("configuration exceeds 64 KiB", too_large.invalid.diagnostics[0].message);
+
+    try bbr_dir.deleteFile(io, "config.toml");
+    try bbr_dir.createDir(io, "config.toml", .default_dir);
+    var unreadable = try load(testing.allocator, io, &env);
+    defer unreadable.deinit(testing.allocator);
+    try testing.expect(unreadable == .invalid);
+    try testing.expect(unreadable.invalid.read_error != null);
 }
