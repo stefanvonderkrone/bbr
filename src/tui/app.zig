@@ -32,8 +32,9 @@
 //! again is selective retry — already-posted Drafts are skipped).
 //!
 //! Lifetime: vaxis cells borrow their text until `render`. A Session owns its
-//! diff/threads for as long as it is current; per-frame gutter/overlay text is
-//! synthesized into `frame_arena`, reset *after* render.
+//! diff/threads and transferred File Enrichment sides for as long as it is
+//! current; per-frame gutter/overlay text is synthesized into `frame_arena`,
+//! reset *after* render.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -47,6 +48,7 @@ const Picker = @import("picker.zig").Picker;
 const composer_mod = @import("composer.zig");
 const Composer = composer_mod.Composer;
 const session = @import("session.zig");
+const file_enrichment = @import("file_enrichment.zig");
 const ArenaRing = @import("arena_ring.zig").ArenaRing;
 const Session = session.Session;
 
@@ -127,40 +129,8 @@ const PickerReq = struct {
     epoch: u64,
 };
 
-/// A fetched file blob, owned by its own arena so the worker can hand it across
-/// threads; the main thread copies the text into the Session arena and calls
-/// `destroy` (mirroring `Summaries`).
-const FileEnrichment = struct {
-    arena: std.heap.ArenaAllocator,
-    old: SideOutcome = .absent,
-    new: SideOutcome = .absent,
-
-    fn destroy(self: *FileEnrichment) void {
-        const backing = self.arena.child_allocator;
-        self.arena.deinit();
-        backing.destroy(self);
-    }
-};
-
-const EnrichedSide = struct {
-    text: []const u8,
-    highlights: bbr.highlight.HighlightResult,
-    skipped_too_large: bool = false,
-};
-
-const SideFailure = struct {
-    stage: enum { fetch, highlight },
-    cause: anyerror,
-};
-
-const SideOutcome = union(enum) {
-    absent,
-    ok: EnrichedSide,
-    err: SideFailure,
-};
-
 const EnrichmentOutcome = union(enum) {
-    ok: *FileEnrichment,
+    ok: file_enrichment.Result,
     err: anyerror,
 };
 
@@ -319,7 +289,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
         PendingReview.init(0);
 
     var buf: bbr.diff.Buffer = if (current) |c|
-        try rebuildBuffered(&ring, c, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, c.blobs))
+        try rebuildBuffered(&ring, c, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, sessionBlobs(c)))
     else
         .{ .rows = &.{}, .layout = layout };
 
@@ -441,7 +411,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                 commitDraft(ctx.store, &review, review_arena.allocator(), cur.pr.id, comp) catch |err| {
                                     status_msg = @errorName(err);
                                 };
-                                buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, sessionBlobs(cur))) catch buf;
                                 nav.setRowCount(buf.rows.len);
                             }
                         }
@@ -537,12 +507,12 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                 // --- commands ---
                                 .toggle_resolved => {
                                     show_resolved = !show_resolved;
-                                    buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                    buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, sessionBlobs(cur))) catch buf;
                                     nav.setRowCount(buf.rows.len);
                                 },
                                 .toggle_layout => {
                                     layout = if (layout == .unified) .side_by_side else .unified;
-                                    buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                    buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, sessionBlobs(cur))) catch buf;
                                     nav.setRowCount(buf.rows.len);
                                 },
                                 .cycle_scope => {
@@ -551,7 +521,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                     // lazily below the loop.
                                     scope = scope.next();
                                     expanded.clearRetainingCapacity();
-                                    buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                    buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, sessionBlobs(cur))) catch buf;
                                     nav.setRowCount(buf.rows.len);
                                 },
                                 .comment => openComposer(&composer, &composer_arena, .{ .kind = .top_level, .label = "New comment" }),
@@ -573,13 +543,13 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                     // Toggle the isolate view over the focused file.
                                     if (isolate_file) |only| {
                                         isolate_file = null;
-                                        buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                        buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, sessionBlobs(cur))) catch buf;
                                         nav.setRowCount(buf.rows.len);
                                         // Land the cursor back on the file we were isolating.
                                         if (fileHeaderRow(buf, only)) |hr| nav.jumpTo(hr);
                                     } else {
                                         isolate_file = fileIndexForRow(buf, nav.cursor);
-                                        buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                        buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, sessionBlobs(cur))) catch buf;
                                         nav = Nav.init(buf.rows.len, vx.window().height);
                                     }
                                 },
@@ -588,7 +558,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                     if (isolate_file) |only| {
                                         if (only + 1 < cur.diff.files.len) {
                                             isolate_file = only + 1;
-                                            buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                            buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, sessionBlobs(cur))) catch buf;
                                             nav = Nav.init(buf.rows.len, vx.window().height);
                                         }
                                     } else if (nextFileHeaderRow(buf, nav.cursor)) |hr| nav.jumpTo(hr);
@@ -598,7 +568,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                     if (isolate_file) |only| {
                                         if (only > 0) {
                                             isolate_file = only - 1;
-                                            buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                            buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, sessionBlobs(cur))) catch buf;
                                             nav = Nav.init(buf.rows.len, vx.window().height);
                                         }
                                     } else if (prevFileHeaderRow(buf, nav.cursor)) |hr| nav.jumpTo(hr);
@@ -613,7 +583,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                                     // Expand the fold under the cursor, if any.
                                     if (nav.cursor < buf.rows.len and buf.rows[nav.cursor] == .fold) {
                                         expanded.append(gpa, buf.rows[nav.cursor].fold.id) catch {};
-                                        buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                                        buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, sessionBlobs(cur))) catch buf;
                                         nav.setRowCount(buf.rows.len);
                                     }
                                 },
@@ -672,7 +642,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                             // Load the new PR's pending Drafts into a fresh arena.
                             _ = review_arena.reset(.retain_capacity);
                             review = ctx.store.loadReview(review_arena.allocator(), s.pr.id) catch PendingReview.init(s.pr.id);
-                            buf = rebuildBuffered(&ring, s, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, s.blobs)) catch buf;
+                            buf = rebuildBuffered(&ring, s, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, sessionBlobs(s))) catch buf;
                             nav = Nav.init(buf.rows.len, vx.window().height);
                             resolver = .{}; // drop any half-typed leader
                             status_msg = null;
@@ -714,21 +684,24 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                 // Apply only if the PR it targeted is still current; otherwise
                 // this per-File enrichment was superseded — discard.
                 const applies = if (current) |c|
-                    c.pr.id == done.pr_id and done.file_idx < c.blobs.len and done.file_idx < c.highlights.len and done.file_idx < c.highlight_status.len and done.file_idx < c.highlight_errors.len
+                    c.pr.id == done.pr_id and done.file_idx < c.enrichment.len()
                 else
                     false;
                 switch (done.outcome) {
-                    .ok => |blob| {
-                        defer blob.destroy();
+                    .ok => |result_value| {
+                        var result = result_value;
+                        defer result.deinit();
                         if (applies) {
                             const cur = current.?;
-                            if (acceptEnrichment(cur, done.file_idx, blob.old, blob.new)) {
-                                buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                            if (cur.enrichment.admit(done.file_idx, &result)) {
+                                const projection = cur.enrichment.projection();
+                                buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, projection.blobs)) catch buf;
                                 nav.setRowCount(buf.rows.len);
                             } else |err| status_msg = @errorName(err);
                         }
                     },
                     .err => |e| if (applies) {
+                        if (e == error.OutOfMemory) return error.FileEnrichmentOutOfMemory;
                         status_msg = @errorName(e);
                     },
                 }
@@ -778,7 +751,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                     }
                     // Reflect the new draft states (or their removal) in the pane.
                     if (current) |cur| {
-                        buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, cur.blobs)) catch buf;
+                        buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, sessionBlobs(cur))) catch buf;
                         nav.setRowCount(buf.rows.len);
                     }
                     // Reconcile with the server (M10b): a batch that posted anything
@@ -845,12 +818,12 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
 }
 
 fn highlightingStatus(allocator: std.mem.Allocator, current: *const Session, file_idx: usize) ?[]const u8 {
-    if (file_idx >= current.highlight_status.len) return null;
-    const status = current.highlight_status[file_idx];
+    if (file_idx >= current.enrichment.len()) return null;
+    const status = current.enrichment.status(file_idx);
     if (status.old == .loading or status.new == .loading) return "highlighting…";
     if (status.old == .skipped_too_large or status.new == .skipped_too_large)
         return "highlighting skipped: file side exceeds max_file_bytes";
-    const errors = if (file_idx < current.highlight_errors.len) current.highlight_errors[file_idx] else Session.HighlightErrors{};
+    const errors = current.enrichment.sideErrors(file_idx);
     if (sideStatusMessage(allocator, "old", status.old, errors.old)) |message| return message;
     if (sideStatusMessage(allocator, "new", status.new, errors.new)) |message| return message;
     return null;
@@ -909,10 +882,14 @@ fn rebuildBuffered(ring: *ArenaRing(2), s: *const Session, layout: bbr.diff.Layo
     const alloc = ring.begin();
     errdefer ring.abort();
     var enriched = opts;
-    enriched.highlights = s.highlights;
+    enriched.highlights = s.enrichment.projection().highlights;
     const buffer = try bbr.diff.buffer.buildWithComments(alloc, s.diff, layout, s.threads, enriched);
     ring.commit();
     return buffer;
+}
+
+fn sessionBlobs(s: *const Session) []const bbr.diff.FileBlob {
+    return s.enrichment.projection().blobs;
 }
 
 /// Open the Picker immediately in a loading state and kick the summaries fetch
@@ -1397,18 +1374,17 @@ fn ensureEnrichment(
     gpa: std.mem.Allocator,
 ) void {
     if (!ctx.online) return;
-    if (focused >= current.diff.files.len or focused >= current.blobs.len) return;
+    if (focused >= current.diff.files.len or focused >= current.enrichment.len()) return;
     const file = current.diff.files[focused];
-    if (focused >= current.highlight_status.len) return;
-    const old_ready = sideFinished(current.highlight_status[focused].old);
-    const new_ready = sideFinished(current.highlight_status[focused].new);
+    const status = current.enrichment.status(focused);
+    const old_ready = sideFinished(status.old);
+    const new_ready = sideFinished(status.new);
     if (old_ready and new_ready) return;
     for (enrichment_inflight.items) |b| {
         if (b.pr_id == current.pr.id and b.file_idx == focused) return; // in flight
     }
     spawnEnrichment(ctx, loop, enrichment_loads, enrichment_epoch, gpa, current.pr.id, focused, current.pr.source_commit, current.pr.destination_commit, file) catch return;
-    if (current.highlight_status[focused].old == .pending) current.highlight_status[focused].old = .loading;
-    if (current.highlight_status[focused].new == .pending) current.highlight_status[focused].new = .loading;
+    current.enrichment.markLoading(focused);
     enrichment_inflight.append(gpa, .{ .pr_id = current.pr.id, .file_idx = focused }) catch {};
 }
 
@@ -1417,42 +1393,6 @@ fn sideFinished(state: bbr.highlight.SideState) bool {
         .pending, .loading => false,
         .absent, .ready, .skipped_too_large, .fetch_failed, .highlight_failed => true,
     };
-}
-
-/// Copy one worker-owned enrichment into the Session arena. Each side is
-/// independent: a fetch/highlight failure leaves that side plain while the
-/// other side is still accepted.
-fn acceptEnrichment(current: *Session, file_idx: usize, old: SideOutcome, new: SideOutcome) !void {
-    const a = current.arena.allocator();
-    try acceptSide(a, &current.blobs[file_idx].old, &current.highlights[file_idx].old, &current.highlight_status[file_idx].old, &current.highlight_errors[file_idx].old, old);
-    try acceptSide(a, &current.blobs[file_idx].new, &current.highlights[file_idx].new, &current.highlight_status[file_idx].new, &current.highlight_errors[file_idx].new, new);
-}
-
-fn acceptSide(
-    allocator: std.mem.Allocator,
-    blob_slot: *?[]const u8,
-    highlight_slot: *?bbr.highlight.HighlightResult,
-    state: *bbr.highlight.SideState,
-    error_slot: *?anyerror,
-    outcome: SideOutcome,
-) !void {
-    switch (outcome) {
-        .absent => state.* = .absent,
-        .err => |failure| {
-            state.* = if (failure.stage == .fetch) .fetch_failed else .highlight_failed;
-            error_slot.* = failure.cause;
-        },
-        .ok => |side| {
-            blob_slot.* = try allocator.dupe(u8, side.text);
-            const spans = try allocator.alloc(bbr.highlight.Span, side.highlights.spans.len);
-            for (side.highlights.spans, 0..) |span, i| {
-                spans[i] = span;
-                spans[i].capture.name = try allocator.dupe(u8, span.capture.name);
-            }
-            highlight_slot.* = .{ .spans = spans };
-            state.* = if (side.skipped_too_large) .skipped_too_large else .ready;
-        },
-    }
 }
 
 /// Drop the in-flight record for (`pr_id`, `file_idx`) once its result arrives.
@@ -1518,10 +1458,23 @@ fn enrichmentWorker(
     req: EnrichmentReq,
 ) void {
     const repo = req.repo[0..req.repo_len];
-    const outcome: EnrichmentOutcome = if (fetchEnrichment(io, env_map, cred, highlighter, max_file_bytes, repo, req)) |b|
-        .{ .ok = b }
-    else |err|
-        .{ .err = err };
+    const page = std.heap.page_allocator;
+    var scratch = std.heap.ArenaAllocator.init(page);
+    defer scratch.deinit();
+    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
+    defer http.deinit();
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    const bb = bbr.bitbucket.Client.init(http.httpClient(), cred);
+
+    var outcome: EnrichmentOutcome = if (file_enrichment.enrich(page, bb, highlighter, .{
+        .repo = repo,
+        .status = req.status,
+        .source_commit = req.source_commit[0..req.source_commit_len],
+        .destination_commit = req.destination_commit[0..req.destination_commit_len],
+        .old_path = req.old_path[0..req.old_path_len],
+        .new_path = req.new_path[0..req.new_path_len],
+        .max_file_bytes = max_file_bytes,
+    })) |result| .{ .ok = result } else |err| .{ .err = err };
 
     loop.postEvent(.{ .enrichment_done = .{
         .epoch = req.epoch,
@@ -1529,77 +1482,8 @@ fn enrichmentWorker(
         .file_idx = req.file_idx,
         .outcome = outcome,
     } }) catch {
-        if (outcome == .ok) outcome.ok.destroy();
+        if (outcome == .ok) outcome.ok.deinit();
     };
-}
-
-/// Fetch and highlight one File into a self-owned result on the page allocator
-/// (thread safe, so the worker never races the main thread's gpa).
-fn fetchEnrichment(
-    io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
-    highlighter: bbr.highlight.Highlighter,
-    max_file_bytes: usize,
-    repo: []const u8,
-    req: EnrichmentReq,
-) !*FileEnrichment {
-    const page = std.heap.page_allocator;
-    const b = try createEnrichment(page);
-    errdefer b.destroy();
-    const a = b.arena.allocator();
-
-    var http = bbr.http.StdHttpClient.init(a, io);
-    defer http.deinit();
-    try http.initDefaultProxies(a, env_map);
-    const bb = bbr.bitbucket.Client.init(http.httpClient(), cred);
-
-    if (req.status != .added) {
-        b.old = fetchAndHighlight(
-            a,
-            bb,
-            highlighter,
-            max_file_bytes,
-            repo,
-            req.destination_commit[0..req.destination_commit_len],
-            req.old_path[0..req.old_path_len],
-        );
-    }
-    if (req.status != .removed) {
-        b.new = fetchAndHighlight(
-            a,
-            bb,
-            highlighter,
-            max_file_bytes,
-            repo,
-            req.source_commit[0..req.source_commit_len],
-            req.new_path[0..req.new_path_len],
-        );
-    }
-    return b;
-}
-
-fn createEnrichment(backing: std.mem.Allocator) !*FileEnrichment {
-    const enrichment = try backing.create(FileEnrichment);
-    enrichment.* = .{ .arena = std.heap.ArenaAllocator.init(backing) };
-    return enrichment;
-}
-
-fn fetchAndHighlight(
-    allocator: std.mem.Allocator,
-    bb: bbr.bitbucket.Client,
-    highlighter: bbr.highlight.Highlighter,
-    max_file_bytes: usize,
-    repo: []const u8,
-    commit: []const u8,
-    path: []const u8,
-) SideOutcome {
-    const text = bb.getFileBlob(allocator, repo, commit, path) catch |err| return .{ .err = .{ .stage = .fetch, .cause = err } };
-    if (max_file_bytes != 0 and text.len > max_file_bytes) {
-        return .{ .ok = .{ .text = text, .highlights = .{ .spans = &.{} }, .skipped_too_large = true } };
-    }
-    const result = highlighter.highlight(allocator, path, text) catch |err| return .{ .err = .{ .stage = .highlight, .cause = err } };
-    return .{ .ok = .{ .text = text, .highlights = result } };
 }
 
 /// Await and drop the tracked load with `epoch` (its result has arrived). The
@@ -1873,15 +1757,6 @@ test "spanFromLines: mixed sides and gaps are refused" {
     try testing.expectError(error.NotOnALine, spanFromLines(&.{}, false));
 }
 
-test "a new File enrichment starts with both sides absent" {
-    var poisoned: [4096]u8 align(@alignOf(FileEnrichment)) = @splat(0xaa);
-    var fixed = std.heap.FixedBufferAllocator.init(&poisoned);
-    const enrichment = try createEnrichment(fixed.allocator());
-    defer enrichment.destroy();
-    try testing.expect(enrichment.old == .absent);
-    try testing.expect(enrichment.new == .absent);
-}
-
 test "commitDraft fences a suggestion, adds it to the review, and persists it" {
     var mem = bbr.review.InMemoryStore.init(testing.allocator);
     defer mem.deinit();
@@ -1926,4 +1801,5 @@ test {
     _ = @import("session.zig");
     _ = @import("arena_ring.zig");
     _ = @import("composer.zig");
+    _ = @import("file_enrichment.zig");
 }

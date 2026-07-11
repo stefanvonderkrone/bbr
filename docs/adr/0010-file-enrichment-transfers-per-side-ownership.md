@@ -1,0 +1,5 @@
+# File Enrichment transfers ownership independently per side
+
+File Enrichment is a deep Presentation module that owns fetching, Highlighting outcomes, worker-result cleanup, and the Session's File-indexed enrichment storage. Each old/new side is single-assignment and transfers its owned blob, Spans, and Capture names into the Session without copying; the sides commit independently so failure on one never suppresses usable content from the other.
+
+Presentation continues to own worker scheduling and stale-Epoch rejection because only it knows which Session is visible. A successful fetch remains usable when Highlighting fails, Diff Buffer construction receives only a borrowed immutable projection, and `OutOfMemory` transfers nothing, tears down cleanly, and exits with a distinct File Enrichment message. This shape was chosen over Session-arena deep copies and File-wide atomicity to concentrate ownership invariants, avoid duplicate allocations, and make allocation failure testable through one seam.

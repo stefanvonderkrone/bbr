@@ -9,6 +9,10 @@ and how the reviewer navigates. Owns no domain data — it projects the Diff and
 The currently loaded review and the per-File data retained while that review is open. Switching reviews replaces the Session; Buffer rebuilds and screen redraws do not.
 _Avoid_: workspace, document, review state.
 
+**File Enrichment**:
+The lazily acquired old/new full-file content and Highlighting attached to a File during a Session. Each side becomes available independently; failure on one side does not suppress usable content from the other.
+_Avoid_: blob load, highlight job, hydration.
+
 **Pane**:
 A tiled region of the screen with a defined role (Sidebar, DiffPane, ThreadPane). Panes tile; they do not overlap.
 _Avoid_: window (reserved for vaxis's surface), view, panel.

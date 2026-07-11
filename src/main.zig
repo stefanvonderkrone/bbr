@@ -125,7 +125,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
     defer store.deinit();
     var tree_sitter_highlighter: TreeSitterHighlighter = .{};
 
-    try app.run(.{
+    app.run(.{
         .io = init.io,
         .gpa = gpa,
         .env_map = init.environ_map,
@@ -136,7 +136,20 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .keymap = configuration.keymap.keymap(),
         .highlighter = tree_sitter_highlighter.highlighter(),
         .highlight_max_file_bytes = configuration.highlight_max_file_bytes,
-    }, null, target.id);
+    }, null, target.id) catch |err| {
+        if (tuiFatalMessage(err)) |message| {
+            std.debug.print("{s}\n", .{message});
+            return;
+        }
+        return err;
+    };
+}
+
+fn tuiFatalMessage(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.FileEnrichmentOutOfMemory => "bbr: file enrichment ran out of memory; the review was not modified",
+        else => null,
+    };
 }
 
 /// Open the pending-review store at `~/.local/state/bbr/pending.db`, creating the
@@ -344,6 +357,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
     const a = s.arena.allocator();
 
     s.diff = try bbr.diff.parse(a, demo_diff);
+    try s.initializeEnrichment();
 
     const path = "src/server.zig";
     const comments = try a.dupe(bbr.review.Comment, &.{
@@ -397,6 +411,14 @@ test {
     _ = @import("tui/app.zig");
     _ = @import("tui/config.zig");
     _ = @import("persist/sqlite_store.zig");
+}
+
+test "File Enrichment OOM has a distinct fatal message" {
+    try std.testing.expectEqualStrings(
+        "bbr: file enrichment ran out of memory; the review was not modified",
+        tuiFatalMessage(error.FileEnrichmentOutOfMemory).?,
+    );
+    try std.testing.expect(tuiFatalMessage(error.NotFound) == null);
 }
 
 // The demo is our offline validation surface, so guard that its synthetic data

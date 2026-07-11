@@ -1,7 +1,7 @@
 //! A loaded PR review session and the (blocking) fetch that builds one. Each
-//! Session owns everything the viewer renders — the PullRequest, its parsed
-//! Diff, and the comment Threads — in a private arena, so switching PRs is just
-//! "build a new Session, swap it in, destroy the old one".
+//! Session owns everything the viewer renders. PullRequest, Diff, and Threads
+//! live in its private arena; lazily acquired File Enrichment sides retain
+//! their transferred arenas so switching PRs is still "build, swap, destroy".
 //!
 //! The arena is backed by a caller-supplied allocator. When a Session is built
 //! off-thread (the async Picker switch, app.zig), that backing is the stateless
@@ -14,34 +14,32 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const bbr = @import("bbr");
+const file_enrichment = @import("file_enrichment.zig");
 
 const PullRequest = bbr.bitbucket.PullRequest;
 const Client = bbr.bitbucket.Client;
 const Credential = bbr.bitbucket.Credential;
 
 pub const Session = struct {
-    pub const HighlightErrors = struct { old: ?anyerror = null, new: ?anyerror = null };
     arena: std.heap.ArenaAllocator,
     pr: PullRequest,
     diff: bbr.diff.Diff,
     threads: []const bbr.review.Thread,
-    /// Per-file whole-file blobs, index-aligned with `diff.files` (M9). All null
-    /// after load; the lazy per-file fetch (app.zig) fills a slot on demand and
-    /// the blob text lives in this arena. Empty for a Session with no diff yet.
-    blobs: []bbr.diff.FileBlob = &.{},
-    /// Per-file old/new Highlighting results, index-aligned with `diff.files`.
-    /// Results survive Buffer rebuilds and borrow Capture names from the
-    /// process-lifetime Highlighter registry.
-    highlights: []bbr.highlight.FileHighlights = &.{},
-    highlight_status: []bbr.highlight.FileHighlightStatus = &.{},
-    highlight_errors: []HighlightErrors = &.{},
+    enrichment: file_enrichment.Storage,
 
-    /// Free the Session and everything it owns. Reclaims both the arena and the
-    /// Session struct itself (both came from the same backing allocator).
+    /// Free transferred File Enrichment sides, the Session arena, and finally
+    /// the Session struct itself.
     pub fn destroy(self: *Session) void {
         const backing = self.arena.child_allocator;
+        self.enrichment.deinit();
         self.arena.deinit();
         backing.destroy(self);
+    }
+
+    pub fn initializeEnrichment(self: *Session) !void {
+        const next = try file_enrichment.Storage.init(self.arena.allocator(), self.diff.files);
+        self.enrichment.deinit();
+        self.enrichment = next;
     }
 };
 
@@ -50,12 +48,11 @@ pub const Session = struct {
 /// fetch. Fill `pr`, `diff`, and `threads` using `s.arena.allocator()`.
 pub fn create(backing: Allocator) !*Session {
     const s = try backing.create(Session);
+    errdefer backing.destroy(s);
     s.arena = std.heap.ArenaAllocator.init(backing);
+    errdefer s.arena.deinit();
     s.threads = &.{};
-    s.blobs = &.{};
-    s.highlights = &.{};
-    s.highlight_status = &.{};
-    s.highlight_errors = &.{};
+    s.enrichment = try file_enrichment.Storage.init(s.arena.allocator(), &.{});
     return s;
 }
 
@@ -73,30 +70,14 @@ pub fn loadWith(backing: Allocator, bb: Client, repo: []const u8, id: u64) !*Ses
     s.pr = try bb.getPullRequest(a, repo, id);
     const raw = try bb.getDiff(a, repo, id);
     s.diff = try bbr.diff.parse(a, raw);
+    s.enrichment = try file_enrichment.Storage.init(a, s.diff.files);
+    errdefer s.enrichment.deinit();
     const comments = try bb.getComments(a, repo, id, .{
         .source = s.pr.source_commit,
         .destination = s.pr.destination_commit,
     });
     s.threads = try bbr.review.buildThreads(a, comments);
 
-    // One (empty) blob slot per file; the whole-file view fills them lazily.
-    const blobs = try a.alloc(bbr.diff.FileBlob, s.diff.files.len);
-    @memset(blobs, .{});
-    s.blobs = blobs;
-    const highlights = try a.alloc(bbr.highlight.FileHighlights, s.diff.files.len);
-    @memset(highlights, .{});
-    s.highlights = highlights;
-    const highlight_status = try a.alloc(bbr.highlight.FileHighlightStatus, s.diff.files.len);
-    for (s.diff.files, 0..) |file, i| {
-        highlight_status[i] = .{
-            .old = if (file.status == .added) .absent else .pending,
-            .new = if (file.status == .removed) .absent else .pending,
-        };
-    }
-    s.highlight_status = highlight_status;
-    const highlight_errors = try a.alloc(Session.HighlightErrors, s.diff.files.len);
-    @memset(highlight_errors, .{});
-    s.highlight_errors = highlight_errors;
     return s;
 }
 
@@ -162,14 +143,11 @@ test "loadWith builds a session in order and owns everything" {
     try testing.expectEqual(@as(usize, 1), s.threads.len);
     try testing.expectEqual(@as(usize, 3), fake.call_count);
 
-    // One empty whole-file blob slot per file, filled lazily later (M9).
-    try testing.expectEqual(@as(usize, 1), s.blobs.len);
-    try testing.expect(s.blobs[0].new == null);
-    try testing.expectEqual(@as(usize, 1), s.highlights.len);
-    try testing.expectEqual(@as(usize, 1), s.highlight_status.len);
-    try testing.expectEqual(@as(usize, 1), s.highlight_errors.len);
-    try testing.expect(s.highlight_status[0].old == .pending);
-    try testing.expect(s.highlight_status[0].new == .pending);
+    try testing.expectEqual(@as(usize, 1), s.enrichment.len());
+    const projection = s.enrichment.projection();
+    try testing.expect(projection.blobs[0].new == null);
+    try testing.expect(s.enrichment.status(0).old == .pending);
+    try testing.expect(s.enrichment.status(0).new == .pending);
 }
 
 test "loadWith surfaces an error and leaks nothing" {
