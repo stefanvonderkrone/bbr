@@ -85,7 +85,34 @@ pub const SessionLoaded = struct {
 pub const OwnedInput = union(enum) {
     choose_pull_request: ReviewKey,
     session_loaded: SessionLoaded,
+    push_count_digit: u8,
+    resize_viewport: usize,
+    review_action: ReviewAction,
     request_shutdown,
+};
+
+/// Session-relative actions whose complete state is Navigation. They are
+/// suspended while a replacement is pending, along with every other Action
+/// that depends on the currently published review.
+pub const ReviewAction = enum {
+    down,
+    up,
+    half_page_down,
+    half_page_up,
+    page_down,
+    page_up,
+    to_top,
+    to_bottom,
+    center,
+    scroll_cursor_top,
+    scroll_cursor_bottom,
+    cursor_view_top,
+    cursor_view_middle,
+    cursor_view_bottom,
+    select_down,
+    select_up,
+    toggle_selection,
+    clear_selection,
 };
 
 pub const LoadSession = struct {
@@ -265,6 +292,9 @@ pub const Presentation = struct {
         switch (input) {
             .choose_pull_request => |key| if (!self.shutdown_requested) try self.choosePullRequest(key),
             .session_loaded => |completed| self.acceptLoadedSession(completed),
+            .push_count_digit => |digit| self.pushCountDigit(digit),
+            .resize_viewport => |rows| self.resizeViewport(rows),
+            .review_action => |action| self.applyReviewAction(action),
             .request_shutdown => self.requestShutdown(),
         }
     }
@@ -293,6 +323,47 @@ pub const Presentation = struct {
         self.shutdown_requested = true;
         self.commands.clearRetainingCapacity();
         self.replacement = null;
+    }
+
+    fn pushCountDigit(self: *Presentation, digit: u8) void {
+        if (self.shutdown_requested or self.replacement != null) return;
+        if (self.published) |published| published.navigation.pushDigit(digit);
+    }
+
+    fn resizeViewport(self: *Presentation, rows: usize) void {
+        self.viewport_rows = rows;
+        if (self.published) |published| published.navigation.setViewport(rows);
+    }
+
+    fn applyReviewAction(self: *Presentation, action: ReviewAction) void {
+        if (self.shutdown_requested or self.replacement != null) return;
+        const published = self.published orelse return;
+        switch (action) {
+            .down => published.navigation.down(),
+            .up => published.navigation.up(),
+            .half_page_down => published.navigation.halfPageDown(),
+            .half_page_up => published.navigation.halfPageUp(),
+            .page_down => published.navigation.pageDown(),
+            .page_up => published.navigation.pageUp(),
+            .to_top => published.navigation.toTop(),
+            .to_bottom => published.navigation.toBottom(),
+            .center => published.navigation.center(),
+            .scroll_cursor_top => published.navigation.scrollCursorTop(),
+            .scroll_cursor_bottom => published.navigation.scrollCursorBottom(),
+            .cursor_view_top => published.navigation.cursorToViewTop(),
+            .cursor_view_middle => published.navigation.cursorToViewMiddle(),
+            .cursor_view_bottom => published.navigation.cursorToViewBottom(),
+            .select_down => {
+                published.navigation.ensureMark();
+                published.navigation.down();
+            },
+            .select_up => {
+                published.navigation.ensureMark();
+                published.navigation.up();
+            },
+            .toggle_selection => published.navigation.toggleMark(),
+            .clear_selection => published.navigation.clearMark(),
+        }
     }
 
     fn choosePullRequest(self: *Presentation, key: ReviewKey) !void {
@@ -528,4 +599,46 @@ test "shutdown drains issued loads and disposes their late completions" {
 
     try testing.expect(presentation.readyToExit());
     try testing.expect(presentation.projection().review == null);
+}
+
+test "Navigation and Count mutate only through dispatch" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 2,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .push_count_digit = 2 });
+    try presentation.dispatch(.{ .review_action = .down });
+    try testing.expectEqual(@as(usize, 2), presentation.projection().review.?.navigation.cursor);
+    try presentation.dispatch(.{ .review_action = .toggle_selection });
+    try presentation.dispatch(.{ .review_action = .up });
+    const navigation = presentation.projection().review.?.navigation;
+    try testing.expectEqual(@as(usize, 1), navigation.cursor);
+    try testing.expectEqual(@as(?usize, 2), navigation.mark);
+}
+
+test "Session-relative Navigation is suspended during replacement" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 2,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .review_action = .down });
+    const before = presentation.projection().review.?.navigation;
+    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .review_action = .down });
+    try presentation.dispatch(.{ .push_count_digit = 9 });
+    try testing.expect(std.meta.eql(before, presentation.projection().review.?.navigation));
 }
