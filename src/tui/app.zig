@@ -56,6 +56,7 @@ const Credential = bbr.bitbucket.Credential;
 const PullRequestSummary = bbr.bitbucket.PullRequestSummary;
 const PendingReview = bbr.review.PendingReview;
 const PendingReviewStore = bbr.review.PendingReviewStore;
+const ReviewKey = bbr.review.ReviewKey;
 const Draft = bbr.review.Draft;
 
 /// Everything `run` needs to fetch and switch PRs. `online` is false for the
@@ -284,7 +285,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
     // Empty until the first Session arrives; the initial-load path (below) fills
     // both `review` and `buf` on `load_done`.
     var review = if (current) |c|
-        ctx.store.loadReview(review_arena.allocator(), c.pr.id) catch PendingReview.init(c.pr.id)
+        ctx.store.loadReview(review_arena.allocator(), reviewKey(ctx, c.pr.id)) catch PendingReview.init(c.pr.id)
     else
         PendingReview.init(0);
 
@@ -408,7 +409,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                         // Composer can only open over a loaded Session.
                         if (!comp.isBlank()) {
                             if (current) |cur| {
-                                commitDraft(ctx.store, &review, review_arena.allocator(), cur.pr.id, comp) catch |err| {
+                                commitDraft(ctx.store, &review, review_arena.allocator(), reviewKey(ctx, cur.pr.id), comp) catch |err| {
                                     status_msg = @errorName(err);
                                 };
                                 buf = rebuildBuffered(&ring, cur, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, sessionBlobs(cur))) catch buf;
@@ -641,7 +642,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                             submitting = false;
                             // Load the new PR's pending Drafts into a fresh arena.
                             _ = review_arena.reset(.retain_capacity);
-                            review = ctx.store.loadReview(review_arena.allocator(), s.pr.id) catch PendingReview.init(s.pr.id);
+                            review = ctx.store.loadReview(review_arena.allocator(), reviewKey(ctx, s.pr.id)) catch PendingReview.init(s.pr.id);
                             buf = rebuildBuffered(&ring, s, layout, buildOpts(show_resolved, scope, expanded.items, review.drafts.items, isolate_file, sessionBlobs(s))) catch buf;
                             nav = Nav.init(buf.rows.len, vx.window().height);
                             resolver = .{}; // drop any half-typed leader
@@ -721,7 +722,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                         };
                         if (new_state) |st| if (review.get(p.item.temp_id)) |d| {
                             d.state = st;
-                            ctx.store.put(c.pr.id, d.*) catch |err| {
+                            ctx.store.put(reviewKey(ctx, c.pr.id), d.*) catch |err| {
                                 status_msg = @errorName(err);
                             };
                         };
@@ -745,7 +746,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                     // lingering posted rows — the comments live on the server.
                     if (!done.stale and done.aborted == null and done.failed == 0 and done.skipped == 0) {
                         if (current) |cur| {
-                            for (review.drafts.items) |d| ctx.store.remove(cur.pr.id, d.local_id) catch {};
+                            for (review.drafts.items) |d| ctx.store.remove(reviewKey(ctx, cur.pr.id), d.local_id) catch {};
                             review.drafts.clearRetainingCapacity();
                         }
                     }
@@ -1011,7 +1012,15 @@ fn openReply(composer: *?Composer, arena: *std.heap.ArenaAllocator, buf: bbr.dif
 /// Persist a composed Draft: dupe its body (fencing a suggestion) and anchor
 /// strings into the review arena, add it to the PendingReview, and write it
 /// through the store so it survives a crash / quit / PR switch.
-fn commitDraft(store: PendingReviewStore, review: *PendingReview, a: std.mem.Allocator, pr_id: u64, comp: *const Composer) !void {
+fn reviewKey(ctx: RunCtx, pull_request_id: u64) ReviewKey {
+    return .{
+        .workspace = ctx.cred.workspace,
+        .repository = ctx.repo,
+        .pull_request_id = pull_request_id,
+    };
+}
+
+fn commitDraft(store: PendingReviewStore, review: *PendingReview, a: std.mem.Allocator, key: ReviewKey, comp: *const Composer) !void {
     var nd = comp.toNewDraft();
     nd.body = if (nd.kind == .suggestion)
         try std.fmt.allocPrint(a, "```suggestion\n{s}\n```", .{comp.body()})
@@ -1022,7 +1031,7 @@ fn commitDraft(store: PendingReviewStore, review: *PendingReview, a: std.mem.All
         if (anc.commit) |cm| anc.commit = try a.dupe(u8, cm);
     }
     const id = try review.add(a, nd);
-    if (review.get(id)) |d| try store.put(pr_id, d.*);
+    if (review.get(id)) |d| try store.put(key, d.*);
 }
 
 /// The diff line under the cursor (a unified `.line` or either side of a
@@ -1774,7 +1783,8 @@ test "commitDraft fences a suggestion, adds it to the review, and persists it" {
     defer comp.deinit();
     try comp.insert("do it this way");
 
-    try commitDraft(store, &review, review_arena.allocator(), 42, &comp);
+    const key: ReviewKey = .{ .workspace = "workspace", .repository = "repo", .pull_request_id = 42 };
+    try commitDraft(store, &review, review_arena.allocator(), key, &comp);
 
     // Added to the in-memory review, with the suggestion body fenced.
     try testing.expectEqual(@as(usize, 1), review.drafts.items.len);
@@ -1785,7 +1795,7 @@ test "commitDraft fences a suggestion, adds it to the review, and persists it" {
     // Persisted through the store: a fresh load round-trips it.
     var load_arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer load_arena.deinit();
-    const loaded = try store.load(load_arena.allocator(), 42);
+    const loaded = try store.load(load_arena.allocator(), key);
     try testing.expectEqual(@as(usize, 1), loaded.len);
     try testing.expectEqualStrings("f.zig", loaded[0].anchor.?.path);
     try testing.expectEqualStrings("c0", loaded[0].anchor.?.commit.?);

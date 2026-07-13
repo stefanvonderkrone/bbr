@@ -65,6 +65,7 @@ pub const review = struct {
     pub const NewDraft = draft.NewDraft;
     pub const PendingReview = draft.PendingReview;
     pub const PendingReviewStore = store.PendingReviewStore;
+    pub const ReviewKey = store.ReviewKey;
     pub const InMemoryStore = store.InMemoryStore;
     pub const Submission = submission.Submission;
     pub const CommentPoster = submission.CommentPoster;
