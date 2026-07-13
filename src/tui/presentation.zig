@@ -6,6 +6,8 @@ const bbr = @import("bbr");
 const session_mod = @import("session.zig");
 const ArenaRing = @import("arena_ring.zig").ArenaRing;
 const Nav = @import("nav.zig").Nav;
+const composer_mod = @import("composer.zig");
+const Composer = composer_mod.Composer;
 
 const Allocator = std.mem.Allocator;
 const Session = session_mod.Session;
@@ -88,7 +90,34 @@ pub const OwnedInput = union(enum) {
     push_count_digit: u8,
     resize_viewport: usize,
     action: Action,
+    composer: ComposerInput,
     request_shutdown,
+};
+
+pub const TextChunk = struct {
+    bytes: [64]u8 = undefined,
+    len: u8,
+
+    pub fn init(text: []const u8) error{TextTooLong}!TextChunk {
+        if (text.len > 64) return error.TextTooLong;
+        var chunk: TextChunk = .{ .len = @intCast(text.len) };
+        @memcpy(chunk.bytes[0..text.len], text);
+        return chunk;
+    }
+
+    pub fn slice(self: *const TextChunk) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+pub const ComposerInput = union(enum) {
+    insert: TextChunk,
+    newline,
+    backspace,
+    delete_word,
+    delete_to_line_start,
+    cancel,
+    save,
 };
 
 /// Session-relative actions whose complete state is Navigation. They are
@@ -175,15 +204,24 @@ pub const ReviewProjection = struct {
 
 pub const Projection = struct {
     review: ?ReviewProjection,
+    composer: ?ComposerProjection,
     replacing: bool,
     replacement_error: ?ReplacementError,
     action_error: ?ActionError,
     shutting_down: bool,
 };
 
+pub const ComposerProjection = struct {
+    label: []const u8,
+    body: []const u8,
+};
+
 pub const ActionError = enum {
+    action_refused,
     buffer_build_failed,
+    invalid_selection,
     out_of_memory,
+    persistence_failed,
 };
 
 const BufferTransactionError = error{ BufferBuildFailed, OutOfMemory };
@@ -207,6 +245,8 @@ const Published = struct {
     navigation: Nav,
     expanded_folds: std.ArrayList(*const bbr.diff.Line),
     isolated_file: ?usize,
+    composer_arena: std.heap.ArenaAllocator,
+    composer: ?Composer,
 
     fn create(
         allocator: Allocator,
@@ -236,6 +276,9 @@ const Published = struct {
         published.expanded_folds = .empty;
         errdefer published.expanded_folds.deinit(allocator);
         published.isolated_file = null;
+        published.composer_arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer published.composer_arena.deinit();
+        published.composer = null;
 
         const buffer_allocator = published.buffers.begin();
         errdefer published.buffers.abort();
@@ -264,6 +307,8 @@ const Published = struct {
 
     fn destroy(self: *Published) void {
         const allocator = self.allocator;
+        if (self.composer) |*composer| composer.deinit();
+        self.composer_arena.deinit();
         self.expanded_folds.deinit(allocator);
         self.buffers.deinit();
         self.review_arena.deinit();
@@ -292,6 +337,20 @@ const Published = struct {
         expanded_folds: []const *const bbr.diff.Line,
         isolated_file: ?usize,
     ) BufferTransactionError!void {
+        const candidate = try self.stageBuffer(preferences, expanded_folds, isolated_file);
+        self.buffers.commit();
+        self.buffer = candidate;
+        self.navigation.setRowCount(candidate.rows.len);
+    }
+
+    /// Begin and populate the inactive Buffer generation. The caller must
+    /// commit it or abort it after any additional fallible work.
+    fn stageBuffer(
+        self: *Published,
+        preferences: Preferences,
+        expanded_folds: []const *const bbr.diff.Line,
+        isolated_file: ?usize,
+    ) BufferTransactionError!bbr.diff.Buffer {
         const allocator = self.buffers.begin();
         errdefer self.buffers.abort();
         const enrichment = self.session.enrichment.projection();
@@ -314,9 +373,7 @@ const Published = struct {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return error.BufferBuildFailed;
         };
-        self.buffers.commit();
-        self.buffer = candidate;
-        self.navigation.setRowCount(candidate.rows.len);
+        return candidate;
     }
 };
 
@@ -377,6 +434,7 @@ pub const Presentation = struct {
             .push_count_digit => |digit| self.pushCountDigit(digit),
             .resize_viewport => |rows| self.resizeViewport(rows),
             .action => |action| self.applyAction(action),
+            .composer => |composer_input| self.applyComposerInput(composer_input),
             .request_shutdown => self.requestShutdown(),
         }
     }
@@ -391,6 +449,10 @@ pub const Presentation = struct {
     pub fn projection(self: *const Presentation) Projection {
         return .{
             .review = if (self.published) |published| published.projection(self.preferences) else null,
+            .composer = if (self.published) |published| if (published.composer) |*composer| .{
+                .label = composer.request.label,
+                .body = composer.body(),
+            } else null else null,
             .replacing = self.replacement != null,
             .replacement_error = self.replacement_error,
             .action_error = self.action_error,
@@ -476,16 +538,221 @@ pub const Presentation = struct {
             .next_file => self.moveFile(published, 1),
             .prev_file => self.moveFile(published, -1),
             .expand_fold => self.expandFold(published),
+            .comment => self.openComposer(published, .{ .kind = .top_level, .label = "New comment" }),
+            .reply => self.openReplyComposer(published),
+            .inline_comment => self.openInlineComposer(published, .inline_comment),
+            .suggest => self.openInlineComposer(published, .suggestion),
             .open_picker,
-            .comment,
-            .inline_comment,
-            .suggest,
-            .reply,
             .submit,
             .help,
             => {},
             .quit => unreachable,
         }
+    }
+
+    fn openComposer(self: *Presentation, published: *Published, request: composer_mod.Request) void {
+        if (published.composer != null) return;
+        _ = published.composer_arena.reset(.retain_capacity);
+        published.composer = Composer.init(published.composer_arena.allocator(), request);
+        self.action_error = null;
+    }
+
+    fn openReplyComposer(self: *Presentation, published: *Published) void {
+        if (published.navigation.cursor >= published.buffer.rows.len) {
+            self.action_error = .action_refused;
+            return;
+        }
+        const parent: bbr.review.draft.Parent = switch (published.buffer.rows[published.navigation.cursor]) {
+            .comment => |row| .{ .comment = row.comment.id },
+            .draft => |row| .{ .draft = row.draft.local_id },
+            else => {
+                self.action_error = .action_refused;
+                return;
+            },
+        };
+        self.openComposer(published, .{ .kind = .reply, .parent = parent, .label = "Reply" });
+    }
+
+    fn openInlineComposer(self: *Presentation, published: *Published, kind: bbr.review.DraftKind) void {
+        if (published.composer != null) return;
+        if (published.navigation.cursor >= published.buffer.rows.len) {
+            self.action_error = .action_refused;
+            return;
+        }
+        const file_index = published.isolated_file orelse fileIndexForRow(published.buffer, published.navigation.cursor);
+        if (file_index >= published.session.diff.files.len) {
+            self.action_error = .action_refused;
+            return;
+        }
+
+        _ = published.composer_arena.reset(.retain_capacity);
+        const allocator = published.composer_arena.allocator();
+        var lines: std.ArrayList(*const bbr.diff.Line) = .empty;
+        if (published.navigation.selection()) |selection| {
+            collectSelectedLines(published.buffer, selection[0], selection[1], &lines, allocator) catch {
+                self.action_error = .invalid_selection;
+                return;
+            };
+        } else if (lineAtRow(published.buffer.rows[published.navigation.cursor])) |line| {
+            lines.append(allocator, line) catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
+        }
+        const span = spanFromLines(lines.items, kind == .suggestion) catch {
+            self.action_error = .invalid_selection;
+            return;
+        };
+        const path = published.session.diff.files[file_index].new_path;
+        const anchor: bbr.review.Anchor = .{
+            .path = allocator.dupe(u8, path) catch {
+                self.action_error = .out_of_memory;
+                return;
+            },
+            .from = span.from,
+            .to = span.to,
+            .start_from = span.start_from,
+            .start_to = span.start_to,
+            .commit = allocator.dupe(u8, published.session.pr.source_commit) catch {
+                self.action_error = .out_of_memory;
+                return;
+            },
+        };
+        const noun = if (kind == .suggestion) "Suggest on" else "Comment on";
+        const bottom = span.to orelse span.from orelse 0;
+        const top = span.start_to orelse span.start_from;
+        const label = (if (top) |first|
+            std.fmt.allocPrint(allocator, "{s} {s}:{d}-{d}", .{ noun, path, first, bottom })
+        else
+            std.fmt.allocPrint(allocator, "{s} {s}:{d}", .{ noun, path, bottom })) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        published.composer = Composer.init(allocator, .{ .kind = kind, .anchor = anchor, .label = label });
+        if (kind == .suggestion) {
+            var seed: std.ArrayList(u8) = .empty;
+            for (lines.items, 0..) |line, index| {
+                if (index > 0) seed.append(allocator, '\n') catch {
+                    published.composer = null;
+                    self.action_error = .out_of_memory;
+                    return;
+                };
+                seed.appendSlice(allocator, line.text) catch {
+                    published.composer = null;
+                    self.action_error = .out_of_memory;
+                    return;
+                };
+            }
+            published.composer.?.seed(seed.items) catch {
+                published.composer = null;
+                self.action_error = .out_of_memory;
+                return;
+            };
+        }
+        published.navigation.clearMark();
+        self.action_error = null;
+    }
+
+    fn applyComposerInput(self: *Presentation, composer_input: ComposerInput) void {
+        if (self.shutdown_requested or self.replacement != null) return;
+        const published = self.published orelse return;
+        const composer = if (published.composer) |*value| value else return;
+        switch (composer_input) {
+            .insert => |chunk| {
+                composer.insert(chunk.slice()) catch {
+                    self.action_error = .out_of_memory;
+                    return;
+                };
+                self.action_error = null;
+            },
+            .newline => {
+                composer.newline() catch {
+                    self.action_error = .out_of_memory;
+                    return;
+                };
+                self.action_error = null;
+            },
+            .backspace => {
+                composer.backspace();
+                self.action_error = null;
+            },
+            .delete_word => {
+                composer.deleteWord();
+                self.action_error = null;
+            },
+            .delete_to_line_start => {
+                composer.deleteToLineStart();
+                self.action_error = null;
+            },
+            .cancel => {
+                composer.deinit();
+                published.composer = null;
+                self.action_error = null;
+            },
+            .save => self.saveComposer(published),
+        }
+    }
+
+    fn saveComposer(self: *Presentation, published: *Published) void {
+        const composer = if (published.composer) |*value| value else return;
+        if (composer.isBlank()) return;
+        const review_allocator = published.review_arena.allocator();
+        published.review.drafts.ensureUnusedCapacity(review_allocator, 1) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+
+        const new_draft = composer.toNewDraft();
+        var draft: bbr.review.Draft = .{
+            .local_id = published.review.next_id,
+            .kind = new_draft.kind,
+            .target = new_draft.target,
+            .parent = new_draft.parent,
+            .body = (if (new_draft.kind == .suggestion)
+                std.fmt.allocPrint(review_allocator, "```suggestion\n{s}\n```", .{new_draft.body})
+            else
+                review_allocator.dupe(u8, new_draft.body)) catch {
+                self.action_error = .out_of_memory;
+                return;
+            },
+        };
+        if (new_draft.anchor) |anchor| {
+            draft.anchor = anchor;
+            draft.anchor.?.path = review_allocator.dupe(u8, anchor.path) catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
+            if (anchor.commit) |commit| {
+                draft.anchor.?.commit = review_allocator.dupe(u8, commit) catch {
+                    self.action_error = .out_of_memory;
+                    return;
+                };
+            }
+        }
+
+        published.review.drafts.appendAssumeCapacity(draft);
+        published.review.next_id += 1;
+        const previous_len = published.review.drafts.items.len - 1;
+        const candidate = published.stageBuffer(self.preferences, published.expanded_folds.items, published.isolated_file) catch |err| {
+            published.review.drafts.shrinkRetainingCapacity(previous_len);
+            published.review.next_id -= 1;
+            self.action_error = normalizeActionError(err);
+            return;
+        };
+
+        self.dependencies.reviews.put(published.key.storeKey(), draft) catch {
+            published.buffers.abort();
+            published.review.drafts.shrinkRetainingCapacity(previous_len);
+            published.review.next_id -= 1;
+            self.action_error = .persistence_failed;
+            return;
+        };
+        published.buffers.commit();
+        published.buffer = candidate;
+        published.navigation.setRowCount(candidate.rows.len);
+        composer.deinit();
+        published.composer = null;
+        self.action_error = null;
     }
 
     fn publishPreferences(self: *Presentation, published: *Published, candidate: Preferences) void {
@@ -633,6 +900,59 @@ fn normalizeActionError(err: BufferTransactionError) ActionError {
         error.BufferBuildFailed => .buffer_build_failed,
         error.OutOfMemory => .out_of_memory,
     };
+}
+
+fn lineAtRow(row: bbr.diff.buffer.Row) ?*const bbr.diff.Line {
+    return switch (row) {
+        .line => |line| line.line,
+        .line_pair => |pair| if (pair.right) |right| right.line else if (pair.left) |left| left.line else null,
+        else => null,
+    };
+}
+
+const AnchorSpan = struct {
+    from: ?u32 = null,
+    to: ?u32 = null,
+    start_from: ?u32 = null,
+    start_to: ?u32 = null,
+};
+
+fn spanFromLines(lines: []const *const bbr.diff.Line, suggestion: bool) !AnchorSpan {
+    if (lines.len == 0) return error.NotOnALine;
+    var all_new = true;
+    var all_old = true;
+    for (lines) |line| {
+        if (line.new_no == null) all_new = false;
+        if (line.old_no == null) all_old = false;
+    }
+    if (!all_new and !all_old) return error.MixedSides;
+    if (all_new) {
+        for (lines[1..], 1..) |line, index| {
+            if (line.new_no.? != lines[index - 1].new_no.? + 1) return error.NonContiguous;
+        }
+        const last = lines[lines.len - 1].new_no.?;
+        return if (lines.len == 1) .{ .to = last } else .{ .to = last, .start_to = lines[0].new_no.? };
+    }
+    if (suggestion) return error.SuggestionOnRemoved;
+    for (lines[1..], 1..) |line, index| {
+        if (line.old_no.? != lines[index - 1].old_no.? + 1) return error.NonContiguous;
+    }
+    const last = lines[lines.len - 1].old_no.?;
+    return if (lines.len == 1) .{ .from = last } else .{ .from = last, .start_from = lines[0].old_no.? };
+}
+
+fn collectSelectedLines(
+    buffer: bbr.diff.Buffer,
+    low: usize,
+    high: usize,
+    lines: *std.ArrayList(*const bbr.diff.Line),
+    allocator: Allocator,
+) !void {
+    var index = low;
+    while (index <= high and index < buffer.rows.len) : (index += 1) {
+        if (buffer.rows[index] == .file_header) return error.NonContiguous;
+        if (lineAtRow(buffer.rows[index])) |line| try lines.append(allocator, line);
+    }
 }
 
 fn fileIndexForRow(buffer: bbr.diff.Buffer, cursor: usize) usize {
@@ -975,4 +1295,200 @@ test "preferences survive replacement while file isolation resets" {
     try testing.expectEqual(Scope.fetched, replaced.preferences.scope);
     try testing.expectEqual(@as(?usize, null), replaced.isolated_file);
     try testing.expectEqual(@as(usize, 0), replaced.navigation.cursor);
+}
+
+test "saving a Composer Draft persists it for a later Session" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+
+    {
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+            .viewport_rows = 8,
+        });
+        defer presentation.deinit();
+
+        try presentation.dispatch(.{ .action = .comment });
+        try testing.expectEqualStrings("New comment", presentation.projection().composer.?.label);
+        try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("ship it") } });
+        try presentation.dispatch(.{ .composer = .save });
+
+        const projection = presentation.projection();
+        try testing.expect(projection.composer == null);
+        try testing.expectEqual(@as(usize, 1), projection.review.?.drafts.len);
+        try testing.expectEqualStrings("ship it", projection.review.?.drafts[0].body);
+    }
+
+    var resumed = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer resumed.deinit();
+    try testing.expectEqualStrings("ship it", resumed.projection().review.?.drafts[0].body);
+}
+
+test "Reply on a Draft row saves a child linked to that Draft" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 7,
+        .kind = .top_level,
+        .body = "parent",
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    const review = presentation.projection().review.?;
+    var draft_row: usize = 0;
+    for (review.buffer.rows, 0..) |row, index| {
+        if (row == .draft) {
+            draft_row = index;
+            break;
+        }
+    }
+    for (0..draft_row) |_| try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .reply });
+    try testing.expectEqualStrings("Reply", presentation.projection().composer.?.label);
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("child") } });
+    try presentation.dispatch(.{ .composer = .save });
+
+    const drafts = presentation.projection().review.?.drafts;
+    try testing.expectEqual(@as(usize, 2), drafts.len);
+    try testing.expectEqualStrings("child", drafts[1].body);
+    try testing.expect(drafts[1].parent.? == .draft);
+    try testing.expectEqual(@as(bbr.review.TempId, 7), drafts[1].parent.?.draft);
+    try testing.expect(drafts[1].anchor == null);
+}
+
+test "Suggest derives an Anchor and persists a fenced seeded Draft" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    const review = presentation.projection().review.?;
+    var added_row: usize = 0;
+    for (review.buffer.rows, 0..) |row, index| switch (row) {
+        .line => |line| if (line.line.new_no != null) {
+            added_row = index;
+            break;
+        },
+        else => {},
+    };
+    for (0..added_row) |_| try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .suggest });
+    try testing.expectEqualStrings("new", presentation.projection().composer.?.body);
+    try presentation.dispatch(.{ .composer = .save });
+
+    const draft = presentation.projection().review.?.drafts[0];
+    try testing.expectEqualStrings("```suggestion\nnew\n```", draft.body);
+    try testing.expectEqualStrings("a.zig", draft.anchor.?.path);
+    try testing.expectEqual(@as(?u32, 1), draft.anchor.?.to);
+    try testing.expectEqualStrings("source", draft.anchor.?.commit.?);
+}
+
+test "persistence failure preserves Composer and the exact published review" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var store = bbr.review.InMemoryStore.init(failing.allocator());
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .comment });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("keep me") } });
+    const before = presentation.projection().review.?;
+
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .composer = .save });
+
+    const failed = presentation.projection();
+    try testing.expect(failing.has_induced_failure);
+    try testing.expectEqual(ActionError.persistence_failed, failed.action_error.?);
+    try testing.expectEqualStrings("keep me", failed.composer.?.body);
+    try testing.expectEqual(@as(usize, 0), failed.review.?.drafts.len);
+    try testing.expectEqual(before.buffer.rows.ptr, failed.review.?.buffer.rows.ptr);
+    try testing.expect(std.meta.eql(before.navigation, failed.review.?.navigation));
+
+    failing.fail_index = std.math.maxInt(usize);
+    try presentation.dispatch(.{ .composer = .save });
+    try testing.expect(presentation.projection().composer == null);
+    try testing.expectEqualStrings("keep me", presentation.projection().review.?.drafts[0].body);
+}
+
+test "inline Composer allocation failure publishes no invalid Overlay" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    const rows = presentation.projection().review.?.buffer.rows;
+    var added_row: usize = 0;
+    for (rows, 0..) |row, index| switch (row) {
+        .line => |line| if (line.line.new_no != null) {
+            added_row = index;
+            break;
+        },
+        else => {},
+    };
+    for (0..added_row) |_| try presentation.dispatch(.{ .action = .down });
+
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .action = .suggest });
+
+    const projection = presentation.projection();
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(projection.composer == null);
+    try testing.expectEqual(ActionError.out_of_memory, projection.action_error.?);
+}
+
+test "failed replacement preserves Composer and successful replacement resets it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .comment });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("survive rollback") } });
+
+    const key_two = try ReviewKey.init("workspace", "repo", 2);
+    try presentation.dispatch(.{ .choose_pull_request = key_two });
+    const failed_command = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .intent = failed_command.intent,
+        .outcome = .{ .failed = error.NotFound },
+    } });
+    try testing.expectEqualStrings("survive rollback", presentation.projection().composer.?.body);
+
+    try presentation.dispatch(.{ .choose_pull_request = key_two });
+    const successful_command = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .intent = successful_command.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+    } });
+    try testing.expect(presentation.projection().composer == null);
 }

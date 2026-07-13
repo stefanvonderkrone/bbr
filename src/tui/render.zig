@@ -14,7 +14,8 @@ const bbr = @import("bbr");
 
 const Theme = @import("theme.zig").Theme;
 const Nav = @import("nav.zig").Nav;
-const ReviewProjection = @import("presentation.zig").ReviewProjection;
+const presentation = @import("presentation.zig");
+const ReviewProjection = presentation.ReviewProjection;
 const Buffer = bbr.diff.buffer.Buffer;
 const Row = bbr.diff.buffer.Row;
 const LineRow = bbr.diff.buffer.LineRow;
@@ -25,7 +26,6 @@ const FileStatus = bbr.diff.FileStatus;
 const Thread = bbr.review.Thread;
 const Draft = bbr.review.Draft;
 const Picker = @import("picker.zig").Picker;
-const Composer = @import("composer.zig").Composer;
 const keymap = @import("keymap.zig");
 
 pub const sidebar_width: u16 = 28;
@@ -388,13 +388,17 @@ pub fn drawPicker(scratch: std.mem.Allocator, win: vaxis.Window, picker: *const 
 /// the body typed so far (scrolled to the tail with a cursor block), and a hint
 /// line. Borrowed text (the label, the body) outlives render via the composer's
 /// own arena. `scratch` outlives render for the synthesized header/hint.
-pub fn drawComposer(scratch: std.mem.Allocator, win: vaxis.Window, composer: *const Composer, theme: Theme) void {
+pub fn drawComposerProjection(scratch: std.mem.Allocator, win: vaxis.Window, composer: presentation.ComposerProjection, theme: Theme) void {
+    drawComposerText(scratch, win, composer.label, composer.body, theme);
+}
+
+fn drawComposerText(scratch: std.mem.Allocator, win: vaxis.Window, label: []const u8, body: []const u8, theme: Theme) void {
     const modal = centeredModal(win, 72, 14) orelse return;
     const h = modal.height;
 
     // Header (row 0) and hint (last row).
     fillRow(modal, 0, theme.picker_query);
-    const header = std.fmt.allocPrint(scratch, "✎ {s}", .{composer.request.label}) catch "✎ compose";
+    const header = std.fmt.allocPrint(scratch, "✎ {s}", .{label}) catch "✎ compose";
     _ = modal.printSegment(.{ .text = header, .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
 
     const hint_row = h - 1;
@@ -410,7 +414,6 @@ pub fn drawComposer(scratch: std.mem.Allocator, win: vaxis.Window, composer: *co
     var r: u16 = 1;
     while (r < hint_row) : (r += 1) fillRow(modal, r, theme.picker);
 
-    const body = composer.body();
     var total: u16 = 1; // one line, plus one per newline
     for (body) |ch| {
         if (ch == '\n') total += 1;
@@ -981,19 +984,16 @@ fn rowHasGrapheme(win: vaxis.Window, r: u16, g: []const u8) bool {
     return false;
 }
 
-test "the composer modal draws its header and typed body" {
+test "the Composer Overlay draws its projected header and body" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-
-    var composer = Composer.init(a, .{ .kind = .top_level, .label = "New comment" });
-    try composer.insert("looks good");
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
 
-    drawComposer(a, win, &composer, theme_dark);
+    drawComposerProjection(a, win, .{ .label = "New comment", .body = "looks good" }, theme_dark);
 
     // Modal geometry: 72×14 centered on 80×24 → origin (4, 5). Header row 0.
     const mx: u16 = (80 - 72) / 2;

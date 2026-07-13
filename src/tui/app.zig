@@ -802,7 +802,10 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
             drawStatus(frame, win, cur.pr, nav, buf, layout, scope, show_resolved, isolate_file != null, loading, submitting, review.drafts.items.len, visible_status);
         }
         if (picker) |*p| render.drawPicker(frame, win, p, active_theme);
-        if (composer) |*comp| render.drawComposer(frame, win, comp, active_theme);
+        if (composer) |*comp| render.drawComposerProjection(frame, win, .{
+            .label = comp.request.label,
+            .body = comp.body(),
+        }, active_theme);
         // The progress modal floats over the viewer while a batch runs; when it
         // finishes the result dialog takes its place (and stays up, over the
         // reconcile re-fetch, until the reviewer dismisses it).
