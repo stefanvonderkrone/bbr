@@ -232,7 +232,7 @@ pub const SqliteStore = struct {
 
         bindText(stmt, 11, d.body);
 
-        // state: 0 draft / 1 submitting / 2 posted(id) / 3 failed(err name).
+        // state: 0 draft / 1 submitting / 2 posted(id) / 3 failed(err) / 4 outcome unknown.
         switch (d.state) {
             .draft => {
                 bindInt(stmt, 12, 0);
@@ -253,6 +253,11 @@ pub const SqliteStore = struct {
                 bindInt(stmt, 12, 3);
                 bindNull(stmt, 13);
                 bindText(stmt, 14, @errorName(e));
+            },
+            .outcome_unknown => {
+                bindInt(stmt, 12, 4);
+                bindNull(stmt, 13);
+                bindNull(stmt, 14);
             },
         }
         bindText(stmt, 17, key.workspace);
@@ -542,6 +547,8 @@ pub const SqliteStore = struct {
             \\  EXISTS(SELECT 1 FROM submission_runs
             \\    WHERE workspace=? AND repository=? AND pr_id=? AND state=0),
             \\  COALESCE((SELECT target FROM drafts
+            \\    WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?), -1),
+            \\  COALESCE((SELECT state_kind FROM drafts
             \\    WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?), -1);
         ;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
@@ -553,7 +560,12 @@ pub const SqliteStore = struct {
         bindText(stmt, 5, key.repository);
         bindInt(stmt, 6, @intCast(key.pull_request_id));
         bindInt(stmt, 7, @intCast(local_id));
+        bindText(stmt, 8, key.workspace);
+        bindText(stmt, 9, key.repository);
+        bindInt(stmt, 10, @intCast(key.pull_request_id));
+        bindInt(stmt, 11, @intCast(local_id));
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.Step;
+        if (columnInt(stmt, 2) == 4) return true;
         if (columnInt(stmt, 0) == 0) return false;
         if (incoming_target == .bitbucket) return true;
         return columnInt(stmt, 1) == @intFromEnum(CommentTarget.bitbucket);
@@ -595,6 +607,7 @@ pub const SqliteStore = struct {
         const state: DraftState = switch (columnInt(stmt, 10)) {
             2 => .{ .posted = @intCast(columnInt(stmt, 11)) },
             3 => .{ .failed = apiErrorFromName((try columnTextDup(allocator, stmt, 12)) orelse "") },
+            4 => .outcome_unknown,
             1 => .submitting,
             else => .draft,
         };
@@ -642,6 +655,11 @@ fn bindSubmissionOutcome(stmt: ?*c.sqlite3_stmt, outcome: SubmissionOutcome) voi
             bindNull(stmt, 2);
             bindText(stmt, 3, @errorName(err));
         },
+        .outcome_unknown => {
+            bindInt(stmt, 1, 4);
+            bindNull(stmt, 2);
+            bindNull(stmt, 3);
+        },
     }
 }
 fn bindSubmissionPendingState(stmt: ?*c.sqlite3_stmt, state: SubmissionPendingState) void {
@@ -655,6 +673,11 @@ fn bindSubmissionPendingState(stmt: ?*c.sqlite3_stmt, state: SubmissionPendingSt
             bindInt(stmt, 1, 3);
             bindNull(stmt, 2);
             bindText(stmt, 3, @errorName(err));
+        },
+        .outcome_unknown => {
+            bindInt(stmt, 1, 4);
+            bindNull(stmt, 2);
+            bindNull(stmt, 3);
         },
     }
 }
@@ -724,12 +747,18 @@ test "in-memory round-trip preserves fields, anchor, parent, and state" {
         .body = "agreed",
         .state = .{ .failed = error.RateLimited },
     });
+    try store.put(testReviewKey(7), .{
+        .local_id = 3,
+        .kind = .top_level,
+        .body = "unknown outcome",
+        .state = .outcome_unknown,
+    });
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const drafts = try store.load(arena.allocator(), testReviewKey(7));
 
-    try testing.expectEqual(@as(usize, 2), drafts.len);
+    try testing.expectEqual(@as(usize, 3), drafts.len);
     const d0 = drafts[0];
     try testing.expect(d0.kind == .inline_comment);
     try testing.expectEqualStrings("src/f.zig", d0.anchor.?.path);
@@ -747,6 +776,7 @@ test "in-memory round-trip preserves fields, anchor, parent, and state" {
     try testing.expect(d1.parent.? == .draft and d1.parent.?.draft == 1);
     try testing.expect(d1.anchor == null);
     try testing.expectEqual(ApiError.RateLimited, d1.state.failed);
+    try testing.expect(drafts[2].state == .outcome_unknown);
 }
 
 test "put replaces on key; remove deletes; both scope to the PR" {
@@ -920,6 +950,20 @@ test "SQLite locks Bitbucket Draft mutation during an active Submission" {
     try testing.expectError(error.DraftLocked, store.remove(key, 1));
     try store.put(key, .{ .local_id = 2, .kind = .top_level, .target = .local, .body = "changed local" });
     try store.remove(key, 2);
+}
+
+test "SQLite keeps an unresolved outcome immutable after partial completion" {
+    var s = try SqliteStore.open(":memory:");
+    defer s.deinit();
+    const store = s.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "unknown" });
+    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    try store.checkpointSubmission(operation_id, key, 1, .outcome_unknown, null);
+    try store.completeSubmission(operation_id, key, .partial);
+
+    try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "changed" }));
+    try testing.expectError(error.DraftLocked, store.remove(key, 1));
 }
 
 test "SQLite rejects clean completion while a Bitbucket Draft failed" {

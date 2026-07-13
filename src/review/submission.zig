@@ -85,7 +85,7 @@ pub const Step = union(enum) {
 pub const PostStep = struct { temp_id: TempId, parent: ?CommentId, dedupe: bool };
 
 /// The fate of one draft in a finished (or aborted) batch.
-pub const ItemStatus = enum { posted, failed, skipped };
+pub const ItemStatus = enum { posted, failed, skipped, outcome_unknown };
 
 pub const ItemResult = struct {
     temp_id: TempId,
@@ -104,6 +104,7 @@ pub const Summary = struct {
     posted: usize = 0,
     failed: usize = 0,
     skipped: usize = 0,
+    outcome_unknown: usize = 0,
     aborted: ?ApiError = null,
 };
 
@@ -151,6 +152,11 @@ pub const Submission = struct {
         @memset(amb, false);
         const results = try alloc.alloc(?ItemResult, n);
         @memset(results, null);
+        for (order, 0..) |temp_id, i| {
+            const draft = review.getConst(temp_id) orelse continue;
+            if (draft.state == .outcome_unknown)
+                results[i] = .{ .temp_id = temp_id, .status = .outcome_unknown };
+        }
         return .{
             .review = review,
             .order = order,
@@ -253,10 +259,21 @@ pub const Submission = struct {
                 .posted => s.posted += 1,
                 .failed => s.failed += 1,
                 .skipped => s.skipped += 1,
+                .outcome_unknown => s.outcome_unknown += 1,
             }
         }
         s.items = try items.toOwnedSlice(alloc);
         return s;
+    }
+
+    /// Valid after `.done`: true when every decided remote Draft posted and no
+    /// Draft was failed or skipped. Local-only Drafts are intentionally absent.
+    pub fn isClean(self: *const Submission) bool {
+        if (self.aborted_reason != null) return false;
+        for (self.results) |maybe| if (maybe) |result| {
+            if (result.status != .posted) return false;
+        };
+        return true;
     }
 
     const ParentResolution = union(enum) { ok: ?CommentId, blocked };
@@ -295,8 +312,12 @@ pub const Submission = struct {
     fn scheduleRetryOrFail(self: *Submission, i: usize, err: ?ApiError, ambiguous: bool, retry_after_ms: ?u64) void {
         self.attempts[i] += 1;
         if (self.attempts[i] >= max_attempts) {
-            // Exhausted: an ambiguous run has no ApiError of its own → server-ish.
-            self.failItem(i, self.order[i], err orelse error.ServerError);
+            if (err) |api_error| {
+                self.failItem(i, self.order[i], api_error);
+            } else {
+                self.results[i] = .{ .temp_id = self.order[i], .status = .outcome_unknown };
+                self.idx += 1;
+            }
             return;
         }
         self.ambiguous_last[i] = ambiguous;
@@ -496,6 +517,30 @@ test "ambiguous failure sets the dedupe flag on retry" {
     _ = sub.advance(); // .wait
     const retry = sub.advance();
     try testing.expect(retry.post.dedupe); // caller must GET-and-match now
+}
+
+test "exhausted ambiguity remains unresolved across selective retry" {
+    var pr = PendingReview.init(1);
+    defer pr.deinit(testing.allocator);
+    const temp_id = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "a" });
+    var sub = try Submission.init(testing.allocator, &pr);
+
+    var attempt: u8 = 0;
+    while (attempt < max_attempts) : (attempt += 1) {
+        if (sub.advance() == .wait) _ = sub.advance();
+        sub.report(.ambiguous, null);
+    }
+    try testing.expect(sub.advance() == .done);
+    const sum = try sub.summary(testing.allocator);
+    try testing.expectEqual(ItemStatus.outcome_unknown, find(sum.items, temp_id).?.status);
+    try testing.expectEqual(@as(usize, 1), sum.outcome_unknown);
+    testing.allocator.free(sum.items);
+    sub.deinit();
+
+    pr.setState(temp_id, .outcome_unknown);
+    var retry = try Submission.init(testing.allocator, &pr);
+    defer retry.deinit();
+    try testing.expect(retry.advance() == .done);
 }
 
 test "retries exhaust into an item failure" {

@@ -97,7 +97,22 @@ pub const OwnedInput = union(enum) {
     composer: ComposerInput,
     ensure_focused_enrichment,
     file_enrichment_completed: FileEnrichmentCompleted,
+    post_draft_completed: PostDraftCompleted,
+    submission_wait_completed: WaitSubmission,
     request_shutdown,
+};
+
+pub const PostDraftCompleted = struct {
+    operation_id: bbr.review.OperationId,
+    temp_id: bbr.review.TempId,
+    outcome: bbr.review.PostOutcome,
+    retry_after_ms: ?u64 = null,
+};
+
+pub const WaitSubmission = struct {
+    operation_id: bbr.review.OperationId,
+    temp_id: bbr.review.TempId,
+    ms: u64,
 };
 
 pub const FileEnrichmentOutcome = union(enum) {
@@ -294,11 +309,12 @@ pub const OwnedCommand = union(enum) {
     load_session: LoadSession,
     enrich_file: EnrichFile,
     post_draft: *PostDraft,
+    wait_submission: WaitSubmission,
 
     pub fn deinit(self: *OwnedCommand) void {
         switch (self.*) {
             .post_draft => |command| command.destroy(),
-            .load_session, .enrich_file => {},
+            .load_session, .enrich_file, .wait_submission => {},
         }
         self.* = undefined;
     }
@@ -332,7 +348,8 @@ pub const Projection = struct {
 pub const SubmissionProjection = struct {
     operation_id: bbr.review.OperationId,
     key: ReviewKey,
-    current_temp_id: bbr.review.TempId,
+    current_temp_id: ?bbr.review.TempId,
+    persistence_paused: bool,
 };
 
 pub const FatalError = enum {
@@ -524,15 +541,42 @@ const DurableSubmission = struct {
     allocator: Allocator,
     key: ReviewKey,
     operation_id: bbr.review.OperationId = 0,
-    current_temp_id: bbr.review.TempId = 0,
+    current_temp_id: ?bbr.review.TempId = null,
     lock: bbr.review.SubmissionLockGuard,
     arena: std.heap.ArenaAllocator,
     review: bbr.review.PendingReview,
     machine: bbr.review.Submission,
+    phase: enum { post_queued, awaiting_post, wait_queued, awaiting_wait, admission_paused, persistence_paused } = .post_queued,
+    pending_admission: ?PendingAdmission = null,
+    pending_persistence: ?PendingPersistence = null,
 
     const Started = struct {
         durable: *DurableSubmission,
         command: *PostDraft,
+    };
+
+    const PersistedTransition = struct {
+        temp_id: bbr.review.TempId,
+        state: bbr.review.DraftState,
+    };
+
+    const PendingPersistence = struct {
+        transition: PersistedTransition,
+        outcome: ?bbr.review.SubmissionOutcome,
+        next: ?bbr.review.submission.PostStep = null,
+        completion: ?bbr.review.SubmissionCompletion = null,
+        checkpoint_done: bool = false,
+    };
+
+    const PendingAdmission = union(enum) {
+        post: PostDraftCompleted,
+        wait: WaitSubmission,
+    };
+
+    const AfterPost = union(enum) {
+        next: struct { command: *PostDraft, transition: PersistedTransition },
+        wait: WaitSubmission,
+        finished: struct { completion: bbr.review.SubmissionCompletion, transition: PersistedTransition },
     };
 
     fn create(allocator: Allocator, store: bbr.review.PendingReviewStore, key: ReviewKey, lock: bbr.review.SubmissionLockGuard) !*DurableSubmission {
@@ -549,6 +593,9 @@ const DurableSubmission = struct {
         errdefer durable.arena.deinit();
         durable.review = try store.loadReview(durable.arena.allocator(), key.storeKey());
         durable.machine = try bbr.review.Submission.init(durable.arena.allocator(), &durable.review);
+        durable.phase = .post_queued;
+        durable.pending_admission = null;
+        durable.pending_persistence = null;
         return durable;
     }
 
@@ -580,6 +627,116 @@ const DurableSubmission = struct {
         durable.current_temp_id = post.temp_id;
         command.operation_id = operation_id;
         return .{ .durable = durable, .command = command };
+    }
+
+    fn acceptPost(
+        self: *DurableSubmission,
+        allocator: Allocator,
+        store: bbr.review.PendingReviewStore,
+        completed: PostDraftCompleted,
+    ) !AfterPost {
+        self.machine.report(completed.outcome, completed.retry_after_ms);
+        const outcome: bbr.review.SubmissionOutcome = switch (completed.outcome) {
+            .posted => |id| .{ .posted = id },
+            .rejected => |err| .{ .failed = err },
+            .ambiguous => .outcome_unknown,
+        };
+        switch (self.machine.advance()) {
+            .post => |next| {
+                self.pending_persistence = .{
+                    .transition = .{ .temp_id = completed.temp_id, .state = outcome.draftState() },
+                    .outcome = outcome,
+                    .next = next,
+                };
+            },
+            .done => {
+                const completion: bbr.review.SubmissionCompletion = if (self.machine.isClean()) .clean else .partial;
+                self.pending_persistence = .{
+                    .transition = .{ .temp_id = completed.temp_id, .state = outcome.draftState() },
+                    .outcome = outcome,
+                    .completion = completion,
+                };
+            },
+            .aborted => {
+                const draft = self.review.getConst(completed.temp_id) orelse return error.DraftNotFound;
+                const restore: bbr.review.SubmissionPendingState = switch (draft.state) {
+                    .draft => .draft,
+                    .failed => |err| .{ .failed = err },
+                    .outcome_unknown => .outcome_unknown,
+                    else => return error.InvalidSubmissionState,
+                };
+                const completion: bbr.review.SubmissionCompletion = .{ .aborted = restore };
+                self.pending_persistence = .{
+                    .transition = .{ .temp_id = completed.temp_id, .state = restore.draftState() },
+                    .outcome = null,
+                    .completion = completion,
+                };
+            },
+            .wait => |wait| {
+                self.phase = .wait_queued;
+                return .{ .wait = .{
+                    .operation_id = self.operation_id,
+                    .temp_id = wait.temp_id,
+                    .ms = wait.ms,
+                } };
+            },
+        }
+        self.phase = .persistence_paused;
+        return self.retryPersistence(allocator, store);
+    }
+
+    fn retryPersistence(self: *DurableSubmission, allocator: Allocator, store: bbr.review.PendingReviewStore) !AfterPost {
+        const pending = if (self.pending_persistence) |*value| value else return error.NoPendingPersistence;
+        var next_command: ?*PostDraft = null;
+        if (pending.next) |next| {
+            const draft = self.review.getConst(next.temp_id) orelse return error.DraftNotFound;
+            next_command = try PostDraft.create(allocator, self.key, draft.*, next);
+            next_command.?.operation_id = self.operation_id;
+        }
+        errdefer if (next_command) |command| command.destroy();
+
+        if (!pending.checkpoint_done) if (pending.outcome) |outcome| {
+            try store.checkpointSubmission(
+                self.operation_id,
+                self.key.storeKey(),
+                pending.transition.temp_id,
+                outcome,
+                if (pending.next) |next| next.temp_id else null,
+            );
+            self.recordCheckpoint(pending.transition.temp_id, outcome, if (pending.next) |next| next.temp_id else null);
+            pending.checkpoint_done = true;
+        };
+
+        const transition = pending.transition;
+        if (pending.completion) |completion| {
+            try store.completeSubmission(self.operation_id, self.key.storeKey(), completion);
+            self.pending_persistence = null;
+            return .{ .finished = .{ .completion = completion, .transition = transition } };
+        }
+        const command = next_command orelse return error.MissingNextSubmissionCommand;
+        self.pending_persistence = null;
+        self.phase = .post_queued;
+        return .{ .next = .{ .command = command, .transition = transition } };
+    }
+
+    fn completeWait(self: *DurableSubmission, allocator: Allocator, wait: WaitSubmission) !*PostDraft {
+        if (self.operation_id != wait.operation_id or self.current_temp_id != wait.temp_id or self.phase != .awaiting_wait)
+            return error.StaleSubmissionWait;
+        const post = switch (self.machine.advance()) {
+            .post => |value| value,
+            else => return error.InvalidSubmissionState,
+        };
+        const draft = self.review.getConst(post.temp_id) orelse return error.DraftNotFound;
+        const command = try PostDraft.create(allocator, self.key, draft.*, post);
+        command.operation_id = self.operation_id;
+        self.phase = .post_queued;
+        return command;
+    }
+
+    fn recordCheckpoint(self: *DurableSubmission, completed_temp_id: bbr.review.TempId, outcome: bbr.review.SubmissionOutcome, next_temp_id: ?bbr.review.TempId) void {
+        self.review.setState(completed_temp_id, outcome.draftState());
+        if (next_temp_id) |next| self.review.setState(next, .submitting);
+        self.current_temp_id = next_temp_id;
     }
 
     fn destroy(self: *DurableSubmission) void {
@@ -653,6 +810,8 @@ pub const Presentation = struct {
             .composer => |composer_input| self.applyComposerInput(composer_input),
             .ensure_focused_enrichment => try self.ensureFocusedEnrichment(),
             .file_enrichment_completed => |completed| self.acceptFileEnrichment(completed),
+            .post_draft_completed => |completed| self.acceptPostDraft(completed),
+            .submission_wait_completed => |completed| self.acceptSubmissionWait(completed),
             .request_shutdown => self.requestShutdown(),
         }
     }
@@ -667,7 +826,14 @@ pub const Presentation = struct {
                 .session_epoch = enrich.session_epoch,
                 .file_index = enrich.file_index,
             }),
-            .post_draft => {},
+            .post_draft => |post| if (self.durable_submission) |durable| {
+                if (durable.operation_id == post.operation_id and durable.current_temp_id == post.draft.local_id and durable.phase == .post_queued)
+                    durable.phase = .awaiting_post;
+            },
+            .wait_submission => |wait| if (self.durable_submission) |durable| {
+                if (durable.operation_id == wait.operation_id and durable.current_temp_id == wait.temp_id and durable.phase == .wait_queued)
+                    durable.phase = .awaiting_wait;
+            },
         }
         return command;
     }
@@ -679,6 +845,7 @@ pub const Presentation = struct {
                 .operation_id = durable.operation_id,
                 .key = durable.key,
                 .current_temp_id = durable.current_temp_id,
+                .persistence_paused = durable.pending_persistence != null,
             } else null,
             .composer = if (self.published) |published| if (published.composer) |*composer| .{
                 .label = composer.request.label,
@@ -700,13 +867,14 @@ pub const Presentation = struct {
         self.shutdown_requested = true;
         var write: usize = 0;
         for (self.commands.items) |command| {
-            if (command == .post_draft) {
+            if (command == .post_draft or command == .wait_submission) {
                 self.commands.items[write] = command;
                 write += 1;
             }
         }
         self.commands.shrinkRetainingCapacity(write);
         self.replacement = null;
+        self.resumeDurableSubmission();
     }
 
     fn pushCountDigit(self: *Presentation, digit: u8) void {
@@ -724,7 +892,11 @@ pub const Presentation = struct {
             self.requestShutdown();
             return;
         }
-        if (self.shutdown_requested or self.replacement != null) return;
+        if (self.shutdown_requested) {
+            if (action == .submit) self.resumeDurableSubmission();
+            return;
+        }
+        if (self.replacement != null) return;
         const published = self.published orelse return;
         self.action_error = null;
         switch (action) {
@@ -788,7 +960,15 @@ pub const Presentation = struct {
     }
 
     fn startSubmission(self: *Presentation, published: *Published) void {
-        if (self.durable_submission != null) {
+        if (self.durable_submission) |durable| {
+            if (durable.pending_admission != null) {
+                self.resumeSubmissionAdmission(durable);
+                return;
+            }
+            if (durable.pending_persistence != null) {
+                self.resumeSubmissionPersistence(durable);
+                return;
+            }
             self.action_error = .submission_already_active;
             return;
         }
@@ -822,8 +1002,123 @@ pub const Presentation = struct {
         };
         self.commands.appendAssumeCapacity(.{ .post_draft = started.command });
         self.durable_submission = started.durable;
-        published.review.setState(started.durable.current_temp_id, .submitting);
+        published.review.setState(started.durable.current_temp_id.?, .submitting);
         self.action_error = null;
+    }
+
+    fn resumeDurableSubmission(self: *Presentation) void {
+        const durable = self.durable_submission orelse return;
+        if (durable.pending_admission != null) {
+            self.resumeSubmissionAdmission(durable);
+        } else if (durable.pending_persistence != null) {
+            self.resumeSubmissionPersistence(durable);
+        }
+    }
+
+    fn acceptPostDraft(self: *Presentation, completed: PostDraftCompleted) void {
+        const durable = self.durable_submission orelse return;
+        if (durable.operation_id != completed.operation_id or durable.current_temp_id != completed.temp_id or durable.phase != .awaiting_post) return;
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+            durable.pending_admission = .{ .post = completed };
+            durable.phase = .admission_paused;
+            self.action_error = .out_of_memory;
+            return;
+        };
+        self.processPostDraft(durable, completed);
+    }
+
+    fn processPostDraft(self: *Presentation, durable: *DurableSubmission, completed: PostDraftCompleted) void {
+        const progress = durable.acceptPost(self.allocator, self.dependencies.reviews, completed) catch {
+            self.publishDurableCheckpoint(durable);
+            self.action_error = .persistence_failed;
+            return;
+        };
+        self.publishSubmissionProgress(durable, progress);
+        self.action_error = null;
+    }
+
+    fn resumeSubmissionAdmission(self: *Presentation, durable: *DurableSubmission) void {
+        const pending = durable.pending_admission orelse return;
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        switch (pending) {
+            .post => |completed| {
+                durable.pending_admission = null;
+                durable.phase = .awaiting_post;
+                self.processPostDraft(durable, completed);
+            },
+            .wait => |completed| {
+                durable.pending_admission = null;
+                durable.phase = .awaiting_wait;
+                self.processSubmissionWait(durable, completed);
+            },
+        }
+    }
+
+    fn resumeSubmissionPersistence(self: *Presentation, durable: *DurableSubmission) void {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        const progress = durable.retryPersistence(self.allocator, self.dependencies.reviews) catch {
+            self.publishDurableCheckpoint(durable);
+            self.action_error = .persistence_failed;
+            return;
+        };
+        self.publishSubmissionProgress(durable, progress);
+        self.action_error = null;
+    }
+
+    fn publishSubmissionProgress(self: *Presentation, durable: *DurableSubmission, progress: DurableSubmission.AfterPost) void {
+        switch (progress) {
+            .next => |next| {
+                self.recordVisibleTransition(durable, next.transition);
+                if (self.published) |published| if (ReviewKey.eql(published.key, durable.key))
+                    published.review.setState(durable.current_temp_id.?, .submitting);
+                self.commands.appendAssumeCapacity(.{ .post_draft = next.command });
+            },
+            .wait => |wait| self.commands.appendAssumeCapacity(.{ .wait_submission = wait }),
+            .finished => |finished| {
+                self.recordVisibleTransition(durable, finished.transition);
+                self.durable_submission = null;
+                durable.destroy();
+            },
+        }
+    }
+
+    fn acceptSubmissionWait(self: *Presentation, completed: WaitSubmission) void {
+        const durable = self.durable_submission orelse return;
+        if (durable.operation_id != completed.operation_id or durable.current_temp_id != completed.temp_id or durable.phase != .awaiting_wait) return;
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+            durable.pending_admission = .{ .wait = completed };
+            durable.phase = .admission_paused;
+            self.action_error = .out_of_memory;
+            return;
+        };
+        self.processSubmissionWait(durable, completed);
+    }
+
+    fn processSubmissionWait(self: *Presentation, durable: *DurableSubmission, completed: WaitSubmission) void {
+        const command = durable.completeWait(self.allocator, completed) catch {
+            durable.pending_admission = .{ .wait = completed };
+            durable.phase = .admission_paused;
+            self.action_error = .out_of_memory;
+            return;
+        };
+        self.commands.appendAssumeCapacity(.{ .post_draft = command });
+        self.action_error = null;
+    }
+
+    fn recordVisibleTransition(self: *Presentation, durable: *const DurableSubmission, transition: DurableSubmission.PersistedTransition) void {
+        if (self.published) |published| if (ReviewKey.eql(published.key, durable.key))
+            published.review.setState(transition.temp_id, transition.state);
+    }
+
+    fn publishDurableCheckpoint(self: *Presentation, durable: *const DurableSubmission) void {
+        const pending = durable.pending_persistence orelse return;
+        if (pending.checkpoint_done) self.recordVisibleTransition(durable, pending.transition);
     }
 
     fn openComposer(self: *Presentation, published: *Published, request: composer_mod.Request) void {
@@ -2331,4 +2626,441 @@ test "Submission state allocation failure releases ownership before transfer" {
     try testing.expect((try store.store().activeSubmission(testing.allocator)) == null);
     var reacquired = (try locks.locks().tryAcquire(key.storeKey())).?;
     reacquired.release();
+}
+
+test "durable POST completion checkpoints outcome and next intent before next command" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "parent" });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .reply, .parent = .{ .draft = 1 }, .body = "reply" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var first = presentation.takeCommand().?;
+    const operation_id = first.post_draft.operation_id;
+    first.deinit();
+
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .posted = 900 },
+    } });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try store.store().load(arena.allocator(), key.storeKey());
+    try testing.expectEqual(@as(bbr.review.CommentId, 900), drafts[0].state.posted);
+    try testing.expect(drafts[1].state == .submitting);
+    const run = (try store.store().activeSubmission(arena.allocator())).?;
+    try testing.expectEqual(@as(?bbr.review.TempId, 2), run.current_temp_id);
+    var second = presentation.takeCommand().?;
+    defer second.deinit();
+    try testing.expectEqual(operation_id, second.post_draft.operation_id);
+    try testing.expectEqual(@as(bbr.review.TempId, 2), second.post_draft.draft.local_id);
+    try testing.expectEqual(@as(?bbr.review.CommentId, 900), second.post_draft.parent);
+}
+
+test "stale POST completion cannot mutate the next in-flight Draft" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "first" });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .top_level, .body = "second" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var first = presentation.takeCommand().?;
+    const operation_id = first.post_draft.operation_id;
+    first.deinit();
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .posted = 900 },
+    } });
+    var second = presentation.takeCommand().?;
+    defer second.deinit();
+
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .posted = 901 },
+    } });
+
+    try testing.expectEqual(@as(?bbr.review.TempId, 2), presentation.projection().submission.?.current_temp_id);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try store.store().load(arena.allocator(), key.storeKey());
+    try testing.expectEqual(@as(bbr.review.CommentId, 900), drafts[0].state.posted);
+    try testing.expect(drafts[1].state == .submitting);
+}
+
+test "final successful POST completes clean and releases Submission ownership" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "only" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var post = presentation.takeCommand().?;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .posted = 900 },
+    } });
+
+    try testing.expect(presentation.takeCommand() == null);
+    try testing.expect(presentation.projection().submission == null);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect((try store.store().activeSubmission(arena.allocator())) == null);
+    try testing.expectEqual(@as(usize, 0), (try store.store().load(arena.allocator(), key.storeKey())).len);
+    var reacquired = (try locks.locks().tryAcquire(key.storeKey())).?;
+    reacquired.release();
+}
+
+test "retryable POST rejection waits and reissues without checkpointing an outcome" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "retry" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var first = presentation.takeCommand().?;
+    const operation_id = first.post_draft.operation_id;
+    first.deinit();
+
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .rejected = error.RateLimited },
+        .retry_after_ms = 17,
+    } });
+
+    const wait = presentation.takeCommand().?.wait_submission;
+    try testing.expectEqual(@as(u64, 17), wait.ms);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const before_retry = try store.store().load(arena.allocator(), key.storeKey());
+    try testing.expect(before_retry[0].state == .submitting);
+    try presentation.dispatch(.{ .submission_wait_completed = wait });
+    var retry = presentation.takeCommand().?;
+    defer retry.deinit();
+    try testing.expectEqual(@as(bbr.review.TempId, 1), retry.post_draft.draft.local_id);
+    try testing.expect(!retry.post_draft.dedupe);
+}
+
+test "exhausted ambiguous POST persists an immutable unresolved Draft" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "uncertain" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+
+    var attempt: u8 = 0;
+    while (attempt < bbr.review.submission.max_attempts) : (attempt += 1) {
+        var post = presentation.takeCommand().?;
+        const operation_id = post.post_draft.operation_id;
+        post.deinit();
+        try presentation.dispatch(.{ .post_draft_completed = .{
+            .operation_id = operation_id,
+            .temp_id = 1,
+            .outcome = .ambiguous,
+        } });
+        if (attempt + 1 < bbr.review.submission.max_attempts) {
+            const wait = presentation.takeCommand().?.wait_submission;
+            try presentation.dispatch(.{ .submission_wait_completed = wait });
+        }
+    }
+
+    try testing.expect(presentation.projection().submission == null);
+    try testing.expect(presentation.projection().review.?.drafts[0].state == .outcome_unknown);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect((try store.store().load(arena.allocator(), key.storeKey()))[0].state == .outcome_unknown);
+    try presentation.dispatch(.{ .action = .submit });
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "auth rejection aborts Submission and restores the pending Draft" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "keep pending" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var command = presentation.takeCommand().?;
+    const operation_id = command.post_draft.operation_id;
+    command.deinit();
+
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .rejected = error.Forbidden },
+    } });
+
+    try testing.expect(presentation.projection().submission == null);
+    try testing.expect(presentation.projection().review.?.drafts[0].state == .draft);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try store.store().load(arena.allocator(), key.storeKey());
+    try testing.expect(drafts[0].state == .draft);
+    try testing.expect((try store.store().activeSubmission(arena.allocator())) == null);
+}
+
+test "non-retryable POST rejection completes partially and retains the failed Draft" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "retain me" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var command = presentation.takeCommand().?;
+    const operation_id = command.post_draft.operation_id;
+    command.deinit();
+
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .rejected = error.NotFound },
+    } });
+
+    try testing.expect(presentation.projection().submission == null);
+    try testing.expectEqual(error.NotFound, presentation.projection().review.?.drafts[0].state.failed);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try store.store().load(arena.allocator(), key.storeKey());
+    try testing.expectEqual(error.NotFound, drafts[0].state.failed);
+    try testing.expect((try store.store().activeSubmission(arena.allocator())) == null);
+}
+
+test "checkpoint failure pauses Submission and retry persists before next POST" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "first" });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .top_level, .body = "second" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var first = presentation.takeCommand().?;
+    const operation_id = first.post_draft.operation_id;
+    first.deinit();
+    store.fail_next_checkpoint = true;
+
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .posted = 900 },
+    } });
+
+    try testing.expect(presentation.takeCommand() == null);
+    try testing.expect(presentation.projection().submission.?.persistence_paused);
+    var before_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer before_arena.deinit();
+    const before = try store.store().load(before_arena.allocator(), key.storeKey());
+    try testing.expect(before[0].state == .submitting);
+    try testing.expect(before[1].state == .draft);
+
+    try presentation.dispatch(.{ .action = .submit });
+
+    var second = presentation.takeCommand().?;
+    defer second.deinit();
+    try testing.expectEqual(@as(bbr.review.TempId, 2), second.post_draft.draft.local_id);
+    var after_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer after_arena.deinit();
+    const after = try store.store().load(after_arena.allocator(), key.storeKey());
+    try testing.expectEqual(@as(bbr.review.CommentId, 900), after[0].state.posted);
+    try testing.expect(after[1].state == .submitting);
+}
+
+test "terminal persistence retry does not repeat an already-durable checkpoint" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "only" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var post = presentation.takeCommand().?;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    store.fail_next_completion = true;
+
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .posted = 900 },
+    } });
+
+    try testing.expect(presentation.projection().submission.?.persistence_paused);
+    var before_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer before_arena.deinit();
+    const run = (try store.store().activeSubmission(before_arena.allocator())).?;
+    try testing.expect(run.current_temp_id == null);
+    const before = try store.store().load(before_arena.allocator(), key.storeKey());
+    try testing.expectEqual(@as(bbr.review.CommentId, 900), before[0].state.posted);
+    try testing.expectEqual(@as(?bbr.review.TempId, null), presentation.projection().submission.?.current_temp_id);
+    try testing.expectEqual(@as(bbr.review.CommentId, 900), presentation.projection().review.?.drafts[0].state.posted);
+
+    try presentation.dispatch(.{ .action = .submit });
+
+    try testing.expect(presentation.projection().submission == null);
+    var after_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer after_arena.deinit();
+    try testing.expect((try store.store().activeSubmission(after_arena.allocator())) == null);
+    try testing.expectEqual(@as(usize, 0), (try store.store().load(after_arena.allocator(), key.storeKey())).len);
+}
+
+test "queue allocation failure retains a POST completion for admission retry" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "only" });
+    var presentation = try Presentation.init(failing.allocator(), .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var post = presentation.takeCommand().?;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    while (presentation.commands.items.len < presentation.commands.capacity)
+        presentation.commands.appendAssumeCapacity(.{ .load_session = .{ .intent = 99, .key = key } });
+    failing.fail_index = failing.alloc_index;
+
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .posted = 900 },
+    } });
+
+    try testing.expect(failing.has_induced_failure);
+    try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+    try testing.expect(presentation.projection().submission != null);
+    presentation.commands.clearRetainingCapacity();
+    failing.fail_index = std.math.maxInt(usize);
+    try presentation.dispatch(.{ .action = .submit });
+    try testing.expect(presentation.projection().submission == null);
+}
+
+test "shutdown retries a paused terminal persistence step" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "only" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var post = presentation.takeCommand().?;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    store.fail_next_completion = true;
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .posted = 900 },
+    } });
+    try testing.expect(presentation.projection().submission.?.persistence_paused);
+
+    try presentation.dispatch(.request_shutdown);
+
+    try testing.expect(presentation.readyToExit());
+    try testing.expect(presentation.projection().submission == null);
 }

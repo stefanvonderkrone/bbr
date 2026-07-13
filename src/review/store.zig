@@ -54,11 +54,13 @@ pub const ActiveSubmissionRun = struct {
 pub const SubmissionOutcome = union(enum) {
     posted: CommentId,
     failed: ApiError,
+    outcome_unknown,
 
-    fn draftState(self: SubmissionOutcome) DraftState {
+    pub fn draftState(self: SubmissionOutcome) DraftState {
         return switch (self) {
             .posted => |id| .{ .posted = id },
             .failed => |err| .{ .failed = err },
+            .outcome_unknown => .outcome_unknown,
         };
     }
 };
@@ -66,11 +68,13 @@ pub const SubmissionOutcome = union(enum) {
 pub const SubmissionPendingState = union(enum) {
     draft,
     failed: ApiError,
+    outcome_unknown,
 
-    fn draftState(self: SubmissionPendingState) DraftState {
+    pub fn draftState(self: SubmissionPendingState) DraftState {
         return switch (self) {
             .draft => .draft,
             .failed => |err| .{ .failed = err },
+            .outcome_unknown => .outcome_unknown,
         };
     }
 };
@@ -167,6 +171,10 @@ pub const InMemoryStore = struct {
     entries: std.ArrayList(Entry),
     active_submission: ?ActiveSubmissionRun = null,
     next_operation_id: OperationId = 1,
+    /// Deterministic adapter fault injection for Presentation checkpoint tests.
+    fail_next_checkpoint: bool = false,
+    /// Deterministic adapter fault injection after a terminal checkpoint.
+    fail_next_completion: bool = false,
 
     const Entry = struct { key: ReviewKey, draft: Draft };
 
@@ -197,6 +205,10 @@ pub const InMemoryStore = struct {
 
     fn putImpl(ptr: *anyopaque, key: ReviewKey, d: Draft) anyerror!void {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        for (self.entries.items) |entry| {
+            if (ReviewKey.eql(entry.key, key) and entry.draft.local_id == d.local_id and entry.draft.state == .outcome_unknown)
+                return error.DraftLocked;
+        }
         if (self.active_submission) |run| {
             if (ReviewKey.eql(run.key, key)) {
                 if (d.target == .bitbucket) return error.DraftLocked;
@@ -224,6 +236,10 @@ pub const InMemoryStore = struct {
 
     fn removeImpl(ptr: *anyopaque, key: ReviewKey, local_id: TempId) anyerror!void {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        for (self.entries.items) |entry| {
+            if (ReviewKey.eql(entry.key, key) and entry.draft.local_id == local_id and entry.draft.state == .outcome_unknown)
+                return error.DraftLocked;
+        }
         if (self.active_submission) |run| {
             if (ReviewKey.eql(run.key, key)) {
                 for (self.entries.items) |entry| {
@@ -299,6 +315,10 @@ pub const InMemoryStore = struct {
 
     fn checkpointSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: ReviewKey, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) anyerror!void {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        if (self.fail_next_checkpoint) {
+            self.fail_next_checkpoint = false;
+            return error.InjectedCheckpointFailure;
+        }
         const run = if (self.active_submission) |*active| active else return error.SubmissionNotActive;
         if (run.operation_id != operation_id or !ReviewKey.eql(run.key, key) or
             run.current_temp_id != completed_temp_id)
@@ -327,6 +347,10 @@ pub const InMemoryStore = struct {
 
     fn completeSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: ReviewKey, completion: SubmissionCompletion) anyerror!void {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        if (self.fail_next_completion) {
+            self.fail_next_completion = false;
+            return error.InjectedCompletionFailure;
+        }
         const run = self.active_submission orelse return error.SubmissionNotActive;
         if (run.operation_id != operation_id or !ReviewKey.eql(run.key, key))
             return error.InvalidSubmissionCompletion;
@@ -571,6 +595,20 @@ test "partial Submission completion keeps outcomes for repair" {
     const drafts = try store.load(arena.allocator(), key);
     try testing.expectEqual(@as(usize, 1), drafts.len);
     try testing.expectEqual(ApiError.Forbidden, drafts[0].state.failed);
+}
+
+test "unresolved outcome remains immutable after partial completion" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "unknown" });
+    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    try store.checkpointSubmission(operation_id, key, 1, .outcome_unknown, null);
+    try store.completeSubmission(operation_id, key, .partial);
+
+    try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "changed" }));
+    try testing.expectError(error.DraftLocked, store.remove(key, 1));
 }
 
 test "active Submission locks Bitbucket Draft mutation but not local Drafts" {

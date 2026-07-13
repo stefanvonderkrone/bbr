@@ -63,6 +63,9 @@ pub const Theme = struct {
     draft: Style,
     /// A reply Draft, indented under whatever it replies to.
     draft_reply: Style,
+    /// A Draft whose POST outcome remains unresolved after Duplicate guards.
+    outcome_unknown: Style,
+    outcome_unknown_reply: Style,
     /// A section divider (PR comments / Pending / Outdated).
     section: Style,
     /// The PR picker overlay's background rows.
@@ -185,6 +188,8 @@ pub const dark: Theme = .{
     .suggestion = .{ .bg = rgb(0x14_28_28), .fg = rgb(0x9c_d0_c0) },
     .draft = .{ .bg = rgb(0x2c_24_10), .fg = rgb(0xe0_c8_88), .bold = true },
     .draft_reply = .{ .bg = rgb(0x24_1e_0c), .fg = rgb(0xc8_b0_78) },
+    .outcome_unknown = .{ .bg = rgb(0x5a_30_00), .fg = rgb(0xff_d0_70), .bold = true },
+    .outcome_unknown_reply = .{ .bg = rgb(0x46_25_00), .fg = rgb(0xf0_b8_58) },
     .section = .{ .fg = rgb(0x88_88_a0), .bold = true },
     .picker = .{ .bg = rgb(0x20_20_2c), .fg = rgb(0xc8_c8_d8) },
     .picker_selected = .{ .bg = rgb(0x3a_3a_52), .fg = rgb(0xff_ff_ff), .bold = true },
@@ -225,6 +230,8 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
         .suggestion = .{ .fg = rgb(p.teal), .bg = rgb(p.surface) },
         .draft = .{ .fg = rgb(p.yellow), .bg = rgb(p.surface), .bold = true },
         .draft_reply = .{ .fg = rgb(p.yellow), .bg = rgb(p.surface) },
+        .outcome_unknown = .{ .fg = rgb(p.fg), .bg = rgb(if (p.light) 0xff_e0_a3 else 0x5a_30_00), .bold = true },
+        .outcome_unknown_reply = .{ .fg = rgb(p.fg), .bg = rgb(if (p.light) 0xff_e9_bd else 0x46_25_00) },
         .section = .{ .fg = rgb(p.muted), .bg = rgb(p.bg), .bold = true },
         .picker = .{ .fg = rgb(p.fg), .bg = rgb(p.surface) },
         .picker_selected = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2), .bold = true },
@@ -265,6 +272,8 @@ pub const system: Theme = .{
     .suggestion = .{ .fg = .{ .index = 6 } },
     .draft = .{ .fg = .{ .index = 3 }, .bold = true },
     .draft_reply = .{ .fg = .{ .index = 3 } },
+    .outcome_unknown = .{ .fg = .{ .index = 0 }, .bg = .{ .index = 3 }, .bold = true },
+    .outcome_unknown_reply = .{ .fg = .{ .index = 0 }, .bg = .{ .index = 3 } },
     .section = .{ .fg = .{ .index = 8 }, .bold = true },
     .picker = .{},
     .picker_selected = .{ .reverse = true, .bold = true },

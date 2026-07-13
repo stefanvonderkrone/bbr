@@ -33,13 +33,15 @@ pub const DraftKind = enum { top_level, inline_comment, reply, suggestion };
 pub const CommentTarget = enum { bitbucket, local };
 
 /// A Draft's lifecycle. `posted` carries the server-assigned id (so a resumed
-/// review knows it is already published); `failed` carries the ApiError reason.
-/// All four states persist, so a crash mid-submit resumes exactly (design §6).
+/// review knows it is already published); `failed` carries the ApiError reason;
+/// `outcome_unknown` requires Duplicate-guard reconciliation before mutation.
+/// Every state persists, so a crash mid-submit resumes exactly (design §6).
 pub const DraftState = union(enum) {
     draft,
     submitting,
     posted: CommentId,
     failed: ApiError,
+    outcome_unknown,
 };
 
 /// What a Reply attaches to: another pending `Draft` (identified by its TempId,

@@ -719,6 +719,7 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                             .posted => .{ .posted = p.item.id.? },
                             .failed => .{ .failed = p.item.reason orelse error.ServerError },
                             .skipped => null,
+                            .outcome_unknown => .outcome_unknown,
                         };
                         if (new_state) |st| if (review.get(p.item.temp_id)) |d| {
                             d.state = st;
@@ -1348,6 +1349,9 @@ fn submitWorker(
             .posted => posted += 1,
             .failed => failed += 1,
             .skipped => skipped += 1,
+            // Keep the legacy adapter's clean-completion predicate false. The
+            // Presentation adapter will expose this as its own result category.
+            .outcome_unknown => failed += 1,
         }
     }
     loop.postEvent(.{ .submit_done = .{

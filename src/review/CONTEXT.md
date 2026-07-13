@@ -47,7 +47,7 @@ An authored-but-unpublished Comment/Reply/Suggestion held locally. Carries a loc
 _Avoid_: pending comment, unsent, staged.
 
 **DraftState**:
-A Draft's lifecycle: `draft` → `submitting` → `posted` (carries the server-assigned CommentId) or `failed` (carries the ApiError reason). Persisted, so a crash resumes mid-Submission. `posted` is a *transient reconciliation* state, not a permanent record: it exists to survive a crash mid-batch, and the Draft's row is deleted once the whole Submission batch succeeds — thereafter the published Comment lives only on Bitbucket (ADR-0007).
+A Draft's lifecycle: `draft` → `submitting` → `posted` (carries the server-assigned CommentId), `failed` (carries a confirmed ApiError reason), or `outcome_unknown` (every Duplicate-guarded retry still lost the POST response, so publication remains unresolved). Persisted, so a crash resumes mid-Submission. An `outcome_unknown` Draft remains immutable until the reviewer links it to an existing Comment or confirms it was not published. `posted` is a *transient reconciliation* state, not a permanent record: it exists to survive a crash mid-batch, and the Draft's row is deleted once the whole Submission batch succeeds — thereafter the published Comment lives only on Bitbucket (ADR-0007).
 _Avoid_: status, phase.
 
 **PendingReview**:

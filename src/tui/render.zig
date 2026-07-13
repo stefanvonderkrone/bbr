@@ -291,7 +291,10 @@ fn drawComment(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, cr: Commen
 /// hang-indent like a comment. The body is drawn verbatim.
 fn drawDraft(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, dr: DraftRow, theme: Theme) void {
     const d = dr.draft;
-    const style = if (dr.is_reply) theme.draft_reply else theme.draft;
+    const unknown = d.state == .outcome_unknown;
+    const style = if (unknown)
+        (if (dr.is_reply) theme.outcome_unknown_reply else theme.outcome_unknown)
+    else if (dr.is_reply) theme.draft_reply else theme.draft;
     fillRow(win, r, style);
 
     const col: u16 = if (dr.is_reply) 6 else 2;
@@ -300,7 +303,8 @@ fn drawDraft(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, dr: DraftRow
             .suggestion => "±",
             else => if (dr.is_reply) "↳" else "✎",
         };
-        const text = std.fmt.allocPrint(scratch, "{s} draft: {s}", .{ marker, dr.line }) catch "✎ draft";
+        const label = if (unknown) "outcome unknown - resolve before editing" else "draft";
+        const text = std.fmt.allocPrint(scratch, "{s} {s}: {s}", .{ marker, label, dr.line }) catch "✎ draft";
         _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = col, .wrap = .none });
     } else {
         _ = win.printSegment(.{ .text = dr.line, .style = style }, .{ .row_offset = r, .col_offset = col + 2, .wrap = .none });
