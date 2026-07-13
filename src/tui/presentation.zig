@@ -87,14 +87,14 @@ pub const OwnedInput = union(enum) {
     session_loaded: SessionLoaded,
     push_count_digit: u8,
     resize_viewport: usize,
-    review_action: ReviewAction,
+    action: Action,
     request_shutdown,
 };
 
 /// Session-relative actions whose complete state is Navigation. They are
 /// suspended while a replacement is pending, along with every other Action
 /// that depends on the currently published review.
-pub const ReviewAction = enum {
+pub const Action = enum {
     down,
     up,
     half_page_down,
@@ -111,14 +111,22 @@ pub const ReviewAction = enum {
     cursor_view_bottom,
     select_down,
     select_up,
-    toggle_selection,
+    quit,
+    open_picker,
+    comment,
+    inline_comment,
+    suggest,
+    reply,
+    submit,
+    help,
+    toggle_select,
     clear_selection,
     toggle_resolved,
     toggle_layout,
     cycle_scope,
-    isolate_file,
+    isolate,
     next_file,
-    previous_file,
+    prev_file,
     expand_fold,
 };
 
@@ -151,13 +159,6 @@ pub const OwnedCommand = union(enum) {
     load_session: LoadSession,
 };
 
-pub const NavigationProjection = struct {
-    cursor: usize,
-    scroll: usize,
-    count: usize,
-    mark: ?usize,
-};
-
 pub const ReviewProjection = struct {
     key: ReviewKey,
     session_epoch: SessionEpoch,
@@ -166,7 +167,8 @@ pub const ReviewProjection = struct {
     threads: []const bbr.review.Thread,
     drafts: []const bbr.review.Draft,
     buffer: bbr.diff.Buffer,
-    navigation: NavigationProjection,
+    /// A value snapshot. Mutating this copy cannot affect Presentation.
+    navigation: Nav,
     preferences: Preferences,
     isolated_file: ?usize,
 };
@@ -278,12 +280,7 @@ const Published = struct {
             .threads = self.session.threads,
             .drafts = self.review.drafts.items,
             .buffer = self.buffer,
-            .navigation = .{
-                .cursor = self.navigation.cursor,
-                .scroll = self.navigation.scroll,
-                .count = self.navigation.count,
-                .mark = self.navigation.mark,
-            },
+            .navigation = self.navigation,
             .preferences = preferences,
             .isolated_file = self.isolated_file,
         };
@@ -379,7 +376,7 @@ pub const Presentation = struct {
             .session_loaded => |completed| self.acceptLoadedSession(completed),
             .push_count_digit => |digit| self.pushCountDigit(digit),
             .resize_viewport => |rows| self.resizeViewport(rows),
-            .review_action => |action| self.applyReviewAction(action),
+            .action => |action| self.applyAction(action),
             .request_shutdown => self.requestShutdown(),
         }
     }
@@ -421,7 +418,11 @@ pub const Presentation = struct {
         if (self.published) |published| published.navigation.setViewport(rows);
     }
 
-    fn applyReviewAction(self: *Presentation, action: ReviewAction) void {
+    fn applyAction(self: *Presentation, action: Action) void {
+        if (action == .quit) {
+            self.requestShutdown();
+            return;
+        }
         if (self.shutdown_requested or self.replacement != null) return;
         const published = self.published orelse return;
         self.action_error = null;
@@ -448,7 +449,7 @@ pub const Presentation = struct {
                 published.navigation.ensureMark();
                 published.navigation.up();
             },
-            .toggle_selection => published.navigation.toggleMark(),
+            .toggle_select => published.navigation.toggleMark(),
             .clear_selection => published.navigation.clearMark(),
             .toggle_resolved => {
                 var candidate = self.preferences;
@@ -471,10 +472,19 @@ pub const Presentation = struct {
                 published.expanded_folds.clearRetainingCapacity();
                 self.action_error = null;
             },
-            .isolate_file => self.toggleIsolation(published),
+            .isolate => self.toggleIsolation(published),
             .next_file => self.moveFile(published, 1),
-            .previous_file => self.moveFile(published, -1),
+            .prev_file => self.moveFile(published, -1),
             .expand_fold => self.expandFold(published),
+            .open_picker,
+            .comment,
+            .inline_comment,
+            .suggest,
+            .reply,
+            .submit,
+            .help,
+            => {},
+            .quit => unreachable,
         }
     }
 
@@ -874,10 +884,10 @@ test "Navigation and Count mutate only through dispatch" {
     defer presentation.deinit();
 
     try presentation.dispatch(.{ .push_count_digit = 2 });
-    try presentation.dispatch(.{ .review_action = .down });
+    try presentation.dispatch(.{ .action = .down });
     try testing.expectEqual(@as(usize, 2), presentation.projection().review.?.navigation.cursor);
-    try presentation.dispatch(.{ .review_action = .toggle_selection });
-    try presentation.dispatch(.{ .review_action = .up });
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try presentation.dispatch(.{ .action = .up });
     const navigation = presentation.projection().review.?.navigation;
     try testing.expectEqual(@as(usize, 1), navigation.cursor);
     try testing.expectEqual(@as(?usize, 2), navigation.mark);
@@ -895,10 +905,10 @@ test "Session-relative Navigation is suspended during replacement" {
     });
     defer presentation.deinit();
 
-    try presentation.dispatch(.{ .review_action = .down });
+    try presentation.dispatch(.{ .action = .down });
     const before = presentation.projection().review.?.navigation;
     try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
-    try presentation.dispatch(.{ .review_action = .down });
+    try presentation.dispatch(.{ .action = .down });
     try presentation.dispatch(.{ .push_count_digit = 9 });
     try testing.expect(std.meta.eql(before, presentation.projection().review.?.navigation));
 }
@@ -915,11 +925,11 @@ test "failed Buffer transaction preserves Buffer preferences and Navigation" {
         .viewport_rows = 2,
     });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .review_action = .down });
+    try presentation.dispatch(.{ .action = .down });
     const before = presentation.projection().review.?;
 
     failing.fail_index = failing.alloc_index;
-    try presentation.dispatch(.{ .review_action = .toggle_layout });
+    try presentation.dispatch(.{ .action = .toggle_layout });
 
     const after = presentation.projection();
     try testing.expect(failing.has_induced_failure);
@@ -942,10 +952,10 @@ test "preferences survive replacement while file isolation resets" {
     });
     defer presentation.deinit();
 
-    try presentation.dispatch(.{ .review_action = .toggle_layout });
-    try presentation.dispatch(.{ .review_action = .toggle_resolved });
-    try presentation.dispatch(.{ .review_action = .cycle_scope });
-    try presentation.dispatch(.{ .review_action = .isolate_file });
+    try presentation.dispatch(.{ .action = .toggle_layout });
+    try presentation.dispatch(.{ .action = .toggle_resolved });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .action = .isolate });
     const isolated = presentation.projection().review.?;
     try testing.expectEqual(@as(?usize, 0), isolated.isolated_file);
     try testing.expectEqual(bbr.diff.Layout.side_by_side, isolated.preferences.layout);

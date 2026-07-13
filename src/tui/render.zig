@@ -14,6 +14,7 @@ const bbr = @import("bbr");
 
 const Theme = @import("theme.zig").Theme;
 const Nav = @import("nav.zig").Nav;
+const ReviewProjection = @import("presentation.zig").ReviewProjection;
 const Buffer = bbr.diff.buffer.Buffer;
 const Row = bbr.diff.buffer.Row;
 const LineRow = bbr.diff.buffer.LineRow;
@@ -52,6 +53,28 @@ pub fn draw(
 
     drawSidebar(scratch, sidebar, diff, theme, selected_file, threads, drafts);
     drawPane(scratch, pane, buf, theme, nav);
+}
+
+/// Render the immutable snapshot exposed by Presentation. The terminal adapter
+/// selects only the sidebar focus; it cannot reach the owned mutable review.
+pub fn drawReview(
+    scratch: std.mem.Allocator,
+    win: vaxis.Window,
+    review: ReviewProjection,
+    theme: Theme,
+    selected_file: usize,
+) void {
+    draw(
+        scratch,
+        win,
+        review.diff.*,
+        review.buffer,
+        theme,
+        review.navigation,
+        selected_file,
+        review.threads,
+        review.drafts,
+    );
 }
 
 /// Single-char status label. Returns a static string so vaxis cells can borrow

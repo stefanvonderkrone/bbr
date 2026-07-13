@@ -21,45 +21,10 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 
-/// A discrete viewer action or motion a key resolves to. Everything the viewer
-/// does from a keypress is one of these.
-pub const Action = enum {
-    // motions
-    down,
-    up,
-    half_page_down,
-    half_page_up,
-    page_down,
-    page_up,
-    to_top,
-    to_bottom,
-    center,
-    scroll_cursor_top,
-    scroll_cursor_bottom,
-    cursor_view_top,
-    cursor_view_middle,
-    cursor_view_bottom,
-    select_down,
-    select_up,
-    // commands
-    quit,
-    open_picker,
-    toggle_resolved,
-    toggle_layout,
-    cycle_scope,
-    comment,
-    toggle_select,
-    clear_selection,
-    inline_comment,
-    suggest,
-    isolate,
-    next_file,
-    prev_file,
-    reply,
-    expand_fold,
-    submit,
-    help,
-};
+/// Portable Presentation Action. This module owns only terminal-key resolution;
+/// the resulting vocabulary is independent of vaxis and belongs to the state
+/// machine that consumes it.
+pub const Action = @import("presentation.zig").Action;
 
 /// Is this Action a Motion (movement within a Pane) rather than a command? The
 /// help overlay groups the two; `select_down`/`select_up` count as motions since
