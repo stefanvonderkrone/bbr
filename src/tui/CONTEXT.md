@@ -33,9 +33,13 @@ _Avoid_: search, finder, switcher, palette.
 The Overlay for writing a Draft (comment, reply, or suggestion) before it enters the PendingReview.
 _Avoid_: editor, input, form.
 
-**Epoch**:
-A monotonically increasing token stamped on each PR/File load; background results carrying a stale Epoch are discarded. How a PR switch cancels in-flight work.
-_Avoid_: generation, version, token, nonce.
+**Session Epoch**:
+The identity of one published Session. Session-bound work such as File Enrichment carries that Session's Epoch and cannot change a later Session, even when both Sessions represent the same PullRequest. The Epoch changes only when a complete Session replacement is published; a failed replacement preserves the current Epoch and its in-flight work.
+_Avoid_: PR id (identifies the PullRequest, not one Session), generation, version, token, nonce.
+
+**Durable Operation**:
+Reviewer-authorized work that belongs to a PullRequest rather than to the Session that started it. A Submission remains valid and persists its outcomes when that Session is replaced; only projecting its progress or result into the current screen depends on which Session is published.
+_Avoid_: Session work, background job, task.
 
 **Keymap**:
 The binding of key input to actions, supporting vim-style Motions and arrow keys side by side. Config-driven; the source the keybinding-help Overlay reads from.

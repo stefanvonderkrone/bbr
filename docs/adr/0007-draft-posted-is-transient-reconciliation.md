@@ -34,3 +34,12 @@ So the deletion is on **batch** success, not per-item success.
   normal launch.
 - Submission (M10) owns the delete-on-batch-success step; the `PendingReviewStore` already
   supports it via per-Draft `remove`.
+- Submission checkpoints each Draft around its network call; it does not POST the whole batch
+  and persist all outcomes in one transaction at the end. Before a POST, the Draft's
+  `submitting` intent is persisted. Before the next POST, the previous outcome (`posted` with
+  its `CommentId`, or `failed`) is persisted. Persisting one outcome and the next intent may
+  share a short SQLite transaction, but no database transaction stays open during network I/O.
+- A crash after Bitbucket accepts a POST but before its outcome is persisted leaves a
+  `submitting` Draft. Resume treats that state as ambiguous and runs the Duplicate guard before
+  attempting another POST. This is the unavoidable recovery seam between two systems that
+  cannot share a transaction.

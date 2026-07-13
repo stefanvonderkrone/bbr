@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Presentation memory architecture — current vs proposed</title>
+  <style>
+    :root {
+      --ink: #172033;
+      --muted: #657087;
+      --paper: #f4f1e9;
+      --card: #fffdf8;
+      --line: #d8d1c4;
+      --current: #b64d3c;
+      --current-soft: #f8e7e1;
+      --proposed: #176b63;
+      --proposed-soft: #dff1ec;
+      --durable: #3455a4;
+      --durable-soft: #e7edfb;
+      --session: #a66a14;
+      --session-soft: #fbefd9;
+      --shadow: 0 18px 50px rgba(39, 38, 33, .09);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 12% 2%, rgba(182, 77, 60, .08), transparent 28rem),
+        radial-gradient(circle at 90% 18%, rgba(23, 107, 99, .10), transparent 32rem),
+        var(--paper);
+      font: 15px/1.55 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main { max-width: 1240px; margin: 0 auto; padding: 54px 28px 80px; }
+    h1, h2, h3, p { margin-top: 0; }
+    h1, h2 { font-family: Georgia, "Times New Roman", serif; font-weight: 500; }
+    h1 { max-width: 900px; margin-bottom: 18px; font-size: clamp(2.5rem, 6vw, 5rem); line-height: .98; letter-spacing: -.045em; }
+    h2 { margin-bottom: 8px; font-size: clamp(1.75rem, 3vw, 2.5rem); letter-spacing: -.025em; }
+    h3 { margin-bottom: 8px; font-size: 1rem; }
+    code { font: .9em ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    .eyebrow { margin-bottom: 16px; color: var(--proposed); font-size: .72rem; font-weight: 800; letter-spacing: .18em; text-transform: uppercase; }
+    .lede { max-width: 820px; margin-bottom: 26px; color: var(--muted); font-size: 1.08rem; }
+    .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 42px; }
+    .chip { display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 999px; padding: 7px 11px; background: rgba(255,255,255,.55); color: var(--muted); font-size: .76rem; font-weight: 700; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+    .dot.current { background: var(--current); }
+    .dot.proposed { background: var(--proposed); }
+    .dot.session { background: var(--session); }
+    .dot.durable { background: var(--durable); }
+
+    .comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; align-items: stretch; }
+    .panel { position: relative; overflow: hidden; border: 1px solid var(--line); border-radius: 22px; background: var(--card); box-shadow: var(--shadow); }
+    .panel > header { min-height: 132px; padding: 28px 30px 22px; border-bottom: 1px solid var(--line); }
+    .panel.current > header { background: linear-gradient(135deg, var(--current-soft), #fffaf7); }
+    .panel.proposed > header { background: linear-gradient(135deg, var(--proposed-soft), #f9fffc); }
+    .panel-tag { margin-bottom: 8px; font-size: .68rem; font-weight: 900; letter-spacing: .18em; text-transform: uppercase; }
+    .current .panel-tag { color: var(--current); }
+    .proposed .panel-tag { color: var(--proposed); }
+    .panel header p { max-width: 500px; margin-bottom: 0; color: var(--muted); }
+    .diagram { display: grid; gap: 14px; padding: 26px; }
+    .node { position: relative; border: 1px solid var(--line); border-radius: 14px; padding: 15px 16px; background: #fff; }
+    .node strong { display: block; margin-bottom: 3px; }
+    .node small { display: block; color: var(--muted); line-height: 1.35; }
+    .node.danger { border-color: #e0a397; background: var(--current-soft); }
+    .node.deep { border: 2px solid var(--proposed); background: #123f3b; color: #fff; box-shadow: 0 12px 28px rgba(23, 107, 99, .16); }
+    .node.deep small { color: #bfe2da; }
+    .node.session { border-color: #dfbd7f; background: var(--session-soft); }
+    .node.durable { border-color: #9bb0df; background: var(--durable-soft); }
+    .node.adapter { border-style: dashed; }
+    .arrow { height: 20px; text-align: center; color: #8f958f; font-size: 20px; line-height: 20px; }
+    .fanout { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .fanout .node { min-height: 104px; }
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .warning { margin: 0 26px 26px; border-left: 4px solid var(--current); padding: 14px 16px; background: #fff8f5; color: #70463f; }
+    .success { margin: 0 26px 26px; border-left: 4px solid var(--proposed); padding: 14px 16px; background: #f2fbf8; color: #285c56; }
+
+    .section { margin-top: 54px; }
+    .section-intro { display: flex; justify-content: space-between; gap: 28px; align-items: end; margin-bottom: 20px; }
+    .section-intro p { max-width: 590px; margin-bottom: 0; color: var(--muted); }
+    .sequence-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+    .sequence { border: 1px solid var(--line); border-radius: 20px; padding: 24px; background: rgba(255,253,248,.82); }
+    .sequence ol { display: grid; gap: 10px; margin: 20px 0 0; padding: 0; list-style: none; counter-reset: step; }
+    .sequence li { position: relative; min-height: 48px; border: 1px solid var(--line); border-radius: 11px; padding: 12px 14px 12px 50px; background: #fff; counter-increment: step; }
+    .sequence li::before { content: counter(step); position: absolute; top: 10px; left: 13px; display: grid; width: 26px; height: 26px; place-items: center; border-radius: 50%; background: #ece9e1; font-weight: 800; }
+    .sequence.bad li:last-child { border-color: #e0a397; background: var(--current-soft); }
+    .sequence.good li.commit { border-color: #7db6aa; background: var(--proposed-soft); font-weight: 700; }
+
+    .lanes { overflow: hidden; border: 1px solid var(--line); border-radius: 22px; background: var(--card); box-shadow: var(--shadow); }
+    .lane { display: grid; grid-template-columns: 190px 1fr 54px 1fr; gap: 14px; align-items: center; padding: 22px 24px; }
+    .lane + .lane { border-top: 1px solid var(--line); }
+    .lane-label strong { display: block; }
+    .lane-label small { color: var(--muted); }
+    .lane-arrow { color: var(--muted); text-align: center; font-size: 22px; }
+    .outcome { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; background: #fff; }
+    .outcome small { color: var(--muted); }
+    .outcome.session { background: var(--session-soft); border-color: #dfbd7f; }
+    .outcome.durable { background: var(--durable-soft); border-color: #9bb0df; }
+
+    .notes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 22px; }
+    .note { border-top: 3px solid var(--line); padding: 17px 3px 0; }
+    .note:nth-child(1) { border-color: var(--proposed); }
+    .note:nth-child(2) { border-color: var(--durable); }
+    .note:nth-child(3) { border-color: var(--session); }
+    .note p { margin-bottom: 0; color: var(--muted); }
+    footer { margin-top: 58px; border-top: 1px solid var(--line); padding-top: 20px; color: var(--muted); font-size: .82rem; }
+
+    @media (max-width: 860px) {
+      .comparison, .sequence-grid, .notes { grid-template-columns: 1fr; }
+      .section-intro { display: block; }
+      .lane { grid-template-columns: 1fr; }
+      .lane-arrow { transform: rotate(90deg); }
+    }
+    @media (max-width: 560px) {
+      main { padding: 34px 16px 54px; }
+      .fanout, .split { grid-template-columns: 1fr; }
+      .panel > header, .diagram { padding-left: 19px; padding-right: 19px; }
+      .warning, .success { margin-left: 19px; margin-right: 19px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">Memory architecture · design checkpoint · 13 July 2026</p>
+      <h1>From orchestration by convention to atomic Presentation transitions</h1>
+      <p class="lede">The proposed seam does not cancel everything when a Session changes. It separates ephemeral, Session-bound projections from durable work that must finish against the Pull Request that authorized it.</p>
+      <div class="legend" aria-label="Legend">
+        <span class="chip"><span class="dot current"></span>current risk</span>
+        <span class="chip"><span class="dot proposed"></span>proposed deep module</span>
+        <span class="chip"><span class="dot session"></span>Session-bound</span>
+        <span class="chip"><span class="dot durable"></span>durable work</span>
+      </div>
+    </header>
+
+    <section class="comparison" aria-label="Current and proposed architecture">
+      <article class="panel current">
+        <header>
+          <p class="panel-tag">Current</p>
+          <h2>One event loop coordinates every lifetime</h2>
+          <p>Safe primitives exist, but their ordering remains a caller responsibility inside <code>app.run</code>.</p>
+        </header>
+        <div class="diagram">
+          <div class="node danger">
+            <strong>app.run</strong>
+            <small>Actions · worker completions · four Epoch families · arenas · Session swaps · Buffer swaps · navigation</small>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="fanout">
+            <div class="node session"><strong>Session</strong><small>destroyed before the replacement Buffer is known-good</small></div>
+            <div class="node"><strong>ArenaRing</strong><small><code>begin / commit / abort</code> called manually</small></div>
+            <div class="node durable"><strong>Submission</strong><small>POST continues, but persistence is gated by current Session</small></div>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node danger">
+            <strong><code>catch buf</code> can preserve only the Buffer value</strong>
+            <small>Its borrowed Session data may already have been destroyed, creating a hybrid state.</small>
+          </div>
+        </div>
+        <p class="warning"><strong>Failure mode:</strong> each helper is locally reasonable, yet event ordering can combine them into an invalid lifetime.</p>
+      </article>
+
+      <article class="panel proposed">
+        <header>
+          <p class="panel-tag">Proposed</p>
+          <h2>Presentation publishes one coherent state</h2>
+          <p>The event loop becomes an adapter. A deep state-transition module owns preparation, commit, rollback, and projection validity.</p>
+        </header>
+        <div class="diagram">
+          <div class="split">
+            <div class="node adapter"><strong>Terminal adapter</strong><small>turns keys and worker messages into inputs</small></div>
+            <div class="node adapter"><strong>Test adapter</strong><small>drives deterministic sequences with failing allocators</small></div>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node deep">
+            <strong>Presentation state-transition module</strong>
+            <small>prepare candidate · build Buffer · normalize navigation · commit atomically · reject stale projections</small>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="split">
+            <div class="node session"><strong>Published state</strong><small>Session + Pending Review + Buffer + navigation + view-relative state</small></div>
+            <div class="node durable"><strong>Durable operations</strong><small>submission identity + original PR id + persistence lifecycle</small></div>
+          </div>
+        </div>
+        <p class="success"><strong>Invariant:</strong> observers see either the complete old state or the complete new state—never a mixture.</p>
+      </article>
+    </section>
+
+    <section class="section">
+      <div class="section-intro">
+        <div>
+          <p class="eyebrow">Critical transition</p>
+          <h2>Replacing a Session</h2>
+        </div>
+        <p>A replacement includes the Session, persisted Pending Review, initial Buffer, navigation, and Session-relative UI state. Reviewer preferences such as layout and scope survive.</p>
+      </div>
+      <div class="sequence-grid">
+        <article class="sequence bad">
+          <p class="panel-tag" style="color:var(--current)">Current ordering</p>
+          <h3>Mutation happens before validation finishes</h3>
+          <ol>
+            <li>Destroy the old Session.</li>
+            <li>Set <code>current = new_session</code>.</li>
+            <li>Clear folds, isolation, in-flight markers, and submission UI.</li>
+            <li>Load Pending Review; silently substitute empty on failure.</li>
+            <li>Build Buffer; on failure retain the old Buffer value—a potentially dangling hybrid.</li>
+          </ol>
+        </article>
+        <article class="sequence good">
+          <p class="panel-tag" style="color:var(--proposed)">Proposed transaction</p>
+          <h3>Preparation is private; publication is atomic</h3>
+          <ol>
+            <li>Own the candidate Session without touching published state.</li>
+            <li>Load its Pending Review; failure discards the candidate.</li>
+            <li>Build its Buffer and normalized navigation in staging.</li>
+            <li class="commit">Commit the complete candidate as the new published state.</li>
+            <li>Destroy the replaced state only after the commit is valid.</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-intro">
+        <div>
+          <p class="eyebrow">Ownership after a switch</p>
+          <h2>Not every completion becomes stale</h2>
+        </div>
+        <p>The key distinction is whether a result enriches one Session projection or completes durable work already authorized for a Pull Request.</p>
+      </div>
+      <div class="lanes">
+        <div class="lane">
+          <div class="lane-label"><strong>File Enrichment</strong><small>Session-bound</small></div>
+          <div class="outcome session"><strong>Stamp with Session Epoch</strong><br><small>Same PR id and File index are insufficient after refresh or reconciliation.</small></div>
+          <div class="lane-arrow">→</div>
+          <div class="outcome"><strong>Accept only for current Epoch</strong><br><small>Otherwise destroy the result exactly once without changing Presentation.</small></div>
+        </div>
+        <div class="lane">
+          <div class="lane-label"><strong>Submission</strong><small>durable operation</small></div>
+          <div class="outcome durable"><strong>Stamp with operation id + PR id</strong><br><small>The worker owns a Draft snapshot and may outlive its originating Session.</small></div>
+          <div class="lane-arrow">→</div>
+          <div class="outcome"><strong>Always persist original PR progress</strong><br><small>Update visible UI only when the relevant PR/Session is published.</small></div>
+        </div>
+        <div class="lane">
+          <div class="lane-label"><strong>Draft save</strong><small>durable, synchronous today</small></div>
+          <div class="outcome durable"><strong>Write through PendingReviewStore</strong><br><small>The SQLite row survives quit and PR switches.</small></div>
+          <div class="lane-arrow">→</div>
+          <div class="outcome"><strong>Then update the projection</strong><br><small>No background Session ownership is required for the durable write.</small></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-intro">
+        <div>
+          <p class="eyebrow">Same Pull Request</p>
+          <h2>PR identity is not Session identity</h2>
+        </div>
+        <p>The Picker may make selecting the already-open PR a no-op, but same-PR replacement remains necessary for post-submit reconciliation and explicit refresh.</p>
+      </div>
+      <div class="notes">
+        <article class="note"><h3>Picker reuse</h3><p>Selecting the currently open PR can keep the existing Session when the user did not request a refresh.</p></article>
+        <article class="note"><h3>Reconciliation</h3><p>After posting, the same PR reloads so authoritative Bitbucket Comments replace successfully published Drafts.</p></article>
+        <article class="note"><h3>Changed head</h3><p>The same PR id can later describe a different source commit, Diff, File ordering, and anchor set.</p></article>
+      </div>
+    </section>
+
+    <footer>
+      Design status: accepted. Presentation uses a typed command-producing state machine with atomic published state, Session Epoch routing, and Session-independent Durable Operations. See ADR-0012.
+    </footer>
+  </main>
+</body>
+</html>

@@ -58,6 +58,10 @@ _Avoid_: batch (that's the act), queue, staging.
 The act of publishing a PendingReview: topologically order Drafts (parents before Replies), POST each, remap temp ids to server CommentIds, and continue-on-item-failure while stopping the batch on auth failure. A retryable failure (rate-limit, server, network) is retried with backoff; a validation failure fails that Draft and *skips its reply-descendants* (they have no valid parent to attach to); an auth failure aborts the whole batch with everything kept pending. Modeled as a clock-free state machine that emits the next action as data, so its policy is pure; the network is the **CommentPoster** seam. After a batch that posts anything, the PR is re-fetched so the freshly published Comments reappear (see Reconciliation) — Bitbucket, not the deleted Drafts, is now their home.
 _Avoid_: submit, flush, push, sync.
 
+**SubmissionRun**:
+The durable record of one attempt to carry a PullRequest's Submission to a terminal outcome, including where an interrupted attempt must resume. It is identified within a Repository-qualified PullRequest and is distinct from the process that currently owns the work.
+_Avoid_: batch (the Submission is the batch), worker, job, Session.
+
 **Reconciliation**:
 The step after a Submission that posted at least one Comment: re-fetch the PR so the just-published Comments (now owned by Bitbucket, ADR-0001) reappear in place of the Drafts that were deleted on a clean batch. During the transient window of a *partial* batch, a still-pending Draft under a now-posted parent stays visible while the posted parent's own row is hidden (the fetched Comment represents it) — the render-path dedup ADR-0007 anticipates.
 _Avoid_: refresh, sync, merge.
