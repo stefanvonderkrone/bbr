@@ -466,3 +466,7 @@ test "demo data weaves through the real pipeline" {
     }
     try testing.expectEqual(@as(usize, 5), shown_comments);
 }
+
+test {
+    _ = @import("tui/presentation.zig");
+}
