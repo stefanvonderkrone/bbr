@@ -64,6 +64,7 @@ pub const ReviewKey = struct {
 
 pub const Dependencies = struct {
     reviews: bbr.review.PendingReviewStore,
+    submission_locks: ?bbr.review.SubmissionLocks = null,
     highlight_max_file_bytes: usize = 0,
 };
 
@@ -257,9 +258,50 @@ pub const EnrichFile = struct {
     }
 };
 
+/// Self-owned network payload. It remains valid if the originating Session is
+/// replaced while the durable Submission continues.
+pub const PostDraft = struct {
+    allocator: Allocator,
+    arena: std.heap.ArenaAllocator,
+    operation_id: bbr.review.OperationId,
+    key: ReviewKey,
+    draft: bbr.review.Draft,
+    parent: ?bbr.review.CommentId,
+    dedupe: bool,
+
+    fn create(allocator: Allocator, key: ReviewKey, draft: bbr.review.Draft, step: bbr.review.submission.PostStep) !*PostDraft {
+        const command = try allocator.create(PostDraft);
+        errdefer allocator.destroy(command);
+        command.allocator = allocator;
+        command.arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer command.arena.deinit();
+        command.operation_id = 0;
+        command.key = key;
+        command.draft = try bbr.review.store.dupeDraft(command.arena.allocator(), draft);
+        command.parent = step.parent;
+        command.dedupe = step.dedupe;
+        return command;
+    }
+
+    pub fn destroy(self: *PostDraft) void {
+        const allocator = self.allocator;
+        self.arena.deinit();
+        allocator.destroy(self);
+    }
+};
+
 pub const OwnedCommand = union(enum) {
     load_session: LoadSession,
     enrich_file: EnrichFile,
+    post_draft: *PostDraft,
+
+    pub fn deinit(self: *OwnedCommand) void {
+        switch (self.*) {
+            .post_draft => |command| command.destroy(),
+            .load_session, .enrich_file => {},
+        }
+        self.* = undefined;
+    }
 };
 
 pub const ReviewProjection = struct {
@@ -278,12 +320,19 @@ pub const ReviewProjection = struct {
 
 pub const Projection = struct {
     review: ?ReviewProjection,
+    submission: ?SubmissionProjection,
     composer: ?ComposerProjection,
     replacing: bool,
     replacement_error: ?ReplacementError,
     action_error: ?ActionError,
     fatal_error: ?FatalError,
     shutting_down: bool,
+};
+
+pub const SubmissionProjection = struct {
+    operation_id: bbr.review.OperationId,
+    key: ReviewKey,
+    current_temp_id: bbr.review.TempId,
 };
 
 pub const FatalError = enum {
@@ -302,6 +351,9 @@ pub const ActionError = enum {
     invalid_selection,
     out_of_memory,
     persistence_failed,
+    submission_already_active,
+    submission_owned_elsewhere,
+    submission_start_failed,
 };
 
 const BufferTransactionError = error{ BufferBuildFailed, OutOfMemory };
@@ -468,6 +520,77 @@ const IssuedEnrichment = struct {
     file_index: usize,
 };
 
+const DurableSubmission = struct {
+    allocator: Allocator,
+    key: ReviewKey,
+    operation_id: bbr.review.OperationId = 0,
+    current_temp_id: bbr.review.TempId = 0,
+    lock: bbr.review.SubmissionLockGuard,
+    arena: std.heap.ArenaAllocator,
+    review: bbr.review.PendingReview,
+    machine: bbr.review.Submission,
+
+    const Started = struct {
+        durable: *DurableSubmission,
+        command: *PostDraft,
+    };
+
+    fn create(allocator: Allocator, store: bbr.review.PendingReviewStore, key: ReviewKey, lock: bbr.review.SubmissionLockGuard) !*DurableSubmission {
+        var owned_lock = lock;
+        errdefer owned_lock.release();
+        const durable = try allocator.create(DurableSubmission);
+        errdefer allocator.destroy(durable);
+        durable.allocator = allocator;
+        durable.key = key;
+        durable.lock = owned_lock;
+        owned_lock.ptr = null;
+        errdefer durable.lock.release();
+        durable.arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer durable.arena.deinit();
+        durable.review = try store.loadReview(durable.arena.allocator(), key.storeKey());
+        durable.machine = try bbr.review.Submission.init(durable.arena.allocator(), &durable.review);
+        return durable;
+    }
+
+    /// Takes ownership of `lock`. A null result means the persisted review has
+    /// no remote Draft to post. Every failure rolls back all in-memory work and
+    /// releases ownership; the store publishes only inside `beginSubmission`.
+    fn begin(
+        allocator: Allocator,
+        store: bbr.review.PendingReviewStore,
+        key: ReviewKey,
+        source_commit: []const u8,
+        lock: bbr.review.SubmissionLockGuard,
+    ) !?Started {
+        const durable = try create(allocator, store, key, lock);
+        errdefer durable.destroy();
+        const post = switch (durable.machine.advance()) {
+            .post => |value| value,
+            .done => {
+                durable.destroy();
+                return null;
+            },
+            .wait, .aborted => unreachable,
+        };
+        const draft = durable.review.getConst(post.temp_id) orelse return error.DraftNotFound;
+        const command = try PostDraft.create(allocator, durable.key, draft.*, post);
+        errdefer command.destroy();
+        const operation_id = try store.beginSubmission(durable.key.storeKey(), source_commit, post.temp_id);
+        durable.operation_id = operation_id;
+        durable.current_temp_id = post.temp_id;
+        command.operation_id = operation_id;
+        return .{ .durable = durable, .command = command };
+    }
+
+    fn destroy(self: *DurableSubmission) void {
+        const allocator = self.allocator;
+        self.machine.deinit();
+        self.arena.deinit();
+        self.lock.release();
+        allocator.destroy(self);
+    }
+};
+
 pub const Presentation = struct {
     allocator: Allocator,
     dependencies: Dependencies,
@@ -481,6 +604,7 @@ pub const Presentation = struct {
     commands: std.ArrayList(OwnedCommand) = .empty,
     outstanding_loads: usize = 0,
     issued_enrichments: std.ArrayList(IssuedEnrichment) = .empty,
+    durable_submission: ?*DurableSubmission = null,
     shutdown_requested: bool = false,
     replacement_error: ?ReplacementError = null,
     action_error: ?ActionError = null,
@@ -509,6 +633,8 @@ pub const Presentation = struct {
     }
 
     pub fn deinit(self: *Presentation) void {
+        for (self.commands.items) |*command| command.deinit();
+        if (self.durable_submission) |durable| durable.destroy();
         if (self.published) |published| published.destroy();
         self.commands.deinit(self.allocator);
         self.issued_enrichments.deinit(self.allocator);
@@ -541,6 +667,7 @@ pub const Presentation = struct {
                 .session_epoch = enrich.session_epoch,
                 .file_index = enrich.file_index,
             }),
+            .post_draft => {},
         }
         return command;
     }
@@ -548,6 +675,11 @@ pub const Presentation = struct {
     pub fn projection(self: *const Presentation) Projection {
         return .{
             .review = if (self.published) |published| published.projection(self.preferences) else null,
+            .submission = if (self.durable_submission) |durable| .{
+                .operation_id = durable.operation_id,
+                .key = durable.key,
+                .current_temp_id = durable.current_temp_id,
+            } else null,
             .composer = if (self.published) |published| if (published.composer) |*composer| .{
                 .label = composer.request.label,
                 .body = composer.body(),
@@ -561,12 +693,19 @@ pub const Presentation = struct {
     }
 
     pub fn readyToExit(self: *const Presentation) bool {
-        return self.shutdown_requested and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.issued_enrichments.items.len == 0;
+        return self.shutdown_requested and self.durable_submission == null and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.issued_enrichments.items.len == 0;
     }
 
     fn requestShutdown(self: *Presentation) void {
         self.shutdown_requested = true;
-        self.commands.clearRetainingCapacity();
+        var write: usize = 0;
+        for (self.commands.items) |command| {
+            if (command == .post_draft) {
+                self.commands.items[write] = command;
+                write += 1;
+            }
+        }
+        self.commands.shrinkRetainingCapacity(write);
         self.replacement = null;
     }
 
@@ -642,12 +781,49 @@ pub const Presentation = struct {
             .reply => self.openReplyComposer(published),
             .inline_comment => self.openInlineComposer(published, .inline_comment),
             .suggest => self.openInlineComposer(published, .suggestion),
-            .open_picker,
-            .submit,
-            .help,
-            => {},
+            .submit => self.startSubmission(published),
+            .open_picker, .help => {},
             .quit => unreachable,
         }
+    }
+
+    fn startSubmission(self: *Presentation, published: *Published) void {
+        if (self.durable_submission != null) {
+            self.action_error = .submission_already_active;
+            return;
+        }
+        const locks = self.dependencies.submission_locks orelse {
+            self.action_error = .action_refused;
+            return;
+        };
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+            self.action_error = .submission_start_failed;
+            return;
+        };
+        const lock = locks.tryAcquire(published.key.storeKey()) catch {
+            self.action_error = .submission_start_failed;
+            return;
+        } orelse {
+            self.action_error = .submission_owned_elsewhere;
+            return;
+        };
+        const started = DurableSubmission.begin(
+            self.allocator,
+            self.dependencies.reviews,
+            published.key,
+            published.session.pr.source_commit,
+            lock,
+        ) catch |err| {
+            self.action_error = if (err == error.SubmissionAlreadyActive) .submission_already_active else .submission_start_failed;
+            return;
+        } orelse {
+            self.action_error = .action_refused;
+            return;
+        };
+        self.commands.appendAssumeCapacity(.{ .post_draft = started.command });
+        self.durable_submission = started.durable;
+        published.review.setState(started.durable.current_temp_id, .submitting);
+        self.action_error = null;
     }
 
     fn openComposer(self: *Presentation, published: *Published, request: composer_mod.Request) void {
@@ -1979,4 +2155,180 @@ test "File Enrichment out of memory projects a distinct fatal shutdown" {
     try testing.expectEqual(FatalError.file_enrichment_out_of_memory, presentation.projection().fatal_error.?);
     try testing.expect(presentation.projection().shutting_down);
     try testing.expect(presentation.readyToExit());
+}
+
+test "Submission start acquires ownership persists intent and emits one durable POST" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "publish me" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .submit });
+
+    const command = presentation.takeCommand().?.post_draft;
+    defer command.destroy();
+    try testing.expectEqual(@as(bbr.review.TempId, 1), command.draft.local_id);
+    try testing.expectEqualStrings("publish me", command.draft.body);
+    const run = (try store.store().activeSubmission(testing.allocator)).?;
+    defer {
+        testing.allocator.free(run.key.workspace);
+        testing.allocator.free(run.key.repository);
+        testing.allocator.free(run.source_commit);
+    }
+    try testing.expectEqual(run.operation_id, command.operation_id);
+    try testing.expectEqual(@as(?bbr.review.TempId, 1), run.current_temp_id);
+    try testing.expect((try locks.locks().tryAcquire(key.storeKey())) == null);
+    try testing.expectEqual(run.operation_id, presentation.projection().submission.?.operation_id);
+}
+
+test "Submission lock contention emits no command or durable intent" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "publish me" });
+    var other_owner = (try locks.locks().tryAcquire(key.storeKey())).?;
+    defer other_owner.release();
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .submit });
+
+    try testing.expect(presentation.takeCommand() == null);
+    try testing.expect((try store.store().activeSubmission(testing.allocator)) == null);
+    try testing.expectEqual(ActionError.submission_owned_elsewhere, presentation.projection().action_error.?);
+}
+
+test "Submission payload and identity survive originating Session replacement" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const first_key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(first_key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "survive replacement" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = first_key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .submit });
+    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    const post = presentation.takeCommand().?.post_draft;
+    defer post.destroy();
+    const load = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+    } });
+
+    try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.key.pull_request_id);
+    try testing.expectEqual(@as(u64, 1), presentation.projection().submission.?.key.pull_request_id);
+    try testing.expectEqualStrings("survive replacement", post.draft.body);
+}
+
+test "shutdown retains an authorized Submission command and waits for terminal durability" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "finish me" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .submit });
+    try presentation.dispatch(.request_shutdown);
+
+    try testing.expect(!presentation.readyToExit());
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expect(command == .post_draft);
+}
+
+test "Submission persistence failure publishes no command and releases ownership" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var store = bbr.review.InMemoryStore.init(failing.allocator());
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "publish me" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    var long_commit: [4096]u8 = undefined;
+    @memset(&long_commit, 'a');
+    presentation.published.?.session.pr.source_commit = &long_commit;
+    failing.fail_index = failing.alloc_index;
+
+    try presentation.dispatch(.{ .action = .submit });
+
+    try testing.expect(failing.has_induced_failure);
+    try testing.expectEqual(ActionError.submission_start_failed, presentation.projection().action_error.?);
+    try testing.expect(presentation.projection().submission == null);
+    try testing.expect(presentation.takeCommand() == null);
+    try testing.expect((try store.store().activeSubmission(testing.allocator)) == null);
+    var reacquired = (try locks.locks().tryAcquire(key.storeKey())).?;
+    reacquired.release();
+}
+
+test "Submission state allocation failure releases ownership before transfer" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "publish me" });
+    var presentation = try Presentation.init(failing.allocator(), .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.commands.ensureUnusedCapacity(failing.allocator(), 1);
+    failing.fail_index = failing.alloc_index;
+
+    try presentation.dispatch(.{ .action = .submit });
+
+    try testing.expect(failing.has_induced_failure);
+    try testing.expectEqual(ActionError.submission_start_failed, presentation.projection().action_error.?);
+    try testing.expect(presentation.projection().submission == null);
+    try testing.expect((try store.store().activeSubmission(testing.allocator)) == null);
+    var reacquired = (try locks.locks().tryAcquire(key.storeKey())).?;
+    reacquired.release();
 }

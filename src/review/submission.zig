@@ -186,6 +186,10 @@ pub const Submission = struct {
                 self.idx += 1;
                 continue;
             };
+            if (d.target == .local) {
+                self.idx += 1;
+                continue;
+            }
 
             // A draft posted by a prior (interrupted) batch: already done.
             if (d.state == .posted) {
@@ -536,6 +540,18 @@ test "a prior-posted draft is skipped (selective retry) and remaps its replies" 
     const sum = try sub.summary(testing.allocator);
     defer testing.allocator.free(sum.items);
     try testing.expectEqual(@as(usize, 2), sum.posted); // the seeded root counts as posted
+}
+
+test "local-only Drafts are never emitted as Submission posts" {
+    var pr = PendingReview.init(1);
+    defer pr.deinit(testing.allocator);
+    _ = try pr.add(testing.allocator, .{ .kind = .top_level, .target = .local, .body = "private" });
+    const remote = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "publish" });
+
+    var sub = try Submission.init(testing.allocator, &pr);
+    defer sub.deinit();
+    const step = sub.advance();
+    try testing.expectEqual(remote, step.post.temp_id);
 }
 
 test "backoffMs is exponential, capped" {
