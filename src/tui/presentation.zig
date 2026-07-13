@@ -113,6 +113,33 @@ pub const ReviewAction = enum {
     select_up,
     toggle_selection,
     clear_selection,
+    toggle_resolved,
+    toggle_layout,
+    cycle_scope,
+    isolate_file,
+    next_file,
+    previous_file,
+    expand_fold,
+};
+
+pub const Scope = enum {
+    changes,
+    fetched,
+    whole,
+
+    fn next(self: Scope) Scope {
+        return switch (self) {
+            .changes => .fetched,
+            .fetched => .whole,
+            .whole => .changes,
+        };
+    }
+};
+
+pub const Preferences = struct {
+    layout: bbr.diff.Layout = .unified,
+    scope: Scope = .changes,
+    show_resolved: bool = false,
 };
 
 pub const LoadSession = struct {
@@ -140,14 +167,24 @@ pub const ReviewProjection = struct {
     drafts: []const bbr.review.Draft,
     buffer: bbr.diff.Buffer,
     navigation: NavigationProjection,
+    preferences: Preferences,
+    isolated_file: ?usize,
 };
 
 pub const Projection = struct {
     review: ?ReviewProjection,
     replacing: bool,
     replacement_error: ?ReplacementError,
+    action_error: ?ActionError,
     shutting_down: bool,
 };
+
+pub const ActionError = enum {
+    buffer_build_failed,
+    out_of_memory,
+};
+
+const BufferTransactionError = error{ BufferBuildFailed, OutOfMemory };
 
 pub const ReplacementError = enum {
     session_load_failed,
@@ -166,6 +203,8 @@ const Published = struct {
     buffers: ArenaRing(2),
     buffer: bbr.diff.Buffer,
     navigation: Nav,
+    expanded_folds: std.ArrayList(*const bbr.diff.Line),
+    isolated_file: ?usize,
 
     fn create(
         allocator: Allocator,
@@ -174,6 +213,7 @@ const Published = struct {
         epoch: SessionEpoch,
         session: *Session,
         viewport_rows: usize,
+        preferences: Preferences,
     ) !*Published {
         const published = try allocator.create(Published);
         errdefer allocator.destroy(published);
@@ -191,6 +231,9 @@ const Published = struct {
         };
         published.buffers = ArenaRing(2).init(allocator);
         errdefer published.buffers.deinit();
+        published.expanded_folds = .empty;
+        errdefer published.expanded_folds.deinit(allocator);
+        published.isolated_file = null;
 
         const buffer_allocator = published.buffers.begin();
         errdefer published.buffers.abort();
@@ -198,12 +241,15 @@ const Published = struct {
         published.buffer = bbr.diff.buffer.buildWithComments(
             buffer_allocator,
             session.diff,
-            .unified,
+            preferences.layout,
             session.threads,
             .{
                 .drafts = published.review.drafts.items,
                 .blobs = enrichment.blobs,
                 .highlights = enrichment.highlights,
+                .show_resolved = preferences.show_resolved,
+                .fold_context = preferences.scope == .changes,
+                .whole_file = preferences.scope == .whole,
             },
         ) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -216,13 +262,14 @@ const Published = struct {
 
     fn destroy(self: *Published) void {
         const allocator = self.allocator;
+        self.expanded_folds.deinit(allocator);
         self.buffers.deinit();
         self.review_arena.deinit();
         self.session.destroy();
         allocator.destroy(self);
     }
 
-    fn projection(self: *const Published) ReviewProjection {
+    fn projection(self: *const Published, preferences: Preferences) ReviewProjection {
         return .{
             .key = self.key,
             .session_epoch = self.epoch,
@@ -237,7 +284,42 @@ const Published = struct {
                 .count = self.navigation.count,
                 .mark = self.navigation.mark,
             },
+            .preferences = preferences,
+            .isolated_file = self.isolated_file,
         };
+    }
+
+    fn rebuild(
+        self: *Published,
+        preferences: Preferences,
+        expanded_folds: []const *const bbr.diff.Line,
+        isolated_file: ?usize,
+    ) BufferTransactionError!void {
+        const allocator = self.buffers.begin();
+        errdefer self.buffers.abort();
+        const enrichment = self.session.enrichment.projection();
+        const candidate = bbr.diff.buffer.buildWithComments(
+            allocator,
+            self.session.diff,
+            preferences.layout,
+            self.session.threads,
+            .{
+                .show_resolved = preferences.show_resolved,
+                .fold_context = preferences.scope == .changes,
+                .whole_file = preferences.scope == .whole,
+                .expanded = expanded_folds,
+                .drafts = self.review.drafts.items,
+                .only_file = isolated_file,
+                .blobs = enrichment.blobs,
+                .highlights = enrichment.highlights,
+            },
+        ) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return error.BufferBuildFailed;
+        };
+        self.buffers.commit();
+        self.buffer = candidate;
+        self.navigation.setRowCount(candidate.rows.len);
     }
 };
 
@@ -250,6 +332,7 @@ pub const Presentation = struct {
     allocator: Allocator,
     dependencies: Dependencies,
     viewport_rows: usize,
+    preferences: Preferences = .{},
     published: ?*Published = null,
     replacement: ?Replacement = null,
     next_intent: LoadIntent = 0,
@@ -258,6 +341,7 @@ pub const Presentation = struct {
     outstanding_loads: usize = 0,
     shutdown_requested: bool = false,
     replacement_error: ?ReplacementError = null,
+    action_error: ?ActionError = null,
 
     pub fn init(allocator: Allocator, dependencies: Dependencies, boot: Boot) !Presentation {
         var self: Presentation = .{
@@ -275,6 +359,7 @@ pub const Presentation = struct {
                 self.next_session_epoch,
                 initial.session,
                 boot.viewport_rows,
+                self.preferences,
             );
         }
         return self;
@@ -308,9 +393,10 @@ pub const Presentation = struct {
 
     pub fn projection(self: *const Presentation) Projection {
         return .{
-            .review = if (self.published) |published| published.projection() else null,
+            .review = if (self.published) |published| published.projection(self.preferences) else null,
             .replacing = self.replacement != null,
             .replacement_error = self.replacement_error,
+            .action_error = self.action_error,
             .shutting_down = self.shutdown_requested,
         };
     }
@@ -338,6 +424,7 @@ pub const Presentation = struct {
     fn applyReviewAction(self: *Presentation, action: ReviewAction) void {
         if (self.shutdown_requested or self.replacement != null) return;
         const published = self.published orelse return;
+        self.action_error = null;
         switch (action) {
             .down => published.navigation.down(),
             .up => published.navigation.up(),
@@ -363,7 +450,98 @@ pub const Presentation = struct {
             },
             .toggle_selection => published.navigation.toggleMark(),
             .clear_selection => published.navigation.clearMark(),
+            .toggle_resolved => {
+                var candidate = self.preferences;
+                candidate.show_resolved = !candidate.show_resolved;
+                self.publishPreferences(published, candidate);
+            },
+            .toggle_layout => {
+                var candidate = self.preferences;
+                candidate.layout = if (candidate.layout == .unified) .side_by_side else .unified;
+                self.publishPreferences(published, candidate);
+            },
+            .cycle_scope => {
+                var candidate = self.preferences;
+                candidate.scope = candidate.scope.next();
+                published.rebuild(candidate, &.{}, published.isolated_file) catch |err| {
+                    self.action_error = normalizeActionError(err);
+                    return;
+                };
+                self.preferences = candidate;
+                published.expanded_folds.clearRetainingCapacity();
+                self.action_error = null;
+            },
+            .isolate_file => self.toggleIsolation(published),
+            .next_file => self.moveFile(published, 1),
+            .previous_file => self.moveFile(published, -1),
+            .expand_fold => self.expandFold(published),
         }
+    }
+
+    fn publishPreferences(self: *Presentation, published: *Published, candidate: Preferences) void {
+        published.rebuild(candidate, published.expanded_folds.items, published.isolated_file) catch |err| {
+            self.action_error = normalizeActionError(err);
+            return;
+        };
+        self.preferences = candidate;
+        self.action_error = null;
+    }
+
+    fn toggleIsolation(self: *Presentation, published: *Published) void {
+        if (published.session.diff.files.len == 0) return;
+        const previous = published.isolated_file;
+        const candidate = if (previous) |_| null else fileIndexForRow(published.buffer, published.navigation.cursor);
+        published.rebuild(self.preferences, published.expanded_folds.items, candidate) catch |err| {
+            self.action_error = normalizeActionError(err);
+            return;
+        };
+        published.isolated_file = candidate;
+        if (previous) |file_index| {
+            if (fileHeaderRow(published.buffer, file_index)) |row| published.navigation.jumpTo(row);
+        } else {
+            published.navigation = Nav.init(published.buffer.rows.len, self.viewport_rows);
+        }
+        self.action_error = null;
+    }
+
+    fn moveFile(self: *Presentation, published: *Published, direction: i2) void {
+        if (published.isolated_file) |current| {
+            const candidate = if (direction > 0)
+                if (current + 1 < published.session.diff.files.len) current + 1 else return
+            else if (current > 0)
+                current - 1
+            else
+                return;
+            published.rebuild(self.preferences, published.expanded_folds.items, candidate) catch |err| {
+                self.action_error = normalizeActionError(err);
+                return;
+            };
+            published.isolated_file = candidate;
+            published.navigation = Nav.init(published.buffer.rows.len, self.viewport_rows);
+            self.action_error = null;
+            return;
+        }
+        const row = if (direction > 0)
+            nextFileHeaderRow(published.buffer, published.navigation.cursor)
+        else
+            previousFileHeaderRow(published.buffer, published.navigation.cursor);
+        if (row) |target| published.navigation.jumpTo(target);
+    }
+
+    fn expandFold(self: *Presentation, published: *Published) void {
+        if (published.navigation.cursor >= published.buffer.rows.len) return;
+        if (published.buffer.rows[published.navigation.cursor] != .fold) return;
+        const old_len = published.expanded_folds.items.len;
+        published.expanded_folds.append(self.allocator, published.buffer.rows[published.navigation.cursor].fold.id) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        published.rebuild(self.preferences, published.expanded_folds.items, published.isolated_file) catch |err| {
+            published.expanded_folds.shrinkRetainingCapacity(old_len);
+            self.action_error = normalizeActionError(err);
+            return;
+        };
+        self.action_error = null;
     }
 
     fn choosePullRequest(self: *Presentation, key: ReviewKey) !void {
@@ -417,6 +595,7 @@ pub const Presentation = struct {
                     epoch,
                     session,
                     self.viewport_rows,
+                    self.preferences,
                 ) catch |err| {
                     self.replacement = null;
                     self.replacement_error = switch (err) {
@@ -432,11 +611,60 @@ pub const Presentation = struct {
                 self.next_session_epoch = epoch;
                 self.replacement = null;
                 self.replacement_error = null;
+                self.action_error = null;
                 if (previous) |published| published.destroy();
             },
         }
     }
 };
+
+fn normalizeActionError(err: BufferTransactionError) ActionError {
+    return switch (err) {
+        error.BufferBuildFailed => .buffer_build_failed,
+        error.OutOfMemory => .out_of_memory,
+    };
+}
+
+fn fileIndexForRow(buffer: bbr.diff.Buffer, cursor: usize) usize {
+    var file_index: usize = 0;
+    var seen_file = false;
+    var row: usize = 0;
+    while (row <= cursor and row < buffer.rows.len) : (row += 1) {
+        if (buffer.rows[row] == .file_header) {
+            if (seen_file) file_index += 1 else seen_file = true;
+        }
+    }
+    return file_index;
+}
+
+fn nextFileHeaderRow(buffer: bbr.diff.Buffer, cursor: usize) ?usize {
+    var row = cursor +| 1;
+    while (row < buffer.rows.len) : (row += 1) {
+        if (buffer.rows[row] == .file_header) return row;
+    }
+    return null;
+}
+
+fn previousFileHeaderRow(buffer: bbr.diff.Buffer, cursor: usize) ?usize {
+    if (cursor == 0) return null;
+    var row = cursor;
+    while (row > 0) {
+        row -= 1;
+        if (buffer.rows[row] == .file_header) return row;
+    }
+    return null;
+}
+
+fn fileHeaderRow(buffer: bbr.diff.Buffer, file_index: usize) ?usize {
+    var seen: usize = 0;
+    for (buffer.rows, 0..) |row, index| {
+        if (row == .file_header) {
+            if (seen == file_index) return index;
+            seen += 1;
+        }
+    }
+    return null;
+}
 
 const testing = std.testing;
 
@@ -460,6 +688,38 @@ fn testSession(backing: std.mem.Allocator, id: u64, marker: u8) !*session_mod.Se
         .destination_commit = "destination",
     };
     s.diff = try bbr.diff.parse(a, raw);
+    try s.initializeEnrichment();
+    return s;
+}
+
+fn testTwoFileSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
+    const s = try session_mod.create(backing);
+    errdefer s.destroy();
+    const a = s.arena.allocator();
+    s.pr = .{
+        .id = id,
+        .title = "Two files",
+        .state = "OPEN",
+        .author_display_name = "Reviewer",
+        .source_branch = "feature",
+        .destination_branch = "main",
+        .source_commit = "source",
+        .destination_commit = "destination",
+    };
+    s.diff = try bbr.diff.parse(a,
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-old a
+        \\+new a
+        \\diff --git a/b.zig b/b.zig
+        \\--- a/b.zig
+        \\+++ b/b.zig
+        \\@@ -1 +1 @@
+        \\-old b
+        \\+new b
+    );
     try s.initializeEnrichment();
     return s;
 }
@@ -641,4 +901,68 @@ test "Session-relative Navigation is suspended during replacement" {
     try presentation.dispatch(.{ .review_action = .down });
     try presentation.dispatch(.{ .push_count_digit = 9 });
     try testing.expect(std.meta.eql(before, presentation.projection().review.?.navigation));
+}
+
+test "failed Buffer transaction preserves Buffer preferences and Navigation" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 2,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .review_action = .down });
+    const before = presentation.projection().review.?;
+
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .review_action = .toggle_layout });
+
+    const after = presentation.projection();
+    try testing.expect(failing.has_induced_failure);
+    try testing.expectEqual(before.buffer.rows.ptr, after.review.?.buffer.rows.ptr);
+    try testing.expectEqual(before.buffer.layout, after.review.?.buffer.layout);
+    try testing.expect(std.meta.eql(before.preferences, after.review.?.preferences));
+    try testing.expect(std.meta.eql(before.navigation, after.review.?.navigation));
+    try testing.expectEqual(ActionError.out_of_memory, after.action_error.?);
+}
+
+test "preferences survive replacement while file isolation resets" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testTwoFileSession(testing.allocator, 1),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .review_action = .toggle_layout });
+    try presentation.dispatch(.{ .review_action = .toggle_resolved });
+    try presentation.dispatch(.{ .review_action = .cycle_scope });
+    try presentation.dispatch(.{ .review_action = .isolate_file });
+    const isolated = presentation.projection().review.?;
+    try testing.expectEqual(@as(?usize, 0), isolated.isolated_file);
+    try testing.expectEqual(bbr.diff.Layout.side_by_side, isolated.preferences.layout);
+    try testing.expect(isolated.preferences.show_resolved);
+    try testing.expectEqual(Scope.fetched, isolated.preferences.scope);
+
+    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    const command = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .intent = command.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'c') },
+    } });
+
+    const replaced = presentation.projection().review.?;
+    try testing.expectEqual(bbr.diff.Layout.side_by_side, replaced.preferences.layout);
+    try testing.expect(replaced.preferences.show_resolved);
+    try testing.expectEqual(Scope.fetched, replaced.preferences.scope);
+    try testing.expectEqual(@as(?usize, null), replaced.isolated_file);
+    try testing.expectEqual(@as(usize, 0), replaced.navigation.cursor);
 }
