@@ -220,7 +220,10 @@ pub const Preferences = struct {
 pub const LoadSession = struct {
     intent: LoadIntent,
     key: ReviewKey,
+    cause: SessionLoadCause = .picker,
 };
+
+pub const SessionLoadCause = enum { picker, reconciliation };
 
 fn BoundedText(comptime capacity: usize) type {
     return struct {
@@ -549,6 +552,7 @@ const DurableSubmission = struct {
     phase: enum { post_queued, awaiting_post, wait_queued, awaiting_wait, admission_paused, persistence_paused } = .post_queued,
     pending_admission: ?PendingAdmission = null,
     pending_persistence: ?PendingPersistence = null,
+    posted_any: bool = false,
 
     const Started = struct {
         durable: *DurableSubmission,
@@ -596,6 +600,7 @@ const DurableSubmission = struct {
         durable.phase = .post_queued;
         durable.pending_admission = null;
         durable.pending_persistence = null;
+        durable.posted_any = false;
         return durable;
     }
 
@@ -636,6 +641,7 @@ const DurableSubmission = struct {
         completed: PostDraftCompleted,
     ) !AfterPost {
         self.machine.report(completed.outcome, completed.retry_after_ms);
+        if (completed.outcome == .posted) self.posted_any = true;
         const outcome: bbr.review.SubmissionOutcome = switch (completed.outcome) {
             .posted => |id| .{ .posted = id },
             .rejected => |err| .{ .failed = err },
@@ -1082,8 +1088,12 @@ pub const Presentation = struct {
             .wait => |wait| self.commands.appendAssumeCapacity(.{ .wait_submission = wait }),
             .finished => |finished| {
                 self.recordVisibleTransition(durable, finished.transition);
+                const reconcile = durable.posted_any and !self.shutdown_requested and self.replacement == null and
+                    (if (self.published) |published| ReviewKey.eql(published.key, durable.key) else false);
+                const key = durable.key;
                 self.durable_submission = null;
                 durable.destroy();
+                if (reconcile) self.queueReconciliation(key);
             },
         }
     }
@@ -1517,7 +1527,16 @@ pub const Presentation = struct {
         // to supersede. Already-taken commands complete normally and are
         // rejected later by their LoadIntent.
         self.removeQueuedSessionLoads();
-        self.commands.appendAssumeCapacity(.{ .load_session = .{ .intent = intent, .key = key } });
+        self.commands.appendAssumeCapacity(.{ .load_session = .{ .intent = intent, .key = key, .cause = .picker } });
+        self.next_intent = intent;
+        self.replacement = .{ .intent = intent, .key = key };
+        self.replacement_error = null;
+    }
+
+    fn queueReconciliation(self: *Presentation, key: ReviewKey) void {
+        const intent = self.next_intent + 1;
+        self.removeQueuedSessionLoads();
+        self.commands.appendAssumeCapacity(.{ .load_session = .{ .intent = intent, .key = key, .cause = .reconciliation } });
         self.next_intent = intent;
         self.replacement = .{ .intent = intent, .key = key };
         self.replacement_error = null;
@@ -2542,6 +2561,44 @@ test "Submission payload and identity survive originating Session replacement" {
     try testing.expectEqualStrings("survive replacement", post.draft.body);
 }
 
+test "Submission completion does not reconcile over a different visible PR" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const first_key = try ReviewKey.init("workspace", "repo", 1);
+    const second_key = try ReviewKey.init("workspace", "repo", 2);
+    try store.store().put(first_key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "post elsewhere" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = first_key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var post = presentation.takeCommand().?;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    try presentation.dispatch(.{ .choose_pull_request = second_key });
+    const load = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+    } });
+
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .posted = 900 },
+    } });
+
+    try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.key.pull_request_id);
+    try testing.expect(presentation.projection().submission == null);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
 test "shutdown retains an authorized Submission command and waits for terminal durability" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -2711,7 +2768,7 @@ test "stale POST completion cannot mutate the next in-flight Draft" {
     try testing.expect(drafts[1].state == .submitting);
 }
 
-test "final successful POST completes clean and releases Submission ownership" {
+test "final successful POST completes clean, releases ownership, and reconciles the visible PR" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
@@ -2737,7 +2794,9 @@ test "final successful POST completes clean and releases Submission ownership" {
         .outcome = .{ .posted = 900 },
     } });
 
-    try testing.expect(presentation.takeCommand() == null);
+    const reconciliation = presentation.takeCommand().?.load_session;
+    try testing.expect(reconciliation.cause == .reconciliation);
+    try testing.expect(ReviewKey.eql(reconciliation.key, key));
     try testing.expect(presentation.projection().submission == null);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
