@@ -238,6 +238,18 @@ pub const Storage = struct {
         if (self.statuses[file_idx].new == .pending) self.statuses[file_idx].new = .loading;
     }
 
+    pub fn resetLoading(self: *Storage, file_idx: usize) void {
+        std.debug.assert(file_idx < self.statuses.len);
+        if (self.statuses[file_idx].old == .loading) self.statuses[file_idx].old = .pending;
+        if (self.statuses[file_idx].new == .loading) self.statuses[file_idx].new = .pending;
+    }
+
+    pub fn needsEnrichment(self: *const Storage, file_idx: usize) bool {
+        std.debug.assert(file_idx < self.statuses.len);
+        const file_status = self.statuses[file_idx];
+        return sideNeedsEnrichment(file_status.old) or sideNeedsEnrichment(file_status.new);
+    }
+
     pub fn projection(self: *const Storage) Projection {
         return .{ .blobs = self.blobs, .highlights = self.highlights };
     }
@@ -272,6 +284,13 @@ pub const Storage = struct {
         }
     }
 };
+
+fn sideNeedsEnrichment(state: bbr.highlight.SideState) bool {
+    return switch (state) {
+        .pending => true,
+        .loading, .absent, .ready, .skipped_too_large, .fetch_failed, .highlight_failed => false,
+    };
+}
 
 fn transfer(side: *SideResult) StoredSide {
     const stored: StoredSide = switch (side.*) {

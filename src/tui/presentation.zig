@@ -8,12 +8,14 @@ const ArenaRing = @import("arena_ring.zig").ArenaRing;
 const Nav = @import("nav.zig").Nav;
 const composer_mod = @import("composer.zig");
 const Composer = composer_mod.Composer;
+const file_enrichment = @import("file_enrichment.zig");
 
 const Allocator = std.mem.Allocator;
 const Session = session_mod.Session;
 
 pub const SessionEpoch = u64;
 pub const LoadIntent = u64;
+pub const WorkId = u64;
 
 /// Repository-qualified identity copied by value into commands and state. The
 /// fixed storage keeps the first command protocol self-owned without exposing
@@ -62,6 +64,7 @@ pub const ReviewKey = struct {
 
 pub const Dependencies = struct {
     reviews: bbr.review.PendingReviewStore,
+    highlight_max_file_bytes: usize = 0,
 };
 
 pub const InitialReview = struct {
@@ -91,7 +94,26 @@ pub const OwnedInput = union(enum) {
     resize_viewport: usize,
     action: Action,
     composer: ComposerInput,
+    ensure_focused_enrichment,
+    file_enrichment_completed: FileEnrichmentCompleted,
     request_shutdown,
+};
+
+pub const FileEnrichmentOutcome = union(enum) {
+    completed: file_enrichment.Result,
+    failed: FileEnrichmentFailure,
+};
+
+pub const FileEnrichmentFailure = enum {
+    launch_failed,
+    out_of_memory,
+};
+
+pub const FileEnrichmentCompleted = struct {
+    work_id: WorkId,
+    session_epoch: SessionEpoch,
+    file_index: usize,
+    outcome: FileEnrichmentOutcome,
 };
 
 pub const TextChunk = struct {
@@ -184,8 +206,60 @@ pub const LoadSession = struct {
     key: ReviewKey,
 };
 
+fn BoundedText(comptime capacity: usize) type {
+    return struct {
+        bytes: [capacity]u8 = undefined,
+        len: usize,
+
+        fn init(value: []const u8) error{ValueTooLong}!@This() {
+            if (value.len > capacity) return error.ValueTooLong;
+            var text: @This() = .{ .len = value.len };
+            @memcpy(text.bytes[0..value.len], value);
+            return text;
+        }
+
+        fn slice(self: *const @This()) []const u8 {
+            return self.bytes[0..self.len];
+        }
+    };
+}
+
+pub const EnrichFile = struct {
+    work_id: WorkId,
+    session_epoch: SessionEpoch,
+    file_index: usize,
+    repo: BoundedText(256),
+    source_commit: BoundedText(64),
+    destination_commit: BoundedText(64),
+    old_path: BoundedText(512),
+    new_path: BoundedText(512),
+    status: bbr.diff.FileStatus,
+    max_file_bytes: usize,
+
+    pub fn repository(self: *const EnrichFile) []const u8 {
+        return self.repo.slice();
+    }
+
+    pub fn newPath(self: *const EnrichFile) []const u8 {
+        return self.new_path.slice();
+    }
+
+    pub fn request(self: *const EnrichFile) file_enrichment.Request {
+        return .{
+            .repo = self.repo.slice(),
+            .status = self.status,
+            .source_commit = self.source_commit.slice(),
+            .destination_commit = self.destination_commit.slice(),
+            .old_path = self.old_path.slice(),
+            .new_path = self.new_path.slice(),
+            .max_file_bytes = self.max_file_bytes,
+        };
+    }
+};
+
 pub const OwnedCommand = union(enum) {
     load_session: LoadSession,
+    enrich_file: EnrichFile,
 };
 
 pub const ReviewProjection = struct {
@@ -208,7 +282,12 @@ pub const Projection = struct {
     replacing: bool,
     replacement_error: ?ReplacementError,
     action_error: ?ActionError,
+    fatal_error: ?FatalError,
     shutting_down: bool,
+};
+
+pub const FatalError = enum {
+    file_enrichment_out_of_memory,
 };
 
 pub const ComposerProjection = struct {
@@ -219,6 +298,7 @@ pub const ComposerProjection = struct {
 pub const ActionError = enum {
     action_refused,
     buffer_build_failed,
+    file_enrichment_launch_failed,
     invalid_selection,
     out_of_memory,
     persistence_failed,
@@ -382,6 +462,12 @@ const Replacement = struct {
     key: ReviewKey,
 };
 
+const IssuedEnrichment = struct {
+    work_id: WorkId,
+    session_epoch: SessionEpoch,
+    file_index: usize,
+};
+
 pub const Presentation = struct {
     allocator: Allocator,
     dependencies: Dependencies,
@@ -391,11 +477,14 @@ pub const Presentation = struct {
     replacement: ?Replacement = null,
     next_intent: LoadIntent = 0,
     next_session_epoch: SessionEpoch = 0,
+    next_work_id: WorkId = 0,
     commands: std.ArrayList(OwnedCommand) = .empty,
     outstanding_loads: usize = 0,
+    issued_enrichments: std.ArrayList(IssuedEnrichment) = .empty,
     shutdown_requested: bool = false,
     replacement_error: ?ReplacementError = null,
     action_error: ?ActionError = null,
+    fatal_error: ?FatalError = null,
 
     pub fn init(allocator: Allocator, dependencies: Dependencies, boot: Boot) !Presentation {
         var self: Presentation = .{
@@ -422,6 +511,7 @@ pub const Presentation = struct {
     pub fn deinit(self: *Presentation) void {
         if (self.published) |published| published.destroy();
         self.commands.deinit(self.allocator);
+        self.issued_enrichments.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -435,6 +525,8 @@ pub const Presentation = struct {
             .resize_viewport => |rows| self.resizeViewport(rows),
             .action => |action| self.applyAction(action),
             .composer => |composer_input| self.applyComposerInput(composer_input),
+            .ensure_focused_enrichment => try self.ensureFocusedEnrichment(),
+            .file_enrichment_completed => |completed| self.acceptFileEnrichment(completed),
             .request_shutdown => self.requestShutdown(),
         }
     }
@@ -442,7 +534,14 @@ pub const Presentation = struct {
     pub fn takeCommand(self: *Presentation) ?OwnedCommand {
         if (self.commands.items.len == 0) return null;
         const command = self.commands.orderedRemove(0);
-        self.outstanding_loads += 1;
+        switch (command) {
+            .load_session => self.outstanding_loads += 1,
+            .enrich_file => |enrich| self.issued_enrichments.appendAssumeCapacity(.{
+                .work_id = enrich.work_id,
+                .session_epoch = enrich.session_epoch,
+                .file_index = enrich.file_index,
+            }),
+        }
         return command;
     }
 
@@ -456,12 +555,13 @@ pub const Presentation = struct {
             .replacing = self.replacement != null,
             .replacement_error = self.replacement_error,
             .action_error = self.action_error,
+            .fatal_error = self.fatal_error,
             .shutting_down = self.shutdown_requested,
         };
     }
 
     pub fn readyToExit(self: *const Presentation) bool {
-        return self.shutdown_requested and self.commands.items.len == 0 and self.outstanding_loads == 0;
+        return self.shutdown_requested and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.issued_enrichments.items.len == 0;
     }
 
     fn requestShutdown(self: *Presentation) void {
@@ -693,6 +793,111 @@ pub const Presentation = struct {
         }
     }
 
+    fn ensureFocusedEnrichment(self: *Presentation) !void {
+        if (self.shutdown_requested) return;
+        const published = self.published orelse return;
+        const file_index = published.isolated_file orelse fileIndexForRow(published.buffer, published.navigation.cursor);
+        if (file_index >= published.session.diff.files.len or file_index >= published.session.enrichment.len()) return;
+        if (!published.session.enrichment.needsEnrichment(file_index)) return;
+
+        const file = published.session.diff.files[file_index];
+        const work_id = self.next_work_id + 1;
+        const command: EnrichFile = .{
+            .work_id = work_id,
+            .session_epoch = published.epoch,
+            .file_index = file_index,
+            .repo = BoundedText(256).init(published.key.repository()) catch {
+                self.action_error = .action_refused;
+                return;
+            },
+            .source_commit = BoundedText(64).init(published.session.pr.source_commit) catch {
+                self.action_error = .action_refused;
+                return;
+            },
+            .destination_commit = BoundedText(64).init(published.session.pr.destination_commit) catch {
+                self.action_error = .action_refused;
+                return;
+            },
+            .old_path = BoundedText(512).init(file.old_path) catch {
+                self.action_error = .action_refused;
+                return;
+            },
+            .new_path = BoundedText(512).init(file.new_path) catch {
+                self.action_error = .action_refused;
+                return;
+            },
+            .status = file.status,
+            .max_file_bytes = self.dependencies.highlight_max_file_bytes,
+        };
+        var queued_enrichments: usize = 0;
+        for (self.commands.items) |queued| if (queued == .enrich_file) {
+            queued_enrichments += 1;
+        };
+        try self.issued_enrichments.ensureTotalCapacity(
+            self.allocator,
+            self.issued_enrichments.items.len + queued_enrichments + 1,
+        );
+        try self.commands.append(self.allocator, .{ .enrich_file = command });
+        self.next_work_id = work_id;
+        published.session.enrichment.markLoading(file_index);
+        self.action_error = null;
+    }
+
+    fn acceptFileEnrichment(self: *Presentation, completed: FileEnrichmentCompleted) void {
+        var issued_index: ?usize = null;
+        for (self.issued_enrichments.items, 0..) |issued, index| {
+            if (issued.work_id == completed.work_id and
+                issued.session_epoch == completed.session_epoch and
+                issued.file_index == completed.file_index)
+            {
+                issued_index = index;
+                break;
+            }
+        }
+        if (issued_index == null) {
+            if (completed.outcome == .completed) {
+                var result = completed.outcome.completed;
+                result.deinit();
+            }
+            return;
+        }
+        _ = self.issued_enrichments.orderedRemove(issued_index.?);
+        const published = self.published;
+        const applies = if (published) |current|
+            current.epoch == completed.session_epoch and completed.file_index < current.session.enrichment.len()
+        else
+            false;
+
+        switch (completed.outcome) {
+            .failed => |failure| if (applies) {
+                const current = published.?;
+                current.session.enrichment.resetLoading(completed.file_index);
+                switch (failure) {
+                    .launch_failed => self.action_error = .file_enrichment_launch_failed,
+                    .out_of_memory => {
+                        self.requestShutdown();
+                        self.fatal_error = .file_enrichment_out_of_memory;
+                    },
+                }
+            },
+            .completed => |result_value| {
+                var result = result_value;
+                defer result.deinit();
+                if (!applies) return;
+                const current = published.?;
+                current.session.enrichment.admit(completed.file_index, &result) catch {
+                    self.action_error = .action_refused;
+                    return;
+                };
+                current.rebuild(self.preferences, current.expanded_folds.items, current.isolated_file) catch |err| {
+                    self.action_error = normalizeActionError(err);
+                    return;
+                };
+                self.action_error = null;
+            },
+        }
+    }
+
     fn saveComposer(self: *Presentation, published: *Published) void {
         const composer = if (published.composer) |*value| value else return;
         if (composer.isBlank()) return;
@@ -827,7 +1032,7 @@ pub const Presentation = struct {
                 self.next_intent += 1; // invalidate a candidate already in flight
                 self.replacement = null;
                 self.replacement_error = null;
-                self.commands.clearRetainingCapacity();
+                self.removeQueuedSessionLoads();
                 return;
             }
         }
@@ -836,15 +1041,25 @@ pub const Presentation = struct {
         // Reserve before changing either the queued command or replacement
         // intent. Once one slot exists, superseding a not-yet-started load is
         // allocation-free and cannot strand Presentation in `.replacing`.
-        try self.commands.ensureTotalCapacity(self.allocator, 1);
+        try self.commands.ensureTotalCapacity(self.allocator, self.commands.items.len + 1);
         // Commands not yet transferred to the terminal adapter are still ours
         // to supersede. Already-taken commands complete normally and are
         // rejected later by their LoadIntent.
-        self.commands.clearRetainingCapacity();
+        self.removeQueuedSessionLoads();
         self.commands.appendAssumeCapacity(.{ .load_session = .{ .intent = intent, .key = key } });
         self.next_intent = intent;
         self.replacement = .{ .intent = intent, .key = key };
         self.replacement_error = null;
+    }
+
+    fn removeQueuedSessionLoads(self: *Presentation) void {
+        var write: usize = 0;
+        for (self.commands.items) |command| {
+            if (command == .load_session) continue;
+            self.commands.items[write] = command;
+            write += 1;
+        }
+        self.commands.shrinkRetainingCapacity(write);
     }
 
     fn acceptLoadedSession(self: *Presentation, completed: SessionLoaded) void {
@@ -1491,4 +1706,277 @@ test "failed replacement preserves Composer and successful replacement resets it
         .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
     } });
     try testing.expect(presentation.projection().composer == null);
+}
+
+test "focused File Enrichment emits one Session Epoch command while in flight" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const command = presentation.takeCommand().?.enrich_file;
+    try testing.expectEqual(presentation.projection().review.?.session_epoch, command.session_epoch);
+    try testing.expectEqual(@as(usize, 0), command.file_index);
+    try testing.expectEqualStrings("repo", command.repository());
+    try testing.expectEqualStrings("a.zig", command.newPath());
+
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+const TestNoopHighlighter = struct {
+    fn highlighter(self: *TestNoopHighlighter) bbr.highlight.Highlighter {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: bbr.highlight.Highlighter.VTable = .{ .highlight = highlight };
+
+    fn highlight(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
+        return .{ .spans = &.{} };
+    }
+};
+
+test "matching File Enrichment is admitted and reprojects whole-file Buffer" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    const before_rows = presentation.projection().review.?.buffer.rows.len;
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const command = presentation.takeCommand().?.enrich_file;
+    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    const replacement = presentation.takeCommand().?.load_session;
+
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 200, .body = "prefix\nold\nsuffix\n" },
+        .{ .status = 200, .body = "prefix\nnew\nsuffix\n" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+    var highlighter = TestNoopHighlighter{};
+    var result = try @import("file_enrichment.zig").enrich(testing.allocator, client, highlighter.highlighter(), command.request());
+
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .work_id = command.work_id,
+        .session_epoch = command.session_epoch,
+        .file_index = command.file_index,
+        .outcome = .{ .completed = result },
+    } });
+    result = undefined; // ownership moved into dispatch
+
+    try testing.expect(presentation.projection().review.?.buffer.rows.len > before_rows);
+    try testing.expect(presentation.projection().replacing);
+    try presentation.dispatch(.{ .session_loaded = .{
+        .intent = replacement.intent,
+        .outcome = .{ .failed = error.NotFound },
+    } });
+    try testing.expectEqual(@as(u64, 1), presentation.projection().review.?.pull_request.id);
+    try testing.expect(presentation.projection().review.?.buffer.rows.len > before_rows);
+}
+
+test "replacement preserves queued File Enrichment for the published rollback Session" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+
+    try testing.expect(presentation.takeCommand().? == .enrich_file);
+    try testing.expect(presentation.takeCommand().? == .load_session);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "stale File Enrichment is disposed without mutating the replacement Session" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const enrich = presentation.takeCommand().?.enrich_file;
+    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    const load = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+    } });
+    const before = presentation.projection().review.?;
+
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 200, .body = "old\n" },
+        .{ .status = 200, .body = "new\n" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+    var highlighter = TestNoopHighlighter{};
+    const result = try file_enrichment.enrich(testing.allocator, client, highlighter.highlighter(), enrich.request());
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .work_id = enrich.work_id,
+        .session_epoch = enrich.session_epoch,
+        .file_index = enrich.file_index,
+        .outcome = .{ .completed = result },
+    } });
+
+    const after = presentation.projection();
+    try testing.expectEqual(@as(u64, 2), after.review.?.pull_request.id);
+    try testing.expectEqual(before.buffer.rows.ptr, after.review.?.buffer.rows.ptr);
+    try testing.expect(after.action_error == null);
+}
+
+test "admitted File Enrichment survives failed Buffer reprojection" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const command = presentation.takeCommand().?.enrich_file;
+    const before = presentation.projection().review.?;
+
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 200, .body = "prefix\nold\nsuffix\n" },
+        .{ .status = 200, .body = "prefix\nnew\nsuffix\n" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+    var highlighter = TestNoopHighlighter{};
+    const result = try file_enrichment.enrich(testing.allocator, client, highlighter.highlighter(), command.request());
+
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .work_id = command.work_id,
+        .session_epoch = command.session_epoch,
+        .file_index = command.file_index,
+        .outcome = .{ .completed = result },
+    } });
+    const failed = presentation.projection();
+    try testing.expect(failing.has_induced_failure);
+    try testing.expectEqual(before.buffer.rows.ptr, failed.review.?.buffer.rows.ptr);
+    try testing.expectEqual(ActionError.out_of_memory, failed.action_error.?);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try presentation.dispatch(.{ .action = .toggle_resolved });
+    try testing.expect(presentation.projection().review.?.buffer.rows.len > before.buffer.rows.len);
+}
+
+test "File Enrichment launch failure restores retryable pending state" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const first = presentation.takeCommand().?.enrich_file;
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .work_id = first.work_id,
+        .session_epoch = first.session_epoch,
+        .file_index = first.file_index,
+        .outcome = .{ .failed = .launch_failed },
+    } });
+    try testing.expectEqual(ActionError.file_enrichment_launch_failed, presentation.projection().action_error.?);
+
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const retry = presentation.takeCommand().?.enrich_file;
+    try testing.expect(retry.work_id != first.work_id);
+}
+
+test "duplicate File Enrichment completion cannot drain a newer WorkId" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const first = presentation.takeCommand().?.enrich_file;
+    const first_failure: FileEnrichmentCompleted = .{
+        .work_id = first.work_id,
+        .session_epoch = first.session_epoch,
+        .file_index = first.file_index,
+        .outcome = .{ .failed = .launch_failed },
+    };
+    try presentation.dispatch(.{ .file_enrichment_completed = first_failure });
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const retry = presentation.takeCommand().?.enrich_file;
+
+    try presentation.dispatch(.{ .file_enrichment_completed = first_failure });
+    try presentation.dispatch(.request_shutdown);
+    try testing.expect(!presentation.readyToExit());
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .work_id = retry.work_id,
+        .session_epoch = retry.session_epoch,
+        .file_index = retry.file_index,
+        .outcome = .{ .failed = .launch_failed },
+    } });
+    try testing.expect(presentation.readyToExit());
+}
+
+test "File Enrichment out of memory projects a distinct fatal shutdown" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const command = presentation.takeCommand().?.enrich_file;
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .work_id = command.work_id,
+        .session_epoch = command.session_epoch,
+        .file_index = command.file_index,
+        .outcome = .{ .failed = .out_of_memory },
+    } });
+
+    try testing.expectEqual(FatalError.file_enrichment_out_of_memory, presentation.projection().fatal_error.?);
+    try testing.expect(presentation.projection().shutting_down);
+    try testing.expect(presentation.readyToExit());
 }
