@@ -17,9 +17,13 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const draft_mod = @import("draft.zig");
 const Draft = draft_mod.Draft;
+const DraftState = draft_mod.DraftState;
 const TempId = draft_mod.TempId;
 const PendingReview = draft_mod.PendingReview;
-const Anchor = @import("comment.zig").Anchor;
+const comment = @import("comment.zig");
+const Anchor = comment.Anchor;
+const CommentId = comment.CommentId;
+const ApiError = @import("../bitbucket/types.zig").ApiError;
 
 /// Durable identity of a Pending Review. Bitbucket PullRequestIds are unique
 /// only within a Repository, so every store operation carries the full scope.
@@ -35,6 +39,52 @@ pub const ReviewKey = struct {
     }
 };
 
+pub const OperationId = u64;
+
+pub const ActiveSubmissionRun = struct {
+    operation_id: OperationId,
+    key: ReviewKey,
+    source_commit: []const u8,
+    current_temp_id: ?TempId,
+};
+
+/// The durable result of one network post. Keeping this narrower than
+/// `DraftState` prevents an invalid checkpoint from moving a completed item
+/// back to `.draft` or `.submitting`.
+pub const SubmissionOutcome = union(enum) {
+    posted: CommentId,
+    failed: ApiError,
+
+    fn draftState(self: SubmissionOutcome) DraftState {
+        return switch (self) {
+            .posted => |id| .{ .posted = id },
+            .failed => |err| .{ .failed = err },
+        };
+    }
+};
+
+pub const SubmissionPendingState = union(enum) {
+    draft,
+    failed: ApiError,
+
+    fn draftState(self: SubmissionPendingState) DraftState {
+        return switch (self) {
+            .draft => .draft,
+            .failed => |err| .{ .failed = err },
+        };
+    }
+};
+
+pub const SubmissionCompletion = union(enum) {
+    /// Every remote Draft posted; transient `.posted` rows can be removed.
+    clean,
+    /// At least one outcome needs repair; retain every Draft as evidence.
+    partial,
+    /// An abort produced no item outcome. Restore the in-flight Draft to the
+    /// pending state it had before intent was persisted, then close partial.
+    aborted: SubmissionPendingState,
+};
+
 pub const PendingReviewStore = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -46,6 +96,10 @@ pub const PendingReviewStore = struct {
         remove: *const fn (ptr: *anyopaque, key: ReviewKey, local_id: TempId) anyerror!void,
         /// Every Draft for `pr_id`, each with its strings duped into `allocator`.
         load: *const fn (ptr: *anyopaque, allocator: Allocator, key: ReviewKey) anyerror![]Draft,
+        begin_submission: *const fn (ptr: *anyopaque, key: ReviewKey, source_commit: []const u8, first_temp_id: TempId) anyerror!OperationId,
+        checkpoint_submission: *const fn (ptr: *anyopaque, operation_id: OperationId, key: ReviewKey, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) anyerror!void,
+        complete_submission: *const fn (ptr: *anyopaque, operation_id: OperationId, key: ReviewKey, completion: SubmissionCompletion) anyerror!void,
+        active_submission: *const fn (ptr: *anyopaque, allocator: Allocator) anyerror!?ActiveSubmissionRun,
     };
 
     pub fn put(self: PendingReviewStore, key: ReviewKey, draft: Draft) !void {
@@ -58,6 +112,24 @@ pub const PendingReviewStore = struct {
 
     pub fn load(self: PendingReviewStore, allocator: Allocator, key: ReviewKey) ![]Draft {
         return self.vtable.load(self.ptr, allocator, key);
+    }
+
+    pub fn beginSubmission(self: PendingReviewStore, key: ReviewKey, source_commit: []const u8, first_temp_id: TempId) !OperationId {
+        return self.vtable.begin_submission(self.ptr, key, source_commit, first_temp_id);
+    }
+
+    pub fn activeSubmission(self: PendingReviewStore, allocator: Allocator) !?ActiveSubmissionRun {
+        return self.vtable.active_submission(self.ptr, allocator);
+    }
+
+    /// Persist one post's outcome and the next post intent as one transaction.
+    /// No network operation belongs inside this call.
+    pub fn checkpointSubmission(self: PendingReviewStore, operation_id: OperationId, key: ReviewKey, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) !void {
+        return self.vtable.checkpoint_submission(self.ptr, operation_id, key, completed_temp_id, outcome, next_temp_id);
+    }
+
+    pub fn completeSubmission(self: PendingReviewStore, operation_id: OperationId, key: ReviewKey, completion: SubmissionCompletion) !void {
+        return self.vtable.complete_submission(self.ptr, operation_id, key, completion);
     }
 
     /// Resume: load a PR's Drafts and rebuild the PendingReview graph. Strings
@@ -93,6 +165,8 @@ fn dupeAnchor(alloc: Allocator, a: Anchor) !Anchor {
 pub const InMemoryStore = struct {
     arena: std.heap.ArenaAllocator,
     entries: std.ArrayList(Entry),
+    active_submission: ?ActiveSubmissionRun = null,
+    next_operation_id: OperationId = 1,
 
     const Entry = struct { key: ReviewKey, draft: Draft };
 
@@ -115,10 +189,23 @@ pub const InMemoryStore = struct {
         .put = putImpl,
         .remove = removeImpl,
         .load = loadImpl,
+        .begin_submission = beginSubmissionImpl,
+        .checkpoint_submission = checkpointSubmissionImpl,
+        .complete_submission = completeSubmissionImpl,
+        .active_submission = activeSubmissionImpl,
     };
 
     fn putImpl(ptr: *anyopaque, key: ReviewKey, d: Draft) anyerror!void {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        if (self.active_submission) |run| {
+            if (ReviewKey.eql(run.key, key)) {
+                if (d.target == .bitbucket) return error.DraftLocked;
+                for (self.entries.items) |entry| {
+                    if (ReviewKey.eql(entry.key, key) and entry.draft.local_id == d.local_id and entry.draft.target == .bitbucket)
+                        return error.DraftLocked;
+                }
+            }
+        }
         const owned = try dupeDraft(self.arena.allocator(), d);
         // Replace an existing row with the same key; else append.
         for (self.entries.items) |*e| {
@@ -137,6 +224,14 @@ pub const InMemoryStore = struct {
 
     fn removeImpl(ptr: *anyopaque, key: ReviewKey, local_id: TempId) anyerror!void {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        if (self.active_submission) |run| {
+            if (ReviewKey.eql(run.key, key)) {
+                for (self.entries.items) |entry| {
+                    if (ReviewKey.eql(entry.key, key) and entry.draft.local_id == local_id and entry.draft.target == .bitbucket)
+                        return error.DraftLocked;
+                }
+            }
+        }
         var i: usize = 0;
         while (i < self.entries.items.len) {
             const e = self.entries.items[i];
@@ -154,6 +249,118 @@ pub const InMemoryStore = struct {
             if (ReviewKey.eql(e.key, key)) try out.append(allocator, try dupeDraft(allocator, e.draft));
         }
         return out.toOwnedSlice(allocator);
+    }
+
+    fn beginSubmissionImpl(ptr: *anyopaque, key: ReviewKey, source_commit: []const u8, first_temp_id: TempId) anyerror!OperationId {
+        const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        if (self.active_submission != null) return error.SubmissionAlreadyActive;
+        var draft: ?*Draft = null;
+        for (self.entries.items) |*entry| {
+            if (ReviewKey.eql(entry.key, key) and entry.draft.local_id == first_temp_id) {
+                draft = &entry.draft;
+                break;
+            }
+        }
+        const first = draft orelse return error.DraftNotFound;
+        if (first.target != .bitbucket or (first.state != .draft and first.state != .failed))
+            return error.DraftNotSubmittable;
+        const owned_key: ReviewKey = .{
+            .workspace = try self.arena.allocator().dupe(u8, key.workspace),
+            .repository = try self.arena.allocator().dupe(u8, key.repository),
+            .pull_request_id = key.pull_request_id,
+        };
+        const owned_commit = try self.arena.allocator().dupe(u8, source_commit);
+        const operation_id = self.next_operation_id;
+        self.active_submission = .{
+            .operation_id = operation_id,
+            .key = owned_key,
+            .source_commit = owned_commit,
+            .current_temp_id = first_temp_id,
+        };
+        self.next_operation_id += 1;
+        first.state = .submitting;
+        return operation_id;
+    }
+
+    fn activeSubmissionImpl(ptr: *anyopaque, allocator: Allocator) anyerror!?ActiveSubmissionRun {
+        const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        const run = self.active_submission orelse return null;
+        return .{
+            .operation_id = run.operation_id,
+            .key = .{
+                .workspace = try allocator.dupe(u8, run.key.workspace),
+                .repository = try allocator.dupe(u8, run.key.repository),
+                .pull_request_id = run.key.pull_request_id,
+            },
+            .source_commit = try allocator.dupe(u8, run.source_commit),
+            .current_temp_id = run.current_temp_id,
+        };
+    }
+
+    fn checkpointSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: ReviewKey, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) anyerror!void {
+        const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        const run = if (self.active_submission) |*active| active else return error.SubmissionNotActive;
+        if (run.operation_id != operation_id or !ReviewKey.eql(run.key, key) or
+            run.current_temp_id != completed_temp_id)
+            return error.InvalidSubmissionCheckpoint;
+        if (next_temp_id == completed_temp_id) return error.InvalidSubmissionCheckpoint;
+
+        var completed: ?*Draft = null;
+        var next: ?*Draft = null;
+        for (self.entries.items) |*entry| {
+            if (!ReviewKey.eql(entry.key, key)) continue;
+            if (entry.draft.local_id == completed_temp_id) completed = &entry.draft;
+            if (next_temp_id != null and entry.draft.local_id == next_temp_id.?) next = &entry.draft;
+        }
+        const completed_draft = completed orelse return error.DraftNotFound;
+        if (completed_draft.state != .submitting) return error.InvalidSubmissionCheckpoint;
+        const next_draft = if (next_temp_id != null) next orelse return error.DraftNotFound else null;
+        if (next_draft) |draft| {
+            if (draft.target != .bitbucket or (draft.state != .draft and draft.state != .failed))
+                return error.InvalidSubmissionCheckpoint;
+        }
+
+        completed_draft.state = outcome.draftState();
+        if (next_draft) |draft| draft.state = .submitting;
+        run.current_temp_id = next_temp_id;
+    }
+
+    fn completeSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: ReviewKey, completion: SubmissionCompletion) anyerror!void {
+        const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        const run = self.active_submission orelse return error.SubmissionNotActive;
+        if (run.operation_id != operation_id or !ReviewKey.eql(run.key, key))
+            return error.InvalidSubmissionCompletion;
+
+        switch (completion) {
+            .clean => {
+                if (run.current_temp_id != null) return error.InvalidSubmissionCompletion;
+                for (self.entries.items) |entry| {
+                    if (ReviewKey.eql(entry.key, key) and entry.draft.target == .bitbucket and entry.draft.state != .posted)
+                        return error.SubmissionNotClean;
+                }
+                var i: usize = 0;
+                while (i < self.entries.items.len) {
+                    const entry = self.entries.items[i];
+                    if (ReviewKey.eql(entry.key, key) and entry.draft.target == .bitbucket and entry.draft.state == .posted) {
+                        _ = self.entries.orderedRemove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+            },
+            .partial => if (run.current_temp_id != null) return error.InvalidSubmissionCompletion,
+            .aborted => |restore| {
+                const current_id = run.current_temp_id orelse return error.InvalidSubmissionCompletion;
+                var current: ?*Draft = null;
+                for (self.entries.items) |*entry| {
+                    if (ReviewKey.eql(entry.key, key) and entry.draft.local_id == current_id) current = &entry.draft;
+                }
+                const draft = current orelse return error.DraftNotFound;
+                if (draft.state != .submitting) return error.InvalidSubmissionCompletion;
+                draft.state = restore.draftState();
+            },
+        }
+        self.active_submission = null;
     }
 };
 
@@ -265,4 +472,151 @@ test "loadReview rebuilds the graph and next_id for resume" {
     // A fresh draft is assigned an id past every loaded one.
     const fresh = try review.add(arena.allocator(), .{ .kind = .top_level, .body = "new" });
     try testing.expectEqual(@as(TempId, 9), fresh);
+}
+
+test "beginning a Submission atomically records its run and first submitting Draft" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "first" });
+    try store.put(key, .{ .local_id = 2, .kind = .top_level, .body = "second" });
+
+    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const run = (try store.activeSubmission(arena.allocator())).?;
+    try testing.expectEqual(operation_id, run.operation_id);
+    try testing.expect(ReviewKey.eql(key, run.key));
+    try testing.expectEqualStrings("source-commit", run.source_commit);
+    try testing.expectEqual(@as(?TempId, 1), run.current_temp_id);
+
+    const drafts = try store.load(arena.allocator(), key);
+    try testing.expect(drafts[0].state == .submitting);
+    try testing.expect(drafts[1].state == .draft);
+}
+
+test "Submission checkpoint persists the outcome and next intent together" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "first" });
+    try store.put(key, .{ .local_id = 2, .kind = .top_level, .body = "second", .state = .{ .failed = error.ServerError } });
+    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+
+    try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, 2);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const run = (try store.activeSubmission(arena.allocator())).?;
+    try testing.expectEqual(@as(?TempId, 2), run.current_temp_id);
+    const drafts = try store.load(arena.allocator(), key);
+    try testing.expectEqual(@as(u64, 900), drafts[0].state.posted);
+    try testing.expect(drafts[1].state == .submitting);
+}
+
+test "a rejected Submission checkpoint leaves the run and Draft unchanged" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "first" });
+    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+
+    try testing.expectError(error.DraftNotFound, store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, 99));
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const run = (try store.activeSubmission(arena.allocator())).?;
+    try testing.expectEqual(@as(?TempId, 1), run.current_temp_id);
+    const drafts = try store.load(arena.allocator(), key);
+    try testing.expect(drafts[0].state == .submitting);
+}
+
+test "clean Submission completion removes posted Drafts and closes the run" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "posted" });
+    try store.put(key, .{ .local_id = 2, .kind = .top_level, .target = .local, .body = "keep local", .state = .{ .posted = 901 } });
+    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, null);
+
+    try store.completeSubmission(operation_id, key, .clean);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect((try store.activeSubmission(arena.allocator())) == null);
+    const drafts = try store.load(arena.allocator(), key);
+    try testing.expectEqual(@as(usize, 1), drafts.len);
+    try testing.expectEqual(@as(TempId, 2), drafts[0].local_id);
+}
+
+test "partial Submission completion keeps outcomes for repair" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "failed" });
+    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    try store.checkpointSubmission(operation_id, key, 1, .{ .failed = error.Forbidden }, null);
+
+    try store.completeSubmission(operation_id, key, .partial);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect((try store.activeSubmission(arena.allocator())) == null);
+    const drafts = try store.load(arena.allocator(), key);
+    try testing.expectEqual(@as(usize, 1), drafts.len);
+    try testing.expectEqual(ApiError.Forbidden, drafts[0].state.failed);
+}
+
+test "active Submission locks Bitbucket Draft mutation but not local Drafts" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "remote" });
+    try store.put(key, .{ .local_id = 2, .kind = .top_level, .target = .local, .body = "local" });
+    _ = try store.beginSubmission(key, "source-commit", 1);
+
+    try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "changed" }));
+    try testing.expectError(error.DraftLocked, store.remove(key, 1));
+    try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 3, .kind = .top_level, .body = "new remote" }));
+    try store.put(key, .{ .local_id = 2, .kind = .top_level, .target = .local, .body = "changed local" });
+    try store.remove(key, 2);
+}
+
+test "clean completion rejects a Submission with failed Bitbucket Drafts" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "failed" });
+    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    try store.checkpointSubmission(operation_id, key, 1, .{ .failed = error.Forbidden }, null);
+
+    try testing.expectError(error.SubmissionNotClean, store.completeSubmission(operation_id, key, .clean));
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect((try store.activeSubmission(arena.allocator())) != null);
+}
+
+test "aborted Submission restores the current Draft and closes partial" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "retry", .state = .{ .failed = error.ServerError } });
+    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+
+    try store.completeSubmission(operation_id, key, .{ .aborted = .{ .failed = error.ServerError } });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect((try store.activeSubmission(arena.allocator())) == null);
+    const drafts = try store.load(arena.allocator(), key);
+    try testing.expectEqual(ApiError.ServerError, drafts[0].state.failed);
 }
