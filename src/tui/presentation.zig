@@ -98,6 +98,7 @@ pub const OwnedInput = union(enum) {
     ensure_focused_enrichment,
     file_enrichment_completed: FileEnrichmentCompleted,
     post_draft_completed: PostDraftCompleted,
+    post_draft_launch_failed: PostDraftLaunchFailed,
     submission_wait_completed: WaitSubmission,
     request_shutdown,
 };
@@ -107,6 +108,11 @@ pub const PostDraftCompleted = struct {
     temp_id: bbr.review.TempId,
     outcome: bbr.review.PostOutcome,
     retry_after_ms: ?u64 = null,
+};
+
+pub const PostDraftLaunchFailed = struct {
+    operation_id: bbr.review.OperationId,
+    temp_id: bbr.review.TempId,
 };
 
 pub const WaitSubmission = struct {
@@ -372,6 +378,7 @@ pub const ActionError = enum {
     out_of_memory,
     persistence_failed,
     submission_already_active,
+    submission_launch_failed,
     submission_owned_elsewhere,
     submission_start_failed,
 };
@@ -549,7 +556,7 @@ const DurableSubmission = struct {
     arena: std.heap.ArenaAllocator,
     review: bbr.review.PendingReview,
     machine: bbr.review.Submission,
-    phase: enum { post_queued, awaiting_post, wait_queued, awaiting_wait, admission_paused, persistence_paused } = .post_queued,
+    phase: enum { post_queued, awaiting_post, post_retry_paused, wait_queued, awaiting_wait, admission_paused, persistence_paused } = .post_queued,
     pending_admission: ?PendingAdmission = null,
     pending_persistence: ?PendingPersistence = null,
     posted_any: bool = false,
@@ -728,6 +735,10 @@ const DurableSubmission = struct {
     fn completeWait(self: *DurableSubmission, allocator: Allocator, wait: WaitSubmission) !*PostDraft {
         if (self.operation_id != wait.operation_id or self.current_temp_id != wait.temp_id or self.phase != .awaiting_wait)
             return error.StaleSubmissionWait;
+        return self.materializeCurrentPost(allocator);
+    }
+
+    fn materializeCurrentPost(self: *DurableSubmission, allocator: Allocator) !*PostDraft {
         const post = switch (self.machine.advance()) {
             .post => |value| value,
             else => return error.InvalidSubmissionState,
@@ -737,6 +748,11 @@ const DurableSubmission = struct {
         command.operation_id = self.operation_id;
         self.phase = .post_queued;
         return command;
+    }
+
+    fn retryPost(self: *DurableSubmission, allocator: Allocator) !*PostDraft {
+        if (self.phase != .post_retry_paused) return error.InvalidSubmissionState;
+        return self.materializeCurrentPost(allocator);
     }
 
     fn recordCheckpoint(self: *DurableSubmission, completed_temp_id: bbr.review.TempId, outcome: bbr.review.SubmissionOutcome, next_temp_id: ?bbr.review.TempId) void {
@@ -817,6 +833,7 @@ pub const Presentation = struct {
             .ensure_focused_enrichment => try self.ensureFocusedEnrichment(),
             .file_enrichment_completed => |completed| self.acceptFileEnrichment(completed),
             .post_draft_completed => |completed| self.acceptPostDraft(completed),
+            .post_draft_launch_failed => |failed| self.acceptPostDraftLaunchFailure(failed),
             .submission_wait_completed => |completed| self.acceptSubmissionWait(completed),
             .request_shutdown => self.requestShutdown(),
         }
@@ -967,6 +984,10 @@ pub const Presentation = struct {
 
     fn startSubmission(self: *Presentation, published: *Published) void {
         if (self.durable_submission) |durable| {
+            if (durable.phase == .post_retry_paused) {
+                self.resumePostDraftLaunch(durable);
+                return;
+            }
             if (durable.pending_admission != null) {
                 self.resumeSubmissionAdmission(durable);
                 return;
@@ -1014,7 +1035,9 @@ pub const Presentation = struct {
 
     fn resumeDurableSubmission(self: *Presentation) void {
         const durable = self.durable_submission orelse return;
-        if (durable.pending_admission != null) {
+        if (durable.phase == .post_retry_paused) {
+            self.resumePostDraftLaunch(durable);
+        } else if (durable.pending_admission != null) {
             self.resumeSubmissionAdmission(durable);
         } else if (durable.pending_persistence != null) {
             self.resumeSubmissionPersistence(durable);
@@ -1031,6 +1054,26 @@ pub const Presentation = struct {
             return;
         };
         self.processPostDraft(durable, completed);
+    }
+
+    fn acceptPostDraftLaunchFailure(self: *Presentation, failed: PostDraftLaunchFailed) void {
+        const durable = self.durable_submission orelse return;
+        if (durable.operation_id != failed.operation_id or durable.current_temp_id != failed.temp_id or durable.phase != .awaiting_post) return;
+        durable.phase = .post_retry_paused;
+        self.action_error = .submission_launch_failed;
+    }
+
+    fn resumePostDraftLaunch(self: *Presentation, durable: *DurableSubmission) void {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        const command = durable.retryPost(self.allocator) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        self.commands.appendAssumeCapacity(.{ .post_draft = command });
+        self.action_error = null;
     }
 
     fn processPostDraft(self: *Presentation, durable: *DurableSubmission, completed: PostDraftCompleted) void {
@@ -3089,6 +3132,45 @@ test "queue allocation failure retains a POST completion for admission retry" {
     failing.fail_index = std.math.maxInt(usize);
     try presentation.dispatch(.{ .action = .submit });
     try testing.expect(presentation.projection().submission == null);
+}
+
+test "POST launch failure pauses without reporting a remote outcome and submit retries" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "retry launch" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var first = presentation.takeCommand().?;
+    const operation_id = first.post_draft.operation_id;
+    first.deinit();
+
+    try presentation.dispatch(.{ .post_draft_launch_failed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+    } });
+
+    try testing.expectEqual(ActionError.submission_launch_failed, presentation.projection().action_error.?);
+    try testing.expect(presentation.takeCommand() == null);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect((try store.store().load(arena.allocator(), key.storeKey()))[0].state == .submitting);
+
+    try presentation.dispatch(.{ .action = .submit });
+    var retry = presentation.takeCommand().?;
+    defer retry.deinit();
+    try testing.expectEqual(operation_id, retry.post_draft.operation_id);
+    try testing.expectEqual(@as(bbr.review.TempId, 1), retry.post_draft.draft.local_id);
+    try testing.expect(!retry.post_draft.dedupe);
 }
 
 test "shutdown retries a paused terminal persistence step" {

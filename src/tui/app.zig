@@ -49,6 +49,7 @@ const composer_mod = @import("composer.zig");
 const Composer = composer_mod.Composer;
 const session = @import("session.zig");
 const file_enrichment = @import("file_enrichment.zig");
+const presentation_adapter = @import("presentation_adapter.zig");
 const ArenaRing = @import("arena_ring.zig").ArenaRing;
 const Session = session.Session;
 
@@ -1321,16 +1322,7 @@ fn submitWorker(
                 const d = req.review.getConst(ps.temp_id).?;
                 // On an ambiguous retry, dedupe first (GET-and-match) so a
                 // lost-response POST isn't sent twice (§9 "Duplicates").
-                var outcome: bbr.review.PostOutcome = undefined;
-                if (ps.dedupe) {
-                    if (cp.findExisting(d.*) catch null) |existing| {
-                        outcome = .{ .posted = existing };
-                    } else {
-                        outcome = cp.post(d.*, ps.parent) catch .ambiguous;
-                    }
-                } else {
-                    outcome = cp.post(d.*, ps.parent) catch .ambiguous;
-                }
+                const outcome = presentation_adapter.postOutcome(cp, d.*, ps.parent, ps.dedupe) catch .ambiguous;
                 sub.report(outcome, null);
                 emitProgress(loop, req, &sub, emitted);
             },
