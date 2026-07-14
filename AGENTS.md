@@ -1,5 +1,7 @@
 # Agent guidance
 
+Only use subagents if the user explicitly requests them.
+
 ## Agent skills
 
 ### Issue tracker
