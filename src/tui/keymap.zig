@@ -9,9 +9,8 @@
 //!   * a **Leader** begins a configured multi-chord sequence the `Resolver`
 //!     tracks; a Leader has no standalone binding.
 //!
-//! Bindings are matched against a live event with the smart `vaxis.Key.matches`,
-//! so `S` = shift+`s`, text-vs-codepoint, and caps-lock all resolve the vaxis
-//! way rather than by raw equality.
+//! Bindings are matched against a portable `KeyStroke`, so the state-machine
+//! boundary does not expose terminal-library event types.
 //!
 //! Only viewer (normal) mode is tabled here; the Composer and Picker overlays
 //! keep their own fixed editing keys (their surface is mostly text entry). User
@@ -24,7 +23,38 @@ const vaxis = @import("vaxis");
 /// Portable Presentation Action. This module owns only terminal-key resolution;
 /// the resulting vocabulary is independent of vaxis and belongs to the state
 /// machine that consumes it.
-pub const Action = @import("presentation.zig").Action;
+pub const Action = @import("action.zig").Action;
+
+pub const Modifiers = struct {
+    shift: bool = false,
+    alt: bool = false,
+    ctrl: bool = false,
+    super: bool = false,
+    hyper: bool = false,
+    meta: bool = false,
+
+    pub fn eql(a: Modifiers, b: Modifiers) bool {
+        return std.meta.eql(a, b);
+    }
+};
+
+pub const KeyStroke = struct {
+    codepoint: u21,
+    text: ?[]const u8 = null,
+    mods: Modifiers = .{},
+
+    pub fn matches(self: KeyStroke, codepoint: u21, modifiers: Modifiers) bool {
+        return self.codepoint == codepoint and self.mods.eql(modifiers);
+    }
+};
+
+pub const special = struct {
+    pub const escape = vaxis.Key.escape;
+    pub const enter = vaxis.Key.enter;
+    pub const backspace = vaxis.Key.backspace;
+    pub const up = vaxis.Key.up;
+    pub const down = vaxis.Key.down;
+};
 
 /// Is this Action a Motion (movement within a Pane) rather than a command? The
 /// help overlay groups the two; `select_down`/`select_up` count as motions since
@@ -64,7 +94,7 @@ pub const Chord = struct {
         return .{ .strokes = strokes, .count = 1 };
     }
 
-    pub fn modified(cp: u21, mods: vaxis.Key.Modifiers) Chord {
+    pub fn modified(cp: u21, mods: Modifiers) Chord {
         var chord = one(cp);
         chord.strokes[0].mods = mods;
         return chord;
@@ -88,7 +118,7 @@ pub const Chord = struct {
 
 pub const Stroke = struct {
     cp: u21,
-    mods: vaxis.Key.Modifiers = .{},
+    mods: Modifiers = .{},
 };
 
 pub const Binding = struct {
@@ -225,7 +255,7 @@ fn parseSequence(text: []const u8) !Chord {
 
 fn parseStroke(text: []const u8) !Stroke {
     var rest = text;
-    var mods: vaxis.Key.Modifiers = .{};
+    var mods: Modifiers = .{};
     while (true) {
         const dash = std.mem.indexOfScalar(u8, rest, '-') orelse break;
         const part = rest[0..dash];
@@ -238,7 +268,7 @@ fn parseStroke(text: []const u8) !Stroke {
     return .{ .cp = cp, .mods = mods };
 }
 
-fn modifier(name: []const u8, mods: *vaxis.Key.Modifiers) bool {
+fn modifier(name: []const u8, mods: *Modifiers) bool {
     if (std.mem.eql(u8, name, "shift")) mods.shift = true else if (std.mem.eql(u8, name, "alt") or std.mem.eql(u8, name, "option")) mods.alt = true else if (std.mem.eql(u8, name, "ctrl") or std.mem.eql(u8, name, "control")) mods.ctrl = true else if (std.mem.eql(u8, name, "super") or std.mem.eql(u8, name, "cmd") or std.mem.eql(u8, name, "command")) mods.super = true else if (std.mem.eql(u8, name, "hyper")) mods.hyper = true else if (std.mem.eql(u8, name, "meta")) mods.meta = true else return false;
     return true;
 }
@@ -309,9 +339,9 @@ fn validatePrefixes(bindings: []const Binding) !void {
     };
 }
 
-/// Threads multi-chord Action grammar across keypresses. Owned by the event
-/// loop; one per viewer. `Nav` owns the Count, so the resolver only tracks the
-/// pending Keymap sequence.
+/// Threads multi-chord Action grammar across keypresses. Presentation owns one
+/// resolver and resets it when a replacement Session publishes. `Nav` owns the
+/// Count, so the resolver only tracks the pending Keymap sequence.
 pub const Resolver = struct {
     leader: ?u21 = null,
     pending: [8]Stroke = undefined,
@@ -326,7 +356,7 @@ pub const Resolver = struct {
         action: Action,
     };
 
-    pub fn feed(self: *Resolver, km: Keymap, key: vaxis.Key) Result {
+    pub fn feed(self: *Resolver, km: Keymap, key: KeyStroke) Result {
         if (self.pending_len > 0 and key.matches(vaxis.Key.escape, .{})) {
             self.pending_len = 0;
             self.leader = null;
@@ -376,7 +406,7 @@ pub const Resolver = struct {
 // ---------------------------------------------------------------------------
 const testing = std.testing;
 
-fn plain(cp: u21) vaxis.Key {
+fn plain(cp: u21) KeyStroke {
     return .{ .codepoint = cp };
 }
 

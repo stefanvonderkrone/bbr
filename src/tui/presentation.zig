@@ -9,6 +9,8 @@ const Nav = @import("nav.zig").Nav;
 const composer_mod = @import("composer.zig");
 const Composer = composer_mod.Composer;
 const file_enrichment = @import("file_enrichment.zig");
+const keymap_mod = @import("keymap.zig");
+const Picker = @import("picker.zig").Picker;
 
 const Allocator = std.mem.Allocator;
 const Session = session_mod.Session;
@@ -67,6 +69,8 @@ pub const Dependencies = struct {
     submission_locks: ?bbr.review.SubmissionLocks = null,
     highlight_max_file_bytes: usize = 0,
     require_source_check: bool = false,
+    keymap: keymap_mod.Keymap = .default,
+    remote_enabled: bool = true,
 };
 
 pub const InitialReview = struct {
@@ -91,6 +95,7 @@ pub const SessionLoaded = struct {
 
 pub const OwnedInput = union(enum) {
     choose_pull_request: ReviewKey,
+    key: keymap_mod.KeyStroke,
     session_loaded: SessionLoaded,
     push_count_digit: u8,
     resize_viewport: usize,
@@ -105,6 +110,7 @@ pub const OwnedInput = union(enum) {
     submission_wait_launch_failed: WaitSubmission,
     recovery_checked: RecoveryChecked,
     duplicate_checked: DuplicateChecked,
+    pull_requests_loaded: PullRequestsLoaded,
     dismiss_submission_result,
     request_shutdown,
 
@@ -117,6 +123,7 @@ pub const OwnedInput = union(enum) {
                 var result = completed.outcome.completed;
                 result.deinit();
             },
+            .pull_requests_loaded => |loaded| if (loaded.outcome == .loaded) loaded.outcome.loaded.destroy(),
             else => {},
         }
         self.* = undefined;
@@ -183,6 +190,35 @@ pub const DuplicateChecked = struct {
     outcome: DuplicateCheckOutcome,
 };
 
+pub const PullRequestSummaries = struct {
+    arena: std.heap.ArenaAllocator,
+    prs: []const bbr.bitbucket.PullRequestSummary,
+
+    pub fn create(backing: Allocator) !*PullRequestSummaries {
+        const summaries = try backing.create(PullRequestSummaries);
+        summaries.arena = std.heap.ArenaAllocator.init(backing);
+        summaries.prs = &.{};
+        return summaries;
+    }
+
+    pub fn destroy(self: *PullRequestSummaries) void {
+        const backing = self.arena.child_allocator;
+        self.arena.deinit();
+        backing.destroy(self);
+    }
+};
+
+pub const PullRequestsLoadOutcome = union(enum) { loaded: *PullRequestSummaries, failed };
+pub const PullRequestsLoaded = struct { work_id: WorkId, outcome: PullRequestsLoadOutcome };
+pub const ListPullRequests = struct {
+    work_id: WorkId,
+    repository: BoundedText(256),
+
+    pub fn repositoryName(self: *const ListPullRequests) []const u8 {
+        return self.repository.slice();
+    }
+};
+
 pub fn recoveryCheckSucceeded(operation_id: bbr.review.OperationId, source_commit: []const u8) OwnedInput {
     const source = BoundedText(64).init(source_commit) catch return .{ .recovery_checked = .{
         .operation_id = operation_id,
@@ -247,44 +283,7 @@ pub const UnknownResolutionInput = union(enum) {
 /// Session-relative actions whose complete state is Navigation. They are
 /// suspended while a replacement is pending, along with every other Action
 /// that depends on the currently published review.
-pub const Action = enum {
-    down,
-    up,
-    half_page_down,
-    half_page_up,
-    page_down,
-    page_up,
-    to_top,
-    to_bottom,
-    center,
-    scroll_cursor_top,
-    scroll_cursor_bottom,
-    cursor_view_top,
-    cursor_view_middle,
-    cursor_view_bottom,
-    select_down,
-    select_up,
-    quit,
-    open_picker,
-    comment,
-    inline_comment,
-    suggest,
-    reply,
-    submit,
-    recover_submission,
-    resolve_unpublished,
-    link_existing_comment,
-    help,
-    toggle_select,
-    clear_selection,
-    toggle_resolved,
-    toggle_layout,
-    cycle_scope,
-    isolate,
-    next_file,
-    prev_file,
-    expand_fold,
-};
+pub const Action = @import("action.zig").Action;
 
 pub const Scope = enum {
     changes,
@@ -404,11 +403,12 @@ pub const OwnedCommand = union(enum) {
     wait_submission: WaitSubmission,
     check_recovery: CheckRecovery,
     find_duplicate: *PostDraft,
+    list_pull_requests: ListPullRequests,
 
     pub fn deinit(self: *OwnedCommand) void {
         switch (self.*) {
             .post_draft, .find_duplicate => |command| command.destroy(),
-            .load_session, .enrich_file, .wait_submission, .check_recovery => {},
+            .load_session, .enrich_file, .wait_submission, .check_recovery, .list_pull_requests => {},
         }
         self.* = undefined;
     }
@@ -434,6 +434,9 @@ pub const Projection = struct {
     submission_result: ?SubmissionResultProjection,
     recovery: ?RecoveryNotice,
     unknown_resolution: ?UnknownResolutionProjection,
+    picker: ?*const Picker,
+    help_visible: bool,
+    loading_pull_request_id: ?u64,
     composer: ?ComposerProjection,
     replacing: bool,
     replacement_error: ?ReplacementError,
@@ -489,6 +492,7 @@ pub const ActionError = enum {
     recovery_claim_failed,
     recovery_source_changed,
     duplicate_check_failed,
+    picker_load_failed,
 };
 
 const BufferTransactionError = error{ BufferBuildFailed, OutOfMemory };
@@ -996,7 +1000,13 @@ pub const Presentation = struct {
     next_work_id: WorkId = 0,
     commands: std.ArrayList(OwnedCommand) = .empty,
     outstanding_loads: usize = 0,
+    outstanding_picker_loads: usize = 0,
     issued_enrichments: std.ArrayList(IssuedEnrichment) = .empty,
+    resolver: keymap_mod.Resolver = .{},
+    picker: ?Picker = null,
+    picker_summaries: ?*PullRequestSummaries = null,
+    picker_work_id: ?WorkId = null,
+    help_visible: bool = false,
     durable_submission: ?*DurableSubmission = null,
     submission_result: ?SubmissionResultProjection = null,
     recovery: ?RecoveryNotice = null,
@@ -1032,6 +1042,8 @@ pub const Presentation = struct {
     pub fn deinit(self: *Presentation) void {
         for (self.commands.items) |*command| command.deinit();
         if (self.durable_submission) |durable| durable.destroy();
+        if (self.picker) |*picker| picker.deinit();
+        if (self.picker_summaries) |summaries| summaries.destroy();
         if (self.published) |published| published.destroy();
         self.commands.deinit(self.allocator);
         self.issued_enrichments.deinit(self.allocator);
@@ -1043,6 +1055,7 @@ pub const Presentation = struct {
     pub fn dispatch(self: *Presentation, input: OwnedInput) !void {
         switch (input) {
             .choose_pull_request => |key| if (!self.shutdown_requested) try self.choosePullRequest(key),
+            .key => |key| try self.applyKey(key),
             .session_loaded => |completed| self.acceptLoadedSession(completed),
             .push_count_digit => |digit| self.pushCountDigit(digit),
             .resize_viewport => |rows| self.resizeViewport(rows),
@@ -1057,6 +1070,7 @@ pub const Presentation = struct {
             .submission_wait_launch_failed => |failed| self.acceptSubmissionWaitLaunchFailure(failed),
             .recovery_checked => |checked| self.acceptRecoveryCheck(checked),
             .duplicate_checked => |checked| self.acceptDuplicateCheck(checked),
+            .pull_requests_loaded => |loaded| self.acceptPullRequests(loaded),
             .dismiss_submission_result => self.submission_result = null,
             .request_shutdown => self.requestShutdown(),
         }
@@ -1088,6 +1102,7 @@ pub const Presentation = struct {
                 if (durable.operation_id == check.operation_id and durable.current_temp_id == check.draft.local_id and durable.phase == .duplicate_queued)
                     durable.phase = .awaiting_duplicate;
             },
+            .list_pull_requests => self.outstanding_picker_loads += 1,
         }
         return command;
     }
@@ -1112,6 +1127,9 @@ pub const Presentation = struct {
                 .temp_id = editor.temp_id,
                 .comment_id = editor.text(),
             } else null,
+            .picker = if (self.picker) |*picker| picker else null,
+            .help_visible = self.help_visible,
+            .loading_pull_request_id = if (self.replacement) |replacement| replacement.key.pull_request_id else null,
             .composer = if (self.published) |published| if (published.composer) |*composer| .{
                 .label = composer.request.label,
                 .body = composer.body(),
@@ -1125,7 +1143,7 @@ pub const Presentation = struct {
     }
 
     pub fn readyToExit(self: *const Presentation) bool {
-        return self.shutdown_requested and self.durable_submission == null and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.issued_enrichments.items.len == 0;
+        return self.shutdown_requested and self.durable_submission == null and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.outstanding_picker_loads == 0 and self.issued_enrichments.items.len == 0;
     }
 
     fn discoverRecovery(self: *Presentation) void {
@@ -1303,6 +1321,9 @@ pub const Presentation = struct {
 
     fn requestShutdown(self: *Presentation) void {
         self.shutdown_requested = true;
+        self.closePicker();
+        self.help_visible = false;
+        self.unknown_resolution = null;
         var write: usize = 0;
         for (self.commands.items) |command| {
             if (command == .post_draft or command == .wait_submission or command == .check_recovery or command == .find_duplicate) {
@@ -1320,6 +1341,59 @@ pub const Presentation = struct {
         if (self.published) |published| published.navigation.pushDigit(digit);
     }
 
+    fn applyKey(self: *Presentation, key: keymap_mod.KeyStroke) !void {
+        if (self.submission_result != null) {
+            self.submission_result = null;
+            return;
+        }
+        if (self.help_visible) {
+            self.help_visible = false;
+            return;
+        }
+        if (self.unknown_resolution != null) {
+            if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.applyUnknownResolutionInput(.cancel);
+            if (key.matches(keymap_mod.special.enter, .{})) return self.applyUnknownResolutionInput(.confirm);
+            if (key.matches(keymap_mod.special.backspace, .{})) return self.applyUnknownResolutionInput(.backspace);
+            if (key.text) |text| for (text) |byte| if (byte >= '0' and byte <= '9') self.applyUnknownResolutionInput(.{ .digit = byte - '0' });
+            return;
+        }
+        if (self.published) |published| if (published.composer != null) {
+            if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.applyComposerInput(.cancel);
+            if (key.matches('d', .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) return self.applyComposerInput(.save);
+            if (key.matches(keymap_mod.special.enter, .{})) return self.applyComposerInput(.newline);
+            if (key.matches('w', .{ .ctrl = true })) return self.applyComposerInput(.delete_word);
+            if (key.matches('u', .{ .ctrl = true })) return self.applyComposerInput(.delete_to_line_start);
+            if (key.matches(keymap_mod.special.backspace, .{})) return self.applyComposerInput(.backspace);
+            if (key.text) |text| if (TextChunk.init(text)) |chunk| return self.applyComposerInput(.{ .insert = chunk }) else |_| {};
+            return;
+        };
+        if (self.picker) |*picker| {
+            if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
+                self.closePicker();
+            } else if (key.matches(keymap_mod.special.enter, .{})) {
+                const selected = picker.selection();
+                self.closePicker();
+                if (selected) |item| try self.choosePullRequest(try ReviewKey.init(
+                    if (self.published) |published| published.key.workspace() else self.replacement.?.key.workspace(),
+                    if (self.published) |published| published.key.repository() else self.replacement.?.key.repository(),
+                    item.id,
+                ));
+            } else if (key.matches(keymap_mod.special.up, .{}) or key.matches('p', .{ .ctrl = true })) {
+                picker.moveUp();
+            } else if (key.matches(keymap_mod.special.down, .{}) or key.matches('n', .{ .ctrl = true })) {
+                picker.moveDown();
+            } else if (key.matches(keymap_mod.special.backspace, .{})) {
+                picker.backspace();
+            } else if (key.text) |text| picker.insert(text);
+            return;
+        }
+        switch (self.resolver.feed(self.dependencies.keymap, key)) {
+            .none => {},
+            .digit => |digit| self.pushCountDigit(digit),
+            .action => |action| self.applyAction(action),
+        }
+    }
+
     fn resizeViewport(self: *Presentation, rows: usize) void {
         self.viewport_rows = rows;
         if (self.published) |published| published.navigation.setViewport(rows);
@@ -1330,12 +1404,20 @@ pub const Presentation = struct {
             self.requestShutdown();
             return;
         }
+        if (self.shutdown_requested) {
+            if (action == .submit) self.resumeDurableSubmission();
+            return;
+        }
         if (action == .recover_submission) {
             self.recoverSubmission();
             return;
         }
-        if (self.shutdown_requested) {
-            if (action == .submit) self.resumeDurableSubmission();
+        if (action == .help) {
+            self.help_visible = true;
+            return;
+        }
+        if (action == .open_picker) {
+            self.openPicker();
             return;
         }
         if (self.replacement != null) return;
@@ -1399,7 +1481,7 @@ pub const Presentation = struct {
             .recover_submission => unreachable,
             .resolve_unpublished => self.resolveSelectedUnknownAsUnpublished(published),
             .link_existing_comment => self.openUnknownResolutionEditor(published),
-            .open_picker, .help => {},
+            .open_picker, .help => unreachable,
             .quit => unreachable,
         }
     }
@@ -2195,8 +2277,69 @@ pub const Presentation = struct {
         self.action_error = null;
     }
 
+    fn openPicker(self: *Presentation) void {
+        if (!self.dependencies.remote_enabled) {
+            self.action_error = .action_refused;
+            return;
+        }
+        const key = if (self.published) |published| published.key else if (self.replacement) |replacement| replacement.key else {
+            self.action_error = .action_refused;
+            return;
+        };
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        const repository = BoundedText(256).init(key.repository()) catch {
+            self.action_error = .action_refused;
+            return;
+        };
+        self.closePicker();
+        self.next_work_id += 1;
+        self.picker = Picker.initLoading(self.allocator);
+        self.picker_work_id = self.next_work_id;
+        self.commands.appendAssumeCapacity(.{ .list_pull_requests = .{
+            .work_id = self.next_work_id,
+            .repository = repository,
+        } });
+        self.action_error = null;
+    }
+
+    fn closePicker(self: *Presentation) void {
+        if (self.picker) |*picker| picker.deinit();
+        self.picker = null;
+        if (self.picker_summaries) |summaries| summaries.destroy();
+        self.picker_summaries = null;
+        self.picker_work_id = null;
+    }
+
+    fn acceptPullRequests(self: *Presentation, loaded: PullRequestsLoaded) void {
+        if (self.outstanding_picker_loads > 0) self.outstanding_picker_loads -= 1;
+        if (self.picker_work_id != loaded.work_id or self.picker == null) {
+            if (loaded.outcome == .loaded) loaded.outcome.loaded.destroy();
+            return;
+        }
+        switch (loaded.outcome) {
+            .failed => {
+                self.closePicker();
+                self.action_error = .picker_load_failed;
+            },
+            .loaded => |summaries| {
+                self.picker.?.populate(summaries.prs) catch {
+                    summaries.destroy();
+                    self.closePicker();
+                    self.action_error = .out_of_memory;
+                    return;
+                };
+                self.picker_summaries = summaries;
+                self.action_error = null;
+            },
+        }
+    }
+
     fn choosePullRequest(self: *Presentation, key: ReviewKey) !void {
         self.unknown_resolution = null;
+        self.help_visible = false;
         if (self.published) |published| {
             if (ReviewKey.eql(published.key, key)) {
                 self.next_intent += 1; // invalidate a candidate already in flight
@@ -2280,6 +2423,7 @@ pub const Presentation = struct {
                 const previous = self.published;
                 self.published = candidate;
                 self.next_session_epoch = epoch;
+                self.resolver = .{};
                 self.replacement = null;
                 self.replacement_error = null;
                 self.action_error = null;
@@ -2535,6 +2679,37 @@ test "a complete candidate publishes atomically and advances the Session Epoch" 
     try testing.expect(after.review.?.buffer.rows.ptr != before.buffer.rows.ptr);
     try testing.expect(!after.replacing);
     try testing.expect(after.replacement_error == null);
+}
+
+test "replacement rollback preserves input grammar and commit resets it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 24,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'g', .text = "g" } });
+    try testing.expectEqual(@as(u4, 1), presentation.resolver.pending_len);
+    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    const failed = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .intent = failed.intent,
+        .outcome = .{ .failed = error.NotFound },
+    } });
+    try testing.expectEqual(@as(u4, 1), presentation.resolver.pending_len);
+
+    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    const loaded = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .intent = loaded.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+    } });
+    try testing.expectEqual(@as(u4, 0), presentation.resolver.pending_len);
 }
 
 test "a stale candidate is disposed and the latest failure restores the exact published review" {
@@ -3418,6 +3593,77 @@ test "reviewer can link a selected unresolved Draft to an existing Comment" {
     defer arena.deinit();
     try testing.expectEqual(@as(bbr.review.CommentId, 812), (try store.store().load(arena.allocator(), key.storeKey()))[0].state.posted);
     try testing.expect(presentation.takeCommand().? == .load_session);
+}
+
+test "portable key input owns help overlay capture" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = '?', .text = "?" } });
+    try testing.expect(presentation.projection().help_visible);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'j', .text = "j" } });
+    try testing.expect(!presentation.projection().help_visible);
+}
+
+test "portable Picker input loads summaries and selects a replacement" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'p', .text = "p" } });
+    const list = presentation.takeCommand().?.list_pull_requests;
+    var summaries = try PullRequestSummaries.create(testing.allocator);
+    summaries.prs = try summaries.arena.allocator().dupe(bbr.bitbucket.PullRequestSummary, &.{.{
+        .id = 2,
+        .title = "second",
+        .state = "OPEN",
+        .author_display_name = "reviewer",
+        .source_branch = "feature",
+        .destination_branch = "main",
+    }});
+    try presentation.dispatch(.{ .pull_requests_loaded = .{
+        .work_id = list.work_id,
+        .outcome = .{ .loaded = summaries },
+    } });
+    try testing.expect(presentation.projection().picker != null);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(presentation.projection().picker == null);
+    try testing.expectEqual(@as(u64, 2), presentation.takeCommand().?.load_session.key.pull_request_id);
+}
+
+test "shutdown closes Picker and disposes its late completion" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'p', .text = "p" } });
+    const list = presentation.takeCommand().?.list_pull_requests;
+    try presentation.dispatch(.request_shutdown);
+    try testing.expect(presentation.projection().picker == null);
+    try testing.expect(!presentation.readyToExit());
+
+    const summaries = try PullRequestSummaries.create(testing.allocator);
+    try presentation.dispatch(.{ .pull_requests_loaded = .{
+        .work_id = list.work_id,
+        .outcome = .{ .loaded = summaries },
+    } });
+    try testing.expect(presentation.projection().picker == null);
+    try testing.expect(presentation.readyToExit());
 }
 
 test "Submission payload and identity survive originating Session replacement" {
