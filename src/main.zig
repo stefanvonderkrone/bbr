@@ -123,6 +123,10 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
     // Global-tier pending-review store (design §11): opened once, lives until exit.
     var store = openStore(gpa, init.io, init.environ_map);
     defer store.deinit();
+    var lock_dir = try openSubmissionLockDir(gpa, init.io, init.environ_map);
+    defer lock_dir.close(init.io);
+    var os_locks = bbr.review.OsSubmissionLocks.init(gpa, init.io, lock_dir);
+    defer os_locks.deinit();
     var tree_sitter_highlighter: TreeSitterHighlighter = .{};
 
     app.run(.{
@@ -136,6 +140,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .keymap = configuration.keymap.keymap(),
         .highlighter = tree_sitter_highlighter.highlighter(),
         .highlight_max_file_bytes = configuration.highlight_max_file_bytes,
+        .submission_locks = os_locks.locks(),
     }, null, target.id) catch |err| {
         if (tuiFatalMessage(err)) |message| {
             std.debug.print("{s}\n", .{message});
@@ -175,6 +180,13 @@ fn statePath(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.M
     var d = try std.Io.Dir.cwd().createDirPathOpen(io, dir, .{});
     d.close(io);
     return std.fmt.allocPrintSentinel(gpa, "{s}/pending.db", .{dir}, 0);
+}
+
+fn openSubmissionLockDir(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map) !std.Io.Dir {
+    const home = env_map.get("HOME") orelse return error.NoHome;
+    const path = try std.fmt.allocPrint(gpa, "{s}/.local/state/bbr/submission-locks", .{home});
+    defer gpa.free(path);
+    return std.Io.Dir.cwd().createDirPathOpen(io, path, .{});
 }
 
 fn looksLikeUrl(s: []const u8) bool {
@@ -386,7 +398,6 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
     var store = persist.SqliteStore.open(":memory:") catch @panic("sqlite :memory: open failed");
     defer store.deinit();
     var plain_highlighter: bbr.highlight.PlainHighlighter = .{};
-
     try app.run(.{
         .io = io,
         .gpa = gpa,

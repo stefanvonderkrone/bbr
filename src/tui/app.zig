@@ -50,6 +50,8 @@ const Composer = composer_mod.Composer;
 const session = @import("session.zig");
 const file_enrichment = @import("file_enrichment.zig");
 const presentation_adapter = @import("presentation_adapter.zig");
+const presentation_runtime = @import("presentation_runtime.zig");
+const presentation = @import("presentation.zig");
 const ArenaRing = @import("arena_ring.zig").ArenaRing;
 const Session = session.Session;
 
@@ -74,6 +76,7 @@ pub const RunCtx = struct {
     keymap: keymap.Keymap,
     highlighter: bbr.highlight.Highlighter,
     highlight_max_file_bytes: usize,
+    submission_locks: ?bbr.review.SubmissionLocks = null,
     online: bool = true,
 };
 
@@ -88,6 +91,12 @@ const AppEvent = union(enum) {
     enrichment_done: EnrichmentDone,
     submit_progress: SubmitProgress,
     submit_done: SubmitDone,
+    presentation_done: PresentationDone,
+};
+
+const PresentationDone = struct {
+    work_id: u64,
+    input: presentation.OwnedInput,
 };
 
 const LoadOutcome = union(enum) {
@@ -235,6 +244,11 @@ const Load = struct {
     future: std.Io.Future(void),
 };
 
+const PresentationWork = struct {
+    id: u64,
+    future: std.Io.Future(void),
+};
+
 /// Request handed to a load worker. `repo` is copied by value (a fixed buffer)
 /// so the worker has no dangling reference to the caller's slice.
 const LoadReq = struct {
@@ -244,12 +258,253 @@ const LoadReq = struct {
     epoch: u64,
 };
 
+fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
+    var state = try presentation.Presentation.init(ctx.gpa, .{
+        .reviews = ctx.store,
+        .submission_locks = ctx.submission_locks,
+        .highlight_max_file_bytes = ctx.highlight_max_file_bytes,
+    }, .{
+        .initial = if (initial) |loaded| .{
+            .key = try presentation.ReviewKey.init(ctx.cred.workspace, ctx.repo, loaded.pr.id),
+            .session = loaded,
+        } else null,
+        .viewport_rows = 1,
+    });
+    defer state.deinit();
+    if (initial == null) try state.dispatch(.{ .choose_pull_request = try presentation.ReviewKey.init(ctx.cred.workspace, ctx.repo, initial_id) });
+
+    var write_buf: [4096]u8 = undefined;
+    var tty = try vaxis.Tty.init(ctx.io, &write_buf);
+    defer tty.deinit();
+    const writer = tty.writer();
+    var vx = try vaxis.init(ctx.io, ctx.gpa, ctx.env_map, .{});
+    defer vx.deinit(ctx.gpa, writer);
+    var loop: Loop = .init(ctx.io, &tty, &vx);
+    try loop.start();
+    defer loop.stop();
+    try loop.installResizeHandler();
+    try vx.enterAltScreen(writer);
+    try state.dispatch(.{ .resize_viewport = vx.window().height });
+
+    var futures: std.ArrayList(PresentationWork) = .empty;
+    defer {
+        for (futures.items) |*work| _ = work.future.await(ctx.io);
+        futures.deinit(ctx.gpa);
+    }
+    var next_work_id: u64 = 1;
+    var picker_arena = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer picker_arena.deinit();
+    var picker: ?Picker = null;
+    var picker_epoch: u64 = 0;
+    var picker_loads: std.ArrayList(Load) = .empty;
+    defer {
+        for (picker_loads.items) |*load| _ = load.future.await(ctx.io);
+        picker_loads.deinit(ctx.gpa);
+    }
+    var resolver = keymap.Resolver{};
+    var show_help = false;
+    var loading_id = initial_id;
+    var frame_arena = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer frame_arena.deinit();
+
+    try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id);
+    while (true) {
+        const event = try loop.nextEvent();
+        switch (event) {
+            .key_press => |key| {
+                if (state.projection().submission_result != null) {
+                    try state.dispatch(.dismiss_submission_result);
+                } else if (show_help) {
+                    show_help = false;
+                } else if (state.projection().composer != null) {
+                    if (key.matches(vaxis.Key.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
+                        try state.dispatch(.{ .composer = .cancel });
+                    } else if (key.matches('d', .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) {
+                        try state.dispatch(.{ .composer = .save });
+                    } else if (key.matches(vaxis.Key.enter, .{})) {
+                        try state.dispatch(.{ .composer = .newline });
+                    } else if (key.matches('w', .{ .ctrl = true })) {
+                        try state.dispatch(.{ .composer = .delete_word });
+                    } else if (key.matches('u', .{ .ctrl = true })) {
+                        try state.dispatch(.{ .composer = .delete_to_line_start });
+                    } else if (key.matches(vaxis.Key.backspace, .{})) {
+                        try state.dispatch(.{ .composer = .backspace });
+                    } else if (key.text) |chunk| {
+                        if (presentation.TextChunk.init(chunk)) |text| try state.dispatch(.{ .composer = .{ .insert = text } }) else |_| {}
+                    }
+                } else if (picker) |*active_picker| {
+                    if (key.matches(vaxis.Key.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
+                        picker = null;
+                    } else if (key.matches(vaxis.Key.enter, .{})) {
+                        const selected = active_picker.selection();
+                        picker = null;
+                        if (selected) |item| {
+                            loading_id = item.id;
+                            try state.dispatch(.{ .choose_pull_request = try presentation.ReviewKey.init(ctx.cred.workspace, ctx.repo, item.id) });
+                        }
+                    } else if (key.matches(vaxis.Key.up, .{}) or key.matches('p', .{ .ctrl = true })) {
+                        active_picker.moveUp();
+                    } else if (key.matches(vaxis.Key.down, .{}) or key.matches('n', .{ .ctrl = true })) {
+                        active_picker.moveDown();
+                    } else if (key.matches(vaxis.Key.backspace, .{})) {
+                        active_picker.backspace();
+                    } else if (key.text) |chunk| active_picker.insert(chunk);
+                } else switch (resolver.feed(ctx.keymap, key)) {
+                    .none => {},
+                    .digit => |digit| try state.dispatch(.{ .push_count_digit = digit }),
+                    .action => |action| switch (action) {
+                        .open_picker => if (ctx.online) try openPicker(ctx, &picker, &picker_arena, &loop, &picker_loads, &picker_epoch, ctx.gpa),
+                        .help => show_help = true,
+                        else => try state.dispatch(.{ .action = action }),
+                    },
+                }
+            },
+            .winsize => |winsize| {
+                try vx.resize(ctx.gpa, writer, winsize);
+                try state.dispatch(.{ .resize_viewport = vx.window().height });
+            },
+            .presentation_done => |done| {
+                reapPresentationWork(&futures, ctx.io, done.work_id);
+                try state.dispatch(done.input);
+            },
+            .picker_done => |done| {
+                reap(&picker_loads, ctx.io, done.epoch);
+                if (done.epoch != picker_epoch or picker == null) {
+                    if (done.outcome == .ok) done.outcome.ok.destroy();
+                } else switch (done.outcome) {
+                    .ok => |summaries| {
+                        defer summaries.destroy();
+                        const copied = try dupeSummaries(picker_arena.allocator(), summaries.prs);
+                        if (picker) |*active_picker| try active_picker.populate(copied);
+                    },
+                    .err => picker = null,
+                }
+            },
+            .load_done => |done| if (done.outcome == .ok) done.outcome.ok.destroy(),
+            .enrichment_done => |done| if (done.outcome == .ok) {
+                var result = done.outcome.ok;
+                result.deinit();
+            },
+            .submit_progress, .submit_done => {},
+        }
+
+        try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id);
+        if (state.projection().review != null) {
+            try state.dispatch(.ensure_focused_enrichment);
+            try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id);
+        }
+        if (state.readyToExit()) break;
+
+        const projection = state.projection();
+        const win = vx.window();
+        const frame = frame_arena.allocator();
+        if (projection.review) |review_projection| {
+            const selected_file = fileIndexForRow(review_projection.buffer, review_projection.navigation.cursor);
+            render.drawReview(frame, win, review_projection, ctx.active_theme, selected_file);
+            const status = presentationStatus(frame, projection, review_projection.key);
+            drawStatus(
+                frame,
+                win,
+                review_projection.pull_request.*,
+                review_projection.navigation,
+                review_projection.buffer,
+                review_projection.preferences.layout,
+                switch (review_projection.preferences.scope) {
+                    .changes => .changes,
+                    .fetched => .fetched,
+                    .whole => .whole,
+                },
+                review_projection.preferences.show_resolved,
+                review_projection.isolated_file != null,
+                projection.replacing,
+                projection.submission != null,
+                review_projection.drafts.len,
+                status,
+            );
+        } else {
+            const status = presentationStatus(frame, projection, null);
+            render.drawLoading(frame, win, loading_id, ctx.active_theme, status);
+        }
+        if (picker) |*active_picker| render.drawPicker(frame, win, active_picker, ctx.active_theme);
+        if (projection.composer) |composer| render.drawComposerProjection(frame, win, composer, ctx.active_theme);
+        if (projection.submission) |submission| {
+            if (projection.review) |review_projection| if (presentation.ReviewKey.eql(submission.key, review_projection.key))
+                render.drawSubmit(frame, win, ctx.active_theme, submission.completed, submission.total);
+        } else if (projection.submission_result) |result| {
+            if (projection.review) |review_projection| if (presentation.ReviewKey.eql(result.key, review_projection.key))
+                render.drawSubmitResult(
+                    frame,
+                    win,
+                    ctx.active_theme,
+                    result.posted,
+                    result.failed + result.outcome_unknown,
+                    result.skipped,
+                    submissionAbortName(result.completion),
+                    false,
+                );
+        }
+        if (show_help) render.drawHelp(frame, win, ctx.active_theme, ctx.keymap);
+        try vx.render(writer);
+        _ = frame_arena.reset(.retain_capacity);
+    }
+}
+
+fn presentationStatus(
+    frame: std.mem.Allocator,
+    projection: presentation.Projection,
+    visible_key: ?presentation.ReviewKey,
+) ?[]const u8 {
+    if (projection.fatal_error) |err| return @tagName(err);
+    if (projection.action_error) |err| return @tagName(err);
+    if (projection.shutting_down) {
+        if (projection.submission) |submission|
+            return std.fmt.allocPrint(frame, "finishing Submission for {s}#{d}", .{ submission.key.repository(), submission.key.pull_request_id }) catch "finishing Submission";
+        return "shutting down…";
+    }
+    if (projection.submission) |submission| {
+        if (visible_key == null or !presentation.ReviewKey.eql(submission.key, visible_key.?))
+            return std.fmt.allocPrint(frame, "submitting {s}#{d} · {d}/{d}", .{
+                submission.key.repository(),
+                submission.key.pull_request_id,
+                submission.completed,
+                submission.total,
+            }) catch "submitting another pull request…";
+    }
+    if (projection.submission_result) |result| {
+        if (visible_key == null or !presentation.ReviewKey.eql(result.key, visible_key.?))
+            return std.fmt.allocPrint(frame, "{s}#{d}: {d} posted · {d} failed · {d} skipped", .{
+                result.key.repository(),
+                result.key.pull_request_id,
+                result.posted,
+                result.failed + result.outcome_unknown,
+                result.skipped,
+            }) catch "submission finished for another pull request";
+    }
+    if (projection.replacement_error) |err| return @tagName(err);
+    return null;
+}
+
+fn submissionAbortName(completion: bbr.review.SubmissionCompletion) ?[]const u8 {
+    return switch (completion) {
+        .clean, .partial => null,
+        .aborted => |pending| switch (pending) {
+            .failed => |err| @errorName(err),
+            .draft => "submission aborted",
+            .outcome_unknown => "outcome unknown",
+        },
+    };
+}
+
 /// Run the viewer. `initial` is a pre-built Session (the offline demo) or null,
 /// in which case PR `initial_id` is loaded on a worker thread while a "Loading
 /// PR #N…" frame shows — the TUI never blocks the alt-screen on the first fetch.
 /// Takes ownership of the current Session and destroys it (and any it switches
 /// to) before returning.
 pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
+    return runPresentation(ctx, initial, initial_id);
+}
+
+fn runLegacy(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
     const gpa = ctx.gpa;
     const io = ctx.io;
 
@@ -777,6 +1032,12 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                     }
                 }
             },
+            .presentation_done => |done| {
+                // The Presentation-driven loop consumes this case after the
+                // cutover. No typed worker is launched by the legacy loop.
+                var input = done.input;
+                input.deinit();
+            },
         }
 
         // Lazily enrich the focused File off-thread. One job fetches every
@@ -1259,6 +1520,164 @@ fn buildSubmit(
     s.loaded_commit = try a.dupe(u8, loaded_commit);
     s.epoch = epoch;
     return s;
+}
+
+const PresentationSinkContext = struct {
+    loop: *Loop,
+    work_id: u64,
+};
+
+fn presentationSink(context: *PresentationSinkContext) presentation_runtime.CompletionSink {
+    return .{ .ptr = context, .post_fn = postPresentationInput };
+}
+
+fn postPresentationInput(ptr: *anyopaque, input: presentation.OwnedInput) anyerror!void {
+    const context: *PresentationSinkContext = @ptrCast(@alignCast(ptr));
+    try context.loop.postEvent(.{ .presentation_done = .{ .work_id = context.work_id, .input = input } });
+}
+
+/// Runs one typed POST command. The worker consumes the command and returns one
+/// correlated completion through the same terminal event queue as all other
+/// Presentation inputs.
+fn presentationPostWorker(
+    loop: *Loop,
+    work_id: u64,
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+    cred: Credential,
+    command: *presentation.PostDraft,
+) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
+    defer http.deinit();
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
+    var poster = bbr.bitbucket.Poster{
+        .client = client,
+        .allocator = scratch.allocator(),
+        .repo_slug = command.key.repository(),
+        .pr_id = command.key.pull_request_id,
+    };
+    presentation_runtime.executePost(presentationSink(&sink_context), command, poster.poster());
+}
+
+fn presentationLoadWorker(
+    loop: *Loop,
+    work_id: u64,
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+    cred: Credential,
+    command: presentation.LoadSession,
+) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    const outcome: presentation.SessionLoadOutcome = if (session.load(
+        io,
+        std.heap.page_allocator,
+        env_map,
+        cred,
+        command.key.repository(),
+        command.key.pull_request_id,
+    )) |loaded| .{ .loaded = loaded } else |err| .{ .failed = err };
+    presentation_runtime.deliver(presentationSink(&sink_context), .{ .session_loaded = .{
+        .intent = command.intent,
+        .outcome = outcome,
+    } });
+}
+
+fn presentationEnrichmentWorker(
+    loop: *Loop,
+    work_id: u64,
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+    cred: Credential,
+    highlighter: bbr.highlight.Highlighter,
+    command: presentation.EnrichFile,
+) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
+    defer http.deinit();
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
+    const outcome: presentation.FileEnrichmentOutcome = if (file_enrichment.enrich(
+        std.heap.page_allocator,
+        client,
+        highlighter,
+        command.request(),
+    )) |result| .{ .completed = result } else |err| .{ .failed = if (err == error.OutOfMemory) .out_of_memory else .launch_failed };
+    presentation_runtime.deliver(presentationSink(&sink_context), .{ .file_enrichment_completed = .{
+        .work_id = command.work_id,
+        .session_epoch = command.session_epoch,
+        .file_index = command.file_index,
+        .outcome = outcome,
+    } });
+}
+
+fn presentationWaitWorker(loop: *Loop, work_id: u64, io: std.Io, wait: presentation.WaitSubmission) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    io.sleep(std.Io.Duration.fromMilliseconds(@intCast(wait.ms)), .awake) catch {
+        presentation_runtime.deliver(presentationSink(&sink_context), .{ .submission_wait_launch_failed = wait });
+        return;
+    };
+    presentation_runtime.deliver(presentationSink(&sink_context), .{ .submission_wait_completed = wait });
+}
+
+fn drainPresentationCommands(
+    state: *presentation.Presentation,
+    ctx: RunCtx,
+    loop: *Loop,
+    futures: *std.ArrayList(PresentationWork),
+    next_work_id: *u64,
+) !void {
+    while (state.takeCommand()) |command_value| {
+        var command = command_value;
+        futures.ensureUnusedCapacity(ctx.gpa, 1) catch {
+            try admitPresentationLaunchFailure(state, &command);
+            continue;
+        };
+        const work_id = next_work_id.*;
+        next_work_id.* +%= 1;
+        const future = switch (command) {
+            .load_session => |load| ctx.io.concurrent(presentationLoadWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, load }),
+            .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, ctx.highlighter, enrich }),
+            .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, post }),
+            .wait_submission => |wait| ctx.io.concurrent(presentationWaitWorker, .{ loop, work_id, ctx.io, wait }),
+        } catch {
+            try admitPresentationLaunchFailure(state, &command);
+            continue;
+        };
+        futures.appendAssumeCapacity(.{ .id = work_id, .future = future });
+        // A POST pointer moved into its worker. Value commands need no cleanup.
+        command = undefined;
+    }
+}
+
+fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *presentation.OwnedCommand) !void {
+    const input: presentation.OwnedInput = switch (command.*) {
+        .load_session => |load| .{ .session_loaded = .{ .intent = load.intent, .outcome = .{ .failed = error.WorkerLaunchFailed } } },
+        .enrich_file => |enrich| .{ .file_enrichment_completed = .{
+            .work_id = enrich.work_id,
+            .session_epoch = enrich.session_epoch,
+            .file_index = enrich.file_index,
+            .outcome = .{ .failed = .launch_failed },
+        } },
+        .post_draft => |post| presentation_adapter.postLaunchFailed(post),
+        .wait_submission => |wait| .{ .submission_wait_launch_failed = wait },
+    };
+    command.* = undefined;
+    try state.dispatch(input);
+}
+
+fn reapPresentationWork(work: *std.ArrayList(PresentationWork), io: std.Io, id: u64) void {
+    for (work.items, 0..) |item, index| {
+        if (item.id != id) continue;
+        var completed = work.swapRemove(index);
+        _ = completed.future.await(io);
+        return;
+    }
 }
 
 /// Runs on a worker thread. Drives the pure `Submission` engine over the snapshot

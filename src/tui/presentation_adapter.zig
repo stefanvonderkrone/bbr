@@ -30,6 +30,15 @@ pub fn executePost(command: *presentation.PostDraft, poster: bbr.review.CommentP
     } };
 }
 
+/// Consumes a command that could not be transferred to a worker.
+pub fn postLaunchFailed(command: *presentation.PostDraft) presentation.OwnedInput {
+    defer command.destroy();
+    return .{ .post_draft_launch_failed = .{
+        .operation_id = command.operation_id,
+        .temp_id = command.draft.local_id,
+    } };
+}
+
 const std = @import("std");
 const testing = std.testing;
 
@@ -119,4 +128,11 @@ test "executePost returns correlated ambiguity when execution errors" {
     try testing.expectEqual(@as(bbr.review.OperationId, 23), input.post_draft_completed.operation_id);
     try testing.expectEqual(@as(bbr.review.TempId, 41), input.post_draft_completed.temp_id);
     try testing.expect(input.post_draft_completed.outcome == .ambiguous);
+}
+
+test "postLaunchFailed consumes the command and preserves correlation" {
+    const input = postLaunchFailed(try testCommand(29, false));
+
+    try testing.expectEqual(@as(bbr.review.OperationId, 29), input.post_draft_launch_failed.operation_id);
+    try testing.expectEqual(@as(bbr.review.TempId, 41), input.post_draft_launch_failed.temp_id);
 }

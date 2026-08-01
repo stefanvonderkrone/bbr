@@ -484,6 +484,8 @@ pub fn drawSubmitResult(
         " Submit refused — PR moved"
     else if (aborted != null)
         " Submit aborted"
+    else if (failed > 0 or skipped > 0)
+        " Submission completed with issues"
     else
         " Review submitted";
     _ = modal.printSegment(.{ .text = title, .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });

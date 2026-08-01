@@ -100,7 +100,23 @@ pub const OwnedInput = union(enum) {
     post_draft_completed: PostDraftCompleted,
     post_draft_launch_failed: PostDraftLaunchFailed,
     submission_wait_completed: WaitSubmission,
+    submission_wait_launch_failed: WaitSubmission,
+    dismiss_submission_result,
     request_shutdown,
+
+    /// Dispose an input that could not be handed to `dispatch` (for example,
+    /// because the terminal event queue is already shutting down).
+    pub fn deinit(self: *OwnedInput) void {
+        switch (self.*) {
+            .session_loaded => |loaded| if (loaded.outcome == .loaded) loaded.outcome.loaded.destroy(),
+            .file_enrichment_completed => |completed| if (completed.outcome == .completed) {
+                var result = completed.outcome.completed;
+                result.deinit();
+            },
+            else => {},
+        }
+        self.* = undefined;
+    }
 };
 
 pub const PostDraftCompleted = struct {
@@ -346,6 +362,7 @@ pub const ReviewProjection = struct {
 pub const Projection = struct {
     review: ?ReviewProjection,
     submission: ?SubmissionProjection,
+    submission_result: ?SubmissionResultProjection,
     composer: ?ComposerProjection,
     replacing: bool,
     replacement_error: ?ReplacementError,
@@ -359,6 +376,17 @@ pub const SubmissionProjection = struct {
     key: ReviewKey,
     current_temp_id: ?bbr.review.TempId,
     persistence_paused: bool,
+    completed: usize,
+    total: usize,
+};
+
+pub const SubmissionResultProjection = struct {
+    key: ReviewKey,
+    completion: bbr.review.SubmissionCompletion,
+    posted: usize,
+    failed: usize,
+    skipped: usize,
+    outcome_unknown: usize,
 };
 
 pub const FatalError = enum {
@@ -556,9 +584,10 @@ const DurableSubmission = struct {
     arena: std.heap.ArenaAllocator,
     review: bbr.review.PendingReview,
     machine: bbr.review.Submission,
-    phase: enum { post_queued, awaiting_post, post_retry_paused, wait_queued, awaiting_wait, admission_paused, persistence_paused } = .post_queued,
+    phase: enum { post_queued, awaiting_post, post_retry_paused, wait_queued, awaiting_wait, wait_retry_paused, admission_paused, persistence_paused } = .post_queued,
     pending_admission: ?PendingAdmission = null,
     pending_persistence: ?PendingPersistence = null,
+    pending_wait_retry: ?WaitSubmission = null,
     posted_any: bool = false,
 
     const Started = struct {
@@ -587,7 +616,7 @@ const DurableSubmission = struct {
     const AfterPost = union(enum) {
         next: struct { command: *PostDraft, transition: PersistedTransition },
         wait: WaitSubmission,
-        finished: struct { completion: bbr.review.SubmissionCompletion, transition: PersistedTransition },
+        finished: struct { result: SubmissionResultProjection, transition: PersistedTransition },
     };
 
     fn create(allocator: Allocator, store: bbr.review.PendingReviewStore, key: ReviewKey, lock: bbr.review.SubmissionLockGuard) !*DurableSubmission {
@@ -607,6 +636,7 @@ const DurableSubmission = struct {
         durable.phase = .post_queued;
         durable.pending_admission = null;
         durable.pending_persistence = null;
+        durable.pending_wait_retry = null;
         durable.posted_any = false;
         return durable;
     }
@@ -723,8 +753,9 @@ const DurableSubmission = struct {
         const transition = pending.transition;
         if (pending.completion) |completion| {
             try store.completeSubmission(self.operation_id, self.key.storeKey(), completion);
+            const result = self.resultProjection(completion);
             self.pending_persistence = null;
-            return .{ .finished = .{ .completion = completion, .transition = transition } };
+            return .{ .finished = .{ .result = result, .transition = transition } };
         }
         const command = next_command orelse return error.MissingNextSubmissionCommand;
         self.pending_persistence = null;
@@ -761,6 +792,36 @@ const DurableSubmission = struct {
         self.current_temp_id = next_temp_id;
     }
 
+    fn progress(self: *const DurableSubmission) struct { completed: usize, total: usize } {
+        var completed: usize = 0;
+        var total: usize = 0;
+        for (self.machine.order, self.machine.results) |temp_id, result| {
+            const draft = self.review.getConst(temp_id) orelse continue;
+            if (draft.target != .bitbucket) continue;
+            total += 1;
+            if (result != null) completed += 1;
+        }
+        return .{ .completed = completed, .total = total };
+    }
+
+    fn resultProjection(self: *const DurableSubmission, completion: bbr.review.SubmissionCompletion) SubmissionResultProjection {
+        var result: SubmissionResultProjection = .{
+            .key = self.key,
+            .completion = completion,
+            .posted = 0,
+            .failed = 0,
+            .skipped = 0,
+            .outcome_unknown = 0,
+        };
+        for (self.machine.results) |maybe| if (maybe) |item| switch (item.status) {
+            .posted => result.posted += 1,
+            .failed => result.failed += 1,
+            .skipped => result.skipped += 1,
+            .outcome_unknown => result.outcome_unknown += 1,
+        };
+        return result;
+    }
+
     fn destroy(self: *DurableSubmission) void {
         const allocator = self.allocator;
         self.machine.deinit();
@@ -784,6 +845,7 @@ pub const Presentation = struct {
     outstanding_loads: usize = 0,
     issued_enrichments: std.ArrayList(IssuedEnrichment) = .empty,
     durable_submission: ?*DurableSubmission = null,
+    submission_result: ?SubmissionResultProjection = null,
     shutdown_requested: bool = false,
     replacement_error: ?ReplacementError = null,
     action_error: ?ActionError = null,
@@ -835,6 +897,8 @@ pub const Presentation = struct {
             .post_draft_completed => |completed| self.acceptPostDraft(completed),
             .post_draft_launch_failed => |failed| self.acceptPostDraftLaunchFailure(failed),
             .submission_wait_completed => |completed| self.acceptSubmissionWait(completed),
+            .submission_wait_launch_failed => |failed| self.acceptSubmissionWaitLaunchFailure(failed),
+            .dismiss_submission_result => self.submission_result = null,
             .request_shutdown => self.requestShutdown(),
         }
     }
@@ -864,12 +928,18 @@ pub const Presentation = struct {
     pub fn projection(self: *const Presentation) Projection {
         return .{
             .review = if (self.published) |published| published.projection(self.preferences) else null,
-            .submission = if (self.durable_submission) |durable| .{
-                .operation_id = durable.operation_id,
-                .key = durable.key,
-                .current_temp_id = durable.current_temp_id,
-                .persistence_paused = durable.pending_persistence != null,
+            .submission = if (self.durable_submission) |durable| blk: {
+                const progress = durable.progress();
+                break :blk .{
+                    .operation_id = durable.operation_id,
+                    .key = durable.key,
+                    .current_temp_id = durable.current_temp_id,
+                    .persistence_paused = durable.pending_persistence != null,
+                    .completed = progress.completed,
+                    .total = progress.total,
+                };
             } else null,
+            .submission_result = self.submission_result,
             .composer = if (self.published) |published| if (published.composer) |*composer| .{
                 .label = composer.request.label,
                 .body = composer.body(),
@@ -988,6 +1058,10 @@ pub const Presentation = struct {
                 self.resumePostDraftLaunch(durable);
                 return;
             }
+            if (durable.phase == .wait_retry_paused) {
+                self.resumeSubmissionWaitLaunch(durable);
+                return;
+            }
             if (durable.pending_admission != null) {
                 self.resumeSubmissionAdmission(durable);
                 return;
@@ -1037,6 +1111,8 @@ pub const Presentation = struct {
         const durable = self.durable_submission orelse return;
         if (durable.phase == .post_retry_paused) {
             self.resumePostDraftLaunch(durable);
+        } else if (durable.phase == .wait_retry_paused) {
+            self.resumeSubmissionWaitLaunch(durable);
         } else if (durable.pending_admission != null) {
             self.resumeSubmissionAdmission(durable);
         } else if (durable.pending_persistence != null) {
@@ -1134,6 +1210,7 @@ pub const Presentation = struct {
                 const reconcile = durable.posted_any and !self.shutdown_requested and self.replacement == null and
                     (if (self.published) |published| ReviewKey.eql(published.key, durable.key) else false);
                 const key = durable.key;
+                self.submission_result = finished.result;
                 self.durable_submission = null;
                 durable.destroy();
                 if (reconcile) self.queueReconciliation(key);
@@ -1151,6 +1228,26 @@ pub const Presentation = struct {
             return;
         };
         self.processSubmissionWait(durable, completed);
+    }
+
+    fn acceptSubmissionWaitLaunchFailure(self: *Presentation, failed: WaitSubmission) void {
+        const durable = self.durable_submission orelse return;
+        if (durable.operation_id != failed.operation_id or durable.current_temp_id != failed.temp_id or durable.phase != .awaiting_wait) return;
+        durable.pending_wait_retry = failed;
+        durable.phase = .wait_retry_paused;
+        self.action_error = .submission_launch_failed;
+    }
+
+    fn resumeSubmissionWaitLaunch(self: *Presentation, durable: *DurableSubmission) void {
+        const wait = durable.pending_wait_retry orelse return;
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        durable.pending_wait_retry = null;
+        durable.phase = .wait_queued;
+        self.commands.appendAssumeCapacity(.{ .wait_submission = wait });
+        self.action_error = null;
     }
 
     fn processSubmissionWait(self: *Presentation, durable: *DurableSubmission, completed: WaitSubmission) void {
@@ -2601,6 +2698,8 @@ test "Submission payload and identity survive originating Session replacement" {
 
     try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.key.pull_request_id);
     try testing.expectEqual(@as(u64, 1), presentation.projection().submission.?.key.pull_request_id);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().submission.?.completed);
+    try testing.expectEqual(@as(usize, 1), presentation.projection().submission.?.total);
     try testing.expectEqualStrings("survive replacement", post.draft.body);
 }
 
@@ -2639,7 +2738,14 @@ test "Submission completion does not reconcile over a different visible PR" {
 
     try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.key.pull_request_id);
     try testing.expect(presentation.projection().submission == null);
+    const result = presentation.projection().submission_result.?;
+    try testing.expectEqual(@as(u64, 1), result.key.pull_request_id);
+    try testing.expect(result.completion == .clean);
+    try testing.expectEqual(@as(usize, 1), result.posted);
+    try testing.expectEqual(@as(usize, 0), result.failed);
     try testing.expect(presentation.takeCommand() == null);
+    try presentation.dispatch(.dismiss_submission_result);
+    try testing.expect(presentation.projection().submission_result == null);
 }
 
 test "shutdown retains an authorized Submission command and waits for terminal durability" {
@@ -2887,6 +2993,44 @@ test "retryable POST rejection waits and reissues without checkpointing an outco
     defer retry.deinit();
     try testing.expectEqual(@as(bbr.review.TempId, 1), retry.post_draft.draft.local_id);
     try testing.expect(!retry.post_draft.dedupe);
+}
+
+test "wait launch failure pauses and submit retries the exact delay" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "retry wait" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var first = presentation.takeCommand().?;
+    const operation_id = first.post_draft.operation_id;
+    first.deinit();
+
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .operation_id = operation_id,
+        .temp_id = 1,
+        .outcome = .{ .rejected = error.RateLimited },
+        .retry_after_ms = 17,
+    } });
+    const wait = presentation.takeCommand().?.wait_submission;
+    try presentation.dispatch(.{ .submission_wait_launch_failed = wait });
+
+    try testing.expectEqual(ActionError.submission_launch_failed, presentation.projection().action_error.?);
+    try testing.expect(presentation.takeCommand() == null);
+    try presentation.dispatch(.{ .action = .submit });
+    const retry = presentation.takeCommand().?.wait_submission;
+    try testing.expectEqual(wait.operation_id, retry.operation_id);
+    try testing.expectEqual(wait.temp_id, retry.temp_id);
+    try testing.expectEqual(wait.ms, retry.ms);
 }
 
 test "exhausted ambiguous POST persists an immutable unresolved Draft" {
