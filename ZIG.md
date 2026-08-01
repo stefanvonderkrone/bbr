@@ -126,6 +126,10 @@ the main thread; the Epoch token still guards against stale results.
 - **`std.heap.ArenaAllocator`** (`std/heap/ArenaAllocator.zig`):
   - `init(child_allocator)`; `allocator()` returns the `Allocator` interface.
   - `reset(mode: ResetMode) bool` where `ResetMode = union(enum){ free_all, retain_capacity, /* shrink-to-N */ }`.
+  - `queryCapacity() usize` reports arena allocation capacity without the allocator's internal
+    linked-list node storage. File-content cache accounting uses it because an arena can retain
+    scratch allocations even after individual `free` calls; only the most recent allocation is
+    freed individually.
   - **`reset(.retain_capacity)`** keeps the backing pages — this is what makes our
     buffer-scoped arena cheap to reuse on file switch (§11 of the design doc).
 - **`std.heap.GeneralPurposeAllocator`** (or `c_allocator` when we link C) backs the global tier
@@ -240,5 +244,6 @@ the main thread; the Epoch token still guards against stale results.
 - [ ] `initDefaultProxies` + `Proxy` struct shape unchanged?
 - [ ] `std.Io.Threaded.init` options (esp. `async_limit`) unchanged?
 - [ ] `ArenaAllocator.ResetMode` variants unchanged?
+- [ ] `ArenaAllocator.queryCapacity` semantics still exclude internal node storage?
 - [ ] `std.Io.Reader`/`Writer` method surface we use unchanged?
 - [ ] libvaxis still builds against the new toolchain; re-pin its commit.
