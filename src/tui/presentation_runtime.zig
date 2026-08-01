@@ -65,7 +65,19 @@ test "deliver transfers a correlated completion to the terminal sink" {
 
 test "deliver owns and disposes a completion rejected during shutdown" {
     var capture = CapturingSink{ .reject = true };
-    var input: presentation.OwnedInput = .{ .post_draft_launch_failed = .{ .operation_id = 7, .temp_id = 11 } };
+    const summaries = try presentation.PullRequestSummaries.create(testing.allocator);
+    summaries.prs = try summaries.arena.allocator().dupe(bbr.bitbucket.PullRequestSummary, &.{.{
+        .id = 7,
+        .title = "owned result",
+        .state = "OPEN",
+        .author_display_name = "Reviewer",
+        .source_branch = "feature",
+        .destination_branch = "main",
+    }});
+    var input: presentation.OwnedInput = .{ .pull_requests_loaded = .{
+        .work_id = 9,
+        .outcome = .{ .loaded = summaries },
+    } };
     deliver(capture.sink(), input);
     input = undefined;
 
