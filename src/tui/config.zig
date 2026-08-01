@@ -18,11 +18,14 @@ const Diagnostic = struct {
 
 pub const Configuration = struct {
     pub const default_highlight_max_file_bytes: usize = 2 * 1024 * 1024;
+    pub const default_file_cache_max_retained_bytes_per_review: usize = 256 * 1024 * 1024;
 
     theme_name: []const u8,
     active_theme: theme.Theme,
     keymap: keymap.OwnedKeymap,
     highlight_max_file_bytes: usize,
+    file_cache_enabled: bool,
+    file_cache_max_retained_bytes_per_review: usize,
 
     pub fn deinit(self: *Configuration, allocator: std.mem.Allocator) void {
         allocator.free(self.theme_name);
@@ -85,6 +88,8 @@ fn defaults(allocator: std.mem.Allocator) !Configuration {
         .active_theme = theme.system,
         .keymap = try keymap.Keymap.fromOverrides(allocator, &.{}),
         .highlight_max_file_bytes = Configuration.default_highlight_max_file_bytes,
+        .file_cache_enabled = true,
+        .file_cache_max_retained_bytes_per_review = Configuration.default_file_cache_max_retained_bytes_per_review,
     };
 }
 
@@ -136,7 +141,12 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
     var theme_seen = false;
     var highlight_max_file_bytes = Configuration.default_highlight_max_file_bytes;
     var highlight_limit_seen = false;
-    var section: enum { root, keymap, highlight, unknown } = .root;
+    var file_cache_enabled = true;
+    var file_cache_enabled_seen = false;
+    var file_cache_max_retained_bytes_per_review = Configuration.default_file_cache_max_retained_bytes_per_review;
+    var file_cache_limit_seen = false;
+    var file_cache_limit_line: usize = 1;
+    var section: enum { root, keymap, highlight, files_cache, unknown } = .root;
 
     var lines = std.mem.splitScalar(u8, source, '\n');
     var line_number: usize = 0;
@@ -147,15 +157,15 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
         if (parser.done() or parser.peek() == '#') continue;
         if (parser.peek() == '[') {
             const parsed_section = parser.section() catch {
-                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "malformed table header", .hint = "use [keymap] or [highlight]" });
+                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "malformed table header", .hint = "use [keymap], [highlight], or [files.cache]" });
                 section = .unknown;
                 continue;
             };
             parser.space();
             if (!parser.trailing()) try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "unexpected text after table header" });
-            if (std.mem.eql(u8, parsed_section, "keymap")) section = .keymap else if (std.mem.eql(u8, parsed_section, "highlight")) section = .highlight else {
+            if (std.mem.eql(u8, parsed_section, "keymap")) section = .keymap else if (std.mem.eql(u8, parsed_section, "highlight")) section = .highlight else if (std.mem.eql(u8, parsed_section, "files.cache")) section = .files_cache else {
                 section = .unknown;
-                try diagnostics.append(allocator, .{ .line = line_number, .column = 2, .message = "unknown table", .hint = "use [keymap] or [highlight]" });
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 2, .message = "unknown table", .hint = "use [keymap], [highlight], or [files.cache]" });
             }
             continue;
         }
@@ -170,12 +180,22 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
             continue;
         }
         parser.space();
-        const value: []const u8 = if (section == .highlight) parser.unsigned() catch {
-            try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a non-negative integer byte count" });
-            continue;
-        } else parser.quoted() catch {
-            try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a quoted string value" });
-            continue;
+        const value: []const u8 = switch (section) {
+            .highlight => parser.unsigned() catch {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a non-negative integer byte count" });
+                continue;
+            },
+            .files_cache => if (std.mem.eql(u8, key, "enabled")) parser.boolean() catch {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected true or false" });
+                continue;
+            } else parser.unsigned() catch {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a non-negative integer byte count" });
+                continue;
+            },
+            else => parser.quoted() catch {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a quoted string value" });
+                continue;
+            },
         };
         parser.space();
         if (!parser.trailing()) {
@@ -236,8 +256,31 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
                 };
                 highlight_limit_seen = true;
             },
+            .files_cache => if (std.mem.eql(u8, key, "enabled")) {
+                if (file_cache_enabled_seen) {
+                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'enabled' key", .hint = "keep exactly one File cache switch" });
+                } else file_cache_enabled = std.mem.eql(u8, value, "true");
+                file_cache_enabled_seen = true;
+            } else if (std.mem.eql(u8, key, "max_retained_bytes_per_review")) {
+                if (file_cache_limit_seen) {
+                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'max_retained_bytes_per_review' key", .hint = "keep exactly one File cache budget" });
+                } else {
+                    file_cache_max_retained_bytes_per_review = std.fmt.parseInt(usize, value, 10) catch {
+                        try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "File cache byte budget is too large" });
+                        file_cache_limit_seen = true;
+                        file_cache_limit_line = line_number;
+                        continue;
+                    };
+                    file_cache_limit_line = line_number;
+                }
+                file_cache_limit_seen = true;
+            } else try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown File cache key", .hint = "use enabled or max_retained_bytes_per_review" }),
             .unknown => {},
         }
+    }
+
+    if (file_cache_enabled and file_cache_max_retained_bytes_per_review == 0) {
+        try diagnostics.append(allocator, .{ .line = file_cache_limit_line, .column = 1, .message = "enabled File cache budget must be greater than zero", .hint = "set enabled = false to disable inactive caching" });
     }
 
     var owned_keymap = keymap.Keymap.fromOverrides(allocator, overrides.items) catch |err| {
@@ -257,6 +300,8 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
         .active_theme = theme.byName(theme_name).?,
         .keymap = owned_keymap,
         .highlight_max_file_bytes = highlight_max_file_bytes,
+        .file_cache_enabled = file_cache_enabled,
+        .file_cache_max_retained_bytes_per_review = file_cache_max_retained_bytes_per_review,
     } };
 }
 
@@ -360,6 +405,20 @@ const LineParser = struct {
         if (self.pos == start) return error.ExpectedUnsigned;
         return self.text[start..self.pos];
     }
+
+    fn boolean(self: *LineParser) ![]const u8 {
+        if (std.mem.startsWith(u8, self.text[self.pos..], "true")) {
+            const start = self.pos;
+            self.pos += 4;
+            return self.text[start..self.pos];
+        }
+        if (std.mem.startsWith(u8, self.text[self.pos..], "false")) {
+            const start = self.pos;
+            self.pos += 5;
+            return self.text[start..self.pos];
+        }
+        return error.ExpectedBoolean;
+    }
 };
 
 test "configuration resolves theme and keymap while collecting independent diagnostics" {
@@ -406,6 +465,31 @@ test "Highlighting size limit defaults to 2 MiB and accepts zero as unlimited" {
     );
     defer invalid.deinit(testing.allocator);
     try testing.expect(invalid == .invalid);
+}
+
+test "File content cache defaults on at 256 MiB and accepts an explicit positive budget" {
+    var default_result = try parse(testing.allocator, "");
+    defer default_result.deinit(testing.allocator);
+    try testing.expect(default_result.ok.file_cache_enabled);
+    try testing.expectEqual(@as(usize, 256 * 1024 * 1024), default_result.ok.file_cache_max_retained_bytes_per_review);
+
+    var configured = try parse(testing.allocator,
+        \\[files.cache]
+        \\enabled = false
+        \\max_retained_bytes_per_review = 1073741824
+    );
+    defer configured.deinit(testing.allocator);
+    try testing.expect(configured == .ok);
+    try testing.expect(!configured.ok.file_cache_enabled);
+    try testing.expectEqual(@as(usize, 1024 * 1024 * 1024), configured.ok.file_cache_max_retained_bytes_per_review);
+
+    var zero = try parse(testing.allocator,
+        \\[files.cache]
+        \\enabled = true
+        \\max_retained_bytes_per_review = 0
+    );
+    defer zero.deinit(testing.allocator);
+    try testing.expect(zero == .invalid);
 }
 
 test "configuration path prefers XDG and falls back to HOME" {

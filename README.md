@@ -87,6 +87,10 @@ theme = "system"
 
 [highlight]
 max_file_bytes = 2097152
+
+[files.cache]
+enabled = true
+max_retained_bytes_per_review = 268435456
 ```
 
 `system` is the default Theme and uses the terminal foreground, background, and ANSI palette.
@@ -101,6 +105,13 @@ the start of a sequence, and no complete binding may be a Leader for a longer bi
 Syntax highlighting is loaded lazily for the focused File. `max_file_bytes` limits each old/new
 file side independently; the 2 MiB default avoids expensive parsing of generated or minified
 files. Set it to `0` for no limit. Files above the limit remain readable as plain text.
+
+Full file content has no size limit. The focused File is always retained while it is being
+reviewed. Inactive file content uses a whole-File least-recently-used cache: it is enabled by
+default with a 256 MiB budget across the current review, counting the complete owned allocation
+capacity for blobs, Highlight Spans, Capture names, and retained scratch. Evicted Files are fetched again when revisited. Set `enabled = false` to retain
+only the focused File; `max_retained_bytes_per_review` must be greater than zero while the cache
+is enabled.
 
 ## Reference
 

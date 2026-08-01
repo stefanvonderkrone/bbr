@@ -37,6 +37,8 @@ pub const RunCtx = struct {
     keymap: keymap.Keymap,
     highlighter: bbr.highlight.Highlighter,
     highlight_max_file_bytes: usize,
+    file_cache_enabled: bool,
+    file_cache_max_retained_bytes_per_review: usize,
     submission_locks: ?bbr.review.SubmissionLocks = null,
     online: bool = true,
 };
@@ -66,6 +68,8 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
         .reviews = ctx.store,
         .submission_locks = ctx.submission_locks,
         .highlight_max_file_bytes = ctx.highlight_max_file_bytes,
+        .file_cache_enabled = ctx.file_cache_enabled,
+        .file_cache_max_retained_bytes_per_review = ctx.file_cache_max_retained_bytes_per_review,
         .require_source_check = ctx.online,
         .keymap = ctx.keymap,
         .remote_enabled = ctx.online,

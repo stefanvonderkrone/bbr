@@ -140,6 +140,8 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .keymap = configuration.keymap.keymap(),
         .highlighter = tree_sitter_highlighter.highlighter(),
         .highlight_max_file_bytes = configuration.highlight_max_file_bytes,
+        .file_cache_enabled = configuration.file_cache_enabled,
+        .file_cache_max_retained_bytes_per_review = configuration.file_cache_max_retained_bytes_per_review,
         .submission_locks = os_locks.locks(),
     }, null, target.id) catch |err| {
         if (tuiFatalMessage(err)) |message| {
@@ -409,6 +411,8 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
         .keymap = configuration.keymap.keymap(),
         .highlighter = plain_highlighter.highlighter(),
         .highlight_max_file_bytes = configuration.highlight_max_file_bytes,
+        .file_cache_enabled = configuration.file_cache_enabled,
+        .file_cache_max_retained_bytes_per_review = configuration.file_cache_max_retained_bytes_per_review,
         .online = false,
     }, s, s.pr.id);
 }

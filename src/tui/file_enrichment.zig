@@ -50,6 +50,7 @@ const OwnedSide = struct {
     arena: std.heap.ArenaAllocator,
     blob: []const u8,
     highlighting: HighlightingView,
+    retained_bytes: usize,
 
     fn destroy(self: *OwnedSide) void {
         const backing = self.arena.child_allocator;
@@ -110,15 +111,25 @@ fn enrichSide(backing: Allocator, bb: bbr.bitbucket.Client, highlighter: bbr.hig
     };
     if (max_file_bytes != 0 and side.blob.len > max_file_bytes) {
         side.highlighting = .skipped_too_large;
+        side.retained_bytes = retainedBytes(side);
         return .{ .owned = side };
     }
     const highlights = highlighter.highlight(allocator, path, side.blob) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         side.highlighting = .{ .failed = err };
+        side.retained_bytes = retainedBytes(side);
         return .{ .owned = side };
     };
     side.highlighting = .{ .ready = highlights };
+    side.retained_bytes = retainedBytes(side);
     return .{ .owned = side };
+}
+
+fn retainedBytes(side: *const OwnedSide) usize {
+    // ArenaAllocator.queryCapacity excludes its internal linked-list nodes but
+    // includes every allocation the owned side keeps alive: blob, Highlight
+    // output, Capture names, and any scratch capacity not individually freed.
+    return side.arena.queryCapacity();
 }
 
 const StoredSide = union(enum) {
@@ -145,11 +156,24 @@ const StoredSide = union(enum) {
 const StoredFile = struct {
     old: StoredSide = .pending,
     new: StoredSide = .pending,
+    last_used: u64 = 0,
 
     fn deinit(self: *StoredFile) void {
         self.old.deinit();
         self.new.deinit();
     }
+
+    fn retainedBytes(self: *const StoredFile) usize {
+        var total: usize = 0;
+        if (self.old == .content) total +|= self.old.content.retained_bytes;
+        if (self.new == .content) total +|= self.new.content.retained_bytes;
+        return total;
+    }
+};
+
+pub const CachePolicy = struct {
+    enabled: bool = true,
+    max_retained_bytes: usize = std.math.maxInt(usize),
 };
 
 pub const Storage = struct {
@@ -159,6 +183,10 @@ pub const Storage = struct {
     highlights: []bbr.highlight.FileHighlights,
     statuses: []bbr.highlight.FileHighlightStatus,
     errors: []SideErrors,
+    cache: CachePolicy = .{},
+    focused_file: ?usize = null,
+    recency: u64 = 0,
+    retired: std.ArrayList(RetiredFile) = .empty,
 
     pub fn init(allocator: Allocator, diff_files: []const bbr.diff.File) !Storage {
         const files = try allocator.alloc(StoredFile, diff_files.len);
@@ -181,7 +209,7 @@ pub const Storage = struct {
         const errors = try allocator.alloc(SideErrors, diff_files.len);
         errdefer allocator.free(errors);
         @memset(errors, .{});
-        return .{
+        var storage: Storage = .{
             .allocator = allocator,
             .files = files,
             .blobs = blobs,
@@ -189,9 +217,14 @@ pub const Storage = struct {
             .statuses = statuses,
             .errors = errors,
         };
+        errdefer storage.retired.deinit(allocator);
+        try storage.retired.ensureTotalCapacity(allocator, diff_files.len);
+        return storage;
     }
 
     pub fn deinit(self: *Storage) void {
+        for (self.retired.items) |*retired| retired.file.deinit();
+        self.retired.deinit(self.allocator);
         for (self.files) |*stored_file| stored_file.deinit();
         self.allocator.free(self.files);
         self.allocator.free(self.blobs);
@@ -202,6 +235,12 @@ pub const Storage = struct {
     }
 
     pub fn admit(self: *Storage, file_idx: usize, result: *Result) error{ AlreadyTransferred, AlreadyAdmitted, FileOutOfRange }!void {
+        _ = try self.stageAdmission(file_idx, result);
+        self.commitCacheUpdate();
+    }
+
+    pub fn stageAdmission(self: *Storage, file_idx: usize, result: *Result) error{ AlreadyTransferred, AlreadyAdmitted, FileOutOfRange }!bool {
+        std.debug.assert(self.retired.items.len == 0);
         if (file_idx >= self.files.len) return error.FileOutOfRange;
         if (result.old == .transferred or result.new == .transferred) return error.AlreadyTransferred;
         const stored = &self.files[file_idx];
@@ -211,6 +250,42 @@ pub const Storage = struct {
         stored.new = transfer(&result.new);
         self.projectSide(file_idx, .old);
         self.projectSide(file_idx, .new);
+        return self.stageCacheEnforcement();
+    }
+
+    pub fn configureCache(self: *Storage, policy: CachePolicy) void {
+        std.debug.assert(!policy.enabled or policy.max_retained_bytes > 0);
+        self.cache = policy;
+        _ = self.stageCacheEnforcement();
+        self.commitCacheUpdate();
+    }
+
+    pub fn focus(self: *Storage, file_idx: usize) void {
+        _ = self.stageFocus(file_idx);
+        self.commitCacheUpdate();
+    }
+
+    pub fn stageFocus(self: *Storage, file_idx: usize) bool {
+        std.debug.assert(self.retired.items.len == 0);
+        std.debug.assert(file_idx < self.files.len);
+        self.recency +|= 1;
+        self.files[file_idx].last_used = self.recency;
+        self.focused_file = file_idx;
+        return self.stageCacheEnforcement();
+    }
+
+    pub fn commitCacheUpdate(self: *Storage) void {
+        for (self.retired.items) |*retired| retired.file.deinit();
+        self.retired.clearRetainingCapacity();
+    }
+
+    pub fn rollbackCacheUpdate(self: *Storage) void {
+        while (self.retired.pop()) |retired| {
+            std.debug.assert(self.files[retired.index].retainedBytes() == 0);
+            self.files[retired.index] = retired.file;
+            self.projectSide(retired.index, .old);
+            self.projectSide(retired.index, .new);
+        }
     }
 
     pub fn file(self: *const Storage, file_idx: usize) FileView {
@@ -260,6 +335,9 @@ pub const Storage = struct {
         const highlight_slot = &@field(self.highlights[file_idx], @tagName(which));
         const status_slot = &@field(self.statuses[file_idx], @tagName(which));
         const error_slot = &@field(self.errors[file_idx], @tagName(which));
+        blob_slot.* = null;
+        highlight_slot.* = null;
+        error_slot.* = null;
         switch (stored) {
             .pending => status_slot.* = .pending,
             .absent => status_slot.* = .absent,
@@ -283,6 +361,44 @@ pub const Storage = struct {
             },
         }
     }
+
+    fn stageCacheEnforcement(self: *Storage) bool {
+        const budget = if (self.cache.enabled) self.cache.max_retained_bytes else 0;
+        var changed = false;
+        while (self.inactiveRetainedBytes() > budget) {
+            const victim = self.leastRecentlyUsedInactive() orelse break;
+            self.retired.appendAssumeCapacity(.{ .index = victim, .file = self.files[victim] });
+            self.files[victim] = .{ .last_used = self.files[victim].last_used };
+            self.projectSide(victim, .old);
+            self.projectSide(victim, .new);
+            changed = true;
+        }
+        return changed;
+    }
+
+    fn inactiveRetainedBytes(self: *const Storage) usize {
+        var total: usize = 0;
+        for (self.files, 0..) |*stored_file, file_idx| {
+            if (self.focused_file != null and self.focused_file.? == file_idx) continue;
+            total +|= stored_file.retainedBytes();
+        }
+        return total;
+    }
+
+    fn leastRecentlyUsedInactive(self: *const Storage) ?usize {
+        var victim: ?usize = null;
+        for (self.files, 0..) |*stored_file, file_idx| {
+            if (self.focused_file != null and self.focused_file.? == file_idx) continue;
+            if (stored_file.retainedBytes() == 0) continue;
+            if (victim == null or stored_file.last_used < self.files[victim.?].last_used) victim = file_idx;
+        }
+        return victim;
+    }
+};
+
+const RetiredFile = struct {
+    index: usize,
+    file: StoredFile,
 };
 
 fn sideNeedsEnrichment(state: bbr.highlight.SideState) bool {
@@ -307,6 +423,23 @@ const testing = std.testing;
 
 fn oneTestFile(status: bbr.diff.FileStatus) [1]bbr.diff.File {
     return .{.{ .old_path = "src/main.ts", .new_path = "src/main.ts", .status = status, .hunks = &.{} }};
+}
+
+const test_files = [_]bbr.diff.File{
+    .{ .old_path = "/dev/null", .new_path = "a.zig", .status = .added, .hunks = &.{} },
+    .{ .old_path = "/dev/null", .new_path = "b.zig", .status = .added, .hunks = &.{} },
+    .{ .old_path = "/dev/null", .new_path = "c.zig", .status = .added, .hunks = &.{} },
+};
+
+fn ownedAddedResult(backing: Allocator, blob: []const u8) !Result {
+    const side = try backing.create(OwnedSide);
+    errdefer backing.destroy(side);
+    side.arena = std.heap.ArenaAllocator.init(backing);
+    errdefer side.arena.deinit();
+    side.blob = try side.arena.allocator().dupe(u8, blob);
+    side.highlighting = .{ .ready = .{ .spans = &.{} } };
+    side.retained_bytes = side.blob.len;
+    return .{ .old = .absent, .new = .{ .owned = side } };
 }
 
 const ScriptedHighlighter = struct {
@@ -455,4 +588,58 @@ fn exerciseAddedFileOwnership(allocator: Allocator) !void {
 
 test "File Enrichment reclaims ownership at every allocation failure" {
     try testing.checkAllAllocationFailures(testing.allocator, exerciseAddedFileOwnership, .{});
+}
+
+test "File content cache evicts the least-recently-focused whole File and refetches it on revisit" {
+    var storage = try Storage.init(testing.allocator, test_files[0..3]);
+    defer storage.deinit();
+    storage.configureCache(.{ .enabled = true, .max_retained_bytes = 10 });
+
+    storage.focus(0);
+    var first = try ownedAddedResult(testing.allocator, "aaaaaa");
+    defer first.deinit();
+    try storage.admit(0, &first);
+
+    storage.focus(1);
+    var second = try ownedAddedResult(testing.allocator, "bbbbbb");
+    defer second.deinit();
+    try storage.admit(1, &second);
+
+    storage.focus(2);
+    try testing.expect(storage.file(0).new == .pending);
+    try testing.expect(storage.needsEnrichment(0));
+    try testing.expectEqualStrings("bbbbbb", storage.file(1).new.content.blob);
+
+    storage.focus(0);
+    var revisited = try ownedAddedResult(testing.allocator, "AAAAAA");
+    defer revisited.deinit();
+    try storage.admit(0, &revisited);
+    try testing.expectEqualStrings("AAAAAA", storage.file(0).new.content.blob);
+}
+
+test "File content cache budget includes Highlight Spans and Capture names" {
+    const responses = [_]bbr.http.Canned{.{ .status = 200, .body = "const" }};
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var scripted = ScriptedHighlighter{};
+    var result = try enrich(testing.allocator, bb, scripted.highlighter(), .{
+        .repo = "repo",
+        .status = .added,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "/dev/null",
+        .new_path = "a.zig",
+        .max_file_bytes = 0,
+    });
+    defer result.deinit();
+
+    var storage = try Storage.init(testing.allocator, test_files[0..2]);
+    defer storage.deinit();
+    storage.configureCache(.{ .enabled = true, .max_retained_bytes = "const".len });
+    storage.focus(0);
+    try storage.admit(0, &result);
+    try testing.expectEqualStrings("keyword", storage.file(0).new.content.highlighting.ready.spans[0].capture.name);
+
+    storage.focus(1);
+    try testing.expect(storage.file(0).new == .pending);
 }

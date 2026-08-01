@@ -68,6 +68,8 @@ pub const Dependencies = struct {
     reviews: bbr.review.PendingReviewStore,
     submission_locks: ?bbr.review.SubmissionLocks = null,
     highlight_max_file_bytes: usize = 0,
+    file_cache_enabled: bool = true,
+    file_cache_max_retained_bytes_per_review: usize = 256 * 1024 * 1024,
     require_source_check: bool = false,
     keymap: keymap_mod.Keymap = .default,
     remote_enabled: bool = true,
@@ -527,6 +529,7 @@ const Published = struct {
         session: *Session,
         viewport_rows: usize,
         preferences: Preferences,
+        cache_policy: file_enrichment.CachePolicy,
     ) !*Published {
         const published = try allocator.create(Published);
         errdefer allocator.destroy(published);
@@ -550,6 +553,8 @@ const Published = struct {
         published.composer_arena = std.heap.ArenaAllocator.init(allocator);
         errdefer published.composer_arena.deinit();
         published.composer = null;
+        session.enrichment.configureCache(cache_policy);
+        if (session.enrichment.len() > 0) session.enrichment.focus(0);
 
         const buffer_allocator = published.buffers.begin();
         errdefer published.buffers.abort();
@@ -612,6 +617,15 @@ const Published = struct {
         self.buffers.commit();
         self.buffer = candidate;
         self.navigation.setRowCount(candidate.rows.len);
+    }
+
+    fn focusEnrichment(self: *Published, preferences: Preferences, file_index: usize) BufferTransactionError!void {
+        if (!self.session.enrichment.stageFocus(file_index)) return;
+        self.rebuild(preferences, self.expanded_folds.items, self.isolated_file) catch |err| {
+            self.session.enrichment.rollbackCacheUpdate();
+            return err;
+        };
+        self.session.enrichment.commitCacheUpdate();
     }
 
     /// Begin and populate the inactive Buffer generation. The caller must
@@ -1033,6 +1047,10 @@ pub const Presentation = struct {
                 initial.session,
                 boot.viewport_rows,
                 self.preferences,
+                .{
+                    .enabled = dependencies.file_cache_enabled,
+                    .max_retained_bytes = dependencies.file_cache_max_retained_bytes_per_review,
+                },
             );
         }
         self.discoverRecovery();
@@ -2049,6 +2067,10 @@ pub const Presentation = struct {
         const published = self.published orelse return;
         const file_index = published.isolated_file orelse fileIndexForRow(published.buffer, published.navigation.cursor);
         if (file_index >= published.session.diff.files.len or file_index >= published.session.enrichment.len()) return;
+        published.focusEnrichment(self.preferences, file_index) catch |err| {
+            self.action_error = normalizeActionError(err);
+            return;
+        };
         if (!published.session.enrichment.needsEnrichment(file_index)) return;
 
         const file = published.session.diff.files[file_index];
@@ -2136,14 +2158,16 @@ pub const Presentation = struct {
                 defer result.deinit();
                 if (!applies) return;
                 const current = published.?;
-                current.session.enrichment.admit(completed.file_index, &result) catch {
+                _ = current.session.enrichment.stageAdmission(completed.file_index, &result) catch {
                     self.action_error = .action_refused;
                     return;
                 };
                 current.rebuild(self.preferences, current.expanded_folds.items, current.isolated_file) catch |err| {
+                    current.session.enrichment.rollbackCacheUpdate();
                     self.action_error = normalizeActionError(err);
                     return;
                 };
+                current.session.enrichment.commitCacheUpdate();
                 self.action_error = null;
             },
         }
@@ -2410,6 +2434,10 @@ pub const Presentation = struct {
                     session,
                     self.viewport_rows,
                     self.preferences,
+                    .{
+                        .enabled = self.dependencies.file_cache_enabled,
+                        .max_retained_bytes = self.dependencies.file_cache_max_retained_bytes_per_review,
+                    },
                 ) catch |err| {
                     self.replacement = null;
                     self.replacement_error = switch (err) {
@@ -3090,6 +3118,48 @@ test "focused File Enrichment emits one Session Epoch command while in flight" {
 
     try presentation.dispatch(.ensure_focused_enrichment);
     try testing.expect(presentation.takeCommand() == null);
+}
+
+test "disabled File cache discards an inactive completion and revisiting refetches it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .file_cache_enabled = false,
+    }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testTwoFileSession(testing.allocator, 1),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const first = presentation.takeCommand().?.enrich_file;
+    try testing.expectEqual(@as(usize, 0), first.file_index);
+    try presentation.dispatch(.{ .action = .next_file });
+    try presentation.dispatch(.ensure_focused_enrichment);
+    _ = presentation.takeCommand().?.enrich_file;
+
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 200, .body = "old a\n" },
+        .{ .status = 200, .body = "new a\n" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+    var highlighter = TestNoopHighlighter{};
+    const result = try file_enrichment.enrich(testing.allocator, client, highlighter.highlighter(), first.request());
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .work_id = first.work_id,
+        .session_epoch = first.session_epoch,
+        .file_index = first.file_index,
+        .outcome = .{ .completed = result },
+    } });
+
+    try presentation.dispatch(.{ .action = .prev_file });
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try testing.expectEqual(@as(usize, 0), presentation.takeCommand().?.enrich_file.file_index);
 }
 
 const TestNoopHighlighter = struct {
