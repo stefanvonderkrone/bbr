@@ -89,6 +89,11 @@ pub const SubmissionCompletion = union(enum) {
     aborted: SubmissionPendingState,
 };
 
+pub const UnknownResolution = union(enum) {
+    posted: CommentId,
+    unpublished,
+};
+
 pub const PendingReviewStore = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -104,6 +109,7 @@ pub const PendingReviewStore = struct {
         checkpoint_submission: *const fn (ptr: *anyopaque, operation_id: OperationId, key: ReviewKey, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) anyerror!void,
         complete_submission: *const fn (ptr: *anyopaque, operation_id: OperationId, key: ReviewKey, completion: SubmissionCompletion) anyerror!void,
         active_submission: *const fn (ptr: *anyopaque, allocator: Allocator) anyerror!?ActiveSubmissionRun,
+        resolve_unknown: *const fn (ptr: *anyopaque, key: ReviewKey, temp_id: TempId, resolution: UnknownResolution) anyerror!void,
     };
 
     pub fn put(self: PendingReviewStore, key: ReviewKey, draft: Draft) !void {
@@ -124,6 +130,10 @@ pub const PendingReviewStore = struct {
 
     pub fn activeSubmission(self: PendingReviewStore, allocator: Allocator) !?ActiveSubmissionRun {
         return self.vtable.active_submission(self.ptr, allocator);
+    }
+
+    pub fn resolveUnknown(self: PendingReviewStore, key: ReviewKey, temp_id: TempId, resolution: UnknownResolution) !void {
+        return self.vtable.resolve_unknown(self.ptr, key, temp_id, resolution);
     }
 
     /// Persist one post's outcome and the next post intent as one transaction.
@@ -201,6 +211,7 @@ pub const InMemoryStore = struct {
         .checkpoint_submission = checkpointSubmissionImpl,
         .complete_submission = completeSubmissionImpl,
         .active_submission = activeSubmissionImpl,
+        .resolve_unknown = resolveUnknownImpl,
     };
 
     fn putImpl(ptr: *anyopaque, key: ReviewKey, d: Draft) anyerror!void {
@@ -311,6 +322,21 @@ pub const InMemoryStore = struct {
             .source_commit = try allocator.dupe(u8, run.source_commit),
             .current_temp_id = run.current_temp_id,
         };
+    }
+
+    fn resolveUnknownImpl(ptr: *anyopaque, key: ReviewKey, temp_id: TempId, resolution: UnknownResolution) anyerror!void {
+        const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        if (self.active_submission) |run| if (ReviewKey.eql(run.key, key)) return error.DraftLocked;
+        for (self.entries.items) |*entry| {
+            if (!ReviewKey.eql(entry.key, key) or entry.draft.local_id != temp_id) continue;
+            if (entry.draft.state != .outcome_unknown) return error.InvalidUnknownResolution;
+            entry.draft.state = switch (resolution) {
+                .posted => |id| .{ .posted = id },
+                .unpublished => .draft,
+            };
+            return;
+        }
+        return error.DraftNotFound;
     }
 
     fn checkpointSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: ReviewKey, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) anyerror!void {
@@ -609,6 +635,8 @@ test "unresolved outcome remains immutable after partial completion" {
 
     try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "changed" }));
     try testing.expectError(error.DraftLocked, store.remove(key, 1));
+    try store.resolveUnknown(key, 1, .unpublished);
+    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "changed" });
 }
 
 test "active Submission locks Bitbucket Draft mutation but not local Drafts" {

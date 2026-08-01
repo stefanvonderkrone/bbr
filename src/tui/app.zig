@@ -263,6 +263,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
         .reviews = ctx.store,
         .submission_locks = ctx.submission_locks,
         .highlight_max_file_bytes = ctx.highlight_max_file_bytes,
+        .require_source_check = ctx.online,
     }, .{
         .initial = if (initial) |loaded| .{
             .key = try presentation.ReviewKey.init(ctx.cred.workspace, ctx.repo, loaded.pr.id),
@@ -316,6 +317,17 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                     try state.dispatch(.dismiss_submission_result);
                 } else if (show_help) {
                     show_help = false;
+                } else if (state.projection().unknown_resolution != null) {
+                    if (key.matches(vaxis.Key.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
+                        try state.dispatch(.{ .unknown_resolution = .cancel });
+                    } else if (key.matches(vaxis.Key.enter, .{})) {
+                        try state.dispatch(.{ .unknown_resolution = .confirm });
+                    } else if (key.matches(vaxis.Key.backspace, .{})) {
+                        try state.dispatch(.{ .unknown_resolution = .backspace });
+                    } else if (key.text) |chunk| {
+                        for (chunk) |byte| if (byte >= '0' and byte <= '9')
+                            try state.dispatch(.{ .unknown_resolution = .{ .digit = byte - '0' } });
+                    }
                 } else if (state.projection().composer != null) {
                     if (key.matches(vaxis.Key.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
                         try state.dispatch(.{ .composer = .cancel });
@@ -427,6 +439,10 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
         }
         if (picker) |*active_picker| render.drawPicker(frame, win, active_picker, ctx.active_theme);
         if (projection.composer) |composer| render.drawComposerProjection(frame, win, composer, ctx.active_theme);
+        if (projection.unknown_resolution) |resolution| render.drawComposerProjection(frame, win, .{
+            .label = "Link existing Bitbucket Comment ID",
+            .body = resolution.comment_id,
+        }, ctx.active_theme);
         if (projection.submission) |submission| {
             if (projection.review) |review_projection| if (presentation.ReviewKey.eql(submission.key, review_projection.key))
                 render.drawSubmit(frame, win, ctx.active_theme, submission.completed, submission.total);
@@ -480,6 +496,16 @@ fn presentationStatus(
                 result.skipped,
             }) catch "submission finished for another pull request";
     }
+    if (projection.recovery) |recovery| return switch (recovery.ownership) {
+        .recoverable => std.fmt.allocPrint(frame, "interrupted Submission for {s}#{d} · Y resume", .{
+            recovery.key.repository(),
+            recovery.key.pull_request_id,
+        }) catch "interrupted Submission · Y resume",
+        .running_elsewhere => std.fmt.allocPrint(frame, "{s}#{d} is submitting in another bbr instance", .{
+            recovery.key.repository(),
+            recovery.key.pull_request_id,
+        }) catch "Submission owned by another bbr instance",
+    };
     if (projection.replacement_error) |err| return @tagName(err);
     return null;
 }
@@ -1625,6 +1651,61 @@ fn presentationWaitWorker(loop: *Loop, work_id: u64, io: std.Io, wait: presentat
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .submission_wait_completed = wait });
 }
 
+fn presentationRecoveryCheckWorker(
+    loop: *Loop,
+    work_id: u64,
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+    cred: Credential,
+    check: presentation.CheckRecovery,
+) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
+    defer http.deinit();
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
+    const input = if (client.getPullRequest(scratch.allocator(), check.key.repository(), check.key.pull_request_id)) |pr|
+        presentation.recoveryCheckSucceeded(check.operation_id, pr.source_commit)
+    else |_|
+        presentation.OwnedInput{ .recovery_checked = .{ .operation_id = check.operation_id, .outcome = .failed } };
+    presentation_runtime.deliver(presentationSink(&sink_context), input);
+}
+
+fn presentationDuplicateCheckWorker(
+    loop: *Loop,
+    work_id: u64,
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+    cred: Credential,
+    command: *presentation.PostDraft,
+) void {
+    defer command.destroy();
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
+    defer http.deinit();
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
+    var poster = bbr.bitbucket.Poster{
+        .client = client,
+        .allocator = scratch.allocator(),
+        .repo_slug = command.key.repository(),
+        .pr_id = command.key.pull_request_id,
+    };
+    const outcome: presentation.DuplicateCheckOutcome = if (poster.poster().findExisting(command.draft)) |existing|
+        if (existing) |id| .{ .found = id } else .missing
+    else |_|
+        .failed;
+    presentation_runtime.deliver(presentationSink(&sink_context), .{ .duplicate_checked = .{
+        .operation_id = command.operation_id,
+        .temp_id = command.draft.local_id,
+        .outcome = outcome,
+    } });
+}
+
 fn drainPresentationCommands(
     state: *presentation.Presentation,
     ctx: RunCtx,
@@ -1645,6 +1726,8 @@ fn drainPresentationCommands(
             .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, ctx.highlighter, enrich }),
             .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, post }),
             .wait_submission => |wait| ctx.io.concurrent(presentationWaitWorker, .{ loop, work_id, ctx.io, wait }),
+            .check_recovery => |check| ctx.io.concurrent(presentationRecoveryCheckWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, check }),
+            .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, check }),
         } catch {
             try admitPresentationLaunchFailure(state, &command);
             continue;
@@ -1666,6 +1749,16 @@ fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *p
         } },
         .post_draft => |post| presentation_adapter.postLaunchFailed(post),
         .wait_submission => |wait| .{ .submission_wait_launch_failed = wait },
+        .check_recovery => |check| .{ .recovery_checked = .{ .operation_id = check.operation_id, .outcome = .failed } },
+        .find_duplicate => |check| blk: {
+            const input: presentation.OwnedInput = .{ .duplicate_checked = .{
+                .operation_id = check.operation_id,
+                .temp_id = check.draft.local_id,
+                .outcome = .failed,
+            } };
+            check.destroy();
+            break :blk input;
+        },
     };
     command.* = undefined;
     try state.dispatch(input);

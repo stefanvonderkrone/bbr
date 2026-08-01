@@ -72,6 +72,7 @@ pub const review = struct {
     pub const SubmissionOutcome = store.SubmissionOutcome;
     pub const SubmissionPendingState = store.SubmissionPendingState;
     pub const SubmissionCompletion = store.SubmissionCompletion;
+    pub const UnknownResolution = store.UnknownResolution;
     pub const InMemoryStore = store.InMemoryStore;
     pub const Submission = submission.Submission;
     pub const CommentPoster = submission.CommentPoster;

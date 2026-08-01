@@ -33,6 +33,7 @@ const OperationId = bbr.review.OperationId;
 const ActiveSubmissionRun = bbr.review.ActiveSubmissionRun;
 const SubmissionOutcome = bbr.review.SubmissionOutcome;
 const SubmissionPendingState = bbr.review.SubmissionPendingState;
+const UnknownResolution = bbr.review.UnknownResolution;
 const SubmissionCompletion = bbr.review.SubmissionCompletion;
 
 pub const SqliteError = error{ Open, Exec, Prepare, Step };
@@ -173,6 +174,7 @@ pub const SqliteStore = struct {
         .checkpoint_submission = checkpointSubmissionImpl,
         .complete_submission = completeSubmissionImpl,
         .active_submission = activeSubmissionImpl,
+        .resolve_unknown = resolveUnknownImpl,
     };
 
     fn putImpl(ptr: *anyopaque, key: ReviewKey, d: Draft) anyerror!void {
@@ -392,6 +394,42 @@ pub const SqliteStore = struct {
             },
             else => error.Step,
         };
+    }
+
+    fn resolveUnknownImpl(ptr: *anyopaque, key: ReviewKey, temp_id: TempId, resolution: UnknownResolution) anyerror!void {
+        const self: *SqliteStore = @ptrCast(@alignCast(ptr));
+        try self.exec("BEGIN IMMEDIATE;");
+        errdefer self.exec("ROLLBACK;") catch {};
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql =
+            \\UPDATE drafts SET state_kind=?, state_id=?, state_err=NULL
+            \\ WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?
+            \\   AND state_kind=4
+            \\   AND NOT EXISTS(SELECT 1 FROM submission_runs
+            \\     WHERE workspace=? AND repository=? AND pr_id=? AND state=0);
+        ;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(stmt);
+        switch (resolution) {
+            .posted => |id| {
+                bindInt(stmt, 1, 2);
+                bindInt(stmt, 2, @intCast(id));
+            },
+            .unpublished => {
+                bindInt(stmt, 1, 0);
+                if (c.sqlite3_bind_null(stmt, 2) != c.SQLITE_OK) return error.Bind;
+            },
+        }
+        bindText(stmt, 3, key.workspace);
+        bindText(stmt, 4, key.repository);
+        bindInt(stmt, 5, @intCast(key.pull_request_id));
+        bindInt(stmt, 6, @intCast(temp_id));
+        bindText(stmt, 7, key.workspace);
+        bindText(stmt, 8, key.repository);
+        bindInt(stmt, 9, @intCast(key.pull_request_id));
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
+        if (c.sqlite3_changes(self.db) != 1) return error.InvalidUnknownResolution;
+        try self.exec("COMMIT;");
     }
 
     fn checkpointSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: ReviewKey, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) anyerror!void {
@@ -964,6 +1002,10 @@ test "SQLite keeps an unresolved outcome immutable after partial completion" {
 
     try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "changed" }));
     try testing.expectError(error.DraftLocked, store.remove(key, 1));
+    try store.resolveUnknown(key, 1, .{ .posted = 812 });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(@as(CommentId, 812), (try store.load(arena.allocator(), key))[0].state.posted);
 }
 
 test "SQLite rejects clean completion while a Bitbucket Draft failed" {

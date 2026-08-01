@@ -1231,10 +1231,12 @@ test "the help overlay floats a centered Keybindings modal from the Keymap" {
 
     drawHelp(a, win, theme_dark, keymap.Keymap.default);
 
-    // Modal is 74×20 centered on 80×24 → x_off 3, y_off 2. Title " Keybindings"
-    // puts 'K' at modal (1,0) → screen (4,2).
-    try testing.expectEqualStrings("K", win.readCell(4, 2).?.char.grapheme);
-    // First motion row (modal row 1 → screen row 3) starts at col_offset 2 →
+    const rows = buildHelpRows(a, keymap.Keymap.default);
+    const modal_height: u16 = @intCast(@min(@max(rows.motions.len, rows.commands.len) + 3, screen.height));
+    const modal_y = (screen.height - modal_height) / 2;
+    // Title " Keybindings" begins one cell into the centered 74-column modal.
+    try testing.expectEqualStrings("K", win.readCell(4, modal_y).?.char.grapheme);
+    // First motion row starts at col_offset 2 and one row below the title →
     // screen col 5, and the first motion binding is `j`/`↓` → down.
-    try testing.expectEqualStrings("j", win.readCell(5, 3).?.char.grapheme);
+    try testing.expectEqualStrings("j", win.readCell(5, modal_y + 1).?.char.grapheme);
 }

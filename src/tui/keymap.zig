@@ -142,6 +142,9 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one('r'), .action = .reply, .help = "reply" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .expand_fold, .help = "expand fold" },
     .{ .chord = Chord.one('X'), .action = .submit, .help = "submit review" },
+    .{ .chord = Chord.one('Y'), .action = .recover_submission, .help = "resume interrupted submission" },
+    .{ .chord = Chord.one('U'), .action = .resolve_unpublished, .help = "mark unknown draft unpublished" },
+    .{ .chord = Chord.one('C'), .action = .link_existing_comment, .help = "link unknown draft to comment" },
     .{ .chord = Chord.one('?'), .action = .help, .help = "toggle this help" },
 };
 
