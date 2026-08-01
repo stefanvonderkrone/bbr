@@ -498,6 +498,7 @@ pub const ActionError = enum {
 };
 
 const BufferTransactionError = error{ BufferBuildFailed, OutOfMemory };
+const SaveDraftError = BufferTransactionError || error{PersistenceFailed};
 
 pub const ReplacementError = enum {
     session_load_failed,
@@ -507,6 +508,25 @@ pub const ReplacementError = enum {
 };
 
 const Published = struct {
+    const StagedBuffer = struct {
+        published: *Published,
+        buffer: bbr.diff.Buffer,
+        active: bool = true,
+
+        fn deinit(self: *StagedBuffer) void {
+            if (self.active) self.published.buffers.abort();
+            self.* = undefined;
+        }
+
+        fn publish(self: *StagedBuffer) void {
+            std.debug.assert(self.active);
+            self.published.buffers.commit();
+            self.published.buffer = self.buffer;
+            self.published.navigation.setRowCount(self.buffer.rows.len);
+            self.active = false;
+        }
+    };
+
     allocator: Allocator,
     key: ReviewKey,
     epoch: SessionEpoch,
@@ -613,10 +633,9 @@ const Published = struct {
         expanded_folds: []const *const bbr.diff.Line,
         isolated_file: ?usize,
     ) BufferTransactionError!void {
-        const candidate = try self.stageBuffer(preferences, expanded_folds, isolated_file);
-        self.buffers.commit();
-        self.buffer = candidate;
-        self.navigation.setRowCount(candidate.rows.len);
+        var staged = try self.prepareBuffer(preferences, expanded_folds, isolated_file);
+        defer staged.deinit();
+        staged.publish();
     }
 
     fn focusEnrichment(self: *Published, preferences: Preferences, file_index: usize) BufferTransactionError!void {
@@ -628,14 +647,51 @@ const Published = struct {
         self.session.enrichment.commitCacheUpdate();
     }
 
-    /// Begin and populate the inactive Buffer generation. The caller must
-    /// commit it or abort it after any additional fallible work.
-    fn stageBuffer(
+    fn saveDraft(
+        self: *Published,
+        store: bbr.review.PendingReviewStore,
+        preferences: Preferences,
+        new_draft: bbr.review.NewDraft,
+    ) SaveDraftError!void {
+        const review_allocator = self.review_arena.allocator();
+        try self.review.drafts.ensureUnusedCapacity(review_allocator, 1);
+
+        var draft: bbr.review.Draft = .{
+            .local_id = self.review.next_id,
+            .kind = new_draft.kind,
+            .target = new_draft.target,
+            .parent = new_draft.parent,
+            .body = if (new_draft.kind == .suggestion)
+                try std.fmt.allocPrint(review_allocator, "```suggestion\n{s}\n```", .{new_draft.body})
+            else
+                try review_allocator.dupe(u8, new_draft.body),
+        };
+        if (new_draft.anchor) |anchor| {
+            draft.anchor = anchor;
+            draft.anchor.?.path = try review_allocator.dupe(u8, anchor.path);
+            if (anchor.commit) |commit| draft.anchor.?.commit = try review_allocator.dupe(u8, commit);
+        }
+
+        const previous_len = self.review.drafts.items.len;
+        self.review.drafts.appendAssumeCapacity(draft);
+        self.review.next_id += 1;
+        errdefer {
+            self.review.drafts.shrinkRetainingCapacity(previous_len);
+            self.review.next_id -= 1;
+        }
+
+        var staged = try self.prepareBuffer(preferences, self.expanded_folds.items, self.isolated_file);
+        defer staged.deinit();
+        store.put(self.key.storeKey(), draft) catch return error.PersistenceFailed;
+        staged.publish();
+    }
+
+    fn prepareBuffer(
         self: *Published,
         preferences: Preferences,
         expanded_folds: []const *const bbr.diff.Line,
         isolated_file: ?usize,
-    ) BufferTransactionError!bbr.diff.Buffer {
+    ) BufferTransactionError!StagedBuffer {
         const allocator = self.buffers.begin();
         errdefer self.buffers.abort();
         const enrichment = self.session.enrichment.projection();
@@ -658,7 +714,7 @@ const Published = struct {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return error.BufferBuildFailed;
         };
-        return candidate;
+        return .{ .published = self, .buffer = candidate };
     }
 };
 
@@ -2176,60 +2232,14 @@ pub const Presentation = struct {
     fn saveComposer(self: *Presentation, published: *Published) void {
         const composer = if (published.composer) |*value| value else return;
         if (composer.isBlank()) return;
-        const review_allocator = published.review_arena.allocator();
-        published.review.drafts.ensureUnusedCapacity(review_allocator, 1) catch {
-            self.action_error = .out_of_memory;
-            return;
-        };
-
-        const new_draft = composer.toNewDraft();
-        var draft: bbr.review.Draft = .{
-            .local_id = published.review.next_id,
-            .kind = new_draft.kind,
-            .target = new_draft.target,
-            .parent = new_draft.parent,
-            .body = (if (new_draft.kind == .suggestion)
-                std.fmt.allocPrint(review_allocator, "```suggestion\n{s}\n```", .{new_draft.body})
-            else
-                review_allocator.dupe(u8, new_draft.body)) catch {
-                self.action_error = .out_of_memory;
-                return;
-            },
-        };
-        if (new_draft.anchor) |anchor| {
-            draft.anchor = anchor;
-            draft.anchor.?.path = review_allocator.dupe(u8, anchor.path) catch {
-                self.action_error = .out_of_memory;
-                return;
+        published.saveDraft(self.dependencies.reviews, self.preferences, composer.toNewDraft()) catch |err| {
+            self.action_error = switch (err) {
+                error.PersistenceFailed => .persistence_failed,
+                error.BufferBuildFailed => .buffer_build_failed,
+                error.OutOfMemory => .out_of_memory,
             };
-            if (anchor.commit) |commit| {
-                draft.anchor.?.commit = review_allocator.dupe(u8, commit) catch {
-                    self.action_error = .out_of_memory;
-                    return;
-                };
-            }
-        }
-
-        published.review.drafts.appendAssumeCapacity(draft);
-        published.review.next_id += 1;
-        const previous_len = published.review.drafts.items.len - 1;
-        const candidate = published.stageBuffer(self.preferences, published.expanded_folds.items, published.isolated_file) catch |err| {
-            published.review.drafts.shrinkRetainingCapacity(previous_len);
-            published.review.next_id -= 1;
-            self.action_error = normalizeActionError(err);
             return;
         };
-
-        self.dependencies.reviews.put(published.key.storeKey(), draft) catch {
-            published.buffers.abort();
-            published.review.drafts.shrinkRetainingCapacity(previous_len);
-            published.review.next_id -= 1;
-            self.action_error = .persistence_failed;
-            return;
-        };
-        published.buffers.commit();
-        published.buffer = candidate;
-        published.navigation.setRowCount(candidate.rows.len);
         composer.deinit();
         published.composer = null;
         self.action_error = null;
@@ -3031,6 +3041,34 @@ test "persistence failure preserves Composer and the exact published review" {
     try presentation.dispatch(.{ .composer = .save });
     try testing.expect(presentation.projection().composer == null);
     try testing.expectEqualStrings("keep me", presentation.projection().review.?.drafts[0].body);
+}
+
+test "Composer save allocation failure preserves Composer and the exact published review" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .comment });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("keep me") } });
+    const before = presentation.projection().review.?;
+
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .composer = .save });
+
+    const failed = presentation.projection();
+    try testing.expect(failing.has_induced_failure);
+    try testing.expectEqual(ActionError.out_of_memory, failed.action_error.?);
+    try testing.expectEqualStrings("keep me", failed.composer.?.body);
+    try testing.expectEqual(@as(usize, 0), failed.review.?.drafts.len);
+    try testing.expectEqual(before.buffer.rows.ptr, failed.review.?.buffer.rows.ptr);
+    try testing.expect(std.meta.eql(before.navigation, failed.review.?.navigation));
 }
 
 test "inline Composer allocation failure publishes no invalid Overlay" {

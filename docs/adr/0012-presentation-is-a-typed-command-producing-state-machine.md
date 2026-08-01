@@ -105,6 +105,8 @@ Buffer allocation, construction, commit/rollback, navigation normalization, and 
 
 Changing layout, scope, resolved visibility, folds, isolation, Draft projection, or File Enrichment stages the resulting Buffer before publishing the related visible state. A failed rebuild preserves the previous Buffer and navigation. File Enrichment already admitted safely into its Session remains available for a later reprojection even if that immediate Buffer build fails.
 
+Draft saving uses one deep `Published.saveDraft` interface rather than exposing a Buffer candidate or transaction guard. It constructs the candidate Draft, stages its Buffer, persists the Draft, and then publishes Draft and Buffer through an infallible final step. Allocation, Buffer construction, or persistence failure preserves the exact old projection; the Composer closes only after success. This keeps the stage → persist → publish ordering and `ArenaRing` generation policy out of every caller.
+
 ## Session-bound work and Durable Operations
 
 Session replacement invalidates only Session-bound projection work. It does not cancel reviewer-authorized durable effects.
@@ -253,4 +255,3 @@ This minimizes local writes but loses all remote outcomes if the process dies be
 - Submission changes from one monolithic background worker into a sequence of externally executed commands, increasing event traffic while making persist-before-next-POST structural and testable.
 - The durability store requires a schema/interface migration from `(pr_id, local_id)` CRUD to Repository-qualified, transaction-shaped operations and active SubmissionRun discovery.
 - Removing Presentation would scatter its invariants back across the terminal loop, workers, store calls, and tests. Passing this deletion test is evidence that the module earns its seam.
-
