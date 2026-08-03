@@ -1,13 +1,13 @@
 # Highlighting
 
-Syntax coloring of file content via tree-sitter. Post-MVP and behind the `Highlighter`
-seam; the MVP ships a plain (no-op) implementation. Produces foreground colors only —
+Syntax coloring of file content via tree-sitter, behind the `Highlighter` seam; plain and
+tree-sitter implementations ship today. Produces foreground colors only —
 diff backgrounds are composed over them per cell by Presentation.
 
 ## Language
 
 **Highlighter**:
-The seam that turns a File's full content into Spans. Implementations: `PlainHighlighter` (none) now, `TreeSitterHighlighter` later.
+The seam that turns a File's full content into Spans. Implementations: `PlainHighlighter` (none) and `TreeSitterHighlighter` (built-in Grammars).
 _Avoid_: colorizer, lexer, formatter.
 
 **Grammar**:

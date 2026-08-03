@@ -26,7 +26,7 @@ _Avoid_: WorkingCopy (one checkout), object store, raw remote URL.
 The stable local identifier assigned to a ReviewRepository. Alias conflicts never merge ReviewRepositoryIds automatically; they require explicit resolution.
 _Avoid_: remote hash, common-directory path, Repository slug.
 
-Separate clones share a ReviewRepositoryId only when a normalized Remote alias connects them. Without one, M14 cannot prove they are the same logical repository and assigns distinct identities; linked Worktrees still share through their common-directory alias. Explicit relinking or merging of repository identities is a future workflow.
+Separate clones share a ReviewRepositoryId only when a normalized Remote alias connects them. Without one, M14 cannot prove they are the same logical repository and assigns distinct identities; linked Worktrees still share through their common-directory alias. M18 owns the explicit relinking/merging workflow.
 
 **Worktree**:
 A git worktree: a checkout with its own branch sharing one object store. bbr detects the branch of the *current* worktree, so linked worktrees each review their own branch.

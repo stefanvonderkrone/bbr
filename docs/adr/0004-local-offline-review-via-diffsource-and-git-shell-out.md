@@ -34,7 +34,7 @@ and source-specific policies remain behind the Published review module.
 - Separate clones share identity only through a common normalized Remote alias. When no such
   alias exists, M14 assigns distinct ReviewRepositoryIds because it cannot prove the clones are
   the same logical repository. Linked Worktrees still share via their common-directory alias;
-  explicit identity relinking or merging is deferred.
+  explicit identity relinking or merging is scheduled for M18.
 - When several Remotes exist, ReviewRepository identity uses the SourceRef's tracking Remote,
   then `origin`, then the common-directory fallback; it never selects another Remote arbitrarily.
 - BaseRef and SourceRef use canonical Ref identities rather than user-entered spellings or their
@@ -50,7 +50,7 @@ and source-specific policies remain behind the Published review module.
 - A clone that lacks the commit stored on a shared Draft's Anchor reports resolution unavailable;
   absence of the commit is not evidence that the Anchor is outdated.
 - The MVP supports **committed refs only** (branch vs base commit) so every Anchor binds to a
-  stable commit + line. Dirty working-tree diffs — which would force fuzzy content-based
-  anchoring — are a deliberately deferred enhancement.
+  stable commit + line. M18 owns dirty working-tree diffs and the required fuzzy content-based
+  anchoring.
 - From a local checkout, Git can find the **AdjacentPullRequest** (open PR whose source branch
   matches the current branch/worktree) to open a remote review instead.

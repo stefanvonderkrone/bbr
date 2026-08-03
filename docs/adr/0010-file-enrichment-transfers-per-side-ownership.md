@@ -13,4 +13,4 @@ A same-Session completion that arrives after focus moved becomes the least-recen
 - Session-lifetime retention was rejected because retaining every fetched blob remains proportional to the review size.
 - A hard per-side limit was rejected because arbitrarily large Files must remain reviewable.
 - Byte-budgeted LRU bounds inactive retained content while preserving access to every File; its costs are a refetch when an evicted File is revisited and an active working set that may exceed the cache budget while a large File is focused. Per-version eviction was rejected because focus and fetch both operate on a whole File; partially cached Files would complicate refetching and produce asymmetric WholeFile fallback.
-- A disk-backed cache could avoid network refetches without retaining all content in memory, but its storage and invalidation policy are deferred rather than coupled to the in-memory retention change.
+- A disk-backed cache could avoid network refetches without retaining all content in memory; M17 decides whether its storage and invalidation policy earn the added complexity.

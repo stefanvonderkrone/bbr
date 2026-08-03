@@ -37,8 +37,8 @@ suggestions that stay **pending locally** until you submit them as a batch.
 - **Two review modes over one pipeline** — remote (Bitbucket PR) and local (branch vs base ref,
   offline, comments in SQLite), unified by a `DiffSource`
   ([ADR-0004](docs/adr/0004-local-offline-review-via-diffsource-and-git-shell-out.md)).
-- **Comments have an anchor lifecycle** — current / moved / outdated; outdated and resolved
-  comments are shown, never hidden
+- **Comments have an anchor lifecycle** — current / moved / outdated; outdated comments are
+  always retained and resolved Threads can be revealed as a whole
   ([ADR-0005](docs/adr/0005-comment-anchor-lifecycle.md)).
 
 ## Milestones
@@ -51,7 +51,10 @@ Small vertical slices (sizes are relative effort, not dates):
 `M8` file view scope (single-file) → `M9` true whole-file view →
 `M10` pending review submission → `M10b` multi-line anchors/reconciliation →
 `M11` keymap & motions → `M12` themes & config →
-`M13` syntax highlighting → `M14` local / offline review.
+`M13` syntax highlighting → `M14` local / offline review →
+`M15` presentation/navigation polish → `M16` review-item mutation/submission hardening →
+`M17` diff/blob/highlighting completeness → `M18` local-review expansion →
+`M19` operational hardening/product gates.
 
 **MVP line:** M0–M3 (usable read-only), M4 (ergonomic), M6+M10 (write-capable — the headline).
 Full breakdown with dependencies in `docs/design.html` §14 and `TODO.md`.

@@ -14,16 +14,16 @@ Sizes are relative effort (S/M/L), not calendar estimates. Dependencies noted pe
 - [x] vaxis boots, alt-screen, quit key; render one PR's title/author/branches.
 - [x] Test: FakeHttpClient fixture → parsed PullRequest; 401/429/5xx → correct `ApiError`. (8/8 pass)
 
-## M1 — Diff model & parser (pure, no UI)  ·  S/M  ·  needs M0
-- [x] Bitbucket: `getDiff` (raw unified text). ✅ done · `getDiffStat` (paginated file list) deferred to M2 (viewer needs the file list, not the parser).
+## M1 — Diff model & parser (pure, no UI)  ·  S/M  ·  ✅ done
+- [x] Bitbucket: `getDiff` (raw unified text). ✅ done. The parser supplies the File list used by the viewer; M17 will either give paginated `getDiffStat` a concrete metadata consumer or close the original deferral as obsolete.
 - [x] Diff parser: RawDiff → `Diff`/`File`/`Hunk`/`Line` (Bitbucket line numbers authoritative). ✅ done — `src/diff/parser.zig`, zero-copy over the raw text.
-- [x] `File` status (added/modified/removed/renamed). ✅ done. Full old/new blob capture deferred — needed only for `WholeFile` scope (M5), and Bitbucket serves blobs from a separate endpoint.
+- [x] `File` status (added/modified/removed/renamed). ✅ done. Full blob acquisition later shipped lazily in M9 because Bitbucket serves blobs from a separate endpoint.
 - [x] Tests: fixtures — hunk boundaries, line numbering, adds/removes, `\ No newline`, count-omitted ranges, malformed headers, end-to-end getDiff→parse. **No UI.** ✅ 8 diff tests + 3 getDiff tests (19 total green).
 
-## M2 — Unified diff viewer (open by id)  ·  M  ·  needs M1
+## M2 — Unified diff viewer (open by id)  ·  M  ·  ✅ done
 - [x] `Theme` abstraction + one default. ✅ `src/tui/theme.zig` — `dark`; selectable themes are M12.
 - [x] Presentation: Sidebar (files) + DiffPane (unified) with neutral/green/red backgrounds. ✅ `src/diff/buffer.zig` (pure flatten → rows) + `src/tui/render.zig` (full-width bands, gutter line numbers, sidebar highlight).
-- [x] Buffer-scoped arena. ✅ in `app.run` (buffer arena + per-frame gutter arena, reset after render). — Background runtime + event-queue + Epoch **deferred to M4**: nothing to cancel until PRs can be *switched*; M2 fetches synchronously in `main`.
+- [x] Buffer-scoped arena. ✅ in `app.run` (buffer arena + per-frame gutter arena, reset after render). Background runtime + event queue + Session Epoch later shipped in M4, when PRs became switchable.
 - [x] Basic navigation: arrows + core motions (`j`/`k`, `ctrl-d`/`ctrl-u`, `gg`/`G`, numeric Count). ✅ `src/tui/nav.zig` (pure) wired in `app.run`.
 - [x] Test: headless surface asserts cell colors for a known Buffer. ✅ `render.zig` builds a detached Window over `Screen.init` and asserts band bg + sidebar highlight via `readCell`; nav math + buffer flatten unit-tested. Suite green.
 
@@ -32,7 +32,7 @@ Sizes are relative effort (S/M/L), not calendar estimates. Dependencies noted pe
 - [x] Thread builder: flat comments → nested `Thread`s (by `parent.id`). ✅ `src/review/thread.zig` — resolves each comment to its ultimate root, buckets replies in creation order, promotes orphans, handles out-of-order input. Zero-copy over the comment slice.
 - [x] ThreadPane: inline threads + PR-level comments; render ```suggestion``` blocks distinctly. ✅ woven in `buffer.buildWithComments` (PR-level section at top; inline threads under their anchored line; root/reply rows) and drawn in `render.zig` (`▸` root, `↳` reply, `±` suggestion with its own band). Multi-line bodies show the lead line + `…` (full markdown rendering is M11).
 - [x] `resolved` state + reveal-resolved toggle (whole thread). ✅ resolved-but-current threads hidden by default; `R` flips `show_resolved` and rebuilds the buffer, revealing the *whole* thread. Status bar shows the toggle state.
-- [x] AnchorState display (current/moved/outdated from Bitbucket verdict); per-file Outdated collapsible. ✅ outdated threads grouped in a per-file "Outdated (N)" section and **never hidden** (even when resolved). Outdated is derived from each comment's `links.code` revision vs the PR's current source/destination commits — the list endpoint omits `inline.outdated` and it can't be recomputed from line numbers (see `bitbucket/CONTEXT.md`). Verified live on PR 1726 (8 outdated roots). `moved` isn't produced remotely; local diff-walk for `moved` is M6. The Outdated group is always expanded — fold/collapse deferred to M5 (`Fold`s).
+- [x] AnchorState display (current/moved/outdated from Bitbucket verdict); per-file Outdated grouping. ✅ outdated threads grouped in a per-file "Outdated (N)" section and **never hidden** (even when resolved). Outdated is derived from each comment's `links.code` revision vs the PR's current source/destination commits — the list endpoint omits `inline.outdated` and it can't be recomputed from line numbers (see `bitbucket/CONTEXT.md`). Verified live on PR 1726 (8 outdated roots). `moved` isn't produced remotely; local diff-walk ships in M14. The Outdated group is always expanded — collapse/re-expand is scheduled for M15.
 - [x] Tests: thread nesting, resolved toggle, outdated grouping. ✅ thread nesting/orphan/out-of-order (`thread.zig`), weaving + resolved toggle + outdated grouping (`buffer.zig`), headless comment/suggestion render (`render.zig`), paginated `getComments` (`client.zig`). Suite green 62/62.
 
 ## M4 — PR discovery & switching  ·  M  ·  ✅ done
@@ -42,7 +42,7 @@ Sizes are relative effort (S/M/L), not calendar estimates. Dependencies noted pe
 - [x] PR Picker overlay (zf); URL parser; switch PRs with Epoch cancellation. ✅ `src/tui/picker.zig` (pure zf-ranked, navigable state machine), `src/bitbucket/url.zig` (web+API PR URL parser), and an async switch: `p` opens the picker, Enter bumps an Epoch and spawns a load worker (`std.Io.concurrent`) that builds the new `Session` off `page_allocator` and posts a `load_done` event; only the current epoch's result is applied (stale discarded). Futures are awaited before teardown.
 - [x] Tests: remote URL parsing, branch detection (fake GitClient), resolution branches. ✅ remote parser (8), GitClient fakes (4), url parser (6), listPullRequests (4), resolution branches (7), picker (6), session loader over fake http (2), picker-overlay headless render (1). Suite green. `bbr detect [<repo>]` prints the resolution without the TUI (scriptable live check).
 
-_Deferred:_ SideBySide + folds (M5), moved-anchor local diff-walk (M6). The Picker lists **all** open PRs on open (not re-filtered to the current branch); PR-list fetch on picker-open is synchronous (one request) while the *switch load* is async — listing could go async later if it ever feels slow.
+_Follow-through:_ SideBySide + folds shipped in M5, moved-anchor local diff-walk in M14, and async Picker loading in M7. Whether Picker-open should initially filter to the current branch is scheduled for M15.
 
 ## M5 — Diff polish  ·  M  ·  ✅ done
 - [x] Intra-line word-diff → emphasis `Segment`s; emphasized background. ✅ `src/diff/intraline.zig` (token-level LCS: word/whitespace/punct tokens, common tokens marked, the rest coalesced into emphasized runs; `similarity()` gates edit-vs-unrelated). Woven at buffer build: `computeEmphasis` pairs a removed run with the following added run by index and attaches segments when similar ≥ 0.5. `Row.line` is now a `LineRow` (line + emphasis); renderer draws the body as styled segments so only changed runs get the brighter `added_emphasis`/`removed_emphasis` band.
@@ -51,7 +51,7 @@ _Deferred:_ SideBySide + folds (M5), moved-anchor local diff-walk (M6). The Pick
 - [x] Arena pool/ring for multi-file view. ✅ `src/tui/arena_ring.zig` — a fixed ring of N arenas; `next()` rotates + resets. The viewer uses a ring of 2 to double-buffer the row-buffer rebuild (the displayed buffer stays valid while the next builds), replacing the single reset-and-reuse arena.
 - [x] Tests: intra-line segment cases; fold expansion; projection invariants. ✅ intraline (8: partition/emphasis/insertion/identical/disjoint/empty/similarity/indent), buffer emphasis + side-by-side pairing + fold/expand/whole-file/side-by-side-fold, renderer emphasis-band + side-by-side panes + fold-row, arena ring (3). Suite green 130/130.
 
-_Deferred:_ true **whole-file** scope (unchanged regions *outside* the fetched hunks) needs the file blob from a separate Bitbucket endpoint — the current whole-file scope shows every *fetched* line. **Now planned as its own milestone, M9.** Fold re-collapse is one-way (revealed folds stay revealed until the scope toggles). Side-by-side pairs removed[k]↔added[k] by index (no LCS line-matching across a block).
+_Follow-through:_ true **whole-file** scope shipped in M9. Fold re-collapse is scheduled for M15; line-level side-by-side matching for change blocks is scheduled for M17.
 
 ## M6 — Pending review: authoring & persistence  ·  M  ·  ✅ done
 - [x] `PendingReviewStore` seam + in-memory fake + SQLite implementation (schema + migrations). ✅ `src/review/store.zig` (ptr+vtable seam mirroring `HttpClient`, `InMemoryStore` fake) + `src/persist/sqlite_store.zig` (vendored amalgamation, `vendors/sqlite`, compiled into the exe only so the pure module stays C-free — ADR-0006). One row per Draft keyed `(pr_id, local_id)`; `PRAGMA user_version` migrations.
@@ -59,44 +59,44 @@ _Deferred:_ true **whole-file** scope (unchanged regions *outside* the fetched h
 - [x] `DraftState` + `CommentTarget` persistence; resume on launch; render drafts distinctly. ✅ all four DraftStates + parent + anchor (with authored-against commit, ADR-0005) round-trip through SQLite; `app.run` loads the PR's Drafts on entry and re-loads on each PR switch (PR-scoped review arena). Drafts weave into the buffer (anchored under their line, unanchored in a "Pending" section) and render in a distinct amber band (`✎`/`↳`/`±`).
 - [x] Tests: store round-trip (fake + SQLite), draft graph construction. ✅ draft graph (add/topological-order/remove), fake + SQLite round-trip (fields/anchor/parent/state, replace, scoped remove, close-reopen durability), buffer draft weaving, headless composer + draft-row render, `commitDraft` round-trip. Suite green 155.
 
-_Deferred:_ `AnchorState.moved` via local diff-walk (needs the GitClient diffing subset — M14). Side-by-side draft weaving works (via `weaveInline`), but a draft anchored to a *removed-only* line pairs on the old side only. The Composer is append-only (no mid-text cursor); full editing is post-MVP.
+_Follow-through:_ `AnchorState.moved` via local diff-walk shipped in M14. Side-by-side draft weaving works (via `weaveInline`), including removed-only Anchors on the old side. Full editing and an external-editor handoff are scheduled for M16.
 
-## M7 — Responsiveness (non-blocking loads)  ·  M  ·  ✅ core done (fan-out deferred)
+## M7 — Responsiveness (non-blocking loads)  ·  M  ·  ✅ done
 - [x] Async picker open: `p` shows the picker overlay instantly in a loading state; the `listPullRequests` fetch runs off-thread and populates the rows when it returns. ✅ done via a sibling `picker_done` event with its own `picker_epoch` generation; `Picker.initLoading`/`populate` let the overlay exist with no items yet.
 - [x] Boot the TUI immediately with a static "Loading PR #N…" view instead of blocking on `session.load` before `enterAltScreen`. ✅ the initial load now goes through the `spawnLoad` path; `run` holds `current: ?*Session` and dispatches loading-view vs. viewer per frame (`render.drawLoading`). `p` still opens the picker during the initial load.
-- [ ] _Deferred (needs live measurement)._ Parallelize the initial fetches in `loadWith` (`session.zig`): `getPullRequest` ∥ `getDiff`, `getComments` after the PR. **Findings from scoping:** (1) this is a single-load *latency* optimization only — the whole load already runs off the UI thread (`loadWorker`), so responsiveness is unaffected. (2) `getComments` needs the commit hashes only to *anchor* (`dupeComment`, `client.zig`), never to *fetch* the URL — so all three could fan out. (3) But `StdHttpClient` wraps `std.http.Client.fetch`, whose pool already reuses **one** keep-alive connection across the three sequential requests (**1 TLS handshake**); true fan-out can't share that connection concurrently and would open a second → **+1 handshake**. So fan-out trades one overlapped fetch against one extra handshake — a net win only if the diff fetch dominates a handshake, which needs measurement against the live API. Revisit with a real timing before adding the complexity (threading `io` into `loadWith`, a second client, and making the `FakeHttpClient` test order-independent).
-- [x] Tests: async picker open (loading → populated over a fake) and boot loading-view render. ✅ (`loadWith` fan-out ordering/parity tests deferred with the fan-out itself.)
+- [x] Scope parallel Session fetches and keep them out of M7 until live measurement justifies them. ✅ This is a single-load latency optimization, not responsiveness: the whole load already runs off the UI thread. `std.http.Client` reuses one keep-alive connection sequentially, while true fan-out needs another connection/TLS handshake. The measurement/implementation gate is scheduled for M19.
+- [x] Tests: async picker open (loading → populated over a fake) and boot loading-view render. ✅ M19 owns fan-out ordering/parity tests if its measurement gate selects parallel loading.
 
-_Deferred:_ animated spinner — the vaxis `Loop` has no timer (`nextEvent` blocks on real events), so animation needs a tick thread posting via `postEvent`; static "Loading…" text delivers most of the perceived win at no concurrency cost. Revisit if the static frame feels dead.
+_Follow-up:_ an animated spinner needs a tick thread because vaxis `nextEvent` blocks; its measured UX gate is scheduled for M15.
 
-## M8 — File view scope (single-file)  ·  S/M  ·  ✅ done (Epoch-per-file deferred)
+## M8 — File view scope (single-file)  ·  S/M  ·  ✅ done
 - [x] `only_file` scope in `BuildOptions`: project the Buffer to a single File's rows. ✅ `buffer.zig` `only_file: ?usize`; when set, only `diff.files[only_file]` is emitted (header, hunks, woven inline threads/drafts, outdated section) and the PR-level comment/pending sections plus other-file stranded drafts are suppressed (`draftInScope`). Reconciles the code with the domain language (`src/diff/CONTEXT.md` Buffer entry updated: whole-Diff scroll by default, single-File isolate view as the canonical review unit).
 - [x] Make the Sidebar a selector, not just a position indicator. ✅ `o` isolates the focused file (captures `fileIndexForRow(cursor)` into `isolate_file`); the sidebar highlight then tracks `isolate_file` directly. `o` again exits and lands the cursor back on that file's header (`fileHeaderRow`).
 - [x] Jump-to-file motion: scroll the pane to a File's header within the all-files buffer. ✅ `[`/`]` jump the cursor to the prev/next `file_header` (`prevFileHeaderRow`/`nextFileHeaderRow` + `Nav.jumpTo`); in the isolate view they step which file is isolated instead. Both readings (jump vs. isolate) are offered.
-- [ ] _Deferred (no payload to fetch yet)._ Treat a File focus as an Epoch-stamped load. **Finding:** the whole Diff already lives in one `Session` (one fetch), so isolating a file is a pure in-memory projection — an Epoch-stamped per-file "load" would be ceremony with nothing to load or cancel. The seam only earns its keep once a file focus triggers real work (lazy per-file blob fetch for true WholeFile — M9, or syntax highlighting — M13). Revisit with M9 / M13.
+- [x] Treat File Enrichment as Epoch-stamped work once focus has a real payload. ✅ M9 (blobs) and M13 (highlighting) implement the seam; M8 correctly keeps isolation as an in-memory projection.
 - [x] Tests: `only_file` projection (one File's rows, nothing else) + isolate suppression of PR-level/other-file rows (`buffer.zig`), `Nav.jumpTo` (`nav.zig`), jump-to-file cursor math (`nextFileHeaderRow`/`prevFileHeaderRow`/`fileHeaderRow`, `app.zig`).
 
-## M9 — True whole-file view (Bitbucket blobs)  ·  M  ·  ✅ done (removed-file old-side splice deferred)
+## M9 — True whole-file view (Bitbucket blobs)  ·  M  ·  ✅ done
 Today's `WholeFile` scope shows every *fetched* diff line but not the unchanged regions **outside** the hunks — the diff endpoint only returns hunks + context. True whole-file needs the full file blob, which Bitbucket serves from a separate endpoint.
-- [x] Bitbucket: fetch a file's blob at a commit. ✅ `Client.getFileBlob(repo, commit, path)` → `GET /repositories/{ws}/{repo}/src/{commit}/{path}`, raw text owned by the caller, same `classify`/`ApiError` mapping as `getDiff`. _Live shape-check against the real API still pending (only exercised via `FakeHttpClient`)._
-- [x] Populate blobs **lazily per file** on the Epoch-per-file seam M8 deferred. ✅ `Session.blobs: []FileBlob` (side table, index-aligned with `diff.files`, empty at load — blobs can't live on the const `File` the parser yields). `app.ensureBlob` fetches the *focused* file's new-side blob on a worker thread when scope is whole-file, keyed by `(pr_id, file_idx)` so each file fetches at most once; the result posts a `blob_done` event and re-weaves. Stale results (superseded PR / filled slot) are discarded; in-flight fetches are awaited before teardown.
+- [x] Bitbucket: fetch a file's blob at a commit. ✅ `Client.getFileBlob(repo, commit, path)` → `GET /repositories/{ws}/{repo}/src/{commit}/{path}`, raw text owned by the caller, same `classify`/`ApiError` mapping as `getDiff`. M17 owns the opt-in live shape check; M9's hermetic contract is complete.
+- [x] Populate blobs **lazily per file** on the Epoch-per-file seam anticipated by M8. ✅ `Session.blobs: []FileBlob` (side table, index-aligned with `diff.files`, empty at load — blobs can't live on the const `File` the parser yields). `app.ensureBlob` fetches the *focused* file's new-side blob on a worker thread when scope is whole-file, keyed by `(pr_id, file_idx)` so each file fetches at most once; the result posts a `blob_done` event and re-weaves. Stale results (superseded PR / filled slot) are discarded; in-flight fetches are awaited before teardown.
 - [x] `buffer.zig`: true-whole-file splice. ✅ `BuildOptions.whole_file` + `blobs`; `spliceNewSide` fills the gaps before/between/after hunks with `.context` lines drawn from the blob, keyed off the authoritative hunk line numbers (ADR-0001); hunk lines are copied verbatim. No hunk headers/folds in this scope. `f` cycles Changes → fetched-whole → whole-file (per the chosen 3-state model); whole-file falls back to the fetched rendering when the blob isn't loaded or the file is removed.
 - [x] Anchor safety: blob-sourced context lines get `Line.in_hunk = false` and `weaveInline` refuses to attach comments/drafts to them — only hunk lines anchor.
 - [x] Tests: blob fetch + `ApiError` (fake http, `client.zig`); splice invariants (hunk lines preserved, gaps filled from the blob, `in_hunk` flags, fallback to per-hunk when no blob) + anchor-safety (`buffer.zig`); `Session.blobs` alloc (`session.zig`).
 
-_Deferred:_ the **removed-file** old-side splice — a deletion's whole-file view would show the entire old file as removed; low value over the hunks, and it needs the old blob at the destination commit (a second fetch side). The splice handles new-side files (added/modified/renamed); removed files fall back to the fetched rendering. Also: whole-file currently splices only the *focused* file's blob (the isolate trigger); scrolling across files in whole-file scope without isolating fetches each file as it gains focus.
+_Follow-up (M17):_ add the **removed-file** old-side splice and live blob shape checks. Whole-file remains demand-loaded for the focused File; M17 also owns the measurement gate for bounded prefetch.
 
-## M10 — Pending review: submission & failures  ·  M  ·  ✅ done (rich per-item overlay & Retry-After deferred)
+## M10 — Pending review: submission & failures  ·  M  ·  ✅ done
 - [x] `Submission`: topological order, temp-id → CommentId remap. ✅ `src/review/submission.zig` — a pure, clock-free state machine (`advance` returns the next action as data — post/wait/done/aborted — `report` feeds outcomes back). Reply parents remap to the parent's freshly-posted `CommentId` (or a `Parent.comment`'s existing id). The network is the new `CommentPoster` ptr+vtable seam (`Poster` in `src/bitbucket/poster.zig` implements it; `Client.createComment` POSTs).
 - [x] Failure model: retry (network/429/5xx), abort-on-auth, mark-and-continue (validation). ✅ retryable → capped exponential backoff (`.wait` step; 429 honors an explicit `Retry-After` param); auth (401/403) → `aborted`, everything kept pending; validation (400/404/malformed) → item `failed`, its reply-descendants `skipped` (a missing parent id blocks them naturally). Retries exhaust into an item failure after `max_attempts`.
 - [x] Duplicate guard (GET-and-dedupe on ambiguous failure). ✅ a transport failure is a distinct `ambiguous` outcome; the retry sets a `dedupe` flag and the worker `findExisting`s (GET-and-match on anchor + body) before re-POSTing.
-- [x] Stale-anchor check: capture SourceCommit on load, re-check head before submit. ✅ the submit worker re-fetches the PR head and, if `headChanged` vs the loaded source commit, refuses the batch (`stale`) with a "reopen the PR" message. _A force-submit-anyway path is deferred — reload is the remedy for now._
-- [x] Per-item summary + selective retry of failed subtrees. ✅ each item's fate streams back (`submit_progress`, persisted as it lands — ADR-0007 crash-safety) and rolls up into a status-bar summary (`N posted · M failed · K skipped`); a clean batch deletes its published Drafts, a partial one keeps failures pending so `X` again is selective retry (posted Drafts skipped). _A richer per-item overlay (list each Draft's status/reason) is deferred to M15 polish._
+- [x] Stale-anchor check: capture SourceCommit on load, re-check head before submit. ✅ the submit worker re-fetches the PR head and, if `headChanged` vs the loaded source commit, refuses the batch (`stale`) with a "reopen the PR" message. M16 owns the explicit UX decision about any submit-anyway path.
+- [x] Per-item summary + selective retry of failed subtrees. ✅ each item's fate streams back (`submit_progress`, persisted as it lands — ADR-0007 crash-safety) and rolls up into a status-bar summary (`N posted · M failed · K skipped`); a clean batch deletes its published Drafts, a partial one keeps failures pending so `X` again is selective retry (posted Drafts skipped). M16 adds the richer per-item overlay.
 - [x] Tests: submission ordering, remap, each failure class, dedupe. ✅ 15 engine tests (ordering, remap, abort, skip-descendants, backoff schedule + Retry-After, dedupe-on-ambiguous, retry exhaustion, selective retry, `headChanged`, driver-through-seam) + `createComment` URL/body/id/error tests + `Poster` posted/rejected/ambiguous mapping + dedupe hit/miss. Suite green.
 
-_Deferred:_ the async submit worker glue (event wiring, worker loop) isn't unit-tested — same posture as the M7/M9 workers; the pure engine and adapter carry the logic. `Retry-After` is plumbed through `report` but the `Poster` doesn't yet surface the header, so live 429s use computed backoff. Submission is single-batch-at-a-time (a second `X` while one runs is refused). No idempotency key exists on Bitbucket, so the duplicate guard is best-effort (anchor + exact-body match).
+_Follow-up (M16):_ integration-test the async worker/event glue and surface live `Retry-After`. Submission intentionally remains single-batch-at-a-time. Bitbucket exposes no idempotency key, so the duplicate guard remains best-effort (Anchor + exact body).
 
-## M10b — Multi-line anchors, suggestion prefill & post-submit reconcile  ·  M  ·  ✅ done ($EDITOR handoff deferred)
+## M10b — Multi-line anchors, suggestion prefill & post-submit reconcile  ·  M  ·  ✅ done
 - [x] Multi-line anchors: thread `start_from`/`start_to` through the `Anchor` model, the client (send null-omitted + parse back), the `Poster` dedupe, and the SQLite store (v2 migration). ✅ Field names/roles verified by live probes on PR 1856 (`{start_to, to}` new-side, `{start_from, from}` old-side; start_* = range top).
 - [x] Visual line selection: `Nav.mark` + `v` toggle and shift+arrow start/extend (one sticky model; plain motions extend, Esc clears); selection band tinted in the pane. ✅ shift+arrow is terminal-dependent so `v` is the robust primary — both drive the same state.
 - [x] Selection → anchor mapping (`spanFromLines`, pure/tested): new-side range for additions+context, old-side for deletions, single line stays single-sided; refuse mixed sides / hunk gaps / file borders / a suggestion over removed lines. ✅ `i`/`S` act on the selection when active, else the cursor line.
@@ -104,28 +104,28 @@ _Deferred:_ the async submit worker glue (event wiring, worker loop) isn't unit-
 - [x] Post-submit reconciliation: re-fetch the PR after a batch that posted anything, so published Comments reappear (ADR-0001); hide a posted/submitting Draft's row (the fetched Comment represents it) while keeping its pending descendants (ADR-0007 render-path dedup). ✅
 - [x] Submit modal: float a "Submitting review — n/total" overlay over the viewer during a batch, then the loading frame covers the re-fetch. ✅ shared `centeredModal` helper extracted; picker/composer/submit all route through it.
 
-_Deferred:_ editing a prefilled/multi-line suggestion is append-only (revise from the tail); the real multi-line editor is an `$EDITOR` handoff (spawn `$EDITOR` on a temp file, read the result back through the same `Composer.seed` seam) — recorded, not built. Old-side (deletion) ranges are supported for comments but were only lightly probed; the apply-replaces-N-lines behavior of a multi-line suggestion is Bitbucket UI behavior we don't control (our POST contract is verified). No test drives the shift+arrow/selection glue through vaxis (same posture as the worker glue); the pure `spanFromLines`/`Nav` selection logic carries the rules.
+_Follow-up (M16):_ add the `$EDITOR` handoff, live-probe old-side ranges, document Bitbucket's multi-line Suggestion UI behavior, and drive the shift+arrow/selection glue through vaxis.
 
-## M11 — Keymap & motions  ·  S/M  ·  ✅ done (config-file loading → M12; markdown → follow-up)
+## M11 — Keymap & motions  ·  S/M  ·  ✅ done
 - [x] Full vim motion set + numeric Count register (`5j`, `zz`, …); arrows side by side. ✅ Added `ctrl-f`/`ctrl-b` (full page), `zz`/`zt`/`zb` (center / cursor-to-top / cursor-to-bottom scroll positioning), and `H`/`M`/`L` (cursor to viewport top/middle/bottom) as pure `Nav` methods; the existing `hjkl`/arrows/`ctrl-d`/`ctrl-u`/`gg`/`G`/Count/shift-select carry over. Skipped search/paragraph/operator-pending (no meaning in a diff viewer). `PageUp`/`PageDown` stay half-page (unchanged); `ctrl-f`/`ctrl-b` are the full-page keys.
-- [x] Configurable `Keymap` from config. ✅ Vim-aligned: one `(chord)→Action` table (`src/tui/keymap.zig`) where motions and commands are both bindings, so dispatch and the help overlay read one source of truth. The Count and the multi-key **Leader** (`g`/`z`) stay in the engine (`Nav` + `Resolver`), not the table — matching how vim keeps that grammar above its mapping table. The 15-arm `key.matches` viewer chain became one `switch (Action)`. _Loading overrides from a config file is deferred to **M12** (which introduces the TOML config); M11 ships the defaults + the seam (`Keymap.default`, overlaid at the `km` binding in `app.run`)._
+- [x] Configurable `Keymap` seam. ✅ Vim-aligned: one `(chord)→Action` table (`src/tui/keymap.zig`) where motions and commands are both bindings, so dispatch and the help overlay read one source of truth. The Count and the multi-key **Leader** (`g`/`z`) stay in the engine (`Nav` + `Resolver`), not the table — matching how vim keeps that grammar above its mapping table. The 15-arm `key.matches` viewer chain became one `switch (Action)`; config-file overrides shipped in M12.
 - [x] Keybinding-help Overlay (reads Keymap). ✅ `?` floats a centered "Keybindings" modal (`render.drawHelp`) built straight from `Keymap.default` — Motions in the left column, commands in the right, adjacent alternate bindings coalesced (`j ↓`), so it can't drift from the live table. Any key dismisses it (captures input while open); a `? help` hint sits in the status bar for discoverability.
-- [x] **Multi-line comment/draft/suggestion body rendering.** ✅ Kept the one-Row-per-screen-line invariant (so `Nav`/scroll are untouched): a multi-line body emits one `CommentRow`/`DraftRow` per visual line, all sharing the owner pointer, `is_first` marking the header row (option A2). `r`/reply resolves from any line for free (every row carries the owner). Bodies render **verbatim**, fences and all (§Q5-A) — the `±` marker + suggestion band still signal a suggestion; fence-aware styling waits for markdown. Full body, **no cap** — the pane already scrolls; capping/folding is a deferred follow-up (layers cleanly on A2). Continuation rows hang-indent two columns; a single trailing newline is trimmed so it emits no blank row.
+- [x] **Multi-line comment/draft/suggestion body rendering.** ✅ Kept the one-Row-per-screen-line invariant (so `Nav`/scroll are untouched): a multi-line body emits one `CommentRow`/`DraftRow` per visual line, all sharing the owner pointer, `is_first` marking the header row (option A2). `r`/reply resolves from any line for free (every row carries the owner). Bodies render **verbatim**, fences and all (§Q5-A) — the `±` marker + suggestion band still signal a suggestion. Full body, **no cap** — the pane already scrolls. M15 owns Markdown styling and optional folding. Continuation rows hang-indent two columns; a single trailing newline is trimmed so it emits no blank row.
 
-  _Deferred:_ markdown rendering (headings/bold, fence-aware suggestion styling — item (B) above); a length cap/fold for pathological bodies.
+  _Follow-up (M15):_ Markdown rendering and a length cap/fold for pathological bodies.
 
-## M12 — Themes & config  ·  S  ·  needs M2
+## M12 — Themes & config  ·  S  ·  ✅ done
 - [x] Config file. ✅ Strict, allocation-light TOML subset at `$XDG_CONFIG_HOME/bbr/config.toml` (fallback `$HOME/.config/bbr/config.toml`); a missing file uses defaults, while malformed/unknown entries produce collected path + line/column diagnostics before the TUI starts.
 - [x] Built-in Themes. ✅ Default `system` follows terminal colors; fixed plain light/dark, all four Catppuccin flavors, and light/dark Gruvbox and Solarized variants resolve inside the Theme module.
 - [x] **Keymap overrides from config.** ✅ `[keymap]` maps one-to-eight chord sequences to Actions (or `none`), canonicalizes modifier aliases, preserves Count, rejects prefix conflicts, and materializes one Keymap shared by dispatch and the help Overlay.
 
-## M13 — Syntax highlighting  ·  L  ·  needs M2
+## M13 — Syntax highlighting  ·  L  ·  ✅ done
 - [x] `Highlighter` seam + `PlainHighlighter`. ✅ C-free ptr/vtable seam; ordered line-relative `Span`s and zero-copy `LineDecoration` live in the core module.
-- [x] tree-sitter Zig bindings; decide grammar delivery (build-time vs runtime). ✅ C runtime and copied, pinned Grammar sources compile into the executable; no submodules or build-time downloads (ADR-0009). Grammar selection remains private to the adapter so later `UserGrammar` installation does not change the public seam.
+- [x] tree-sitter Zig bindings; decide built-in Grammar delivery. ✅ C runtime and copied, pinned Grammar sources compile into the executable; no submodules or build-time downloads (ADR-0009). Grammar selection remains private to the adapter so M17 can add `UserGrammar` installation without changing the public seam.
 - [x] Grammars: tsx/jsx, css, go, bash, json, yaml + highlight queries. ✅ JavaScript/TypeScript/TSX, CSS, Go, Bash, JSON, and YAML are vendored with commits/checksums and fixture tests; unsupported Files stay plain.
 - [x] Compose syntax foreground over diff background per cell; wire into `Theme`. ✅ Buffer constructs `LineDecoration`s from side-specific Spans + intra-line emphasis; Presentation maps Capture foregrounds while retaining diff/emphasis/cursor backgrounds.
 
-_Delivery notes:_ focused Files enrich lazily off-thread in one old/new pipeline; partial side failures remain usable and report context in the status bar. `[highlight].max_file_bytes` defaults to 2 MiB per side (`0` = unlimited). Conditional query patterns are currently applied conservatively only when they have no predicates; predicate evaluation is a follow-up for richer built-in classifications, not a correctness dependency for parsing or rendering.
+_Delivery notes:_ focused Files enrich lazily off-thread in one old/new pipeline; partial side failures remain usable and report context in the status bar. `[highlight].max_file_bytes` defaults to 2 MiB per side (`0` = unlimited). M17 owns query-predicate support and the `UserGrammar` lifecycle.
 
 ## M14 — Local / offline review  ·  M/L  ·  ✅ done
 - [x] Explicit `bbr local [base-ref] [source-ref]` entry with no credential requirement: SourceRef defaults to the current Worktree branch; BaseRef defaults to Git's locally recorded remote default and otherwise requires an argument.
@@ -137,20 +137,62 @@ _Delivery notes:_ focused Files enrich lazily off-thread in one old/new pipeline
 - [x] Shared configurable `R` refresh Action: atomically reload the same PullRequest or re-resolve the same LocalReview's Refs. Remote-only Actions stay discoverable but grey in local help and report a status message when invoked.
 - [x] Tests: shell worktree/ref/diff/blob acquisition, DiffSource parity, repository aliases and concurrent TempIds, local authoring/snapshots/action gating, and local anchor mapping/projection (current/moved/outdated/unavailable).
 
-## M15 — Polish  ·  S/M  ·  needs M2 (resolved indicator needs M3/M6)
-Small feature and layout refinements once the core flow works.
-- [ ] File-content cache configuration UX: review the clarity of the initial `[files.cache]` settings `enabled` and `max_retained_bytes_per_review`. Caching defaults on with a 256 MiB budget covering the owned allocation capacity for blobs, Highlight Spans, Capture names, and retained scratch; disabling it retains only the focused File, which remains usable even when it exceeds the budget. Keep the internal term “File Enrichment” out of user-facing configuration, clearly distinguish the cache budget from `[highlight].max_file_bytes`, document eviction/refetch and the unbounded focused working set, and preserve compatibility through aliases if a future rename is justified. A persistent disk cache is a separate future design.
+## M15 — Presentation & navigation polish  ·  M  ·  needs M14
+Finish the visible interaction details deferred by M3–M14 before expanding the product surface.
+- [ ] File-content cache configuration UX: review the clarity of the initial `[files.cache]` settings `enabled` and `max_retained_bytes_per_review`. Caching defaults on with a 256 MiB budget covering the owned allocation capacity for blobs, Highlight Spans, Capture names, and retained scratch; disabling it retains only the focused File, which remains usable even when it exceeds the budget. Keep the internal term “File Enrichment” out of user-facing configuration, clearly distinguish the cache budget from `[highlight].max_file_bytes`, document eviction/refetch and the unbounded focused working set, and preserve compatibility through aliases if a future rename is justified. M17 separately decides whether to add persistent disk caching.
 - [ ] Resolved threads: show a collapsed **indicator** in place (not just hide-behind-toggle), e.g. `✓ resolved · N replies`, that expands the whole Thread on demand. **Note:** this reverses the current domain rule — the Thread entry in `src/review/CONTEXT.md` explicitly says "never a bare 'a resolved comment exists' marker". Confirm and update that glossary entry (and the `show_resolved` behaviour in `buffer.zig`) as part of this item. Reply count comes from `Thread.replies.len`.
+- [ ] Make both context Folds and per-file Outdated sections independently collapsible and re-collapsible. Preserve expansion state across Buffer rebuilds and clear it only when its Session identity is no longer valid. This closes the one-way Fold and always-expanded Outdated follow-ups from M3/M5.
 - [ ] Layout polish: borders/separators around panes and overlays (sidebar ↔ diff, the composer modal, section dividers). Today panes are separated by spacing only (`src/tui/render.zig`); add box-drawing borders styled via the active `Theme`.
 - [ ] Sidebar: the per-file comment/draft counts should be **right-aligned and always visible**, and the file name **truncated with an ellipsis** when the row is too narrow. Today the counts are printed immediately after the name using the name segment's `PrintResult.col` (`drawSidebar` in `render.zig`), so a long name pushes them off-screen. Reserve a fixed right-hand column for the counts, then truncate the name to fill the remaining width.
-- [ ] Binary files (images etc.): Bitbucket's diff renders a binary change as a `Binary files … differ` stub with no hunks, so today such a File flattens to just a header with nothing under it — and the whole-file scope (M9) would try to fetch/splice a text blob that isn't text. Detect binary Files (the diff stub, or a non-UTF-8 blob) and show a clear placeholder row instead of an empty file / garbled bytes, e.g. `⬦ binary file (N bytes) · added/modified/removed`. An actual inline image preview (e.g. via a terminal image protocol like kitty/iterm/sixel) is a stretch goal, gated on terminal capability; the baseline is just "don't pretend it's text." Suppress the M9 blob fetch for binary Files.
 - [ ] Yank to clipboard: a `y` Action that copies the current diff line (or, with an active selection, the selected lines) to the system clipboard. Add a `yank` Action to the Keymap and copy the underlying source text — the code content of each `BufferRow`, not the rendered gutter/marker decoration — joined by newlines. Use libvaxis's OSC 52 clipboard write (`vaxis.copyToSystemClipboard` / the `Vaxis.copy_to_clipboard` path) so it works over SSH without a local clipboard daemon; verify the exact API against the 0.6.0 source before wiring it. Count-aware like other Motions (`3y`).
+- [ ] Render Comment/Draft Markdown (at least headings, emphasis, links, and fence-aware Suggestions) and add a configurable collapsed summary for pathological body lengths, expandable in place.
+- [ ] Add an event-loop tick only if an instrumented UX check shows the static loading frame feels stalled; use it for a loading spinner without weakening the blocking `nextEvent` model.
+- [ ] Decide whether opening the Picker should retain the current all-open list or initially filter to the adjacent branch; whichever behavior wins, make the active filter visible and easy to clear.
 
-## Cross-cutting / tech debt
-- [ ] Decide libcurl fallback trigger (once proxy type at check24 is known).
-- [ ] Rotate the API token currently in plaintext in `opencode.jsonc`; move to keychain.
-- [ ] CI: `zig build test` on 0.16.0; formatting check.
-- [ ] *(deferred)* dirty working-tree diffs with fuzzy content-based anchoring.
+## M16 — Review-item mutation & submission hardening  ·  M/L  ·  needs M10b
+Complete the repair and mutation workflows around the client-side Pending Review. The detailed
+acceptance criteria already live in `.scratch/review-item-mutation/issues/`.
+- [ ] Implement `.scratch/review-item-mutation/issues/01-edit-reanchor-delete-drafts.md`: edit Draft bodies without changing identity, re-anchor root Drafts, cascade deletion through Draft descendants, enforce active/recovered SubmissionRun immutability, and persist before publishing Presentation state.
+- [ ] Implement `.scratch/review-item-mutation/issues/02-edit-delete-owned-bitbucket-comments.md`: verify Bitbucket Cloud's authorship and mutation contract, expose edit/delete only for author-owned Comments, and reconcile after success.
+- [ ] Add an `$EDITOR` handoff for substantial or prefilled multi-line bodies: write a secure temporary file, suspend/restore the terminal safely, read the result through `Composer.seed`, and preserve cancel/error semantics. Keep the inline Composer for short edits.
+- [ ] Replace the status-bar-only Submission result with a per-item overlay showing posted/failed/skipped state, classified reason, reply dependency, and the selective-retry subtree.
+- [ ] Surface Bitbucket's `Retry-After` response header through `HttpClient`/`Poster`, and tune retry/backoff limits from observed rate-limit behavior while retaining the pure engine override tests.
+- [ ] Decide and document SourceCommit-change UX. Default to reload/re-anchor; add an explicit submit-anyway path only if its anchor and confirmation semantics can be made unambiguous.
+- [ ] Add deterministic integration coverage for the async Submission worker/event glue and vaxis selection input, including recovery and stale-epoch rejection.
+- [ ] Live-probe old-side multi-line Comment ranges and document the observed Bitbucket UI behavior for multi-line Suggestions; keep unsupported behavior out of the UI.
+
+## M17 — Diff, blob & highlighting completeness  ·  M/L  ·  needs M13
+Close fidelity gaps in the shared remote/local rendering pipeline.
+- [ ] Detect binary Files from diff stubs and non-UTF-8 blobs, suppress text enrichment, and render a clear size/status placeholder. Treat terminal image protocols as a separately gated stretch, not baseline behavior.
+- [ ] Fetch the old-side blob for removed Files and splice a true whole-file deletion view. Add an opt-in live shape check for both old- and new-side Bitbucket blob endpoints; fixtures remain the hermetic test tier.
+- [ ] Replace index-based removed/added pairing in side-by-side change blocks with tested line-level matching so insertions do not misalign the rest of a block.
+- [ ] Decide whether Bitbucket `diffstat` adds metadata the parsed Diff cannot supply. Implement paginated `getDiffStat` only for a concrete consumer; otherwise record the M1 deferral as obsolete.
+- [ ] Evaluate focused-only whole-file fetching against sequential all-file review. Keep demand loading as the baseline, and add bounded prefetch only if measurements show it improves navigation without defeating the File cache budget.
+- [ ] Evaluate and implement the tree-sitter query predicates needed by the built-in queries, with fixtures proving captures are neither silently dropped nor incorrectly applied.
+- [ ] Deliver the `UserGrammar` workflow anticipated by ADR-0009: installation/update/removal, trust and ABI checks, query validation, ordered GrammarMatch configuration, and cache lifecycle without changing the `Highlighter` seam.
+- [ ] Decide whether a persistent disk cache earns its storage/invalidation complexity; document a no-go decision or introduce it behind the existing in-memory File cache policy.
+
+## M18 — Local-review expansion  ·  L  ·  needs M14
+Address the workflows intentionally excluded from the committed-ref MVP.
+- [ ] Review dirty index/worktree changes through the common Diff pipeline. Define a stable snapshot identity and fuzzy content-based Anchor projection before allowing locally authored Drafts on mutable lines.
+- [ ] Add an explicit ReviewRepository relink/merge workflow for no-Remote clones and alias conflicts, with preview, conflict refusal, transactional migration, and rollback-safe tests.
+- [ ] Design an explicit copy workflow from a LocalReview's Drafts to an AdjacentPullRequest's PendingReview. Never retarget or silently mix `CommentTarget`s; preview every Anchor translation and leave the source Review intact.
+- [ ] Evaluate live synchronization between concurrent bbr processes. Keep explicit refresh as the documented baseline unless a watcher/notification design preserves atomic Session replacement.
+
+## M19 — Operational hardening & product gates  ·  S/M  ·  needs M14
+Turn the remaining environment-dependent questions into measured decisions.
+- [ ] Add CI for `zig build test` on Zig 0.16.0 plus `zig fmt --check`; keep live Bitbucket checks opt-in and credential-gated.
+- [ ] Rotate the API token currently present in plaintext `opencode.jsonc`, remove it from tracked/local plaintext configuration, and document environment/keychain injection without logging secret values.
+- [ ] Identify the corporate proxy/authentication type and run a representative connectivity check. Add a libcurl adapter only if `std.http.Client` cannot support the observed requirement; otherwise close the fallback decision.
+- [ ] Benchmark sequential versus parallel PR/diff/comment loading against the live API, including TLS handshakes and rate-limit behavior. Implement fan-out and order-independent fakes only when the measured latency gain justifies the second connection.
+- [ ] Decide whether approve/merge/decline belongs in bbr after the review workflow is stable. If accepted, specify permissions, confirmation, stale-head, and failure behavior before adding Actions; otherwise record it as a durable non-goal.
+
+### Closed historical deferrals
+
+The following notes remain in M0–M14 as implementation history but require no post-M14 work:
+M1 blob capture → M9; M2 background runtime/Epoch → M4; M3/M6 moved Anchors → M14;
+M4/M7 async Picker loading → M7; M5 true whole-file scope → M9; M8 per-File Epoch work →
+M9/M13 File Enrichment; M11 config loading → M12; M13 grammar delivery → ADR-0009.
 
 ---
 
@@ -165,10 +207,15 @@ M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M10    (authoring → submission)
               ├─ M11             (keymap)
               ├─ M12             (themes/config)
               ├─ M13             (highlighting)
-              ├─ M15             (polish: resolved indicator, borders, sidebar)
-              └─ M3 ─ M6 ─ M14   (local review; needs authoring, not submission)
+              ├─ M15             (presentation & navigation polish)
+              ├─ M6 ─ M10b ─ M16 (review-item mutation & submission hardening)
+              ├─ M9 ─ M13 ─ M17  (diff, blob & highlighting completeness)
+              ├─ M3 ─ M6 ─ M14 ─ M18 (local-review expansion)
+              └─ M14 ─ M19       (operational hardening & product gates)
 ```
 
 **MVP line:** M0–M3 gives a usable read-only reviewer; M4 makes it ergonomic; M6+M10 make it
 write-capable (the headline). M5/M7/M8/M9/M11/M12/M13 are parallelizable polish once M2 lands; M14 is the
-largest standalone feature and depends only on read + authoring, not submission.
+largest standalone feature and depends only on read + authoring, not submission. M15–M19 gather
+all still-actionable follow-ups recorded by the completed milestones, design open questions,
+ADRs, domain docs, and the local issue tracker.

@@ -36,4 +36,4 @@ bbr reviews changes from one of two sources, sharing all rendering and comment m
 - `GitClient` — seam under Git; shells out to `git` now, fakeable with fixtures in tests.
 - `PendingReviewStore` — repository seam under Review; SQLite/libSQL now, in-memory fake in tests.
 - `SubmissionLocks` — live local ownership seam under Review; OS advisory locks in production, an in-memory lock table in deterministic tests.
-- `Highlighter` — seam under Highlighting; no-op/plain now, tree-sitter later.
+- `Highlighter` — seam under Highlighting; plain and tree-sitter implementations now, user-managed Grammars in M17.
