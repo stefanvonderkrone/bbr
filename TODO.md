@@ -127,12 +127,15 @@ _Deferred:_ editing a prefilled/multi-line suggestion is append-only (revise fro
 
 _Delivery notes:_ focused Files enrich lazily off-thread in one old/new pipeline; partial side failures remain usable and report context in the status bar. `[highlight].max_file_bytes` defaults to 2 MiB per side (`0` = unlimited). Conditional query patterns are currently applied conservatively only when they have no predicates; predicate evaluation is a follow-up for richer built-in classifications, not a correctness dependency for parsing or rendering.
 
-## M14 — Local / offline review  ·  M/L  ·  needs M6 (not M10)
-- [ ] Extend `GitClient` with diffing subset: worktree list, ref resolution, `diff` between refs, blob at ref.
-- [ ] `DiffSource` abstraction; local `git diff <base>..<branch>` → same Diff parser.
-- [ ] Local `CommentTarget` in SQLite (no submission path).
-- [ ] Local anchor lifecycle via diff-walking (`git diff <anchor_commit> <ref>`); committed refs only.
-- [ ] Tests: worktree detection, DiffSource parity, local anchor mapping (current/moved/outdated).
+## M14 — Local / offline review  ·  M/L  ·  ✅ done
+- [x] Explicit `bbr local [base-ref] [source-ref]` entry with no credential requirement: SourceRef defaults to the current Worktree branch; BaseRef defaults to Git's locally recorded remote default and otherwise requires an argument.
+- [x] Extend `GitClient` with diffing subset: worktree list, ref resolution, `diff` between refs, blob at ref.
+- [x] `DiffSource` abstraction; local `git diff <base>..<branch>` → same Diff parser.
+- [x] Local `CommentTarget` in SQLite (no submission path); Presentation enforces one target per PendingReview.
+- [x] Durable ReviewRepository identity: stable store-assigned id with normalized Remote and common-Git-directory aliases; share no-remote linked Worktrees, but keep unverifiable separate no-remote clones distinct. Refuse alias conflicts rather than merging automatically. TempIds are reserved transactionally across processes.
+- [x] Local anchor lifecycle via diff-walking (`git diff <anchor_commit> <ref>`); committed refs only. Resolve all persisted root Draft anchors to current/moved/outdated/unavailable while staging the candidate Session, before atomic publication; cache compatible transition Diffs and keep outdated/unavailable anchors visible from immutable snapshots.
+- [x] Shared configurable `R` refresh Action: atomically reload the same PullRequest or re-resolve the same LocalReview's Refs. Remote-only Actions stay discoverable but grey in local help and report a status message when invoked.
+- [x] Tests: shell worktree/ref/diff/blob acquisition, DiffSource parity, repository aliases and concurrent TempIds, local authoring/snapshots/action gating, and local anchor mapping/projection (current/moved/outdated/unavailable).
 
 ## M15 — Polish  ·  S/M  ·  needs M2 (resolved indicator needs M3/M6)
 Small feature and layout refinements once the core flow works.

@@ -84,11 +84,11 @@ Rendering receives only a borrowed immutable Projection. It cannot retain pointe
 
 ## Atomic Session replacement
 
-A loaded Session is a candidate, not current state. Replacement prepares the candidate's PendingReview, initial Buffer, navigation, and reset Session-relative state privately. Only a completely usable candidate is published; the old aggregate is destroyed after publication commits.
+A loaded Session is a candidate, not current state. Replacement prepares the candidate's PendingReview, session-scoped AnchorProjection, initial Buffer, navigation, and reset Session-relative state privately. Local Anchor Resolution is exhaustive before publication: every persisted root Draft yields `current`, `moved`, `outdated`, or `unavailable`, with compatible Git work grouped by authored commit, current Ref, side, and path. `unavailable` is renderable fallback state and does not fail the candidate. The AnchorProjection is keyed by root TempId and belongs to the candidate published-review aggregate, not the source Session or durable PendingReview; Replies reuse their root's entry. Only a completely usable candidate is published; the old aggregate is destroyed after publication commits.
 
 The agreed outcomes are:
 
-- If candidate PendingReview loading or Buffer construction fails, destroy the candidate and preserve the exact old aggregate, including its cursor, Selection, folds, isolation, input grammar, and Session Epoch.
+- If candidate PendingReview loading, Anchor Resolution infrastructure, or Buffer construction fails, destroy the candidate and preserve the exact old aggregate, including its cursor, Selection, folds, isolation, input grammar, and Session Epoch. A per-Anchor `unavailable` result is not infrastructure failure.
 - If initial load fails and there is no old aggregate, publish no Session. Quit, help, and Picker Actions remain available.
 - While replacement loads, retain the old aggregate as rollback state but suspend Session-specific Actions. Session-independent Actions remain available, and Durable Operations continue.
 - Latest replacement intent wins. If A is current and B then C are requested, discard B even if it completes first. If C fails, restore interaction with A rather than falling back to B.
@@ -105,7 +105,7 @@ Buffer allocation, construction, commit/rollback, navigation normalization, and 
 
 Changing layout, scope, resolved visibility, folds, isolation, Draft projection, or File Enrichment stages the resulting Buffer before publishing the related visible state. A failed rebuild preserves the previous Buffer and navigation. File Enrichment already admitted safely into its Session remains available for a later reprojection even if that immediate Buffer build fails.
 
-Draft saving uses one deep `Published.saveDraft` interface rather than exposing a Buffer candidate or transaction guard. It constructs the candidate Draft, stages its Buffer, persists the Draft, and then publishes Draft and Buffer through an infallible final step. Allocation, Buffer construction, or persistence failure preserves the exact old projection; the Composer closes only after success. This keeps the stage → persist → publish ordering and `ArenaRing` generation policy out of every caller.
+Draft saving uses one deep `Published.saveDraft` interface rather than exposing a Buffer candidate or transaction guard. The PendingReviewStore first reserves a TempId transactionally so concurrent processes cannot choose the same identifier; an unused reservation is an acceptable gap, not a partially saved Draft. Presentation then constructs the candidate Draft, stages its Buffer, persists the Draft, and publishes Draft and Buffer through an infallible final step. Allocation, Buffer construction, or persistence failure preserves the exact old projection; the Composer closes only after success. This keeps reserve → stage → persist → publish ordering and `ArenaRing` generation policy out of every caller.
 
 ## Session-bound work and Durable Operations
 
@@ -117,7 +117,12 @@ Session replacement invalidates only Session-bound projection work. It does not 
 - When another PullRequest becomes current, remove the old PullRequest's blocking submission modal and show a non-blocking global status identifying the PullRequest being submitted. Completion likewise produces a PullRequest-qualified global result.
 - Only one Submission is active globally for now. Another PullRequest may be reviewed, but attempting another Submission reports which PullRequest is already submitting.
 
-PullRequest storage identity is `(Workspace, Repository, PullRequestId)`. PullRequestId alone is only unique within a Repository and cannot key the global SQLite database safely.
+Review storage uses one tagged ReviewIdentity. Its remote case is `(Workspace, Repository,
+PullRequestId)` because PullRequestId alone is only Repository-unique; its local case is
+`(ReviewRepository, BaseRef, SourceRef)` and deliberately excludes the currently resolved
+commits. Session Epoch remains separate and identifies one published snapshot of either case.
+Submission commands carry only the remote identity case, so a local Review cannot enter
+Submission through a late mode check.
 
 ## Submission checkpoints
 
@@ -190,6 +195,20 @@ Local-substitutable dependencies are injected as internal seams:
 Bitbucket is truly external. Presentation represents remote work as typed commands and completions. The production worker adapter uses the existing Bitbucket/HTTP/CommentPoster implementations; deterministic tests inspect commands and feed scripted completions without credentials, threads, sleeps, vaxis, or PTYs.
 
 Terminal rendering is an adapter over Projection. vaxis does not cross the Presentation seam.
+
+Review-source policy also stays behind the Presentation seam. A Published review may be remote
+or local, but the terminal adapter does not branch on that mode to choose CommentTarget,
+Submission availability, commit selection, File Enrichment, or replacement behavior.
+Presentation emits explicit source-specific commands when external work differs; the adapter
+executes those commands and renders source-agnostic display data and available Actions from the
+Projection.
+
+Projection includes ActionAvailability for contextual help. An unavailable Action remains
+discoverable but is greyed in the help Overlay; invoking its configured key produces a specific
+status message rather than a silent no-op. In a LocalReview, remote Submission and PullRequest
+Picker Actions are unavailable while refresh remains available and resolves the local Refs.
+The shared configurable refresh Action defaults to `R`: it reloads the same PullRequest remotely
+or resolves the same LocalReview's Refs and prepares a replacement Session locally.
 
 ## Errors and tests
 

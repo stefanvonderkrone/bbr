@@ -162,6 +162,8 @@ the main thread; the Epoch token still guards against stale results.
 - `test "name" { ... }` blocks compiled and run by `zig build test`; `std.testing`
   (`expect`, `expectEqual`, `expectEqualStrings`, `expectError`).
 - `std.testing.allocator` detects leaks per test — pair every `alloc` with `defer free`.
+- `std.testing.io` is a test-runner-provided `std.Io`; use it for hermetic process integration
+  tests (`std.process.run`) instead of constructing a runtime manually.
 - Our TDD relies on the seams' **fakes** (FakeHttpClient, in-memory store, plain highlighter)
   so domain tests need no network, disk, or C toolchain.
 - **You can't cleanly read env vars inside a `test` block in 0.16.** The env API flows through

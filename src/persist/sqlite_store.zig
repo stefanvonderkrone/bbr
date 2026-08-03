@@ -147,6 +147,38 @@ pub const SqliteStore = struct {
                 \\COMMIT;
             );
         }
+        // v5 (M14): stable logical-repository aliases and transactional Draft
+        // identifiers shared by concurrent bbr processes.
+        if (try self.userVersion() < 5) {
+            try self.exec(
+                \\BEGIN;
+                \\CREATE TABLE review_repositories (
+                \\  repository_id INTEGER PRIMARY KEY AUTOINCREMENT
+                \\);
+                \\CREATE TABLE review_repository_aliases (
+                \\  alias TEXT PRIMARY KEY,
+                \\  repository_id INTEGER NOT NULL REFERENCES review_repositories(repository_id)
+                \\);
+                \\CREATE TABLE draft_temp_ids (
+                \\  workspace TEXT NOT NULL, repository TEXT NOT NULL, pr_id INTEGER NOT NULL,
+                \\  next_id INTEGER NOT NULL,
+                \\  PRIMARY KEY (workspace, repository, pr_id)
+                \\) WITHOUT ROWID;
+                \\PRAGMA user_version = 5;
+                \\COMMIT;
+            );
+        }
+        // v6 (M14): immutable fallback context for local root Draft Anchors.
+        if (try self.userVersion() < 6) {
+            try self.exec(
+                \\BEGIN;
+                \\ALTER TABLE drafts ADD COLUMN snapshot_text TEXT;
+                \\ALTER TABLE drafts ADD COLUMN snapshot_selection_start INTEGER;
+                \\ALTER TABLE drafts ADD COLUMN snapshot_selection_len INTEGER;
+                \\PRAGMA user_version = 6;
+                \\COMMIT;
+            );
+        }
     }
 
     fn userVersion(self: *SqliteStore) SqliteError!i64 {
@@ -175,7 +207,95 @@ pub const SqliteStore = struct {
         .complete_submission = completeSubmissionImpl,
         .active_submission = activeSubmissionImpl,
         .resolve_unknown = resolveUnknownImpl,
+        .resolve_repository = resolveRepositoryImpl,
+        .reserve_temp_id = reserveTempIdImpl,
     };
+
+    fn resolveRepositoryImpl(ptr: *anyopaque, aliases: []const []const u8) anyerror!bbr.review.ReviewRepositoryId {
+        const self: *SqliteStore = @ptrCast(@alignCast(ptr));
+        if (aliases.len == 0) return error.NoRepositoryAlias;
+        try self.exec("BEGIN IMMEDIATE;");
+        errdefer self.exec("ROLLBACK;") catch {};
+
+        var resolved: ?bbr.review.ReviewRepositoryId = null;
+        for (aliases) |alias| {
+            var query: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "SELECT repository_id FROM review_repository_aliases WHERE alias=?;", -1, &query, null) != c.SQLITE_OK)
+                return error.Prepare;
+            defer _ = c.sqlite3_finalize(query);
+            bindText(query, 1, alias);
+            switch (c.sqlite3_step(query)) {
+                c.SQLITE_ROW => {
+                    const id: bbr.review.ReviewRepositoryId = @intCast(c.sqlite3_column_int64(query, 0));
+                    if (resolved != null and resolved.? != id) return error.RepositoryIdentityConflict;
+                    resolved = id;
+                },
+                c.SQLITE_DONE => {},
+                else => return error.Step,
+            }
+        }
+
+        const repository_id = resolved orelse blk: {
+            if (c.sqlite3_exec(self.db, "INSERT INTO review_repositories DEFAULT VALUES;", null, null, null) != c.SQLITE_OK)
+                return error.Exec;
+            break :blk @as(bbr.review.ReviewRepositoryId, @intCast(c.sqlite3_last_insert_rowid(self.db)));
+        };
+        for (aliases) |alias| {
+            var insert: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "INSERT OR IGNORE INTO review_repository_aliases(alias, repository_id) VALUES (?,?);", -1, &insert, null) != c.SQLITE_OK)
+                return error.Prepare;
+            defer _ = c.sqlite3_finalize(insert);
+            bindText(insert, 1, alias);
+            bindInt(insert, 2, @intCast(repository_id));
+            if (c.sqlite3_step(insert) != c.SQLITE_DONE) return error.Step;
+        }
+        try self.exec("COMMIT;");
+        return repository_id;
+    }
+
+    fn reserveTempIdImpl(ptr: *anyopaque, key: ReviewKey) anyerror!TempId {
+        const self: *SqliteStore = @ptrCast(@alignCast(ptr));
+        try self.exec("BEGIN IMMEDIATE;");
+        errdefer self.exec("ROLLBACK;") catch {};
+
+        var query: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT next_id FROM draft_temp_ids WHERE workspace=? AND repository=? AND pr_id=?;", -1, &query, null) != c.SQLITE_OK)
+            return error.Prepare;
+        defer _ = c.sqlite3_finalize(query);
+        bindText(query, 1, key.workspace);
+        bindText(query, 2, key.repository);
+        bindInt(query, 3, @intCast(key.pull_request_id));
+        const reserved: TempId = switch (c.sqlite3_step(query)) {
+            c.SQLITE_ROW => @intCast(c.sqlite3_column_int64(query, 0)),
+            c.SQLITE_DONE => blk: {
+                var maximum: ?*c.sqlite3_stmt = null;
+                if (c.sqlite3_prepare_v2(self.db, "SELECT COALESCE(MAX(local_id),0)+1 FROM drafts WHERE workspace=? AND repository=? AND pr_id=?;", -1, &maximum, null) != c.SQLITE_OK)
+                    return error.Prepare;
+                defer _ = c.sqlite3_finalize(maximum);
+                bindText(maximum, 1, key.workspace);
+                bindText(maximum, 2, key.repository);
+                bindInt(maximum, 3, @intCast(key.pull_request_id));
+                if (c.sqlite3_step(maximum) != c.SQLITE_ROW) return error.Step;
+                break :blk @intCast(c.sqlite3_column_int64(maximum, 0));
+            },
+            else => return error.Step,
+        };
+
+        var upsert: ?*c.sqlite3_stmt = null;
+        const sql =
+            \\INSERT INTO draft_temp_ids(workspace,repository,pr_id,next_id) VALUES (?,?,?,?)
+            \\ON CONFLICT(workspace,repository,pr_id) DO UPDATE SET next_id=excluded.next_id;
+        ;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &upsert, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(upsert);
+        bindText(upsert, 1, key.workspace);
+        bindText(upsert, 2, key.repository);
+        bindInt(upsert, 3, @intCast(key.pull_request_id));
+        bindInt(upsert, 4, @intCast(reserved + 1));
+        if (c.sqlite3_step(upsert) != c.SQLITE_DONE) return error.Step;
+        try self.exec("COMMIT;");
+        return reserved;
+    }
 
     fn putImpl(ptr: *anyopaque, key: ReviewKey, d: Draft) anyerror!void {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
@@ -187,8 +307,9 @@ pub const SqliteStore = struct {
             \\ (pr_id, local_id, kind, target, parent_kind, parent_id,
             \\  anchor_path, anchor_from, anchor_to, anchor_commit,
             \\  body, state_kind, state_id, state_err,
-            \\  anchor_start_from, anchor_start_to, workspace, repository)
-            \\ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
+            \\  anchor_start_from, anchor_start_to, workspace, repository,
+            \\  snapshot_text, snapshot_selection_start, snapshot_selection_len)
+            \\ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
         ;
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
@@ -264,6 +385,15 @@ pub const SqliteStore = struct {
         }
         bindText(stmt, 17, key.workspace);
         bindText(stmt, 18, key.repository);
+        if (d.snapshot) |snapshot| {
+            bindText(stmt, 19, snapshot.text);
+            bindInt(stmt, 20, @intCast(snapshot.selection_start));
+            bindInt(stmt, 21, @intCast(snapshot.selection_len));
+        } else {
+            bindNull(stmt, 19);
+            bindNull(stmt, 20);
+            bindNull(stmt, 21);
+        }
 
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
         try self.exec("COMMIT;");
@@ -296,7 +426,8 @@ pub const SqliteStore = struct {
             \\SELECT local_id, kind, target, parent_kind, parent_id,
             \\ anchor_path, anchor_from, anchor_to, anchor_commit,
             \\ body, state_kind, state_id, state_err,
-            \\ anchor_start_from, anchor_start_to
+            \\ anchor_start_from, anchor_start_to,
+            \\ snapshot_text, snapshot_selection_start, snapshot_selection_len
             \\ FROM drafts
             \\ WHERE workspace=? AND repository=? AND pr_id=? ORDER BY local_id;
         ;
@@ -650,11 +781,18 @@ pub const SqliteStore = struct {
             else => .draft,
         };
 
+        const snapshot = if (try columnTextDup(allocator, stmt, 15)) |text| bbr.review.AnchorSnapshot{
+            .text = text,
+            .selection_start = @intCast(columnInt(stmt, 16)),
+            .selection_len = @intCast(columnInt(stmt, 17)),
+        } else null;
+
         return .{
             .local_id = @intCast(columnInt(stmt, 0)),
             .kind = @enumFromInt(columnInt(stmt, 1)),
             .target = @enumFromInt(columnInt(stmt, 2)),
             .anchor = anchor,
+            .snapshot = snapshot,
             .parent = parent,
             .body = (try columnTextDup(allocator, stmt, 9)) orelse "",
             .state = state,
@@ -775,6 +913,7 @@ test "in-memory round-trip preserves fields, anchor, parent, and state" {
         .kind = .inline_comment,
         .target = .bitbucket,
         .anchor = .{ .path = "src/f.zig", .from = 3, .to = 12, .start_to = 9, .commit = "deadbeef" },
+        .snapshot = .{ .text = "before\nselected\nafter", .selection_start = 1, .selection_len = 1 },
         .body = "needs a test",
         .state = .{ .posted = 555 },
     });
@@ -806,6 +945,9 @@ test "in-memory round-trip preserves fields, anchor, parent, and state" {
     try testing.expect(d0.anchor.?.start_from == null);
     try testing.expect(d0.anchor.?.isRange());
     try testing.expectEqualStrings("deadbeef", d0.anchor.?.commit.?);
+    try testing.expectEqualStrings("before\nselected\nafter", d0.snapshot.?.text);
+    try testing.expectEqual(@as(u32, 1), d0.snapshot.?.selection_start);
+    try testing.expectEqual(@as(u32, 1), d0.snapshot.?.selection_len);
     try testing.expectEqualStrings("needs a test", d0.body);
     try testing.expectEqual(@as(CommentId, 555), d0.state.posted);
 
@@ -1051,4 +1193,34 @@ test "SQLite reports an already-active Submission consistently" {
     _ = try store.beginSubmission(first, "first-commit", 1);
 
     try testing.expectError(error.SubmissionAlreadyActive, store.beginSubmission(second, "second-commit", 1));
+}
+
+test "SQLite repository aliases are durable and reject conflicting identities" {
+    var s = try SqliteStore.open(":memory:");
+    defer s.deinit();
+    const store = s.store();
+    const remote = "remote:example.test/team/repo";
+    const common = "common:/work/repo/.git";
+    const id = try store.resolveRepository(&.{remote});
+    try testing.expectEqual(id, try store.resolveRepository(&.{ remote, common }));
+    try testing.expectEqual(id, try store.resolveRepository(&.{common}));
+    _ = try store.resolveRepository(&.{"remote:example.test/other/repo"});
+    try testing.expectError(error.RepositoryIdentityConflict, store.resolveRepository(&.{ remote, "remote:example.test/other/repo" }));
+}
+
+test "SQLite serializes TempId reservations across connections" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = try std.fmt.allocPrintSentinel(arena.allocator(), ".zig-cache/tmp/{s}/ids.db", .{&tmp.sub_path}, 0);
+    var first = try SqliteStore.open(path);
+    defer first.deinit();
+    var second = try SqliteStore.open(path);
+    defer second.deinit();
+    const key = testReviewKey(91);
+
+    try testing.expectEqual(@as(TempId, 1), try first.store().reserveTempId(key));
+    try testing.expectEqual(@as(TempId, 2), try second.store().reserveTempId(key));
+    try testing.expectEqual(@as(TempId, 3), try first.store().reserveTempId(key));
 }

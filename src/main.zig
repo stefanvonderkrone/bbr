@@ -14,6 +14,7 @@ const session = @import("tui/session.zig");
 const persist = @import("persist/sqlite_store.zig");
 const config = @import("tui/config.zig");
 const TreeSitterHighlighter = @import("highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter;
+const presentation = @import("tui/presentation.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -33,6 +34,7 @@ pub fn main(init: std.process.Init) !void {
                 .invalid => |failure| failure.report(),
             };
         }
+        if (std.mem.eql(u8, f, "local")) return localRun(init, gpa, &it);
     }
 
     const cred = bbr.bitbucket.Credential.fromEnv(init.environ_map) catch |err| {
@@ -143,13 +145,89 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .file_cache_enabled = configuration.file_cache_enabled,
         .file_cache_max_retained_bytes_per_review = configuration.file_cache_max_retained_bytes_per_review,
         .submission_locks = os_locks.locks(),
-    }, null, target.id) catch |err| {
+    }, null, try presentation.ReviewKey.init(cred.workspace, target.repo, target.id)) catch |err| {
         if (tuiFatalMessage(err)) |message| {
             std.debug.print("{s}\n", .{message});
             return;
         }
         return err;
     };
+}
+
+fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
+    const base_input = it.next();
+    const source_input = it.next();
+    if (it.next() != null) return usage();
+
+    var loaded = try config.load(gpa, init.io, init.environ_map);
+    defer loaded.deinit(gpa);
+    const configuration = switch (loaded) {
+        .ok => |*value| value,
+        .invalid => |failure| return failure.report(),
+    };
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var git = bbr.git.ShellGitClient.init(gpa, init.io);
+    const client = git.gitClient();
+    const source_name = if (source_input) |value| value else client.currentBranch(a) catch |err| {
+        std.debug.print("bbr local: cannot determine SourceRef: {s}\n", .{@errorName(err)});
+        return;
+    };
+    const source = client.resolveRef(a, source_name) catch |err| {
+        std.debug.print("bbr local: cannot resolve SourceRef '{s}': {s}\n", .{ source_name, @errorName(err) });
+        return;
+    };
+    const base_name = if (base_input) |value| value else client.defaultBaseRef(a, source.canonical) catch |err| {
+        std.debug.print("bbr local: no default BaseRef ({s}); pass one explicitly\n", .{@errorName(err)});
+        return;
+    };
+    const base = client.resolveRef(a, base_name) catch |err| {
+        std.debug.print("bbr local: cannot resolve BaseRef '{s}': {s}\n", .{ base_name, @errorName(err) });
+        return;
+    };
+    const common_dir = client.commonDir(a) catch |err| {
+        std.debug.print("bbr local: cannot identify repository: {s}\n", .{@errorName(err)});
+        return;
+    };
+
+    var store = openStore(gpa, init.io, init.environ_map);
+    defer store.deinit();
+    const common_alias = try std.fmt.allocPrint(a, "common:{s}", .{common_dir});
+    var aliases: [2][]const u8 = undefined;
+    var alias_count: usize = 0;
+    if (client.repositoryRemote(a, source.canonical)) |remote| {
+        aliases[alias_count] = try std.fmt.allocPrint(a, "remote:{s}", .{remote});
+        alias_count += 1;
+    } else |_| {}
+    aliases[alias_count] = common_alias;
+    alias_count += 1;
+    const repository_id = store.store().resolveRepository(aliases[0..alias_count]) catch |err| {
+        std.debug.print("bbr local: cannot resolve repository identity: {s}\n", .{@errorName(err)});
+        return;
+    };
+    const key = presentation.ReviewKey.initLocal(repository_id, base.canonical, source.canonical) catch {
+        std.debug.print("bbr local: Ref name is too long\n", .{});
+        return;
+    };
+
+    var tree_sitter_highlighter: TreeSitterHighlighter = .{};
+    try app.run(.{
+        .io = init.io,
+        .gpa = gpa,
+        .env_map = init.environ_map,
+        .cred = .{ .username = "", .token = "", .workspace = "" },
+        .repo = "",
+        .store = store.store(),
+        .active_theme = configuration.active_theme,
+        .keymap = configuration.keymap.keymap(),
+        .highlighter = tree_sitter_highlighter.highlighter(),
+        .highlight_max_file_bytes = configuration.highlight_max_file_bytes,
+        .file_cache_enabled = configuration.file_cache_enabled,
+        .file_cache_max_retained_bytes_per_review = configuration.file_cache_max_retained_bytes_per_review,
+        .online = false,
+    }, null, key);
 }
 
 fn tuiFatalMessage(err: anyerror) ?[]const u8 {
@@ -325,10 +403,11 @@ fn usage() void {
         \\  bbr <pr-url>                     open a pasted Bitbucket PR URL
         \\  bbr <repo-slug>                  detect the current branch's PR in <repo>
         \\  bbr <repo-slug> <pr-id>          open a specific PR in the TUI
+        \\  bbr local [base-ref] [source-ref] review committed local Git changes
         \\  bbr check <repo-slug> <pr-id>    live smoke check (fetch + print, no TUI)
         \\  bbr demo                         open the TUI with synthetic data (no network)
         \\
-        \\Everything but `demo` needs BITBUCKET_USERNAME, BITBUCKET_TOKEN,
+        \\Remote review commands need BITBUCKET_USERNAME, BITBUCKET_TOKEN,
         \\BITBUCKET_WORKSPACE in the environment.
         \\
     , .{});
@@ -385,7 +464,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
     });
     s.threads = try bbr.review.buildThreads(a, comments);
 
-    s.pr = .{
+    const pr: bbr.bitbucket.PullRequest = .{
         .id = 1799,
         .title = "Demo: raise handler timeout",
         .state = "OPEN",
@@ -394,6 +473,18 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
         .destination_branch = "main",
         .source_commit = "democ0ffee",
         .destination_commit = "demodeadbeef",
+    };
+    s.source = .{ .remote = pr };
+    s.header = .{
+        .title = pr.title,
+        .source_ref = pr.source_branch,
+        .base_ref = pr.destination_branch,
+        .source_commit = pr.source_commit,
+        .base_commit = pr.destination_commit,
+        .author = pr.author_display_name,
+        .locator = "demo",
+        .source_label = "Demo",
+        .pull_request_id = pr.id,
     };
 
     // Ephemeral in-memory store: the demo authors drafts but persists nothing.
@@ -414,7 +505,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
         .file_cache_enabled = configuration.file_cache_enabled,
         .file_cache_max_retained_bytes_per_review = configuration.file_cache_max_retained_bytes_per_review,
         .online = false,
-    }, s, s.pr.id);
+    }, s, try presentation.ReviewKey.init("", "", pr.id));
 }
 
 // Test discovery only follows `_ = @import(...)` chains rooted in the *test

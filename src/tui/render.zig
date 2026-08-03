@@ -198,8 +198,15 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, them
         .fold => |f| drawFold(scratch, win, r, f, theme),
         .comment => |cr| drawComment(scratch, win, r, cr, theme),
         .draft => |dr| drawDraft(scratch, win, r, dr, theme),
+        .snapshot => |snapshot| drawSnapshot(win, r, snapshot, theme),
         .section => |sec| drawSection(scratch, win, r, sec, theme),
     }
+}
+
+fn drawSnapshot(win: vaxis.Window, row: u16, snapshot: bbr.diff.buffer.SnapshotRow, theme: Theme) void {
+    const style = if (snapshot.selected) theme.section else theme.gutter;
+    fillRow(win, row, style);
+    _ = win.printSegment(.{ .text = snapshot.line, .style = style }, .{ .row_offset = row, .col_offset = gutter_cols, .wrap = .none });
 }
 
 /// Side-by-side gutter: one 4-wide line-number column plus a trailing space.
@@ -324,7 +331,11 @@ fn drawSection(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, sec: Secti
     const text = switch (sec.kind) {
         .pr_comments => std.fmt.allocPrint(scratch, "── PR comments ({d}) ──", .{sec.count}) catch "── PR comments ──",
         .pending => std.fmt.allocPrint(scratch, "── Pending ({d}) ──", .{sec.count}) catch "── Pending ──",
-        .outdated => std.fmt.allocPrint(scratch, "── Outdated · {s} ({d}) ──", .{ sec.path, sec.count }) catch "── Outdated ──",
+        .outdated => if (sec.path.len > 0)
+            std.fmt.allocPrint(scratch, "── Outdated · {s} ({d}) ──", .{ sec.path, sec.count }) catch "── Outdated ──"
+        else
+            std.fmt.allocPrint(scratch, "── Outdated ({d}) ──", .{sec.count}) catch "── Outdated ──",
+        .unavailable => std.fmt.allocPrint(scratch, "── Anchor unavailable ({d}) ──", .{sec.count}) catch "── Anchor unavailable ──",
     };
     _ = win.printSegment(.{ .text = text, .style = theme.section }, .{ .row_offset = r, .wrap = .none });
 }
@@ -547,10 +558,11 @@ fn chordLabel(scratch: std.mem.Allocator, c: keymap.Chord) []const u8 {
 /// Coalesce the Keymap into two help columns — Motions and commands — one line
 /// per Action ("keys  label"), merging the (adjacent) alternate bindings of an
 /// Action into one "j ↓"-style key list.
-const HelpRows = struct { motions: [][]const u8, commands: [][]const u8 };
-fn buildHelpRows(scratch: std.mem.Allocator, km: keymap.Keymap) HelpRows {
-    var motions: std.ArrayList([]const u8) = .empty;
-    var commands: std.ArrayList([]const u8) = .empty;
+const HelpRow = struct { text: []const u8, available: bool };
+const HelpRows = struct { motions: []HelpRow, commands: []HelpRow };
+fn buildHelpRows(scratch: std.mem.Allocator, km: keymap.Keymap, availability: presentation.ActionAvailability) HelpRows {
+    var motions: std.ArrayList(HelpRow) = .empty;
+    var commands: std.ArrayList(HelpRow) = .empty;
     var i: usize = 0;
     while (i < km.bindings.len) {
         const act = km.bindings[i].action;
@@ -561,7 +573,10 @@ fn buildHelpRows(scratch: std.mem.Allocator, km: keymap.Keymap) HelpRows {
             keys.appendSlice(scratch, chordLabel(scratch, km.bindings[i].chord)) catch {};
         }
         const line = std.fmt.allocPrint(scratch, "{s:<8}{s}", .{ keys.items, help }) catch help;
-        (if (keymap.isMotion(act)) &motions else &commands).append(scratch, line) catch {};
+        (if (keymap.isMotion(act)) &motions else &commands).append(scratch, .{
+            .text = line,
+            .available = availability.available(act),
+        }) catch {};
     }
     return .{ .motions = motions.items, .commands = commands.items };
 }
@@ -570,8 +585,8 @@ fn buildHelpRows(scratch: std.mem.Allocator, km: keymap.Keymap) HelpRows {
 /// column and commands in the right, read straight from the Keymap so it can
 /// never drift from the live bindings. Dismissed by any key. `scratch` outlives
 /// render for the synthesized rows.
-pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, km: keymap.Keymap) void {
-    const rows = buildHelpRows(scratch, km);
+pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, km: keymap.Keymap, availability: presentation.ActionAvailability) void {
+    const rows = buildHelpRows(scratch, km, availability);
     const n = @max(rows.motions.len, rows.commands.len);
     const want_h: u16 = @intCast(@min(n + 3, 255));
     const modal = centeredModal(win, 74, want_h) orelse return;
@@ -586,9 +601,9 @@ pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, km:
     while (i < n and 1 + i + 1 < modal.height) : (i += 1) {
         const rr: u16 = 1 + @as(u16, @intCast(i));
         if (i < rows.motions.len)
-            _ = modal.printSegment(.{ .text = rows.motions[i], .style = theme.picker }, .{ .row_offset = rr, .col_offset = 2, .wrap = .none });
+            _ = modal.printSegment(.{ .text = rows.motions[i].text, .style = if (rows.motions[i].available) theme.picker else theme.gutter }, .{ .row_offset = rr, .col_offset = 2, .wrap = .none });
         if (i < rows.commands.len)
-            _ = modal.printSegment(.{ .text = rows.commands[i], .style = theme.picker }, .{ .row_offset = rr, .col_offset = col_right, .wrap = .none });
+            _ = modal.printSegment(.{ .text = rows.commands[i].text, .style = if (rows.commands[i].available) theme.picker else theme.gutter }, .{ .row_offset = rr, .col_offset = col_right, .wrap = .none });
     }
 
     const hint_row = modal.height - 1;
@@ -599,7 +614,7 @@ pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, km:
 /// The boot/switch frame shown until a Session arrives: a centered floating
 /// "Loading PR #N…" dialog (or the error, if the fetch failed), over a cleared
 /// backdrop. `scratch` outlives render for the synthesized text.
-pub fn drawLoading(scratch: std.mem.Allocator, win: vaxis.Window, id: u64, theme: Theme, status_msg: ?[]const u8) void {
+pub fn drawLoading(scratch: std.mem.Allocator, win: vaxis.Window, id: ?u64, theme: Theme, status_msg: ?[]const u8) void {
     if (win.height == 0 or win.width == 0) return;
     // Blank the whole window first: on a switch the previous viewer frame is
     // still in the screen buffer behind the dialog.
@@ -608,9 +623,11 @@ pub fn drawLoading(scratch: std.mem.Allocator, win: vaxis.Window, id: u64, theme
     var r: u16 = 0;
     while (r < modal.height) : (r += 1) fillRow(modal, r, theme.picker);
     const text: []const u8 = if (status_msg) |m|
-        std.fmt.allocPrint(scratch, " PR #{d}: {s}", .{ id, m }) catch m
+        if (id) |pr_id| std.fmt.allocPrint(scratch, " PR #{d}: {s}", .{ pr_id, m }) catch m else m
+    else if (id) |pr_id|
+        std.fmt.allocPrint(scratch, " Loading PR #{d}…", .{pr_id}) catch "Loading…"
     else
-        std.fmt.allocPrint(scratch, " Loading PR #{d}…", .{id}) catch "Loading…";
+        " Loading local review…";
     const row = modal.height / 2;
     _ = modal.printSegment(.{ .text = text, .style = theme.picker_query }, .{ .row_offset = row, .wrap = .none });
 }
@@ -1229,9 +1246,9 @@ test "the help overlay floats a centered Keybindings modal from the Keymap" {
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
 
-    drawHelp(a, win, theme_dark, keymap.Keymap.default);
+    drawHelp(a, win, theme_dark, keymap.Keymap.default, .{ .remote = true });
 
-    const rows = buildHelpRows(a, keymap.Keymap.default);
+    const rows = buildHelpRows(a, keymap.Keymap.default, .{ .remote = true });
     const modal_height: u16 = @intCast(@min(@max(rows.motions.len, rows.commands.len) + 3, screen.height));
     const modal_y = (screen.height - modal_height) / 2;
     // Title " Keybindings" begins one cell into the centered 74-column modal.
@@ -1239,4 +1256,16 @@ test "the help overlay floats a centered Keybindings modal from the Keymap" {
     // First motion row starts at col_offset 2 and one row below the title →
     // screen col 5, and the first motion binding is `j`/`↓` → down.
     try testing.expectEqualStrings("j", win.readCell(5, modal_y + 1).?.char.grapheme);
+}
+
+test "local help projection marks remote-only commands unavailable" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const rows = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = false });
+    var unavailable: usize = 0;
+    for (rows.commands) |row| {
+        if (!row.available) unavailable += 1;
+    }
+    try testing.expectEqual(@as(usize, 5), unavailable);
+    for (rows.motions) |row| try testing.expect(row.available);
 }

@@ -32,7 +32,7 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [ ] **Resolved toggle** — reveal whole resolved Threads (comment + replies), not bare markers. `M3`
 
 ## Comment anchoring
-- [ ] **Anchor state** — render comments as current / moved / outdated. `M3` (remote) · `M13` (local)
+- [x] **Anchor state** — render comments as current / moved / outdated. `M3` (remote) · `M14` (local)
 - [ ] **Show outdated comments** — never hidden; per-file collapsible with captured context. `M3`
 - [ ] **Stale-anchor warning** — detect SourceCommit change before submit. `M9`
 
@@ -51,11 +51,12 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [ ] **Failure handling** — retry / abort-on-auth / mark-and-continue + dedupe guard. `M9`
 
 ## Local & offline review
-- [ ] **Detect current branch/worktree** — read the WorkingCopy's branch. `M4` (branch+remote) · `M13` (worktree/diff)
-- [ ] **Parse tracking remote** — `origin` → `(workspace, repo_slug)`, SSH + HTTPS + `url.insteadof`. `M4`
-- [ ] **Local branch diff** — review a branch against a BaseRef with no Bitbucket. `M13`
-- [ ] **Local comments** — persist to SQLite with `CommentTarget = local`; never submit. `M13`
-- [ ] **git worktree support** — each worktree reviews its own branch. `M13`
+- [x] **Detect current branch/worktree** — read the WorkingCopy's branch and common Git directory. `M4` (branch+remote) · `M14` (worktree/diff)
+- [x] **Parse tracking remote** — SSH/HTTPS/`url.insteadof`, normalized without credentials for durable repository identity. `M4` · `M14`
+- [x] **Local branch diff** — review committed SourceRef changes against a BaseRef with no Bitbucket or credentials. `M14`
+- [x] **Local comments** — persist to SQLite with `CommentTarget = local`; never submit. `M14`
+- [x] **git worktree support** — linked worktrees share a logical Review and drafts for the same BaseRef/SourceRef. `M14`
+- [x] **Local anchor projection** — refresh maps drafts to current/moved/outdated/unavailable and preserves authored context. `M14`
 - [ ] *(deferred)* dirty working-tree diffs with fuzzy content-based anchoring. `later`
 
 ## Shell & UX

@@ -4,11 +4,10 @@ A Zig terminal UI for reviewing **Bitbucket Cloud** pull requests: browse the di
 coloring and syntax highlighting, read comment threads, and compose comments, replies, and
 suggestions that stay **pending locally** until you submit them as a batch.
 
-> Status: **M2 (unified diff viewer) complete** — `bbr <repo> <id>` opens a PR, fetches and parses
-> its diff, and renders a file sidebar + unified diff pane with neutral/green/red line bands and
-> line-number gutter, navigable with vim motions (`j`/`k`, `ctrl-d`/`ctrl-u`, `gg`/`G`, numeric
-> counts) and arrows. Diff parsing, row flattening, navigation, and cell colors are all tested
-> hermetically (`zig build test`). Implementation continues through the milestones below.
+> Status: **M14 (local/offline review) complete** — `bbr` reviews Bitbucket PullRequests or
+> committed local Git refs through the same diff, authoring, highlighting, and rendering pipeline.
+> Local drafts persist in SQLite, share across linked worktrees/clones with the same repository
+> identity, and remain local-only. The implementation is exercised hermetically by `zig build test`.
 
 ## Documentation map
 
@@ -49,11 +48,12 @@ Small vertical slices (sizes are relative effort, not dates):
 `M0` walking skeleton → `M1` diff model & parser (pure, tested) → `M2` unified viewer →
 `M3` comments (read) → `M4` PR discovery & switching → `M5` diff polish →
 `M6` pending review: authoring → `M7` responsiveness (non-blocking loads) →
-`M8` file view scope (single-file) → `M9` pending review: submission →
-`M10` keymap & motions → `M11` themes & config → `M12` syntax highlighting →
-`M13` local / offline review.
+`M8` file view scope (single-file) → `M9` true whole-file view →
+`M10` pending review submission → `M10b` multi-line anchors/reconciliation →
+`M11` keymap & motions → `M12` themes & config →
+`M13` syntax highlighting → `M14` local / offline review.
 
-**MVP line:** M0–M3 (usable read-only), M4 (ergonomic), M6+M9 (write-capable — the headline).
+**MVP line:** M0–M3 (usable read-only), M4 (ergonomic), M6+M10 (write-capable — the headline).
 Full breakdown with dependencies in `docs/design.html` §14 and `TODO.md`.
 
 ## Building (once code lands)
@@ -62,14 +62,16 @@ Full breakdown with dependencies in `docs/design.html` §14 and `TODO.md`.
 zig build                        # build the bbr executable
 zig build test                   # unit tests — hermetic, no network/disk (seams are faked)
 zig build check -- <repo> <id>   # live smoke check against real Bitbucket (needs creds)
+zig build run -- local [base-ref] [source-ref]  # committed local review (no creds)
 ```
 
 `zig build test` is hermetic and CI-safe. `zig build check` is the opt-in live tier: it hits real
 Bitbucket, so it needs credentials and is never part of `test`.
 
-Credentials come from the environment only (never a config file, never persisted):
-`BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, `BITBUCKET_WORKSPACE`. For local runs, keep them in a
-gitignored `.env` and source it: `set -a; source .env; set +a`.
+Remote-review credentials come from the environment only (never a config file, never persisted):
+`BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, `BITBUCKET_WORKSPACE`. `bbr local` does not read or
+require them. Its SourceRef defaults to the current branch; its BaseRef defaults to the tracking
+remote's locally recorded default branch and must be supplied when Git has no such default.
 
 ## Configuration
 

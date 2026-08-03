@@ -30,6 +30,64 @@ pub const Rewrite = struct {
     base: []const u8,
 };
 
+/// Normalize a generic Git remote to credential-free `host/path` identity.
+/// Transport spelling and a matching `url.*.insteadOf` prefix do not affect
+/// the result. The returned bytes are owned by `allocator`.
+pub fn normalize(allocator: std.mem.Allocator, url: []const u8, rewrites: []const Rewrite) ![]u8 {
+    var effective = url;
+    var expanded: ?[]u8 = null;
+    defer if (expanded) |bytes| allocator.free(bytes);
+    var best: ?Rewrite = null;
+    for (rewrites) |rewrite| {
+        if (!std.mem.startsWith(u8, url, rewrite.alias)) continue;
+        if (best == null or rewrite.alias.len > best.?.alias.len) best = rewrite;
+    }
+    if (best) |rewrite| {
+        expanded = try std.mem.concat(allocator, u8, &.{ rewrite.base, url[rewrite.alias.len..] });
+        effective = expanded.?;
+    }
+
+    if (std.mem.startsWith(u8, effective, "file://")) {
+        return normalizeFileRemote(allocator, effective["file://".len..]);
+    }
+    if (std.mem.startsWith(u8, effective, "/")) return normalizeFileRemote(allocator, effective);
+
+    var host_part: []const u8 = "";
+    var path_part: []const u8 = "";
+    if (std.mem.indexOf(u8, effective, "://")) |scheme| {
+        const authority_path = effective[scheme + 3 ..];
+        const slash = std.mem.indexOfScalar(u8, authority_path, '/') orelse return error.MalformedUrl;
+        var authority = authority_path[0..slash];
+        if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
+        host_part = authority;
+        path_part = authority_path[slash + 1 ..];
+    } else if (std.mem.indexOfScalar(u8, effective, ':')) |colon| {
+        var authority = effective[0..colon];
+        if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
+        host_part = authority;
+        path_part = effective[colon + 1 ..];
+    } else return error.MalformedUrl;
+    if (host_part.len == 0 or path_part.len == 0) return error.MalformedUrl;
+    if (std.mem.indexOfAny(u8, path_part, "?#")) |end| path_part = path_part[0..end];
+    while (std.mem.endsWith(u8, path_part, "/")) path_part = path_part[0 .. path_part.len - 1];
+    if (std.mem.endsWith(u8, path_part, ".git")) path_part = path_part[0 .. path_part.len - 4];
+    while (std.mem.startsWith(u8, path_part, "/")) path_part = path_part[1..];
+    if (path_part.len == 0) return error.MalformedUrl;
+
+    const normalized = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ host_part, path_part });
+    for (normalized[0..host_part.len]) |*byte| byte.* = std.ascii.toLower(byte.*);
+    return normalized;
+}
+
+fn normalizeFileRemote(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    if (!std.mem.startsWith(u8, input, "/")) return error.MalformedUrl;
+    var path = input;
+    while (path.len > 1 and std.mem.endsWith(u8, path, "/")) path = path[0 .. path.len - 1];
+    if (std.mem.endsWith(u8, path, ".git")) path = path[0 .. path.len - 4];
+    if (path.len == 0) return error.MalformedUrl;
+    return std.fmt.allocPrint(allocator, "file:{s}", .{path});
+}
+
 const host = "bitbucket.org";
 
 /// Parse `url` into a `Remote`. `rewrites` are applied longest-alias-first (as
@@ -173,4 +231,29 @@ test "malformed urls" {
     // Missing tail segment.
     try testing.expectError(error.MalformedUrl, parse("git@bitbucket.org:onlyone", &.{}));
     try testing.expectError(error.MalformedUrl, parse("https://bitbucket.org/", &.{}));
+}
+
+test "generic normalization collapses transport and strips credentials" {
+    const https = try normalize(testing.allocator, "https://user:token@Example.COM/team/repo.git", &.{});
+    defer testing.allocator.free(https);
+    const ssh = try normalize(testing.allocator, "git@example.com:team/repo.git", &.{});
+    defer testing.allocator.free(ssh);
+    try testing.expectEqualStrings("example.com/team/repo", https);
+    try testing.expectEqualStrings(https, ssh);
+}
+
+test "generic normalization applies insteadOf before identifying the host" {
+    const normalized = try normalize(testing.allocator, "corp:team/repo.git", &.{.{
+        .alias = "corp:",
+        .base = "ssh://git@example.com/",
+    }});
+    defer testing.allocator.free(normalized);
+    try testing.expectEqualStrings("example.com/team/repo", normalized);
+}
+
+test "filesystem normalization accepts stable absolute paths but rejects relative aliases" {
+    const absolute = try normalize(testing.allocator, "file:///srv/git/repo.git", &.{});
+    defer testing.allocator.free(absolute);
+    try testing.expectEqualStrings("file:/srv/git/repo", absolute);
+    try testing.expectError(error.MalformedUrl, normalize(testing.allocator, "../repo.git", &.{}));
 }

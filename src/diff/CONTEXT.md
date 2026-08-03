@@ -14,7 +14,7 @@ The complete set of changed Files from one DiffSource. The aggregate the whole U
 _Avoid_: changeset, patch.
 
 **File**:
-One changed path within a Diff, carrying its change status (added / modified / removed / renamed) and its Hunks. Its full old/new file text (the blobs used for the WholeFile scope and, later, highlighting) is fetched lazily and held in a Session-side table index-aligned with the files, not on `File` itself — it arrives after the diff is parsed.
+One changed path within a Diff, carrying distinct old/new paths, its change status (added / modified / removed / renamed), and its Hunks. Old-side Anchors match the old path and new-side Anchors match the new path; the displayed path is the surviving side, or the old path for a removed File. Full old/new file text is fetched lazily and held in a Session-side table index-aligned with the Files.
 _Avoid_: buffer (that's the render-side term), document, blob.
 
 **Hunk**:

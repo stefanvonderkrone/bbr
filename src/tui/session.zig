@@ -1,5 +1,5 @@
-//! A loaded PR review session and the (blocking) fetch that builds one. Each
-//! Session owns everything the viewer renders. PullRequest, Diff, and Threads
+//! A loaded review session and the blocking acquisition that builds one. Each
+//! Session owns everything the viewer renders. ReviewHeader, Diff, and Threads
 //! live in its private arena; lazily acquired File Enrichment sides retain
 //! their transferred arenas so switching PRs is still "build, swap, destroy".
 //!
@@ -20,9 +20,31 @@ const PullRequest = bbr.bitbucket.PullRequest;
 const Client = bbr.bitbucket.Client;
 const Credential = bbr.bitbucket.Credential;
 
+pub const ReviewHeader = struct {
+    title: []const u8,
+    source_ref: []const u8,
+    base_ref: []const u8,
+    source_commit: []const u8,
+    base_commit: []const u8,
+    author: ?[]const u8 = null,
+    locator: []const u8,
+    source_label: []const u8,
+    pull_request_id: ?u64 = null,
+};
+
+pub const LocalContext = struct {
+    common_dir: []const u8,
+};
+
+pub const SourceContext = union(enum) {
+    remote: PullRequest,
+    local: LocalContext,
+};
+
 pub const Session = struct {
     arena: std.heap.ArenaAllocator,
-    pr: PullRequest,
+    header: ReviewHeader,
+    source: SourceContext,
     diff: bbr.diff.Diff,
     threads: []const bbr.review.Thread,
     enrichment: file_enrichment.Storage,
@@ -41,11 +63,25 @@ pub const Session = struct {
         self.enrichment.deinit();
         self.enrichment = next;
     }
+
+    pub fn remotePullRequest(self: *Session) ?*PullRequest {
+        return switch (self.source) {
+            .remote => |*pr| pr,
+            .local => null,
+        };
+    }
+
+    pub fn remotePullRequestConst(self: *const Session) ?*const PullRequest {
+        return switch (self.source) {
+            .remote => |*pr| pr,
+            .local => null,
+        };
+    }
 };
 
 /// Allocate an empty Session (arena initialized, fields unset) so a caller can
 /// fill it from data it owns — used by the offline `demo`, which has no network
-/// fetch. Fill `pr`, `diff`, and `threads` using `s.arena.allocator()`.
+/// fetch. Fill `header`, `source`, `diff`, and `threads` using its arena.
 pub fn create(backing: Allocator) !*Session {
     const s = try backing.create(Session);
     errdefer backing.destroy(s);
@@ -67,17 +103,73 @@ pub fn loadWith(backing: Allocator, bb: Client, repo: []const u8, id: u64) !*Ses
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
 
-    s.pr = try bb.getPullRequest(a, repo, id);
+    const pr = try bb.getPullRequest(a, repo, id);
+    s.source = .{ .remote = pr };
+    s.header = .{
+        .title = pr.title,
+        .source_ref = pr.source_branch,
+        .base_ref = pr.destination_branch,
+        .source_commit = pr.source_commit,
+        .base_commit = pr.destination_commit,
+        .author = pr.author_display_name,
+        .locator = repo,
+        .source_label = "Bitbucket",
+        .pull_request_id = pr.id,
+    };
     const raw = try bb.getDiff(a, repo, id);
-    s.diff = try bbr.diff.parse(a, raw);
+    var diff_source: bbr.diff.TextDiffSource = .{ .text = raw };
+    s.diff = try bbr.diff.loadFromSource(a, diff_source.source());
     s.enrichment = try file_enrichment.Storage.init(a, s.diff.files);
     errdefer s.enrichment.deinit();
     const comments = try bb.getComments(a, repo, id, .{
-        .source = s.pr.source_commit,
-        .destination = s.pr.destination_commit,
+        .source = pr.source_commit,
+        .destination = pr.destination_commit,
     });
     s.threads = try bbr.review.buildThreads(a, comments);
 
+    return s;
+}
+
+/// Build a committed local Session through the same DiffSource/parser path.
+/// `source_ref` defaults to the current Worktree branch; `base_ref` defaults to
+/// the selected Remote's locally recorded HEAD and is never guessed otherwise.
+pub fn loadLocalWith(
+    backing: Allocator,
+    git: bbr.git.GitClient,
+    base_ref: ?[]const u8,
+    source_ref: ?[]const u8,
+) !*Session {
+    const s = try backing.create(Session);
+    errdefer backing.destroy(s);
+    s.arena = std.heap.ArenaAllocator.init(backing);
+    errdefer s.arena.deinit();
+    const a = s.arena.allocator();
+
+    const source_input = if (source_ref) |ref| try a.dupe(u8, ref) else try git.currentBranch(a);
+    const source = try git.resolveRef(a, source_input);
+    const base_input = if (base_ref) |ref| try a.dupe(u8, ref) else try git.defaultBaseRef(a, source.canonical);
+    const base = try git.resolveRef(a, base_input);
+    const common_dir = try git.commonDir(a);
+
+    var diff_source: bbr.diff.GitDiffSource = .{
+        .git = git,
+        .base_commit = base.commit,
+        .source_commit = source.commit,
+    };
+    s.diff = try bbr.diff.loadFromSource(a, diff_source.source());
+    s.enrichment = try file_enrichment.Storage.init(a, s.diff.files);
+    errdefer s.enrichment.deinit();
+    s.threads = &.{};
+    s.source = .{ .local = .{ .common_dir = common_dir } };
+    s.header = .{
+        .title = "Local review",
+        .source_ref = source.canonical,
+        .base_ref = base.canonical,
+        .source_commit = source.commit,
+        .base_commit = base.commit,
+        .locator = common_dir,
+        .source_label = "Git",
+    };
     return s;
 }
 
@@ -137,8 +229,9 @@ test "loadWith builds a session in order and owns everything" {
     const s = try loadWith(std.heap.page_allocator, bb, "repo", 7);
     defer s.destroy();
 
-    try testing.expectEqual(@as(u64, 7), s.pr.id);
-    try testing.expectEqualStrings("feature/x", s.pr.source_branch);
+    try testing.expectEqual(@as(?u64, 7), s.header.pull_request_id);
+    try testing.expectEqualStrings("feature/x", s.header.source_ref);
+    try testing.expect(s.remotePullRequestConst() != null);
     try testing.expectEqual(@as(usize, 1), s.diff.files.len);
     try testing.expectEqual(@as(usize, 1), s.threads.len);
     try testing.expectEqual(@as(usize, 3), fake.call_count);
@@ -148,6 +241,31 @@ test "loadWith builds a session in order and owns everything" {
     try testing.expect(projection.blobs[0].new == null);
     try testing.expect(s.enrichment.status(0).old == .pending);
     try testing.expect(s.enrichment.status(0).new == .pending);
+}
+
+test "loadLocalWith resolves defaults and builds a source-neutral Session" {
+    const raw =
+        "diff --git a/f.zig b/f.zig\n--- a/f.zig\n+++ b/f.zig\n" ++
+        "@@ -1 +1 @@\n-old\n+new\n";
+    var fake: bbr.git.FakeGitClient = .{
+        .branch = "feature",
+        .resolved_ref = .{ .canonical = "refs/heads/feature", .commit = "source-hash" },
+        .default_base = "refs/remotes/origin/main",
+        .common_dir_result = "/repo/.git",
+        .diff_result = raw,
+    };
+    // The fake returns one canned resolution, so pass a base spelling whose
+    // identity is not asserted here; the shell integration test covers both.
+    const s = try loadLocalWith(std.heap.page_allocator, fake.gitClient(), "main", null);
+    defer s.destroy();
+
+    try testing.expectEqualStrings("Git", s.header.source_label);
+    try testing.expectEqualStrings("refs/heads/feature", s.header.source_ref);
+    try testing.expectEqualStrings("source-hash", s.header.source_commit);
+    try testing.expect(s.header.pull_request_id == null);
+    try testing.expect(s.remotePullRequestConst() == null);
+    try testing.expectEqual(@as(usize, 1), s.diff.files.len);
+    try testing.expectEqual(@as(usize, 0), s.threads.len);
 }
 
 test "loadWith surfaces an error and leaks nothing" {

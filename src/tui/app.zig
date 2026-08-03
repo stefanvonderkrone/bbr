@@ -63,9 +63,13 @@ const PresentationWork = struct {
     future: std.Io.Future(void),
 };
 
-fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
+fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.ReviewKey) !void {
+    var anchor_git = bbr.git.ShellGitClient.init(ctx.gpa, ctx.io);
+    var git_anchor_resolver = bbr.review.GitAnchorResolver.init(ctx.gpa, anchor_git.gitClient());
+    defer git_anchor_resolver.deinit();
     var state = try presentation.Presentation.init(ctx.gpa, .{
         .reviews = ctx.store,
+        .anchor_resolver = git_anchor_resolver.resolver(),
         .submission_locks = ctx.submission_locks,
         .highlight_max_file_bytes = ctx.highlight_max_file_bytes,
         .file_cache_enabled = ctx.file_cache_enabled,
@@ -75,13 +79,13 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
         .remote_enabled = ctx.online,
     }, .{
         .initial = if (initial) |loaded| .{
-            .key = try presentation.ReviewKey.init(ctx.cred.workspace, ctx.repo, loaded.pr.id),
+            .key = initial_key,
             .session = loaded,
         } else null,
         .viewport_rows = 1,
     });
     defer state.deinit();
-    if (initial == null) try state.dispatch(.{ .choose_pull_request = try presentation.ReviewKey.init(ctx.cred.workspace, ctx.repo, initial_id) });
+    if (initial == null) try state.dispatch(.{ .choose_pull_request = initial_key });
 
     var write_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(ctx.io, &write_buf);
@@ -140,7 +144,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
             drawStatus(
                 frame,
                 win,
-                review_projection.pull_request.*,
+                review_projection.header,
                 review_projection.navigation,
                 review_projection.buffer,
                 review_projection.preferences.layout,
@@ -158,7 +162,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
             );
         } else {
             const status = presentationStatus(frame, projection, null);
-            render.drawLoading(frame, win, projection.loading_pull_request_id orelse initial_id, ctx.active_theme, status);
+            render.drawLoading(frame, win, projection.loading_pull_request_id, ctx.active_theme, status);
         }
         if (projection.picker) |active_picker| render.drawPicker(frame, win, active_picker, ctx.active_theme);
         if (projection.composer) |composer| render.drawComposerProjection(frame, win, composer, ctx.active_theme);
@@ -182,7 +186,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
                     false,
                 );
         }
-        if (projection.help_visible) render.drawHelp(frame, win, ctx.active_theme, ctx.keymap);
+        if (projection.help_visible) render.drawHelp(frame, win, ctx.active_theme, ctx.keymap, projection.action_availability);
         try vx.render(writer);
         _ = frame_arena.reset(.retain_capacity);
     }
@@ -194,7 +198,12 @@ fn presentationStatus(
     visible_key: ?presentation.ReviewKey,
 ) ?[]const u8 {
     if (projection.fatal_error) |err| return @tagName(err);
-    if (projection.action_error) |err| return @tagName(err);
+    if (projection.action_error) |err| return switch (err) {
+        .local_review_no_picker => "Pull Request Picker is unavailable for a local review",
+        .local_review_no_submission => "Submit is unavailable for a local review; drafts remain local",
+        .local_review_remote_action_unavailable => "This action is unavailable for a local review",
+        else => @tagName(err),
+    };
     if (projection.shutting_down) {
         if (projection.submission) |submission|
             return std.fmt.allocPrint(frame, "finishing Submission for {s}#{d}", .{ submission.key.repository(), submission.key.pull_request_id }) catch "finishing Submission";
@@ -264,8 +273,8 @@ fn submissionAbortName(completion: bbr.review.SubmissionCompletion) ?[]const u8 
 /// PR #N…" frame shows — the TUI never blocks the alt-screen on the first fetch.
 /// Takes ownership of the current Session and destroys it (and any it switches
 /// to) before returning.
-pub fn run(ctx: RunCtx, initial: ?*Session, initial_id: u64) !void {
-    return runPresentation(ctx, initial, initial_id);
+pub fn run(ctx: RunCtx, initial: ?*Session, initial_key: presentation.ReviewKey) !void {
+    return runPresentation(ctx, initial, initial_key);
 }
 
 const PresentationSinkContext = struct {
@@ -318,14 +327,25 @@ fn presentationLoadWorker(
     command: presentation.LoadSession,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
-    const outcome: presentation.SessionLoadOutcome = if (session.load(
-        io,
-        std.heap.page_allocator,
-        env_map,
-        cred,
-        command.key.repository(),
-        command.key.pull_request_id,
-    )) |loaded| .{ .loaded = loaded } else |err| .{ .failed = err };
+    const outcome: presentation.SessionLoadOutcome = switch (command.key.kind) {
+        .remote => if (session.load(
+            io,
+            std.heap.page_allocator,
+            env_map,
+            cred,
+            command.key.repository(),
+            command.key.pull_request_id,
+        )) |loaded| .{ .loaded = loaded } else |err| .{ .failed = err },
+        .local => blk: {
+            var git = bbr.git.ShellGitClient.init(std.heap.page_allocator, io);
+            break :blk if (session.loadLocalWith(
+                std.heap.page_allocator,
+                git.gitClient(),
+                command.key.baseRef(),
+                command.key.sourceRef(),
+            )) |loaded| .{ .loaded = loaded } else |err| .{ .failed = err };
+        },
+    };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .session_loaded = .{
         .intent = command.intent,
         .outcome = outcome,
@@ -344,16 +364,30 @@ fn presentationEnrichmentWorker(
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
-    defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
-    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
-    const outcome: presentation.FileEnrichmentOutcome = if (file_enrichment.enrich(
-        std.heap.page_allocator,
-        client,
-        highlighter,
-        command.request(),
-    )) |result| .{ .completed = result } else |err| .{ .failed = if (err == error.OutOfMemory) .out_of_memory else .launch_failed };
+    const outcome: presentation.FileEnrichmentOutcome = switch (command.source) {
+        .remote => blk: {
+            var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
+            defer http.deinit();
+            http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+            const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
+            break :blk if (file_enrichment.enrich(
+                std.heap.page_allocator,
+                client,
+                highlighter,
+                command.request(),
+            )) |result| .{ .completed = result } else |err| .{ .failed = if (err == error.OutOfMemory) .out_of_memory else .launch_failed };
+        },
+        .local => blk: {
+            var git = bbr.git.ShellGitClient.init(std.heap.page_allocator, io);
+            var source: file_enrichment.GitBlobSource = .{ .client = git.gitClient() };
+            break :blk if (file_enrichment.enrichFrom(
+                std.heap.page_allocator,
+                source.source(),
+                highlighter,
+                command.request(),
+            )) |result| .{ .completed = result } else |err| .{ .failed = if (err == error.OutOfMemory) .out_of_memory else .launch_failed };
+        },
+    };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .file_enrichment_completed = .{
         .work_id = command.work_id,
         .session_epoch = command.session_epoch,
@@ -546,7 +580,7 @@ fn fileIndexForRow(buf: bbr.diff.Buffer, cursor: usize) usize {
 fn drawStatus(
     frame: std.mem.Allocator,
     win: vaxis.Window,
-    pr: bbr.bitbucket.PullRequest,
+    header: session.ReviewHeader,
     nav: Nav,
     buf: bbr.diff.Buffer,
     layout: bbr.diff.Layout,
@@ -576,11 +610,14 @@ fn drawStatus(
     else
         "c/i comment  ·  [ ] file  ·  p switch  ·  ? help  ·  q quit";
     const tail: []const u8 = if (status_msg) |m| m else if (submitting) "submitting…" else if (loading) "loading…" else default_tail;
-    const text = std.fmt.allocPrint(frame, " #{d} {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s}  ·  {s}  ·  {s}  ·  {s} ", .{
-        pr.id,
-        pr.title,
-        pr.source_branch,
-        pr.destination_branch,
+    const identity = if (header.pull_request_id) |id|
+        (std.fmt.allocPrint(frame, "#{d} {s}", .{ id, header.title }) catch header.title)
+    else
+        header.title;
+    const text = std.fmt.allocPrint(frame, " {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s}  ·  {s}  ·  {s}  ·  {s} ", .{
+        identity,
+        header.source_ref,
+        header.base_ref,
         @min(nav.cursor + 1, buf.rows.len),
         buf.rows.len,
         layout_hint,

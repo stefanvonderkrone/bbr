@@ -17,6 +17,7 @@ pub const Action = enum {
     select_up,
     quit,
     open_picker,
+    refresh,
     comment,
     inline_comment,
     suggest,

@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const comment = @import("comment.zig");
 const CommentId = comment.CommentId;
 const Anchor = comment.Anchor;
+const AnchorSnapshot = comment.AnchorSnapshot;
 const ApiError = @import("../bitbucket/types.zig").ApiError;
 
 /// A Draft's client-side identifier, assigned by the PendingReview on creation
@@ -59,6 +60,9 @@ pub const Draft = struct {
     target: CommentTarget = .bitbucket,
     /// The diff location, or null for a PR-level (top-level) Draft.
     anchor: ?Anchor = null,
+    /// Present only on an anchored local root; Replies inherit their root's
+    /// snapshot through the parent relationship rather than duplicating it.
+    snapshot: ?AnchorSnapshot = null,
     /// The comment/draft this replies to, or null for a root Draft.
     parent: ?Parent = null,
     /// Raw markdown body, as authored.
@@ -85,6 +89,7 @@ pub const NewDraft = struct {
     kind: DraftKind,
     target: CommentTarget = .bitbucket,
     anchor: ?Anchor = null,
+    snapshot: ?AnchorSnapshot = null,
     parent: ?Parent = null,
     body: []const u8,
 };
@@ -116,6 +121,7 @@ pub const PendingReview = struct {
             .kind = d.kind,
             .target = d.target,
             .anchor = d.anchor,
+            .snapshot = d.snapshot,
             .parent = d.parent,
             .body = d.body,
         });

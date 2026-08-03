@@ -6,6 +6,42 @@ const bbr = @import("bbr");
 
 const Allocator = std.mem.Allocator;
 
+pub const BlobSource = struct {
+    ptr: *anyopaque,
+    read_fn: *const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror![]u8,
+
+    pub fn read(self: BlobSource, allocator: Allocator, commit: []const u8, path: []const u8) ![]u8 {
+        return self.read_fn(self.ptr, allocator, commit, path);
+    }
+};
+
+pub const RemoteBlobSource = struct {
+    client: bbr.bitbucket.Client,
+    repo: []const u8,
+
+    pub fn source(self: *RemoteBlobSource) BlobSource {
+        return .{ .ptr = self, .read_fn = read };
+    }
+
+    fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8) anyerror![]u8 {
+        const self: *RemoteBlobSource = @ptrCast(@alignCast(ptr));
+        return self.client.getFileBlob(allocator, self.repo, commit, path);
+    }
+};
+
+pub const GitBlobSource = struct {
+    client: bbr.git.GitClient,
+
+    pub fn source(self: *GitBlobSource) BlobSource {
+        return .{ .ptr = self, .read_fn = read };
+    }
+
+    fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8) anyerror![]u8 {
+        const self: *GitBlobSource = @ptrCast(@alignCast(ptr));
+        return self.client.blob(allocator, commit, path);
+    }
+};
+
 pub const Request = struct {
     repo: []const u8,
     status: bbr.diff.FileStatus,
@@ -86,25 +122,30 @@ pub const Result = struct {
 };
 
 pub fn enrich(backing: Allocator, bb: bbr.bitbucket.Client, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
+    var remote: RemoteBlobSource = .{ .client = bb, .repo = req.repo };
+    return enrichFrom(backing, remote.source(), highlighter, req);
+}
+
+pub fn enrichFrom(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
     var result: Result = .{ .old = .absent, .new = .absent };
     errdefer result.deinit();
     if (req.status != .added) {
-        result.old = try enrichSide(backing, bb, highlighter, req.max_file_bytes, req.repo, req.destination_commit, req.old_path);
+        result.old = try enrichSide(backing, source, highlighter, req.max_file_bytes, req.destination_commit, req.old_path);
     }
     if (req.status != .removed) {
-        result.new = try enrichSide(backing, bb, highlighter, req.max_file_bytes, req.repo, req.source_commit, req.new_path);
+        result.new = try enrichSide(backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path);
     }
     return result;
 }
 
-fn enrichSide(backing: Allocator, bb: bbr.bitbucket.Client, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, repo: []const u8, commit: []const u8, path: []const u8) error{OutOfMemory}!SideResult {
+fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, commit: []const u8, path: []const u8) error{OutOfMemory}!SideResult {
     const side = try backing.create(OwnedSide);
     errdefer backing.destroy(side);
     side.arena = std.heap.ArenaAllocator.init(backing);
     errdefer side.arena.deinit();
     const allocator = side.arena.allocator();
 
-    side.blob = bb.getFileBlob(allocator, repo, commit, path) catch |err| {
+    side.blob = source.read(allocator, commit, path) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         side.destroy();
         return .{ .fetch_failed = err };
@@ -501,6 +542,28 @@ test "an added File transfers its enriched new side into Session storage" {
     try testing.expectEqual(@as(usize, 1), projected.new.content.highlighting.ready.spans.len);
     try testing.expectEqualStrings("keyword", projected.new.content.highlighting.ready.spans[0].capture.name);
     try testing.expectError(error.AlreadyTransferred, storage.admit(0, &result));
+}
+
+test "local Git blob source uses the same File Enrichment pipeline" {
+    var fake_git: bbr.git.FakeGitClient = .{ .blob_result = "const local = true;\n" };
+    var source: GitBlobSource = .{ .client = fake_git.gitClient() };
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    var result = try enrichFrom(testing.allocator, source.source(), plain.highlighter(), .{
+        .repo = "",
+        .status = .added,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "/dev/null",
+        .new_path = "src/local.zig",
+        .max_file_bytes = 0,
+    });
+    defer result.deinit();
+
+    const files = [_]bbr.diff.File{.{ .old_path = "/dev/null", .new_path = "src/local.zig", .status = .added, .hunks = &.{} }};
+    var storage = try Storage.init(testing.allocator, &files);
+    defer storage.deinit();
+    try storage.admit(0, &result);
+    try testing.expectEqualStrings("const local = true;\n", storage.file(0).new.content.blob);
 }
 
 test "fetched content remains usable when Highlighting fails" {

@@ -18,16 +18,22 @@ const Session = session_mod.Session;
 pub const SessionEpoch = u64;
 pub const LoadIntent = u64;
 pub const WorkId = u64;
+pub const ReviewKind = enum { remote, local };
 
 /// Repository-qualified identity copied by value into commands and state. The
 /// fixed storage keeps the first command protocol self-owned without exposing
 /// another allocator lifetime to the terminal adapter.
 pub const ReviewKey = struct {
+    kind: ReviewKind = .remote,
     workspace_buf: [128]u8 = undefined,
     workspace_len: u8,
-    repository_buf: [256]u8 = undefined,
+    repository_buf: [768]u8 = undefined,
     repository_len: u16,
     pull_request_id: u64,
+    base_ref_buf: [256]u8 = undefined,
+    base_ref_len: u16 = 0,
+    source_ref_buf: [256]u8 = undefined,
+    source_ref_len: u16 = 0,
 
     pub fn init(workspace_name: []const u8, repository_name: []const u8, pull_request_id: u64) error{NameTooLong}!ReviewKey {
         if (workspace_name.len > 128 or repository_name.len > 256) return error.NameTooLong;
@@ -41,6 +47,26 @@ pub const ReviewKey = struct {
         return key;
     }
 
+    pub fn initLocal(repository_id: u64, base_ref: []const u8, source_ref: []const u8) error{NameTooLong}!ReviewKey {
+        if (base_ref.len > 256 or source_ref.len > 256 or base_ref.len + source_ref.len + 1 > 768)
+            return error.NameTooLong;
+        var key: ReviewKey = .{
+            .kind = .local,
+            .workspace_len = 6,
+            .repository_len = @intCast(base_ref.len + source_ref.len + 1),
+            .pull_request_id = repository_id,
+            .base_ref_len = @intCast(base_ref.len),
+            .source_ref_len = @intCast(source_ref.len),
+        };
+        @memcpy(key.workspace_buf[0..6], "\x1flocal");
+        @memcpy(key.repository_buf[0..base_ref.len], base_ref);
+        key.repository_buf[base_ref.len] = 0x1f;
+        @memcpy(key.repository_buf[base_ref.len + 1 .. key.repository_len], source_ref);
+        @memcpy(key.base_ref_buf[0..base_ref.len], base_ref);
+        @memcpy(key.source_ref_buf[0..source_ref.len], source_ref);
+        return key;
+    }
+
     pub fn workspace(self: *const ReviewKey) []const u8 {
         return self.workspace_buf[0..self.workspace_len];
     }
@@ -49,8 +75,35 @@ pub const ReviewKey = struct {
         return self.repository_buf[0..self.repository_len];
     }
 
+    pub fn baseRef(self: *const ReviewKey) []const u8 {
+        return self.base_ref_buf[0..self.base_ref_len];
+    }
+
+    pub fn sourceRef(self: *const ReviewKey) []const u8 {
+        return self.source_ref_buf[0..self.source_ref_len];
+    }
+
+    pub fn isRemote(self: ReviewKey) bool {
+        return self.kind == .remote;
+    }
+
+    pub fn identity(self: *const ReviewKey) bbr.review.ReviewIdentity {
+        return switch (self.kind) {
+            .remote => .{ .remote = .{
+                .workspace = self.workspace(),
+                .repository = self.repository(),
+                .pull_request_id = self.pull_request_id,
+            } },
+            .local => .{ .local = .{
+                .repository_id = self.pull_request_id,
+                .base_ref = self.baseRef(),
+                .source_ref = self.sourceRef(),
+            } },
+        };
+    }
+
     pub fn eql(a: ReviewKey, b: ReviewKey) bool {
-        return a.pull_request_id == b.pull_request_id and
+        return a.kind == b.kind and a.pull_request_id == b.pull_request_id and
             std.mem.eql(u8, a.workspace(), b.workspace()) and
             std.mem.eql(u8, a.repository(), b.repository());
     }
@@ -66,6 +119,7 @@ pub const ReviewKey = struct {
 
 pub const Dependencies = struct {
     reviews: bbr.review.PendingReviewStore,
+    anchor_resolver: ?bbr.review.AnchorResolver = null,
     submission_locks: ?bbr.review.SubmissionLocks = null,
     highlight_max_file_bytes: usize = 0,
     file_cache_enabled: bool = true,
@@ -313,7 +367,7 @@ pub const LoadSession = struct {
     cause: SessionLoadCause = .picker,
 };
 
-pub const SessionLoadCause = enum { picker, reconciliation };
+pub const SessionLoadCause = enum { picker, refresh, reconciliation };
 
 fn BoundedText(comptime capacity: usize) type {
     return struct {
@@ -337,7 +391,7 @@ pub const EnrichFile = struct {
     work_id: WorkId,
     session_epoch: SessionEpoch,
     file_index: usize,
-    repo: BoundedText(256),
+    source: EnrichmentSource,
     source_commit: BoundedText(64),
     destination_commit: BoundedText(64),
     old_path: BoundedText(512),
@@ -346,7 +400,10 @@ pub const EnrichFile = struct {
     max_file_bytes: usize,
 
     pub fn repository(self: *const EnrichFile) []const u8 {
-        return self.repo.slice();
+        return switch (self.source) {
+            .remote => |*repo| repo.slice(),
+            .local => "",
+        };
     }
 
     pub fn newPath(self: *const EnrichFile) []const u8 {
@@ -355,7 +412,7 @@ pub const EnrichFile = struct {
 
     pub fn request(self: *const EnrichFile) file_enrichment.Request {
         return .{
-            .repo = self.repo.slice(),
+            .repo = self.repository(),
             .status = self.status,
             .source_commit = self.source_commit.slice(),
             .destination_commit = self.destination_commit.slice(),
@@ -364,6 +421,11 @@ pub const EnrichFile = struct {
             .max_file_bytes = self.max_file_bytes,
         };
     }
+};
+
+pub const EnrichmentSource = union(enum) {
+    remote: BoundedText(256),
+    local,
 };
 
 /// Self-owned network payload. It remains valid if the originating Session is
@@ -418,8 +480,10 @@ pub const OwnedCommand = union(enum) {
 
 pub const ReviewProjection = struct {
     key: ReviewKey,
+    identity: bbr.review.ReviewIdentity,
     session_epoch: SessionEpoch,
-    pull_request: *const bbr.bitbucket.PullRequest,
+    header: session_mod.ReviewHeader,
+    pull_request: ?*const bbr.bitbucket.PullRequest,
     diff: *const bbr.diff.Diff,
     threads: []const bbr.review.Thread,
     drafts: []const bbr.review.Draft,
@@ -438,6 +502,7 @@ pub const Projection = struct {
     unknown_resolution: ?UnknownResolutionProjection,
     picker: ?*const Picker,
     help_visible: bool,
+    action_availability: ActionAvailability,
     loading_pull_request_id: ?u64,
     composer: ?ComposerProjection,
     replacing: bool,
@@ -445,6 +510,18 @@ pub const Projection = struct {
     action_error: ?ActionError,
     fatal_error: ?FatalError,
     shutting_down: bool,
+};
+
+pub const ActionAvailability = struct {
+    remote: bool,
+
+    pub fn available(self: ActionAvailability, action: Action) bool {
+        if (self.remote) return true;
+        return switch (action) {
+            .open_picker, .submit, .recover_submission, .resolve_unpublished, .link_existing_comment => false,
+            else => true,
+        };
+    }
 };
 
 pub const SubmissionProjection = struct {
@@ -495,6 +572,9 @@ pub const ActionError = enum {
     recovery_source_changed,
     duplicate_check_failed,
     picker_load_failed,
+    local_review_no_picker,
+    local_review_no_submission,
+    local_review_remote_action_unavailable,
 };
 
 const BufferTransactionError = error{ BufferBuildFailed, OutOfMemory };
@@ -533,6 +613,7 @@ const Published = struct {
     session: *Session,
     review_arena: std.heap.ArenaAllocator,
     review: bbr.review.PendingReview,
+    anchor_projection: std.ArrayList(bbr.review.AnchorProjectionEntry),
     buffers: ArenaRing(2),
     buffer: bbr.diff.Buffer,
     navigation: Nav,
@@ -544,6 +625,7 @@ const Published = struct {
     fn create(
         allocator: Allocator,
         store: bbr.review.PendingReviewStore,
+        anchor_resolver: ?bbr.review.AnchorResolver,
         key: ReviewKey,
         epoch: SessionEpoch,
         session: *Session,
@@ -565,6 +647,26 @@ const Published = struct {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return error.PendingReviewLoadFailed;
         };
+        const expected_target: bbr.review.CommentTarget = if (key.isRemote()) .bitbucket else .local;
+        for (published.review.drafts.items) |draft| {
+            if (draft.target != expected_target) return error.PendingReviewLoadFailed;
+        }
+        published.anchor_projection = .empty;
+        if (!key.isRemote()) {
+            for (published.review.drafts.items) |draft| {
+                if (draft.parent != null) continue;
+                const anchor = draft.anchor orelse continue;
+                const current_commit = if (anchor.to != null) session.header.source_commit else session.header.base_commit;
+                const resolution: bbr.review.AnchorResolution = if (anchor_resolver) |resolver|
+                    resolver.resolve(published.review_arena.allocator(), anchor, current_commit) catch .unavailable
+                else
+                    .unavailable;
+                try published.anchor_projection.append(published.review_arena.allocator(), .{
+                    .temp_id = draft.local_id,
+                    .resolution = resolution,
+                });
+            }
+        }
         published.buffers = ArenaRing(2).init(allocator);
         errdefer published.buffers.deinit();
         published.expanded_folds = .empty;
@@ -586,6 +688,7 @@ const Published = struct {
             session.threads,
             .{
                 .drafts = published.review.drafts.items,
+                .anchor_projections = published.anchor_projection.items,
                 .blobs = enrichment.blobs,
                 .highlights = enrichment.highlights,
                 .show_resolved = preferences.show_resolved,
@@ -615,8 +718,10 @@ const Published = struct {
     fn projection(self: *const Published, preferences: Preferences) ReviewProjection {
         return .{
             .key = self.key,
+            .identity = self.key.identity(),
             .session_epoch = self.epoch,
-            .pull_request = &self.session.pr,
+            .header = self.session.header,
+            .pull_request = self.session.remotePullRequestConst(),
             .diff = &self.session.diff,
             .threads = self.session.threads,
             .drafts = self.review.drafts.items,
@@ -654,13 +759,19 @@ const Published = struct {
         new_draft: bbr.review.NewDraft,
     ) SaveDraftError!void {
         const review_allocator = self.review_arena.allocator();
+        const reserved_id = store.reserveTempId(self.key.storeKey()) catch return error.PersistenceFailed;
         try self.review.drafts.ensureUnusedCapacity(review_allocator, 1);
 
         var draft: bbr.review.Draft = .{
-            .local_id = self.review.next_id,
+            .local_id = reserved_id,
             .kind = new_draft.kind,
             .target = new_draft.target,
             .parent = new_draft.parent,
+            .snapshot = if (new_draft.snapshot) |snapshot| .{
+                .text = try review_allocator.dupe(u8, snapshot.text),
+                .selection_start = snapshot.selection_start,
+                .selection_len = snapshot.selection_len,
+            } else null,
             .body = if (new_draft.kind == .suggestion)
                 try std.fmt.allocPrint(review_allocator, "```suggestion\n{s}\n```", .{new_draft.body})
             else
@@ -673,11 +784,20 @@ const Published = struct {
         }
 
         const previous_len = self.review.drafts.items.len;
+        const previous_projection_len = self.anchor_projection.items.len;
+        const previous_next_id = self.review.next_id;
         self.review.drafts.appendAssumeCapacity(draft);
-        self.review.next_id += 1;
+        self.review.next_id = @max(self.review.next_id, reserved_id + 1);
         errdefer {
             self.review.drafts.shrinkRetainingCapacity(previous_len);
-            self.review.next_id -= 1;
+            self.anchor_projection.shrinkRetainingCapacity(previous_projection_len);
+            self.review.next_id = previous_next_id;
+        }
+        if (!self.key.isRemote() and draft.parent == null and draft.anchor != null) {
+            self.anchor_projection.append(review_allocator, .{
+                .temp_id = draft.local_id,
+                .resolution = .{ .resolved = .{ .state = .current, .anchor = draft.anchor.? } },
+            }) catch return error.OutOfMemory;
         }
 
         var staged = try self.prepareBuffer(preferences, self.expanded_folds.items, self.isolated_file);
@@ -706,6 +826,7 @@ const Published = struct {
                 .whole_file = preferences.scope == .whole,
                 .expanded = expanded_folds,
                 .drafts = self.review.drafts.items,
+                .anchor_projections = self.anchor_projection.items,
                 .only_file = isolated_file,
                 .blobs = enrichment.blobs,
                 .highlights = enrichment.highlights,
@@ -1098,6 +1219,7 @@ pub const Presentation = struct {
             self.published = try Published.create(
                 allocator,
                 dependencies.reviews,
+                dependencies.anchor_resolver,
                 initial.key,
                 self.next_session_epoch,
                 initial.session,
@@ -1203,7 +1325,11 @@ pub const Presentation = struct {
             } else null,
             .picker = if (self.picker) |*picker| picker else null,
             .help_visible = self.help_visible,
-            .loading_pull_request_id = if (self.replacement) |replacement| replacement.key.pull_request_id else null,
+            .action_availability = .{ .remote = if (self.published) |published| published.key.isRemote() else true },
+            .loading_pull_request_id = if (self.replacement) |replacement|
+                if (replacement.key.isRemote()) replacement.key.pull_request_id else null
+            else
+                null,
             .composer = if (self.published) |published| if (published.composer) |*composer| .{
                 .label = composer.request.label,
                 .body = composer.body(),
@@ -1478,6 +1604,20 @@ pub const Presentation = struct {
             self.requestShutdown();
             return;
         }
+        const visible_key = if (self.published) |published|
+            published.key
+        else if (self.replacement) |replacement|
+            replacement.key
+        else
+            null;
+        if (visible_key) |key| if (!(ActionAvailability{ .remote = key.isRemote() }).available(action)) {
+            self.action_error = switch (action) {
+                .open_picker => .local_review_no_picker,
+                .submit => .local_review_no_submission,
+                else => .local_review_remote_action_unavailable,
+            };
+            return;
+        };
         if (self.shutdown_requested) {
             if (action == .submit) self.resumeDurableSubmission();
             return;
@@ -1527,6 +1667,7 @@ pub const Presentation = struct {
                 candidate.show_resolved = !candidate.show_resolved;
                 self.publishPreferences(published, candidate);
             },
+            .refresh => self.queueRefresh(published.key),
             .toggle_layout => {
                 var candidate = self.preferences;
                 candidate.layout = if (candidate.layout == .unified) .side_by_side else .unified;
@@ -1632,6 +1773,10 @@ pub const Presentation = struct {
     }
 
     fn startSubmission(self: *Presentation, published: *Published) void {
+        if (!published.key.isRemote()) {
+            self.action_error = .local_review_no_submission;
+            return;
+        }
         if (self.durable_submission) |durable| {
             if (durable.phase == .post_retry_paused) {
                 self.resumePostDraftLaunch(durable);
@@ -1668,7 +1813,7 @@ pub const Presentation = struct {
             return;
         };
         const source_check = if (self.dependencies.require_source_check)
-            BoundedText(64).init(published.session.pr.source_commit) catch {
+            BoundedText(64).init(published.session.header.source_commit) catch {
                 self.action_error = .submission_start_failed;
                 return;
             }
@@ -1678,7 +1823,7 @@ pub const Presentation = struct {
             self.allocator,
             self.dependencies.reviews,
             published.key,
-            published.session.pr.source_commit,
+            published.session.header.source_commit,
             lock,
         ) catch |err| {
             self.action_error = if (err == error.SubmissionAlreadyActive) .submission_already_active else .submission_start_failed;
@@ -1978,7 +2123,9 @@ pub const Presentation = struct {
     fn openComposer(self: *Presentation, published: *Published, request: composer_mod.Request) void {
         if (published.composer != null) return;
         _ = published.composer_arena.reset(.retain_capacity);
-        published.composer = Composer.init(published.composer_arena.allocator(), request);
+        var targeted = request;
+        targeted.target = if (published.key.isRemote()) .bitbucket else .local;
+        published.composer = Composer.init(published.composer_arena.allocator(), targeted);
         self.action_error = null;
     }
 
@@ -2028,7 +2175,10 @@ pub const Presentation = struct {
             self.action_error = .invalid_selection;
             return;
         };
-        const path = published.session.diff.files[file_index].new_path;
+        const file = published.session.diff.files[file_index];
+        const old_side = span.to == null;
+        const path = if (old_side) file.old_path else file.new_path;
+        const authored_commit = if (old_side) published.session.header.base_commit else published.session.header.source_commit;
         const anchor: bbr.review.Anchor = .{
             .path = allocator.dupe(u8, path) catch {
                 self.action_error = .out_of_memory;
@@ -2038,7 +2188,7 @@ pub const Presentation = struct {
             .to = span.to,
             .start_from = span.start_from,
             .start_to = span.start_to,
-            .commit = allocator.dupe(u8, published.session.pr.source_commit) catch {
+            .commit = allocator.dupe(u8, authored_commit) catch {
                 self.action_error = .out_of_memory;
                 return;
             },
@@ -2053,7 +2203,17 @@ pub const Presentation = struct {
             self.action_error = .out_of_memory;
             return;
         };
-        published.composer = Composer.init(allocator, .{ .kind = kind, .anchor = anchor, .label = label });
+        const snapshot = if (!published.key.isRemote()) captureAnchorSnapshot(allocator, file, lines.items) catch {
+            self.action_error = .out_of_memory;
+            return;
+        } else null;
+        published.composer = Composer.init(allocator, .{
+            .kind = kind,
+            .target = if (published.key.isRemote()) .bitbucket else .local,
+            .anchor = anchor,
+            .snapshot = snapshot,
+            .label = label,
+        });
         if (kind == .suggestion) {
             var seed: std.ArrayList(u8) = .empty;
             for (lines.items, 0..) |line, index| {
@@ -2135,15 +2295,18 @@ pub const Presentation = struct {
             .work_id = work_id,
             .session_epoch = published.epoch,
             .file_index = file_index,
-            .repo = BoundedText(256).init(published.key.repository()) catch {
+            .source = switch (published.key.kind) {
+                .remote => .{ .remote = BoundedText(256).init(published.key.repository()) catch {
+                    self.action_error = .action_refused;
+                    return;
+                } },
+                .local => .local,
+            },
+            .source_commit = BoundedText(64).init(published.session.header.source_commit) catch {
                 self.action_error = .action_refused;
                 return;
             },
-            .source_commit = BoundedText(64).init(published.session.pr.source_commit) catch {
-                self.action_error = .action_refused;
-                return;
-            },
-            .destination_commit = BoundedText(64).init(published.session.pr.destination_commit) catch {
+            .destination_commit = BoundedText(64).init(published.session.header.base_commit) catch {
                 self.action_error = .action_refused;
                 return;
             },
@@ -2312,14 +2475,18 @@ pub const Presentation = struct {
     }
 
     fn openPicker(self: *Presentation) void {
-        if (!self.dependencies.remote_enabled) {
-            self.action_error = .action_refused;
-            return;
-        }
         const key = if (self.published) |published| published.key else if (self.replacement) |replacement| replacement.key else {
             self.action_error = .action_refused;
             return;
         };
+        if (!key.isRemote()) {
+            self.action_error = .local_review_no_picker;
+            return;
+        }
+        if (!self.dependencies.remote_enabled) {
+            self.action_error = .action_refused;
+            return;
+        }
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
             self.action_error = .out_of_memory;
             return;
@@ -2408,6 +2575,20 @@ pub const Presentation = struct {
         self.replacement_error = null;
     }
 
+    fn queueRefresh(self: *Presentation, key: ReviewKey) void {
+        const intent = self.next_intent + 1;
+        self.commands.ensureTotalCapacity(self.allocator, self.commands.items.len + 1) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        self.removeQueuedSessionLoads();
+        self.commands.appendAssumeCapacity(.{ .load_session = .{ .intent = intent, .key = key, .cause = .refresh } });
+        self.next_intent = intent;
+        self.replacement = .{ .intent = intent, .key = key };
+        self.replacement_error = null;
+        self.action_error = null;
+    }
+
     fn removeQueuedSessionLoads(self: *Presentation) void {
         var write: usize = 0;
         for (self.commands.items) |command| {
@@ -2439,6 +2620,7 @@ pub const Presentation = struct {
                 const candidate = Published.create(
                     self.allocator,
                     self.dependencies.reviews,
+                    self.dependencies.anchor_resolver,
                     replacement.key,
                     epoch,
                     session,
@@ -2476,6 +2658,34 @@ fn recoveryMatches(notice: RecoveryNotice, active: bbr.review.ActiveSubmissionRu
         ReviewKey.eql(notice.key, ReviewKey.init(active.key.workspace, active.key.repository, active.key.pull_request_id) catch return false) and
         notice.current_temp_id == active.current_temp_id and
         std.mem.eql(u8, notice.source_commit.slice(), active.source_commit);
+}
+
+fn captureAnchorSnapshot(allocator: Allocator, file: bbr.diff.File, selected: []const *const bbr.diff.Line) !?bbr.review.AnchorSnapshot {
+    if (selected.len == 0) return null;
+    for (file.hunks) |hunk| {
+        var first: ?usize = null;
+        var last: ?usize = null;
+        for (hunk.lines, 0..) |*line, index| {
+            for (selected) |candidate| if (candidate == line) {
+                if (first == null) first = index;
+                last = index;
+            };
+        }
+        if (first == null or last == null) continue;
+        const start = first.? -| 3;
+        const end = @min(hunk.lines.len, last.? + 4);
+        var text: std.ArrayList(u8) = .empty;
+        for (hunk.lines[start..end], 0..) |line, index| {
+            if (index > 0) try text.append(allocator, '\n');
+            try text.appendSlice(allocator, line.text);
+        }
+        return .{
+            .text = try text.toOwnedSlice(allocator),
+            .selection_start = @intCast(first.? - start),
+            .selection_len = @intCast(last.? - first.? + 1),
+        };
+    }
+    return null;
 }
 
 fn normalizeActionError(err: BufferTransactionError) ActionError {
@@ -2590,7 +2800,7 @@ fn testSession(backing: std.mem.Allocator, id: u64, marker: u8) !*session_mod.Se
         "diff --git a/{c}.zig b/{c}.zig\n--- a/{c}.zig\n+++ b/{c}.zig\n@@ -1 +1 @@\n-old\n+new\n",
         .{ marker, marker, marker, marker },
     );
-    s.pr = .{
+    const pr: bbr.bitbucket.PullRequest = .{
         .id = id,
         .title = try std.fmt.allocPrint(a, "PR {d}", .{id}),
         .state = "OPEN",
@@ -2600,16 +2810,114 @@ fn testSession(backing: std.mem.Allocator, id: u64, marker: u8) !*session_mod.Se
         .source_commit = "source",
         .destination_commit = "destination",
     };
+    s.source = .{ .remote = pr };
+    s.header = .{
+        .title = pr.title,
+        .source_ref = pr.source_branch,
+        .base_ref = pr.destination_branch,
+        .source_commit = pr.source_commit,
+        .base_commit = pr.destination_commit,
+        .author = pr.author_display_name,
+        .locator = "repo",
+        .source_label = "Bitbucket",
+        .pull_request_id = pr.id,
+    };
     s.diff = try bbr.diff.parse(a, raw);
     try s.initializeEnrichment();
     return s;
+}
+
+fn testLocalSession(backing: std.mem.Allocator) !*session_mod.Session {
+    const s = try session_mod.create(backing);
+    errdefer s.destroy();
+    const a = s.arena.allocator();
+    s.source = .{ .local = .{ .common_dir = "/repo/.git" } };
+    s.header = .{
+        .title = "Local review",
+        .source_ref = "refs/heads/feature",
+        .base_ref = "refs/remotes/origin/main",
+        .source_commit = "source",
+        .base_commit = "base",
+        .locator = "/repo",
+        .source_label = "Git",
+    };
+    s.diff = try bbr.diff.parse(a,
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    );
+    try s.initializeEnrichment();
+    return s;
+}
+
+test "local review gates remote actions and refreshes the same identity" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try ReviewKey.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testLocalSession(testing.allocator) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    const initial = presentation.projection();
+    try testing.expect(initial.review.?.pull_request == null);
+    try testing.expectEqual(@as(bbr.review.ReviewRepositoryId, 42), initial.review.?.identity.local.repository_id);
+    try testing.expectEqualStrings("refs/remotes/origin/main", initial.review.?.identity.local.base_ref);
+    try testing.expectEqualStrings("refs/heads/feature", initial.review.?.identity.local.source_ref);
+    try testing.expect(!initial.action_availability.available(.open_picker));
+    try testing.expect(!initial.action_availability.available(.submit));
+
+    try presentation.dispatch(.{ .action = .open_picker });
+    try testing.expectEqual(ActionError.local_review_no_picker, presentation.projection().action_error.?);
+    try testing.expect(presentation.takeCommand() == null);
+    try presentation.dispatch(.{ .action = .submit });
+    try testing.expectEqual(ActionError.local_review_no_submission, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .action = .recover_submission });
+    try testing.expectEqual(ActionError.local_review_remote_action_unavailable, presentation.projection().action_error.?);
+
+    try presentation.dispatch(.{ .action = .refresh });
+    const refresh = presentation.takeCommand().?.load_session;
+    try testing.expectEqual(SessionLoadCause.refresh, refresh.cause);
+    try testing.expect(ReviewKey.eql(key, refresh.key));
+}
+
+test "local inline authoring persists a local target and authored context" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try ReviewKey.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testLocalSession(testing.allocator) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .inline_comment });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("remember this") } });
+    try presentation.dispatch(.{ .composer = .save });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try store.store().load(arena.allocator(), key.storeKey());
+    try testing.expectEqual(@as(usize, 1), drafts.len);
+    try testing.expectEqual(bbr.review.CommentTarget.local, drafts[0].target);
+    try testing.expectEqualStrings("source", drafts[0].anchor.?.commit.?);
+    try testing.expectEqualStrings("old\nnew", drafts[0].snapshot.?.text);
+    try testing.expectEqual(@as(u32, 1), drafts[0].snapshot.?.selection_start);
+    try testing.expectEqual(@as(u32, 1), drafts[0].snapshot.?.selection_len);
 }
 
 fn testTwoFileSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
     const s = try session_mod.create(backing);
     errdefer s.destroy();
     const a = s.arena.allocator();
-    s.pr = .{
+    const pr: bbr.bitbucket.PullRequest = .{
         .id = id,
         .title = "Two files",
         .state = "OPEN",
@@ -2618,6 +2926,18 @@ fn testTwoFileSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session
         .destination_branch = "main",
         .source_commit = "source",
         .destination_commit = "destination",
+    };
+    s.source = .{ .remote = pr };
+    s.header = .{
+        .title = pr.title,
+        .source_ref = pr.source_branch,
+        .base_ref = pr.destination_branch,
+        .source_commit = pr.source_commit,
+        .base_commit = pr.destination_commit,
+        .author = pr.author_display_name,
+        .locator = "repo",
+        .source_label = "Bitbucket",
+        .pull_request_id = pr.id,
     };
     s.diff = try bbr.diff.parse(a,
         \\diff --git a/a.zig b/a.zig
@@ -2664,7 +2984,7 @@ test "failed replacement Buffer construction preserves the published review" {
 
     try testing.expect(failing.has_induced_failure);
     const after = presentation.projection();
-    try testing.expectEqual(@as(u64, 1), after.review.?.pull_request.id);
+    try testing.expectEqual(@as(u64, 1), after.review.?.pull_request.?.id);
     try testing.expectEqual(before.session_epoch, after.review.?.session_epoch);
     try testing.expectEqual(before.buffer.rows.ptr, after.review.?.buffer.rows.ptr);
     try testing.expect(std.meta.eql(before.navigation, after.review.?.navigation));
@@ -2712,7 +3032,7 @@ test "a complete candidate publishes atomically and advances the Session Epoch" 
     } });
 
     const after = presentation.projection();
-    try testing.expectEqual(@as(u64, 2), after.review.?.pull_request.id);
+    try testing.expectEqual(@as(u64, 2), after.review.?.pull_request.?.id);
     try testing.expectEqual(before.session_epoch + 1, after.review.?.session_epoch);
     try testing.expect(after.review.?.buffer.rows.ptr != before.buffer.rows.ptr);
     try testing.expect(!after.replacing);
@@ -2776,7 +3096,7 @@ test "a stale candidate is disposed and the latest failure restores the exact pu
     } });
 
     const after = presentation.projection();
-    try testing.expectEqual(@as(u64, 1), after.review.?.pull_request.id);
+    try testing.expectEqual(@as(u64, 1), after.review.?.pull_request.?.id);
     try testing.expectEqual(before.session_epoch, after.review.?.session_epoch);
     try testing.expectEqual(before.buffer.rows.ptr, after.review.?.buffer.rows.ptr);
     try testing.expect(std.meta.eql(before.navigation, after.review.?.navigation));
@@ -3254,7 +3574,7 @@ test "matching File Enrichment is admitted and reprojects whole-file Buffer" {
         .intent = replacement.intent,
         .outcome = .{ .failed = error.NotFound },
     } });
-    try testing.expectEqual(@as(u64, 1), presentation.projection().review.?.pull_request.id);
+    try testing.expectEqual(@as(u64, 1), presentation.projection().review.?.pull_request.?.id);
     try testing.expect(presentation.projection().review.?.buffer.rows.len > before_rows);
 }
 
@@ -3315,7 +3635,7 @@ test "stale File Enrichment is disposed without mutating the replacement Session
     } });
 
     const after = presentation.projection();
-    try testing.expectEqual(@as(u64, 2), after.review.?.pull_request.id);
+    try testing.expectEqual(@as(u64, 2), after.review.?.pull_request.?.id);
     try testing.expectEqual(before.buffer.rows.ptr, after.review.?.buffer.rows.ptr);
     try testing.expect(after.action_error == null);
 }
@@ -3895,7 +4215,7 @@ test "Submission persistence failure publishes no command and releases ownership
     defer presentation.deinit();
     var long_commit: [4096]u8 = undefined;
     @memset(&long_commit, 'a');
-    presentation.published.?.session.pr.source_commit = &long_commit;
+    presentation.published.?.session.header.source_commit = &long_commit;
     failing.fail_index = failing.alloc_index;
 
     try presentation.dispatch(.{ .action = .submit });

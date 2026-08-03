@@ -53,6 +53,15 @@ pub const Anchor = struct {
     }
 };
 
+/// Immutable fallback evidence captured when a local root Draft is authored.
+/// `text` contains the selected range plus up to three surrounding lines;
+/// `selection_start` is the zero-based first selected line within that text.
+pub const AnchorSnapshot = struct {
+    text: []const u8,
+    selection_start: u32,
+    selection_len: u32,
+};
+
 /// A piece of authored prose on a PullRequest, optionally anchored and optionally
 /// a Reply. The generic term; a Thread gives it its display role.
 pub const Comment = struct {

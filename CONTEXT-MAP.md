@@ -28,7 +28,7 @@ bbr reviews changes from one of two sources, sharing all rendering and comment m
 - **Diff ↔ Review**: a comment's **Anchor** references a `File` path + Line numbers + the commit it was authored on. Review computes AnchorState (current/moved/outdated) — trusting Bitbucket for remote comments, diff-walking via Git for local comments and drafts.
 - **Diff → Presentation**: Presentation projects one Diff `Buffer` through a `Layout` × `Scope` matrix. No second data source.
 - **Diff → Highlighting**: Highlighting colors both sides of a File's full content. A removed Line takes Spans from the old side, an added Line from the new side, and a context Line prefers the new side with old-side fallback; Presentation composes syntax foreground over diff background per cell, styled by the active `Theme`.
-- **Shared kernel**: `Anchor`, `LineKind`, and identifier types (`PullRequestId`, `CommentId`, commit hash) are shared vocabulary across Git, Diff, and Review.
+- **Shared kernel**: `ReviewIdentity`, `Anchor`, `LineKind`, and identifier types (`PullRequestId`, `CommentId`, commit hash) are shared vocabulary across Git, Diff, Review, and Presentation. A ReviewIdentity is either a Repository-qualified PullRequest or a ReviewRepository-qualified BaseRef/SourceRef pair; a Session Epoch identifies one loaded snapshot of that Review.
 
 ## Seams (dependency-inversion boundaries)
 

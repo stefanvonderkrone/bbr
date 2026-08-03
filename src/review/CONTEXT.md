@@ -6,20 +6,34 @@ draft/pending concept, so this batching is entirely ours to model.
 
 ## Language
 
+**ReviewIdentity**:
+The durable identity of one Review: either a Workspace/Repository/PullRequestId for remote review or a ReviewRepository/BaseRef/SourceRef for local review. It survives Session replacement and never includes resolved commit hashes; a Session Epoch identifies a particular loaded snapshot.
+_Avoid_: ReviewKey, Session identity, commit pair.
+
 **Anchor**:
-The location a Comment attaches to: a File `path`, the **commit** it was authored against, plus line coordinates `{ from, to, start_from, start_to }`, where `from`/`start_from` are old-file lines and `to`/`start_to` are new-file lines. A range spans `start_*` → `from`/`to`. A Comment with no Anchor is a PR-level comment. Anchors also carry a few captured context lines so an outdated Comment stays legible.
+The location a Comment attaches to: a File `path`, the **commit** containing its anchored side, plus line coordinates `{ from, to, start_from, start_to }`, where `from`/`start_from` are old-file lines and `to`/`start_to` are new-file lines. In a LocalReview, an old-side Anchor binds to the resolved BaseRef commit and a new-side Anchor binds to the resolved SourceRef commit. A range spans `start_*` → `from`/`to`; captured context keeps an unresolved or outdated Comment legible.
 _Avoid_: position, location, target, ref.
 
 **AnchorState**:
-Where a Comment resolves against the currently viewed diff: `current` (line unchanged), `moved` (line shifted by surrounding edits), or `outdated` (line no longer exists). For remote Comments we trust Bitbucket's verdict; for local Comments and Drafts we compute it by diff-walking via the GitClient.
+The successful verdict for an Anchor against the currently viewed Diff: `current` (same path and coordinates), `moved` (Git proves the same Anchor at different coordinates or a renamed path), or `outdated` (the anchored content no longer exists). For remote Comments we trust Bitbucket's verdict; for local Comments and Drafts we compute it by diff-walking via the GitClient.
 _Avoid_: status, stale, dangling.
 
+**AnchorResolution**:
+The result of attempting to place an Anchor against the currently viewed Diff: either a resolved AnchorState or `unavailable` when required Git history or mapping evidence cannot be obtained. Unavailable never implies outdated and retains the Anchor's captured context.
+_Avoid_: AnchorState (only a successful verdict), unknown state, assumed outdated.
+
+An AnchorResolution is derived projection data, not durable authored state. For Drafts it lives in the Presentation-owned AnchorProjection keyed by root TempId; the PendingReview retains only the original Anchor and AnchorSnapshot. Replies inherit their root's projected placement.
+
+**AnchorSnapshot**:
+The immutable authored code stored with a root local Draft: its complete selected range plus three surrounding lines on each side. It keeps outdated or unavailable Anchors legible but never participates in mapping or silently changes an Anchor; Replies inherit their root Draft's snapshot.
+_Avoid_: fuzzy-match context, cached blob, projected source.
+
 **Outdated**:
-The `outdated` AnchorState. Outdated Comments are never hidden — Presentation shows them in a per-file collapsible using their captured context.
+The `outdated` AnchorState. Outdated Comments and Drafts are never hidden — Presentation shows them with their AnchorSnapshot in an always-expanded File or review-level section.
 _Avoid_: stale, orphaned, dead.
 
 **CommentTarget**:
-Where a Comment/Draft lives: `bitbucket` (syncs; Drafts submit) or `local` (persists only in SQLite, never submits). Set by the review mode.
+Where every Draft in one PendingReview lives: `bitbucket` (Drafts submit) or `local` (persists only in SQLite, never submits). It is an invariant of the Review mode; a PendingReview never mixes targets.
 _Avoid_: backend, sink, destination.
 
 **Comment**:
@@ -51,7 +65,7 @@ A Draft's lifecycle: `draft` → `submitting` → `posted` (carries the server-a
 _Avoid_: status, phase.
 
 **PendingReview**:
-The whole graph of Drafts for one PullRequest, persisted via the PendingReviewStore. Survives quit and file/PR switches.
+The whole graph of Drafts for one Review, with one CommentTarget, persisted via the PendingReviewStore. Survives quit and Review switches.
 _Avoid_: batch (that's the act), queue, staging.
 
 **Submission**:

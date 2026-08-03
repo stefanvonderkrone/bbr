@@ -15,6 +15,7 @@ const bbr = @import("bbr");
 const DraftKind = bbr.review.DraftKind;
 const CommentTarget = bbr.review.CommentTarget;
 const Anchor = bbr.review.Anchor;
+const AnchorSnapshot = bbr.review.comment.AnchorSnapshot;
 const Parent = bbr.review.draft.Parent;
 const NewDraft = bbr.review.NewDraft;
 
@@ -25,6 +26,7 @@ pub const Request = struct {
     kind: DraftKind,
     target: CommentTarget = .bitbucket,
     anchor: ?Anchor = null,
+    snapshot: ?AnchorSnapshot = null,
     parent: ?Parent = null,
     label: []const u8,
 };
@@ -108,6 +110,7 @@ pub const Composer = struct {
             .kind = self.request.kind,
             .target = self.request.target,
             .anchor = self.request.anchor,
+            .snapshot = self.request.snapshot,
             .parent = self.request.parent,
             .body = self.body(),
         };

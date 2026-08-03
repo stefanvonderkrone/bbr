@@ -40,6 +40,22 @@ pub const ReviewKey = struct {
 };
 
 pub const OperationId = u64;
+pub const ReviewRepositoryId = u64;
+
+/// Source-neutral domain identity. Commit hashes deliberately do not appear:
+/// advancing either Ref replaces the Session snapshot, not the Review.
+pub const ReviewIdentity = union(enum) {
+    remote: struct {
+        workspace: []const u8,
+        repository: []const u8,
+        pull_request_id: u64,
+    },
+    local: struct {
+        repository_id: ReviewRepositoryId,
+        base_ref: []const u8,
+        source_ref: []const u8,
+    },
+};
 
 pub const ActiveSubmissionRun = struct {
     operation_id: OperationId,
@@ -110,6 +126,8 @@ pub const PendingReviewStore = struct {
         complete_submission: *const fn (ptr: *anyopaque, operation_id: OperationId, key: ReviewKey, completion: SubmissionCompletion) anyerror!void,
         active_submission: *const fn (ptr: *anyopaque, allocator: Allocator) anyerror!?ActiveSubmissionRun,
         resolve_unknown: *const fn (ptr: *anyopaque, key: ReviewKey, temp_id: TempId, resolution: UnknownResolution) anyerror!void,
+        resolve_repository: *const fn (ptr: *anyopaque, aliases: []const []const u8) anyerror!ReviewRepositoryId,
+        reserve_temp_id: *const fn (ptr: *anyopaque, key: ReviewKey) anyerror!TempId,
     };
 
     pub fn put(self: PendingReviewStore, key: ReviewKey, draft: Draft) !void {
@@ -134,6 +152,14 @@ pub const PendingReviewStore = struct {
 
     pub fn resolveUnknown(self: PendingReviewStore, key: ReviewKey, temp_id: TempId, resolution: UnknownResolution) !void {
         return self.vtable.resolve_unknown(self.ptr, key, temp_id, resolution);
+    }
+
+    pub fn resolveRepository(self: PendingReviewStore, aliases: []const []const u8) !ReviewRepositoryId {
+        return self.vtable.resolve_repository(self.ptr, aliases);
+    }
+
+    pub fn reserveTempId(self: PendingReviewStore, key: ReviewKey) !TempId {
+        return self.vtable.reserve_temp_id(self.ptr, key);
     }
 
     /// Persist one post's outcome and the next post intent as one transaction.
@@ -162,6 +188,10 @@ pub fn dupeDraft(alloc: Allocator, d: Draft) !Draft {
     var copy = d;
     copy.body = try alloc.dupe(u8, d.body);
     if (d.anchor) |anchor| copy.anchor = try dupeAnchor(alloc, anchor);
+    if (d.snapshot) |snapshot| {
+        copy.snapshot = snapshot;
+        copy.snapshot.?.text = try alloc.dupe(u8, snapshot.text);
+    }
     return copy;
 }
 
@@ -181,12 +211,17 @@ pub const InMemoryStore = struct {
     entries: std.ArrayList(Entry),
     active_submission: ?ActiveSubmissionRun = null,
     next_operation_id: OperationId = 1,
+    next_repository_id: ReviewRepositoryId = 1,
+    repository_aliases: std.ArrayList(RepositoryAlias) = .empty,
+    temp_counters: std.ArrayList(TempCounter) = .empty,
     /// Deterministic adapter fault injection for Presentation checkpoint tests.
     fail_next_checkpoint: bool = false,
     /// Deterministic adapter fault injection after a terminal checkpoint.
     fail_next_completion: bool = false,
 
     const Entry = struct { key: ReviewKey, draft: Draft };
+    const RepositoryAlias = struct { alias: []const u8, repository_id: ReviewRepositoryId };
+    const TempCounter = struct { key: ReviewKey, next_id: TempId };
 
     pub fn init(gpa: Allocator) InMemoryStore {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa), .entries = .empty };
@@ -195,6 +230,8 @@ pub const InMemoryStore = struct {
     pub fn deinit(self: *InMemoryStore) void {
         const gpa = self.arena.child_allocator;
         self.entries.deinit(gpa);
+        self.repository_aliases.deinit(gpa);
+        self.temp_counters.deinit(gpa);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -212,7 +249,57 @@ pub const InMemoryStore = struct {
         .complete_submission = completeSubmissionImpl,
         .active_submission = activeSubmissionImpl,
         .resolve_unknown = resolveUnknownImpl,
+        .resolve_repository = resolveRepositoryImpl,
+        .reserve_temp_id = reserveTempIdImpl,
     };
+
+    fn resolveRepositoryImpl(ptr: *anyopaque, aliases: []const []const u8) anyerror!ReviewRepositoryId {
+        const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        if (aliases.len == 0) return error.NoRepositoryAlias;
+        var resolved: ?ReviewRepositoryId = null;
+        for (aliases) |alias| for (self.repository_aliases.items) |entry| {
+            if (!std.mem.eql(u8, alias, entry.alias)) continue;
+            if (resolved != null and resolved.? != entry.repository_id) return error.RepositoryIdentityConflict;
+            resolved = entry.repository_id;
+        };
+        const id = resolved orelse blk: {
+            const fresh = self.next_repository_id;
+            self.next_repository_id += 1;
+            break :blk fresh;
+        };
+        for (aliases) |alias| {
+            var exists = false;
+            for (self.repository_aliases.items) |entry| if (std.mem.eql(u8, alias, entry.alias)) {
+                exists = true;
+                break;
+            };
+            if (!exists) try self.repository_aliases.append(self.arena.child_allocator, .{
+                .alias = try self.arena.allocator().dupe(u8, alias),
+                .repository_id = id,
+            });
+        }
+        return id;
+    }
+
+    fn reserveTempIdImpl(ptr: *anyopaque, key: ReviewKey) anyerror!TempId {
+        const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        for (self.temp_counters.items) |*counter| if (ReviewKey.eql(counter.key, key)) {
+            const id = counter.next_id;
+            counter.next_id += 1;
+            return id;
+        };
+        var next_id: TempId = 1;
+        for (self.entries.items) |entry| {
+            if (ReviewKey.eql(entry.key, key)) next_id = @max(next_id, entry.draft.local_id + 1);
+        }
+        const owned_key: ReviewKey = .{
+            .workspace = try self.arena.allocator().dupe(u8, key.workspace),
+            .repository = try self.arena.allocator().dupe(u8, key.repository),
+            .pull_request_id = key.pull_request_id,
+        };
+        try self.temp_counters.append(self.arena.child_allocator, .{ .key = owned_key, .next_id = next_id + 1 });
+        return next_id;
+    }
 
     fn putImpl(ptr: *anyopaque, key: ReviewKey, d: Draft) anyerror!void {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
@@ -685,4 +772,30 @@ test "aborted Submission restores the current Draft and closes partial" {
     try testing.expect((try store.activeSubmission(arena.allocator())) == null);
     const drafts = try store.load(arena.allocator(), key);
     try testing.expectEqual(ApiError.ServerError, drafts[0].state.failed);
+}
+
+test "repository aliases converge on one stable identity and conflicts refuse merging" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+    const remote = "remote:example.test/team/repo";
+    const common = "common:/work/repo/.git";
+    const id = try store.resolveRepository(&.{remote});
+    try testing.expectEqual(id, try store.resolveRepository(&.{ remote, common }));
+    try testing.expectEqual(id, try store.resolveRepository(&.{common}));
+
+    const other = try store.resolveRepository(&.{"remote:example.test/other/repo"});
+    try testing.expect(id != other);
+    try testing.expectError(error.RepositoryIdentityConflict, store.resolveRepository(&.{ remote, "remote:example.test/other/repo" }));
+}
+
+test "TempId reservation is monotonic and gaps remain valid" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+    const key = testReviewKey(77);
+    try testing.expectEqual(@as(TempId, 1), try store.reserveTempId(key));
+    try testing.expectEqual(@as(TempId, 2), try store.reserveTempId(key));
+    try store.put(key, .{ .local_id = 2, .kind = .top_level, .body = "second" });
+    try testing.expectEqual(@as(TempId, 3), try store.reserveTempId(key));
 }
