@@ -98,7 +98,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
     defer loop.stop();
     try loop.installResizeHandler();
     try vx.enterAltScreen(writer);
-    try state.dispatch(.{ .resize_viewport = vx.window().height });
+    try state.dispatch(.{ .resize_viewport = contentViewportRows(vx.window().height) });
 
     var futures: std.ArrayList(PresentationWork) = .empty;
     defer {
@@ -116,7 +116,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
             .key_press => |key| try state.dispatch(.{ .key = portableKey(key) }),
             .winsize => |winsize| {
                 try vx.resize(ctx.gpa, writer, winsize);
-                try state.dispatch(.{ .resize_viewport = vx.window().height });
+                try state.dispatch(.{ .resize_viewport = contentViewportRows(vx.window().height) });
             },
             .presentation_done => |done| {
                 reapPresentationWork(&futures, ctx.io, done.work_id);
@@ -139,7 +139,13 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
         const frame = frame_arena.allocator();
         if (projection.review) |review_projection| {
             const selected_file = fileIndexForRow(review_projection.buffer, review_projection.navigation.cursor);
-            render.drawReview(frame, win, review_projection, ctx.active_theme, selected_file);
+            const content_win = win.child(.{
+                .x_off = 0,
+                .y_off = 0,
+                .width = win.width,
+                .height = win.height -| 1,
+            });
+            render.drawReview(frame, content_win, review_projection, ctx.active_theme, selected_file);
             const status = presentationStatus(frame, projection, review_projection.key);
             drawStatus(
                 frame,
@@ -575,6 +581,10 @@ fn fileIndexForRow(buf: bbr.diff.Buffer, cursor: usize) usize {
     return idx;
 }
 
+fn contentViewportRows(window_rows: u16) usize {
+    return @max(window_rows -| 1, 1);
+}
+
 /// A one-line status bar across the bottom row. `frame` is the per-frame arena
 /// (outlives render); a stack buffer would dangle since cells borrow the text.
 fn drawStatus(
@@ -643,4 +653,10 @@ test {
     _ = @import("arena_ring.zig");
     _ = @import("composer.zig");
     _ = @import("file_enrichment.zig");
+}
+
+test "content viewport reserves the bottom status row" {
+    try std.testing.expectEqual(@as(usize, 9), contentViewportRows(10));
+    try std.testing.expectEqual(@as(usize, 1), contentViewportRows(1));
+    try std.testing.expectEqual(@as(usize, 1), contentViewportRows(0));
 }
