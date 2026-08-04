@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PROTOTYPE — M15 Pane and Overlay framing</title>
+  <style>
+    :root { color-scheme: dark; --bg:#1e1e2e; --fg:#cdd6f4; --muted:#7f84a2; --surface:#313244; --surface2:#45475a; --blue:#89b4fa; --green:#a6e3a1; --red:#f38ba8; --yellow:#f9e2af; --violet:#cba6f7; --teal:#94e2d5; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; background:#11111b; color:var(--fg); font:15px/1.25 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; display:grid; place-items:center; padding:28px 18px 92px; }
+    button { font:inherit; color:inherit; }
+    .stage { width:min(100%, 1280px); }
+    .prototype-note { color:var(--muted); margin:0 0 10px; font-size:12px; }
+    .terminal { width:100%; height:690px; max-height:calc(100vh - 150px); min-height:430px; margin:auto; background:var(--bg); border:1px solid #585b70; box-shadow:0 24px 70px #0009; overflow:hidden; position:relative; transition:width .2s; }
+    .terminal[data-width="80"] { width:min(100%, 900px); }
+    .terminal[data-width="56"] { width:min(100%, 650px); }
+    .chrome { height:28px; display:flex; align-items:center; gap:7px; padding:0 10px; background:#181825; border-bottom:1px solid #45475a; color:var(--muted); font-size:12px; }
+    .dot { width:9px; height:9px; border-radius:50%; background:#585b70; }
+    .app { height:calc(100% - 28px); display:grid; grid-template-rows:1fr 25px; }
+    .work { display:grid; grid-template-columns:29ch 1fr; min-height:0; position:relative; }
+    .sidebar,.diff { min-width:0; overflow:hidden; }
+    .pane-title { height:28px; display:flex; align-items:center; justify-content:space-between; padding:0 10px; color:var(--muted); font-size:12px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; white-space:nowrap; }
+    .tree,.code { white-space:nowrap; overflow:hidden; }
+    .tree-row { height:24px; padding:3px 8px; display:flex; gap:7px; align-items:center; }
+    .tree-row.active { background:var(--surface); color:#fff; font-weight:700; }
+    .tree-row .name { overflow:hidden; text-overflow:ellipsis; }
+    .tree-row .tally { margin-left:auto; flex:none; color:var(--yellow); }
+    .st-a{color:var(--green)} .st-m{color:var(--yellow)} .st-d{color:var(--red)}
+    .review-header { height:48px; padding:7px 12px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .review-header small { display:block; color:var(--muted); font-weight:400; margin-top:3px; }
+    .line { height:23px; padding:2px 10px; white-space:pre; overflow:hidden; text-overflow:clip; }
+    .line.add { background:#1f3a28; }.line.remove { background:#452028; }
+    .ln { display:inline-block; width:9ch; color:var(--muted); user-select:none; }
+    .kw{color:var(--violet)} .fn{color:var(--blue)} .str{color:var(--green)}
+    .comment { margin:3px 8px 4px 10ch; padding:6px 9px; color:#d9e0ff; background:#262638; }
+    .comment b { color:var(--blue); }
+    .section { height:29px; display:flex; align-items:center; color:var(--muted); font-weight:700; padding:0 10px; }
+    .status { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:0 10px; color:var(--muted); background:#181825; font-size:12px; white-space:nowrap; overflow:hidden; }
+    .status strong { color:var(--fg); }
+    .overlay-wrap { position:absolute; inset:0; display:grid; place-items:center; background:#11111b55; pointer-events:none; padding:12px; }
+    .overlay { width:min(72ch,84%); min-height:190px; max-height:75%; background:#20202d; overflow:hidden; pointer-events:auto; }
+    .overlay-head { height:31px; display:flex; align-items:center; justify-content:space-between; padding:0 10px; font-weight:700; }
+    .overlay-body { padding:9px 12px; }
+    .field { min-height:91px; padding:8px; color:#fff; background:#181825; }
+    .overlay-foot { padding:7px 10px; color:var(--muted); font-size:12px; }
+    .picker-row { padding:5px 8px; }.picker-row.active { background:var(--surface2); color:#fff; }
+    .keys { display:grid; grid-template-columns:1fr 1fr; gap:3px 18px; }.keys span:nth-child(odd){color:var(--blue)}
+
+    /* A — one strong divider, quiet content, single-line Overlay frames. */
+    .variant-a .work { column-gap:1px; background:var(--surface2); }
+    .variant-a .sidebar,.variant-a .diff { background:var(--bg); }
+    .variant-a .pane-title { border-bottom:1px solid var(--surface2); }
+    .variant-a .section::before,.variant-a .section::after { content:""; height:1px; background:var(--surface2); flex:1; }
+    .variant-a .section { gap:8px; }
+    .variant-a .overlay { border:1px solid var(--blue); box-shadow:0 8px 28px #000b; }
+    .variant-a .overlay-head { border-bottom:1px solid var(--surface2); color:var(--blue); }
+    .variant-a .overlay-foot { border-top:1px solid var(--surface2); }
+
+    /* B — each Pane is a visible box; overlays use a double frame. */
+    .variant-b .work { gap:1ch; padding:1ch; }
+    .variant-b .sidebar,.variant-b .diff { border:1px solid var(--muted); }
+    .variant-b .pane-title { color:var(--fg); border-bottom:1px solid var(--muted); }
+    .variant-b .review-header { border-bottom:1px solid var(--muted); }
+    .variant-b .section { margin:5px 8px; border:1px solid var(--surface2); height:27px; color:var(--yellow); }
+    .variant-b .overlay { border:3px double var(--violet); box-shadow:8px 8px 0 #11111b; }
+    .variant-b .overlay-head { color:var(--violet); border-bottom:3px double var(--violet); }
+    .variant-b .overlay-foot { border-top:1px solid var(--surface2); text-align:right; }
+
+    /* C — tinted navigation rail; content stays borderless; overlays use title/action bands. */
+    .variant-c .work { grid-template-columns:29ch 2px 1fr; background:var(--bg); }
+    .variant-c .work::after { content:""; grid-column:2; grid-row:1; background:var(--blue); opacity:.7; }
+    .variant-c .sidebar { grid-column:1; grid-row:1; background:#181825; }
+    .variant-c .diff { grid-column:3; grid-row:1; }
+    .variant-c .pane-title { color:var(--blue); }
+    .variant-c .section { color:var(--yellow); padding-top:8px; height:37px; }
+    .variant-c .section::before { content:"◆"; color:var(--yellow); margin-right:8px; font-size:10px; }
+    .variant-c .overlay { border:0; box-shadow:0 0 0 1px #11111b,0 16px 46px #000d; }
+    .variant-c .overlay-head { background:var(--blue); color:#11111b; }
+    .variant-c .overlay-foot { background:var(--surface); color:var(--fg); }
+
+    .switcher { position:fixed; z-index:10; left:50%; bottom:20px; transform:translateX(-50%); display:flex; align-items:center; gap:6px; padding:7px; background:#fafafa; color:#181825; border-radius:999px; box-shadow:0 8px 30px #000a; }
+    .switcher button { border:0; background:#e8e8ee; border-radius:999px; padding:7px 10px; cursor:pointer; }
+    .switcher button.active { background:#181825; color:#fff; }
+    .switcher .label { min-width:180px; text-align:center; font-weight:700; }
+    .switcher select { font:inherit; border:0; background:#e8e8ee; padding:7px; border-radius:999px; }
+    @media(max-width:720px){ body{padding-inline:4px}.terminal{height:620px}.work,.variant-c .work{grid-template-columns:19ch 1px 1fr}.tree-row{padding-inline:4px}.review-header{padding-inline:7px}.line{padding-inline:4px}.overlay{width:94%}.switcher{width:calc(100% - 12px);overflow:auto}.switcher .label{min-width:120px}.keys{grid-template-columns:1fr} }
+  </style>
+</head>
+<body>
+  <main class="stage">
+    <p class="prototype-note">THROWAWAY PROTOTYPE · Three framing systems on the same review surface, switchable via <code>?variant=A|B|C</code>.</p>
+    <section class="terminal" id="terminal" data-width="120">
+      <div class="chrome"><i class="dot"></i><i class="dot"></i><i class="dot"></i><span>bbr · PR #1842</span></div>
+      <div class="app">
+        <div class="work">
+          <aside class="sidebar">
+            <div class="pane-title"><span>Files</span><span>8 changed</span></div>
+            <div class="tree">
+              <div class="tree-row"><span>▾</span><span class="name">src/</span></div>
+              <div class="tree-row"><span>　▾</span><span class="name">tui/</span></div>
+              <div class="tree-row active"><span>　　<span class="st-m">M</span></span><span class="name">render.zig</span><span class="tally">●3 ✎1</span></div>
+              <div class="tree-row"><span>　　<span class="st-m">M</span></span><span class="name">theme.zig</span><span class="tally">●1</span></div>
+              <div class="tree-row"><span>　　<span class="st-a">A</span></span><span class="name">framing.zig</span></div>
+              <div class="tree-row"><span>　▸</span><span class="name">review/</span></div>
+              <div class="tree-row"><span>▾</span><span class="name">docs/adr/</span></div>
+              <div class="tree-row"><span>　<span class="st-a">A</span></span><span class="name">0011-pane-frames.md</span></div>
+            </div>
+          </aside>
+          <article class="diff">
+            <div class="pane-title"><span>Diff</span><span>unified · changes</span></div>
+            <div class="review-header">Polish presentation and navigation<small>feature/m15 → main · stefan · 8 files</small></div>
+            <div class="section">M src/tui/render.zig</div>
+            <div class="line"><span class="ln"> 41  41  </span><span class="kw">pub fn</span> <span class="fn">draw</span>(win: Window) void {</div>
+            <div class="line remove"><span class="ln"> 42      </span>-  <span class="fn">drawSidebar</span>(win);</div>
+            <div class="line add"><span class="ln">     42  </span>+  <span class="fn">drawFramedSidebar</span>(win, theme);</div>
+            <div class="line"><span class="ln"> 43  43  </span>   <span class="fn">drawDiff</span>(win);</div>
+            <div class="comment"><b>▸ maya</b> · The separator needs to survive narrow terminals without competing with diff bands.</div>
+            <div class="line"><span class="ln"> 44  44  </span>}</div>
+            <div class="section">▸ Outdated · src/tui/render.zig · 2 threads</div>
+            <div class="line"><span class="ln"> 61  61  </span><span class="kw">const</span> border = theme.pane_border;</div>
+          </article>
+          <div class="overlay-wrap" id="overlay-wrap">
+            <section class="overlay" id="overlay"></section>
+          </div>
+        </div>
+        <footer class="status"><span><strong>render.zig</strong> · 42/286 · changes</span><span>Tab pane · ? help · Esc close</span></footer>
+      </div>
+    </section>
+  </main>
+  <nav class="switcher" aria-label="Prototype controls">
+    <button id="prev" title="Previous variant">←</button>
+    <span class="label" id="variant-label"></span>
+    <button id="next" title="Next variant">→</button>
+    <select id="overlay-select" aria-label="Overlay"><option value="composer">Composer</option><option value="picker">Picker</option><option value="help">Help</option></select>
+    <select id="width-select" aria-label="Terminal width"><option value="120">120 col</option><option value="80">80 col</option><option value="56">56 col</option></select>
+  </nav>
+  <script>
+    const variants = {
+      A: 'Hairline split',
+      B: 'Framed Panes',
+      C: 'Navigation rail'
+    };
+    const terminal = document.querySelector('#terminal');
+    const label = document.querySelector('#variant-label');
+    const overlay = document.querySelector('#overlay');
+    const params = new URLSearchParams(location.search);
+    let current = variants[params.get('variant')] ? params.get('variant') : 'A';
+    let overlayKind = params.get('overlay') || 'composer';
+    let terminalWidth = params.get('width') || '120';
+    const overlayMarkup = {
+      composer: `<div class="overlay-head"><span>New inline comment</span><span>Esc</span></div><div class="overlay-body"><div class="field">Could we keep the frame role separate from the diff gutter?<br><br>│</div></div><div class="overlay-foot">Ctrl-D save draft · Esc cancel</div>`,
+      picker: `<div class="overlay-head"><span>Pull Request Picker</span><span>Esc</span></div><div class="overlay-body"><div class="field">› presentation polish<div class="picker-row active">#1842　Polish presentation and navigation</div><div class="picker-row">#1797　Fix narrow terminal rendering</div><div class="picker-row">#1726　Preserve outdated comments</div></div></div><div class="overlay-foot">↑↓ move · Enter open · Esc cancel</div>`,
+      help: `<div class="overlay-head"><span>Keybindings</span><span>any key closes</span></div><div class="overlay-body keys"><span>j / ↓</span><span>next row</span><span>k / ↑</span><span>previous row</span><span>Tab</span><span>switch Pane</span><span>Enter</span><span>toggle disclosure</span><span>p</span><span>open Picker</span><span>?</span><span>this help</span></div><div class="overlay-foot">Unavailable Actions remain visible in a muted Theme role.</div>`
+    };
+    function syncUrl(){ const p=new URLSearchParams({variant:current,overlay:overlayKind,width:terminalWidth}); history.replaceState({},'',`?${p}`); }
+    function render(){
+      terminal.className=`terminal variant-${current.toLowerCase()}`;
+      terminal.dataset.width=terminalWidth;
+      label.textContent=`${current} — ${variants[current]}`;
+      overlay.innerHTML=overlayMarkup[overlayKind];
+      document.querySelector('#overlay-select').value=overlayKind;
+      document.querySelector('#width-select').value=terminalWidth;
+      syncUrl();
+    }
+    function cycle(delta){ const ks=Object.keys(variants); current=ks[(ks.indexOf(current)+delta+ks.length)%ks.length]; render(); }
+    document.querySelector('#prev').onclick=()=>cycle(-1); document.querySelector('#next').onclick=()=>cycle(1);
+    document.querySelector('#overlay-select').onchange=e=>{overlayKind=e.target.value;render()};
+    document.querySelector('#width-select').onchange=e=>{terminalWidth=e.target.value;render()};
+    addEventListener('keydown',e=>{if(['INPUT','TEXTAREA'].includes(e.target.tagName)||e.target.isContentEditable)return;if(e.key==='ArrowLeft')cycle(-1);if(e.key==='ArrowRight')cycle(1)});
+    render();
+  </script>
+</body>
+</html>
