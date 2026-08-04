@@ -37,8 +37,12 @@ Where every Draft in one PendingReview lives: `bitbucket` (Drafts submit) or `lo
 _Avoid_: backend, sink, destination.
 
 **Comment**:
-A piece of authored prose on a PullRequest, optionally anchored. May be a root comment or a Reply. The generic term; prefer Thread/Reply/Suggestion when the role is specific.
+A piece of authored prose on a PullRequest, optionally scoped to a File or anchored to lines. May be a root comment or a Reply. The generic term; prefer Thread/Reply/Suggestion when the role is specific.
 _Avoid_: note, remark, message.
+
+**File-level Comment**:
+A root Comment scoped to one File as a whole, without line coordinates. It is distinct from both an inline Comment, whose Anchor identifies lines, and a PullRequest-level Comment, which belongs to no File.
+_Avoid_: whole-File Comment (confusable with the WholeFile Diff scope), unanchored inline Comment.
 
 **Thread**:
 A root Comment together with its ordered Replies, carrying a `resolved` flag. The unit the UI displays and collapses. Resolved Threads are hidden behind a toggle that reveals the *whole* Thread (comment + replies) — never a bare "a resolved comment exists" marker.

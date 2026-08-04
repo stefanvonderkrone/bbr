@@ -22,8 +22,12 @@ A tiled region of the screen with a defined role (Sidebar, DiffPane, ThreadPane)
 _Avoid_: window (reserved for vaxis's surface), view, panel.
 
 **Sidebar**:
-The persistent Pane listing the current PullRequest's Files, with change status and comment/draft counts.
-_Avoid_: file tree, nav, drawer.
+The persistent Pane containing the current review's File Tree, with change status and comment/draft counts.
+_Avoid_: nav, drawer.
+
+**File Tree**:
+The collapsible repository-path hierarchy shown inside the Sidebar. Its entries are Directories and Files.
+_Avoid_: Sidebar (the containing Pane), flat file list.
 
 **Overlay**:
 A floating surface drawn over the Panes — keybinding help, the PR picker, a comment composer. Dismissible; captures input while open.
