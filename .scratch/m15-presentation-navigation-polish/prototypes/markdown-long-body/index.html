@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>M15 Markdown and long-body prototype</title>
+  <style>
+    :root { color-scheme:dark; --bg:#090d12; --pane:#0e151c; --pane2:#131c25; --line:#273440; --text:#d8e2eb; --muted:#8393a2; --cyan:#73d2df; --blue:#82b7f2; --amber:#e6b35f; --green:#76c995; --red:#e07c7c; --purple:#c5a0ef; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; background:radial-gradient(circle at 50% -25%,#192b3b 0,var(--bg) 46%); color:var(--text); font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    header { max-width:1160px; margin:0 auto; padding:20px 22px 10px; display:flex; align-items:end; justify-content:space-between; gap:22px; }
+    h1 { margin:0 0 4px; font:650 18px/1.2 system-ui,sans-serif; }
+    header p { margin:0; color:var(--muted); }
+    kbd { border:1px solid #465767; border-bottom-width:2px; border-radius:4px; padding:1px 5px; background:#17222c; color:#d2dce5; }
+    main { max-width:1160px; margin:0 auto; padding:8px 22px 92px; display:grid; grid-template-columns:minmax(0,1fr) 248px; gap:14px; }
+    .terminal,.state { border:1px solid var(--line); border-radius:7px; background:rgba(10,15,21,.96); box-shadow:0 18px 48px #0008; overflow:hidden; }
+    .chrome { height:31px; display:flex; align-items:center; gap:7px; padding:0 11px; border-bottom:1px solid var(--line); background:#151e27; color:var(--muted); font-size:12px; }
+    .dot { width:8px; height:8px; border-radius:50%; background:#465461; }
+    .screen { min-height:650px; padding:8px 0 18px; overflow:hidden; }
+    .diff,.file,.hunk { min-height:24px; padding:3px 12px; white-space:pre; overflow:hidden; text-overflow:clip; }
+    .file { margin:5px 0; color:#e4edf5; background:#17212b; border-block:1px solid #23303c; }
+    .hunk { color:#91a9bd; background:#101b25; }
+    .diff { color:#aebac6; }
+    .diff.add { color:#adddbb; background:#10251a; }
+    .review { position:relative; margin:0; }
+    .review.focused { box-shadow:inset 3px 0 var(--cyan); }
+    .review-head { min-height:26px; padding:4px 12px; color:#dbe6ef; background:#17222c; }
+    .review-head .meta { color:var(--muted); }
+    .review-body { position:relative; }
+    .md-row { min-height:24px; padding:3px 18px 3px 36px; white-space:pre-wrap; overflow-wrap:anywhere; background:#121b23; }
+    .md-heading { color:#eef6fb; font-weight:700; }
+    .md-heading::before { content:'§ '; color:var(--cyan); }
+    .md-quote { color:#b4c0ca; border-left:2px solid #506170; padding-left:14px; }
+    .md-bullet::before { content:'• '; color:var(--cyan); }
+    .em { color:#f1f6fa; font-style:italic; }
+    .strong { color:#fff; font-weight:700; }
+    .link { color:var(--blue); text-decoration:underline; text-underline-offset:2px; }
+    .url { color:#6e91b3; }
+    .code { color:#d8c1ef; background:#191522; }
+    .suggestion { margin:3px 18px 3px 36px; border-left:3px solid var(--green); background:#10241a; }
+    .suggestion-label { padding:3px 9px; color:#9dddb1; border-bottom:1px solid #284833; }
+    .suggestion-line { min-height:23px; padding:2px 9px; color:#c4e9ce; white-space:pre; overflow:hidden; }
+    .disclose { width:100%; min-height:26px; border:0; border-top:1px solid #2b3945; padding:4px 16px 4px 36px; text-align:left; color:#9fb0bf; background:#10171e; font:inherit; cursor:pointer; }
+    .disclose:hover { color:#d9e3eb; }
+    .fade { height:18px; margin-top:-18px; position:relative; pointer-events:none; background:linear-gradient(transparent,#121b23); }
+    .state { align-self:start; position:sticky; top:12px; }
+    .state-body { padding:14px; }
+    .state h2 { margin:0 0 11px; font-size:13px; color:#f1f6fa; }
+    .state dl { margin:0; display:grid; grid-template-columns:1fr auto; gap:7px 10px; color:var(--muted); }
+    .state dd { margin:0; color:var(--text); }
+    .state .hint { border-top:1px solid var(--line); margin-top:14px; padding-top:12px; color:var(--muted); font-size:12px; }
+    .thresholds { display:flex; gap:5px; margin-top:9px; }
+    .thresholds button { flex:1; border:1px solid #354554; border-radius:4px; padding:4px; color:#aebdca; background:#17212a; font:inherit; cursor:pointer; }
+    .thresholds button.active { color:#0b141b; background:var(--cyan); border-color:var(--cyan); font-weight:700; }
+    .switcher { position:fixed; z-index:10; left:50%; bottom:18px; transform:translateX(-50%); display:flex; align-items:center; gap:8px; padding:7px; border:1px solid #586879; border-radius:999px; background:#e7edf3; color:#15202a; box-shadow:0 9px 30px #000a; font:650 13px/1 system-ui,sans-serif; }
+    .switcher button { width:34px; height:30px; border:0; border-radius:999px; background:#cbd6df; color:#17202a; cursor:pointer; font-size:18px; }
+    .variant-name { min-width:272px; text-align:center; }
+    /* A — continuous terminal-native flow */
+    .a .review { border-block:1px solid #24313c; }
+    .a .review-head { padding-left:18px; }
+    .a .review-head .kind { display:inline-block; width:18px; color:var(--cyan); }
+    /* B — bounded review cards */
+    .b .review { margin:7px 13px 9px 27px; border:1px solid #314251; border-radius:6px; overflow:hidden; background:#121b23; }
+    .b .review.focused { box-shadow:0 0 0 1px var(--cyan); }
+    .b .review-head { display:flex; justify-content:space-between; padding:6px 10px; background:#192632; }
+    .b .review-head .kind { color:var(--cyan); margin-right:7px; }
+    .b .md-row { padding-left:14px; padding-right:14px; }
+    .b .suggestion { margin:5px 12px; border:1px solid #31513a; border-left:4px solid var(--green); border-radius:4px; overflow:hidden; }
+    .b .disclose { padding-left:14px; background:#17232c; }
+    /* C — source-faithful outline */
+    .c .review { margin-left:25px; border-left:1px solid #40505d; }
+    .c .review.focused { border-left:3px solid var(--cyan); box-shadow:none; margin-left:23px; }
+    .c .review-head { background:transparent; color:#b9c7d2; padding-left:12px; }
+    .c .review-head .kind { color:var(--amber); margin-right:7px; }
+    .c .md-row { padding-left:20px; color:#b7c3cd; background:transparent; }
+    .c .md-heading::before { content:'# '; color:#75899a; }
+    .c .md-heading { color:#d6e0e8; }
+    .c .md-bullet::before { content:'- '; color:#75899a; }
+    .c .link { text-decoration:none; color:#a9c9e8; }
+    .c .suggestion { margin-left:20px; background:#111b17; }
+    .c .suggestion-label::before { content:'```'; color:#6d8b77; margin-right:5px; }
+    .c .suggestion-label::after { content:'```'; color:#6d8b77; float:right; }
+    .c .disclose { padding-left:20px; border-top:0; background:transparent; color:#7f93a3; }
+    @media (max-width:780px) { main { grid-template-columns:1fr; } .state { position:static; } header { align-items:start; flex-direction:column; } }
+  </style>
+</head>
+<body>
+  <!-- Three variants of Markdown and long-body presentation in the existing DiffPane, switchable via ?variant=. PROTOTYPE: throw away after the decision. -->
+  <header>
+    <div><h1>Markdown inside the DiffPane</h1><p>Rendered prose and Suggestions must remain navigable Buffer-owned rows.</p></div>
+    <p><kbd>j</kbd>/<kbd>k</kbd> item · <kbd>Enter</kbd> disclose · <kbd>t</kbd> threshold · <kbd>←</kbd>/<kbd>→</kbd> variant</p>
+  </header>
+  <main>
+    <section class="terminal" aria-label="Markdown and long-body presentation prototype">
+      <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span style="margin-left:6px">bbr · src/tui/render.zig · Changes · Unified</span></div>
+      <div class="screen" id="screen"></div>
+    </section>
+    <aside class="state">
+      <div class="chrome">PROTOTYPE STATE</div>
+      <div class="state-body">
+        <h2 id="variant-title"></h2>
+        <dl><dt>Focused item</dt><dd id="s-focus"></dd><dt>Long body</dt><dd id="s-long"></dd><dt>Threshold</dt><dd id="s-threshold"></dd><dt>Visible rows</dt><dd id="s-rows"></dd></dl>
+        <div class="thresholds" id="thresholds" aria-label="Collapsed row threshold"></div>
+        <div class="hint">Threshold means rendered body rows, not source lines or bytes. The disclosure row belongs to the same review item; Enter on any of its rows toggles the whole item.</div>
+      </div>
+    </aside>
+  </main>
+  <nav class="switcher" aria-label="Prototype variants"><button id="prev" aria-label="Previous variant">←</button><span class="variant-name" id="switch-label"></span><button id="next" aria-label="Next variant">→</button></nav>
+  <script>
+    const variants = {
+      A:{name:'Continuous rendered flow',cls:'a'},
+      B:{name:'Bounded review cards',cls:'b'},
+      C:{name:'Source-faithful outline',cls:'c'},
+    };
+    let key = new URLSearchParams(location.search).get('variant')?.toUpperCase();
+    if (!variants[key]) key='A';
+    let focused=0, expanded={0:false,1:false,2:true}, threshold=8;
+    const thresholds=[6,8,12];
+    const items=[
+      {author:'Mara',label:'comment · 4 min ago',kind:'▸',type:'comment',rows:[
+        ['heading','Why keep this state in Presentation?'],
+        ['text','The value is **Session-relative**, so rebuilding the Buffer must not discard it.'],
+        ['quote','A redraw is not a new Session.'],
+        ['text','The current implementation mixes the projection key with a screen row.'],
+        ['bullet','Key by the root Comment id.'],
+        ['bullet','Keep Markdown parsing independent of terminal width.'],
+        ['bullet','Wrap only while projecting display rows.'],
+        ['text','That also prevents narrow panes from changing disclosure identity.'],
+        ['heading','Pathological input'],
+        ['text','A pasted stack trace can be hundreds of lines long and drown out the surrounding Diff.'],
+        ['text','Collapse by rendered rows, preserve the author header, and show both hidden-row and total-row counts.'],
+        ['text','The expanded state should survive Buffer rebuilds within the current Session.'],
+        ['text','See [ADR-0004](docs/adr/0004-buffer-ownership.md) for the ownership boundary.'],
+        ['text','Finally, malformed Markdown must degrade to literal text rather than hiding content.'],
+      ]},
+      {author:'Bo',label:'reply · 1 min ago',kind:'↳',type:'reply',rows:[
+        ['text','Agreed. I would keep *emphasis* quiet, make **strong text** brighter, and show link destinations inline.'],
+        ['text','This stays readable even when OSC 8 links are unavailable.'],
+      ]},
+      {author:'you',label:'draft suggestion',kind:'±',type:'suggestion',rows:[
+        ['text','This avoids coupling the parser to screen coordinates:'],
+        ['suggestion','const body = try markdown.parse(arena, comment.body);\nconst rows = try project.wrap(body, pane_width);'],
+        ['text','The fence is structural: its contents render as code, never as prose Markdown.'],
+      ]},
+    ];
+    const escape=s=>s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+    function inline(s){
+      let out=escape(s);
+      out=out.replace(/\*\*(.+?)\*\*/g,'<span class="strong">$1</span>');
+      out=out.replace(/\*(.+?)\*/g,'<span class="em">$1</span>');
+      out=out.replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<span class="link">$1</span> <span class="url">‹$2›</span>');
+      return out;
+    }
+    function renderRow(row){
+      const [type,text]=row;
+      if(type==='suggestion') return `<div class="suggestion"><div class="suggestion-label">suggestion</div>${text.split('\n').map(x=>`<div class="suggestion-line">+ ${escape(x)}</div>`).join('')}</div>`;
+      const cls=type==='heading'?'md-heading':type==='quote'?'md-quote':type==='bullet'?'md-bullet':'';
+      return `<div class="md-row ${cls}">${inline(text)}</div>`;
+    }
+    function review(item,index){
+      const total=item.rows.reduce((n,r)=>n+(r[0]==='suggestion'?r[1].split('\n').length+1:1),0);
+      const open=expanded[index] || total<=threshold;
+      let used=0, visible=[];
+      for(const row of item.rows){ const size=row[0]==='suggestion'?row[1].split('\n').length+1:1; if(!open && used+size>threshold) break; visible.push(row); used+=size; }
+      const hidden=total-used;
+      const focus=index===focused?' focused':'';
+      const head=key==='B'
+        ? `<div><span class="kind">${item.kind}</span><strong>${item.author}</strong></div><span class="meta">${item.label}</span>`
+        : `<span class="kind">${item.kind}</span><strong>${item.author}</strong> <span class="meta">· ${item.label}</span>`;
+      return `<section class="review${focus}" data-index="${index}"><div class="review-head">${head}</div><div class="review-body">${visible.map(renderRow).join('')}${!open?'<div class="fade"></div>':''}</div>${total>threshold?`<button class="disclose" data-toggle="${index}">${open?'▾ collapse to '+threshold+' rows':'▸ '+hidden+' hidden rows · '+total+' total · enter to expand'}</button>`:''}</section>`;
+    }
+    function render(){
+      const v=variants[key];
+      document.getElementById('screen').className=`screen ${v.cls}`;
+      document.getElementById('variant-title').textContent=`${key} — ${v.name}`;
+      document.getElementById('switch-label').textContent=`${key} — ${v.name}`;
+      document.getElementById('screen').innerHTML=`<div class="file">M  src/tui/presentation.zig</div><div class="hunk">@@ -812,6 +819,12 @@ fn rebuildBuffer</div><div class="diff">  819   const old_cursor = self.nav.cursor;</div><div class="diff add">+ 820   const body_state = self.review_body_state;</div>${items.map(review).join('')}<div class="diff">  821   self.buffer = try buildProjection(...);</div><div class="diff add">+ 822   self.restoreReviewBodyState(body_state);</div>`;
+      document.querySelectorAll('[data-index]').forEach(el=>el.onclick=()=>{focused=Number(el.dataset.index);render();});
+      document.querySelectorAll('[data-toggle]').forEach(el=>el.onclick=e=>{e.stopPropagation();const i=Number(el.dataset.toggle);focused=i;expanded[i]=!expanded[i];render();});
+      document.getElementById('s-focus').textContent=`${items[focused].author} (${items[focused].type})`;
+      document.getElementById('s-long').textContent=expanded[0]?'expanded':'collapsed';
+      document.getElementById('s-threshold').textContent=`${threshold} rows`;
+      const visible=items.reduce((n,item,i)=>n+(expanded[i]?item.rows.length:Math.min(item.rows.length,threshold)),0);
+      document.getElementById('s-rows').textContent=visible;
+      document.getElementById('thresholds').innerHTML=thresholds.map(n=>`<button data-threshold="${n}" class="${n===threshold?'active':''}">${n}</button>`).join('');
+      document.querySelectorAll('[data-threshold]').forEach(el=>el.onclick=()=>{threshold=Number(el.dataset.threshold);render();});
+    }
+    function switchVariant(dir){const all=Object.keys(variants),i=all.indexOf(key);key=all[(i+dir+all.length)%all.length];history.replaceState({},'',`?variant=${key}`);render();}
+    function cycleThreshold(){threshold=thresholds[(thresholds.indexOf(threshold)+1)%thresholds.length];render();}
+    document.getElementById('prev').onclick=()=>switchVariant(-1);
+    document.getElementById('next').onclick=()=>switchVariant(1);
+    addEventListener('keydown',e=>{
+      if(['INPUT','TEXTAREA'].includes(document.activeElement.tagName)||document.activeElement.isContentEditable)return;
+      if(e.key==='ArrowLeft')return switchVariant(-1);
+      if(e.key==='ArrowRight')return switchVariant(1);
+      if(e.key==='j'||e.key==='ArrowDown'){focused=Math.min(items.length-1,focused+1);return render();}
+      if(e.key==='k'||e.key==='ArrowUp'){focused=Math.max(0,focused-1);return render();}
+      if(e.key==='Enter'||e.key===' '){expanded[focused]=!expanded[focused];return render();}
+      if(e.key==='t')cycleThreshold();
+    });
+    render();
+  </script>
+</body>
+</html>
