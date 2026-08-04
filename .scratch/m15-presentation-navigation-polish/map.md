@@ -19,6 +19,7 @@ An implementation-ready M15 specification and dependency map in which every pres
 ## Decisions so far
 
 - [Establish Bitbucket's File-level Comment contract](issues/01-establish-bitbucket-file-level-comment-contract.md) — Bitbucket natively supports path-only root Comments through its ordinary comment and Thread APIs, so M15's File-level scope gate passes.
+- [Choose the Sidebar File Tree interaction](issues/02-choose-sidebar-file-tree-interaction.md) — Use a compacted repository-path outline with conventional tree motions, a separate Sidebar cursor, centered active-File reveal, and fixed right-edge tallies.
 - [Establish the mouse compatibility envelope](issues/07-establish-mouse-compatibility-envelope.md) — Click focus/disclosure and vertical scrolling are sound candidates; drag selection needs a narrow contract, and every mouse gesture requires keyboard parity.
 
 ## Not yet specified
