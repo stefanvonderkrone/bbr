@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PROTOTYPE — bbr Sidebar File Tree</title>
+  <style>
+    :root { color-scheme: dark; --sidebar-ch: 28; --bg: #111318; --surface: #191c23; --surface2: #292d38; --fg: #d7dae0; --muted: #777f8f; --blue: #77b7ff; --green: #74d99f; --yellow: #edc26d; --red: #ff8585; --purple: #c49cff; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: #090b0f; color: var(--fg); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    button, input { font: inherit; }
+    .page { max-width: 1180px; margin: 0 auto; padding: 28px 24px 104px; }
+    .prototype-note { color: var(--yellow); letter-spacing: .08em; font-size: 12px; text-transform: uppercase; }
+    h1 { margin: 8px 0 6px; font-size: 22px; }
+    .lede { margin: 0 0 20px; color: #a6adba; line-height: 1.5; }
+    .controls { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin-bottom: 16px; color: #a6adba; font-size: 13px; }
+    .controls label { display: flex; align-items: center; gap: 8px; }
+    .controls output { min-width: 5ch; color: var(--fg); }
+    .terminal { height: 630px; min-height: 440px; overflow: hidden; border: 1px solid #3a3f4b; border-radius: 8px; background: var(--bg); box-shadow: 0 18px 60px #0008; display: grid; grid-template-rows: 31px minmax(0, 1fr) 27px; }
+    .terminal-header, .status { display: flex; align-items: center; padding: 0 10px; white-space: nowrap; overflow: hidden; }
+    .terminal-header { border-bottom: 1px solid #353a46; color: #b7becb; background: #171a20; }
+    .status { border-top: 1px solid #4c5260; background: #d2d5da; color: #15171b; font-size: 12px; }
+    .workspace { min-height: 0; display: flex; }
+    .sidebar { width: calc(var(--sidebar-ch) * 1ch + 18px); min-width: calc(var(--sidebar-ch) * 1ch + 18px); border-right: 1px solid #4c5260; background: var(--surface); display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
+    .sidebar-title { padding: 8px 9px 7px; border-bottom: 1px solid #303540; color: #c4cad5; display: flex; justify-content: space-between; font-size: 12px; }
+    .tree { min-height: 0; overflow-y: auto; scrollbar-width: thin; outline: none; padding: 4px 0; }
+    .tree:focus { box-shadow: inset 2px 0 var(--blue); }
+    .tree-row { height: 25px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; padding-right: 6px; cursor: default; color: #aeb5c1; }
+    .tree-row:hover { background: #232731; }
+    .tree-row.cursor { background: #252a35; outline: 1px solid #474f60; outline-offset: -1px; }
+    .tree-row.active { background: #303647; color: #fff; font-weight: 650; }
+    .tree-row.active.cursor { background: #3a4358; }
+    .row-main { display: flex; align-items: center; min-width: 0; gap: 5px; padding-left: calc(5px + var(--depth, 0) * 13px); }
+    .marker { width: 1ch; flex: 0 0 1ch; color: var(--blue); }
+    .disclosure { width: 1ch; flex: 0 0 1ch; color: #8992a3; }
+    .status-letter { width: 1ch; flex: 0 0 1ch; }
+    .status-A { color: var(--green); } .status-M, .status-R { color: var(--yellow); } .status-D { color: var(--red); }
+    .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .directory .name { color: #d5d9e2; }
+    .counts { white-space: nowrap; padding-left: 5px; color: var(--muted); background: inherit; }
+    .comments { color: var(--purple); } .drafts { color: var(--yellow); }
+    .aggregate { color: #6f7787; font-size: 11px; }
+    .sidebar-help { min-height: 66px; border-top: 1px solid #303540; padding: 7px 9px; color: #7f8796; font-size: 11px; line-height: 1.45; }
+    .sidebar-help b { color: #cbd1db; font-weight: 500; }
+    .diff { min-width: 0; flex: 1; overflow: hidden; color: #aeb5bf; }
+    .diff-head { padding: 8px 12px; background: #20242c; color: #e4e7ec; border-bottom: 1px solid #353a46; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .diff-row { padding: 3px 12px; white-space: pre; overflow: hidden; }
+    .diff-row.add { background: #153524; color: #a9e7bd; }
+    .diff-row.del { background: #3a1b20; color: #efb1b8; }
+    .diff-row.hunk { color: #85b6e8; background: #182838; }
+    .file-controls { display: flex; gap: 8px; margin: 12px; }
+    .file-controls button { border: 1px solid #4b5363; background: #222731; color: #d9dde5; border-radius: 4px; padding: 5px 9px; cursor: pointer; }
+    .file-controls button:hover { background: #303746; }
+    .variant-summary { margin: 18px 0 0; border-left: 3px solid var(--blue); padding: 4px 0 4px 12px; color: #b8bfcb; line-height: 1.5; }
+    .variant-summary strong { color: #eef1f5; }
+    .switcher { position: fixed; z-index: 20; left: 50%; bottom: 22px; transform: translateX(-50%); display: grid; grid-template-columns: 38px minmax(210px, auto) 38px; align-items: center; overflow: hidden; border: 1px solid #788399; border-radius: 999px; background: #eceff4; color: #14171d; box-shadow: 0 8px 30px #000a; }
+    .switcher button { height: 38px; border: 0; background: transparent; color: inherit; cursor: pointer; font-size: 18px; }
+    .switcher button:hover { background: #cfd5df; }
+    .switcher-label { padding: 0 12px; text-align: center; font-size: 12px; font-weight: 700; }
+    .drill-group { margin: 4px 5px 8px; border: 1px solid #303642; border-radius: 4px; overflow: hidden; }
+    .drill-header { height: 27px; display: flex; align-items: center; gap: 6px; padding: 0 7px; background: #222731; color: #dce0e7; cursor: default; }
+    .drill-header.cursor { outline: 1px solid #59647a; outline-offset: -1px; }
+    .drill-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .drill-files .tree-row { padding-left: 3px; }
+    @media (max-width: 720px) { .page { padding: 14px 8px 90px; } .terminal { height: 560px; } }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <div class="prototype-note">Throwaway prototype · not production UI</div>
+    <h1 id="heading">Sidebar File Tree</h1>
+    <p class="lede">Use <kbd>[</kbd>/<kbd>]</kbd> to simulate DiffPane File navigation. Focus the Sidebar and use the variant’s keys to inspect collapse and focus behavior.</p>
+    <div class="controls">
+      <label>Sidebar width <input id="width" type="range" min="18" max="38" value="28"> <output id="width-output">28 cols</output></label>
+      <span>Active File must remain visible; counts never surrender their right edge.</span>
+    </div>
+    <section class="terminal" aria-label="bbr terminal prototype">
+      <div class="terminal-header">bbr · #418 Harden presentation boundaries · feature/m15 → main</div>
+      <div class="workspace">
+        <aside class="sidebar">
+          <div class="sidebar-title"><span>CHANGED FILES</span><span id="visible-count">12 files</span></div>
+          <div id="tree" class="tree" tabindex="0" aria-label="File Tree"></div>
+          <div id="sidebar-help" class="sidebar-help"></div>
+        </aside>
+        <section class="diff">
+          <div class="diff-head" id="diff-head"></div>
+          <div class="file-controls"><button id="prev-file">[ Previous File</button><button id="next-file">] Next File</button></div>
+          <div class="diff-row hunk">@@ -88,8 +91,13 @@ fn drawSidebar(...)</div>
+          <div class="diff-row">  const selected = i == selected_file;</div>
+          <div class="diff-row del">- const name = file.displayPath();</div>
+          <div class="diff-row add">+ const tree = projection.file_tree;</div>
+          <div class="diff-row add">+ const visible = tree.visibleEntries();</div>
+          <div class="diff-row">  drawPane(scratch, pane, buf, theme, nav);</div>
+        </section>
+      </div>
+      <div class="status">12/294 · s split · f: changes · o isolate · c/i comment · [ ] file · ? help · q quit</div>
+    </section>
+    <p id="variant-summary" class="variant-summary"></p>
+  </main>
+  <nav class="switcher" aria-label="Prototype variants">
+    <button id="previous-variant" aria-label="Previous variant">←</button>
+    <div id="switcher-label" class="switcher-label"></div>
+    <button id="next-variant" aria-label="Next variant">→</button>
+  </nav>
+
+  <script>
+    // Three Sidebar File Tree variants, switchable via ?variant=, on one static prototype route.
+    const variants = {
+      A: {
+        name: 'Explicit outline',
+        summary: '<strong>A — Explicit outline:</strong> every Directory is a row. One roving tree cursor visits both Directories and Files; <kbd>h/l</kbd> collapse/expand or move to parent/child, and <kbd>Enter</kbd> focuses a File. This is the most conventional and the most vertically expensive.',
+        help: '<b>j/k</b> next/previous entry<br><b>h/l</b> collapse/expand · parent/child<br><b>Enter</b> focus File or toggle Directory'
+      },
+      B: {
+        name: 'Compacted outline',
+        summary: '<strong>B — Compacted outline:</strong> single-child Directory chains become one row (for example <code>src/tui/</code>). It keeps the conventional roving cursor and structural <kbd>h/j/k/l</kbd> grammar while reducing visual noise and scroll distance.',
+        help: '<b>j/k</b> next/previous entry<br><b>h/l</b> collapse/expand · parent/child<br><b>Enter</b> focus File or toggle compact path'
+      },
+      C: {
+        name: 'Directory groups',
+        summary: '<strong>C — Directory groups:</strong> top-level path groups are bordered sections. <kbd>j/k</kbd> moves only among Files; <kbd>H/L</kbd> moves between groups and <kbd>Space</kbd> toggles one. It optimizes File-to-File review flow but introduces a second navigation grammar.',
+        help: '<b>j/k</b> previous/next visible File<br><b>H/L</b> previous/next group · <b>Space</b> toggle<br><b>Enter</b> focus File'
+      }
+    };
+
+    const files = [
+      { path: 'build.zig', status: 'M', comments: 0, drafts: 0 },
+      { path: 'docs/adr/0011-presentation-state.md', status: 'A', comments: 1, drafts: 0 },
+      { path: 'src/bitbucket/client.zig', status: 'M', comments: 0, drafts: 1 },
+      { path: 'src/diff/buffer.zig', status: 'M', comments: 3, drafts: 1 },
+      { path: 'src/diff/CONTEXT.md', status: 'M', comments: 0, drafts: 0 },
+      { path: 'src/review/comment.zig', status: 'R', comments: 2, drafts: 0 },
+      { path: 'src/review/CONTEXT.md', status: 'M', comments: 0, drafts: 2 },
+      { path: 'src/tui/app.zig', status: 'M', comments: 4, drafts: 1 },
+      { path: 'src/tui/presentation.zig', status: 'M', comments: 7, drafts: 3 },
+      { path: 'src/tui/render.zig', status: 'M', comments: 2, drafts: 2 },
+      { path: 'src/tui/theme.zig', status: 'M', comments: 0, drafts: 0 },
+      { path: 'tests/fixtures/wide-path-name-that-must-truncate-cleanly.diff', status: 'A', comments: 1, drafts: 1 }
+    ];
+
+    const rows = {
+      A: [
+        ['f','build.zig','build.zig',0,[]], ['d','docs','docs',0,[]], ['d','adr','docs/adr',1,['docs']], ['f','0011-presentation-state.md','docs/adr/0011-presentation-state.md',2,['docs','docs/adr']],
+        ['d','src','src',0,[]], ['d','bitbucket','src/bitbucket',1,['src']], ['f','client.zig','src/bitbucket/client.zig',2,['src','src/bitbucket']],
+        ['d','diff','src/diff',1,['src']], ['f','buffer.zig','src/diff/buffer.zig',2,['src','src/diff']], ['f','CONTEXT.md','src/diff/CONTEXT.md',2,['src','src/diff']],
+        ['d','review','src/review',1,['src']], ['f','comment.zig','src/review/comment.zig',2,['src','src/review']], ['f','CONTEXT.md','src/review/CONTEXT.md',2,['src','src/review']],
+        ['d','tui','src/tui',1,['src']], ['f','app.zig','src/tui/app.zig',2,['src','src/tui']], ['f','presentation.zig','src/tui/presentation.zig',2,['src','src/tui']], ['f','render.zig','src/tui/render.zig',2,['src','src/tui']], ['f','theme.zig','src/tui/theme.zig',2,['src','src/tui']],
+        ['d','tests','tests',0,[]], ['d','fixtures','tests/fixtures',1,['tests']], ['f','wide-path-name-that-must-truncate-cleanly.diff','tests/fixtures/wide-path-name-that-must-truncate-cleanly.diff',2,['tests','tests/fixtures']]
+      ],
+      B: [
+        ['f','build.zig','build.zig',0,[]], ['d','docs/adr','docs/adr',0,[]], ['f','0011-presentation-state.md','docs/adr/0011-presentation-state.md',1,['docs/adr']],
+        ['d','src','src',0,[]], ['d','bitbucket','src/bitbucket',1,['src']], ['f','client.zig','src/bitbucket/client.zig',2,['src','src/bitbucket']],
+        ['d','diff','src/diff',1,['src']], ['f','buffer.zig','src/diff/buffer.zig',2,['src','src/diff']], ['f','CONTEXT.md','src/diff/CONTEXT.md',2,['src','src/diff']],
+        ['d','review','src/review',1,['src']], ['f','comment.zig','src/review/comment.zig',2,['src','src/review']], ['f','CONTEXT.md','src/review/CONTEXT.md',2,['src','src/review']],
+        ['d','tui','src/tui',1,['src']], ['f','app.zig','src/tui/app.zig',2,['src','src/tui']], ['f','presentation.zig','src/tui/presentation.zig',2,['src','src/tui']], ['f','render.zig','src/tui/render.zig',2,['src','src/tui']], ['f','theme.zig','src/tui/theme.zig',2,['src','src/tui']],
+        ['d','tests/fixtures','tests/fixtures',0,[]], ['f','wide-path-name-that-must-truncate-cleanly.diff','tests/fixtures/wide-path-name-that-must-truncate-cleanly.diff',1,['tests/fixtures']]
+      ]
+    };
+
+    const state = { variant: new URLSearchParams(location.search).get('variant') || 'A', active: 7, cursor: 0, collapsed: new Set(), groupCursor: 0 };
+    if (!variants[state.variant]) state.variant = 'A';
+    const tree = document.querySelector('#tree');
+
+    function fileFor(path) { return files.find(file => file.path === path); }
+    function counts(file) {
+      if (!file || (!file.comments && !file.drafts)) return '';
+      return `${file.comments ? `<span class="comments">●${file.comments}</span>` : ''}${file.comments && file.drafts ? ' ' : ''}${file.drafts ? `<span class="drafts">✎${file.drafts}</span>` : ''}`;
+    }
+    function isVisible(row) { return row[4].every(parent => !state.collapsed.has(parent)); }
+    function visibleRows() { return (rows[state.variant] || []).filter(isVisible); }
+    function directoryHasActive(path) { return files[state.active].path.startsWith(path + '/'); }
+
+    function renderRow(row, index) {
+      const [kind, name, path, depth] = row;
+      const file = kind === 'f' ? fileFor(path) : null;
+      const active = file && file.path === files[state.active].path;
+      const cursor = index === state.cursor;
+      const open = !state.collapsed.has(path);
+      return `<div class="tree-row ${kind === 'd' ? 'directory' : 'file'} ${active ? 'active' : ''} ${cursor ? 'cursor' : ''}" data-index="${index}" data-kind="${kind}" data-path="${path}" style="--depth:${depth}">
+        <span class="row-main"><span class="marker">${active ? '›' : directoryHasActive(path) ? '·' : ''}</span><span class="disclosure">${kind === 'd' ? (open ? '▾' : '▸') : ''}</span>${file ? `<span class="status-letter status-${file.status}">${file.status}</span>` : ''}<span class="name">${name}${kind === 'd' && state.variant === 'B' ? '/' : ''}</span></span>
+        <span class="counts">${counts(file)}</span>
+      </div>`;
+    }
+
+    function topGroups() {
+      const definitions = [
+        ['root', 'Repository root', files.filter(f => !f.path.includes('/'))],
+        ['docs', 'docs/', files.filter(f => f.path.startsWith('docs/'))],
+        ['bitbucket', 'src/bitbucket/', files.filter(f => f.path.startsWith('src/bitbucket/'))],
+        ['diff', 'src/diff/', files.filter(f => f.path.startsWith('src/diff/'))],
+        ['review', 'src/review/', files.filter(f => f.path.startsWith('src/review/'))],
+        ['tui', 'src/tui/', files.filter(f => f.path.startsWith('src/tui/'))],
+        ['tests', 'tests/', files.filter(f => f.path.startsWith('tests/'))]
+      ];
+      return definitions.filter(group => group[2].length);
+    }
+
+    function renderGroups() {
+      let visibleIndex = 0;
+      tree.innerHTML = topGroups().map((group, groupIndex) => {
+        const [id, label, groupFiles] = group;
+        const closed = state.collapsed.has('group:' + id);
+        const body = closed ? '' : groupFiles.map(file => {
+          const fileIndex = files.indexOf(file);
+          const active = fileIndex === state.active;
+          const cursor = visibleIndex++ === state.cursor;
+          return `<div class="tree-row file ${active ? 'active' : ''} ${cursor ? 'cursor' : ''}" data-kind="f" data-path="${file.path}"><span class="row-main"><span class="marker">${active ? '›' : ''}</span><span class="status-letter status-${file.status}">${file.status}</span><span class="name">${file.path.split('/').pop()}</span></span><span class="counts">${counts(file)}</span></div>`;
+        }).join('');
+        return `<section class="drill-group"><div class="drill-header ${groupIndex === state.groupCursor ? 'cursor' : ''}" data-kind="g" data-group="${id}"><span>${closed ? '▸' : '▾'}</span><span class="drill-path">${label}</span><span class="aggregate">${groupFiles.length}</span></div><div class="drill-files">${body}</div></section>`;
+      }).join('');
+    }
+
+    function ensureActiveVisible() {
+      const path = files[state.active].path;
+      for (const row of (rows[state.variant] || [])) if (row[0] === 'f' && row[2] === path) for (const ancestor of row[4]) state.collapsed.delete(ancestor);
+      if (state.variant === 'C') {
+        const group = topGroups().find(group => group[2].some(file => file.path === path));
+        if (group) state.collapsed.delete('group:' + group[0]);
+      }
+    }
+
+    function render() {
+      document.documentElement.style.setProperty('--sidebar-ch', document.querySelector('#width').value);
+      document.querySelector('#width-output').value = document.querySelector('#width').value + ' cols';
+      document.querySelector('#switcher-label').textContent = `${state.variant} — ${variants[state.variant].name}`;
+      document.querySelector('#variant-summary').innerHTML = variants[state.variant].summary;
+      document.querySelector('#sidebar-help').innerHTML = variants[state.variant].help;
+      document.querySelector('#diff-head').textContent = `${files[state.active].status} ${files[state.active].path}`;
+      document.querySelector('#visible-count').textContent = `${files.length} files`;
+      if (state.variant === 'C') renderGroups(); else {
+        const visible = visibleRows();
+        state.cursor = Math.max(0, Math.min(state.cursor, visible.length - 1));
+        tree.innerHTML = visible.map(renderRow).join('');
+      }
+      requestAnimationFrame(() => tree.querySelector('.active')?.scrollIntoView({ block: 'center', behavior: 'smooth' }));
+    }
+
+    function setVariant(key) {
+      state.variant = key;
+      state.cursor = 0;
+      state.groupCursor = 0;
+      history.replaceState({}, '', `?variant=${key}`);
+      render();
+    }
+    function cycleVariant(delta) {
+      const keys = Object.keys(variants);
+      setVariant(keys[(keys.indexOf(state.variant) + delta + keys.length) % keys.length]);
+    }
+    function moveActive(delta) {
+      state.active = (state.active + delta + files.length) % files.length;
+      ensureActiveVisible();
+      render();
+    }
+    function activatePath(path) {
+      const index = files.findIndex(file => file.path === path);
+      if (index >= 0) { state.active = index; ensureActiveVisible(); render(); }
+    }
+    function toggleDirectory(path) {
+      if (state.collapsed.has(path)) state.collapsed.delete(path); else state.collapsed.add(path);
+      render();
+    }
+
+    tree.addEventListener('click', event => {
+      const row = event.target.closest('[data-kind]');
+      if (!row) return;
+      if (row.dataset.kind === 'f') activatePath(row.dataset.path);
+      if (row.dataset.kind === 'd') toggleDirectory(row.dataset.path);
+      if (row.dataset.kind === 'g') toggleDirectory('group:' + row.dataset.group);
+    });
+    tree.addEventListener('keydown', event => {
+      const key = event.key;
+      if (!['j','k','h','l','H','L','Enter',' '].includes(key)) return;
+      event.preventDefault();
+      if (state.variant === 'C') {
+        const visibleFiles = topGroups().flatMap(group => state.collapsed.has('group:' + group[0]) ? [] : group[2]);
+        if (key === 'j' || key === 'k') {
+          const current = Math.max(0, visibleFiles.findIndex(file => file.path === files[state.active].path));
+          const next = visibleFiles[(current + (key === 'j' ? 1 : -1) + visibleFiles.length) % visibleFiles.length];
+          if (next) activatePath(next.path);
+        } else if (key === 'H' || key === 'L') {
+          const groups = topGroups();
+          state.groupCursor = (state.groupCursor + (key === 'L' ? 1 : -1) + groups.length) % groups.length;
+          render();
+        } else if (key === ' ') {
+          const groups = topGroups();
+          toggleDirectory('group:' + groups[state.groupCursor][0]);
+        } else if (key === 'Enter') activatePath(files[state.active].path);
+        return;
+      }
+      const visible = visibleRows();
+      if (key === 'j' || key === 'k') state.cursor = (state.cursor + (key === 'j' ? 1 : -1) + visible.length) % visible.length;
+      else {
+        const row = visible[state.cursor];
+        if (!row) return;
+        if (key === 'Enter') row[0] === 'f' ? activatePath(row[2]) : toggleDirectory(row[2]);
+        if (key === 'l' && row[0] === 'd' && state.collapsed.has(row[2])) state.collapsed.delete(row[2]);
+        else if (key === 'l' && row[0] === 'd') {
+          const childIndex = visible.findIndex(candidate => candidate[4].includes(row[2]));
+          if (childIndex >= 0) state.cursor = childIndex;
+        }
+        if (key === 'h' && row[0] === 'd' && !state.collapsed.has(row[2])) state.collapsed.add(row[2]);
+        else if (key === 'h' && row[4].length) {
+          const parent = row[4][row[4].length - 1];
+          const parentIndex = visible.findIndex(candidate => candidate[2] === parent);
+          if (parentIndex >= 0) state.cursor = parentIndex;
+        }
+      }
+      render();
+      requestAnimationFrame(() => tree.querySelector('.cursor')?.scrollIntoView({ block: 'nearest' }));
+    });
+    document.addEventListener('keydown', event => {
+      if (event.target === tree) return;
+      if (event.key === '[') moveActive(-1);
+      if (event.key === ']') moveActive(1);
+      if (event.key === 'ArrowLeft') cycleVariant(-1);
+      if (event.key === 'ArrowRight') cycleVariant(1);
+    });
+    document.querySelector('#width').addEventListener('input', render);
+    document.querySelector('#prev-file').addEventListener('click', () => moveActive(-1));
+    document.querySelector('#next-file').addEventListener('click', () => moveActive(1));
+    document.querySelector('#previous-variant').addEventListener('click', () => cycleVariant(-1));
+    document.querySelector('#next-variant').addEventListener('click', () => cycleVariant(1));
+    ensureActiveVisible();
+    render();
+  </script>
+</body>
+</html>
