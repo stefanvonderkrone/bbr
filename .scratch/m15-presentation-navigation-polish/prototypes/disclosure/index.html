@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>M15 disclosure prototype</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b0f14; --pane:#111820; --line:#26313d; --text:#d7e0ea; --muted:#7f8d9b; --cyan:#72d6e5; --amber:#e8b45b; --green:#70c78d; --red:#e17474; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; background:radial-gradient(circle at 50% -20%,#162331 0,var(--bg) 43%); color:var(--text); font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    header { max-width:1080px; margin:0 auto; padding:22px 24px 12px; display:flex; justify-content:space-between; gap:24px; align-items:end; }
+    h1 { margin:0 0 3px; font:600 18px/1.2 system-ui,sans-serif; }
+    header p { margin:0; color:var(--muted); }
+    kbd { border:1px solid #455462; border-bottom-width:2px; border-radius:4px; padding:1px 5px; color:#c9d5df; background:#18212b; }
+    main { max-width:1080px; margin:0 auto; padding:8px 24px 92px; display:grid; grid-template-columns:minmax(0,1fr) 245px; gap:14px; }
+    .terminal,.state { border:1px solid var(--line); border-radius:7px; background:rgba(12,17,23,.94); box-shadow:0 18px 48px #0008; overflow:hidden; }
+    .chrome { height:31px; display:flex; align-items:center; gap:7px; padding:0 11px; border-bottom:1px solid var(--line); background:#151d26; color:var(--muted); font-size:12px; }
+    .dot { width:8px; height:8px; border-radius:50%; background:#43515e; }
+    .screen { min-height:590px; padding:9px 0 20px; }
+    .line,.disclosure,.content { min-height:25px; padding:3px 13px; white-space:pre-wrap; }
+    .line { color:#aab7c4; }
+    .line.add { color:#a8dab6; background:#11261a; }
+    .line.del { color:#e0aaaa; background:#281517; }
+    .file { color:#dbe7f1; background:#151d26; border-block:1px solid #202b35; margin:6px 0; }
+    .disclosure { width:100%; display:block; border:0; color:var(--text); text-align:left; font:inherit; cursor:pointer; }
+    .disclosure:focus { outline:none; }
+    .disclosure.cursor { background:#243344 !important; box-shadow:inset 3px 0 var(--cyan); }
+    .content { border-left:2px solid #334352; margin-left:28px; color:#bbc7d1; }
+    .content .meta { color:var(--muted); }
+    .content.resolved { border-color:var(--green); }
+    .content.outdated { border-color:var(--amber); }
+    .state { align-self:start; position:sticky; top:12px; }
+    .state-body { padding:14px; }
+    .state h2 { margin:0 0 10px; color:#eff5fa; font-size:13px; }
+    .state dl { margin:0; display:grid; grid-template-columns:1fr auto; gap:7px 10px; color:var(--muted); }
+    .state dd { margin:0; color:var(--text); }
+    .state .hint { border-top:1px solid var(--line); margin-top:14px; padding-top:12px; color:var(--muted); font-size:12px; }
+    .switcher { position:fixed; z-index:10; left:50%; bottom:20px; transform:translateX(-50%); display:flex; align-items:center; gap:8px; padding:7px; border:1px solid #536172; border-radius:999px; background:#e7edf3; color:#17202a; box-shadow:0 9px 30px #000a; font:600 13px/1 system-ui,sans-serif; }
+    .switcher button { width:34px; height:30px; border:0; border-radius:999px; background:#cbd6df; color:#17202a; cursor:pointer; font-size:18px; }
+    .variant-name { min-width:245px; text-align:center; }
+    /* A: one visual grammar */
+    .a .disclosure { background:#151c24; border-block:1px solid #232e38; }
+    .a .token { display:inline-block; width:20px; color:var(--cyan); }
+    .a .resolved-row { color:#a9dab8; }
+    .a .fold-row { color:#9fb0be; }
+    .a .outdated-row { color:#e2be78; }
+    .a .action { float:right; color:var(--muted); }
+    /* B: type-specific hierarchy */
+    .b .resolved-row { margin:5px 13px; width:calc(100% - 26px); border:1px solid #31523e; border-radius:5px; padding:5px 9px; background:#14231a; color:#a9dab8; }
+    .b .fold-row { display:flex; align-items:center; gap:9px; color:#8696a5; background:transparent; }
+    .b .fold-row::before,.b .fold-row::after { content:""; height:1px; background:#33404b; flex:1; }
+    .b .outdated-row { margin-top:9px; border-block:1px solid #4b3a21; background:#261f14; color:#e2be78; text-transform:uppercase; letter-spacing:.05em; font-size:12px; }
+    .b .action { color:var(--muted); margin-left:9px; text-transform:none; letter-spacing:0; }
+    /* C: gutter control */
+    .c .disclosure { background:transparent; border-left:1px solid #30404d; margin-left:21px; width:calc(100% - 21px); padding-left:10px; }
+    .c .token { display:inline-block; width:24px; color:var(--cyan); font-weight:bold; }
+    .c .resolved-row { color:#a9dab8; }
+    .c .fold-row { color:#9ba9b6; }
+    .c .outdated-row { color:#e2be78; }
+    .c .action { color:#647585; }
+    @media (max-width:760px) { main { grid-template-columns:1fr; } .state { position:static; } header { align-items:start; flex-direction:column; } }
+  </style>
+</head>
+<body>
+  <!-- Three variants of in-place disclosure in the DiffPane, switchable via ?variant=. PROTOTYPE: throw away after the decision. -->
+  <header>
+    <div><h1>Hidden review content</h1><p>One interaction for resolved Threads, context Folds, and Outdated sections.</p></div>
+    <p><kbd>j</kbd>/<kbd>k</kbd> move · <kbd>Enter</kbd> toggles · <kbd>r</kbd> rebuild · <kbd>n</kbd> new Session</p>
+  </header>
+  <main>
+    <section class="terminal" aria-label="Disclosure interaction prototype">
+      <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span style="margin-left:6px">bbr · src/cache.zig</span></div>
+      <div class="screen" id="screen"></div>
+    </section>
+    <aside class="state">
+      <div class="chrome">PROTOTYPE STATE</div>
+      <div class="state-body">
+        <h2 id="variant-title"></h2>
+        <dl><dt>Resolved Thread</dt><dd id="s-resolved"></dd><dt>Context Fold</dt><dd id="s-fold"></dd><dt>Outdated</dt><dd id="s-outdated"></dd><dt>Buffer rebuilds</dt><dd id="s-rebuilds"></dd><dt>Session</dt><dd id="s-session"></dd></dl>
+        <div class="hint">Each item owns independent state. A Buffer rebuild preserves it; a new Session resets it. Click rows or use the keyboard.</div>
+      </div>
+    </aside>
+  </main>
+  <nav class="switcher" aria-label="Prototype variants"><button id="prev" aria-label="Previous variant">←</button><span class="variant-name" id="switch-label"></span><button id="next" aria-label="Next variant">→</button></nav>
+  <script>
+    const variants = {
+      A: { name:'Uniform disclosure rows', cls:'a' },
+      B: { name:'Type-shaped affordances', cls:'b' },
+      C: { name:'Minimal gutter controls', cls:'c' },
+    };
+    let key = new URLSearchParams(location.search).get('variant')?.toUpperCase();
+    if (!variants[key]) key = 'A';
+    let open = { resolved:false, fold:false, outdated:false };
+    let cursor = 0, rebuilds = 0, session = 1;
+    const ids = ['resolved','fold','outdated'];
+    const chevron = id => open[id] ? '▾' : '▸';
+    function row(id,label,kind) {
+      const v = variants[key];
+      const cursorClass = ids[cursor] === id ? ' cursor' : '';
+      let html = '';
+      if (key === 'A') html = `<span class="token">${chevron(id)}</span>${label}<span class="action">enter to ${open[id]?'collapse':'expand'}</span>`;
+      if (key === 'B') html = `${label}<span class="action">${chevron(id)} ${open[id]?'collapse':'expand'}</span>`;
+      if (key === 'C') html = `<span class="token">${open[id]?'−':'+'}</span>${label} <span class="action">${open[id]?'shown':'hidden'}</span>`;
+      return `<button class="disclosure ${kind}-row${cursorClass}" data-id="${id}">${html}</button>`;
+    }
+    function render() {
+      const v = variants[key];
+      document.getElementById('screen').className = `screen ${v.cls}`;
+      document.getElementById('variant-title').textContent = `${key} — ${v.name}`;
+      document.getElementById('switch-label').textContent = `${key} — ${v.name}`;
+      document.getElementById('screen').innerHTML = `
+        <div class="line file">M  src/cache.zig</div>
+        <div class="line">  48  48   const budget = config.max_retained_bytes;</div>
+        ${row('resolved','✓ Resolved thread · 2 replies','resolved')}
+        ${open.resolved ? '<div class="content resolved"><span class="meta">Mara · resolved</span><br>Could this use the shared budget type?<br><span class="meta">↳ 2 replies · last by Stefan</span></div>' : ''}
+        <div class="line del">- 49       return old_cache.retain(bytes);</div>
+        <div class="line add">+ 49       return cache.retainWithin(budget, bytes);</div>
+        ${row('fold','⋯ 18 unchanged lines','fold')}
+        ${open.fold ? '<div class="line">  50  50   }</div><div class="line">  51  51</div><div class="line">  52  52   fn evictOldest(...) {</div><div class="line">         … 15 more visible context lines …</div>' : ''}
+        <div class="line">  69  69   try cache.commit();</div>
+        ${row('outdated','⚠ Outdated · src/cache.zig · 2 threads','outdated')}
+        ${open.outdated ? '<div class="content outdated"><span class="meta">Anchor no longer exists · captured lines 81–83</span><br>Does eviction still preserve the focused File?<br><br><span class="meta">Anchor no longer exists · captured line 104</span><br>This name no longer matches the config.</div>' : ''}
+        <div class="line file">M  src/config.zig</div><div class="line">  17  17   pub const Cache = struct {</div>`;
+      document.querySelectorAll('[data-id]').forEach(el => el.addEventListener('click', () => { cursor = ids.indexOf(el.dataset.id); toggle(el.dataset.id); }));
+      for (const id of ids) document.getElementById(`s-${id}`).textContent = open[id] ? 'expanded' : 'collapsed';
+      document.getElementById('s-rebuilds').textContent = rebuilds;
+      document.getElementById('s-session').textContent = session;
+    }
+    function toggle(id) { open[id] = !open[id]; render(); }
+    function switchVariant(dir) { const all = Object.keys(variants), i = all.indexOf(key); key = all[(i + dir + all.length) % all.length]; history.replaceState({},'',`?variant=${key}`); render(); }
+    document.getElementById('prev').onclick = () => switchVariant(-1);
+    document.getElementById('next').onclick = () => switchVariant(1);
+    addEventListener('keydown', e => {
+      if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName) || document.activeElement.isContentEditable) return;
+      if (e.key === 'ArrowLeft') return switchVariant(-1);
+      if (e.key === 'ArrowRight') return switchVariant(1);
+      if (e.key === 'j' || e.key === 'ArrowDown') { cursor = Math.min(ids.length-1,cursor+1); render(); }
+      if (e.key === 'k' || e.key === 'ArrowUp') { cursor = Math.max(0,cursor-1); render(); }
+      if (e.key === 'Enter' || e.key === ' ') toggle(ids[cursor]);
+      if (e.key === 'r') { rebuilds++; render(); }
+      if (e.key === 'n') { session++; rebuilds=0; open={resolved:false,fold:false,outdated:false}; cursor=0; render(); }
+    });
+    render();
+  </script>
+</body>
+</html>
