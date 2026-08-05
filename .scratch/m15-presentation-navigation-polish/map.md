@@ -22,10 +22,10 @@ An implementation-ready M15 specification and dependency map in which every pres
 - [Choose the Sidebar File Tree interaction](issues/02-choose-sidebar-file-tree-interaction.md) — Use a compacted repository-path outline with conventional tree motions, a separate Sidebar cursor, centered active-File reveal, and fixed right-edge tallies.
 - [Choose the disclosure language for hidden review content](issues/03-choose-disclosure-language-for-hidden-review-content.md) — Use type-shaped persistent disclosure rows with one Enter-to-toggle contract and independent Session-relative state for resolved Threads, context Folds, and Outdated sections.
 - [Establish the mouse compatibility envelope](issues/07-establish-mouse-compatibility-envelope.md) — Click focus/disclosure and vertical scrolling are sound candidates; drag selection needs a narrow contract, and every mouse gesture requires keyboard parity.
+- [Decide M15 mouse support](issues/08-decide-m15-mouse-support.md) — Ship default-on, configurable clicks and wheel navigation for Panes, disclosures, and Pickers, while excluding mouse Selection and less portable gestures.
 
 ## Not yet specified
 
-- The concrete mouse event, hit-testing, and selection work implied if mouse support is accepted.
 - The rendering/parser seam and state representation implied by the chosen Markdown and disclosure behavior.
 - Implementation slices and their test matrix until the interaction decisions establish the state transitions that must be integrated.
 
