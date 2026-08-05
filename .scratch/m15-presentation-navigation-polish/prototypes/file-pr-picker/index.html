@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>M15 File / PullRequest Picker prototype</title>
+  <!-- Three variants of the File finder and PullRequest Picker, switchable via ?variant=, inside the existing review screen. -->
+  <style>
+    :root { --bg:#101416; --panel:#151b1e; --ink:#d9e2e7; --muted:#708089; --line:#3a484f; --cyan:#65d1d4; --amber:#efbd72; --green:#88cb88; --sel:#203d42; }
+    * { box-sizing:border-box; }
+    html, body { height:100%; margin:0; }
+    body { background:#090c0d; color:var(--ink); font:15px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; display:grid; place-items:center; }
+    button, input { font:inherit; }
+    .terminal { width:min(1180px,96vw); height:min(760px,90vh); min-height:560px; background:var(--bg); border:1px solid #2b3439; box-shadow:0 24px 80px #000b; position:relative; overflow:hidden; }
+    .review { height:100%; display:grid; grid-template-columns:290px 1fr; gap:10px; padding:10px 10px 30px; opacity:.52; }
+    .pane { border:1px solid var(--line); overflow:hidden; }
+    .pane-title { color:var(--muted); border-bottom:1px solid var(--line); padding:5px 8px; }
+    .tree, .diff { padding:7px 8px; white-space:pre; }
+    .tree .active { color:var(--cyan); background:#162a2e; display:block; }
+    .diff .add { background:#13271d; color:#a6d7ae; display:block; }
+    .diff .del { background:#2a1818; color:#d9a0a0; display:block; }
+    .shade { position:absolute; inset:0; background:#05070888; }
+    .overlay { position:absolute; left:50%; top:47%; transform:translate(-50%,-50%); width:min(780px,86%); max-height:76%; background:var(--panel); border:1px solid var(--cyan); box-shadow:0 16px 50px #000c; display:flex; flex-direction:column; }
+    .title { min-height:38px; display:flex; align-items:center; gap:10px; padding:6px 10px; border-bottom:1px solid var(--line); }
+    .title strong { color:var(--cyan); }
+    .title .spacer { flex:1; }
+    .key { color:var(--muted); border:1px solid var(--line); padding:0 5px; }
+    .modes { display:flex; gap:6px; }
+    .mode { border:0; color:var(--muted); background:transparent; padding:3px 8px; cursor:pointer; }
+    .mode.on { color:var(--bg); background:var(--cyan); }
+    .query-row { display:flex; align-items:center; gap:8px; min-height:42px; padding:5px 10px; border-bottom:1px solid var(--line); }
+    .prompt { color:var(--cyan); }
+    #query { flex:1; color:var(--ink); background:transparent; border:0; outline:0; min-width:0; }
+    .chip { color:var(--amber); border:1px solid #6d593b; padding:2px 7px; white-space:nowrap; }
+    .chip button { border:0; background:transparent; color:var(--amber); cursor:pointer; padding:0 0 0 5px; }
+    .results { min-height:248px; max-height:390px; overflow:auto; padding:5px 0; }
+    .row { display:grid; align-items:center; gap:10px; min-height:33px; padding:5px 10px; cursor:pointer; }
+    .row.file { grid-template-columns:18px 1fr auto; }
+    .row.pr { grid-template-columns:18px 1fr auto; }
+    .row.selected { background:var(--sel); color:#eefcff; }
+    .marker { color:var(--cyan); }
+    .primary { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .secondary { color:var(--muted); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .id { color:var(--amber); }
+    .match { color:#fff; font-weight:700; text-decoration:underline; text-decoration-color:var(--cyan); }
+    .footer { color:var(--muted); border-top:1px solid var(--line); padding:6px 10px; display:flex; gap:10px; min-height:34px; font-size:12px; white-space:nowrap; }
+    .footer .status { margin-left:auto; color:var(--green); }
+    .variant-note { color:#a9bbc3; background:#10191d; border-bottom:1px solid var(--line); padding:6px 10px; font-size:13px; }
+    .rail-layout { display:grid; grid-template-columns:170px 1fr; min-height:340px; }
+    .rail { border-right:1px solid var(--line); padding:8px; }
+    .rail button { display:block; width:100%; text-align:left; color:var(--muted); border:0; background:transparent; padding:7px; cursor:pointer; }
+    .rail button.on { color:var(--cyan); background:#1c2a2f; }
+    .rail small { display:block; color:#596970; margin-top:3px; }
+    .content { display:flex; flex-direction:column; min-width:0; }
+    .scope-line { padding:6px 10px; border-bottom:1px solid var(--line); color:var(--muted); }
+    .token { color:var(--bg); background:var(--amber); padding:2px 6px; margin-right:7px; }
+    .switcher { position:fixed; left:50%; bottom:16px; transform:translateX(-50%); background:#edf7f8; color:#172024; border-radius:999px; box-shadow:0 8px 30px #0009; padding:5px; display:flex; align-items:center; gap:4px; z-index:10; font-family:system-ui,sans-serif; }
+    .switcher button { border:0; border-radius:999px; background:transparent; color:#172024; cursor:pointer; padding:7px 12px; }
+    .switcher button:hover { background:#d5e9eb; }
+    .switcher span { min-width:220px; text-align:center; font-weight:650; font-size:13px; }
+    .toast { position:absolute; top:14px; left:50%; transform:translateX(-50%); background:#102a20; color:#aee2bd; border:1px solid #39694b; padding:7px 12px; opacity:0; transition:opacity .15s; z-index:4; }
+    .toast.show { opacity:1; }
+    @media (max-width:700px) { .review { grid-template-columns:1fr; } .review .pane:first-child { display:none; } .overlay { width:94%; } .rail-layout { grid-template-columns:120px 1fr; } .footer span:nth-child(2) { display:none; } }
+  </style>
+</head>
+<body>
+  <main class="terminal">
+    <section class="review" aria-hidden="true">
+      <div class="pane"><div class="pane-title">Files · 8 changed</div><div class="tree">▾ src/
+  ▾ tui/
+    <span class="active">● M presentation.zig       ●3 ✎1</span>
+      M picker.zig             ●1
+      M render.zig
+  ▾ review/
+      M thread.zig             ●2
+▸ docs/
+  M TODO.md</div></div>
+      <div class="pane"><div class="pane-title">M src/tui/presentation.zig · feature/nav → main</div><div class="diff">@@ -1567,8 +1570,12 @@
+ <span class="del">- if (self.picker) |*picker| {</span>
+ <span class="add">+ if (self.active_overlay == .picker) {</span>
+   if (key.matches(escape, .{})) {
+     self.closePicker();
+   }
+
+├─ ✓ Resolved thread · 2 replies ─────────────────────────────┤
+
+ <span class="add">+ picker.moveSelection(.down);</span></div></div>
+    </section>
+    <div class="shade"></div>
+    <section id="prototype"></section>
+    <div id="toast" class="toast"></div>
+  </main>
+  <nav class="switcher" aria-label="Prototype variant switcher">
+    <button id="prev" aria-label="Previous variant">←</button><span id="variant-label"></span><button id="next" aria-label="Next variant">→</button>
+  </nav>
+  <script>
+    const files = [
+      {name:'presentation.zig', path:'src/tui/presentation.zig', tally:'●3  ✎1'},
+      {name:'picker.zig', path:'src/tui/picker.zig', tally:'●1'},
+      {name:'render.zig', path:'src/tui/render.zig', tally:''},
+      {name:'thread.zig', path:'src/review/thread.zig', tally:'●2'},
+      {name:'client.zig', path:'src/bitbucket/client.zig', tally:''},
+      {name:'TODO.md', path:'TODO.md', tally:''},
+    ];
+    const prs = [
+      {id:1742,title:'M15 presentation navigation polish',branch:'feature/m15-navigation',author:'Stefan',adjacent:true},
+      {id:1761,title:'Navigation fixes for narrow terminals',branch:'fix/narrow-navigation',author:'Mira',adjacent:false},
+      {id:1542,title:'Present draft reconciliation outcome',branch:'feature/reconcile-drafts',author:'Ada',adjacent:false},
+      {id:15,title:'Add diff parser',branch:'feature/diff-parser',author:'Lin',adjacent:false},
+      {id:1805,title:'Render markdown comment cards',branch:'feature/markdown',author:'Grace',adjacent:false},
+    ];
+    const variants = {A:'Shared modes', B:'Purpose-shaped overlays', C:'Scoped command picker'};
+    const params = new URLSearchParams(location.search);
+    let variant = variants[params.get('variant')] ? params.get('variant') : 'A';
+    let mode = variant === 'B' ? 'file' : 'pr';
+    let branchFilter = true;
+    let selected = 0;
+    let query = '';
+
+    function esc(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+    function fuzzy(text,q){ q=q.toLowerCase().trim(); if(!q)return true; let at=0; for(const c of text.toLowerCase()){if(c===q[at])at++; if(at===q.length)return true;} return false; }
+    function scorePR(pr,q){
+      q=q.toLowerCase().trim(); if(!q)return 0;
+      const title=pr.title.toLowerCase(), id=String(pr.id);
+      if(title.includes(q)) return 1000-q.length-(title.indexOf(q)*2);
+      if(fuzzy(title,q)) return 700;
+      if(id===q) return 650;
+      if(id.includes(q)) return 520;
+      if(fuzzy(pr.branch+' '+pr.author,q)) return 300;
+      return -1;
+    }
+    function visible(){
+      const q = query.replace(/^\s*(file|pr):\s*/i,'');
+      if(mode==='file') return files.filter(x=>fuzzy(x.path,q));
+      return prs.filter(x=>(!branchFilter||x.adjacent) && scorePR(x,q)>=0).sort((a,b)=>scorePR(b,q)-scorePR(a,q));
+    }
+    function rowHtml(x,i){
+      const on=i===selected?' selected':'';
+      if(mode==='file') return `<div class="row file${on}" data-i="${i}"><span class="marker">${i===selected?'▸':''}</span><span><span class="primary">${esc(x.name)}</span><br><span class="secondary">${esc(x.path)}</span></span><span class="secondary">${esc(x.tally)}</span></div>`;
+      return `<div class="row pr${on}" data-i="${i}"><span class="marker">${i===selected?'▸':''}</span><span><span class="primary">${esc(x.title)}</span><br><span class="secondary">${esc(x.branch)} · ${esc(x.author)}</span></span><span class="id">#${x.id}</span></div>`;
+    }
+    function queryRow(placeholder, token=''){
+      const chip = mode==='pr'&&branchFilter ? `<span class="chip">branch: feature/m15-navigation <button id="clear-filter" aria-label="Clear adjacent branch filter">×</button></span>` : '';
+      return `<div class="query-row">${token}<span class="prompt">›</span><input id="query" value="${esc(query)}" placeholder="${placeholder}" autocomplete="off" spellcheck="false">${chip}</div>`;
+    }
+    function resultsHtml(){ const list=visible(); if(selected>=list.length)selected=Math.max(0,list.length-1); return `<div id="results" class="results">${list.length?list.map(rowHtml).join(''):'<div class="row"><span></span><span class="secondary">no matches</span></div>'}</div>`; }
+    function footer(){return `<div class="footer"><span>↑↓/ctrl-p ctrl-n move</span><span>wheel scroll · click selects</span><span>enter confirms · esc closes</span><span class="status">${visible().length} results</span></div>`;}
+    function variantA(){
+      return `<section class="overlay"><div class="title"><strong>Picker</strong><div class="modes"><button class="mode ${mode==='file'?'on':''}" data-mode="file">Files <span class="key">f</span></button><button class="mode ${mode==='pr'?'on':''}" data-mode="pr">Pull Requests <span class="key">p</span></button></div><span class="spacer"></span><span class="key">esc</span></div><div class="variant-note">One Overlay and one result grammar; explicit modes change the dataset and confirmation effect.</div>${queryRow(mode==='file'?'fuzzy-find changed files':'title preferred · #id also matches')}${resultsHtml()}${footer()}</section>`;
+    }
+    function variantB(){
+      const file = mode==='file';
+      return `<section class="overlay"><div class="title"><strong>${file?'Jump to File':'Open Pull Request'}</strong><span class="spacer"></span><span class="key">${file?'F':'p'}</span><span class="key">esc</span></div><div class="variant-note">Separate purpose-shaped Overlays share navigation and confirmation, but not information hierarchy.</div><div class="rail-layout"><aside class="rail"><button class="${file?'on':''}" data-mode="file">Jump to File<small>current Session</small></button><button class="${!file?'on':''}" data-mode="pr">Pull Requests<small>replace Session</small></button></aside><div class="content">${queryRow(file?'path or leaf name':'find by title or #id')}${resultsHtml()}</div></div>${footer()}</section>`;
+    }
+    function variantC(){
+      const tok=`<span class="token">${mode}:</span>`;
+      return `<section class="overlay"><div class="title"><strong>Go to…</strong><span class="spacer"></span><span class="key">tab scope</span><span class="key">esc</span></div><div class="variant-note">A command-style Picker makes scope part of the query language; Tab changes <b>file:</b> / <b>pr:</b>.</div><div class="scope-line">scope <span class="key">file:</span> focuses within this Session · <span class="key">pr:</span> replaces the Session</div>${queryRow(mode==='file'?'path or leaf name':'title preferred · #id also matches',tok)}${resultsHtml()}${footer()}</section>`;
+    }
+    function render(){
+      document.getElementById('prototype').innerHTML = variant==='A'?variantA():variant==='B'?variantB():variantC();
+      document.getElementById('variant-label').textContent=`${variant} — ${variants[variant]}`;
+      const input=document.getElementById('query');
+      input?.addEventListener('input',e=>{query=e.target.value; selected=0; render(); document.getElementById('query')?.focus();});
+      document.querySelectorAll('[data-mode]').forEach(b=>b.addEventListener('click',()=>{mode=b.dataset.mode; query=''; selected=0; render();}));
+      document.querySelectorAll('[data-i]').forEach(r=>r.addEventListener('click',()=>{selected=Number(r.dataset.i); render();}));
+      document.getElementById('clear-filter')?.addEventListener('click',()=>{branchFilter=false;selected=0;render();});
+    }
+    function switchVariant(delta){ const ks=Object.keys(variants), at=ks.indexOf(variant); variant=ks[(at+delta+ks.length)%ks.length]; history.replaceState({},'',`?variant=${variant}`); mode=variant==='B'?'file':'pr'; query=''; selected=0; branchFilter=true; render(); }
+    function confirm(){ const item=visible()[selected]; if(!item)return; const msg=mode==='file'?`Focus File: ${item.path}`:`Replace Session with #${item.id}: ${item.title}`; const toast=document.getElementById('toast');toast.textContent=msg;toast.classList.add('show');setTimeout(()=>toast.classList.remove('show'),1600); }
+    document.getElementById('prev').onclick=()=>switchVariant(-1); document.getElementById('next').onclick=()=>switchVariant(1);
+    addEventListener('keydown',e=>{
+      const editing=['INPUT','TEXTAREA'].includes(document.activeElement?.tagName)||document.activeElement?.isContentEditable;
+      if(!editing&&e.key==='ArrowLeft'){e.preventDefault();return switchVariant(-1);} if(!editing&&e.key==='ArrowRight'){e.preventDefault();return switchVariant(1);}
+      if(e.key==='Tab'&&variant==='C'){e.preventDefault();mode=mode==='file'?'pr':'file';query='';selected=0;return render();}
+      if(e.key==='ArrowDown'||(e.ctrlKey&&e.key==='n')){e.preventDefault();selected=Math.min(selected+1,Math.max(0,visible().length-1));return render();}
+      if(e.key==='ArrowUp'||(e.ctrlKey&&e.key==='p')){e.preventDefault();selected=Math.max(0,selected-1);return render();}
+      if(e.key==='Enter'){e.preventDefault();return confirm();}
+      if(variant==='A'&&!editing&&e.key==='f'){mode='file';query='';selected=0;return render();}
+      if(variant==='A'&&!editing&&e.key==='p'){mode='pr';query='';selected=0;return render();}
+    });
+    render();
+  </script>
+</body>
+</html>
