@@ -25,6 +25,7 @@ An implementation-ready M15 specification and dependency map in which every pres
 - [Choose Pane and Overlay framing](issues/05-choose-pane-and-overlay-framing.md) — Frame the Sidebar and DiffPane as focused tiled boxes, use joined one-row section rules, and keep Overlays to a restrained single-line frame.
 - [Establish the mouse compatibility envelope](issues/07-establish-mouse-compatibility-envelope.md) — Click focus/disclosure and vertical scrolling are sound candidates; drag selection needs a narrow contract, and every mouse gesture requires keyboard parity.
 - [Decide M15 mouse support](issues/08-decide-m15-mouse-support.md) — Ship default-on, configurable clicks and wheel navigation for Panes, disclosures, and Pickers, while excluding mouse Selection and less portable gestures.
+- [Choose File finder and PullRequest Picker behavior](issues/09-choose-file-finder-and-picker-behavior.md) — Use separate purpose-shaped Overlays with shared navigation, all-open PullRequest startup, title-first ranking, and Enter-only confirmation.
 - [Choose File cache configuration language](issues/10-choose-file-cache-configuration-language.md) — Use `enabled` and `max_bytes` for the inactive in-memory File cache, with 256 MiB by default, zero meaning unlimited, and the focused File outside the budget.
 
 ## Not yet specified
