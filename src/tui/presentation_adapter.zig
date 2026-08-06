@@ -5,7 +5,17 @@
 //! the result back into a typed `OwnedInput` for serialized admission.
 
 const bbr = @import("bbr");
+const std = @import("std");
+const vaxis = @import("vaxis");
 const presentation = @import("presentation.zig");
+
+/// Consumes Presentation-owned source bytes at the terminal boundary and
+/// reports whether OSC 52 was written successfully.
+pub fn copyToClipboard(vx: vaxis.Vaxis, tty: *std.Io.Writer, command: *presentation.ClipboardCopy) presentation.OwnedInput {
+    defer command.destroy();
+    vx.copyToSystemClipboard(tty, command.text, command.allocator) catch return .{ .clipboard_completed = false };
+    return .{ .clipboard_completed = true };
+}
 
 pub fn postOutcome(
     poster: bbr.review.CommentPoster,
@@ -39,7 +49,6 @@ pub fn postLaunchFailed(command: *presentation.PostDraft) presentation.OwnedInpu
     } };
 }
 
-const std = @import("std");
 const testing = std.testing;
 
 const FakePoster = struct {

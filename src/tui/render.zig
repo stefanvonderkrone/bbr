@@ -26,6 +26,7 @@ const FileStatus = bbr.diff.FileStatus;
 const Thread = bbr.review.Thread;
 const Draft = bbr.review.Draft;
 const Picker = @import("picker.zig").Picker;
+const FileFinder = @import("picker.zig").FileFinder;
 const keymap = @import("keymap.zig");
 const buffer_mod = @import("buffer.zig");
 
@@ -483,6 +484,32 @@ pub fn drawPicker(scratch: std.mem.Allocator, win: vaxis.Window, picker: *const 
             marker, pr.id, pr.title, pr.source_branch,
         }) catch pr.title;
         _ = modal.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .wrap = .none });
+    }
+}
+
+pub fn drawFileFinder(scratch: std.mem.Allocator, win: vaxis.Window, finder: *const FileFinder, theme: Theme) void {
+    const modal = centeredModal(win, 60, 16) orelse return;
+    fillRow(modal, 0, theme.picker_query);
+    const prompt = std.fmt.allocPrint(scratch, "File › {s}", .{finder.query()}) catch "File ›";
+    _ = modal.printSegment(.{ .text = prompt, .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
+    const list_rows = modal.height - 1;
+    const matches = finder.matches();
+    var top: usize = 0;
+    if (finder.selected >= list_rows) top = finder.selected - list_rows + 1;
+    var row: u16 = 1;
+    while (row <= list_rows) : (row += 1) {
+        const match_index = top + row - 1;
+        const selected = match_index < matches.len and match_index == finder.selected;
+        const style = if (selected) theme.picker_selected else theme.picker;
+        fillRow(modal, row, style);
+        if (match_index < matches.len) {
+            const file = finder.files[matches[match_index]];
+            const text = std.fmt.allocPrint(scratch, "{s}{s}", .{ if (selected) "▸ " else "  ", file.displayPath() }) catch file.displayPath();
+            _ = modal.printSegment(.{ .text = text, .style = style }, .{ .row_offset = row, .wrap = .none });
+        } else if (row == 1 and matches.len == 0) {
+            const message = if (finder.files.len == 0) "  no changed files" else "  no matching files";
+            _ = modal.printSegment(.{ .text = message, .style = style }, .{ .row_offset = row, .wrap = .none });
+        }
     }
 }
 

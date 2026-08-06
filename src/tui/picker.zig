@@ -13,6 +13,7 @@ const zf = @import("zf");
 const bbr = @import("bbr");
 
 const PullRequestSummary = bbr.bitbucket.PullRequestSummary;
+const File = bbr.diff.File;
 
 /// Max whitespace-separated needles honored in a query; extra words are ignored.
 const max_needles = 8;
@@ -167,14 +168,30 @@ pub const Picker = struct {
             n += 1;
         }
 
-        // Rank every haystack; keep those that match, tracking their score.
+        // Rank semantic fields independently so title relevance wins over an
+        // incidental bare id/branch/author hit. `#N` is the explicit direct-id
+        // route and intentionally bypasses title-first ranking.
         var count: usize = 0;
-        for (self.haystacks, 0..) |h, i| {
-            if (zf.rank(h, needles[0..n], .{ .plain = true, .case_sensitive = false })) |r| {
-                self.match_buf[count] = i;
-                self.score_buf[count] = r;
-                count += 1;
-            }
+        const explicit_id = q.len > 1 and q[0] == '#';
+        for (self.prs, 0..) |pr, i| {
+            var id_buf: [32]u8 = undefined;
+            const id_text = std.fmt.bufPrint(&id_buf, "{d}", .{pr.id}) catch continue;
+            const score: f64 = if (explicit_id) blk: {
+                if (!std.mem.eql(u8, q[1..], id_text)) continue;
+                break :blk 10000;
+            } else if (zf.rank(pr.title, needles[0..n], .{ .plain = true, .case_sensitive = false })) |rank|
+                rank + 3000
+            else if (zf.rank(pr.source_branch, needles[0..n], .{ .plain = true, .case_sensitive = false })) |rank|
+                rank + 2000
+            else if (zf.rank(pr.author_display_name, needles[0..n], .{ .plain = true, .case_sensitive = false })) |rank|
+                rank + 1000
+            else if (zf.rank(id_text, needles[0..n], .{ .plain = true, .case_sensitive = false })) |rank|
+                rank
+            else
+                continue;
+            self.match_buf[count] = i;
+            self.score_buf[count] = score;
+            count += 1;
         }
         self.match_count = count;
 
@@ -202,6 +219,105 @@ pub const Picker = struct {
         } else if (self.selected >= self.match_count) {
             self.selected = self.match_count - 1;
         }
+    }
+};
+
+/// Synchronous, Session-local File finder. It borrows the Diff's Files and owns
+/// only ranking buffers; confirming a result never replaces the Session.
+pub const FileFinder = struct {
+    allocator: std.mem.Allocator,
+    files: []const File,
+    match_buf: []usize,
+    score_buf: []f64,
+    match_count: usize = 0,
+    selected: usize = 0,
+    query_buf: [256]u8 = undefined,
+    query_len: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator, files: []const File) !FileFinder {
+        var self: FileFinder = .{
+            .allocator = allocator,
+            .files = files,
+            .match_buf = try allocator.alloc(usize, files.len),
+            .score_buf = &.{},
+        };
+        errdefer allocator.free(self.match_buf);
+        self.score_buf = try allocator.alloc(f64, files.len);
+        self.refilter();
+        return self;
+    }
+
+    pub fn deinit(self: *FileFinder) void {
+        self.allocator.free(self.match_buf);
+        self.allocator.free(self.score_buf);
+        self.* = undefined;
+    }
+
+    pub fn query(self: *const FileFinder) []const u8 {
+        return self.query_buf[0..self.query_len];
+    }
+    pub fn matches(self: *const FileFinder) []const usize {
+        return self.match_buf[0..self.match_count];
+    }
+    pub fn selection(self: *const FileFinder) ?usize {
+        return if (self.match_count == 0) null else self.match_buf[self.selected];
+    }
+    pub fn moveDown(self: *FileFinder) void {
+        if (self.selected + 1 < self.match_count) self.selected += 1;
+    }
+    pub fn moveUp(self: *FileFinder) void {
+        if (self.selected > 0) self.selected -= 1;
+    }
+    pub fn insert(self: *FileFinder, bytes: []const u8) void {
+        for (bytes) |byte| if (self.query_len < self.query_buf.len) {
+            self.query_buf[self.query_len] = byte;
+            self.query_len += 1;
+        };
+        self.refilter();
+    }
+    pub fn backspace(self: *FileFinder) void {
+        if (self.query_len > 0) self.query_len -= 1;
+        self.refilter();
+    }
+
+    fn refilter(self: *FileFinder) void {
+        const query_text = std.mem.trim(u8, self.query(), " \t");
+        if (query_text.len == 0) {
+            for (self.files, 0..) |_, index| self.match_buf[index] = index;
+            self.match_count = self.files.len;
+            self.clamp();
+            return;
+        }
+        const needles = [_][]const u8{query_text};
+        var count: usize = 0;
+        for (self.files, 0..) |file, index| {
+            const path = file.displayPath();
+            const leaf = std.fs.path.basename(path);
+            const leaf_rank = zf.rank(leaf, &needles, .{ .plain = true, .case_sensitive = false });
+            const path_rank = zf.rank(path, &needles, .{ .plain = true, .case_sensitive = false });
+            const score = if (leaf_rank) |rank| rank + 1000 else path_rank orelse continue;
+            self.match_buf[count] = index;
+            self.score_buf[count] = score;
+            count += 1;
+        }
+        self.match_count = count;
+        var index: usize = 1;
+        while (index < count) : (index += 1) {
+            const item = self.match_buf[index];
+            const score = self.score_buf[index];
+            var insertion = index;
+            while (insertion > 0 and self.score_buf[insertion - 1] < score) : (insertion -= 1) {
+                self.match_buf[insertion] = self.match_buf[insertion - 1];
+                self.score_buf[insertion] = self.score_buf[insertion - 1];
+            }
+            self.match_buf[insertion] = item;
+            self.score_buf[insertion] = score;
+        }
+        self.clamp();
+    }
+
+    fn clamp(self: *FileFinder) void {
+        if (self.match_count == 0) self.selected = 0 else if (self.selected >= self.match_count) self.selected = self.match_count - 1;
     }
 };
 
@@ -243,6 +359,22 @@ test "matching by id and by author" {
     p.backspace();
     p.insert("Grace");
     try testing.expectEqual(@as(u64, 11), p.selection().?.id);
+}
+
+test "title ranks ahead of bare id while hash id is direct" {
+    const prs = [_]PullRequestSummary{
+        .{ .id = 15, .title = "Routine cleanup", .state = "OPEN", .author_display_name = "Ada", .source_branch = "cleanup", .destination_branch = "main" },
+        .{ .id = 42, .title = "M15 navigation polish", .state = "OPEN", .author_display_name = "Grace", .source_branch = "navigation", .destination_branch = "main" },
+    };
+    var p = try Picker.init(testing.allocator, &prs);
+    defer p.deinit();
+    p.insert("15");
+    try testing.expectEqual(@as(u64, 42), p.selection().?.id);
+    p.backspace();
+    p.backspace();
+    p.insert("#15");
+    try testing.expectEqual(@as(u64, 15), p.selection().?.id);
+    try testing.expectEqual(@as(usize, 1), p.matches().len);
 }
 
 test "no match yields a null selection" {

@@ -24,6 +24,7 @@ const vaxis = @import("vaxis");
 /// the resulting vocabulary is independent of vaxis and belongs to the state
 /// machine that consumes it.
 pub const Action = @import("action.zig").Action;
+pub const InteractionContext = @import("action.zig").InteractionContext;
 
 pub const Modifiers = struct {
     shift: bool = false,
@@ -130,8 +131,8 @@ pub const Binding = struct {
     help: []const u8,
 };
 
-/// The default viewer bindings. Order matters only for the help overlay's
-/// grouping; dispatch resolution is unambiguous (no key maps to two actions).
+/// The default bindings. Contextual Actions deliberately share chords; the
+/// resolver filters them through the active Interaction Context.
 pub const default_bindings = [_]Binding{
     // --- motions ---
     .{ .chord = Chord.one('j'), .action = .down, .help = "down" },
@@ -148,6 +149,8 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one(vaxis.Key.page_up), .action = .half_page_up, .help = "half page up" },
     .{ .chord = Chord.modified('f', .{ .ctrl = true }), .action = .page_down, .help = "page down" },
     .{ .chord = Chord.modified('b', .{ .ctrl = true }), .action = .page_up, .help = "page up" },
+    .{ .chord = Chord.modified('y', .{ .ctrl = true }), .action = .scroll_row_up, .help = "scroll one row up" },
+    .{ .chord = Chord.modified('e', .{ .ctrl = true }), .action = .scroll_row_down, .help = "scroll one row down" },
     .{ .chord = Chord.two('g', 'g'), .action = .to_top, .help = "go to top" },
     .{ .chord = Chord.one(vaxis.Key.home), .action = .to_top, .help = "go to top" },
     .{ .chord = Chord.one('G'), .action = .to_bottom, .help = "go to bottom" },
@@ -163,24 +166,31 @@ pub const default_bindings = [_]Binding{
     // --- commands ---
     .{ .chord = Chord.one('q'), .action = .quit, .help = "quit" },
     .{ .chord = Chord.modified('c', .{ .ctrl = true }), .action = .quit, .help = "quit" },
-    .{ .chord = Chord.one('p'), .action = .open_picker, .help = "open PR picker" },
+    .{ .chord = Chord.one('F'), .action = .open_file_finder, .help = "open File finder" },
+    .{ .chord = Chord.one('p'), .action = .open_pull_request_picker, .help = "open PullRequest Picker" },
     .{ .chord = Chord.one('R'), .action = .refresh, .help = "refresh review" },
     .{ .chord = Chord.one('s'), .action = .toggle_layout, .help = "toggle unified / side-by-side" },
     .{ .chord = Chord.one('f'), .action = .cycle_scope, .help = "cycle diff scope" },
-    .{ .chord = Chord.one('c'), .action = .comment, .help = "new PR comment" },
     .{ .chord = Chord.one('v'), .action = .toggle_select, .help = "toggle visual selection" },
     .{ .chord = Chord.one(vaxis.Key.escape), .action = .clear_selection, .help = "clear selection" },
     .{ .chord = Chord.one('i'), .action = .inline_comment, .help = "inline comment" },
+    .{ .chord = Chord.one('I'), .action = .file_comment, .help = "File-level comment" },
+    .{ .chord = Chord.one('C'), .action = .review_comment, .help = "Review-level comment" },
     .{ .chord = Chord.one('S'), .action = .suggest, .help = "suggestion" },
     .{ .chord = Chord.one('o'), .action = .isolate, .help = "isolate / exit file" },
     .{ .chord = Chord.one(']'), .action = .next_file, .help = "next file" },
     .{ .chord = Chord.one('['), .action = .prev_file, .help = "previous file" },
     .{ .chord = Chord.one('r'), .action = .reply, .help = "reply" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_disclosure, .help = "toggle disclosure" },
+    .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_review_card, .help = "toggle ReviewCard" },
+    .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_directory, .help = "toggle Directory" },
+    .{ .chord = Chord.one(vaxis.Key.enter), .action = .focus_file, .help = "focus File" },
+    .{ .chord = Chord.one(vaxis.Key.enter), .action = .confirm_picker, .help = "confirm selection" },
     .{ .chord = Chord.one('X'), .action = .submit, .help = "submit review" },
     .{ .chord = Chord.one('Y'), .action = .recover_submission, .help = "resume interrupted submission" },
     .{ .chord = Chord.one('U'), .action = .resolve_unpublished, .help = "mark unknown draft unpublished" },
-    .{ .chord = Chord.one('C'), .action = .link_existing_comment, .help = "link unknown draft to comment" },
+    .{ .chord = Chord.two('g', 'C'), .action = .link_existing_comment, .help = "link unknown draft to comment" },
+    .{ .chord = Chord.one('y'), .action = .yank, .help = "yank source text" },
     .{ .chord = Chord.one('?'), .action = .help, .help = "toggle this help" },
     .{ .chord = Chord.one(vaxis.Key.tab), .action = .focus_next_pane, .help = "switch Pane" },
 };
@@ -196,29 +206,29 @@ pub const Keymap = struct {
         try bindings.appendSlice(allocator, &default_bindings);
 
         for (overrides) |override| {
-            const chord = try parseSequence(override.sequence);
-            const found = findChord(bindings.items, chord);
-            if (std.mem.eql(u8, override.action, "none")) {
-                if (found) |index| _ = bindings.orderedRemove(index);
-                continue;
-            }
             const action = actionFromName(override.action) orelse return error.UnknownAction;
-            const binding: Binding = .{ .chord = chord, .action = action, .help = helpFor(action) };
-            if (found) |index| bindings.items[index] = binding else try bindings.append(allocator, binding);
+            var index: usize = 0;
+            while (index < bindings.items.len) {
+                if (bindings.items[index].action == action) _ = bindings.orderedRemove(index) else index += 1;
+            }
+            for (override.sequences) |sequence| {
+                const chord = try parseSequence(sequence);
+                try bindings.append(allocator, .{ .chord = chord, .action = action, .help = helpFor(action) });
+            }
         }
-        try validatePrefixes(bindings.items);
+        try validateBindings(bindings.items);
         return .{ .bindings = try bindings.toOwnedSlice(allocator) };
     }
 };
 
 pub const Override = struct {
-    sequence: []const u8,
     action: []const u8,
+    sequences: []const []const u8 = &.{},
 };
 
 pub fn validateOverride(override: Override) !void {
-    _ = try parseSequence(override.sequence);
-    if (!std.mem.eql(u8, override.action, "none") and actionFromName(override.action) == null) return error.UnknownAction;
+    if (actionFromName(override.action) == null) return error.UnknownAction;
+    for (override.sequences) |sequence| _ = try parseSequence(sequence);
 }
 
 pub const SequenceConflict = enum { duplicate, prefix };
@@ -308,9 +318,7 @@ fn actionFromName(name: []const u8) ?Action {
 }
 
 fn canonicalNameEqual(configured: []const u8, tag: []const u8) bool {
-    if (configured.len != tag.len) return false;
-    for (configured, tag) |a, b| if (a != (if (b == '_') '-' else b)) return false;
-    return true;
+    return std.mem.eql(u8, configured, tag);
 }
 
 fn helpFor(action: Action) []const u8 {
@@ -333,8 +341,9 @@ fn findChord(bindings: []const Binding, chord: Chord) ?usize {
     return null;
 }
 
-fn validatePrefixes(bindings: []const Binding) !void {
+fn validateBindings(bindings: []const Binding) !void {
     for (bindings, 0..) |a, i| for (bindings[i + 1 ..]) |b| {
+        if (sameChord(a.chord, b.chord) and a.action != b.action and contextsOverlap(a.action, b.action)) return error.AmbiguousContext;
         const shorter, const longer = if (a.chord.len() < b.chord.len()) .{ a.chord, b.chord } else .{ b.chord, a.chord };
         if (shorter.len() == longer.len()) continue;
         var prefix = true;
@@ -344,6 +353,148 @@ fn validatePrefixes(bindings: []const Binding) !void {
         };
         if (prefix) return error.PrefixConflict;
     };
+}
+
+pub fn supportsContext(action: Action, context: InteractionContext) bool {
+    return switch (context) {
+        .composer, .help, .unknown_resolution => false,
+        .file_finder, .pull_request_picker => switch (action) {
+            .up, .down, .confirm_picker, .quit => true,
+            else => false,
+        },
+        .sidebar_directory => switch (action) {
+            .down,
+            .up,
+            .left,
+            .right,
+            .to_top,
+            .to_bottom,
+            .scroll_row_up,
+            .scroll_row_down,
+            .quit,
+            .open_file_finder,
+            .open_pull_request_picker,
+            .refresh,
+            .review_comment,
+            .submit,
+            .recover_submission,
+            .resolve_unpublished,
+            .link_existing_comment,
+            .help,
+            .toggle_layout,
+            .cycle_scope,
+            .toggle_directory,
+            .focus_next_pane,
+            => true,
+            else => false,
+        },
+        .sidebar_file => switch (action) {
+            .down,
+            .up,
+            .left,
+            .right,
+            .to_top,
+            .to_bottom,
+            .scroll_row_up,
+            .scroll_row_down,
+            .quit,
+            .open_file_finder,
+            .open_pull_request_picker,
+            .refresh,
+            .file_comment,
+            .review_comment,
+            .submit,
+            .recover_submission,
+            .resolve_unpublished,
+            .link_existing_comment,
+            .help,
+            .toggle_layout,
+            .cycle_scope,
+            .focus_file,
+            .focus_next_pane,
+            => true,
+            else => false,
+        },
+        .sidebar => switch (action) {
+            .down,
+            .up,
+            .left,
+            .right,
+            .quit,
+            .open_file_finder,
+            .open_pull_request_picker,
+            .refresh,
+            .review_comment,
+            .help,
+            .focus_next_pane,
+            => true,
+            else => false,
+        },
+        .diff_disclosure => switch (action) {
+            .toggle_disclosure => true,
+            else => supportsContext(action, .diff),
+        },
+        .diff_review_card => switch (action) {
+            .toggle_review_card, .reply => true,
+            else => supportsContext(action, .diff),
+        },
+        .diff_source => switch (action) {
+            .inline_comment, .suggest, .yank => true,
+            else => supportsContext(action, .diff),
+        },
+        .diff => switch (action) {
+            .down,
+            .up,
+            .half_page_down,
+            .half_page_up,
+            .page_down,
+            .page_up,
+            .to_top,
+            .to_bottom,
+            .center,
+            .scroll_cursor_top,
+            .scroll_cursor_bottom,
+            .cursor_view_top,
+            .cursor_view_middle,
+            .cursor_view_bottom,
+            .scroll_row_up,
+            .scroll_row_down,
+            .select_down,
+            .select_up,
+            .quit,
+            .open_file_finder,
+            .open_pull_request_picker,
+            .refresh,
+            .inline_comment,
+            .file_comment,
+            .review_comment,
+            .suggest,
+            .yank,
+            .submit,
+            .recover_submission,
+            .resolve_unpublished,
+            .link_existing_comment,
+            .help,
+            .toggle_select,
+            .clear_selection,
+            .toggle_layout,
+            .cycle_scope,
+            .isolate,
+            .next_file,
+            .prev_file,
+            .focus_next_pane,
+            => true,
+            else => false,
+        },
+    };
+}
+
+fn contextsOverlap(a: Action, b: Action) bool {
+    inline for (std.meta.fields(InteractionContext)) |field| {
+        const context: InteractionContext = @enumFromInt(field.value);
+        if (supportsContext(a, context) and supportsContext(b, context)) return true;
+    }
+    return false;
 }
 
 /// Threads multi-chord Action grammar across keypresses. Presentation owns one
@@ -363,7 +514,7 @@ pub const Resolver = struct {
         action: Action,
     };
 
-    pub fn feed(self: *Resolver, km: Keymap, key: KeyStroke) Result {
+    pub fn feed(self: *Resolver, km: Keymap, context: InteractionContext, key: KeyStroke) Result {
         if (self.pending_len > 0 and key.matches(vaxis.Key.escape, .{})) {
             self.pending_len = 0;
             self.leader = null;
@@ -376,6 +527,7 @@ pub const Resolver = struct {
         var has_prefix = false;
         var matched_stroke: Stroke = undefined;
         for (km.bindings) |binding| {
+            if (!supportsContext(binding.action, context)) continue;
             if (self.pending_len >= binding.chord.len()) continue;
             var matches = true;
             for (0..self.pending_len) |i| {
@@ -420,12 +572,12 @@ fn plain(cp: u21) KeyStroke {
 test "single-key actions and motions resolve" {
     const km = Keymap.default;
     var res = Resolver{};
-    try testing.expectEqual(Action.quit, res.feed(km, plain('q')).action);
-    try testing.expectEqual(Action.down, res.feed(km, plain('j')).action);
-    try testing.expectEqual(Action.to_bottom, res.feed(km, plain('G')).action);
-    try testing.expectEqual(Action.cursor_view_middle, res.feed(km, plain('M')).action);
-    try testing.expectEqual(Action.reply, res.feed(km, plain('r')).action);
-    try testing.expectEqual(Action.help, res.feed(km, .{ .codepoint = '?', .text = "?" }).action);
+    try testing.expectEqual(Action.quit, res.feed(km, .diff, plain('q')).action);
+    try testing.expectEqual(Action.down, res.feed(km, .diff, plain('j')).action);
+    try testing.expectEqual(Action.to_bottom, res.feed(km, .diff, plain('G')).action);
+    try testing.expectEqual(Action.cursor_view_middle, res.feed(km, .diff, plain('M')).action);
+    try testing.expectEqual(Action.reply, res.feed(km, .diff_review_card, plain('r')).action);
+    try testing.expectEqual(Action.help, res.feed(km, .diff, .{ .codepoint = '?', .text = "?" }).action);
 }
 
 test "isMotion separates movement from commands" {
@@ -439,91 +591,108 @@ test "isMotion separates movement from commands" {
 test "ctrl chords resolve and don't collide with their plain letters" {
     const km = Keymap.default;
     var res = Resolver{};
-    try testing.expectEqual(Action.half_page_down, res.feed(km, .{ .codepoint = 'd', .mods = .{ .ctrl = true } }).action);
-    try testing.expectEqual(Action.page_down, res.feed(km, .{ .codepoint = 'f', .mods = .{ .ctrl = true } }).action);
+    try testing.expectEqual(Action.half_page_down, res.feed(km, .diff, .{ .codepoint = 'd', .mods = .{ .ctrl = true } }).action);
+    try testing.expectEqual(Action.page_down, res.feed(km, .diff, .{ .codepoint = 'f', .mods = .{ .ctrl = true } }).action);
     // Plain 'f' is a different action (cycle scope), not page down.
-    try testing.expectEqual(Action.cycle_scope, res.feed(km, plain('f')).action);
+    try testing.expectEqual(Action.cycle_scope, res.feed(km, .diff, plain('f')).action);
     // ctrl-c quits, like q.
-    try testing.expectEqual(Action.quit, res.feed(km, .{ .codepoint = 'c', .mods = .{ .ctrl = true } }).action);
-    // Plain 'c' is a new comment.
-    try testing.expectEqual(Action.comment, res.feed(km, plain('c')).action);
+    try testing.expectEqual(Action.quit, res.feed(km, .diff, .{ .codepoint = 'c', .mods = .{ .ctrl = true } }).action);
+    try testing.expect(res.feed(km, .diff, plain('c')) == .none);
 }
 
 test "gg and the z-leader motions need two keys" {
     const km = Keymap.default;
     var res = Resolver{};
     // First g arms the leader (nothing yet), second g fires.
-    try testing.expect(res.feed(km, plain('g')) == .none);
+    try testing.expect(res.feed(km, .diff, plain('g')) == .none);
     try testing.expectEqual(@as(?u21, 'g'), res.leader);
-    try testing.expectEqual(Action.to_top, res.feed(km, plain('g')).action);
+    try testing.expectEqual(Action.to_top, res.feed(km, .diff, plain('g')).action);
     try testing.expect(res.leader == null);
 
-    try testing.expect(res.feed(km, plain('z')) == .none);
-    try testing.expectEqual(Action.center, res.feed(km, plain('z')).action);
-    try testing.expect(res.feed(km, plain('z')) == .none);
-    try testing.expectEqual(Action.scroll_cursor_top, res.feed(km, plain('t')).action);
-    try testing.expect(res.feed(km, plain('z')) == .none);
-    try testing.expectEqual(Action.scroll_cursor_bottom, res.feed(km, plain('b')).action);
+    try testing.expect(res.feed(km, .diff, plain('z')) == .none);
+    try testing.expectEqual(Action.center, res.feed(km, .diff, plain('z')).action);
+    try testing.expect(res.feed(km, .diff, plain('z')) == .none);
+    try testing.expectEqual(Action.scroll_cursor_top, res.feed(km, .diff, plain('t')).action);
+    try testing.expect(res.feed(km, .diff, plain('z')) == .none);
+    try testing.expectEqual(Action.scroll_cursor_bottom, res.feed(km, .diff, plain('b')).action);
 }
 
 test "an invalid leader combo is dropped, not misread" {
     const km = Keymap.default;
     var res = Resolver{};
-    try testing.expect(res.feed(km, plain('g')) == .none); // arm g
-    try testing.expect(res.feed(km, plain('x')) == .none); // gx: dropped
+    try testing.expect(res.feed(km, .diff, plain('g')) == .none); // arm g
+    try testing.expect(res.feed(km, .diff, plain('x')) == .none); // gx: dropped
     try testing.expect(res.leader == null);
     // A fresh 'j' after the aborted combo still moves.
-    try testing.expectEqual(Action.down, res.feed(km, plain('j')).action);
+    try testing.expectEqual(Action.down, res.feed(km, .diff, plain('j')).action);
 }
 
 test "numeric Count digits surface as digit results, not actions" {
     const km = Keymap.default;
     var res = Resolver{};
-    const r = res.feed(km, .{ .codepoint = '5', .text = "5" });
+    const r = res.feed(km, .diff, .{ .codepoint = '5', .text = "5" });
     try testing.expectEqual(@as(u8, 5), r.digit);
 }
 
 test "shift+arrow resolves to a selection motion" {
     const km = Keymap.default;
     var res = Resolver{};
-    const r = res.feed(km, .{ .codepoint = vaxis.Key.down, .mods = .{ .shift = true } });
+    const r = res.feed(km, .diff, .{ .codepoint = vaxis.Key.down, .mods = .{ .shift = true } });
     try testing.expectEqual(Action.select_down, r.action);
     // Plain arrow is a bare motion.
-    try testing.expectEqual(Action.down, res.feed(km, plain(vaxis.Key.down)).action);
+    try testing.expectEqual(Action.down, res.feed(km, .diff, plain(vaxis.Key.down)).action);
 }
 
 test "an unbound key resolves to none" {
     const km = Keymap.default;
     var res = Resolver{};
-    try testing.expect(res.feed(km, plain('Z')) == .none);
+    try testing.expect(res.feed(km, .diff, plain('Z')) == .none);
 }
 
-test "configured sequences replace, remove, and resolve beyond two chords" {
+test "Action-oriented configuration replaces all chords and empty list unbinds" {
     const overrides = [_]Override{
-        .{ .sequence = "ctrl-d", .action = "page-down" },
-        .{ .sequence = "q", .action = "none" },
-        .{ .sequence = "space r c", .action = "comment" },
+        .{ .action = "page_down", .sequences = &.{"ctrl-x"} },
+        .{ .action = "quit", .sequences = &.{} },
+        .{ .action = "review_comment", .sequences = &.{"space x c"} },
     };
     var configured = try Keymap.fromOverrides(testing.allocator, &overrides);
     defer configured.deinit(testing.allocator);
 
     var resolver = Resolver{};
-    try testing.expectEqual(Action.page_down, resolver.feed(configured.keymap(), .{ .codepoint = 'd', .mods = .{ .ctrl = true } }).action);
-    try testing.expect(resolver.feed(configured.keymap(), plain('q')) == .none);
-    try testing.expect(resolver.feed(configured.keymap(), plain(' ')) == .none);
-    try testing.expect(resolver.feed(configured.keymap(), plain('r')) == .none);
-    try testing.expectEqual(Action.comment, resolver.feed(configured.keymap(), plain('c')).action);
+    try testing.expectEqual(Action.page_down, resolver.feed(configured.keymap(), .diff, .{ .codepoint = 'x', .mods = .{ .ctrl = true } }).action);
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain('q')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain(' ')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain('x')) == .none);
+    try testing.expectEqual(Action.review_comment, resolver.feed(configured.keymap(), .diff, plain('c')).action);
 }
 
 test "Escape cancels a pending sequence and aliases normalize before conflict checks" {
-    const overrides = [_]Override{.{ .sequence = "space r c", .action = "comment" }};
+    const overrides = [_]Override{.{ .action = "review_comment", .sequences = &.{"space x c"} }};
     var configured = try Keymap.fromOverrides(testing.allocator, &overrides);
     defer configured.deinit(testing.allocator);
     var resolver = Resolver{};
-    try testing.expect(resolver.feed(configured.keymap(), plain(' ')) == .none);
-    try testing.expect(resolver.feed(configured.keymap(), plain(vaxis.Key.escape)) == .none);
-    try testing.expectEqual(Action.reply, resolver.feed(configured.keymap(), plain('r')).action);
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain(' ')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain(vaxis.Key.escape)) == .none);
+    try testing.expectEqual(Action.reply, resolver.feed(configured.keymap(), .diff_review_card, plain('r')).action);
 
     try testing.expectEqual(SequenceConflict.duplicate, (try sequenceConflict("ctrl-d", "control-d")).?);
     try testing.expectEqual(SequenceConflict.prefix, (try sequenceConflict("space r", "space r c")).?);
+}
+
+test "Enter resolves to the precise Action for mutually exclusive targets" {
+    var resolver = Resolver{};
+    try testing.expectEqual(Action.toggle_disclosure, resolver.feed(.default, .diff_disclosure, plain(vaxis.Key.enter)).action);
+    try testing.expectEqual(Action.toggle_review_card, resolver.feed(.default, .diff_review_card, plain(vaxis.Key.enter)).action);
+    try testing.expectEqual(Action.toggle_directory, resolver.feed(.default, .sidebar_directory, plain(vaxis.Key.enter)).action);
+    try testing.expectEqual(Action.focus_file, resolver.feed(.default, .sidebar_file, plain(vaxis.Key.enter)).action);
+    try testing.expectEqual(Action.confirm_picker, resolver.feed(.default, .file_finder, plain(vaxis.Key.enter)).action);
+    try testing.expect(resolver.feed(.default, .composer, plain(vaxis.Key.enter)) == .none);
+}
+
+test "same chord is rejected when Actions overlap in an Interaction Context" {
+    const overrides = [_]Override{
+        .{ .action = "down", .sequences = &.{"x"} },
+        .{ .action = "up", .sequences = &.{"x"} },
+    };
+    try testing.expectError(error.AmbiguousContext, Keymap.fromOverrides(testing.allocator, &overrides));
 }

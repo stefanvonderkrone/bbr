@@ -11,6 +11,7 @@ const Composer = composer_mod.Composer;
 const file_enrichment = @import("file_enrichment.zig");
 const keymap_mod = @import("keymap.zig");
 const Picker = @import("picker.zig").Picker;
+const FileFinder = @import("picker.zig").FileFinder;
 const frame_mod = @import("frame.zig");
 const file_tree = frame_mod.file_tree;
 const buffer_mod = @import("buffer.zig");
@@ -177,6 +178,7 @@ pub const OwnedInput = union(enum) {
     recovery_checked: RecoveryChecked,
     duplicate_checked: DuplicateChecked,
     pull_requests_loaded: PullRequestsLoaded,
+    clipboard_completed: bool,
     dismiss_submission_result,
     request_shutdown,
 
@@ -477,13 +479,26 @@ pub const OwnedCommand = union(enum) {
     check_recovery: CheckRecovery,
     find_duplicate: *PostDraft,
     list_pull_requests: ListPullRequests,
+    copy_clipboard: *ClipboardCopy,
 
     pub fn deinit(self: *OwnedCommand) void {
         switch (self.*) {
             .post_draft, .find_duplicate => |command| command.destroy(),
+            .copy_clipboard => |command| command.destroy(),
             .load_session, .enrich_file, .wait_submission, .check_recovery, .list_pull_requests => {},
         }
         self.* = undefined;
+    }
+};
+
+pub const ClipboardCopy = struct {
+    allocator: Allocator,
+    text: []u8,
+
+    pub fn destroy(self: *ClipboardCopy) void {
+        const allocator = self.allocator;
+        allocator.free(self.text);
+        allocator.destroy(self);
     }
 };
 
@@ -511,6 +526,7 @@ pub const Projection = struct {
     recovery: ?RecoveryNotice,
     unknown_resolution: ?UnknownResolutionProjection,
     picker: ?*const Picker,
+    file_finder: ?*const FileFinder,
     help_visible: bool,
     action_availability: ActionAvailability,
     loading_pull_request_id: ?u64,
@@ -518,17 +534,30 @@ pub const Projection = struct {
     replacing: bool,
     replacement_error: ?ReplacementError,
     action_error: ?ActionError,
+    clipboard_status: ?ClipboardStatus,
     fatal_error: ?FatalError,
     shutting_down: bool,
 };
 
+pub const ClipboardStatus = enum { copied, failed };
+
 pub const ActionAvailability = struct {
     remote: bool,
+    has_review: bool = true,
+    context: keymap_mod.InteractionContext = .diff,
+    source: bool = true,
 
     pub fn available(self: ActionAvailability, action: Action) bool {
-        if (self.remote) return true;
+        if (!self.has_review) return switch (action) {
+            .quit, .help, .open_pull_request_picker => self.remote,
+            else => false,
+        };
+        if (!self.remote) switch (action) {
+            .open_pull_request_picker, .submit, .recover_submission, .resolve_unpublished, .link_existing_comment => return false,
+            else => {},
+        };
         return switch (action) {
-            .open_picker, .submit, .recover_submission, .resolve_unpublished, .link_existing_comment => false,
+            .inline_comment, .suggest, .yank => self.source,
             else => true,
         };
     }
@@ -585,6 +614,8 @@ pub const ActionError = enum {
     local_review_no_picker,
     local_review_no_submission,
     local_review_remote_action_unavailable,
+    source_action_unavailable,
+    target_action_unavailable,
 };
 
 const BufferTransactionError = error{ BufferBuildFailed, OutOfMemory };
@@ -1381,6 +1412,7 @@ pub const Presentation = struct {
     issued_enrichments: std.ArrayList(IssuedEnrichment) = .empty,
     resolver: keymap_mod.Resolver = .{},
     picker: ?Picker = null,
+    file_finder: ?FileFinder = null,
     picker_summaries: ?*PullRequestSummaries = null,
     picker_work_id: ?WorkId = null,
     help_visible: bool = false,
@@ -1392,6 +1424,7 @@ pub const Presentation = struct {
     replacement_error: ?ReplacementError = null,
     action_error: ?ActionError = null,
     fatal_error: ?FatalError = null,
+    clipboard_status: ?ClipboardStatus = null,
 
     pub fn init(allocator: Allocator, dependencies: Dependencies, boot: Boot) !Presentation {
         const geometry: frame_mod.Geometry = boot.geometry orelse .{
@@ -1432,6 +1465,7 @@ pub const Presentation = struct {
         for (self.commands.items) |*command| command.deinit();
         if (self.durable_submission) |durable| durable.destroy();
         if (self.picker) |*picker| picker.deinit();
+        if (self.file_finder) |*finder| finder.deinit();
         if (self.picker_summaries) |summaries| summaries.destroy();
         if (self.published) |published| published.destroy();
         self.commands.deinit(self.allocator);
@@ -1461,6 +1495,10 @@ pub const Presentation = struct {
             .recovery_checked => |checked| self.acceptRecoveryCheck(checked),
             .duplicate_checked => |checked| self.acceptDuplicateCheck(checked),
             .pull_requests_loaded => |loaded| self.acceptPullRequests(loaded),
+            .clipboard_completed => |success| {
+                self.clipboard_status = if (success) .copied else .failed;
+                self.action_error = null;
+            },
             .dismiss_submission_result => self.submission_result = null,
             .request_shutdown => self.requestShutdown(),
         }
@@ -1493,6 +1531,7 @@ pub const Presentation = struct {
                     durable.phase = .awaiting_duplicate;
             },
             .list_pull_requests => self.outstanding_picker_loads += 1,
+            .copy_clipboard => {},
         }
         return command;
     }
@@ -1518,8 +1557,9 @@ pub const Presentation = struct {
                 .comment_id = editor.text(),
             } else null,
             .picker = if (self.picker) |*picker| picker else null,
+            .file_finder = if (self.file_finder) |*finder| finder else null,
             .help_visible = self.help_visible,
-            .action_availability = .{ .remote = if (self.published) |published| published.key.isRemote() else true },
+            .action_availability = self.actionAvailability(),
             .loading_pull_request_id = if (self.replacement) |replacement|
                 if (replacement.key.isRemote()) replacement.key.pull_request_id else null
             else
@@ -1531,6 +1571,7 @@ pub const Presentation = struct {
             .replacing = self.replacement != null,
             .replacement_error = self.replacement_error,
             .action_error = self.action_error,
+            .clipboard_status = self.clipboard_status,
             .fatal_error = self.fatal_error,
             .shutting_down = self.shutdown_requested,
         };
@@ -1716,6 +1757,7 @@ pub const Presentation = struct {
     fn requestShutdown(self: *Presentation) void {
         self.shutdown_requested = true;
         self.closePicker();
+        self.closeFileFinder();
         self.help_visible = false;
         self.unknown_resolution = null;
         var write: usize = 0;
@@ -1733,6 +1775,47 @@ pub const Presentation = struct {
     fn pushCountDigit(self: *Presentation, digit: u8) void {
         if (self.shutdown_requested or self.replacement != null) return;
         if (self.published) |published| published.navigation.pushDigit(digit);
+    }
+
+    fn interactionContext(self: *const Presentation) keymap_mod.InteractionContext {
+        if (self.help_visible) return .help;
+        if (self.unknown_resolution != null) return .unknown_resolution;
+        if (self.file_finder != null) return .file_finder;
+        if (self.picker != null) return .pull_request_picker;
+        return self.paneContext();
+    }
+
+    fn paneContext(self: *const Presentation) keymap_mod.InteractionContext {
+        const published = self.published orelse return .diff;
+        if (published.composer != null) return .composer;
+        if (published.focus == .sidebar) {
+            const entry = published.sidebarEntry() orelse return .sidebar;
+            return if (entry.identity == .directory) .sidebar_directory else .sidebar_file;
+        }
+        if (published.navigation.cursor >= published.buffer.rows.len) return .diff;
+        return switch (published.buffer.rows[published.navigation.cursor]) {
+            .line, .line_pair => .diff_source,
+            .disclosure => .diff_disclosure,
+            .comment, .draft => |card| if (card.part == .disclosure_footer) .diff_review_card else .diff_review_card,
+            else => .diff,
+        };
+    }
+
+    fn actionAvailability(self: *const Presentation) ActionAvailability {
+        const context = if (self.help_visible) self.paneContext() else self.interactionContext();
+        const published = self.published orelse return .{
+            .remote = self.dependencies.remote_enabled,
+            .has_review = false,
+            .context = context,
+        };
+        const source = context == .diff_source or published.navigation.count > 0 or blk: {
+            const selection = published.navigation.selection() orelse break :blk false;
+            var index = selection[0];
+            while (index <= selection[1] and index < published.buffer.rows.len) : (index += 1)
+                if (lineAtRow(published.buffer.rows[index]) != null) break :blk true;
+            break :blk false;
+        };
+        return .{ .remote = published.key.isRemote(), .context = context, .source = source };
     }
 
     fn applyKey(self: *Presentation, key: keymap_mod.KeyStroke) !void {
@@ -1761,16 +1844,35 @@ pub const Presentation = struct {
             if (key.text) |text| if (TextChunk.init(text)) |chunk| return self.applyComposerInput(.{ .insert = chunk }) else |_| {};
             return;
         };
+        if (self.file_finder) |*finder| {
+            if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
+                self.closeFileFinder();
+            } else if (key.matches(keymap_mod.special.enter, .{})) {
+                const selected = finder.selection() orelse return;
+                self.closeFileFinder();
+                if (self.published) |published| {
+                    self.focusFile(published, selected);
+                    published.focus = .diff;
+                }
+            } else if (key.matches(keymap_mod.special.up, .{}) or key.matches('p', .{ .ctrl = true })) {
+                finder.moveUp();
+            } else if (key.matches(keymap_mod.special.down, .{}) or key.matches('n', .{ .ctrl = true })) {
+                finder.moveDown();
+            } else if (key.matches(keymap_mod.special.backspace, .{})) {
+                finder.backspace();
+            } else if (key.text) |text| finder.insert(text);
+            return;
+        }
         if (self.picker) |*picker| {
             if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
                 self.closePicker();
             } else if (key.matches(keymap_mod.special.enter, .{})) {
-                const selected = picker.selection();
+                const selected = picker.selection() orelse return;
                 self.closePicker();
-                if (selected) |item| try self.choosePullRequest(try ReviewKey.init(
+                try self.choosePullRequest(try ReviewKey.init(
                     if (self.published) |published| published.key.workspace() else self.replacement.?.key.workspace(),
                     if (self.published) |published| published.key.repository() else self.replacement.?.key.repository(),
-                    item.id,
+                    selected.id,
                 ));
             } else if (key.matches(keymap_mod.special.up, .{}) or key.matches('p', .{ .ctrl = true })) {
                 picker.moveUp();
@@ -1781,7 +1883,7 @@ pub const Presentation = struct {
             } else if (key.text) |text| picker.insert(text);
             return;
         }
-        switch (self.resolver.feed(self.dependencies.keymap, key)) {
+        switch (self.resolver.feed(self.dependencies.keymap, self.interactionContext(), key)) {
             .none => {},
             .digit => |digit| self.pushCountDigit(digit),
             .action => |action| self.applyAction(action),
@@ -1818,6 +1920,7 @@ pub const Presentation = struct {
     }
 
     fn applyAction(self: *Presentation, action: Action) void {
+        self.clipboard_status = null;
         if (action == .quit) {
             self.requestShutdown();
             return;
@@ -1828,14 +1931,15 @@ pub const Presentation = struct {
             replacement.key
         else
             null;
-        if (visible_key) |key| if (!(ActionAvailability{ .remote = key.isRemote() }).available(action)) {
+        if (visible_key != null and !self.actionAvailability().available(action)) {
             self.action_error = switch (action) {
-                .open_picker => .local_review_no_picker,
+                .open_pull_request_picker => .local_review_no_picker,
                 .submit => .local_review_no_submission,
+                .inline_comment, .suggest, .yank => .source_action_unavailable,
                 else => .local_review_remote_action_unavailable,
             };
             return;
-        };
+        }
         if (self.shutdown_requested) {
             if (action == .submit) self.resumeDurableSubmission();
             return;
@@ -1848,8 +1952,12 @@ pub const Presentation = struct {
             self.help_visible = true;
             return;
         }
-        if (action == .open_picker) {
+        if (action == .open_pull_request_picker) {
             self.openPicker();
+            return;
+        }
+        if (action == .open_file_finder) {
+            self.openFileFinder();
             return;
         }
         if (self.replacement != null) return;
@@ -1873,6 +1981,8 @@ pub const Presentation = struct {
             .cursor_view_top => published.navigation.cursorToViewTop(),
             .cursor_view_middle => published.navigation.cursorToViewMiddle(),
             .cursor_view_bottom => published.navigation.cursorToViewBottom(),
+            .scroll_row_up => published.navigation.scrollRows(-1),
+            .scroll_row_down => published.navigation.scrollRows(1),
             .select_down => {
                 published.navigation.ensureMark();
                 published.navigation.down();
@@ -1903,8 +2013,11 @@ pub const Presentation = struct {
             .next_file => if (published.focus == .diff) self.moveFile(published, 1),
             .prev_file => if (published.focus == .diff) self.moveFile(published, -1),
             .toggle_disclosure => if (published.focus == .sidebar) self.activateSidebarEntry(published) else self.toggleDisclosure(published),
+            .toggle_review_card => self.toggleDisclosure(published),
+            .toggle_directory, .focus_file => self.activateSidebarEntry(published),
             .focus_next_pane => self.togglePaneFocus(published),
-            .comment => self.openComposer(published, .{ .kind = .comment, .label = "New comment" }),
+            .review_comment => self.openComposer(published, .{ .kind = .comment, .label = "New comment", .scope = .review }),
+            .file_comment => self.openFileComposer(published),
             .reply => self.openReplyComposer(published),
             .inline_comment => self.openInlineComposer(published, .comment),
             .suggest => self.openInlineComposer(published, .suggestion),
@@ -1912,7 +2025,8 @@ pub const Presentation = struct {
             .recover_submission => unreachable,
             .resolve_unpublished => self.resolveSelectedUnknownAsUnpublished(published),
             .link_existing_comment => self.openUnknownResolutionEditor(published),
-            .open_picker, .help => unreachable,
+            .yank => self.yank(published),
+            .open_file_finder, .open_pull_request_picker, .confirm_picker, .help => unreachable,
             .quit => unreachable,
         }
         if (published.focus == .diff and active_before != published.activeFile()) self.revealActiveFile(published);
@@ -1969,17 +2083,22 @@ pub const Presentation = struct {
         switch (entry.identity) {
             .directory => if (entry.expanded) self.sidebarLeft(published) else self.sidebarRight(published),
             .file => |file_index| {
-                if (published.isolated_file != null) {
-                    published.rebuild(self.preferences, published.expanded_disclosures.items, file_index) catch |err| {
-                        self.action_error = normalizeActionError(err);
-                        return;
-                    };
-                    published.isolated_file = file_index;
-                    published.navigation = Nav.init(published.buffer.rows.len, frame_mod.paneRects(published.geometry).diff_content.height);
-                } else if (fileHeaderRow(published.buffer, file_index)) |row| published.navigation.jumpTo(row);
-                self.revealActiveFile(published);
+                self.focusFile(published, file_index);
             },
         }
+    }
+
+    fn focusFile(self: *Presentation, published: *Published, file_index: usize) void {
+        if (file_index >= published.session.diff.files.len) return;
+        if (published.isolated_file != null) {
+            published.rebuild(self.preferences, published.expanded_disclosures.items, file_index) catch |err| {
+                self.action_error = normalizeActionError(err);
+                return;
+            };
+            published.isolated_file = file_index;
+            published.navigation = Nav.init(published.buffer.rows.len, frame_mod.paneRects(published.geometry).diff_content.height);
+        } else if (fileHeaderRow(published.buffer, file_index)) |row| published.navigation.jumpTo(row);
+        self.revealActiveFile(published);
     }
 
     fn revealActiveFile(self: *Presentation, published: *Published) void {
@@ -2435,6 +2554,20 @@ pub const Presentation = struct {
         self.action_error = null;
     }
 
+    fn openFileComposer(self: *Presentation, published: *Published) void {
+        const file_index = published.activeFile() orelse {
+            self.action_error = .action_refused;
+            return;
+        };
+        const file = published.session.diff.files[file_index];
+        const path = if (file.new_path.len > 0) file.new_path else file.old_path;
+        self.openComposer(published, .{
+            .kind = .comment,
+            .scope = .{ .file = .{ .path = path, .source_commit = published.session.header.source_commit } },
+            .label = "New File comment",
+        });
+    }
+
     fn openReplyComposer(self: *Presentation, published: *Published) void {
         if (published.navigation.cursor >= published.buffer.rows.len) {
             self.action_error = .action_refused;
@@ -2820,6 +2953,81 @@ pub const Presentation = struct {
         self.action_error = null;
     }
 
+    fn openFileFinder(self: *Presentation) void {
+        const published = self.published orelse {
+            self.action_error = .action_refused;
+            return;
+        };
+        self.closeFileFinder();
+        self.file_finder = FileFinder.init(self.allocator, published.session.diff.files) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        self.action_error = null;
+    }
+
+    fn yank(self: *Presentation, published: *Published) void {
+        if (published.navigation.cursor >= published.buffer.rows.len) {
+            self.action_error = .invalid_selection;
+            return;
+        }
+        const start_file = fileIndexForRow(published.buffer, published.navigation.cursor);
+        const selection = published.navigation.selection();
+        const wanted = if (selection == null) @max(published.navigation.count, 1) else std.math.maxInt(usize);
+        published.navigation.count = 0;
+        const first = if (selection) |range| range[0] else published.navigation.cursor;
+        const last = if (selection) |range| range[1] else published.buffer.rows.len - 1;
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(self.allocator);
+        var copied: usize = 0;
+        var row_index = first;
+        while (row_index <= last and row_index < published.buffer.rows.len and copied < wanted) : (row_index += 1) {
+            if (fileIndexForRow(published.buffer, row_index) != start_file) break;
+            const source: ?[]const u8 = switch (published.buffer.rows[row_index]) {
+                .line => |line| line.line.text,
+                .line_pair => |pair| if (pair.right) |right| right.line.text else if (pair.left) |left| left.line.text else null,
+                else => null,
+            };
+            if (source) |text_value| {
+                if (copied > 0) bytes.append(self.allocator, '\n') catch {
+                    self.action_error = .out_of_memory;
+                    return;
+                };
+                bytes.appendSlice(self.allocator, text_value) catch {
+                    self.action_error = .out_of_memory;
+                    return;
+                };
+                copied += 1;
+            }
+        }
+        if (copied == 0) {
+            self.action_error = .invalid_selection;
+            return;
+        }
+        const command = self.allocator.create(ClipboardCopy) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        const owned = bytes.toOwnedSlice(self.allocator) catch {
+            self.allocator.destroy(command);
+            self.action_error = .out_of_memory;
+            return;
+        };
+        command.* = .{ .allocator = self.allocator, .text = owned };
+        self.commands.append(self.allocator, .{ .copy_clipboard = command }) catch {
+            command.destroy();
+            self.action_error = .out_of_memory;
+            return;
+        };
+        published.navigation.clearMark();
+        self.action_error = null;
+    }
+
+    fn closeFileFinder(self: *Presentation) void {
+        if (self.file_finder) |*finder| finder.deinit();
+        self.file_finder = null;
+    }
+
     fn closePicker(self: *Presentation) void {
         if (self.picker) |*picker| picker.deinit();
         self.picker = null;
@@ -3185,10 +3393,10 @@ test "local review gates remote actions and refreshes the same identity" {
     try testing.expectEqual(@as(bbr.review.ReviewRepositoryId, 42), initial.review.?.identity.local.repository_id);
     try testing.expectEqualStrings("refs/remotes/origin/main", initial.review.?.identity.local.base_ref);
     try testing.expectEqualStrings("refs/heads/feature", initial.review.?.identity.local.source_ref);
-    try testing.expect(!initial.action_availability.available(.open_picker));
+    try testing.expect(!initial.action_availability.available(.open_pull_request_picker));
     try testing.expect(!initial.action_availability.available(.submit));
 
-    try presentation.dispatch(.{ .action = .open_picker });
+    try presentation.dispatch(.{ .action = .open_pull_request_picker });
     try testing.expectEqual(ActionError.local_review_no_picker, presentation.projection().action_error.?);
     try testing.expect(presentation.takeCommand() == null);
     try presentation.dispatch(.{ .action = .submit });
@@ -3322,7 +3530,7 @@ test "Pane focus gives the Sidebar an independent cursor while DiffPane File mot
     frame = presentation.projection().review.?.frame;
     try testing.expectEqual(frame_mod.PaneFocus.sidebar, frame.focus);
     try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 1 }));
-    try presentation.dispatch(.{ .action = .toggle_disclosure });
+    try presentation.dispatch(.{ .action = .toggle_directory });
     frame = presentation.projection().review.?.frame;
     try testing.expectEqual(@as(usize, 1), fileIndexForRow(frame.buffer, frame.navigation.cursor));
 
@@ -3335,6 +3543,128 @@ test "Pane focus gives the Sidebar an independent cursor while DiffPane File mot
     frame = presentation.projection().review.?.frame;
     try testing.expectEqual(@as(usize, 0), fileIndexForRow(frame.buffer, frame.navigation.cursor));
     try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 1 }));
+}
+
+test "File finder filters synchronously and confirms within the same Session" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 10 },
+    });
+    defer presentation.deinit();
+    const epoch = presentation.projection().review.?.session_epoch;
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'F', .text = "F" } });
+    try testing.expect(presentation.projection().file_finder != null);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'x', .text = "xyz" } });
+    try testing.expectEqual(@as(usize, 0), presentation.projection().file_finder.?.matches().len);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(presentation.projection().file_finder != null);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try presentation.dispatch(.{ .action = .open_file_finder });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'b', .text = "b" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+
+    const projection = presentation.projection();
+    try testing.expect(projection.file_finder == null);
+    try testing.expectEqual(epoch, projection.review.?.session_epoch);
+    try testing.expectEqual(@as(usize, 1), fileIndexForRow(projection.review.?.buffer, projection.review.?.navigation.cursor));
+    try testing.expectEqual(frame_mod.PaneFocus.diff, projection.review.?.frame.focus);
+}
+
+test "File finder Escape dismisses and reopening resets its query" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_file_finder });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'b', .text = "b" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expect(presentation.projection().file_finder == null);
+    try presentation.dispatch(.{ .action = .open_file_finder });
+    try testing.expectEqualStrings("", presentation.projection().file_finder.?.query());
+}
+
+test "Comment Action ladder carries inline File and Review scopes" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+
+    try presentation.dispatch(.{ .action = .review_comment });
+    try testing.expect(published.composer.?.request.scope.? == .review);
+    try presentation.dispatch(.{ .composer = .cancel });
+
+    try presentation.dispatch(.{ .action = .file_comment });
+    try testing.expect(published.composer.?.request.scope.? == .file);
+    try testing.expectEqualStrings("a.zig", published.composer.?.request.scope.?.file.path);
+    try presentation.dispatch(.{ .composer = .cancel });
+
+    for (published.buffer.rows, 0..) |row, index| if (lineAtRow(row) != null) {
+        published.navigation.jumpTo(index);
+        break;
+    };
+    try presentation.dispatch(.{ .action = .inline_comment });
+    try testing.expect(published.composer.?.request.anchor != null);
+    try testing.expect(published.composer.?.request.scope == null);
+}
+
+test "source-only Action reports availability instead of silently doing nothing" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    presentation.published.?.navigation.jumpTo(0);
+    try testing.expect(!presentation.projection().action_availability.available(.yank));
+    try presentation.dispatch(.{ .action = .yank });
+    try testing.expectEqual(ActionError.source_action_unavailable, presentation.projection().action_error.?);
+}
+
+test "yank Count skips Presentation rows and stops at the File boundary" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    published.navigation.jumpTo(0); // File header; Count starts here and skips it.
+    published.navigation.pushDigit(9);
+    try presentation.dispatch(.{ .action = .yank });
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expect(command == .copy_clipboard);
+    try testing.expectEqualStrings("old a\nnew a", command.copy_clipboard.text);
+    try testing.expectEqual(@as(usize, 0), published.navigation.count);
+}
+
+test "side-by-side yank applies provisional new-side-first source selection" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .toggle_layout });
+    const published = presentation.published.?;
+    for (published.buffer.rows, 0..) |row, index| if (row == .line_pair) {
+        published.navigation.jumpTo(index);
+        break;
+    };
+    try presentation.dispatch(.{ .action = .yank });
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqualStrings("new a", command.copy_clipboard.text);
+    try presentation.dispatch(.{ .clipboard_completed = true });
+    try testing.expectEqual(ClipboardStatus.copied, presentation.projection().clipboard_status.?);
 }
 
 test "successful Session replacement resets Pane and Sidebar defaults" {
@@ -3475,7 +3805,7 @@ test "Session disclosures toggle independently persist through rebuilds and rese
     try testing.expect(folds_restored.buffer.rows[findDisclosureRow(folds_restored.buffer.rows, fold_key.?).?].disclosure.expanded);
 
     // Saving a Draft also rebuilds the Frame without discarding choices.
-    try presentation.dispatch(.{ .action = .comment });
+    try presentation.dispatch(.{ .action = .review_comment });
     try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("new review note") } });
     try presentation.dispatch(.{ .composer = .save });
     try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
@@ -3795,7 +4125,7 @@ test "saving a Composer Draft persists it for a later Session" {
         });
         defer presentation.deinit();
 
-        try presentation.dispatch(.{ .action = .comment });
+        try presentation.dispatch(.{ .action = .review_comment });
         try testing.expectEqualStrings("New comment", presentation.projection().composer.?.label);
         try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("ship it") } });
         try presentation.dispatch(.{ .composer = .save });
@@ -3894,7 +4224,7 @@ test "persistence failure preserves Composer and the exact published review" {
         .viewport_rows = 8,
     });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .action = .comment });
+    try presentation.dispatch(.{ .action = .review_comment });
     try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("keep me") } });
     const before = presentation.projection().review.?;
 
@@ -3927,7 +4257,7 @@ test "Composer save allocation failure preserves Composer and the exact publishe
         .viewport_rows = 8,
     });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .action = .comment });
+    try presentation.dispatch(.{ .action = .review_comment });
     try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("keep me") } });
     const before = presentation.projection().review.?;
 
@@ -3986,7 +4316,7 @@ test "failed replacement preserves Composer and successful replacement resets it
         .viewport_rows = 8,
     });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .action = .comment });
+    try presentation.dispatch(.{ .action = .review_comment });
     try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("survive rollback") } });
 
     const key_two = try ReviewKey.init("workspace", "repo", 2);

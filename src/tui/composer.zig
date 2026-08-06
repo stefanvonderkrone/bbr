@@ -18,6 +18,7 @@ const Anchor = bbr.review.Anchor;
 const AnchorSnapshot = bbr.review.comment.AnchorSnapshot;
 const Parent = bbr.review.draft.Parent;
 const NewDraft = bbr.review.NewDraft;
+const CommentScope = bbr.review.CommentScope;
 
 /// The context an authoring action carries in from `app.zig`: everything a
 /// `NewDraft` needs except the body the reviewer types. `label` is a short
@@ -26,6 +27,7 @@ pub const Request = struct {
     kind: DraftKind,
     target: CommentTarget = .bitbucket,
     anchor: ?Anchor = null,
+    scope: ?CommentScope = null,
     snapshot: ?AnchorSnapshot = null,
     parent: ?Parent = null,
     label: []const u8,
@@ -110,6 +112,7 @@ pub const Composer = struct {
             .kind = self.request.kind,
             .target = self.request.target,
             .anchor = self.request.anchor,
+            .scope = self.request.scope,
             .snapshot = self.request.snapshot,
             .parent = self.request.parent,
             .body = self.body(),

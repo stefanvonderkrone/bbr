@@ -137,7 +137,10 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     errdefer diagnostics.deinit(allocator);
     var overrides: std.ArrayList(keymap.Override) = .empty;
-    defer overrides.deinit(allocator);
+    defer {
+        for (overrides.items) |override| allocator.free(override.sequences);
+        overrides.deinit(allocator);
+    }
     var override_lines: std.ArrayList(usize) = .empty;
     defer override_lines.deinit(allocator);
     var theme_name: []const u8 = "system";
@@ -185,6 +188,46 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
             continue;
         }
         parser.space();
+        if (section == .keymap) {
+            const parsed = parser.stringArray() catch {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected an array of quoted key chords", .hint = "use action_name = [\"key\", \"other-key\"] or [] to unbind" });
+                continue;
+            };
+            parser.space();
+            if (!parser.trailing()) {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "unexpected text after value" });
+                continue;
+            }
+            if (overrides.items.len == 256) {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "more than 256 Keymap entries" });
+                continue;
+            }
+            var duplicate = false;
+            for (overrides.items) |existing| if (std.mem.eql(u8, existing.action, key)) {
+                duplicate = true;
+                break;
+            };
+            if (duplicate) {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate Keymap Action", .hint = "keep exactly one chord list for each Action" });
+                continue;
+            }
+            const sequences = try allocator.dupe([]const u8, parsed.slice());
+            const override: keymap.Override = .{ .action = key, .sequences = sequences };
+            keymap.validateOverride(override) catch |err| {
+                allocator.free(sequences);
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = switch (err) {
+                    error.UnknownAction => "unknown Action name",
+                    error.UnknownKey => "unknown key name",
+                    error.SequenceTooLong => "key sequence exceeds eight chords",
+                    error.CountConflict => "key sequence cannot begin with a Count digit",
+                    else => "invalid key sequence",
+                }, .hint = if (err == error.UnknownAction) "use an Action name shown in the Keybindings Overlay" else null });
+                continue;
+            };
+            try overrides.append(allocator, override);
+            try override_lines.append(allocator, line_number);
+            continue;
+        }
         const value: []const u8 = switch (section) {
             .highlight, .comments => parser.unsigned() catch {
                 try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a non-negative integer byte count" });
@@ -217,38 +260,7 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
                 } else theme_name = value;
                 theme_seen = true;
             } else try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown top-level key", .hint = "did you mean 'theme'?" }),
-            .keymap => {
-                if (overrides.items.len == 256) {
-                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "more than 256 Keymap entries" });
-                    continue;
-                }
-                const override: keymap.Override = .{ .sequence = key, .action = value };
-                keymap.validateOverride(override) catch |err| {
-                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = switch (err) {
-                        error.UnknownAction => "unknown Action name",
-                        error.UnknownKey => "unknown key name",
-                        error.SequenceTooLong => "key sequence exceeds eight chords",
-                        error.CountConflict => "key sequence cannot begin with a Count digit",
-                        else => "invalid key sequence",
-                    }, .hint = switch (err) {
-                        error.UnknownAction => "use a kebab-case Action name shown in the Keybindings Overlay",
-                        error.UnknownKey => "use a printable key or a documented named key such as page-down",
-                        else => null,
-                    } });
-                    continue;
-                };
-                var duplicate = false;
-                for (overrides.items) |existing| {
-                    duplicate = (try keymap.sequenceConflict(existing.sequence, override.sequence)) == .duplicate;
-                    if (duplicate) break;
-                }
-                if (duplicate) {
-                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate Keymap chord", .hint = "keep exactly one entry for each chord sequence" });
-                    continue;
-                }
-                try overrides.append(allocator, override);
-                try override_lines.append(allocator, line_number);
-            },
+            .keymap => unreachable,
             .highlight => if (!std.mem.eql(u8, key, "max_file_bytes")) {
                 try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown Highlighting key", .hint = "use max_file_bytes" });
             } else if (highlight_limit_seen) {
@@ -303,6 +315,7 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
     var owned_keymap = keymap.Keymap.fromOverrides(allocator, overrides.items) catch |err| {
         try diagnostics.append(allocator, .{ .line = if (override_lines.getLastOrNull()) |line| line else 1, .column = 1, .message = switch (err) {
             error.PrefixConflict => "a key sequence is the prefix of another binding",
+            error.AmbiguousContext => "a Keymap chord is ambiguous in one Interaction Context",
             else => "Keymap could not be materialized",
         }, .hint = "remove one binding, unbind the conflicting default, or choose distinct prefixes" });
         return .{ .invalid = try diagnostics.toOwnedSlice(allocator) };
@@ -334,8 +347,8 @@ test "strict configuration rejects duplicate keys and sequence prefixes together
         \\theme = "dark"
         \\theme = "light"
         \\[keymap]
-        \\"space r" = "reply"
-        \\"space r c" = "comment"
+        \\down = ["x"]
+        \\up = ["x"]
     ;
     var result = try parse(testing.allocator, source);
     defer result.deinit(testing.allocator);
@@ -348,8 +361,8 @@ test "strict configuration rejects duplicate keys and sequence prefixes together
 test "unbinding a default can free its Leader for a shorter Action" {
     const source =
         \\[keymap]
-        \\"g g" = "none"
-        \\"g" = "to-top"
+        \\link_existing_comment = []
+        \\to_top = ["g"]
     ;
     var result = try parse(testing.allocator, source);
     defer result.deinit(testing.allocator);
@@ -417,6 +430,31 @@ const LineParser = struct {
         return value;
     }
 
+    const StringArray = struct {
+        items: [16][]const u8 = undefined,
+        len: usize = 0,
+
+        fn slice(self: *const StringArray) []const []const u8 {
+            return self.items[0..self.len];
+        }
+    };
+
+    fn stringArray(self: *LineParser) !StringArray {
+        var result: StringArray = .{};
+        if (!self.take('[')) return error.ExpectedArray;
+        self.space();
+        if (self.take(']')) return result;
+        while (true) {
+            if (result.len == result.items.len) return error.TooManyItems;
+            result.items[result.len] = try self.quoted();
+            result.len += 1;
+            self.space();
+            if (self.take(']')) return result;
+            if (!self.take(',')) return error.ExpectedComma;
+            self.space();
+        }
+    }
+
     fn unsigned(self: *LineParser) ![]const u8 {
         const start = self.pos;
         while (!self.done() and std.ascii.isDigit(self.peek())) self.pos += 1;
@@ -443,8 +481,8 @@ test "configuration resolves theme and keymap while collecting independent diagn
     const source =
         \\theme = "catppuccin-mocha"
         \\[keymap]
-        \\"ctrl-d" = "page-down"
-        \\"q" = "none"
+        \\page_down = ["ctrl-x"]
+        \\quit = []
     ;
     var result = try parse(testing.allocator, source);
     defer result.deinit(testing.allocator);
@@ -455,7 +493,7 @@ test "configuration resolves theme and keymap while collecting independent diagn
         \\theem = "dark"
         \\theme = "midnight"
         \\[keymap]
-        \\"ctrl-d" = "fly"
+        \\fly = ["ctrl-d"]
     ;
     var invalid = try parse(testing.allocator, broken);
     defer invalid.deinit(testing.allocator);
@@ -559,7 +597,7 @@ test "configuration intake owns missing valid malformed and unreadable file stat
     try file.writeStreamingAll(io,
         \\theme = "gruvbox-light"
         \\[keymap]
-        \\"ctrl-d" = "page-down"
+        \\page_down = ["ctrl-x"]
     );
     file.close(io);
     var valid = try load(testing.allocator, io, &env);
@@ -568,7 +606,7 @@ test "configuration intake owns missing valid malformed and unreadable file stat
     try testing.expectEqualStrings("gruvbox-light", valid.ok.theme_name);
     try testing.expect(std.meta.eql(theme.gruvbox_light, valid.ok.active_theme));
     var resolver = keymap.Resolver{};
-    try testing.expectEqual(keymap.Action.page_down, resolver.feed(valid.ok.keymap.keymap(), .{ .codepoint = 'd', .mods = .{ .ctrl = true } }).action);
+    try testing.expectEqual(keymap.Action.page_down, resolver.feed(valid.ok.keymap.keymap(), .diff, .{ .codepoint = 'x', .mods = .{ .ctrl = true } }).action);
 
     file = try bbr_dir.createFile(io, "config.toml", .{ .truncate = true });
     try file.writeStreamingAll(io, "theem = \"dark\"\n");

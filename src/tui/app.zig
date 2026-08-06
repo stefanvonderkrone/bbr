@@ -114,7 +114,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
     var frame_arena = std.heap.ArenaAllocator.init(ctx.gpa);
     defer frame_arena.deinit();
 
-    try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id);
+    try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, vx, writer);
     while (true) {
         const event = try loop.nextEvent();
         switch (event) {
@@ -129,10 +129,10 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
             },
         }
 
-        try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id);
+        try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, vx, writer);
         if (state.projection().review != null) {
             try state.dispatch(.ensure_focused_enrichment);
-            try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id);
+            try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, vx, writer);
         }
         // A completed worker may still own a payload queued for Presentation.
         // Keep the loop alive until every completion has been received and
@@ -175,6 +175,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
             render.drawLoading(frame, win, projection.loading_pull_request_id, ctx.active_theme, status);
         }
         if (projection.picker) |active_picker| render.drawPicker(frame, win, active_picker, ctx.active_theme);
+        if (projection.file_finder) |finder| render.drawFileFinder(frame, win, finder, ctx.active_theme);
         if (projection.composer) |composer| render.drawComposerProjection(frame, win, composer, ctx.active_theme);
         if (projection.unknown_resolution) |resolution| render.drawComposerProjection(frame, win, .{
             .label = "Link existing Bitbucket Comment ID",
@@ -229,7 +230,13 @@ fn presentationStatus(
         .local_review_no_picker => "Pull Request Picker is unavailable for a local review",
         .local_review_no_submission => "Submit is unavailable for a local review; drafts remain local",
         .local_review_remote_action_unavailable => "This action is unavailable for a local review",
+        .source_action_unavailable => "This action requires a source line or Selection",
+        .target_action_unavailable => "This action is unavailable for the current target",
         else => @tagName(err),
+    };
+    if (projection.clipboard_status) |status| return switch (status) {
+        .copied => "copied source text",
+        .failed => "could not copy source text",
     };
     if (projection.shutting_down) {
         if (projection.submission) |submission|
@@ -527,9 +534,17 @@ fn drainPresentationCommands(
     loop: *Loop,
     futures: *std.ArrayList(PresentationWork),
     next_work_id: *u64,
+    vx: vaxis.Vaxis,
+    writer: *std.Io.Writer,
 ) !void {
     while (state.takeCommand()) |command_value| {
         var command = command_value;
+        if (command == .copy_clipboard) {
+            const input = presentation_adapter.copyToClipboard(vx, writer, command.copy_clipboard);
+            command = undefined;
+            try state.dispatch(input);
+            continue;
+        }
         futures.ensureUnusedCapacity(ctx.gpa, 1) catch {
             try admitPresentationLaunchFailure(state, &command);
             continue;
@@ -544,6 +559,7 @@ fn drainPresentationCommands(
             .check_recovery => |check| ctx.io.concurrent(presentationRecoveryCheckWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, check }),
             .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, check }),
             .list_pull_requests => |list| ctx.io.concurrent(presentationListPullRequestsWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, list }),
+            .copy_clipboard => unreachable,
         } catch {
             try admitPresentationLaunchFailure(state, &command);
             continue;
@@ -576,6 +592,10 @@ fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *p
             break :blk input;
         },
         .list_pull_requests => |list| .{ .pull_requests_loaded = .{ .work_id = list.work_id, .outcome = .failed } },
+        .copy_clipboard => |copy| blk: {
+            copy.destroy();
+            break :blk .{ .clipboard_completed = false };
+        },
     };
     command.* = undefined;
     try state.dispatch(input);

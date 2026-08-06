@@ -86,9 +86,9 @@ all detected diagnostics and stops before entering the alternate screen.
 theme = "system"
 
 [keymap]
-"ctrl-d" = "page-down"
-"q" = "none"
-"space r c" = "comment"
+page_down = ["ctrl-f", "page-down"]
+quit = []
+review_comment = ["C", "space r c"]
 
 [highlight]
 max_file_bytes = 2097152
@@ -102,10 +102,17 @@ max_retained_bytes_per_review = 268435456
 Fixed Themes are `dark`, `light`, all four `catppuccin-*` flavors, `gruvbox-light`,
 `gruvbox-dark`, `solarized-light`, and `solarized-dark`.
 
-Keymap entries map one-to-eight space-separated chords to kebab-case Action names. Modifiers are
+Keymap entries map each Action name to one or more one-to-eight-chord sequences.
+An empty list unbinds that Action. Contextual Actions may deliberately share a chord—Enter, for
+example, confirms a Picker, focuses a File, toggles a Directory, or toggles the disclosure under
+the DiffPane cursor. Bindings that can be available together are rejected as ambiguous. Modifiers are
 `shift`, `alt`, `ctrl`, `super`, `hyper`, and `meta`; `option`, `control`, `cmd`, and `command`
-are accepted aliases. Assign `none` to remove a default binding. Count digits remain reserved at
+are accepted aliases. Count digits remain reserved at
 the start of a sequence, and no complete binding may be a Leader for a longer binding.
+
+The default workflow keys are `F` for the Session-local File finder, `p` for the PullRequest
+Picker, `i`/`I`/`C` for inline/File-level/Review-level Comments, `gC` for recovery linking,
+`ctrl-y`/`ctrl-e` for one-row scrolling, and `y` for OSC 52 source-text yank.
 
 Syntax highlighting is loaded lazily for the focused File. `max_file_bytes` limits each old/new
 file side independently; the 2 MiB default avoids expensive parsing of generated or minified

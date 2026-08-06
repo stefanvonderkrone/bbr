@@ -145,6 +145,22 @@ pub const Nav = struct {
         self.clampScroll();
     }
 
+    /// Scroll the viewport by signed rows while keeping the cursor visible.
+    /// When an edge would pass the cursor, the cursor follows that edge.
+    pub fn scrollRows(self: *Nav, delta: isize) void {
+        self.count = 0;
+        const max_scroll = if (self.row_count > self.viewport) self.row_count - self.viewport else 0;
+        if (delta < 0) {
+            const amount: usize = @intCast(-delta);
+            self.scroll -|= amount;
+        } else {
+            const amount: usize = @intCast(delta);
+            self.scroll = @min(self.scroll +| amount, max_scroll);
+        }
+        if (self.cursor < self.scroll) self.cursor = self.scroll;
+        if (self.cursor >= self.scroll +| self.viewport) self.cursor = self.scroll +| self.viewport -| 1;
+    }
+
     // --- viewport-relative cursor jumps (the viewport stays; the cursor moves) -
     // `H`/`M`/`L`: land the cursor on the row at the top / middle / bottom of the
     // current viewport. The target is already visible, so `moveTo`'s clampScroll
@@ -225,6 +241,20 @@ test "down/up move the cursor and clamp at the ends" {
     try testing.expectEqual(@as(usize, 0), nav.cursor);
     nav.up(); // already at top
     try testing.expectEqual(@as(usize, 0), nav.cursor);
+}
+
+test "row scrolling moves the viewport and only carries the cursor at an edge" {
+    var nav = Nav.init(20, 5);
+    nav.jumpTo(2);
+    nav.scrollRows(1);
+    try testing.expectEqual(@as(usize, 1), nav.scroll);
+    try testing.expectEqual(@as(usize, 2), nav.cursor);
+    nav.scrollRows(4);
+    try testing.expectEqual(@as(usize, 5), nav.scroll);
+    try testing.expectEqual(@as(usize, 5), nav.cursor);
+    nav.scrollRows(-2);
+    try testing.expectEqual(@as(usize, 3), nav.scroll);
+    try testing.expectEqual(@as(usize, 5), nav.cursor);
 }
 
 test "Count prefix multiplies a motion and then clears" {

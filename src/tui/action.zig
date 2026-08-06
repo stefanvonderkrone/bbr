@@ -15,13 +15,17 @@ pub const Action = enum {
     cursor_view_top,
     cursor_view_middle,
     cursor_view_bottom,
+    scroll_row_up,
+    scroll_row_down,
     select_down,
     select_up,
     quit,
-    open_picker,
+    open_file_finder,
+    open_pull_request_picker,
     refresh,
-    comment,
     inline_comment,
+    file_comment,
+    review_comment,
     suggest,
     reply,
     submit,
@@ -37,5 +41,28 @@ pub const Action = enum {
     next_file,
     prev_file,
     toggle_disclosure,
+    toggle_review_card,
+    toggle_directory,
+    focus_file,
+    confirm_picker,
+    yank,
     focus_next_pane,
+};
+
+/// The terminal-independent input surface and semantic cursor target used to
+/// resolve contextual Actions. An Overlay replaces, rather than augments, the
+/// Pane context while it captures input.
+pub const InteractionContext = enum {
+    diff,
+    diff_source,
+    diff_disclosure,
+    diff_review_card,
+    sidebar,
+    sidebar_directory,
+    sidebar_file,
+    file_finder,
+    pull_request_picker,
+    composer,
+    help,
+    unknown_resolution,
 };
