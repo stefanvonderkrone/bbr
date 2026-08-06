@@ -132,6 +132,8 @@ pub const Dependencies = struct {
     file_cache_enabled: bool = true,
     file_cache_max_retained_bytes_per_review: usize = 256 * 1024 * 1024,
     comments_collapsed_rows: usize = 6,
+    mouse_enabled: bool = true,
+    mouse_vertical_scroll_rows: usize = 3,
     require_source_check: bool = false,
     keymap: keymap_mod.Keymap = .default,
     remote_enabled: bool = true,
@@ -162,6 +164,7 @@ pub const SessionLoaded = struct {
 pub const OwnedInput = union(enum) {
     choose_pull_request: ReviewKey,
     key: keymap_mod.KeyStroke,
+    mouse: MouseInput,
     session_loaded: SessionLoaded,
     push_count_digit: u8,
     resize_viewport: usize,
@@ -196,6 +199,27 @@ pub const OwnedInput = union(enum) {
         }
         self.* = undefined;
     }
+};
+
+pub const MouseButton = enum {
+    left,
+    middle,
+    right,
+    wheel_up,
+    wheel_down,
+    wheel_left,
+    wheel_right,
+    unsupported,
+};
+
+pub const MouseType = enum { press, release, motion, drag };
+
+pub const MouseInput = struct {
+    col: u16,
+    row: u16,
+    button: MouseButton,
+    type: MouseType,
+    modified: bool = false,
 };
 
 pub const PostDraftCompleted = struct {
@@ -833,7 +857,6 @@ const Published = struct {
             .targets_revision = self.frame_revision,
             .geometry = self.geometry,
             .panes = frame_mod.paneRects(self.geometry),
-            .overlays = &.{},
             .targets = self.targets,
             .buffer = self.buffer,
             .navigation = self.navigation,
@@ -1004,6 +1027,19 @@ const Published = struct {
         if (direction > 0) self.tree.cursor = @min(self.tree.cursor + 1, self.tree.entries.len - 1) else self.tree.cursor -|= 1;
         if (self.tree.cursor < self.tree.scroll) self.tree.scroll = self.tree.cursor;
         if (self.tree.viewport > 0 and self.tree.cursor >= self.tree.scroll + self.tree.viewport) self.tree.scroll = self.tree.cursor + 1 - self.tree.viewport;
+        self.frame_revision += 1;
+    }
+
+    fn sidebarScrollRows(self: *Published, delta: isize) void {
+        self.navigation.count = 0;
+        const max_scroll = self.tree.entries.len -| self.tree.viewport;
+        if (delta < 0)
+            self.tree.scroll -|= @intCast(-delta)
+        else
+            self.tree.scroll = @min(self.tree.scroll +| @as(usize, @intCast(delta)), max_scroll);
+        if (self.tree.cursor < self.tree.scroll) self.tree.cursor = self.tree.scroll;
+        if (self.tree.viewport > 0 and self.tree.cursor >= self.tree.scroll + self.tree.viewport)
+            self.tree.cursor = self.tree.scroll + self.tree.viewport - 1;
         self.frame_revision += 1;
     }
 
@@ -1425,6 +1461,13 @@ pub const Presentation = struct {
     action_error: ?ActionError = null,
     fatal_error: ?FatalError = null,
     clipboard_status: ?ClipboardStatus = null,
+    interaction_revision: frame_mod.Revision = 1,
+    mouse_press: ?MousePress = null,
+
+    const MousePress = struct {
+        revision: frame_mod.Revision,
+        target: frame_mod.HitTarget,
+    };
 
     pub fn init(allocator: Allocator, dependencies: Dependencies, boot: Boot) !Presentation {
         const geometry: frame_mod.Geometry = boot.geometry orelse .{
@@ -1476,9 +1519,14 @@ pub const Presentation = struct {
     /// The sole mutation entry point. Candidate construction consumes a loaded
     /// Session whether it commits, fails, or proves stale.
     pub fn dispatch(self: *Presentation, input: OwnedInput) !void {
+        if (input != .mouse) {
+            self.mouse_press = null;
+            self.interaction_revision +%= 1;
+        }
         switch (input) {
             .choose_pull_request => |key| if (!self.shutdown_requested) try self.choosePullRequest(key),
             .key => |key| try self.applyKey(key),
+            .mouse => |mouse| self.applyMouse(mouse),
             .session_loaded => |completed| self.acceptLoadedSession(completed),
             .push_count_digit => |digit| self.pushCountDigit(digit),
             .resize_viewport => |rows| self.resizeViewport(rows),
@@ -1538,7 +1586,7 @@ pub const Presentation = struct {
 
     pub fn projection(self: *const Presentation) Projection {
         return .{
-            .review = if (self.published) |published| published.projection(self.preferences) else null,
+            .review = if (self.published) |published| self.reviewProjection(published) else null,
             .submission = if (self.durable_submission) |durable| blk: {
                 const progress = durable.progress();
                 break :blk .{
@@ -1579,6 +1627,155 @@ pub const Presentation = struct {
 
     pub fn readyToExit(self: *const Presentation) bool {
         return self.shutdown_requested and self.durable_submission == null and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.outstanding_picker_loads == 0 and self.issued_enrichments.items.len == 0;
+    }
+
+    fn reviewProjection(self: *const Presentation, published: *const Published) ReviewProjection {
+        var review = published.projection(self.preferences);
+        review.frame = self.frameProjection();
+        return review;
+    }
+
+    /// The one current immutable Frame used by projection, rendering, and all
+    /// semantic mouse targeting.
+    fn frameProjection(self: *const Presentation) frame_mod.Projection {
+        var frame: frame_mod.Projection = if (self.published) |published|
+            published.frameProjection()
+        else
+            .{
+                .revision = self.interaction_revision,
+                .targets_revision = self.interaction_revision,
+                .geometry = self.geometry,
+                .panes = frame_mod.paneRects(self.geometry),
+                .targets = &.{},
+                .buffer = .{ .rows = &.{}, .layout = .unified },
+                .navigation = Nav.init(0, frame_mod.paneRects(self.geometry).diff_content.height),
+            };
+        frame.revision = self.interaction_revision;
+        frame.overlay = self.overlayTarget();
+        return frame;
+    }
+
+    fn overlayTarget(self: *const Presentation) ?frame_mod.OverlayTarget {
+        if (self.help_visible or self.unknown_resolution != null or self.visibleSubmissionOverlay())
+            return otherOverlay(self.geometry);
+        if (self.file_finder) |finder| {
+            const rect = frame_mod.overlayRect(self.geometry, 60, 16) orelse return null;
+            return .{ .kind = .picker, .rect = rect, .row_count = finder.matches().len, .scroll = pickerTop(finder.selected, rect.height -| 1) };
+        }
+        if (self.picker) |picker| {
+            const rect = frame_mod.overlayRect(self.geometry, 60, 16) orelse return null;
+            return .{ .kind = .picker, .rect = rect, .row_count = picker.matches().len, .scroll = pickerTop(picker.selected, rect.height -| 1) };
+        }
+        if (self.published) |published| if (published.composer != null) return otherOverlay(self.geometry);
+        return null;
+    }
+
+    fn visibleSubmissionOverlay(self: *const Presentation) bool {
+        const published = self.published orelse return false;
+        if (self.durable_submission) |submission| if (ReviewKey.eql(submission.key, published.key)) return true;
+        if (self.submission_result) |result| if (ReviewKey.eql(result.key, published.key)) return true;
+        return false;
+    }
+
+    fn applyMouse(self: *Presentation, mouse: MouseInput) void {
+        if (!self.dependencies.mouse_enabled) {
+            self.mouse_press = null;
+            return;
+        }
+        if (mouse.modified or mouse.type == .motion or mouse.type == .drag) {
+            self.mouse_press = null;
+            return;
+        }
+        switch (mouse.button) {
+            .wheel_up, .wheel_down => {
+                self.mouse_press = null;
+                if (mouse.type == .press) self.applyMouseWheel(mouse, mouse.button == .wheel_down);
+            },
+            .left => switch (mouse.type) {
+                .press => {
+                    const frame = self.frameProjection();
+                    const target = frame_mod.hitTest(frame, mouse.col, mouse.row) orelse {
+                        self.mouse_press = null;
+                        return;
+                    };
+                    self.mouse_press = .{ .revision = frame.revision, .target = target };
+                },
+                .release => {
+                    const pressed = self.mouse_press orelse return;
+                    self.mouse_press = null;
+                    const frame = self.frameProjection();
+                    if (pressed.revision != frame.revision) return;
+                    const target = frame_mod.hitTest(frame, mouse.col, mouse.row) orelse return;
+                    if (!std.meta.eql(pressed.target, target)) return;
+                    self.activateMouseTarget(target);
+                },
+                .motion, .drag => unreachable,
+            },
+            .middle, .right, .wheel_left, .wheel_right, .unsupported => self.mouse_press = null,
+        }
+    }
+
+    fn activateMouseTarget(self: *Presentation, target: frame_mod.HitTarget) void {
+        switch (target) {
+            .picker_entry => |index| {
+                if (self.file_finder) |*finder| finder.select(index) else if (self.picker) |*picker| picker.select(index) else return;
+            },
+            .sidebar => {
+                const published = self.published orelse return;
+                self.focusPane(published, .sidebar);
+            },
+            .diff => {
+                const published = self.published orelse return;
+                self.focusPane(published, .diff);
+            },
+            .sidebar_entry => |index| {
+                const published = self.published orelse return;
+                if (index >= published.tree.entries.len) return;
+                self.focusPane(published, .sidebar);
+                published.tree.cursor = index;
+                self.applyAction(switch (published.tree.entries[index].identity) {
+                    .directory => .toggle_directory,
+                    .file => .focus_file,
+                });
+            },
+            .diff_row => |index| {
+                const published = self.published orelse return;
+                if (index >= published.buffer.rows.len) return;
+                self.focusPane(published, .diff);
+                published.navigation.jumpTo(index);
+                if (buffer_mod.disclosureKey(published.buffer.rows[index]) != null)
+                    self.applyAction(.toggle_disclosure);
+            },
+        }
+        self.interaction_revision +%= 1;
+    }
+
+    fn applyMouseWheel(self: *Presentation, mouse: MouseInput, down: bool) void {
+        const target = frame_mod.hitTest(self.frameProjection(), mouse.col, mouse.row) orelse return;
+        const rows = self.dependencies.mouse_vertical_scroll_rows;
+        if (rows == 0) return;
+        switch (target) {
+            .picker_entry => {
+                var remaining = rows;
+                while (remaining > 0) : (remaining -= 1) {
+                    if (self.file_finder) |*finder| {
+                        if (down) finder.moveDown() else finder.moveUp();
+                    } else if (self.picker) |*picker| {
+                        if (down) picker.moveDown() else picker.moveUp();
+                    } else return;
+                }
+            },
+            .sidebar_entry => {
+                const published = self.published orelse return;
+                self.scrollPane(published, .sidebar, if (down) @as(isize, @intCast(rows)) else -@as(isize, @intCast(rows)));
+            },
+            .diff_row => {
+                const published = self.published orelse return;
+                self.scrollPane(published, .diff, if (down) @as(isize, @intCast(rows)) else -@as(isize, @intCast(rows)));
+            },
+            .sidebar, .diff => return,
+        }
+        self.interaction_revision +%= 1;
     }
 
     fn discoverRecovery(self: *Presentation) void {
@@ -1981,8 +2178,8 @@ pub const Presentation = struct {
             .cursor_view_top => published.navigation.cursorToViewTop(),
             .cursor_view_middle => published.navigation.cursorToViewMiddle(),
             .cursor_view_bottom => published.navigation.cursorToViewBottom(),
-            .scroll_row_up => published.navigation.scrollRows(-1),
-            .scroll_row_down => published.navigation.scrollRows(1),
+            .scroll_row_up => self.scrollPane(published, published.focus, -1),
+            .scroll_row_down => self.scrollPane(published, published.focus, 1),
             .select_down => {
                 published.navigation.ensureMark();
                 published.navigation.down();
@@ -2033,10 +2230,23 @@ pub const Presentation = struct {
     }
 
     fn togglePaneFocus(self: *Presentation, published: *Published) void {
+        self.focusPane(published, if (published.focus == .diff) .sidebar else .diff);
+    }
+
+    fn focusPane(self: *Presentation, published: *Published, focus: frame_mod.PaneFocus) void {
         _ = self;
-        published.focus = if (published.focus == .diff) .sidebar else .diff;
-        if (published.focus == .sidebar) published.cursorToActiveFile();
+        if (published.focus == focus) return;
+        published.focus = focus;
+        if (focus == .sidebar) published.cursorToActiveFile();
         published.frame_revision += 1;
+    }
+
+    fn scrollPane(self: *Presentation, published: *Published, pane: frame_mod.PaneFocus, delta: isize) void {
+        _ = self;
+        switch (pane) {
+            .sidebar => published.sidebarScrollRows(delta),
+            .diff => published.navigation.scrollRows(delta),
+        }
     }
 
     fn sidebarLeft(self: *Presentation, published: *Published) void {
@@ -3273,6 +3483,16 @@ fn collectSelectedLines(
     }
 }
 
+fn otherOverlay(geometry: frame_mod.Geometry) ?frame_mod.OverlayTarget {
+    const rect = frame_mod.overlayRect(geometry, geometry.cols, geometry.rows) orelse return null;
+    return .{ .kind = .other, .rect = rect };
+}
+
+fn pickerTop(selected: usize, visible_rows: usize) usize {
+    if (visible_rows == 0 or selected < visible_rows) return 0;
+    return selected - visible_rows + 1;
+}
+
 fn fileIndexForRow(buffer: buffer_mod.Buffer, cursor: usize) usize {
     var file_index: usize = 0;
     var seen_file = false;
@@ -3454,14 +3674,15 @@ test "resize publishes one complete Presentation Frame revision" {
     try presentation.dispatch(.{ .action = .down });
     try presentation.dispatch(.{ .action = .toggle_select });
     const navigated = presentation.projection().review.?.frame;
+    try testing.expect(navigated.revision > before.revision);
     const owner = navigated.targets[navigated.navigation.cursor].owner;
     try presentation.dispatch(.{ .resize = .{ .cols = 40, .rows = 4 } });
     const after = presentation.projection().review.?.frame;
 
-    try testing.expectEqual(before.revision + 1, after.revision);
+    try testing.expectEqual(navigated.revision + 1, after.revision);
     try testing.expectEqual(@as(u16, 40), after.geometry.cols);
     try testing.expectEqual(@as(u16, 4), after.geometry.rows);
-    try testing.expectEqual(after.revision, after.targets_revision);
+    try testing.expect(after.targets_revision <= after.revision);
     try testing.expect(owner.eql(after.targets[after.navigation.cursor].owner));
     try testing.expectEqual(navigated.navigation.mark, after.navigation.mark);
     try testing.expectEqual(@as(usize, after.panes.sidebar_content.height), after.file_tree.viewport);
@@ -3509,6 +3730,26 @@ fn testTwoFileSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session
         \\+new b
     );
     try s.initializeEnrichment();
+    return s;
+}
+
+fn testDirectorySession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
+    const s = try testTwoFileSession(backing, id);
+    errdefer s.destroy();
+    s.diff = try bbr.diff.parse(s.arena.allocator(),
+        \\diff --git a/src/a.zig b/src/a.zig
+        \\--- a/src/a.zig
+        \\+++ b/src/a.zig
+        \\@@ -1 +1 @@
+        \\-old a
+        \\+new a
+        \\diff --git a/src/b.zig b/src/b.zig
+        \\--- a/src/b.zig
+        \\+++ b/src/b.zig
+        \\@@ -1 +1 @@
+        \\-old b
+        \\+new b
+    );
     return s;
 }
 
@@ -5655,4 +5896,198 @@ test "shutdown retries a paused terminal persistence step" {
 
     try testing.expect(presentation.readyToExit());
     try testing.expect(presentation.projection().submission == null);
+}
+
+test "mouse click uses the published Frame target and a Motion cancels a pending press" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 10 },
+    });
+    defer presentation.deinit();
+    const content = presentation.projection().review.?.frame.panes.diff_content;
+
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 2, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 2, .button = .left, .type = .release } });
+    try testing.expectEqual(@as(usize, 2), presentation.projection().review.?.navigation.cursor);
+
+    try presentation.dispatch(.{ .action = .to_top });
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 2, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 2, .button = .left, .type = .motion } });
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 2, .button = .left, .type = .release } });
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.cursor);
+
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 2, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 3, .button = .left, .type = .release } });
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.cursor);
+
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 3, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 3, .button = .left, .type = .release } });
+    try testing.expectEqual(@as(usize, 1), presentation.projection().review.?.navigation.cursor);
+}
+
+test "mouse wheel uses configured rows without focus changes and ignored gestures are inert" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .mouse_vertical_scroll_rows = 2,
+    }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 4 },
+    });
+    defer presentation.deinit();
+    const diff = presentation.projection().review.?.frame.panes.diff_content;
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try presentation.dispatch(.{ .mouse = .{ .col = diff.x, .row = diff.y, .button = .wheel_down, .type = .press } });
+    var frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(usize, 2), frame.navigation.scroll);
+    try testing.expectEqual(@as(usize, 2), frame.navigation.cursor);
+    try testing.expectEqual(@as(?usize, 0), frame.navigation.mark);
+    try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
+
+    const before = frame.navigation;
+    for ([_]MouseInput{
+        .{ .col = diff.x, .row = diff.y, .button = .wheel_left, .type = .press },
+        .{ .col = diff.x, .row = diff.y, .button = .right, .type = .press },
+        .{ .col = diff.x, .row = diff.y, .button = .left, .type = .drag },
+        .{ .col = diff.x, .row = diff.y, .button = .left, .type = .press, .modified = true },
+    }) |mouse| try presentation.dispatch(.{ .mouse = mouse });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(before.cursor, frame.navigation.cursor);
+    try testing.expectEqual(before.scroll, frame.navigation.scroll);
+
+    var disabled = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .mouse_enabled = false }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 2), .session = try testTwoFileSession(testing.allocator, 2) },
+        .geometry = .{ .cols = 80, .rows = 4 },
+    });
+    defer disabled.deinit();
+    const disabled_diff = disabled.projection().review.?.frame.panes.diff_content;
+    try disabled.dispatch(.{ .mouse = .{ .col = disabled_diff.x, .row = disabled_diff.y, .button = .wheel_down, .type = .press } });
+    try testing.expectEqual(@as(usize, 0), disabled.projection().review.?.navigation.scroll);
+    try disabled.dispatch(.{ .action = .down });
+    try testing.expectEqual(@as(usize, 1), disabled.projection().review.?.navigation.cursor);
+}
+
+test "Picker mouse click selects only and non-Picker Overlay captures Pane clicks" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 10 },
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .open_file_finder });
+    const overlay = presentation.projection().review.?.frame.overlay.?;
+    try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 2, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 2, .button = .left, .type = .release } });
+    try testing.expectEqual(@as(usize, 1), presentation.projection().file_finder.?.selected);
+    try testing.expect(presentation.projection().file_finder != null); // click never confirms
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try presentation.dispatch(.{ .action = .review_comment });
+    const before = presentation.projection().review.?.navigation.cursor;
+    const diff = presentation.projection().review.?.frame.panes.diff_content;
+    try presentation.dispatch(.{ .mouse = .{ .col = diff.x, .row = diff.y + 2, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = diff.x, .row = diff.y + 2, .button = .left, .type = .release } });
+    try testing.expectEqual(before, presentation.projection().review.?.navigation.cursor);
+    try testing.expect(presentation.projection().composer != null);
+}
+
+test "PullRequest Picker wheel and click move selection while Enter alone confirms" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        .geometry = .{ .cols = 80, .rows = 10 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_pull_request_picker });
+    const list = presentation.takeCommand().?.list_pull_requests;
+    var summaries = try PullRequestSummaries.create(testing.allocator);
+    summaries.prs = try summaries.arena.allocator().dupe(bbr.bitbucket.PullRequestSummary, &.{
+        .{ .id = 1, .title = "one", .state = "OPEN", .author_display_name = "a", .source_branch = "one", .destination_branch = "main" },
+        .{ .id = 2, .title = "two", .state = "OPEN", .author_display_name = "b", .source_branch = "two", .destination_branch = "main" },
+        .{ .id = 3, .title = "three", .state = "OPEN", .author_display_name = "c", .source_branch = "three", .destination_branch = "main" },
+        .{ .id = 4, .title = "four", .state = "OPEN", .author_display_name = "d", .source_branch = "four", .destination_branch = "main" },
+    });
+    try presentation.dispatch(.{ .pull_requests_loaded = .{ .work_id = list.work_id, .outcome = .{ .loaded = summaries } } });
+    const overlay = presentation.projection().review.?.frame.overlay.?;
+    try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 1, .button = .wheel_down, .type = .press } });
+    try testing.expectEqual(@as(usize, 3), presentation.projection().picker.?.selected);
+
+    const current_overlay = presentation.projection().review.?.frame.overlay.?;
+    try presentation.dispatch(.{ .mouse = .{ .col = current_overlay.rect.x, .row = current_overlay.rect.y + 2, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = current_overlay.rect.x, .row = current_overlay.rect.y + 2, .button = .left, .type = .release } });
+    try testing.expectEqual(@as(usize, 1), presentation.projection().picker.?.selected);
+    try testing.expect(presentation.takeCommand() == null);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expectEqual(@as(u64, 2), presentation.takeCommand().?.load_session.key.pull_request_id);
+}
+
+test "mouse activates Sidebar Files and disclosures and replacement cancels a press" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 8 },
+    });
+    defer presentation.deinit();
+    const disclosure_key: buffer_mod.DisclosureKey = .{ .resolved_thread = 1 };
+    const row = findDisclosureRow(presentation.projection().review.?.buffer.rows, disclosure_key).?;
+    presentation.published.?.navigation.jumpTo(row);
+    const frame = presentation.projection().review.?.frame;
+    const screen_row: u16 = frame.panes.diff_content.y + @as(u16, @intCast(row - frame.navigation.scroll));
+    try presentation.dispatch(.{ .mouse = .{ .col = frame.panes.diff_content.x, .row = screen_row, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = frame.panes.diff_content.x, .row = screen_row, .button = .left, .type = .release } });
+    const opened = presentation.projection().review.?;
+    try testing.expect(opened.buffer.rows[findDisclosureRow(opened.buffer.rows, disclosure_key).?].disclosure.expanded);
+
+    const sidebar = opened.frame.panes.sidebar_content;
+    try presentation.dispatch(.{ .mouse = .{ .col = sidebar.x, .row = sidebar.y, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = sidebar.x, .row = sidebar.y, .button = .left, .type = .release } });
+    try testing.expectEqual(frame_mod.PaneFocus.sidebar, presentation.projection().review.?.frame.focus);
+
+    const current = presentation.projection().review.?.frame;
+    try presentation.dispatch(.{ .mouse = .{ .col = current.panes.diff_content.x, .row = current.panes.diff_content.y + 1, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    const load = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{ .intent = load.intent, .outcome = .{ .loaded = try testDisclosureSession(testing.allocator, 2) } } });
+    const replacement = presentation.projection().review.?.frame;
+    try presentation.dispatch(.{ .mouse = .{ .col = replacement.panes.diff_content.x, .row = replacement.panes.diff_content.y + 1, .button = .left, .type = .release } });
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.cursor);
+}
+
+test "Sidebar mouse click toggles a Directory and focuses a child File" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testDirectorySession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 8 },
+    });
+    defer presentation.deinit();
+
+    var frame = presentation.projection().review.?.frame;
+    const content = frame.panes.sidebar_content;
+    try testing.expect(frame.file_tree.entries[0].identity == .directory);
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y, .button = .left, .type = .release } });
+    frame = presentation.projection().review.?.frame;
+    try testing.expect(!frame.file_tree.entries[0].expanded);
+    try testing.expectEqual(@as(usize, 1), frame.file_tree.entries.len);
+
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y, .button = .left, .type = .release } });
+    frame = presentation.projection().review.?.frame;
+    try testing.expect(frame.file_tree.entries[0].expanded);
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 1, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 1, .button = .left, .type = .release } });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(frame_mod.PaneFocus.sidebar, frame.focus);
+    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 0 }));
+    try testing.expectEqual(@as(usize, 0), frame.navigation.cursor);
 }

@@ -210,6 +210,12 @@ the main thread; the Epoch token still guards against stale results.
   posts unconditionally (`focus_in`, `mouse`, …) exists. A custom event union must be a **superset**
   of `vaxis.Event`'s field names.
 - **Keys:** `key.matches('q', .{})`, `key.matches('c', .{ .ctrl = true })`.
+- **Mouse reporting:** `Vaxis.setMouseMode(self, tty: *std.Io.Writer, enable: bool) !void`
+  enables cell or pixel reporting according to terminal capabilities and flushes the writer
+  (`src/Vaxis.zig:886-903`). `vaxis.Mouse` carries signed `i16` cell coordinates, a `Button`
+  including vertical/horizontal wheel and extra buttons, `Modifiers{shift,alt,ctrl}`, and
+  `Type{press,release,motion,drag}` (`src/Mouse.zig:16-50`). Validate negative coordinates before
+  converting to the Presentation adapter's unsigned Frame cells.
 - **Cells borrow text.** `Cell.Character.grapheme` is `[]const u8`; text handed to `printSegment`
   must stay valid until `render()`. Keep per-line buffers in scope across the whole draw+render, or
   reuse one buffer and you'll corrupt earlier cells.

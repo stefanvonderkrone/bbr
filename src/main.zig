@@ -146,6 +146,8 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .file_cache_enabled = configuration.file_cache_enabled,
         .file_cache_max_retained_bytes_per_review = configuration.file_cache_max_retained_bytes_per_review,
         .comments_collapsed_rows = configuration.comments_collapsed_rows,
+        .mouse_enabled = configuration.mouse_enabled,
+        .mouse_vertical_scroll_rows = configuration.mouse_vertical_scroll_rows,
         .submission_locks = os_locks.locks(),
     }, null, try presentation.ReviewKey.init(cred.workspace, target.repo, target.id)) catch |err| {
         if (tuiFatalMessage(err)) |message| {
@@ -229,6 +231,8 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
         .file_cache_enabled = configuration.file_cache_enabled,
         .file_cache_max_retained_bytes_per_review = configuration.file_cache_max_retained_bytes_per_review,
         .comments_collapsed_rows = configuration.comments_collapsed_rows,
+        .mouse_enabled = configuration.mouse_enabled,
+        .mouse_vertical_scroll_rows = configuration.mouse_vertical_scroll_rows,
         .online = false,
     }, null, key);
 }
@@ -508,6 +512,8 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
         .file_cache_enabled = configuration.file_cache_enabled,
         .file_cache_max_retained_bytes_per_review = configuration.file_cache_max_retained_bytes_per_review,
         .comments_collapsed_rows = configuration.comments_collapsed_rows,
+        .mouse_enabled = configuration.mouse_enabled,
+        .mouse_vertical_scroll_rows = configuration.mouse_vertical_scroll_rows,
         .online = false,
     }, s, try presentation.ReviewKey.init("", "", pr.id));
 }

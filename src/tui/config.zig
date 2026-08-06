@@ -28,6 +28,8 @@ pub const Configuration = struct {
     file_cache_enabled: bool,
     file_cache_max_retained_bytes_per_review: usize,
     comments_collapsed_rows: usize,
+    mouse_enabled: bool,
+    mouse_vertical_scroll_rows: usize,
 
     pub fn deinit(self: *Configuration, allocator: std.mem.Allocator) void {
         allocator.free(self.theme_name);
@@ -93,6 +95,8 @@ fn defaults(allocator: std.mem.Allocator) !Configuration {
         .file_cache_enabled = true,
         .file_cache_max_retained_bytes_per_review = Configuration.default_file_cache_max_retained_bytes_per_review,
         .comments_collapsed_rows = Configuration.default_comments_collapsed_rows,
+        .mouse_enabled = true,
+        .mouse_vertical_scroll_rows = 3,
     };
 }
 
@@ -154,7 +158,12 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
     var file_cache_limit_line: usize = 1;
     var comments_collapsed_rows = Configuration.default_comments_collapsed_rows;
     var comments_collapsed_seen = false;
-    var section: enum { root, keymap, highlight, files_cache, comments, unknown } = .root;
+    var mouse_enabled = true;
+    var mouse_enabled_seen = false;
+    var mouse_vertical_scroll_rows: usize = 3;
+    var mouse_scroll_seen = false;
+    var mouse_scroll_line: usize = 1;
+    var section: enum { root, keymap, highlight, files_cache, comments, input_mouse, unknown } = .root;
 
     var lines = std.mem.splitScalar(u8, source, '\n');
     var line_number: usize = 0;
@@ -165,15 +174,15 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
         if (parser.done() or parser.peek() == '#') continue;
         if (parser.peek() == '[') {
             const parsed_section = parser.section() catch {
-                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "malformed table header", .hint = "use [keymap], [highlight], [files.cache], or [comments]" });
+                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "malformed table header", .hint = "use [keymap], [highlight], [files.cache], [comments], or [input.mouse]" });
                 section = .unknown;
                 continue;
             };
             parser.space();
             if (!parser.trailing()) try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "unexpected text after table header" });
-            if (std.mem.eql(u8, parsed_section, "keymap")) section = .keymap else if (std.mem.eql(u8, parsed_section, "highlight")) section = .highlight else if (std.mem.eql(u8, parsed_section, "files.cache")) section = .files_cache else if (std.mem.eql(u8, parsed_section, "comments")) section = .comments else {
+            if (std.mem.eql(u8, parsed_section, "keymap")) section = .keymap else if (std.mem.eql(u8, parsed_section, "highlight")) section = .highlight else if (std.mem.eql(u8, parsed_section, "files.cache")) section = .files_cache else if (std.mem.eql(u8, parsed_section, "comments")) section = .comments else if (std.mem.eql(u8, parsed_section, "input.mouse")) section = .input_mouse else {
                 section = .unknown;
-                try diagnostics.append(allocator, .{ .line = line_number, .column = 2, .message = "unknown table", .hint = "use [keymap], [highlight], [files.cache], or [comments]" });
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 2, .message = "unknown table", .hint = "use [keymap], [highlight], [files.cache], [comments], or [input.mouse]" });
             }
             continue;
         }
@@ -240,6 +249,13 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
                 try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a non-negative integer byte count" });
                 continue;
             },
+            .input_mouse => if (std.mem.eql(u8, key, "enabled")) parser.boolean() catch {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected true or false" });
+                continue;
+            } else parser.unsigned() catch {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a positive row count" });
+                continue;
+            },
             else => parser.quoted() catch {
                 try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a quoted string value" });
                 continue;
@@ -304,6 +320,22 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
                 };
                 comments_collapsed_seen = true;
             },
+            .input_mouse => if (std.mem.eql(u8, key, "enabled")) {
+                if (mouse_enabled_seen) {
+                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'enabled' key", .hint = "keep exactly one mouse input switch" });
+                } else mouse_enabled = std.mem.eql(u8, value, "true");
+                mouse_enabled_seen = true;
+            } else if (std.mem.eql(u8, key, "vertical_scroll_rows")) {
+                mouse_scroll_line = line_number;
+                if (mouse_scroll_seen) {
+                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'vertical_scroll_rows' key", .hint = "keep exactly one mouse scroll row count" });
+                } else mouse_vertical_scroll_rows = std.fmt.parseInt(usize, value, 10) catch {
+                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "mouse scroll row count is too large" });
+                    mouse_scroll_seen = true;
+                    continue;
+                };
+                mouse_scroll_seen = true;
+            } else try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown Mouse input key", .hint = "use enabled or vertical_scroll_rows" }),
             .unknown => {},
         }
     }
@@ -311,6 +343,8 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
     if (file_cache_enabled and file_cache_max_retained_bytes_per_review == 0) {
         try diagnostics.append(allocator, .{ .line = file_cache_limit_line, .column = 1, .message = "enabled File cache budget must be greater than zero", .hint = "set enabled = false to disable inactive caching" });
     }
+    if (mouse_vertical_scroll_rows == 0)
+        try diagnostics.append(allocator, .{ .line = mouse_scroll_line, .column = 1, .message = "mouse vertical scroll rows must be greater than zero", .hint = "use enabled = false to disable mouse input" });
 
     var owned_keymap = keymap.Keymap.fromOverrides(allocator, overrides.items) catch |err| {
         try diagnostics.append(allocator, .{ .line = if (override_lines.getLastOrNull()) |line| line else 1, .column = 1, .message = switch (err) {
@@ -333,6 +367,8 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
         .file_cache_enabled = file_cache_enabled,
         .file_cache_max_retained_bytes_per_review = file_cache_max_retained_bytes_per_review,
         .comments_collapsed_rows = comments_collapsed_rows,
+        .mouse_enabled = mouse_enabled,
+        .mouse_vertical_scroll_rows = mouse_vertical_scroll_rows,
     } };
 }
 
@@ -560,6 +596,30 @@ test "Comment disclosure defaults to six rendered rows and zero disables collaps
     defer configured.deinit(testing.allocator);
     try testing.expect(configured == .ok);
     try testing.expectEqual(@as(usize, 0), configured.ok.comments_collapsed_rows);
+}
+
+test "Mouse input defaults on with three-row scrolling and accepts opt-out and row count" {
+    var default_result = try parse(testing.allocator, "");
+    defer default_result.deinit(testing.allocator);
+    try testing.expect(default_result.ok.mouse_enabled);
+    try testing.expectEqual(@as(usize, 3), default_result.ok.mouse_vertical_scroll_rows);
+
+    var configured = try parse(testing.allocator,
+        \\[input.mouse]
+        \\enabled = false
+        \\vertical_scroll_rows = 7
+    );
+    defer configured.deinit(testing.allocator);
+    try testing.expect(configured == .ok);
+    try testing.expect(!configured.ok.mouse_enabled);
+    try testing.expectEqual(@as(usize, 7), configured.ok.mouse_vertical_scroll_rows);
+
+    var zero = try parse(testing.allocator,
+        \\[input.mouse]
+        \\vertical_scroll_rows = 0
+    );
+    defer zero.deinit(testing.allocator);
+    try testing.expect(zero == .invalid);
 }
 
 test "configuration path prefers XDG and falls back to HOME" {

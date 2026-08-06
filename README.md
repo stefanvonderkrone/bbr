@@ -96,6 +96,10 @@ max_file_bytes = 2097152
 [files.cache]
 enabled = true
 max_retained_bytes_per_review = 268435456
+
+[input.mouse]
+enabled = true
+vertical_scroll_rows = 3
 ```
 
 `system` is the default Theme and uses the terminal foreground, background, and ANSI palette.
@@ -113,6 +117,13 @@ the start of a sequence, and no complete binding may be a Leader for a longer bi
 The default workflow keys are `F` for the Session-local File finder, `p` for the PullRequest
 Picker, `i`/`I`/`C` for inline/File-level/Review-level Comments, `gC` for recovery linking,
 `ctrl-y`/`ctrl-e` for one-row scrolling, and `y` for OSC 52 source-text yank.
+
+Mouse navigation is enabled by default as an optional keyboard-equivalent convenience. Left-click
+focuses Panes, activates File Tree entries and disclosures, or selects a Picker row; Picker clicks
+never confirm. The vertical wheel scrolls three rows by default. Set `[input.mouse].enabled = false`
+to restore ordinary terminal mouse handling, or configure `vertical_scroll_rows` to another positive
+count. Terminals commonly use Shift or Option as a terminal-dependent bypass for native selection
+while mouse reporting is enabled.
 
 Syntax highlighting is loaded lazily for the focused File. `max_file_bytes` limits each old/new
 file side independently; the 2 MiB default avoids expensive parsing of generated or minified

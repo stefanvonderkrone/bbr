@@ -35,6 +35,23 @@ pub const PaneRects = struct {
 
 pub const PaneFocus = enum { sidebar, diff };
 
+pub const OverlayKind = enum { picker, other };
+
+pub const OverlayTarget = struct {
+    kind: OverlayKind,
+    rect: Rect,
+    row_count: usize = 0,
+    scroll: usize = 0,
+};
+
+pub const HitTarget = union(enum) {
+    sidebar,
+    diff,
+    sidebar_entry: usize,
+    diff_row: usize,
+    picker_entry: usize,
+};
+
 pub const RowOwner = union(enum) {
     file: *const bbr.diff.File,
     hunk: *const bbr.diff.model.Hunk,
@@ -71,13 +88,38 @@ pub const Projection = struct {
     targets_revision: Revision,
     geometry: Geometry,
     panes: PaneRects,
-    overlays: []const Rect,
+    overlay: ?OverlayTarget = null,
     targets: []const SemanticTarget,
     buffer: buffer_mod.Buffer,
     navigation: Nav,
     file_tree: file_tree.Projection = .{},
     focus: PaneFocus = .diff,
 };
+
+/// Resolve a cell solely against the immutable, already-published Frame. An
+/// Overlay captures the complete input surface, even outside its rectangle.
+pub fn hitTest(frame: Projection, col: u16, row: u16) ?HitTarget {
+    if (frame.overlay) |overlay| {
+        if (overlay.kind != .picker or !overlay.rect.contains(col, row)) return null;
+        const relative_row = row - overlay.rect.y;
+        if (relative_row == 0) return null; // query/title row
+        const index = overlay.scroll + relative_row - 1;
+        if (index >= overlay.row_count) return null;
+        return .{ .picker_entry = index };
+    }
+
+    if (frame.panes.sidebar_content.contains(col, row)) {
+        const index = frame.file_tree.scroll + row - frame.panes.sidebar_content.y;
+        if (index < frame.file_tree.entries.len) return .{ .sidebar_entry = index };
+        return .sidebar;
+    }
+    if (frame.panes.diff_content.contains(col, row)) {
+        const index = frame.navigation.scroll + row - frame.panes.diff_content.y;
+        if (index < frame.targets.len) return .{ .diff_row = index };
+        return .diff;
+    }
+    return null;
+}
 
 pub fn paneRects(geometry: Geometry) PaneRects {
     const gap: u16 = if (geometry.cols >= 60) 1 else 0;
@@ -91,6 +133,20 @@ pub fn paneRects(geometry: Geometry) PaneRects {
         .diff = diff,
         .sidebar_content = paneContent(sidebar),
         .diff_content = paneContent(diff),
+    };
+}
+
+/// Shared centered Overlay geometry used by both rendering and semantic input
+/// targeting. A zero-sized Frame has no targetable Overlay.
+pub fn overlayRect(geometry: Geometry, max_width: u16, max_height: u16) ?Rect {
+    const width = @min(max_width, geometry.cols);
+    const height = @min(max_height, geometry.rows);
+    if (width == 0 or height == 0) return null;
+    return .{
+        .x = (geometry.cols - width) / 2,
+        .y = (geometry.rows - height) / 2,
+        .width = width,
+        .height = height,
     };
 }
 
@@ -273,6 +329,42 @@ test "framed Pane geometry is bounded at zero narrow ordinary and wide sizes" {
     try testing.expectEqual(@as(u16, 0), paneRects(.{ .cols = 40, .rows = 24 }).diff.x - paneRects(.{ .cols = 40, .rows = 24 }).sidebar.width);
 }
 
+test "Overlay geometry is centered and clipped to the published Frame" {
+    try testing.expectEqual(Rect{ .x = 10, .y = 4, .width = 60, .height = 16 }, overlayRect(.{ .cols = 80, .rows = 24 }, 60, 16).?);
+    try testing.expectEqual(Rect{ .x = 0, .y = 0, .width = 20, .height = 8 }, overlayRect(.{ .cols = 20, .rows = 8 }, 60, 16).?);
+    try testing.expect(overlayRect(.{ .cols = 0, .rows = 8 }, 60, 16) == null);
+}
+
+test "published Frame hit testing gives Overlay rows precedence and clips blank rows" {
+    const entries = [_]file_tree.Entry{.{
+        .identity = .{ .file = 0 },
+        .parent = null,
+        .depth = 0,
+        .label = "a.zig",
+    }};
+    var projection: Projection = .{
+        .revision = 7,
+        .targets_revision = 7,
+        .geometry = .{ .cols = 20, .rows = 8 },
+        .panes = paneRects(.{ .cols = 20, .rows = 8 }),
+        .targets = &.{},
+        .buffer = .{ .rows = &.{}, .layout = .unified },
+        .navigation = Nav.init(0, 5),
+        .file_tree = .{ .entries = &entries, .viewport = 5 },
+        .overlay = .{ .kind = .picker, .rect = .{ .x = 5, .y = 1, .width = 10, .height = 4 }, .row_count = 2 },
+    };
+
+    try testing.expectEqual(HitTarget{ .picker_entry = 0 }, hitTest(projection, 6, 2).?);
+    try testing.expectEqual(HitTarget{ .picker_entry = 1 }, hitTest(projection, 6, 3).?);
+    try testing.expect(hitTest(projection, 6, 4) == null);
+    try testing.expect(hitTest(projection, 1, 2) == null); // Overlay capture prevents Pane pass-through.
+
+    projection.overlay = null;
+    try testing.expectEqual(HitTarget{ .sidebar_entry = 0 }, hitTest(projection, 1, 2).?);
+    try testing.expectEqual(HitTarget.sidebar, hitTest(projection, 1, 3).?);
+    try testing.expect(hitTest(projection, 0, 2) == null); // Pane border.
+}
+
 test "navigation restoration follows stable owners and clears a shifted Selection" {
     const old_targets = [_]SemanticTarget{
         .{ .owner = .{ .section = .{ .kind = .pr_comments, .path = "" } }, .measured_cells = 0 },
@@ -292,7 +384,6 @@ test "navigation restoration follows stable owners and clears a shifted Selectio
         .targets_revision = 4,
         .geometry = .{ .cols = 80, .rows = 4 },
         .panes = paneRects(.{ .cols = 80, .rows = 4 }),
-        .overlays = &.{},
         .targets = &old_targets,
         .buffer = .{ .rows = &.{}, .layout = .unified },
         .navigation = navigation,
@@ -318,7 +409,6 @@ test "ReviewCard restoration follows containing source offset and collapsed foot
         .targets_revision = 1,
         .geometry = .{ .cols = 40, .rows = 3 },
         .panes = paneRects(.{ .cols = 40, .rows = 3 }),
-        .overlays = &.{},
         .targets = &old_targets,
         .buffer = .{ .rows = &.{}, .layout = .unified },
         .navigation = navigation,

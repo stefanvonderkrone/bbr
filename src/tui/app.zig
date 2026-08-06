@@ -41,6 +41,8 @@ pub const RunCtx = struct {
     file_cache_enabled: bool,
     file_cache_max_retained_bytes_per_review: usize,
     comments_collapsed_rows: usize,
+    mouse_enabled: bool = true,
+    mouse_vertical_scroll_rows: usize = 3,
     submission_locks: ?bbr.review.SubmissionLocks = null,
     online: bool = true,
 };
@@ -49,6 +51,7 @@ pub const RunCtx = struct {
 /// Presentation worker.
 const AppEvent = union(enum) {
     key_press: vaxis.Key,
+    mouse: vaxis.Mouse,
     winsize: vaxis.Winsize,
     presentation_done: PresentationDone,
 };
@@ -78,6 +81,8 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
         .file_cache_enabled = ctx.file_cache_enabled,
         .file_cache_max_retained_bytes_per_review = ctx.file_cache_max_retained_bytes_per_review,
         .comments_collapsed_rows = ctx.comments_collapsed_rows,
+        .mouse_enabled = ctx.mouse_enabled,
+        .mouse_vertical_scroll_rows = ctx.mouse_vertical_scroll_rows,
         .require_source_check = ctx.online,
         .keymap = ctx.keymap,
         .remote_enabled = ctx.online,
@@ -103,6 +108,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
     defer loop.stop();
     try loop.installResizeHandler();
     try vx.enterAltScreen(writer);
+    if (ctx.mouse_enabled) try vx.setMouseMode(writer, true);
     try state.dispatch(.{ .resize = contentGeometry(vx.window()) });
 
     var futures: std.ArrayList(PresentationWork) = .empty;
@@ -119,6 +125,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
         const event = try loop.nextEvent();
         switch (event) {
             .key_press => |key| try state.dispatch(.{ .key = portableKey(key) }),
+            .mouse => |mouse| if (portableMouse(mouse)) |input| try state.dispatch(.{ .mouse = input }),
             .winsize => |winsize| {
                 try vx.resize(ctx.gpa, writer, winsize);
                 try state.dispatch(.{ .resize = contentGeometry(vx.window()) });
@@ -141,15 +148,15 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
 
         const projection = state.projection();
         const win = vx.window();
+        const content_win = win.child(.{
+            .x_off = 0,
+            .y_off = 0,
+            .width = win.width,
+            .height = win.height -| 1,
+        });
         const frame = frame_arena.allocator();
         if (projection.review) |review_projection| {
             const selected_file = fileIndexForRow(review_projection.frame.buffer, review_projection.frame.navigation.cursor);
-            const content_win = win.child(.{
-                .x_off = 0,
-                .y_off = 0,
-                .width = win.width,
-                .height = win.height -| 1,
-            });
             render.drawReview(frame, content_win, review_projection, ctx.active_theme, selected_file);
             const status = presentationStatus(frame, projection, review_projection.key);
             drawStatus(
@@ -172,23 +179,23 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
             );
         } else {
             const status = presentationStatus(frame, projection, null);
-            render.drawLoading(frame, win, projection.loading_pull_request_id, ctx.active_theme, status);
+            render.drawLoading(frame, content_win, projection.loading_pull_request_id, ctx.active_theme, status);
         }
-        if (projection.picker) |active_picker| render.drawPicker(frame, win, active_picker, ctx.active_theme);
-        if (projection.file_finder) |finder| render.drawFileFinder(frame, win, finder, ctx.active_theme);
-        if (projection.composer) |composer| render.drawComposerProjection(frame, win, composer, ctx.active_theme);
-        if (projection.unknown_resolution) |resolution| render.drawComposerProjection(frame, win, .{
+        if (projection.picker) |active_picker| render.drawPicker(frame, content_win, active_picker, ctx.active_theme);
+        if (projection.file_finder) |finder| render.drawFileFinder(frame, content_win, finder, ctx.active_theme);
+        if (projection.composer) |composer| render.drawComposerProjection(frame, content_win, composer, ctx.active_theme);
+        if (projection.unknown_resolution) |resolution| render.drawComposerProjection(frame, content_win, .{
             .label = "Link existing Bitbucket Comment ID",
             .body = resolution.comment_id,
         }, ctx.active_theme);
         if (projection.submission) |submission| {
             if (projection.review) |review_projection| if (presentation.ReviewKey.eql(submission.key, review_projection.key))
-                render.drawSubmit(frame, win, ctx.active_theme, submission.completed, submission.total);
+                render.drawSubmit(frame, content_win, ctx.active_theme, submission.completed, submission.total);
         } else if (projection.submission_result) |result| {
             if (projection.review) |review_projection| if (presentation.ReviewKey.eql(result.key, review_projection.key))
                 render.drawSubmitResult(
                     frame,
-                    win,
+                    content_win,
                     ctx.active_theme,
                     result.posted,
                     result.failed + result.outcome_unknown,
@@ -197,7 +204,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
                     false,
                 );
         }
-        if (projection.help_visible) render.drawHelp(frame, win, ctx.active_theme, ctx.keymap, projection.action_availability);
+        if (projection.help_visible) render.drawHelp(frame, content_win, ctx.active_theme, ctx.keymap, projection.action_availability);
         try vx.render(writer);
         _ = frame_arena.reset(.retain_capacity);
     }
@@ -288,6 +295,31 @@ fn portableKey(key: vaxis.Key) keymap.KeyStroke {
             .hyper = key.mods.hyper,
             .meta = key.mods.meta,
         },
+    };
+}
+
+fn portableMouse(mouse: vaxis.Mouse) ?presentation.MouseInput {
+    if (mouse.col < 0 or mouse.row < 0) return null;
+    return .{
+        .col = @intCast(mouse.col),
+        .row = @intCast(mouse.row),
+        .button = switch (mouse.button) {
+            .left => .left,
+            .middle => .middle,
+            .right => .right,
+            .wheel_up => .wheel_up,
+            .wheel_down => .wheel_down,
+            .wheel_left => .wheel_left,
+            .wheel_right => .wheel_right,
+            .none, .button_8, .button_9, .button_10, .button_11 => .unsupported,
+        },
+        .type = switch (mouse.type) {
+            .press => .press,
+            .release => .release,
+            .motion => .motion,
+            .drag => .drag,
+        },
+        .modified = mouse.mods.shift or mouse.mods.alt or mouse.mods.ctrl,
     };
 }
 

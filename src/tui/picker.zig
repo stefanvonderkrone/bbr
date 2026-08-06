@@ -128,6 +128,10 @@ pub const Picker = struct {
         if (self.selected > 0) self.selected -= 1;
     }
 
+    pub fn select(self: *Picker, index: usize) void {
+        if (index < self.match_count) self.selected = index;
+    }
+
     /// Append typed bytes to the query and re-filter.
     pub fn insert(self: *Picker, bytes: []const u8) void {
         for (bytes) |b| {
@@ -267,6 +271,9 @@ pub const FileFinder = struct {
     }
     pub fn moveUp(self: *FileFinder) void {
         if (self.selected > 0) self.selected -= 1;
+    }
+    pub fn select(self: *FileFinder, index: usize) void {
+        if (index < self.match_count) self.selected = index;
     }
     pub fn insert(self: *FileFinder, bytes: []const u8) void {
         for (bytes) |byte| if (self.query_len < self.query_buf.len) {

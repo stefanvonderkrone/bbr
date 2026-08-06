@@ -434,10 +434,8 @@ fn drawSection(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, sec: Secti
 /// Center a modal box of up to `max_w`×`max_h` over `win`, bounded by it.
 /// Returns null when there's no room. The shared geometry behind every overlay.
 fn centeredModal(win: vaxis.Window, max_w: u16, max_h: u16) ?vaxis.Window {
-    const w: u16 = @min(max_w, win.width);
-    const h: u16 = @min(max_h, win.height);
-    if (w == 0 or h == 0) return null;
-    return win.child(.{ .x_off = (win.width - w) / 2, .y_off = (win.height - h) / 2, .width = w, .height = h });
+    const rect = @import("frame.zig").overlayRect(.{ .cols = win.width, .rows = win.height }, max_w, max_h) orelse return null;
+    return childRect(win, rect);
 }
 
 pub fn drawPicker(scratch: std.mem.Allocator, win: vaxis.Window, picker: *const Picker, theme: Theme) void {
@@ -702,7 +700,7 @@ fn buildHelpRows(scratch: std.mem.Allocator, km: keymap.Keymap, availability: pr
 pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, km: keymap.Keymap, availability: presentation.ActionAvailability) void {
     const rows = buildHelpRows(scratch, km, availability);
     const n = @max(rows.motions.len, rows.commands.len);
-    const want_h: u16 = @intCast(@min(n + 3, 255));
+    const want_h: u16 = @intCast(@min(n + 5, 255));
     const modal = centeredModal(win, 74, want_h) orelse return;
     var r: u16 = 0;
     while (r < modal.height) : (r += 1) fillRow(modal, r, theme.picker);
@@ -711,13 +709,21 @@ pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, km:
     _ = modal.printSegment(.{ .text = " Keybindings", .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
 
     const col_right: u16 = modal.width / 2 + 1;
+    const keyboard_rows = @min(n, modal.height -| 5);
     var i: usize = 0;
-    while (i < n and 1 + i + 1 < modal.height) : (i += 1) {
+    while (i < keyboard_rows) : (i += 1) {
         const rr: u16 = 1 + @as(u16, @intCast(i));
         if (i < rows.motions.len)
             _ = modal.printSegment(.{ .text = rows.motions[i].text, .style = if (rows.motions[i].available) theme.picker else theme.gutter }, .{ .row_offset = rr, .col_offset = 2, .wrap = .none });
         if (i < rows.commands.len)
             _ = modal.printSegment(.{ .text = rows.commands[i].text, .style = if (rows.commands[i].available) theme.picker else theme.gutter }, .{ .row_offset = rr, .col_offset = col_right, .wrap = .none });
+    }
+
+    const mouse_row: u16 = @intCast(keyboard_rows + 1);
+    if (mouse_row + 2 < modal.height) {
+        _ = modal.printSegment(.{ .text = " Mouse", .style = theme.picker_query }, .{ .row_offset = mouse_row, .col_offset = 1, .wrap = .none });
+        _ = modal.printSegment(.{ .text = " click focus/select/toggle · wheel scroll", .style = theme.picker }, .{ .row_offset = mouse_row + 1, .col_offset = 2, .wrap = .none });
+        _ = modal.printSegment(.{ .text = " Shift/Option: native selection · [input.mouse] enabled=false", .style = theme.gutter }, .{ .row_offset = mouse_row + 2, .col_offset = 2, .wrap = .none });
     }
 
     const hint_row = modal.height - 1;
@@ -1391,13 +1397,15 @@ test "the help overlay floats a centered Keybindings modal from the Keymap" {
     drawHelp(a, win, theme_dark, keymap.Keymap.default, .{ .remote = true });
 
     const rows = buildHelpRows(a, keymap.Keymap.default, .{ .remote = true });
-    const modal_height: u16 = @intCast(@min(@max(rows.motions.len, rows.commands.len) + 3, screen.height));
+    const modal_height: u16 = @intCast(@min(@max(rows.motions.len, rows.commands.len) + 5, screen.height));
     const modal_y = (screen.height - modal_height) / 2;
     // Title " Keybindings" begins one cell into the centered 74-column modal.
     try testing.expectEqualStrings("K", win.readCell(4, modal_y).?.char.grapheme);
     // First motion row starts at col_offset 2 and one row below the title →
     // screen col 5, and the first motion binding is `j`/`↓` → down.
     try testing.expectEqualStrings("j", win.readCell(5, modal_y + 1).?.char.grapheme);
+    const mouse_row: u16 = @intCast(@min(@max(rows.motions.len, rows.commands.len), modal_height -| 5) + 1);
+    try testing.expectEqualStrings("M", win.readCell(5, modal_y + mouse_row).?.char.grapheme);
 }
 
 test "local help projection marks remote-only commands unavailable" {
