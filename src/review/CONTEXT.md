@@ -1,8 +1,8 @@
 # Review
 
-Comment threads on a PullRequest and the client-side **Pending Review**: the batch of
-drafts the reviewer composes locally and publishes together. Bitbucket Cloud has no native
-draft/pending concept, so this batching is entirely ours to model.
+Comment threads in a Review and the client-side **Pending Review**: the batch of drafts the
+reviewer composes locally and, for a Remote review, publishes together. Bitbucket Cloud has
+no native draft/pending concept, so this batching is entirely ours to model.
 
 ## Language
 
@@ -15,7 +15,7 @@ The line or range an inline Comment attaches to: a File `path`, the **commit** c
 _Avoid_: position, location, target, ref.
 
 **CommentScope**:
-The exhaustive scope of a root Comment or root Draft: `pull_request`, `file` carrying a FileScope, or `inline` carrying an Anchor. Replies carry only their parent and inherit the root's CommentScope.
+The exhaustive scope of a root Comment or root Draft: `review`, `file` carrying a FileScope, or `inline` carrying an Anchor. Replies carry only their parent and inherit the root's CommentScope. Review scope belongs to the Review as a whole in both RemoteReview and LocalReview; Bitbucket represents it by omitting `inline`.
 _Avoid_: optional Anchor, placement, target (reserved for CommentTarget).
 
 **FileScope**:
@@ -27,7 +27,7 @@ The successful verdict for a File or inline CommentScope against the currently v
 _Avoid_: status, stale, dangling.
 
 **ScopeResolution**:
-The result of attempting to place a CommentScope against the currently viewed Diff: either a resolved ScopeState carrying the projected CommentScope or `unavailable` when required Git history or mapping evidence cannot be obtained. PullRequest scope always resolves unchanged. Unavailable never implies outdated and retains the durable authored scope and any captured context.
+The result of attempting to place a CommentScope against the currently viewed Diff: either a resolved ScopeState carrying the projected CommentScope or `unavailable` when required Git history or mapping evidence cannot be obtained. Review scope always resolves unchanged. Unavailable never implies outdated and retains the durable authored scope and any captured context.
 _Avoid_: ScopeState (only a successful verdict), unknown state, assumed outdated.
 
 A ScopeResolution is derived projection data, not durable authored state. For Drafts it lives in the Presentation-owned ScopeProjection keyed by root TempId; the PendingReview retains only the original CommentScope and any inline AnchorSnapshot. Replies inherit their root's projected placement.
@@ -45,11 +45,15 @@ Where every Draft in one PendingReview lives: `bitbucket` (Drafts submit) or `lo
 _Avoid_: backend, sink, destination.
 
 **Comment**:
-A piece of authored prose on a PullRequest. A root carries exactly one CommentScope; a Reply inherits its root's scope through its parent. The generic term; prefer Thread/Reply/Suggestion when the role is specific.
+A piece of authored prose in a Review. A root carries exactly one CommentScope; a Reply inherits its root's scope through its parent. The generic term; prefer Thread/Reply/Suggestion when the role is specific.
 _Avoid_: note, remark, message.
 
+**Review-level Comment**:
+A root Comment scoped to the Review as a whole, independent of any File or line. It is valid in both RemoteReview and LocalReview; at the Bitbucket boundary its root omits `inline`.
+_Avoid_: PullRequest-level Comment (excludes LocalReview), top-level Comment (describes hierarchy, not scope), unanchored Comment.
+
 **File-level Comment**:
-A root Comment scoped through a FileScope to one File as a whole, without line coordinates. It is distinct from both an inline Comment, whose Anchor identifies lines, and a PullRequest-level Comment, which belongs to no File.
+A root Comment scoped through a FileScope to one File as a whole, without line coordinates. It is distinct from both an inline Comment, whose Anchor identifies lines, and a Review-level Comment, which belongs to no File.
 _Avoid_: whole-File Comment (confusable with the WholeFile Diff scope), unanchored inline Comment.
 
 **Thread**:

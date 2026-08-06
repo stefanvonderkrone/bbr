@@ -23,12 +23,13 @@ An implementation-ready M15 specification and dependency map in which every pres
 - [Choose the disclosure language for hidden review content](issues/03-choose-disclosure-language-for-hidden-review-content.md) — Use type-shaped persistent disclosure rows with one Enter-to-toggle contract and independent Session-relative state for resolved Threads, context Folds, and Outdated sections.
 - [Choose Markdown and long-body presentation](issues/04-choose-markdown-and-long-body-presentation.md) — Use bounded review cards with terminal-native Markdown, visible link destinations, structural Suggestion fences, and per-body disclosure after six rendered rows.
 - [Choose Pane and Overlay framing](issues/05-choose-pane-and-overlay-framing.md) — Frame the Sidebar and DiffPane as focused tiled boxes, use joined one-row section rules, and keep Overlays to a restrained single-line frame.
+- [Choose Comment scopes and default Actions](issues/06-choose-comment-scopes-and-default-actions.md) — Use the `i` / `I` / `C` scope ladder for inline, File-level, and Review-level Comments, with explicit Actions and `gC` for recovery linking.
 - [Establish the mouse compatibility envelope](issues/07-establish-mouse-compatibility-envelope.md) — Click focus/disclosure and vertical scrolling are sound candidates; drag selection needs a narrow contract, and every mouse gesture requires keyboard parity.
 - [Decide M15 mouse support](issues/08-decide-m15-mouse-support.md) — Ship default-on, configurable clicks and wheel navigation for Panes, disclosures, and Pickers, while excluding mouse Selection and less portable gestures.
 - [Choose File finder and PullRequest Picker behavior](issues/09-choose-file-finder-and-picker-behavior.md) — Use separate purpose-shaped Overlays with shared navigation, all-open PullRequest startup, title-first ranking, and Enter-only confirmation.
 - [Choose File cache configuration language](issues/10-choose-file-cache-configuration-language.md) — Use `enabled` and `max_bytes` for the inactive in-memory File cache, with 256 MiB by default, zero meaning unlimited, and the focused File outside the budget.
 - [Decide Picker loading feedback](issues/11-decide-picker-loading-feedback.md) — Add a single-glyph Picker spinner driven by scoped tick events through the blocking event path; avoid richer indeterminate animation.
-- [Choose the File-level Comment model](issues/13-choose-file-level-comment-model.md) — Use an exhaustive root-owned CommentScope, scope-wide Session projection, and File-header placement without overloading line Anchors.
+- [Choose the File-level Comment model](issues/13-choose-file-level-comment-model.md) — Use exhaustive root-owned Review/File/inline CommentScope, scope-wide Session projection, and File-header placement without overloading line Anchors.
 
 ## Not yet specified
 
