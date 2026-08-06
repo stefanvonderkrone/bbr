@@ -30,6 +30,7 @@ An implementation-ready M15 specification and dependency map in which every pres
 - [Choose File cache configuration language](issues/10-choose-file-cache-configuration-language.md) — Use `enabled` and `max_bytes` for the inactive in-memory File cache, with 256 MiB by default, zero meaning unlimited, and the focused File outside the budget.
 - [Decide Picker loading feedback](issues/11-decide-picker-loading-feedback.md) — Add a single-glyph Picker spinner driven by scoped tick events through the blocking event path; avoid richer indeterminate animation.
 - [Choose the File-level Comment model](issues/13-choose-file-level-comment-model.md) — Use exhaustive root-owned Review/File/inline CommentScope, scope-wide Session projection, and File-header placement without overloading line Anchors.
+- [Choose the Markdown projection seam](issues/14-choose-markdown-projection-seam.md) — Use a pure two-stage ReviewBody-to-ReviewCardRow projection with shared geometry, grapheme metrics, stable source ownership, Theme composition, and a hard rendered-row disclosure limit.
 
 ## Not yet specified
 

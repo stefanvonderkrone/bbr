@@ -41,6 +41,14 @@ _Avoid_: search, finder, switcher, palette.
 The Overlay for writing a Draft (comment, reply, or suggestion) before it enters the PendingReview.
 _Avoid_: editor, input, form.
 
+**ReviewBody**:
+Presentation's width-independent semantic reading of a Comment or Draft's authored Markdown. Review retains the authored bytes; a ReviewBody identifies prose, headings, Suggestions, visible links, and inline emphasis so terminal-width changes only reproject its rows.
+_Avoid_: parsed Comment, rendered Markdown, Markdown document.
+
+**ReviewCard**:
+The bounded DiffPane presentation of one Comment or Draft: an identifying header, ReviewBody rows, and an in-place disclosure footer when the projected body exceeds its row budget. Every row belongs to the same stable Comment or Draft identity.
+_Avoid_: Comment (the Review entity), panel, box.
+
 **Session Epoch**:
 The identity of one published Session. Session-bound work such as File Enrichment carries that Session's Epoch and cannot change a later Session, even when both Sessions represent the same PullRequest. The Epoch changes only when a complete Session replacement is published; a failed replacement preserves the current Epoch and its in-flight work.
 _Avoid_: PR id (identifies the PullRequest, not one Session), generation, version, token, nonce.
