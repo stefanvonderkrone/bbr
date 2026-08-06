@@ -4,6 +4,7 @@ const std = @import("std");
 const bbr = @import("bbr");
 const Nav = @import("nav.zig").Nav;
 const buffer_mod = @import("buffer.zig");
+pub const CellMetrics = @import("cell_metrics.zig").CellMetrics;
 
 pub const Revision = u64;
 
@@ -29,35 +30,13 @@ pub const PaneRects = struct {
     diff: Rect,
 };
 
-/// Projection depends on this portable seam, never on vaxis's active width
-/// method. The adapter may inject the terminal's grapheme/cell implementation.
-pub const CellMetrics = struct {
-    ptr: *const anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        width: *const fn (ptr: *const anyopaque, text: []const u8) usize,
-    };
-
-    pub fn width(self: CellMetrics, text: []const u8) usize {
-        return self.vtable.width(self.ptr, text);
-    }
-
-    pub const bytes: CellMetrics = .{ .ptr = &byte_context, .vtable = &byte_vtable };
-    const byte_context: u8 = 0;
-    const byte_vtable: VTable = .{ .width = byteWidth };
-    fn byteWidth(_: *const anyopaque, text: []const u8) usize {
-        return text.len;
-    }
-};
-
 pub const RowOwner = union(enum) {
     file: *const bbr.diff.File,
     hunk: *const bbr.diff.model.Hunk,
     line: *const bbr.diff.Line,
     fold: *const bbr.diff.Line,
-    comment: struct { id: bbr.review.CommentId, source_offset: usize },
-    draft: struct { id: bbr.review.TempId, source_offset: usize },
+    comment: struct { id: bbr.review.CommentId, source_offset: usize, part: ?@import("review_card.zig").Part = null },
+    draft: struct { id: bbr.review.TempId, source_offset: usize, part: ?@import("review_card.zig").Part = null },
     snapshot: struct { id: bbr.review.TempId, source_offset: usize },
     section: struct { kind: buffer_mod.SectionKind, path: []const u8 },
 
@@ -68,8 +47,8 @@ pub const RowOwner = union(enum) {
             .hunk => |value| value == b.hunk,
             .line => |value| value == b.line,
             .fold => |value| value == b.fold,
-            .comment => |value| value.id == b.comment.id and value.source_offset == b.comment.source_offset,
-            .draft => |value| value.id == b.draft.id and value.source_offset == b.draft.source_offset,
+            .comment => |value| value.id == b.comment.id and value.source_offset == b.comment.source_offset and value.part == b.comment.part,
+            .draft => |value| value.id == b.draft.id and value.source_offset == b.draft.source_offset and value.part == b.draft.part,
             .snapshot => |value| value.id == b.snapshot.id and value.source_offset == b.snapshot.source_offset,
             .section => |value| value.kind == b.section.kind and std.mem.eql(u8, value.path, b.section.path),
         };
@@ -79,6 +58,7 @@ pub const RowOwner = union(enum) {
 pub const SemanticTarget = struct {
     owner: RowOwner,
     measured_cells: usize,
+    source_end: usize = 0,
 };
 
 pub const Projection = struct {
@@ -109,7 +89,8 @@ pub fn buildTargets(
     const targets = try allocator.alloc(SemanticTarget, rows.len);
     for (rows, targets) |row, *target| target.* = .{
         .owner = owner(row),
-        .measured_cells = metrics.width(rowText(row)),
+        .measured_cells = rowWidth(row, metrics),
+        .source_end = rowSourceEnd(row),
     };
     return targets;
 }
@@ -138,6 +119,24 @@ pub fn restoreNavigation(previous: Projection, targets: []const SemanticTarget, 
 
 fn findOwner(targets: []const SemanticTarget, wanted: RowOwner) ?usize {
     for (targets, 0..) |target, index| if (target.owner.eql(wanted)) return index;
+    // Width changes alter projected row starts. Restore a ReviewCard to the
+    // same source offset's containing row, or the nearest following row. A
+    // collapsed card's footer uses the body-end offset, so hidden content lands
+    // on that disclosure instead of another item.
+    var nearest: ?usize = null;
+    var nearest_offset: usize = std.math.maxInt(usize);
+    for (targets, 0..) |target, index| switch (wanted) {
+        .comment => |value| if (target.owner == .comment and target.owner.comment.id == value.id and target.owner.comment.part != .header and ((target.owner.comment.source_offset <= value.source_offset and value.source_offset < target.source_end) or target.owner.comment.source_offset >= value.source_offset) and target.owner.comment.source_offset < nearest_offset) {
+            nearest = index;
+            nearest_offset = target.owner.comment.source_offset;
+        },
+        .draft => |value| if (target.owner == .draft and target.owner.draft.id == value.id and target.owner.draft.part != .header and ((target.owner.draft.source_offset <= value.source_offset and value.source_offset < target.source_end) or target.owner.draft.source_offset >= value.source_offset) and target.owner.draft.source_offset < nearest_offset) {
+            nearest = index;
+            nearest_offset = target.owner.draft.source_offset;
+        },
+        else => {},
+    };
+    if (nearest) |index| return index;
     return null;
 }
 
@@ -153,10 +152,31 @@ fn owner(row: buffer_mod.Row) RowOwner {
         .line => |line| .{ .line = line.line },
         .line_pair => |pair| .{ .line = if (pair.right) |right| right.line else pair.left.?.line },
         .fold => |fold| .{ .fold = fold.id },
-        .comment => |comment| .{ .comment = .{ .id = comment.comment.id, .source_offset = sourceOffset(comment.comment.body, comment.line) } },
-        .draft => |draft| .{ .draft = .{ .id = draft.draft.local_id, .source_offset = sourceOffset(draft.draft.body, draft.line) } },
+        .comment => |card| switch (card.owner) {
+            .comment => |id| .{ .comment = .{ .id = id, .source_offset = card.source_range.start, .part = anchorPart(card.part) } },
+            else => unreachable,
+        },
+        .draft => |card| switch (card.owner) {
+            .draft => |id| .{ .draft = .{ .id = id, .source_offset = card.source_range.start, .part = anchorPart(card.part) } },
+            else => unreachable,
+        },
         .snapshot => |snapshot| .{ .snapshot = .{ .id = snapshot.draft.local_id, .source_offset = if (snapshot.draft.snapshot) |value| sourceOffset(value.text, snapshot.line) else 0 } },
         .section => |section| .{ .section = .{ .kind = section.kind, .path = section.path } },
+    };
+}
+
+fn anchorPart(part: @import("review_card.zig").Part) ?@import("review_card.zig").Part {
+    return switch (part) {
+        .header, .disclosure_footer => part,
+        else => null,
+    };
+}
+
+fn rowSourceEnd(row: buffer_mod.Row) usize {
+    return switch (row) {
+        .comment => |card| card.source_range.end,
+        .draft => |card| card.source_range.end,
+        else => 0,
     };
 }
 
@@ -167,11 +187,25 @@ fn rowText(row: buffer_mod.Row) []const u8 {
         .line => |line| line.line.text,
         .line_pair => |pair| if (pair.right) |right| right.line.text else if (pair.left) |left| left.line.text else "",
         .fold => "",
-        .comment => |comment| comment.line,
-        .draft => |draft| draft.line,
+        .comment => |card| card.text(),
+        .draft => |card| card.text(),
         .snapshot => |snapshot| snapshot.line,
         .section => |section| section.path,
     };
+}
+
+fn rowWidth(row: buffer_mod.Row, metrics: CellMetrics) usize {
+    return switch (row) {
+        .comment => |card| segmentsWidth(card.segments, metrics),
+        .draft => |card| segmentsWidth(card.segments, metrics),
+        else => metrics.width(rowText(row)),
+    };
+}
+
+fn segmentsWidth(segments: []const @import("review_card.zig").Segment, metrics: CellMetrics) usize {
+    var width: usize = 0;
+    for (segments) |segment| width += metrics.width(segment.text);
+    return width;
 }
 
 fn sourceOffset(source: []const u8, part: []const u8) usize {
@@ -187,13 +221,13 @@ test "semantic targets use the injected CellMetrics seam" {
     const Metrics = struct {
         calls: usize = 0,
 
-        fn cellWidth(ptr: *const anyopaque, text: []const u8) usize {
+        fn next(ptr: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
             const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
             self.calls += 1;
-            return if (std.mem.eql(u8, text, "wide")) 2 else 0;
+            return .{ .byte_len = if (text.len == 0) 0 else 1, .cell_width = if (text.len > 0 and text[0] == 'w') 2 else 1 };
         }
     };
-    const vtable: CellMetrics.VTable = .{ .width = Metrics.cellWidth };
+    const vtable: CellMetrics.VTable = .{ .next = Metrics.next };
     var metrics_context: Metrics = .{};
     const metrics: CellMetrics = .{ .ptr = &metrics_context, .vtable = &vtable };
     const rows = [_]buffer_mod.Row{.{ .section = .{ .kind = .outdated, .count = 1, .path = "wide" } }};
@@ -201,8 +235,8 @@ test "semantic targets use the injected CellMetrics seam" {
     const targets = try buildTargets(testing.allocator, &rows, metrics);
     defer testing.allocator.free(targets);
 
-    try testing.expectEqual(@as(usize, 1), metrics_context.calls);
-    try testing.expectEqual(@as(usize, 2), targets[0].measured_cells);
+    try testing.expectEqual(@as(usize, 4), metrics_context.calls);
+    try testing.expectEqual(@as(usize, 5), targets[0].measured_cells);
 }
 
 test "navigation restoration follows stable owners and clears a shifted Selection" {
@@ -236,4 +270,35 @@ test "navigation restoration follows stable owners and clears a shifted Selectio
     try testing.expectEqual(@as(usize, 7), restored.count);
     try testing.expectEqual(@as(usize, 3), restored.viewport);
     try testing.expect(restored.mark == null);
+}
+
+test "ReviewCard restoration follows containing source offset and collapsed footer" {
+    const old_targets = [_]SemanticTarget{
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 0, .part = .header } }, .measured_cells = 5 },
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 8 } }, .measured_cells = 10, .source_end = 18 },
+    };
+    var navigation = Nav.init(old_targets.len, 3);
+    navigation.cursor = 1;
+    const previous: Projection = .{
+        .revision = 1,
+        .targets_revision = 1,
+        .geometry = .{ .cols = 40, .rows = 3 },
+        .panes = paneRects(.{ .cols = 40, .rows = 3 }),
+        .overlays = &.{},
+        .targets = &old_targets,
+        .buffer = .{ .rows = &.{}, .layout = .unified },
+        .navigation = navigation,
+    };
+    const resized = [_]SemanticTarget{
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 0, .part = .header } }, .measured_cells = 5 },
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 4 } }, .measured_cells = 18, .source_end = 14 },
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 14 } }, .measured_cells = 4, .source_end = 18 },
+    };
+    try testing.expectEqual(@as(usize, 1), restoreNavigation(previous, &resized, .{ .cols = 60, .rows = 3 }).cursor);
+
+    const collapsed = [_]SemanticTarget{
+        resized[0],
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 18, .part = .disclosure_footer } }, .measured_cells = 20, .source_end = 18 },
+    };
+    try testing.expectEqual(@as(usize, 1), restoreNavigation(previous, &collapsed, .{ .cols = 30, .rows = 3 }).cursor);
 }

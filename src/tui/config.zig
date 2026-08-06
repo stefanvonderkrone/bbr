@@ -19,6 +19,7 @@ const Diagnostic = struct {
 pub const Configuration = struct {
     pub const default_highlight_max_file_bytes: usize = 2 * 1024 * 1024;
     pub const default_file_cache_max_retained_bytes_per_review: usize = 256 * 1024 * 1024;
+    pub const default_comments_collapsed_rows: usize = 6;
 
     theme_name: []const u8,
     active_theme: theme.Theme,
@@ -26,6 +27,7 @@ pub const Configuration = struct {
     highlight_max_file_bytes: usize,
     file_cache_enabled: bool,
     file_cache_max_retained_bytes_per_review: usize,
+    comments_collapsed_rows: usize,
 
     pub fn deinit(self: *Configuration, allocator: std.mem.Allocator) void {
         allocator.free(self.theme_name);
@@ -90,6 +92,7 @@ fn defaults(allocator: std.mem.Allocator) !Configuration {
         .highlight_max_file_bytes = Configuration.default_highlight_max_file_bytes,
         .file_cache_enabled = true,
         .file_cache_max_retained_bytes_per_review = Configuration.default_file_cache_max_retained_bytes_per_review,
+        .comments_collapsed_rows = Configuration.default_comments_collapsed_rows,
     };
 }
 
@@ -146,7 +149,9 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
     var file_cache_max_retained_bytes_per_review = Configuration.default_file_cache_max_retained_bytes_per_review;
     var file_cache_limit_seen = false;
     var file_cache_limit_line: usize = 1;
-    var section: enum { root, keymap, highlight, files_cache, unknown } = .root;
+    var comments_collapsed_rows = Configuration.default_comments_collapsed_rows;
+    var comments_collapsed_seen = false;
+    var section: enum { root, keymap, highlight, files_cache, comments, unknown } = .root;
 
     var lines = std.mem.splitScalar(u8, source, '\n');
     var line_number: usize = 0;
@@ -157,15 +162,15 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
         if (parser.done() or parser.peek() == '#') continue;
         if (parser.peek() == '[') {
             const parsed_section = parser.section() catch {
-                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "malformed table header", .hint = "use [keymap], [highlight], or [files.cache]" });
+                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "malformed table header", .hint = "use [keymap], [highlight], [files.cache], or [comments]" });
                 section = .unknown;
                 continue;
             };
             parser.space();
             if (!parser.trailing()) try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "unexpected text after table header" });
-            if (std.mem.eql(u8, parsed_section, "keymap")) section = .keymap else if (std.mem.eql(u8, parsed_section, "highlight")) section = .highlight else if (std.mem.eql(u8, parsed_section, "files.cache")) section = .files_cache else {
+            if (std.mem.eql(u8, parsed_section, "keymap")) section = .keymap else if (std.mem.eql(u8, parsed_section, "highlight")) section = .highlight else if (std.mem.eql(u8, parsed_section, "files.cache")) section = .files_cache else if (std.mem.eql(u8, parsed_section, "comments")) section = .comments else {
                 section = .unknown;
-                try diagnostics.append(allocator, .{ .line = line_number, .column = 2, .message = "unknown table", .hint = "use [keymap], [highlight], or [files.cache]" });
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 2, .message = "unknown table", .hint = "use [keymap], [highlight], [files.cache], or [comments]" });
             }
             continue;
         }
@@ -181,7 +186,7 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
         }
         parser.space();
         const value: []const u8 = switch (section) {
-            .highlight => parser.unsigned() catch {
+            .highlight, .comments => parser.unsigned() catch {
                 try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a non-negative integer byte count" });
                 continue;
             },
@@ -275,6 +280,18 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
                 }
                 file_cache_limit_seen = true;
             } else try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown File cache key", .hint = "use enabled or max_retained_bytes_per_review" }),
+            .comments => if (!std.mem.eql(u8, key, "collapsed_rows")) {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown Comments key", .hint = "use collapsed_rows" });
+            } else if (comments_collapsed_seen) {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'collapsed_rows' key", .hint = "keep exactly one Comment row limit" });
+            } else {
+                comments_collapsed_rows = std.fmt.parseInt(usize, value, 10) catch {
+                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "Comment row limit is too large" });
+                    comments_collapsed_seen = true;
+                    continue;
+                };
+                comments_collapsed_seen = true;
+            },
             .unknown => {},
         }
     }
@@ -302,6 +319,7 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
         .highlight_max_file_bytes = highlight_max_file_bytes,
         .file_cache_enabled = file_cache_enabled,
         .file_cache_max_retained_bytes_per_review = file_cache_max_retained_bytes_per_review,
+        .comments_collapsed_rows = comments_collapsed_rows,
     } };
 }
 
@@ -490,6 +508,20 @@ test "File content cache defaults on at 256 MiB and accepts an explicit positive
     );
     defer zero.deinit(testing.allocator);
     try testing.expect(zero == .invalid);
+}
+
+test "Comment disclosure defaults to six rendered rows and zero disables collapse" {
+    var default_result = try parse(testing.allocator, "");
+    defer default_result.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 6), default_result.ok.comments_collapsed_rows);
+
+    var configured = try parse(testing.allocator,
+        \\[comments]
+        \\collapsed_rows = 0
+    );
+    defer configured.deinit(testing.allocator);
+    try testing.expect(configured == .ok);
+    try testing.expectEqual(@as(usize, 0), configured.ok.comments_collapsed_rows);
 }
 
 test "configuration path prefers XDG and falls back to HOME" {

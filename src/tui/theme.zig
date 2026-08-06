@@ -12,6 +12,7 @@ const bbr = @import("bbr");
 const LineKind = bbr.diff.LineKind;
 const Style = vaxis.Style;
 const Color = vaxis.Cell.Color;
+const review_card = @import("review_card.zig");
 
 pub const Theme = struct {
     /// Unchanged lines — terminal default background.
@@ -103,6 +104,32 @@ pub const Theme = struct {
             .added => self.added_emphasis,
             .removed => self.removed_emphasis,
         };
+    }
+
+    /// Compose a ReviewCard surface, semantic part, and inline Markdown marks.
+    /// Cursor focus is applied by the renderer last through `cursorBg`.
+    pub fn reviewCardStyle(self: Theme, role: review_card.CardRole, part: review_card.Part, marks: review_card.Marks) Style {
+        var style = switch (role) {
+            .comment => self.comment,
+            .comment_reply => self.comment_reply,
+            .draft => self.draft,
+            .draft_reply => self.draft_reply,
+            .outcome_unknown => self.outcome_unknown,
+            .outcome_unknown_reply => self.outcome_unknown_reply,
+        };
+        switch (part) {
+            .suggestion_label, .suggestion_body => style = self.suggestion,
+            .disclosure_footer => {
+                style.fg = self.section.fg;
+                style.dim = true;
+            },
+            .header => style.bold = true,
+            .body => {},
+        }
+        style.italic = style.italic or marks.emphasis;
+        style.bold = style.bold or marks.strong;
+        if (marks.link_label or marks.link_destination) style.ul_style = .single;
+        return style;
     }
 
     /// Highlighted background for a cell on the cursor row. A cell with an rgb
@@ -369,6 +396,20 @@ test "every built-in Theme resolves by its exact name and keeps diff bands disti
         try testing.expect(!std.meta.eql(selected.status_added, selected.status_removed));
     }
     try testing.expect(byName("catppuccin") == null);
+}
+
+test "every built-in Theme composes every ReviewCard role and Markdown refinement" {
+    for (builtins) |builtin| {
+        inline for (std.meta.tags(review_card.CardRole)) |role| {
+            const prose = builtin.value.reviewCardStyle(role, .body, .{ .emphasis = true });
+            try testing.expect(prose.italic);
+            const strong_link = builtin.value.reviewCardStyle(role, .body, .{ .strong = true, .link_label = true });
+            try testing.expect(strong_link.bold and strong_link.ul_style == .single);
+            try testing.expect(std.meta.eql(builtin.value.suggestion, builtin.value.reviewCardStyle(role, .suggestion_body, .{})));
+            try testing.expect(builtin.value.reviewCardStyle(role, .header, .{}).bold);
+            try testing.expect(builtin.value.reviewCardStyle(role, .disclosure_footer, .{}).dim);
+        }
+    }
 }
 
 test "Capture colors resolve hierarchical names and preserve unknown foregrounds" {

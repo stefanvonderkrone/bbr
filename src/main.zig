@@ -145,6 +145,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .highlight_max_file_bytes = configuration.highlight_max_file_bytes,
         .file_cache_enabled = configuration.file_cache_enabled,
         .file_cache_max_retained_bytes_per_review = configuration.file_cache_max_retained_bytes_per_review,
+        .comments_collapsed_rows = configuration.comments_collapsed_rows,
         .submission_locks = os_locks.locks(),
     }, null, try presentation.ReviewKey.init(cred.workspace, target.repo, target.id)) catch |err| {
         if (tuiFatalMessage(err)) |message| {
@@ -227,6 +228,7 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
         .highlight_max_file_bytes = configuration.highlight_max_file_bytes,
         .file_cache_enabled = configuration.file_cache_enabled,
         .file_cache_max_retained_bytes_per_review = configuration.file_cache_max_retained_bytes_per_review,
+        .comments_collapsed_rows = configuration.comments_collapsed_rows,
         .online = false,
     }, null, key);
 }
@@ -505,6 +507,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
         .highlight_max_file_bytes = configuration.highlight_max_file_bytes,
         .file_cache_enabled = configuration.file_cache_enabled,
         .file_cache_max_retained_bytes_per_review = configuration.file_cache_max_retained_bytes_per_review,
+        .comments_collapsed_rows = configuration.comments_collapsed_rows,
         .online = false,
     }, s, try presentation.ReviewKey.init("", "", pr.id));
 }
@@ -517,6 +520,8 @@ test {
     _ = @import("highlight/tree_sitter_highlighter.zig");
     _ = @import("tui/app.zig");
     _ = @import("tui/config.zig");
+    _ = @import("tui/review_body.zig");
+    _ = @import("tui/review_card.zig");
     _ = @import("persist/sqlite_store.zig");
 }
 
@@ -557,7 +562,7 @@ test "demo data weaves through the real pipeline" {
     for (hidden.rows) |r| {
         // A multi-line body emits one row per visual line (M11); count the
         // header (`is_first`) rows to tally distinct comments woven.
-        if (r == .comment and r.comment.is_first) hidden_comments += 1;
+        if (r == .comment and r.comment.part == .header) hidden_comments += 1;
         if (r == .section and r.section.kind == .outdated) outdated_sections += 1;
     }
     // PR-level (#1) + inline root (#2) + suggestion reply (#4) + outdated (#7) = 4;
@@ -569,7 +574,7 @@ test "demo data weaves through the real pipeline" {
     const shown = try buffer_mod.buildWithComments(a, diff, .unified, threads, .{ .show_resolved = true });
     var shown_comments: usize = 0;
     for (shown.rows) |r| {
-        if (r == .comment and r.comment.is_first) shown_comments += 1;
+        if (r == .comment and r.comment.part == .header) shown_comments += 1;
     }
     try testing.expectEqual(@as(usize, 5), shown_comments);
 }

@@ -295,19 +295,7 @@ fn drawLineBody(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, body_col:
 /// a `±` marker so it reads distinctly; the body is drawn verbatim (fences and
 /// all — markdown rendering is a later follow-up).
 fn drawComment(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, cr: CommentRow, theme: Theme) void {
-    const c = cr.comment;
-    const is_suggestion = c.suggestion() != null;
-    const style = if (is_suggestion) theme.suggestion else if (cr.is_reply) theme.comment_reply else theme.comment;
-    fillRow(win, r, style);
-
-    const col: u16 = if (cr.is_reply) 6 else 2;
-    if (cr.is_first) {
-        const marker: []const u8 = if (is_suggestion) "±" else if (cr.is_reply) "↳" else "▸";
-        const text = std.fmt.allocPrint(scratch, "{s} {s}: {s}", .{ marker, c.author, cr.line }) catch c.author;
-        _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = col, .wrap = .none });
-    } else {
-        _ = win.printSegment(.{ .text = cr.line, .style = style }, .{ .row_offset = r, .col_offset = col + 2, .wrap = .none });
-    }
+    drawReviewCard(scratch, win, r, cr, theme);
 }
 
 /// A pending Draft — the reviewer's own unsent comment, one visual line per row.
@@ -315,25 +303,21 @@ fn drawComment(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, cr: Commen
 /// already-published; a suggestion Draft shows its `±` marker. Continuation rows
 /// hang-indent like a comment. The body is drawn verbatim.
 fn drawDraft(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, dr: DraftRow, theme: Theme) void {
-    const d = dr.draft;
-    const unknown = d.state == .outcome_unknown;
-    const style = if (unknown)
-        (if (dr.is_reply) theme.outcome_unknown_reply else theme.outcome_unknown)
-    else if (dr.is_reply) theme.draft_reply else theme.draft;
-    fillRow(win, r, style);
+    drawReviewCard(scratch, win, r, dr, theme);
+}
 
-    const col: u16 = if (dr.is_reply) 6 else 2;
-    if (dr.is_first) {
-        const marker: []const u8 = switch (d.kind) {
-            .suggestion => "±",
-            else => if (dr.is_reply) "↳" else "✎",
-        };
-        const label = if (unknown) "outcome unknown - resolve before editing" else "draft";
-        const text = std.fmt.allocPrint(scratch, "{s} {s}: {s}", .{ marker, label, dr.line }) catch "✎ draft";
-        _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = col, .wrap = .none });
-    } else {
-        _ = win.printSegment(.{ .text = dr.line, .style = style }, .{ .row_offset = r, .col_offset = col + 2, .wrap = .none });
-    }
+fn drawReviewCard(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, card: buffer_mod.ReviewCardRow, theme: Theme) void {
+    var base = theme.reviewCardStyle(card.role, card.part, .{});
+    if (card.block_kind == .heading) base.bold = true;
+    fillRow(win, r, base);
+    if (card.segments.len == 0) return;
+    const segments = scratch.alloc(vaxis.Segment, card.segments.len) catch return;
+    for (card.segments, 0..) |segment, index| segments[index] = .{
+        .text = segment.text,
+        .style = theme.reviewCardStyle(card.role, card.part, segment.marks),
+    };
+    const col: u16 = (if (card.isReply()) @as(u16, 6) else 2) + (if (card.part == .header) @as(u16, 0) else 2);
+    _ = win.print(segments, .{ .row_offset = r, .col_offset = col, .wrap = .none });
 }
 
 /// A collapsed-context fold: "  ⋯ N unchanged lines · enter to expand ⋯".
@@ -1076,7 +1060,7 @@ test "a pending draft renders in the draft band with its marker" {
     // Find the draft row's screen position.
     var draft_row: ?u16 = null;
     for (buf.rows, 0..) |row, idx| {
-        if (row == .draft) draft_row = @intCast(idx);
+        if (row == .draft and row.draft.part == .header) draft_row = @intCast(idx);
     }
     const dr = draft_row.?;
     const px = sidebar_width + 1;
@@ -1236,23 +1220,18 @@ test "a woven comment renders with its marker and style; a suggestion is distinc
     const nav = Nav.init(buf.rows.len, 24);
     draw(a, win, diff, buf, theme_dark, nav, 0, &.{}, &.{});
 
-    // Pane rows: 0 file_header, 1 hunk_header, 2 line(old), 3 line(new),
-    // 4 comment(root), then the 3-line suggestion reply verbatim (M11): 5 the
-    // "± Bo: ```suggestion" header, 6 "renamed", 7 the closing "```". Pane x =
-    // sidebar_width + 1.
+    // Pane rows: root header/body, then Suggestion reply header, semantic label,
+    // and literal code body. Fences themselves are structural, not displayed.
     const px = sidebar_width + 1;
     // Root comment marker "▸" at its indent (col 2 within the pane).
     try testing.expectEqualStrings("▸", win.readCell(px + 2, 4).?.char.grapheme);
     try testing.expectEqual(theme_dark.comment.bg, win.readCell(px + 2, 4).?.style.bg);
-    // The reply is a suggestion → "±" marker and the suggestion band on the
-    // header row (reply indent, col 6).
-    try testing.expectEqualStrings("±", win.readCell(px + 6, 5).?.char.grapheme);
-    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 6, 5).?.style.bg);
-    // Continuation rows render the body verbatim (fences and all), hang-indented
-    // two columns past the marker (col 8), keeping the suggestion band.
-    try testing.expectEqualStrings("r", win.readCell(px + 8, 6).?.char.grapheme);
-    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 8, 6).?.style.bg);
-    try testing.expectEqualStrings("`", win.readCell(px + 8, 7).?.char.grapheme);
+    try testing.expectEqualStrings("±", win.readCell(px + 6, 6).?.char.grapheme);
+    try testing.expectEqual(theme_dark.comment_reply.bg, win.readCell(px + 6, 6).?.style.bg);
+    try testing.expectEqualStrings("s", win.readCell(px + 8, 7).?.char.grapheme);
+    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 8, 7).?.style.bg);
+    try testing.expectEqualStrings("r", win.readCell(px + 8, 8).?.char.grapheme);
+    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 8, 8).?.style.bg);
 }
 
 test "the help overlay floats a centered Keybindings modal from the Keymap" {

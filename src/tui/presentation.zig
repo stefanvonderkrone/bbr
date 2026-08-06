@@ -129,6 +129,7 @@ pub const Dependencies = struct {
     highlight_max_file_bytes: usize = 0,
     file_cache_enabled: bool = true,
     file_cache_max_retained_bytes_per_review: usize = 256 * 1024 * 1024,
+    comments_collapsed_rows: usize = 6,
     require_source_check: bool = false,
     keymap: keymap_mod.Keymap = .default,
     remote_enabled: bool = true,
@@ -635,6 +636,7 @@ const Published = struct {
     geometry: frame_mod.Geometry,
     frame_revision: frame_mod.Revision,
     cell_metrics: frame_mod.CellMetrics,
+    comments_collapsed_rows: usize,
     navigation: Nav,
     expanded_folds: std.ArrayList(*const bbr.diff.Line),
     isolated_file: ?usize,
@@ -653,6 +655,7 @@ const Published = struct {
         preferences: Preferences,
         cache_policy: file_enrichment.CachePolicy,
         cell_metrics: frame_mod.CellMetrics,
+        comments_collapsed_rows: usize,
     ) !*Published {
         const published = try allocator.create(Published);
         errdefer allocator.destroy(published);
@@ -707,6 +710,7 @@ const Published = struct {
         published.geometry = geometry;
         published.frame_revision = 1;
         published.cell_metrics = cell_metrics;
+        published.comments_collapsed_rows = comments_collapsed_rows;
         session.enrichment.configureCache(cache_policy);
         if (session.enrichment.len() > 0) session.enrichment.focus(0);
 
@@ -726,6 +730,9 @@ const Published = struct {
                 .show_resolved = preferences.show_resolved,
                 .fold_context = preferences.scope == .changes,
                 .whole_file = preferences.scope == .whole,
+                .card_width = frame_mod.paneRects(geometry).diff.width,
+                .cell_metrics = cell_metrics,
+                .collapsed_rows = published.comments_collapsed_rows,
             },
         ) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -892,6 +899,9 @@ const Published = struct {
                 .only_file = isolated_file,
                 .blobs = enrichment.blobs,
                 .highlights = enrichment.highlights,
+                .card_width = frame_mod.paneRects(geometry).diff.width,
+                .cell_metrics = self.cell_metrics,
+                .collapsed_rows = self.commentsCollapsedRows(),
             },
         ) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -899,6 +909,12 @@ const Published = struct {
         };
         const targets = try frame_mod.buildTargets(allocator, candidate.rows, self.cell_metrics);
         return .{ .published = self, .buffer = candidate, .targets = targets, .geometry = geometry };
+    }
+
+    fn commentsCollapsedRows(self: *const Published) usize {
+        // Published projection policy is supplied by its owning Presentation;
+        // keep the value alongside the other process preferences in a field.
+        return self.comments_collapsed_rows;
     }
 };
 
@@ -1298,6 +1314,7 @@ pub const Presentation = struct {
                     .max_retained_bytes = dependencies.file_cache_max_retained_bytes_per_review,
                 },
                 dependencies.cell_metrics,
+                dependencies.comments_collapsed_rows,
             );
         }
         self.discoverRecovery();
@@ -1800,8 +1817,8 @@ pub const Presentation = struct {
             .draft => |draft_row| draft_row,
             else => return null,
         };
-        if (row.draft.state != .outcome_unknown) return null;
-        return published.review.get(row.draft.local_id);
+        if (row.draftItem().state != .outcome_unknown) return null;
+        return published.review.get(row.draftItem().local_id);
     }
 
     fn resolveSelectedUnknownAsUnpublished(self: *Presentation, published: *Published) void {
@@ -2228,8 +2245,8 @@ pub const Presentation = struct {
             return;
         }
         const parent: bbr.review.draft.Parent = switch (published.buffer.rows[published.navigation.cursor]) {
-            .comment => |row| .{ .comment = row.comment.id },
-            .draft => |row| .{ .draft = row.draft.local_id },
+            .comment => |row| .{ .comment = row.commentItem().id },
+            .draft => |row| .{ .draft = row.draftItem().local_id },
             else => {
                 self.action_error = .action_refused;
                 return;
@@ -2725,6 +2742,7 @@ pub const Presentation = struct {
                         .max_retained_bytes = self.dependencies.file_cache_max_retained_bytes_per_review,
                     },
                     self.dependencies.cell_metrics,
+                    self.dependencies.comments_collapsed_rows,
                 ) catch |err| {
                     self.replacement = null;
                     self.replacement_error = switch (err) {
@@ -4110,7 +4128,7 @@ test "reviewer can mark a selected unresolved Draft as unpublished" {
         .viewport_rows = 8,
     });
     defer presentation.deinit();
-    for (presentation.published.?.buffer.rows, 0..) |row, index| if (row == .draft and row.draft.draft.local_id == 1) {
+    for (presentation.published.?.buffer.rows, 0..) |row, index| if (row == .draft and row.draft.draftItem().local_id == 1) {
         presentation.published.?.navigation.jumpTo(index);
         break;
     };
@@ -4129,7 +4147,7 @@ test "reviewer can link a selected unresolved Draft to an existing Comment" {
         .viewport_rows = 8,
     });
     defer presentation.deinit();
-    for (presentation.published.?.buffer.rows, 0..) |row, index| if (row == .draft and row.draft.draft.local_id == 1) {
+    for (presentation.published.?.buffer.rows, 0..) |row, index| if (row == .draft and row.draft.draftItem().local_id == 1) {
         presentation.published.?.navigation.jumpTo(index);
         break;
     };

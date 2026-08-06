@@ -20,6 +20,8 @@ const Comment = review.Comment;
 const Draft = bbr.review.Draft;
 const Parent = bbr.review.draft.Parent;
 const anchor_projection = bbr.review.anchor;
+const review_card = @import("review_card.zig");
+const CellMetrics = @import("cell_metrics.zig").CellMetrics;
 
 /// Re-export so the renderer can name the segment type without reaching into
 /// `intraline` directly.
@@ -61,23 +63,9 @@ pub const LinePair = struct {
 /// buffer keeps its one-Row-per-screen-line invariant and `Nav`/scroll are
 /// untouched. `line` is that row's visual line (zero-copy into `comment.body`);
 /// `is_first` marks the header row that carries the marker + author.
-pub const CommentRow = struct {
-    comment: *const Comment,
-    is_reply: bool,
-    line: []const u8 = "",
-    is_first: bool = true,
-};
-
-/// A pending Draft woven into the diff: the Draft itself plus whether it's a
-/// reply (indented under whatever it replies to), so the renderer can mark it
-/// distinctly from a published comment. Multi-line bodies emit one DraftRow per
-/// visual line, mirroring CommentRow (see above).
-pub const DraftRow = struct {
-    draft: *const Draft,
-    is_reply: bool,
-    line: []const u8 = "",
-    is_first: bool = true,
-};
+pub const ReviewCardRow = review_card.ReviewCardRow;
+pub const CommentRow = ReviewCardRow;
+pub const DraftRow = ReviewCardRow;
 
 pub const SnapshotRow = struct {
     draft: *const Draft,
@@ -168,6 +156,11 @@ pub const BuildOptions = struct {
     blobs: []const model.FileBlob = &.{},
     /// Side-specific Highlighting results, index-aligned with `diff.files`.
     highlights: []const bbr.highlight.highlighter.FileHighlights = &.{},
+    /// Shared terminal geometry for ReviewCard wrapping.
+    card_width: usize = 80,
+    cell_metrics: CellMetrics = .bytes,
+    collapsed_rows: usize = 6,
+    expanded_cards: []const review_card.Owner = &.{},
 };
 
 pub const Buffer = struct {
@@ -383,20 +376,24 @@ const Weave = struct {
         }
     }
 
-    /// Emit one CommentRow per visual line of the body (verbatim, fences and
-    /// all — M11 §Q5-A), the first carrying the marker + author. `splitScalar`
-    /// always yields at least one line, so an empty body still shows its header.
+    /// Parse authored bytes into a width-independent ReviewBody and project the
+    /// shared ReviewCardRow shape used by root Comments, Replies, and Drafts.
     fn emitComment(w: *Weave, c: *const Comment, is_reply: bool) !void {
-        var it = std.mem.splitScalar(u8, trimTrailingNewline(c.body), '\n');
-        var first = true;
-        while (it.next()) |ln| : (first = false) {
-            try w.rows.append(w.a, .{ .comment = .{
-                .comment = c,
-                .is_reply = is_reply,
-                .line = ln,
-                .is_first = first,
-            } });
-        }
+        const owner: review_card.Owner = .{ .comment = c.id };
+        const marker = if (c.suggestion() != null) "±" else if (is_reply) "↳" else "▸";
+        const header = try std.fmt.allocPrint(w.a, "{s} {s}", .{ marker, c.author });
+        const parsed = try review_card.ReviewBody.parse(w.a, c.body);
+        const projected = try review_card.project(w.a, parsed, .{
+            .owner = owner,
+            .source = .{ .comment = c },
+            .role = if (is_reply) .comment_reply else .comment,
+            .header = header,
+            .content_width = cardContentWidth(w.opts.card_width, is_reply),
+            .metrics = w.opts.cell_metrics,
+            .collapsed_rows = w.opts.collapsed_rows,
+            .expanded = cardExpanded(w.opts.expanded_cards, owner),
+        });
+        for (projected) |row| try w.rows.append(w.a, .{ .comment = row });
     }
 
     /// Append one Draft row (marking it emitted), then cascade its own pending
@@ -415,16 +412,29 @@ const Weave = struct {
             else => false,
         };
         if (!published) {
-            var it = std.mem.splitScalar(u8, trimTrailingNewline(d.body), '\n');
-            var first = true;
-            while (it.next()) |ln| : (first = false) {
-                try w.rows.append(w.a, .{ .draft = .{
-                    .draft = d,
-                    .is_reply = d.parent != null,
-                    .line = ln,
-                    .is_first = first,
-                } });
-            }
+            const is_reply = d.parent != null;
+            const owner: review_card.Owner = .{ .draft = d.local_id };
+            const marker: []const u8 = if (d.kind == .suggestion) "±" else if (is_reply) "↳" else "✎";
+            const label = if (d.state == .outcome_unknown) "outcome unknown" else "draft";
+            const header = try std.fmt.allocPrint(w.a, "{s} {s}", .{ marker, label });
+            const parsed = try review_card.ReviewBody.parse(w.a, d.body);
+            const role: review_card.CardRole = if (d.state == .outcome_unknown)
+                (if (is_reply) .outcome_unknown_reply else .outcome_unknown)
+            else if (is_reply)
+                .draft_reply
+            else
+                .draft;
+            const projected = try review_card.project(w.a, parsed, .{
+                .owner = owner,
+                .source = .{ .draft = d },
+                .role = role,
+                .header = header,
+                .content_width = cardContentWidth(w.opts.card_width, is_reply),
+                .metrics = w.opts.cell_metrics,
+                .collapsed_rows = w.opts.collapsed_rows,
+                .expanded = cardExpanded(w.opts.expanded_cards, owner),
+            });
+            for (projected) |row| try w.rows.append(w.a, .{ .draft = row });
         }
         try w.emitRepliesTo(.{ .draft = d.local_id });
     }
@@ -570,6 +580,16 @@ const Weave = struct {
         }
     }
 };
+
+fn cardContentWidth(width: usize, is_reply: bool) usize {
+    const indent: usize = if (is_reply) 8 else 4;
+    return @max(width -| indent, 1);
+}
+
+fn cardExpanded(expanded: []const review_card.Owner, owner: review_card.Owner) bool {
+    for (expanded) |candidate| if (std.meta.eql(candidate, owner)) return true;
+    return false;
+}
 
 /// True when two `Parent` references name the same target.
 fn parentEql(a: Parent, b: Parent) bool {
@@ -1137,7 +1157,16 @@ const anchor_diff =
 fn countKind(buf: Buffer, kind: RowKind) usize {
     var n: usize = 0;
     for (buf.rows) |r| {
-        if (r == kind) n += 1;
+        if (r != kind) continue;
+        switch (r) {
+            .comment => |card| if (card.part == .header) {
+                n += 1;
+            },
+            .draft => |card| if (card.part == .header) {
+                n += 1;
+            },
+            else => n += 1,
+        }
     }
     return n;
 }
@@ -1233,16 +1262,15 @@ test "an inline thread is woven right under its anchored line, replies indented"
     const threads = try bbr.review.thread.build(a, &comments);
     const buf = try buildWithComments(a, diff, .unified, threads, .{});
 
-    // Rows: file_header, hunk_header, line(keep), line(old), line(new),
-    //       comment(root), comment(reply).
-    try testing.expectEqual(@as(usize, 7), buf.rows.len);
+    // Each ReviewCard has a header followed by its projected body.
+    try testing.expectEqual(@as(usize, 9), buf.rows.len);
     try testing.expect(buf.rows[4] == .line);
     try testing.expectEqual(@as(?u32, 2), buf.rows[4].line.line.new_no);
     try testing.expect(buf.rows[5] == .comment);
-    try testing.expect(!buf.rows[5].comment.is_reply);
-    try testing.expectEqual(@as(review.CommentId, 1), buf.rows[5].comment.comment.id);
-    try testing.expect(buf.rows[6] == .comment);
-    try testing.expect(buf.rows[6].comment.is_reply);
+    try testing.expect(!buf.rows[5].comment.isReply());
+    try testing.expectEqual(@as(review.CommentId, 1), buf.rows[5].comment.commentItem().id);
+    try testing.expect(buf.rows[7] == .comment);
+    try testing.expect(buf.rows[7].comment.isReply());
 }
 
 test "PR-level comments get a section at the top" {
@@ -1353,13 +1381,13 @@ test "an anchored draft is woven under its line; a PR-level draft gets a pending
     try testing.expectEqual(SectionKind.pending, buf.rows[0].section.kind);
     try testing.expectEqual(@as(usize, 1), buf.rows[0].section.count);
     try testing.expect(buf.rows[1] == .draft);
-    try testing.expectEqual(@as(u64, 1), buf.rows[1].draft.draft.local_id);
+    try testing.expectEqual(@as(u64, 1), buf.rows[1].draft.draftItem().local_id);
 
     // Exactly two draft rows total (one pending, one inline), and the inline one
     // sits right after the "+new" line (new_no == 2).
     try testing.expectEqual(@as(usize, 2), countKind(buf, .draft));
     for (buf.rows, 0..) |r, i| {
-        if (r == .draft and r.draft.draft.local_id == 2) {
+        if (r == .draft and r.draft.draftItem().local_id == 2 and r.draft.part == .header) {
             try testing.expect(buf.rows[i - 1] == .line);
             try testing.expectEqual(@as(?u32, 2), buf.rows[i - 1].line.line.new_no);
         }
@@ -1406,7 +1434,7 @@ test "a reply draft to a resolved thread hides and reveals with its parent" {
     const shown = try buildWithComments(a, diff, .unified, threads, .{ .drafts = &drafts, .show_resolved = true });
     try testing.expectEqual(@as(usize, 1), countKind(shown, .draft));
     for (shown.rows) |r| {
-        if (r == .draft) try testing.expect(r.draft.is_reply);
+        if (r == .draft) try testing.expect(r.draft.isReply());
     }
 }
 
@@ -1428,8 +1456,8 @@ test "a reply draft to a PR-level comment nests under it, not in the pending sec
     // Row 0: the PR-comments section. Row 1: the comment. Row 2: the reply draft,
     // sitting directly under the comment it answers — not in a pending section.
     try testing.expectEqual(SectionKind.pr_comments, buf.rows[0].section.kind);
-    try testing.expect(buf.rows[1] == .comment and buf.rows[1].comment.comment.id == 1);
-    try testing.expect(buf.rows[2] == .draft and buf.rows[2].draft.is_reply);
+    try testing.expect(buf.rows[1] == .comment and buf.rows[1].comment.commentItem().id == 1);
+    try testing.expect(buf.rows[3] == .draft and buf.rows[3].draft.isReply());
     try testing.expectEqual(@as(usize, 1), countKind(buf, .draft));
     // No pending section was emitted for the reply.
     for (buf.rows) |r| {
@@ -1454,9 +1482,9 @@ test "a reply draft to an inline thread nests right after the thread" {
 
     // The reply draft immediately follows the published comment it answers.
     for (buf.rows, 0..) |r, i| {
-        if (r == .comment and r.comment.comment.id == 7) {
+        if (r == .comment and r.comment.commentItem().id == 7 and r.comment.part == .body) {
             try testing.expect(buf.rows[i + 1] == .draft);
-            try testing.expect(buf.rows[i + 1].draft.is_reply);
+            try testing.expect(buf.rows[i + 1].draft.isReply());
         }
     }
     // Placed inline, so no pending section at the top.
@@ -1477,10 +1505,10 @@ test "a reply-to-draft chain nests under its root draft" {
 
     try testing.expectEqual(@as(usize, 2), countKind(buf, .draft));
     for (buf.rows, 0..) |r, i| {
-        if (r == .draft and r.draft.draft.local_id == 1) {
+        if (r == .draft and r.draft.draftItem().local_id == 1 and r.draft.part == .body) {
             try testing.expect(buf.rows[i + 1] == .draft);
-            try testing.expectEqual(@as(u64, 2), buf.rows[i + 1].draft.draft.local_id);
-            try testing.expect(buf.rows[i + 1].draft.is_reply);
+            try testing.expectEqual(@as(u64, 2), buf.rows[i + 1].draft.draftItem().local_id);
+            try testing.expect(buf.rows[i + 1].draft.isReply());
         }
     }
 }
@@ -1503,7 +1531,7 @@ test "a posted draft's row is hidden but its pending reply is still placed" {
     // pending reply renders as a draft row.
     try testing.expectEqual(@as(usize, 1), countKind(buf, .draft));
     for (buf.rows) |r| {
-        if (r == .draft) try testing.expectEqual(@as(u64, 2), r.draft.draft.local_id);
+        if (r == .draft) try testing.expectEqual(@as(u64, 2), r.draft.draftItem().local_id);
     }
 }
 
@@ -1558,7 +1586,7 @@ test "the isolate view suppresses PR-level and other-file rows" {
     // Exactly the one inline comment that anchors to a.txt; b's comment is gone.
     try testing.expectEqual(@as(usize, 1), countKind(buf, .comment));
     for (buf.rows) |r| {
-        if (r == .comment) try testing.expectEqual(@as(review.CommentId, 2), r.comment.comment.id);
+        if (r == .comment) try testing.expectEqual(@as(review.CommentId, 2), r.comment.commentItem().id);
     }
     // The PR-level draft and the b.txt draft are both suppressed.
     try testing.expectEqual(@as(usize, 0), countKind(buf, .draft));
@@ -1687,13 +1715,13 @@ test "a multi-line body emits one row per visual line, sharing one owner, is_fir
     for (buf.rows) |r| {
         if (r != .comment) continue;
         comment_rows += 1;
-        try testing.expectEqual(&comments[0], r.comment.comment);
-        if (r.comment.is_first) {
+        try testing.expectEqual(&comments[0], r.comment.commentItem());
+        if (r.comment.part == .header) {
             first_rows += 1;
-            try testing.expectEqualStrings("line one", r.comment.line);
+            try testing.expectEqualStrings("▸ Ada", r.comment.text());
         }
     }
-    try testing.expectEqual(@as(usize, 3), comment_rows);
+    try testing.expectEqual(@as(usize, 2), comment_rows);
     try testing.expectEqual(@as(usize, 1), first_rows);
 
     // Two draft rows for the 2-line body; only the header is_first.
@@ -1702,11 +1730,9 @@ test "a multi-line body emits one row per visual line, sharing one owner, is_fir
     for (buf.rows) |r| {
         if (r != .draft) continue;
         draft_rows += 1;
-        if (r.draft.is_first) {
+        if (r.draft.part == .header) {
             draft_first += 1;
-            try testing.expectEqualStrings("draft a", r.draft.line);
-        } else {
-            try testing.expectEqualStrings("draft b", r.draft.line);
+            try testing.expectEqualStrings("✎ draft", r.draft.text());
         }
     }
     try testing.expectEqual(@as(usize, 2), draft_rows);
@@ -1789,7 +1815,7 @@ test "a moved local Draft is woven at its projected Anchor" {
         .drafts = &drafts,
         .anchor_projections = &projections,
     });
-    for (buf.rows, 0..) |row, index| if (row == .draft) {
+    for (buf.rows, 0..) |row, index| if (row == .draft and row.draft.part == .header) {
         try testing.expect(buf.rows[index - 1] == .line);
         try testing.expectEqual(@as(?u32, 1), buf.rows[index - 1].line.line.new_no);
     };
@@ -1914,16 +1940,16 @@ test "ScopeProjection places each root and Replies once and tallies roots per Fi
         try testing.expectEqual(@as(usize, 1), buf.file_tallies[0].drafts);
         try testing.expectEqual(@as(usize, 0), buf.file_tallies[1].comments);
         try testing.expect(buf.rows[0] == .file_header);
-        try testing.expect(buf.rows[1] == .comment and buf.rows[1].comment.comment.id == 1);
-        try testing.expect(buf.rows[2] == .comment and buf.rows[2].comment.comment.id == 2);
-        try testing.expect(buf.rows[3] == .draft and buf.rows[3].draft.draft.local_id == 10);
-        try testing.expect(buf.rows[4] == .draft and buf.rows[4].draft.draft.local_id == 11);
+        try testing.expect(buf.rows[1] == .comment and buf.rows[1].comment.commentItem().id == 1);
+        try testing.expect(buf.rows[3] == .comment and buf.rows[3].comment.commentItem().id == 2);
+        try testing.expect(buf.rows[5] == .draft and buf.rows[5].draft.draftItem().local_id == 10);
+        try testing.expect(buf.rows[7] == .draft and buf.rows[7].draft.draftItem().local_id == 11);
         var roots: usize = 0;
         var replies: usize = 0;
         for (buf.rows) |row| switch (row) {
-            .comment => |value| if (value.is_first) {
-                if (value.comment.id == 1 or value.comment.id == 3) roots += 1;
-                if (value.comment.id == 2) replies += 1;
+            .comment => |value| if (value.part == .header) {
+                if (value.commentItem().id == 1 or value.commentItem().id == 3) roots += 1;
+                if (value.commentItem().id == 2) replies += 1;
             },
             else => {},
         };

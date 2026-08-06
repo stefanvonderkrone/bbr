@@ -40,6 +40,7 @@ pub const RunCtx = struct {
     highlight_max_file_bytes: usize,
     file_cache_enabled: bool,
     file_cache_max_retained_bytes_per_review: usize,
+    comments_collapsed_rows: usize,
     submission_locks: ?bbr.review.SubmissionLocks = null,
     online: bool = true,
 };
@@ -76,9 +77,11 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
         .highlight_max_file_bytes = ctx.highlight_max_file_bytes,
         .file_cache_enabled = ctx.file_cache_enabled,
         .file_cache_max_retained_bytes_per_review = ctx.file_cache_max_retained_bytes_per_review,
+        .comments_collapsed_rows = ctx.comments_collapsed_rows,
         .require_source_check = ctx.online,
         .keymap = ctx.keymap,
         .remote_enabled = ctx.online,
+        .cell_metrics = vaxis_cell_metrics,
     }, .{
         .initial = if (initial) |loaded| .{
             .key = initial_key,
@@ -198,6 +201,19 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
         try vx.render(writer);
         _ = frame_arena.reset(.retain_capacity);
     }
+}
+
+const metrics_context: u8 = 0;
+const metrics_vtable: @import("cell_metrics.zig").CellMetrics.VTable = .{ .next = nextVaxisGrapheme };
+const vaxis_cell_metrics: @import("cell_metrics.zig").CellMetrics = .{ .ptr = &metrics_context, .vtable = &metrics_vtable };
+
+fn nextVaxisGrapheme(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
+    var iterator = vaxis.unicode.graphemeIterator(text);
+    const grapheme = iterator.next() orelse return .{ .byte_len = 1, .cell_width = 1 };
+    return .{
+        .byte_len = grapheme.len,
+        .cell_width = vaxis.gwidth.gwidth(grapheme.bytes(text), .unicode),
+    };
 }
 
 fn contentGeometry(win: vaxis.Window) presentation.FrameGeometry {
