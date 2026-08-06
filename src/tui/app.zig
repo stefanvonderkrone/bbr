@@ -18,6 +18,7 @@ const file_enrichment = @import("file_enrichment.zig");
 const presentation_adapter = @import("presentation_adapter.zig");
 const presentation_runtime = @import("presentation_runtime.zig");
 const presentation = @import("presentation.zig");
+const buffer_mod = @import("buffer.zig");
 const Session = session.Session;
 
 const Credential = bbr.bitbucket.Credential;
@@ -98,7 +99,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
     defer loop.stop();
     try loop.installResizeHandler();
     try vx.enterAltScreen(writer);
-    try state.dispatch(.{ .resize_viewport = contentViewportRows(vx.window().height) });
+    try state.dispatch(.{ .resize = contentGeometry(vx.window()) });
 
     var futures: std.ArrayList(PresentationWork) = .empty;
     defer {
@@ -116,7 +117,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
             .key_press => |key| try state.dispatch(.{ .key = portableKey(key) }),
             .winsize => |winsize| {
                 try vx.resize(ctx.gpa, writer, winsize);
-                try state.dispatch(.{ .resize_viewport = contentViewportRows(vx.window().height) });
+                try state.dispatch(.{ .resize = contentGeometry(vx.window()) });
             },
             .presentation_done => |done| {
                 reapPresentationWork(&futures, ctx.io, done.work_id);
@@ -138,7 +139,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
         const win = vx.window();
         const frame = frame_arena.allocator();
         if (projection.review) |review_projection| {
-            const selected_file = fileIndexForRow(review_projection.buffer, review_projection.navigation.cursor);
+            const selected_file = fileIndexForRow(review_projection.frame.buffer, review_projection.frame.navigation.cursor);
             const content_win = win.child(.{
                 .x_off = 0,
                 .y_off = 0,
@@ -196,6 +197,10 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
         try vx.render(writer);
         _ = frame_arena.reset(.retain_capacity);
     }
+}
+
+fn contentGeometry(win: vaxis.Window) presentation.FrameGeometry {
+    return .{ .cols = win.width, .rows = @intCast(contentViewportRows(win.height)) };
 }
 
 fn presentationStatus(
@@ -569,7 +574,7 @@ fn reapPresentationWork(work: *std.ArrayList(PresentationWork), io: std.Io, id: 
     }
 }
 
-fn fileIndexForRow(buf: bbr.diff.Buffer, cursor: usize) usize {
+fn fileIndexForRow(buf: buffer_mod.Buffer, cursor: usize) usize {
     var idx: usize = 0;
     var seen_any = false;
     var i: usize = 0;
@@ -592,8 +597,8 @@ fn drawStatus(
     win: vaxis.Window,
     header: session.ReviewHeader,
     nav: Nav,
-    buf: bbr.diff.Buffer,
-    layout: bbr.diff.Layout,
+    buf: buffer_mod.Buffer,
+    layout: buffer_mod.Layout,
     scope: presentation.Scope,
     show_resolved: bool,
     isolate: bool,
@@ -644,6 +649,8 @@ fn drawStatus(
 
 // Force the presentation modules' tests into the exe test binary.
 test {
+    _ = @import("buffer.zig");
+    _ = @import("frame.zig");
     _ = @import("render.zig");
     _ = @import("theme.zig");
     _ = @import("nav.zig");

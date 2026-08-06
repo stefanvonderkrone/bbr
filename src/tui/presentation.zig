@@ -11,6 +11,10 @@ const Composer = composer_mod.Composer;
 const file_enrichment = @import("file_enrichment.zig");
 const keymap_mod = @import("keymap.zig");
 const Picker = @import("picker.zig").Picker;
+const frame_mod = @import("frame.zig");
+const buffer_mod = @import("buffer.zig");
+pub const FrameGeometry = frame_mod.Geometry;
+pub const Layout = buffer_mod.Layout;
 
 const Allocator = std.mem.Allocator;
 const Session = session_mod.Session;
@@ -127,6 +131,7 @@ pub const Dependencies = struct {
     require_source_check: bool = false,
     keymap: keymap_mod.Keymap = .default,
     remote_enabled: bool = true,
+    cell_metrics: frame_mod.CellMetrics = .bytes,
 };
 
 pub const InitialReview = struct {
@@ -136,7 +141,8 @@ pub const InitialReview = struct {
 
 pub const Boot = struct {
     initial: ?InitialReview = null,
-    viewport_rows: usize,
+    viewport_rows: usize = 1,
+    geometry: ?frame_mod.Geometry = null,
 };
 
 pub const SessionLoadOutcome = union(enum) {
@@ -155,6 +161,7 @@ pub const OwnedInput = union(enum) {
     session_loaded: SessionLoaded,
     push_count_digit: u8,
     resize_viewport: usize,
+    resize: frame_mod.Geometry,
     action: Action,
     composer: ComposerInput,
     unknown_resolution: UnknownResolutionInput,
@@ -356,7 +363,7 @@ pub const Scope = enum {
 };
 
 pub const Preferences = struct {
-    layout: bbr.diff.Layout = .unified,
+    layout: Layout = .unified,
     scope: Scope = .changes,
     show_resolved: bool = false,
 };
@@ -487,11 +494,12 @@ pub const ReviewProjection = struct {
     diff: *const bbr.diff.Diff,
     threads: []const bbr.review.Thread,
     drafts: []const bbr.review.Draft,
-    buffer: bbr.diff.Buffer,
+    buffer: buffer_mod.Buffer,
     /// A value snapshot. Mutating this copy cannot affect Presentation.
     navigation: Nav,
     preferences: Preferences,
     isolated_file: ?usize,
+    frame: frame_mod.Projection,
 };
 
 pub const Projection = struct {
@@ -590,7 +598,9 @@ pub const ReplacementError = enum {
 const Published = struct {
     const StagedBuffer = struct {
         published: *Published,
-        buffer: bbr.diff.Buffer,
+        buffer: buffer_mod.Buffer,
+        targets: []const frame_mod.SemanticTarget,
+        geometry: frame_mod.Geometry,
         active: bool = true,
 
         fn deinit(self: *StagedBuffer) void {
@@ -600,9 +610,13 @@ const Published = struct {
 
         fn publish(self: *StagedBuffer) void {
             std.debug.assert(self.active);
+            const previous = self.published.frameProjection();
             self.published.buffers.commit();
             self.published.buffer = self.buffer;
-            self.published.navigation.setRowCount(self.buffer.rows.len);
+            self.published.targets = self.targets;
+            self.published.geometry = self.geometry;
+            self.published.navigation = frame_mod.restoreNavigation(previous, self.targets, self.geometry);
+            self.published.frame_revision += 1;
             self.active = false;
         }
     };
@@ -615,7 +629,11 @@ const Published = struct {
     review: bbr.review.PendingReview,
     anchor_projection: std.ArrayList(bbr.review.AnchorProjectionEntry),
     buffers: ArenaRing(2),
-    buffer: bbr.diff.Buffer,
+    buffer: buffer_mod.Buffer,
+    targets: []const frame_mod.SemanticTarget,
+    geometry: frame_mod.Geometry,
+    frame_revision: frame_mod.Revision,
+    cell_metrics: frame_mod.CellMetrics,
     navigation: Nav,
     expanded_folds: std.ArrayList(*const bbr.diff.Line),
     isolated_file: ?usize,
@@ -629,9 +647,10 @@ const Published = struct {
         key: ReviewKey,
         epoch: SessionEpoch,
         session: *Session,
-        viewport_rows: usize,
+        geometry: frame_mod.Geometry,
         preferences: Preferences,
         cache_policy: file_enrichment.CachePolicy,
+        cell_metrics: frame_mod.CellMetrics,
     ) !*Published {
         const published = try allocator.create(Published);
         errdefer allocator.destroy(published);
@@ -675,13 +694,16 @@ const Published = struct {
         published.composer_arena = std.heap.ArenaAllocator.init(allocator);
         errdefer published.composer_arena.deinit();
         published.composer = null;
+        published.geometry = geometry;
+        published.frame_revision = 1;
+        published.cell_metrics = cell_metrics;
         session.enrichment.configureCache(cache_policy);
         if (session.enrichment.len() > 0) session.enrichment.focus(0);
 
         const buffer_allocator = published.buffers.begin();
         errdefer published.buffers.abort();
         const enrichment = session.enrichment.projection();
-        published.buffer = bbr.diff.buffer.buildWithComments(
+        published.buffer = buffer_mod.buildWithComments(
             buffer_allocator,
             session.diff,
             preferences.layout,
@@ -699,8 +721,9 @@ const Published = struct {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return error.BufferBuildFailed;
         };
+        published.targets = try frame_mod.buildTargets(buffer_allocator, published.buffer.rows, cell_metrics);
         published.buffers.commit();
-        published.navigation = Nav.init(published.buffer.rows.len, viewport_rows);
+        published.navigation = Nav.init(published.buffer.rows.len, geometry.rows);
         return published;
     }
 
@@ -729,6 +752,20 @@ const Published = struct {
             .navigation = self.navigation,
             .preferences = preferences,
             .isolated_file = self.isolated_file,
+            .frame = self.frameProjection(),
+        };
+    }
+
+    fn frameProjection(self: *const Published) frame_mod.Projection {
+        return .{
+            .revision = self.frame_revision,
+            .targets_revision = self.frame_revision,
+            .geometry = self.geometry,
+            .panes = frame_mod.paneRects(self.geometry),
+            .overlays = &.{},
+            .targets = self.targets,
+            .buffer = self.buffer,
+            .navigation = self.navigation,
         };
     }
 
@@ -738,7 +775,7 @@ const Published = struct {
         expanded_folds: []const *const bbr.diff.Line,
         isolated_file: ?usize,
     ) BufferTransactionError!void {
-        var staged = try self.prepareBuffer(preferences, expanded_folds, isolated_file);
+        var staged = try self.prepareBuffer(preferences, expanded_folds, isolated_file, self.geometry);
         defer staged.deinit();
         staged.publish();
     }
@@ -800,7 +837,7 @@ const Published = struct {
             }) catch return error.OutOfMemory;
         }
 
-        var staged = try self.prepareBuffer(preferences, self.expanded_folds.items, self.isolated_file);
+        var staged = try self.prepareBuffer(preferences, self.expanded_folds.items, self.isolated_file, self.geometry);
         defer staged.deinit();
         store.put(self.key.storeKey(), draft) catch return error.PersistenceFailed;
         staged.publish();
@@ -811,11 +848,12 @@ const Published = struct {
         preferences: Preferences,
         expanded_folds: []const *const bbr.diff.Line,
         isolated_file: ?usize,
+        geometry: frame_mod.Geometry,
     ) BufferTransactionError!StagedBuffer {
         const allocator = self.buffers.begin();
         errdefer self.buffers.abort();
         const enrichment = self.session.enrichment.projection();
-        const candidate = bbr.diff.buffer.buildWithComments(
+        const candidate = buffer_mod.buildWithComments(
             allocator,
             self.session.diff,
             preferences.layout,
@@ -835,7 +873,8 @@ const Published = struct {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return error.BufferBuildFailed;
         };
-        return .{ .published = self, .buffer = candidate };
+        const targets = try frame_mod.buildTargets(allocator, candidate.rows, self.cell_metrics);
+        return .{ .published = self, .buffer = candidate, .targets = targets, .geometry = geometry };
     }
 };
 
@@ -1182,7 +1221,7 @@ const DurableSubmission = struct {
 pub const Presentation = struct {
     allocator: Allocator,
     dependencies: Dependencies,
-    viewport_rows: usize,
+    geometry: frame_mod.Geometry,
     preferences: Preferences = .{},
     published: ?*Published = null,
     replacement: ?Replacement = null,
@@ -1208,10 +1247,14 @@ pub const Presentation = struct {
     fatal_error: ?FatalError = null,
 
     pub fn init(allocator: Allocator, dependencies: Dependencies, boot: Boot) !Presentation {
+        const geometry: frame_mod.Geometry = boot.geometry orelse .{
+            .cols = 80,
+            .rows = @as(u16, @intCast(@min(boot.viewport_rows, std.math.maxInt(u16)))),
+        };
         var self: Presentation = .{
             .allocator = allocator,
             .dependencies = dependencies,
-            .viewport_rows = boot.viewport_rows,
+            .geometry = geometry,
         };
         errdefer self.deinit();
         if (boot.initial) |initial| {
@@ -1223,12 +1266,13 @@ pub const Presentation = struct {
                 initial.key,
                 self.next_session_epoch,
                 initial.session,
-                boot.viewport_rows,
+                geometry,
                 self.preferences,
                 .{
                     .enabled = dependencies.file_cache_enabled,
                     .max_retained_bytes = dependencies.file_cache_max_retained_bytes_per_review,
                 },
+                dependencies.cell_metrics,
             );
         }
         self.discoverRecovery();
@@ -1255,6 +1299,7 @@ pub const Presentation = struct {
             .session_loaded => |completed| self.acceptLoadedSession(completed),
             .push_count_digit => |digit| self.pushCountDigit(digit),
             .resize_viewport => |rows| self.resizeViewport(rows),
+            .resize => |geometry| self.resize(geometry),
             .action => |action| self.applyAction(action),
             .composer => |composer_input| self.applyComposerInput(composer_input),
             .unknown_resolution => |resolution_input| self.applyUnknownResolutionInput(resolution_input),
@@ -1595,8 +1640,31 @@ pub const Presentation = struct {
     }
 
     fn resizeViewport(self: *Presentation, rows: usize) void {
-        self.viewport_rows = rows;
-        if (self.published) |published| published.navigation.setViewport(rows);
+        self.resize(.{
+            .cols = self.geometry.cols,
+            .rows = @as(u16, @intCast(@min(rows, std.math.maxInt(u16)))),
+        });
+    }
+
+    fn resize(self: *Presentation, geometry: frame_mod.Geometry) void {
+        if (std.meta.eql(self.geometry, geometry)) return;
+        const published = self.published orelse {
+            self.geometry = geometry;
+            return;
+        };
+        var staged = published.prepareBuffer(
+            self.preferences,
+            published.expanded_folds.items,
+            published.isolated_file,
+            geometry,
+        ) catch |err| {
+            self.action_error = normalizeActionError(err);
+            return;
+        };
+        defer staged.deinit();
+        staged.publish();
+        self.geometry = geometry;
+        self.action_error = null;
     }
 
     fn applyAction(self: *Presentation, action: Action) void {
@@ -2429,7 +2497,7 @@ pub const Presentation = struct {
         if (previous) |file_index| {
             if (fileHeaderRow(published.buffer, file_index)) |row| published.navigation.jumpTo(row);
         } else {
-            published.navigation = Nav.init(published.buffer.rows.len, self.viewport_rows);
+            published.navigation = Nav.init(published.buffer.rows.len, self.geometry.rows);
         }
         self.action_error = null;
     }
@@ -2447,7 +2515,7 @@ pub const Presentation = struct {
                 return;
             };
             published.isolated_file = candidate;
-            published.navigation = Nav.init(published.buffer.rows.len, self.viewport_rows);
+            published.navigation = Nav.init(published.buffer.rows.len, self.geometry.rows);
             self.action_error = null;
             return;
         }
@@ -2624,12 +2692,13 @@ pub const Presentation = struct {
                     replacement.key,
                     epoch,
                     session,
-                    self.viewport_rows,
+                    self.geometry,
                     self.preferences,
                     .{
                         .enabled = self.dependencies.file_cache_enabled,
                         .max_retained_bytes = self.dependencies.file_cache_max_retained_bytes_per_review,
                     },
+                    self.dependencies.cell_metrics,
                 ) catch |err| {
                     self.replacement = null;
                     self.replacement_error = switch (err) {
@@ -2695,7 +2764,7 @@ fn normalizeActionError(err: BufferTransactionError) ActionError {
     };
 }
 
-fn lineAtRow(row: bbr.diff.buffer.Row) ?*const bbr.diff.Line {
+fn lineAtRow(row: buffer_mod.Row) ?*const bbr.diff.Line {
     return switch (row) {
         .line => |line| line.line,
         .line_pair => |pair| if (pair.right) |right| right.line else if (pair.left) |left| left.line else null,
@@ -2735,7 +2804,7 @@ fn spanFromLines(lines: []const *const bbr.diff.Line, suggestion: bool) !AnchorS
 }
 
 fn collectSelectedLines(
-    buffer: bbr.diff.Buffer,
+    buffer: buffer_mod.Buffer,
     low: usize,
     high: usize,
     lines: *std.ArrayList(*const bbr.diff.Line),
@@ -2748,7 +2817,7 @@ fn collectSelectedLines(
     }
 }
 
-fn fileIndexForRow(buffer: bbr.diff.Buffer, cursor: usize) usize {
+fn fileIndexForRow(buffer: buffer_mod.Buffer, cursor: usize) usize {
     var file_index: usize = 0;
     var seen_file = false;
     var row: usize = 0;
@@ -2760,7 +2829,7 @@ fn fileIndexForRow(buffer: bbr.diff.Buffer, cursor: usize) usize {
     return file_index;
 }
 
-fn nextFileHeaderRow(buffer: bbr.diff.Buffer, cursor: usize) ?usize {
+fn nextFileHeaderRow(buffer: buffer_mod.Buffer, cursor: usize) ?usize {
     var row = cursor +| 1;
     while (row < buffer.rows.len) : (row += 1) {
         if (buffer.rows[row] == .file_header) return row;
@@ -2768,7 +2837,7 @@ fn nextFileHeaderRow(buffer: bbr.diff.Buffer, cursor: usize) ?usize {
     return null;
 }
 
-fn previousFileHeaderRow(buffer: bbr.diff.Buffer, cursor: usize) ?usize {
+fn previousFileHeaderRow(buffer: buffer_mod.Buffer, cursor: usize) ?usize {
     if (cursor == 0) return null;
     var row = cursor;
     while (row > 0) {
@@ -2778,7 +2847,7 @@ fn previousFileHeaderRow(buffer: bbr.diff.Buffer, cursor: usize) ?usize {
     return null;
 }
 
-fn fileHeaderRow(buffer: bbr.diff.Buffer, file_index: usize) ?usize {
+fn fileHeaderRow(buffer: buffer_mod.Buffer, file_index: usize) ?usize {
     var seen: usize = 0;
     for (buffer.rows, 0..) |row, index| {
         if (row == .file_header) {
@@ -2911,6 +2980,34 @@ test "local inline authoring persists a local target and authored context" {
     try testing.expectEqualStrings("old\nnew", drafts[0].snapshot.?.text);
     try testing.expectEqual(@as(u32, 1), drafts[0].snapshot.?.selection_start);
     try testing.expectEqual(@as(u32, 1), drafts[0].snapshot.?.selection_len);
+}
+
+test "resize publishes one complete Presentation Frame revision" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try ReviewKey.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .geometry = .{ .cols = 80, .rows = 8 },
+    });
+    defer presentation.deinit();
+
+    const before = presentation.projection().review.?.frame;
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .toggle_select });
+    const navigated = presentation.projection().review.?.frame;
+    const owner = navigated.targets[navigated.navigation.cursor].owner;
+    try presentation.dispatch(.{ .resize = .{ .cols = 40, .rows = 4 } });
+    const after = presentation.projection().review.?.frame;
+
+    try testing.expectEqual(before.revision + 1, after.revision);
+    try testing.expectEqual(@as(u16, 40), after.geometry.cols);
+    try testing.expectEqual(@as(u16, 4), after.geometry.rows);
+    try testing.expectEqual(after.revision, after.targets_revision);
+    try testing.expect(owner.eql(after.targets[after.navigation.cursor].owner));
+    try testing.expectEqual(navigated.navigation.mark, after.navigation.mark);
 }
 
 fn testTwoFileSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
@@ -3212,7 +3309,7 @@ test "preferences survive replacement while file isolation resets" {
     try presentation.dispatch(.{ .action = .isolate });
     const isolated = presentation.projection().review.?;
     try testing.expectEqual(@as(?usize, 0), isolated.isolated_file);
-    try testing.expectEqual(bbr.diff.Layout.side_by_side, isolated.preferences.layout);
+    try testing.expectEqual(Layout.side_by_side, isolated.preferences.layout);
     try testing.expect(isolated.preferences.show_resolved);
     try testing.expectEqual(Scope.fetched, isolated.preferences.scope);
 
@@ -3224,7 +3321,7 @@ test "preferences survive replacement while file isolation resets" {
     } });
 
     const replaced = presentation.projection().review.?;
-    try testing.expectEqual(bbr.diff.Layout.side_by_side, replaced.preferences.layout);
+    try testing.expectEqual(Layout.side_by_side, replaced.preferences.layout);
     try testing.expect(replaced.preferences.show_resolved);
     try testing.expectEqual(Scope.fetched, replaced.preferences.scope);
     try testing.expectEqual(@as(?usize, null), replaced.isolated_file);

@@ -6,19 +6,20 @@
 //! `Diff` (and the raw text it borrows) must outlive the `Buffer`. Only the row
 //! array is allocated — pass an arena.
 //!
-//! Presentation concern, but it depends only on the diff model (no vaxis), so it
-//! lives with the model and stays hermetically testable.
+//! Presentation owns this projection. It depends on Diff and Review's public
+//! models but remains network-free and vaxis-free.
 
 const std = @import("std");
-const model = @import("model.zig");
-const intraline = @import("intraline.zig");
-const decoration = @import("../highlight/decoration.zig");
-const review = @import("../review/comment.zig");
-const Thread = @import("../review/thread.zig").Thread;
+const bbr = @import("bbr");
+const model = bbr.diff.model;
+const intraline = bbr.diff.intraline;
+const decoration = bbr.highlight.decoration;
+const review = bbr.review.comment;
+const Thread = bbr.review.Thread;
 const Comment = review.Comment;
-const Draft = @import("../review/draft.zig").Draft;
-const Parent = @import("../review/draft.zig").Parent;
-const anchor_projection = @import("../review/anchor.zig");
+const Draft = bbr.review.Draft;
+const Parent = bbr.review.draft.Parent;
+const anchor_projection = bbr.review.anchor;
 
 /// Re-export so the renderer can name the segment type without reaching into
 /// `intraline` directly.
@@ -165,7 +166,7 @@ pub const BuildOptions = struct {
     /// (a shorter/empty slice just means "not loaded" for the missing files).
     blobs: []const model.FileBlob = &.{},
     /// Side-specific Highlighting results, index-aligned with `diff.files`.
-    highlights: []const @import("../highlight/highlighter.zig").FileHighlights = &.{},
+    highlights: []const bbr.highlight.highlighter.FileHighlights = &.{},
 };
 
 pub const Buffer = struct {
@@ -567,7 +568,7 @@ fn decoratedLine(allocator: std.mem.Allocator, line: *const model.Line, spans: [
 }
 
 /// Select the agreed file side, then return only the ordered Spans for `line`.
-fn lineSpans(highlights: []const @import("../highlight/highlighter.zig").FileHighlights, file_idx: usize, line: model.Line) []const decoration.Span {
+fn lineSpans(highlights: []const bbr.highlight.highlighter.FileHighlights, file_idx: usize, line: model.Line) []const decoration.Span {
     if (file_idx >= highlights.len) return &.{};
     const file = highlights[file_idx];
     const selected = switch (line.kind) {
@@ -867,7 +868,7 @@ fn anchorMatchesLine(anchor: review.Anchor, ln: *const model.Line) bool {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
-const parse = @import("parser.zig").parse;
+const parse = bbr.diff.parse;
 
 const two_file_diff =
     \\diff --git a/a.txt b/a.txt
@@ -1030,7 +1031,7 @@ test "side_by_side weaves an inline thread once, under its anchored pair" {
     const comments = [_]Comment{
         .{ .id = 1, .author = "Ada", .body = "why?", .anchor = .{ .path = "a.txt", .to = 2 } },
     };
-    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const threads = try bbr.review.thread.build(a, &comments);
     const buf = try buildWithComments(a, diff, .side_by_side, threads, .{});
 
     // Exactly one comment row (not double-woven across the two panes).
@@ -1147,7 +1148,7 @@ test "an inline thread is woven right under its anchored line, replies indented"
         .{ .id = 1, .author = "Ada", .body = "why?", .anchor = .{ .path = "a.txt", .to = 2 } },
         .{ .id = 2, .parent_id = 1, .author = "Bo", .body = "because" },
     };
-    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const threads = try bbr.review.thread.build(a, &comments);
     const buf = try buildWithComments(a, diff, .unified, threads, .{});
 
     // Rows: file_header, hunk_header, line(keep), line(old), line(new),
@@ -1171,7 +1172,7 @@ test "PR-level comments get a section at the top" {
     const comments = [_]Comment{
         .{ .id = 1, .author = "Ada", .body = "overall LGTM" }, // no anchor
     };
-    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const threads = try bbr.review.thread.build(a, &comments);
     const buf = try buildWithComments(a, diff, .unified, threads, .{});
 
     try testing.expect(buf.rows[0] == .section);
@@ -1190,7 +1191,7 @@ test "resolved threads hide behind the toggle, whole thread revealed when on" {
         .{ .id = 1, .author = "Ada", .body = "nit", .resolved = true, .anchor = .{ .path = "a.txt", .to = 2 } },
         .{ .id = 2, .parent_id = 1, .author = "Bo", .body = "fixed" },
     };
-    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const threads = try bbr.review.thread.build(a, &comments);
 
     // Hidden by default: no comment rows.
     const hidden = try buildWithComments(a, diff, .unified, threads, .{});
@@ -1211,7 +1212,7 @@ test "outdated threads go in a per-file section and are never hidden" {
         // Outdated AND resolved — still shown (outdated wins).
         .{ .id = 1, .author = "Ada", .body = "stale note", .resolved = true, .state = .outdated, .anchor = .{ .path = "a.txt", .from = 99 } },
     };
-    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const threads = try bbr.review.thread.build(a, &comments);
 
     // Even with the resolved toggle off, the outdated section shows.
     const buf = try buildWithComments(a, diff, .unified, threads, .{});
@@ -1241,7 +1242,7 @@ test "an outdated thread remains under a deleted File's old path" {
         .state = .outdated,
         .anchor = .{ .path = "gone.txt", .from = 1 },
     }};
-    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const threads = try bbr.review.thread.build(a, &comments);
     const buf = try buildWithComments(a, diff, .unified, threads, .{});
 
     try testing.expectEqual(@as(usize, 1), countKind(buf, .comment));
@@ -1309,7 +1310,7 @@ test "a reply draft to a resolved thread hides and reveals with its parent" {
         .{ .id = 1, .author = "Ada", .body = "nit", .resolved = true, .anchor = .{ .path = "a.txt", .to = 2 } },
         .{ .id = 2, .parent_id = 1, .author = "Bo", .body = "fixed" },
     };
-    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const threads = try bbr.review.thread.build(a, &comments);
     const drafts = [_]Draft{
         .{ .local_id = 1, .kind = .reply, .body = "actually, reopen", .parent = .{ .comment = 1 } },
     };
@@ -1336,7 +1337,7 @@ test "a reply draft to a PR-level comment nests under it, not in the pending sec
     const comments = [_]Comment{
         .{ .id = 1, .author = "Ada", .body = "overall looks good" }, // PR-level (no anchor)
     };
-    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const threads = try bbr.review.thread.build(a, &comments);
     const drafts = [_]Draft{
         .{ .local_id = 1, .kind = .reply, .body = "one nit though", .parent = .{ .comment = 1 } },
     };
@@ -1363,7 +1364,7 @@ test "a reply draft to an inline thread nests right after the thread" {
     const comments = [_]Comment{
         .{ .id = 7, .author = "Ada", .body = "why?", .anchor = .{ .path = "a.txt", .to = 2 } },
     };
-    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const threads = try bbr.review.thread.build(a, &comments);
     const drafts = [_]Draft{
         .{ .local_id = 1, .kind = .reply, .body = "because X", .parent = .{ .comment = 7 } },
     };
@@ -1460,7 +1461,7 @@ test "the isolate view suppresses PR-level and other-file rows" {
         .{ .id = 2, .author = "Bo", .body = "on a", .anchor = .{ .path = "a.txt", .to = 1 } },
         .{ .id = 3, .author = "Cy", .body = "on b", .anchor = .{ .path = "b.txt", .to = 5 } },
     };
-    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const threads = try bbr.review.thread.build(a, &comments);
     // A PR-level draft and one anchored to the other file.
     const drafts = [_]Draft{
         .{ .local_id = 1, .kind = .top_level, .body = "needs tests" }, // PR-level
@@ -1555,12 +1556,12 @@ test "whole_file anchors bind only to hunk lines, never blob gaps" {
     // A comment on new line 1 (a blob gap) must not attach; one on new line 3
     // (the added "CHANGED", a real Hunk line) must.
     const on_gap = [_]Comment{.{ .id = 1, .author = "Ada", .body = "gap?", .anchor = .{ .path = "a.txt", .to = 1 } }};
-    const gap_threads = try @import("../review/thread.zig").build(a, &on_gap);
+    const gap_threads = try bbr.review.thread.build(a, &on_gap);
     const gap_buf = try buildWithComments(a, diff, .unified, gap_threads, .{ .whole_file = true, .blobs = &blobs });
     try testing.expectEqual(@as(usize, 0), countKind(gap_buf, .comment));
 
     const on_hunk = [_]Comment{.{ .id = 1, .author = "Ada", .body = "here", .anchor = .{ .path = "a.txt", .to = 3 } }};
-    const hunk_threads = try @import("../review/thread.zig").build(a, &on_hunk);
+    const hunk_threads = try bbr.review.thread.build(a, &on_hunk);
     const hunk_buf = try buildWithComments(a, diff, .unified, hunk_threads, .{ .whole_file = true, .blobs = &blobs });
     try testing.expectEqual(@as(usize, 1), countKind(hunk_buf, .comment));
 }
@@ -1577,7 +1578,7 @@ test "an inline thread anchored to a missing current line is not lost silently" 
     const comments = [_]Comment{
         .{ .id = 1, .author = "Ada", .body = "ghost", .anchor = .{ .path = "a.txt", .to = 999 } },
     };
-    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const threads = try bbr.review.thread.build(a, &comments);
     const buf = try buildWithComments(a, diff, .unified, threads, .{});
     try testing.expectEqual(@as(usize, 0), countKind(buf, .comment));
 }
@@ -1592,7 +1593,7 @@ test "a multi-line body emits one row per visual line, sharing one owner, is_fir
     const comments = [_]Comment{
         .{ .id = 1, .author = "Ada", .body = "line one\nline two\nline three", .anchor = .{ .path = "a.txt", .to = 2 } },
     };
-    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const threads = try bbr.review.thread.build(a, &comments);
     const drafts = [_]Draft{
         .{ .local_id = 1, .kind = .inline_comment, .body = "draft a\ndraft b", .anchor = .{ .path = "a.txt", .to = 2, .commit = "c0" } },
     };
@@ -1639,7 +1640,7 @@ test "a trailing newline does not emit a spurious blank last row" {
     const comments = [_]Comment{
         .{ .id = 1, .author = "Ada", .body = "solo\n", .anchor = .{ .path = "a.txt", .to = 2 } },
     };
-    const threads = try @import("../review/thread.zig").build(a, &comments);
+    const threads = try bbr.review.thread.build(a, &comments);
     const buf = try buildWithComments(a, diff, .unified, threads, .{});
     // "solo\n" trims to one line, not two.
     try testing.expectEqual(@as(usize, 1), countKind(buf, .comment));
@@ -1651,7 +1652,7 @@ test "Line decoration selects old Spans for removed and new Spans for added and 
         .{ .line = 7, .start = 0, .end = 3, .capture = .{ .name = "new.added" } },
         .{ .line = 8, .start = 0, .end = 3, .capture = .{ .name = "new.context" } },
     };
-    const highlights = [_]@import("../highlight/highlighter.zig").FileHighlights{.{
+    const highlights = [_]bbr.highlight.highlighter.FileHighlights{.{
         .old = .{ .spans = &old_spans },
         .new = .{ .spans = &new_spans },
     }};

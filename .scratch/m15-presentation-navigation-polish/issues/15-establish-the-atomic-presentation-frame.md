@@ -1,6 +1,6 @@
 # Establish the atomic Presentation Frame
 
-Status: ready-for-agent
+Status: ready-for-human
 
 ## What to build
 
@@ -8,12 +8,12 @@ Introduce the Presentation-owned frame boundary that all later M15 behavior can 
 
 ## Acceptance criteria
 
-- [ ] Buffer construction is owned by a Presentation package; Diff remains responsible only for Files, Hunks, Lines, Folds, and intra-line data, and the terminal renderer remains an adapter over projected rows.
-- [ ] One Frame owns the geometry, projected rows, Pane and Overlay rectangles, navigation-restoration metadata, and semantic targets consumed by rendering, cursor movement, and hit testing.
-- [ ] Every geometry-affecting rebuild stages and publishes a complete revision; allocation or projection failure preserves the previous Frame, navigation, and interaction state.
-- [ ] Rebuilds restore logical navigation through stable Line, File, disclosure, or ReviewCard ownership and clear Selection when its projected row range changes.
-- [ ] Cell width and grapheme measurement enter through an injectable `CellMetrics` seam rather than terminal-specific logic in projection.
-- [ ] Deterministic tests cover revision consistency, resize/rebuild restoration, forced allocation failure, and the absence of intentional visible regressions.
+- [x] Buffer construction is owned by a Presentation package; Diff remains responsible only for Files, Hunks, Lines, Folds, and intra-line data, and the terminal renderer remains an adapter over projected rows.
+- [x] One Frame owns the geometry, projected rows, Pane and Overlay rectangles, navigation-restoration metadata, and semantic targets consumed by rendering, cursor movement, and hit testing.
+- [x] Every geometry-affecting rebuild stages and publishes a complete revision; allocation or projection failure preserves the previous Frame, navigation, and interaction state.
+- [x] Rebuilds restore logical navigation through stable Line, File, disclosure, or ReviewCard ownership and clear Selection when its projected row range changes.
+- [x] Cell width and grapheme measurement enter through an injectable `CellMetrics` seam rather than terminal-specific logic in projection.
+- [x] Deterministic tests cover revision consistency, resize/rebuild restoration, forced allocation failure, and the absence of intentional visible regressions.
 
 ## Blocked by
 

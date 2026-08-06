@@ -15,6 +15,7 @@ const persist = @import("persist/sqlite_store.zig");
 const config = @import("tui/config.zig");
 const TreeSitterHighlighter = @import("highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter;
 const presentation = @import("tui/presentation.zig");
+const buffer_mod = @import("tui/buffer.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -550,7 +551,7 @@ test "demo data weaves through the real pipeline" {
     try testing.expect(comments[2].suggestion() != null);
 
     // Hidden: the resolved thread contributes no comment rows.
-    const hidden = try bbr.diff.buffer.buildWithComments(a, diff, .unified, threads, .{});
+    const hidden = try buffer_mod.buildWithComments(a, diff, .unified, threads, .{});
     var hidden_comments: usize = 0;
     var outdated_sections: usize = 0;
     for (hidden.rows) |r| {
@@ -565,7 +566,7 @@ test "demo data weaves through the real pipeline" {
     try testing.expectEqual(@as(usize, 1), outdated_sections);
 
     // Revealed: the resolved thread's root now appears too.
-    const shown = try bbr.diff.buffer.buildWithComments(a, diff, .unified, threads, .{ .show_resolved = true });
+    const shown = try buffer_mod.buildWithComments(a, diff, .unified, threads, .{ .show_resolved = true });
     var shown_comments: usize = 0;
     for (shown.rows) |r| {
         if (r == .comment and r.comment.is_first) shown_comments += 1;

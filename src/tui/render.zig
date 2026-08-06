@@ -16,17 +16,18 @@ const Theme = @import("theme.zig").Theme;
 const Nav = @import("nav.zig").Nav;
 const presentation = @import("presentation.zig");
 const ReviewProjection = presentation.ReviewProjection;
-const Buffer = bbr.diff.buffer.Buffer;
-const Row = bbr.diff.buffer.Row;
-const LineRow = bbr.diff.buffer.LineRow;
-const CommentRow = bbr.diff.buffer.CommentRow;
-const DraftRow = bbr.diff.buffer.DraftRow;
-const Section = bbr.diff.buffer.Section;
+const Buffer = buffer_mod.Buffer;
+const Row = buffer_mod.Row;
+const LineRow = buffer_mod.LineRow;
+const CommentRow = buffer_mod.CommentRow;
+const DraftRow = buffer_mod.DraftRow;
+const Section = buffer_mod.Section;
 const FileStatus = bbr.diff.FileStatus;
 const Thread = bbr.review.Thread;
 const Draft = bbr.review.Draft;
 const Picker = @import("picker.zig").Picker;
 const keymap = @import("keymap.zig");
+const buffer_mod = @import("buffer.zig");
 
 pub const sidebar_width: u16 = 28;
 
@@ -43,14 +44,30 @@ pub fn draw(
     threads: []const Thread,
     drafts: []const Draft,
 ) void {
-    win.clear();
-
     const sb_w = @min(sidebar_width, win.width);
-    const sidebar = win.child(.{ .x_off = 0, .y_off = 0, .width = sb_w, .height = win.height });
     // +1 leaves a one-column divider gutter between the panes.
     const pane_x = @min(sb_w + 1, win.width);
-    const pane = win.child(.{ .x_off = pane_x, .y_off = 0, .width = win.width - pane_x, .height = win.height });
+    drawProjected(scratch, win, diff, buf, theme, nav, selected_file, threads, drafts, .{
+        .sidebar = .{ .x = 0, .y = 0, .width = sb_w, .height = win.height },
+        .diff = .{ .x = pane_x, .y = 0, .width = win.width - pane_x, .height = win.height },
+    });
+}
 
+fn drawProjected(
+    scratch: std.mem.Allocator,
+    win: vaxis.Window,
+    diff: bbr.diff.Diff,
+    buf: Buffer,
+    theme: Theme,
+    nav: Nav,
+    selected_file: usize,
+    threads: []const Thread,
+    drafts: []const Draft,
+    panes: @import("frame.zig").PaneRects,
+) void {
+    win.clear();
+    const sidebar = win.child(.{ .x_off = panes.sidebar.x, .y_off = panes.sidebar.y, .width = panes.sidebar.width, .height = panes.sidebar.height });
+    const pane = win.child(.{ .x_off = panes.diff.x, .y_off = panes.diff.y, .width = panes.diff.width, .height = panes.diff.height });
     drawSidebar(scratch, sidebar, diff, theme, selected_file, threads, drafts);
     drawPane(scratch, pane, buf, theme, nav);
 }
@@ -64,16 +81,17 @@ pub fn drawReview(
     theme: Theme,
     selected_file: usize,
 ) void {
-    draw(
+    drawProjected(
         scratch,
         win,
         review.diff.*,
-        review.buffer,
+        review.frame.buffer,
         theme,
-        review.navigation,
+        review.frame.navigation,
         selected_file,
         review.threads,
         review.drafts,
+        review.frame.panes,
     );
 }
 
@@ -203,7 +221,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, them
     }
 }
 
-fn drawSnapshot(win: vaxis.Window, row: u16, snapshot: bbr.diff.buffer.SnapshotRow, theme: Theme) void {
+fn drawSnapshot(win: vaxis.Window, row: u16, snapshot: buffer_mod.SnapshotRow, theme: Theme) void {
     const style = if (snapshot.selected) theme.section else theme.gutter;
     fillRow(win, row, style);
     _ = win.printSegment(.{ .text = snapshot.line, .style = style }, .{ .row_offset = row, .col_offset = gutter_cols, .wrap = .none });
@@ -216,7 +234,7 @@ const side_gutter: u16 = 5;
 /// right half, split by a one-column divider. Each half is a 1-row child window
 /// so a long line is clipped at the divider instead of bleeding into the other
 /// pane. An absent side is drawn as a neutral empty half.
-fn drawLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, pair: bbr.diff.buffer.LinePair, theme: Theme) void {
+fn drawLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, pair: buffer_mod.LinePair, theme: Theme) void {
     const half = win.width / 2;
     if (half == 0) return;
     const right_x = half + 1; // divider column sits at `half`
@@ -319,7 +337,7 @@ fn drawDraft(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, dr: DraftRow
 }
 
 /// A collapsed-context fold: "  ⋯ N unchanged lines · enter to expand ⋯".
-fn drawFold(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, f: bbr.diff.Fold, theme: Theme) void {
+fn drawFold(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, f: buffer_mod.Fold, theme: Theme) void {
     fillRow(win, r, theme.fold);
     const text = std.fmt.allocPrint(scratch, "  ⋯ {d} unchanged lines · enter to expand ⋯", .{f.lines.len}) catch "  ⋯ folded ⋯";
     _ = win.printSegment(.{ .text = text, .style = theme.fold }, .{ .row_offset = r, .col_offset = gutter_cols, .wrap = .none });
@@ -681,7 +699,7 @@ test "diff lines render with their band background at the text cells" {
         \\
     ;
     const diff = try bbr.diff.parse(a, raw);
-    const buf = try bbr.diff.buffer.build(a, diff, .unified);
+    const buf = try buffer_mod.build(a, diff, .unified);
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
@@ -722,7 +740,7 @@ test "syntax foreground composes over an added Line background" {
     const diff = try bbr.diff.parse(a, raw);
     const spans = [_]bbr.highlight.Span{.{ .line = 1, .start = 0, .end = 3, .capture = .{ .name = "keyword" } }};
     const highlights = [_]bbr.highlight.FileHighlights{.{ .new = .{ .spans = &spans } }};
-    const buf = try bbr.diff.buffer.buildWithComments(a, diff, .unified, &.{}, .{ .highlights = &highlights });
+    const buf = try buffer_mod.buildWithComments(a, diff, .unified, &.{}, .{ .highlights = &highlights });
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
@@ -749,7 +767,7 @@ test "a modified line paints only its changed run with the emphasis band" {
         \\
     ;
     const diff = try bbr.diff.parse(a, raw);
-    const buf = try bbr.diff.buffer.build(a, diff, .unified);
+    const buf = try buffer_mod.build(a, diff, .unified);
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
@@ -786,7 +804,7 @@ test "side-by-side draws old on the left, new on the right" {
         \\
     ;
     const diff = try bbr.diff.parse(a, raw);
-    const buf = try bbr.diff.buffer.build(a, diff, .side_by_side);
+    const buf = try buffer_mod.build(a, diff, .side_by_side);
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
@@ -830,7 +848,7 @@ test "the cursor row is highlighted across its whole width, keeping band hue" {
         \\
     ;
     const diff = try bbr.diff.parse(a, raw);
-    const buf = try bbr.diff.buffer.build(a, diff, .unified);
+    const buf = try buffer_mod.build(a, diff, .unified);
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
@@ -885,7 +903,7 @@ test "a folded context run renders as a fold row" {
         \\
     ;
     const diff = try bbr.diff.parse(a, raw);
-    const buf = try bbr.diff.buffer.buildWithComments(a, diff, .unified, &.{}, .{ .fold_context = true });
+    const buf = try buffer_mod.buildWithComments(a, diff, .unified, &.{}, .{ .fold_context = true });
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
@@ -927,7 +945,7 @@ test "sidebar highlights the selected file" {
         \\
     ;
     const diff = try bbr.diff.parse(a, raw);
-    const buf = try bbr.diff.buffer.build(a, diff, .unified);
+    const buf = try buffer_mod.build(a, diff, .unified);
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
@@ -967,7 +985,7 @@ test "the sidebar tallies comments per file and hides a zero count" {
         \\
     ;
     const diff = try bbr.diff.parse(a, raw);
-    const buf = try bbr.diff.buffer.build(a, diff, .unified);
+    const buf = try buffer_mod.build(a, diff, .unified);
 
     // Two comments on one.txt, none on two.txt.
     const comments = [_]bbr.review.Comment{
@@ -1046,7 +1064,7 @@ test "a pending draft renders in the draft band with its marker" {
     const drafts = [_]bbr.review.Draft{
         .{ .local_id = 1, .kind = .inline_comment, .body = "author it", .anchor = .{ .path = "a.txt", .to = 1, .commit = "c0" } },
     };
-    const buf = try bbr.diff.buffer.buildWithComments(a, diff, .unified, &.{}, .{ .drafts = &drafts });
+    const buf = try buffer_mod.buildWithComments(a, diff, .unified, &.{}, .{ .drafts = &drafts });
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
@@ -1163,7 +1181,7 @@ test "sidebar prefix shows selection marker and status, borrowing no stack" {
         \\
     ;
     const diff = try bbr.diff.parse(a, raw);
-    const buf = try bbr.diff.buffer.build(a, diff, .unified);
+    const buf = try buffer_mod.build(a, diff, .unified);
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
@@ -1209,7 +1227,7 @@ test "a woven comment renders with its marker and style; a suggestion is distinc
         .{ .id = 2, .parent_id = 1, .author = "Bo", .body = "```suggestion\nrenamed\n```" },
     };
     const threads = try bbr.review.buildThreads(a, &comments);
-    const buf = try bbr.diff.buffer.buildWithComments(a, diff, .unified, threads, .{});
+    const buf = try buffer_mod.buildWithComments(a, diff, .unified, threads, .{});
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
