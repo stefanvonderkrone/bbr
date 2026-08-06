@@ -93,9 +93,12 @@ review_comment = ["C", "space r c"]
 [highlight]
 max_file_bytes = 2097152
 
+[comments]
+collapsed_rows = 6
+
 [files.cache]
 enabled = true
-max_retained_bytes_per_review = 268435456
+max_bytes = 268435456
 
 [input.mouse]
 enabled = true
@@ -113,10 +116,25 @@ the DiffPane cursor. Bindings that can be available together are rejected as amb
 `shift`, `alt`, `ctrl`, `super`, `hyper`, and `meta`; `option`, `control`, `cmd`, and `command`
 are accepted aliases. Count digits remain reserved at
 the start of a sequence, and no complete binding may be a Leader for a longer binding.
+Unknown or duplicate settings, invalid values, renamed keys, and ambiguous contextual bindings are
+rejected with the source line. Configuration names are exact; superseded Action and setting names
+are not retained as compatibility aliases.
 
 The default workflow keys are `F` for the Session-local File finder, `p` for the PullRequest
 Picker, `i`/`I`/`C` for inline/File-level/Review-level Comments, `gC` for recovery linking,
 `ctrl-y`/`ctrl-e` for one-row scrolling, and `y` for OSC 52 source-text yank.
+The File finder focuses a changed File in the current Session. The PullRequest Picker opens all
+open PullRequests, accepts input while loading, shows a small spinner, and replaces the Session
+only after Enter confirms a result; Escape dismisses either Overlay. Unavailable Actions remain
+visible but subdued in help and explain why they cannot run—for example, remote-only Actions in a
+local review or source-only Actions away from a source row.
+
+Enter also opens and closes the disclosure at the cursor: resolved Threads, context Folds,
+Outdated sections, and over-limit ReviewCards retain independent disclosure state within the
+current Session. Comments and Drafts show six rendered body rows when collapsed by default.
+Set `[comments].collapsed_rows = 0` to disable automatic ReviewCard collapse. Root Comments can
+target the Review (`C`), the focused File (`I`), or an inline source location (`i`); Replies keep
+their root Comment's scope.
 
 Mouse navigation is enabled by default as an optional keyboard-equivalent convenience. Left-click
 focuses Panes, activates File Tree entries and disclosures, or selects a Picker row; Picker clicks
@@ -131,10 +149,11 @@ files. Set it to `0` for no limit. Files above the limit remain readable as plai
 
 Full file content has no size limit. The focused File is always retained while it is being
 reviewed. Inactive file content uses a whole-File least-recently-used cache: it is enabled by
-default with a 256 MiB budget across the current review, counting the complete owned allocation
-capacity for blobs, Highlight Spans, Capture names, and retained scratch. Evicted Files are fetched again when revisited. Set `enabled = false` to retain
-only the focused File; `max_retained_bytes_per_review` must be greater than zero while the cache
-is enabled.
+default with a 256 MiB budget across the current review. Evicted Files are fetched again when
+revisited. The focused File is outside the budget and may exceed it. Set `max_bytes = 0` for
+unlimited inactive caching, or `enabled = false` to retain only the focused File. This cache limit
+controls retained inactive content; `[highlight].max_file_bytes` separately limits Highlighting
+work and never makes oversized content unreadable.
 
 ## Reference
 

@@ -199,6 +199,11 @@ fn shiftChannel(v: u8, delta: i16) u8 {
 /// The default dark theme. Backgrounds are muted so foreground text stays
 /// readable; foregrounds are left `default` except where contrast needs it.
 pub const dark: Theme = .{
+    .pane_border = .{ .fg = rgb(0x70_70_80), .dim = true },
+    .pane_border_focused = .{ .fg = rgb(0xd0_d0_d0), .bold = true },
+    .overlay_border = .{ .fg = rgb(0xd0_d0_d0), .bold = true },
+    .overlay_title = .{ .fg = rgb(0xff_ff_ff), .bold = true },
+    .section_rule = .{ .fg = rgb(0x70_70_80), .dim = true },
     .context = .{},
     .added = .{ .bg = rgb(0x18_32_18) },
     .removed = .{ .bg = rgb(0x3a_18_18) },
@@ -241,6 +246,11 @@ pub const dark: Theme = .{
 
 fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24, muted: u24, green: u24, red: u24, yellow: u24, blue: u24, violet: u24, teal: u24, light: bool }) Theme {
     return .{
+        .pane_border = .{ .fg = rgb(p.muted), .bg = rgb(p.bg), .dim = true },
+        .pane_border_focused = .{ .fg = rgb(p.fg), .bg = rgb(p.bg), .bold = true },
+        .overlay_border = .{ .fg = rgb(p.fg), .bg = rgb(p.surface), .bold = true },
+        .overlay_title = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2), .bold = true },
+        .section_rule = .{ .fg = rgb(p.muted), .bg = rgb(p.bg), .dim = true },
         .context = .{ .fg = rgb(p.fg), .bg = rgb(p.bg) },
         .added = .{ .fg = rgb(p.fg), .bg = rgb(if (p.light) 0xd8_ef_d0 else 0x1f_3a_28) },
         .removed = .{ .fg = rgb(p.fg), .bg = rgb(if (p.light) 0xf4_d4_d4 else 0x45_20_28) },
@@ -283,6 +293,11 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
 }
 
 pub const system: Theme = .{
+    .pane_border = .{ .fg = .{ .index = 8 }, .dim = true },
+    .pane_border_focused = .{ .bold = true },
+    .overlay_border = .{ .bold = true },
+    .overlay_title = .{ .reverse = true, .bold = true },
+    .section_rule = .{ .fg = .{ .index = 8 }, .dim = true },
     .context = .{},
     .added = .{ .bg = .{ .index = 2 } },
     .removed = .{ .bg = .{ .index = 1 } },
@@ -400,6 +415,11 @@ test "every built-in Theme resolves by its exact name and keeps diff bands disti
         const selected = byName(builtin.name).?;
         try testing.expect(!std.meta.eql(selected.added.bg, selected.removed.bg));
         try testing.expect(!std.meta.eql(selected.status_added, selected.status_removed));
+        try testing.expect(selected.pane_border.dim);
+        try testing.expect(selected.pane_border_focused.bold);
+        try testing.expect(selected.overlay_border.bold);
+        try testing.expect(selected.overlay_title.bold);
+        try testing.expect(selected.section_rule.dim);
     }
     try testing.expect(byName("catppuccin") == null);
 }

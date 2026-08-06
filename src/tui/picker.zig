@@ -40,6 +40,7 @@ pub const Picker = struct {
     /// A loading Picker shows a placeholder; it still accepts query input, which
     /// is applied against the list the moment `populate` runs.
     loading: bool = false,
+    spinner_phase: u3 = 0,
     /// Whether `haystacks`/`match_buf`/`score_buf` are heap allocations we own.
     /// A loading Picker that is never populated owns nothing to free.
     populated: bool = false,
@@ -149,6 +150,14 @@ pub const Picker = struct {
         self.refilter();
     }
 
+    pub fn tick(self: *Picker) void {
+        if (self.loading) self.spinner_phase +%= 1;
+    }
+
+    pub fn spinnerGlyph(self: *const Picker) []const u8 {
+        return spinner_glyphs[self.spinner_phase];
+    }
+
     /// Recompute `match_buf` from the current query. An empty (or blank) query
     /// matches every PR in input order; otherwise entries are ranked by zf and
     /// sorted best-first. The cursor is clamped into the new match set.
@@ -225,6 +234,8 @@ pub const Picker = struct {
         }
     }
 };
+
+const spinner_glyphs = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧" };
 
 /// Synchronous, Session-local File finder. It borrows the Diff's Files and owns
 /// only ranking buffers; confirming a result never replaces the Session.
@@ -418,6 +429,17 @@ test "a loading picker has no matches until populated" {
     try testing.expect(!p.loading);
     try testing.expectEqual(@as(usize, 1), p.matches().len);
     try testing.expectEqual(@as(u64, 11), p.selection().?.id);
+}
+
+test "loading Picker spinner advances one fixed-width glyph per scoped tick" {
+    var p = Picker.initLoading(testing.allocator);
+    defer p.deinit();
+    try testing.expectEqualStrings("\xe2\xa0\x8b", p.spinnerGlyph());
+    p.tick();
+    try testing.expectEqualStrings("\xe2\xa0\x99", p.spinnerGlyph());
+    try p.populate(&.{});
+    p.tick();
+    try testing.expectEqualStrings("\xe2\xa0\x99", p.spinnerGlyph());
 }
 
 test "populate with an empty list leaves a ready, empty picker" {

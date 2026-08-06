@@ -34,7 +34,7 @@ A floating surface drawn over the Panes — keybinding help, the PR picker, a co
 _Avoid_: popup, modal, dialog, hover (describe the trigger, not the thing).
 
 **Picker**:
-The Overlay for fuzzy-finding a PullRequest by id or title (backed by `zf`) to switch the loaded PR.
+The Overlay for fuzzy-finding a PullRequest by id or title (backed by `zf`) to switch the loaded PR. While its PullRequest list loads, a scoped low-frequency tick advances a single-glyph spinner without changing the blocking input loop.
 _Avoid_: search, finder, switcher, palette.
 
 **Composer**:

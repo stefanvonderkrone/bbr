@@ -456,7 +456,10 @@ pub fn drawPicker(scratch: std.mem.Allocator, win: vaxis.Window, picker: *const 
     if (picker.loading or picker.prs.len == 0) {
         var r: u16 = 1;
         while (r <= list_rows) : (r += 1) fillRow(modal, r, theme.picker);
-        const msg: []const u8 = if (picker.loading) "  loading…" else "  no open pull requests";
+        const msg: []const u8 = if (picker.loading)
+            (std.fmt.allocPrint(scratch, "{s} Loading pull requests…", .{picker.spinnerGlyph()}) catch "  Loading pull requests…")
+        else
+            "  no open pull requests";
         _ = modal.printSegment(.{ .text = msg, .style = theme.picker }, .{ .row_offset = 1, .wrap = .none });
         return;
     }
@@ -1218,7 +1221,7 @@ test "picker overlay draws the query line and highlights the selection" {
     try testing.expectEqual(theme_dark.picker.bg, win.readCell(mx, my + 1).?.style.bg);
 }
 
-test "a loading picker shows a placeholder instead of matches" {
+test "a loading picker shows its single-glyph spinner beside the placeholder" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1235,7 +1238,8 @@ test "a loading picker shows a placeholder instead of matches" {
     // Modal at (10, 4); row 1 of the modal carries "  loading…".
     const mx: u16 = 10;
     const my: u16 = 4;
-    try testing.expectEqualStrings("l", win.readCell(mx + 2, my + 1).?.char.grapheme);
+    try testing.expectEqualStrings("L", win.readCell(mx + 2, my + 1).?.char.grapheme);
+    try testing.expectEqualStrings(picker.spinnerGlyph(), win.readCell(mx, my + 1).?.char.grapheme);
 }
 
 test "the boot loading view floats a Loading PR dialog" {

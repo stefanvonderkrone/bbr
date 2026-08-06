@@ -39,7 +39,7 @@ pub const RunCtx = struct {
     highlighter: bbr.highlight.Highlighter,
     highlight_max_file_bytes: usize,
     file_cache_enabled: bool,
-    file_cache_max_retained_bytes_per_review: usize,
+    inactive_file_cache_max_bytes: usize,
     comments_collapsed_rows: usize,
     mouse_enabled: bool = true,
     mouse_vertical_scroll_rows: usize = 3,
@@ -54,6 +54,12 @@ const AppEvent = union(enum) {
     mouse: vaxis.Mouse,
     winsize: vaxis.Winsize,
     presentation_done: PresentationDone,
+    picker_tick: PickerTickDone,
+};
+
+const PickerTickDone = struct {
+    future_id: u64,
+    scope: presentation.WorkId,
 };
 
 const PresentationDone = struct {
@@ -68,6 +74,21 @@ const PresentationWork = struct {
     future: std.Io.Future(void),
 };
 
+const PickerTickWork = struct {
+    id: u64,
+    scope: presentation.WorkId,
+};
+
+const PickerTickTransition = union(enum) {
+    idle,
+    start: presentation.WorkId,
+    keep,
+    stop,
+    replace: presentation.WorkId,
+};
+
+const picker_tick_interval_ms = 250;
+
 fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.ReviewKey) !void {
     var anchor_git = bbr.git.ShellGitClient.init(ctx.gpa, ctx.io);
     var git_anchor_resolver = bbr.review.GitAnchorResolver.init(ctx.gpa, anchor_git.gitClient());
@@ -79,7 +100,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
         .submission_locks = ctx.submission_locks,
         .highlight_max_file_bytes = ctx.highlight_max_file_bytes,
         .file_cache_enabled = ctx.file_cache_enabled,
-        .file_cache_max_retained_bytes_per_review = ctx.file_cache_max_retained_bytes_per_review,
+        .inactive_file_cache_max_bytes = ctx.inactive_file_cache_max_bytes,
         .comments_collapsed_rows = ctx.comments_collapsed_rows,
         .mouse_enabled = ctx.mouse_enabled,
         .mouse_vertical_scroll_rows = ctx.mouse_vertical_scroll_rows,
@@ -117,10 +138,12 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
         futures.deinit(ctx.gpa);
     }
     var next_work_id: u64 = 1;
+    var picker_tick_work: ?PickerTickWork = null;
     var frame_arena = std.heap.ArenaAllocator.init(ctx.gpa);
     defer frame_arena.deinit();
 
     try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, vx, writer);
+    try syncPickerTick(&state, ctx, &loop, &futures, &next_work_id, &picker_tick_work);
     while (true) {
         const event = try loop.nextEvent();
         switch (event) {
@@ -134,6 +157,12 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
                 reapPresentationWork(&futures, ctx.io, done.work_id);
                 try state.dispatch(done.input);
             },
+            .picker_tick => |done| {
+                reapPresentationWork(&futures, ctx.io, done.future_id);
+                if (picker_tick_work != null and picker_tick_work.?.id == done.future_id)
+                    picker_tick_work = null;
+                try state.dispatch(.{ .picker_tick = done.scope });
+            },
         }
 
         try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, vx, writer);
@@ -141,6 +170,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
             try state.dispatch(.ensure_focused_enrichment);
             try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, vx, writer);
         }
+        try syncPickerTick(&state, ctx, &loop, &futures, &next_work_id, &picker_tick_work);
         // A completed worker may still own a payload queued for Presentation.
         // Keep the loop alive until every completion has been received and
         // reaped so shutdown cannot strand that payload in the event queue.
@@ -208,6 +238,50 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
         try vx.render(writer);
         _ = frame_arena.reset(.retain_capacity);
     }
+}
+
+fn pickerTickWorker(loop: *Loop, future_id: u64, scope: presentation.WorkId, io: std.Io) void {
+    io.sleep(std.Io.Duration.fromMilliseconds(picker_tick_interval_ms), .awake) catch return;
+    loop.postEvent(.{ .picker_tick = .{ .future_id = future_id, .scope = scope } }) catch {};
+}
+
+fn pickerTickTransition(scope: ?presentation.WorkId, active: ?PickerTickWork) PickerTickTransition {
+    if (active) |running| {
+        const wanted = scope orelse return .stop;
+        return if (wanted == running.scope) .keep else .{ .replace = wanted };
+    }
+    return if (scope) |wanted| .{ .start = wanted } else .idle;
+}
+
+fn syncPickerTick(
+    state: *const presentation.Presentation,
+    ctx: RunCtx,
+    loop: *Loop,
+    futures: *std.ArrayList(PresentationWork),
+    next_work_id: *u64,
+    active: *?PickerTickWork,
+) !void {
+    const scope = state.projection().picker_tick_scope;
+    const start_scope: ?presentation.WorkId = switch (pickerTickTransition(scope, active.*)) {
+        .idle, .keep => return,
+        .stop => {
+            cancelPresentationWork(futures, ctx.io, active.*.?.id);
+            active.* = null;
+            return;
+        },
+        .replace => |wanted| blk: {
+            cancelPresentationWork(futures, ctx.io, active.*.?.id);
+            active.* = null;
+            break :blk wanted;
+        },
+        .start => |wanted| wanted,
+    };
+    try futures.ensureUnusedCapacity(ctx.gpa, 1);
+    const id = next_work_id.*;
+    next_work_id.* +%= 1;
+    const future = try ctx.io.concurrent(pickerTickWorker, .{ loop, id, start_scope.?, ctx.io });
+    futures.appendAssumeCapacity(.{ .id = id, .future = future });
+    active.* = .{ .id = id, .scope = start_scope.? };
 }
 
 const metrics_context: u8 = 0;
@@ -642,6 +716,15 @@ fn reapPresentationWork(work: *std.ArrayList(PresentationWork), io: std.Io, id: 
     }
 }
 
+fn cancelPresentationWork(work: *std.ArrayList(PresentationWork), io: std.Io, id: u64) void {
+    for (work.items, 0..) |item, index| {
+        if (item.id != id) continue;
+        var canceled = work.swapRemove(index);
+        _ = canceled.future.cancel(io);
+        return;
+    }
+}
+
 fn fileIndexForRow(buf: buffer_mod.Buffer, cursor: usize) usize {
     var idx: usize = 0;
     var seen_any = false;
@@ -732,4 +815,28 @@ test "content viewport reserves the bottom status row" {
     try std.testing.expectEqual(@as(usize, 9), contentViewportRows(10));
     try std.testing.expectEqual(@as(usize, 1), contentViewportRows(1));
     try std.testing.expectEqual(@as(usize, 1), contentViewportRows(0));
+}
+
+test "Picker tick scheduler starts only while loading and stops on every scope end" {
+    try std.testing.expectEqual(PickerTickTransition.idle, pickerTickTransition(null, null));
+    try std.testing.expectEqual(PickerTickTransition{ .start = 7 }, pickerTickTransition(7, null));
+    try std.testing.expectEqual(PickerTickTransition.keep, pickerTickTransition(7, .{ .id = 11, .scope = 7 }));
+    try std.testing.expectEqual(PickerTickTransition.stop, pickerTickTransition(null, .{ .id = 11, .scope = 7 }));
+    try std.testing.expectEqual(PickerTickTransition{ .replace = 8 }, pickerTickTransition(8, .{ .id = 11, .scope = 7 }));
+}
+
+fn testSleepingPickerTick(io: std.Io) void {
+    io.sleep(std.Io.Duration.fromSeconds(60), .awake) catch return;
+}
+
+test "stopping a Picker tick cancels and reaps its sleeping future" {
+    const io = std.testing.io;
+    var work: std.ArrayList(PresentationWork) = .empty;
+    defer work.deinit(std.testing.allocator);
+    const future = try io.concurrent(testSleepingPickerTick, .{io});
+    try work.append(std.testing.allocator, .{ .id = 19, .future = future });
+
+    cancelPresentationWork(&work, io, 19);
+
+    try std.testing.expectEqual(@as(usize, 0), work.items.len);
 }

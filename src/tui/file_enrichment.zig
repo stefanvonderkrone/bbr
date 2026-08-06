@@ -295,7 +295,6 @@ pub const Storage = struct {
     }
 
     pub fn configureCache(self: *Storage, policy: CachePolicy) void {
-        std.debug.assert(!policy.enabled or policy.max_retained_bytes > 0);
         self.cache = policy;
         _ = self.stageCacheEnforcement();
         self.commitCacheUpdate();
@@ -404,7 +403,12 @@ pub const Storage = struct {
     }
 
     fn stageCacheEnforcement(self: *Storage) bool {
-        const budget = if (self.cache.enabled) self.cache.max_retained_bytes else 0;
+        const budget = if (!self.cache.enabled)
+            0
+        else if (self.cache.max_retained_bytes == 0)
+            std.math.maxInt(usize)
+        else
+            self.cache.max_retained_bytes;
         var changed = false;
         while (self.inactiveRetainedBytes() > budget) {
             const victim = self.leastRecentlyUsedInactive() orelse break;
@@ -705,4 +709,41 @@ test "File content cache budget includes Highlight Spans and Capture names" {
 
     storage.focus(1);
     try testing.expect(storage.file(0).new == .pending);
+}
+
+test "zero File cache budget retains unlimited inactive content and excludes the focused File" {
+    var storage = try Storage.init(testing.allocator, test_files[0..3]);
+    defer storage.deinit();
+    storage.configureCache(.{ .enabled = true, .max_retained_bytes = 0 });
+
+    storage.focus(0);
+    var first = try ownedAddedResult(testing.allocator, "aaaaaa");
+    defer first.deinit();
+    try storage.admit(0, &first);
+
+    storage.focus(1);
+    var second = try ownedAddedResult(testing.allocator, "bbbbbb");
+    defer second.deinit();
+    try storage.admit(1, &second);
+
+    storage.focus(2);
+    try testing.expectEqualStrings("aaaaaa", storage.file(0).new.content.blob);
+    try testing.expectEqualStrings("bbbbbb", storage.file(1).new.content.blob);
+}
+
+test "equal-recency inactive Files evict in stable File order" {
+    var storage = try Storage.init(testing.allocator, test_files[0..3]);
+    defer storage.deinit();
+    storage.configureCache(.{ .enabled = true, .max_retained_bytes = 6 });
+    storage.focus(2);
+
+    var first = try ownedAddedResult(testing.allocator, "aaaaaa");
+    defer first.deinit();
+    try storage.admit(0, &first);
+    var second = try ownedAddedResult(testing.allocator, "bbbbbb");
+    defer second.deinit();
+    try storage.admit(1, &second);
+
+    try testing.expect(storage.file(0).new == .pending);
+    try testing.expectEqualStrings("bbbbbb", storage.file(1).new.content.blob);
 }

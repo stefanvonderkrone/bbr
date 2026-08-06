@@ -1,6 +1,6 @@
 # Complete Picker feedback and public configuration
 
-Status: ready-for-agent
+Status: ready-for-human
 
 ## What to build
 
@@ -8,12 +8,12 @@ Finish M15's visible loading feedback and public configuration as one coherent p
 
 ## Acceptance criteria
 
-- [ ] A visible loading Picker receives scoped tick events through the blocking event path and shows a single-glyph spinner; ticks stop when loading, the Overlay, or the application ends and never create idle polling.
-- [ ] The inactive File cache honors `enabled = true` and `max_bytes = 268435456` defaults, treats `0` as unlimited, excludes the focused File from the budget, and evicts inactive content deterministically.
-- [ ] Comment, File-cache, mouse, Theme, and Action settings implement their documented defaults, zero semantics, and opt-outs without compatibility aliases for renamed keys.
-- [ ] Invalid values, duplicate keys, unknown tables or keys, ambiguous contextual bindings, and unusable mouse scroll values produce line-specific diagnostics.
-- [ ] Help and user documentation describe the accepted keyboard and mouse workflows, ActionAvailability, Picker behavior, disclosure behavior, Comment scopes, cache semantics, and configuration.
-- [ ] All new style roles exist in every built-in Theme, relevant ADRs reflect the final boundaries, and tests cover spinner lifetime, idle blocking, cache budgeting/eviction, defaults, opt-outs, and diagnostics.
+- [x] A visible loading Picker receives scoped tick events through the blocking event path and shows a single-glyph spinner; ticks stop when loading, the Overlay, or the application ends and never create idle polling.
+- [x] The inactive File cache honors `enabled = true` and `max_bytes = 268435456` defaults, treats `0` as unlimited, excludes the focused File from the budget, and evicts inactive content deterministically.
+- [x] Comment, File-cache, mouse, Theme, and Action settings implement their documented defaults, zero semantics, and opt-outs without compatibility aliases for renamed keys.
+- [x] Invalid values, duplicate keys, unknown tables or keys, ambiguous contextual bindings, and unusable mouse scroll values produce line-specific diagnostics.
+- [x] Help and user documentation describe the accepted keyboard and mouse workflows, ActionAvailability, Picker behavior, disclosure behavior, Comment scopes, cache semantics, and configuration.
+- [x] All new style roles exist in every built-in Theme, relevant ADRs reflect the final boundaries, and tests cover spinner lifetime, idle blocking, cache budgeting/eviction, defaults, opt-outs, and diagnostics.
 
 ## Blocked by
 

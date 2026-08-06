@@ -130,7 +130,7 @@ pub const Dependencies = struct {
     submission_locks: ?bbr.review.SubmissionLocks = null,
     highlight_max_file_bytes: usize = 0,
     file_cache_enabled: bool = true,
-    file_cache_max_retained_bytes_per_review: usize = 256 * 1024 * 1024,
+    inactive_file_cache_max_bytes: usize = 256 * 1024 * 1024,
     comments_collapsed_rows: usize = 6,
     mouse_enabled: bool = true,
     mouse_vertical_scroll_rows: usize = 3,
@@ -181,6 +181,7 @@ pub const OwnedInput = union(enum) {
     recovery_checked: RecoveryChecked,
     duplicate_checked: DuplicateChecked,
     pull_requests_loaded: PullRequestsLoaded,
+    picker_tick: WorkId,
     clipboard_completed: bool,
     dismiss_submission_result,
     request_shutdown,
@@ -550,6 +551,7 @@ pub const Projection = struct {
     recovery: ?RecoveryNotice,
     unknown_resolution: ?UnknownResolutionProjection,
     picker: ?*const Picker,
+    picker_tick_scope: ?WorkId,
     file_finder: ?*const FileFinder,
     help_visible: bool,
     action_availability: ActionAvailability,
@@ -1494,7 +1496,7 @@ pub const Presentation = struct {
                 self.preferences,
                 .{
                     .enabled = dependencies.file_cache_enabled,
-                    .max_retained_bytes = dependencies.file_cache_max_retained_bytes_per_review,
+                    .max_retained_bytes = dependencies.inactive_file_cache_max_bytes,
                 },
                 dependencies.cell_metrics,
                 dependencies.comments_collapsed_rows,
@@ -1543,6 +1545,9 @@ pub const Presentation = struct {
             .recovery_checked => |checked| self.acceptRecoveryCheck(checked),
             .duplicate_checked => |checked| self.acceptDuplicateCheck(checked),
             .pull_requests_loaded => |loaded| self.acceptPullRequests(loaded),
+            .picker_tick => |scope| if (!self.shutdown_requested and self.picker_work_id == scope) {
+                if (self.picker) |*active_picker| active_picker.tick();
+            },
             .clipboard_completed => |success| {
                 self.clipboard_status = if (success) .copied else .failed;
                 self.action_error = null;
@@ -1605,6 +1610,10 @@ pub const Presentation = struct {
                 .comment_id = editor.text(),
             } else null,
             .picker = if (self.picker) |*picker| picker else null,
+            .picker_tick_scope = if (!self.shutdown_requested) if (self.picker) |*picker|
+                if (picker.loading) self.picker_work_id else null
+            else
+                null else null,
             .file_finder = if (self.file_finder) |*finder| finder else null,
             .help_visible = self.help_visible,
             .action_availability = self.actionAvailability(),
@@ -3361,7 +3370,7 @@ pub const Presentation = struct {
                     self.preferences,
                     .{
                         .enabled = self.dependencies.file_cache_enabled,
-                        .max_retained_bytes = self.dependencies.file_cache_max_retained_bytes_per_review,
+                        .max_retained_bytes = self.dependencies.inactive_file_cache_max_bytes,
                     },
                     self.dependencies.cell_metrics,
                     self.dependencies.comments_collapsed_rows,
@@ -5191,6 +5200,33 @@ test "portable Picker input loads summaries and selects a replacement" {
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
     try testing.expect(presentation.projection().picker == null);
     try testing.expectEqual(@as(u64, 2), presentation.takeCommand().?.load_session.key.pull_request_id);
+}
+
+test "Picker tick advances only its visible loading scope" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try ReviewKey.init("workspace", "repo", 1);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'p', .text = "p" } });
+    const list = presentation.takeCommand().?.list_pull_requests;
+    const initial = presentation.projection().picker.?.spinnerGlyph();
+    try testing.expectEqual(list.work_id, presentation.projection().picker_tick_scope.?);
+
+    try presentation.dispatch(.{ .picker_tick = list.work_id + 1 });
+    try testing.expectEqualStrings(initial, presentation.projection().picker.?.spinnerGlyph());
+    try presentation.dispatch(.{ .picker_tick = list.work_id });
+    try testing.expect(!std.mem.eql(u8, initial, presentation.projection().picker.?.spinnerGlyph()));
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expect(presentation.projection().picker == null);
+    try testing.expect(presentation.projection().picker_tick_scope == null);
+    try presentation.dispatch(.{ .picker_tick = list.work_id });
+    try testing.expect(presentation.projection().picker == null);
 }
 
 test "shutdown closes Picker and disposes its late completion" {

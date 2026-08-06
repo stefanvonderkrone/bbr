@@ -18,7 +18,7 @@ const Diagnostic = struct {
 
 pub const Configuration = struct {
     pub const default_highlight_max_file_bytes: usize = 2 * 1024 * 1024;
-    pub const default_file_cache_max_retained_bytes_per_review: usize = 256 * 1024 * 1024;
+    pub const default_inactive_file_cache_max_bytes: usize = 256 * 1024 * 1024;
     pub const default_comments_collapsed_rows: usize = 6;
 
     theme_name: []const u8,
@@ -26,7 +26,7 @@ pub const Configuration = struct {
     keymap: keymap.OwnedKeymap,
     highlight_max_file_bytes: usize,
     file_cache_enabled: bool,
-    file_cache_max_retained_bytes_per_review: usize,
+    inactive_file_cache_max_bytes: usize,
     comments_collapsed_rows: usize,
     mouse_enabled: bool,
     mouse_vertical_scroll_rows: usize,
@@ -93,7 +93,7 @@ fn defaults(allocator: std.mem.Allocator) !Configuration {
         .keymap = try keymap.Keymap.fromOverrides(allocator, &.{}),
         .highlight_max_file_bytes = Configuration.default_highlight_max_file_bytes,
         .file_cache_enabled = true,
-        .file_cache_max_retained_bytes_per_review = Configuration.default_file_cache_max_retained_bytes_per_review,
+        .inactive_file_cache_max_bytes = Configuration.default_inactive_file_cache_max_bytes,
         .comments_collapsed_rows = Configuration.default_comments_collapsed_rows,
         .mouse_enabled = true,
         .mouse_vertical_scroll_rows = 3,
@@ -153,9 +153,8 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
     var highlight_limit_seen = false;
     var file_cache_enabled = true;
     var file_cache_enabled_seen = false;
-    var file_cache_max_retained_bytes_per_review = Configuration.default_file_cache_max_retained_bytes_per_review;
+    var inactive_file_cache_max_bytes = Configuration.default_inactive_file_cache_max_bytes;
     var file_cache_limit_seen = false;
-    var file_cache_limit_line: usize = 1;
     var comments_collapsed_rows = Configuration.default_comments_collapsed_rows;
     var comments_collapsed_seen = false;
     var mouse_enabled = true;
@@ -294,20 +293,18 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
                     try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'enabled' key", .hint = "keep exactly one File cache switch" });
                 } else file_cache_enabled = std.mem.eql(u8, value, "true");
                 file_cache_enabled_seen = true;
-            } else if (std.mem.eql(u8, key, "max_retained_bytes_per_review")) {
+            } else if (std.mem.eql(u8, key, "max_bytes")) {
                 if (file_cache_limit_seen) {
-                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'max_retained_bytes_per_review' key", .hint = "keep exactly one File cache budget" });
+                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'max_bytes' key", .hint = "keep exactly one File cache budget" });
                 } else {
-                    file_cache_max_retained_bytes_per_review = std.fmt.parseInt(usize, value, 10) catch {
+                    inactive_file_cache_max_bytes = std.fmt.parseInt(usize, value, 10) catch {
                         try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "File cache byte budget is too large" });
                         file_cache_limit_seen = true;
-                        file_cache_limit_line = line_number;
                         continue;
                     };
-                    file_cache_limit_line = line_number;
                 }
                 file_cache_limit_seen = true;
-            } else try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown File cache key", .hint = "use enabled or max_retained_bytes_per_review" }),
+            } else try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown File cache key", .hint = "use enabled or max_bytes" }),
             .comments => if (!std.mem.eql(u8, key, "collapsed_rows")) {
                 try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown Comments key", .hint = "use collapsed_rows" });
             } else if (comments_collapsed_seen) {
@@ -326,23 +323,22 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
                 } else mouse_enabled = std.mem.eql(u8, value, "true");
                 mouse_enabled_seen = true;
             } else if (std.mem.eql(u8, key, "vertical_scroll_rows")) {
-                mouse_scroll_line = line_number;
                 if (mouse_scroll_seen) {
                     try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'vertical_scroll_rows' key", .hint = "keep exactly one mouse scroll row count" });
-                } else mouse_vertical_scroll_rows = std.fmt.parseInt(usize, value, 10) catch {
-                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "mouse scroll row count is too large" });
-                    mouse_scroll_seen = true;
-                    continue;
-                };
+                } else {
+                    mouse_scroll_line = line_number;
+                    mouse_vertical_scroll_rows = std.fmt.parseInt(usize, value, 10) catch {
+                        try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "mouse scroll row count is too large" });
+                        mouse_scroll_seen = true;
+                        continue;
+                    };
+                }
                 mouse_scroll_seen = true;
             } else try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown Mouse input key", .hint = "use enabled or vertical_scroll_rows" }),
             .unknown => {},
         }
     }
 
-    if (file_cache_enabled and file_cache_max_retained_bytes_per_review == 0) {
-        try diagnostics.append(allocator, .{ .line = file_cache_limit_line, .column = 1, .message = "enabled File cache budget must be greater than zero", .hint = "set enabled = false to disable inactive caching" });
-    }
     if (mouse_vertical_scroll_rows == 0)
         try diagnostics.append(allocator, .{ .line = mouse_scroll_line, .column = 1, .message = "mouse vertical scroll rows must be greater than zero", .hint = "use enabled = false to disable mouse input" });
 
@@ -365,7 +361,7 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
         .keymap = owned_keymap,
         .highlight_max_file_bytes = highlight_max_file_bytes,
         .file_cache_enabled = file_cache_enabled,
-        .file_cache_max_retained_bytes_per_review = file_cache_max_retained_bytes_per_review,
+        .inactive_file_cache_max_bytes = inactive_file_cache_max_bytes,
         .comments_collapsed_rows = comments_collapsed_rows,
         .mouse_enabled = mouse_enabled,
         .mouse_vertical_scroll_rows = mouse_vertical_scroll_rows,
@@ -559,29 +555,38 @@ test "Highlighting size limit defaults to 2 MiB and accepts zero as unlimited" {
     try testing.expect(invalid == .invalid);
 }
 
-test "File content cache defaults on at 256 MiB and accepts an explicit positive budget" {
+test "File content cache defaults on at 256 MiB and zero means unlimited" {
     var default_result = try parse(testing.allocator, "");
     defer default_result.deinit(testing.allocator);
     try testing.expect(default_result.ok.file_cache_enabled);
-    try testing.expectEqual(@as(usize, 256 * 1024 * 1024), default_result.ok.file_cache_max_retained_bytes_per_review);
+    try testing.expectEqual(@as(usize, 256 * 1024 * 1024), default_result.ok.inactive_file_cache_max_bytes);
 
     var configured = try parse(testing.allocator,
         \\[files.cache]
         \\enabled = false
-        \\max_retained_bytes_per_review = 1073741824
+        \\max_bytes = 1073741824
     );
     defer configured.deinit(testing.allocator);
     try testing.expect(configured == .ok);
     try testing.expect(!configured.ok.file_cache_enabled);
-    try testing.expectEqual(@as(usize, 1024 * 1024 * 1024), configured.ok.file_cache_max_retained_bytes_per_review);
+    try testing.expectEqual(@as(usize, 1024 * 1024 * 1024), configured.ok.inactive_file_cache_max_bytes);
 
     var zero = try parse(testing.allocator,
         \\[files.cache]
         \\enabled = true
-        \\max_retained_bytes_per_review = 0
+        \\max_bytes = 0
     );
     defer zero.deinit(testing.allocator);
-    try testing.expect(zero == .invalid);
+    try testing.expect(zero == .ok);
+    try testing.expectEqual(@as(usize, 0), zero.ok.inactive_file_cache_max_bytes);
+
+    var renamed_key = try parse(testing.allocator,
+        \\[files.cache]
+        \\max_retained_bytes_per_review = 1
+    );
+    defer renamed_key.deinit(testing.allocator);
+    try testing.expect(renamed_key == .invalid);
+    try testing.expectEqual(@as(usize, 2), renamed_key.invalid[0].line);
 }
 
 test "Comment disclosure defaults to six rendered rows and zero disables collapse" {
@@ -620,6 +625,16 @@ test "Mouse input defaults on with three-row scrolling and accepts opt-out and r
     );
     defer zero.deinit(testing.allocator);
     try testing.expect(zero == .invalid);
+
+    var duplicate_after_zero = try parse(testing.allocator,
+        \\[input.mouse]
+        \\vertical_scroll_rows = 0
+        \\vertical_scroll_rows = 4
+    );
+    defer duplicate_after_zero.deinit(testing.allocator);
+    try testing.expect(duplicate_after_zero == .invalid);
+    try testing.expectEqual(@as(usize, 3), duplicate_after_zero.invalid[0].line);
+    try testing.expectEqual(@as(usize, 2), duplicate_after_zero.invalid[1].line);
 }
 
 test "configuration path prefers XDG and falls back to HOME" {

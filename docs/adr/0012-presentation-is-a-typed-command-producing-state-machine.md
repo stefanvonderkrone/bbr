@@ -196,6 +196,13 @@ Bitbucket is truly external. Presentation represents remote work as typed comman
 
 Terminal rendering is an adapter over Projection. vaxis does not cross the Presentation seam.
 
+Picker animation follows the same boundary. A visible loading Picker exposes its scoped work id
+and Presentation-owned spinner phase. The terminal adapter keeps `nextEvent` blocking and starts at
+most one low-frequency one-shot timer; its completion posts a scoped tick through the ordinary
+event queue. Presentation advances only the matching visible loading Picker. Population, failure,
+dismissal, staleness, or shutdown removes the scope, so the adapter schedules no replacement tick
+and an idle review has no polling source.
+
 Review-source policy also stays behind the Presentation seam. A Published review may be remote
 or local, but the terminal adapter does not branch on that mode to choose CommentTarget,
 Submission availability, commit selection, File Enrichment, or replacement behavior.
