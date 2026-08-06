@@ -50,6 +50,8 @@ pub fn draw(
     drawProjected(scratch, win, diff, buf, theme, nav, selected_file, threads, drafts, .{
         .sidebar = .{ .x = 0, .y = 0, .width = sb_w, .height = win.height },
         .diff = .{ .x = pane_x, .y = 0, .width = win.width - pane_x, .height = win.height },
+        .sidebar_content = .{ .x = 0, .y = 0, .width = sb_w, .height = win.height },
+        .diff_content = .{ .x = pane_x, .y = 0, .width = win.width - pane_x, .height = win.height },
     });
 }
 
@@ -81,18 +83,87 @@ pub fn drawReview(
     theme: Theme,
     selected_file: usize,
 ) void {
-    drawProjected(
-        scratch,
-        win,
-        review.diff.*,
-        review.frame.buffer,
-        theme,
-        review.frame.navigation,
-        selected_file,
-        review.threads,
-        review.drafts,
-        review.frame.panes,
-    );
+    _ = selected_file;
+    win.clear();
+    drawPaneFrame(win, review.frame.panes.sidebar, "Files", theme, review.frame.focus == .sidebar);
+    drawPaneFrame(win, review.frame.panes.diff, "Diff", theme, review.frame.focus == .diff);
+    const sidebar = childRect(win, review.frame.panes.sidebar_content);
+    const diff_pane = childRect(win, review.frame.panes.diff_content);
+    drawFileTree(sidebar, review.frame.file_tree, theme);
+    drawPane(scratch, diff_pane, review.frame.buffer, theme, review.frame.navigation);
+    joinSectionRules(win, review.frame.panes.diff, review.frame.panes.diff_content, review.frame.buffer, review.frame.navigation, theme);
+}
+
+fn joinSectionRules(win: vaxis.Window, outer: @import("frame.zig").Rect, content: @import("frame.zig").Rect, buf: Buffer, nav: Nav, theme: Theme) void {
+    if (outer.width == 0) return;
+    var screen_row: u16 = 0;
+    while (screen_row < content.height) : (screen_row += 1) {
+        const index = nav.scroll + screen_row;
+        if (index >= buf.rows.len) break;
+        const joined = switch (buf.rows[index]) {
+            .file_header, .section => true,
+            else => false,
+        };
+        if (!joined) continue;
+        const row = content.y + screen_row;
+        win.writeCell(outer.x, row, .{ .char = .{ .grapheme = "├", .width = 1 }, .style = theme.section_rule });
+        if (outer.width > 1) win.writeCell(outer.x + outer.width - 1, row, .{ .char = .{ .grapheme = "┤", .width = 1 }, .style = theme.section_rule });
+    }
+}
+
+fn childRect(win: vaxis.Window, rect: @import("frame.zig").Rect) vaxis.Window {
+    return win.child(.{ .x_off = rect.x, .y_off = rect.y, .width = rect.width, .height = rect.height });
+}
+
+fn drawPaneFrame(win: vaxis.Window, rect: @import("frame.zig").Rect, title: []const u8, theme: Theme, focused: bool) void {
+    if (rect.width == 0 or rect.height == 0) return;
+    const pane = childRect(win, rect);
+    const style = if (focused) theme.pane_border_focused else theme.pane_border;
+    const last_col = rect.width - 1;
+    const last_row = rect.height - 1;
+    var col: u16 = 0;
+    while (col < rect.width) : (col += 1) {
+        pane.writeCell(col, 0, .{ .char = .{ .grapheme = if (col == 0) "┌" else if (col == last_col) "┐" else "─", .width = 1 }, .style = style });
+        if (last_row > 0) pane.writeCell(col, last_row, .{ .char = .{ .grapheme = if (col == 0) "└" else if (col == last_col) "┘" else "─", .width = 1 }, .style = style });
+    }
+    var row: u16 = 1;
+    while (row < last_row) : (row += 1) {
+        pane.writeCell(0, row, .{ .char = .{ .grapheme = if (row == 1) "├" else "│", .width = 1 }, .style = style });
+        if (last_col > 0) pane.writeCell(last_col, row, .{ .char = .{ .grapheme = if (row == 1) "┤" else "│", .width = 1 }, .style = style });
+    }
+    if (rect.height > 1 and rect.width > 2) {
+        col = 1;
+        while (col < last_col) : (col += 1) pane.writeCell(col, 1, .{ .char = .{ .grapheme = "─", .width = 1 }, .style = style });
+    }
+    if (rect.width > 4) _ = pane.printSegment(.{ .text = title, .style = style }, .{ .row_offset = 0, .col_offset = 2, .wrap = .none });
+}
+
+fn drawFileTree(win: vaxis.Window, tree: @import("file_tree.zig").Projection, theme: Theme) void {
+    var screen_row: u16 = 0;
+    while (screen_row < win.height) : (screen_row += 1) {
+        const index = tree.scroll + screen_row;
+        if (index >= tree.entries.len) break;
+        const entry = tree.entries[index];
+        const style = if (entry.active or index == tree.cursor) theme.sidebar_selected else theme.sidebar_item;
+        fillRow(win, screen_row, style);
+        var col: u16 = @intCast(@min(entry.depth * 2, win.width));
+        if (col < win.width) {
+            const marker = if (entry.active) "›" else if (entry.active_descendant) "·" else " ";
+            win.writeCell(col, screen_row, .{ .char = .{ .grapheme = marker, .width = 1 }, .style = style });
+            col += 1;
+        }
+        if (entry.identity == .directory) {
+            if (col < win.width) win.writeCell(col, screen_row, .{ .char = .{ .grapheme = if (entry.expanded) "▾" else "▸", .width = 1 }, .style = style });
+            col +|= 1;
+        } else if (entry.status) |status| {
+            if (col < win.width) win.writeCell(col, screen_row, .{ .char = .{ .grapheme = statusChar(status), .width = 1 }, .style = .{ .fg = theme.statusColor(status), .bg = style.bg } });
+            col +|= 1;
+        }
+        col +|= 1;
+        if (col < win.width) _ = win.printSegment(.{ .text = entry.label, .style = style }, .{ .row_offset = screen_row, .col_offset = col, .wrap = .none });
+        const tally_width: u16 = @intCast(@min(entry.tally_width, win.width));
+        if (tally_width > 0) _ = win.printSegment(.{ .text = entry.tally, .style = style }, .{ .row_offset = screen_row, .col_offset = win.width - tally_width, .wrap = .none });
+    }
 }
 
 /// Single-char status label. Returns a static string so vaxis cells can borrow
@@ -192,8 +263,8 @@ const gutter_cols: u16 = 10;
 fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, theme: Theme) void {
     switch (row) {
         .file_header => |file| {
-            fillRow(win, r, theme.file_header);
-            const text = std.fmt.allocPrint(scratch, "{s} {s}", .{ statusChar(file.status), file.displayPath() }) catch file.displayPath();
+            fillRuleRow(win, r, theme.section_rule);
+            const text = std.fmt.allocPrint(scratch, "─ {s} {s} ", .{ statusChar(file.status), file.displayPath() }) catch file.displayPath();
             _ = win.printSegment(.{ .text = text, .style = theme.file_header }, .{ .row_offset = r, .wrap = .none });
         },
         .hunk_header => |hunk| {
@@ -219,6 +290,11 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, them
         .snapshot => |snapshot| drawSnapshot(win, r, snapshot, theme),
         .section => |sec| drawSection(scratch, win, r, sec, theme),
     }
+}
+
+fn fillRuleRow(win: vaxis.Window, row: u16, style: vaxis.Style) void {
+    var col: u16 = 0;
+    while (col < win.width) : (col += 1) win.writeCell(col, row, .{ .char = .{ .grapheme = "─", .width = 1 }, .style = style });
 }
 
 fn drawSnapshot(win: vaxis.Window, row: u16, snapshot: buffer_mod.SnapshotRow, theme: Theme) void {
@@ -1198,6 +1274,39 @@ test "sidebar prefix shows selection marker and status, borrowing no stack" {
     // The name is colored by change kind: modified → yellow, removed → red.
     try testing.expectEqual(theme_dark.status_modified, win.readCell(4, 0).?.style.fg);
     try testing.expectEqual(theme_dark.status_removed, win.readCell(4, 1).?.style.fg);
+}
+
+test "focused Pane frames and File Tree tallies use Frame-owned geometry" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 8, .cols = 32, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const panes = @import("frame.zig").paneRects(.{ .cols = 32, .rows = 8 });
+    drawPaneFrame(win, panes.sidebar, "Files", theme_dark, true);
+    drawPaneFrame(win, panes.diff, "Diff", theme_dark, false);
+    try testing.expectEqualStrings("┌", win.readCell(panes.sidebar.x, 0).?.char.grapheme);
+    try testing.expect(win.readCell(panes.sidebar.x, 0).?.style.bold);
+    try testing.expect(!win.readCell(panes.diff.x, 0).?.style.bold);
+    try testing.expectEqualStrings("├", win.readCell(panes.sidebar.x, 1).?.char.grapheme);
+
+    const entries = [_]@import("file_tree.zig").Entry{.{
+        .identity = .{ .file = 0 },
+        .parent = null,
+        .depth = 0,
+        .label = "long-name…",
+        .active = true,
+        .status = .modified,
+        .comments = 3,
+        .drafts = 1,
+        .tally = "●3 ✎1",
+        .tally_width = 5,
+    }};
+    const content = childRect(win, panes.sidebar_content);
+    drawFileTree(content, .{ .entries = &entries, .cursor = 0, .scroll = 0, .viewport = content.height }, theme_dark);
+    try testing.expectEqualStrings("1", content.readCell(content.width - 1, 0).?.char.grapheme);
+    try testing.expectEqualStrings("●", content.readCell(content.width - 5, 0).?.char.grapheme);
 }
 
 test "a woven comment renders with its marker and style; a suggestion is distinct" {

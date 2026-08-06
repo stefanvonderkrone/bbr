@@ -4,6 +4,7 @@ const std = @import("std");
 const bbr = @import("bbr");
 const Nav = @import("nav.zig").Nav;
 const buffer_mod = @import("buffer.zig");
+pub const file_tree = @import("file_tree.zig");
 pub const CellMetrics = @import("cell_metrics.zig").CellMetrics;
 
 pub const Revision = u64;
@@ -28,7 +29,11 @@ pub const Rect = struct {
 pub const PaneRects = struct {
     sidebar: Rect,
     diff: Rect,
+    sidebar_content: Rect,
+    diff_content: Rect,
 };
+
+pub const PaneFocus = enum { sidebar, diff };
 
 pub const RowOwner = union(enum) {
     file: *const bbr.diff.File,
@@ -70,14 +75,31 @@ pub const Projection = struct {
     targets: []const SemanticTarget,
     buffer: buffer_mod.Buffer,
     navigation: Nav,
+    file_tree: file_tree.Projection = .{},
+    focus: PaneFocus = .diff,
 };
 
 pub fn paneRects(geometry: Geometry) PaneRects {
-    const sidebar_width: u16 = @min(28, geometry.cols);
-    const diff_x: u16 = @min(sidebar_width +| 1, geometry.cols);
+    const gap: u16 = if (geometry.cols >= 60) 1 else 0;
+    const sidebar_width: u16 = if (geometry.cols < 6) geometry.cols / 2 else @min(28, geometry.cols - 3 - gap);
+    const diff_x: u16 = @min(sidebar_width +| gap, geometry.cols);
+    const diff_width = geometry.cols - diff_x;
+    const sidebar: Rect = .{ .x = 0, .y = 0, .width = sidebar_width, .height = geometry.rows };
+    const diff: Rect = .{ .x = diff_x, .y = 0, .width = diff_width, .height = geometry.rows };
     return .{
-        .sidebar = .{ .x = 0, .y = 0, .width = sidebar_width, .height = geometry.rows },
-        .diff = .{ .x = diff_x, .y = 0, .width = geometry.cols - diff_x, .height = geometry.rows },
+        .sidebar = sidebar,
+        .diff = diff,
+        .sidebar_content = paneContent(sidebar),
+        .diff_content = paneContent(diff),
+    };
+}
+
+fn paneContent(rect: Rect) Rect {
+    return .{
+        .x = rect.x +| @min(rect.width, 1),
+        .y = rect.y +| @min(rect.height, 2),
+        .width = rect.width -| 2,
+        .height = rect.height -| 3,
     };
 }
 
@@ -96,7 +118,7 @@ pub fn buildTargets(
 }
 
 pub fn restoreNavigation(previous: Projection, targets: []const SemanticTarget, geometry: Geometry) Nav {
-    var restored = Nav.init(targets.len, geometry.rows);
+    var restored = Nav.init(targets.len, paneRects(geometry).diff_content.height);
     restored.count = previous.navigation.count;
     const cursor_owner = targetOwner(previous.targets, previous.navigation.cursor) orelse return restored;
     const cursor = findOwner(targets, cursor_owner) orelse return restored;
@@ -105,7 +127,7 @@ pub fn restoreNavigation(previous: Projection, targets: []const SemanticTarget, 
 
     const old_offset = previous.navigation.cursor -| previous.navigation.scroll;
     restored.scroll = cursor -| old_offset;
-    restored.setViewport(geometry.rows);
+    restored.setViewport(paneRects(geometry).diff_content.height);
 
     if (previous.navigation.mark) |mark| {
         const mark_owner = targetOwner(previous.targets, mark) orelse return restored;
@@ -239,6 +261,18 @@ test "semantic targets use the injected CellMetrics seam" {
     try testing.expectEqual(@as(usize, 5), targets[0].measured_cells);
 }
 
+test "framed Pane geometry is bounded at zero narrow ordinary and wide sizes" {
+    for ([_]Geometry{ .{ .cols = 0, .rows = 0 }, .{ .cols = 5, .rows = 2 }, .{ .cols = 80, .rows = 24 }, .{ .cols = 160, .rows = 40 } }) |geometry| {
+        const panes = paneRects(geometry);
+        try testing.expect(panes.sidebar.x + panes.sidebar.width <= geometry.cols);
+        try testing.expect(panes.diff.x + panes.diff.width <= geometry.cols);
+        try testing.expect(panes.sidebar_content.x + panes.sidebar_content.width <= geometry.cols);
+        try testing.expect(panes.diff_content.y + panes.diff_content.height <= geometry.rows);
+    }
+    try testing.expectEqual(@as(u16, 1), paneRects(.{ .cols = 80, .rows = 24 }).diff.x - paneRects(.{ .cols = 80, .rows = 24 }).sidebar.width);
+    try testing.expectEqual(@as(u16, 0), paneRects(.{ .cols = 40, .rows = 24 }).diff.x - paneRects(.{ .cols = 40, .rows = 24 }).sidebar.width);
+}
+
 test "navigation restoration follows stable owners and clears a shifted Selection" {
     const old_targets = [_]SemanticTarget{
         .{ .owner = .{ .section = .{ .kind = .pr_comments, .path = "" } }, .measured_cells = 0 },
@@ -268,7 +302,7 @@ test "navigation restoration follows stable owners and clears a shifted Selectio
 
     try testing.expectEqual(@as(usize, 2), restored.cursor);
     try testing.expectEqual(@as(usize, 7), restored.count);
-    try testing.expectEqual(@as(usize, 3), restored.viewport);
+    try testing.expectEqual(@as(usize, 1), restored.viewport);
     try testing.expect(restored.mark == null);
 }
 

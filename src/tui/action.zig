@@ -1,6 +1,8 @@
 pub const Action = enum {
     down,
     up,
+    left,
+    right,
     half_page_down,
     half_page_up,
     page_down,
@@ -35,4 +37,5 @@ pub const Action = enum {
     next_file,
     prev_file,
     toggle_disclosure,
+    focus_next_pane,
 };

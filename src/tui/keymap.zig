@@ -63,6 +63,8 @@ pub fn isMotion(a: Action) bool {
     return switch (a) {
         .down,
         .up,
+        .left,
+        .right,
         .half_page_down,
         .half_page_up,
         .page_down,
@@ -136,6 +138,10 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one(vaxis.Key.down), .action = .down, .help = "down" },
     .{ .chord = Chord.one('k'), .action = .up, .help = "up" },
     .{ .chord = Chord.one(vaxis.Key.up), .action = .up, .help = "up" },
+    .{ .chord = Chord.one('h'), .action = .left, .help = "collapse / parent" },
+    .{ .chord = Chord.one(vaxis.Key.left), .action = .left, .help = "collapse / parent" },
+    .{ .chord = Chord.one('l'), .action = .right, .help = "expand / child" },
+    .{ .chord = Chord.one(vaxis.Key.right), .action = .right, .help = "expand / child" },
     .{ .chord = Chord.modified('d', .{ .ctrl = true }), .action = .half_page_down, .help = "half page down" },
     .{ .chord = Chord.one(vaxis.Key.page_down), .action = .half_page_down, .help = "half page down" },
     .{ .chord = Chord.modified('u', .{ .ctrl = true }), .action = .half_page_up, .help = "half page up" },
@@ -176,6 +182,7 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one('U'), .action = .resolve_unpublished, .help = "mark unknown draft unpublished" },
     .{ .chord = Chord.one('C'), .action = .link_existing_comment, .help = "link unknown draft to comment" },
     .{ .chord = Chord.one('?'), .action = .help, .help = "toggle this help" },
+    .{ .chord = Chord.one(vaxis.Key.tab), .action = .focus_next_pane, .help = "switch Pane" },
 };
 
 pub const Keymap = struct {

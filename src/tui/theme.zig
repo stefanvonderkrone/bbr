@@ -15,6 +15,12 @@ const Color = vaxis.Cell.Color;
 const review_card = @import("review_card.zig");
 
 pub const Theme = struct {
+    /// Frame-owned Pane and Overlay chrome.
+    pane_border: Style = .{ .dim = true },
+    pane_border_focused: Style = .{ .bold = true },
+    overlay_border: Style = .{ .bold = true },
+    overlay_title: Style = .{ .bold = true },
+    section_rule: Style = .{ .dim = true },
     /// Unchanged lines — terminal default background.
     context: Style,
     /// Added lines — green band.

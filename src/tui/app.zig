@@ -664,6 +664,7 @@ fn drawStatus(
 test {
     _ = @import("buffer.zig");
     _ = @import("frame.zig");
+    _ = @import("file_tree.zig");
     _ = @import("render.zig");
     _ = @import("theme.zig");
     _ = @import("nav.zig");

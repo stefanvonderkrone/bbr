@@ -1,6 +1,6 @@
 # Add framed Panes and the Sidebar File Tree
 
-Status: ready-for-agent
+Status: ready-for-human
 
 ## What to build
 
@@ -8,12 +8,12 @@ Present the Sidebar and DiffPane as focused tiled Panes and replace the flat Fil
 
 ## Acceptance criteria
 
-- [ ] Sidebar and DiffPane use Frame-owned focused borders and joined one-row section rules; restrained single-line framing remains reserved for Overlays.
-- [ ] The Sidebar projects a deterministic compacted repository-path tree with stable Directory and File identities, grapheme-safe truncation, and fixed right-edge tallies.
-- [ ] `Tab` changes Pane focus; Sidebar `j`/`k`/`h`/`l` and arrow motions navigate, expand, collapse, and focus entries conventionally; `[` and `]` retain previous/next File navigation in the DiffPane.
-- [ ] A new Session starts in the DiffPane at the first File with all Directories expanded and the Sidebar cursor on the active File.
-- [ ] Active-File changes reopen its ancestors and reveal its row near the Sidebar center without destroying unrelated explicit Directory state.
-- [ ] Geometry and navigation tests cover empty and deep trees, long and Unicode paths, fixed tallies, zero/narrow/ordinary/wide terminals, resize, and Session replacement.
+- [x] Sidebar and DiffPane use Frame-owned focused borders and joined one-row section rules; restrained single-line framing remains reserved for Overlays.
+- [x] The Sidebar projects a deterministic compacted repository-path tree with stable Directory and File identities, grapheme-safe truncation, and fixed right-edge tallies.
+- [x] `Tab` changes Pane focus; Sidebar `j`/`k`/`h`/`l` and arrow motions navigate, expand, collapse, and focus entries conventionally; `[` and `]` retain previous/next File navigation in the DiffPane.
+- [x] A new Session starts in the DiffPane at the first File with all Directories expanded and the Sidebar cursor on the active File.
+- [x] Active-File changes reopen its ancestors and reveal its row near the Sidebar center without destroying unrelated explicit Directory state.
+- [x] Geometry and navigation tests cover empty and deep trees, long and Unicode paths, fixed tallies, zero/narrow/ordinary/wide terminals, resize, and Session replacement.
 
 ## Blocked by
 

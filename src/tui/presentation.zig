@@ -12,6 +12,7 @@ const file_enrichment = @import("file_enrichment.zig");
 const keymap_mod = @import("keymap.zig");
 const Picker = @import("picker.zig").Picker;
 const frame_mod = @import("frame.zig");
+const file_tree = frame_mod.file_tree;
 const buffer_mod = @import("buffer.zig");
 pub const FrameGeometry = frame_mod.Geometry;
 pub const Layout = buffer_mod.Layout;
@@ -601,6 +602,7 @@ const Published = struct {
         published: *Published,
         buffer: buffer_mod.Buffer,
         targets: []const frame_mod.SemanticTarget,
+        tree: file_tree.Projection,
         geometry: frame_mod.Geometry,
         active: bool = true,
 
@@ -615,6 +617,7 @@ const Published = struct {
             self.published.buffers.commit();
             self.published.buffer = self.buffer;
             self.published.targets = self.targets;
+            self.published.tree = self.tree;
             self.published.geometry = self.geometry;
             self.published.navigation = frame_mod.restoreNavigation(previous, self.targets, self.geometry);
             self.published.frame_revision += 1;
@@ -632,12 +635,15 @@ const Published = struct {
     buffers: ArenaRing(2),
     buffer: buffer_mod.Buffer,
     targets: []const frame_mod.SemanticTarget,
+    tree: file_tree.Projection,
     geometry: frame_mod.Geometry,
     frame_revision: frame_mod.Revision,
     cell_metrics: frame_mod.CellMetrics,
     comments_collapsed_rows: usize,
     navigation: Nav,
     expanded_disclosures: std.ArrayList(buffer_mod.DisclosureKey),
+    collapsed_directories: std.ArrayList([]const u8),
+    focus: frame_mod.PaneFocus,
     isolated_file: ?usize,
     composer_arena: std.heap.ArenaAllocator,
     composer: ?Composer,
@@ -702,6 +708,9 @@ const Published = struct {
         errdefer published.buffers.deinit();
         published.expanded_disclosures = .empty;
         errdefer published.expanded_disclosures.deinit(allocator);
+        published.collapsed_directories = .empty;
+        errdefer published.collapsed_directories.deinit(allocator);
+        published.focus = .diff;
         published.isolated_file = null;
         published.composer_arena = std.heap.ArenaAllocator.init(allocator);
         errdefer published.composer_arena.deinit();
@@ -737,8 +746,22 @@ const Published = struct {
             return error.BufferBuildFailed;
         };
         published.targets = try frame_mod.buildTargets(buffer_allocator, published.buffer.rows, cell_metrics);
+        const panes = frame_mod.paneRects(geometry);
+        published.tree = try file_tree.build(
+            buffer_allocator,
+            session.diff,
+            session.threads,
+            published.review.drafts.items,
+            published.collapsed_directories.items,
+            if (session.diff.files.len == 0) null else 0,
+            panes.sidebar_content.width,
+            panes.sidebar_content.height,
+            if (session.diff.files.len == 0) null else .{ .file = 0 },
+            0,
+            cell_metrics,
+        );
         published.buffers.commit();
-        published.navigation = Nav.init(published.buffer.rows.len, geometry.rows);
+        published.navigation = Nav.init(published.buffer.rows.len, panes.diff_content.height);
         return published;
     }
 
@@ -747,6 +770,8 @@ const Published = struct {
         if (self.composer) |*composer| composer.deinit();
         self.composer_arena.deinit();
         self.expanded_disclosures.deinit(allocator);
+        for (self.collapsed_directories.items) |path| allocator.free(path);
+        self.collapsed_directories.deinit(allocator);
         self.buffers.deinit();
         self.review_arena.deinit();
         self.session.destroy();
@@ -781,6 +806,8 @@ const Published = struct {
             .targets = self.targets,
             .buffer = self.buffer,
             .navigation = self.navigation,
+            .file_tree = self.tree,
+            .focus = self.focus,
         };
     }
 
@@ -905,13 +932,96 @@ const Published = struct {
             return error.BufferBuildFailed;
         };
         const targets = try frame_mod.buildTargets(allocator, candidate.rows, self.cell_metrics);
-        return .{ .published = self, .buffer = candidate, .targets = targets, .geometry = geometry };
+        const panes = frame_mod.paneRects(geometry);
+        const wanted_cursor = if (self.tree.entries.len == 0) null else self.tree.entries[self.tree.cursor].identity;
+        const active_file = if (self.session.diff.files.len == 0) null else isolated_file orelse fileIndexForRow(self.buffer, self.navigation.cursor);
+        const tree = try file_tree.build(
+            allocator,
+            self.session.diff,
+            self.session.threads,
+            self.review.drafts.items,
+            self.collapsed_directories.items,
+            active_file,
+            panes.sidebar_content.width,
+            panes.sidebar_content.height,
+            wanted_cursor,
+            self.tree.scroll,
+            self.cell_metrics,
+        );
+        return .{ .published = self, .buffer = candidate, .targets = targets, .tree = tree, .geometry = geometry };
     }
 
     fn commentsCollapsedRows(self: *const Published) usize {
         // Published projection policy is supplied by its owning Presentation;
         // keep the value alongside the other process preferences in a field.
         return self.comments_collapsed_rows;
+    }
+
+    fn activeFile(self: *const Published) ?usize {
+        if (self.session.diff.files.len == 0) return null;
+        return self.isolated_file orelse fileIndexForRow(self.buffer, self.navigation.cursor);
+    }
+
+    fn sidebarEntry(self: *const Published) ?file_tree.Entry {
+        if (self.tree.cursor >= self.tree.entries.len) return null;
+        return self.tree.entries[self.tree.cursor];
+    }
+
+    fn sidebarVertical(self: *Published, direction: i2) void {
+        self.navigation.count = 0;
+        if (self.tree.entries.len == 0) return;
+        if (direction > 0) self.tree.cursor = @min(self.tree.cursor + 1, self.tree.entries.len - 1) else self.tree.cursor -|= 1;
+        if (self.tree.cursor < self.tree.scroll) self.tree.scroll = self.tree.cursor;
+        if (self.tree.viewport > 0 and self.tree.cursor >= self.tree.scroll + self.tree.viewport) self.tree.scroll = self.tree.cursor + 1 - self.tree.viewport;
+        self.frame_revision += 1;
+    }
+
+    fn cursorToIdentity(self: *Published, identity: file_tree.Identity) void {
+        for (self.tree.entries, 0..) |entry, index| if (entry.identity.eql(identity)) {
+            self.tree.cursor = index;
+            if (index < self.tree.scroll) self.tree.scroll = index;
+            if (self.tree.viewport > 0 and index >= self.tree.scroll + self.tree.viewport) self.tree.scroll = index + 1 - self.tree.viewport;
+            self.frame_revision += 1;
+            return;
+        };
+    }
+
+    fn cursorToActiveFile(self: *Published) void {
+        const active = self.activeFile() orelse return;
+        for (self.tree.entries, 0..) |entry, index| {
+            const selected = (entry.identity == .file and entry.identity.file == active) or
+                (entry.identity == .directory and !entry.expanded and entry.active_descendant);
+            if (selected) {
+                self.tree.cursor = index;
+                if (index < self.tree.scroll) self.tree.scroll = index;
+                if (self.tree.viewport > 0 and index >= self.tree.scroll + self.tree.viewport) self.tree.scroll = index + 1 - self.tree.viewport;
+                return;
+            }
+        }
+    }
+
+    fn centerActiveFile(self: *Published) void {
+        const active = self.activeFile() orelse return;
+        for (self.tree.entries, 0..) |entry, index| if (entry.identity == .file and entry.identity.file == active) {
+            const half = self.tree.viewport / 2;
+            self.tree.scroll = @min(index -| half, self.tree.entries.len -| self.tree.viewport);
+            return;
+        };
+    }
+
+    fn collapseDirectory(self: *Published, path: []const u8) !void {
+        for (self.collapsed_directories.items) |candidate| if (std.mem.eql(u8, candidate, path)) return;
+        const owned = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned);
+        try self.collapsed_directories.append(self.allocator, owned);
+    }
+
+    fn takeCollapsedDirectory(self: *Published, path: []const u8) ?[]const u8 {
+        for (self.collapsed_directories.items, 0..) |candidate, index| if (std.mem.eql(u8, candidate, path)) {
+            _ = self.collapsed_directories.orderedRemove(index);
+            return candidate;
+        };
+        return null;
     }
 };
 
@@ -1702,6 +1812,7 @@ pub const Presentation = struct {
         };
         defer staged.deinit();
         staged.publish();
+        published.centerActiveFile();
         self.geometry = geometry;
         self.action_error = null;
     }
@@ -1744,9 +1855,12 @@ pub const Presentation = struct {
         if (self.replacement != null) return;
         const published = self.published orelse return;
         self.action_error = null;
+        const active_before = published.activeFile();
         switch (action) {
-            .down => published.navigation.down(),
-            .up => published.navigation.up(),
+            .down => if (published.focus == .sidebar) published.sidebarVertical(1) else published.navigation.down(),
+            .up => if (published.focus == .sidebar) published.sidebarVertical(-1) else published.navigation.up(),
+            .left => if (published.focus == .sidebar) self.sidebarLeft(published),
+            .right => if (published.focus == .sidebar) self.sidebarRight(published),
             .half_page_down => published.navigation.halfPageDown(),
             .half_page_up => published.navigation.halfPageUp(),
             .page_down => published.navigation.pageDown(),
@@ -1786,9 +1900,10 @@ pub const Presentation = struct {
                 self.action_error = null;
             },
             .isolate => self.toggleIsolation(published),
-            .next_file => self.moveFile(published, 1),
-            .prev_file => self.moveFile(published, -1),
-            .toggle_disclosure => self.toggleDisclosure(published),
+            .next_file => if (published.focus == .diff) self.moveFile(published, 1),
+            .prev_file => if (published.focus == .diff) self.moveFile(published, -1),
+            .toggle_disclosure => if (published.focus == .sidebar) self.activateSidebarEntry(published) else self.toggleDisclosure(published),
+            .focus_next_pane => self.togglePaneFocus(published),
             .comment => self.openComposer(published, .{ .kind = .comment, .label = "New comment" }),
             .reply => self.openReplyComposer(published),
             .inline_comment => self.openInlineComposer(published, .comment),
@@ -1800,6 +1915,96 @@ pub const Presentation = struct {
             .open_picker, .help => unreachable,
             .quit => unreachable,
         }
+        if (published.focus == .diff and active_before != published.activeFile()) self.revealActiveFile(published);
+    }
+
+    fn togglePaneFocus(self: *Presentation, published: *Published) void {
+        _ = self;
+        published.focus = if (published.focus == .diff) .sidebar else .diff;
+        if (published.focus == .sidebar) published.cursorToActiveFile();
+        published.frame_revision += 1;
+    }
+
+    fn sidebarLeft(self: *Presentation, published: *Published) void {
+        published.navigation.count = 0;
+        const entry = published.sidebarEntry() orelse return;
+        if (entry.identity == .directory and entry.expanded) {
+            published.collapseDirectory(entry.identity.directory) catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
+            published.rebuild(self.preferences, published.expanded_disclosures.items, published.isolated_file) catch |err| {
+                const path = published.collapsed_directories.pop().?;
+                published.allocator.free(path);
+                self.action_error = normalizeActionError(err);
+            };
+            return;
+        }
+        if (entry.parent) |parent| published.cursorToIdentity(parent);
+    }
+
+    fn sidebarRight(self: *Presentation, published: *Published) void {
+        published.navigation.count = 0;
+        const entry = published.sidebarEntry() orelse return;
+        if (entry.identity != .directory) return;
+        if (!entry.expanded) {
+            const removed = published.takeCollapsedDirectory(entry.identity.directory) orelse return;
+            published.rebuild(self.preferences, published.expanded_disclosures.items, published.isolated_file) catch |err| {
+                published.collapsed_directories.appendAssumeCapacity(removed);
+                self.action_error = normalizeActionError(err);
+                return;
+            };
+            published.allocator.free(removed);
+            return;
+        }
+        const next = published.tree.cursor + 1;
+        if (next < published.tree.entries.len and published.tree.entries[next].parent != null and published.tree.entries[next].parent.?.eql(entry.identity)) {
+            published.tree.cursor = next;
+            published.frame_revision += 1;
+        }
+    }
+
+    fn activateSidebarEntry(self: *Presentation, published: *Published) void {
+        const entry = published.sidebarEntry() orelse return;
+        switch (entry.identity) {
+            .directory => if (entry.expanded) self.sidebarLeft(published) else self.sidebarRight(published),
+            .file => |file_index| {
+                if (published.isolated_file != null) {
+                    published.rebuild(self.preferences, published.expanded_disclosures.items, file_index) catch |err| {
+                        self.action_error = normalizeActionError(err);
+                        return;
+                    };
+                    published.isolated_file = file_index;
+                    published.navigation = Nav.init(published.buffer.rows.len, frame_mod.paneRects(published.geometry).diff_content.height);
+                } else if (fileHeaderRow(published.buffer, file_index)) |row| published.navigation.jumpTo(row);
+                self.revealActiveFile(published);
+            },
+        }
+    }
+
+    fn revealActiveFile(self: *Presentation, published: *Published) void {
+        const active = published.activeFile() orelse return;
+        const path = published.session.diff.files[active].displayPath();
+        var removed: std.ArrayList([]const u8) = .empty;
+        defer removed.deinit(published.allocator);
+        removed.ensureTotalCapacity(published.allocator, published.collapsed_directories.items.len) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        var collapsed_index = published.collapsed_directories.items.len;
+        while (collapsed_index > 0) {
+            collapsed_index -= 1;
+            const candidate = published.collapsed_directories.items[collapsed_index];
+            if (path.len > candidate.len and std.mem.startsWith(u8, path, candidate) and path[candidate.len] == '/')
+                removed.appendAssumeCapacity(published.collapsed_directories.orderedRemove(collapsed_index));
+        }
+        published.rebuild(self.preferences, published.expanded_disclosures.items, published.isolated_file) catch |err| {
+            published.collapsed_directories.appendSliceAssumeCapacity(removed.items);
+            self.action_error = normalizeActionError(err);
+            return;
+        };
+        for (removed.items) |candidate| published.allocator.free(candidate);
+        published.centerActiveFile();
     }
 
     fn selectedUnknownDraft(published: *Published) ?*bbr.review.Draft {
@@ -2530,7 +2735,7 @@ pub const Presentation = struct {
         if (previous) |file_index| {
             if (fileHeaderRow(published.buffer, file_index)) |row| published.navigation.jumpTo(row);
         } else {
-            published.navigation = Nav.init(published.buffer.rows.len, self.geometry.rows);
+            published.navigation = Nav.init(published.buffer.rows.len, frame_mod.paneRects(self.geometry).diff_content.height);
         }
         self.action_error = null;
     }
@@ -2548,7 +2753,7 @@ pub const Presentation = struct {
                 return;
             };
             published.isolated_file = candidate;
-            published.navigation = Nav.init(published.buffer.rows.len, self.geometry.rows);
+            published.navigation = Nav.init(published.buffer.rows.len, frame_mod.paneRects(self.geometry).diff_content.height);
             self.action_error = null;
             return;
         }
@@ -3051,6 +3256,8 @@ test "resize publishes one complete Presentation Frame revision" {
     try testing.expectEqual(after.revision, after.targets_revision);
     try testing.expect(owner.eql(after.targets[after.navigation.cursor].owner));
     try testing.expectEqual(navigated.navigation.mark, after.navigation.mark);
+    try testing.expectEqual(@as(usize, after.panes.sidebar_content.height), after.file_tree.viewport);
+    try testing.expect(after.file_tree.entries[after.file_tree.cursor].active);
 }
 
 fn testTwoFileSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
@@ -3095,6 +3302,60 @@ fn testTwoFileSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session
     );
     try s.initializeEnrichment();
     return s;
+}
+
+test "Pane focus gives the Sidebar an independent cursor while DiffPane File motions remain complete" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 10 },
+    });
+    defer presentation.deinit();
+
+    var frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
+    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 0 }));
+
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try presentation.dispatch(.{ .action = .down });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(frame_mod.PaneFocus.sidebar, frame.focus);
+    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 1 }));
+    try presentation.dispatch(.{ .action = .toggle_disclosure });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(usize, 1), fileIndexForRow(frame.buffer, frame.navigation.cursor));
+
+    // File Actions are scoped to the DiffPane and do not consume Sidebar state.
+    try presentation.dispatch(.{ .action = .prev_file });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(usize, 1), fileIndexForRow(frame.buffer, frame.navigation.cursor));
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try presentation.dispatch(.{ .action = .prev_file });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(usize, 0), fileIndexForRow(frame.buffer, frame.navigation.cursor));
+    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 1 }));
+}
+
+test "successful Session replacement resets Pane and Sidebar defaults" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 10 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try presentation.dispatch(.{ .action = .down });
+
+    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    const command = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{ .intent = command.intent, .outcome = .{ .loaded = try testTwoFileSession(testing.allocator, 2) } } });
+    const frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
+    try testing.expectEqual(@as(usize, 0), frame.navigation.cursor);
+    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 0 }));
+    for (frame.file_tree.entries) |entry| if (entry.identity == .directory) try testing.expect(entry.expanded);
 }
 
 fn testDisclosureSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
