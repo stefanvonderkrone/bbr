@@ -1521,7 +1521,10 @@ pub const Presentation = struct {
     /// The sole mutation entry point. Candidate construction consumes a loaded
     /// Session whether it commits, fails, or proves stale.
     pub fn dispatch(self: *Presentation, input: OwnedInput) !void {
-        if (input != .mouse) {
+        // A candidate completion is not itself an interaction or a Frame
+        // change. Keep a press across rollback; a committed replacement
+        // invalidates it below when the new Session becomes published.
+        if (input != .mouse and input != .session_loaded) {
             self.mouse_press = null;
             self.interaction_revision +%= 1;
         }
@@ -3388,6 +3391,8 @@ pub const Presentation = struct {
                 self.published = candidate;
                 self.next_session_epoch = epoch;
                 self.resolver = .{};
+                self.mouse_press = null;
+                self.interaction_revision +%= 1;
                 self.replacement = null;
                 self.replacement_error = null;
                 self.action_error = null;
@@ -3742,6 +3747,114 @@ fn testTwoFileSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session
     return s;
 }
 
+fn testUnicodeSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
+    const s = try testSession(backing, id, 'u');
+    errdefer s.destroy();
+    s.diff = try bbr.diff.parse(s.arena.allocator(),
+        \\diff --git a/unicode.zig b/unicode.zig
+        \\--- a/unicode.zig
+        \\+++ b/unicode.zig
+        \\@@ -1 +1 @@
+        \\-plain
+        \\+é界👩‍💻
+    );
+    const comments = try s.arena.allocator().alloc(bbr.review.Comment, 1);
+    comments[0] = .{
+        .id = 1,
+        .author = "Metrics",
+        .body = "é界👩‍💻",
+        .anchor = .{ .path = "unicode.zig", .to = 1 },
+    };
+    s.threads = try bbr.review.buildThreads(s.arena.allocator(), comments);
+    return s;
+}
+
+const matrix_graphemes = [_]struct { text: []const u8, cell_width: usize }{
+    .{ .text = "é", .cell_width = 1 },
+    .{ .text = "界", .cell_width = 2 },
+    .{ .text = "👩‍💻", .cell_width = 2 },
+};
+
+const MatrixGraphemeMetrics = struct {
+    fn next(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
+        for (matrix_graphemes) |grapheme| if (std.mem.startsWith(u8, text, grapheme.text))
+            return .{ .byte_len = grapheme.text.len, .cell_width = grapheme.cell_width };
+        const byte_len = std.unicode.utf8ByteSequenceLength(text[0]) catch 1;
+        return .{ .byte_len = @min(@as(usize, byte_len), text.len), .cell_width = 1 };
+    }
+
+    const context: u8 = 0;
+    const vtable: frame_mod.CellMetrics.VTable = .{ .next = next };
+    const value: frame_mod.CellMetrics = .{ .ptr = &context, .vtable = &vtable };
+};
+
+fn expectCompleteMatrixGraphemes(text: []const u8) !void {
+    var remaining = text;
+    while (remaining.len > 0) {
+        var matched = false;
+        for (matrix_graphemes) |grapheme| {
+            if (!std.mem.startsWith(u8, remaining, grapheme.text)) continue;
+            remaining = remaining[grapheme.text.len..];
+            matched = true;
+            break;
+        }
+        if (!matched) return error.SplitGrapheme;
+    }
+}
+
+test "M15 Layout Scope and geometry matrix restores a Unicode source row" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .cell_metrics = MatrixGraphemeMetrics.value,
+    }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testUnicodeSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 10 },
+    });
+    defer presentation.deinit();
+
+    var source_row: usize = 0;
+    for (presentation.projection().review.?.buffer.rows, 0..) |row, index| {
+        if (row == .line and row.line.line.kind == .added) {
+            source_row = index;
+            break;
+        }
+    }
+    try moveToRow(&presentation, source_row);
+    const owner = presentation.projection().review.?.frame.targets[source_row].owner;
+    const geometries = [_]frame_mod.Geometry{
+        .{ .cols = 0, .rows = 0 },
+        .{ .cols = 8, .rows = 2 },
+        .{ .cols = 80, .rows = 24 },
+        .{ .cols = 240, .rows = 80 },
+    };
+    try testing.expectEqual(@as(usize, 5), MatrixGraphemeMetrics.value.width("é界👩‍💻"));
+
+    for (0..2) |layout_index| {
+        if (layout_index > 0) try presentation.dispatch(.{ .action = .toggle_layout });
+        for (0..3) |scope_index| {
+            if (scope_index > 0) try presentation.dispatch(.{ .action = .cycle_scope });
+            for (geometries) |geometry| {
+                try presentation.dispatch(.{ .resize = geometry });
+                const review = presentation.projection().review.?;
+                try testing.expectEqual(geometry, review.frame.geometry);
+                try testing.expect(review.frame.targets_revision <= review.frame.revision);
+                try testing.expect(review.navigation.cursor < review.frame.targets.len);
+                try testing.expect(owner.eql(review.frame.targets[review.navigation.cursor].owner));
+                try testing.expectEqualStrings("é界👩‍💻", lineAtRow(review.buffer.rows[review.navigation.cursor]).?.text);
+                var saw_projected_body = false;
+                for (review.buffer.rows) |row| if (row == .comment and row.comment.part == .body) {
+                    saw_projected_body = true;
+                    for (row.comment.segments) |segment| try expectCompleteMatrixGraphemes(segment.text);
+                };
+                try testing.expect(saw_projected_body);
+            }
+        }
+        try presentation.dispatch(.{ .action = .cycle_scope });
+    }
+}
+
 fn testDirectorySession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
     const s = try testTwoFileSession(backing, id);
     errdefer s.destroy();
@@ -3915,6 +4028,39 @@ test "side-by-side yank applies provisional new-side-first source selection" {
     try testing.expectEqualStrings("new a", command.copy_clipboard.text);
     try presentation.dispatch(.{ .clipboard_completed = true });
     try testing.expectEqual(ClipboardStatus.copied, presentation.projection().clipboard_status.?);
+}
+
+test "Selection overrides Count for yank and clipboard failure is visible" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 10 },
+    });
+    defer presentation.deinit();
+
+    var first_context: ?usize = null;
+    for (presentation.projection().review.?.buffer.rows, 0..) |row, index| {
+        const line = lineAtRow(row) orelse continue;
+        if (std.mem.eql(u8, line.text, "c1")) {
+            first_context = index;
+            break;
+        }
+    }
+    try testing.expect(first_context != null);
+    try moveToRow(&presentation, first_context.?);
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .push_count_digit = 9 });
+    try presentation.dispatch(.{ .action = .yank });
+
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqualStrings("c1\nc2", command.copy_clipboard.text);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.count);
+    try testing.expect(presentation.projection().review.?.navigation.mark == null);
+    try presentation.dispatch(.{ .clipboard_completed = false });
+    try testing.expectEqual(ClipboardStatus.failed, presentation.projection().clipboard_status.?);
 }
 
 test "successful Session replacement resets Pane and Sidebar defaults" {
@@ -6096,6 +6242,41 @@ test "mouse activates Sidebar Files and disclosures and replacement cancels a pr
     const replacement = presentation.projection().review.?.frame;
     try presentation.dispatch(.{ .mouse = .{ .col = replacement.panes.diff_content.x, .row = replacement.panes.diff_content.y + 1, .button = .left, .type = .release } });
     try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.cursor);
+}
+
+test "failed Session replacement preserves a pending mouse press" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 10 },
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    const load = presentation.takeCommand().?.load_session;
+    const frame = presentation.projection().review.?.frame;
+    const target_row = frame.panes.diff_content.y + 2;
+    try presentation.dispatch(.{ .mouse = .{
+        .col = frame.panes.diff_content.x,
+        .row = target_row,
+        .button = .left,
+        .type = .press,
+    } });
+
+    try presentation.dispatch(.{ .session_loaded = .{
+        .intent = load.intent,
+        .outcome = .{ .failed = error.NetworkFailure },
+    } });
+    try presentation.dispatch(.{ .mouse = .{
+        .col = frame.panes.diff_content.x,
+        .row = target_row,
+        .button = .left,
+        .type = .release,
+    } });
+
+    try testing.expectEqual(@as(usize, 2), presentation.projection().review.?.navigation.cursor);
+    try testing.expectEqual(ReplacementError.session_load_failed, presentation.projection().replacement_error.?);
 }
 
 test "Sidebar mouse click toggles a Directory and focuses a child File" {
