@@ -28,6 +28,7 @@ An implementation-ready M15 specification and dependency map in which every pres
 - [Choose File finder and PullRequest Picker behavior](issues/09-choose-file-finder-and-picker-behavior.md) — Use separate purpose-shaped Overlays with shared navigation, all-open PullRequest startup, title-first ranking, and Enter-only confirmation.
 - [Choose File cache configuration language](issues/10-choose-file-cache-configuration-language.md) — Use `enabled` and `max_bytes` for the inactive in-memory File cache, with 256 MiB by default, zero meaning unlimited, and the focused File outside the budget.
 - [Decide Picker loading feedback](issues/11-decide-picker-loading-feedback.md) — Add a single-glyph Picker spinner driven by scoped tick events through the blocking event path; avoid richer indeterminate animation.
+- [Choose the File-level Comment model](issues/13-choose-file-level-comment-model.md) — Use an exhaustive root-owned CommentScope, scope-wide Session projection, and File-header placement without overloading line Anchors.
 
 ## Not yet specified
 

@@ -11,25 +11,33 @@ The durable identity of one Review: either a Workspace/Repository/PullRequestId 
 _Avoid_: ReviewKey, Session identity, commit pair.
 
 **Anchor**:
-The location a Comment attaches to: a File `path`, the **commit** containing its anchored side, plus line coordinates `{ from, to, start_from, start_to }`, where `from`/`start_from` are old-file lines and `to`/`start_to` are new-file lines. In a LocalReview, an old-side Anchor binds to the resolved BaseRef commit and a new-side Anchor binds to the resolved SourceRef commit. A range spans `start_*` → `from`/`to`; captured context keeps an unresolved or outdated Comment legible.
+The line or range an inline Comment attaches to: a File `path`, the **commit** containing its anchored side, plus line coordinates `{ from, to, start_from, start_to }`, where `from`/`start_from` are old-file lines and `to`/`start_to` are new-file lines. In a LocalReview, an old-side Anchor binds to the resolved BaseRef commit and a new-side Anchor binds to the resolved SourceRef commit. A range spans `start_*` → `from`/`to`; captured context keeps an unresolved or outdated Comment legible. An Anchor always has line coordinates; a File-level Comment uses a File scope instead.
 _Avoid_: position, location, target, ref.
 
-**AnchorState**:
-The successful verdict for an Anchor against the currently viewed Diff: `current` (same path and coordinates), `moved` (Git proves the same Anchor at different coordinates or a renamed path), or `outdated` (the anchored content no longer exists). For remote Comments we trust Bitbucket's verdict; for local Comments and Drafts we compute it by diff-walking via the GitClient.
+**CommentScope**:
+The exhaustive scope of a root Comment or root Draft: `pull_request`, `file` carrying a FileScope, or `inline` carrying an Anchor. Replies carry only their parent and inherit the root's CommentScope.
+_Avoid_: optional Anchor, placement, target (reserved for CommentTarget).
+
+**FileScope**:
+The durable authored identity of a File-level Comment: its path and the source commit of the Session in which it was authored. On LocalReview refresh, it remains `current` at the same path, becomes `moved` only when Git proves a rename, becomes `outdated` when Git proves the File no longer participates, and is `unavailable` when the evidence cannot be obtained; the authored FileScope never mutates.
+_Avoid_: path-only Anchor, File Anchor, current File.
+
+**ScopeState**:
+The successful verdict for a File or inline CommentScope against the currently viewed Diff: `current` (same path and, for inline scope, coordinates), `moved` (Git proves a renamed File or moved inline Anchor), or `outdated` (the scoped File or anchored content no longer participates). For remote Comments we trust Bitbucket's verdict; for local Comments and Drafts we compute it by diff-walking via the GitClient.
 _Avoid_: status, stale, dangling.
 
-**AnchorResolution**:
-The result of attempting to place an Anchor against the currently viewed Diff: either a resolved AnchorState or `unavailable` when required Git history or mapping evidence cannot be obtained. Unavailable never implies outdated and retains the Anchor's captured context.
-_Avoid_: AnchorState (only a successful verdict), unknown state, assumed outdated.
+**ScopeResolution**:
+The result of attempting to place a CommentScope against the currently viewed Diff: either a resolved ScopeState carrying the projected CommentScope or `unavailable` when required Git history or mapping evidence cannot be obtained. PullRequest scope always resolves unchanged. Unavailable never implies outdated and retains the durable authored scope and any captured context.
+_Avoid_: ScopeState (only a successful verdict), unknown state, assumed outdated.
 
-An AnchorResolution is derived projection data, not durable authored state. For Drafts it lives in the Presentation-owned AnchorProjection keyed by root TempId; the PendingReview retains only the original Anchor and AnchorSnapshot. Replies inherit their root's projected placement.
+A ScopeResolution is derived projection data, not durable authored state. For Drafts it lives in the Presentation-owned ScopeProjection keyed by root TempId; the PendingReview retains only the original CommentScope and any inline AnchorSnapshot. Replies inherit their root's projected placement.
 
 **AnchorSnapshot**:
-The immutable authored code stored with a root local Draft: its complete selected range plus three surrounding lines on each side. It keeps outdated or unavailable Anchors legible but never participates in mapping or silently changes an Anchor; Replies inherit their root Draft's snapshot.
+The immutable authored code stored only with an inline root local Draft: its complete selected range plus three surrounding lines on each side. It keeps outdated or unavailable inline scopes legible but never participates in mapping or silently changes an Anchor; Replies inherit their root Draft's snapshot. File-level Drafts retain their authored path, body, and Replies without copying the File's contents.
 _Avoid_: fuzzy-match context, cached blob, projected source.
 
 **Outdated**:
-The `outdated` AnchorState. Outdated Comments and Drafts are never hidden — Presentation shows them with their AnchorSnapshot in an always-expanded File or review-level section.
+The `outdated` ScopeState. Outdated Comments and Drafts are never hidden — Presentation shows them with any available AnchorSnapshot in a File or review-level disclosure section.
 _Avoid_: stale, orphaned, dead.
 
 **CommentTarget**:
@@ -37,11 +45,11 @@ Where every Draft in one PendingReview lives: `bitbucket` (Drafts submit) or `lo
 _Avoid_: backend, sink, destination.
 
 **Comment**:
-A piece of authored prose on a PullRequest, optionally scoped to a File or anchored to lines. May be a root comment or a Reply. The generic term; prefer Thread/Reply/Suggestion when the role is specific.
+A piece of authored prose on a PullRequest. A root carries exactly one CommentScope; a Reply inherits its root's scope through its parent. The generic term; prefer Thread/Reply/Suggestion when the role is specific.
 _Avoid_: note, remark, message.
 
 **File-level Comment**:
-A root Comment scoped to one File as a whole, without line coordinates. It is distinct from both an inline Comment, whose Anchor identifies lines, and a PullRequest-level Comment, which belongs to no File.
+A root Comment scoped through a FileScope to one File as a whole, without line coordinates. It is distinct from both an inline Comment, whose Anchor identifies lines, and a PullRequest-level Comment, which belongs to no File.
 _Avoid_: whole-File Comment (confusable with the WholeFile Diff scope), unanchored inline Comment.
 
 **Thread**:
@@ -53,7 +61,7 @@ A non-root Comment whose parent is another Comment (which may itself still be a 
 _Avoid_: child, response, answer.
 
 **Suggestion**:
-A Comment whose body contains a fenced ```suggestion``` block proposing replacement lines. Authoring one prefills the composer with the current source of the anchored line(s), so the reviewer edits real code inside the fence rather than retyping it. A Suggestion is only meaningful over new-file lines — Bitbucket refuses to *apply* a suggestion anchored to removed lines — so authoring one over an old-side (deletion) range is refused. *Applying* a Suggestion stays in the Bitbucket web UI.
+A Comment whose body contains a fenced ```suggestion``` block proposing replacement lines. It may be an inline root or a Reply in an inline Thread; a Reply inherits the root's inline CommentScope. Authoring one prefills the composer with the current source of the anchored line(s), so the reviewer edits real code inside the fence rather than retyping it. A Suggestion is only meaningful over new-file lines — Bitbucket refuses to *apply* a suggestion anchored to removed lines — so authoring one outside an inline Thread or over an old-side (deletion) range is refused. *Applying* a Suggestion stays in the Bitbucket web UI.
 _Avoid_: patch, fix, edit, proposal.
 
 **Selection**:
@@ -61,8 +69,10 @@ A contiguous run of diff lines the reviewer marks (via `v` or shift+arrow) to an
 _Avoid_: highlight, mark, region.
 
 **Draft**:
-An authored-but-unpublished Comment/Reply/Suggestion held locally. Carries a local temp id, its DraftState, and — for a root Draft — an Anchor. A *reply* Draft carries no Anchor of its own: its location comes from its parent. The parent link (not a copied Anchor) is the single expression of that relationship — it drives both rendering placement and Submission ordering. A reply therefore shares its parent's visibility: hide the parent thread (resolved, toggle off) and the reply hides with it. The atom of a Pending Review.
+An authored-but-unpublished Comment/Reply/Suggestion held locally. Carries a local temp id, its DraftState, and — for a root Draft — exactly one CommentScope. A *reply* Draft carries no scope of its own: its scope comes from its parent. The parent link (not a copied scope) is the single expression of that relationship — it drives both rendering placement and Submission ordering. A reply therefore shares its parent's visibility: hide the parent thread (resolved, toggle off) and the reply hides with it. The atom of a Pending Review.
 _Avoid_: pending comment, unsent, staged.
+
+Draft kind (`comment` or `suggestion`), parentage, and CommentScope are orthogonal. A Suggestion may be a root or a Reply, but its effective inherited CommentScope must be `inline`.
 
 **DraftState**:
 A Draft's lifecycle: `draft` → `submitting` → `posted` (carries the server-assigned CommentId), `failed` (carries a confirmed ApiError reason), or `outcome_unknown` (every Duplicate-guarded retry still lost the POST response, so publication remains unresolved). Persisted, so a crash resumes mid-Submission. An `outcome_unknown` Draft remains immutable until the reviewer links it to an existing Comment or confirms it was not published. `posted` is a *transient reconciliation* state, not a permanent record: it exists to survive a crash mid-batch, and the Draft's row is deleted once the whole Submission batch succeeds — thereafter the published Comment lives only on Bitbucket (ADR-0007).

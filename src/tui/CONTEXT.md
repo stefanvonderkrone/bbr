@@ -46,12 +46,12 @@ The identity of one published Session. Session-bound work such as File Enrichmen
 _Avoid_: PR id (identifies the PullRequest, not one Session), generation, version, token, nonce.
 
 **Candidate Session**:
-A privately staged replacement for the published Session. For a LocalReview, loading it includes resolving every persisted root Draft Anchor against the candidate's resolved Refs before publication. Every attempt finishes as `current`, `moved`, `outdated`, or `unavailable`; an unavailable Anchor is usable fallback content, not a failed candidate. Presentation publishes the candidate only after this phase and initial Buffer construction complete.
+A privately staged replacement for the published Session. For a LocalReview, loading it includes resolving every persisted root Draft CommentScope against the candidate's resolved Refs before publication. Every attempt finishes as `current`, `moved`, `outdated`, or `unavailable`; unavailable placement is usable fallback content, not a failed candidate. Presentation publishes the candidate only after this phase and initial Buffer construction complete.
 _Avoid_: partially loaded Session, hydration state, incremental refresh.
 
-**AnchorProjection**:
-The Session-scoped placement of a PendingReview's root Draft Anchors, keyed by root TempId. It is derived from the durable authored Anchor plus the current Session and owns each AnchorResolution and projected coordinates; Replies reuse their root's entry. It belongs to the published review aggregate, not to Session or PendingReview, and is rebuilt on Session replacement. A newly saved Draft enters it as `current` because it was authored against that Session.
-_Avoid_: persisted anchor state, resolved Draft, mutable Anchor.
+**ScopeProjection**:
+The Session-scoped placement of a PendingReview's root Draft CommentScopes, keyed by root TempId. It is derived from the durable authored scope plus the current Session and owns each ScopeResolution and projected scope; Replies reuse their root's entry. PullRequest scope resolves unchanged, while File and inline scopes may move or become outdated or unavailable. It belongs to the published review aggregate, not to Session or PendingReview, and is rebuilt on Session replacement. A newly saved Draft enters it as `current` because it was authored against that Session.
+_Avoid_: persisted scope state, resolved Draft, mutable CommentScope, AnchorProjection.
 
 **Durable Operation**:
 Reviewer-authorized work that belongs to a PullRequest rather than to the Session that started it. A Submission remains valid and persists its outcomes when that Session is replaced; only projecting its progress or result into the current screen depends on which Session is published.
