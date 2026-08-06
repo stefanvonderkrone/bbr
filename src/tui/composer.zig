@@ -123,7 +123,7 @@ pub const Composer = struct {
 const testing = std.testing;
 
 test "typing, newline, and backspace build the body" {
-    var comp = Composer.init(testing.allocator, .{ .kind = .top_level, .label = "New comment" });
+    var comp = Composer.init(testing.allocator, .{ .kind = .comment, .label = "New comment" });
     defer comp.deinit();
 
     try testing.expect(comp.isBlank());
@@ -152,7 +152,7 @@ test "seed prefills the body and can then be edited from the end" {
 }
 
 test "blank detection ignores whitespace-only bodies" {
-    var comp = Composer.init(testing.allocator, .{ .kind = .top_level, .label = "x" });
+    var comp = Composer.init(testing.allocator, .{ .kind = .comment, .label = "x" });
     defer comp.deinit();
     try comp.insert("  \t");
     try comp.newline();
@@ -161,7 +161,7 @@ test "blank detection ignores whitespace-only bodies" {
 
 test "toNewDraft carries the request's kind, anchor, and parent" {
     var comp = Composer.init(testing.allocator, .{
-        .kind = .reply,
+        .kind = .comment,
         .anchor = .{ .path = "f.zig", .to = 12, .commit = "abc" },
         .parent = .{ .draft = 3 },
         .label = "Reply",
@@ -170,7 +170,7 @@ test "toNewDraft carries the request's kind, anchor, and parent" {
     try comp.insert("agreed");
 
     const nd = comp.toNewDraft();
-    try testing.expect(nd.kind == .reply);
+    try testing.expect(nd.kind == .comment);
     try testing.expectEqualStrings("f.zig", nd.anchor.?.path);
     try testing.expectEqualStrings("abc", nd.anchor.?.commit.?);
     try testing.expect(nd.parent.? == .draft and nd.parent.?.draft == 3);
@@ -178,14 +178,14 @@ test "toNewDraft carries the request's kind, anchor, and parent" {
 }
 
 test "backspace on an empty body is a no-op" {
-    var comp = Composer.init(testing.allocator, .{ .kind = .top_level, .label = "x" });
+    var comp = Composer.init(testing.allocator, .{ .kind = .comment, .label = "x" });
     defer comp.deinit();
     comp.backspace();
     try testing.expectEqual(@as(usize, 0), comp.body().len);
 }
 
 test "deleteWord drops trailing spaces then the last word" {
-    var comp = Composer.init(testing.allocator, .{ .kind = .top_level, .label = "x" });
+    var comp = Composer.init(testing.allocator, .{ .kind = .comment, .label = "x" });
     defer comp.deinit();
     try comp.insert("hello world  ");
     comp.deleteWord();
@@ -197,7 +197,7 @@ test "deleteWord drops trailing spaces then the last word" {
 }
 
 test "deleteWord at a line start joins to the previous line" {
-    var comp = Composer.init(testing.allocator, .{ .kind = .top_level, .label = "x" });
+    var comp = Composer.init(testing.allocator, .{ .kind = .comment, .label = "x" });
     defer comp.deinit();
     try comp.insert("first");
     try comp.newline();
@@ -206,7 +206,7 @@ test "deleteWord at a line start joins to the previous line" {
 }
 
 test "deleteToLineStart clears the current line, keeping earlier ones" {
-    var comp = Composer.init(testing.allocator, .{ .kind = .top_level, .label = "x" });
+    var comp = Composer.init(testing.allocator, .{ .kind = .comment, .label = "x" });
     defer comp.deinit();
     try comp.insert("line one");
     try comp.newline();

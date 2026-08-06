@@ -124,6 +124,7 @@ pub const ReviewKey = struct {
 pub const Dependencies = struct {
     reviews: bbr.review.PendingReviewStore,
     anchor_resolver: ?bbr.review.AnchorResolver = null,
+    scope_resolver: ?bbr.review.ScopeResolver = null,
     submission_locks: ?bbr.review.SubmissionLocks = null,
     highlight_max_file_bytes: usize = 0,
     file_cache_enabled: bool = true,
@@ -627,7 +628,7 @@ const Published = struct {
     session: *Session,
     review_arena: std.heap.ArenaAllocator,
     review: bbr.review.PendingReview,
-    anchor_projection: std.ArrayList(bbr.review.AnchorProjectionEntry),
+    scope_projection: std.ArrayList(bbr.review.ScopeProjectionEntry),
     buffers: ArenaRing(2),
     buffer: buffer_mod.Buffer,
     targets: []const frame_mod.SemanticTarget,
@@ -644,6 +645,7 @@ const Published = struct {
         allocator: Allocator,
         store: bbr.review.PendingReviewStore,
         anchor_resolver: ?bbr.review.AnchorResolver,
+        scope_resolver: ?bbr.review.ScopeResolver,
         key: ReviewKey,
         epoch: SessionEpoch,
         session: *Session,
@@ -670,21 +672,29 @@ const Published = struct {
         for (published.review.drafts.items) |draft| {
             if (draft.target != expected_target) return error.PendingReviewLoadFailed;
         }
-        published.anchor_projection = .empty;
-        if (!key.isRemote()) {
-            for (published.review.drafts.items) |draft| {
-                if (draft.parent != null) continue;
-                const anchor = draft.anchor orelse continue;
-                const current_commit = if (anchor.to != null) session.header.source_commit else session.header.base_commit;
-                const resolution: bbr.review.AnchorResolution = if (anchor_resolver) |resolver|
-                    resolver.resolve(published.review_arena.allocator(), anchor, current_commit) catch .unavailable
-                else
-                    .unavailable;
-                try published.anchor_projection.append(published.review_arena.allocator(), .{
-                    .temp_id = draft.local_id,
-                    .resolution = resolution,
-                });
-            }
+        published.scope_projection = .empty;
+        for (published.review.drafts.items) |draft| {
+            if (draft.parent != null) continue;
+            const authored = draft.effectiveScope();
+            const current_commit = switch (authored) {
+                .@"inline" => |anchor| if (anchor.to != null) session.header.source_commit else session.header.base_commit,
+                else => session.header.source_commit,
+            };
+            const resolution: bbr.review.ScopeResolution = if (key.isRemote())
+                .{ .resolved = .{ .state = .current, .scope = authored } }
+            else if (scope_resolver) |resolver|
+                resolver.resolve(published.review_arena.allocator(), authored, current_commit) catch .unavailable
+            else if (authored == .@"inline" and anchor_resolver != null) blk: {
+                const legacy = anchor_resolver.?.resolve(published.review_arena.allocator(), authored.@"inline", current_commit) catch .unavailable;
+                break :blk switch (legacy) {
+                    .unavailable => .unavailable,
+                    .resolved => |value| .{ .resolved = .{ .state = value.state, .scope = .{ .@"inline" = value.anchor } } },
+                };
+            } else if (authored == .review)
+                .{ .resolved = .{ .state = .current, .scope = .review } }
+            else
+                .unavailable;
+            try published.scope_projection.append(published.review_arena.allocator(), .{ .temp_id = draft.local_id, .resolution = resolution });
         }
         published.buffers = ArenaRing(2).init(allocator);
         errdefer published.buffers.deinit();
@@ -710,7 +720,7 @@ const Published = struct {
             session.threads,
             .{
                 .drafts = published.review.drafts.items,
-                .anchor_projections = published.anchor_projection.items,
+                .scope_projections = published.scope_projection.items,
                 .blobs = enrichment.blobs,
                 .highlights = enrichment.highlights,
                 .show_resolved = preferences.show_resolved,
@@ -804,6 +814,7 @@ const Published = struct {
             .kind = new_draft.kind,
             .target = new_draft.target,
             .parent = new_draft.parent,
+            .scope = if (new_draft.parent == null) new_draft.scope else null,
             .snapshot = if (new_draft.snapshot) |snapshot| .{
                 .text = try review_allocator.dupe(u8, snapshot.text),
                 .selection_start = snapshot.selection_start,
@@ -814,6 +825,19 @@ const Published = struct {
             else
                 try review_allocator.dupe(u8, new_draft.body),
         };
+        if (draft.scope) |scope| switch (scope) {
+            .review => {},
+            .file => |file| draft.scope = .{ .file = .{
+                .path = try review_allocator.dupe(u8, file.path),
+                .source_commit = try review_allocator.dupe(u8, file.source_commit),
+            } },
+            .@"inline" => |anchor| {
+                var owned = anchor;
+                owned.path = try review_allocator.dupe(u8, anchor.path);
+                if (anchor.commit) |commit| owned.commit = try review_allocator.dupe(u8, commit);
+                draft.scope = .{ .@"inline" = owned };
+            },
+        };
         if (new_draft.anchor) |anchor| {
             draft.anchor = anchor;
             draft.anchor.?.path = try review_allocator.dupe(u8, anchor.path);
@@ -821,19 +845,19 @@ const Published = struct {
         }
 
         const previous_len = self.review.drafts.items.len;
-        const previous_projection_len = self.anchor_projection.items.len;
+        const previous_projection_len = self.scope_projection.items.len;
         const previous_next_id = self.review.next_id;
         self.review.drafts.appendAssumeCapacity(draft);
         self.review.next_id = @max(self.review.next_id, reserved_id + 1);
         errdefer {
             self.review.drafts.shrinkRetainingCapacity(previous_len);
-            self.anchor_projection.shrinkRetainingCapacity(previous_projection_len);
+            self.scope_projection.shrinkRetainingCapacity(previous_projection_len);
             self.review.next_id = previous_next_id;
         }
-        if (!self.key.isRemote() and draft.parent == null and draft.anchor != null) {
-            self.anchor_projection.append(review_allocator, .{
+        if (draft.parent == null) {
+            self.scope_projection.append(review_allocator, .{
                 .temp_id = draft.local_id,
-                .resolution = .{ .resolved = .{ .state = .current, .anchor = draft.anchor.? } },
+                .resolution = .{ .resolved = .{ .state = .current, .scope = draft.effectiveScope() } },
             }) catch return error.OutOfMemory;
         }
 
@@ -864,7 +888,7 @@ const Published = struct {
                 .whole_file = preferences.scope == .whole,
                 .expanded = expanded_folds,
                 .drafts = self.review.drafts.items,
-                .anchor_projections = self.anchor_projection.items,
+                .scope_projections = self.scope_projection.items,
                 .only_file = isolated_file,
                 .blobs = enrichment.blobs,
                 .highlights = enrichment.highlights,
@@ -1263,6 +1287,7 @@ pub const Presentation = struct {
                 allocator,
                 dependencies.reviews,
                 dependencies.anchor_resolver,
+                dependencies.scope_resolver,
                 initial.key,
                 self.next_session_epoch,
                 initial.session,
@@ -1756,9 +1781,9 @@ pub const Presentation = struct {
             .next_file => self.moveFile(published, 1),
             .prev_file => self.moveFile(published, -1),
             .expand_fold => self.expandFold(published),
-            .comment => self.openComposer(published, .{ .kind = .top_level, .label = "New comment" }),
+            .comment => self.openComposer(published, .{ .kind = .comment, .label = "New comment" }),
             .reply => self.openReplyComposer(published),
-            .inline_comment => self.openInlineComposer(published, .inline_comment),
+            .inline_comment => self.openInlineComposer(published, .comment),
             .suggest => self.openInlineComposer(published, .suggestion),
             .submit => self.startSubmission(published),
             .recover_submission => unreachable,
@@ -2210,7 +2235,7 @@ pub const Presentation = struct {
                 return;
             },
         };
-        self.openComposer(published, .{ .kind = .reply, .parent = parent, .label = "Reply" });
+        self.openComposer(published, .{ .kind = .comment, .parent = parent, .label = "Reply" });
     }
 
     fn openInlineComposer(self: *Presentation, published: *Published, kind: bbr.review.DraftKind) void {
@@ -2689,6 +2714,7 @@ pub const Presentation = struct {
                     self.allocator,
                     self.dependencies.reviews,
                     self.dependencies.anchor_resolver,
+                    self.dependencies.scope_resolver,
                     replacement.key,
                     epoch,
                     session,
@@ -3365,7 +3391,7 @@ test "Reply on a Draft row saves a child linked to that Draft" {
     const key = try ReviewKey.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{
         .local_id = 7,
-        .kind = .top_level,
+        .kind = .comment,
         .body = "parent",
     });
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -3873,7 +3899,7 @@ test "Submission start acquires ownership persists intent and emits one durable 
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "publish me" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish me" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -3907,7 +3933,7 @@ test "Submission lock contention emits no command or durable intent" {
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "publish me" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish me" });
     var other_owner = (try locks.locks().tryAcquire(key.storeKey())).?;
     defer other_owner.release();
     var presentation = try Presentation.init(testing.allocator, .{
@@ -3932,7 +3958,7 @@ test "fresh Submission checks the source commit before its first POST" {
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "stale anchor" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "stale anchor" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -3961,7 +3987,7 @@ test "startup discovers and explicitly claims an interrupted Submission" {
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 7);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "recover me" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "recover me" });
     const operation_id = try store.store().beginSubmission(key.storeKey(), "old-head", 1);
 
     var presentation = try Presentation.init(testing.allocator, .{
@@ -3992,7 +4018,7 @@ test "startup reports a live owner without stealing its Submission" {
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 7);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "owned" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "owned" });
     _ = try store.store().beginSubmission(key.storeKey(), "head", 1);
     var owner = (try locks.locks().tryAcquire(key.storeKey())).?;
     defer owner.release();
@@ -4014,7 +4040,7 @@ test "changed-source recovery only runs the Duplicate guard and leaves a miss un
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 7);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "stale" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "stale" });
     const operation_id = try store.store().beginSubmission(key.storeKey(), "old-head", 1);
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -4049,7 +4075,7 @@ test "changed-source Duplicate guard records an existing Comment without posting
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 7);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "already posted" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "already posted" });
     const operation_id = try store.store().beginSubmission(key.storeKey(), "old-head", 1);
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -4078,7 +4104,7 @@ test "reviewer can mark a selected unresolved Draft as unpublished" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "unknown", .state = .outcome_unknown });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "unknown", .state = .outcome_unknown });
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
         .viewport_rows = 8,
@@ -4097,7 +4123,7 @@ test "reviewer can link a selected unresolved Draft to an existing Comment" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "unknown", .state = .outcome_unknown });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "unknown", .state = .outcome_unknown });
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
         .viewport_rows = 8,
@@ -4197,7 +4223,7 @@ test "Submission payload and identity survive originating Session replacement" {
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const first_key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(first_key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "survive replacement" });
+    try store.store().put(first_key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "survive replacement" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -4231,7 +4257,7 @@ test "Submission completion does not reconcile over a different visible PR" {
     defer locks.deinit();
     const first_key = try ReviewKey.init("workspace", "repo", 1);
     const second_key = try ReviewKey.init("workspace", "repo", 2);
-    try store.store().put(first_key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "post elsewhere" });
+    try store.store().put(first_key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "post elsewhere" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -4275,7 +4301,7 @@ test "shutdown retains an authorized Submission command and waits for terminal d
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "finish me" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "finish me" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -4301,7 +4327,7 @@ test "Submission persistence failure publishes no command and releases ownership
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "publish me" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish me" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -4333,7 +4359,7 @@ test "Submission state allocation failure releases ownership before transfer" {
     defer locks.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "publish me" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish me" });
     var presentation = try Presentation.init(failing.allocator(), .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -4361,8 +4387,8 @@ test "durable POST completion checkpoints outcome and next intent before next co
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "parent" });
-    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .reply, .parent = .{ .draft = 1 }, .body = "reply" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "parent" });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -4402,8 +4428,8 @@ test "stale POST completion cannot mutate the next in-flight Draft" {
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "first" });
-    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .top_level, .body = "second" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "first" });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .body = "second" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -4444,7 +4470,7 @@ test "final successful POST completes clean, releases ownership, and reconciles 
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "only" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "only" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -4482,7 +4508,7 @@ test "retryable POST rejection waits and reissues without checkpointing an outco
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "retry" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "retry" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -4522,7 +4548,7 @@ test "wait launch failure pauses and submit retries the exact delay" {
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "retry wait" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "retry wait" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -4560,7 +4586,7 @@ test "exhausted ambiguous POST persists an immutable unresolved Draft" {
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "uncertain" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "uncertain" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -4602,7 +4628,7 @@ test "auth rejection aborts Submission and restores the pending Draft" {
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "keep pending" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "keep pending" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -4637,7 +4663,7 @@ test "non-retryable POST rejection completes partially and retains the failed Dr
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "retain me" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "retain me" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -4672,8 +4698,8 @@ test "checkpoint failure pauses Submission and retry persists before next POST" 
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "first" });
-    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .top_level, .body = "second" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "first" });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .body = "second" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -4720,7 +4746,7 @@ test "terminal persistence retry does not repeat an already-durable checkpoint" 
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "only" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "only" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -4767,7 +4793,7 @@ test "queue allocation failure retains a POST completion for admission retry" {
     defer locks.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "only" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "only" });
     var presentation = try Presentation.init(failing.allocator(), .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -4805,7 +4831,7 @@ test "POST launch failure pauses without reporting a remote outcome and submit r
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "retry launch" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "retry launch" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -4844,7 +4870,7 @@ test "shutdown retries a paused terminal persistence step" {
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     const key = try ReviewKey.init("workspace", "repo", 1);
-    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .top_level, .body = "only" });
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "only" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),

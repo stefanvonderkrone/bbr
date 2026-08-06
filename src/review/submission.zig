@@ -346,15 +346,15 @@ pub const CommentPoster = struct {
         post: *const fn (ptr: *anyopaque, draft: Draft, parent: ?CommentId) anyerror!PostOutcome,
         /// Dedupe lookup for an ambiguous retry: the id of an already-posted
         /// comment matching this draft (path/line/body), or null if none.
-        findExisting: *const fn (ptr: *anyopaque, draft: Draft) anyerror!?CommentId,
+        findExisting: *const fn (ptr: *anyopaque, draft: Draft, parent: ?CommentId) anyerror!?CommentId,
     };
 
     pub fn post(self: CommentPoster, draft: Draft, parent: ?CommentId) !PostOutcome {
         return self.vtable.post(self.ptr, draft, parent);
     }
 
-    pub fn findExisting(self: CommentPoster, draft: Draft) !?CommentId {
-        return self.vtable.findExisting(self.ptr, draft);
+    pub fn findExisting(self: CommentPoster, draft: Draft, parent: ?CommentId) !?CommentId {
+        return self.vtable.findExisting(self.ptr, draft, parent);
     }
 };
 
@@ -373,8 +373,8 @@ fn find(items: []const ItemResult, tid: TempId) ?ItemResult {
 test "topological post order and temp-id → CommentId remap" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
-    const root = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "root" });
-    const reply = try pr.add(testing.allocator, .{ .kind = .reply, .body = "re", .parent = .{ .draft = root } });
+    const root = try pr.add(testing.allocator, .{ .kind = .comment, .body = "root" });
+    const reply = try pr.add(testing.allocator, .{ .kind = .comment, .body = "re", .parent = .{ .draft = root } });
 
     var sub = try Submission.init(testing.allocator, &pr);
     defer sub.deinit();
@@ -403,7 +403,7 @@ test "topological post order and temp-id → CommentId remap" {
 test "reply to an already-posted server comment posts against that id" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
-    const r = try pr.add(testing.allocator, .{ .kind = .reply, .body = "re", .parent = .{ .comment = 99 } });
+    const r = try pr.add(testing.allocator, .{ .kind = .comment, .body = "re", .parent = .{ .comment = 99 } });
 
     var sub = try Submission.init(testing.allocator, &pr);
     defer sub.deinit();
@@ -415,8 +415,8 @@ test "reply to an already-posted server comment posts against that id" {
 test "auth failure aborts the whole batch, leaving items pending" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
-    _ = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "a" });
-    _ = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "b" });
+    _ = try pr.add(testing.allocator, .{ .kind = .comment, .body = "a" });
+    _ = try pr.add(testing.allocator, .{ .kind = .comment, .body = "b" });
 
     var sub = try Submission.init(testing.allocator, &pr);
     defer sub.deinit();
@@ -435,10 +435,10 @@ test "auth failure aborts the whole batch, leaving items pending" {
 test "validation failure fails the item and skips its reply-descendants" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
-    const root = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "root" });
-    const child = try pr.add(testing.allocator, .{ .kind = .reply, .body = "re", .parent = .{ .draft = root } });
-    const grandchild = try pr.add(testing.allocator, .{ .kind = .reply, .body = "re2", .parent = .{ .draft = child } });
-    const other = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "independent" });
+    const root = try pr.add(testing.allocator, .{ .kind = .comment, .body = "root" });
+    const child = try pr.add(testing.allocator, .{ .kind = .comment, .body = "re", .parent = .{ .draft = root } });
+    const grandchild = try pr.add(testing.allocator, .{ .kind = .comment, .body = "re2", .parent = .{ .draft = child } });
+    const other = try pr.add(testing.allocator, .{ .kind = .comment, .body = "independent" });
 
     var sub = try Submission.init(testing.allocator, &pr);
     defer sub.deinit();
@@ -468,7 +468,7 @@ test "validation failure fails the item and skips its reply-descendants" {
 test "retryable failure schedules backoff waits then succeeds" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
-    _ = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "a" });
+    _ = try pr.add(testing.allocator, .{ .kind = .comment, .body = "a" });
 
     var sub = try Submission.init(testing.allocator, &pr);
     defer sub.deinit();
@@ -495,7 +495,7 @@ test "retryable failure schedules backoff waits then succeeds" {
 test "429 Retry-After overrides the computed backoff" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
-    _ = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "a" });
+    _ = try pr.add(testing.allocator, .{ .kind = .comment, .body = "a" });
     var sub = try Submission.init(testing.allocator, &pr);
     defer sub.deinit();
 
@@ -507,7 +507,7 @@ test "429 Retry-After overrides the computed backoff" {
 test "ambiguous failure sets the dedupe flag on retry" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
-    _ = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "a" });
+    _ = try pr.add(testing.allocator, .{ .kind = .comment, .body = "a" });
     var sub = try Submission.init(testing.allocator, &pr);
     defer sub.deinit();
 
@@ -522,7 +522,7 @@ test "ambiguous failure sets the dedupe flag on retry" {
 test "exhausted ambiguity remains unresolved across selective retry" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
-    const temp_id = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "a" });
+    const temp_id = try pr.add(testing.allocator, .{ .kind = .comment, .body = "a" });
     var sub = try Submission.init(testing.allocator, &pr);
 
     var attempt: u8 = 0;
@@ -546,7 +546,7 @@ test "exhausted ambiguity remains unresolved across selective retry" {
 test "retries exhaust into an item failure" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
-    const a = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "a" });
+    const a = try pr.add(testing.allocator, .{ .kind = .comment, .body = "a" });
     var sub = try Submission.init(testing.allocator, &pr);
     defer sub.deinit();
 
@@ -569,8 +569,8 @@ test "a prior-posted draft is skipped (selective retry) and remaps its replies" 
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
     // Simulate a resumed batch: the root already posted as comment 42.
-    try pr.addExisting(testing.allocator, .{ .local_id = 1, .kind = .top_level, .body = "root", .state = .{ .posted = 42 } });
-    const reply = try pr.add(testing.allocator, .{ .kind = .reply, .body = "re", .parent = .{ .draft = 1 } });
+    try pr.addExisting(testing.allocator, .{ .local_id = 1, .kind = .comment, .body = "root", .state = .{ .posted = 42 } });
+    const reply = try pr.add(testing.allocator, .{ .kind = .comment, .body = "re", .parent = .{ .draft = 1 } });
 
     var sub = try Submission.init(testing.allocator, &pr);
     defer sub.deinit();
@@ -590,8 +590,8 @@ test "a prior-posted draft is skipped (selective retry) and remaps its replies" 
 test "local-only Drafts are never emitted as Submission posts" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
-    _ = try pr.add(testing.allocator, .{ .kind = .top_level, .target = .local, .body = "private" });
-    const remote = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "publish" });
+    _ = try pr.add(testing.allocator, .{ .kind = .comment, .target = .local, .body = "private" });
+    const remote = try pr.add(testing.allocator, .{ .kind = .comment, .body = "publish" });
 
     var sub = try Submission.init(testing.allocator, &pr);
     defer sub.deinit();
@@ -632,7 +632,7 @@ const FakeCommentPoster = struct {
         defer self.calls += 1;
         return self.outcomes[self.calls];
     }
-    fn findImpl(ptr: *anyopaque, _: Draft) anyerror!?CommentId {
+    fn findImpl(ptr: *anyopaque, _: Draft, _: ?CommentId) anyerror!?CommentId {
         const self: *FakeCommentPoster = @ptrCast(@alignCast(ptr));
         self.find_calls += 1;
         return self.existing;
@@ -642,8 +642,8 @@ const FakeCommentPoster = struct {
 test "driver runs the engine through the CommentPoster seam" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
-    const root = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "root" });
-    _ = try pr.add(testing.allocator, .{ .kind = .reply, .body = "re", .parent = .{ .draft = root } });
+    const root = try pr.add(testing.allocator, .{ .kind = .comment, .body = "root" });
+    _ = try pr.add(testing.allocator, .{ .kind = .comment, .body = "re", .parent = .{ .draft = root } });
 
     var fake = FakeCommentPoster{ .outcomes = &.{ .{ .posted = 10 }, .{ .posted = 11 } } };
     const poster = fake.poster();

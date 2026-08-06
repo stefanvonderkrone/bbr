@@ -179,6 +179,22 @@ pub const SqliteStore = struct {
                 \\COMMIT;
             );
         }
+        // v7 (M15): exhaustive root CommentScope. Legacy parentless rows map
+        // from optional anchors; Replies discard echoed scope and inherit.
+        if (try self.userVersion() < 7) {
+            try self.exec(
+                \\BEGIN;
+                \\ALTER TABLE drafts ADD COLUMN scope_kind INTEGER;
+                \\ALTER TABLE drafts ADD COLUMN file_source_commit TEXT;
+                \\UPDATE drafts SET scope_kind = CASE
+                \\  WHEN parent_kind != 0 THEN NULL
+                \\  WHEN anchor_path IS NULL THEN 0
+                \\  ELSE 2 END;
+                \\UPDATE drafts SET kind = CASE WHEN kind = 3 THEN 1 ELSE 0 END;
+                \\PRAGMA user_version = 7;
+                \\COMMIT;
+            );
+        }
     }
 
     fn userVersion(self: *SqliteStore) SqliteError!i64 {
@@ -308,8 +324,9 @@ pub const SqliteStore = struct {
             \\  anchor_path, anchor_from, anchor_to, anchor_commit,
             \\  body, state_kind, state_id, state_err,
             \\  anchor_start_from, anchor_start_to, workspace, repository,
-            \\  snapshot_text, snapshot_selection_start, snapshot_selection_len)
-            \\ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
+            \\  snapshot_text, snapshot_selection_start, snapshot_selection_len,
+            \\  scope_kind, file_source_commit)
+            \\ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
         ;
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
@@ -335,9 +352,14 @@ pub const SqliteStore = struct {
             bindNull(stmt, 6);
         }
 
-        // anchor: NULL path means no anchor. Range top lines (15/16) append
-        // after the state columns, matching the v2 ALTER TABLE order.
-        if (d.anchor) |a| {
+        const root_scope = if (d.parent == null) d.effectiveScope() else null;
+        const inline_anchor: ?Anchor = if (root_scope) |scope| switch (scope) {
+            .@"inline" => |anchor| anchor,
+            else => null,
+        } else null;
+        // Inline scope retains the legacy anchor columns so v6 data migrates
+        // losslessly. File scope uses path plus its authored source commit.
+        if (inline_anchor) |a| {
             bindText(stmt, 7, a.path);
             bindOptU32(stmt, 8, a.from);
             bindOptU32(stmt, 9, a.to);
@@ -345,7 +367,10 @@ pub const SqliteStore = struct {
             bindOptU32(stmt, 15, a.start_from);
             bindOptU32(stmt, 16, a.start_to);
         } else {
-            bindNull(stmt, 7);
+            if (root_scope) |scope| switch (scope) {
+                .file => |file| bindText(stmt, 7, file.path),
+                else => bindNull(stmt, 7),
+            } else bindNull(stmt, 7);
             bindNull(stmt, 8);
             bindNull(stmt, 9);
             bindNull(stmt, 10);
@@ -394,6 +419,20 @@ pub const SqliteStore = struct {
             bindNull(stmt, 20);
             bindNull(stmt, 21);
         }
+        if (root_scope) |scope| {
+            bindInt(stmt, 22, switch (scope) {
+                .review => 0,
+                .file => 1,
+                .@"inline" => 2,
+            });
+            switch (scope) {
+                .file => |file| bindText(stmt, 23, file.source_commit),
+                else => bindNull(stmt, 23),
+            }
+        } else {
+            bindNull(stmt, 22);
+            bindNull(stmt, 23);
+        }
 
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
         try self.exec("COMMIT;");
@@ -427,7 +466,8 @@ pub const SqliteStore = struct {
             \\ anchor_path, anchor_from, anchor_to, anchor_commit,
             \\ body, state_kind, state_id, state_err,
             \\ anchor_start_from, anchor_start_to,
-            \\ snapshot_text, snapshot_selection_start, snapshot_selection_len
+            \\ snapshot_text, snapshot_selection_start, snapshot_selection_len,
+            \\ scope_kind, file_source_commit
             \\ FROM drafts
             \\ WHERE workspace=? AND repository=? AND pr_id=? ORDER BY local_id;
         ;
@@ -761,17 +801,29 @@ pub const SqliteStore = struct {
             else => null,
         };
 
+        const path = if (parent == null) try columnTextDup(allocator, stmt, 5) else null;
+        const scope_kind = if (c.sqlite3_column_type(stmt, 18) == c.SQLITE_NULL) null else columnInt(stmt, 18);
+        var scope: ?bbr.review.CommentScope = null;
         var anchor: ?Anchor = null;
-        if (try columnTextDup(allocator, stmt, 5)) |path| {
-            anchor = .{
-                .path = path,
-                .from = columnOptU32(stmt, 6),
-                .to = columnOptU32(stmt, 7),
-                .commit = try columnTextDup(allocator, stmt, 8),
-                .start_from = columnOptU32(stmt, 13),
-                .start_to = columnOptU32(stmt, 14),
-            };
-        }
+        if (parent == null) if (scope_kind) |kind| switch (kind) {
+            0 => scope = .review,
+            1 => scope = .{ .file = .{
+                .path = path orelse return error.Step,
+                .source_commit = (try columnTextDup(allocator, stmt, 19)) orelse return error.Step,
+            } },
+            2 => {
+                anchor = .{
+                    .path = path orelse return error.Step,
+                    .from = columnOptU32(stmt, 6),
+                    .to = columnOptU32(stmt, 7),
+                    .commit = try columnTextDup(allocator, stmt, 8),
+                    .start_from = columnOptU32(stmt, 13),
+                    .start_to = columnOptU32(stmt, 14),
+                };
+                scope = .{ .@"inline" = anchor.? };
+            },
+            else => return error.Step,
+        };
 
         const state: DraftState = switch (columnInt(stmt, 10)) {
             2 => .{ .posted = @intCast(columnInt(stmt, 11)) },
@@ -791,6 +843,7 @@ pub const SqliteStore = struct {
             .local_id = @intCast(columnInt(stmt, 0)),
             .kind = @enumFromInt(columnInt(stmt, 1)),
             .target = @enumFromInt(columnInt(stmt, 2)),
+            .scope = scope,
             .anchor = anchor,
             .snapshot = snapshot,
             .parent = parent,
@@ -910,7 +963,7 @@ test "in-memory round-trip preserves fields, anchor, parent, and state" {
 
     try store.put(testReviewKey(7), .{
         .local_id = 1,
-        .kind = .inline_comment,
+        .kind = .comment,
         .target = .bitbucket,
         .anchor = .{ .path = "src/f.zig", .from = 3, .to = 12, .start_to = 9, .commit = "deadbeef" },
         .snapshot = .{ .text = "before\nselected\nafter", .selection_start = 1, .selection_len = 1 },
@@ -919,14 +972,14 @@ test "in-memory round-trip preserves fields, anchor, parent, and state" {
     });
     try store.put(testReviewKey(7), .{
         .local_id = 2,
-        .kind = .reply,
+        .kind = .comment,
         .parent = .{ .draft = 1 },
         .body = "agreed",
         .state = .{ .failed = error.RateLimited },
     });
     try store.put(testReviewKey(7), .{
         .local_id = 3,
-        .kind = .top_level,
+        .kind = .comment,
         .body = "unknown outcome",
         .state = .outcome_unknown,
     });
@@ -937,7 +990,7 @@ test "in-memory round-trip preserves fields, anchor, parent, and state" {
 
     try testing.expectEqual(@as(usize, 3), drafts.len);
     const d0 = drafts[0];
-    try testing.expect(d0.kind == .inline_comment);
+    try testing.expect(d0.kind == .comment);
     try testing.expectEqualStrings("src/f.zig", d0.anchor.?.path);
     try testing.expectEqual(@as(?u32, 3), d0.anchor.?.from);
     try testing.expectEqual(@as(?u32, 12), d0.anchor.?.to);
@@ -952,11 +1005,32 @@ test "in-memory round-trip preserves fields, anchor, parent, and state" {
     try testing.expectEqual(@as(CommentId, 555), d0.state.posted);
 
     const d1 = drafts[1];
-    try testing.expect(d1.kind == .reply);
+    try testing.expect(d1.kind == .comment);
     try testing.expect(d1.parent.? == .draft and d1.parent.?.draft == 1);
     try testing.expect(d1.anchor == null);
     try testing.expectEqual(ApiError.RateLimited, d1.state.failed);
     try testing.expect(drafts[2].state == .outcome_unknown);
+}
+
+test "SQLite round-trip preserves exhaustive root scope and File authored commit" {
+    var s = try SqliteStore.open(":memory:");
+    defer s.deinit();
+    const store = s.store();
+    try store.put(testReviewKey(8), .{ .local_id = 1, .kind = .comment, .scope = .review, .body = "review" });
+    try store.put(testReviewKey(8), .{ .local_id = 2, .kind = .comment, .scope = .{ .file = .{ .path = "src/f.zig", .source_commit = "source-abc" } }, .body = "file" });
+    try store.put(testReviewKey(8), .{ .local_id = 3, .kind = .comment, .scope = .{ .@"inline" = .{ .path = "src/f.zig", .to = 7, .commit = "source-abc" } }, .body = "line" });
+    try store.put(testReviewKey(8), .{ .local_id = 4, .kind = .comment, .scope = .review, .parent = .{ .draft = 2 }, .body = "reply" });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try store.load(arena.allocator(), testReviewKey(8));
+    try testing.expect(drafts[0].scope.? == .review);
+    try testing.expect(drafts[1].scope.? == .file);
+    try testing.expectEqualStrings("src/f.zig", drafts[1].scope.?.file.path);
+    try testing.expectEqualStrings("source-abc", drafts[1].scope.?.file.source_commit);
+    try testing.expect(drafts[2].scope.? == .@"inline");
+    try testing.expectEqual(@as(?u32, 7), drafts[2].scope.?.@"inline".to);
+    try testing.expect(drafts[3].scope == null);
 }
 
 test "put replaces on key; remove deletes; both scope to the PR" {
@@ -964,10 +1038,10 @@ test "put replaces on key; remove deletes; both scope to the PR" {
     defer s.deinit();
     const store = s.store();
 
-    try store.put(testReviewKey(1), .{ .local_id = 1, .kind = .top_level, .body = "first" });
-    try store.put(testReviewKey(1), .{ .local_id = 1, .kind = .top_level, .body = "edited" }); // replace
-    try store.put(testReviewKey(1), .{ .local_id = 2, .kind = .top_level, .body = "second" });
-    try store.put(testReviewKey(2), .{ .local_id = 1, .kind = .top_level, .body = "other pr" });
+    try store.put(testReviewKey(1), .{ .local_id = 1, .kind = .comment, .body = "first" });
+    try store.put(testReviewKey(1), .{ .local_id = 1, .kind = .comment, .body = "edited" }); // replace
+    try store.put(testReviewKey(1), .{ .local_id = 2, .kind = .comment, .body = "second" });
+    try store.put(testReviewKey(2), .{ .local_id = 1, .kind = .comment, .body = "other pr" });
     try store.remove(testReviewKey(1), 2);
     try store.remove(testReviewKey(1), 999); // idempotent
 
@@ -985,8 +1059,8 @@ test "identical PullRequestIds remain isolated by Repository in SQLite" {
     const alpha: ReviewKey = .{ .workspace = "ws", .repository = "alpha", .pull_request_id = 7 };
     const beta: ReviewKey = .{ .workspace = "ws", .repository = "beta", .pull_request_id = 7 };
 
-    try store.put(alpha, .{ .local_id = 1, .kind = .top_level, .body = "alpha" });
-    try store.put(beta, .{ .local_id = 1, .kind = .top_level, .body = "beta" });
+    try store.put(alpha, .{ .local_id = 1, .kind = .comment, .body = "alpha" });
+    try store.put(beta, .{ .local_id = 1, .kind = .comment, .body = "beta" });
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1015,7 +1089,11 @@ test "v2 rows are migrated and claimed by the first repository load" {
         \\ALTER TABLE drafts ADD COLUMN anchor_start_from INTEGER;
         \\ALTER TABLE drafts ADD COLUMN anchor_start_to INTEGER;
         \\INSERT INTO drafts (pr_id, local_id, kind, target, parent_kind, body, state_kind)
-        \\ VALUES (42, 1, 0, 0, 0, 'legacy draft', 0);
+        \\ VALUES (42, 1, 0, 0, 0, 'legacy review', 0);
+        \\INSERT INTO drafts (pr_id, local_id, kind, target, parent_kind, body, state_kind, anchor_path, anchor_to, anchor_commit)
+        \\ VALUES (42, 2, 1, 0, 0, 'legacy inline', 0, 'src/f.zig', 9, 'old-source');
+        \\INSERT INTO drafts (pr_id, local_id, kind, target, parent_kind, parent_id, body, state_kind, anchor_path, anchor_to)
+        \\ VALUES (42, 3, 2, 0, 1, 2, 'legacy reply', 0, 'wire-echo', 99);
         \\PRAGMA user_version = 2;
     , null, null, null));
     _ = c.sqlite3_close(legacy.?);
@@ -1025,8 +1103,13 @@ test "v2 rows are migrated and claimed by the first repository load" {
     defer upgraded.deinit();
     const key: ReviewKey = .{ .workspace = "ws", .repository = "repo", .pull_request_id = 42 };
     const drafts = try upgraded.store().load(arena.allocator(), key);
-    try testing.expectEqual(@as(usize, 1), drafts.len);
-    try testing.expectEqualStrings("legacy draft", drafts[0].body);
+    try testing.expectEqual(@as(usize, 3), drafts.len);
+    try testing.expectEqualStrings("legacy review", drafts[0].body);
+    try testing.expect(drafts[0].scope.? == .review);
+    try testing.expect(drafts[1].scope.? == .@"inline");
+    try testing.expectEqualStrings("src/f.zig", drafts[1].scope.?.@"inline".path);
+    try testing.expectEqualStrings("old-source", drafts[1].scope.?.@"inline".commit.?);
+    try testing.expect(drafts[2].scope == null);
 
     const other: ReviewKey = .{ .workspace = "ws", .repository = "other", .pull_request_id = 42 };
     const other_drafts = try upgraded.store().load(arena.allocator(), other);
@@ -1048,8 +1131,8 @@ test "drafts survive closing and reopening the database (resume)" {
         var s = try SqliteStore.open(path);
         defer s.deinit();
         const store = s.store();
-        try store.put(testReviewKey(42), .{ .local_id = 1, .kind = .top_level, .body = "persist me" });
-        try store.put(testReviewKey(42), .{ .local_id = 2, .kind = .reply, .parent = .{ .comment = 900 }, .body = "reply to remote" });
+        try store.put(testReviewKey(42), .{ .local_id = 1, .kind = .comment, .body = "persist me" });
+        try store.put(testReviewKey(42), .{ .local_id = 2, .kind = .comment, .parent = .{ .comment = 900 }, .body = "reply to remote" });
     }
 
     // Reopen: a fresh handle over the same file resumes the review.
@@ -1060,7 +1143,7 @@ test "drafts survive closing and reopening the database (resume)" {
     try testing.expectEqualStrings("persist me", review.get(1).?.body);
     try testing.expect(review.get(2).?.parent.? == .comment);
     // next_id resumes past the loaded drafts.
-    const fresh = try review.add(a, .{ .kind = .top_level, .body = "new" });
+    const fresh = try review.add(a, .{ .kind = .comment, .body = "new" });
     try testing.expectEqual(@as(TempId, 3), fresh);
 }
 
@@ -1077,8 +1160,8 @@ test "Submission checkpoint survives closing and reopening the database" {
         var s = try SqliteStore.open(path);
         defer s.deinit();
         const store = s.store();
-        try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "first" });
-        try store.put(key, .{ .local_id = 2, .kind = .top_level, .body = "second", .state = .{ .failed = error.ServerError } });
+        try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "first" });
+        try store.put(key, .{ .local_id = 2, .kind = .comment, .body = "second", .state = .{ .failed = error.ServerError } });
         operation_id = try store.beginSubmission(key, "source-commit", 1);
         try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, 2);
     }
@@ -1105,7 +1188,7 @@ test "a rejected SQLite Submission checkpoint rolls back its completed outcome" 
     defer s.deinit();
     const store = s.store();
     const key = testReviewKey(7);
-    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "first" });
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "first" });
     const operation_id = try store.beginSubmission(key, "source-commit", 1);
 
     try testing.expectError(error.InvalidSubmissionCheckpoint, store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, 99));
@@ -1123,12 +1206,12 @@ test "SQLite locks Bitbucket Draft mutation during an active Submission" {
     defer s.deinit();
     const store = s.store();
     const key = testReviewKey(7);
-    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "remote" });
-    try store.put(key, .{ .local_id = 2, .kind = .top_level, .target = .local, .body = "local" });
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "remote" });
+    try store.put(key, .{ .local_id = 2, .kind = .comment, .target = .local, .body = "local" });
     _ = try store.beginSubmission(key, "source-commit", 1);
 
     try testing.expectError(error.DraftLocked, store.remove(key, 1));
-    try store.put(key, .{ .local_id = 2, .kind = .top_level, .target = .local, .body = "changed local" });
+    try store.put(key, .{ .local_id = 2, .kind = .comment, .target = .local, .body = "changed local" });
     try store.remove(key, 2);
 }
 
@@ -1137,12 +1220,12 @@ test "SQLite keeps an unresolved outcome immutable after partial completion" {
     defer s.deinit();
     const store = s.store();
     const key = testReviewKey(7);
-    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "unknown" });
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "unknown" });
     const operation_id = try store.beginSubmission(key, "source-commit", 1);
     try store.checkpointSubmission(operation_id, key, 1, .outcome_unknown, null);
     try store.completeSubmission(operation_id, key, .partial);
 
-    try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "changed" }));
+    try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 1, .kind = .comment, .body = "changed" }));
     try testing.expectError(error.DraftLocked, store.remove(key, 1));
     try store.resolveUnknown(key, 1, .{ .posted = 812 });
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1155,7 +1238,7 @@ test "SQLite rejects clean completion while a Bitbucket Draft failed" {
     defer s.deinit();
     const store = s.store();
     const key = testReviewKey(7);
-    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "failed" });
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "failed" });
     const operation_id = try store.beginSubmission(key, "source-commit", 1);
     try store.checkpointSubmission(operation_id, key, 1, .{ .failed = error.Forbidden }, null);
 
@@ -1170,7 +1253,7 @@ test "SQLite aborted completion restores the current Draft and closes partial" {
     defer s.deinit();
     const store = s.store();
     const key = testReviewKey(7);
-    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "retry", .state = .{ .failed = error.ServerError } });
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "retry", .state = .{ .failed = error.ServerError } });
     const operation_id = try store.beginSubmission(key, "source-commit", 1);
 
     try store.completeSubmission(operation_id, key, .{ .aborted = .{ .failed = error.ServerError } });
@@ -1188,8 +1271,8 @@ test "SQLite reports an already-active Submission consistently" {
     const store = s.store();
     const first = testReviewKey(7);
     const second = testReviewKey(8);
-    try store.put(first, .{ .local_id = 1, .kind = .top_level, .body = "first" });
-    try store.put(second, .{ .local_id = 1, .kind = .top_level, .body = "second" });
+    try store.put(first, .{ .local_id = 1, .kind = .comment, .body = "first" });
+    try store.put(second, .{ .local_id = 1, .kind = .comment, .body = "second" });
     _ = try store.beginSubmission(first, "first-commit", 1);
 
     try testing.expectError(error.SubmissionAlreadyActive, store.beginSubmission(second, "second-commit", 1));

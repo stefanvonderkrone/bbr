@@ -995,7 +995,7 @@ test "the sidebar tallies comments per file and hides a zero count" {
     const threads = try bbr.review.buildThreads(a, &comments);
     // One pending draft on two.txt.
     const drafts = [_]bbr.review.Draft{
-        .{ .local_id = 1, .kind = .inline_comment, .body = "wip", .anchor = .{ .path = "two.txt", .to = 1 } },
+        .{ .local_id = 1, .kind = .comment, .body = "wip", .anchor = .{ .path = "two.txt", .to = 1 } },
     };
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
@@ -1062,7 +1062,7 @@ test "a pending draft renders in the draft band with its marker" {
     ;
     const diff = try bbr.diff.parse(a, raw);
     const drafts = [_]bbr.review.Draft{
-        .{ .local_id = 1, .kind = .inline_comment, .body = "author it", .anchor = .{ .path = "a.txt", .to = 1, .commit = "c0" } },
+        .{ .local_id = 1, .kind = .comment, .body = "author it", .anchor = .{ .path = "a.txt", .to = 1, .commit = "c0" } },
     };
     const buf = try buffer_mod.buildWithComments(a, diff, .unified, &.{}, .{ .drafts = &drafts });
 

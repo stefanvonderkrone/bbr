@@ -71,6 +71,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
     var state = try presentation.Presentation.init(ctx.gpa, .{
         .reviews = ctx.store,
         .anchor_resolver = git_anchor_resolver.resolver(),
+        .scope_resolver = git_anchor_resolver.scopeResolver(),
         .submission_locks = ctx.submission_locks,
         .highlight_max_file_bytes = ctx.highlight_max_file_bytes,
         .file_cache_enabled = ctx.file_cache_enabled,
@@ -460,7 +461,7 @@ fn presentationDuplicateCheckWorker(
         .repo_slug = command.key.repository(),
         .pr_id = command.key.pull_request_id,
     };
-    const outcome: presentation.DuplicateCheckOutcome = if (poster.poster().findExisting(command.draft)) |existing|
+    const outcome: presentation.DuplicateCheckOutcome = if (poster.poster().findExisting(command.draft, command.parent)) |existing|
         if (existing) |id| .{ .found = id } else .missing
     else |_|
         .failed;

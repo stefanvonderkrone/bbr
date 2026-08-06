@@ -9,6 +9,7 @@ const comment = @import("comment.zig");
 
 const Allocator = std.mem.Allocator;
 const Anchor = comment.Anchor;
+const CommentScope = comment.CommentScope;
 
 pub const ResolvedAnchor = struct {
     state: comment.AnchorState,
@@ -18,6 +19,35 @@ pub const ResolvedAnchor = struct {
 pub const AnchorResolution = union(enum) {
     resolved: ResolvedAnchor,
     unavailable,
+};
+
+pub const ResolvedScope = struct {
+    state: comment.ScopeState,
+    scope: CommentScope,
+};
+
+pub const ScopeResolution = union(enum) {
+    resolved: ResolvedScope,
+    unavailable,
+};
+
+pub const ScopeProjectionEntry = struct {
+    temp_id: @import("draft.zig").TempId,
+    resolution: ScopeResolution,
+};
+
+pub fn findScope(entries: []const ScopeProjectionEntry, temp_id: @import("draft.zig").TempId) ?ScopeResolution {
+    for (entries) |entry| if (entry.temp_id == temp_id) return entry.resolution;
+    return null;
+}
+
+pub const ScopeResolver = struct {
+    ptr: *anyopaque,
+    resolve_fn: *const fn (*anyopaque, Allocator, CommentScope, []const u8) anyerror!ScopeResolution,
+
+    pub fn resolve(self: ScopeResolver, allocator: Allocator, scope: CommentScope, current_commit: []const u8) !ScopeResolution {
+        return self.resolve_fn(self.ptr, allocator, scope, current_commit);
+    }
 };
 
 pub const ProjectionEntry = struct {
@@ -58,6 +88,43 @@ pub const GitAnchorResolver = struct {
         return .{ .ptr = self, .resolve_fn = resolve };
     }
 
+    pub fn scopeResolver(self: *GitAnchorResolver) ScopeResolver {
+        return .{ .ptr = self, .resolve_fn = resolveScope };
+    }
+
+    fn resolveScope(ptr: *anyopaque, allocator: Allocator, authored: CommentScope, current_commit: []const u8) anyerror!ScopeResolution {
+        const self: *GitAnchorResolver = @ptrCast(@alignCast(ptr));
+        switch (authored) {
+            .review => return .{ .resolved = .{ .state = .current, .scope = .review } },
+            .file => |file| {
+                const transition = (try self.loadTransition(file.source_commit, current_commit)) orelse return .unavailable;
+                return resolveScopeAgainst(allocator, authored, transition);
+            },
+            .@"inline" => |anchor| {
+                const authored_commit = anchor.commit orelse return .unavailable;
+                const transition = (try self.loadTransition(authored_commit, current_commit)) orelse return .unavailable;
+                return resolveScopeAgainst(allocator, authored, transition);
+            },
+        }
+    }
+
+    fn loadTransition(self: *GitAnchorResolver, authored_commit: []const u8, current_commit: []const u8) !?diff_mod.Diff {
+        const cache = self.cache_arena.allocator();
+        const key = try std.fmt.allocPrint(cache, "{s}\x00{s}", .{ authored_commit, current_commit });
+        if (self.unavailable_transitions.contains(key)) return null;
+        if (self.transitions.get(key)) |cached| return cached;
+        const raw = self.git.diff(cache, authored_commit, current_commit) catch {
+            try self.unavailable_transitions.put(cache, key, {});
+            return null;
+        };
+        const parsed_transition = parser.parse(cache, raw) catch {
+            try self.unavailable_transitions.put(cache, key, {});
+            return null;
+        };
+        try self.transitions.put(cache, key, parsed_transition);
+        return parsed_transition;
+    }
+
     fn resolve(ptr: *anyopaque, allocator: Allocator, authored: Anchor, current_commit: []const u8) anyerror!AnchorResolution {
         const self: *GitAnchorResolver = @ptrCast(@alignCast(ptr));
         const authored_commit = authored.commit orelse return .unavailable;
@@ -79,6 +146,40 @@ pub const GitAnchorResolver = struct {
         return resolveAgainst(allocator, authored, transition);
     }
 };
+
+/// Resolve a root scope without mutating its durable authored identity.
+pub fn resolveScopeAgainst(allocator: Allocator, authored: CommentScope, transition: diff_mod.Diff) !ScopeResolution {
+    return switch (authored) {
+        .review => .{ .resolved = .{ .state = .current, .scope = .review } },
+        .file => |file_scope| resolveFileAgainst(allocator, file_scope, transition),
+        .@"inline" => |anchor| switch (try resolveAgainst(allocator, anchor, transition)) {
+            .unavailable => .unavailable,
+            .resolved => |resolved| .{ .resolved = .{
+                .state = resolved.state,
+                .scope = .{ .@"inline" = resolved.anchor },
+            } },
+        },
+    };
+}
+
+fn resolveFileAgainst(allocator: Allocator, authored: comment.FileScope, transition: diff_mod.Diff) !ScopeResolution {
+    for (transition.files) |file| {
+        if (!std.mem.eql(u8, file.old_path, authored.path) and !std.mem.eql(u8, file.new_path, authored.path)) continue;
+        const projected_path = if (file.status == .renamed) file.new_path else authored.path;
+        const projected = comment.FileScope{
+            .path = try allocator.dupe(u8, projected_path),
+            .source_commit = try allocator.dupe(u8, authored.source_commit),
+        };
+        return .{ .resolved = .{
+            .state = if (file.status == .removed) .outdated else if (file.status == .renamed) .moved else .current,
+            .scope = .{ .file = projected },
+        } };
+    }
+    return .{ .resolved = .{ .state = .current, .scope = .{ .file = .{
+        .path = try allocator.dupe(u8, authored.path),
+        .source_commit = try allocator.dupe(u8, authored.source_commit),
+    } } } };
+}
 
 /// Map an authored line/range from the old side of `transition` to its new
 /// side. The stored Anchor remains untouched; returned coordinates are owned by
@@ -246,4 +347,20 @@ test "Git resolver also groups unavailable transition evidence" {
     try testing.expect((try resolver.resolver().resolve(arena.allocator(), .{ .path = "f.zig", .to = 1, .commit = "missing" }, "new")) == .unavailable);
     try testing.expect((try resolver.resolver().resolve(arena.allocator(), .{ .path = "g.zig", .to = 2, .commit = "missing" }, "new")) == .unavailable);
     try testing.expectEqual(@as(usize, 1), fake.diff_calls);
+}
+
+test "scope resolution exhausts Review and all File outcomes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const transition = try parsed(arena.allocator(), "diff --git a/old.zig b/new.zig\nsimilarity index 100%\nrename from old.zig\nrename to new.zig\n--- a/old.zig\n+++ b/new.zig\n" ++
+        "diff --git a/gone.zig b/gone.zig\ndeleted file mode 100644\n--- a/gone.zig\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n");
+    const review = try resolveScopeAgainst(arena.allocator(), .review, transition);
+    try testing.expect(review.resolved.state == .current);
+    const moved = try resolveScopeAgainst(arena.allocator(), .{ .file = .{ .path = "old.zig", .source_commit = "abc" } }, transition);
+    try testing.expect(moved.resolved.state == .moved);
+    try testing.expectEqualStrings("new.zig", moved.resolved.scope.file.path);
+    const outdated = try resolveScopeAgainst(arena.allocator(), .{ .file = .{ .path = "gone.zig", .source_commit = "abc" } }, transition);
+    try testing.expect(outdated.resolved.state == .outdated);
+    const current = try resolveScopeAgainst(arena.allocator(), .{ .file = .{ .path = "same.zig", .source_commit = "abc" } }, transition);
+    try testing.expect(current.resolved.state == .current);
 }

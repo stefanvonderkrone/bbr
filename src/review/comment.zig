@@ -16,7 +16,8 @@ pub const CommentId = u64;
 /// Where a Comment resolves against the currently-viewed diff. Remote comments
 /// carry Bitbucket's verdict; `moved` is only ever computed locally (M6+), so a
 /// parsed remote comment is `current` or `outdated`.
-pub const AnchorState = enum { current, moved, outdated };
+pub const ScopeState = enum { current, moved, outdated };
+pub const AnchorState = ScopeState;
 
 /// The diff location a Comment attaches to. `from`/`to` are the anchor line
 /// itself: `from` is an old-file (left) line, `to` a new-file (right) line — a
@@ -53,6 +54,30 @@ pub const Anchor = struct {
     }
 };
 
+/// Durable authored identity of a File-level root.
+pub const FileScope = struct {
+    path: []const u8,
+    source_commit: []const u8,
+};
+
+/// Exhaustive scope carried by roots. Replies carry only `parent_id` and use
+/// their Thread root's scope.
+pub const CommentScope = union(enum) {
+    review,
+    file: FileScope,
+    @"inline": Anchor,
+
+    pub fn isReview(self: CommentScope) bool {
+        return self == .review;
+    }
+    pub fn isFile(self: CommentScope) bool {
+        return self == .file;
+    }
+    pub fn isInline(self: CommentScope) bool {
+        return self == .@"inline";
+    }
+};
+
 /// Immutable fallback evidence captured when a local root Draft is authored.
 /// `text` contains the selected range plus up to three surrounding lines;
 /// `selection_start` is the zero-based first selected line within that text.
@@ -71,19 +96,45 @@ pub const Comment = struct {
     author: []const u8,
     /// Raw markdown body, as authored. Not rendered as markdown yet (M11).
     body: []const u8,
-    /// The diff anchor, or null for a PR-level comment.
+    /// Roots carry one exhaustive scope; Replies carry null and inherit it.
+    scope: ?CommentScope = null,
+    /// Transitional source compatibility for pre-CommentScope callers. New
+    /// code writes `scope`; `effectiveScope` maps old root values losslessly.
     anchor: ?Anchor = null,
     /// Bitbucket's thread-resolution flag (set on the root comment).
     resolved: bool = false,
     /// Bitbucket's anchor verdict against the current diff.
-    state: AnchorState = .current,
+    state: ScopeState = .current,
 
     pub fn isReply(self: Comment) bool {
         return self.parent_id != null;
     }
 
     pub fn isInline(self: Comment) bool {
-        return self.anchor != null;
+        return self.effectiveScope() == .@"inline";
+    }
+
+    pub fn isFile(self: Comment) bool {
+        return self.effectiveScope() == .file;
+    }
+
+    pub fn isReview(self: Comment) bool {
+        return self.effectiveScope() == .review;
+    }
+
+    pub fn effectiveScope(self: Comment) CommentScope {
+        if (self.scope) |scope| return scope;
+        if (self.anchor) |anchor| return .{ .@"inline" = anchor };
+        return .review;
+    }
+
+    pub fn validate(self: Comment) error{InvalidCommentScope}!void {
+        if (self.isReply()) {
+            if (self.scope != null or self.anchor != null) return error.InvalidCommentScope;
+            return;
+        }
+        const scope = self.effectiveScope();
+        if (scope == .@"inline" and scope.@"inline".line() == null) return error.InvalidCommentScope;
     }
 
     /// If the body contains a fenced ```suggestion block, return the proposed
@@ -122,8 +173,22 @@ test "role predicates: reply and inline" {
     const reply: Comment = .{ .id = 2, .parent_id = 1, .author = "b", .body = "re" };
     try testing.expect(reply.isReply());
 
-    const inline_c: Comment = .{ .id = 3, .author = "c", .body = "x", .anchor = .{ .path = "f.zig", .to = 10 } };
+    const inline_c: Comment = .{ .id = 3, .author = "c", .body = "x", .scope = .{ .@"inline" = .{ .path = "f.zig", .to = 10 } } };
     try testing.expect(inline_c.isInline());
+}
+
+test "root scopes are exhaustive and Replies carry only parentage" {
+    const review_root: Comment = .{ .id = 1, .author = "a", .body = "review", .scope = .review };
+    const file_root: Comment = .{ .id = 2, .author = "a", .body = "file", .scope = .{ .file = .{ .path = "f.zig", .source_commit = "abc" } } };
+    const reply: Comment = .{ .id = 3, .parent_id = 2, .author = "b", .body = "reply", .scope = null };
+    try testing.expect(review_root.isReview());
+    try testing.expect(file_root.isFile());
+    try testing.expect(reply.scope == null);
+}
+
+test "invalid root and Reply scope combinations are rejected" {
+    try testing.expectError(error.InvalidCommentScope, (Comment{ .id = 1, .author = "a", .body = "bad", .scope = .{ .@"inline" = .{ .path = "f" } } }).validate());
+    try testing.expectError(error.InvalidCommentScope, (Comment{ .id = 2, .parent_id = 1, .author = "b", .body = "bad reply", .scope = .review }).validate());
 }
 
 test "anchor line prefers the new side" {

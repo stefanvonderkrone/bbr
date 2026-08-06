@@ -35,6 +35,8 @@ pub const FakeHttpClient = struct {
     last_method: ?client.Method = null,
     url_buf: [1024]u8 = undefined,
     url_len: usize = 0,
+    body_buf: [4096]u8 = undefined,
+    body_len: usize = 0,
     call_count: usize = 0,
 
     pub fn httpClient(self: *FakeHttpClient) HttpClient {
@@ -47,6 +49,11 @@ pub const FakeHttpClient = struct {
         return self.url_buf[0..self.url_len];
     }
 
+    pub fn lastBody(self: *const FakeHttpClient) ?[]const u8 {
+        if (self.call_count == 0) return null;
+        return self.body_buf[0..self.body_len];
+    }
+
     const vtable: HttpClient.VTable = .{ .send = send };
 
     fn send(ptr: *anyopaque, allocator: Allocator, req: Request) anyerror!Response {
@@ -54,6 +61,10 @@ pub const FakeHttpClient = struct {
         self.last_method = req.method;
         self.url_len = @min(req.url.len, self.url_buf.len);
         @memcpy(self.url_buf[0..self.url_len], req.url[0..self.url_len]);
+        if (req.body) |body| {
+            self.body_len = @min(body.len, self.body_buf.len);
+            @memcpy(self.body_buf[0..self.body_len], body[0..self.body_len]);
+        } else self.body_len = 0;
 
         if (self.send_error) |e| {
             self.call_count += 1;

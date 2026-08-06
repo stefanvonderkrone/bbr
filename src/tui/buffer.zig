@@ -149,6 +149,7 @@ pub const BuildOptions = struct {
     /// section near the top. Borrowed — must outlive the Buffer.
     drafts: []const Draft = &.{},
     anchor_projections: []const anchor_projection.ProjectionEntry = &.{},
+    scope_projections: []const anchor_projection.ScopeProjectionEntry = &.{},
     /// Isolate view: when set, project only `diff.files[only_file]` — its header,
     /// hunks (with woven inline threads/drafts), and its outdated section. The
     /// PR-level comment and pending sections are suppressed (they belong to no
@@ -172,7 +173,10 @@ pub const BuildOptions = struct {
 pub const Buffer = struct {
     rows: []const Row,
     layout: Layout,
+    file_tallies: []const FileTally = &.{},
 };
+
+pub const FileTally = struct { comments: usize = 0, drafts: usize = 0 };
 
 pub const BuildError = error{
     /// The requested `Layout` is not implemented yet.
@@ -207,12 +211,15 @@ pub fn buildWithComments(
     // vanish.
     const emitted = try allocator.alloc(bool, opts.drafts.len);
     @memset(emitted, false);
+    const emitted_threads = try allocator.alloc(bool, threads.len);
+    @memset(emitted_threads, false);
     var w: Weave = .{
         .a = allocator,
         .rows = &rows,
         .threads = threads,
         .drafts = opts.drafts,
         .emitted = emitted,
+        .emitted_threads = emitted_threads,
         .opts = opts,
     };
 
@@ -233,7 +240,7 @@ pub fn buildWithComments(
     if (pending_count > 0) {
         try rows.append(allocator, .{ .section = .{ .kind = .pending, .count = pending_count } });
         for (opts.drafts, 0..) |*d, i| {
-            if (d.parent == null and d.anchor == null) try w.emitDraft(i);
+            if (d.parent == null and draftScope(d, opts) == .review) try w.emitDraft(i);
         }
     }
 
@@ -244,6 +251,14 @@ pub fn buildWithComments(
             if (fi != only) continue;
         }
         try rows.append(allocator, .{ .file_header = file });
+
+        // File-level roots live at the File header, before hunks/folds/lines.
+        for (threads) |*t| {
+            if (threadCurrentInFile(t.*, file.*) and inlineVisible(t.*, opts)) try w.emitThread(t);
+        }
+        for (opts.drafts, 0..) |*draft, draft_index| {
+            if (draft.parent == null and draftCurrentInFile(draft, opts, file.*)) try w.emitDraft(draft_index);
+        }
 
         // True-whole-file: splice the fetched Hunk lines into the blob's
         // unchanged lines and emit the file as one continuous sequence (no hunk
@@ -268,7 +283,7 @@ pub fn buildWithComments(
         }
 
         // Per-file outdated section — never hidden (design §9b).
-        const od_count = fileOutdatedCount(threads, file.*) + draftOutdatedCount(opts.drafts, opts.anchor_projections, file.*);
+        const od_count = fileOutdatedCount(threads, file.*) + draftOutdatedCount(opts.drafts, opts, file.*);
         if (od_count > 0) {
             try rows.append(allocator, .{ .section = .{ .kind = .outdated, .count = od_count, .path = file.displayPath() } });
             for (threads) |*t| {
@@ -276,17 +291,20 @@ pub fn buildWithComments(
             }
             for (opts.drafts, 0..) |*draft, draft_index| {
                 if (draft.parent != null or w.emitted[draft_index]) continue;
-                if (draftOutdatedInFile(draft, opts.anchor_projections, file.*)) try w.emitDraftSnapshot(draft_index);
+                if (draftOutdatedInFile(draft, opts, file.*)) try w.emitDraftSnapshot(draft_index);
             }
         }
     }
 
     var unavailable_count: usize = 0;
     var fallback_outdated_count: usize = 0;
+    if (opts.only_file == null) for (threads, 0..) |thread, thread_index| {
+        if (!emitted_threads[thread_index] and thread.root.state == .outdated) fallback_outdated_count += 1;
+    };
     for (opts.drafts, 0..) |*draft, draft_index| {
         if (draft.parent != null or emitted[draft_index]) continue;
-        if (!draftInScope(draft, diff, opts.only_file, opts.anchor_projections)) continue;
-        switch (anchor_projection.find(opts.anchor_projections, draft.local_id) orelse continue) {
+        if (!draftInScope(draft, diff, opts)) continue;
+        switch (draftResolution(draft, opts)) {
             .unavailable => unavailable_count += 1,
             .resolved => |resolved| {
                 if (resolved.state == .outdated) fallback_outdated_count += 1;
@@ -295,10 +313,13 @@ pub fn buildWithComments(
     }
     if (fallback_outdated_count > 0) {
         try rows.append(allocator, .{ .section = .{ .kind = .outdated, .count = fallback_outdated_count } });
+        if (opts.only_file == null) for (threads, 0..) |*thread, thread_index| {
+            if (!emitted_threads[thread_index] and thread.root.state == .outdated) try w.emitThread(thread);
+        };
         for (opts.drafts, 0..) |*draft, draft_index| {
             if (draft.parent != null or emitted[draft_index]) continue;
-            if (!draftInScope(draft, diff, opts.only_file, opts.anchor_projections)) continue;
-            const resolution = anchor_projection.find(opts.anchor_projections, draft.local_id) orelse continue;
+            if (!draftInScope(draft, diff, opts)) continue;
+            const resolution = draftResolution(draft, opts);
             if (resolution == .resolved and resolution.resolved.state == .outdated) try w.emitDraftSnapshot(draft_index);
         }
     }
@@ -306,8 +327,8 @@ pub fn buildWithComments(
         try rows.append(allocator, .{ .section = .{ .kind = .unavailable, .count = unavailable_count } });
         for (opts.drafts, 0..) |*draft, draft_index| {
             if (draft.parent != null or emitted[draft_index]) continue;
-            if (!draftInScope(draft, diff, opts.only_file, opts.anchor_projections)) continue;
-            const resolution = anchor_projection.find(opts.anchor_projections, draft.local_id) orelse continue;
+            if (!draftInScope(draft, diff, opts)) continue;
+            const resolution = draftResolution(draft, opts);
             switch (resolution) {
                 .unavailable => try w.emitDraftSnapshot(draft_index),
                 .resolved => {},
@@ -322,16 +343,16 @@ pub fn buildWithComments(
     // in a trailing pending section (with its own reply subtree) rather than lost.
     var stranded: usize = 0;
     for (opts.drafts, 0..) |*d, i| {
-        if (!emitted[i] and d.parent == null and draftInScope(d, diff, opts.only_file, opts.anchor_projections)) stranded += 1;
+        if (!emitted[i] and d.parent == null and draftInScope(d, diff, opts)) stranded += 1;
     }
     if (stranded > 0) {
         try rows.append(allocator, .{ .section = .{ .kind = .pending, .count = stranded } });
         for (opts.drafts, 0..) |*d, i| {
-            if (!emitted[i] and d.parent == null and draftInScope(d, diff, opts.only_file, opts.anchor_projections)) try w.emitDraft(i);
+            if (!emitted[i] and d.parent == null and draftInScope(d, diff, opts)) try w.emitDraft(i);
         }
     }
 
-    return .{ .rows = try rows.toOwnedSlice(allocator), .layout = layout };
+    return .{ .rows = try rows.toOwnedSlice(allocator), .layout = layout, .file_tallies = try fileTallies(allocator, diff, threads, opts.drafts, opts) };
 }
 
 /// Mutable weaving context shared by the emit helpers: the row sink plus the
@@ -345,11 +366,15 @@ const Weave = struct {
     drafts: []const Draft,
     /// Index-aligned with `drafts`; set once the Draft has been placed.
     emitted: []bool,
+    emitted_threads: []bool,
     opts: BuildOptions,
 
     /// Append a thread's rows: root, then any pending reply-Drafts to the root,
     /// then each published reply followed by its own pending reply-Drafts.
     fn emitThread(w: *Weave, t: *const Thread) !void {
+        const index = (@intFromPtr(t) - @intFromPtr(w.threads.ptr)) / @sizeOf(Thread);
+        if (w.emitted_threads[index]) return;
+        w.emitted_threads[index] = true;
         try w.emitComment(t.root, false);
         try w.emitRepliesTo(.{ .comment = t.root.id });
         for (t.replies) |reply| {
@@ -529,7 +554,7 @@ const Weave = struct {
         // only Hunk lines bind comments/Drafts (M9 anchor safety).
         if (!ln.in_hunk) return;
         for (w.threads) |*t| {
-            const anc = t.root.anchor orelse continue;
+            const anc = t.anchor() orelse continue;
             if (t.root.state == .outdated) continue; // grouped below
             if (!anchorMatchesFile(anc, file.*)) continue;
             if (!inlineVisible(t.*, w.opts)) continue;
@@ -539,7 +564,7 @@ const Weave = struct {
         // thread. Reply Drafts are placed under their parent, not by anchor.
         for (w.drafts, 0..) |*d, i| {
             if (d.parent != null) continue;
-            const anc = projectedDraftAnchor(d, w.opts.anchor_projections) orelse continue;
+            const anc = projectedDraftAnchor(d, w.opts) orelse continue;
             if (!anchorMatchesFile(anc, file.*)) continue;
             if (anchorMatchesLine(anc, ln)) try w.emitDraft(i);
         }
@@ -770,7 +795,7 @@ fn computeEmphasis(allocator: std.mem.Allocator, lines: []const model.Line) ![]c
 }
 
 fn isPrLevel(t: Thread) bool {
-    return t.root.anchor == null;
+    return t.scope() == .review;
 }
 
 /// A current/moved thread is visible unless it's resolved and the toggle is off.
@@ -779,8 +804,12 @@ fn inlineVisible(t: Thread, opts: BuildOptions) bool {
 }
 
 fn isFileOutdated(t: Thread, file: model.File) bool {
-    const anc = t.root.anchor orelse return false;
-    return t.root.state == .outdated and anchorMatchesFile(anc, file);
+    if (t.root.state != .outdated) return false;
+    return scopeMatchesFile(t.scope(), file);
+}
+
+fn threadCurrentInFile(t: Thread, file: model.File) bool {
+    return t.root.state != .outdated and t.scope() == .file and scopeMatchesFile(t.scope(), file);
 }
 
 fn fileOutdatedCount(threads: []const Thread, file: model.File) usize {
@@ -791,27 +820,27 @@ fn fileOutdatedCount(threads: []const Thread, file: model.File) usize {
     return n;
 }
 
-fn projectedDraftAnchor(draft: *const Draft, projections: []const anchor_projection.ProjectionEntry) ?review.Anchor {
-    const authored = draft.anchor orelse return null;
-    const resolution = anchor_projection.find(projections, draft.local_id) orelse return authored;
-    return switch (resolution) {
+fn projectedDraftAnchor(draft: *const Draft, opts: BuildOptions) ?review.Anchor {
+    return switch (draftResolution(draft, opts)) {
         .unavailable => null,
-        .resolved => |resolved| if (resolved.state == .outdated) null else resolved.anchor,
+        .resolved => |resolved| if (resolved.state == .outdated) null else switch (resolved.scope) {
+            .@"inline" => |anchor| anchor,
+            else => null,
+        },
     };
 }
 
-fn draftOutdatedInFile(draft: *const Draft, projections: []const anchor_projection.ProjectionEntry, file: model.File) bool {
-    const resolution = anchor_projection.find(projections, draft.local_id) orelse return false;
-    return switch (resolution) {
+fn draftOutdatedInFile(draft: *const Draft, opts: BuildOptions, file: model.File) bool {
+    return switch (draftResolution(draft, opts)) {
         .unavailable => false,
-        .resolved => |resolved| resolved.state == .outdated and anchorMatchesFile(resolved.anchor, file),
+        .resolved => |resolved| resolved.state == .outdated and scopeMatchesFile(resolved.scope, file),
     };
 }
 
-fn draftOutdatedCount(drafts: []const Draft, projections: []const anchor_projection.ProjectionEntry, file: model.File) usize {
+fn draftOutdatedCount(drafts: []const Draft, opts: BuildOptions, file: model.File) usize {
     var count: usize = 0;
     for (drafts) |*draft| {
-        if (draft.parent == null and draftOutdatedInFile(draft, projections, file)) count += 1;
+        if (draft.parent == null and draftOutdatedInFile(draft, opts, file)) count += 1;
     }
     return count;
 }
@@ -827,24 +856,77 @@ fn anchorMatchesFile(anchor: review.Anchor, file: model.File) bool {
 /// (`only_file == null`) every Draft is in scope; in the isolate view only a
 /// Draft anchored to the focused file is — so a stranded PR-level or other-file
 /// Draft never leaks into a single-file projection.
-fn draftInScope(d: *const Draft, diff: model.Diff, only_file: ?usize, projections: []const anchor_projection.ProjectionEntry) bool {
-    const only = only_file orelse return true;
+fn draftInScope(d: *const Draft, diff: model.Diff, opts: BuildOptions) bool {
+    const only = opts.only_file orelse return true;
     if (only >= diff.files.len) return false;
-    const authored = d.anchor orelse return false;
-    const anc = if (anchor_projection.find(projections, d.local_id)) |resolution| switch (resolution) {
-        .unavailable => authored,
-        .resolved => |resolved| resolved.anchor,
-    } else authored;
-    return anchorMatchesFile(anc, diff.files[only]);
+    return switch (draftResolution(d, opts)) {
+        .unavailable => false,
+        .resolved => |resolved| scopeMatchesFile(resolved.scope, diff.files[only]),
+    };
 }
 
 /// Root Drafts (not replies) with no anchor — the PR-level "Pending" section.
 fn countPendingRoots(drafts: []const Draft) usize {
     var n: usize = 0;
     for (drafts) |*d| {
-        if (d.parent == null and d.anchor == null) n += 1;
+        if (d.parent == null and d.effectiveScope() == .review) n += 1;
     }
     return n;
+}
+
+fn draftScope(draft: *const Draft, opts: BuildOptions) review.CommentScope {
+    return switch (draftResolution(draft, opts)) {
+        .unavailable => draft.effectiveScope(),
+        .resolved => |resolved| resolved.scope,
+    };
+}
+
+fn draftResolution(draft: *const Draft, opts: BuildOptions) anchor_projection.ScopeResolution {
+    if (anchor_projection.findScope(opts.scope_projections, draft.local_id)) |resolution| return resolution;
+    if (anchor_projection.find(opts.anchor_projections, draft.local_id)) |legacy| return switch (legacy) {
+        .unavailable => .unavailable,
+        .resolved => |resolved| .{ .resolved = .{ .state = resolved.state, .scope = .{ .@"inline" = resolved.anchor } } },
+    };
+    return .{ .resolved = .{ .state = .current, .scope = draft.effectiveScope() } };
+}
+
+fn draftCurrentInFile(draft: *const Draft, opts: BuildOptions, file: model.File) bool {
+    return switch (draftResolution(draft, opts)) {
+        .unavailable => false,
+        .resolved => |resolved| resolved.state != .outdated and resolved.scope == .file and scopeMatchesFile(resolved.scope, file),
+    };
+}
+
+fn scopeMatchesFile(scope: review.CommentScope, file: model.File) bool {
+    return switch (scope) {
+        .review => false,
+        .file => |value| std.mem.eql(u8, value.path, file.old_path) or std.mem.eql(u8, value.path, file.new_path),
+        .@"inline" => |anchor| anchorMatchesFile(anchor, file),
+    };
+}
+
+pub fn fileTallies(allocator: std.mem.Allocator, diff: model.Diff, threads: []const Thread, drafts: []const Draft, opts: BuildOptions) ![]const FileTally {
+    const tallies = try allocator.alloc(FileTally, diff.files.len);
+    @memset(tallies, .{});
+    for (threads) |thread| for (diff.files, 0..) |file, index| {
+        if (scopeMatchesFile(thread.scope(), file)) {
+            tallies[index].comments += 1;
+            break;
+        }
+    };
+    for (drafts) |*draft| {
+        if (draft.parent != null) continue;
+        const resolution = draftResolution(draft, opts);
+        const scope = switch (resolution) {
+            .unavailable => continue,
+            .resolved => |resolved| resolved.scope,
+        };
+        for (diff.files, 0..) |file, index| if (scopeMatchesFile(scope, file)) {
+            tallies[index].drafts += 1;
+            break;
+        };
+    }
+    return tallies;
 }
 
 fn countWhere(threads: []const Thread, pred: fn (Thread) bool, opts: BuildOptions) usize {
@@ -1261,8 +1343,8 @@ test "an anchored draft is woven under its line; a PR-level draft gets a pending
 
     const diff = try parse(a, anchor_diff);
     const drafts = [_]Draft{
-        .{ .local_id = 1, .kind = .top_level, .body = "overall: needs tests" }, // no anchor
-        .{ .local_id = 2, .kind = .inline_comment, .body = "why new?", .anchor = .{ .path = "a.txt", .to = 2, .commit = "c0" } },
+        .{ .local_id = 1, .kind = .comment, .body = "overall: needs tests" }, // no anchor
+        .{ .local_id = 2, .kind = .comment, .body = "why new?", .anchor = .{ .path = "a.txt", .to = 2, .commit = "c0" } },
     };
     const buf = try buildWithComments(a, diff, .unified, &.{}, .{ .drafts = &drafts });
 
@@ -1294,7 +1376,7 @@ test "a reply draft whose parent is absent stays hidden (shares parent visibilit
         // Parent comment 5 isn't present, so the reply has nothing to nest under.
         // A reply is never surfaced as a root, so it stays hidden — it still
         // persists and submits, but it doesn't float free in the diff.
-        .{ .local_id = 1, .kind = .reply, .body = "re", .parent = .{ .comment = 5 } },
+        .{ .local_id = 1, .kind = .comment, .body = "re", .parent = .{ .comment = 5 } },
     };
     const buf = try buildWithComments(a, diff, .unified, &.{}, .{ .drafts = &drafts });
     try testing.expectEqual(@as(usize, 0), countKind(buf, .draft));
@@ -1312,7 +1394,7 @@ test "a reply draft to a resolved thread hides and reveals with its parent" {
     };
     const threads = try bbr.review.thread.build(a, &comments);
     const drafts = [_]Draft{
-        .{ .local_id = 1, .kind = .reply, .body = "actually, reopen", .parent = .{ .comment = 1 } },
+        .{ .local_id = 1, .kind = .comment, .body = "actually, reopen", .parent = .{ .comment = 1 } },
     };
 
     // Toggle off: the resolved thread is hidden, and so is the reply to it.
@@ -1339,7 +1421,7 @@ test "a reply draft to a PR-level comment nests under it, not in the pending sec
     };
     const threads = try bbr.review.thread.build(a, &comments);
     const drafts = [_]Draft{
-        .{ .local_id = 1, .kind = .reply, .body = "one nit though", .parent = .{ .comment = 1 } },
+        .{ .local_id = 1, .kind = .comment, .body = "one nit though", .parent = .{ .comment = 1 } },
     };
     const buf = try buildWithComments(a, diff, .unified, threads, .{ .drafts = &drafts });
 
@@ -1366,7 +1448,7 @@ test "a reply draft to an inline thread nests right after the thread" {
     };
     const threads = try bbr.review.thread.build(a, &comments);
     const drafts = [_]Draft{
-        .{ .local_id = 1, .kind = .reply, .body = "because X", .parent = .{ .comment = 7 } },
+        .{ .local_id = 1, .kind = .comment, .body = "because X", .parent = .{ .comment = 7 } },
     };
     const buf = try buildWithComments(a, diff, .unified, threads, .{ .drafts = &drafts });
 
@@ -1388,8 +1470,8 @@ test "a reply-to-draft chain nests under its root draft" {
 
     const diff = try parse(a, anchor_diff);
     const drafts = [_]Draft{
-        .{ .local_id = 1, .kind = .inline_comment, .body = "root", .anchor = .{ .path = "a.txt", .to = 2, .commit = "c0" } },
-        .{ .local_id = 2, .kind = .reply, .body = "reply to my own draft", .parent = .{ .draft = 1 } },
+        .{ .local_id = 1, .kind = .comment, .body = "root", .anchor = .{ .path = "a.txt", .to = 2, .commit = "c0" } },
+        .{ .local_id = 2, .kind = .comment, .body = "reply to my own draft", .parent = .{ .draft = 1 } },
     };
     const buf = try buildWithComments(a, diff, .unified, &.{}, .{ .drafts = &drafts });
 
@@ -1412,8 +1494,8 @@ test "a posted draft's row is hidden but its pending reply is still placed" {
     // A partial batch: the root posted (now owned by the server after re-fetch),
     // its reply failed and stays pending for a selective retry.
     const drafts = [_]Draft{
-        .{ .local_id = 1, .kind = .inline_comment, .body = "root", .anchor = .{ .path = "a.txt", .to = 2, .commit = "c0" }, .state = .{ .posted = 999 } },
-        .{ .local_id = 2, .kind = .reply, .body = "still pending", .parent = .{ .draft = 1 }, .state = .{ .failed = error.ServerError } },
+        .{ .local_id = 1, .kind = .comment, .body = "root", .anchor = .{ .path = "a.txt", .to = 2, .commit = "c0" }, .state = .{ .posted = 999 } },
+        .{ .local_id = 2, .kind = .comment, .body = "still pending", .parent = .{ .draft = 1 }, .state = .{ .failed = error.ServerError } },
     };
     const buf = try buildWithComments(a, diff, .unified, &.{}, .{ .drafts = &drafts });
 
@@ -1464,8 +1546,8 @@ test "the isolate view suppresses PR-level and other-file rows" {
     const threads = try bbr.review.thread.build(a, &comments);
     // A PR-level draft and one anchored to the other file.
     const drafts = [_]Draft{
-        .{ .local_id = 1, .kind = .top_level, .body = "needs tests" }, // PR-level
-        .{ .local_id = 2, .kind = .inline_comment, .body = "on b", .anchor = .{ .path = "b.txt", .to = 5, .commit = "c0" } },
+        .{ .local_id = 1, .kind = .comment, .body = "needs tests" }, // PR-level
+        .{ .local_id = 2, .kind = .comment, .body = "on b", .anchor = .{ .path = "b.txt", .to = 5, .commit = "c0" } },
     };
 
     // Isolate a.txt: no PR-level comment/pending sections, no b.txt comment/draft.
@@ -1595,7 +1677,7 @@ test "a multi-line body emits one row per visual line, sharing one owner, is_fir
     };
     const threads = try bbr.review.thread.build(a, &comments);
     const drafts = [_]Draft{
-        .{ .local_id = 1, .kind = .inline_comment, .body = "draft a\ndraft b", .anchor = .{ .path = "a.txt", .to = 2, .commit = "c0" } },
+        .{ .local_id = 1, .kind = .comment, .body = "draft a\ndraft b", .anchor = .{ .path = "a.txt", .to = 2, .commit = "c0" } },
     };
     const buf = try buildWithComments(a, diff, .unified, threads, .{ .drafts = &drafts });
 
@@ -1690,7 +1772,7 @@ test "a moved local Draft is woven at its projected Anchor" {
     const diff = try parse(a, anchor_diff);
     const drafts = [_]Draft{.{
         .local_id = 7,
-        .kind = .inline_comment,
+        .kind = .comment,
         .target = .local,
         .body = "moved note",
         .anchor = .{ .path = "a.txt", .to = 2, .commit = "old" },
@@ -1720,7 +1802,7 @@ test "an outdated local Draft remains visible with its authored snapshot" {
     const diff = try parse(a, anchor_diff);
     const drafts = [_]Draft{.{
         .local_id = 8,
-        .kind = .inline_comment,
+        .kind = .comment,
         .target = .local,
         .body = "stale note",
         .anchor = .{ .path = "a.txt", .to = 2, .commit = "old" },
@@ -1763,7 +1845,7 @@ test "a local Draft with unavailable Git evidence remains visible" {
     const diff = try parse(a, anchor_diff);
     const drafts = [_]Draft{.{
         .local_id = 9,
-        .kind = .inline_comment,
+        .kind = .comment,
         .target = .local,
         .body = "cannot resolve",
         .anchor = .{ .path = "missing.txt", .to = 2, .commit = "missing" },
@@ -1791,7 +1873,7 @@ test "single-file scope does not leak another File's outdated local Draft" {
     const diff = try parse(a, two_file_diff);
     const drafts = [_]Draft{.{
         .local_id = 10,
-        .kind = .inline_comment,
+        .kind = .comment,
         .target = .local,
         .body = "belongs to b",
         .anchor = .{ .path = "b.txt", .to = 5, .commit = "old" },
@@ -1808,4 +1890,81 @@ test "single-file scope does not leak another File's outdated local Draft" {
     });
     try testing.expectEqual(@as(usize, 0), countKind(buf, .draft));
     try testing.expectEqual(@as(usize, 0), countKind(buf, .section));
+}
+
+test "ScopeProjection places each root and Replies once and tallies roots per File" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try parse(a, two_file_diff);
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "file root", .scope = .{ .file = .{ .path = "a.txt", .source_commit = "abc" } } },
+        .{ .id = 2, .parent_id = 1, .author = "Bo", .body = "file reply", .scope = null },
+        .{ .id = 3, .author = "Cy", .body = "line root", .scope = .{ .@"inline" = .{ .path = "a.txt", .to = 1 } } },
+    };
+    const threads = try bbr.review.thread.build(a, &comments);
+    const drafts = [_]Draft{
+        .{ .local_id = 10, .kind = .comment, .body = "file draft", .scope = .{ .file = .{ .path = "a.txt", .source_commit = "abc" } } },
+        .{ .local_id = 11, .kind = .comment, .body = "draft reply", .parent = .{ .draft = 10 }, .scope = null },
+    };
+
+    for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        const buf = try buildWithComments(a, diff, layout, threads, .{ .drafts = &drafts, .only_file = 0 });
+        try testing.expectEqual(@as(usize, 2), buf.file_tallies[0].comments);
+        try testing.expectEqual(@as(usize, 1), buf.file_tallies[0].drafts);
+        try testing.expectEqual(@as(usize, 0), buf.file_tallies[1].comments);
+        try testing.expect(buf.rows[0] == .file_header);
+        try testing.expect(buf.rows[1] == .comment and buf.rows[1].comment.comment.id == 1);
+        try testing.expect(buf.rows[2] == .comment and buf.rows[2].comment.comment.id == 2);
+        try testing.expect(buf.rows[3] == .draft and buf.rows[3].draft.draft.local_id == 10);
+        try testing.expect(buf.rows[4] == .draft and buf.rows[4].draft.draft.local_id == 11);
+        var roots: usize = 0;
+        var replies: usize = 0;
+        for (buf.rows) |row| switch (row) {
+            .comment => |value| if (value.is_first) {
+                if (value.comment.id == 1 or value.comment.id == 3) roots += 1;
+                if (value.comment.id == 2) replies += 1;
+            },
+            else => {},
+        };
+        try testing.expectEqual(@as(usize, 2), roots);
+        try testing.expectEqual(@as(usize, 1), replies);
+    }
+}
+
+test "scope fallbacks distinguish unmatched outdated from unavailable and do not leak into isolate" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try parse(a, two_file_diff);
+    const comments = [_]Comment{.{
+        .id = 20,
+        .author = "Ada",
+        .body = "removed file",
+        .scope = .{ .file = .{ .path = "gone.txt", .source_commit = "old" } },
+        .state = .outdated,
+    }};
+    const threads = try bbr.review.thread.build(a, &comments);
+    const drafts = [_]Draft{.{
+        .local_id = 21,
+        .kind = .comment,
+        .body = "no evidence",
+        .scope = .{ .file = .{ .path = "unknown.txt", .source_commit = "missing" } },
+    }};
+    const projections = [_]anchor_projection.ScopeProjectionEntry{.{ .temp_id = 21, .resolution = .unavailable }};
+    const all = try buildWithComments(a, diff, .unified, threads, .{ .drafts = &drafts, .scope_projections = &projections });
+    var saw_outdated = false;
+    var saw_unavailable = false;
+    for (all.rows) |row| if (row == .section) switch (row.section.kind) {
+        .outdated => if (row.section.path.len == 0) {
+            saw_outdated = true;
+        },
+        .unavailable => saw_unavailable = true,
+        else => {},
+    };
+    try testing.expect(saw_outdated and saw_unavailable);
+
+    const isolated = try buildWithComments(a, diff, .unified, threads, .{ .drafts = &drafts, .scope_projections = &projections, .only_file = 0 });
+    try testing.expectEqual(@as(usize, 0), countKind(isolated, .comment));
+    try testing.expectEqual(@as(usize, 0), countKind(isolated, .draft));
 }

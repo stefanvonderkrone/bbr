@@ -14,7 +14,7 @@ pub fn postOutcome(
     dedupe: bool,
 ) !bbr.review.PostOutcome {
     if (dedupe) {
-        if (try poster.findExisting(draft)) |existing| return .{ .posted = existing };
+        if (try poster.findExisting(draft, parent)) |existing| return .{ .posted = existing };
     }
     return poster.post(draft, parent);
 }
@@ -65,7 +65,7 @@ const FakePoster = struct {
         return self.posted;
     }
 
-    fn findExisting(ptr: *anyopaque, _: bbr.review.Draft) anyerror!?bbr.review.CommentId {
+    fn findExisting(ptr: *anyopaque, _: bbr.review.Draft, _: ?bbr.review.CommentId) anyerror!?bbr.review.CommentId {
         const self: *FakePoster = @ptrCast(@alignCast(ptr));
         self.find_calls += 1;
         return self.existing;
@@ -79,7 +79,7 @@ fn testCommand(operation_id: bbr.review.OperationId, dedupe: bool) !*presentatio
         .arena = std.heap.ArenaAllocator.init(testing.allocator),
         .operation_id = operation_id,
         .key = try presentation.ReviewKey.init("workspace", "repo", 1),
-        .draft = .{ .local_id = 41, .kind = .top_level, .body = "body" },
+        .draft = .{ .local_id = 41, .kind = .comment, .body = "body" },
         .parent = null,
         .dedupe = dedupe,
     };
@@ -90,7 +90,7 @@ test "dedupe hit completes from the existing Comment without another POST" {
     var fake = FakePoster{ .existing = 777 };
     const outcome = try postOutcome(fake.poster(), .{
         .local_id = 1,
-        .kind = .top_level,
+        .kind = .comment,
         .body = "already posted",
     }, null, true);
 
@@ -103,7 +103,7 @@ test "dedupe miss performs the POST" {
     var fake = FakePoster{};
     const outcome = try postOutcome(fake.poster(), .{
         .local_id = 1,
-        .kind = .top_level,
+        .kind = .comment,
         .body = "new comment",
     }, null, true);
 

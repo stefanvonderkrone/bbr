@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const comment = @import("comment.zig");
 const CommentId = comment.CommentId;
 const Anchor = comment.Anchor;
+const CommentScope = comment.CommentScope;
 const AnchorSnapshot = comment.AnchorSnapshot;
 const ApiError = @import("../bitbucket/types.zig").ApiError;
 
@@ -27,7 +28,7 @@ const ApiError = @import("../bitbucket/types.zig").ApiError;
 pub const TempId = u64;
 
 /// What role a Draft plays. Mirrors design §6.
-pub const DraftKind = enum { top_level, inline_comment, reply, suggestion };
+pub const DraftKind = enum { comment, suggestion };
 
 /// Where a Draft lives: `bitbucket` submits on Submission; `local` persists only
 /// in SQLite and is never submitted (the offline review mode, M14).
@@ -58,7 +59,9 @@ pub const Draft = struct {
     local_id: TempId,
     kind: DraftKind,
     target: CommentTarget = .bitbucket,
-    /// The diff location, or null for a PR-level (top-level) Draft.
+    /// Roots carry one exhaustive scope; Replies carry null and inherit it.
+    scope: ?CommentScope = null,
+    /// Transitional source compatibility; new code writes `scope`.
     anchor: ?Anchor = null,
     /// Present only on an anchored local root; Replies inherit their root's
     /// snapshot through the parent relationship rather than duplicating it.
@@ -74,7 +77,13 @@ pub const Draft = struct {
     }
 
     pub fn isInline(self: Draft) bool {
-        return self.anchor != null;
+        return self.effectiveScope() == .@"inline";
+    }
+
+    pub fn effectiveScope(self: Draft) CommentScope {
+        if (self.scope) |scope| return scope;
+        if (self.anchor) |anchor| return .{ .@"inline" = anchor };
+        return .review;
     }
 
     /// True once the Draft carries a server id (submission succeeded).
@@ -88,10 +97,22 @@ pub const Draft = struct {
 pub const NewDraft = struct {
     kind: DraftKind,
     target: CommentTarget = .bitbucket,
+    scope: ?CommentScope = null,
     anchor: ?Anchor = null,
     snapshot: ?AnchorSnapshot = null,
     parent: ?Parent = null,
     body: []const u8,
+
+    pub fn validate(self: NewDraft) error{InvalidDraftScope}!void {
+        if (self.parent != null) {
+            if (self.scope != null or self.anchor != null or self.snapshot != null) return error.InvalidDraftScope;
+            return;
+        }
+        const scope: CommentScope = self.scope orelse if (self.anchor) |anchor| .{ .@"inline" = anchor } else .review;
+        if (scope == .@"inline" and scope.@"inline".line() == null) return error.InvalidDraftScope;
+        if (self.kind == .suggestion and (scope != .@"inline" or scope.@"inline".to == null)) return error.InvalidDraftScope;
+        if (scope != .@"inline" and self.snapshot != null) return error.InvalidDraftScope;
+    }
 };
 
 /// The whole graph of Drafts for one PullRequest. Owns the Drafts; `add` assigns
@@ -114,13 +135,15 @@ pub const PendingReview = struct {
 
     /// Create a Draft, assigning the next TempId, and return that id.
     pub fn add(self: *PendingReview, alloc: Allocator, d: NewDraft) !TempId {
+        try d.validate();
         const id = self.next_id;
         self.next_id += 1;
         try self.drafts.append(alloc, .{
             .local_id = id,
             .kind = d.kind,
             .target = d.target,
-            .anchor = d.anchor,
+            .scope = if (d.parent == null) d.scope else null,
+            .anchor = if (d.parent == null and d.scope == null) d.anchor else null,
             .snapshot = d.snapshot,
             .parent = d.parent,
             .body = d.body,
@@ -260,8 +283,8 @@ test "add assigns monotonic ids and stores fields" {
     var pr = PendingReview.init(7);
     defer pr.deinit(testing.allocator);
 
-    const a = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "first" });
-    const b = try pr.add(testing.allocator, .{ .kind = .inline_comment, .body = "second", .anchor = .{ .path = "f.zig", .to = 10, .commit = "abc" } });
+    const a = try pr.add(testing.allocator, .{ .kind = .comment, .body = "first" });
+    const b = try pr.add(testing.allocator, .{ .kind = .comment, .body = "second", .anchor = .{ .path = "f.zig", .to = 10, .commit = "abc" } });
     try testing.expectEqual(@as(TempId, 1), a);
     try testing.expectEqual(@as(TempId, 2), b);
     try testing.expectEqual(@as(usize, 2), pr.drafts.items.len);
@@ -276,7 +299,7 @@ test "add assigns monotonic ids and stores fields" {
 test "setState advances the lifecycle" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
-    const id = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "x" });
+    const id = try pr.add(testing.allocator, .{ .kind = .comment, .body = "x" });
 
     pr.setState(id, .submitting);
     try testing.expect(pr.get(id).?.state == .submitting);
@@ -290,20 +313,20 @@ test "setState advances the lifecycle" {
 test "addExisting keeps next_id past loaded ids (resume)" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
-    try pr.addExisting(testing.allocator, .{ .local_id = 5, .kind = .top_level, .body = "loaded" });
-    try pr.addExisting(testing.allocator, .{ .local_id = 3, .kind = .top_level, .body = "loaded2" });
+    try pr.addExisting(testing.allocator, .{ .local_id = 5, .kind = .comment, .body = "loaded" });
+    try pr.addExisting(testing.allocator, .{ .local_id = 3, .kind = .comment, .body = "loaded2" });
     // A fresh draft gets an id above every loaded one.
-    const fresh = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "new" });
+    const fresh = try pr.add(testing.allocator, .{ .kind = .comment, .body = "new" });
     try testing.expectEqual(@as(TempId, 6), fresh);
 }
 
 test "topological order places a reply after its draft parent" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
-    const root = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "root" });
-    const reply = try pr.add(testing.allocator, .{ .kind = .reply, .body = "re", .parent = .{ .draft = root } });
+    const root = try pr.add(testing.allocator, .{ .kind = .comment, .body = "root" });
+    const reply = try pr.add(testing.allocator, .{ .kind = .comment, .body = "re", .parent = .{ .draft = root } });
     // Reply to the reply (parent has no server id yet either).
-    const reply2 = try pr.add(testing.allocator, .{ .kind = .reply, .body = "re2", .parent = .{ .draft = reply } });
+    const reply2 = try pr.add(testing.allocator, .{ .kind = .comment, .body = "re2", .parent = .{ .draft = reply } });
 
     const order = try pr.topologicalOrder(testing.allocator);
     defer testing.allocator.free(order);
@@ -315,8 +338,8 @@ test "topological order places a reply after its draft parent" {
 test "replies to already-posted comments are roots (no reordering needed)" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
-    const a = try pr.add(testing.allocator, .{ .kind = .reply, .body = "to server comment", .parent = .{ .comment = 99 } });
-    const b = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "top" });
+    const a = try pr.add(testing.allocator, .{ .kind = .comment, .body = "to server comment", .parent = .{ .comment = 99 } });
+    const b = try pr.add(testing.allocator, .{ .kind = .comment, .body = "top" });
     const order = try pr.topologicalOrder(testing.allocator);
     defer testing.allocator.free(order);
     try testing.expectEqual(a, order[0]);
@@ -326,9 +349,9 @@ test "replies to already-posted comments are roots (no reordering needed)" {
 test "remove takes a draft's reply-descendants with it" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
-    const root = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "root" });
-    _ = try pr.add(testing.allocator, .{ .kind = .reply, .body = "re", .parent = .{ .draft = root } });
-    const keep = try pr.add(testing.allocator, .{ .kind = .top_level, .body = "unrelated" });
+    const root = try pr.add(testing.allocator, .{ .kind = .comment, .body = "root" });
+    _ = try pr.add(testing.allocator, .{ .kind = .comment, .body = "re", .parent = .{ .draft = root } });
+    const keep = try pr.add(testing.allocator, .{ .kind = .comment, .body = "unrelated" });
 
     const removed = pr.remove(testing.allocator, root);
     try testing.expectEqual(@as(usize, 2), removed);

@@ -122,7 +122,8 @@ pub const Client = struct {
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
 
-        try buf.print(allocator,
+        try buf.print(
+            allocator,
             "{s}/repositories/{s}/{s}/pullrequests?pagelen=50&state={s}",
             .{ base_url, self.cred.workspace, repo_slug, opts.state },
         );
@@ -247,14 +248,16 @@ pub const Client = struct {
         var wire = Wire{ .content = .{ .raw = nc.body } };
         if (nc.parent) |pid| {
             wire.parent = .{ .id = pid };
-        } else if (nc.anchor) |anc| {
-            wire.@"inline" = .{
+        } else switch (nc.effectiveScope()) {
+            .review => {},
+            .file => |file| wire.@"inline" = .{ .path = file.path },
+            .@"inline" => |anc| wire.@"inline" = .{
                 .path = anc.path,
                 .from = anc.from,
                 .to = anc.to,
                 .start_from = anc.start_from,
                 .start_to = anc.start_to,
-            };
+            },
         }
         const body = try std.json.Stringify.valueAlloc(allocator, wire, .{ .emit_null_optional_fields = false });
         defer allocator.free(body);
@@ -435,8 +438,16 @@ pub const ListOptions = struct {
 /// markdown (a suggestion's fenced block is already part of the body).
 pub const NewComment = struct {
     body: []const u8,
+    scope: ?review.CommentScope = null,
+    /// Transitional source compatibility for callers predating CommentScope.
     anchor: ?Anchor = null,
     parent: ?CommentId = null,
+
+    pub fn effectiveScope(self: NewComment) review.CommentScope {
+        if (self.scope) |scope| return scope;
+        if (self.anchor) |anchor| return .{ .@"inline" = anchor };
+        return .review;
+    }
 };
 
 /// Percent-encode `raw` into `buf`, escaping everything outside the RFC 3986
@@ -580,22 +591,41 @@ fn dupeComment(allocator: Allocator, cj: CommentJson, head: HeadCommits) !Commen
     const body_owned = try allocator.dupe(u8, raw);
     errdefer allocator.free(body_owned);
 
+    const parent_id: ?CommentId = if (cj.parent) |p| p.id else null;
+    var scope: ?review.CommentScope = null;
     var anchor: ?Anchor = null;
-    if (cj.@"inline") |inl| {
-        anchor = .{
-            .path = try allocator.dupe(u8, inl.path),
-            .from = inl.from,
-            .to = inl.to,
-            .start_from = inl.start_from,
-            .start_to = inl.start_to,
-        };
+    if (parent_id == null) {
+        if (cj.@"inline") |inl| {
+            const has_old = inl.from != null or inl.start_from != null;
+            const has_new = inl.to != null or inl.start_to != null;
+            if (has_old and has_new) return error.MalformedResponse;
+            const path = try allocator.dupe(u8, inl.path);
+            if (!has_old and !has_new) {
+                scope = .{ .file = .{
+                    .path = path,
+                    .source_commit = try allocator.dupe(u8, head.source),
+                } };
+            } else {
+                anchor = .{
+                    .path = path,
+                    .from = inl.from,
+                    .to = inl.to,
+                    .start_from = inl.start_from,
+                    .start_to = inl.start_to,
+                };
+                scope = .{ .@"inline" = anchor.? };
+            }
+        } else {
+            scope = .review;
+        }
     }
 
     return .{
         .id = cj.id,
-        .parent_id = if (cj.parent) |p| p.id else null,
+        .parent_id = parent_id,
         .author = author_owned,
         .body = body_owned,
+        .scope = scope,
         .anchor = anchor,
         .resolved = cj.resolution != null,
         .state = commentState(cj, head),
@@ -649,7 +679,14 @@ pub fn deinitComments(allocator: Allocator, comments: []Comment) void {
     for (comments) |c| {
         allocator.free(c.author);
         allocator.free(c.body);
-        if (c.anchor) |a| allocator.free(a.path);
+        if (c.scope) |scope| switch (scope) {
+            .review => {},
+            .file => |file| {
+                allocator.free(file.path);
+                allocator.free(file.source_commit);
+            },
+            .@"inline" => |anchor| allocator.free(anchor.path),
+        } else if (c.anchor) |a| allocator.free(a.path);
     }
     allocator.free(comments);
 }
@@ -923,6 +960,21 @@ test "createComment builds an inline body for a root anchored comment" {
     , body);
 }
 
+test "createComment maps File scope to a path-only inline object" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 201, .body =
+        \\{ "id": 1 }
+    };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    _ = try bb.createComment(a, "myrepo", 7, .{
+        .body = "whole file",
+        .scope = .{ .file = .{ .path = "src/foo.zig", .source_commit = "local-only" } },
+    });
+    try testing.expectEqualStrings(
+        \\{"content":{"raw":"whole file"},"inline":{"path":"src/foo.zig"}}
+    , fake.lastBody().?);
+}
+
 test "createComment sends start_to alongside to for a new-side range" {
     const a = testing.allocator;
     var fake: FakeHttpClient = .{ .status = 201, .body =
@@ -1047,6 +1099,28 @@ test "getComments follows next links and returns non-deleted comments" {
     // Bitbucket's outdated verdict is honored.
     try testing.expectEqual(review.AnchorState.outdated, comments[3].state);
     try testing.expectEqual(@as(?u32, 10), comments[3].anchor.?.from);
+}
+
+test "getComments classifies Review File inline roots and strips Reply scope" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body =
+        \\{ "values": [
+        \\ { "id": 1, "content": { "raw": "review" }, "user": { "display_name": "A" } },
+        \\ { "id": 2, "content": { "raw": "file" }, "user": { "display_name": "A" }, "inline": { "path": "src/f.zig" } },
+        \\ { "id": 3, "content": { "raw": "line" }, "user": { "display_name": "A" }, "inline": { "path": "src/f.zig", "to": 4 } },
+        \\ { "id": 4, "parent": { "id": 3 }, "content": { "raw": "reply" }, "user": { "display_name": "B" }, "inline": { "path": "wire-echo", "to": 99 } }
+        \\] }
+    };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const comments = try bb.getComments(a, "repo", 1, .{ .source = "abc", .destination = "def" });
+    defer deinitComments(a, comments);
+    try testing.expect(comments[0].scope.? == .review);
+    try testing.expect(comments[1].scope.? == .file);
+    try testing.expectEqualStrings("src/f.zig", comments[1].scope.?.file.path);
+    try testing.expectEqualStrings("abc", comments[1].scope.?.file.source_commit);
+    try testing.expect(comments[2].scope.? == .@"inline");
+    try testing.expect(comments[3].scope == null);
+    try testing.expect(comments[3].anchor == null);
 }
 
 // A real single-comment shape captured from PR 1726 (comment 811927613): an

@@ -16,6 +16,7 @@ const comment = @import("comment.zig");
 const Comment = comment.Comment;
 const CommentId = comment.CommentId;
 const Anchor = comment.Anchor;
+const CommentScope = comment.CommentScope;
 
 /// A root Comment together with its ordered Replies. The unit the UI collapses.
 /// Resolved Threads hide behind a toggle that reveals the *whole* Thread.
@@ -26,11 +27,18 @@ pub const Thread = struct {
 
     /// The diff anchor this thread hangs off (the root's), or null for PR-level.
     pub fn anchor(self: Thread) ?Anchor {
-        return self.root.anchor;
+        return switch (self.scope()) {
+            .@"inline" => |anc| anc,
+            else => null,
+        };
+    }
+
+    pub fn scope(self: Thread) CommentScope {
+        return self.root.effectiveScope();
     }
 
     pub fn isInline(self: Thread) bool {
-        return self.root.anchor != null;
+        return self.scope() == .@"inline";
     }
 };
 

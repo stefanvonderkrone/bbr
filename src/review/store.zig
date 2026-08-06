@@ -187,6 +187,14 @@ pub const PendingReviewStore = struct {
 pub fn dupeDraft(alloc: Allocator, d: Draft) !Draft {
     var copy = d;
     copy.body = try alloc.dupe(u8, d.body);
+    if (d.scope) |scope| copy.scope = switch (scope) {
+        .review => .review,
+        .file => |file| .{ .file = .{
+            .path = try alloc.dupe(u8, file.path),
+            .source_commit = try alloc.dupe(u8, file.source_commit),
+        } },
+        .@"inline" => |anchor| .{ .@"inline" = try dupeAnchor(alloc, anchor) },
+    };
     if (d.anchor) |anchor| copy.anchor = try dupeAnchor(alloc, anchor);
     if (d.snapshot) |snapshot| {
         copy.snapshot = snapshot;
@@ -517,7 +525,7 @@ test "round-trips a draft's fields, anchor, and state through the fake" {
 
     try s.put(testReviewKey(7), .{
         .local_id = 1,
-        .kind = .inline_comment,
+        .kind = .comment,
         .anchor = .{ .path = "src/f.zig", .to = 12, .commit = "deadbeef" },
         .body = "needs a test",
         .state = .{ .posted = 555 },
@@ -530,7 +538,7 @@ test "round-trips a draft's fields, anchor, and state through the fake" {
     try testing.expectEqual(@as(usize, 1), drafts.len);
     const d = drafts[0];
     try testing.expectEqual(@as(TempId, 1), d.local_id);
-    try testing.expect(d.kind == .inline_comment);
+    try testing.expect(d.kind == .comment);
     try testing.expectEqualStrings("needs a test", d.body);
     try testing.expectEqualStrings("src/f.zig", d.anchor.?.path);
     try testing.expectEqual(@as(?u32, 12), d.anchor.?.to);
@@ -543,10 +551,10 @@ test "put replaces the same key; load scopes to the PR" {
     defer mem.deinit();
     const s = mem.store();
 
-    try s.put(testReviewKey(1), .{ .local_id = 1, .kind = .top_level, .body = "first" });
-    try s.put(testReviewKey(1), .{ .local_id = 1, .kind = .top_level, .body = "edited" }); // replace
-    try s.put(testReviewKey(1), .{ .local_id = 2, .kind = .top_level, .body = "second" });
-    try s.put(testReviewKey(2), .{ .local_id = 1, .kind = .top_level, .body = "other pr" });
+    try s.put(testReviewKey(1), .{ .local_id = 1, .kind = .comment, .body = "first" });
+    try s.put(testReviewKey(1), .{ .local_id = 1, .kind = .comment, .body = "edited" }); // replace
+    try s.put(testReviewKey(1), .{ .local_id = 2, .kind = .comment, .body = "second" });
+    try s.put(testReviewKey(2), .{ .local_id = 1, .kind = .comment, .body = "other pr" });
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -564,8 +572,8 @@ test "Pending Reviews with the same PullRequestId are scoped by Repository" {
     const alpha: ReviewKey = .{ .workspace = "ws", .repository = "alpha", .pull_request_id = 1 };
     const beta: ReviewKey = .{ .workspace = "ws", .repository = "beta", .pull_request_id = 1 };
 
-    try s.put(alpha, .{ .local_id = 1, .kind = .top_level, .body = "alpha draft" });
-    try s.put(beta, .{ .local_id = 1, .kind = .top_level, .body = "beta draft" });
+    try s.put(alpha, .{ .local_id = 1, .kind = .comment, .body = "alpha draft" });
+    try s.put(beta, .{ .local_id = 1, .kind = .comment, .body = "beta draft" });
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -579,8 +587,8 @@ test "remove is scoped and idempotent" {
     var mem = InMemoryStore.init(testing.allocator);
     defer mem.deinit();
     const s = mem.store();
-    try s.put(testReviewKey(1), .{ .local_id = 1, .kind = .top_level, .body = "a" });
-    try s.put(testReviewKey(1), .{ .local_id = 2, .kind = .top_level, .body = "b" });
+    try s.put(testReviewKey(1), .{ .local_id = 1, .kind = .comment, .body = "a" });
+    try s.put(testReviewKey(1), .{ .local_id = 2, .kind = .comment, .body = "b" });
 
     try s.remove(testReviewKey(1), 1);
     try s.remove(testReviewKey(1), 1); // idempotent — no error
@@ -597,8 +605,8 @@ test "loadReview rebuilds the graph and next_id for resume" {
     var mem = InMemoryStore.init(testing.allocator);
     defer mem.deinit();
     const s = mem.store();
-    try s.put(testReviewKey(1), .{ .local_id = 3, .kind = .top_level, .body = "root" });
-    try s.put(testReviewKey(1), .{ .local_id = 8, .kind = .reply, .body = "re", .parent = .{ .draft = 3 } });
+    try s.put(testReviewKey(1), .{ .local_id = 3, .kind = .comment, .body = "root" });
+    try s.put(testReviewKey(1), .{ .local_id = 8, .kind = .comment, .body = "re", .parent = .{ .draft = 3 } });
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -607,7 +615,7 @@ test "loadReview rebuilds the graph and next_id for resume" {
     try testing.expectEqual(@as(usize, 2), review.drafts.items.len);
     try testing.expect(review.get(8).?.isReply());
     // A fresh draft is assigned an id past every loaded one.
-    const fresh = try review.add(arena.allocator(), .{ .kind = .top_level, .body = "new" });
+    const fresh = try review.add(arena.allocator(), .{ .kind = .comment, .body = "new" });
     try testing.expectEqual(@as(TempId, 9), fresh);
 }
 
@@ -616,8 +624,8 @@ test "beginning a Submission atomically records its run and first submitting Dra
     defer mem.deinit();
     const store = mem.store();
     const key = testReviewKey(7);
-    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "first" });
-    try store.put(key, .{ .local_id = 2, .kind = .top_level, .body = "second" });
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "first" });
+    try store.put(key, .{ .local_id = 2, .kind = .comment, .body = "second" });
 
     const operation_id = try store.beginSubmission(key, "source-commit", 1);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -638,8 +646,8 @@ test "Submission checkpoint persists the outcome and next intent together" {
     defer mem.deinit();
     const store = mem.store();
     const key = testReviewKey(7);
-    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "first" });
-    try store.put(key, .{ .local_id = 2, .kind = .top_level, .body = "second", .state = .{ .failed = error.ServerError } });
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "first" });
+    try store.put(key, .{ .local_id = 2, .kind = .comment, .body = "second", .state = .{ .failed = error.ServerError } });
     const operation_id = try store.beginSubmission(key, "source-commit", 1);
 
     try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, 2);
@@ -658,7 +666,7 @@ test "a rejected Submission checkpoint leaves the run and Draft unchanged" {
     defer mem.deinit();
     const store = mem.store();
     const key = testReviewKey(7);
-    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "first" });
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "first" });
     const operation_id = try store.beginSubmission(key, "source-commit", 1);
 
     try testing.expectError(error.DraftNotFound, store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, 99));
@@ -676,8 +684,8 @@ test "clean Submission completion removes posted Drafts and closes the run" {
     defer mem.deinit();
     const store = mem.store();
     const key = testReviewKey(7);
-    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "posted" });
-    try store.put(key, .{ .local_id = 2, .kind = .top_level, .target = .local, .body = "keep local", .state = .{ .posted = 901 } });
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "posted" });
+    try store.put(key, .{ .local_id = 2, .kind = .comment, .target = .local, .body = "keep local", .state = .{ .posted = 901 } });
     const operation_id = try store.beginSubmission(key, "source-commit", 1);
     try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, null);
 
@@ -696,7 +704,7 @@ test "partial Submission completion keeps outcomes for repair" {
     defer mem.deinit();
     const store = mem.store();
     const key = testReviewKey(7);
-    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "failed" });
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "failed" });
     const operation_id = try store.beginSubmission(key, "source-commit", 1);
     try store.checkpointSubmission(operation_id, key, 1, .{ .failed = error.Forbidden }, null);
 
@@ -715,15 +723,15 @@ test "unresolved outcome remains immutable after partial completion" {
     defer mem.deinit();
     const store = mem.store();
     const key = testReviewKey(7);
-    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "unknown" });
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "unknown" });
     const operation_id = try store.beginSubmission(key, "source-commit", 1);
     try store.checkpointSubmission(operation_id, key, 1, .outcome_unknown, null);
     try store.completeSubmission(operation_id, key, .partial);
 
-    try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "changed" }));
+    try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 1, .kind = .comment, .body = "changed" }));
     try testing.expectError(error.DraftLocked, store.remove(key, 1));
     try store.resolveUnknown(key, 1, .unpublished);
-    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "changed" });
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "changed" });
 }
 
 test "active Submission locks Bitbucket Draft mutation but not local Drafts" {
@@ -731,14 +739,14 @@ test "active Submission locks Bitbucket Draft mutation but not local Drafts" {
     defer mem.deinit();
     const store = mem.store();
     const key = testReviewKey(7);
-    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "remote" });
-    try store.put(key, .{ .local_id = 2, .kind = .top_level, .target = .local, .body = "local" });
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "remote" });
+    try store.put(key, .{ .local_id = 2, .kind = .comment, .target = .local, .body = "local" });
     _ = try store.beginSubmission(key, "source-commit", 1);
 
-    try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "changed" }));
+    try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 1, .kind = .comment, .body = "changed" }));
     try testing.expectError(error.DraftLocked, store.remove(key, 1));
-    try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 3, .kind = .top_level, .body = "new remote" }));
-    try store.put(key, .{ .local_id = 2, .kind = .top_level, .target = .local, .body = "changed local" });
+    try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 3, .kind = .comment, .body = "new remote" }));
+    try store.put(key, .{ .local_id = 2, .kind = .comment, .target = .local, .body = "changed local" });
     try store.remove(key, 2);
 }
 
@@ -747,7 +755,7 @@ test "clean completion rejects a Submission with failed Bitbucket Drafts" {
     defer mem.deinit();
     const store = mem.store();
     const key = testReviewKey(7);
-    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "failed" });
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "failed" });
     const operation_id = try store.beginSubmission(key, "source-commit", 1);
     try store.checkpointSubmission(operation_id, key, 1, .{ .failed = error.Forbidden }, null);
 
@@ -762,7 +770,7 @@ test "aborted Submission restores the current Draft and closes partial" {
     defer mem.deinit();
     const store = mem.store();
     const key = testReviewKey(7);
-    try store.put(key, .{ .local_id = 1, .kind = .top_level, .body = "retry", .state = .{ .failed = error.ServerError } });
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "retry", .state = .{ .failed = error.ServerError } });
     const operation_id = try store.beginSubmission(key, "source-commit", 1);
 
     try store.completeSubmission(operation_id, key, .{ .aborted = .{ .failed = error.ServerError } });
@@ -796,6 +804,6 @@ test "TempId reservation is monotonic and gaps remain valid" {
     const key = testReviewKey(77);
     try testing.expectEqual(@as(TempId, 1), try store.reserveTempId(key));
     try testing.expectEqual(@as(TempId, 2), try store.reserveTempId(key));
-    try store.put(key, .{ .local_id = 2, .kind = .top_level, .body = "second" });
+    try store.put(key, .{ .local_id = 2, .kind = .comment, .body = "second" });
     try testing.expectEqual(@as(TempId, 3), try store.reserveTempId(key));
 }
