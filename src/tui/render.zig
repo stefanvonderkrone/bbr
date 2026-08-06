@@ -213,7 +213,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, them
             drawLineBody(scratch, win, r, gutter_cols, lr, theme, style);
         },
         .line_pair => |pair| drawLinePair(scratch, win, r, pair, theme),
-        .fold => |f| drawFold(scratch, win, r, f, theme),
+        .disclosure => |value| drawDisclosure(scratch, win, r, value, theme),
         .comment => |cr| drawComment(scratch, win, r, cr, theme),
         .draft => |dr| drawDraft(scratch, win, r, dr, theme),
         .snapshot => |snapshot| drawSnapshot(win, r, snapshot, theme),
@@ -320,11 +320,20 @@ fn drawReviewCard(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, card: b
     _ = win.print(segments, .{ .row_offset = r, .col_offset = col, .wrap = .none });
 }
 
-/// A collapsed-context fold: "  ⋯ N unchanged lines · enter to expand ⋯".
-fn drawFold(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, f: buffer_mod.Fold, theme: Theme) void {
-    fillRow(win, r, theme.fold);
-    const text = std.fmt.allocPrint(scratch, "  ⋯ {d} unchanged lines · enter to expand ⋯", .{f.lines.len}) catch "  ⋯ folded ⋯";
-    _ = win.printSegment(.{ .text = text, .style = theme.fold }, .{ .row_offset = r, .col_offset = gutter_cols, .wrap = .none });
+fn drawDisclosure(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, value: buffer_mod.Disclosure, theme: Theme) void {
+    const style = if (value.kind == .fold) theme.fold else theme.section;
+    fillRow(win, r, style);
+    const glyph: []const u8 = if (value.expanded) "▾" else "▸";
+    const text = switch (value.kind) {
+        .resolved_thread => std.fmt.allocPrint(scratch, "{s} ✓ Resolved thread · {d} replies", .{ glyph, value.count }) catch glyph,
+        .fold => std.fmt.allocPrint(scratch, "{s} ⋯ {d} unchanged lines", .{ glyph, value.count }) catch glyph,
+        .outdated => if (value.path.len > 0)
+            std.fmt.allocPrint(scratch, "{s} Outdated · {s} · {d} threads", .{ glyph, value.path, value.count }) catch glyph
+        else
+            std.fmt.allocPrint(scratch, "{s} Outdated · {d} threads", .{ glyph, value.count }) catch glyph,
+        .review_card => unreachable,
+    };
+    _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = gutter_cols, .wrap = .none });
 }
 
 /// A section divider: "── PR comments (N) ──" or "── Outdated · path (N) ──".
@@ -899,7 +908,7 @@ test "a folded context run renders as a fold row" {
     // Find the fold row's screen position by scanning the buffer.
     var fold_row: ?u16 = null;
     for (buf.rows, 0..) |row, idx| {
-        if (row == .fold) fold_row = @intCast(idx);
+        if (row == .disclosure and row.disclosure.kind == .fold) fold_row = @intCast(idx);
     }
     const fr = fold_row.?;
     const px = sidebar_width + 1;

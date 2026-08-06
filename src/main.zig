@@ -555,7 +555,7 @@ test "demo data weaves through the real pipeline" {
     // The inline suggestion is detected on comment #4.
     try testing.expect(comments[2].suggestion() != null);
 
-    // Hidden: the resolved thread contributes no comment rows.
+    // Collapsed disclosures contribute no content rows.
     const hidden = try buffer_mod.buildWithComments(a, diff, .unified, threads, .{});
     var hidden_comments: usize = 0;
     var outdated_sections: usize = 0;
@@ -563,15 +563,18 @@ test "demo data weaves through the real pipeline" {
         // A multi-line body emits one row per visual line (M11); count the
         // header (`is_first`) rows to tally distinct comments woven.
         if (r == .comment and r.comment.part == .header) hidden_comments += 1;
-        if (r == .section and r.section.kind == .outdated) outdated_sections += 1;
+        if (r == .disclosure and r.disclosure.kind == .outdated) outdated_sections += 1;
     }
-    // PR-level (#1) + inline root (#2) + suggestion reply (#4) + outdated (#7) = 4;
-    // resolved #5 hidden.
-    try testing.expectEqual(@as(usize, 4), hidden_comments);
+    // PR-level (#1) + inline root (#2) + suggestion reply (#4); both hidden
+    // groups remain represented by their disclosure rows.
+    try testing.expectEqual(@as(usize, 3), hidden_comments);
     try testing.expectEqual(@as(usize, 1), outdated_sections);
 
     // Revealed: the resolved thread's root now appears too.
-    const shown = try buffer_mod.buildWithComments(a, diff, .unified, threads, .{ .show_resolved = true });
+    const shown = try buffer_mod.buildWithComments(a, diff, .unified, threads, .{ .expanded_disclosures = &.{
+        .{ .resolved_thread = 5 },
+        .{ .outdated_file = &diff.files[0] },
+    } });
     var shown_comments: usize = 0;
     for (shown.rows) |r| {
         if (r == .comment and r.comment.part == .header) shown_comments += 1;

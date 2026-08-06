@@ -367,7 +367,6 @@ pub const Scope = enum {
 pub const Preferences = struct {
     layout: Layout = .unified,
     scope: Scope = .changes,
-    show_resolved: bool = false,
 };
 
 pub const LoadSession = struct {
@@ -638,7 +637,7 @@ const Published = struct {
     cell_metrics: frame_mod.CellMetrics,
     comments_collapsed_rows: usize,
     navigation: Nav,
-    expanded_folds: std.ArrayList(*const bbr.diff.Line),
+    expanded_disclosures: std.ArrayList(buffer_mod.DisclosureKey),
     isolated_file: ?usize,
     composer_arena: std.heap.ArenaAllocator,
     composer: ?Composer,
@@ -701,8 +700,8 @@ const Published = struct {
         }
         published.buffers = ArenaRing(2).init(allocator);
         errdefer published.buffers.deinit();
-        published.expanded_folds = .empty;
-        errdefer published.expanded_folds.deinit(allocator);
+        published.expanded_disclosures = .empty;
+        errdefer published.expanded_disclosures.deinit(allocator);
         published.isolated_file = null;
         published.composer_arena = std.heap.ArenaAllocator.init(allocator);
         errdefer published.composer_arena.deinit();
@@ -727,7 +726,6 @@ const Published = struct {
                 .scope_projections = published.scope_projection.items,
                 .blobs = enrichment.blobs,
                 .highlights = enrichment.highlights,
-                .show_resolved = preferences.show_resolved,
                 .fold_context = preferences.scope == .changes,
                 .whole_file = preferences.scope == .whole,
                 .card_width = frame_mod.paneRects(geometry).diff.width,
@@ -748,7 +746,7 @@ const Published = struct {
         const allocator = self.allocator;
         if (self.composer) |*composer| composer.deinit();
         self.composer_arena.deinit();
-        self.expanded_folds.deinit(allocator);
+        self.expanded_disclosures.deinit(allocator);
         self.buffers.deinit();
         self.review_arena.deinit();
         self.session.destroy();
@@ -789,17 +787,17 @@ const Published = struct {
     fn rebuild(
         self: *Published,
         preferences: Preferences,
-        expanded_folds: []const *const bbr.diff.Line,
+        expanded_disclosures: []const buffer_mod.DisclosureKey,
         isolated_file: ?usize,
     ) BufferTransactionError!void {
-        var staged = try self.prepareBuffer(preferences, expanded_folds, isolated_file, self.geometry);
+        var staged = try self.prepareBuffer(preferences, expanded_disclosures, isolated_file, self.geometry);
         defer staged.deinit();
         staged.publish();
     }
 
     fn focusEnrichment(self: *Published, preferences: Preferences, file_index: usize) BufferTransactionError!void {
         if (!self.session.enrichment.stageFocus(file_index)) return;
-        self.rebuild(preferences, self.expanded_folds.items, self.isolated_file) catch |err| {
+        self.rebuild(preferences, self.expanded_disclosures.items, self.isolated_file) catch |err| {
             self.session.enrichment.rollbackCacheUpdate();
             return err;
         };
@@ -868,7 +866,7 @@ const Published = struct {
             }) catch return error.OutOfMemory;
         }
 
-        var staged = try self.prepareBuffer(preferences, self.expanded_folds.items, self.isolated_file, self.geometry);
+        var staged = try self.prepareBuffer(preferences, self.expanded_disclosures.items, self.isolated_file, self.geometry);
         defer staged.deinit();
         store.put(self.key.storeKey(), draft) catch return error.PersistenceFailed;
         staged.publish();
@@ -877,7 +875,7 @@ const Published = struct {
     fn prepareBuffer(
         self: *Published,
         preferences: Preferences,
-        expanded_folds: []const *const bbr.diff.Line,
+        expanded_disclosures: []const buffer_mod.DisclosureKey,
         isolated_file: ?usize,
         geometry: frame_mod.Geometry,
     ) BufferTransactionError!StagedBuffer {
@@ -890,10 +888,9 @@ const Published = struct {
             preferences.layout,
             self.session.threads,
             .{
-                .show_resolved = preferences.show_resolved,
                 .fold_context = preferences.scope == .changes,
                 .whole_file = preferences.scope == .whole,
-                .expanded = expanded_folds,
+                .expanded_disclosures = expanded_disclosures,
                 .drafts = self.review.drafts.items,
                 .scope_projections = self.scope_projection.items,
                 .only_file = isolated_file,
@@ -1696,7 +1693,7 @@ pub const Presentation = struct {
         };
         var staged = published.prepareBuffer(
             self.preferences,
-            published.expanded_folds.items,
+            published.expanded_disclosures.items,
             published.isolated_file,
             geometry,
         ) catch |err| {
@@ -1772,11 +1769,6 @@ pub const Presentation = struct {
             },
             .toggle_select => published.navigation.toggleMark(),
             .clear_selection => published.navigation.clearMark(),
-            .toggle_resolved => {
-                var candidate = self.preferences;
-                candidate.show_resolved = !candidate.show_resolved;
-                self.publishPreferences(published, candidate);
-            },
             .refresh => self.queueRefresh(published.key),
             .toggle_layout => {
                 var candidate = self.preferences;
@@ -1786,18 +1778,17 @@ pub const Presentation = struct {
             .cycle_scope => {
                 var candidate = self.preferences;
                 candidate.scope = candidate.scope.next();
-                published.rebuild(candidate, &.{}, published.isolated_file) catch |err| {
+                published.rebuild(candidate, published.expanded_disclosures.items, published.isolated_file) catch |err| {
                     self.action_error = normalizeActionError(err);
                     return;
                 };
                 self.preferences = candidate;
-                published.expanded_folds.clearRetainingCapacity();
                 self.action_error = null;
             },
             .isolate => self.toggleIsolation(published),
             .next_file => self.moveFile(published, 1),
             .prev_file => self.moveFile(published, -1),
-            .expand_fold => self.expandFold(published),
+            .toggle_disclosure => self.toggleDisclosure(published),
             .comment => self.openComposer(published, .{ .kind = .comment, .label = "New comment" }),
             .reply => self.openReplyComposer(published),
             .inline_comment => self.openInlineComposer(published, .comment),
@@ -2491,7 +2482,7 @@ pub const Presentation = struct {
                     self.action_error = .action_refused;
                     return;
                 };
-                current.rebuild(self.preferences, current.expanded_folds.items, current.isolated_file) catch |err| {
+                current.rebuild(self.preferences, current.expanded_disclosures.items, current.isolated_file) catch |err| {
                     current.session.enrichment.rollbackCacheUpdate();
                     self.action_error = normalizeActionError(err);
                     return;
@@ -2519,7 +2510,7 @@ pub const Presentation = struct {
     }
 
     fn publishPreferences(self: *Presentation, published: *Published, candidate: Preferences) void {
-        published.rebuild(candidate, published.expanded_folds.items, published.isolated_file) catch |err| {
+        published.rebuild(candidate, published.expanded_disclosures.items, published.isolated_file) catch |err| {
             self.action_error = normalizeActionError(err);
             return;
         };
@@ -2531,7 +2522,7 @@ pub const Presentation = struct {
         if (published.session.diff.files.len == 0) return;
         const previous = published.isolated_file;
         const candidate = if (previous) |_| null else fileIndexForRow(published.buffer, published.navigation.cursor);
-        published.rebuild(self.preferences, published.expanded_folds.items, candidate) catch |err| {
+        published.rebuild(self.preferences, published.expanded_disclosures.items, candidate) catch |err| {
             self.action_error = normalizeActionError(err);
             return;
         };
@@ -2552,7 +2543,7 @@ pub const Presentation = struct {
                 current - 1
             else
                 return;
-            published.rebuild(self.preferences, published.expanded_folds.items, candidate) catch |err| {
+            published.rebuild(self.preferences, published.expanded_disclosures.items, candidate) catch |err| {
                 self.action_error = normalizeActionError(err);
                 return;
             };
@@ -2568,16 +2559,24 @@ pub const Presentation = struct {
         if (row) |target| published.navigation.jumpTo(target);
     }
 
-    fn expandFold(self: *Presentation, published: *Published) void {
+    fn toggleDisclosure(self: *Presentation, published: *Published) void {
         if (published.navigation.cursor >= published.buffer.rows.len) return;
-        if (published.buffer.rows[published.navigation.cursor] != .fold) return;
-        const old_len = published.expanded_folds.items.len;
-        published.expanded_folds.append(self.allocator, published.buffer.rows[published.navigation.cursor].fold.id) catch {
+        const key = buffer_mod.disclosureKey(published.buffer.rows[published.navigation.cursor]) orelse return;
+        const old_len = published.expanded_disclosures.items.len;
+        var removed_index: ?usize = null;
+        for (published.expanded_disclosures.items, 0..) |candidate, index| if (std.meta.eql(candidate, key)) {
+            removed_index = index;
+            _ = published.expanded_disclosures.orderedRemove(index);
+            break;
+        };
+        if (removed_index == null) published.expanded_disclosures.append(self.allocator, key) catch {
             self.action_error = .out_of_memory;
             return;
         };
-        published.rebuild(self.preferences, published.expanded_folds.items, published.isolated_file) catch |err| {
-            published.expanded_folds.shrinkRetainingCapacity(old_len);
+        published.rebuild(self.preferences, published.expanded_disclosures.items, published.isolated_file) catch |err| {
+            if (removed_index) |index| {
+                published.expanded_disclosures.insert(self.allocator, index, key) catch unreachable;
+            } else published.expanded_disclosures.shrinkRetainingCapacity(old_len);
             self.action_error = normalizeActionError(err);
             return;
         };
@@ -3098,6 +3097,160 @@ fn testTwoFileSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session
     return s;
 }
 
+fn testDisclosureSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
+    const s = try session_mod.create(backing);
+    errdefer s.destroy();
+    const a = s.arena.allocator();
+    const pr: bbr.bitbucket.PullRequest = .{
+        .id = id,
+        .title = "Disclosure review",
+        .state = "OPEN",
+        .author_display_name = "Reviewer",
+        .source_branch = "feature",
+        .destination_branch = "main",
+        .source_commit = "source",
+        .destination_commit = "destination",
+    };
+    s.source = .{ .remote = pr };
+    s.header = .{
+        .title = pr.title,
+        .source_ref = pr.source_branch,
+        .base_ref = pr.destination_branch,
+        .source_commit = pr.source_commit,
+        .base_commit = pr.destination_commit,
+        .author = pr.author_display_name,
+        .locator = "repo",
+        .source_label = "Bitbucket",
+        .pull_request_id = pr.id,
+    };
+    s.diff = try bbr.diff.parse(a,
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,12 +1,12 @@
+        \\-a
+        \\+A
+        \\ c1
+        \\ c2
+        \\ c3
+        \\ c4
+        \\ c5
+        \\ c6
+        \\ c7
+        \\ c8
+        \\ c9
+        \\ c10
+        \\-b
+        \\+B
+    );
+    const comments = try a.alloc(bbr.review.Comment, 3);
+    comments[0] = .{ .id = 1, .author = "Ada", .body = "one\n\ntwo\n\nthree\n\nfour\n\nfive\n\nsix\n\nseven\n\neight", .resolved = true, .anchor = .{ .path = "a.txt", .to = 12 } };
+    comments[1] = .{ .id = 2, .parent_id = 1, .author = "Bo", .body = "fixed" };
+    comments[2] = .{ .id = 3, .author = "Cy", .body = "history", .state = .outdated, .anchor = .{ .path = "a.txt", .from = 99 } };
+    s.threads = try bbr.review.buildThreads(a, comments);
+    try s.initializeEnrichment();
+    return s;
+}
+
+fn findDisclosureRow(rows: []const buffer_mod.Row, key: buffer_mod.DisclosureKey) ?usize {
+    for (rows, 0..) |row, index| {
+        const candidate = buffer_mod.disclosureKey(row) orelse continue;
+        if (std.meta.eql(candidate, key)) return index;
+    }
+    return null;
+}
+
+fn moveToRow(presentation: *Presentation, row: usize) !void {
+    try presentation.dispatch(.{ .action = .to_top });
+    var index: usize = 0;
+    while (index < row) : (index += 1) try presentation.dispatch(.{ .action = .down });
+}
+
+test "Session disclosures toggle independently persist through rebuilds and reset atomically" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 12 },
+    });
+    defer presentation.deinit();
+
+    const thread_key: buffer_mod.DisclosureKey = .{ .resolved_thread = 1 };
+    const initial = presentation.projection().review.?;
+    const thread_row = findDisclosureRow(initial.buffer.rows, thread_key).?;
+    try testing.expect(!initial.buffer.rows[thread_row].disclosure.expanded);
+    try testing.expect(findDisclosureRow(initial.buffer.rows, .{ .outdated_file = &initial.diff.files[0] }) != null);
+
+    try moveToRow(&presentation, thread_row);
+    try presentation.dispatch(.{ .action = .toggle_disclosure });
+    const opened = presentation.projection().review.?;
+    try testing.expect(opened.buffer.rows[opened.navigation.cursor] == .disclosure);
+    try testing.expect(std.meta.eql(thread_key, opened.buffer.rows[opened.navigation.cursor].disclosure.key));
+
+    const card_key: buffer_mod.DisclosureKey = .{ .review_card = .{ .comment = 1 } };
+    const card_row = findDisclosureRow(opened.buffer.rows, card_key).?;
+    try moveToRow(&presentation, card_row);
+    try presentation.dispatch(.{ .action = .toggle_disclosure });
+    const nested = presentation.projection().review.?;
+    try testing.expect(findDisclosureRow(nested.buffer.rows, thread_key) != null);
+    try testing.expect(nested.buffer.rows[findDisclosureRow(nested.buffer.rows, card_key).?].comment.hidden_rows == 0);
+
+    // A Fold is another independent key. Cycling Scope temporarily omits it;
+    // returning to Changes restores the explicit choice.
+    var fold_key: ?buffer_mod.DisclosureKey = null;
+    var fold_row: usize = 0;
+    for (nested.buffer.rows, 0..) |row, index| if (row == .disclosure and row.disclosure.kind == .fold) {
+        fold_key = row.disclosure.key;
+        fold_row = index;
+        break;
+    };
+    try moveToRow(&presentation, fold_row);
+    try presentation.dispatch(.{ .action = .toggle_disclosure });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try testing.expect(findDisclosureRow(presentation.projection().review.?.buffer.rows, fold_key.?) == null);
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    const folds_restored = presentation.projection().review.?;
+    try testing.expect(folds_restored.buffer.rows[findDisclosureRow(folds_restored.buffer.rows, fold_key.?).?].disclosure.expanded);
+
+    // Saving a Draft also rebuilds the Frame without discarding choices.
+    try presentation.dispatch(.{ .action = .comment });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("new review note") } });
+    try presentation.dispatch(.{ .composer = .save });
+    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
+
+    // Width and isolation rebuild the Frame but preserve both explicit choices.
+    try presentation.dispatch(.{ .resize = .{ .cols = 72, .rows = 8 } });
+    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
+    try presentation.dispatch(.{ .action = .isolate });
+    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
+
+    // Selecting disclosed content and then collapsing its semantic owner drops
+    // the Selection because that content no longer exists in the new Frame.
+    const content_row = findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).? + 1;
+    try moveToRow(&presentation, content_row);
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try moveToRow(&presentation, findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?);
+    try presentation.dispatch(.{ .action = .toggle_disclosure });
+    try testing.expect(presentation.projection().review.?.navigation.mark == null);
+
+    // Reopen, then prove failed replacement preserves it and successful
+    // replacement starts from the canonical all-collapsed defaults.
+    try presentation.dispatch(.{ .action = .toggle_disclosure });
+    const before_failed = presentation.projection().review.?;
+    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    const failed_command = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{ .intent = failed_command.intent, .outcome = .{ .failed = error.NetworkFailure } } });
+    try testing.expectEqual(before_failed.buffer.rows.ptr, presentation.projection().review.?.buffer.rows.ptr);
+    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
+
+    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    const replacement = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{ .intent = replacement.intent, .outcome = .{ .loaded = try testDisclosureSession(testing.allocator, 2) } } });
+    const replaced = presentation.projection().review.?;
+    try testing.expect(!replaced.buffer.rows[findDisclosureRow(replaced.buffer.rows, thread_key).?].disclosure.expanded);
+}
+
 test "failed replacement Buffer construction preserves the published review" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -3348,13 +3501,11 @@ test "preferences survive replacement while file isolation resets" {
     defer presentation.deinit();
 
     try presentation.dispatch(.{ .action = .toggle_layout });
-    try presentation.dispatch(.{ .action = .toggle_resolved });
     try presentation.dispatch(.{ .action = .cycle_scope });
     try presentation.dispatch(.{ .action = .isolate });
     const isolated = presentation.projection().review.?;
     try testing.expectEqual(@as(?usize, 0), isolated.isolated_file);
     try testing.expectEqual(Layout.side_by_side, isolated.preferences.layout);
-    try testing.expect(isolated.preferences.show_resolved);
     try testing.expectEqual(Scope.fetched, isolated.preferences.scope);
 
     try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
@@ -3366,7 +3517,6 @@ test "preferences survive replacement while file isolation resets" {
 
     const replaced = presentation.projection().review.?;
     try testing.expectEqual(Layout.side_by_side, replaced.preferences.layout);
-    try testing.expect(replaced.preferences.show_resolved);
     try testing.expectEqual(Scope.fetched, replaced.preferences.scope);
     try testing.expectEqual(@as(?usize, null), replaced.isolated_file);
     try testing.expectEqual(@as(usize, 0), replaced.navigation.cursor);
@@ -3821,8 +3971,9 @@ test "admitted File Enrichment survives failed Buffer reprojection" {
     try testing.expectEqual(ActionError.out_of_memory, failed.action_error.?);
 
     failing.fail_index = std.math.maxInt(usize);
-    try presentation.dispatch(.{ .action = .toggle_resolved });
-    try testing.expect(presentation.projection().review.?.buffer.rows.len > before.buffer.rows.len);
+    try presentation.dispatch(.{ .action = .toggle_layout });
+    try testing.expect(presentation.projection().review.?.buffer.rows.ptr != before.buffer.rows.ptr);
+    try testing.expect(presentation.projection().action_error == null);
 }
 
 test "File Enrichment launch failure restores retryable pending state" {

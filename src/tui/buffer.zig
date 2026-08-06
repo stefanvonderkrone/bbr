@@ -35,7 +35,25 @@ const emphasis_threshold: f64 = 0.5;
 /// `side_by_side` is the other axis (design §11) and lands later.
 pub const Layout = enum { unified, side_by_side };
 
-pub const RowKind = enum { file_header, hunk_header, line, line_pair, fold, comment, draft, snapshot, section };
+pub const RowKind = enum { file_header, hunk_header, line, line_pair, disclosure, comment, draft, snapshot, section };
+
+pub const DisclosureKey = union(enum) {
+    resolved_thread: review.CommentId,
+    fold: *const model.Line,
+    outdated_file: *const model.File,
+    outdated_review,
+    review_card: review_card.Owner,
+};
+
+pub const DisclosureKind = enum { resolved_thread, fold, outdated, review_card };
+
+pub const Disclosure = struct {
+    key: DisclosureKey,
+    kind: DisclosureKind,
+    expanded: bool,
+    count: usize,
+    path: []const u8 = "",
+};
 
 /// A diff body line plus any intra-line emphasis. `emphasis` is empty for
 /// context lines and for changed lines with no modified counterpart (pure
@@ -97,7 +115,7 @@ pub const Row = union(RowKind) {
     hunk_header: *const model.Hunk,
     line: LineRow,
     line_pair: LinePair,
-    fold: Fold,
+    disclosure: Disclosure,
     comment: CommentRow,
     draft: DraftRow,
     snapshot: SnapshotRow,
@@ -117,21 +135,18 @@ pub const Fold = struct {
 
 /// Options for a build: comment weaving plus diff scope/folding.
 ///
-/// `show_resolved` reveals resolved (but current) threads otherwise hidden
-/// behind the toggle; outdated threads are never hidden regardless (design §9b).
-///
 /// `fold_context` is the "Changes" scope: context runs longer than
 /// `2*context_margin + min_fold` collapse into a `Fold`, keeping `context_margin`
 /// lines next to each change. `false` is the "whole-file" scope over the fetched
 /// diff — every fetched line shown, no folds. (True whole-file, including
 /// unchanged regions *outside* the fetched hunks, needs the file blob and is
-/// deferred.) Folds whose `id` is in `expanded` are shown in full.
+/// deferred.) Every hidden-content owner keeps a persistent disclosure row and
+/// is expanded only when its tagged semantic key is explicitly present.
 pub const BuildOptions = struct {
-    show_resolved: bool = false,
     fold_context: bool = false,
     context_margin: usize = 3,
     min_fold: usize = 2,
-    expanded: []const *const model.Line = &.{},
+    expanded_disclosures: []const DisclosureKey = &.{},
     /// Pending Drafts to weave in: anchored Drafts appear under their diff line
     /// (after any published comments there); unanchored ones in a "Pending"
     /// section near the top. Borrowed — must outlive the Buffer.
@@ -160,8 +175,20 @@ pub const BuildOptions = struct {
     card_width: usize = 80,
     cell_metrics: CellMetrics = .bytes,
     collapsed_rows: usize = 6,
-    expanded_cards: []const review_card.Owner = &.{},
 };
+
+pub fn disclosureKey(row: Row) ?DisclosureKey {
+    return switch (row) {
+        .disclosure => |value| value.key,
+        .comment, .draft => |card| if (card.part == .disclosure_footer) .{ .review_card = card.owner } else null,
+        else => null,
+    };
+}
+
+fn disclosureExpanded(keys: []const DisclosureKey, key: DisclosureKey) bool {
+    for (keys) |candidate| if (std.meta.eql(candidate, key)) return true;
+    return false;
+}
 
 pub const Buffer = struct {
     rows: []const Row,
@@ -185,7 +212,8 @@ pub fn build(allocator: std.mem.Allocator, diff: model.Diff, layout: Layout) Bui
 /// Flatten `diff` and weave `threads` in: PR-level comments as a section at the
 /// top; each current/moved inline thread right under the diff line it anchors
 /// to; each file's outdated threads in a per-file "Outdated" section after its
-/// hunks. Resolved-but-current threads are hidden unless `opts.show_resolved`.
+/// hunks. Resolved Threads and Outdated groups keep a disclosure row even when
+/// their content is collapsed.
 /// Rows borrow both `diff` and `threads` (and the comments they point at).
 pub fn buildWithComments(
     allocator: std.mem.Allocator,
@@ -218,11 +246,11 @@ pub fn buildWithComments(
 
     // 1. PR-level comments (no anchor), respecting the resolved toggle. Skipped
     // in the isolate view — PR-level comments belong to no single File.
-    const pr_count = if (opts.only_file == null) countWhere(threads, isPrLevel, opts) else 0;
+    const pr_count = if (opts.only_file == null) countWhere(threads, isPrLevel) else 0;
     if (pr_count > 0) {
         try rows.append(allocator, .{ .section = .{ .kind = .pr_comments, .count = pr_count } });
         for (threads) |*t| {
-            if (isPrLevel(t.*) and inlineVisible(t.*, opts)) try w.emitThread(t);
+            if (isPrLevel(t.*)) try w.emitThread(t);
         }
     }
 
@@ -247,7 +275,7 @@ pub fn buildWithComments(
 
         // File-level roots live at the File header, before hunks/folds/lines.
         for (threads) |*t| {
-            if (threadCurrentInFile(t.*, file.*) and inlineVisible(t.*, opts)) try w.emitThread(t);
+            if (threadCurrentInFile(t.*, file.*)) try w.emitThread(t);
         }
         for (opts.drafts, 0..) |*draft, draft_index| {
             if (draft.parent == null and draftCurrentInFile(draft, opts, file.*)) try w.emitDraft(draft_index);
@@ -275,16 +303,27 @@ pub fn buildWithComments(
             }
         }
 
-        // Per-file outdated section — never hidden (design §9b).
+        // Per-file Outdated disclosure remains at the File even while closed.
         const od_count = fileOutdatedCount(threads, file.*) + draftOutdatedCount(opts.drafts, opts, file.*);
         if (od_count > 0) {
-            try rows.append(allocator, .{ .section = .{ .kind = .outdated, .count = od_count, .path = file.displayPath() } });
-            for (threads) |*t| {
-                if (isFileOutdated(t.*, file.*)) try w.emitThread(t);
-            }
-            for (opts.drafts, 0..) |*draft, draft_index| {
-                if (draft.parent != null or w.emitted[draft_index]) continue;
-                if (draftOutdatedInFile(draft, opts, file.*)) try w.emitDraftSnapshot(draft_index);
+            const key: DisclosureKey = .{ .outdated_file = file };
+            const expanded = disclosureExpanded(opts.expanded_disclosures, key);
+            try rows.append(allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = od_count, .path = file.displayPath() } });
+            if (expanded) {
+                for (threads) |*t| {
+                    if (isFileOutdated(t.*, file.*)) try w.emitThreadContent(t);
+                }
+                for (opts.drafts, 0..) |*draft, draft_index| {
+                    if (draft.parent != null or w.emitted[draft_index]) continue;
+                    if (draftOutdatedInFile(draft, opts, file.*)) try w.emitDraftSnapshot(draft_index);
+                }
+            } else {
+                for (threads, 0..) |*thread, thread_index| {
+                    if (isFileOutdated(thread.*, file.*)) w.emitted_threads[thread_index] = true;
+                }
+                for (opts.drafts, 0..) |*draft, draft_index| {
+                    if (draft.parent == null and draftOutdatedInFile(draft, opts, file.*)) w.emitted[draft_index] = true;
+                }
             }
         }
     }
@@ -305,15 +344,26 @@ pub fn buildWithComments(
         }
     }
     if (fallback_outdated_count > 0) {
-        try rows.append(allocator, .{ .section = .{ .kind = .outdated, .count = fallback_outdated_count } });
-        if (opts.only_file == null) for (threads, 0..) |*thread, thread_index| {
-            if (!emitted_threads[thread_index] and thread.root.state == .outdated) try w.emitThread(thread);
-        };
-        for (opts.drafts, 0..) |*draft, draft_index| {
-            if (draft.parent != null or emitted[draft_index]) continue;
-            if (!draftInScope(draft, diff, opts)) continue;
-            const resolution = draftResolution(draft, opts);
-            if (resolution == .resolved and resolution.resolved.state == .outdated) try w.emitDraftSnapshot(draft_index);
+        const key: DisclosureKey = .outdated_review;
+        const expanded = disclosureExpanded(opts.expanded_disclosures, key);
+        try rows.append(allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = fallback_outdated_count } });
+        if (expanded) {
+            if (opts.only_file == null) for (threads, 0..) |*thread, thread_index| {
+                if (!emitted_threads[thread_index] and thread.root.state == .outdated) try w.emitThreadContent(thread);
+            };
+            for (opts.drafts, 0..) |*draft, draft_index| {
+                if (draft.parent != null or emitted[draft_index]) continue;
+                if (!draftInScope(draft, diff, opts)) continue;
+                const resolution = draftResolution(draft, opts);
+                if (resolution == .resolved and resolution.resolved.state == .outdated) try w.emitDraftSnapshot(draft_index);
+            }
+        } else {
+            for (opts.drafts, 0..) |*draft, draft_index| {
+                if (draft.parent != null or emitted[draft_index]) continue;
+                if (!draftInScope(draft, diff, opts)) continue;
+                const resolution = draftResolution(draft, opts);
+                if (resolution == .resolved and resolution.resolved.state == .outdated) emitted[draft_index] = true;
+            }
         }
     }
     if (unavailable_count > 0) {
@@ -365,6 +415,16 @@ const Weave = struct {
     /// Append a thread's rows: root, then any pending reply-Drafts to the root,
     /// then each published reply followed by its own pending reply-Drafts.
     fn emitThread(w: *Weave, t: *const Thread) !void {
+        if (t.resolved) {
+            const key: DisclosureKey = .{ .resolved_thread = t.root.id };
+            const expanded = disclosureExpanded(w.opts.expanded_disclosures, key);
+            try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .resolved_thread, .expanded = expanded, .count = t.replies.len } });
+            if (!expanded) return;
+        }
+        try w.emitThreadContent(t);
+    }
+
+    fn emitThreadContent(w: *Weave, t: *const Thread) !void {
         const index = (@intFromPtr(t) - @intFromPtr(w.threads.ptr)) / @sizeOf(Thread);
         if (w.emitted_threads[index]) return;
         w.emitted_threads[index] = true;
@@ -391,7 +451,7 @@ const Weave = struct {
             .content_width = cardContentWidth(w.opts.card_width, is_reply),
             .metrics = w.opts.cell_metrics,
             .collapsed_rows = w.opts.collapsed_rows,
-            .expanded = cardExpanded(w.opts.expanded_cards, owner),
+            .expanded = disclosureExpanded(w.opts.expanded_disclosures, .{ .review_card = owner }),
         });
         for (projected) |row| try w.rows.append(w.a, .{ .comment = row });
     }
@@ -432,7 +492,7 @@ const Weave = struct {
                 .content_width = cardContentWidth(w.opts.card_width, is_reply),
                 .metrics = w.opts.cell_metrics,
                 .collapsed_rows = w.opts.collapsed_rows,
-                .expanded = cardExpanded(w.opts.expanded_cards, owner),
+                .expanded = disclosureExpanded(w.opts.expanded_disclosures, .{ .review_card = owner }),
             });
             for (projected) |row| try w.rows.append(w.a, .{ .draft = row });
         }
@@ -479,9 +539,13 @@ const Weave = struct {
         var i: usize = 0;
         while (i < lines.len) {
             if (foldStartingAt(folds, &lines[i])) |f| {
-                try w.rows.append(w.a, .{ .fold = f });
-                i += f.lines.len;
-                continue;
+                const key: DisclosureKey = .{ .fold = f.id };
+                const expanded = disclosureExpanded(w.opts.expanded_disclosures, key);
+                try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
+                if (!expanded) {
+                    i += f.lines.len;
+                    continue;
+                }
             }
             try w.rows.append(w.a, .{ .line = try decoratedLine(w.a, &lines[i], lineSpans(w.opts.highlights, file_idx, lines[i]), emphasis[i]) });
             try w.weaveInline(file, &lines[i]);
@@ -504,9 +568,13 @@ const Weave = struct {
         var i: usize = 0;
         while (i < lines.len) {
             if (foldStartingAt(folds, &lines[i])) |f| {
-                try w.rows.append(w.a, .{ .fold = f });
-                i += f.lines.len;
-                continue;
+                const key: DisclosureKey = .{ .fold = f.id };
+                const expanded = disclosureExpanded(w.opts.expanded_disclosures, key);
+                try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
+                if (!expanded) {
+                    i += f.lines.len;
+                    continue;
+                }
             }
             switch (lines[i].kind) {
                 .context => {
@@ -567,7 +635,6 @@ const Weave = struct {
             const anc = t.anchor() orelse continue;
             if (t.root.state == .outdated) continue; // grouped below
             if (!anchorMatchesFile(anc, file.*)) continue;
-            if (!inlineVisible(t.*, w.opts)) continue;
             if (anchorMatchesLine(anc, ln)) try w.emitThread(t);
         }
         // Root anchored Drafts hang off the same line, after any published
@@ -584,11 +651,6 @@ const Weave = struct {
 fn cardContentWidth(width: usize, is_reply: bool) usize {
     const indent: usize = if (is_reply) 8 else 4;
     return @max(width -| indent, 1);
-}
-
-fn cardExpanded(expanded: []const review_card.Owner, owner: review_card.Owner) bool {
-    for (expanded) |candidate| if (std.meta.eql(candidate, owner)) return true;
-    return false;
 }
 
 /// True when two `Parent` references name the same target.
@@ -757,7 +819,6 @@ fn computeFolds(allocator: std.mem.Allocator, lines: []const model.Line, opts: B
 
         const fold_start = s + keep_top;
         const fold_end = e - keep_bottom;
-        if (isExpanded(opts.expanded, &lines[fold_start])) continue;
         try folds.append(allocator, .{ .id = &lines[fold_start], .lines = lines[fold_start..fold_end] });
     }
     return folds.toOwnedSlice(allocator);
@@ -768,13 +829,6 @@ fn foldStartingAt(folds: []const Fold, line_ptr: *const model.Line) ?Fold {
         if (f.id == line_ptr) return f;
     }
     return null;
-}
-
-fn isExpanded(expanded: []const *const model.Line, id: *const model.Line) bool {
-    for (expanded) |e| {
-        if (e == id) return true;
-    }
-    return false;
 }
 
 /// Compute intra-line emphasis for every line in a hunk. Returns a slice
@@ -816,11 +870,6 @@ fn computeEmphasis(allocator: std.mem.Allocator, lines: []const model.Line) ![]c
 
 fn isPrLevel(t: Thread) bool {
     return t.scope() == .review;
-}
-
-/// A current/moved thread is visible unless it's resolved and the toggle is off.
-fn inlineVisible(t: Thread, opts: BuildOptions) bool {
-    return opts.show_resolved or !t.resolved;
 }
 
 fn isFileOutdated(t: Thread, file: model.File) bool {
@@ -949,10 +998,10 @@ pub fn fileTallies(allocator: std.mem.Allocator, diff: model.Diff, threads: []co
     return tallies;
 }
 
-fn countWhere(threads: []const Thread, pred: fn (Thread) bool, opts: BuildOptions) usize {
+fn countWhere(threads: []const Thread, pred: fn (Thread) bool) usize {
     var n: usize = 0;
     for (threads) |*t| {
-        if (pred(t.*) and inlineVisible(t.*, opts)) n += 1;
+        if (pred(t.*)) n += 1;
     }
     return n;
 }
@@ -1203,28 +1252,28 @@ test "the changes scope folds a long context run, keeping a margin each side" {
 
     // Whole-file scope (the default): no folding.
     const whole = try build(a, diff, .unified);
-    try testing.expectEqual(@as(usize, 0), countKind(whole, .fold));
+    try testing.expectEqual(@as(usize, 0), countKind(whole, .disclosure));
 
     // Changes scope: the 10-line context run keeps 3 lines each side and folds
     // the remaining 4 into a single fold row.
     const folded = try buildWithComments(a, diff, .unified, &.{}, .{ .fold_context = true });
-    try testing.expectEqual(@as(usize, 1), countKind(folded, .fold));
+    try testing.expectEqual(@as(usize, 1), countKind(folded, .disclosure));
     var fold_id: *const model.Line = undefined;
     for (folded.rows) |r| {
-        if (r == .fold) {
-            try testing.expectEqual(@as(usize, 4), r.fold.lines.len);
-            fold_id = r.fold.id;
+        if (r == .disclosure and r.disclosure.kind == .fold) {
+            try testing.expectEqual(@as(usize, 4), r.disclosure.count);
+            fold_id = r.disclosure.key.fold;
         }
     }
 
     // Expanding that fold (by id) reveals all lines, with no fold row left.
     const expanded = try buildWithComments(a, diff, .unified, &.{}, .{
         .fold_context = true,
-        .expanded = &.{fold_id},
+        .expanded_disclosures = &.{.{ .fold = fold_id }},
     });
-    try testing.expectEqual(@as(usize, 0), countKind(expanded, .fold));
-    // The expanded buffer has exactly the fold's hidden lines more than the folded one.
-    try testing.expectEqual(folded.rows.len + 4 - 1, expanded.rows.len);
+    try testing.expectEqual(@as(usize, 1), countKind(expanded, .disclosure));
+    // The persistent disclosure remains and the four hidden lines appear below it.
+    try testing.expectEqual(folded.rows.len + 4, expanded.rows.len);
 }
 
 test "a short context run is never folded" {
@@ -1235,7 +1284,7 @@ test "a short context run is never folded" {
     // anchor_diff has only one context line — nothing to fold.
     const diff = try parse(a, anchor_diff);
     const buf = try buildWithComments(a, diff, .unified, &.{}, .{ .fold_context = true });
-    try testing.expectEqual(@as(usize, 0), countKind(buf, .fold));
+    try testing.expectEqual(@as(usize, 0), countKind(buf, .disclosure));
 }
 
 test "folds apply in the side-by-side layout too" {
@@ -1245,7 +1294,7 @@ test "folds apply in the side-by-side layout too" {
 
     const diff = try parse(a, long_context_diff);
     const buf = try buildWithComments(a, diff, .side_by_side, &.{}, .{ .fold_context = true });
-    try testing.expectEqual(@as(usize, 1), countKind(buf, .fold));
+    try testing.expectEqual(@as(usize, 1), countKind(buf, .disclosure));
 }
 
 test "an inline thread is woven right under its anchored line, replies indented" {
@@ -1308,11 +1357,33 @@ test "resolved threads hide behind the toggle, whole thread revealed when on" {
     try testing.expectEqual(@as(usize, 0), countKind(hidden, .comment));
 
     // Revealed: the whole thread (root + reply) appears.
-    const shown = try buildWithComments(a, diff, .unified, threads, .{ .show_resolved = true });
+    const shown = try buildWithComments(a, diff, .unified, threads, .{ .expanded_disclosures = &.{.{ .resolved_thread = 1 }} });
     try testing.expectEqual(@as(usize, 2), countKind(shown, .comment));
 }
 
-test "outdated threads go in a per-file section and are never hidden" {
+test "resolved Thread disclosure remains present while independently expanded" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try parse(a, anchor_diff);
+    const comments = [_]Comment{
+        .{ .id = 41, .author = "Ada", .body = "first", .resolved = true, .anchor = .{ .path = "a.txt", .to = 2 } },
+        .{ .id = 42, .author = "Lin", .body = "second", .resolved = true, .anchor = .{ .path = "a.txt", .to = 2 } },
+    };
+    const threads = try bbr.review.thread.build(a, &comments);
+
+    const collapsed = try buildWithComments(a, diff, .unified, threads, .{});
+    try testing.expectEqual(@as(usize, 2), countKind(collapsed, .disclosure));
+    try testing.expectEqual(@as(usize, 0), countKind(collapsed, .comment));
+
+    const expanded = try buildWithComments(a, diff, .unified, threads, .{
+        .expanded_disclosures = &.{.{ .resolved_thread = 41 }},
+    });
+    try testing.expectEqual(@as(usize, 2), countKind(expanded, .disclosure));
+    try testing.expectEqual(@as(usize, 1), countKind(expanded, .comment));
+}
+
+test "outdated threads remain represented by a per-File disclosure" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1324,19 +1395,18 @@ test "outdated threads go in a per-file section and are never hidden" {
     };
     const threads = try bbr.review.thread.build(a, &comments);
 
-    // Even with the resolved toggle off, the outdated section shows.
     const buf = try buildWithComments(a, diff, .unified, threads, .{});
-    try testing.expectEqual(@as(usize, 1), countKind(buf, .section));
+    try testing.expectEqual(@as(usize, 1), countKind(buf, .disclosure));
     var found = false;
     for (buf.rows) |r| {
-        if (r == .section and r.section.kind == .outdated) {
+        if (r == .disclosure and r.disclosure.kind == .outdated) {
             found = true;
-            try testing.expectEqual(@as(usize, 1), r.section.count);
-            try testing.expectEqualStrings("a.txt", r.section.path);
+            try testing.expectEqual(@as(usize, 1), r.disclosure.count);
+            try testing.expectEqualStrings("a.txt", r.disclosure.path);
         }
     }
     try testing.expect(found);
-    try testing.expectEqual(@as(usize, 1), countKind(buf, .comment));
+    try testing.expectEqual(@as(usize, 0), countKind(buf, .comment));
 }
 
 test "an outdated thread remains under a deleted File's old path" {
@@ -1353,13 +1423,13 @@ test "an outdated thread remains under a deleted File's old path" {
         .anchor = .{ .path = "gone.txt", .from = 1 },
     }};
     const threads = try bbr.review.thread.build(a, &comments);
-    const buf = try buildWithComments(a, diff, .unified, threads, .{});
+    const buf = try buildWithComments(a, diff, .unified, threads, .{ .expanded_disclosures = &.{.{ .outdated_file = &diff.files[0] }} });
 
     try testing.expectEqual(@as(usize, 1), countKind(buf, .comment));
     var found = false;
-    for (buf.rows) |row| if (row == .section and row.section.kind == .outdated) {
+    for (buf.rows) |row| if (row == .disclosure and row.disclosure.kind == .outdated) {
         found = true;
-        try testing.expectEqualStrings("gone.txt", row.section.path);
+        try testing.expectEqualStrings("gone.txt", row.disclosure.path);
     };
     try testing.expect(found);
 }
@@ -1431,7 +1501,7 @@ test "a reply draft to a resolved thread hides and reveals with its parent" {
     try testing.expectEqual(@as(usize, 0), countKind(hidden, .comment));
 
     // Toggle on: the whole thread reveals, with the reply draft nested under it.
-    const shown = try buildWithComments(a, diff, .unified, threads, .{ .drafts = &drafts, .show_resolved = true });
+    const shown = try buildWithComments(a, diff, .unified, threads, .{ .drafts = &drafts, .expanded_disclosures = &.{.{ .resolved_thread = 1 }} });
     try testing.expectEqual(@as(usize, 1), countKind(shown, .draft));
     for (shown.rows) |r| {
         if (r == .draft) try testing.expect(r.draft.isReply());
@@ -1845,15 +1915,16 @@ test "an outdated local Draft remains visible with its authored snapshot" {
     const buf = try buildWithComments(a, diff, .unified, &.{}, .{
         .drafts = &drafts,
         .anchor_projections = &projections,
+        .expanded_disclosures = &.{.{ .outdated_file = &diff.files[0] }},
     });
     try testing.expectEqual(@as(usize, 3), countKind(buf, .snapshot));
     try testing.expectEqual(@as(usize, 1), countKind(buf, .draft));
     var saw_outdated = false;
     var saw_selected = false;
     for (buf.rows) |row| switch (row) {
-        .section => |section| if (section.kind == .outdated) {
+        .disclosure => |disclosure| if (disclosure.kind == .outdated) {
             saw_outdated = true;
-            try testing.expectEqualStrings("a.txt", section.path);
+            try testing.expectEqualStrings("a.txt", disclosure.path);
         },
         .snapshot => |snapshot| if (snapshot.selected) {
             saw_selected = true;
@@ -1981,14 +2052,15 @@ test "scope fallbacks distinguish unmatched outdated from unavailable and do not
     const all = try buildWithComments(a, diff, .unified, threads, .{ .drafts = &drafts, .scope_projections = &projections });
     var saw_outdated = false;
     var saw_unavailable = false;
-    for (all.rows) |row| if (row == .section) switch (row.section.kind) {
-        .outdated => if (row.section.path.len == 0) {
-            saw_outdated = true;
-        },
-        .unavailable => saw_unavailable = true,
-        else => {},
-    };
+    for (all.rows) |row| {
+        if (row == .disclosure and row.disclosure.kind == .outdated) {
+            if (row.disclosure.path.len == 0) saw_outdated = true;
+        } else if (row == .section and row.section.kind == .unavailable) {
+            saw_unavailable = true;
+        }
+    }
     try testing.expect(saw_outdated and saw_unavailable);
+    try testing.expectEqual(@as(usize, 0), countKind(all, .comment));
 
     const isolated = try buildWithComments(a, diff, .unified, threads, .{ .drafts = &drafts, .scope_projections = &projections, .only_file = 0 });
     try testing.expectEqual(@as(usize, 0), countKind(isolated, .comment));

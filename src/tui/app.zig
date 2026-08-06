@@ -164,7 +164,6 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
                     .fetched => .fetched,
                     .whole => .whole,
                 },
-                review_projection.preferences.show_resolved,
                 review_projection.isolated_file != null,
                 projection.replacing,
                 projection.submission != null,
@@ -617,7 +616,6 @@ fn drawStatus(
     buf: buffer_mod.Buffer,
     layout: buffer_mod.Layout,
     scope: presentation.Scope,
-    show_resolved: bool,
     isolate: bool,
     loading: bool,
     submitting: bool,
@@ -634,7 +632,6 @@ fn drawStatus(
         .whole => "f: whole",
     };
     const file_hint: []const u8 = if (isolate) "o all files" else "o isolate";
-    const resolved_hint: []const u8 = if (show_resolved) "R hide resolved" else "R show resolved";
     // A transient message (error/summary) or an in-progress indicator takes the
     // tail slot; otherwise the key hints, with the pending-draft count on `X`.
     const default_tail: []const u8 = if (draft_count > 0)
@@ -646,7 +643,7 @@ fn drawStatus(
         (std.fmt.allocPrint(frame, "#{d} {s}", .{ id, header.title }) catch header.title)
     else
         header.title;
-    const text = std.fmt.allocPrint(frame, " {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s}  ·  {s}  ·  {s}  ·  {s} ", .{
+    const text = std.fmt.allocPrint(frame, " {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s}  ·  {s}  ·  {s} ", .{
         identity,
         header.source_ref,
         header.base_ref,
@@ -655,7 +652,6 @@ fn drawStatus(
         layout_hint,
         scope_hint,
         file_hint,
-        resolved_hint,
         tail,
     }) catch " q quit ";
     const style: vaxis.Style = .{ .fg = .{ .index = 0 }, .bg = .{ .index = 7 } };

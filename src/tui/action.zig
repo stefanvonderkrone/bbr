@@ -29,11 +29,10 @@ pub const Action = enum {
     help,
     toggle_select,
     clear_selection,
-    toggle_resolved,
     toggle_layout,
     cycle_scope,
     isolate,
     next_file,
     prev_file,
-    expand_fold,
+    toggle_disclosure,
 };
