@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PROTOTYPE — Markdown disclosure boundaries</title>
+  <style>
+    :root { color-scheme:dark; --bg:#0c0f12; --pane:#11151a; --card:#1b2028; --card2:#171b22; --line:#3e4855; --muted:#8994a1; --text:#d7dee8; --accent:#8fbcbb; --draft:#ebcb8b; --suggest:#88c0d0; --focus:#30394a; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; background:#080a0d; color:var(--text); font:14px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; padding:26px 22px 104px; }
+    main { width:min(1180px,100%); margin:auto; }
+    .intro { display:flex; justify-content:space-between; align-items:end; gap:24px; margin-bottom:16px; }
+    h1 { margin:0 0 5px; font:650 19px/1.2 system-ui,sans-serif; }
+    .intro p { margin:0; color:var(--muted); font-size:12px; }
+    .legend { display:flex; gap:14px; color:var(--muted); white-space:nowrap; font-size:12px; }
+    .terminal { border:1px solid #39414b; border-radius:8px; background:var(--bg); box-shadow:0 22px 70px #000a; overflow:hidden; }
+    .chrome { height:34px; display:flex; align-items:center; justify-content:space-between; padding:0 12px; color:#77828e; background:#191d23; border-bottom:1px solid #353c45; font-size:12px; }
+    .layout { display:grid; grid-template-columns:230px 1fr; min-height:640px; }
+    .sidebar { padding:11px 8px; border-right:1px solid #343c46; color:#6f7b88; }
+    .tree { padding:3px 7px; white-space:nowrap; overflow:hidden; }
+    .tree.active { color:#c2ccd8; background:#202731; }
+    .pane { padding:13px 16px 18px; overflow:hidden; }
+    .section-rule { color:#758291; border-bottom:1px solid #313944; padding-bottom:5px; margin-bottom:11px; }
+    .cases { display:grid; grid-template-columns:1fr 1fr; gap:13px; }
+    .case { min-width:0; }
+    .case-label { display:flex; justify-content:space-between; gap:8px; color:#8995a2; font-size:11px; margin:0 3px 5px; }
+    .case-label span:last-child { color:#626d79; }
+    .card { border:1px solid #444e5b; background:var(--card); cursor:pointer; min-height:160px; outline:none; }
+    .card:hover,.card:focus-visible { border-color:#77879a; }
+    .card.expanded { border-color:#7d8ea2; }
+    .card-head { height:30px; padding:6px 9px; background:#232a34; border-bottom:1px solid #414b58; color:#bfc9d5; white-space:nowrap; overflow:hidden; }
+    .author { color:var(--accent); font-weight:700; }
+    .meta { color:#74808d; }
+    .body { min-height:102px; padding:6px 9px 5px; }
+    .row { height:18px; white-space:nowrap; overflow:hidden; text-overflow:clip; }
+    .row.heading { font-weight:800; color:#eef2f7; }
+    .row.paragraph { color:#cbd3dd; }
+    .row.suggestion-label { color:var(--suggest); font-weight:700; background:#15262c; padding-left:5px; }
+    .row.suggestion { color:#a9d6d5; background:#15262c; padding-left:11px; }
+    .empty { color:#5f6a77; height:36px; display:flex; align-items:center; font-style:italic; }
+    .footer { min-height:27px; border-top:1px solid #3b4551; padding:5px 9px; color:#9aa6b4; background:#171c23; white-space:nowrap; overflow:hidden; }
+    .footer.none { color:#56616e; }
+    .note { margin-top:11px; padding:9px 11px; border-left:2px solid var(--accent); background:#12171d; color:#aab5c1; font-size:12px; }
+    .switcher { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:4px; padding:6px; background:#f3f4f6; color:#15171a; border-radius:999px; box-shadow:0 8px 30px #000a; font:13px/1.2 system-ui,sans-serif; z-index:10; }
+    .switcher button { border:0; background:transparent; color:inherit; cursor:pointer; min-width:38px; height:32px; border-radius:99px; font:inherit; }
+    .switcher button:hover { background:#dfe3e8; }
+    .variant-label { min-width:295px; text-align:center; font-weight:700; }
+    @media (max-width:850px) { .layout{grid-template-columns:1fr}.sidebar{display:none}.cases{grid-template-columns:1fr}.legend{display:none}.variant-label{min-width:220px}.pane{padding:11px} }
+  </style>
+</head>
+<body>
+  <!-- PROTOTYPE: Three Markdown-disclosure policies, switchable via ?variant=A|B|C, shown against identical projected bodies. -->
+  <main>
+    <div class="intro">
+      <div><h1>Six-row Markdown disclosure</h1><p>Click a card to expand it. Header and footer do not count toward the body budget.</p></div>
+      <div class="legend"><span>strong = heading</span><span>cyan = Suggestion</span><span>plain = prose</span></div>
+    </div>
+    <section class="terminal" aria-label="bbr Markdown disclosure prototype">
+      <div class="chrome"><span>bbr · presentation prototype</span><span id="policyShort"></span></div>
+      <div class="layout">
+        <aside class="sidebar">
+          <div class="tree">▾ src</div><div class="tree">&nbsp;&nbsp;▾ tui</div><div class="tree active">&nbsp;&nbsp;&nbsp;&nbsp;presentation.zig&nbsp;&nbsp; 4</div><div class="tree">&nbsp;&nbsp;&nbsp;&nbsp;render.zig&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; 2</div><div class="tree">&nbsp;&nbsp;▸ review</div><div class="tree">▸ docs</div>
+        </aside>
+        <section class="pane">
+          <div class="section-rule">presentation.zig · review cards at 62 cells</div>
+          <div class="cases" id="cases"></div>
+          <div class="note" id="policyNote"></div>
+        </section>
+      </div>
+    </section>
+  </main>
+  <nav class="switcher" aria-label="Prototype variants">
+    <button id="prev" aria-label="Previous variant">←</button>
+    <span class="variant-label" id="variantLabel"></span>
+    <button id="next" aria-label="Next variant">→</button>
+  </nav>
+  <script>
+    const limit = 6;
+    const variants = {
+      A: { name:'Whole blocks only', short:'strict atomic blocks', note:'Every block is atomic. This preserves all boundaries, but a long paragraph can leave most or all of the six-row preview unused.' },
+      B: { name:'Flow split · structure atomic', short:'recommended mixed policy', note:'Paragraph and literal-flow rows can cross the disclosure boundary. Headings and Suggestions move as whole blocks, preserving the structures whose partial display is misleading.' },
+      C: { name:'Hard limit · split all blocks', short:'strict six-row projection', note:'The projector always emits at most six collapsed body rows. Paragraphs, headings, and Suggestions may cross the disclosure boundary; semantic block metadata and styling remain intact on every visible row.' },
+    };
+    const cases = [
+      { title:'Heading + 12-row paragraph', detail:'1 heading · 12 prose', blocks:[
+        {kind:'heading', rows:['Projection ownership']},
+        {kind:'paragraph', rows:['A Buffer row must retain the identity of the review item', 'that produced it, even after wrapping changes the number of', 'visual rows. The owner remains a tagged CommentId or TempId,', 'while each row also carries its local block ordinal and part.', 'This lets Enter toggle disclosure from the header, prose, or', 'footer without consulting terminal coordinates. Rebuilding at', 'a narrower width may add rows, but it cannot change which card', 'owns them. Navigation restores against the stable owner first,', 'then selects the nearest surviving visual row. Theme resolution', 'happens later and never participates in identity. The renderer', 'therefore paints an immutable projection instead of discovering', 'layout or sending measurements back into Presentation.']},
+      ]},
+      { title:'Oversized heading first', detail:'7 heading rows · 4 prose', blocks:[
+        {kind:'heading', rows:['A deliberately', 'very narrow', 'heading that', 'wraps across', 'seven complete', 'terminal display', 'rows']},
+        {kind:'paragraph', rows:['The following prose is short,', 'but begins only after the', 'atomic heading has finished.', 'Expansion reveals both blocks.']},
+      ]},
+      { title:'Suggestion crosses boundary', detail:'3 prose · 5 suggestion', blocks:[
+        {kind:'paragraph', rows:['The prose establishes why the replacement is safe.', 'Three rows fit before the fenced Suggestion begins.', 'Only three rows remain in the collapsed budget.']},
+        {kind:'suggestion', rows:['suggestion', 'const owner = row.owner;', 'const card = projection.card(owner);', 'try card.toggle();', 'try projection.rebuild();']},
+      ]},
+      { title:'Everything fits exactly', detail:'1 heading · 3 prose · 2 suggestion', blocks:[
+        {kind:'heading', rows:['Small complete body']},
+        {kind:'paragraph', rows:['All semantic content fits inside', 'the six-row body budget without', 'requiring a disclosure footer.']},
+        {kind:'suggestion', rows:['suggestion', 'return .accepted;']},
+      ]},
+    ];
+    const expanded = new Set();
+    const keys = Object.keys(variants);
+    function key(){ const v=new URLSearchParams(location.search).get('variant')?.toUpperCase(); return variants[v]?v:'B'; }
+    function setVariant(v){ const url=new URL(location); url.searchParams.set('variant',v); history.replaceState({},'',url); expanded.clear(); render(); }
+    function flatten(c){ return c.blocks.flatMap((b,bi)=>b.rows.map((text,ri)=>({kind:b.kind,text,block:bi,row:ri}))); }
+    function collapsedRows(c, policy){
+      if(policy==='A'){
+        const out=[]; for(let bi=0;bi<c.blocks.length;bi++){ const b=c.blocks[bi]; if(out.length+b.rows.length>limit) break; b.rows.forEach((text,ri)=>out.push({kind:b.kind,text,block:bi,row:ri})); } return out;
+      }
+      if(policy==='B'){
+        const out=[]; for(let bi=0;bi<c.blocks.length && out.length<limit;bi++){ const b=c.blocks[bi]; const atomic=b.kind==='heading'||b.kind==='suggestion'; const remaining=limit-out.length; if(atomic&&b.rows.length>remaining) break; b.rows.slice(0,remaining).forEach((text,ri)=>out.push({kind:b.kind,text,block:bi,row:ri})); if(b.rows.length>remaining) break; } return out;
+      }
+      return flatten(c).slice(0,limit);
+    }
+    function rowClass(row){ if(row.kind==='suggestion'&&row.row===0)return 'suggestion-label'; return row.kind; }
+    function render(){
+      const policy=key(), meta=variants[policy];
+      document.querySelector('#variantLabel').textContent=`${policy} — ${meta.name}`;
+      document.querySelector('#policyShort').textContent=meta.short;
+      document.querySelector('#policyNote').textContent=meta.note;
+      const host=document.querySelector('#cases'); host.innerHTML='';
+      cases.forEach((c,i)=>{
+        const all=flatten(c); const open=expanded.has(i); const shown=open?all:collapsedRows(c,policy); const hidden=all.length-shown.length;
+        const shell=document.createElement('section'); shell.className='case';
+        shell.innerHTML=`<div class="case-label"><span>${c.title}</span><span>${c.detail}</span></div><div class="card ${open?'expanded':''}" tabindex="0" role="button" aria-expanded="${open}"><div class="card-head">● <span class="author">Ada</span> <span class="meta">commented · Enter toggles this card</span></div><div class="body"></div><div class="footer ${hidden?'':'none'}"></div></div>`;
+        const body=shell.querySelector('.body');
+        if(!shown.length) body.innerHTML='<div class="empty">No complete body content fits this policy.</div>';
+        else shown.forEach(row=>{ const el=document.createElement('div'); el.className=`row ${rowClass(row)}`; el.textContent=(row.kind==='heading'?'# ':row.kind==='suggestion'&&row.row>0?'  ':'')+row.text; body.appendChild(el); });
+        const footer=shell.querySelector('.footer');
+        if(open&&all.length>limit) footer.textContent=`▾ ${all.length} total rows · enter to collapse`;
+        else if(hidden) footer.textContent=`▸ ${hidden} hidden rows · ${all.length} total · enter to expand`;
+        else footer.textContent=`✓ ${all.length} total rows · no disclosure needed`;
+        const toggle=()=>{ expanded.has(i)?expanded.delete(i):expanded.add(i); render(); };
+        const card=shell.querySelector('.card'); card.onclick=toggle; card.onkeydown=e=>{ if(e.key==='Enter'||e.key===' '){e.preventDefault();toggle();} };
+        host.appendChild(shell);
+      });
+    }
+    function cycle(delta){ const i=keys.indexOf(key()); setVariant(keys[(i+delta+keys.length)%keys.length]); }
+    document.querySelector('#prev').onclick=()=>cycle(-1); document.querySelector('#next').onclick=()=>cycle(1);
+    addEventListener('keydown',e=>{ if(['INPUT','TEXTAREA','SELECT'].includes(e.target.tagName)||e.target.isContentEditable)return; if(e.key==='ArrowLeft')cycle(-1); if(e.key==='ArrowRight')cycle(1); });
+    render();
+  </script>
+</body>
+</html>
