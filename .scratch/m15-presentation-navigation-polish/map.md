@@ -31,13 +31,13 @@ An implementation-ready M15 specification and dependency map in which every pres
 - [Decide Picker loading feedback](issues/11-decide-picker-loading-feedback.md) — Add a single-glyph Picker spinner driven by scoped tick events through the blocking event path; avoid richer indeterminate animation.
 - [Choose the File-level Comment model](issues/13-choose-file-level-comment-model.md) — Use exhaustive root-owned Review/File/inline CommentScope, scope-wide Session projection, and File-header placement without overloading line Anchors.
 - [Choose the Markdown projection seam](issues/14-choose-markdown-projection-seam.md) — Use a pure two-stage ReviewBody-to-ReviewCardRow projection with shared geometry, grapheme metrics, stable source ownership, Theme composition, and a hard rendered-row disclosure limit.
+- [Define the integrated M15 contract](issues/12-define-the-integrated-m15-contract.md) — Organize M15 around atomic Presentation Frames, context-resolved semantic Actions, explicit state lifetimes, public configuration, and nine dependency-ordered tested slices.
 
 ## Not yet specified
-
-- Implementation slices and their test matrix until the interaction decisions establish the state transitions that must be integrated.
 
 ## Out of scope
 
 - Implementing M15; this map ends at an implementation-ready specification.
 - Review-item editing, mutation, and submission hardening owned by M16.
 - Diff/highlighting completeness and persistent disk caching owned by M17.
+- [Choose explicit old/new side inspection and yank behavior](../side-version-navigation/issues/01-choose-old-new-side-inspection-and-yank.md) — explicit side switching and side-isolated copy/view behavior are deferred to M20; M15 keeps a provisional new-side-first yank rule.

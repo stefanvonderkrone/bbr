@@ -49,6 +49,10 @@ _Avoid_: parsed Comment, rendered Markdown, Markdown document.
 The bounded DiffPane presentation of one Comment or Draft: an identifying header, ReviewBody rows, and an in-place disclosure footer when the projected body exceeds its row budget. Every row belongs to the same stable Comment or Draft identity.
 _Avoid_: Comment (the Review entity), panel, box.
 
+**Presentation Frame**:
+One internally consistent projection of the published Session and its Session-relative interaction state at the current terminal geometry. It is the shared source for rendering, navigation restoration, and semantic mouse targeting; a failed reprojection preserves the previous complete Frame.
+_Avoid_: screen (the terminal output), Buffer (only the DiffPane rows), render state, layout snapshot.
+
 **Session Epoch**:
 The identity of one published Session. Session-bound work such as File Enrichment carries that Session's Epoch and cannot change a later Session, even when both Sessions represent the same PullRequest. The Epoch changes only when a complete Session replacement is published; a failed replacement preserves the current Epoch and its in-flight work.
 _Avoid_: PR id (identifies the PullRequest, not one Session), generation, version, token, nonce.
@@ -78,8 +82,12 @@ The pending numeric prefix applied to the next Motion (e.g. `5j`). Held in a reg
 _Avoid_: repeat, multiplier, prefix.
 
 **Action**:
-What a key resolves to in the Keymap: a Motion or a command (quit, reply, submit, toggle a view…). The unit the Keymap binds and dispatch acts on; the broader term Motion specializes.
+The semantic operation input resolves to in the current Interaction Context: a Motion or a command (quit, reply, submit, toggle a disclosure…). The unit the Keymap binds and Presentation dispatch acts on; the broader term Motion specializes. The same key may resolve to different Actions in different Interaction Contexts, while mouse parity dispatches the same semantic Action where the accepted gesture has a keyboard equivalent.
 _Avoid_: command, handler, event.
+
+**Interaction Context**:
+The active input surface and semantic target from the current Presentation Frame: an Overlay when one captures input, otherwise the focused Pane and its cursor target. It determines Action resolution and ActionAvailability without becoming Review state.
+_Avoid_: mode (too broad), focus alone (omits the target), input state.
 
 **ActionAvailability**:
 Whether an Action is valid for the currently published Review. Unavailable Actions remain visible but greyed in the help Overlay; invoking one produces an explanatory status message, while Presentation alone decides availability.

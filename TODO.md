@@ -193,6 +193,11 @@ Turn the remaining environment-dependent questions into measured decisions.
 - [ ] Benchmark sequential versus parallel PR/diff/comment loading against the live API, including TLS handshakes and rate-limit behavior. Implement fan-out and order-independent fakes only when the measured latency gain justifies the second connection.
 - [ ] Decide whether approve/merge/decline belongs in bbr after the review workflow is stable. If accepted, specify permissions, confirmation, stale-head, and failure behavior before adding Actions; otherwise record it as a durable non-goal.
 
+## M20 — Side-aware version inspection  ·  M  ·  needs M15/M17
+Make old-versus-new File version choice explicit after M15 establishes the Presentation contract
+and M17 closes the remaining old-side and side-by-side fidelity gaps.
+- [ ] Resolve `.scratch/side-version-navigation/issues/01-choose-old-new-side-inspection-and-yank.md`: decide how a reviewer switches between old and new versions for isolated viewing and clipboard operations, including Action grammar, visible side indication, Selection/Count behavior, unavailable sides, state lifetime, and keyboard/mouse parity.
+
 ### Closed historical deferrals
 
 The following notes remain in M0–M14 as implementation history but require no post-M14 work:
@@ -217,11 +222,12 @@ M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M10    (authoring → submission)
               ├─ M6 ─ M10b ─ M16 (review-item mutation & submission hardening)
               ├─ M9 ─ M13 ─ M17  (diff, blob & highlighting completeness)
               ├─ M3 ─ M6 ─ M14 ─ M18 (local-review expansion)
-              └─ M14 ─ M19       (operational hardening & product gates)
+              ├─ M14 ─ M19       (operational hardening & product gates)
+              └─ M15 ─ M17 ─ M20 (side-aware version inspection)
 ```
 
 **MVP line:** M0–M3 gives a usable read-only reviewer; M4 makes it ergonomic; M6+M10 make it
 write-capable (the headline). M5/M7/M8/M9/M11/M12/M13 are parallelizable polish once M2 lands; M14 is the
-largest standalone feature and depends only on read + authoring, not submission. M15–M19 gather
+largest standalone feature and depends only on read + authoring, not submission. M15–M20 gather
 all still-actionable follow-ups recorded by the completed milestones, design open questions,
 ADRs, domain docs, and the local issue tracker.

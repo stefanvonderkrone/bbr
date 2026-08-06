@@ -213,6 +213,11 @@ the main thread; the Epoch token still guards against stale results.
 - **Cells borrow text.** `Cell.Character.grapheme` is `[]const u8`; text handed to `printSegment`
   must stay valid until `render()`. Keep per-line buffers in scope across the whole draw+render, or
   reuse one buffer and you'll corrupt earlier cells.
+- **OSC 52 clipboard writes:** pinned libvaxis exposes
+  `Vaxis.copyToSystemClipboard(_: Vaxis, tty: *std.Io.Writer, text: []const u8, encode_allocator: std.mem.Allocator) !void`
+  (`src/Vaxis.zig:1107` in package `vaxis-0.6.0-BWNV_Gz5CQBTx7g34RYMPTL-bJhsFCU3ECHQ-CZlBVsn`).
+  It base64-encodes `text`, writes `osc52_clipboard_copy`, and flushes the tty writer. Supplying
+  `system_clipboard_allocator` is required for clipboard *requests*, not for this copy method.
 - Module wiring: `b.dependency("vaxis", .{...}).module("vaxis")`; the core `bbr` module stays
   vaxis-free so its tests need no TUI.
 - **Headless rendering for tests (no tty):** `vaxis.Screen.init(alloc, .{ .rows, .cols, .x_pixel,
@@ -249,3 +254,4 @@ the main thread; the Epoch token still guards against stale results.
 - [ ] `ArenaAllocator.queryCapacity` semantics still exclude internal node storage?
 - [ ] `std.Io.Reader`/`Writer` method surface we use unchanged?
 - [ ] libvaxis still builds against the new toolchain; re-pin its commit.
+- [ ] libvaxis `Vaxis.copyToSystemClipboard` signature and OSC 52 behavior unchanged?
