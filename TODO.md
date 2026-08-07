@@ -198,6 +198,28 @@ Make old-versus-new File version choice explicit after M15 establishes the Prese
 and M17 closes the remaining old-side and side-by-side fidelity gaps.
 - [ ] Resolve `.scratch/side-version-navigation/issues/01-choose-old-new-side-inspection-and-yank.md`: decide how a reviewer switches between old and new versions for isolated viewing and clipboard operations, including Action grammar, visible side indication, Selection/Count behavior, unavailable sides, state lifetime, and keyboard/mouse parity.
 
+## M21 — Buffer & Review search  ·  M/L  ·  needs M20
+Find source text without leaving the review, first within the current DiffPane Buffer and then
+across the complete contents of every changed File in the current Review.
+- [ ] Add `/` search for the current Buffer. Open an inline query prompt, update matches as the reviewer types, highlight every occurrence, show the active/total match count, and use `n`/`N` to move forward/backward with wraparound. `esc` cancels without moving; accepting an empty query retains the previous query. Match semantic source and authored body text, not gutters, borders, or other generated presentation chrome.
+- [ ] Define and test predictable query semantics: Buffer Search uses literal smart-case matching; Review Search uses fuzzy ranking while preserving exact occurrence locations. Matching operates on Unicode text without allowing invalid/non-text File content to break the search.
+- [ ] Add a Review Search Overlay that searches the full selected version of every changed File, not only loaded blobs or visible diff hunks. Show one selectable result per occurrence with path, line/column, and a contextual snippet; keep a larger preview of the selected occurrence with all query hits highlighted, comparable to a live-grep picker.
+- [ ] Stream Review Search results as File content becomes available without blocking input. Scope acquisition and result publication to the Session Epoch, cancel stale work on review replacement, bound concurrent File Enrichment, honor the File cache budget, and expose per-File loading/failure state without discarding usable results.
+- [ ] Selecting an occurrence closes the Overlay, focuses its File and selected side, switches to WholeFile scope when the line is outside a visible hunk, and positions the cursor on the exact occurrence. Returning to the Overlay preserves the query and selection while the Session remains current.
+- [ ] Support remote PullRequests and LocalReviews through their existing File Enrichment seams. Search the chosen old/new side from M20; when a side is unavailable (including binary Files), show that explicitly instead of silently searching a different version.
+- [ ] Add pure matcher/ranker tests plus Presentation integration coverage for incremental input, match highlighting, `n`/`N`, streamed result ordering, preview selection, navigation into out-of-hunk content, partial failures, and stale-Epoch rejection.
+
+## M22 — Durable File read state  ·  M  ·  needs M15/M17
+Make review progress visible in the File Tree and preserve it locally without allowing a changed
+File to inherit an obsolete read decision.
+- [ ] Derive a deterministic File Review Fingerprint from the review-visible change: old/new path, change kind, side availability, and canonical old/new diff content (including the binary/removed-file representation completed by M17). The fingerprint must remain stable across an unchanged Session reload but change whenever what the reviewer must inspect changes; do not use the PullRequest SourceCommit alone, which would invalidate unrelated Files.
+- [ ] Add a reviewer-local File Read Receipt keyed by `ReviewIdentity` and canonical File path (new path when present, otherwise old path), carrying the File Review Fingerprint that was accepted. Persist receipts in SQLite through a narrow `FileReadStore` seam with an in-memory fake; add a forward `PRAGMA user_version` migration without coupling the state to PendingReview Draft rows.
+- [ ] Render every File without a matching receipt in bold in the File Tree. A File with a matching receipt renders at regular weight. Directory rows remain structural, but may summarize descendant progress without replacing the per-File distinction.
+- [ ] Add a configurable `toggle_file_read` Action, initially bound to `m`, for the focused File in either the Sidebar or DiffPane. Persist before publishing the regular-weight state; a failed write leaves the File bold and reports the error. Toggling a read File back to unread deletes its receipt so reviewers can correct accidental completion.
+- [ ] During Candidate Session preparation and explicit refresh, load receipts and compare them with the new File Review Fingerprints before atomic publication. A missing, mismatched, or unverifiable fingerprint is unread and therefore bold; discard stale receipts for changed or no-longer-participating Files. A receipt-load failure must not block the Review—publish conservatively with Files unread and a visible warning.
+- [ ] Preserve matching read state across quit/reopen, PullRequest switching, Session replacement, and LocalReview Ref refresh. Keep receipts isolated by full ReviewIdentity so equal paths or PullRequestIds in different Reviews never share progress.
+- [ ] Add fingerprint fixtures and fake/SQLite round-trip tests, plus Presentation coverage for initial bold styling, successful and failed toggles, unchanged reload retention, selective invalidation when only one File changes, rename/removal/binary cases, storage failure fallback, and ReviewIdentity isolation.
+
 ### Closed historical deferrals
 
 The following notes remain in M0–M14 as implementation history but require no post-M14 work:
@@ -223,11 +245,12 @@ M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M10    (authoring → submission)
               ├─ M9 ─ M13 ─ M17  (diff, blob & highlighting completeness)
               ├─ M3 ─ M6 ─ M14 ─ M18 (local-review expansion)
               ├─ M14 ─ M19       (operational hardening & product gates)
-              └─ M15 ─ M17 ─ M20 (side-aware version inspection)
+              ├─ M15 ─ M17 ─ M20 ─ M21 (side-aware inspection → review search)
+              └─ M15 ─ M17 ─ M22 (durable File read state)
 ```
 
 **MVP line:** M0–M3 gives a usable read-only reviewer; M4 makes it ergonomic; M6+M10 make it
 write-capable (the headline). M5/M7/M8/M9/M11/M12/M13 are parallelizable polish once M2 lands; M14 is the
-largest standalone feature and depends only on read + authoring, not submission. M15–M20 gather
+largest standalone feature and depends only on read + authoring, not submission. M15–M22 gather
 all still-actionable follow-ups recorded by the completed milestones, design open questions,
 ADRs, domain docs, and the local issue tracker.

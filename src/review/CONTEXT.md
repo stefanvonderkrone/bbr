@@ -10,6 +10,14 @@ no native draft/pending concept, so this batching is entirely ours to model.
 The durable identity of one Review: either a Workspace/Repository/PullRequestId for remote review or a ReviewRepository/BaseRef/SourceRef for local review. It survives Session replacement and never includes resolved commit hashes; a Session Epoch identifies a particular loaded snapshot.
 _Avoid_: ReviewKey, Session identity, commit pair.
 
+**File Review Fingerprint**:
+A deterministic digest of one File's review-visible change: its old/new paths, change kind, side availability, and canonical old/new diff content. It identifies what the reviewer inspected without using the Review's SourceCommit as a coarse proxy, so an update to one File does not invalidate read state for unrelated Files.
+_Avoid_: commit hash (too broad), blob hash (does not describe both sides of the reviewed change), Session identity.
+
+**File Read Receipt**:
+The reviewer-local durable fact that a File Review Fingerprint was explicitly marked read within one ReviewIdentity. It is current only while the loaded File has the same fingerprint; missing, mismatched, or unverifiable receipts project as unread. Receipts live in local persistence for both RemoteReview and LocalReview and never synchronize to Bitbucket.
+_Avoid_: read File (conflates the File with the decision), viewed state (does not imply explicit completion), Session state (the receipt survives replacement).
+
 **Anchor**:
 The line or range an inline Comment attaches to: a File `path`, the **commit** containing its anchored side, plus line coordinates `{ from, to, start_from, start_to }`, where `from`/`start_from` are old-file lines and `to`/`start_to` are new-file lines. In a LocalReview, an old-side Anchor binds to the resolved BaseRef commit and a new-side Anchor binds to the resolved SourceRef commit. A range spans `start_*` → `from`/`to`; captured context keeps an unresolved or outdated Comment legible. An Anchor always has line coordinates; a File-level Comment uses a File scope instead.
 _Avoid_: position, location, target, ref.

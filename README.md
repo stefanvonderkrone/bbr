@@ -54,7 +54,8 @@ Small vertical slices (sizes are relative effort, not dates):
 `M13` syntax highlighting → `M14` local / offline review →
 `M15` presentation/navigation polish → `M16` review-item mutation/submission hardening →
 `M17` diff/blob/highlighting completeness → `M18` local-review expansion →
-`M19` operational hardening/product gates.
+`M19` operational hardening/product gates → `M20` side-aware version inspection →
+`M21` buffer & review search → `M22` durable File read state.
 
 **MVP line:** M0–M3 (usable read-only), M4 (ergonomic), M6+M10 (write-capable — the headline).
 Full breakdown with dependencies in `docs/design.html` §14 and `TODO.md`.

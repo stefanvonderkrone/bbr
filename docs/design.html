@@ -515,11 +515,14 @@ DraftState = union(enum){ draft, submitting, posted: CommentId, failed: ApiError
     <tr><td>M17</td><td>Diff, blob &amp; highlighting completeness</td><td>M/L</td><td>M13</td><td>Binary and removed-file handling, line matching, blob/diffstat validation, query predicates, UserGrammar lifecycle, and cache/prefetch decisions.</td></tr>
     <tr><td>M18</td><td>Local-review expansion</td><td>L</td><td>M14</td><td>Dirty worktrees with fuzzy anchors, repository relinking, explicit local-to-remote Draft copy, and a concurrent-process sync decision.</td></tr>
     <tr><td>M19</td><td>Operational hardening &amp; product gates</td><td>S/M</td><td>M14</td><td>CI, credential cleanup, measured HTTP/proxy/load decisions, and an approve/merge/decline product gate.</td></tr>
+    <tr><td>M20</td><td>Side-aware version inspection</td><td>M</td><td>M15, M17</td><td>Explicit old/new File version choice for isolated viewing and clipboard operations, with visible side state and unavailable-side behavior.</td></tr>
+    <tr><td>M21</td><td>Buffer &amp; Review search</td><td>M/L</td><td>M20</td><td><code>/</code> search with match traversal in the current Buffer, plus an asynchronous fuzzy-search Overlay over occurrences in every changed File with contextual preview and jump-to-match.</td></tr>
+    <tr><td>M22</td><td>Durable File read state</td><td>M</td><td>M15, M17</td><td>Bold unread Files in the File Tree, explicit read/unread toggling, SQLite-backed File Read Receipts, and selective invalidation when a File's reviewed change differs after reload.</td></tr>
   </table>
   <p><small><b>MVP line:</b> M0–M3 = a usable read-only reviewer; M4 makes it ergonomic; M6+M10
   make it write-capable (the headline). M5/M7/M8/M9/M11/M12/M13 are parallelizable polish once M2 lands.
   M14 (the largest standalone feature) needs read + authoring (M6), <em>not</em> submission (M10).
-  M15–M19 gather the actionable residue from the completed milestones; detailed acceptance criteria live in <code>TODO.md</code>.</small></p>
+  M15–M22 gather the actionable residue from the completed milestones; detailed acceptance criteria live in <code>TODO.md</code>.</small></p>
 </section>
 
 <section id="open">

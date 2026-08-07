@@ -23,6 +23,7 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [x] **Scope: WholeFile** — entire file with changes inline. `M5` (fetched) · `M9` (true full file)
 - [x] **Single-file view** — isolate the DiffPane to one File (`only_file`); Sidebar selects it. `M8`
 - [x] **Jump-to-file** — motion to scroll the pane to a File's header. `M8`
+- [ ] **Durable File read state** — unread Files are bold; locally persisted read Files return to unread when their reviewed content changes. `M22`
 - [x] **Syntax highlighting** — tree-sitter foreground over diff background. `M13`
 - [ ] **Binary and removed-file completeness** — safe placeholders and old-side whole-file splice. `M17`
 - [ ] **User-installed Grammars** — managed, validated tree-sitter Grammars and match rules. `M17`
@@ -44,6 +45,8 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [x] **Full vim motions** — `zz` and numeric Count (`5j`), complete set. `M11`
 - [x] **Configurable Keymap** — bindings from config; drives the help overlay. `M11`/`M12`
 - [ ] **Yank source text** — OSC 52 clipboard copy for current/selected diff lines. `M15`
+- [ ] **Search current Buffer** — `/` incremental smart-case search with highlighted matches and `n`/`N` traversal. `M21`
+- [ ] **Search changed Files** — fuzzy Review Search Overlay with streamed occurrences, contextual preview, and jump-to-match. `M21`
 
 ## Pending Review (write)
 - [x] **Draft top-level comment** `M6`

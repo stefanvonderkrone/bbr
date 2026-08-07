@@ -29,6 +29,10 @@ _Avoid_: nav, drawer.
 The collapsible repository-path hierarchy shown inside the Sidebar. Its entries are Directories and Files.
 _Avoid_: Sidebar (the containing Pane), flat file list.
 
+**File Read State**:
+The current Presentation projection of a File Read Receipt against its File Review Fingerprint. An unread File is bold in the File Tree; a read File uses regular weight. It is derived from durable review state and the current Session rather than persisted as a bare boolean.
+_Avoid_: File Read Receipt (the durable evidence), viewed state, bold flag.
+
 **Overlay**:
 A floating surface drawn over the Panes — keybinding help, the PR picker, a comment composer. Dismissible; captures input while open.
 _Avoid_: popup, modal, dialog, hover (describe the trigger, not the thing).
@@ -36,6 +40,14 @@ _Avoid_: popup, modal, dialog, hover (describe the trigger, not the thing).
 **Picker**:
 The Overlay for fuzzy-finding a PullRequest by id or title (backed by `zf`) to switch the loaded PR. While its PullRequest list loads, a scoped low-frequency tick advances a single-glyph spinner without changing the blocking input loop.
 _Avoid_: search, finder, switcher, palette.
+
+**Buffer Search**:
+The `/`-initiated search over semantic text in the current DiffPane Buffer. It highlights every occurrence and gives `n`/`N` a current match to traverse without including rendered gutters or framing.
+_Avoid_: Review Search (crosses File boundaries), find (the Action has defined search semantics).
+
+**Review Search**:
+The Overlay for fuzzy-searching occurrences across the selected version of every changed File in the current remote PullRequest or LocalReview. Results stream as File Enrichment arrives and retain exact source locations for preview and navigation.
+_Avoid_: Pull Request search (also applies to LocalReview), repository search (only changed Files participate), Picker (switches PullRequests).
 
 **Composer**:
 The Overlay for writing a Draft (comment, reply, or suggestion) before it enters the PendingReview.
