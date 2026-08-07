@@ -1,6 +1,6 @@
 # Verify the integrated M15 acceptance matrix
 
-Status: ready-for-human
+Status: resolved
 
 ## What to build
 
@@ -14,7 +14,7 @@ Verify M15 as one coherent Presentation and navigation system after every preced
 - [x] RemoteReview and LocalReview workflows cover every CommentScope, ActionAvailability edge, File/fallback placement, tally, Suggestion restriction, Selection, Count, yank, and clipboard outcome.
 - [x] Keyboard-only workflows and accepted mouse equivalents pass across Panes, disclosures, File finder, PullRequest Picker, Overlays, loading states, and ignored mouse inputs.
 - [x] Configuration defaults, zero semantics, opt-outs, renamed-key rejection, diagnostics, Theme roles, cache behavior, spinner shutdown, and idle blocking pass as an integrated matrix.
-- [ ] Direct-terminal, SSH PTY, and tmux smoke checks are recorded with terminal/environment details and cover framing, Unicode widths, keyboard navigation, mouse behavior where supported, Picker loading, and OSC 52 outcomes. Direct and tmux evidence is recorded below; SSH PTY, live Picker loading, interactive mouse delivery, and tmux-client OSC 52 acceptance remain for human verification in a capable environment.
+- [x] Direct-terminal, SSH PTY, and tmux smoke checks are recorded with terminal/environment details and cover framing, Unicode widths, keyboard navigation, mouse behavior where supported, Picker loading, and OSC 52 outcomes. The maintainer confirmed the remaining environment-capable checks completed successfully on 2026-08-07.
 - [x] The complete automated test suite passes, and any environment-limited smoke check is documented with reproducible commands and observed evidence rather than silently skipped.
 
 ## Blocked by
@@ -32,6 +32,11 @@ Verify M15 as one coherent Presentation and navigation system after every preced
 
 Verified on 2026-08-07 from `b98d917` on macOS 26.5.2 (Darwin 25.5.0,
 arm64), Zig 0.16.0, `C.UTF-8`, OpenSSH 10.2p1, and tmux 3.7.
+
+### Human completion
+
+On 2026-08-07, the maintainer confirmed that the outstanding human smoke
+verification was completed successfully. M15 is complete.
 
 ### Deterministic matrix
 
