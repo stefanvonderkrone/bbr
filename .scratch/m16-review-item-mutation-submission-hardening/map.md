@@ -1,0 +1,41 @@
+# M16 review-item mutation and submission hardening
+
+Label: wayfinder:map
+
+## Destination
+
+An implementation-ready M16 specification and dependency map in which every review-item mutation, editor-handoff, Submission repair, rate-limit, stale-SourceCommit, and integration-test decision is resolved, without implementing the milestone itself.
+
+## Notes
+
+- Primary domains: Review, Presentation, and Bitbucket. Consult `src/review/CONTEXT.md`, `src/tui/CONTEXT.md`, `src/bitbucket/CONTEXT.md`, and ADR-0002, ADR-0005, ADR-0007, ADR-0008, ADR-0011, and ADR-0012 as relevant.
+- Use the `prototype`, `grilling`, `domain-modeling`, `research`, and `zig` skills as each ticket requires.
+- Treat M16 in `TODO.md` and the acceptance criteria in `.scratch/review-item-mutation/issues/` as constraints rather than reopening them from first principles.
+- Editing a Draft or an author-owned published Comment or Reply uses the same prefilled Composer interaction; their persistence and Reconciliation effects remain distinct.
+- `Ctrl-E` opens `$EDITOR` only in the Composer Interaction Context; the existing DiffPane one-row scroll binding remains unchanged.
+- Submission uses one live per-item Overlay from start through completion. A retry targets only the selected failed Draft and its Reply-descendant subtree; there is no retry-all Action.
+- A changed SourceCommit always requires reload and repair/re-anchor before new POSTs. M16 does not offer submit-anyway.
+- Bitbucket remains authoritative for published Comments. Re-anchor is exposed for a published inline Comment only if primary evidence proves Bitbucket supports it unambiguously.
+- Research conclusions must cite primary sources. Environment-dependent behavior may remain an explicit live-probe task when credentials or a suitable PullRequest are unavailable.
+
+## Decisions so far
+
+- [Establish Bitbucket's published Comment mutation contract](issues/01-establish-bitbucket-comment-mutation-contract.md) — Use UUID ownership, body-only ID-addressed updates and deletes, immutable published Anchors, and post-mutation Reconciliation; live-probe the few undocumented edge cases.
+- [Probe old-side Comment ranges and multi-line Suggestions](issues/02-probe-old-side-ranges-and-suggestions.md) — Use documented side-specific 1-based range fields, keep Suggestions new-side-only, refuse ambiguous range shapes, and live-probe the undocumented UI and rejection envelope.
+- [Establish Bitbucket's Retry-After contract](issues/03-establish-retry-after-contract.md) — Treat `429` as rate limiting, parse either standard `Retry-After` form when present, fall back to bounded local backoff otherwise, and choose a local retry ceiling because Bitbucket publishes none.
+- [Live-probe old-side range and Suggestion behavior](issues/14-live-probe-old-side-range-and-suggestion-behavior.md) — Place range cards at their signed bottom line, cap Anchors at 30 inclusive lines, keep strict one-side-only shapes, and refuse old-side Suggestions because Bitbucket renders their Apply action disabled.
+- [Choose the review-item mutation interaction](issues/04-choose-review-item-mutation-interaction.md) — Use direct contextual ReviewCard Actions, one typed-target prefilled Composer, two-stage root-Draft re-anchor capture, and identity-specific confirmation and unavailability reasons.
+
+## Not yet specified
+
+- The exact recovery affordances for an ambiguous recovered `submitting` Draft may split into additional tickets after the mutation interaction and published-Comment capability contracts are known.
+- The dependency-ordered implementation slices cannot be finalized until the individual mutation, editor, Submission, and integration contracts converge.
+
+## Out of scope
+
+- Implementing M16; this map ends at an implementation-ready specification.
+- Submitting Drafts after SourceCommit changes without first reloading and repairing their CommentScopes.
+- Mutating Comments authored by another Bitbucket user.
+- Applying Suggestions; that remains a Bitbucket web-UI responsibility.
+- General Presentation/navigation polish owned by M15, diff/highlighting completeness owned by M17, and local-review expansion owned by M18.
+- More than one active Submission at a time or automatic takeover of another process's live SubmissionRun.
