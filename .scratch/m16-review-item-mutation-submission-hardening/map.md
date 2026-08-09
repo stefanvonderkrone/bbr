@@ -25,6 +25,7 @@ An implementation-ready M16 specification and dependency map in which every revi
 - [Establish Bitbucket's Retry-After contract](issues/03-establish-retry-after-contract.md) — Treat `429` as rate limiting, parse either standard `Retry-After` form when present, fall back to bounded local backoff otherwise, and choose a local retry ceiling because Bitbucket publishes none.
 - [Live-probe old-side range and Suggestion behavior](issues/14-live-probe-old-side-range-and-suggestion-behavior.md) — Place range cards at their signed bottom line, cap Anchors at 30 inclusive lines, keep strict one-side-only shapes, and refuse old-side Suggestions because Bitbucket renders their Apply action disabled.
 - [Choose the review-item mutation interaction](issues/04-choose-review-item-mutation-interaction.md) — Use direct contextual ReviewCard Actions, one typed-target prefilled Composer, two-stage root-Draft re-anchor capture, and identity-specific confirmation and unavailability reasons.
+- [Define the Draft mutation contract](issues/05-define-draft-mutation-contract.md) — Mutate eligible Drafts through atomic stage-persist-publish transactions, freeze SubmissionRun participants and ambiguous outcomes, and permit conservative recovery abandonment without losing evidence.
 
 ## Not yet specified
 

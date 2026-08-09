@@ -50,7 +50,7 @@ The Overlay for fuzzy-searching occurrences across the selected version of every
 _Avoid_: Pull Request search (also applies to LocalReview), repository search (only changed Files participate), Picker (switches PullRequests).
 
 **Composer**:
-The Overlay for writing a Draft (comment, reply, or suggestion) before it enters the PendingReview.
+The Overlay for authoring or editing a Comment, Reply, or Suggestion body. Mutation uses the same interaction and validation as creation with the previous editable content prefilled; a Suggestion exposes its replacement code while bbr preserves the fenced Markdown representation.
 _Avoid_: editor, input, form.
 
 **ReviewBody**:

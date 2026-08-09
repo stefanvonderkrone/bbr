@@ -102,6 +102,10 @@ _Avoid_: submit, flush, push, sync.
 The durable record of one attempt to carry a PullRequest's Submission to a terminal outcome, including where an interrupted attempt must resume. It is identified within a Repository-qualified PullRequest and is distinct from the process that currently owns the work.
 _Avoid_: batch (the Submission is the batch), worker, job, Session.
 
+**Abandon recovery**:
+The reviewer decision to end a recovered SubmissionRun without further POSTs when its in-flight outcome cannot be reconciled. The run becomes terminal and partial while the ambiguous Draft remains `outcome_unknown`; abandonment never means the Draft was unpublished.
+_Avoid_: cancel Submission, discard recovery, confirm unpublished.
+
 **Reconciliation**:
 The step after a Submission that posted at least one Comment: re-fetch the PR so the just-published Comments (now owned by Bitbucket, ADR-0001) reappear in place of the Drafts that were deleted on a clean batch. During the transient window of a *partial* batch, a still-pending Draft under a now-posted parent stays visible while the posted parent's own row is hidden (the fetched Comment represents it) — the render-path dedup ADR-0007 anticipates.
 _Avoid_: refresh, sync, merge.
