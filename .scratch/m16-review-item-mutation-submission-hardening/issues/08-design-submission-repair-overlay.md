@@ -1,8 +1,25 @@
 # Design the live Submission repair Overlay
 
 Type: prototype
+Status: resolved
 Blocked by: none
 
 ## Question
 
 How should one live Overlay present a PendingReview's dependency-shaped per-Draft progress and final posted, failed, skipped, and outcome-unknown states; expose classified reasons and reply dependencies; let the reviewer repair or retry only the selected failed Draft and its Reply-descendant subtree; and offer conservative Abandon recovery when a recovered run cannot finish, while preserving Durable Operation behavior across Session replacement?
+
+## Answer
+
+Use the prototype's **Dependency tree** variant. One Submission Overlay is projected for the current PullRequest from the start of a SubmissionRun through its terminal result. Its stable body is the PendingReview's topologically ordered forest: roots appear in order, Replies are indented beneath their parent, and every row carries the Draft's typed local identity, short body summary, scope or parent context, and an explicit textual state. Meaning never depends on color or glyph alone.
+
+The header always names the Repository-qualified PullRequest and rolls up the current counts. During execution, rows distinguish queued, posting, waiting-to-retry, reconciling an ambiguous POST, persisting a checkpoint, posted, failed, skipped, and outcome unknown as applicable. The selected row opens an in-Overlay detail region rather than a second floating surface. That region owns the complete classified reason, retry attempt or server delay when known, the direct parent dependency, and the resulting Reply-descendant impact. A skipped Reply names the nearest failed or unresolved ancestor that prevents a valid Bitbucket parent remap; it is not presented as an independent failure.
+
+While a nonterminal run belongs to the currently published PullRequest, the Overlay captures input and cannot be dismissed as though the Durable Operation were cancelled. Terminal clean and partial results retain the same Overlay and tree, replacing progress Actions with result Actions; the reviewer dismisses the terminal result explicitly. Posted rows are inspectable but never retryable. An `outcome_unknown` row uses the established amber/orange treatment plus `outcome unknown - resolve before editing` and permits no mutation or retry until ownership is resolved.
+
+For a terminal partial result, selection determines ActionAvailability. A confirmed failed Draft offers its valid contextual repair Actions and **Retry selected subtree**. The retry participant set is exactly that selected Draft plus its transitive Reply descendants; unrelated roots, ancestors, published items, and sibling subtrees are excluded, and there is no retry-all Action. The detail region previews that participant set before authorization. Skipped descendants point back to their failed ancestor rather than offering a misleading independent retry. Repair delegates to the already-settled typed-target mutation interaction: body editing uses the prefilled Composer, root re-anchor uses the two-stage capture, and deletion uses identity-specific confirmation. Returning from repair rebuilds the same dependency projection and retains the logical selection when that Draft still exists.
+
+Recovery uses the same tree rather than a separate recovery Overlay. Read-only Duplicate-guard reconciliation is visible as progress. If an ambiguous recovered `submitting` Draft cannot be resolved automatically, its detail region offers **Link existing author-owned Bitbucket Comment**, **Confirm not published**, and **Decide later** with their settled meanings. **Abandon recovery** is exposed only for a recovered run that cannot finish, requires a consequence-specific confirmation, emits no further POST, closes the run terminal-partial, releases its lock, converts the in-flight ambiguous item to `outcome_unknown`, and preserves all evidence. It never claims the Comment was unpublished and never makes that ambiguous Draft mutable.
+
+Overlay visibility is Session-relative; Submission ownership is not. Projection and completions are correlated by OperationId and Repository-qualified PullRequest identity. Replacing the Session with another PullRequest removes the blocking Overlay and shows a non-blocking global status naming the PullRequest whose Durable Operation continues. Returning to that PullRequest reconstructs the same Overlay from current durable progress rather than retaining a stale Session Frame. Completion while another PullRequest is visible becomes a PullRequest-qualified global result, and opening the owning PullRequest exposes the terminal tree. Session Epoch rejects stale presentation work but never cancels, redirects, or discards Submission checkpoints.
+
+Prototype context: branch `prototype/submission-repair-overlay`, commit `3e6a0807415db8712b5bed989bb396f3ff98b5ca`. Inspect with `git show prototype/submission-repair-overlay:.scratch/m16-review-item-mutation-submission-hardening/assets/submission-overlay-prototype.html` and the adjacent JavaScript asset.
