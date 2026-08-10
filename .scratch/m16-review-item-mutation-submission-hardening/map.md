@@ -12,7 +12,7 @@ An implementation-ready M16 specification and dependency map in which every revi
 - Use the `prototype`, `grilling`, `domain-modeling`, `research`, and `zig` skills as each ticket requires.
 - Treat M16 in `TODO.md` and the acceptance criteria in `.scratch/review-item-mutation/issues/` as constraints rather than reopening them from first principles.
 - Editing a Draft or an author-owned published Comment or Reply uses the same prefilled Composer interaction; their persistence and Reconciliation effects remain distinct.
-- `Ctrl-E` opens `$EDITOR` only in the Composer Interaction Context; the existing DiffPane one-row scroll binding remains unchanged.
+- `Ctrl-E` opens External Edit only in the Composer Interaction Context; the existing DiffPane one-row scroll binding remains unchanged.
 - Submission uses one live per-item Overlay from start through completion. A retry targets only the selected failed Draft and its Reply-descendant subtree; there is no retry-all Action.
 - A changed SourceCommit always requires reload and repair/re-anchor before new POSTs. M16 does not offer submit-anyway.
 - Bitbucket remains authoritative for published Comments. Re-anchor is exposed for a published inline Comment only if primary evidence proves Bitbucket supports it unambiguously.
@@ -26,6 +26,7 @@ An implementation-ready M16 specification and dependency map in which every revi
 - [Live-probe old-side range and Suggestion behavior](issues/14-live-probe-old-side-range-and-suggestion-behavior.md) — Place range cards at their signed bottom line, cap Anchors at 30 inclusive lines, keep strict one-side-only shapes, and refuse old-side Suggestions because Bitbucket renders their Apply action disabled.
 - [Choose the review-item mutation interaction](issues/04-choose-review-item-mutation-interaction.md) — Use direct contextual ReviewCard Actions, one typed-target prefilled Composer, two-stage root-Draft re-anchor capture, and identity-specific confirmation and unavailability reasons.
 - [Define the Draft mutation contract](issues/05-define-draft-mutation-contract.md) — Mutate eligible Drafts through atomic stage-persist-publish transactions, freeze SubmissionRun participants and ambiguous outcomes, and permit conservative recovery abandonment without losing evidence.
+- [Define the external-editor handoff](issues/07-define-external-editor-handoff.md) — Use a correlated Composer command/completion, secure exact-byte temporary file, synchronous cooked-terminal handoff, atomic validated reseed, and explicit outcome/cleanup projection; decide the public limit key separately.
 
 ## Not yet specified
 
