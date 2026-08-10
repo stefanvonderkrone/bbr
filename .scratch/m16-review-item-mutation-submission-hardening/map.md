@@ -30,6 +30,7 @@ An implementation-ready M16 specification and dependency map in which every revi
 - [Design the live Submission repair Overlay](issues/08-design-submission-repair-overlay.md) — Use one dependency-tree Overlay through progress and terminal results, selected-subtree repair and retry, conservative recovered-run abandonment, and PullRequest-qualified Durable Operation projection across Session replacement.
 - [Define the rate-limit and retry policy](issues/09-define-rate-limit-and-retry-policy.md) — Use three-attempt POST and Duplicate-guard budgets, deterministic 1s/2s waits raised by valid server guidance, durable wait checkpoints, and static per-item retry projection.
 - [Define the stale-SourceCommit repair workflow](issues/10-define-stale-sourcecommit-repair.md) — Enter a no-POST Stale repair gate, reconcile before explicit abandonment, reload and inspect scope by root, and start fresh SubmissionRuns only for eligible repaired subtrees.
+- [Live-probe published Comment mutation edge cases](issues/13-live-probe-comment-mutation-edge-cases.md) — Root deletion tombstones while preserving Replies, body-only Suggestion and Reply edits round-trip exactly, and Bitbucket rejects published Anchor changes atomically.
 
 ## Not yet specified
 
