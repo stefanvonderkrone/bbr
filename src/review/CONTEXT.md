@@ -116,5 +116,9 @@ Re-running Submission over a PendingReview that already has posted Drafts: those
 **Stale-anchor guard**:
 A pre-Submission check that the PR's SourceCommit has not moved since load. If it has, the diff shifted under the Drafts' Anchors and their lines may no longer exist, so the batch is refused rather than posting to wrong lines.
 
+**Stale repair gate**:
+The no-POST eligibility boundary entered when the Stale-anchor guard observes a changed SourceCommit. Reloaded ScopeResolution provides inspection evidence, but each unpublished root must satisfy its scope-specific repair rule before a fresh SubmissionRun may include that root and its Reply descendants.
+_Avoid_: stale ScopeState, submit-anyway, automatic re-anchor.
+
 **Duplicate guard**:
 The defense against double-posting when a POST's response is lost (an *ambiguous* outcome — the comment may or may not have been created). Before retrying such a POST, fetch the PR's comments and skip if one already matches the Draft's anchor and body; Bitbucket has no idempotency key.
