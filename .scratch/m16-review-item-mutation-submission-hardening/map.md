@@ -28,6 +28,7 @@ An implementation-ready M16 specification and dependency map in which every revi
 - [Define the Draft mutation contract](issues/05-define-draft-mutation-contract.md) — Mutate eligible Drafts through atomic stage-persist-publish transactions, freeze SubmissionRun participants and ambiguous outcomes, and permit conservative recovery abandonment without losing evidence.
 - [Define the external-editor handoff](issues/07-define-external-editor-handoff.md) — Use a correlated Composer command/completion, secure exact-byte temporary file, synchronous cooked-terminal handoff, atomic validated reseed, and explicit outcome/cleanup projection; decide the public limit key separately.
 - [Design the live Submission repair Overlay](issues/08-design-submission-repair-overlay.md) — Use one dependency-tree Overlay through progress and terminal results, selected-subtree repair and retry, conservative recovered-run abandonment, and PullRequest-qualified Durable Operation projection across Session replacement.
+- [Define the rate-limit and retry policy](issues/09-define-rate-limit-and-retry-policy.md) — Use three-attempt POST and Duplicate-guard budgets, deterministic 1s/2s waits raised by valid server guidance, durable wait checkpoints, and static per-item retry projection.
 
 ## Not yet specified
 
