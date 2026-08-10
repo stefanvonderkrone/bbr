@@ -1,0 +1,51 @@
+<!doctype html>
+<!-- PROTOTYPE — throw away after the decision is captured.
+Run: python3 -m http.server 4174 -d .scratch/m16-review-item-mutation-submission-hardening/assets
+Variants: ?variant=A|B|C  Scenarios: &scenario=running|partial|recovery -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PROTOTYPE — Submission repair Overlay</title>
+<style>
+:root{color-scheme:dark;--bg:#101316;--panel:#1c2229;--line:#3a424c;--muted:#89939f;--text:#d8dee7;--cyan:#70c0d8;--green:#78c091;--red:#e47f83;--amber:#e9b86e}
+*{box-sizing:border-box}body{margin:0;background:#080a0c;color:var(--text);font:14px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}button{font:inherit}
+.terminal{width:min(1180px,calc(100vw - 32px));height:min(760px,calc(100vh - 108px));min-height:600px;margin:18px auto 90px;border:1px solid #4a535e;background:var(--bg);box-shadow:0 18px 80px #000;position:relative;overflow:hidden}
+.app{height:100%;display:grid;grid-template-columns:25% 75%;grid-template-rows:1fr 28px}.sidebar,.diff{padding:12px;overflow:hidden}.sidebar{border-right:1px solid #303740;color:#7f8995}.diff{color:#69727c}.status{grid-column:1/-1;background:#242b33;border-top:1px solid #46505b;display:flex;align-items:center;justify-content:space-between;padding:0 10px;color:#aab3be}.file{padding:4px 0}.file.active{color:#cbd3dc;background:#20262c}.code{white-space:pre;margin:0}.shade{position:absolute;inset:0 0 28px;background:#05070888}
+.overlay{position:absolute;inset:7% 7% 10%;border:1px solid #727d89;background:var(--panel);box-shadow:0 10px 50px #000b;display:flex;flex-direction:column}.head{min-height:52px;padding:10px 14px;background:#252c34;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:18px}.head h1{font-size:15px;margin:0;color:#edf1f6}.subhead{color:var(--muted);margin-top:3px;font-size:12px}.summary{display:flex;gap:13px;white-space:nowrap}.summary span{color:var(--muted)}.summary b{color:var(--text)}.body{min-height:0;flex:1;overflow:auto}.foot{min-height:40px;padding:8px 12px;background:#252c34;border-top:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:10px}.keys{color:#aab3be}.keys strong{color:#eef2f6;font-weight:500}.hint{color:var(--muted);font-size:12px}
+.posted{color:var(--green)}.failed{color:var(--red)}.skipped{color:var(--muted)}.unknown{color:var(--amber)}.active-state{color:var(--cyan)}.selected{background:#2c343d;outline:1px solid #53606d}.retry{box-shadow:inset 3px 0 #4d9bb0}.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}.variant{display:none;height:100%}.variant.on{display:flex}
+.tree{flex-direction:column;padding:10px 14px}.tree-row{display:grid;grid-template-columns:23px 1fr 145px;gap:8px;padding:7px 8px;border-bottom:1px solid #293038}.tree-row.reply{padding-left:34px}.item-body{color:#d4dae2}.meta{color:var(--muted);font-size:12px;margin-top:2px}.detail{margin:12px 8px 0;border:1px solid #404953;padding:10px 12px;background:#181d22}.detail p{margin:5px 0}
+.queue-layout{flex-direction:row}.queue{width:53%;border-right:1px solid var(--line);overflow:auto;padding:8px}.queue-row{display:grid;grid-template-columns:23px 64px 1fr;gap:7px;padding:8px;border-bottom:1px solid #293038}.queue-row .path{color:var(--muted);font-size:12px;grid-column:3}.inspector{flex:1;padding:16px;overflow:auto}.inspector h2{font-size:14px;margin:0 0 4px}.inspector section{border-top:1px solid #333b44;margin-top:13px;padding-top:10px}.inspector p{margin:4px 0 8px}.subtree{padding:8px;border:1px solid #3a6370;background:#16262d}
+.lanes-layout{flex-direction:column;padding:10px}.lanes{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;min-height:0;flex:1}.lane{border:1px solid #39424c;background:#181d22;padding:8px;overflow:auto}.lane h2{margin:0 0 8px;font-size:12px;text-transform:uppercase;font-weight:500}.card{border:1px solid #353e47;background:#20262c;padding:8px;margin-bottom:8px}.card .item-body{margin:5px 0}.repair-strip{margin-top:9px;border:1px solid #4b5965;background:#232a31;padding:9px;display:flex;justify-content:space-between;gap:14px;align-items:center}
+.switcher{position:fixed;z-index:10;left:50%;bottom:20px;transform:translateX(-50%);background:#edf1f5;color:#161a1f;border-radius:9px;box-shadow:0 8px 30px #000b;display:flex;align-items:center;padding:6px;gap:5px}.switcher button{border:0;background:transparent;color:inherit;border-radius:5px;padding:7px 11px;cursor:pointer}.switcher button:hover,.switcher button.active{background:#ccd4dd}.switcher .name{width:180px;text-align:center;font-weight:700}.scenario{border-left:1px solid #9ba5af;margin-left:5px;padding-left:7px;display:flex}.away .shade,.away .overlay{display:none}.away .status{color:var(--cyan)}
+@media(max-width:800px){.terminal{width:100vw;margin-top:0}.overlay{inset:3% 2% 8%}.summary{display:none}.lanes{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+<main class="terminal" id="terminal">
+<div class="app">
+<aside class="sidebar"><div style="color:#d0d7df;margin-bottom:10px">bbr · acme/widgets #184</div><div class="file">▾ src</div><div class="file">  ▾ review</div><div class="file active">    M submission.zig        4</div><div class="file">    M draft.zig             2</div><div class="file">  ▾ tui</div><div class="file">    M presentation.zig      1</div></aside>
+<section class="diff"><pre class="code">@@ -306,8 +318,15 @@ fn scheduleRetryOrFail(...)
++  if (retry_after_ms) |delay| {
++      self.wait_ms = delay;
++  } else {
++      self.wait_ms = backoffMs(attempt);
++  }
+
+ fn failItem(...) void {
+-    self.results[i] = .failed;
++    self.results[i] = .{ .failed = err };
+ }</pre></section>
+<footer class="status"><span id="global-status">acme/widgets#184 · Submission</span><span>6 Drafts · ? help</span></footer>
+</div>
+<div class="shade"></div>
+<section class="overlay" aria-label="Submission Overlay">
+<header class="head"><div><h1>Submission · acme/widgets#184</h1><div class="subhead" id="subtitle"></div></div><div class="summary" id="summary"></div></header>
+<div class="body"><div class="variant tree" data-variant="A"></div><div class="variant queue-layout" data-variant="B"></div><div class="variant lanes-layout" data-variant="C"></div></div>
+<footer class="foot"><div class="keys" id="actions"></div><div class="hint">j/k select · Esc returns to review after completion</div></footer>
+</section>
+</main>
+<nav class="switcher" aria-label="Prototype controls"><button id="prev">←</button><span class="name" id="variant-name"></span><button id="next">→</button><div class="scenario"><button data-scenario="running">Running</button><button data-scenario="partial">Partial</button><button data-scenario="recovery">Recovery</button><button id="switch-pr">Switch PR</button></div></nav>
+<script src="submission-overlay-prototype.js"></script>
+</body>
+</html>
