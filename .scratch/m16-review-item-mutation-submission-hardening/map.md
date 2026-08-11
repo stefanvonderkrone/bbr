@@ -32,6 +32,7 @@ An implementation-ready M16 specification and dependency map in which every revi
 - [Define the stale-SourceCommit repair workflow](issues/10-define-stale-sourcecommit-repair.md) — Enter a no-POST Stale repair gate, reconcile before explicit abandonment, reload and inspect scope by root, and start fresh SubmissionRuns only for eligible repaired subtrees.
 - [Live-probe published Comment mutation edge cases](issues/13-live-probe-comment-mutation-edge-cases.md) — Root deletion tombstones while preserving Replies, body-only Suggestion and Reply edits round-trip exactly, and Bitbucket rejects published Anchor changes atomically.
 - [Define the author-owned published Comment mutation contract](issues/06-define-published-comment-mutation-contract.md) — Gate serialized body-only edits and confirmed deletes by UUID ownership, retain styled Deleted Comment tombstones, and reconcile every success or ambiguous outcome without automatic mutation retries.
+- [Choose the external-editor configuration language](issues/15-choose-external-editor-configuration-language.md) — Expose a positive 1 MiB `[external_edit].max_bytes` local returned-file safety limit with precise diagnostics and no implied Bitbucket Comment limit.
 
 ## Not yet specified
 

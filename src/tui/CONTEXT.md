@@ -53,6 +53,10 @@ _Avoid_: Pull Request search (also applies to LocalReview), repository search (o
 The Overlay for authoring or editing a Comment, Reply, or Suggestion body. Mutation uses the same interaction and validation as creation with the previous editable content prefilled; a Suggestion exposes its replacement code while bbr preserves the fenced Markdown representation.
 _Avoid_: editor, input, form.
 
+**External Edit**:
+The Composer Action that temporarily hands its exact authored body to a configured external editing program and, when accepted, returns the changed body to the same open Composer. It does not save or publish the Comment, Reply, or Suggestion.
+_Avoid_: external editor (the program, not the interaction), edit in place, direct Comment edit.
+
 **ReviewBody**:
 Presentation's width-independent semantic reading of a Comment or Draft's authored Markdown. Review retains the authored bytes; a ReviewBody identifies prose, headings, Suggestions, visible links, and inline emphasis so terminal-width changes only reproject its rows.
 _Avoid_: parsed Comment, rendered Markdown, Markdown document.
