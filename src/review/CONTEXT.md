@@ -56,6 +56,10 @@ _Avoid_: backend, sink, destination.
 A piece of authored prose in a Review. A root carries exactly one CommentScope; a Reply inherits its root's scope through its parent. The generic term; prefer Thread/Reply/Suggestion when the role is specific.
 _Avoid_: note, remark, message.
 
+**Deleted Comment**:
+The structural tombstone Bitbucket retains when a deleted Comment still has visible Replies. It keeps the original CommentId, author, parent relationship, and root CommentScope but has no authored body and cannot be mutated. Presentation keeps it in the Thread so surviving Replies retain their real root.
+_Avoid_: hidden Comment, removed Thread, orphaned Replies.
+
 **Review-level Comment**:
 A root Comment scoped to the Review as a whole, independent of any File or line. It is valid in both RemoteReview and LocalReview; at the Bitbucket boundary its root omits `inline`.
 _Avoid_: PullRequest-level Comment (excludes LocalReview), top-level Comment (describes hierarchy, not scope), unanchored Comment.
