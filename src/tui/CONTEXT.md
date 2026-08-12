@@ -62,7 +62,7 @@ The two-stage interaction that repairs one mutable inline root Draft's Anchor. S
 _Avoid_: move Anchor (an authored Anchor never moves itself), drag, re-target.
 
 **Delete Confirmation**:
-The keyboard-complete Overlay that names one local Draft's TempId and the complete Reply-descendant consequence of deleting it, before anything is removed. Enter or `y` confirms, Escape or `n` cancels, every other key is captured so the cursor cannot drift off the Draft it names, and a Session replacement disarms it. It survives a refused or failed deletion so the reviewer can retry, and a changed consequence is refused rather than silently deleting a different set.
+The keyboard-complete Overlay that names one local Draft's TempId and the complete Reply-descendant consequence of deleting it, before anything is removed. Enter or `y` confirms, Escape or `n` cancels, every other key is captured so the cursor cannot drift off the Draft it names, and a Session replacement disarms it. It survives a refused or failed deletion so the reviewer can retry. The consequence it shows is a projection, not a promise: the cascade is recomputed at confirmation and rechecked again inside the store's own write, which is what makes it authoritative.
 _Avoid_: delete prompt, are-you-sure dialog, undo (there is none).
 
 **External Edit**:

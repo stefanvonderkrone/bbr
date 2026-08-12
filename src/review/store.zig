@@ -625,6 +625,10 @@ pub const InMemoryStore = struct {
             }
         }
 
+        // A TempId is never reused. Without this, a review whose ids were only
+        // ever derived from MAX(local_id) — every resumed review — hands the
+        // deleted root's id straight back to the next authored Draft.
+        try self.retainTempIdFloor(key);
         var index: usize = 0;
         while (index < self.entries.items.len) {
             const candidate = self.entries.items[index];
@@ -632,6 +636,25 @@ pub const InMemoryStore = struct {
                 _ = self.entries.orderedRemove(index);
             } else index += 1;
         }
+    }
+
+    /// Pin the reservation counter at or above every id currently in use, so a
+    /// later delete cannot lower the floor it derives from.
+    fn retainTempIdFloor(self: *InMemoryStore, key: RemoteReviewIdentity) !void {
+        var floor: TempId = 1;
+        for (self.entries.items) |candidate| {
+            if (RemoteReviewIdentity.eql(candidate.key, key)) floor = @max(floor, candidate.draft.local_id + 1);
+        }
+        for (self.temp_counters.items) |*counter| if (RemoteReviewIdentity.eql(counter.key, key)) {
+            counter.next_id = @max(counter.next_id, floor);
+            return;
+        };
+        const owned_key: RemoteReviewIdentity = .{
+            .workspace = try self.arena.allocator().dupe(u8, key.workspace),
+            .repository = try self.arena.allocator().dupe(u8, key.repository),
+            .pull_request_id = key.pull_request_id,
+        };
+        try self.temp_counters.append(self.arena.child_allocator, .{ .key = owned_key, .next_id = floor });
     }
 
     fn draftEntry(self: *InMemoryStore, key: RemoteReviewIdentity, temp_id: TempId) ?*Draft {
@@ -1389,6 +1412,22 @@ test "an unresolved outcome refuses deleting the subtree that contains it" {
     try testing.expectEqual(@as(usize, 0), (try s.load(arena.allocator(), key)).len);
 }
 
+test "deleting the highest Draft never hands its TempId back" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const s = mem.store();
+    const key = testReviewKey(4);
+    // Rows persisted without ever reserving — exactly what a resumed review
+    // looks like, and the case where the counter is derived from MAX(local_id).
+    try s.put(key, .{ .local_id = 1, .kind = .comment, .body = "root" });
+    try s.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" });
+
+    try s.deleteDraftSubtree(key, .{ .root_temp_id = 1, .expected_parent = null, .cascade = &.{ 1, 2 } });
+
+    try testing.expectEqual(@as(TempId, 3), try s.reserveTempId(key));
+    try testing.expectEqual(@as(TempId, 4), try s.reserveTempId(key));
+}
+
 test "loadReview rebuilds the graph and next_id for resume" {
     var mem = InMemoryStore.init(testing.allocator);
     defer mem.deinit();
@@ -1615,4 +1654,37 @@ test "abandoning recovery preserves ambiguity and releases participant ownership
     defer arena.deinit();
     try testing.expect((try store.activeSubmission(arena.allocator())) == null);
     try testing.expect((try store.load(arena.allocator(), key))[0].state == .outcome_unknown);
+}
+
+// The fake recomputes subtree membership over its own rows rather than
+// borrowing `draft_mod.descendsFrom`, because its entries are not one
+// contiguous slice. That duplication is only safe while the two agree
+// exactly — including on cycles, orphans, and Replies to published Comments.
+test "the fake's subtree membership matches the shared rule exactly" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const s = mem.store();
+    const key = testReviewKey(4);
+    var review = PendingReview.init(4);
+    defer review.deinit(testing.allocator);
+
+    const rows = [_]Draft{
+        .{ .local_id = 1, .kind = .comment, .body = "root" },
+        .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" },
+        .{ .local_id = 3, .kind = .comment, .parent = .{ .draft = 2 }, .body = "deep" },
+        .{ .local_id = 4, .kind = .comment, .parent = .{ .comment = 900 }, .body = "remote reply" },
+        .{ .local_id = 5, .kind = .comment, .parent = .{ .draft = 99 }, .body = "orphan" },
+        .{ .local_id = 6, .kind = .comment, .parent = .{ .draft = 7 }, .body = "cycle a" },
+        .{ .local_id = 7, .kind = .comment, .parent = .{ .draft = 6 }, .body = "cycle b" },
+    };
+    for (rows) |row| {
+        try s.put(key, row);
+        try review.addExisting(testing.allocator, row);
+    }
+
+    for (0..10) |root| for (0..10) |id| {
+        const pure = draft_mod.descendsFrom(review.drafts.items, @intCast(root), @intCast(id));
+        const stored = mem.descendsFrom(key, @intCast(root), @intCast(id));
+        try testing.expectEqual(pure, stored);
+    };
 }

@@ -374,7 +374,6 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .draft_reply_has_no_anchor => "a Reply inherits its root's placement",
         .draft_scope_not_inline => "only an inline root Draft has an Anchor to replace",
         .draft_descendant_locked => "a Reply below this Draft cannot be deleted yet",
-        .draft_cascade_changed => "this Draft's Replies changed; confirm the deletion again",
         .anchor_candidate_ambiguous => "that source range is ambiguous; select one side of one File",
         .anchor_range_too_long => "an Anchor covers at most 30 lines",
         .suggestion_anchor_not_new_side => "a Suggestion cannot anchor to removed lines",

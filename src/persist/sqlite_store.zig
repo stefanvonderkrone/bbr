@@ -700,6 +700,26 @@ pub const SqliteStore = struct {
             if (columnInt(member, 0) == 0) return error.DraftCascadeConflict;
         }
 
+        // A TempId is never reused. `reserveTempId` falls back to MAX(local_id)+1
+        // whenever no counter row exists — which is every resumed review — so
+        // deleting the highest Draft would hand its id straight back. Pin the
+        // counter at or above every id in use before any row disappears.
+        var floor: ?*c.sqlite3_stmt = null;
+        const floor_sql =
+            \\INSERT INTO draft_temp_ids(workspace,repository,pr_id,next_id)
+            \\ VALUES (?1,?2,?3,
+            \\   (SELECT COALESCE(MAX(local_id),0)+1 FROM drafts
+            \\     WHERE workspace=?1 AND repository=?2 AND pr_id=?3))
+            \\ ON CONFLICT(workspace,repository,pr_id)
+            \\ DO UPDATE SET next_id=MAX(next_id, excluded.next_id);
+        ;
+        if (c.sqlite3_prepare_v2(self.db, floor_sql, -1, &floor, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(floor);
+        bindText(floor, 1, key.workspace);
+        bindText(floor, 2, key.repository);
+        bindInt(floor, 3, @intCast(key.pull_request_id));
+        if (c.sqlite3_step(floor) != c.SQLITE_DONE) return error.Step;
+
         var delete: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, "DELETE FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &delete, null) != c.SQLITE_OK)
             return error.Prepare;
@@ -1608,9 +1628,11 @@ test "a persisted subtree deletion removes every descendant and stays deleted" {
             .expected_parent = null,
             .cascade = &.{ 1, 2, 3 },
         });
-        // TempIds are never reused: the counter does not walk back over a
-        // deleted subtree.
+        // TempIds are never reused, including when the deleted subtree held the
+        // highest id and no counter row had ever been written.
+        try store.deleteDraftSubtree(key, .{ .root_temp_id = 4, .expected_parent = null, .cascade = &.{4} });
         try testing.expectEqual(@as(TempId, 5), try store.reserveTempId(key));
+        try store.put(key, .{ .local_id = 5, .kind = .comment, .body = "successor" });
     }
     var reopened = try SqliteStore.open(path);
     defer reopened.deinit();
@@ -1618,7 +1640,11 @@ test "a persisted subtree deletion removes every descendant and stays deleted" {
     defer arena.deinit();
     const drafts = try reopened.store().load(arena.allocator(), key);
     try testing.expectEqual(@as(usize, 1), drafts.len);
-    try testing.expectEqualStrings("bystander", drafts[0].body);
+    try testing.expectEqualStrings("successor", drafts[0].body);
+    try testing.expectEqual(@as(TempId, 5), drafts[0].local_id);
+    // The pinned counter is durable, so reopening cannot re-derive a lower
+    // floor from the surviving rows either.
+    try testing.expectEqual(@as(TempId, 6), try reopened.store().reserveTempId(key));
 }
 
 test "a persisted deletion refuses a mismatched cascade, immutable member, or run participant" {

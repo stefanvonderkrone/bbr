@@ -821,7 +821,6 @@ pub const ActionError = enum {
     draft_reply_has_no_anchor,
     draft_scope_not_inline,
     draft_descendant_locked,
-    draft_cascade_changed,
     anchor_candidate_ambiguous,
     anchor_range_too_long,
     suggestion_anchor_not_new_side,
@@ -2621,14 +2620,10 @@ pub const Presentation = struct {
             return;
         };
         defer self.allocator.free(cascade);
+        // The cascade is recomputed here rather than retained from the
+        // confirmation, and the store rechecks it again inside its own write:
+        // that transaction, not this snapshot, is what makes it authoritative.
         const len = collectCascade(published, confirmation.temp_id, cascade);
-        // The reviewer accepted one complete consequence; a different one is a
-        // new decision, not this one.
-        if (len != confirmation.descendant_count + 1) {
-            self.action_error = .draft_cascade_changed;
-            return;
-        }
-
         const surviving = survivingRowAfterDeletion(published, cascade[0..len]);
         published.deleteDraftSubtree(
             self.dependencies.reviews,
