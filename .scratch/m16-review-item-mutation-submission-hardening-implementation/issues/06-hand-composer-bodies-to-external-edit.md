@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 — Canonicalize Review identity and command correlation.
 
-**Status:** ready-for-human
+**Status:** resolved
 
 - [x] `Ctrl-E` resolves to External Edit only in the Composer Interaction Context and leaves the existing DiffPane binding unchanged.
 - [x] Presentation emits one correlated command containing the exact Composer body snapshot, refuses Composer input while pending, and accepts only the matching completion.
@@ -15,4 +15,6 @@
 - [x] Composer reseed is atomic and preserves the old body on allocation failure; every non-fatal outcome keeps the Composer open with a specific footer message.
 - [x] Cleanup is attempted on every ordinary path; accepted content survives cleanup-only failure with the retained path reported, while terminal restoration failure exits nonzero and reports the retained file.
 - [x] Configuration exposes only `[external_edit].max_bytes`, defaults to 1048576, rejects zero and invalid values precisely, and documents it as a local returned-file limit.
-- [ ] Deterministic Presentation and adapter tests cover correlation, stale completion, editor precedence, safe shell arguments, permissions, exact bytes, validation, process outcomes, cleanup, and restoration failure; an opt-in PTY smoke verifies the real terminal handoff. Automated coverage is present; the real-terminal PTY smoke remains for human verification.
+- [x] Deterministic Presentation and adapter tests cover correlation, stale completion, editor precedence, safe shell arguments, permissions, exact bytes, validation, process outcomes, cleanup, and restoration failure; an opt-in PTY smoke verifies the real terminal handoff.
+
+PTY smoke verified 2026-08-12 with the demo TUI at 80x20: `Ctrl-E` disabled mouse reporting, exited the alternate screen, ran a deterministic inherited-stdio editor, recreated terminal input, restored geometry, alternate screen, and mouse reporting, fully redrew, and showed the returned `smoke-edited` body with `External Edit accepted` in the still-open Composer.
