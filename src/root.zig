@@ -83,6 +83,7 @@ pub const review = struct {
     pub const ReviewIdentity = store.ReviewIdentity;
     pub const OperationId = store.OperationId;
     pub const ActiveSubmissionRun = store.ActiveSubmissionRun;
+    pub const SubmissionRunItem = store.SubmissionRunItem;
     pub const SubmissionOutcome = store.SubmissionOutcome;
     pub const SubmissionPendingState = store.SubmissionPendingState;
     pub const SubmissionCompletion = store.SubmissionCompletion;

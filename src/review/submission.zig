@@ -27,6 +27,7 @@ const TempId = draft_mod.TempId;
 const comment = @import("comment.zig");
 const CommentId = comment.CommentId;
 const ApiError = @import("../bitbucket/types.zig").ApiError;
+const SubmissionRunItem = @import("store.zig").SubmissionRunItem;
 
 /// Total tries per retryable item (the first attempt plus retries). After this
 /// many failures the item is marked failed and its reply-descendants skipped.
@@ -142,6 +143,23 @@ pub const Submission = struct {
 
     pub fn init(alloc: Allocator, review: *const PendingReview) !Submission {
         const order = try review.topologicalOrder(alloc);
+        return initOrder(alloc, review, order, false);
+    }
+
+    /// Rebuild an interrupted Submission from its durable participant graph.
+    /// Current PendingReview membership and ordering are deliberately ignored.
+    pub fn initFrozen(alloc: Allocator, review: *const PendingReview, items: []const SubmissionRunItem) !Submission {
+        const order = try alloc.alloc(TempId, items.len);
+        errdefer alloc.free(order);
+        for (items, order) |item, *temp_id| {
+            const draft = review.getConst(item.temp_id) orelse return error.DraftNotFound;
+            if (!parentEql(draft.parent, item.parent)) return error.InvalidSubmissionGraph;
+            temp_id.* = item.temp_id;
+        }
+        return initOrder(alloc, review, order, true);
+    }
+
+    fn initOrder(alloc: Allocator, review: *const PendingReview, order: []TempId, settle_failures: bool) !Submission {
         errdefer alloc.free(order);
         const n = order.len;
         const attempts = try alloc.alloc(u8, n);
@@ -154,8 +172,12 @@ pub const Submission = struct {
         @memset(results, null);
         for (order, 0..) |temp_id, i| {
             const draft = review.getConst(temp_id) orelse continue;
-            if (draft.state == .outcome_unknown)
-                results[i] = .{ .temp_id = temp_id, .status = .outcome_unknown };
+            results[i] = switch (draft.state) {
+                .posted => |id| .{ .temp_id = temp_id, .status = .posted, .id = id },
+                .failed => |reason| if (settle_failures) .{ .temp_id = temp_id, .status = .failed, .reason = reason } else null,
+                .outcome_unknown => .{ .temp_id = temp_id, .status = .outcome_unknown },
+                .draft, .submitting => null,
+            };
         }
         return .{
             .review = review,
@@ -294,7 +316,8 @@ pub const Submission = struct {
             const r = self.results[i] orelse return .blocked;
             return if (r.status == .posted) .{ .ok = r.id } else .blocked;
         }
-        return .{ .ok = null }; // parent not in this review → treat as a root
+        const parent = self.review.getConst(pid) orelse return .blocked;
+        return if (parent.state == .posted) .{ .ok = parent.state.posted } else .blocked;
     }
 
     fn parentReason(self: *Submission, d: Draft) ?ApiError {
@@ -306,7 +329,8 @@ pub const Submission = struct {
         for (self.order, 0..) |tid, i| {
             if (tid == pid) return if (self.results[i]) |r| r.reason else null;
         }
-        return null;
+        const parent = self.review.getConst(pid) orelse return null;
+        return if (parent.state == .failed) parent.state.failed else null;
     }
 
     fn scheduleRetryOrFail(self: *Submission, i: usize, err: ?ApiError, ambiguous: bool, retry_after_ms: ?u64) void {
@@ -330,6 +354,14 @@ pub const Submission = struct {
         self.idx += 1;
     }
 };
+
+fn parentEql(a: ?draft_mod.Parent, b: ?draft_mod.Parent) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return switch (a.?) {
+        .draft => |id| b.? == .draft and b.?.draft == id,
+        .comment => |id| b.? == .comment and b.?.comment == id,
+    };
+}
 
 /// The network seam Submission's driver posts through. Same ptr+vtable idiom as
 /// `HttpClient` / `PendingReviewStore`. The Bitbucket adapter implements it;
@@ -585,6 +617,41 @@ test "a prior-posted draft is skipped (selective retry) and remaps its replies" 
     const sum = try sub.summary(testing.allocator);
     defer testing.allocator.free(sum.items);
     try testing.expectEqual(@as(usize, 2), sum.posted); // the seeded root counts as posted
+}
+
+test "frozen recovery excludes new Drafts and remaps Replies through checkpoint evidence" {
+    var pr = PendingReview.init(1);
+    defer pr.deinit(testing.allocator);
+    try pr.addExisting(testing.allocator, .{ .local_id = 1, .kind = .comment, .body = "root", .state = .{ .posted = 42 } });
+    try pr.addExisting(testing.allocator, .{ .local_id = 2, .kind = .comment, .body = "reply", .parent = .{ .draft = 1 }, .state = .submitting });
+    try pr.addExisting(testing.allocator, .{ .local_id = 3, .kind = .comment, .body = "added after begin" });
+    const frozen = [_]SubmissionRunItem{
+        .{ .temp_id = 1, .parent = null },
+        .{ .temp_id = 2, .parent = .{ .draft = 1 } },
+    };
+
+    var recovered = try Submission.initFrozen(testing.allocator, &pr, &frozen);
+    defer recovered.deinit();
+
+    const post = recovered.advance().post;
+    try testing.expectEqual(@as(TempId, 2), post.temp_id);
+    try testing.expectEqual(@as(?CommentId, 42), post.parent);
+    recovered.report(.{ .posted = 43 }, null);
+    try testing.expect(recovered.advance() == .done);
+}
+
+test "fresh Submission retries failed Drafts while frozen recovery preserves their evidence" {
+    var pr = PendingReview.init(1);
+    defer pr.deinit(testing.allocator);
+    try pr.addExisting(testing.allocator, .{ .local_id = 1, .kind = .comment, .body = "retry", .state = .{ .failed = error.ServerError } });
+
+    var fresh = try Submission.init(testing.allocator, &pr);
+    defer fresh.deinit();
+    try testing.expectEqual(@as(TempId, 1), fresh.advance().post.temp_id);
+
+    var recovered = try Submission.initFrozen(testing.allocator, &pr, &.{.{ .temp_id = 1, .parent = null }});
+    defer recovered.deinit();
+    try testing.expect(recovered.advance() == .done);
 }
 
 test "local-only Drafts are never emitted as Submission posts" {

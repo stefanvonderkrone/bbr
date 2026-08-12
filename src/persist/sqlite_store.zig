@@ -31,6 +31,7 @@ const PendingReviewStore = bbr.review.PendingReviewStore;
 const RemoteReviewIdentity = bbr.review.RemoteReviewIdentity;
 const OperationId = bbr.review.OperationId;
 const ActiveSubmissionRun = bbr.review.ActiveSubmissionRun;
+const SubmissionRunItem = bbr.review.SubmissionRunItem;
 const SubmissionOutcome = bbr.review.SubmissionOutcome;
 const SubmissionPendingState = bbr.review.SubmissionPendingState;
 const UnknownResolution = bbr.review.UnknownResolution;
@@ -195,6 +196,29 @@ pub const SqliteStore = struct {
                 \\COMMIT;
             );
         }
+        // v8 (M16): freeze each SubmissionRun's ordered dependency graph.
+        if (try self.userVersion() < 8) {
+            try self.exec(
+                \\BEGIN;
+                \\CREATE TABLE submission_run_items (
+                \\  operation_id INTEGER NOT NULL REFERENCES submission_runs(operation_id) ON DELETE CASCADE,
+                \\  ordinal INTEGER NOT NULL, temp_id INTEGER NOT NULL,
+                \\  parent_kind INTEGER NOT NULL, parent_id INTEGER,
+                \\  PRIMARY KEY (operation_id, ordinal),
+                \\  UNIQUE (operation_id, temp_id)
+                \\) WITHOUT ROWID;
+                // Legacy active runs did not record membership. Preserve their
+                // current item as the only participant that can be recovered safely.
+                \\INSERT INTO submission_run_items(operation_id, ordinal, temp_id, parent_kind, parent_id)
+                \\ SELECT r.operation_id, 0, r.current_temp_id, d.parent_kind, d.parent_id
+                \\ FROM submission_runs r JOIN drafts d
+                \\   ON d.workspace=r.workspace AND d.repository=r.repository
+                \\  AND d.pr_id=r.pr_id AND d.local_id=r.current_temp_id
+                \\ WHERE r.state=0 AND r.current_temp_id IS NOT NULL;
+                \\PRAGMA user_version = 8;
+                \\COMMIT;
+            );
+        }
     }
 
     fn userVersion(self: *SqliteStore) SqliteError!i64 {
@@ -221,6 +245,7 @@ pub const SqliteStore = struct {
         .begin_submission = beginSubmissionImpl,
         .checkpoint_submission = checkpointSubmissionImpl,
         .complete_submission = completeSubmissionImpl,
+        .abandon_submission = abandonSubmissionImpl,
         .active_submission = activeSubmissionImpl,
         .resolve_unknown = resolveUnknownImpl,
         .resolve_repository = resolveRepositoryImpl,
@@ -491,8 +516,10 @@ pub const SqliteStore = struct {
         return out.toOwnedSlice(allocator);
     }
 
-    fn beginSubmissionImpl(ptr: *anyopaque, key: RemoteReviewIdentity, source_commit: []const u8, first_temp_id: TempId) anyerror!OperationId {
+    fn beginSubmissionImpl(ptr: *anyopaque, key: RemoteReviewIdentity, source_commit: []const u8, items: []const SubmissionRunItem) anyerror!OperationId {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
+        if (items.len == 0) return error.EmptySubmission;
+        const first_temp_id = items[0].temp_id;
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
         if (try self.hasActiveSubmission()) return error.SubmissionAlreadyActive;
@@ -512,6 +539,42 @@ pub const SqliteStore = struct {
         bindInt(insert, 5, @intCast(first_temp_id));
         if (c.sqlite3_step(insert) != c.SQLITE_DONE) return error.Step;
         const operation_id: OperationId = @intCast(c.sqlite3_last_insert_rowid(self.db));
+
+        for (items, 0..) |item, ordinal| {
+            var participant: ?*c.sqlite3_stmt = null;
+            const participant_sql =
+                \\INSERT INTO submission_run_items(operation_id, ordinal, temp_id, parent_kind, parent_id)
+                \\ SELECT ?, ?, local_id, parent_kind, parent_id FROM drafts
+                \\ WHERE workspace=? AND repository=? AND pr_id=? AND local_id=? AND target=0
+                \\   AND parent_kind=? AND (parent_id IS ? OR parent_id=?);
+            ;
+            if (c.sqlite3_prepare_v2(self.db, participant_sql, -1, &participant, null) != c.SQLITE_OK) return error.Prepare;
+            defer _ = c.sqlite3_finalize(participant);
+            bindInt(participant, 1, @intCast(operation_id));
+            bindInt(participant, 2, @intCast(ordinal));
+            bindText(participant, 3, key.workspace);
+            bindText(participant, 4, key.repository);
+            bindInt(participant, 5, @intCast(key.pull_request_id));
+            bindInt(participant, 6, @intCast(item.temp_id));
+            const parent_kind: i64 = if (item.parent) |parent| switch (parent) {
+                .draft => 1,
+                .comment => 2,
+            } else 0;
+            bindInt(participant, 7, parent_kind);
+            if (item.parent) |parent| {
+                const parent_id = switch (parent) {
+                    .draft => |id| id,
+                    .comment => |id| id,
+                };
+                bindInt(participant, 8, @intCast(parent_id));
+                bindInt(participant, 9, @intCast(parent_id));
+            } else {
+                bindNull(participant, 8);
+                bindNull(participant, 9);
+            }
+            if (c.sqlite3_step(participant) != c.SQLITE_DONE) return error.Step;
+            if (c.sqlite3_changes(self.db) != 1) return error.InvalidSubmissionGraph;
+        }
 
         var update: ?*c.sqlite3_stmt = null;
         const update_sql =
@@ -553,15 +616,37 @@ pub const SqliteStore = struct {
         defer _ = c.sqlite3_finalize(stmt);
         return switch (c.sqlite3_step(stmt)) {
             c.SQLITE_DONE => null,
-            c.SQLITE_ROW => .{
-                .operation_id = @intCast(columnInt(stmt, 0)),
-                .key = .{
-                    .workspace = (try columnTextDup(allocator, stmt, 1)).?,
-                    .repository = (try columnTextDup(allocator, stmt, 2)).?,
-                    .pull_request_id = @intCast(columnInt(stmt, 3)),
-                },
-                .source_commit = (try columnTextDup(allocator, stmt, 4)).?,
-                .current_temp_id = if (c.sqlite3_column_type(stmt, 5) == c.SQLITE_NULL) null else @intCast(columnInt(stmt, 5)),
+            c.SQLITE_ROW => blk: {
+                const operation_id: OperationId = @intCast(columnInt(stmt, 0));
+                var items_stmt: ?*c.sqlite3_stmt = null;
+                if (c.sqlite3_prepare_v2(self.db, "SELECT temp_id,parent_kind,parent_id FROM submission_run_items WHERE operation_id=? ORDER BY ordinal;", -1, &items_stmt, null) != c.SQLITE_OK) return error.Prepare;
+                defer _ = c.sqlite3_finalize(items_stmt);
+                bindInt(items_stmt, 1, @intCast(operation_id));
+                var items: std.ArrayList(SubmissionRunItem) = .empty;
+                errdefer items.deinit(allocator);
+                while (true) switch (c.sqlite3_step(items_stmt)) {
+                    c.SQLITE_ROW => try items.append(allocator, .{
+                        .temp_id = @intCast(columnInt(items_stmt, 0)),
+                        .parent = switch (columnInt(items_stmt, 1)) {
+                            1 => .{ .draft = @intCast(columnInt(items_stmt, 2)) },
+                            2 => .{ .comment = @intCast(columnInt(items_stmt, 2)) },
+                            else => null,
+                        },
+                    }),
+                    c.SQLITE_DONE => break,
+                    else => return error.Step,
+                };
+                break :blk .{
+                    .operation_id = operation_id,
+                    .key = .{
+                        .workspace = (try columnTextDup(allocator, stmt, 1)).?,
+                        .repository = (try columnTextDup(allocator, stmt, 2)).?,
+                        .pull_request_id = @intCast(columnInt(stmt, 3)),
+                    },
+                    .source_commit = (try columnTextDup(allocator, stmt, 4)).?,
+                    .current_temp_id = if (c.sqlite3_column_type(stmt, 5) == c.SQLITE_NULL) null else @intCast(columnInt(stmt, 5)),
+                    .items = try items.toOwnedSlice(allocator),
+                };
             },
             else => error.Step,
         };
@@ -576,8 +661,9 @@ pub const SqliteStore = struct {
             \\UPDATE drafts SET state_kind=?, state_id=?, state_err=NULL
             \\ WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?
             \\   AND state_kind=4
-            \\   AND NOT EXISTS(SELECT 1 FROM submission_runs
-            \\     WHERE workspace=? AND repository=? AND pr_id=? AND state=0);
+            \\   AND NOT EXISTS(SELECT 1 FROM submission_runs r
+            \\     JOIN submission_run_items i ON i.operation_id=r.operation_id
+            \\     WHERE r.workspace=? AND r.repository=? AND r.pr_id=? AND r.state=0 AND i.temp_id=?);
         ;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
         defer _ = c.sqlite3_finalize(stmt);
@@ -598,6 +684,7 @@ pub const SqliteStore = struct {
         bindText(stmt, 7, key.workspace);
         bindText(stmt, 8, key.repository);
         bindInt(stmt, 9, @intCast(key.pull_request_id));
+        bindInt(stmt, 10, @intCast(temp_id));
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
         if (c.sqlite3_changes(self.db) != 1) return error.InvalidUnknownResolution;
         try self.exec("COMMIT;");
@@ -608,6 +695,22 @@ pub const SqliteStore = struct {
         if (next_temp_id == completed_temp_id) return error.InvalidSubmissionCheckpoint;
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
+
+        if (next_temp_id) |next_id| {
+            var order: ?*c.sqlite3_stmt = null;
+            const order_sql =
+                \\SELECT (SELECT ordinal FROM submission_run_items WHERE operation_id=? AND temp_id=?),
+                \\       (SELECT ordinal FROM submission_run_items WHERE operation_id=? AND temp_id=?);
+            ;
+            if (c.sqlite3_prepare_v2(self.db, order_sql, -1, &order, null) != c.SQLITE_OK) return error.Prepare;
+            defer _ = c.sqlite3_finalize(order);
+            bindInt(order, 1, @intCast(operation_id));
+            bindInt(order, 2, @intCast(completed_temp_id));
+            bindInt(order, 3, @intCast(operation_id));
+            bindInt(order, 4, @intCast(next_id));
+            if (c.sqlite3_step(order) != c.SQLITE_ROW or c.sqlite3_column_type(order, 0) == c.SQLITE_NULL or c.sqlite3_column_type(order, 1) == c.SQLITE_NULL or columnInt(order, 1) <= columnInt(order, 0))
+                return error.InvalidSubmissionCheckpoint;
+        }
 
         var completed: ?*c.sqlite3_stmt = null;
         const completed_sql =
@@ -719,7 +822,8 @@ pub const SqliteStore = struct {
                 \\SELECT EXISTS(
                 \\  SELECT 1 FROM drafts
                 \\  WHERE workspace=? AND repository=? AND pr_id=?
-                \\    AND target=0 AND state_kind!=2
+                \\    AND local_id IN (SELECT temp_id FROM submission_run_items WHERE operation_id=?)
+                \\    AND state_kind!=2
                 \\);
             ;
             if (c.sqlite3_prepare_v2(self.db, dirty_sql, -1, &dirty, null) != c.SQLITE_OK) return error.Prepare;
@@ -727,6 +831,7 @@ pub const SqliteStore = struct {
             bindText(dirty, 1, key.workspace);
             bindText(dirty, 2, key.repository);
             bindInt(dirty, 3, @intCast(key.pull_request_id));
+            bindInt(dirty, 4, @intCast(operation_id));
             if (c.sqlite3_step(dirty) != c.SQLITE_ROW) return error.Step;
             if (columnInt(dirty, 0) != 0) return error.SubmissionNotClean;
 
@@ -734,16 +839,72 @@ pub const SqliteStore = struct {
             const remove_sql =
                 \\DELETE FROM drafts
                 \\ WHERE workspace=? AND repository=? AND pr_id=?
-                \\   AND target=0 AND state_kind=2;
+                \\   AND local_id IN (SELECT temp_id FROM submission_run_items WHERE operation_id=?)
+                \\   AND state_kind=2;
             ;
             if (c.sqlite3_prepare_v2(self.db, remove_sql, -1, &remove, null) != c.SQLITE_OK) return error.Prepare;
             defer _ = c.sqlite3_finalize(remove);
             bindText(remove, 1, key.workspace);
             bindText(remove, 2, key.repository);
             bindInt(remove, 3, @intCast(key.pull_request_id));
+            bindInt(remove, 4, @intCast(operation_id));
             if (c.sqlite3_step(remove) != c.SQLITE_DONE) return error.Step;
         }
 
+        var cleanup_items: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "DELETE FROM submission_run_items WHERE operation_id=?;", -1, &cleanup_items, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(cleanup_items);
+        bindInt(cleanup_items, 1, @intCast(operation_id));
+        if (c.sqlite3_step(cleanup_items) != c.SQLITE_DONE) return error.Step;
+
+        var cleanup_run: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "DELETE FROM submission_runs WHERE operation_id=? AND state!=0;", -1, &cleanup_run, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(cleanup_run);
+        bindInt(cleanup_run, 1, @intCast(operation_id));
+        if (c.sqlite3_step(cleanup_run) != c.SQLITE_DONE) return error.Step;
+
+        try self.exec("COMMIT;");
+    }
+
+    fn abandonSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity) anyerror!void {
+        const self: *SqliteStore = @ptrCast(@alignCast(ptr));
+        try self.exec("BEGIN IMMEDIATE;");
+        errdefer self.exec("ROLLBACK;") catch {};
+
+        var draft: ?*c.sqlite3_stmt = null;
+        const draft_sql =
+            \\UPDATE drafts SET state_kind=4, state_id=NULL, state_err=NULL
+            \\ WHERE workspace=? AND repository=? AND pr_id=? AND state_kind=1
+            \\   AND local_id=(SELECT current_temp_id FROM submission_runs
+            \\     WHERE operation_id=? AND workspace=? AND repository=? AND pr_id=? AND state=0);
+        ;
+        if (c.sqlite3_prepare_v2(self.db, draft_sql, -1, &draft, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(draft);
+        bindText(draft, 1, key.workspace);
+        bindText(draft, 2, key.repository);
+        bindInt(draft, 3, @intCast(key.pull_request_id));
+        bindInt(draft, 4, @intCast(operation_id));
+        bindText(draft, 5, key.workspace);
+        bindText(draft, 6, key.repository);
+        bindInt(draft, 7, @intCast(key.pull_request_id));
+        if (c.sqlite3_step(draft) != c.SQLITE_DONE) return error.Step;
+        if (c.sqlite3_changes(self.db) != 1) return error.InvalidSubmissionCompletion;
+
+        var items: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "DELETE FROM submission_run_items WHERE operation_id=?;", -1, &items, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(items);
+        bindInt(items, 1, @intCast(operation_id));
+        if (c.sqlite3_step(items) != c.SQLITE_DONE) return error.Step;
+
+        var run: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "DELETE FROM submission_runs WHERE operation_id=? AND workspace=? AND repository=? AND pr_id=? AND state=0;", -1, &run, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(run);
+        bindInt(run, 1, @intCast(operation_id));
+        bindText(run, 2, key.workspace);
+        bindText(run, 3, key.repository);
+        bindInt(run, 4, @intCast(key.pull_request_id));
+        if (c.sqlite3_step(run) != c.SQLITE_DONE) return error.Step;
+        if (c.sqlite3_changes(self.db) != 1) return error.InvalidSubmissionCompletion;
         try self.exec("COMMIT;");
     }
 
@@ -753,8 +914,9 @@ pub const SqliteStore = struct {
         var stmt: ?*c.sqlite3_stmt = null;
         const sql =
             \\SELECT
-            \\  EXISTS(SELECT 1 FROM submission_runs
-            \\    WHERE workspace=? AND repository=? AND pr_id=? AND state=0),
+            \\  EXISTS(SELECT 1 FROM submission_runs r
+            \\    JOIN submission_run_items i ON i.operation_id=r.operation_id
+            \\    WHERE r.workspace=? AND r.repository=? AND r.pr_id=? AND r.state=0 AND i.temp_id=?),
             \\  COALESCE((SELECT target FROM drafts
             \\    WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?), -1),
             \\  COALESCE((SELECT state_kind FROM drafts
@@ -765,19 +927,19 @@ pub const SqliteStore = struct {
         bindText(stmt, 1, key.workspace);
         bindText(stmt, 2, key.repository);
         bindInt(stmt, 3, @intCast(key.pull_request_id));
-        bindText(stmt, 4, key.workspace);
-        bindText(stmt, 5, key.repository);
-        bindInt(stmt, 6, @intCast(key.pull_request_id));
-        bindInt(stmt, 7, @intCast(local_id));
-        bindText(stmt, 8, key.workspace);
-        bindText(stmt, 9, key.repository);
-        bindInt(stmt, 10, @intCast(key.pull_request_id));
-        bindInt(stmt, 11, @intCast(local_id));
+        bindInt(stmt, 4, @intCast(local_id));
+        bindText(stmt, 5, key.workspace);
+        bindText(stmt, 6, key.repository);
+        bindInt(stmt, 7, @intCast(key.pull_request_id));
+        bindInt(stmt, 8, @intCast(local_id));
+        bindText(stmt, 9, key.workspace);
+        bindText(stmt, 10, key.repository);
+        bindInt(stmt, 11, @intCast(key.pull_request_id));
+        bindInt(stmt, 12, @intCast(local_id));
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.Step;
         if (columnInt(stmt, 2) == 4) return true;
-        if (columnInt(stmt, 0) == 0) return false;
-        if (incoming_target == .bitbucket) return true;
-        return columnInt(stmt, 1) == @intFromEnum(CommentTarget.bitbucket);
+        _ = incoming_target;
+        return columnInt(stmt, 0) != 0;
     }
 
     fn claimLegacyRows(self: *SqliteStore, key: RemoteReviewIdentity) SqliteError!void {
@@ -1162,7 +1324,7 @@ test "Submission checkpoint survives closing and reopening the database" {
         const store = s.store();
         try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "first" });
         try store.put(key, .{ .local_id = 2, .kind = .comment, .body = "second", .state = .{ .failed = error.ServerError } });
-        operation_id = try store.beginSubmission(key, "source-commit", 1);
+        operation_id = try store.beginSubmission(key, "source-commit", &.{ .{ .temp_id = 1, .parent = null }, .{ .temp_id = 2, .parent = null } });
         try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, 2);
     }
 
@@ -1189,7 +1351,7 @@ test "a rejected SQLite Submission checkpoint rolls back its completed outcome" 
     const store = s.store();
     const key = testReviewKey(7);
     try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "first" });
-    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
 
     try testing.expectError(error.InvalidSubmissionCheckpoint, store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, 99));
 
@@ -1208,7 +1370,7 @@ test "SQLite locks Bitbucket Draft mutation during an active Submission" {
     const key = testReviewKey(7);
     try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "remote" });
     try store.put(key, .{ .local_id = 2, .kind = .comment, .target = .local, .body = "local" });
-    _ = try store.beginSubmission(key, "source-commit", 1);
+    _ = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
 
     try testing.expectError(error.DraftLocked, store.remove(key, 1));
     try store.put(key, .{ .local_id = 2, .kind = .comment, .target = .local, .body = "changed local" });
@@ -1221,7 +1383,7 @@ test "SQLite keeps an unresolved outcome immutable after partial completion" {
     const store = s.store();
     const key = testReviewKey(7);
     try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "unknown" });
-    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
     try store.checkpointSubmission(operation_id, key, 1, .outcome_unknown, null);
     try store.completeSubmission(operation_id, key, .partial);
 
@@ -1239,7 +1401,7 @@ test "SQLite rejects clean completion while a Bitbucket Draft failed" {
     const store = s.store();
     const key = testReviewKey(7);
     try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "failed" });
-    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
     try store.checkpointSubmission(operation_id, key, 1, .{ .failed = error.Forbidden }, null);
 
     try testing.expectError(error.SubmissionNotClean, store.completeSubmission(operation_id, key, .clean));
@@ -1254,7 +1416,7 @@ test "SQLite aborted completion restores the current Draft and closes partial" {
     const store = s.store();
     const key = testReviewKey(7);
     try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "retry", .state = .{ .failed = error.ServerError } });
-    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
 
     try store.completeSubmission(operation_id, key, .{ .aborted = .{ .failed = error.ServerError } });
 
@@ -1273,9 +1435,9 @@ test "SQLite reports an already-active Submission consistently" {
     const second = testReviewKey(8);
     try store.put(first, .{ .local_id = 1, .kind = .comment, .body = "first" });
     try store.put(second, .{ .local_id = 1, .kind = .comment, .body = "second" });
-    _ = try store.beginSubmission(first, "first-commit", 1);
+    _ = try store.beginSubmission(first, "first-commit", &.{.{ .temp_id = 1, .parent = null }});
 
-    try testing.expectError(error.SubmissionAlreadyActive, store.beginSubmission(second, "second-commit", 1));
+    try testing.expectError(error.SubmissionAlreadyActive, store.beginSubmission(second, "second-commit", &.{.{ .temp_id = 1, .parent = null }}));
 }
 
 test "SQLite repository aliases are durable and reject conflicting identities" {
@@ -1306,4 +1468,92 @@ test "SQLite serializes TempId reservations across connections" {
     try testing.expectEqual(@as(TempId, 1), try first.store().reserveTempId(key));
     try testing.expectEqual(@as(TempId, 2), try second.store().reserveTempId(key));
     try testing.expectEqual(@as(TempId, 3), try first.store().reserveTempId(key));
+}
+
+test "SQLite reopens the exact frozen participant graph and ignores later Drafts" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = try std.fmt.allocPrintSentinel(arena.allocator(), ".zig-cache/tmp/{s}/frozen.db", .{&tmp.sub_path}, 0);
+    const key = testReviewKey(42);
+
+    {
+        var sqlite = try SqliteStore.open(path);
+        defer sqlite.deinit();
+        const store = sqlite.store();
+        try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "root" });
+        try store.put(key, .{ .local_id = 2, .kind = .comment, .body = "reply", .parent = .{ .draft = 1 } });
+        _ = try store.beginSubmission(key, "source", &.{ .{ .temp_id = 1, .parent = null }, .{ .temp_id = 2, .parent = .{ .draft = 1 } } });
+        try store.put(key, .{ .local_id = 3, .kind = .comment, .body = "later" });
+    }
+
+    var reopened = try SqliteStore.open(path);
+    defer reopened.deinit();
+    const run = (try reopened.store().activeSubmission(arena.allocator())).?;
+    try testing.expectEqual(@as(usize, 2), run.items.len);
+    try testing.expectEqual(@as(TempId, 1), run.items[0].temp_id);
+    try testing.expectEqual(@as(TempId, 2), run.items[1].temp_id);
+    try testing.expect(run.items[1].parent.? == .draft and run.items[1].parent.?.draft == 1);
+}
+
+test "SQLite abandonment terminalizes the run and retains outcome evidence" {
+    var sqlite = try SqliteStore.open(":memory:");
+    defer sqlite.deinit();
+    const store = sqlite.store();
+    const key = testReviewKey(9);
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "ambiguous" });
+    const operation_id = try store.beginSubmission(key, "source", &.{.{ .temp_id = 1, .parent = null }});
+
+    try store.abandonSubmission(operation_id, key);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect((try store.activeSubmission(arena.allocator())) == null);
+    try testing.expect((try store.load(arena.allocator(), key))[0].state == .outcome_unknown);
+}
+
+test "v8 migration preserves every authored Draft field and lifecycle state" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = try std.fmt.allocPrintSentinel(arena.allocator(), ".zig-cache/tmp/{s}/v7.db", .{&tmp.sub_path}, 0);
+    const key = testReviewKey(51);
+
+    {
+        var sqlite = try SqliteStore.open(path);
+        defer sqlite.deinit();
+        try sqlite.store().put(key, .{
+            .local_id = 4,
+            .kind = .suggestion,
+            .scope = .{ .@"inline" = .{ .path = "src/main.zig", .to = 9, .start_to = 8, .commit = "source" } },
+            .snapshot = .{ .text = "before\nselected\nafter", .selection_start = 1, .selection_len = 1 },
+            .body = "```suggestion\nreplacement\n```",
+            .state = .{ .failed = error.ServerError },
+        });
+        try sqlite.store().put(key, .{
+            .local_id = 5,
+            .kind = .comment,
+            .parent = .{ .draft = 4 },
+            .body = "reply",
+            .state = .outcome_unknown,
+        });
+        try sqlite.exec("DROP TABLE submission_run_items; PRAGMA user_version = 7;");
+    }
+
+    var upgraded = try SqliteStore.open(path);
+    defer upgraded.deinit();
+    const drafts = try upgraded.store().load(arena.allocator(), key);
+    try testing.expectEqual(@as(usize, 2), drafts.len);
+    try testing.expectEqual(@as(TempId, 4), drafts[0].local_id);
+    try testing.expect(drafts[0].kind == .suggestion);
+    try testing.expectEqualStrings("src/main.zig", drafts[0].scope.?.@"inline".path);
+    try testing.expectEqual(@as(?u32, 8), drafts[0].scope.?.@"inline".start_to);
+    try testing.expectEqualStrings("source", drafts[0].scope.?.@"inline".commit.?);
+    try testing.expectEqualStrings("before\nselected\nafter", drafts[0].snapshot.?.text);
+    try testing.expectEqualStrings("```suggestion\nreplacement\n```", drafts[0].body);
+    try testing.expectEqual(ApiError.ServerError, drafts[0].state.failed);
+    try testing.expect(drafts[1].parent.? == .draft and drafts[1].parent.?.draft == 4);
+    try testing.expect(drafts[1].state == .outcome_unknown);
 }

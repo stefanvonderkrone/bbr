@@ -73,6 +73,12 @@ pub const ActiveSubmissionRun = struct {
     key: RemoteReviewIdentity,
     source_commit: []const u8,
     current_temp_id: ?TempId,
+    items: []SubmissionRunItem,
+};
+
+pub const SubmissionRunItem = struct {
+    temp_id: TempId,
+    parent: ?draft_mod.Parent,
 };
 
 /// The durable result of one network post. Keeping this narrower than
@@ -132,9 +138,10 @@ pub const PendingReviewStore = struct {
         remove: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, local_id: TempId) anyerror!void,
         /// Every Draft for `pr_id`, each with its strings duped into `allocator`.
         load: *const fn (ptr: *anyopaque, allocator: Allocator, key: RemoteReviewIdentity) anyerror![]Draft,
-        begin_submission: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, source_commit: []const u8, first_temp_id: TempId) anyerror!OperationId,
+        begin_submission: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, source_commit: []const u8, items: []const SubmissionRunItem) anyerror!OperationId,
         checkpoint_submission: *const fn (ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) anyerror!void,
         complete_submission: *const fn (ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity, completion: SubmissionCompletion) anyerror!void,
+        abandon_submission: *const fn (ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity) anyerror!void,
         active_submission: *const fn (ptr: *anyopaque, allocator: Allocator) anyerror!?ActiveSubmissionRun,
         resolve_unknown: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, temp_id: TempId, resolution: UnknownResolution) anyerror!void,
         resolve_repository: *const fn (ptr: *anyopaque, aliases: []const []const u8) anyerror!ReviewRepositoryId,
@@ -153,8 +160,8 @@ pub const PendingReviewStore = struct {
         return self.vtable.load(self.ptr, allocator, key);
     }
 
-    pub fn beginSubmission(self: PendingReviewStore, key: RemoteReviewIdentity, source_commit: []const u8, first_temp_id: TempId) !OperationId {
-        return self.vtable.begin_submission(self.ptr, key, source_commit, first_temp_id);
+    pub fn beginSubmission(self: PendingReviewStore, key: RemoteReviewIdentity, source_commit: []const u8, items: []const SubmissionRunItem) !OperationId {
+        return self.vtable.begin_submission(self.ptr, key, source_commit, items);
     }
 
     pub fn activeSubmission(self: PendingReviewStore, allocator: Allocator) !?ActiveSubmissionRun {
@@ -181,6 +188,11 @@ pub const PendingReviewStore = struct {
 
     pub fn completeSubmission(self: PendingReviewStore, operation_id: OperationId, key: RemoteReviewIdentity, completion: SubmissionCompletion) !void {
         return self.vtable.complete_submission(self.ptr, operation_id, key, completion);
+    }
+
+    /// Terminalize recovered ambiguous work without asserting non-publication.
+    pub fn abandonSubmission(self: PendingReviewStore, operation_id: OperationId, key: RemoteReviewIdentity) !void {
+        return self.vtable.abandon_submission(self.ptr, operation_id, key);
     }
 
     /// Resume: load a PR's Drafts and rebuild the PendingReview graph. Strings
@@ -299,6 +311,7 @@ pub const InMemoryStore = struct {
         .begin_submission = beginSubmissionImpl,
         .checkpoint_submission = checkpointSubmissionImpl,
         .complete_submission = completeSubmissionImpl,
+        .abandon_submission = abandonSubmissionImpl,
         .active_submission = activeSubmissionImpl,
         .resolve_unknown = resolveUnknownImpl,
         .resolve_repository = resolveRepositoryImpl,
@@ -361,11 +374,7 @@ pub const InMemoryStore = struct {
         }
         if (self.active_submission) |run| {
             if (RemoteReviewIdentity.eql(run.key, key)) {
-                if (d.target == .bitbucket) return error.DraftLocked;
-                for (self.entries.items) |entry| {
-                    if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.local_id == d.local_id and entry.draft.target == .bitbucket)
-                        return error.DraftLocked;
-                }
+                if (submissionItemIndex(run.items, d.local_id) != null) return error.DraftLocked;
             }
         }
         const owned = try dupeDraft(self.arena.allocator(), d);
@@ -392,10 +401,7 @@ pub const InMemoryStore = struct {
         }
         if (self.active_submission) |run| {
             if (RemoteReviewIdentity.eql(run.key, key)) {
-                for (self.entries.items) |entry| {
-                    if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.local_id == local_id and entry.draft.target == .bitbucket)
-                        return error.DraftLocked;
-                }
+                if (submissionItemIndex(run.items, local_id) != null) return error.DraftLocked;
             }
         }
         var i: usize = 0;
@@ -417,9 +423,23 @@ pub const InMemoryStore = struct {
         return out.toOwnedSlice(allocator);
     }
 
-    fn beginSubmissionImpl(ptr: *anyopaque, key: RemoteReviewIdentity, source_commit: []const u8, first_temp_id: TempId) anyerror!OperationId {
+    fn beginSubmissionImpl(ptr: *anyopaque, key: RemoteReviewIdentity, source_commit: []const u8, items: []const SubmissionRunItem) anyerror!OperationId {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
         if (self.active_submission != null) return error.SubmissionAlreadyActive;
+        if (items.len == 0) return error.EmptySubmission;
+        const first_temp_id = items[0].temp_id;
+        for (items, 0..) |item, index| {
+            var found = false;
+            for (self.entries.items) |entry| {
+                if (!RemoteReviewIdentity.eql(entry.key, key) or entry.draft.local_id != item.temp_id) continue;
+                if (entry.draft.target != .bitbucket) return error.DraftNotSubmittable;
+                if (!parentEql(entry.draft.parent, item.parent)) return error.InvalidSubmissionGraph;
+                found = true;
+                break;
+            }
+            if (!found) return error.DraftNotFound;
+            for (items[0..index]) |prior| if (prior.temp_id == item.temp_id) return error.InvalidSubmissionGraph;
+        }
         var draft: ?*Draft = null;
         for (self.entries.items) |*entry| {
             if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.local_id == first_temp_id) {
@@ -436,12 +456,14 @@ pub const InMemoryStore = struct {
             .pull_request_id = key.pull_request_id,
         };
         const owned_commit = try self.arena.allocator().dupe(u8, source_commit);
+        const owned_items = try self.arena.allocator().dupe(SubmissionRunItem, items);
         const operation_id = self.next_operation_id;
         self.active_submission = .{
             .operation_id = operation_id,
             .key = owned_key,
             .source_commit = owned_commit,
             .current_temp_id = first_temp_id,
+            .items = owned_items,
         };
         self.next_operation_id += 1;
         first.state = .submitting;
@@ -460,12 +482,13 @@ pub const InMemoryStore = struct {
             },
             .source_commit = try allocator.dupe(u8, run.source_commit),
             .current_temp_id = run.current_temp_id,
+            .items = try allocator.dupe(SubmissionRunItem, run.items),
         };
     }
 
     fn resolveUnknownImpl(ptr: *anyopaque, key: RemoteReviewIdentity, temp_id: TempId, resolution: UnknownResolution) anyerror!void {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
-        if (self.active_submission) |run| if (RemoteReviewIdentity.eql(run.key, key)) return error.DraftLocked;
+        if (self.active_submission) |run| if (RemoteReviewIdentity.eql(run.key, key) and submissionItemIndex(run.items, temp_id) != null) return error.DraftLocked;
         for (self.entries.items) |*entry| {
             if (!RemoteReviewIdentity.eql(entry.key, key) or entry.draft.local_id != temp_id) continue;
             if (entry.draft.state != .outcome_unknown) return error.InvalidUnknownResolution;
@@ -489,6 +512,11 @@ pub const InMemoryStore = struct {
             run.current_temp_id != completed_temp_id)
             return error.InvalidSubmissionCheckpoint;
         if (next_temp_id == completed_temp_id) return error.InvalidSubmissionCheckpoint;
+        if (next_temp_id) |next_id| {
+            const completed_index = submissionItemIndex(run.items, completed_temp_id) orelse return error.InvalidSubmissionCheckpoint;
+            const next_index = submissionItemIndex(run.items, next_id) orelse return error.InvalidSubmissionCheckpoint;
+            if (next_index <= completed_index) return error.InvalidSubmissionCheckpoint;
+        }
 
         var completed: ?*Draft = null;
         var next: ?*Draft = null;
@@ -523,14 +551,14 @@ pub const InMemoryStore = struct {
         switch (completion) {
             .clean => {
                 if (run.current_temp_id != null) return error.InvalidSubmissionCompletion;
-                for (self.entries.items) |entry| {
-                    if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.target == .bitbucket and entry.draft.state != .posted)
+                for (run.items) |item| {
+                    for (self.entries.items) |entry| if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.local_id == item.temp_id and entry.draft.state != .posted)
                         return error.SubmissionNotClean;
                 }
                 var i: usize = 0;
                 while (i < self.entries.items.len) {
                     const entry = self.entries.items[i];
-                    if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.target == .bitbucket and entry.draft.state == .posted) {
+                    if (RemoteReviewIdentity.eql(entry.key, key) and submissionItemIndex(run.items, entry.draft.local_id) != null and entry.draft.state == .posted) {
                         _ = self.entries.orderedRemove(i);
                     } else {
                         i += 1;
@@ -551,7 +579,35 @@ pub const InMemoryStore = struct {
         }
         self.active_submission = null;
     }
+
+    fn abandonSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity) anyerror!void {
+        const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        const run = self.active_submission orelse return error.SubmissionNotActive;
+        if (run.operation_id != operation_id or !RemoteReviewIdentity.eql(run.key, key)) return error.InvalidSubmissionCompletion;
+        const current_id = run.current_temp_id orelse return error.InvalidSubmissionCompletion;
+        for (self.entries.items) |*entry| {
+            if (!RemoteReviewIdentity.eql(entry.key, key) or entry.draft.local_id != current_id) continue;
+            if (entry.draft.state != .submitting) return error.InvalidSubmissionCompletion;
+            entry.draft.state = .outcome_unknown;
+            self.active_submission = null;
+            return;
+        }
+        return error.DraftNotFound;
+    }
 };
+
+fn parentEql(a: ?draft_mod.Parent, b: ?draft_mod.Parent) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return switch (a.?) {
+        .draft => |id| b.? == .draft and b.?.draft == id,
+        .comment => |id| b.? == .comment and b.?.comment == id,
+    };
+}
+
+fn submissionItemIndex(items: []const SubmissionRunItem, temp_id: TempId) ?usize {
+    for (items, 0..) |item, index| if (item.temp_id == temp_id) return index;
+    return null;
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -671,18 +727,23 @@ test "beginning a Submission atomically records its run and first submitting Dra
     try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "first" });
     try store.put(key, .{ .local_id = 2, .kind = .comment, .body = "second" });
 
-    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    const participants = [_]SubmissionRunItem{
+        .{ .temp_id = 2, .parent = null },
+        .{ .temp_id = 1, .parent = null },
+    };
+    const operation_id = try store.beginSubmission(key, "source-commit", &participants);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const run = (try store.activeSubmission(arena.allocator())).?;
     try testing.expectEqual(operation_id, run.operation_id);
     try testing.expect(RemoteReviewIdentity.eql(key, run.key));
     try testing.expectEqualStrings("source-commit", run.source_commit);
-    try testing.expectEqual(@as(?TempId, 1), run.current_temp_id);
+    try testing.expectEqual(@as(?TempId, 2), run.current_temp_id);
+    try testing.expectEqualSlices(TempId, &.{ 2, 1 }, &.{ run.items[0].temp_id, run.items[1].temp_id });
 
     const drafts = try store.load(arena.allocator(), key);
-    try testing.expect(drafts[0].state == .submitting);
-    try testing.expect(drafts[1].state == .draft);
+    try testing.expect(drafts[0].state == .draft);
+    try testing.expect(drafts[1].state == .submitting);
 }
 
 test "Submission checkpoint persists the outcome and next intent together" {
@@ -692,7 +753,7 @@ test "Submission checkpoint persists the outcome and next intent together" {
     const key = testReviewKey(7);
     try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "first" });
     try store.put(key, .{ .local_id = 2, .kind = .comment, .body = "second", .state = .{ .failed = error.ServerError } });
-    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    const operation_id = try store.beginSubmission(key, "source-commit", &.{ .{ .temp_id = 1, .parent = null }, .{ .temp_id = 2, .parent = null } });
 
     try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, 2);
 
@@ -711,9 +772,9 @@ test "a rejected Submission checkpoint leaves the run and Draft unchanged" {
     const store = mem.store();
     const key = testReviewKey(7);
     try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "first" });
-    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
 
-    try testing.expectError(error.DraftNotFound, store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, 99));
+    try testing.expectError(error.InvalidSubmissionCheckpoint, store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, 99));
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -730,7 +791,7 @@ test "clean Submission completion removes posted Drafts and closes the run" {
     const key = testReviewKey(7);
     try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "posted" });
     try store.put(key, .{ .local_id = 2, .kind = .comment, .target = .local, .body = "keep local", .state = .{ .posted = 901 } });
-    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
     try store.checkpointSubmission(operation_id, key, 1, .{ .posted = 900 }, null);
 
     try store.completeSubmission(operation_id, key, .clean);
@@ -749,7 +810,7 @@ test "partial Submission completion keeps outcomes for repair" {
     const store = mem.store();
     const key = testReviewKey(7);
     try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "failed" });
-    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
     try store.checkpointSubmission(operation_id, key, 1, .{ .failed = error.Forbidden }, null);
 
     try store.completeSubmission(operation_id, key, .partial);
@@ -768,7 +829,7 @@ test "unresolved outcome remains immutable after partial completion" {
     const store = mem.store();
     const key = testReviewKey(7);
     try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "unknown" });
-    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
     try store.checkpointSubmission(operation_id, key, 1, .outcome_unknown, null);
     try store.completeSubmission(operation_id, key, .partial);
 
@@ -785,11 +846,11 @@ test "active Submission locks Bitbucket Draft mutation but not local Drafts" {
     const key = testReviewKey(7);
     try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "remote" });
     try store.put(key, .{ .local_id = 2, .kind = .comment, .target = .local, .body = "local" });
-    _ = try store.beginSubmission(key, "source-commit", 1);
+    _ = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
 
     try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 1, .kind = .comment, .body = "changed" }));
     try testing.expectError(error.DraftLocked, store.remove(key, 1));
-    try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 3, .kind = .comment, .body = "new remote" }));
+    try store.put(key, .{ .local_id = 3, .kind = .comment, .body = "new remote" });
     try store.put(key, .{ .local_id = 2, .kind = .comment, .target = .local, .body = "changed local" });
     try store.remove(key, 2);
 }
@@ -800,7 +861,7 @@ test "clean completion rejects a Submission with failed Bitbucket Drafts" {
     const store = mem.store();
     const key = testReviewKey(7);
     try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "failed" });
-    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
     try store.checkpointSubmission(operation_id, key, 1, .{ .failed = error.Forbidden }, null);
 
     try testing.expectError(error.SubmissionNotClean, store.completeSubmission(operation_id, key, .clean));
@@ -815,7 +876,7 @@ test "aborted Submission restores the current Draft and closes partial" {
     const store = mem.store();
     const key = testReviewKey(7);
     try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "retry", .state = .{ .failed = error.ServerError } });
-    const operation_id = try store.beginSubmission(key, "source-commit", 1);
+    const operation_id = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
 
     try store.completeSubmission(operation_id, key, .{ .aborted = .{ .failed = error.ServerError } });
 
@@ -850,4 +911,20 @@ test "TempId reservation is monotonic and gaps remain valid" {
     try testing.expectEqual(@as(TempId, 2), try store.reserveTempId(key));
     try store.put(key, .{ .local_id = 2, .kind = .comment, .body = "second" });
     try testing.expectEqual(@as(TempId, 3), try store.reserveTempId(key));
+}
+
+test "abandoning recovery preserves ambiguity and releases participant ownership" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const store = mem.store();
+    const key = testReviewKey(7);
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "ambiguous" });
+    const operation_id = try store.beginSubmission(key, "source", &.{.{ .temp_id = 1, .parent = null }});
+
+    try store.abandonSubmission(operation_id, key);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect((try store.activeSubmission(arena.allocator())) == null);
+    try testing.expect((try store.load(arena.allocator(), key))[0].state == .outcome_unknown);
 }

@@ -1255,7 +1255,7 @@ const DurableSubmission = struct {
         finished: struct { result: SubmissionResultProjection, transition: PersistedTransition },
     };
 
-    fn create(allocator: Allocator, store: bbr.review.PendingReviewStore, key: OwnedReviewIdentity, lock: bbr.review.SubmissionLockGuard) !*DurableSubmission {
+    fn create(allocator: Allocator, store: bbr.review.PendingReviewStore, key: OwnedReviewIdentity, lock: bbr.review.SubmissionLockGuard, frozen_items: ?[]const bbr.review.SubmissionRunItem) !*DurableSubmission {
         var owned_lock = lock;
         errdefer owned_lock.release();
         const durable = try allocator.create(DurableSubmission);
@@ -1268,7 +1268,10 @@ const DurableSubmission = struct {
         durable.arena = std.heap.ArenaAllocator.init(allocator);
         errdefer durable.arena.deinit();
         durable.review = try store.loadReview(durable.arena.allocator(), key.storeKey());
-        durable.machine = try bbr.review.Submission.init(durable.arena.allocator(), &durable.review);
+        durable.machine = if (frozen_items) |items|
+            try bbr.review.Submission.initFrozen(durable.arena.allocator(), &durable.review, items)
+        else
+            try bbr.review.Submission.init(durable.arena.allocator(), &durable.review);
         durable.phase = .post_queued;
         durable.pending_admission = null;
         durable.pending_persistence = null;
@@ -1290,7 +1293,7 @@ const DurableSubmission = struct {
         source_commit: []const u8,
         lock: bbr.review.SubmissionLockGuard,
     ) !?Started {
-        const durable = try create(allocator, store, key, lock);
+        const durable = try create(allocator, store, key, lock, null);
         errdefer durable.destroy();
         const post = switch (durable.machine.advance()) {
             .post => |value| value,
@@ -1303,7 +1306,12 @@ const DurableSubmission = struct {
         const draft = durable.review.getConst(post.temp_id) orelse return error.DraftNotFound;
         const command = try PostDraft.create(allocator, durable.key, draft.*, post);
         errdefer command.destroy();
-        const operation_id = try store.beginSubmission(durable.key.storeKey(), source_commit, post.temp_id);
+        const items = try durable.arena.allocator().alloc(bbr.review.SubmissionRunItem, durable.machine.order.len);
+        for (durable.machine.order, items) |temp_id, *item| {
+            const participant = durable.review.getConst(temp_id) orelse return error.DraftNotFound;
+            item.* = .{ .temp_id = temp_id, .parent = participant.parent };
+        }
+        const operation_id = try store.beginSubmission(durable.key.storeKey(), source_commit, items);
         durable.operation_id = operation_id;
         durable.current_temp_id = post.temp_id;
         command.operation_id = operation_id;
@@ -1313,19 +1321,20 @@ const DurableSubmission = struct {
     fn recover(
         allocator: Allocator,
         store: bbr.review.PendingReviewStore,
-        notice: RecoveryNotice,
+        run: bbr.review.ActiveSubmissionRun,
+        key: OwnedReviewIdentity,
         lock: bbr.review.SubmissionLockGuard,
     ) !*DurableSubmission {
-        const durable = try create(allocator, store, notice.key, lock);
+        const durable = try create(allocator, store, key, lock, run.items);
         errdefer durable.destroy();
         const post = switch (durable.machine.advance()) {
             .post => |value| value,
             else => return error.InvalidRecoveryState,
         };
-        if (post.temp_id != notice.current_temp_id.?) return error.InvalidRecoveryState;
-        durable.operation_id = notice.operation_id;
-        durable.current_temp_id = notice.current_temp_id;
-        durable.recovery_source_commit = notice.source_commit;
+        if (post.temp_id != run.current_temp_id.?) return error.InvalidRecoveryState;
+        durable.operation_id = run.operation_id;
+        durable.current_temp_id = run.current_temp_id;
+        durable.recovery_source_commit = try BoundedText(64).init(run.source_commit);
         durable.recovered = true;
         durable.phase = .recovery_check_queued;
         return durable;
@@ -1992,7 +2001,7 @@ pub const Presentation = struct {
             self.completeRecoveredTerminal(notice, &lock);
             return;
         }
-        const durable = DurableSubmission.recover(self.allocator, self.dependencies.reviews, notice, lock) catch {
+        const durable = DurableSubmission.recover(self.allocator, self.dependencies.reviews, active, notice.key, lock) catch {
             lock.ptr = null;
             self.action_error = .recovery_claim_failed;
             return;
@@ -5316,6 +5325,7 @@ test "Submission start acquires ownership persists intent and emits one durable 
         testing.allocator.free(run.key.workspace);
         testing.allocator.free(run.key.repository);
         testing.allocator.free(run.source_commit);
+        testing.allocator.free(run.items);
     }
     try testing.expectEqual(run.operation_id, command.operation_id);
     try testing.expectEqual(@as(?bbr.review.TempId, 1), run.current_temp_id);
@@ -5424,7 +5434,7 @@ test "startup discovers and explicitly claims an interrupted Submission" {
     defer locks.deinit();
     const key = try OwnedReviewIdentity.init("workspace", "repo", 7);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "recover me" });
-    const operation_id = try store.store().beginSubmission(key.storeKey(), "old-head", 1);
+    const operation_id = try store.store().beginSubmission(key.storeKey(), "old-head", &.{.{ .temp_id = 1, .parent = null }});
 
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -5448,6 +5458,32 @@ test "startup discovers and explicitly claims an interrupted Submission" {
     try testing.expectEqual(@as(bbr.review.TempId, 1), post.post_draft.draft.local_id);
 }
 
+test "recovery resumes only frozen participants and preserves parent remapping" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 7);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "root" });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .body = "reply", .parent = .{ .draft = 1 } });
+    const operation_id = try store.store().beginSubmission(key.storeKey(), "old-head", &.{ .{ .temp_id = 1, .parent = null }, .{ .temp_id = 2, .parent = .{ .draft = 1 } } });
+    try store.store().checkpointSubmission(operation_id, key.storeKey(), 1, .{ .posted = 900 }, 2);
+    try store.store().put(key.storeKey(), .{ .local_id = 3, .kind = .comment, .body = "later" });
+
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .viewport_rows = 8 });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .recover_submission });
+    const check = presentation.takeCommand().?.check_recovery;
+    try presentation.dispatch(recoveryCheckSucceeded(check.command_id, operation_id, null, "old-head"));
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqual(@as(bbr.review.TempId, 2), command.post_draft.draft.local_id);
+    try testing.expectEqual(@as(?bbr.review.CommentId, 900), command.post_draft.parent);
+}
+
 test "startup reports a live owner without stealing its Submission" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -5455,7 +5491,7 @@ test "startup reports a live owner without stealing its Submission" {
     defer locks.deinit();
     const key = try OwnedReviewIdentity.init("workspace", "repo", 7);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "owned" });
-    _ = try store.store().beginSubmission(key.storeKey(), "head", 1);
+    _ = try store.store().beginSubmission(key.storeKey(), "head", &.{.{ .temp_id = 1, .parent = null }});
     var owner = (try locks.locks().tryAcquire(key.storeKey())).?;
     defer owner.release();
 
@@ -5477,7 +5513,7 @@ test "changed-source recovery only runs the Duplicate guard and leaves a miss un
     defer locks.deinit();
     const key = try OwnedReviewIdentity.init("workspace", "repo", 7);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "stale" });
-    const operation_id = try store.store().beginSubmission(key.storeKey(), "old-head", 1);
+    const operation_id = try store.store().beginSubmission(key.storeKey(), "old-head", &.{.{ .temp_id = 1, .parent = null }});
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
@@ -5512,7 +5548,7 @@ test "changed-source Duplicate guard records an existing Comment without posting
     defer locks.deinit();
     const key = try OwnedReviewIdentity.init("workspace", "repo", 7);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "already posted" });
-    const operation_id = try store.store().beginSubmission(key.storeKey(), "old-head", 1);
+    const operation_id = try store.store().beginSubmission(key.storeKey(), "old-head", &.{.{ .temp_id = 1, .parent = null }});
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
