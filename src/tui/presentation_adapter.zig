@@ -13,8 +13,8 @@ const presentation = @import("presentation.zig");
 /// reports whether OSC 52 was written successfully.
 pub fn copyToClipboard(vx: vaxis.Vaxis, tty: *std.Io.Writer, command: *presentation.ClipboardCopy) presentation.OwnedInput {
     defer command.destroy();
-    vx.copyToSystemClipboard(tty, command.text, command.allocator) catch return .{ .clipboard_completed = false };
-    return .{ .clipboard_completed = true };
+    vx.copyToSystemClipboard(tty, command.text, command.allocator) catch return .{ .clipboard_completed = .{ .command_id = command.command_id, .success = false } };
+    return .{ .clipboard_completed = .{ .command_id = command.command_id, .success = true } };
 }
 
 pub fn postOutcome(
@@ -34,7 +34,9 @@ pub fn executePost(command: *presentation.PostDraft, poster: bbr.review.CommentP
     defer command.destroy();
     const outcome = postOutcome(poster, command.draft, command.parent, command.dedupe) catch .ambiguous;
     return .{ .post_draft_completed = .{
+        .command_id = command.command_id,
         .operation_id = command.operation_id,
+        .identity = command.identity,
         .temp_id = command.draft.local_id,
         .outcome = outcome,
     } };
@@ -44,7 +46,9 @@ pub fn executePost(command: *presentation.PostDraft, poster: bbr.review.CommentP
 pub fn postLaunchFailed(command: *presentation.PostDraft) presentation.OwnedInput {
     defer command.destroy();
     return .{ .post_draft_launch_failed = .{
+        .command_id = command.command_id,
         .operation_id = command.operation_id,
+        .identity = command.identity,
         .temp_id = command.draft.local_id,
     } };
 }
@@ -87,7 +91,7 @@ fn testCommand(operation_id: bbr.review.OperationId, dedupe: bool) !*presentatio
         .allocator = testing.allocator,
         .arena = std.heap.ArenaAllocator.init(testing.allocator),
         .operation_id = operation_id,
-        .key = try presentation.ReviewKey.init("workspace", "repo", 1),
+        .identity = .init(try presentation.OwnedReviewIdentity.init("workspace", "repo", 1)),
         .draft = .{ .local_id = 41, .kind = .comment, .body = "body" },
         .parent = null,
         .dedupe = dedupe,

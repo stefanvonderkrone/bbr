@@ -28,7 +28,7 @@ const Anchor = bbr.review.Anchor;
 const CommentId = bbr.review.CommentId;
 const ApiError = bbr.bitbucket.ApiError;
 const PendingReviewStore = bbr.review.PendingReviewStore;
-const ReviewKey = bbr.review.ReviewKey;
+const RemoteReviewIdentity = bbr.review.RemoteReviewIdentity;
 const OperationId = bbr.review.OperationId;
 const ActiveSubmissionRun = bbr.review.ActiveSubmissionRun;
 const SubmissionOutcome = bbr.review.SubmissionOutcome;
@@ -269,7 +269,7 @@ pub const SqliteStore = struct {
         return repository_id;
     }
 
-    fn reserveTempIdImpl(ptr: *anyopaque, key: ReviewKey) anyerror!TempId {
+    fn reserveTempIdImpl(ptr: *anyopaque, key: RemoteReviewIdentity) anyerror!TempId {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
@@ -313,7 +313,7 @@ pub const SqliteStore = struct {
         return reserved;
     }
 
-    fn putImpl(ptr: *anyopaque, key: ReviewKey, d: Draft) anyerror!void {
+    fn putImpl(ptr: *anyopaque, key: RemoteReviewIdentity, d: Draft) anyerror!void {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
@@ -438,7 +438,7 @@ pub const SqliteStore = struct {
         try self.exec("COMMIT;");
     }
 
-    fn removeImpl(ptr: *anyopaque, key: ReviewKey, local_id: TempId) anyerror!void {
+    fn removeImpl(ptr: *anyopaque, key: RemoteReviewIdentity, local_id: TempId) anyerror!void {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
@@ -455,7 +455,7 @@ pub const SqliteStore = struct {
         try self.exec("COMMIT;");
     }
 
-    fn loadImpl(ptr: *anyopaque, allocator: std.mem.Allocator, key: ReviewKey) anyerror![]Draft {
+    fn loadImpl(ptr: *anyopaque, allocator: std.mem.Allocator, key: RemoteReviewIdentity) anyerror![]Draft {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         // v2 and older could not record repository identity. The first load of
         // an upgraded PR claims those otherwise-unreachable rows for the
@@ -491,7 +491,7 @@ pub const SqliteStore = struct {
         return out.toOwnedSlice(allocator);
     }
 
-    fn beginSubmissionImpl(ptr: *anyopaque, key: ReviewKey, source_commit: []const u8, first_temp_id: TempId) anyerror!OperationId {
+    fn beginSubmissionImpl(ptr: *anyopaque, key: RemoteReviewIdentity, source_commit: []const u8, first_temp_id: TempId) anyerror!OperationId {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
@@ -567,7 +567,7 @@ pub const SqliteStore = struct {
         };
     }
 
-    fn resolveUnknownImpl(ptr: *anyopaque, key: ReviewKey, temp_id: TempId, resolution: UnknownResolution) anyerror!void {
+    fn resolveUnknownImpl(ptr: *anyopaque, key: RemoteReviewIdentity, temp_id: TempId, resolution: UnknownResolution) anyerror!void {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
@@ -603,7 +603,7 @@ pub const SqliteStore = struct {
         try self.exec("COMMIT;");
     }
 
-    fn checkpointSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: ReviewKey, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) anyerror!void {
+    fn checkpointSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) anyerror!void {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         if (next_temp_id == completed_temp_id) return error.InvalidSubmissionCheckpoint;
         try self.exec("BEGIN IMMEDIATE;");
@@ -662,7 +662,7 @@ pub const SqliteStore = struct {
         try self.exec("COMMIT;");
     }
 
-    fn completeSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: ReviewKey, completion: SubmissionCompletion) anyerror!void {
+    fn completeSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity, completion: SubmissionCompletion) anyerror!void {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
@@ -749,7 +749,7 @@ pub const SqliteStore = struct {
 
     /// Must be called inside a write transaction so an active SubmissionRun
     /// cannot appear between this check and the mutation.
-    fn draftMutationLocked(self: *SqliteStore, key: ReviewKey, local_id: TempId, incoming_target: ?CommentTarget) SqliteError!bool {
+    fn draftMutationLocked(self: *SqliteStore, key: RemoteReviewIdentity, local_id: TempId, incoming_target: ?CommentTarget) SqliteError!bool {
         var stmt: ?*c.sqlite3_stmt = null;
         const sql =
             \\SELECT
@@ -780,7 +780,7 @@ pub const SqliteStore = struct {
         return columnInt(stmt, 1) == @intFromEnum(CommentTarget.bitbucket);
     }
 
-    fn claimLegacyRows(self: *SqliteStore, key: ReviewKey) SqliteError!void {
+    fn claimLegacyRows(self: *SqliteStore, key: RemoteReviewIdentity) SqliteError!void {
         var stmt: ?*c.sqlite3_stmt = null;
         const sql =
             \\UPDATE drafts SET workspace=?, repository=?
@@ -952,7 +952,7 @@ fn apiErrorFromName(name: []const u8) ApiError {
 // ---------------------------------------------------------------------------
 const testing = std.testing;
 
-fn testReviewKey(pull_request_id: u64) ReviewKey {
+fn testReviewKey(pull_request_id: u64) RemoteReviewIdentity {
     return .{ .workspace = "workspace", .repository = "repo", .pull_request_id = pull_request_id };
 }
 
@@ -1056,8 +1056,8 @@ test "identical PullRequestIds remain isolated by Repository in SQLite" {
     var s = try SqliteStore.open(":memory:");
     defer s.deinit();
     const store = s.store();
-    const alpha: ReviewKey = .{ .workspace = "ws", .repository = "alpha", .pull_request_id = 7 };
-    const beta: ReviewKey = .{ .workspace = "ws", .repository = "beta", .pull_request_id = 7 };
+    const alpha: RemoteReviewIdentity = .{ .workspace = "ws", .repository = "alpha", .pull_request_id = 7 };
+    const beta: RemoteReviewIdentity = .{ .workspace = "ws", .repository = "beta", .pull_request_id = 7 };
 
     try store.put(alpha, .{ .local_id = 1, .kind = .comment, .body = "alpha" });
     try store.put(beta, .{ .local_id = 1, .kind = .comment, .body = "beta" });
@@ -1101,7 +1101,7 @@ test "v2 rows are migrated and claimed by the first repository load" {
 
     var upgraded = try SqliteStore.open(path);
     defer upgraded.deinit();
-    const key: ReviewKey = .{ .workspace = "ws", .repository = "repo", .pull_request_id = 42 };
+    const key: RemoteReviewIdentity = .{ .workspace = "ws", .repository = "repo", .pull_request_id = 42 };
     const drafts = try upgraded.store().load(arena.allocator(), key);
     try testing.expectEqual(@as(usize, 3), drafts.len);
     try testing.expectEqualStrings("legacy review", drafts[0].body);
@@ -1111,7 +1111,7 @@ test "v2 rows are migrated and claimed by the first repository load" {
     try testing.expectEqualStrings("old-source", drafts[1].scope.?.@"inline".commit.?);
     try testing.expect(drafts[2].scope == null);
 
-    const other: ReviewKey = .{ .workspace = "ws", .repository = "other", .pull_request_id = 42 };
+    const other: RemoteReviewIdentity = .{ .workspace = "ws", .repository = "other", .pull_request_id = 42 };
     const other_drafts = try upgraded.store().load(arena.allocator(), other);
     try testing.expectEqual(@as(usize, 0), other_drafts.len);
 }

@@ -27,12 +27,12 @@ const ApiError = @import("../bitbucket/types.zig").ApiError;
 
 /// Durable identity of a Pending Review. Bitbucket PullRequestIds are unique
 /// only within a Repository, so every store operation carries the full scope.
-pub const ReviewKey = struct {
+pub const RemoteReviewIdentity = struct {
     workspace: []const u8,
     repository: []const u8,
     pull_request_id: u64,
 
-    pub fn eql(a: ReviewKey, b: ReviewKey) bool {
+    pub fn eql(a: RemoteReviewIdentity, b: RemoteReviewIdentity) bool {
         return a.pull_request_id == b.pull_request_id and
             std.mem.eql(u8, a.workspace, b.workspace) and
             std.mem.eql(u8, a.repository, b.repository);
@@ -45,21 +45,32 @@ pub const ReviewRepositoryId = u64;
 /// Source-neutral domain identity. Commit hashes deliberately do not appear:
 /// advancing either Ref replaces the Session snapshot, not the Review.
 pub const ReviewIdentity = union(enum) {
-    remote: struct {
-        workspace: []const u8,
-        repository: []const u8,
-        pull_request_id: u64,
-    },
+    remote: RemoteReviewIdentity,
     local: struct {
         repository_id: ReviewRepositoryId,
         base_ref: []const u8,
         source_ref: []const u8,
     },
+
+    pub fn eql(a: ReviewIdentity, b: ReviewIdentity) bool {
+        return switch (a) {
+            .remote => |remote| switch (b) {
+                .remote => |other| RemoteReviewIdentity.eql(remote, other),
+                .local => false,
+            },
+            .local => |local| switch (b) {
+                .remote => false,
+                .local => |other| local.repository_id == other.repository_id and
+                    std.mem.eql(u8, local.base_ref, other.base_ref) and
+                    std.mem.eql(u8, local.source_ref, other.source_ref),
+            },
+        };
+    }
 };
 
 pub const ActiveSubmissionRun = struct {
     operation_id: OperationId,
-    key: ReviewKey,
+    key: RemoteReviewIdentity,
     source_commit: []const u8,
     current_temp_id: ?TempId,
 };
@@ -116,33 +127,33 @@ pub const PendingReviewStore = struct {
 
     pub const VTable = struct {
         /// Insert or replace a Draft under `pr_id` (keyed by `draft.local_id`).
-        put: *const fn (ptr: *anyopaque, key: ReviewKey, draft: Draft) anyerror!void,
+        put: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, draft: Draft) anyerror!void,
         /// Delete the Draft `(pr_id, local_id)`. Idempotent — a missing id is ok.
-        remove: *const fn (ptr: *anyopaque, key: ReviewKey, local_id: TempId) anyerror!void,
+        remove: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, local_id: TempId) anyerror!void,
         /// Every Draft for `pr_id`, each with its strings duped into `allocator`.
-        load: *const fn (ptr: *anyopaque, allocator: Allocator, key: ReviewKey) anyerror![]Draft,
-        begin_submission: *const fn (ptr: *anyopaque, key: ReviewKey, source_commit: []const u8, first_temp_id: TempId) anyerror!OperationId,
-        checkpoint_submission: *const fn (ptr: *anyopaque, operation_id: OperationId, key: ReviewKey, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) anyerror!void,
-        complete_submission: *const fn (ptr: *anyopaque, operation_id: OperationId, key: ReviewKey, completion: SubmissionCompletion) anyerror!void,
+        load: *const fn (ptr: *anyopaque, allocator: Allocator, key: RemoteReviewIdentity) anyerror![]Draft,
+        begin_submission: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, source_commit: []const u8, first_temp_id: TempId) anyerror!OperationId,
+        checkpoint_submission: *const fn (ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) anyerror!void,
+        complete_submission: *const fn (ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity, completion: SubmissionCompletion) anyerror!void,
         active_submission: *const fn (ptr: *anyopaque, allocator: Allocator) anyerror!?ActiveSubmissionRun,
-        resolve_unknown: *const fn (ptr: *anyopaque, key: ReviewKey, temp_id: TempId, resolution: UnknownResolution) anyerror!void,
+        resolve_unknown: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, temp_id: TempId, resolution: UnknownResolution) anyerror!void,
         resolve_repository: *const fn (ptr: *anyopaque, aliases: []const []const u8) anyerror!ReviewRepositoryId,
-        reserve_temp_id: *const fn (ptr: *anyopaque, key: ReviewKey) anyerror!TempId,
+        reserve_temp_id: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity) anyerror!TempId,
     };
 
-    pub fn put(self: PendingReviewStore, key: ReviewKey, draft: Draft) !void {
+    pub fn put(self: PendingReviewStore, key: RemoteReviewIdentity, draft: Draft) !void {
         return self.vtable.put(self.ptr, key, draft);
     }
 
-    pub fn remove(self: PendingReviewStore, key: ReviewKey, local_id: TempId) !void {
+    pub fn remove(self: PendingReviewStore, key: RemoteReviewIdentity, local_id: TempId) !void {
         return self.vtable.remove(self.ptr, key, local_id);
     }
 
-    pub fn load(self: PendingReviewStore, allocator: Allocator, key: ReviewKey) ![]Draft {
+    pub fn load(self: PendingReviewStore, allocator: Allocator, key: RemoteReviewIdentity) ![]Draft {
         return self.vtable.load(self.ptr, allocator, key);
     }
 
-    pub fn beginSubmission(self: PendingReviewStore, key: ReviewKey, source_commit: []const u8, first_temp_id: TempId) !OperationId {
+    pub fn beginSubmission(self: PendingReviewStore, key: RemoteReviewIdentity, source_commit: []const u8, first_temp_id: TempId) !OperationId {
         return self.vtable.begin_submission(self.ptr, key, source_commit, first_temp_id);
     }
 
@@ -150,7 +161,7 @@ pub const PendingReviewStore = struct {
         return self.vtable.active_submission(self.ptr, allocator);
     }
 
-    pub fn resolveUnknown(self: PendingReviewStore, key: ReviewKey, temp_id: TempId, resolution: UnknownResolution) !void {
+    pub fn resolveUnknown(self: PendingReviewStore, key: RemoteReviewIdentity, temp_id: TempId, resolution: UnknownResolution) !void {
         return self.vtable.resolve_unknown(self.ptr, key, temp_id, resolution);
     }
 
@@ -158,23 +169,23 @@ pub const PendingReviewStore = struct {
         return self.vtable.resolve_repository(self.ptr, aliases);
     }
 
-    pub fn reserveTempId(self: PendingReviewStore, key: ReviewKey) !TempId {
+    pub fn reserveTempId(self: PendingReviewStore, key: RemoteReviewIdentity) !TempId {
         return self.vtable.reserve_temp_id(self.ptr, key);
     }
 
     /// Persist one post's outcome and the next post intent as one transaction.
     /// No network operation belongs inside this call.
-    pub fn checkpointSubmission(self: PendingReviewStore, operation_id: OperationId, key: ReviewKey, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) !void {
+    pub fn checkpointSubmission(self: PendingReviewStore, operation_id: OperationId, key: RemoteReviewIdentity, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) !void {
         return self.vtable.checkpoint_submission(self.ptr, operation_id, key, completed_temp_id, outcome, next_temp_id);
     }
 
-    pub fn completeSubmission(self: PendingReviewStore, operation_id: OperationId, key: ReviewKey, completion: SubmissionCompletion) !void {
+    pub fn completeSubmission(self: PendingReviewStore, operation_id: OperationId, key: RemoteReviewIdentity, completion: SubmissionCompletion) !void {
         return self.vtable.complete_submission(self.ptr, operation_id, key, completion);
     }
 
     /// Resume: load a PR's Drafts and rebuild the PendingReview graph. Strings
     /// (and the review's backing list) live in `allocator`.
-    pub fn loadReview(self: PendingReviewStore, allocator: Allocator, key: ReviewKey) !PendingReview {
+    pub fn loadReview(self: PendingReviewStore, allocator: Allocator, key: RemoteReviewIdentity) !PendingReview {
         const drafts = try self.load(allocator, key);
         var review = PendingReview.init(key.pull_request_id);
         for (drafts) |d| try review.addExisting(allocator, d);
@@ -203,6 +214,39 @@ pub fn dupeDraft(alloc: Allocator, d: Draft) !Draft {
     return copy;
 }
 
+test "ReviewIdentity equality distinguishes remote and local Reviews by canonical identity" {
+    const remote: ReviewIdentity = .{ .remote = .{
+        .workspace = "workspace",
+        .repository = "repo",
+        .pull_request_id = 7,
+    } };
+    const same_remote: ReviewIdentity = .{ .remote = .{
+        .workspace = "workspace",
+        .repository = "repo",
+        .pull_request_id = 7,
+    } };
+    const other_repository: ReviewIdentity = .{ .remote = .{
+        .workspace = "workspace",
+        .repository = "other",
+        .pull_request_id = 7,
+    } };
+    const local: ReviewIdentity = .{ .local = .{
+        .repository_id = 3,
+        .base_ref = "refs/heads/main",
+        .source_ref = "refs/heads/feature",
+    } };
+    const same_local: ReviewIdentity = .{ .local = .{
+        .repository_id = 3,
+        .base_ref = "refs/heads/main",
+        .source_ref = "refs/heads/feature",
+    } };
+
+    try std.testing.expect(ReviewIdentity.eql(remote, same_remote));
+    try std.testing.expect(!ReviewIdentity.eql(remote, other_repository));
+    try std.testing.expect(!ReviewIdentity.eql(remote, local));
+    try std.testing.expect(ReviewIdentity.eql(local, same_local));
+}
+
 fn dupeAnchor(alloc: Allocator, a: Anchor) !Anchor {
     var copy = a;
     copy.path = try alloc.dupe(u8, a.path);
@@ -227,9 +271,9 @@ pub const InMemoryStore = struct {
     /// Deterministic adapter fault injection after a terminal checkpoint.
     fail_next_completion: bool = false,
 
-    const Entry = struct { key: ReviewKey, draft: Draft };
+    const Entry = struct { key: RemoteReviewIdentity, draft: Draft };
     const RepositoryAlias = struct { alias: []const u8, repository_id: ReviewRepositoryId };
-    const TempCounter = struct { key: ReviewKey, next_id: TempId };
+    const TempCounter = struct { key: RemoteReviewIdentity, next_id: TempId };
 
     pub fn init(gpa: Allocator) InMemoryStore {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa), .entries = .empty };
@@ -289,18 +333,18 @@ pub const InMemoryStore = struct {
         return id;
     }
 
-    fn reserveTempIdImpl(ptr: *anyopaque, key: ReviewKey) anyerror!TempId {
+    fn reserveTempIdImpl(ptr: *anyopaque, key: RemoteReviewIdentity) anyerror!TempId {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
-        for (self.temp_counters.items) |*counter| if (ReviewKey.eql(counter.key, key)) {
+        for (self.temp_counters.items) |*counter| if (RemoteReviewIdentity.eql(counter.key, key)) {
             const id = counter.next_id;
             counter.next_id += 1;
             return id;
         };
         var next_id: TempId = 1;
         for (self.entries.items) |entry| {
-            if (ReviewKey.eql(entry.key, key)) next_id = @max(next_id, entry.draft.local_id + 1);
+            if (RemoteReviewIdentity.eql(entry.key, key)) next_id = @max(next_id, entry.draft.local_id + 1);
         }
-        const owned_key: ReviewKey = .{
+        const owned_key: RemoteReviewIdentity = .{
             .workspace = try self.arena.allocator().dupe(u8, key.workspace),
             .repository = try self.arena.allocator().dupe(u8, key.repository),
             .pull_request_id = key.pull_request_id,
@@ -309,17 +353,17 @@ pub const InMemoryStore = struct {
         return next_id;
     }
 
-    fn putImpl(ptr: *anyopaque, key: ReviewKey, d: Draft) anyerror!void {
+    fn putImpl(ptr: *anyopaque, key: RemoteReviewIdentity, d: Draft) anyerror!void {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
         for (self.entries.items) |entry| {
-            if (ReviewKey.eql(entry.key, key) and entry.draft.local_id == d.local_id and entry.draft.state == .outcome_unknown)
+            if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.local_id == d.local_id and entry.draft.state == .outcome_unknown)
                 return error.DraftLocked;
         }
         if (self.active_submission) |run| {
-            if (ReviewKey.eql(run.key, key)) {
+            if (RemoteReviewIdentity.eql(run.key, key)) {
                 if (d.target == .bitbucket) return error.DraftLocked;
                 for (self.entries.items) |entry| {
-                    if (ReviewKey.eql(entry.key, key) and entry.draft.local_id == d.local_id and entry.draft.target == .bitbucket)
+                    if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.local_id == d.local_id and entry.draft.target == .bitbucket)
                         return error.DraftLocked;
                 }
             }
@@ -327,12 +371,12 @@ pub const InMemoryStore = struct {
         const owned = try dupeDraft(self.arena.allocator(), d);
         // Replace an existing row with the same key; else append.
         for (self.entries.items) |*e| {
-            if (ReviewKey.eql(e.key, key) and e.draft.local_id == d.local_id) {
+            if (RemoteReviewIdentity.eql(e.key, key) and e.draft.local_id == d.local_id) {
                 e.draft = owned;
                 return;
             }
         }
-        const owned_key: ReviewKey = .{
+        const owned_key: RemoteReviewIdentity = .{
             .workspace = try self.arena.allocator().dupe(u8, key.workspace),
             .repository = try self.arena.allocator().dupe(u8, key.repository),
             .pull_request_id = key.pull_request_id,
@@ -340,16 +384,16 @@ pub const InMemoryStore = struct {
         try self.entries.append(self.arena.child_allocator, .{ .key = owned_key, .draft = owned });
     }
 
-    fn removeImpl(ptr: *anyopaque, key: ReviewKey, local_id: TempId) anyerror!void {
+    fn removeImpl(ptr: *anyopaque, key: RemoteReviewIdentity, local_id: TempId) anyerror!void {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
         for (self.entries.items) |entry| {
-            if (ReviewKey.eql(entry.key, key) and entry.draft.local_id == local_id and entry.draft.state == .outcome_unknown)
+            if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.local_id == local_id and entry.draft.state == .outcome_unknown)
                 return error.DraftLocked;
         }
         if (self.active_submission) |run| {
-            if (ReviewKey.eql(run.key, key)) {
+            if (RemoteReviewIdentity.eql(run.key, key)) {
                 for (self.entries.items) |entry| {
-                    if (ReviewKey.eql(entry.key, key) and entry.draft.local_id == local_id and entry.draft.target == .bitbucket)
+                    if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.local_id == local_id and entry.draft.target == .bitbucket)
                         return error.DraftLocked;
                 }
             }
@@ -357,28 +401,28 @@ pub const InMemoryStore = struct {
         var i: usize = 0;
         while (i < self.entries.items.len) {
             const e = self.entries.items[i];
-            if (ReviewKey.eql(e.key, key) and e.draft.local_id == local_id) {
+            if (RemoteReviewIdentity.eql(e.key, key) and e.draft.local_id == local_id) {
                 _ = self.entries.orderedRemove(i);
             } else i += 1;
         }
     }
 
-    fn loadImpl(ptr: *anyopaque, allocator: Allocator, key: ReviewKey) anyerror![]Draft {
+    fn loadImpl(ptr: *anyopaque, allocator: Allocator, key: RemoteReviewIdentity) anyerror![]Draft {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
         var out: std.ArrayList(Draft) = .empty;
         errdefer out.deinit(allocator);
         for (self.entries.items) |e| {
-            if (ReviewKey.eql(e.key, key)) try out.append(allocator, try dupeDraft(allocator, e.draft));
+            if (RemoteReviewIdentity.eql(e.key, key)) try out.append(allocator, try dupeDraft(allocator, e.draft));
         }
         return out.toOwnedSlice(allocator);
     }
 
-    fn beginSubmissionImpl(ptr: *anyopaque, key: ReviewKey, source_commit: []const u8, first_temp_id: TempId) anyerror!OperationId {
+    fn beginSubmissionImpl(ptr: *anyopaque, key: RemoteReviewIdentity, source_commit: []const u8, first_temp_id: TempId) anyerror!OperationId {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
         if (self.active_submission != null) return error.SubmissionAlreadyActive;
         var draft: ?*Draft = null;
         for (self.entries.items) |*entry| {
-            if (ReviewKey.eql(entry.key, key) and entry.draft.local_id == first_temp_id) {
+            if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.local_id == first_temp_id) {
                 draft = &entry.draft;
                 break;
             }
@@ -386,7 +430,7 @@ pub const InMemoryStore = struct {
         const first = draft orelse return error.DraftNotFound;
         if (first.target != .bitbucket or (first.state != .draft and first.state != .failed))
             return error.DraftNotSubmittable;
-        const owned_key: ReviewKey = .{
+        const owned_key: RemoteReviewIdentity = .{
             .workspace = try self.arena.allocator().dupe(u8, key.workspace),
             .repository = try self.arena.allocator().dupe(u8, key.repository),
             .pull_request_id = key.pull_request_id,
@@ -419,11 +463,11 @@ pub const InMemoryStore = struct {
         };
     }
 
-    fn resolveUnknownImpl(ptr: *anyopaque, key: ReviewKey, temp_id: TempId, resolution: UnknownResolution) anyerror!void {
+    fn resolveUnknownImpl(ptr: *anyopaque, key: RemoteReviewIdentity, temp_id: TempId, resolution: UnknownResolution) anyerror!void {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
-        if (self.active_submission) |run| if (ReviewKey.eql(run.key, key)) return error.DraftLocked;
+        if (self.active_submission) |run| if (RemoteReviewIdentity.eql(run.key, key)) return error.DraftLocked;
         for (self.entries.items) |*entry| {
-            if (!ReviewKey.eql(entry.key, key) or entry.draft.local_id != temp_id) continue;
+            if (!RemoteReviewIdentity.eql(entry.key, key) or entry.draft.local_id != temp_id) continue;
             if (entry.draft.state != .outcome_unknown) return error.InvalidUnknownResolution;
             entry.draft.state = switch (resolution) {
                 .posted => |id| .{ .posted = id },
@@ -434,14 +478,14 @@ pub const InMemoryStore = struct {
         return error.DraftNotFound;
     }
 
-    fn checkpointSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: ReviewKey, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) anyerror!void {
+    fn checkpointSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) anyerror!void {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
         if (self.fail_next_checkpoint) {
             self.fail_next_checkpoint = false;
             return error.InjectedCheckpointFailure;
         }
         const run = if (self.active_submission) |*active| active else return error.SubmissionNotActive;
-        if (run.operation_id != operation_id or !ReviewKey.eql(run.key, key) or
+        if (run.operation_id != operation_id or !RemoteReviewIdentity.eql(run.key, key) or
             run.current_temp_id != completed_temp_id)
             return error.InvalidSubmissionCheckpoint;
         if (next_temp_id == completed_temp_id) return error.InvalidSubmissionCheckpoint;
@@ -449,7 +493,7 @@ pub const InMemoryStore = struct {
         var completed: ?*Draft = null;
         var next: ?*Draft = null;
         for (self.entries.items) |*entry| {
-            if (!ReviewKey.eql(entry.key, key)) continue;
+            if (!RemoteReviewIdentity.eql(entry.key, key)) continue;
             if (entry.draft.local_id == completed_temp_id) completed = &entry.draft;
             if (next_temp_id != null and entry.draft.local_id == next_temp_id.?) next = &entry.draft;
         }
@@ -466,27 +510,27 @@ pub const InMemoryStore = struct {
         run.current_temp_id = next_temp_id;
     }
 
-    fn completeSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: ReviewKey, completion: SubmissionCompletion) anyerror!void {
+    fn completeSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity, completion: SubmissionCompletion) anyerror!void {
         const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
         if (self.fail_next_completion) {
             self.fail_next_completion = false;
             return error.InjectedCompletionFailure;
         }
         const run = self.active_submission orelse return error.SubmissionNotActive;
-        if (run.operation_id != operation_id or !ReviewKey.eql(run.key, key))
+        if (run.operation_id != operation_id or !RemoteReviewIdentity.eql(run.key, key))
             return error.InvalidSubmissionCompletion;
 
         switch (completion) {
             .clean => {
                 if (run.current_temp_id != null) return error.InvalidSubmissionCompletion;
                 for (self.entries.items) |entry| {
-                    if (ReviewKey.eql(entry.key, key) and entry.draft.target == .bitbucket and entry.draft.state != .posted)
+                    if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.target == .bitbucket and entry.draft.state != .posted)
                         return error.SubmissionNotClean;
                 }
                 var i: usize = 0;
                 while (i < self.entries.items.len) {
                     const entry = self.entries.items[i];
-                    if (ReviewKey.eql(entry.key, key) and entry.draft.target == .bitbucket and entry.draft.state == .posted) {
+                    if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.target == .bitbucket and entry.draft.state == .posted) {
                         _ = self.entries.orderedRemove(i);
                     } else {
                         i += 1;
@@ -498,7 +542,7 @@ pub const InMemoryStore = struct {
                 const current_id = run.current_temp_id orelse return error.InvalidSubmissionCompletion;
                 var current: ?*Draft = null;
                 for (self.entries.items) |*entry| {
-                    if (ReviewKey.eql(entry.key, key) and entry.draft.local_id == current_id) current = &entry.draft;
+                    if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.local_id == current_id) current = &entry.draft;
                 }
                 const draft = current orelse return error.DraftNotFound;
                 if (draft.state != .submitting) return error.InvalidSubmissionCompletion;
@@ -514,7 +558,7 @@ pub const InMemoryStore = struct {
 // ---------------------------------------------------------------------------
 const testing = std.testing;
 
-fn testReviewKey(pull_request_id: u64) ReviewKey {
+fn testReviewKey(pull_request_id: u64) RemoteReviewIdentity {
     return .{ .workspace = "workspace", .repository = "repo", .pull_request_id = pull_request_id };
 }
 
@@ -569,8 +613,8 @@ test "Pending Reviews with the same PullRequestId are scoped by Repository" {
     var mem = InMemoryStore.init(testing.allocator);
     defer mem.deinit();
     const s = mem.store();
-    const alpha: ReviewKey = .{ .workspace = "ws", .repository = "alpha", .pull_request_id = 1 };
-    const beta: ReviewKey = .{ .workspace = "ws", .repository = "beta", .pull_request_id = 1 };
+    const alpha: RemoteReviewIdentity = .{ .workspace = "ws", .repository = "alpha", .pull_request_id = 1 };
+    const beta: RemoteReviewIdentity = .{ .workspace = "ws", .repository = "beta", .pull_request_id = 1 };
 
     try s.put(alpha, .{ .local_id = 1, .kind = .comment, .body = "alpha draft" });
     try s.put(beta, .{ .local_id = 1, .kind = .comment, .body = "beta draft" });
@@ -632,7 +676,7 @@ test "beginning a Submission atomically records its run and first submitting Dra
     defer arena.deinit();
     const run = (try store.activeSubmission(arena.allocator())).?;
     try testing.expectEqual(operation_id, run.operation_id);
-    try testing.expect(ReviewKey.eql(key, run.key));
+    try testing.expect(RemoteReviewIdentity.eql(key, run.key));
     try testing.expectEqualStrings("source-commit", run.source_commit);
     try testing.expectEqual(@as(?TempId, 1), run.current_temp_id);
 

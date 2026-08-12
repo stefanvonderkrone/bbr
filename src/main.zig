@@ -149,7 +149,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .mouse_enabled = configuration.mouse_enabled,
         .mouse_vertical_scroll_rows = configuration.mouse_vertical_scroll_rows,
         .submission_locks = os_locks.locks(),
-    }, null, try presentation.ReviewKey.init(cred.workspace, target.repo, target.id)) catch |err| {
+    }, null, try presentation.OwnedReviewIdentity.init(cred.workspace, target.repo, target.id)) catch |err| {
         if (tuiFatalMessage(err)) |message| {
             std.debug.print("{s}\n", .{message});
             return;
@@ -211,7 +211,7 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
         std.debug.print("bbr local: cannot resolve repository identity: {s}\n", .{@errorName(err)});
         return;
     };
-    const key = presentation.ReviewKey.initLocal(repository_id, base.canonical, source.canonical) catch {
+    const key = presentation.OwnedReviewIdentity.initLocal(repository_id, base.canonical, source.canonical) catch {
         std.debug.print("bbr local: Ref name is too long\n", .{});
         return;
     };
@@ -515,7 +515,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
         .mouse_enabled = configuration.mouse_enabled,
         .mouse_vertical_scroll_rows = configuration.mouse_vertical_scroll_rows,
         .online = false,
-    }, s, try presentation.ReviewKey.init("", "", pr.id));
+    }, s, try presentation.OwnedReviewIdentity.init("", "", pr.id));
 }
 
 // Test discovery only follows `_ = @import(...)` chains rooted in the *test

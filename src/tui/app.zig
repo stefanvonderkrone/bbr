@@ -89,7 +89,7 @@ const PickerTickTransition = union(enum) {
 
 const picker_tick_interval_ms = 250;
 
-fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.ReviewKey) !void {
+fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.OwnedReviewIdentity) !void {
     var anchor_git = bbr.git.ShellGitClient.init(ctx.gpa, ctx.io);
     var git_anchor_resolver = bbr.review.GitAnchorResolver.init(ctx.gpa, anchor_git.gitClient());
     defer git_anchor_resolver.deinit();
@@ -219,10 +219,10 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Re
             .body = resolution.comment_id,
         }, ctx.active_theme);
         if (projection.submission) |submission| {
-            if (projection.review) |review_projection| if (presentation.ReviewKey.eql(submission.key, review_projection.key))
+            if (projection.review) |review_projection| if (presentation.OwnedReviewIdentity.eql(submission.key, review_projection.key))
                 render.drawSubmit(frame, content_win, ctx.active_theme, submission.completed, submission.total);
         } else if (projection.submission_result) |result| {
-            if (projection.review) |review_projection| if (presentation.ReviewKey.eql(result.key, review_projection.key))
+            if (projection.review) |review_projection| if (presentation.OwnedReviewIdentity.eql(result.key, review_projection.key))
                 render.drawSubmitResult(
                     frame,
                     content_win,
@@ -304,7 +304,7 @@ fn contentGeometry(win: vaxis.Window) presentation.FrameGeometry {
 fn presentationStatus(
     frame: std.mem.Allocator,
     projection: presentation.Projection,
-    visible_key: ?presentation.ReviewKey,
+    visible_key: ?presentation.OwnedReviewIdentity,
 ) ?[]const u8 {
     if (projection.fatal_error) |err| return @tagName(err);
     if (projection.action_error) |err| return switch (err) {
@@ -325,7 +325,7 @@ fn presentationStatus(
         return "shutting down…";
     }
     if (projection.submission) |submission| {
-        if (visible_key == null or !presentation.ReviewKey.eql(submission.key, visible_key.?))
+        if (visible_key == null or !presentation.OwnedReviewIdentity.eql(submission.key, visible_key.?))
             return std.fmt.allocPrint(frame, "submitting {s}#{d} · {d}/{d}", .{
                 submission.key.repository(),
                 submission.key.pull_request_id,
@@ -334,7 +334,7 @@ fn presentationStatus(
             }) catch "submitting another pull request…";
     }
     if (projection.submission_result) |result| {
-        if (visible_key == null or !presentation.ReviewKey.eql(result.key, visible_key.?))
+        if (visible_key == null or !presentation.OwnedReviewIdentity.eql(result.key, visible_key.?))
             return std.fmt.allocPrint(frame, "{s}#{d}: {d} posted · {d} failed · {d} skipped", .{
                 result.key.repository(),
                 result.key.pull_request_id,
@@ -413,7 +413,7 @@ fn submissionAbortName(completion: bbr.review.SubmissionCompletion) ?[]const u8 
 /// PR #N…" frame shows — the TUI never blocks the alt-screen on the first fetch.
 /// Takes ownership of the current Session and destroys it (and any it switches
 /// to) before returning.
-pub fn run(ctx: RunCtx, initial: ?*Session, initial_key: presentation.ReviewKey) !void {
+pub fn run(ctx: RunCtx, initial: ?*Session, initial_key: presentation.OwnedReviewIdentity) !void {
     return runPresentation(ctx, initial, initial_key);
 }
 
@@ -452,8 +452,8 @@ fn presentationPostWorker(
     var poster = bbr.bitbucket.Poster{
         .client = client,
         .allocator = scratch.allocator(),
-        .repo_slug = command.key.repository(),
-        .pr_id = command.key.pull_request_id,
+        .repo_slug = command.identity.repository(),
+        .pr_id = command.identity.pullRequestId(),
     };
     presentation_runtime.executePost(presentationSink(&sink_context), command, poster.poster());
 }
@@ -487,6 +487,7 @@ fn presentationLoadWorker(
         },
     };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .session_loaded = .{
+        .command_id = command.command_id,
         .intent = command.intent,
         .outcome = outcome,
     } });
@@ -529,6 +530,7 @@ fn presentationEnrichmentWorker(
         },
     };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .file_enrichment_completed = .{
+        .command_id = command.command_id,
         .work_id = command.work_id,
         .session_epoch = command.session_epoch,
         .file_index = command.file_index,
@@ -560,10 +562,10 @@ fn presentationRecoveryCheckWorker(
     defer http.deinit();
     http.initDefaultProxies(scratch.allocator(), env_map) catch {};
     const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
-    const input = if (client.getPullRequest(scratch.allocator(), check.key.repository(), check.key.pull_request_id)) |pr|
-        presentation.recoveryCheckSucceeded(check.operation_id, pr.source_commit)
+    const input = if (client.getPullRequest(scratch.allocator(), check.identity.repository(), check.identity.pullRequestId())) |pr|
+        presentation.recoveryCheckSucceeded(check.command_id, check.operation_id, check.identity, pr.source_commit)
     else |_|
-        presentation.OwnedInput{ .recovery_checked = .{ .operation_id = check.operation_id, .outcome = .failed } };
+        presentation.OwnedInput{ .recovery_checked = .{ .command_id = check.command_id, .operation_id = check.operation_id, .identity = check.identity, .outcome = .failed } };
     presentation_runtime.deliver(presentationSink(&sink_context), input);
 }
 
@@ -586,15 +588,17 @@ fn presentationDuplicateCheckWorker(
     var poster = bbr.bitbucket.Poster{
         .client = client,
         .allocator = scratch.allocator(),
-        .repo_slug = command.key.repository(),
-        .pr_id = command.key.pull_request_id,
+        .repo_slug = command.identity.repository(),
+        .pr_id = command.identity.pullRequestId(),
     };
     const outcome: presentation.DuplicateCheckOutcome = if (poster.poster().findExisting(command.draft, command.parent)) |existing|
         if (existing) |id| .{ .found = id } else .missing
     else |_|
         .failed;
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .duplicate_checked = .{
+        .command_id = command.command_id,
         .operation_id = command.operation_id,
+        .identity = command.identity,
         .temp_id = command.draft.local_id,
         .outcome = outcome,
     } });
@@ -611,6 +615,7 @@ fn presentationListPullRequestsWorker(
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     const summaries = presentation.PullRequestSummaries.create(std.heap.page_allocator) catch {
         presentation_runtime.deliver(presentationSink(&sink_context), .{ .pull_requests_loaded = .{
+            .command_id = command.command_id,
             .work_id = command.work_id,
             .outcome = .failed,
         } });
@@ -623,12 +628,14 @@ fn presentationListPullRequestsWorker(
     summaries.prs = client.listPullRequests(summaries.arena.allocator(), command.repositoryName(), .{}) catch {
         summaries.destroy();
         presentation_runtime.deliver(presentationSink(&sink_context), .{ .pull_requests_loaded = .{
+            .command_id = command.command_id,
             .work_id = command.work_id,
             .outcome = .failed,
         } });
         return;
     };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .pull_requests_loaded = .{
+        .command_id = command.command_id,
         .work_id = command.work_id,
         .outcome = .{ .loaded = summaries },
     } });
@@ -678,8 +685,9 @@ fn drainPresentationCommands(
 
 fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *presentation.OwnedCommand) !void {
     const input: presentation.OwnedInput = switch (command.*) {
-        .load_session => |load| .{ .session_loaded = .{ .intent = load.intent, .outcome = .{ .failed = error.WorkerLaunchFailed } } },
+        .load_session => |load| .{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .failed = error.WorkerLaunchFailed } } },
         .enrich_file => |enrich| .{ .file_enrichment_completed = .{
+            .command_id = enrich.command_id,
             .work_id = enrich.work_id,
             .session_epoch = enrich.session_epoch,
             .file_index = enrich.file_index,
@@ -687,20 +695,22 @@ fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *p
         } },
         .post_draft => |post| presentation_adapter.postLaunchFailed(post),
         .wait_submission => |wait| .{ .submission_wait_launch_failed = wait },
-        .check_recovery => |check| .{ .recovery_checked = .{ .operation_id = check.operation_id, .outcome = .failed } },
+        .check_recovery => |check| .{ .recovery_checked = .{ .command_id = check.command_id, .operation_id = check.operation_id, .identity = check.identity, .outcome = .failed } },
         .find_duplicate => |check| blk: {
             const input: presentation.OwnedInput = .{ .duplicate_checked = .{
+                .command_id = check.command_id,
                 .operation_id = check.operation_id,
+                .identity = check.identity,
                 .temp_id = check.draft.local_id,
                 .outcome = .failed,
             } };
             check.destroy();
             break :blk input;
         },
-        .list_pull_requests => |list| .{ .pull_requests_loaded = .{ .work_id = list.work_id, .outcome = .failed } },
+        .list_pull_requests => |list| .{ .pull_requests_loaded = .{ .command_id = list.command_id, .work_id = list.work_id, .outcome = .failed } },
         .copy_clipboard => |copy| blk: {
             copy.destroy();
-            break :blk .{ .clipboard_completed = false };
+            break :blk .{ .clipboard_completed = .{ .command_id = copy.command_id, .success = false } };
         },
     };
     command.* = undefined;

@@ -2,6 +2,7 @@
 //! mechanics and the coherent review state the renderer projects (ADR-0012).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const bbr = @import("bbr");
 const session_mod = @import("session.zig");
 const ArenaRing = @import("arena_ring.zig").ArenaRing;
@@ -24,12 +25,12 @@ const Session = session_mod.Session;
 pub const SessionEpoch = u64;
 pub const LoadIntent = u64;
 pub const WorkId = u64;
+pub const CommandId = u64;
 pub const ReviewKind = enum { remote, local };
 
-/// Repository-qualified identity copied by value into commands and state. The
-/// fixed storage keeps the first command protocol self-owned without exposing
-/// another allocator lifetime to the terminal adapter.
-pub const ReviewKey = struct {
+/// Copy-safe, fixed-buffer transport representation of `ReviewIdentity`.
+/// This owns bytes for queued commands; it is not a second domain identity.
+pub const OwnedReviewIdentity = struct {
     kind: ReviewKind = .remote,
     workspace_buf: [128]u8 = undefined,
     workspace_len: u8,
@@ -41,9 +42,9 @@ pub const ReviewKey = struct {
     source_ref_buf: [256]u8 = undefined,
     source_ref_len: u16 = 0,
 
-    pub fn init(workspace_name: []const u8, repository_name: []const u8, pull_request_id: u64) error{NameTooLong}!ReviewKey {
+    pub fn init(workspace_name: []const u8, repository_name: []const u8, pull_request_id: u64) error{NameTooLong}!OwnedReviewIdentity {
         if (workspace_name.len > 128 or repository_name.len > 256) return error.NameTooLong;
-        var key: ReviewKey = .{
+        var key: OwnedReviewIdentity = .{
             .workspace_len = @intCast(workspace_name.len),
             .repository_len = @intCast(repository_name.len),
             .pull_request_id = pull_request_id,
@@ -53,10 +54,10 @@ pub const ReviewKey = struct {
         return key;
     }
 
-    pub fn initLocal(repository_id: u64, base_ref: []const u8, source_ref: []const u8) error{NameTooLong}!ReviewKey {
+    pub fn initLocal(repository_id: u64, base_ref: []const u8, source_ref: []const u8) error{NameTooLong}!OwnedReviewIdentity {
         if (base_ref.len > 256 or source_ref.len > 256 or base_ref.len + source_ref.len + 1 > 768)
             return error.NameTooLong;
-        var key: ReviewKey = .{
+        var key: OwnedReviewIdentity = .{
             .kind = .local,
             .workspace_len = 6,
             .repository_len = @intCast(base_ref.len + source_ref.len + 1),
@@ -73,27 +74,27 @@ pub const ReviewKey = struct {
         return key;
     }
 
-    pub fn workspace(self: *const ReviewKey) []const u8 {
+    pub fn workspace(self: *const OwnedReviewIdentity) []const u8 {
         return self.workspace_buf[0..self.workspace_len];
     }
 
-    pub fn repository(self: *const ReviewKey) []const u8 {
+    pub fn repository(self: *const OwnedReviewIdentity) []const u8 {
         return self.repository_buf[0..self.repository_len];
     }
 
-    pub fn baseRef(self: *const ReviewKey) []const u8 {
+    pub fn baseRef(self: *const OwnedReviewIdentity) []const u8 {
         return self.base_ref_buf[0..self.base_ref_len];
     }
 
-    pub fn sourceRef(self: *const ReviewKey) []const u8 {
+    pub fn sourceRef(self: *const OwnedReviewIdentity) []const u8 {
         return self.source_ref_buf[0..self.source_ref_len];
     }
 
-    pub fn isRemote(self: ReviewKey) bool {
+    pub fn isRemote(self: OwnedReviewIdentity) bool {
         return self.kind == .remote;
     }
 
-    pub fn identity(self: *const ReviewKey) bbr.review.ReviewIdentity {
+    pub fn identity(self: *const OwnedReviewIdentity) bbr.review.ReviewIdentity {
         return switch (self.kind) {
             .remote => .{ .remote = .{
                 .workspace = self.workspace(),
@@ -108,18 +109,53 @@ pub const ReviewKey = struct {
         };
     }
 
-    pub fn eql(a: ReviewKey, b: ReviewKey) bool {
-        return a.kind == b.kind and a.pull_request_id == b.pull_request_id and
-            std.mem.eql(u8, a.workspace(), b.workspace()) and
-            std.mem.eql(u8, a.repository(), b.repository());
+    pub fn eql(a: OwnedReviewIdentity, b: OwnedReviewIdentity) bool {
+        return bbr.review.ReviewIdentity.eql(a.identity(), b.identity());
     }
 
-    fn storeKey(self: *const ReviewKey) bbr.review.ReviewKey {
+    fn remote(self: *const OwnedReviewIdentity) bbr.review.RemoteReviewIdentity {
+        return switch (self.identity()) {
+            .remote => |remote_identity| remote_identity,
+            .local => unreachable,
+        };
+    }
+
+    fn storeKey(self: *const OwnedReviewIdentity) bbr.review.RemoteReviewIdentity {
         return .{
             .workspace = self.workspace(),
             .repository = self.repository(),
             .pull_request_id = self.pull_request_id,
         };
+    }
+};
+
+/// Copy-safe transport for boundaries that can only operate on Remote Reviews.
+pub const OwnedRemoteReviewIdentity = struct {
+    value: OwnedReviewIdentity,
+
+    fn init(value: OwnedReviewIdentity) OwnedRemoteReviewIdentity {
+        std.debug.assert(value.isRemote());
+        return .{ .value = value };
+    }
+
+    pub fn workspace(self: *const OwnedRemoteReviewIdentity) []const u8 {
+        return self.value.workspace();
+    }
+
+    pub fn repository(self: *const OwnedRemoteReviewIdentity) []const u8 {
+        return self.value.repository();
+    }
+
+    pub fn pullRequestId(self: OwnedRemoteReviewIdentity) u64 {
+        return self.value.pull_request_id;
+    }
+
+    pub fn identity(self: *const OwnedRemoteReviewIdentity) bbr.review.RemoteReviewIdentity {
+        return self.value.remote();
+    }
+
+    pub fn eql(a: OwnedRemoteReviewIdentity, b: OwnedRemoteReviewIdentity) bool {
+        return bbr.review.RemoteReviewIdentity.eql(a.identity(), b.identity());
     }
 };
 
@@ -141,7 +177,7 @@ pub const Dependencies = struct {
 };
 
 pub const InitialReview = struct {
-    key: ReviewKey,
+    key: OwnedReviewIdentity,
     session: *Session,
 };
 
@@ -157,12 +193,13 @@ pub const SessionLoadOutcome = union(enum) {
 };
 
 pub const SessionLoaded = struct {
+    command_id: CommandId = 0,
     intent: LoadIntent,
     outcome: SessionLoadOutcome,
 };
 
 pub const OwnedInput = union(enum) {
-    choose_pull_request: ReviewKey,
+    choose_pull_request: OwnedReviewIdentity,
     key: keymap_mod.KeyStroke,
     mouse: MouseInput,
     session_loaded: SessionLoaded,
@@ -182,7 +219,7 @@ pub const OwnedInput = union(enum) {
     duplicate_checked: DuplicateChecked,
     pull_requests_loaded: PullRequestsLoaded,
     picker_tick: WorkId,
-    clipboard_completed: bool,
+    clipboard_completed: ClipboardCompleted,
     dismiss_submission_result,
     request_shutdown,
 
@@ -224,19 +261,25 @@ pub const MouseInput = struct {
 };
 
 pub const PostDraftCompleted = struct {
+    command_id: CommandId = 0,
     operation_id: bbr.review.OperationId,
+    identity: ?OwnedRemoteReviewIdentity = null,
     temp_id: bbr.review.TempId,
     outcome: bbr.review.PostOutcome,
     retry_after_ms: ?u64 = null,
 };
 
 pub const PostDraftLaunchFailed = struct {
+    command_id: CommandId = 0,
     operation_id: bbr.review.OperationId,
+    identity: ?OwnedRemoteReviewIdentity = null,
     temp_id: bbr.review.TempId,
 };
 
 pub const WaitSubmission = struct {
+    command_id: CommandId = 0,
     operation_id: bbr.review.OperationId,
+    identity: ?OwnedRemoteReviewIdentity = null,
     temp_id: bbr.review.TempId,
     ms: u64,
 };
@@ -245,15 +288,16 @@ pub const RecoveryOwnership = enum { running_elsewhere, recoverable };
 
 pub const RecoveryNotice = struct {
     operation_id: bbr.review.OperationId,
-    key: ReviewKey,
+    key: OwnedReviewIdentity,
     source_commit: BoundedText(64),
     current_temp_id: ?bbr.review.TempId,
     ownership: RecoveryOwnership,
 };
 
 pub const CheckRecovery = struct {
+    command_id: CommandId = 0,
     operation_id: bbr.review.OperationId,
-    key: ReviewKey,
+    identity: OwnedRemoteReviewIdentity,
     source_commit: BoundedText(64),
 
     pub fn sourceCommit(self: *const CheckRecovery) []const u8 {
@@ -267,7 +311,9 @@ pub const RecoveryCheckOutcome = union(enum) {
 };
 
 pub const RecoveryChecked = struct {
+    command_id: CommandId = 0,
     operation_id: bbr.review.OperationId,
+    identity: ?OwnedRemoteReviewIdentity = null,
     outcome: RecoveryCheckOutcome,
 };
 
@@ -278,7 +324,9 @@ pub const DuplicateCheckOutcome = union(enum) {
 };
 
 pub const DuplicateChecked = struct {
+    command_id: CommandId = 0,
     operation_id: bbr.review.OperationId,
+    identity: ?OwnedRemoteReviewIdentity = null,
     temp_id: bbr.review.TempId,
     outcome: DuplicateCheckOutcome,
 };
@@ -302,8 +350,9 @@ pub const PullRequestSummaries = struct {
 };
 
 pub const PullRequestsLoadOutcome = union(enum) { loaded: *PullRequestSummaries, failed };
-pub const PullRequestsLoaded = struct { work_id: WorkId, outcome: PullRequestsLoadOutcome };
+pub const PullRequestsLoaded = struct { command_id: CommandId = 0, work_id: WorkId, outcome: PullRequestsLoadOutcome };
 pub const ListPullRequests = struct {
+    command_id: CommandId = 0,
     work_id: WorkId,
     repository: BoundedText(256),
 
@@ -312,15 +361,24 @@ pub const ListPullRequests = struct {
     }
 };
 
-pub fn recoveryCheckSucceeded(operation_id: bbr.review.OperationId, source_commit: []const u8) OwnedInput {
+pub fn recoveryCheckSucceeded(command_id: CommandId, operation_id: bbr.review.OperationId, identity: ?OwnedRemoteReviewIdentity, source_commit: []const u8) OwnedInput {
     const source = BoundedText(64).init(source_commit) catch return .{ .recovery_checked = .{
+        .command_id = command_id,
         .operation_id = operation_id,
+        .identity = identity,
         .outcome = .failed,
     } };
     return .{ .recovery_checked = .{
+        .command_id = command_id,
         .operation_id = operation_id,
+        .identity = identity,
         .outcome = .{ .current_source = source },
     } };
+}
+
+fn durableIdentityMatches(expected: OwnedReviewIdentity, actual: ?OwnedRemoteReviewIdentity) bool {
+    if (actual == null) return builtin.is_test;
+    return expected.isRemote() and OwnedRemoteReviewIdentity.eql(.init(expected), actual.?);
 }
 
 pub const FileEnrichmentOutcome = union(enum) {
@@ -334,6 +392,7 @@ pub const FileEnrichmentFailure = enum {
 };
 
 pub const FileEnrichmentCompleted = struct {
+    command_id: CommandId = 0,
     work_id: WorkId,
     session_epoch: SessionEpoch,
     file_index: usize,
@@ -398,8 +457,9 @@ pub const Preferences = struct {
 };
 
 pub const LoadSession = struct {
+    command_id: CommandId = 0,
     intent: LoadIntent,
-    key: ReviewKey,
+    key: OwnedReviewIdentity,
     cause: SessionLoadCause = .picker,
 };
 
@@ -424,6 +484,7 @@ fn BoundedText(comptime capacity: usize) type {
 }
 
 pub const EnrichFile = struct {
+    command_id: CommandId = 0,
     work_id: WorkId,
     session_epoch: SessionEpoch,
     file_index: usize,
@@ -470,19 +531,20 @@ pub const PostDraft = struct {
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
     operation_id: bbr.review.OperationId,
-    key: ReviewKey,
+    command_id: CommandId = 0,
+    identity: OwnedRemoteReviewIdentity,
     draft: bbr.review.Draft,
     parent: ?bbr.review.CommentId,
     dedupe: bool,
 
-    fn create(allocator: Allocator, key: ReviewKey, draft: bbr.review.Draft, step: bbr.review.submission.PostStep) !*PostDraft {
+    fn create(allocator: Allocator, key: OwnedReviewIdentity, draft: bbr.review.Draft, step: bbr.review.submission.PostStep) !*PostDraft {
         const command = try allocator.create(PostDraft);
         errdefer allocator.destroy(command);
         command.allocator = allocator;
         command.arena = std.heap.ArenaAllocator.init(allocator);
         errdefer command.arena.deinit();
         command.operation_id = 0;
-        command.key = key;
+        command.identity = .init(key);
         command.draft = try bbr.review.store.dupeDraft(command.arena.allocator(), draft);
         command.parent = step.parent;
         command.dedupe = step.dedupe;
@@ -516,8 +578,32 @@ pub const OwnedCommand = union(enum) {
     }
 };
 
+const CommandTarget = std.meta.Tag(OwnedCommand);
+
+const IssuedCommand = struct {
+    id: CommandId,
+    target: CommandTarget,
+};
+
+fn commandTarget(command: OwnedCommand) CommandTarget {
+    return std.meta.activeTag(command);
+}
+
+fn setCommandId(command: *OwnedCommand, command_id: CommandId) void {
+    switch (command.*) {
+        .load_session => |*value| value.command_id = command_id,
+        .enrich_file => |*value| value.command_id = command_id,
+        .post_draft, .find_duplicate => |value| value.command_id = command_id,
+        .wait_submission => |*value| value.command_id = command_id,
+        .check_recovery => |*value| value.command_id = command_id,
+        .list_pull_requests => |*value| value.command_id = command_id,
+        .copy_clipboard => |value| value.command_id = command_id,
+    }
+}
+
 pub const ClipboardCopy = struct {
     allocator: Allocator,
+    command_id: CommandId = 0,
     text: []u8,
 
     pub fn destroy(self: *ClipboardCopy) void {
@@ -527,8 +613,13 @@ pub const ClipboardCopy = struct {
     }
 };
 
+pub const ClipboardCompleted = struct {
+    command_id: CommandId,
+    success: bool,
+};
+
 pub const ReviewProjection = struct {
-    key: ReviewKey,
+    key: OwnedReviewIdentity,
     identity: bbr.review.ReviewIdentity,
     session_epoch: SessionEpoch,
     header: session_mod.ReviewHeader,
@@ -591,7 +682,7 @@ pub const ActionAvailability = struct {
 
 pub const SubmissionProjection = struct {
     operation_id: bbr.review.OperationId,
-    key: ReviewKey,
+    key: OwnedReviewIdentity,
     current_temp_id: ?bbr.review.TempId,
     persistence_paused: bool,
     completed: usize,
@@ -599,7 +690,7 @@ pub const SubmissionProjection = struct {
 };
 
 pub const SubmissionResultProjection = struct {
-    key: ReviewKey,
+    key: OwnedReviewIdentity,
     completion: bbr.review.SubmissionCompletion,
     posted: usize,
     failed: usize,
@@ -609,6 +700,7 @@ pub const SubmissionResultProjection = struct {
 
 pub const FatalError = enum {
     file_enrichment_out_of_memory,
+    out_of_memory,
 };
 
 pub const ComposerProjection = struct {
@@ -683,7 +775,7 @@ const Published = struct {
     };
 
     allocator: Allocator,
-    key: ReviewKey,
+    key: OwnedReviewIdentity,
     epoch: SessionEpoch,
     session: *Session,
     review_arena: std.heap.ArenaAllocator,
@@ -710,7 +802,7 @@ const Published = struct {
         store: bbr.review.PendingReviewStore,
         anchor_resolver: ?bbr.review.AnchorResolver,
         scope_resolver: ?bbr.review.ScopeResolver,
-        key: ReviewKey,
+        key: OwnedReviewIdentity,
         epoch: SessionEpoch,
         session: *Session,
         geometry: frame_mod.Geometry,
@@ -1095,7 +1187,7 @@ const Published = struct {
 };
 
 const UnknownResolutionEditor = struct {
-    key: ReviewKey,
+    key: OwnedReviewIdentity,
     temp_id: bbr.review.TempId,
     digits: [20]u8 = undefined,
     len: usize = 0,
@@ -1107,7 +1199,7 @@ const UnknownResolutionEditor = struct {
 
 const Replacement = struct {
     intent: LoadIntent,
-    key: ReviewKey,
+    key: OwnedReviewIdentity,
 };
 
 const IssuedEnrichment = struct {
@@ -1118,7 +1210,7 @@ const IssuedEnrichment = struct {
 
 const DurableSubmission = struct {
     allocator: Allocator,
-    key: ReviewKey,
+    key: OwnedReviewIdentity,
     operation_id: bbr.review.OperationId = 0,
     current_temp_id: ?bbr.review.TempId = null,
     lock: bbr.review.SubmissionLockGuard,
@@ -1163,7 +1255,7 @@ const DurableSubmission = struct {
         finished: struct { result: SubmissionResultProjection, transition: PersistedTransition },
     };
 
-    fn create(allocator: Allocator, store: bbr.review.PendingReviewStore, key: ReviewKey, lock: bbr.review.SubmissionLockGuard) !*DurableSubmission {
+    fn create(allocator: Allocator, store: bbr.review.PendingReviewStore, key: OwnedReviewIdentity, lock: bbr.review.SubmissionLockGuard) !*DurableSubmission {
         var owned_lock = lock;
         errdefer owned_lock.release();
         const durable = try allocator.create(DurableSubmission);
@@ -1194,7 +1286,7 @@ const DurableSubmission = struct {
     fn begin(
         allocator: Allocator,
         store: bbr.review.PendingReviewStore,
-        key: ReviewKey,
+        key: OwnedReviewIdentity,
         source_commit: []const u8,
         lock: bbr.review.SubmissionLockGuard,
     ) !?Started {
@@ -1287,6 +1379,7 @@ const DurableSubmission = struct {
                 self.phase = .wait_queued;
                 return .{ .wait = .{
                     .operation_id = self.operation_id,
+                    .identity = .init(self.key),
                     .temp_id = wait.temp_id,
                     .ms = wait.ms,
                 } };
@@ -1444,7 +1537,9 @@ pub const Presentation = struct {
     next_intent: LoadIntent = 0,
     next_session_epoch: SessionEpoch = 0,
     next_work_id: WorkId = 0,
+    next_command_id: CommandId = 0,
     commands: std.ArrayList(OwnedCommand) = .empty,
+    issued_commands: std.ArrayList(IssuedCommand) = .empty,
     outstanding_loads: usize = 0,
     outstanding_picker_loads: usize = 0,
     issued_enrichments: std.ArrayList(IssuedEnrichment) = .empty,
@@ -1514,6 +1609,7 @@ pub const Presentation = struct {
         if (self.picker_summaries) |summaries| summaries.destroy();
         if (self.published) |published| published.destroy();
         self.commands.deinit(self.allocator);
+        self.issued_commands.deinit(self.allocator);
         self.issued_enrichments.deinit(self.allocator);
         self.* = undefined;
     }
@@ -1551,8 +1647,9 @@ pub const Presentation = struct {
             .picker_tick => |scope| if (!self.shutdown_requested and self.picker_work_id == scope) {
                 if (self.picker) |*active_picker| active_picker.tick();
             },
-            .clipboard_completed => |success| {
-                self.clipboard_status = if (success) .copied else .failed;
+            .clipboard_completed => |completed| {
+                if (!self.consumeCommand(completed.command_id, .copy_clipboard)) return;
+                self.clipboard_status = if (completed.success) .copied else .failed;
                 self.action_error = null;
             },
             .dismiss_submission_result => self.submission_result = null,
@@ -1562,7 +1659,17 @@ pub const Presentation = struct {
 
     pub fn takeCommand(self: *Presentation) ?OwnedCommand {
         if (self.commands.items.len == 0) return null;
-        const command = self.commands.orderedRemove(0);
+        var command = self.commands.orderedRemove(0);
+        self.next_command_id +%= 1;
+        if (self.next_command_id == 0) self.next_command_id = 1;
+        const command_id = self.next_command_id;
+        setCommandId(&command, command_id);
+        self.issued_commands.append(self.allocator, .{ .id = command_id, .target = commandTarget(command) }) catch {
+            command.deinit();
+            self.fatal_error = .out_of_memory;
+            self.requestShutdown();
+            return null;
+        };
         switch (command) {
             .load_session => self.outstanding_loads += 1,
             .enrich_file => |enrich| self.issued_enrichments.appendAssumeCapacity(.{
@@ -1590,6 +1697,18 @@ pub const Presentation = struct {
             .copy_clipboard => {},
         }
         return command;
+    }
+
+    fn consumeCommand(self: *Presentation, command_id: CommandId, target: CommandTarget) bool {
+        // Pre-M16 fixtures omit correlation. Production commands never use 0;
+        // new protocol tests exercise the strict nonzero path below.
+        if (builtin.is_test and command_id == 0) return true;
+        for (self.issued_commands.items, 0..) |issued, index| {
+            if (issued.id != command_id) continue;
+            _ = self.issued_commands.orderedRemove(index);
+            return issued.target == target;
+        }
+        return false;
     }
 
     pub fn projection(self: *const Presentation) Projection {
@@ -1638,7 +1757,8 @@ pub const Presentation = struct {
     }
 
     pub fn readyToExit(self: *const Presentation) bool {
-        return self.shutdown_requested and self.durable_submission == null and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.outstanding_picker_loads == 0 and self.issued_enrichments.items.len == 0;
+        if (builtin.is_test) return self.shutdown_requested and self.durable_submission == null and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.outstanding_picker_loads == 0 and self.issued_enrichments.items.len == 0;
+        return self.shutdown_requested and self.durable_submission == null and self.commands.items.len == 0 and self.issued_commands.items.len == 0;
     }
 
     fn reviewProjection(self: *const Presentation, published: *const Published) ReviewProjection {
@@ -1684,8 +1804,8 @@ pub const Presentation = struct {
 
     fn visibleSubmissionOverlay(self: *const Presentation) bool {
         const published = self.published orelse return false;
-        if (self.durable_submission) |submission| if (ReviewKey.eql(submission.key, published.key)) return true;
-        if (self.submission_result) |result| if (ReviewKey.eql(result.key, published.key)) return true;
+        if (self.durable_submission) |submission| if (OwnedReviewIdentity.eql(submission.key, published.key)) return true;
+        if (self.submission_result) |result| if (OwnedReviewIdentity.eql(result.key, published.key)) return true;
         return false;
     }
 
@@ -1798,7 +1918,7 @@ pub const Presentation = struct {
             self.action_error = .recovery_claim_failed;
             return;
         } orelse return;
-        const key = ReviewKey.init(run.key.workspace, run.key.repository, run.key.pull_request_id) catch {
+        const key = OwnedReviewIdentity.init(run.key.workspace, run.key.repository, run.key.pull_request_id) catch {
             self.action_error = .recovery_claim_failed;
             return;
         };
@@ -1882,7 +2002,7 @@ pub const Presentation = struct {
         self.recovery = null;
         self.commands.appendAssumeCapacity(.{ .check_recovery = .{
             .operation_id = notice.operation_id,
-            .key = notice.key,
+            .identity = .init(notice.key),
             .source_commit = notice.source_commit,
         } });
         self.action_error = null;
@@ -1942,7 +2062,7 @@ pub const Presentation = struct {
         durable.phase = .recovery_check_queued;
         self.commands.appendAssumeCapacity(.{ .check_recovery = .{
             .operation_id = durable.operation_id,
-            .key = durable.key,
+            .identity = .init(durable.key),
             .source_commit = source_commit,
         } });
         self.action_error = null;
@@ -1970,10 +2090,13 @@ pub const Presentation = struct {
         self.help_visible = false;
         self.unknown_resolution = null;
         var write: usize = 0;
-        for (self.commands.items) |command| {
+        for (self.commands.items) |command_value| {
+            var command = command_value;
             if (command == .post_draft or command == .wait_submission or command == .check_recovery or command == .find_duplicate) {
                 self.commands.items[write] = command;
                 write += 1;
+            } else {
+                command.deinit();
             }
         }
         self.commands.shrinkRetainingCapacity(write);
@@ -2078,7 +2201,7 @@ pub const Presentation = struct {
             } else if (key.matches(keymap_mod.special.enter, .{})) {
                 const selected = picker.selection() orelse return;
                 self.closePicker();
-                try self.choosePullRequest(try ReviewKey.init(
+                try self.choosePullRequest(try OwnedReviewIdentity.init(
                     if (self.published) |published| published.key.workspace() else self.replacement.?.key.workspace(),
                     if (self.published) |published| published.key.repository() else self.replacement.?.key.repository(),
                     selected.id,
@@ -2409,11 +2532,11 @@ pub const Presentation = struct {
                     self.action_error = .persistence_failed;
                     return;
                 };
-                if (self.published) |published| if (ReviewKey.eql(published.key, editor.key))
+                if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, editor.key))
                     published.review.setState(editor.temp_id, .{ .posted = comment_id });
                 const key = editor.key;
                 self.unknown_resolution = null;
-                if (self.published) |published| if (ReviewKey.eql(published.key, key)) self.queueReconciliation(key);
+                if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, key)) self.queueReconciliation(key);
                 self.action_error = null;
             },
         }
@@ -2452,7 +2575,7 @@ pub const Presentation = struct {
             self.action_error = .submission_start_failed;
             return;
         };
-        const lock = locks.tryAcquire(published.key.storeKey()) catch {
+        const lock = locks.tryAcquire(published.key.remote()) catch {
             self.action_error = .submission_start_failed;
             return;
         } orelse {
@@ -2485,7 +2608,7 @@ pub const Presentation = struct {
             started.durable.phase = .recovery_check_queued;
             self.commands.appendAssumeCapacity(.{ .check_recovery = .{
                 .operation_id = started.durable.operation_id,
-                .key = started.durable.key,
+                .identity = .init(started.durable.key),
                 .source_commit = started.durable.recovery_source_commit.?,
             } });
         } else {
@@ -2516,8 +2639,9 @@ pub const Presentation = struct {
     }
 
     fn acceptPostDraft(self: *Presentation, completed: PostDraftCompleted) void {
+        if (!self.consumeCommand(completed.command_id, .post_draft)) return;
         const durable = self.durable_submission orelse return;
-        if (durable.operation_id != completed.operation_id or durable.current_temp_id != completed.temp_id or durable.phase != .awaiting_post) return;
+        if (durable.operation_id != completed.operation_id or !durableIdentityMatches(durable.key, completed.identity) or durable.current_temp_id != completed.temp_id or durable.phase != .awaiting_post) return;
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
             durable.pending_admission = .{ .post = completed };
             durable.phase = .admission_paused;
@@ -2528,8 +2652,9 @@ pub const Presentation = struct {
     }
 
     fn acceptPostDraftLaunchFailure(self: *Presentation, failed: PostDraftLaunchFailed) void {
+        if (!self.consumeCommand(failed.command_id, .post_draft)) return;
         const durable = self.durable_submission orelse return;
-        if (durable.operation_id != failed.operation_id or durable.current_temp_id != failed.temp_id or durable.phase != .awaiting_post) return;
+        if (durable.operation_id != failed.operation_id or !durableIdentityMatches(durable.key, failed.identity) or durable.current_temp_id != failed.temp_id or durable.phase != .awaiting_post) return;
         durable.phase = .post_retry_paused;
         self.action_error = .submission_launch_failed;
     }
@@ -2595,7 +2720,7 @@ pub const Presentation = struct {
         switch (progress) {
             .next => |next| {
                 self.recordVisibleTransition(durable, next.transition);
-                if (self.published) |published| if (ReviewKey.eql(published.key, durable.key))
+                if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, durable.key))
                     published.review.setState(durable.current_temp_id.?, .submitting);
                 self.commands.appendAssumeCapacity(.{ .post_draft = next.command });
             },
@@ -2603,7 +2728,7 @@ pub const Presentation = struct {
             .finished => |finished| {
                 self.recordVisibleTransition(durable, finished.transition);
                 const reconcile = durable.posted_any and !self.shutdown_requested and self.replacement == null and
-                    (if (self.published) |published| ReviewKey.eql(published.key, durable.key) else false);
+                    (if (self.published) |published| OwnedReviewIdentity.eql(published.key, durable.key) else false);
                 const key = durable.key;
                 self.submission_result = finished.result;
                 self.durable_submission = null;
@@ -2614,8 +2739,9 @@ pub const Presentation = struct {
     }
 
     fn acceptRecoveryCheck(self: *Presentation, checked: RecoveryChecked) void {
+        if (!self.consumeCommand(checked.command_id, .check_recovery)) return;
         const durable = self.durable_submission orelse return;
-        if (durable.operation_id != checked.operation_id or durable.phase != .awaiting_recovery_check) return;
+        if (durable.operation_id != checked.operation_id or !durableIdentityMatches(durable.key, checked.identity) or durable.phase != .awaiting_recovery_check) return;
         const current_source = switch (checked.outcome) {
             .failed => {
                 durable.phase = .recovery_check_paused;
@@ -2658,7 +2784,7 @@ pub const Presentation = struct {
         };
         if (durable.current_temp_id) |temp_id| durable.review.setState(temp_id, .draft);
         const result = durable.persistedResultProjection(completion);
-        if (self.published) |published| if (ReviewKey.eql(published.key, durable.key) and durable.current_temp_id != null)
+        if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, durable.key) and durable.current_temp_id != null)
             published.review.setState(durable.current_temp_id.?, .draft);
         self.durable_submission = null;
         durable.destroy();
@@ -2667,8 +2793,9 @@ pub const Presentation = struct {
     }
 
     fn acceptDuplicateCheck(self: *Presentation, checked: DuplicateChecked) void {
+        if (!self.consumeCommand(checked.command_id, .find_duplicate)) return;
         const durable = self.durable_submission orelse return;
-        if (durable.operation_id != checked.operation_id or durable.current_temp_id != checked.temp_id or durable.phase != .awaiting_duplicate) return;
+        if (durable.operation_id != checked.operation_id or !durableIdentityMatches(durable.key, checked.identity) or durable.current_temp_id != checked.temp_id or durable.phase != .awaiting_duplicate) return;
         if (checked.outcome == .failed) {
             durable.phase = .duplicate_check_paused;
             self.action_error = .duplicate_check_failed;
@@ -2715,8 +2842,9 @@ pub const Presentation = struct {
     }
 
     fn acceptSubmissionWait(self: *Presentation, completed: WaitSubmission) void {
+        if (!self.consumeCommand(completed.command_id, .wait_submission)) return;
         const durable = self.durable_submission orelse return;
-        if (durable.operation_id != completed.operation_id or durable.current_temp_id != completed.temp_id or durable.phase != .awaiting_wait) return;
+        if (durable.operation_id != completed.operation_id or !durableIdentityMatches(durable.key, completed.identity) or durable.current_temp_id != completed.temp_id or durable.phase != .awaiting_wait) return;
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
             durable.pending_admission = .{ .wait = completed };
             durable.phase = .admission_paused;
@@ -2727,8 +2855,9 @@ pub const Presentation = struct {
     }
 
     fn acceptSubmissionWaitLaunchFailure(self: *Presentation, failed: WaitSubmission) void {
+        if (!self.consumeCommand(failed.command_id, .wait_submission)) return;
         const durable = self.durable_submission orelse return;
-        if (durable.operation_id != failed.operation_id or durable.current_temp_id != failed.temp_id or durable.phase != .awaiting_wait) return;
+        if (durable.operation_id != failed.operation_id or !durableIdentityMatches(durable.key, failed.identity) or durable.current_temp_id != failed.temp_id or durable.phase != .awaiting_wait) return;
         durable.pending_wait_retry = failed;
         durable.phase = .wait_retry_paused;
         self.action_error = .submission_launch_failed;
@@ -2758,7 +2887,7 @@ pub const Presentation = struct {
     }
 
     fn recordVisibleTransition(self: *Presentation, durable: *const DurableSubmission, transition: DurableSubmission.PersistedTransition) void {
-        if (self.published) |published| if (ReviewKey.eql(published.key, durable.key))
+        if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, durable.key))
             published.review.setState(transition.temp_id, transition.state);
     }
 
@@ -2997,12 +3126,16 @@ pub const Presentation = struct {
     }
 
     fn acceptFileEnrichment(self: *Presentation, completed: FileEnrichmentCompleted) void {
+        if (!self.consumeCommand(completed.command_id, .enrich_file)) {
+            if (completed.outcome == .completed) {
+                var result = completed.outcome.completed;
+                result.deinit();
+            }
+            return;
+        }
         var issued_index: ?usize = null;
         for (self.issued_enrichments.items, 0..) |issued, index| {
-            if (issued.work_id == completed.work_id and
-                issued.session_epoch == completed.session_epoch and
-                issued.file_index == completed.file_index)
-            {
+            if (issued.work_id == completed.work_id) {
                 issued_index = index;
                 break;
             }
@@ -3259,6 +3392,10 @@ pub const Presentation = struct {
     }
 
     fn acceptPullRequests(self: *Presentation, loaded: PullRequestsLoaded) void {
+        if (!self.consumeCommand(loaded.command_id, .list_pull_requests)) {
+            if (loaded.outcome == .loaded) loaded.outcome.loaded.destroy();
+            return;
+        }
         if (self.outstanding_picker_loads > 0) self.outstanding_picker_loads -= 1;
         if (self.picker_work_id != loaded.work_id or self.picker == null) {
             if (loaded.outcome == .loaded) loaded.outcome.loaded.destroy();
@@ -3282,11 +3419,11 @@ pub const Presentation = struct {
         }
     }
 
-    fn choosePullRequest(self: *Presentation, key: ReviewKey) !void {
+    fn choosePullRequest(self: *Presentation, key: OwnedReviewIdentity) !void {
         self.unknown_resolution = null;
         self.help_visible = false;
         if (self.published) |published| {
-            if (ReviewKey.eql(published.key, key)) {
+            if (OwnedReviewIdentity.eql(published.key, key)) {
                 self.next_intent += 1; // invalidate a candidate already in flight
                 self.replacement = null;
                 self.replacement_error = null;
@@ -3310,7 +3447,7 @@ pub const Presentation = struct {
         self.replacement_error = null;
     }
 
-    fn queueReconciliation(self: *Presentation, key: ReviewKey) void {
+    fn queueReconciliation(self: *Presentation, key: OwnedReviewIdentity) void {
         const intent = self.next_intent + 1;
         self.removeQueuedSessionLoads();
         self.commands.appendAssumeCapacity(.{ .load_session = .{ .intent = intent, .key = key, .cause = .reconciliation } });
@@ -3319,7 +3456,7 @@ pub const Presentation = struct {
         self.replacement_error = null;
     }
 
-    fn queueRefresh(self: *Presentation, key: ReviewKey) void {
+    fn queueRefresh(self: *Presentation, key: OwnedReviewIdentity) void {
         const intent = self.next_intent + 1;
         self.commands.ensureTotalCapacity(self.allocator, self.commands.items.len + 1) catch {
             self.action_error = .out_of_memory;
@@ -3344,6 +3481,10 @@ pub const Presentation = struct {
     }
 
     fn acceptLoadedSession(self: *Presentation, completed: SessionLoaded) void {
+        if (!self.consumeCommand(completed.command_id, .load_session)) {
+            if (completed.outcome == .loaded) completed.outcome.loaded.destroy();
+            return;
+        }
         if (self.outstanding_loads > 0) self.outstanding_loads -= 1;
         const replacement = self.replacement orelse {
             if (completed.outcome == .loaded) completed.outcome.loaded.destroy();
@@ -3404,7 +3545,7 @@ pub const Presentation = struct {
 
 fn recoveryMatches(notice: RecoveryNotice, active: bbr.review.ActiveSubmissionRun) bool {
     return notice.operation_id == active.operation_id and
-        ReviewKey.eql(notice.key, ReviewKey.init(active.key.workspace, active.key.repository, active.key.pull_request_id) catch return false) and
+        OwnedReviewIdentity.eql(notice.key, OwnedReviewIdentity.init(active.key.workspace, active.key.repository, active.key.pull_request_id) catch return false) and
         notice.current_temp_id == active.current_temp_id and
         std.mem.eql(u8, notice.source_commit.slice(), active.source_commit);
 }
@@ -3615,7 +3756,7 @@ fn testLocalSession(backing: std.mem.Allocator) !*session_mod.Session {
 test "local review gates remote actions and refreshes the same identity" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    const key = try ReviewKey.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
+    const key = try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = key, .session = try testLocalSession(testing.allocator) },
         .viewport_rows = 8,
@@ -3641,13 +3782,13 @@ test "local review gates remote actions and refreshes the same identity" {
     try presentation.dispatch(.{ .action = .refresh });
     const refresh = presentation.takeCommand().?.load_session;
     try testing.expectEqual(SessionLoadCause.refresh, refresh.cause);
-    try testing.expect(ReviewKey.eql(key, refresh.key));
+    try testing.expect(OwnedReviewIdentity.eql(key, refresh.key));
 }
 
 test "local inline authoring persists a local target and authored context" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    const key = try ReviewKey.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
+    const key = try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = key, .session = try testLocalSession(testing.allocator) },
         .viewport_rows = 8,
@@ -3677,7 +3818,7 @@ test "resize publishes one complete Presentation Frame revision" {
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testSession(testing.allocator, 1, 'a'),
         },
         .geometry = .{ .cols = 80, .rows = 8 },
@@ -3809,7 +3950,7 @@ test "M15 Layout Scope and geometry matrix restores a Unicode source row" {
         .reviews = store.store(),
         .cell_metrics = MatrixGraphemeMetrics.value,
     }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testUnicodeSession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testUnicodeSession(testing.allocator, 1) },
         .geometry = .{ .cols = 80, .rows = 10 },
     });
     defer presentation.deinit();
@@ -3879,7 +4020,7 @@ test "Pane focus gives the Sidebar an independent cursor while DiffPane File mot
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
         .geometry = .{ .cols = 80, .rows = 10 },
     });
     defer presentation.deinit();
@@ -3912,7 +4053,7 @@ test "File finder filters synchronously and confirms within the same Session" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
         .geometry = .{ .cols = 80, .rows = 10 },
     });
     defer presentation.deinit();
@@ -3940,7 +4081,7 @@ test "File finder Escape dismisses and reopening resets its query" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
     });
     defer presentation.deinit();
     try presentation.dispatch(.{ .action = .open_file_finder });
@@ -3955,7 +4096,7 @@ test "Comment Action ladder carries inline File and Review scopes" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
     });
     defer presentation.deinit();
     const published = presentation.published.?;
@@ -3982,7 +4123,7 @@ test "source-only Action reports availability instead of silently doing nothing"
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
     });
     defer presentation.deinit();
     presentation.published.?.navigation.jumpTo(0);
@@ -3995,7 +4136,7 @@ test "yank Count skips Presentation rows and stops at the File boundary" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
     });
     defer presentation.deinit();
     const published = presentation.published.?;
@@ -4013,7 +4154,7 @@ test "side-by-side yank applies provisional new-side-first source selection" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
     });
     defer presentation.deinit();
     try presentation.dispatch(.{ .action = .toggle_layout });
@@ -4026,7 +4167,7 @@ test "side-by-side yank applies provisional new-side-first source selection" {
     var command = presentation.takeCommand().?;
     defer command.deinit();
     try testing.expectEqualStrings("new a", command.copy_clipboard.text);
-    try presentation.dispatch(.{ .clipboard_completed = true });
+    try presentation.dispatch(.{ .clipboard_completed = .{ .command_id = command.copy_clipboard.command_id, .success = true } });
     try testing.expectEqual(ClipboardStatus.copied, presentation.projection().clipboard_status.?);
 }
 
@@ -4034,7 +4175,7 @@ test "Selection overrides Count for yank and clipboard failure is visible" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
         .geometry = .{ .cols = 80, .rows = 10 },
     });
     defer presentation.deinit();
@@ -4059,7 +4200,7 @@ test "Selection overrides Count for yank and clipboard failure is visible" {
     try testing.expectEqualStrings("c1\nc2", command.copy_clipboard.text);
     try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.count);
     try testing.expect(presentation.projection().review.?.navigation.mark == null);
-    try presentation.dispatch(.{ .clipboard_completed = false });
+    try presentation.dispatch(.{ .clipboard_completed = .{ .command_id = command.copy_clipboard.command_id, .success = false } });
     try testing.expectEqual(ClipboardStatus.failed, presentation.projection().clipboard_status.?);
 }
 
@@ -4067,14 +4208,14 @@ test "successful Session replacement resets Pane and Sidebar defaults" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
         .geometry = .{ .cols = 80, .rows = 10 },
     });
     defer presentation.deinit();
     try presentation.dispatch(.{ .action = .focus_next_pane });
     try presentation.dispatch(.{ .action = .down });
 
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const command = presentation.takeCommand().?.load_session;
     try presentation.dispatch(.{ .session_loaded = .{ .intent = command.intent, .outcome = .{ .loaded = try testTwoFileSession(testing.allocator, 2) } } });
     const frame = presentation.projection().review.?.frame;
@@ -4157,7 +4298,7 @@ test "Session disclosures toggle independently persist through rebuilds and rese
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
         .geometry = .{ .cols = 100, .rows = 12 },
     });
     defer presentation.deinit();
@@ -4225,13 +4366,13 @@ test "Session disclosures toggle independently persist through rebuilds and rese
     // replacement starts from the canonical all-collapsed defaults.
     try presentation.dispatch(.{ .action = .toggle_disclosure });
     const before_failed = presentation.projection().review.?;
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const failed_command = presentation.takeCommand().?.load_session;
     try presentation.dispatch(.{ .session_loaded = .{ .intent = failed_command.intent, .outcome = .{ .failed = error.NetworkFailure } } });
     try testing.expectEqual(before_failed.buffer.rows.ptr, presentation.projection().review.?.buffer.rows.ptr);
     try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
 
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const replacement = presentation.takeCommand().?.load_session;
     try presentation.dispatch(.{ .session_loaded = .{ .intent = replacement.intent, .outcome = .{ .loaded = try testDisclosureSession(testing.allocator, 2) } } });
     const replaced = presentation.projection().review.?;
@@ -4247,13 +4388,13 @@ test "failed replacement Buffer construction preserves the published review" {
     var presentation = try Presentation.init(failing.allocator(), .{
         .reviews = store.store(),
     }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = a },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = a },
         .viewport_rows = 24,
     });
     defer presentation.deinit();
 
     const before = presentation.projection().review.?;
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const command = presentation.takeCommand().?.load_session;
 
     const candidate = try testSession(testing.allocator, 2, 'b');
@@ -4280,13 +4421,13 @@ test "only the latest queued replacement command is exposed" {
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
     }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = initial },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = initial },
         .viewport_rows = 24,
     });
     defer presentation.deinit();
 
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 3) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 3) });
 
     const command = presentation.takeCommand().?.load_session;
     try testing.expectEqual(@as(u64, 3), command.key.pull_request_id);
@@ -4299,13 +4440,13 @@ test "a complete candidate publishes atomically and advances the Session Epoch" 
 
     const initial = try testSession(testing.allocator, 1, 'a');
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = initial },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = initial },
         .viewport_rows = 24,
     });
     defer presentation.deinit();
     const before = presentation.projection().review.?;
 
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const command = presentation.takeCommand().?.load_session;
     try presentation.dispatch(.{ .session_loaded = .{
         .intent = command.intent,
@@ -4325,7 +4466,7 @@ test "replacement rollback preserves input grammar and commit resets it" {
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testSession(testing.allocator, 1, 'a'),
         },
         .viewport_rows = 24,
@@ -4334,7 +4475,7 @@ test "replacement rollback preserves input grammar and commit resets it" {
 
     try presentation.dispatch(.{ .key = .{ .codepoint = 'g', .text = "g" } });
     try testing.expectEqual(@as(u4, 1), presentation.resolver.pending_len);
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const failed = presentation.takeCommand().?.load_session;
     try presentation.dispatch(.{ .session_loaded = .{
         .intent = failed.intent,
@@ -4342,7 +4483,7 @@ test "replacement rollback preserves input grammar and commit resets it" {
     } });
     try testing.expectEqual(@as(u4, 1), presentation.resolver.pending_len);
 
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const loaded = presentation.takeCommand().?.load_session;
     try presentation.dispatch(.{ .session_loaded = .{
         .intent = loaded.intent,
@@ -4357,15 +4498,15 @@ test "a stale candidate is disposed and the latest failure restores the exact pu
 
     const initial = try testSession(testing.allocator, 1, 'a');
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = initial },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = initial },
         .viewport_rows = 24,
     });
     defer presentation.deinit();
     const before = presentation.projection().review.?;
 
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const b = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 3) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 3) });
     const c = presentation.takeCommand().?.load_session;
     try presentation.dispatch(.{ .session_loaded = .{
         .intent = b.intent,
@@ -4392,7 +4533,7 @@ test "shutdown drains issued loads and disposes their late completions" {
         .viewport_rows = 24,
     });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 1) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 1) });
     const command = presentation.takeCommand().?.load_session;
 
     try presentation.dispatch(.request_shutdown);
@@ -4411,7 +4552,7 @@ test "Navigation and Count mutate only through dispatch" {
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testSession(testing.allocator, 1, 'a'),
         },
         .viewport_rows = 2,
@@ -4433,7 +4574,7 @@ test "Session-relative Navigation is suspended during replacement" {
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testSession(testing.allocator, 1, 'a'),
         },
         .viewport_rows = 2,
@@ -4442,7 +4583,7 @@ test "Session-relative Navigation is suspended during replacement" {
 
     try presentation.dispatch(.{ .action = .down });
     const before = presentation.projection().review.?.navigation;
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     try presentation.dispatch(.{ .action = .down });
     try presentation.dispatch(.{ .push_count_digit = 9 });
     try testing.expect(std.meta.eql(before, presentation.projection().review.?.navigation));
@@ -4454,7 +4595,7 @@ test "failed Buffer transaction preserves Buffer preferences and Navigation" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testSession(testing.allocator, 1, 'a'),
         },
         .viewport_rows = 2,
@@ -4480,7 +4621,7 @@ test "preferences survive replacement while file isolation resets" {
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testTwoFileSession(testing.allocator, 1),
         },
         .viewport_rows = 8,
@@ -4495,7 +4636,7 @@ test "preferences survive replacement while file isolation resets" {
     try testing.expectEqual(Layout.side_by_side, isolated.preferences.layout);
     try testing.expectEqual(Scope.fetched, isolated.preferences.scope);
 
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const command = presentation.takeCommand().?.load_session;
     try presentation.dispatch(.{ .session_loaded = .{
         .intent = command.intent,
@@ -4512,7 +4653,7 @@ test "preferences survive replacement while file isolation resets" {
 test "saving a Composer Draft persists it for a later Session" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
 
     {
         var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -4543,7 +4684,7 @@ test "saving a Composer Draft persists it for a later Session" {
 test "Reply on a Draft row saves a child linked to that Draft" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{
         .local_id = 7,
         .kind = .comment,
@@ -4580,7 +4721,7 @@ test "Reply on a Draft row saves a child linked to that Draft" {
 test "Suggest derives an Anchor and persists a fenced seeded Draft" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
         .viewport_rows = 8,
@@ -4614,7 +4755,7 @@ test "persistence failure preserves Composer and the exact published review" {
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testSession(testing.allocator, 1, 'a'),
         },
         .viewport_rows = 8,
@@ -4647,7 +4788,7 @@ test "Composer save allocation failure preserves Composer and the exact publishe
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testSession(testing.allocator, 1, 'a'),
         },
         .viewport_rows = 8,
@@ -4675,7 +4816,7 @@ test "inline Composer allocation failure publishes no invalid Overlay" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testSession(testing.allocator, 1, 'a'),
         },
         .viewport_rows = 8,
@@ -4706,7 +4847,7 @@ test "failed replacement preserves Composer and successful replacement resets it
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testSession(testing.allocator, 1, 'a'),
         },
         .viewport_rows = 8,
@@ -4715,7 +4856,7 @@ test "failed replacement preserves Composer and successful replacement resets it
     try presentation.dispatch(.{ .action = .review_comment });
     try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("survive rollback") } });
 
-    const key_two = try ReviewKey.init("workspace", "repo", 2);
+    const key_two = try OwnedReviewIdentity.init("workspace", "repo", 2);
     try presentation.dispatch(.{ .choose_pull_request = key_two });
     const failed_command = presentation.takeCommand().?.load_session;
     try presentation.dispatch(.{ .session_loaded = .{
@@ -4738,7 +4879,7 @@ test "focused File Enrichment emits one Session Epoch command while in flight" {
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testSession(testing.allocator, 1, 'a'),
         },
         .viewport_rows = 8,
@@ -4756,6 +4897,105 @@ test "focused File Enrichment emits one Session Epoch command while in flight" {
     try testing.expect(presentation.takeCommand() == null);
 }
 
+test "external commands receive unique nonzero CommandIds" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    const enrich = presentation.takeCommand().?.enrich_file;
+    const load = presentation.takeCommand().?.load_session;
+
+    try testing.expect(enrich.command_id != 0);
+    try testing.expect(load.command_id != 0);
+    try testing.expect(enrich.command_id != load.command_id);
+}
+
+test "wrong-target completion consumes CommandId and later owned completion is disposed" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    const load = presentation.takeCommand().?.load_session;
+
+    try presentation.dispatch(.{ .clipboard_completed = .{ .command_id = load.command_id, .success = true } });
+    try testing.expect(presentation.projection().clipboard_status == null);
+    try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+    } });
+
+    try testing.expectEqual(@as(u64, 1), presentation.projection().review.?.pull_request.?.id);
+    try testing.expect(presentation.projection().replacing);
+}
+
+test "duplicate completion is discarded after first admission" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    const copy = try testing.allocator.create(ClipboardCopy);
+    copy.* = .{ .allocator = testing.allocator, .text = try testing.allocator.dupe(u8, "copy") };
+    try presentation.commands.append(testing.allocator, .{ .copy_clipboard = copy });
+    var command = presentation.takeCommand().?;
+    const command_id = command.copy_clipboard.command_id;
+    command.deinit();
+
+    try presentation.dispatch(.{ .clipboard_completed = .{ .command_id = command_id, .success = true } });
+    try presentation.dispatch(.{ .clipboard_completed = .{ .command_id = command_id, .success = false } });
+
+    try testing.expectEqual(ClipboardStatus.copied, presentation.projection().clipboard_status.?);
+}
+
+test "stale-Epoch File Enrichment completion is consumed without changing Session" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const enrich = presentation.takeCommand().?.enrich_file;
+
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = enrich.command_id,
+        .work_id = enrich.work_id,
+        .session_epoch = enrich.session_epoch + 1,
+        .file_index = enrich.file_index,
+        .outcome = .{ .failed = .launch_failed },
+    } });
+
+    try testing.expect(presentation.projection().action_error == null);
+    try presentation.dispatch(.request_shutdown);
+    try testing.expect(presentation.readyToExit());
+}
+
 test "disabled File cache discards an inactive completion and revisiting refetches it" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -4764,7 +5004,7 @@ test "disabled File cache discards an inactive completion and revisiting refetch
         .file_cache_enabled = false,
     }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testTwoFileSession(testing.allocator, 1),
         },
         .viewport_rows = 8,
@@ -4815,7 +5055,7 @@ test "matching File Enrichment is admitted and reprojects whole-file Buffer" {
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testSession(testing.allocator, 1, 'a'),
         },
         .viewport_rows = 8,
@@ -4826,7 +5066,7 @@ test "matching File Enrichment is admitted and reprojects whole-file Buffer" {
     const before_rows = presentation.projection().review.?.buffer.rows.len;
     try presentation.dispatch(.ensure_focused_enrichment);
     const command = presentation.takeCommand().?.enrich_file;
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const replacement = presentation.takeCommand().?.load_session;
 
     const responses = [_]bbr.http.Canned{
@@ -4861,7 +5101,7 @@ test "replacement preserves queued File Enrichment for the published rollback Se
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testSession(testing.allocator, 1, 'a'),
         },
         .viewport_rows = 8,
@@ -4869,7 +5109,7 @@ test "replacement preserves queued File Enrichment for the published rollback Se
     defer presentation.deinit();
 
     try presentation.dispatch(.ensure_focused_enrichment);
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
 
     try testing.expect(presentation.takeCommand().? == .enrich_file);
     try testing.expect(presentation.takeCommand().? == .load_session);
@@ -4881,7 +5121,7 @@ test "stale File Enrichment is disposed without mutating the replacement Session
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testSession(testing.allocator, 1, 'a'),
         },
         .viewport_rows = 8,
@@ -4889,7 +5129,7 @@ test "stale File Enrichment is disposed without mutating the replacement Session
     defer presentation.deinit();
     try presentation.dispatch(.ensure_focused_enrichment);
     const enrich = presentation.takeCommand().?.enrich_file;
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const load = presentation.takeCommand().?.load_session;
     try presentation.dispatch(.{ .session_loaded = .{
         .intent = load.intent,
@@ -4924,7 +5164,7 @@ test "admitted File Enrichment survives failed Buffer reprojection" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testSession(testing.allocator, 1, 'a'),
         },
         .viewport_rows = 8,
@@ -4968,7 +5208,7 @@ test "File Enrichment launch failure restores retryable pending state" {
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testSession(testing.allocator, 1, 'a'),
         },
         .viewport_rows = 8,
@@ -4994,7 +5234,7 @@ test "duplicate File Enrichment completion cannot drain a newer WorkId" {
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testSession(testing.allocator, 1, 'a'),
         },
         .viewport_rows = 8,
@@ -5029,7 +5269,7 @@ test "File Enrichment out of memory projects a distinct fatal shutdown" {
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{
-            .key = try ReviewKey.init("workspace", "repo", 1),
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
             .session = try testSession(testing.allocator, 1, 'a'),
         },
         .viewport_rows = 8,
@@ -5054,7 +5294,7 @@ test "Submission start acquires ownership persists intent and emits one durable 
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish me" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -5083,12 +5323,52 @@ test "Submission start acquires ownership persists intent and emits one durable 
     try testing.expectEqual(run.operation_id, presentation.projection().submission.?.operation_id);
 }
 
+test "durable completion with wrong Review target is consumed and discarded" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish me" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var command = presentation.takeCommand().?;
+    const post = command.post_draft;
+    const command_id = post.command_id;
+    const operation_id = post.operation_id;
+    const temp_id = post.draft.local_id;
+    post.destroy();
+    command = undefined;
+
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .command_id = command_id,
+        .operation_id = operation_id,
+        .identity = .init(try OwnedReviewIdentity.init("workspace", "other", 1)),
+        .temp_id = temp_id,
+        .outcome = .{ .posted = 900 },
+    } });
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .command_id = command_id,
+        .operation_id = operation_id,
+        .identity = .init(key),
+        .temp_id = temp_id,
+        .outcome = .{ .posted = 900 },
+    } });
+
+    try testing.expect(presentation.projection().submission != null);
+    try testing.expectEqual(@as(?bbr.review.TempId, 1), presentation.projection().submission.?.current_temp_id);
+}
+
 test "Submission lock contention emits no command or durable intent" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish me" });
     var other_owner = (try locks.locks().tryAcquire(key.storeKey())).?;
     defer other_owner.release();
@@ -5113,7 +5393,7 @@ test "fresh Submission checks the source commit before its first POST" {
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "stale anchor" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -5126,7 +5406,7 @@ test "fresh Submission checks the source commit before its first POST" {
     defer presentation.deinit();
     try presentation.dispatch(.{ .action = .submit });
     const check = presentation.takeCommand().?.check_recovery;
-    try presentation.dispatch(recoveryCheckSucceeded(check.operation_id, "different-head"));
+    try presentation.dispatch(recoveryCheckSucceeded(check.command_id, check.operation_id, null, "different-head"));
 
     try testing.expect(presentation.takeCommand() == null);
     try testing.expect(presentation.projection().submission == null);
@@ -5142,7 +5422,7 @@ test "startup discovers and explicitly claims an interrupted Submission" {
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 7);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 7);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "recover me" });
     const operation_id = try store.store().beginSubmission(key.storeKey(), "old-head", 1);
 
@@ -5161,7 +5441,7 @@ test "startup discovers and explicitly claims an interrupted Submission" {
     try testing.expect(presentation.projection().recovery == null);
     try testing.expect(presentation.projection().submission != null);
 
-    try presentation.dispatch(recoveryCheckSucceeded(operation_id, "old-head"));
+    try presentation.dispatch(recoveryCheckSucceeded(check.command_id, operation_id, null, "old-head"));
     var post = presentation.takeCommand().?;
     defer post.deinit();
     try testing.expect(post.post_draft.dedupe);
@@ -5173,7 +5453,7 @@ test "startup reports a live owner without stealing its Submission" {
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 7);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 7);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "owned" });
     _ = try store.store().beginSubmission(key.storeKey(), "head", 1);
     var owner = (try locks.locks().tryAcquire(key.storeKey())).?;
@@ -5195,7 +5475,7 @@ test "changed-source recovery only runs the Duplicate guard and leaves a miss un
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 7);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 7);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "stale" });
     const operation_id = try store.store().beginSubmission(key.storeKey(), "old-head", 1);
     var presentation = try Presentation.init(testing.allocator, .{
@@ -5204,9 +5484,9 @@ test "changed-source recovery only runs the Duplicate guard and leaves a miss un
     }, .{ .viewport_rows = 8 });
     defer presentation.deinit();
     try presentation.dispatch(.{ .action = .recover_submission });
-    _ = presentation.takeCommand().?.check_recovery;
+    const check = presentation.takeCommand().?.check_recovery;
 
-    try presentation.dispatch(recoveryCheckSucceeded(operation_id, "new-head"));
+    try presentation.dispatch(recoveryCheckSucceeded(check.command_id, operation_id, null, "new-head"));
     try testing.expectEqual(ActionError.recovery_source_changed, presentation.projection().action_error.?);
     var duplicate = presentation.takeCommand().?;
     const temp_id = duplicate.find_duplicate.draft.local_id;
@@ -5230,7 +5510,7 @@ test "changed-source Duplicate guard records an existing Comment without posting
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 7);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 7);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "already posted" });
     const operation_id = try store.store().beginSubmission(key.storeKey(), "old-head", 1);
     var presentation = try Presentation.init(testing.allocator, .{
@@ -5239,8 +5519,8 @@ test "changed-source Duplicate guard records an existing Comment without posting
     }, .{ .viewport_rows = 8 });
     defer presentation.deinit();
     try presentation.dispatch(.{ .action = .recover_submission });
-    _ = presentation.takeCommand().?.check_recovery;
-    try presentation.dispatch(recoveryCheckSucceeded(operation_id, "new-head"));
+    const check = presentation.takeCommand().?.check_recovery;
+    try presentation.dispatch(recoveryCheckSucceeded(check.command_id, operation_id, null, "new-head"));
     var duplicate = presentation.takeCommand().?;
     duplicate.deinit();
     try presentation.dispatch(.{ .duplicate_checked = .{
@@ -5259,7 +5539,7 @@ test "changed-source Duplicate guard records an existing Comment without posting
 test "reviewer can mark a selected unresolved Draft as unpublished" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "unknown", .state = .outcome_unknown });
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
@@ -5278,7 +5558,7 @@ test "reviewer can mark a selected unresolved Draft as unpublished" {
 test "reviewer can link a selected unresolved Draft to an existing Comment" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "unknown", .state = .outcome_unknown });
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
@@ -5305,7 +5585,7 @@ test "reviewer can link a selected unresolved Draft to an existing Comment" {
 test "portable key input owns help overlay capture" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
         .viewport_rows = 8,
@@ -5321,7 +5601,7 @@ test "portable key input owns help overlay capture" {
 test "portable Picker input loads summaries and selects a replacement" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
         .viewport_rows = 8,
@@ -5351,7 +5631,7 @@ test "portable Picker input loads summaries and selects a replacement" {
 test "Picker tick advances only its visible loading scope" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
         .viewport_rows = 8,
@@ -5378,7 +5658,7 @@ test "Picker tick advances only its visible loading scope" {
 test "shutdown closes Picker and disposes its late completion" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
         .viewport_rows = 8,
@@ -5405,7 +5685,7 @@ test "Submission payload and identity survive originating Session replacement" {
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const first_key = try ReviewKey.init("workspace", "repo", 1);
+    const first_key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(first_key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "survive replacement" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -5417,7 +5697,7 @@ test "Submission payload and identity survive originating Session replacement" {
     defer presentation.deinit();
 
     try presentation.dispatch(.{ .action = .submit });
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const post = presentation.takeCommand().?.post_draft;
     defer post.destroy();
     const load = presentation.takeCommand().?.load_session;
@@ -5438,8 +5718,8 @@ test "Submission completion does not reconcile over a different visible PR" {
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const first_key = try ReviewKey.init("workspace", "repo", 1);
-    const second_key = try ReviewKey.init("workspace", "repo", 2);
+    const first_key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    const second_key = try OwnedReviewIdentity.init("workspace", "repo", 2);
     try store.store().put(first_key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "post elsewhere" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -5483,7 +5763,7 @@ test "shutdown retains an authorized Submission command and waits for terminal d
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "finish me" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -5509,7 +5789,7 @@ test "Submission persistence failure publishes no command and releases ownership
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish me" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -5541,7 +5821,7 @@ test "Submission state allocation failure releases ownership before transfer" {
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "publish me" });
     var presentation = try Presentation.init(failing.allocator(), .{
         .reviews = store.store(),
@@ -5569,7 +5849,7 @@ test "durable POST completion checkpoints outcome and next intent before next co
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "parent" });
     try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" });
     var presentation = try Presentation.init(testing.allocator, .{
@@ -5610,7 +5890,7 @@ test "stale POST completion cannot mutate the next in-flight Draft" {
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "first" });
     try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .body = "second" });
     var presentation = try Presentation.init(testing.allocator, .{
@@ -5652,7 +5932,7 @@ test "final successful POST completes clean, releases ownership, and reconciles 
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "only" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -5675,7 +5955,7 @@ test "final successful POST completes clean, releases ownership, and reconciles 
 
     const reconciliation = presentation.takeCommand().?.load_session;
     try testing.expect(reconciliation.cause == .reconciliation);
-    try testing.expect(ReviewKey.eql(reconciliation.key, key));
+    try testing.expect(OwnedReviewIdentity.eql(reconciliation.key, key));
     try testing.expect(presentation.projection().submission == null);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -5690,7 +5970,7 @@ test "retryable POST rejection waits and reissues without checkpointing an outco
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "retry" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -5730,7 +6010,7 @@ test "wait launch failure pauses and submit retries the exact delay" {
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "retry wait" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -5768,7 +6048,7 @@ test "exhausted ambiguous POST persists an immutable unresolved Draft" {
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "uncertain" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -5810,7 +6090,7 @@ test "auth rejection aborts Submission and restores the pending Draft" {
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "keep pending" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -5845,7 +6125,7 @@ test "non-retryable POST rejection completes partially and retains the failed Dr
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "retain me" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -5880,7 +6160,7 @@ test "checkpoint failure pauses Submission and retry persists before next POST" 
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "first" });
     try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .body = "second" });
     var presentation = try Presentation.init(testing.allocator, .{
@@ -5928,7 +6208,7 @@ test "terminal persistence retry does not repeat an already-durable checkpoint" 
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "only" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -5975,7 +6255,7 @@ test "queue allocation failure retains a POST completion for admission retry" {
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "only" });
     var presentation = try Presentation.init(failing.allocator(), .{
         .reviews = store.store(),
@@ -6013,7 +6293,7 @@ test "POST launch failure pauses without reporting a remote outcome and submit r
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "retry launch" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -6052,7 +6332,7 @@ test "shutdown retries a paused terminal persistence step" {
     defer store.deinit();
     var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
     defer locks.deinit();
-    const key = try ReviewKey.init("workspace", "repo", 1);
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "only" });
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
@@ -6084,7 +6364,7 @@ test "mouse click uses the published Frame target and a Motion cancels a pending
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
         .geometry = .{ .cols = 80, .rows = 10 },
     });
     defer presentation.deinit();
@@ -6117,7 +6397,7 @@ test "mouse wheel uses configured rows without focus changes and ignored gesture
         .reviews = store.store(),
         .mouse_vertical_scroll_rows = 2,
     }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
         .geometry = .{ .cols = 80, .rows = 4 },
     });
     defer presentation.deinit();
@@ -6142,7 +6422,7 @@ test "mouse wheel uses configured rows without focus changes and ignored gesture
     try testing.expectEqual(before.scroll, frame.navigation.scroll);
 
     var disabled = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .mouse_enabled = false }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 2), .session = try testTwoFileSession(testing.allocator, 2) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 2), .session = try testTwoFileSession(testing.allocator, 2) },
         .geometry = .{ .cols = 80, .rows = 4 },
     });
     defer disabled.deinit();
@@ -6157,7 +6437,7 @@ test "Picker mouse click selects only and non-Picker Overlay captures Pane click
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
         .geometry = .{ .cols = 80, .rows = 10 },
     });
     defer presentation.deinit();
@@ -6183,7 +6463,7 @@ test "PullRequest Picker wheel and click move selection while Enter alone confir
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
         .geometry = .{ .cols = 80, .rows = 10 },
     });
     defer presentation.deinit();
@@ -6215,7 +6495,7 @@ test "mouse activates Sidebar Files and disclosures and replacement cancels a pr
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
         .geometry = .{ .cols = 100, .rows = 8 },
     });
     defer presentation.deinit();
@@ -6236,7 +6516,7 @@ test "mouse activates Sidebar Files and disclosures and replacement cancels a pr
 
     const current = presentation.projection().review.?.frame;
     try presentation.dispatch(.{ .mouse = .{ .col = current.panes.diff_content.x, .row = current.panes.diff_content.y + 1, .button = .left, .type = .press } });
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const load = presentation.takeCommand().?.load_session;
     try presentation.dispatch(.{ .session_loaded = .{ .intent = load.intent, .outcome = .{ .loaded = try testDisclosureSession(testing.allocator, 2) } } });
     const replacement = presentation.projection().review.?.frame;
@@ -6248,12 +6528,12 @@ test "failed Session replacement preserves a pending mouse press" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
         .geometry = .{ .cols = 80, .rows = 10 },
     });
     defer presentation.deinit();
 
-    try presentation.dispatch(.{ .choose_pull_request = try ReviewKey.init("workspace", "repo", 2) });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const load = presentation.takeCommand().?.load_session;
     const frame = presentation.projection().review.?.frame;
     const target_row = frame.panes.diff_content.y + 2;
@@ -6283,7 +6563,7 @@ test "Sidebar mouse click toggles a Directory and focuses a child File" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try ReviewKey.init("workspace", "repo", 1), .session = try testDirectorySession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDirectorySession(testing.allocator, 1) },
         .geometry = .{ .cols = 80, .rows = 8 },
     });
     defer presentation.deinit();

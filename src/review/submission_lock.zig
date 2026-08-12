@@ -8,7 +8,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const ReviewKey = @import("store.zig").ReviewKey;
+const RemoteReviewIdentity = @import("store.zig").RemoteReviewIdentity;
 
 pub const Guard = struct {
     ptr: ?*anyopaque,
@@ -27,12 +27,12 @@ pub const SubmissionLocks = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        try_acquire: *const fn (*anyopaque, ReviewKey) anyerror!?Guard,
+        try_acquire: *const fn (*anyopaque, RemoteReviewIdentity) anyerror!?Guard,
     };
 
     /// Returns null when another live owner holds this PullRequest's lock.
-    pub fn tryAcquire(self: SubmissionLocks, key: ReviewKey) !?Guard {
-        return self.vtable.try_acquire(self.ptr, key);
+    pub fn tryAcquire(self: SubmissionLocks, identity: RemoteReviewIdentity) !?Guard {
+        return self.vtable.try_acquire(self.ptr, identity);
     }
 };
 
@@ -43,7 +43,7 @@ pub const InMemorySubmissionLocks = struct {
     next_lease_id: u64 = 1,
 
     const Entry = struct {
-        key: ReviewKey,
+        identity: RemoteReviewIdentity,
         lease_id: ?u64,
     };
 
@@ -61,11 +61,11 @@ pub const InMemorySubmissionLocks = struct {
         return .{ .ptr = self, .vtable = &.{ .try_acquire = tryAcquireImpl } };
     }
 
-    fn tryAcquireImpl(ptr: *anyopaque, key: ReviewKey) anyerror!?Guard {
+    fn tryAcquireImpl(ptr: *anyopaque, identity: RemoteReviewIdentity) anyerror!?Guard {
         const self: *InMemorySubmissionLocks = @ptrCast(@alignCast(ptr));
         var entry: ?*Entry = null;
         for (self.entries.items) |*candidate| {
-            if (ReviewKey.eql(candidate.key, key)) {
+            if (RemoteReviewIdentity.eql(candidate.identity, identity)) {
                 entry = candidate;
                 break;
             }
@@ -73,12 +73,12 @@ pub const InMemorySubmissionLocks = struct {
         if (entry) |existing| {
             if (existing.lease_id != null) return null;
         } else {
-            const owned: ReviewKey = .{
-                .workspace = try self.arena.allocator().dupe(u8, key.workspace),
-                .repository = try self.arena.allocator().dupe(u8, key.repository),
-                .pull_request_id = key.pull_request_id,
+            const owned: RemoteReviewIdentity = .{
+                .workspace = try self.arena.allocator().dupe(u8, identity.workspace),
+                .repository = try self.arena.allocator().dupe(u8, identity.repository),
+                .pull_request_id = identity.pull_request_id,
             };
-            try self.entries.append(self.allocator, .{ .key = owned, .lease_id = null });
+            try self.entries.append(self.allocator, .{ .identity = owned, .lease_id = null });
             entry = &self.entries.items[self.entries.items.len - 1];
         }
 
@@ -126,9 +126,9 @@ pub const OsSubmissionLocks = struct {
         return .{ .ptr = self, .vtable = &.{ .try_acquire = tryAcquireImpl } };
     }
 
-    fn tryAcquireImpl(ptr: *anyopaque, key: ReviewKey) anyerror!?Guard {
+    fn tryAcquireImpl(ptr: *anyopaque, identity: RemoteReviewIdentity) anyerror!?Guard {
         const self: *OsSubmissionLocks = @ptrCast(@alignCast(ptr));
-        const name = lockName(key);
+        const name = lockName(identity);
         const file = self.dir.createFile(self.io, &name, .{
             .truncate = false,
             .lock = .exclusive,
@@ -154,13 +154,13 @@ pub const OsSubmissionLocks = struct {
         }
     }
 
-    fn lockName(key: ReviewKey) [64]u8 {
+    fn lockName(identity: RemoteReviewIdentity) [64]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update(key.workspace);
+        hash.update(identity.workspace);
         hash.update(&.{0});
-        hash.update(key.repository);
+        hash.update(identity.repository);
         hash.update(&.{0});
-        hash.update(std.mem.asBytes(&key.pull_request_id));
+        hash.update(std.mem.asBytes(&identity.pull_request_id));
         var digest: [32]u8 = undefined;
         hash.final(&digest);
         return std.fmt.bytesToHex(digest, .lower);
@@ -169,7 +169,7 @@ pub const OsSubmissionLocks = struct {
 
 const testing = std.testing;
 
-fn testKey(repository: []const u8, pull_request_id: u64) ReviewKey {
+fn testKey(repository: []const u8, pull_request_id: u64) RemoteReviewIdentity {
     return .{ .workspace = "workspace", .repository = repository, .pull_request_id = pull_request_id };
 }
 
