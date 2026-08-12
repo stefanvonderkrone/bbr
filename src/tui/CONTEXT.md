@@ -61,6 +61,10 @@ _Avoid_: selected item, comment id (only one of the two), edit mode.
 The two-stage interaction that repairs one mutable inline root Draft's Anchor. Stage one retains the Draft's TempId and hands input back to the DiffPane; stage two reads whatever the source cursor or Selection currently names, so navigating re-reads the candidate instead of accumulating interaction state. Enter accepts, Escape cancels, and a Session replacement disarms it. Replies, Review- and File-level Drafts, and published Comments have no re-anchor at all.
 _Avoid_: move Anchor (an authored Anchor never moves itself), drag, re-target.
 
+**Delete Confirmation**:
+The keyboard-complete Overlay that names one local Draft's TempId and the complete Reply-descendant consequence of deleting it, before anything is removed. Enter or `y` confirms, Escape or `n` cancels, every other key is captured so the cursor cannot drift off the Draft it names, and a Session replacement disarms it. It survives a refused or failed deletion so the reviewer can retry, and a changed consequence is refused rather than silently deleting a different set.
+_Avoid_: delete prompt, are-you-sure dialog, undo (there is none).
+
 **External Edit**:
 The Composer Action that temporarily hands its exact authored body to a configured external editing program and, when accepted, returns the changed body to the same open Composer. It does not save or publish the Comment, Reply, or Suggestion.
 _Avoid_: external editor (the program, not the interaction), edit in place, direct Comment edit.
@@ -114,7 +118,7 @@ The active input surface and semantic target from the current Presentation Frame
 _Avoid_: mode (too broad), focus alone (omits the target), input state.
 
 **ActionAvailability**:
-Whether an Action is valid for the currently published Review. Unavailable Actions remain visible but greyed in the help Overlay; invoking one produces an explanatory status message, while Presentation alone decides availability. A mutation Action carries the precise refusal reason for the item under the cursor — an active or recovered SubmissionRun owns it, its publication outcome is unresolved, it is in flight, it is already represented by Bitbucket, or there is no ReviewCard there at all.
+Whether an Action is valid for the currently published Review. Unavailable Actions remain visible but greyed in the help Overlay; invoking one produces an explanatory status message, while Presentation alone decides availability. A mutation Action carries the precise refusal reason for the item under the cursor — an active or recovered SubmissionRun owns it, its publication outcome is unresolved, it is in flight, it is already represented by Bitbucket, or there is no ReviewCard there at all. A cascading Action answers for its whole consequence: one ineligible Reply below the item refuses the complete deletion rather than applying part of it.
 _Avoid_: mode check, hidden binding, silent no-op.
 
 **Leader**:

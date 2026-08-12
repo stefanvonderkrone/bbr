@@ -138,6 +138,30 @@ pub const NewDraft = struct {
     }
 };
 
+/// True when `id` is `root` itself or reaches it through Draft parentage — the
+/// membership test for a Draft subtree. It walks *up* the parent chain rather
+/// than expanding the subtree, so it allocates nothing, and a malformed cycle
+/// terminates at the graph's size instead of hanging. A Reply to a published
+/// Comment is a root of its own and never descends from another Draft.
+pub fn descendsFrom(drafts: []const Draft, root: TempId, id: TempId) bool {
+    var current = id;
+    var hops: usize = 0;
+    while (hops <= drafts.len) : (hops += 1) {
+        if (current == root) return true;
+        const found = findDraft(drafts, current) orelse return false;
+        current = switch (found.parent orelse return false) {
+            .draft => |parent_id| parent_id,
+            .comment => return false,
+        };
+    }
+    return false;
+}
+
+fn findDraft(drafts: []const Draft, id: TempId) ?*const Draft {
+    for (drafts) |*d| if (d.local_id == id) return d;
+    return null;
+}
+
 /// The whole graph of Drafts for one PullRequest. Owns the Drafts; `add` assigns
 /// a monotonic TempId. Reset on PR switch by dropping the backing arena.
 pub const PendingReview = struct {
@@ -381,6 +405,35 @@ test "remove takes a draft's reply-descendants with it" {
     try testing.expectEqual(@as(usize, 1), pr.drafts.items.len);
     try testing.expect(pr.get(keep) != null);
     try testing.expect(pr.get(root) == null);
+}
+
+test "subtree membership follows Draft parentage and stops at published Comments" {
+    var pr = PendingReview.init(1);
+    defer pr.deinit(testing.allocator);
+    const root = try pr.add(testing.allocator, .{ .kind = .comment, .body = "root" });
+    const reply = try pr.add(testing.allocator, .{ .kind = .comment, .body = "re", .parent = .{ .draft = root } });
+    const deep = try pr.add(testing.allocator, .{ .kind = .comment, .body = "re re", .parent = .{ .draft = reply } });
+    const sibling = try pr.add(testing.allocator, .{ .kind = .comment, .body = "unrelated" });
+    const remote_reply = try pr.add(testing.allocator, .{ .kind = .comment, .body = "to server", .parent = .{ .comment = 99 } });
+
+    const drafts = pr.drafts.items;
+    try testing.expect(descendsFrom(drafts, root, root));
+    try testing.expect(descendsFrom(drafts, root, reply));
+    try testing.expect(descendsFrom(drafts, root, deep));
+    try testing.expect(!descendsFrom(drafts, root, sibling));
+    try testing.expect(!descendsFrom(drafts, root, remote_reply));
+    try testing.expect(!descendsFrom(drafts, reply, root));
+    try testing.expect(!descendsFrom(drafts, root, 404));
+}
+
+test "subtree membership terminates on a malformed parent cycle" {
+    var pr = PendingReview.init(1);
+    defer pr.deinit(testing.allocator);
+    try pr.addExisting(testing.allocator, .{ .local_id = 1, .kind = .comment, .parent = .{ .draft = 2 }, .body = "a" });
+    try pr.addExisting(testing.allocator, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "b" });
+
+    try testing.expect(descendsFrom(pr.drafts.items, 1, 1));
+    try testing.expect(!descendsFrom(pr.drafts.items, 3, 1));
 }
 
 test "a Suggestion edits its replacement code and round-trips the fence" {

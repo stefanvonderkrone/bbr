@@ -153,6 +153,17 @@ pub const DraftReanchor = struct {
     snapshot: ?comment.AnchorSnapshot = null,
 };
 
+/// The complete deletion of one Draft and every Draft that reaches it through
+/// Draft parentage, applied as one transaction. `cascade` is the closure the
+/// reviewer was shown and confirmed, root first; the store recomputes it inside
+/// the same write and refuses a mismatch, so a cascade staged against a stale
+/// graph can neither strand a Reply nor remove evidence nobody confirmed.
+pub const DraftSubtreeDelete = struct {
+    root_temp_id: TempId,
+    expected_parent: ?draft_mod.Parent,
+    cascade: []const TempId,
+};
+
 pub const DraftEditError = error{
     /// No Draft with that TempId under this ReviewIdentity.
     DraftNotFound,
@@ -170,6 +181,9 @@ pub const DraftEditError = error{
     DraftNotAnchorable,
     /// The proposed Anchor is not structurally valid (see `Anchor.validateShape`).
     InvalidAnchor,
+    /// The Draft-parentage closure recomputed inside the transaction is not the
+    /// one the reviewer confirmed.
+    DraftCascadeConflict,
 };
 
 pub const PendingReviewStore = struct {
@@ -188,6 +202,10 @@ pub const PendingReviewStore = struct {
         /// after rechecking its identity, root inline shape, editable state, and
         /// run participation.
         reanchor_draft: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, reanchor: DraftReanchor) anyerror!void,
+        /// Atomically delete one Draft and its complete Reply-descendant
+        /// closure after rechecking identity, expected parentage, that closure,
+        /// and every member's eligibility.
+        delete_draft_subtree: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, deletion: DraftSubtreeDelete) anyerror!void,
         /// Every Draft for `pr_id`, each with its strings duped into `allocator`.
         load: *const fn (ptr: *anyopaque, allocator: Allocator, key: RemoteReviewIdentity) anyerror![]Draft,
         begin_submission: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, source_commit: []const u8, items: []const SubmissionRunItem) anyerror!OperationId,
@@ -219,6 +237,14 @@ pub const PendingReviewStore = struct {
     /// is untouched because parentage, not a copied scope, places it.
     pub fn reanchorDraft(self: PendingReviewStore, key: RemoteReviewIdentity, reanchor: DraftReanchor) !void {
         return self.vtable.reanchor_draft(self.ptr, key, reanchor);
+    }
+
+    /// Delete `deletion.root_temp_id` together with every Draft that reaches it
+    /// through Draft parentage. Unlike `remove`, which takes one row on trust,
+    /// this refuses unless the whole confirmed subtree is present and every
+    /// member is eligible — a partial cascade would strand a Reply.
+    pub fn deleteDraftSubtree(self: PendingReviewStore, key: RemoteReviewIdentity, deletion: DraftSubtreeDelete) !void {
+        return self.vtable.delete_draft_subtree(self.ptr, key, deletion);
     }
 
     pub fn load(self: PendingReviewStore, allocator: Allocator, key: RemoteReviewIdentity) ![]Draft {
@@ -347,6 +373,8 @@ pub const InMemoryStore = struct {
     fail_next_edit: bool = false,
     /// Deterministic adapter fault injection for Presentation re-anchor tests.
     fail_next_reanchor: bool = false,
+    /// Deterministic adapter fault injection for Presentation delete tests.
+    fail_next_delete: bool = false,
     /// Deterministic adapter fault injection for Presentation checkpoint tests.
     fail_next_checkpoint: bool = false,
     /// Deterministic adapter fault injection after a terminal checkpoint.
@@ -378,6 +406,7 @@ pub const InMemoryStore = struct {
         .remove = removeImpl,
         .edit_draft_body = editDraftBodyImpl,
         .reanchor_draft = reanchorDraftImpl,
+        .delete_draft_subtree = deleteDraftSubtreeImpl,
         .load = loadImpl,
         .begin_submission = beginSubmissionImpl,
         .checkpoint_submission = checkpointSubmissionImpl,
@@ -555,6 +584,77 @@ pub const InMemoryStore = struct {
             return;
         }
         return error.DraftNotFound;
+    }
+
+    fn deleteDraftSubtreeImpl(ptr: *anyopaque, key: RemoteReviewIdentity, deletion: DraftSubtreeDelete) anyerror!void {
+        const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        if (self.fail_next_delete) {
+            self.fail_next_delete = false;
+            return error.InjectedDeleteFailure;
+        }
+        try validateCascadeShape(deletion);
+        // One check-and-delete step: the closure, the expectations, and every
+        // eligibility rule are rechecked here, against this store's own rows.
+        const root = self.draftEntry(key, deletion.root_temp_id) orelse return error.DraftNotFound;
+        if (!parentEql(root.parent, deletion.expected_parent)) return error.DraftEditConflict;
+
+        var members: usize = 0;
+        for (self.entries.items) |candidate| {
+            if (!RemoteReviewIdentity.eql(candidate.key, key)) continue;
+            if (!self.descendsFrom(key, deletion.root_temp_id, candidate.draft.local_id)) continue;
+            members += 1;
+        }
+        if (members != deletion.cascade.len) return error.DraftCascadeConflict;
+        for (deletion.cascade) |temp_id| {
+            if (self.draftEntry(key, temp_id) == null) return error.DraftCascadeConflict;
+            if (!self.descendsFrom(key, deletion.root_temp_id, temp_id)) return error.DraftCascadeConflict;
+        }
+
+        // Ambiguous or run-owned evidence refuses the whole cascade; nothing
+        // below this point can remove part of it.
+        if (self.active_submission) |run| {
+            if (RemoteReviewIdentity.eql(run.key, key))
+                for (deletion.cascade) |temp_id| if (submissionItemIndex(run.items, temp_id) != null) return error.DraftLocked;
+        }
+        for (deletion.cascade) |temp_id| {
+            const member = self.draftEntry(key, temp_id).?;
+            switch (member.state) {
+                .draft, .failed => {},
+                .outcome_unknown => return error.DraftLocked,
+                .submitting, .posted => return error.DraftNotEditable,
+            }
+        }
+
+        var index: usize = 0;
+        while (index < self.entries.items.len) {
+            const candidate = self.entries.items[index];
+            if (RemoteReviewIdentity.eql(candidate.key, key) and containsTempId(deletion.cascade, candidate.draft.local_id)) {
+                _ = self.entries.orderedRemove(index);
+            } else index += 1;
+        }
+    }
+
+    fn draftEntry(self: *InMemoryStore, key: RemoteReviewIdentity, temp_id: TempId) ?*Draft {
+        for (self.entries.items) |*candidate| {
+            if (RemoteReviewIdentity.eql(candidate.key, key) and candidate.draft.local_id == temp_id) return &candidate.draft;
+        }
+        return null;
+    }
+
+    /// `draft_mod.descendsFrom` over this store's rows: walking up the parent
+    /// chain needs no allocation, and a malformed cycle terminates.
+    fn descendsFrom(self: *InMemoryStore, key: RemoteReviewIdentity, root: TempId, temp_id: TempId) bool {
+        var current = temp_id;
+        var hops: usize = 0;
+        while (hops <= self.entries.items.len) : (hops += 1) {
+            if (current == root) return true;
+            const found = self.draftEntry(key, current) orelse return false;
+            current = switch (found.parent orelse return false) {
+                .draft => |parent_id| parent_id,
+                .comment => return false,
+            };
+        }
+        return false;
     }
 
     fn loadImpl(ptr: *anyopaque, allocator: Allocator, key: RemoteReviewIdentity) anyerror![]Draft {
@@ -748,6 +848,22 @@ pub fn parentEql(a: ?draft_mod.Parent, b: ?draft_mod.Parent) bool {
         .draft => |id| b.? == .draft and b.?.draft == id,
         .comment => |id| b.? == .comment and b.?.comment == id,
     };
+}
+
+/// The caller-side shape every adapter demands of a confirmed cascade before it
+/// touches a row: non-empty, rooted at the Draft being deleted, and free of
+/// duplicates. Shared so a malformed cascade is rejected identically everywhere.
+pub fn validateCascadeShape(deletion: DraftSubtreeDelete) error{DraftCascadeConflict}!void {
+    if (deletion.cascade.len == 0) return error.DraftCascadeConflict;
+    if (deletion.cascade[0] != deletion.root_temp_id) return error.DraftCascadeConflict;
+    for (deletion.cascade, 0..) |temp_id, index| {
+        if (containsTempId(deletion.cascade[0..index], temp_id)) return error.DraftCascadeConflict;
+    }
+}
+
+pub fn containsTempId(ids: []const TempId, temp_id: TempId) bool {
+    for (ids) |candidate| if (candidate == temp_id) return true;
+    return false;
 }
 
 fn submissionItemIndex(items: []const SubmissionRunItem, temp_id: TempId) ?usize {
@@ -1101,6 +1217,176 @@ test "re-anchoring refuses ambiguous shapes, non-inline roots, Replies, and lock
     defer arena.deinit();
     const drafts = try s.load(arena.allocator(), key);
     try testing.expectEqual(@as(?u32, 1), drafts[0].effectiveScope().@"inline".to);
+}
+
+test "deleting a Draft subtree removes the root and every transitive descendant" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const s = mem.store();
+    const key = testReviewKey(4);
+    try s.put(key, .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "f.zig", .to = 1, .commit = "source" } },
+        .body = "root",
+    });
+    try s.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" });
+    try s.put(key, .{ .local_id = 3, .kind = .comment, .parent = .{ .draft = 2 }, .body = "deep reply" });
+    try s.put(key, .{ .local_id = 4, .kind = .comment, .body = "bystander" });
+    try s.put(key, .{ .local_id = 5, .kind = .comment, .parent = .{ .comment = 900 }, .body = "reply to Bitbucket" });
+
+    try s.deleteDraftSubtree(key, .{
+        .root_temp_id = 1,
+        .expected_parent = null,
+        .cascade = &.{ 1, 2, 3 },
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try s.load(arena.allocator(), key);
+    try testing.expectEqual(@as(usize, 2), drafts.len);
+    try testing.expectEqual(@as(TempId, 4), drafts[0].local_id);
+    try testing.expectEqual(@as(TempId, 5), drafts[1].local_id);
+}
+
+test "deleting a leaf Reply leaves its root and siblings untouched" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const s = mem.store();
+    const key = testReviewKey(4);
+    try s.put(key, .{ .local_id = 1, .kind = .comment, .body = "root" });
+    try s.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "doomed" });
+    try s.put(key, .{ .local_id = 3, .kind = .comment, .parent = .{ .draft = 1 }, .body = "sibling" });
+
+    try s.deleteDraftSubtree(key, .{
+        .root_temp_id = 2,
+        .expected_parent = .{ .draft = 1 },
+        .cascade = &.{2},
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try s.load(arena.allocator(), key);
+    try testing.expectEqual(@as(usize, 2), drafts.len);
+    try testing.expectEqualStrings("root", drafts[0].body);
+    try testing.expectEqualStrings("sibling", drafts[1].body);
+}
+
+test "a deletion refuses an incomplete, overreaching, or malformed cascade" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const s = mem.store();
+    const key = testReviewKey(4);
+    const other = RemoteReviewIdentity{ .workspace = "workspace", .repository = "other", .pull_request_id = 4 };
+    try s.put(key, .{ .local_id = 1, .kind = .comment, .body = "root" });
+    try s.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" });
+    try s.put(key, .{ .local_id = 3, .kind = .comment, .body = "bystander" });
+
+    // The confirmed cascade omitted the Reply, so committing would strand it.
+    try testing.expectError(error.DraftCascadeConflict, s.deleteDraftSubtree(key, .{
+        .root_temp_id = 1,
+        .expected_parent = null,
+        .cascade = &.{1},
+    }));
+    // A bystander is not in the closure, whatever the reviewer confirmed.
+    try testing.expectError(error.DraftCascadeConflict, s.deleteDraftSubtree(key, .{
+        .root_temp_id = 1,
+        .expected_parent = null,
+        .cascade = &.{ 1, 3 },
+    }));
+    try testing.expectError(error.DraftCascadeConflict, s.deleteDraftSubtree(key, .{
+        .root_temp_id = 1,
+        .expected_parent = null,
+        .cascade = &.{ 2, 1 },
+    }));
+    try testing.expectError(error.DraftCascadeConflict, s.deleteDraftSubtree(key, .{
+        .root_temp_id = 1,
+        .expected_parent = null,
+        .cascade = &.{ 1, 2, 2 },
+    }));
+    try testing.expectError(error.DraftCascadeConflict, s.deleteDraftSubtree(key, .{
+        .root_temp_id = 1,
+        .expected_parent = null,
+        .cascade = &.{},
+    }));
+    // Wrong parentage means the graph moved underneath the confirmation.
+    try testing.expectError(error.DraftEditConflict, s.deleteDraftSubtree(key, .{
+        .root_temp_id = 2,
+        .expected_parent = .{ .comment = 1 },
+        .cascade = &.{2},
+    }));
+    try testing.expectError(error.DraftNotFound, s.deleteDraftSubtree(key, .{
+        .root_temp_id = 99,
+        .expected_parent = null,
+        .cascade = &.{99},
+    }));
+    try testing.expectError(error.DraftNotFound, s.deleteDraftSubtree(other, .{
+        .root_temp_id = 1,
+        .expected_parent = null,
+        .cascade = &.{ 1, 2 },
+    }));
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(@as(usize, 3), (try s.load(arena.allocator(), key)).len);
+}
+
+test "a deletion refuses a run-owned or immutable member and removes nothing" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const s = mem.store();
+    const key = testReviewKey(4);
+    try s.put(key, .{ .local_id = 1, .kind = .comment, .body = "root" });
+    try s.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "published reply", .state = .{ .posted = 77 } });
+    try s.put(key, .{ .local_id = 3, .kind = .comment, .body = "participant" });
+    try s.put(key, .{ .local_id = 4, .kind = .comment, .parent = .{ .draft = 3 }, .body = "participant reply" });
+
+    // The root itself is mutable; a transient `posted` descendant is not.
+    try testing.expectError(error.DraftNotEditable, s.deleteDraftSubtree(key, .{
+        .root_temp_id = 1,
+        .expected_parent = null,
+        .cascade = &.{ 1, 2 },
+    }));
+
+    _ = try s.beginSubmission(key, "source-commit", &.{.{ .temp_id = 3, .parent = null }});
+    try testing.expectError(error.DraftLocked, s.deleteDraftSubtree(key, .{
+        .root_temp_id = 3,
+        .expected_parent = null,
+        .cascade = &.{ 3, 4 },
+    }));
+    // The descendant alone is outside the frozen participant graph.
+    try s.deleteDraftSubtree(key, .{
+        .root_temp_id = 4,
+        .expected_parent = .{ .draft = 3 },
+        .cascade = &.{4},
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try s.load(arena.allocator(), key);
+    try testing.expectEqual(@as(usize, 3), drafts.len);
+    try testing.expectEqualSlices(TempId, &.{ 1, 2, 3 }, &.{ drafts[0].local_id, drafts[1].local_id, drafts[2].local_id });
+}
+
+test "an unresolved outcome refuses deleting the subtree that contains it" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const s = mem.store();
+    const key = testReviewKey(4);
+    try s.put(key, .{ .local_id = 1, .kind = .comment, .body = "ambiguous" });
+    try s.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" });
+    const operation_id = try s.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
+    try s.checkpointSubmission(operation_id, key, 1, .outcome_unknown, null);
+    try s.completeSubmission(operation_id, key, .partial);
+
+    const deletion: DraftSubtreeDelete = .{ .root_temp_id = 1, .expected_parent = null, .cascade = &.{ 1, 2 } };
+    try testing.expectError(error.DraftLocked, s.deleteDraftSubtree(key, deletion));
+    try s.resolveUnknown(key, 1, .unpublished);
+    try s.deleteDraftSubtree(key, deletion);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(@as(usize, 0), (try s.load(arena.allocator(), key)).len);
 }
 
 test "loadReview rebuilds the graph and next_id for resume" {

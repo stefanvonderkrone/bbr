@@ -37,10 +37,33 @@ const SubmissionPendingState = bbr.review.SubmissionPendingState;
 const UnknownResolution = bbr.review.UnknownResolution;
 const DraftBodyEdit = bbr.review.DraftBodyEdit;
 const DraftReanchor = bbr.review.DraftReanchor;
+const DraftSubtreeDelete = bbr.review.DraftSubtreeDelete;
 const parentEql = bbr.review.parentEql;
 const SubmissionCompletion = bbr.review.SubmissionCompletion;
 
 pub const SqliteError = error{ Open, Exec, Prepare, Step };
+
+/// The complete Draft-parentage closure below `?4`, as SQL. `UNION` deduplicates,
+/// so a malformed parent cycle terminates instead of recursing forever. Every
+/// statement that uses it binds its scope through `bindSubtreeScope`.
+const subtree_cte =
+    \\WITH RECURSIVE subtree(local_id) AS (
+    \\ SELECT local_id FROM drafts
+    \\  WHERE workspace=?1 AND repository=?2 AND pr_id=?3 AND local_id=?4
+    \\ UNION
+    \\ SELECT d.local_id FROM drafts d JOIN subtree s
+    \\  ON d.parent_kind=1 AND d.parent_id=s.local_id
+    \\  WHERE d.workspace=?1 AND d.repository=?2 AND d.pr_id=?3
+    \\)
+    \\
+;
+
+fn bindSubtreeScope(stmt: ?*c.sqlite3_stmt, key: RemoteReviewIdentity, root_temp_id: TempId) void {
+    bindText(stmt, 1, key.workspace);
+    bindText(stmt, 2, key.repository);
+    bindInt(stmt, 3, @intCast(key.pull_request_id));
+    bindInt(stmt, 4, @intCast(root_temp_id));
+}
 
 const schema_v1 =
     \\CREATE TABLE IF NOT EXISTS drafts (
@@ -246,6 +269,7 @@ pub const SqliteStore = struct {
         .remove = removeImpl,
         .edit_draft_body = editDraftBodyImpl,
         .reanchor_draft = reanchorDraftImpl,
+        .delete_draft_subtree = deleteDraftSubtreeImpl,
         .load = loadImpl,
         .begin_submission = beginSubmissionImpl,
         .checkpoint_submission = checkpointSubmissionImpl,
@@ -603,6 +627,92 @@ pub const SqliteStore = struct {
         bindInt(update, 13, @intCast(reanchor.temp_id));
         if (c.sqlite3_step(update) != c.SQLITE_DONE) return error.Step;
         if (c.sqlite3_changes(self.db) != 1) return error.DraftNotFound;
+        try self.exec("COMMIT;");
+    }
+
+    /// One transaction: recheck identity and expected parentage, recompute the
+    /// complete Draft-parentage closure, prove it is exactly the confirmed
+    /// cascade, refuse any run-owned or immutable member, then delete every
+    /// member. A refusal at any point leaves every row in place.
+    fn deleteDraftSubtreeImpl(ptr: *anyopaque, key: RemoteReviewIdentity, deletion: DraftSubtreeDelete) anyerror!void {
+        const self: *SqliteStore = @ptrCast(@alignCast(ptr));
+        try bbr.review.validateCascadeShape(deletion);
+        try self.exec("BEGIN IMMEDIATE;");
+        errdefer self.exec("ROLLBACK;") catch {};
+
+        var root: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT parent_kind, parent_id FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &root, null) != c.SQLITE_OK)
+            return error.Prepare;
+        defer _ = c.sqlite3_finalize(root);
+        bindText(root, 1, key.workspace);
+        bindText(root, 2, key.repository);
+        bindInt(root, 3, @intCast(key.pull_request_id));
+        bindInt(root, 4, @intCast(deletion.root_temp_id));
+        switch (c.sqlite3_step(root)) {
+            c.SQLITE_ROW => {},
+            c.SQLITE_DONE => return error.DraftNotFound,
+            else => return error.Step,
+        }
+        const stored_parent: ?Parent = switch (columnInt(root, 0)) {
+            1 => .{ .draft = @intCast(columnInt(root, 1)) },
+            2 => .{ .comment = @intCast(columnInt(root, 1)) },
+            else => null,
+        };
+        if (!parentEql(stored_parent, deletion.expected_parent)) return error.DraftEditConflict;
+
+        // The closure and every eligibility fact, read in one statement so no
+        // partial verdict is possible.
+        var survey: ?*c.sqlite3_stmt = null;
+        const survey_sql = subtree_cte ++
+            \\SELECT
+            \\ (SELECT COUNT(*) FROM subtree),
+            \\ (SELECT COUNT(*) FROM subtree s JOIN drafts d
+            \\   ON d.workspace=?1 AND d.repository=?2 AND d.pr_id=?3 AND d.local_id=s.local_id
+            \\   WHERE d.state_kind IN (1,2)),
+            \\ (SELECT COUNT(*) FROM subtree s JOIN drafts d
+            \\   ON d.workspace=?1 AND d.repository=?2 AND d.pr_id=?3 AND d.local_id=s.local_id
+            \\   WHERE d.state_kind=4),
+            \\ (SELECT EXISTS(SELECT 1 FROM submission_runs r
+            \\   JOIN submission_run_items i ON i.operation_id=r.operation_id
+            \\   WHERE r.workspace=?1 AND r.repository=?2 AND r.pr_id=?3 AND r.state=0
+            \\     AND i.temp_id IN (SELECT local_id FROM subtree)));
+        ;
+        if (c.sqlite3_prepare_v2(self.db, survey_sql, -1, &survey, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(survey);
+        bindSubtreeScope(survey, key, deletion.root_temp_id);
+        if (c.sqlite3_step(survey) != c.SQLITE_ROW) return error.Step;
+        if (columnInt(survey, 0) != @as(i64, @intCast(deletion.cascade.len))) return error.DraftCascadeConflict;
+        if (columnInt(survey, 3) != 0) return error.DraftLocked;
+        if (columnInt(survey, 2) != 0) return error.DraftLocked;
+        if (columnInt(survey, 1) != 0) return error.DraftNotEditable;
+
+        // Equal counts alone would accept a cascade naming other Drafts, so
+        // every confirmed member must also be in the recomputed closure.
+        var member: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, subtree_cte ++ "SELECT EXISTS(SELECT 1 FROM subtree WHERE local_id=?5);", -1, &member, null) != c.SQLITE_OK)
+            return error.Prepare;
+        defer _ = c.sqlite3_finalize(member);
+        bindSubtreeScope(member, key, deletion.root_temp_id);
+        for (deletion.cascade) |temp_id| {
+            if (c.sqlite3_reset(member) != c.SQLITE_OK) return error.Step;
+            bindInt(member, 5, @intCast(temp_id));
+            if (c.sqlite3_step(member) != c.SQLITE_ROW) return error.Step;
+            if (columnInt(member, 0) == 0) return error.DraftCascadeConflict;
+        }
+
+        var delete: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "DELETE FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &delete, null) != c.SQLITE_OK)
+            return error.Prepare;
+        defer _ = c.sqlite3_finalize(delete);
+        for (deletion.cascade) |temp_id| {
+            if (c.sqlite3_reset(delete) != c.SQLITE_OK) return error.Step;
+            bindText(delete, 1, key.workspace);
+            bindText(delete, 2, key.repository);
+            bindInt(delete, 3, @intCast(key.pull_request_id));
+            bindInt(delete, 4, @intCast(temp_id));
+            if (c.sqlite3_step(delete) != c.SQLITE_DONE) return error.Step;
+            if (c.sqlite3_changes(self.db) != 1) return error.DraftCascadeConflict;
+        }
         try self.exec("COMMIT;");
     }
 
@@ -1470,6 +1580,73 @@ test "a persisted re-anchor refuses locked, mismatched, and invalid shapes" {
     defer arena.deinit();
     const drafts = try store.load(arena.allocator(), key);
     try testing.expectEqual(@as(?u32, 1), drafts[0].scope.?.@"inline".to);
+}
+
+test "a persisted subtree deletion removes every descendant and stays deleted" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, ".zig-cache/tmp/{s}/delete.db", .{&tmp.sub_path}, 0);
+    defer testing.allocator.free(path);
+    const key = testReviewKey(16);
+    {
+        var s = try SqliteStore.open(path);
+        defer s.deinit();
+        const store = s.store();
+        try store.put(key, .{
+            .local_id = 1,
+            .kind = .comment,
+            .scope = .{ .@"inline" = .{ .path = "f.zig", .to = 3, .commit = "source" } },
+            .snapshot = .{ .text = "authored", .selection_start = 0, .selection_len = 1 },
+            .body = "root",
+        });
+        try store.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" });
+        try store.put(key, .{ .local_id = 3, .kind = .comment, .parent = .{ .draft = 2 }, .body = "deep reply" });
+        try store.put(key, .{ .local_id = 4, .kind = .comment, .body = "bystander" });
+
+        try store.deleteDraftSubtree(key, .{
+            .root_temp_id = 1,
+            .expected_parent = null,
+            .cascade = &.{ 1, 2, 3 },
+        });
+        // TempIds are never reused: the counter does not walk back over a
+        // deleted subtree.
+        try testing.expectEqual(@as(TempId, 5), try store.reserveTempId(key));
+    }
+    var reopened = try SqliteStore.open(path);
+    defer reopened.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try reopened.store().load(arena.allocator(), key);
+    try testing.expectEqual(@as(usize, 1), drafts.len);
+    try testing.expectEqualStrings("bystander", drafts[0].body);
+}
+
+test "a persisted deletion refuses a mismatched cascade, immutable member, or run participant" {
+    var s = try SqliteStore.open(":memory:");
+    defer s.deinit();
+    const store = s.store();
+    const key = testReviewKey(17);
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "root" });
+    try store.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" });
+    try store.put(key, .{ .local_id = 3, .kind = .comment, .body = "bystander" });
+    try store.put(key, .{ .local_id = 4, .kind = .comment, .body = "published root" });
+    try store.put(key, .{ .local_id = 5, .kind = .comment, .parent = .{ .draft = 4 }, .body = "published reply", .state = .{ .posted = 90 } });
+
+    try testing.expectError(error.DraftNotFound, store.deleteDraftSubtree(key, .{ .root_temp_id = 77, .expected_parent = null, .cascade = &.{77} }));
+    try testing.expectError(error.DraftEditConflict, store.deleteDraftSubtree(key, .{ .root_temp_id = 2, .expected_parent = null, .cascade = &.{2} }));
+    // An incomplete cascade would strand the Reply; a padded one names a Draft
+    // outside the closure. Both counts and membership are rechecked.
+    try testing.expectError(error.DraftCascadeConflict, store.deleteDraftSubtree(key, .{ .root_temp_id = 1, .expected_parent = null, .cascade = &.{1} }));
+    try testing.expectError(error.DraftCascadeConflict, store.deleteDraftSubtree(key, .{ .root_temp_id = 1, .expected_parent = null, .cascade = &.{ 1, 3 } }));
+    try testing.expectError(error.DraftCascadeConflict, store.deleteDraftSubtree(key, .{ .root_temp_id = 1, .expected_parent = null, .cascade = &.{ 1, 2, 3 } }));
+    try testing.expectError(error.DraftNotEditable, store.deleteDraftSubtree(key, .{ .root_temp_id = 4, .expected_parent = null, .cascade = &.{ 4, 5 } }));
+
+    _ = try store.beginSubmission(key, "source", &.{.{ .temp_id = 1, .parent = null }});
+    try testing.expectError(error.DraftLocked, store.deleteDraftSubtree(key, .{ .root_temp_id = 1, .expected_parent = null, .cascade = &.{ 1, 2 } }));
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(@as(usize, 5), (try store.load(arena.allocator(), key)).len);
 }
 
 test "a persisted edit survives reopening the database" {

@@ -1420,10 +1420,19 @@ test "local help projection marks remote-only commands unavailable" {
     for (rows.commands) |row| {
         if (!row.available) unavailable += 1;
     }
-    // Four remote-only commands, plus edit and re-anchor — visible but refused
-    // away from a ReviewCard — and the Picker.
-    try testing.expectEqual(@as(usize, 7), unavailable);
+    // Four remote-only commands, plus edit, re-anchor, and delete — visible but
+    // refused away from a ReviewCard — and the Picker.
+    try testing.expectEqual(@as(usize, 8), unavailable);
     for (rows.motions) |row| try testing.expect(row.available);
+}
+
+test "delete stays discoverable in the help Overlay when it is refused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const refused = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .delete_refusal = .descendant_locked });
+    const deletable = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .delete_refusal = null });
+    try testing.expect(!helpRowAvailable(refused.commands, "delete local Draft subtree").?);
+    try testing.expect(helpRowAvailable(deletable.commands, "delete local Draft subtree").?);
 }
 
 test "re-anchor stays discoverable in the help Overlay when it is refused" {

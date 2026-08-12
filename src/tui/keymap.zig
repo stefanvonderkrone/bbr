@@ -183,6 +183,7 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one('r'), .action = .reply, .help = "reply" },
     .{ .chord = Chord.one('e'), .action = .edit_review_item, .help = "edit local Draft" },
     .{ .chord = Chord.one('a'), .action = .reanchor_review_item, .help = "re-anchor local root Draft" },
+    .{ .chord = Chord.one('D'), .action = .delete_review_item, .help = "delete local Draft subtree" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_disclosure, .help = "toggle disclosure" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_review_card, .help = "toggle ReviewCard" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_directory, .help = "toggle Directory" },
@@ -359,7 +360,7 @@ fn validateBindings(bindings: []const Binding) !void {
 
 pub fn supportsContext(action: Action, context: InteractionContext) bool {
     return switch (context) {
-        .composer, .help, .unknown_resolution => false,
+        .composer, .help, .unknown_resolution, .delete_confirmation => false,
         .file_finder, .pull_request_picker => switch (action) {
             .up, .down, .confirm_picker, .quit => true,
             else => false,
@@ -437,7 +438,7 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             else => supportsContext(action, .diff),
         },
         .diff_review_card => switch (action) {
-            .toggle_review_card, .reply, .edit_review_item, .reanchor_review_item => true,
+            .toggle_review_card, .reply, .edit_review_item, .reanchor_review_item, .delete_review_item => true,
             else => supportsContext(action, .diff),
         },
         .diff_source => switch (action) {

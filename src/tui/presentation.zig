@@ -210,6 +210,7 @@ pub const OwnedInput = union(enum) {
     composer: ComposerInput,
     unknown_resolution: UnknownResolutionInput,
     reanchor: ReanchorInput,
+    delete_confirmation: DeleteConfirmationInput,
     ensure_focused_enrichment,
     file_enrichment_completed: FileEnrichmentCompleted,
     post_draft_completed: PostDraftCompleted,
@@ -437,6 +438,8 @@ pub const UnknownResolutionInput = union(enum) {
 /// cancel and leave the Draft exactly as it was.
 pub const ReanchorInput = enum { accept, cancel };
 
+pub const DeleteConfirmationInput = enum { confirm, cancel };
+
 /// Session-relative actions whose complete state is Navigation. They are
 /// suspended while a replacement is pending, along with every other Action
 /// that depends on the currently published review.
@@ -647,6 +650,7 @@ pub const Projection = struct {
     recovery: ?RecoveryNotice,
     unknown_resolution: ?UnknownResolutionProjection,
     reanchor: ?ReanchorProjection,
+    delete_confirmation: ?DeleteConfirmationProjection,
     picker: ?*const Picker,
     picker_tick_scope: ?WorkId,
     file_finder: ?*const FileFinder,
@@ -687,6 +691,9 @@ pub const MutationRefusal = enum {
     reply_inherits_scope,
     /// A Review-level or File-level root; re-anchor never converts a scope.
     scope_not_inline,
+    /// A Reply somewhere below this Draft is run-owned or immutable, so the
+    /// complete cascade is refused rather than partially applied.
+    descendant_locked,
 };
 
 pub const ActionAvailability = struct {
@@ -699,6 +706,9 @@ pub const ActionAvailability = struct {
     /// null means the ReviewCard under the cursor — or, while re-anchor is
     /// armed, the Draft it retained — accepts a replacement Anchor.
     reanchor_refusal: ?MutationRefusal = .no_review_item,
+    /// null means the ReviewCard under the cursor — and its complete Draft
+    /// Reply-descendant closure — can be deleted.
+    delete_refusal: ?MutationRefusal = .no_review_item,
 
     pub fn available(self: ActionAvailability, action: Action) bool {
         if (!self.has_review) return switch (action) {
@@ -713,6 +723,7 @@ pub const ActionAvailability = struct {
             .inline_comment, .suggest, .yank => self.source,
             .edit_review_item => self.edit_refusal == null,
             .reanchor_review_item => self.reanchor_refusal == null,
+            .delete_review_item => self.delete_refusal == null,
             else => true,
         };
     }
@@ -772,6 +783,13 @@ pub const ReanchorProjection = struct {
     refusal: ?ActionError,
 };
 
+/// The armed delete confirmation: which local Draft it names and the complete
+/// Reply-descendant consequence the reviewer is being asked to accept.
+pub const DeleteConfirmationProjection = struct {
+    temp_id: bbr.review.TempId,
+    descendant_count: usize,
+};
+
 pub const ActionError = enum {
     action_refused,
     buffer_build_failed,
@@ -802,6 +820,8 @@ pub const ActionError = enum {
     draft_edit_conflict,
     draft_reply_has_no_anchor,
     draft_scope_not_inline,
+    draft_descendant_locked,
+    draft_cascade_changed,
     anchor_candidate_ambiguous,
     anchor_range_too_long,
     suggestion_anchor_not_new_side,
@@ -811,6 +831,7 @@ const BufferTransactionError = error{ BufferBuildFailed, OutOfMemory };
 const SaveDraftError = BufferTransactionError || error{PersistenceFailed};
 const EditDraftError = SaveDraftError || error{ DraftEditConflict, DraftLocked };
 const ReanchorDraftError = EditDraftError || error{ DraftNotAnchorable, InvalidAnchor };
+const DeleteDraftError = EditDraftError;
 
 pub const ReplacementError = enum {
     session_load_failed,
@@ -1237,6 +1258,62 @@ const Published = struct {
         staged.publish();
     }
 
+    /// Delete one Draft and its complete confirmed Reply-descendant closure:
+    /// stage the candidate graph and ScopeProjection by compacting both in
+    /// place, stage the Buffer, persist through the transaction-shaped store,
+    /// then publish. Any failure restores the exact previous graph, projection,
+    /// and Frame — a partial cascade is never observable. `next_id` deliberately
+    /// does not walk back, so a deleted TempId is never handed out again.
+    fn deleteDraftSubtree(
+        self: *Published,
+        store: bbr.review.PendingReviewStore,
+        preferences: Preferences,
+        temp_id: bbr.review.TempId,
+        cascade: []const bbr.review.TempId,
+    ) DeleteDraftError!void {
+        const draft = self.review.getConst(temp_id) orelse return error.DraftEditConflict;
+        const expected_parent = draft.parent;
+
+        const saved_drafts = try self.allocator.dupe(bbr.review.Draft, self.review.drafts.items);
+        defer self.allocator.free(saved_drafts);
+        const saved_projection = try self.allocator.dupe(bbr.review.ScopeProjectionEntry, self.scope_projection.items);
+        defer self.allocator.free(saved_projection);
+
+        var kept: usize = 0;
+        for (self.review.drafts.items) |candidate| {
+            if (bbr.review.containsTempId(cascade, candidate.local_id)) continue;
+            self.review.drafts.items[kept] = candidate;
+            kept += 1;
+        }
+        self.review.drafts.shrinkRetainingCapacity(kept);
+        var kept_projection: usize = 0;
+        for (self.scope_projection.items) |entry| {
+            if (bbr.review.containsTempId(cascade, entry.temp_id)) continue;
+            self.scope_projection.items[kept_projection] = entry;
+            kept_projection += 1;
+        }
+        self.scope_projection.shrinkRetainingCapacity(kept_projection);
+        errdefer {
+            self.review.drafts.clearRetainingCapacity();
+            self.review.drafts.appendSliceAssumeCapacity(saved_drafts);
+            self.scope_projection.clearRetainingCapacity();
+            self.scope_projection.appendSliceAssumeCapacity(saved_projection);
+        }
+
+        var staged = try self.prepareBuffer(preferences, self.expanded_disclosures.items, self.isolated_file, self.geometry);
+        defer staged.deinit();
+        store.deleteDraftSubtree(self.key.storeKey(), .{
+            .root_temp_id = temp_id,
+            .expected_parent = expected_parent,
+            .cascade = cascade,
+        }) catch |err| return switch (err) {
+            error.DraftLocked, error.DraftNotEditable => error.DraftLocked,
+            error.DraftEditConflict, error.DraftNotFound, error.DraftCascadeConflict => error.DraftEditConflict,
+            else => error.PersistenceFailed,
+        };
+        staged.publish();
+    }
+
     fn prepareBuffer(
         self: *Published,
         preferences: Preferences,
@@ -1382,6 +1459,23 @@ const Published = struct {
 const ReanchorCapture = struct {
     key: OwnedReviewIdentity,
     temp_id: bbr.review.TempId,
+};
+
+/// The armed delete confirmation. It retains the typed identity and the exact
+/// consequence the reviewer was shown, so a graph that changed underneath the
+/// overlay is refused instead of silently deleting a different set.
+const DeleteConfirmation = struct {
+    key: OwnedReviewIdentity,
+    temp_id: bbr.review.TempId,
+    descendant_count: usize,
+};
+
+/// Where the cursor goes once a deleted subtree's rows are gone: the identity
+/// of the first surviving row after it, else the last surviving row before it.
+const SurvivingRow = union(enum) {
+    draft: bbr.review.TempId,
+    comment: bbr.review.CommentId,
+    line: *const bbr.diff.Line,
 };
 
 const UnknownResolutionEditor = struct {
@@ -1767,6 +1861,9 @@ pub const Presentation = struct {
     /// The armed first stage of re-anchor: the Draft whose Anchor a later
     /// source cursor or Selection will replace.
     reanchor: ?ReanchorCapture = null,
+    /// The armed delete confirmation, if any. It captures input like any other
+    /// Overlay and survives a refusal so the reviewer can retry.
+    delete_confirmation: ?DeleteConfirmation = null,
     shutdown_requested: bool = false,
     replacement_error: ?ReplacementError = null,
     action_error: ?ActionError = null,
@@ -1851,6 +1948,7 @@ pub const Presentation = struct {
             .composer => |composer_input| self.applyComposerInput(composer_input),
             .unknown_resolution => |resolution_input| self.applyUnknownResolutionInput(resolution_input),
             .reanchor => |reanchor_input| self.applyReanchorInput(reanchor_input),
+            .delete_confirmation => |confirmation_input| self.applyDeleteConfirmationInput(confirmation_input),
             .ensure_focused_enrichment => try self.ensureFocusedEnrichment(),
             .file_enrichment_completed => |completed| self.acceptFileEnrichment(completed),
             .post_draft_completed => |completed| self.acceptPostDraft(completed),
@@ -1948,6 +2046,10 @@ pub const Presentation = struct {
                 .comment_id = editor.text(),
             } else null,
             .reanchor = self.reanchorProjection(),
+            .delete_confirmation = if (self.delete_confirmation) |confirmation| .{
+                .temp_id = confirmation.temp_id,
+                .descendant_count = confirmation.descendant_count,
+            } else null,
             .picker = if (self.picker) |*picker| picker else null,
             .picker_tick_scope = if (!self.shutdown_requested) if (self.picker) |*picker|
                 if (picker.loading) self.picker_work_id else null
@@ -2005,7 +2107,7 @@ pub const Presentation = struct {
     }
 
     fn overlayTarget(self: *const Presentation) ?frame_mod.OverlayTarget {
-        if (self.help_visible or self.unknown_resolution != null or self.visibleSubmissionOverlay())
+        if (self.help_visible or self.unknown_resolution != null or self.delete_confirmation != null or self.visibleSubmissionOverlay())
             return otherOverlay(self.geometry);
         if (self.file_finder) |finder| {
             const rect = frame_mod.overlayRect(self.geometry, 60, 16) orelse return null;
@@ -2335,6 +2437,7 @@ pub const Presentation = struct {
     fn interactionContext(self: *const Presentation) keymap_mod.InteractionContext {
         if (self.help_visible) return .help;
         if (self.unknown_resolution != null) return .unknown_resolution;
+        if (self.delete_confirmation != null) return .delete_confirmation;
         if (self.file_finder != null) return .file_finder;
         if (self.picker != null) return .pull_request_picker;
         return self.paneContext();
@@ -2376,6 +2479,7 @@ pub const Presentation = struct {
             .source = source,
             .edit_refusal = self.editRefusal(published),
             .reanchor_refusal = self.reanchorRefusal(published),
+            .delete_refusal = self.deleteRefusal(published),
         };
     }
 
@@ -2427,6 +2531,124 @@ pub const Presentation = struct {
         }
         if (self.submissionOwnsDraft(published.key, temp_id)) return .submission_owns_draft;
         return null;
+    }
+
+    /// Why deleting is refused, or null when the complete subtree can go. While
+    /// a confirmation is armed the answer is about the Draft it retained, so a
+    /// state change under the overlay is visible before the reviewer confirms.
+    fn deleteRefusal(self: *const Presentation, published: *const Published) ?MutationRefusal {
+        if (self.delete_confirmation) |confirmation| {
+            if (!OwnedReviewIdentity.eql(published.key, confirmation.key)) return .no_review_item;
+            return self.draftDeleteRefusal(published, confirmation.temp_id);
+        }
+        const target = reviewCardTarget(published) orelse return .no_review_item;
+        return switch (target) {
+            .comment => .published_comment,
+            .draft => |temp_id| self.draftDeleteRefusal(published, temp_id),
+        };
+    }
+
+    /// The whole cascade must be deletable: one run-owned, in-flight, published,
+    /// or unresolved member anywhere below the root refuses all of it, because
+    /// deleting the rest would strand it or destroy ambiguous evidence.
+    fn draftDeleteRefusal(self: *const Presentation, published: *const Published, temp_id: bbr.review.TempId) ?MutationRefusal {
+        if (published.review.getConst(temp_id) == null) return .no_review_item;
+        for (published.review.drafts.items) |candidate| {
+            if (!bbr.review.descendsFrom(published.review.drafts.items, temp_id, candidate.local_id)) continue;
+            const root = candidate.local_id == temp_id;
+            switch (candidate.state) {
+                .draft, .failed => {},
+                .submitting => return if (root) .submission_in_flight else .descendant_locked,
+                .posted => return if (root) .already_published else .descendant_locked,
+                .outcome_unknown => return if (root) .outcome_unresolved else .descendant_locked,
+            }
+            if (self.submissionOwnsDraft(published.key, candidate.local_id))
+                return if (root) .submission_owns_draft else .descendant_locked;
+        }
+        return null;
+    }
+
+    /// `D` on a deletable ReviewCard: arm the keyboard-complete confirmation
+    /// naming the local TempId and the complete Reply-descendant consequence.
+    fn openDeleteConfirmation(self: *Presentation, published: *Published) void {
+        if (published.composer != null) return;
+        // Already armed: `D` neither re-targets nor confirms the deletion.
+        if (self.delete_confirmation != null) return;
+        if (self.deleteRefusal(published)) |refusal| {
+            self.action_error = mutationRefusalError(refusal);
+            return;
+        }
+        const target = reviewCardTarget(published) orelse {
+            self.action_error = .no_review_item;
+            return;
+        };
+        self.delete_confirmation = .{
+            .key = published.key,
+            .temp_id = target.draft,
+            .descendant_count = descendantCount(published, target.draft),
+        };
+        self.action_error = null;
+    }
+
+    fn applyDeleteConfirmationInput(self: *Presentation, input: DeleteConfirmationInput) void {
+        if (self.shutdown_requested or self.replacement != null) return;
+        const confirmation = self.delete_confirmation orelse return;
+        if (input == .cancel) {
+            self.delete_confirmation = null;
+            self.action_error = null;
+            return;
+        }
+        const published = self.published orelse {
+            self.delete_confirmation = null;
+            return;
+        };
+        if (!OwnedReviewIdentity.eql(published.key, confirmation.key)) {
+            self.delete_confirmation = null;
+            return;
+        }
+        if (published.review.getConst(confirmation.temp_id) == null) {
+            self.delete_confirmation = null;
+            self.action_error = .no_review_item;
+            return;
+        }
+        if (self.draftDeleteRefusal(published, confirmation.temp_id)) |refusal| {
+            self.action_error = mutationRefusalError(refusal);
+            return;
+        }
+
+        const cascade = self.allocator.alloc(bbr.review.TempId, published.review.drafts.items.len) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        defer self.allocator.free(cascade);
+        const len = collectCascade(published, confirmation.temp_id, cascade);
+        // The reviewer accepted one complete consequence; a different one is a
+        // new decision, not this one.
+        if (len != confirmation.descendant_count + 1) {
+            self.action_error = .draft_cascade_changed;
+            return;
+        }
+
+        const surviving = survivingRowAfterDeletion(published, cascade[0..len]);
+        published.deleteDraftSubtree(
+            self.dependencies.reviews,
+            self.preferences,
+            confirmation.temp_id,
+            cascade[0..len],
+        ) catch |err| {
+            self.action_error = switch (err) {
+                error.DraftLocked => .draft_owned_by_submission,
+                error.DraftEditConflict => .draft_edit_conflict,
+                error.PersistenceFailed => .persistence_failed,
+                error.BufferBuildFailed => .buffer_build_failed,
+                error.OutOfMemory => .out_of_memory,
+            };
+            return;
+        };
+        self.delete_confirmation = null;
+        published.navigation.clearMark();
+        followSurvivingRow(published, surviving);
+        self.action_error = null;
     }
 
     fn reanchorProjection(self: *const Presentation) ?ReanchorProjection {
@@ -2564,6 +2786,15 @@ pub const Presentation = struct {
             if (key.text) |text| for (text) |byte| if (byte >= '0' and byte <= '9') self.applyUnknownResolutionInput(.{ .digit = byte - '0' });
             return;
         }
+        // The confirmation is keyboard-complete and captures everything else:
+        // no motion can drift the cursor away from the Draft it names.
+        if (self.delete_confirmation != null) {
+            if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true }) or key.matches('n', .{}))
+                return self.applyDeleteConfirmationInput(.cancel);
+            if (key.matches(keymap_mod.special.enter, .{}) or key.matches('y', .{}))
+                return self.applyDeleteConfirmationInput(.confirm);
+            return;
+        }
         if (self.published) |published| if (published.composer != null) {
             if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.applyComposerInput(.cancel);
             if (key.matches('d', .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) return self.applyComposerInput(.save);
@@ -2675,6 +2906,7 @@ pub const Presentation = struct {
                 .inline_comment, .suggest, .yank => .source_action_unavailable,
                 .edit_review_item => mutationRefusalError(availability.edit_refusal),
                 .reanchor_review_item => mutationRefusalError(availability.reanchor_refusal),
+                .delete_review_item => mutationRefusalError(availability.delete_refusal),
                 else => .local_review_remote_action_unavailable,
             };
             return;
@@ -2760,6 +2992,7 @@ pub const Presentation = struct {
             .reply => self.openReplyComposer(published),
             .edit_review_item => self.openEditComposer(published),
             .reanchor_review_item => self.armReanchor(published),
+            .delete_review_item => self.openDeleteConfirmation(published),
             .inline_comment => self.openInlineComposer(published, .comment),
             .suggest => self.openInlineComposer(published, .suggestion),
             .submit => self.startSubmission(published),
@@ -4005,8 +4238,10 @@ pub const Presentation = struct {
                 const previous = self.published;
                 self.published = candidate;
                 self.next_session_epoch = epoch;
-                // The armed candidate named rows in the replaced Session.
+                // The armed candidate named rows in the replaced Session, and
+                // the confirmed cascade described the replaced graph.
                 self.reanchor = null;
+                self.delete_confirmation = null;
                 self.resolver = .{};
                 self.mouse_press = null;
                 self.interaction_revision +%= 1;
@@ -4071,6 +4306,7 @@ fn mutationRefusalError(refusal: ?MutationRefusal) ActionError {
         .published_comment => .published_comment_edit_unsupported,
         .reply_inherits_scope => .draft_reply_has_no_anchor,
         .scope_not_inline => .draft_scope_not_inline,
+        .descendant_locked => .draft_descendant_locked,
     };
 }
 
@@ -4147,6 +4383,90 @@ fn reanchorCandidate(published: *const Published, kind: bbr.review.DraftKind) !A
         else => error.MixedSides,
     };
     return .{ .file_index = file_index, .anchor = anchor, .lines = lines };
+}
+
+/// How many Reply descendants a Draft carries — the consequence the reviewer
+/// confirms before deleting. Allocation-free, so reading the armed banner
+/// cannot fail.
+fn descendantCount(published: *const Published, temp_id: bbr.review.TempId) usize {
+    var count: usize = 0;
+    for (published.review.drafts.items) |candidate| {
+        if (candidate.local_id == temp_id) continue;
+        if (bbr.review.descendsFrom(published.review.drafts.items, temp_id, candidate.local_id)) count += 1;
+    }
+    return count;
+}
+
+/// The complete closure to delete, root first (the order every store adapter
+/// rechecks). `out` must hold one entry per Draft; the used length is returned.
+fn collectCascade(published: *const Published, temp_id: bbr.review.TempId, out: []bbr.review.TempId) usize {
+    out[0] = temp_id;
+    var len: usize = 1;
+    for (published.review.drafts.items) |candidate| {
+        if (candidate.local_id == temp_id) continue;
+        if (!bbr.review.descendsFrom(published.review.drafts.items, temp_id, candidate.local_id)) continue;
+        out[len] = candidate.local_id;
+        len += 1;
+    }
+    return len;
+}
+
+/// Where the cursor belongs once `cascade`'s rows are gone: the first surviving
+/// semantic row after the deleted card, falling back to the last surviving one
+/// before it. Source rows qualify, so a Draft that owned the tail of a File
+/// still lands on real content.
+fn survivingRowAfterDeletion(published: *const Published, cascade: []const bbr.review.TempId) ?SurvivingRow {
+    const rows = published.buffer.rows;
+    var first: ?usize = null;
+    for (rows, 0..) |row, index| {
+        if (!rowOwnedByCascade(row, cascade)) continue;
+        first = index;
+        break;
+    }
+    const start = first orelse return null;
+    var forward = start;
+    while (forward < rows.len) : (forward += 1) {
+        if (rowOwnedByCascade(rows[forward], cascade)) continue;
+        if (survivingRowIdentity(rows[forward])) |identity| return identity;
+    }
+    var backward = start;
+    while (backward > 0) {
+        backward -= 1;
+        if (rowOwnedByCascade(rows[backward], cascade)) continue;
+        if (survivingRowIdentity(rows[backward])) |identity| return identity;
+    }
+    return null;
+}
+
+fn rowOwnedByCascade(row: buffer_mod.Row, cascade: []const bbr.review.TempId) bool {
+    return switch (row) {
+        .draft => |card| bbr.review.containsTempId(cascade, card.owner.draft),
+        .snapshot => |snapshot| bbr.review.containsTempId(cascade, snapshot.draft.local_id),
+        else => false,
+    };
+}
+
+fn survivingRowIdentity(row: buffer_mod.Row) ?SurvivingRow {
+    return switch (row) {
+        .draft => |card| .{ .draft = card.owner.draft },
+        .comment => |card| .{ .comment = card.owner.comment },
+        else => if (lineAtRow(row)) |line| .{ .line = line } else null,
+    };
+}
+
+fn followSurvivingRow(published: *Published, surviving: ?SurvivingRow) void {
+    const wanted = surviving orelse return;
+    for (published.buffer.rows, 0..) |row, index| {
+        const identity = survivingRowIdentity(row) orelse continue;
+        const matches = switch (wanted) {
+            .draft => |temp_id| identity == .draft and identity.draft == temp_id,
+            .comment => |id| identity == .comment and identity.comment == id,
+            .line => |line| identity == .line and identity.line == line,
+        };
+        if (!matches) continue;
+        published.navigation.jumpTo(index);
+        return;
+    }
 }
 
 /// Put the cursor back on `temp_id`'s ReviewCard wherever the reprojection put
@@ -5319,6 +5639,17 @@ fn cursorToDraftCard(presentation: *Presentation, temp_id: bbr.review.TempId) !v
     return error.DraftCardNotFound;
 }
 
+/// Move the DiffPane cursor onto the header row of a published Comment's card.
+fn cursorToCommentCard(presentation: *Presentation, comment_id: bbr.review.CommentId) !void {
+    const rows = presentation.projection().review.?.buffer.rows;
+    for (rows, 0..) |row, index| {
+        if (row != .comment or row.comment.owner.comment != comment_id or row.comment.part != .header) continue;
+        try moveToRow(presentation, index);
+        return;
+    }
+    return error.CommentCardNotFound;
+}
+
 fn draftBody(presentation: *Presentation, temp_id: bbr.review.TempId) []const u8 {
     for (presentation.projection().review.?.drafts) |draft| {
         if (draft.local_id == temp_id) return draft.body;
@@ -6282,6 +6613,361 @@ test "a failed re-anchor preserves the previous Frame and the armed candidate" {
     try testing.expect(presentation.projection().reanchor == null);
     try testing.expectEqual(@as(?u32, 8), draftAnchor(&presentation, 1).to);
     try testing.expect(presentation.projection().review.?.drafts[0].state == .draft);
+}
+
+/// A root inline Draft on `wide.zig` line 1 with a two-deep Reply chain and an
+/// unrelated bystander root, so a cascade has something to spare.
+fn seedDeletableSubtree(store: bbr.review.PendingReviewStore, key: OwnedReviewIdentity) !void {
+    try store.put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = 1, .commit = "source" } },
+        .snapshot = .{ .text = "added 1", .selection_start = 0, .selection_len = 1 },
+        .body = "root",
+    });
+    try store.put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" });
+    try store.put(key.storeKey(), .{ .local_id = 3, .kind = .comment, .parent = .{ .draft = 2 }, .body = "deep reply" });
+    try store.put(key.storeKey(), .{
+        .local_id = 4,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = 2, .commit = "source" } },
+        .body = "bystander",
+    });
+}
+
+/// How many distinct Drafts still own a ReviewCard header row.
+fn draftCardCount(presentation: *Presentation) usize {
+    var count: usize = 0;
+    for (presentation.projection().review.?.buffer.rows) |row| {
+        if (row == .draft and row.draft.part == .header) count += 1;
+    }
+    return count;
+}
+
+fn sidebarDraftCount(presentation: *Presentation) usize {
+    var count: usize = 0;
+    for (presentation.published.?.tree.entries) |entry| {
+        if (entry.identity == .file) count += entry.drafts;
+    }
+    return count;
+}
+
+fn draftTempIds(presentation: *Presentation, out: []bbr.review.TempId) []const bbr.review.TempId {
+    const drafts = presentation.projection().review.?.drafts;
+    for (drafts, 0..) |draft, index| out[index] = draft.local_id;
+    return out[0..drafts.len];
+}
+
+test "deleting a root Draft removes its complete Reply-descendant subtree" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try seedDeletableSubtree(store.store(), key);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 60 },
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    try testing.expect(presentation.projection().action_availability.available(.delete_review_item));
+    try presentation.dispatch(.{ .action = .delete_review_item });
+
+    // The confirmation names the local TempId and the complete consequence.
+    const confirmation = presentation.projection().delete_confirmation.?;
+    try testing.expectEqual(@as(bbr.review.TempId, 1), confirmation.temp_id);
+    try testing.expectEqual(@as(usize, 2), confirmation.descendant_count);
+    // The Sidebar tallies anchored roots: two before, one after.
+    try testing.expectEqual(@as(usize, 2), sidebarDraftCount(&presentation));
+
+    try presentation.dispatch(.{ .delete_confirmation = .confirm });
+
+    const after = presentation.projection();
+    try testing.expect(after.delete_confirmation == null);
+    try testing.expect(after.action_error == null);
+    var ids: [8]bbr.review.TempId = undefined;
+    try testing.expectEqualSlices(bbr.review.TempId, &.{4}, draftTempIds(&presentation, &ids));
+    // PendingReview nodes, ScopeProjection entries, ReviewCard rows, and the
+    // Sidebar counts all move together, only after durable success.
+    try testing.expectEqual(@as(usize, 1), presentation.published.?.scope_projection.items.len);
+    try testing.expectEqual(@as(bbr.review.TempId, 4), presentation.published.?.scope_projection.items[0].temp_id);
+    try testing.expectEqual(@as(usize, 1), draftCardCount(&presentation));
+    try testing.expectEqual(@as(usize, 1), sidebarDraftCount(&presentation));
+
+    // A fresh Session over the same store proves it is durably gone, and the
+    // deleted TempIds are never handed out again.
+    var resumed = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 60 },
+    });
+    defer resumed.deinit();
+    try testing.expectEqualSlices(bbr.review.TempId, &.{4}, draftTempIds(&resumed, &ids));
+    try testing.expectEqual(@as(bbr.review.TempId, 5), try store.store().reserveTempId(key.storeKey()));
+}
+
+test "deleting a leaf Reply keeps its root and every sibling" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try seedDeletableSubtree(store.store(), key);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 60 },
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 3);
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try testing.expectEqual(@as(usize, 0), presentation.projection().delete_confirmation.?.descendant_count);
+    try presentation.dispatch(.{ .delete_confirmation = .confirm });
+
+    var ids: [8]bbr.review.TempId = undefined;
+    try testing.expectEqualSlices(bbr.review.TempId, &.{ 1, 2, 4 }, draftTempIds(&presentation, &ids));
+    try testing.expectEqualStrings("root", draftBody(&presentation, 1));
+}
+
+test "cancelling a delete confirmation changes nothing" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try seedDeletableSubtree(store.store(), key);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 60 },
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    const before = presentation.projection().review.?;
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try presentation.dispatch(.{ .delete_confirmation = .cancel });
+
+    const after = presentation.projection();
+    try testing.expect(after.delete_confirmation == null);
+    try testing.expect(after.action_error == null);
+    var ids: [8]bbr.review.TempId = undefined;
+    try testing.expectEqualSlices(bbr.review.TempId, &.{ 1, 2, 3, 4 }, draftTempIds(&presentation, &ids));
+    try testing.expectEqual(before.buffer.rows.ptr, after.review.?.buffer.rows.ptr);
+}
+
+test "the delete confirmation is keyboard-complete and captures every other key" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try seedDeletableSubtree(store.store(), key);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 60 },
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 4);
+    const cursor = presentation.published.?.navigation.cursor;
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'D', .text = "D" } });
+    try testing.expect(presentation.projection().delete_confirmation != null);
+
+    // A motion neither moves the cursor nor re-targets the confirmation.
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'j', .text = "j" } });
+    try testing.expectEqual(cursor, presentation.published.?.navigation.cursor);
+    try testing.expectEqual(@as(bbr.review.TempId, 4), presentation.projection().delete_confirmation.?.temp_id);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "n" } });
+    try testing.expect(presentation.projection().delete_confirmation == null);
+    var ids: [8]bbr.review.TempId = undefined;
+    try testing.expectEqualSlices(bbr.review.TempId, &.{ 1, 2, 3, 4 }, draftTempIds(&presentation, &ids));
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'D', .text = "D" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(presentation.projection().delete_confirmation == null);
+    try testing.expectEqualSlices(bbr.review.TempId, &.{ 1, 2, 3 }, draftTempIds(&presentation, &ids));
+}
+
+test "delete stays discoverable but names why each ineligible item refuses it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1, .commit = "source" } },
+        .body = "root with an unresolved Reply",
+    });
+    try store.store().put(key.storeKey(), .{
+        .local_id = 2,
+        .kind = .comment,
+        .parent = .{ .draft = 1 },
+        .body = "ambiguous reply",
+        .state = .outcome_unknown,
+    });
+    try store.store().put(key.storeKey(), .{
+        .local_id = 3,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1, .commit = "source" } },
+        .body = "in a batch",
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testCommentSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 60 },
+    });
+    defer presentation.deinit();
+
+    // A root is refused for its descendant's sake, not its own.
+    try cursorToDraftCard(&presentation, 1);
+    try testing.expect(!presentation.projection().action_availability.available(.delete_review_item));
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try testing.expectEqual(ActionError.draft_descendant_locked, presentation.projection().action_error.?);
+    try testing.expect(presentation.projection().delete_confirmation == null);
+
+    try cursorToDraftCard(&presentation, 2);
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try testing.expectEqual(ActionError.draft_outcome_unresolved, presentation.projection().action_error.?);
+
+    // The transient `posted` window of a partial batch, before Reconciliation
+    // replaces the Draft's row with the published Comment.
+    try cursorToDraftCard(&presentation, 3);
+    presentation.published.?.review.setState(3, .{ .posted = 71 });
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try testing.expectEqual(ActionError.draft_already_published, presentation.projection().action_error.?);
+    presentation.published.?.review.setState(3, .draft);
+
+    // A published Bitbucket Comment is Bitbucket's to remove, not this Action's.
+    try cursorToCommentCard(&presentation, 99);
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try testing.expectEqual(ActionError.published_comment_edit_unsupported, presentation.projection().action_error.?);
+
+    var ids: [8]bbr.review.TempId = undefined;
+    try testing.expectEqualSlices(bbr.review.TempId, &.{ 1, 2, 3 }, draftTempIds(&presentation, &ids));
+}
+
+test "delete refuses a subtree an active SubmissionRun owns" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try seedDeletableSubtree(store.store(), key);
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 60 },
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .submit });
+    const command = presentation.takeCommand().?.post_draft;
+    defer command.destroy();
+
+    try cursorToDraftCard(&presentation, 1);
+    try testing.expect(!presentation.projection().action_availability.available(.delete_review_item));
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try testing.expectEqual(ActionError.draft_submission_in_flight, presentation.projection().action_error.?);
+
+    try cursorToDraftCard(&presentation, 4);
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try testing.expectEqual(ActionError.draft_owned_by_submission, presentation.projection().action_error.?);
+    try testing.expect(presentation.projection().delete_confirmation == null);
+    var ids: [8]bbr.review.TempId = undefined;
+    try testing.expectEqualSlices(bbr.review.TempId, &.{ 1, 2, 3, 4 }, draftTempIds(&presentation, &ids));
+}
+
+test "a failed deletion preserves the previous Frame and keeps the confirmation" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try seedDeletableSubtree(store.store(), key);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 60 },
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    const before = presentation.projection().review.?;
+    store.fail_next_delete = true;
+    try presentation.dispatch(.{ .delete_confirmation = .confirm });
+
+    const failed = presentation.projection();
+    try testing.expectEqual(ActionError.persistence_failed, failed.action_error.?);
+    // The whole graph, ScopeProjection, Frame, and navigation survive intact.
+    var ids: [8]bbr.review.TempId = undefined;
+    try testing.expectEqualSlices(bbr.review.TempId, &.{ 1, 2, 3, 4 }, draftTempIds(&presentation, &ids));
+    try testing.expectEqual(before.buffer.rows.ptr, failed.review.?.buffer.rows.ptr);
+    try testing.expect(std.meta.eql(before.navigation, failed.review.?.navigation));
+    // The confirmation stays available for a retry that then succeeds.
+    try testing.expectEqual(@as(bbr.review.TempId, 1), failed.delete_confirmation.?.temp_id);
+
+    try presentation.dispatch(.{ .delete_confirmation = .confirm });
+    try testing.expect(presentation.projection().delete_confirmation == null);
+    try testing.expectEqualSlices(bbr.review.TempId, &.{4}, draftTempIds(&presentation, &ids));
+}
+
+test "success selects the next surviving semantic row and falls back to the previous one" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try seedDeletableSubtree(store.store(), key);
+    // A Draft on the File's last line has no surviving row after its card.
+    try store.store().put(key.storeKey(), .{
+        .local_id = 5,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = 40, .commit = "source" } },
+        .body = "at the end",
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 60 },
+    });
+    defer presentation.deinit();
+
+    // The Draft on line 1 is followed by line 2's source row, which survives.
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try presentation.dispatch(.{ .delete_confirmation = .confirm });
+    const forward = presentation.published.?.buffer.rows[presentation.published.?.navigation.cursor];
+    try testing.expectEqual(@as(?u32, 2), lineAtRow(forward).?.new_no);
+
+    // Nothing semantic follows the last Draft, so the cursor falls back to the
+    // nearest source row before it.
+    try cursorToDraftCard(&presentation, 5);
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try presentation.dispatch(.{ .delete_confirmation = .confirm });
+    const back = presentation.published.?.buffer.rows[presentation.published.?.navigation.cursor];
+    try testing.expectEqual(@as(?u32, 40), lineAtRow(back).?.new_no);
+}
+
+test "a Session replacement disarms a delete confirmation and a deleted subtree stays gone" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try seedDeletableSubtree(store.store(), key);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 60 },
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try presentation.dispatch(.{ .delete_confirmation = .confirm });
+
+    try cursorToDraftCard(&presentation, 4);
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try testing.expect(presentation.projection().delete_confirmation != null);
+    try presentation.dispatch(.{ .action = .refresh });
+    const command = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .intent = command.intent,
+        .outcome = .{ .loaded = try testWideSession(testing.allocator, 1) },
+    } });
+
+    // The armed confirmation described the replaced graph, so it is dropped —
+    // while the completed deletion survives the reload.
+    try testing.expect(presentation.projection().delete_confirmation == null);
+    var ids: [8]bbr.review.TempId = undefined;
+    try testing.expectEqualSlices(bbr.review.TempId, &.{4}, draftTempIds(&presentation, &ids));
 }
 
 test "Suggest derives an Anchor and persists a fenced seeded Draft" {

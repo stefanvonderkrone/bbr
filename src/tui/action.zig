@@ -30,6 +30,7 @@ pub const Action = enum {
     reply,
     edit_review_item,
     reanchor_review_item,
+    delete_review_item,
     submit,
     recover_submission,
     resolve_unpublished,
@@ -67,4 +68,5 @@ pub const InteractionContext = enum {
     composer,
     help,
     unknown_resolution,
+    delete_confirmation,
 };

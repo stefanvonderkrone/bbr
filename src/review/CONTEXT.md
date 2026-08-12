@@ -88,6 +88,10 @@ _Avoid_: highlight, mark, region.
 An authored-but-unpublished Comment/Reply/Suggestion held locally. Carries a local temp id, its DraftState, and — for a root Draft — exactly one CommentScope. A *reply* Draft carries no scope of its own: its scope comes from its parent. The parent link (not a copied scope) is the single expression of that relationship — it drives both rendering placement and Submission ordering. A reply therefore shares its parent's visibility: hide the parent thread (resolved, toggle off) and the reply hides with it. The atom of a Pending Review.
 _Avoid_: pending comment, unsent, staged.
 
+**Draft subtree**:
+One Draft together with every Draft that reaches it through Draft parentage — the complete consequence of deleting it. It is the unit deletion works in, because a Reply's parent link, not a copied scope, places it: removing anything less would strand a Reply, and removing more would destroy evidence nobody named. A Reply to a published Comment roots a subtree of its own. The whole subtree must be mutable; one run-owned, in-flight, published, or `outcome_unknown` member refuses the complete deletion.
+_Avoid_: thread (a published root plus its Replies), cascade (the act), branch.
+
 Draft kind (`comment` or `suggestion`), parentage, and CommentScope are orthogonal. A Suggestion may be a root or a Reply, but its effective inherited CommentScope must be `inline`.
 
 **DraftState**:

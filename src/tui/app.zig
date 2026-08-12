@@ -218,6 +218,10 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             .label = "Link existing Bitbucket Comment ID",
             .body = resolution.comment_id,
         }, ctx.active_theme);
+        if (projection.delete_confirmation) |confirmation| render.drawComposerProjection(frame, content_win, .{
+            .label = "Delete local Draft · Enter delete · Esc cancel",
+            .body = deleteConfirmationText(frame, confirmation),
+        }, ctx.active_theme);
         if (projection.submission) |submission| {
             if (projection.review) |review_projection| if (presentation.OwnedReviewIdentity.eql(submission.key, review_projection.key))
                 render.drawSubmit(frame, content_win, ctx.active_theme, submission.completed, submission.total);
@@ -369,11 +373,28 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .draft_edit_conflict => "this local Draft changed underneath the edit",
         .draft_reply_has_no_anchor => "a Reply inherits its root's placement",
         .draft_scope_not_inline => "only an inline root Draft has an Anchor to replace",
+        .draft_descendant_locked => "a Reply below this Draft cannot be deleted yet",
+        .draft_cascade_changed => "this Draft's Replies changed; confirm the deletion again",
         .anchor_candidate_ambiguous => "that source range is ambiguous; select one side of one File",
         .anchor_range_too_long => "an Anchor covers at most 30 lines",
         .suggestion_anchor_not_new_side => "a Suggestion cannot anchor to removed lines",
         else => @tagName(err),
     };
+}
+
+/// The complete consequence the reviewer confirms: the local TempId and every
+/// Reply that goes with it.
+fn deleteConfirmationText(
+    frame: std.mem.Allocator,
+    confirmation: presentation.DeleteConfirmationProjection,
+) []const u8 {
+    const fallback = "Delete this local Draft and every Reply below it?";
+    if (confirmation.descendant_count == 0)
+        return std.fmt.allocPrint(frame, "Delete local Draft #{d}? It has no Replies.", .{confirmation.temp_id}) catch fallback;
+    return std.fmt.allocPrint(frame, "Delete local Draft #{d} and its {d} Reply Draft(s)?", .{
+        confirmation.temp_id,
+        confirmation.descendant_count,
+    }) catch fallback;
 }
 
 /// `Re-anchor local Draft #7 → src/f.zig new 12-14 · Enter accept · Esc cancel`
