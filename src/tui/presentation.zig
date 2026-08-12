@@ -5971,6 +5971,66 @@ test "re-anchoring refuses mixed-side and cross-File source ranges" {
     try testing.expectEqual(ActionError.no_review_item, two_file.projection().action_error.?);
 }
 
+/// One File whose two hunks leave an unshown gap between line 2 and line 20.
+fn testHunkGapSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
+    const s = try testSession(backing, id, 'g');
+    errdefer s.destroy();
+    s.diff = try bbr.diff.parse(s.arena.allocator(),
+        \\diff --git a/gap.zig b/gap.zig
+        \\--- a/gap.zig
+        \\+++ b/gap.zig
+        \\@@ -1,2 +1,2 @@
+        \\-old a
+        \\+new a
+        \\ context a
+        \\@@ -20,2 +20,2 @@
+        \\-old b
+        \\+new b
+        \\ context b
+    );
+    return s;
+}
+
+test "a Selection that crosses a hidden hunk gap is refused" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "gap.zig", .to = 1, .commit = "source" } },
+        .body = "across the gap",
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testHunkGapSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 40 },
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .reanchor_review_item });
+
+    // Both ends are real new-side lines; only the unshown lines between them
+    // make the range a guess.
+    const top = try sourceRow(&presentation, .new, 2);
+    const bottom = try sourceRow(&presentation, .new, 20);
+    try moveToRow(&presentation, top);
+    try presentation.dispatch(.{ .action = .toggle_select });
+    for (top..bottom) |_| try presentation.dispatch(.{ .action = .down });
+
+    try testing.expectEqual(ActionError.anchor_candidate_ambiguous, presentation.projection().reanchor.?.refusal.?);
+    try presentation.dispatch(.{ .reanchor = .accept });
+    try testing.expectEqual(ActionError.anchor_candidate_ambiguous, presentation.projection().action_error.?);
+    try testing.expectEqual(@as(?u32, 1), draftAnchor(&presentation, 1).to);
+
+    // Either side of the gap on its own is a perfectly good Anchor.
+    try selectSource(&presentation, .new, 20, 21);
+    try presentation.dispatch(.{ .reanchor = .accept });
+    const anchor = draftAnchor(&presentation, 1);
+    try testing.expectEqual(@as(?u32, 20), anchor.start_to);
+    try testing.expectEqual(@as(?u32, 21), anchor.to);
+}
+
 test "re-anchoring a Draft in a LocalReview captures replacement authored evidence" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
