@@ -82,7 +82,7 @@ The Session-scoped placement of a PendingReview's root Draft CommentScopes, keye
 _Avoid_: persisted scope state, resolved Draft, mutable CommentScope, AnchorProjection.
 
 **Durable Operation**:
-Reviewer-authorized work that belongs to a PullRequest rather than to the Session that started it. A Submission remains valid and persists its outcomes when that Session is replaced; only projecting its progress or result into the current screen depends on which Session is published.
+Reviewer-authorized work that belongs to a PullRequest rather than to the Session that started it. Submission and mutation of an author-owned published Comment remain valid when that Session is replaced; only projecting their progress or result into the current screen depends on which Session is published. M16 serializes these operations through one global remote-write lane.
 _Avoid_: Session work, background job, task.
 
 **Keymap**:

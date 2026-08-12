@@ -34,6 +34,10 @@ _Avoid_: HTTP error, status, exception.
 The Atlassian account email plus API token used for HTTP Basic auth, read from the environment. Never logged, never persisted.
 _Avoid_: password, app password, secret, key.
 
+**Authenticated Account**:
+The Bitbucket account proven by the current Credential, identified for mutation ownership by its UUID. Acquisition is an independent capability: failure to acquire it does not fail Review loading, but published Comment mutation remains unavailable until ownership can be proven. A `401` invalidates the cached identity.
+_Avoid_: reviewer identity (a reviewer may read without proven mutation ownership), display name, credential owner.
+
 ## API quirks (verified against live PRs)
 
 **Outdated comments.** The comments *list* endpoint

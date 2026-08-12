@@ -34,10 +34,11 @@ An implementation-ready M16 specification and dependency map in which every revi
 - [Define the author-owned published Comment mutation contract](issues/06-define-published-comment-mutation-contract.md) — Gate serialized body-only edits and confirmed deletes by UUID ownership, retain styled Deleted Comment tombstones, and reconcile every success or ambiguous outcome without automatic mutation retries.
 - [Choose the external-editor configuration language](issues/15-choose-external-editor-configuration-language.md) — Expose a positive 1 MiB `[external_edit].max_bytes` local returned-file safety limit with precise diagnostics and no implied Bitbucket Comment limit.
 - [Define M16's deterministic integration coverage](issues/11-define-m16-integration-coverage.md) — Use layered seam ownership, representative Presentation sequences, exhaustive transactional failure injection, a scripted async-adapter harness, and narrow opt-in PTY, manual terminal, and credential-gated checks.
+- [Define the integrated M16 contract](issues/12-define-integrated-m16-contract.md) — Use canonical Review identity, Review-owned policy, atomic persistence, one correlated remote-write lane, and eight dependency-ordered vertical slices.
 
 ## Not yet specified
 
-- The dependency-ordered implementation slices cannot be finalized until the individual mutation, editor, Submission, and integration contracts converge.
+None. The route to the implementation-ready M16 specification is complete.
 
 ## Out of scope
 

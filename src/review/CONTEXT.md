@@ -103,7 +103,7 @@ The act of publishing a PendingReview: topologically order Drafts (parents befor
 _Avoid_: submit, flush, push, sync.
 
 **SubmissionRun**:
-The durable record of one attempt to carry a PullRequest's Submission to a terminal outcome, including where an interrupted attempt must resume. It is identified within a Repository-qualified PullRequest and is distinct from the process that currently owns the work.
+The durable record of one attempt to carry a PullRequest's Submission to a terminal outcome, including its frozen ordered participant graph and where an interrupted attempt must resume. Recovery uses that recorded membership rather than recomputing it from the current PendingReview. It is identified within a Repository-qualified PullRequest and is distinct from the process that currently owns the work.
 _Avoid_: batch (the Submission is the batch), worker, job, Session.
 
 **Abandon recovery**:
