@@ -12,8 +12,8 @@ Ticket 05 established that a Draft subtree is the only unit deletion works in: a
 
 Two older paths still delete without that rule, and neither has a production caller:
 
-- `PendingReviewStore.remove` (`src/review/store.zig:225`) — on the seam's **vtable**, so every adapter implements it and any future caller gets a single-row delete that silently strands Replies. Called only from `src/review/store.zig` and `src/persist/sqlite_store.zig` tests.
-- `PendingReview.remove` (`src/review/draft.zig:209`) — an in-memory cascade that now duplicates `collectCascade` + `deleteDraftSubtree`, and reports out-of-memory by returning `0` rather than failing. Called only from its own test at `src/review/draft.zig:403`.
+- `PendingReviewStore.remove` (`src/review/store.zig`) — on the seam's **vtable**, so every adapter implements it and any future caller gets a single-row delete that silently strands Replies. Called only from `src/review/store.zig` and `src/persist/sqlite_store.zig` tests.
+- `PendingReview.remove` (`src/review/draft.zig`) — an in-memory cascade that now duplicates `collectCascade` + `deleteDraftSubtree`, and reports out-of-memory by returning `0` rather than failing. Called only from its own test, `remove takes a draft's reply-descendants with it`.
 
 The hazard is the vtable one: it is a documented, implemented, seam-level operation whose contract contradicts the Draft subtree entry in `src/review/CONTEXT.md`. Dead code is not the problem — a reachable delete with the wrong semantics is.
 
