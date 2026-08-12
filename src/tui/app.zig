@@ -307,21 +307,10 @@ fn presentationStatus(
     visible_key: ?presentation.OwnedReviewIdentity,
 ) ?[]const u8 {
     if (projection.fatal_error) |err| return @tagName(err);
-    if (projection.action_error) |err| return switch (err) {
-        .local_review_no_picker => "Pull Request Picker is unavailable for a local review",
-        .local_review_no_submission => "Submit is unavailable for a local review; drafts remain local",
-        .local_review_remote_action_unavailable => "This action is unavailable for a local review",
-        .source_action_unavailable => "This action requires a source line or Selection",
-        .target_action_unavailable => "This action is unavailable for the current target",
-        .no_review_item => "This action requires a Comment or Draft under the cursor",
-        .draft_owned_by_submission => "an active Submission owns this local Draft",
-        .draft_submission_in_flight => "this local Draft is being submitted",
-        .draft_outcome_unresolved => "outcome unknown — resolve before editing",
-        .draft_already_published => "this Draft is published; Bitbucket owns the Comment",
-        .published_comment_edit_unsupported => "editing a Bitbucket Comment is not available yet",
-        .draft_edit_conflict => "this local Draft changed underneath the edit",
-        else => @tagName(err),
-    };
+    // The armed re-anchor banner outlives one refusal: it keeps naming the
+    // Draft and whatever the source cursor currently proposes.
+    if (projection.reanchor) |reanchor| return reanchorStatus(frame, projection, reanchor);
+    if (projection.action_error) |err| return actionErrorText(err);
     if (projection.clipboard_status) |status| return switch (status) {
         .copied => "copied source text",
         .failed => "could not copy source text",
@@ -362,6 +351,48 @@ fn presentationStatus(
     };
     if (projection.replacement_error) |err| return @tagName(err);
     return null;
+}
+
+fn actionErrorText(err: presentation.ActionError) []const u8 {
+    return switch (err) {
+        .local_review_no_picker => "Pull Request Picker is unavailable for a local review",
+        .local_review_no_submission => "Submit is unavailable for a local review; drafts remain local",
+        .local_review_remote_action_unavailable => "This action is unavailable for a local review",
+        .source_action_unavailable => "This action requires a source line or Selection",
+        .target_action_unavailable => "This action is unavailable for the current target",
+        .no_review_item => "This action requires a Comment or Draft under the cursor",
+        .draft_owned_by_submission => "an active Submission owns this local Draft",
+        .draft_submission_in_flight => "this local Draft is being submitted",
+        .draft_outcome_unresolved => "outcome unknown — resolve before editing",
+        .draft_already_published => "this Draft is published; Bitbucket owns the Comment",
+        .published_comment_edit_unsupported => "editing a Bitbucket Comment is not available yet",
+        .draft_edit_conflict => "this local Draft changed underneath the edit",
+        .draft_reply_has_no_anchor => "a Reply inherits its root's placement",
+        .draft_scope_not_inline => "only an inline root Draft has an Anchor to replace",
+        .anchor_candidate_ambiguous => "that source range is ambiguous; select one side of one File",
+        .anchor_range_too_long => "an Anchor covers at most 30 lines",
+        .suggestion_anchor_not_new_side => "a Suggestion cannot anchor to removed lines",
+        else => @tagName(err),
+    };
+}
+
+/// `Re-anchor local Draft #7 → src/f.zig new 12-14 · Enter accept · Esc cancel`
+fn reanchorStatus(
+    frame: std.mem.Allocator,
+    projection: presentation.Projection,
+    reanchor: presentation.ReanchorProjection,
+) []const u8 {
+    const fallback = "Re-anchor local Draft · Enter accept · Esc cancel";
+    const detail = if (reanchor.candidate) |candidate| std.fmt.allocPrint(frame, "{s} {s} {d}-{d}", .{
+        candidate.path,
+        @tagName(candidate.side),
+        candidate.top,
+        candidate.bottom,
+    }) catch return fallback else actionErrorText(reanchor.refusal orelse projection.action_error orelse .action_refused);
+    return std.fmt.allocPrint(frame, "Re-anchor local Draft #{d} → {s} · Enter accept · Esc cancel", .{
+        reanchor.temp_id,
+        detail,
+    }) catch fallback;
 }
 
 fn portableKey(key: vaxis.Key) keymap.KeyStroke {

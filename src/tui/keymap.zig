@@ -182,6 +182,7 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one('['), .action = .prev_file, .help = "previous file" },
     .{ .chord = Chord.one('r'), .action = .reply, .help = "reply" },
     .{ .chord = Chord.one('e'), .action = .edit_review_item, .help = "edit local Draft" },
+    .{ .chord = Chord.one('a'), .action = .reanchor_review_item, .help = "re-anchor local root Draft" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_disclosure, .help = "toggle disclosure" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_review_card, .help = "toggle ReviewCard" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_directory, .help = "toggle Directory" },
@@ -436,7 +437,7 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             else => supportsContext(action, .diff),
         },
         .diff_review_card => switch (action) {
-            .toggle_review_card, .reply, .edit_review_item => true,
+            .toggle_review_card, .reply, .edit_review_item, .reanchor_review_item => true,
             else => supportsContext(action, .diff),
         },
         .diff_source => switch (action) {
@@ -688,6 +689,14 @@ test "Enter resolves to the precise Action for mutually exclusive targets" {
     try testing.expectEqual(Action.focus_file, resolver.feed(.default, .sidebar_file, plain(vaxis.Key.enter)).action);
     try testing.expectEqual(Action.confirm_picker, resolver.feed(.default, .file_finder, plain(vaxis.Key.enter)).action);
     try testing.expect(resolver.feed(.default, .composer, plain(vaxis.Key.enter)) == .none);
+}
+
+test "the default bindings are themselves unambiguous and prefix-free" {
+    try validateBindings(&default_bindings);
+    var resolver = Resolver{};
+    try testing.expectEqual(Action.reanchor_review_item, resolver.feed(.default, .diff_review_card, plain('a')).action);
+    // Re-anchor belongs to a ReviewCard, not to bare source.
+    try testing.expect(resolver.feed(.default, .diff_source, plain('a')) == .none);
 }
 
 test "same chord is rejected when Actions overlap in an Interaction Context" {

@@ -57,6 +57,10 @@ _Avoid_: editor, input, form.
 The typed identity a Composer save mutates instead of creating: a local Draft's TempId or a Bitbucket Comment's CommentId. Every ReviewCard row resolves to one, and Presentation carries it through the whole interaction rather than flattening both provenances into one numeric id. A Composer without one is authoring something new.
 _Avoid_: selected item, comment id (only one of the two), edit mode.
 
+**Armed Re-anchor**:
+The two-stage interaction that repairs one mutable inline root Draft's Anchor. Stage one retains the Draft's TempId and hands input back to the DiffPane; stage two reads whatever the source cursor or Selection currently names, so navigating re-reads the candidate instead of accumulating interaction state. Enter accepts, Escape cancels, and a Session replacement disarms it. Replies, Review- and File-level Drafts, and published Comments have no re-anchor at all.
+_Avoid_: move Anchor (an authored Anchor never moves itself), drag, re-target.
+
 **External Edit**:
 The Composer Action that temporarily hands its exact authored body to a configured external editing program and, when accepted, returns the changed body to the same open Composer. It does not save or publish the Comment, Reply, or Suggestion.
 _Avoid_: external editor (the program, not the interaction), edit in place, direct Comment edit.

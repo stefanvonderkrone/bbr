@@ -81,7 +81,7 @@ A Comment whose body contains a fenced ```suggestion``` block proposing replacem
 _Avoid_: patch, fix, edit, proposal.
 
 **Selection**:
-A contiguous run of diff lines the reviewer marks (via `v` or shift+arrow) to anchor a multi-line Comment or Suggestion. Maps to a **ranged Anchor**: a new-side selection (lines present in the new file) yields `{ start_to, to }`, an old-side one (a removed line) yields `{ start_from, from }`. A selection that mixes sides, crosses a hunk gap, or spans files is refused rather than anchored to the wrong lines — the same "refuse over guess" stance as the Stale-anchor guard.
+A contiguous run of diff lines the reviewer marks (via `v` or shift+arrow) to anchor a multi-line Comment or Suggestion. Maps to a **ranged Anchor**: a new-side selection (lines present in the new file) yields `{ start_to, to }`, an old-side one (a removed line) yields `{ start_from, from }`. A selection that mixes sides, crosses a hunk gap, spans files, or covers more than 30 inclusive lines — Bitbucket's verified envelope — is refused rather than anchored to the wrong lines, the same "refuse over guess" stance as the Stale-anchor guard.
 _Avoid_: highlight, mark, region.
 
 **Draft**:

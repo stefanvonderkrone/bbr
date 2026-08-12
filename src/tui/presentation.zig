@@ -209,6 +209,7 @@ pub const OwnedInput = union(enum) {
     action: Action,
     composer: ComposerInput,
     unknown_resolution: UnknownResolutionInput,
+    reanchor: ReanchorInput,
     ensure_focused_enrichment,
     file_enrichment_completed: FileEnrichmentCompleted,
     post_draft_completed: PostDraftCompleted,
@@ -432,6 +433,10 @@ pub const UnknownResolutionInput = union(enum) {
     cancel,
 };
 
+/// Stage two of re-anchor: accept the candidate the source cursor names, or
+/// cancel and leave the Draft exactly as it was.
+pub const ReanchorInput = enum { accept, cancel };
+
 /// Session-relative actions whose complete state is Navigation. They are
 /// suspended while a replacement is pending, along with every other Action
 /// that depends on the currently published review.
@@ -641,6 +646,7 @@ pub const Projection = struct {
     submission_result: ?SubmissionResultProjection,
     recovery: ?RecoveryNotice,
     unknown_resolution: ?UnknownResolutionProjection,
+    reanchor: ?ReanchorProjection,
     picker: ?*const Picker,
     picker_tick_scope: ?WorkId,
     file_finder: ?*const FileFinder,
@@ -677,6 +683,10 @@ pub const MutationRefusal = enum {
     already_published,
     /// A published Bitbucket Comment; remote mutation is its own contract.
     published_comment,
+    /// A Reply inherits its root's placement, so it has no Anchor of its own.
+    reply_inherits_scope,
+    /// A Review-level or File-level root; re-anchor never converts a scope.
+    scope_not_inline,
 };
 
 pub const ActionAvailability = struct {
@@ -686,6 +696,9 @@ pub const ActionAvailability = struct {
     source: bool = true,
     /// null means the ReviewCard under the cursor is editable.
     edit_refusal: ?MutationRefusal = .no_review_item,
+    /// null means the ReviewCard under the cursor — or, while re-anchor is
+    /// armed, the Draft it retained — accepts a replacement Anchor.
+    reanchor_refusal: ?MutationRefusal = .no_review_item,
 
     pub fn available(self: ActionAvailability, action: Action) bool {
         if (!self.has_review) return switch (action) {
@@ -699,6 +712,7 @@ pub const ActionAvailability = struct {
         return switch (action) {
             .inline_comment, .suggest, .yank => self.source,
             .edit_review_item => self.edit_refusal == null,
+            .reanchor_review_item => self.reanchor_refusal == null,
             else => true,
         };
     }
@@ -737,6 +751,27 @@ pub const UnknownResolutionProjection = struct {
     comment_id: []const u8,
 };
 
+pub const AnchorSide = enum { old, new };
+
+/// The replacement Anchor the current source cursor or Selection names, as the
+/// armed banner shows it. `path` borrows the published Session's Diff.
+pub const AnchorCandidate = struct {
+    path: []const u8,
+    side: AnchorSide,
+    top: u32,
+    bottom: u32,
+};
+
+/// The armed half of the two-stage re-anchor interaction: which Draft is being
+/// repaired, and what the source cursor currently proposes. `refusal` is why
+/// the proposal is not acceptable yet; navigating changes it without ending
+/// the interaction.
+pub const ReanchorProjection = struct {
+    temp_id: bbr.review.TempId,
+    candidate: ?AnchorCandidate,
+    refusal: ?ActionError,
+};
+
 pub const ActionError = enum {
     action_refused,
     buffer_build_failed,
@@ -765,11 +800,17 @@ pub const ActionError = enum {
     published_comment_edit_unsupported,
     no_review_item,
     draft_edit_conflict,
+    draft_reply_has_no_anchor,
+    draft_scope_not_inline,
+    anchor_candidate_ambiguous,
+    anchor_range_too_long,
+    suggestion_anchor_not_new_side,
 };
 
 const BufferTransactionError = error{ BufferBuildFailed, OutOfMemory };
 const SaveDraftError = BufferTransactionError || error{PersistenceFailed};
 const EditDraftError = SaveDraftError || error{ DraftEditConflict, DraftLocked };
+const ReanchorDraftError = EditDraftError || error{ DraftNotAnchorable, InvalidAnchor };
 
 pub const ReplacementError = enum {
     session_load_failed,
@@ -1120,6 +1161,82 @@ const Published = struct {
         staged.publish();
     }
 
+    /// Replace one inline root Draft's Anchor: stage the candidate graph, its
+    /// `current` ScopeProjection, and the Buffer, persist through the
+    /// transaction-shaped store, then publish. Body, kind, TempId, and the
+    /// whole Reply subtree survive; an identical Anchor is a clean no-op that
+    /// persists nothing and retains any failure evidence. `snapshot` is the
+    /// LocalReview replacement evidence, null for a RemoteReview.
+    fn reanchorDraft(
+        self: *Published,
+        store: bbr.review.PendingReviewStore,
+        preferences: Preferences,
+        temp_id: bbr.review.TempId,
+        anchor: bbr.review.Anchor,
+        snapshot: ?bbr.review.AnchorSnapshot,
+    ) ReanchorDraftError!void {
+        const draft = self.review.get(temp_id) orelse return error.DraftEditConflict;
+        if (draft.parent != null or draft.effectiveScope() != .@"inline") return error.DraftNotAnchorable;
+        if (bbr.review.Anchor.eql(draft.effectiveScope().@"inline", anchor)) return;
+
+        const review_allocator = self.review_arena.allocator();
+        var owned = anchor;
+        owned.path = try review_allocator.dupe(u8, anchor.path);
+        if (anchor.commit) |commit| owned.commit = try review_allocator.dupe(u8, commit);
+        const owned_snapshot: ?bbr.review.AnchorSnapshot = if (snapshot) |captured| .{
+            .text = try review_allocator.dupe(u8, captured.text),
+            .selection_start = captured.selection_start,
+            .selection_len = captured.selection_len,
+        } else null;
+
+        const previous_scope = draft.scope;
+        const previous_anchor = draft.anchor;
+        const previous_snapshot = draft.snapshot;
+        const previous_state = draft.state;
+        draft.scope = .{ .@"inline" = owned };
+        draft.anchor = owned;
+        draft.snapshot = owned_snapshot;
+        // A real Anchor change is a new attempt, so a confirmed failure resets.
+        if (draft.state == .failed) draft.state = .draft;
+
+        // The repaired root was placed against this Session, so its projected
+        // scope is `current`; every Reply reuses this same entry.
+        var projection_index: ?usize = null;
+        var previous_resolution: bbr.review.ScopeResolution = undefined;
+        for (self.scope_projection.items, 0..) |entry, index| if (entry.temp_id == temp_id) {
+            projection_index = index;
+            previous_resolution = entry.resolution;
+            break;
+        };
+        if (projection_index) |index| self.scope_projection.items[index].resolution = .{
+            .resolved = .{ .state = .current, .scope = .{ .@"inline" = owned } },
+        };
+        errdefer {
+            const rollback = self.review.get(temp_id).?;
+            rollback.scope = previous_scope;
+            rollback.anchor = previous_anchor;
+            rollback.snapshot = previous_snapshot;
+            rollback.state = previous_state;
+            if (projection_index) |index| self.scope_projection.items[index].resolution = previous_resolution;
+        }
+
+        var staged = try self.prepareBuffer(preferences, self.expanded_disclosures.items, self.isolated_file, self.geometry);
+        defer staged.deinit();
+        store.reanchorDraft(self.key.storeKey(), .{
+            .temp_id = temp_id,
+            .expected_kind = draft.kind,
+            .anchor = owned,
+            .snapshot = owned_snapshot,
+        }) catch |err| return switch (err) {
+            error.DraftLocked, error.DraftNotEditable => error.DraftLocked,
+            error.DraftEditConflict, error.DraftNotFound => error.DraftEditConflict,
+            error.DraftNotAnchorable => error.DraftNotAnchorable,
+            error.InvalidAnchor => error.InvalidAnchor,
+            else => error.PersistenceFailed,
+        };
+        staged.publish();
+    }
+
     fn prepareBuffer(
         self: *Published,
         preferences: Preferences,
@@ -1257,6 +1374,14 @@ const Published = struct {
         };
         return null;
     }
+};
+
+/// Stage one of re-anchor: the retained typed identity. It deliberately carries
+/// no candidate — the candidate is whatever the source cursor names right now,
+/// so navigating re-reads it instead of accumulating interaction state.
+const ReanchorCapture = struct {
+    key: OwnedReviewIdentity,
+    temp_id: bbr.review.TempId,
 };
 
 const UnknownResolutionEditor = struct {
@@ -1639,6 +1764,9 @@ pub const Presentation = struct {
     /// store refuses the mutation.
     recovery_participants: std.ArrayList(bbr.review.TempId) = .empty,
     unknown_resolution: ?UnknownResolutionEditor = null,
+    /// The armed first stage of re-anchor: the Draft whose Anchor a later
+    /// source cursor or Selection will replace.
+    reanchor: ?ReanchorCapture = null,
     shutdown_requested: bool = false,
     replacement_error: ?ReplacementError = null,
     action_error: ?ActionError = null,
@@ -1722,6 +1850,7 @@ pub const Presentation = struct {
             .action => |action| self.applyAction(action),
             .composer => |composer_input| self.applyComposerInput(composer_input),
             .unknown_resolution => |resolution_input| self.applyUnknownResolutionInput(resolution_input),
+            .reanchor => |reanchor_input| self.applyReanchorInput(reanchor_input),
             .ensure_focused_enrichment => try self.ensureFocusedEnrichment(),
             .file_enrichment_completed => |completed| self.acceptFileEnrichment(completed),
             .post_draft_completed => |completed| self.acceptPostDraft(completed),
@@ -1818,6 +1947,7 @@ pub const Presentation = struct {
                 .temp_id = editor.temp_id,
                 .comment_id = editor.text(),
             } else null,
+            .reanchor = self.reanchorProjection(),
             .picker = if (self.picker) |*picker| picker else null,
             .picker_tick_scope = if (!self.shutdown_requested) if (self.picker) |*picker|
                 if (picker.loading) self.picker_work_id else null
@@ -2245,6 +2375,7 @@ pub const Presentation = struct {
             .context = context,
             .source = source,
             .edit_refusal = self.editRefusal(published),
+            .reanchor_refusal = self.reanchorRefusal(published),
         };
     }
 
@@ -2265,6 +2396,141 @@ pub const Presentation = struct {
         }
         if (self.submissionOwnsDraft(published.key, temp_id)) return .submission_owns_draft;
         return null;
+    }
+
+    /// Why re-anchoring is refused, or null when a replacement Anchor is
+    /// acceptable. While armed the answer is about the retained Draft, because
+    /// the cursor has deliberately moved to the source that will replace it.
+    fn reanchorRefusal(self: *const Presentation, published: *const Published) ?MutationRefusal {
+        if (self.reanchor) |capture| {
+            if (!OwnedReviewIdentity.eql(published.key, capture.key)) return .no_review_item;
+            return self.draftReanchorRefusal(published, capture.temp_id);
+        }
+        const target = reviewCardTarget(published) orelse return .no_review_item;
+        return switch (target) {
+            .comment => .published_comment,
+            .draft => |temp_id| self.draftReanchorRefusal(published, temp_id),
+        };
+    }
+
+    fn draftReanchorRefusal(self: *const Presentation, published: *const Published, temp_id: bbr.review.TempId) ?MutationRefusal {
+        const draft = published.review.getConst(temp_id) orelse return .no_review_item;
+        // Shape first: a Reply or an unanchored root is never re-anchorable,
+        // whatever its state.
+        if (draft.parent != null) return .reply_inherits_scope;
+        if (draft.effectiveScope() != .@"inline") return .scope_not_inline;
+        switch (draft.state) {
+            .draft, .failed => {},
+            .submitting => return .submission_in_flight,
+            .posted => return .already_published,
+            .outcome_unknown => return .outcome_unresolved,
+        }
+        if (self.submissionOwnsDraft(published.key, temp_id)) return .submission_owns_draft;
+        return null;
+    }
+
+    fn reanchorProjection(self: *const Presentation) ?ReanchorProjection {
+        const capture = self.reanchor orelse return null;
+        const published = self.published orelse return null;
+        if (!OwnedReviewIdentity.eql(published.key, capture.key)) return null;
+        const draft = published.review.getConst(capture.temp_id) orelse return null;
+        const candidate = reanchorCandidate(published, draft.kind) catch |err| return .{
+            .temp_id = capture.temp_id,
+            .candidate = null,
+            .refusal = candidateError(err),
+        };
+        return .{
+            .temp_id = capture.temp_id,
+            .candidate = .{
+                .path = candidate.anchor.path,
+                .side = if (candidate.anchor.to != null) .new else .old,
+                .top = candidate.anchor.top().?,
+                .bottom = candidate.anchor.line().?,
+            },
+            .refusal = null,
+        };
+    }
+
+    /// `a` on an eligible inline root Draft: retain its TempId and hand input
+    /// back to the DiffPane, where a later cursor or Selection names the
+    /// replacement Anchor.
+    fn armReanchor(self: *Presentation, published: *Published) void {
+        if (published.composer != null) return;
+        // Already armed: `a` neither re-targets nor cancels the interaction.
+        if (self.reanchor != null) return;
+        if (self.reanchorRefusal(published)) |refusal| {
+            self.action_error = mutationRefusalError(refusal);
+            return;
+        }
+        const target = reviewCardTarget(published) orelse {
+            self.action_error = .no_review_item;
+            return;
+        };
+        self.reanchor = .{ .key = published.key, .temp_id = target.draft };
+        self.action_error = null;
+    }
+
+    fn applyReanchorInput(self: *Presentation, input: ReanchorInput) void {
+        if (self.shutdown_requested or self.replacement != null) return;
+        const capture = self.reanchor orelse return;
+        if (input == .cancel) {
+            self.reanchor = null;
+            self.action_error = null;
+            return;
+        }
+        const published = self.published orelse {
+            self.reanchor = null;
+            return;
+        };
+        if (!OwnedReviewIdentity.eql(published.key, capture.key)) {
+            self.reanchor = null;
+            return;
+        }
+        const draft = published.review.getConst(capture.temp_id) orelse {
+            self.reanchor = null;
+            self.action_error = .no_review_item;
+            return;
+        };
+        if (self.draftReanchorRefusal(published, capture.temp_id)) |refusal| {
+            self.action_error = mutationRefusalError(refusal);
+            return;
+        }
+        const candidate = reanchorCandidate(published, draft.kind) catch |err| {
+            self.action_error = candidateError(err);
+            return;
+        };
+        // A LocalReview replaces its authored evidence from the newly selected
+        // source; a RemoteReview invents no snapshot.
+        const snapshot = if (published.key.isRemote()) null else captureAnchorSnapshot(
+            published.review_arena.allocator(),
+            published.session.diff.files[candidate.file_index],
+            candidate.lines.items(),
+        ) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        published.reanchorDraft(
+            self.dependencies.reviews,
+            self.preferences,
+            capture.temp_id,
+            candidate.anchor,
+            snapshot,
+        ) catch |err| {
+            self.action_error = switch (err) {
+                error.DraftLocked => .draft_owned_by_submission,
+                error.DraftEditConflict => .draft_edit_conflict,
+                error.DraftNotAnchorable => .draft_scope_not_inline,
+                error.InvalidAnchor => .anchor_candidate_ambiguous,
+                error.PersistenceFailed => .persistence_failed,
+                error.BufferBuildFailed => .buffer_build_failed,
+                error.OutOfMemory => .out_of_memory,
+            };
+            return;
+        };
+        self.reanchor = null;
+        published.navigation.clearMark();
+        followDraftCard(published, capture.temp_id);
+        self.action_error = null;
     }
 
     /// True while an active or recovered SubmissionRun holds this Draft in its
@@ -2347,6 +2613,12 @@ pub const Presentation = struct {
             } else if (key.text) |text| picker.insert(text);
             return;
         }
+        // Stage two of re-anchor keeps the DiffPane's whole motion and Selection
+        // vocabulary; only accept and cancel are claimed from it.
+        if (self.reanchor != null) {
+            if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.applyReanchorInput(.cancel);
+            if (key.matches(keymap_mod.special.enter, .{})) return self.applyReanchorInput(.accept);
+        }
         switch (self.resolver.feed(self.dependencies.keymap, self.interactionContext(), key)) {
             .none => {},
             .digit => |digit| self.pushCountDigit(digit),
@@ -2402,6 +2674,7 @@ pub const Presentation = struct {
                 .submit => .local_review_no_submission,
                 .inline_comment, .suggest, .yank => .source_action_unavailable,
                 .edit_review_item => mutationRefusalError(availability.edit_refusal),
+                .reanchor_review_item => mutationRefusalError(availability.reanchor_refusal),
                 else => .local_review_remote_action_unavailable,
             };
             return;
@@ -2486,6 +2759,7 @@ pub const Presentation = struct {
             .file_comment => self.openFileComposer(published),
             .reply => self.openReplyComposer(published),
             .edit_review_item => self.openEditComposer(published),
+            .reanchor_review_item => self.armReanchor(published),
             .inline_comment => self.openInlineComposer(published, .comment),
             .suggest => self.openInlineComposer(published, .suggestion),
             .submit => self.startSubmission(published),
@@ -3731,6 +4005,8 @@ pub const Presentation = struct {
                 const previous = self.published;
                 self.published = candidate;
                 self.next_session_epoch = epoch;
+                // The armed candidate named rows in the replaced Session.
+                self.reanchor = null;
                 self.resolver = .{};
                 self.mouse_press = null;
                 self.interaction_revision +%= 1;
@@ -3793,7 +4069,94 @@ fn mutationRefusalError(refusal: ?MutationRefusal) ActionError {
         .submission_in_flight => .draft_submission_in_flight,
         .already_published => .draft_already_published,
         .published_comment => .published_comment_edit_unsupported,
+        .reply_inherits_scope => .draft_reply_has_no_anchor,
+        .scope_not_inline => .draft_scope_not_inline,
     };
+}
+
+/// Why the source under the cursor cannot become an Anchor. Every reason is a
+/// refusal to guess, not a partially accepted range.
+fn candidateError(err: anyerror) ActionError {
+    return switch (err) {
+        error.RangeTooLong => .anchor_range_too_long,
+        error.SuggestionOnRemoved => .suggestion_anchor_not_new_side,
+        error.NotOnSource, error.NotOnALine => .source_action_unavailable,
+        else => .anchor_candidate_ambiguous,
+    };
+}
+
+/// The lines a replacement Anchor would cover. Bounded by `max_anchor_lines`,
+/// so reading a candidate for the armed banner allocates nothing: anything
+/// longer is refused rather than measured.
+const CandidateLines = struct {
+    storage: [bbr.review.max_anchor_lines]*const bbr.diff.Line = undefined,
+    len: usize = 0,
+
+    fn items(self: *const CandidateLines) []const *const bbr.diff.Line {
+        return self.storage[0..self.len];
+    }
+};
+
+const AnchorCandidatePlacement = struct {
+    file_index: usize,
+    anchor: bbr.review.Anchor,
+    lines: CandidateLines,
+};
+
+fn candidateLines(published: *const Published) !CandidateLines {
+    if (published.navigation.cursor >= published.buffer.rows.len) return error.NotOnSource;
+    var lines: CandidateLines = .{};
+    if (published.navigation.selection()) |selection| {
+        var index = selection[0];
+        while (index <= selection[1] and index < published.buffer.rows.len) : (index += 1) {
+            // A File header inside the Selection means it left this File.
+            if (published.buffer.rows[index] == .file_header) return error.CrossesFile;
+            const line = lineAtRow(published.buffer.rows[index]) orelse continue;
+            if (lines.len == lines.storage.len) return error.RangeTooLong;
+            lines.storage[lines.len] = line;
+            lines.len += 1;
+        }
+    } else if (lineAtRow(published.buffer.rows[published.navigation.cursor])) |line| {
+        lines.storage[0] = line;
+        lines.len = 1;
+    }
+    if (lines.len == 0) return error.NotOnSource;
+    return lines;
+}
+
+/// The Anchor the current source cursor or Selection proposes, under exactly
+/// the rules authoring uses — one File, one side, matched and ascending — plus
+/// the shared `max_anchor_lines` cap. Strings borrow the published Session.
+fn reanchorCandidate(published: *const Published, kind: bbr.review.DraftKind) !AnchorCandidatePlacement {
+    const lines = try candidateLines(published);
+    const file_index = published.isolated_file orelse fileIndexForRow(published.buffer, published.navigation.cursor);
+    if (file_index >= published.session.diff.files.len) return error.NotOnSource;
+    const span = try spanFromLines(lines.items(), kind == .suggestion);
+    const file = published.session.diff.files[file_index];
+    const old_side = span.to == null;
+    const anchor: bbr.review.Anchor = .{
+        .path = if (old_side) file.old_path else file.new_path,
+        .from = span.from,
+        .to = span.to,
+        .start_from = span.start_from,
+        .start_to = span.start_to,
+        .commit = if (old_side) published.session.header.base_commit else published.session.header.source_commit,
+    };
+    anchor.validateShape() catch |err| return switch (err) {
+        error.AnchorRangeTooLong => error.RangeTooLong,
+        else => error.MixedSides,
+    };
+    return .{ .file_index = file_index, .anchor = anchor, .lines = lines };
+}
+
+/// Put the cursor back on `temp_id`'s ReviewCard wherever the reprojection put
+/// it — identity, not a row number, survives a mutation.
+fn followDraftCard(published: *Published, temp_id: bbr.review.TempId) void {
+    for (published.buffer.rows, 0..) |row, index| {
+        if (row != .draft or row.draft.owner.draft != temp_id or row.draft.part != .header) continue;
+        published.navigation.jumpTo(index);
+        return;
+    }
 }
 
 /// The typed owner of the ReviewCard row under the cursor. Every row of a card
@@ -5313,6 +5676,552 @@ test "an edit staged against a changed graph is refused, keeping the Composer" {
     try testing.expectEqualStrings("child edited", failed.composer.?.body);
     try testing.expectEqualStrings("child", draftBody(&presentation, 2));
     try testing.expectEqual(before.buffer.rows.ptr, failed.review.?.buffer.rows.ptr);
+}
+
+/// One File with four removed and forty added lines: enough source to exercise
+/// both sides, ranges, and the 30-line Anchor boundary.
+fn testWideSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
+    const s = try testSession(backing, id, 'w');
+    errdefer s.destroy();
+    const a = s.arena.allocator();
+    var raw: std.ArrayList(u8) = .empty;
+    try raw.appendSlice(a, "diff --git a/wide.zig b/wide.zig\n--- a/wide.zig\n+++ b/wide.zig\n@@ -1,4 +1,40 @@\n");
+    for (0..4) |index| try raw.print(a, "-removed {d}\n", .{index + 1});
+    for (0..40) |index| try raw.print(a, "+added {d}\n", .{index + 1});
+    s.diff = try bbr.diff.parse(a, raw.items);
+    return s;
+}
+
+fn testCommentSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
+    const s = try testSession(backing, id, 'a');
+    errdefer s.destroy();
+    const a = s.arena.allocator();
+    const comments = try a.alloc(bbr.review.Comment, 1);
+    comments[0] = .{
+        .id = 99,
+        .author = "Author",
+        .body = "published",
+        .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1 } },
+    };
+    s.threads = try bbr.review.buildThreads(a, comments);
+    return s;
+}
+
+fn sourceRow(presentation: *Presentation, side: AnchorSide, number: u32) !usize {
+    for (presentation.projection().review.?.buffer.rows, 0..) |row, index| {
+        const line = lineAtRow(row) orelse continue;
+        switch (side) {
+            .new => if (line.new_no == number) return index,
+            .old => if (line.old_no == number and line.new_no == null) return index,
+        }
+    }
+    return error.SourceRowNotFound;
+}
+
+/// Put the cursor on `side`:`number` and, when `through` is larger, extend a
+/// Selection down to it.
+fn selectSource(presentation: *Presentation, side: AnchorSide, number: u32, through: u32) !void {
+    try presentation.dispatch(.{ .action = .clear_selection });
+    try moveToRow(presentation, try sourceRow(presentation, side, number));
+    if (through <= number) return;
+    try presentation.dispatch(.{ .action = .toggle_select });
+    for (number..through) |_| try presentation.dispatch(.{ .action = .down });
+}
+
+fn draftAnchor(presentation: *Presentation, temp_id: bbr.review.TempId) bbr.review.Anchor {
+    for (presentation.projection().review.?.drafts) |draft| {
+        if (draft.local_id == temp_id) return draft.effectiveScope().@"inline";
+    }
+    unreachable;
+}
+
+test "re-anchoring an inline root Draft replaces its Anchor and keeps its subtree" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = 1, .commit = "source" } },
+        .body = "this belongs elsewhere",
+        .state = .{ .failed = error.ServerError },
+    });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "agreed" });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .viewport_rows = 20,
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    try testing.expect(presentation.projection().action_availability.available(.reanchor_review_item));
+    try presentation.dispatch(.{ .action = .reanchor_review_item });
+    // Stage one retains the Draft while navigation returns to the DiffPane.
+    try testing.expectEqual(@as(bbr.review.TempId, 1), presentation.projection().reanchor.?.temp_id);
+
+    try selectSource(&presentation, .new, 5, 7);
+    const armed = presentation.projection().reanchor.?;
+    try testing.expectEqualStrings("wide.zig", armed.candidate.?.path);
+    try testing.expect(armed.candidate.?.side == .new);
+    try testing.expectEqual(@as(u32, 5), armed.candidate.?.top);
+    try testing.expectEqual(@as(u32, 7), armed.candidate.?.bottom);
+    try testing.expect(armed.refusal == null);
+
+    try presentation.dispatch(.{ .reanchor = .accept });
+
+    const after = presentation.projection();
+    try testing.expect(after.reanchor == null);
+    try testing.expect(after.action_error == null);
+    const anchor = draftAnchor(&presentation, 1);
+    try testing.expectEqualStrings("wide.zig", anchor.path);
+    try testing.expectEqual(@as(?u32, 5), anchor.start_to);
+    try testing.expectEqual(@as(?u32, 7), anchor.to);
+    try testing.expectEqualStrings("source", anchor.commit.?);
+    // Identity, body, kind, and the Reply subtree survive; the failure resets.
+    try testing.expectEqualStrings("this belongs elsewhere", draftBody(&presentation, 1));
+    try testing.expect(after.review.?.drafts[0].state == .draft);
+    try testing.expectEqual(@as(usize, 2), after.review.?.drafts.len);
+    try testing.expect(after.review.?.drafts[1].parent.?.draft == 1);
+    // Success follows the TempId to its new ReviewCard.
+    const cursor_row = presentation.published.?.buffer.rows[presentation.published.?.navigation.cursor];
+    try testing.expect(cursor_row == .draft and cursor_row.draft.owner.draft == 1);
+
+    var resumed = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .viewport_rows = 20,
+    });
+    defer resumed.deinit();
+    try testing.expectEqual(@as(?u32, 5), draftAnchor(&resumed, 1).start_to);
+    try testing.expectEqual(@as(?u32, 7), draftAnchor(&resumed, 1).to);
+}
+
+test "cancelling an armed re-anchor changes nothing" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = 1, .commit = "source" } },
+        .body = "keep me here",
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .viewport_rows = 20,
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    const before = presentation.projection().review.?;
+    try presentation.dispatch(.{ .action = .reanchor_review_item });
+    try selectSource(&presentation, .new, 9, 11);
+    try presentation.dispatch(.{ .reanchor = .cancel });
+
+    const after = presentation.projection();
+    try testing.expect(after.reanchor == null);
+    try testing.expect(after.action_error == null);
+    try testing.expectEqual(@as(?u32, 1), draftAnchor(&presentation, 1).to);
+    try testing.expectEqual(before.buffer.rows.ptr, after.review.?.buffer.rows.ptr);
+}
+
+test "an identical replacement Anchor is a clean no-op" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = 3, .commit = "source" } },
+        .body = "already right",
+        .state = .{ .failed = error.ServerError },
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .viewport_rows = 20,
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .reanchor_review_item });
+    try selectSource(&presentation, .new, 3, 3);
+    const before = presentation.projection().review.?;
+    try presentation.dispatch(.{ .reanchor = .accept });
+
+    const after = presentation.projection();
+    try testing.expect(after.reanchor == null);
+    try testing.expect(after.action_error == null);
+    // Nothing persisted and no reprojection: the failure evidence survives.
+    try testing.expectEqual(before.buffer.rows.ptr, after.review.?.buffer.rows.ptr);
+    try testing.expectEqual(bbr.bitbucket.ApiError.ServerError, after.review.?.drafts[0].state.failed);
+    try testing.expectEqual(@as(?u32, 3), draftAnchor(&presentation, 1).to);
+}
+
+test "re-anchoring accepts an old-side Comment range and refuses an old-side Suggestion" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = 1, .commit = "source" } },
+        .body = "about the removed code",
+    });
+    try store.store().put(key.storeKey(), .{
+        .local_id = 2,
+        .kind = .suggestion,
+        .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = 1, .commit = "source" } },
+        .body = "```suggestion\nadded 1\n```",
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .viewport_rows = 20,
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .reanchor_review_item });
+    try selectSource(&presentation, .old, 2, 3);
+    try presentation.dispatch(.{ .reanchor = .accept });
+
+    const old_side = draftAnchor(&presentation, 1);
+    try testing.expectEqual(@as(?u32, 2), old_side.start_from);
+    try testing.expectEqual(@as(?u32, 3), old_side.from);
+    try testing.expectEqual(@as(?u32, null), old_side.to);
+    // An old-side Anchor binds the base commit, not the source commit.
+    try testing.expectEqualStrings("destination", old_side.commit.?);
+
+    try cursorToDraftCard(&presentation, 2);
+    try presentation.dispatch(.{ .action = .reanchor_review_item });
+    try selectSource(&presentation, .old, 2, 2);
+    try testing.expectEqual(ActionError.suggestion_anchor_not_new_side, presentation.projection().reanchor.?.refusal.?);
+    try presentation.dispatch(.{ .reanchor = .accept });
+
+    try testing.expectEqual(ActionError.suggestion_anchor_not_new_side, presentation.projection().action_error.?);
+    // The interaction stays armed so the reviewer can pick a new-side range.
+    try testing.expectEqual(@as(bbr.review.TempId, 2), presentation.projection().reanchor.?.temp_id);
+    try testing.expectEqual(@as(?u32, 1), draftAnchor(&presentation, 2).to);
+}
+
+test "an accepted Anchor covers at most thirty inclusive lines" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = 1, .commit = "source" } },
+        .body = "wide",
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .viewport_rows = 20,
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .reanchor_review_item });
+    try selectSource(&presentation, .new, 2, 32);
+    try testing.expectEqual(ActionError.anchor_range_too_long, presentation.projection().reanchor.?.refusal.?);
+    try presentation.dispatch(.{ .reanchor = .accept });
+    try testing.expectEqual(ActionError.anchor_range_too_long, presentation.projection().action_error.?);
+    try testing.expectEqual(@as(?u32, 1), draftAnchor(&presentation, 1).to);
+
+    // One line shorter is exactly the boundary and is accepted.
+    try selectSource(&presentation, .new, 2, 31);
+    try presentation.dispatch(.{ .reanchor = .accept });
+    const anchor = draftAnchor(&presentation, 1);
+    try testing.expectEqual(@as(?u32, 2), anchor.start_to);
+    try testing.expectEqual(@as(?u32, 31), anchor.to);
+    try testing.expectEqual(@as(?u32, bbr.review.max_anchor_lines), anchor.span());
+}
+
+test "re-anchoring refuses mixed-side and cross-File source ranges" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = 1, .commit = "source" } },
+        .body = "wide",
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .viewport_rows = 20,
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .reanchor_review_item });
+    // The last removed line through the first added line: two sides at once.
+    try moveToRow(&presentation, try sourceRow(&presentation, .old, 4));
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try presentation.dispatch(.{ .action = .down });
+    try testing.expectEqual(ActionError.anchor_candidate_ambiguous, presentation.projection().reanchor.?.refusal.?);
+    try presentation.dispatch(.{ .reanchor = .accept });
+    try testing.expectEqual(ActionError.anchor_candidate_ambiguous, presentation.projection().action_error.?);
+    try testing.expectEqual(@as(?u32, 1), draftAnchor(&presentation, 1).to);
+
+    var two_file = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testTwoFileSession(testing.allocator, 1) },
+        .viewport_rows = 20,
+    });
+    defer two_file.deinit();
+    try two_file.dispatch(.{ .action = .reanchor_review_item });
+    try testing.expectEqual(ActionError.no_review_item, two_file.projection().action_error.?);
+}
+
+test "re-anchoring a Draft in a LocalReview captures replacement authored evidence" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .target = .local,
+        .scope = .{ .@"inline" = .{ .path = "a.zig", .from = 1, .commit = "base" } },
+        .snapshot = .{ .text = "authored elsewhere", .selection_start = 0, .selection_len = 1 },
+        .body = "local note",
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testLocalSession(testing.allocator) },
+        .viewport_rows = 12,
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .reanchor_review_item });
+    try selectSource(&presentation, .new, 1, 1);
+    try presentation.dispatch(.{ .reanchor = .accept });
+
+    const draft = presentation.projection().review.?.drafts[0];
+    try testing.expectEqual(@as(?u32, 1), draft.effectiveScope().@"inline".to);
+    try testing.expectEqualStrings("source", draft.effectiveScope().@"inline".commit.?);
+    try testing.expectEqualStrings("old\nnew", draft.snapshot.?.text);
+    try testing.expectEqual(@as(u32, 1), draft.snapshot.?.selection_start);
+    try testing.expectEqual(@as(u32, 1), draft.snapshot.?.selection_len);
+}
+
+test "re-anchor stays discoverable but names why each ineligible item refuses it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1, .commit = "source" } },
+        .body = "root",
+    });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" });
+    try store.store().put(key.storeKey(), .{ .local_id = 3, .kind = .comment, .scope = .review, .body = "review level" });
+    try store.store().put(key.storeKey(), .{
+        .local_id = 4,
+        .kind = .comment,
+        .scope = .{ .file = .{ .path = "a.zig", .source_commit = "source" } },
+        .body = "file level",
+    });
+    try store.store().put(key.storeKey(), .{
+        .local_id = 5,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1, .commit = "source" } },
+        .body = "unknown",
+        .state = .outcome_unknown,
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testCommentSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 60 },
+    });
+    defer presentation.deinit();
+
+    const refusals = [_]struct { temp_id: bbr.review.TempId, err: ActionError }{
+        .{ .temp_id = 2, .err = .draft_reply_has_no_anchor },
+        .{ .temp_id = 3, .err = .draft_scope_not_inline },
+        .{ .temp_id = 4, .err = .draft_scope_not_inline },
+        .{ .temp_id = 5, .err = .draft_outcome_unresolved },
+    };
+    for (refusals) |refusal| {
+        try cursorToDraftCard(&presentation, refusal.temp_id);
+        try testing.expect(!presentation.projection().action_availability.available(.reanchor_review_item));
+        try presentation.dispatch(.{ .action = .reanchor_review_item });
+        try testing.expectEqual(refusal.err, presentation.projection().action_error.?);
+        try testing.expect(presentation.projection().reanchor == null);
+    }
+
+    // A published Bitbucket Comment is Bitbucket's to place, not ours.
+    var comment_row: usize = 0;
+    for (presentation.projection().review.?.buffer.rows, 0..) |row, index| if (row == .comment) {
+        comment_row = index;
+        break;
+    };
+    try moveToRow(&presentation, comment_row);
+    try presentation.dispatch(.{ .action = .reanchor_review_item });
+    try testing.expectEqual(ActionError.published_comment_edit_unsupported, presentation.projection().action_error.?);
+
+    // The eligible root keeps the Action available.
+    try cursorToDraftCard(&presentation, 1);
+    try testing.expect(presentation.projection().action_availability.available(.reanchor_review_item));
+}
+
+test "re-anchor refuses a Draft an active SubmissionRun owns" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = 1, .commit = "source" } },
+        .body = "in flight",
+    });
+    try store.store().put(key.storeKey(), .{
+        .local_id = 2,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = 2, .commit = "source" } },
+        .body = "queued",
+    });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .viewport_rows = 20,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .submit });
+    const command = presentation.takeCommand().?.post_draft;
+    defer command.destroy();
+
+    try cursorToDraftCard(&presentation, 1);
+    try testing.expect(!presentation.projection().action_availability.available(.reanchor_review_item));
+    try presentation.dispatch(.{ .action = .reanchor_review_item });
+    try testing.expectEqual(ActionError.draft_submission_in_flight, presentation.projection().action_error.?);
+
+    try cursorToDraftCard(&presentation, 2);
+    try presentation.dispatch(.{ .action = .reanchor_review_item });
+    try testing.expectEqual(ActionError.draft_owned_by_submission, presentation.projection().action_error.?);
+    try testing.expect(presentation.projection().reanchor == null);
+}
+
+test "the armed re-anchor keeps DiffPane keys and claims only Enter and Escape" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = 1, .commit = "source" } },
+        .body = "by key",
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .viewport_rows = 20,
+    });
+    defer presentation.deinit();
+
+    // Escape cancels without mutating, and Enter is a plain disclosure toggle
+    // again afterwards rather than an acceptance.
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'a', .text = "a" } });
+    try testing.expect(presentation.projection().reanchor != null);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expect(presentation.projection().reanchor == null);
+    try testing.expectEqual(@as(?u32, 1), draftAnchor(&presentation, 1).to);
+
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'a', .text = "a" } });
+    try moveToRow(&presentation, try sourceRow(&presentation, .new, 3));
+    // Motions and Selection still resolve normally while armed.
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'v', .text = "v" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'j', .text = "j" } });
+    try testing.expectEqual(@as(u32, 4), presentation.projection().reanchor.?.candidate.?.bottom);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+
+    try testing.expect(presentation.projection().reanchor == null);
+    const anchor = draftAnchor(&presentation, 1);
+    try testing.expectEqual(@as(?u32, 3), anchor.start_to);
+    try testing.expectEqual(@as(?u32, 4), anchor.to);
+}
+
+test "a re-anchored Draft survives Session replacement, which disarms an armed capture" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = 1, .commit = "source" } },
+        .body = "repaired",
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .viewport_rows = 20,
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .reanchor_review_item });
+    try selectSource(&presentation, .new, 12, 13);
+    try presentation.dispatch(.{ .reanchor = .accept });
+
+    // Arm again, then replace the Session underneath the armed capture.
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .reanchor_review_item });
+    try testing.expect(presentation.projection().reanchor != null);
+    try presentation.dispatch(.{ .action = .refresh });
+    const command = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .intent = command.intent,
+        .outcome = .{ .loaded = try testWideSession(testing.allocator, 1) },
+    } });
+
+    try testing.expect(presentation.projection().reanchor == null);
+    const anchor = draftAnchor(&presentation, 1);
+    try testing.expectEqual(@as(?u32, 12), anchor.start_to);
+    try testing.expectEqual(@as(?u32, 13), anchor.to);
+}
+
+test "a failed re-anchor preserves the previous Frame and the armed candidate" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "wide.zig", .to = 1, .commit = "source" } },
+        .body = "unmoved",
+        .state = .{ .failed = error.ServerError },
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .viewport_rows = 20,
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .reanchor_review_item });
+    try selectSource(&presentation, .new, 6, 8);
+    const before = presentation.projection().review.?;
+
+    store.fail_next_reanchor = true;
+    try presentation.dispatch(.{ .reanchor = .accept });
+
+    const failed = presentation.projection();
+    try testing.expectEqual(ActionError.persistence_failed, failed.action_error.?);
+    // The Draft, its ScopeProjection, and the Frame are exactly as they were,
+    // and the reviewer's candidate is still armed.
+    try testing.expectEqual(@as(?u32, 1), draftAnchor(&presentation, 1).to);
+    try testing.expectEqual(bbr.bitbucket.ApiError.ServerError, failed.review.?.drafts[0].state.failed);
+    try testing.expectEqual(before.buffer.rows.ptr, failed.review.?.buffer.rows.ptr);
+    try testing.expect(std.meta.eql(before.navigation, failed.review.?.navigation));
+    try testing.expectEqual(@as(u32, 6), failed.reanchor.?.candidate.?.top);
+
+    // The retained interaction retries successfully.
+    try presentation.dispatch(.{ .reanchor = .accept });
+    try testing.expect(presentation.projection().reanchor == null);
+    try testing.expectEqual(@as(?u32, 8), draftAnchor(&presentation, 1).to);
+    try testing.expect(presentation.projection().review.?.drafts[0].state == .draft);
 }
 
 test "Suggest derives an Anchor and persists a fenced seeded Draft" {

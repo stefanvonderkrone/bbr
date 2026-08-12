@@ -1420,10 +1420,19 @@ test "local help projection marks remote-only commands unavailable" {
     for (rows.commands) |row| {
         if (!row.available) unavailable += 1;
     }
-    // Four remote-only commands, plus edit — visible but refused away from a
-    // ReviewCard — and the Picker.
-    try testing.expectEqual(@as(usize, 6), unavailable);
+    // Four remote-only commands, plus edit and re-anchor — visible but refused
+    // away from a ReviewCard — and the Picker.
+    try testing.expectEqual(@as(usize, 7), unavailable);
     for (rows.motions) |row| try testing.expect(row.available);
+}
+
+test "re-anchor stays discoverable in the help Overlay when it is refused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const refused = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .reanchor_refusal = .reply_inherits_scope });
+    const anchorable = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .reanchor_refusal = null });
+    try testing.expect(!helpRowAvailable(refused.commands, "re-anchor local root Draft").?);
+    try testing.expect(helpRowAvailable(anchorable.commands, "re-anchor local root Draft").?);
 }
 
 test "edit stays discoverable in the help Overlay when it is refused" {

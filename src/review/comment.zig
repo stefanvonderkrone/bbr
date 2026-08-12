@@ -52,7 +52,61 @@ pub const Anchor = struct {
     pub fn isRange(self: Anchor) bool {
         return self.start_to != null or self.start_from != null;
     }
+
+    /// The inclusive line count this anchor covers, or null when it carries no
+    /// line at all.
+    pub fn span(self: Anchor) ?u32 {
+        const bottom = self.line() orelse return null;
+        const first = self.top() orelse return null;
+        if (first > bottom) return null;
+        return bottom - first + 1;
+    }
+
+    /// The top line of the anchored range on the side it is anchored to.
+    pub fn top(self: Anchor) ?u32 {
+        if (self.to != null) return self.start_to orelse self.to;
+        if (self.from != null) return self.start_from orelse self.from;
+        return null;
+    }
+
+    /// Structural validity, independent of any Diff: one side only, a matched
+    /// and ascending range, and no more than `max_anchor_lines`. Placement
+    /// against real source (one File, no hidden hunk gap) needs the Diff and
+    /// belongs to whoever holds it; this is the part every adapter can recheck.
+    pub fn validateShape(self: Anchor) ShapeError!void {
+        const new_side = self.to != null;
+        const old_side = self.from != null;
+        if (new_side == old_side) return error.AnchorSideAmbiguous;
+        if (new_side and self.start_from != null) return error.AnchorSideAmbiguous;
+        if (old_side and self.start_to != null) return error.AnchorSideAmbiguous;
+        const bottom = if (new_side) self.to.? else self.from.?;
+        const first = self.top().?;
+        if (bottom < first) return error.AnchorRangeDescending;
+        if (bottom - first + 1 > max_anchor_lines) return error.AnchorRangeTooLong;
+    }
+
+    pub const ShapeError = error{
+        /// Both sides, neither side, or a range whose top is on the other side.
+        AnchorSideAmbiguous,
+        AnchorRangeDescending,
+        AnchorRangeTooLong,
+    };
+
+    /// Identity of two Anchors, so an unchanged re-anchor is a recognizable
+    /// no-op rather than a rewrite of the same coordinates.
+    pub fn eql(a: Anchor, b: Anchor) bool {
+        if (!std.mem.eql(u8, a.path, b.path)) return false;
+        if (a.from != b.from or a.to != b.to) return false;
+        if (a.start_from != b.start_from or a.start_to != b.start_to) return false;
+        if (a.commit == null or b.commit == null) return a.commit == null and b.commit == null;
+        return std.mem.eql(u8, a.commit.?, b.commit.?);
+    }
 };
+
+/// The longest inclusive Anchor range bbr accepts locally. Bitbucket's verified
+/// envelope for a ranged inline Comment; a longer Selection is refused rather
+/// than silently truncated.
+pub const max_anchor_lines: u32 = 30;
 
 /// Durable authored identity of a File-level root.
 pub const FileScope = struct {
@@ -215,6 +269,35 @@ test "anchor isRange reflects a start_* bound; line stays the bottom" {
     const old_range = Anchor{ .path = "f", .start_from = 3, .from = 19 };
     try testing.expect(old_range.isRange());
     try testing.expectEqual(@as(?u32, 19), old_range.line());
+}
+
+test "anchor shape refuses ambiguous, unmatched, descending, and oversized ranges" {
+    try (Anchor{ .path = "f", .to = 4 }).validateShape();
+    try (Anchor{ .path = "f", .start_to = 2, .to = 4 }).validateShape();
+    try (Anchor{ .path = "f", .start_from = 2, .from = 4 }).validateShape();
+
+    try testing.expectError(error.AnchorSideAmbiguous, (Anchor{ .path = "f" }).validateShape());
+    try testing.expectError(error.AnchorSideAmbiguous, (Anchor{ .path = "f", .from = 1, .to = 2 }).validateShape());
+    try testing.expectError(error.AnchorSideAmbiguous, (Anchor{ .path = "f", .start_from = 1, .to = 2 }).validateShape());
+    try testing.expectError(error.AnchorRangeDescending, (Anchor{ .path = "f", .start_to = 9, .to = 2 }).validateShape());
+}
+
+test "the accepted range boundary is exactly thirty inclusive lines" {
+    const at_limit = Anchor{ .path = "f", .start_to = 1, .to = max_anchor_lines };
+    try at_limit.validateShape();
+    try testing.expectEqual(@as(?u32, max_anchor_lines), at_limit.span());
+
+    const past_limit = Anchor{ .path = "f", .start_to = 1, .to = max_anchor_lines + 1 };
+    try testing.expectError(error.AnchorRangeTooLong, past_limit.validateShape());
+}
+
+test "anchor identity compares path, side coordinates, and authored commit" {
+    const anchor = Anchor{ .path = "f.zig", .start_to = 2, .to = 4, .commit = "abc" };
+    try testing.expect(Anchor.eql(anchor, .{ .path = "f.zig", .start_to = 2, .to = 4, .commit = "abc" }));
+    try testing.expect(!Anchor.eql(anchor, .{ .path = "g.zig", .start_to = 2, .to = 4, .commit = "abc" }));
+    try testing.expect(!Anchor.eql(anchor, .{ .path = "f.zig", .start_to = 2, .to = 5, .commit = "abc" }));
+    try testing.expect(!Anchor.eql(anchor, .{ .path = "f.zig", .start_to = 2, .to = 4, .commit = "def" }));
+    try testing.expect(!Anchor.eql(anchor, .{ .path = "f.zig", .start_to = 2, .to = 4 }));
 }
 
 test "suggestion extracts the fenced block body" {

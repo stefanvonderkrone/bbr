@@ -36,6 +36,7 @@ const SubmissionOutcome = bbr.review.SubmissionOutcome;
 const SubmissionPendingState = bbr.review.SubmissionPendingState;
 const UnknownResolution = bbr.review.UnknownResolution;
 const DraftBodyEdit = bbr.review.DraftBodyEdit;
+const DraftReanchor = bbr.review.DraftReanchor;
 const parentEql = bbr.review.parentEql;
 const SubmissionCompletion = bbr.review.SubmissionCompletion;
 
@@ -244,6 +245,7 @@ pub const SqliteStore = struct {
         .put = putImpl,
         .remove = removeImpl,
         .edit_draft_body = editDraftBodyImpl,
+        .reanchor_draft = reanchorDraftImpl,
         .load = loadImpl,
         .begin_submission = beginSubmissionImpl,
         .checkpoint_submission = checkpointSubmissionImpl,
@@ -530,6 +532,75 @@ pub const SqliteStore = struct {
         bindText(update, 4, key.repository);
         bindInt(update, 5, @intCast(key.pull_request_id));
         bindInt(update, 6, @intCast(edit.temp_id));
+        if (c.sqlite3_step(update) != c.SQLITE_DONE) return error.Step;
+        if (c.sqlite3_changes(self.db) != 1) return error.DraftNotFound;
+        try self.exec("COMMIT;");
+    }
+
+    /// One transaction: recheck identity, inline root shape, expected kind,
+    /// editable state, and SubmissionRun participation, then replace the Anchor
+    /// columns and the AnchorSnapshot. Body, kind, parentage, and every Reply
+    /// row are untouched.
+    fn reanchorDraftImpl(ptr: *anyopaque, key: RemoteReviewIdentity, reanchor: DraftReanchor) anyerror!void {
+        const self: *SqliteStore = @ptrCast(@alignCast(ptr));
+        reanchor.anchor.validateShape() catch return error.InvalidAnchor;
+        try self.exec("BEGIN IMMEDIATE;");
+        errdefer self.exec("ROLLBACK;") catch {};
+        if (try self.draftMutationLocked(key, reanchor.temp_id, null)) return error.DraftLocked;
+
+        var query: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT kind, parent_kind, state_kind, scope_kind FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &query, null) != c.SQLITE_OK)
+            return error.Prepare;
+        defer _ = c.sqlite3_finalize(query);
+        bindText(query, 1, key.workspace);
+        bindText(query, 2, key.repository);
+        bindInt(query, 3, @intCast(key.pull_request_id));
+        bindInt(query, 4, @intCast(reanchor.temp_id));
+        switch (c.sqlite3_step(query)) {
+            c.SQLITE_ROW => {},
+            c.SQLITE_DONE => return error.DraftNotFound,
+            else => return error.Step,
+        }
+        switch (columnInt(query, 2)) {
+            0, 3 => {},
+            1, 2 => return error.DraftNotEditable,
+            else => return error.DraftLocked,
+        }
+        if (columnInt(query, 0) != @intFromEnum(reanchor.expected_kind)) return error.DraftEditConflict;
+        if (columnInt(query, 1) != 0) return error.DraftNotAnchorable;
+        if (c.sqlite3_column_type(query, 3) == c.SQLITE_NULL or columnInt(query, 3) != 2) return error.DraftNotAnchorable;
+        // Bitbucket refuses to apply a Suggestion over removed lines.
+        if (reanchor.expected_kind == .suggestion and reanchor.anchor.to == null) return error.InvalidAnchor;
+
+        var update: ?*c.sqlite3_stmt = null;
+        const sql =
+            \\UPDATE drafts SET anchor_path=?, anchor_from=?, anchor_to=?,
+            \\ anchor_start_from=?, anchor_start_to=?, anchor_commit=?,
+            \\ snapshot_text=?, snapshot_selection_start=?, snapshot_selection_len=?,
+            \\ state_kind=0, state_id=NULL, state_err=NULL
+            \\ WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;
+        ;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &update, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(update);
+        bindText(update, 1, reanchor.anchor.path);
+        bindOptU32(update, 2, reanchor.anchor.from);
+        bindOptU32(update, 3, reanchor.anchor.to);
+        bindOptU32(update, 4, reanchor.anchor.start_from);
+        bindOptU32(update, 5, reanchor.anchor.start_to);
+        bindOptText(update, 6, reanchor.anchor.commit);
+        if (reanchor.snapshot) |snapshot| {
+            bindText(update, 7, snapshot.text);
+            bindInt(update, 8, @intCast(snapshot.selection_start));
+            bindInt(update, 9, @intCast(snapshot.selection_len));
+        } else {
+            bindNull(update, 7);
+            bindNull(update, 8);
+            bindNull(update, 9);
+        }
+        bindText(update, 10, key.workspace);
+        bindText(update, 11, key.repository);
+        bindInt(update, 12, @intCast(key.pull_request_id));
+        bindInt(update, 13, @intCast(reanchor.temp_id));
         if (c.sqlite3_step(update) != c.SQLITE_DONE) return error.Step;
         if (c.sqlite3_changes(self.db) != 1) return error.DraftNotFound;
         try self.exec("COMMIT;");
@@ -1308,6 +1379,97 @@ test "a persisted edit refuses unknown, mismatched, in-flight, and run-owned Dra
     const drafts = try store.load(arena.allocator(), key);
     try testing.expectEqualStrings("participant", drafts[0].body);
     try testing.expectEqualStrings("still mine", drafts[1].body);
+}
+
+test "a persisted re-anchor replaces the Anchor and snapshot and survives reopening" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, ".zig-cache/tmp/{s}/reanchor.db", .{&tmp.sub_path}, 0);
+    defer testing.allocator.free(path);
+    const key = testReviewKey(14);
+    {
+        var s = try SqliteStore.open(path);
+        defer s.deinit();
+        const store = s.store();
+        try store.put(key, .{
+            .local_id = 1,
+            .kind = .comment,
+            .scope = .{ .@"inline" = .{ .path = "src/f.zig", .to = 12, .start_to = 9, .commit = "source" } },
+            .snapshot = .{ .text = "authored", .selection_start = 0, .selection_len = 1 },
+            .body = "unchanged prose",
+            .state = .{ .failed = error.ServerError },
+        });
+        try store.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" });
+
+        try testing.expectError(error.DraftNotAnchorable, store.reanchorDraft(key, .{
+            .temp_id = 2,
+            .expected_kind = .comment,
+            .anchor = .{ .path = "src/f.zig", .to = 3, .commit = "source" },
+        }));
+        try store.reanchorDraft(key, .{
+            .temp_id = 1,
+            .expected_kind = .comment,
+            .anchor = .{ .path = "src/g.zig", .start_from = 2, .from = 4, .commit = "base" },
+            .snapshot = .{ .text = "repaired", .selection_start = 1, .selection_len = 3 },
+        });
+    }
+    var reopened = try SqliteStore.open(path);
+    defer reopened.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try reopened.store().load(arena.allocator(), key);
+    try testing.expectEqual(@as(usize, 2), drafts.len);
+    const root = drafts[0];
+    try testing.expectEqualStrings("unchanged prose", root.body);
+    try testing.expect(root.state == .draft);
+    try testing.expectEqualStrings("src/g.zig", root.scope.?.@"inline".path);
+    try testing.expectEqual(@as(?u32, 4), root.scope.?.@"inline".from);
+    try testing.expectEqual(@as(?u32, 2), root.scope.?.@"inline".start_from);
+    try testing.expectEqual(@as(?u32, null), root.scope.?.@"inline".to);
+    try testing.expectEqual(@as(?u32, null), root.scope.?.@"inline".start_to);
+    try testing.expectEqualStrings("base", root.scope.?.@"inline".commit.?);
+    try testing.expectEqualStrings("repaired", root.snapshot.?.text);
+    try testing.expect(drafts[1].parent.? == .draft and drafts[1].parent.?.draft == 1);
+}
+
+test "a persisted re-anchor refuses locked, mismatched, and invalid shapes" {
+    var s = try SqliteStore.open(":memory:");
+    defer s.deinit();
+    const store = s.store();
+    const key = testReviewKey(15);
+    const valid: Anchor = .{ .path = "f.zig", .to = 3, .commit = "source" };
+    try store.put(key, .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "f.zig", .to = 1, .commit = "source" } },
+        .body = "root",
+    });
+    try store.put(key, .{ .local_id = 2, .kind = .comment, .scope = .review, .body = "review level" });
+    try store.put(key, .{
+        .local_id = 3,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "f.zig", .to = 1, .commit = "source" } },
+        .body = "posted",
+        .state = .{ .posted = 90 },
+    });
+
+    try testing.expectError(error.DraftNotFound, store.reanchorDraft(key, .{ .temp_id = 77, .expected_kind = .comment, .anchor = valid }));
+    try testing.expectError(error.DraftNotAnchorable, store.reanchorDraft(key, .{ .temp_id = 2, .expected_kind = .comment, .anchor = valid }));
+    try testing.expectError(error.DraftNotEditable, store.reanchorDraft(key, .{ .temp_id = 3, .expected_kind = .comment, .anchor = valid }));
+    try testing.expectError(error.DraftEditConflict, store.reanchorDraft(key, .{ .temp_id = 1, .expected_kind = .suggestion, .anchor = valid }));
+    try testing.expectError(error.InvalidAnchor, store.reanchorDraft(key, .{
+        .temp_id = 1,
+        .expected_kind = .comment,
+        .anchor = .{ .path = "f.zig", .start_to = 1, .to = 31, .commit = "source" },
+    }));
+
+    _ = try store.beginSubmission(key, "source", &.{.{ .temp_id = 1, .parent = null }});
+    try testing.expectError(error.DraftLocked, store.reanchorDraft(key, .{ .temp_id = 1, .expected_kind = .comment, .anchor = valid }));
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try store.load(arena.allocator(), key);
+    try testing.expectEqual(@as(?u32, 1), drafts[0].scope.?.@"inline".to);
 }
 
 test "a persisted edit survives reopening the database" {

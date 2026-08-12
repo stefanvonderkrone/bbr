@@ -140,6 +140,19 @@ pub const DraftBodyEdit = struct {
     body: []const u8,
 };
 
+/// An Anchor-only replacement of one existing inline root Draft, applied as one
+/// transaction. TempId, kind, body, parentage, and every Reply descendant
+/// survive; only the Anchor — plus a LocalReview's AnchorSnapshot and a `failed`
+/// state, which resets to `draft` — changes. `snapshot` is the replacement
+/// captured from the newly selected source: a RemoteReview passes null because
+/// it invents no local snapshot.
+pub const DraftReanchor = struct {
+    temp_id: TempId,
+    expected_kind: draft_mod.DraftKind,
+    anchor: Anchor,
+    snapshot: ?comment.AnchorSnapshot = null,
+};
+
 pub const DraftEditError = error{
     /// No Draft with that TempId under this ReviewIdentity.
     DraftNotFound,
@@ -151,6 +164,12 @@ pub const DraftEditError = error{
     DraftNotEditable,
     /// The persisted kind or parent relationship is not the one edited.
     DraftEditConflict,
+    /// The persisted Draft is not an inline root, so it has no Anchor of its
+    /// own to replace: a Reply inherits its root's, and Review- and File-level
+    /// scopes are not converted.
+    DraftNotAnchorable,
+    /// The proposed Anchor is not structurally valid (see `Anchor.validateShape`).
+    InvalidAnchor,
 };
 
 pub const PendingReviewStore = struct {
@@ -165,6 +184,10 @@ pub const PendingReviewStore = struct {
         /// Atomically replace one existing Draft's body after rechecking its
         /// identity, expected shape, editable state, and run participation.
         edit_draft_body: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, edit: DraftBodyEdit) anyerror!void,
+        /// Atomically replace one inline root Draft's Anchor (and AnchorSnapshot)
+        /// after rechecking its identity, root inline shape, editable state, and
+        /// run participation.
+        reanchor_draft: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, reanchor: DraftReanchor) anyerror!void,
         /// Every Draft for `pr_id`, each with its strings duped into `allocator`.
         load: *const fn (ptr: *anyopaque, allocator: Allocator, key: RemoteReviewIdentity) anyerror![]Draft,
         begin_submission: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, source_commit: []const u8, items: []const SubmissionRunItem) anyerror!OperationId,
@@ -189,6 +212,13 @@ pub const PendingReviewStore = struct {
     /// because a changed body is a new attempt rather than the failed one.
     pub fn editDraftBody(self: PendingReviewStore, key: RemoteReviewIdentity, edit: DraftBodyEdit) !void {
         return self.vtable.edit_draft_body(self.ptr, key, edit);
+    }
+
+    /// Replace `reanchor.temp_id`'s Anchor. Like a body edit, a real change is
+    /// a new attempt, so a `failed` Draft returns to `draft`; the Reply subtree
+    /// is untouched because parentage, not a copied scope, places it.
+    pub fn reanchorDraft(self: PendingReviewStore, key: RemoteReviewIdentity, reanchor: DraftReanchor) !void {
+        return self.vtable.reanchor_draft(self.ptr, key, reanchor);
     }
 
     pub fn load(self: PendingReviewStore, allocator: Allocator, key: RemoteReviewIdentity) ![]Draft {
@@ -315,6 +345,8 @@ pub const InMemoryStore = struct {
     temp_counters: std.ArrayList(TempCounter) = .empty,
     /// Deterministic adapter fault injection for Presentation edit tests.
     fail_next_edit: bool = false,
+    /// Deterministic adapter fault injection for Presentation re-anchor tests.
+    fail_next_reanchor: bool = false,
     /// Deterministic adapter fault injection for Presentation checkpoint tests.
     fail_next_checkpoint: bool = false,
     /// Deterministic adapter fault injection after a terminal checkpoint.
@@ -345,6 +377,7 @@ pub const InMemoryStore = struct {
         .put = putImpl,
         .remove = removeImpl,
         .edit_draft_body = editDraftBodyImpl,
+        .reanchor_draft = reanchorDraftImpl,
         .load = loadImpl,
         .begin_submission = beginSubmissionImpl,
         .checkpoint_submission = checkpointSubmissionImpl,
@@ -475,6 +508,49 @@ pub const InMemoryStore = struct {
             if (!parentEql(entry.draft.parent, edit.expected_parent)) return error.DraftEditConflict;
             const owned_body = try self.arena.allocator().dupe(u8, edit.body);
             entry.draft.body = owned_body;
+            if (entry.draft.state == .failed) entry.draft.state = .draft;
+            return;
+        }
+        return error.DraftNotFound;
+    }
+
+    fn reanchorDraftImpl(ptr: *anyopaque, key: RemoteReviewIdentity, reanchor: DraftReanchor) anyerror!void {
+        const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        if (self.fail_next_reanchor) {
+            self.fail_next_reanchor = false;
+            return error.InjectedReanchorFailure;
+        }
+        reanchor.anchor.validateShape() catch return error.InvalidAnchor;
+        // One check-and-replace step, like a body edit: no partially re-anchored
+        // Draft is observable between the rechecks and the replacement.
+        if (self.active_submission) |run| {
+            if (RemoteReviewIdentity.eql(run.key, key) and submissionItemIndex(run.items, reanchor.temp_id) != null)
+                return error.DraftLocked;
+        }
+        for (self.entries.items) |*entry| {
+            if (!RemoteReviewIdentity.eql(entry.key, key) or entry.draft.local_id != reanchor.temp_id) continue;
+            switch (entry.draft.state) {
+                .draft, .failed => {},
+                .submitting, .posted => return error.DraftNotEditable,
+                .outcome_unknown => return error.DraftLocked,
+            }
+            if (entry.draft.kind != reanchor.expected_kind) return error.DraftEditConflict;
+            if (entry.draft.parent != null or entry.draft.effectiveScope() != .@"inline") return error.DraftNotAnchorable;
+            // Bitbucket refuses to apply a Suggestion over removed lines.
+            if (entry.draft.kind == .suggestion and reanchor.anchor.to == null) return error.InvalidAnchor;
+
+            const arena = self.arena.allocator();
+            var owned = reanchor.anchor;
+            owned.path = try arena.dupe(u8, reanchor.anchor.path);
+            if (reanchor.anchor.commit) |commit| owned.commit = try arena.dupe(u8, commit);
+            const owned_snapshot: ?comment.AnchorSnapshot = if (reanchor.snapshot) |snapshot| .{
+                .text = try arena.dupe(u8, snapshot.text),
+                .selection_start = snapshot.selection_start,
+                .selection_len = snapshot.selection_len,
+            } else null;
+            entry.draft.scope = .{ .@"inline" = owned };
+            entry.draft.anchor = owned;
+            entry.draft.snapshot = owned_snapshot;
             if (entry.draft.state == .failed) entry.draft.state = .draft;
             return;
         }
@@ -911,6 +987,120 @@ test "an unresolved outcome refuses editing until it is resolved" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectEqualStrings("changed", (try s.load(arena.allocator(), key))[0].body);
+}
+
+test "re-anchoring an inline root replaces its Anchor and snapshot, keeping everything else" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const s = mem.store();
+    const key = testReviewKey(4);
+    try s.put(key, .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "src/f.zig", .to = 4, .commit = "source" } },
+        .snapshot = .{ .text = "authored", .selection_start = 0, .selection_len = 1 },
+        .body = "still the same words",
+        .state = .{ .failed = error.ServerError },
+    });
+    try s.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" });
+
+    try s.reanchorDraft(key, .{
+        .temp_id = 1,
+        .expected_kind = .comment,
+        .anchor = .{ .path = "src/g.zig", .start_to = 9, .to = 11, .commit = "source" },
+        .snapshot = .{ .text = "repaired", .selection_start = 1, .selection_len = 3 },
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try s.load(arena.allocator(), key);
+    const root = drafts[0];
+    try testing.expectEqual(@as(TempId, 1), root.local_id);
+    try testing.expect(root.kind == .comment);
+    try testing.expectEqualStrings("still the same words", root.body);
+    try testing.expectEqualStrings("src/g.zig", root.effectiveScope().@"inline".path);
+    try testing.expectEqual(@as(?u32, 9), root.effectiveScope().@"inline".start_to);
+    try testing.expectEqual(@as(?u32, 11), root.effectiveScope().@"inline".to);
+    try testing.expectEqualStrings("repaired", root.snapshot.?.text);
+    // A real Anchor change is a new attempt.
+    try testing.expect(root.state == .draft);
+    // The Reply subtree is untouched: parentage, not a copied scope, places it.
+    try testing.expectEqual(@as(usize, 2), drafts.len);
+    try testing.expect(drafts[1].parent.? == .draft and drafts[1].parent.?.draft == 1);
+}
+
+test "re-anchoring accepts an old-side Comment range but refuses an old-side Suggestion" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const s = mem.store();
+    const key = testReviewKey(4);
+    try s.put(key, .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "f.zig", .to = 1, .commit = "source" } },
+        .body = "prose",
+    });
+    try s.put(key, .{
+        .local_id = 2,
+        .kind = .suggestion,
+        .scope = .{ .@"inline" = .{ .path = "f.zig", .to = 1, .commit = "source" } },
+        .body = "```suggestion\nnew\n```",
+    });
+
+    try s.reanchorDraft(key, .{
+        .temp_id = 1,
+        .expected_kind = .comment,
+        .anchor = .{ .path = "f.zig", .start_from = 2, .from = 5, .commit = "base" },
+    });
+    try testing.expectError(error.InvalidAnchor, s.reanchorDraft(key, .{
+        .temp_id = 2,
+        .expected_kind = .suggestion,
+        .anchor = .{ .path = "f.zig", .from = 5, .commit = "base" },
+    }));
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try s.load(arena.allocator(), key);
+    try testing.expectEqual(@as(?u32, 5), drafts[0].effectiveScope().@"inline".from);
+    try testing.expectEqualStrings("base", drafts[0].effectiveScope().@"inline".commit.?);
+    try testing.expectEqual(@as(?u32, 1), drafts[1].effectiveScope().@"inline".to);
+}
+
+test "re-anchoring refuses ambiguous shapes, non-inline roots, Replies, and locked Drafts" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const s = mem.store();
+    const key = testReviewKey(4);
+    const inline_scope: Anchor = .{ .path = "f.zig", .to = 1, .commit = "source" };
+    try s.put(key, .{ .local_id = 1, .kind = .comment, .scope = .{ .@"inline" = inline_scope }, .body = "root" });
+    try s.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" });
+    try s.put(key, .{ .local_id = 3, .kind = .comment, .scope = .review, .body = "review level" });
+    try s.put(key, .{ .local_id = 4, .kind = .comment, .scope = .{ .file = .{ .path = "f.zig", .source_commit = "source" } }, .body = "file level" });
+
+    const valid: Anchor = .{ .path = "f.zig", .to = 3, .commit = "source" };
+    try testing.expectError(error.DraftNotFound, s.reanchorDraft(key, .{ .temp_id = 99, .expected_kind = .comment, .anchor = valid }));
+    try testing.expectError(error.DraftNotAnchorable, s.reanchorDraft(key, .{ .temp_id = 2, .expected_kind = .comment, .anchor = valid }));
+    try testing.expectError(error.DraftNotAnchorable, s.reanchorDraft(key, .{ .temp_id = 3, .expected_kind = .comment, .anchor = valid }));
+    try testing.expectError(error.DraftNotAnchorable, s.reanchorDraft(key, .{ .temp_id = 4, .expected_kind = .comment, .anchor = valid }));
+    try testing.expectError(error.DraftEditConflict, s.reanchorDraft(key, .{ .temp_id = 1, .expected_kind = .suggestion, .anchor = valid }));
+    try testing.expectError(error.InvalidAnchor, s.reanchorDraft(key, .{
+        .temp_id = 1,
+        .expected_kind = .comment,
+        .anchor = .{ .path = "f.zig", .from = 2, .to = 3, .commit = "source" },
+    }));
+    try testing.expectError(error.InvalidAnchor, s.reanchorDraft(key, .{
+        .temp_id = 1,
+        .expected_kind = .comment,
+        .anchor = .{ .path = "f.zig", .start_to = 1, .to = 31, .commit = "source" },
+    }));
+
+    _ = try s.beginSubmission(key, "source", &.{.{ .temp_id = 1, .parent = null }});
+    try testing.expectError(error.DraftLocked, s.reanchorDraft(key, .{ .temp_id = 1, .expected_kind = .comment, .anchor = valid }));
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try s.load(arena.allocator(), key);
+    try testing.expectEqual(@as(?u32, 1), drafts[0].effectiveScope().@"inline".to);
 }
 
 test "loadReview rebuilds the graph and next_id for resume" {
