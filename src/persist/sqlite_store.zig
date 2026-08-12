@@ -35,6 +35,8 @@ const SubmissionRunItem = bbr.review.SubmissionRunItem;
 const SubmissionOutcome = bbr.review.SubmissionOutcome;
 const SubmissionPendingState = bbr.review.SubmissionPendingState;
 const UnknownResolution = bbr.review.UnknownResolution;
+const DraftBodyEdit = bbr.review.DraftBodyEdit;
+const parentEql = bbr.review.parentEql;
 const SubmissionCompletion = bbr.review.SubmissionCompletion;
 
 pub const SqliteError = error{ Open, Exec, Prepare, Step };
@@ -241,6 +243,7 @@ pub const SqliteStore = struct {
     const vtable: PendingReviewStore.VTable = .{
         .put = putImpl,
         .remove = removeImpl,
+        .edit_draft_body = editDraftBodyImpl,
         .load = loadImpl,
         .begin_submission = beginSubmissionImpl,
         .checkpoint_submission = checkpointSubmissionImpl,
@@ -477,6 +480,58 @@ pub const SqliteStore = struct {
         bindInt(stmt, 3, @intCast(key.pull_request_id));
         bindInt(stmt, 4, @intCast(local_id));
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
+        try self.exec("COMMIT;");
+    }
+
+    /// One transaction: recheck identity, expected shape, editable state, and
+    /// SubmissionRun participation, then replace the body. Nothing else about
+    /// the row — kind, parent, scope, anchor, snapshot — is touched.
+    fn editDraftBodyImpl(ptr: *anyopaque, key: RemoteReviewIdentity, edit: DraftBodyEdit) anyerror!void {
+        const self: *SqliteStore = @ptrCast(@alignCast(ptr));
+        try self.exec("BEGIN IMMEDIATE;");
+        errdefer self.exec("ROLLBACK;") catch {};
+        if (try self.draftMutationLocked(key, edit.temp_id, null)) return error.DraftLocked;
+
+        var query: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT kind, parent_kind, parent_id, state_kind FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &query, null) != c.SQLITE_OK)
+            return error.Prepare;
+        defer _ = c.sqlite3_finalize(query);
+        bindText(query, 1, key.workspace);
+        bindText(query, 2, key.repository);
+        bindInt(query, 3, @intCast(key.pull_request_id));
+        bindInt(query, 4, @intCast(edit.temp_id));
+        switch (c.sqlite3_step(query)) {
+            c.SQLITE_ROW => {},
+            c.SQLITE_DONE => return error.DraftNotFound,
+            else => return error.Step,
+        }
+        const state_kind = columnInt(query, 3);
+        switch (state_kind) {
+            0, 3 => {},
+            1, 2 => return error.DraftNotEditable,
+            else => return error.DraftLocked,
+        }
+        if (columnInt(query, 0) != @intFromEnum(edit.expected_kind)) return error.DraftEditConflict;
+        const stored_parent: ?Parent = switch (columnInt(query, 1)) {
+            1 => .{ .draft = @intCast(columnInt(query, 2)) },
+            2 => .{ .comment = @intCast(columnInt(query, 2)) },
+            else => null,
+        };
+        if (!parentEql(stored_parent, edit.expected_parent)) return error.DraftEditConflict;
+
+        // A changed body is a new attempt, so a confirmed failure resets.
+        var update: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE drafts SET body=?, state_kind=?, state_err=NULL WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &update, null) != c.SQLITE_OK)
+            return error.Prepare;
+        defer _ = c.sqlite3_finalize(update);
+        bindText(update, 1, edit.body);
+        bindInt(update, 2, 0);
+        bindText(update, 3, key.workspace);
+        bindText(update, 4, key.repository);
+        bindInt(update, 5, @intCast(key.pull_request_id));
+        bindInt(update, 6, @intCast(edit.temp_id));
+        if (c.sqlite3_step(update) != c.SQLITE_DONE) return error.Step;
+        if (c.sqlite3_changes(self.db) != 1) return error.DraftNotFound;
         try self.exec("COMMIT;");
     }
 
@@ -1172,6 +1227,113 @@ test "in-memory round-trip preserves fields, anchor, parent, and state" {
     try testing.expect(d1.anchor == null);
     try testing.expectEqual(ApiError.RateLimited, d1.state.failed);
     try testing.expect(drafts[2].state == .outcome_unknown);
+}
+
+test "editing a persisted Draft body keeps every other authored fact" {
+    var s = try SqliteStore.open(":memory:");
+    defer s.deinit();
+    const store = s.store();
+    const key = testReviewKey(11);
+    try store.put(key, .{
+        .local_id = 3,
+        .kind = .suggestion,
+        .scope = .{ .@"inline" = .{ .path = "src/f.zig", .to = 12, .start_to = 9, .commit = "deadbeef" } },
+        .snapshot = .{ .text = "before\nselected\nafter", .selection_start = 1, .selection_len = 1 },
+        .body = "```suggestion\nold\n```",
+        .state = .{ .failed = error.ServerError },
+    });
+    try store.put(key, .{ .local_id = 4, .kind = .comment, .parent = .{ .draft = 3 }, .body = "reply" });
+
+    try store.editDraftBody(key, .{
+        .temp_id = 3,
+        .expected_kind = .suggestion,
+        .expected_parent = null,
+        .body = "```suggestion\nnew\n```",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try store.load(arena.allocator(), key);
+    const edited = drafts[0];
+    try testing.expectEqual(@as(TempId, 3), edited.local_id);
+    try testing.expect(edited.kind == .suggestion);
+    try testing.expectEqualStrings("```suggestion\nnew\n```", edited.body);
+    try testing.expect(edited.state == .draft); // a real change retries as a fresh Draft
+    try testing.expectEqualStrings("src/f.zig", edited.scope.?.@"inline".path);
+    try testing.expectEqual(@as(?u32, 12), edited.scope.?.@"inline".to);
+    try testing.expectEqual(@as(?u32, 9), edited.scope.?.@"inline".start_to);
+    try testing.expectEqualStrings("deadbeef", edited.scope.?.@"inline".commit.?);
+    try testing.expectEqualStrings("before\nselected\nafter", edited.snapshot.?.text);
+    try testing.expectEqualStrings("reply", drafts[1].body);
+    try testing.expect(drafts[1].parent.? == .draft and drafts[1].parent.?.draft == 3);
+}
+
+test "a persisted edit refuses unknown, mismatched, in-flight, and run-owned Drafts" {
+    var s = try SqliteStore.open(":memory:");
+    defer s.deinit();
+    const store = s.store();
+    const key = testReviewKey(12);
+    const other: RemoteReviewIdentity = .{ .workspace = "workspace", .repository = "other", .pull_request_id = 12 };
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "participant" });
+    try store.put(key, .{ .local_id = 2, .kind = .comment, .body = "bystander" });
+    try store.put(key, .{ .local_id = 3, .kind = .comment, .body = "posted", .state = .{ .posted = 90 } });
+    const edit: DraftBodyEdit = .{ .temp_id = 1, .expected_kind = .comment, .expected_parent = null, .body = "changed" };
+
+    try testing.expectError(error.DraftNotFound, store.editDraftBody(key, .{
+        .temp_id = 77,
+        .expected_kind = .comment,
+        .expected_parent = null,
+        .body = "changed",
+    }));
+    try testing.expectError(error.DraftNotFound, store.editDraftBody(other, edit));
+    try testing.expectError(error.DraftEditConflict, store.editDraftBody(key, .{
+        .temp_id = 1,
+        .expected_kind = .comment,
+        .expected_parent = .{ .draft = 2 },
+        .body = "changed",
+    }));
+    try testing.expectError(error.DraftNotEditable, store.editDraftBody(key, .{
+        .temp_id = 3,
+        .expected_kind = .comment,
+        .expected_parent = null,
+        .body = "changed",
+    }));
+
+    _ = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
+    try testing.expectError(error.DraftLocked, store.editDraftBody(key, edit));
+    try store.editDraftBody(key, .{ .temp_id = 2, .expected_kind = .comment, .expected_parent = null, .body = "still mine" });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try store.load(arena.allocator(), key);
+    try testing.expectEqualStrings("participant", drafts[0].body);
+    try testing.expectEqualStrings("still mine", drafts[1].body);
+}
+
+test "a persisted edit survives reopening the database" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, ".zig-cache/tmp/{s}/edit.db", .{&tmp.sub_path}, 0);
+    defer testing.allocator.free(path);
+    const key = testReviewKey(13);
+    {
+        var s = try SqliteStore.open(path);
+        defer s.deinit();
+        try s.store().put(key, .{ .local_id = 1, .kind = .comment, .body = "original" });
+        try s.store().editDraftBody(key, .{
+            .temp_id = 1,
+            .expected_kind = .comment,
+            .expected_parent = null,
+            .body = "persisted edit",
+        });
+    }
+    var reopened = try SqliteStore.open(path);
+    defer reopened.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try reopened.store().load(arena.allocator(), key);
+    try testing.expectEqual(@as(usize, 1), drafts.len);
+    try testing.expectEqualStrings("persisted edit", drafts[0].body);
 }
 
 test "SQLite round-trip preserves exhaustive root scope and File authored commit" {

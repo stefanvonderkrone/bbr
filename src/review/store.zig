@@ -127,6 +127,32 @@ pub const UnknownResolution = union(enum) {
     unpublished,
 };
 
+/// A body-only replacement of one existing Draft, applied as one transaction.
+/// The expectations are rechecked inside that transaction so an edit staged
+/// against a stale in-memory graph is refused instead of overwriting a Draft
+/// whose kind or parentage changed underneath it. TempId, kind, parent,
+/// CommentScope, Anchor, and AnchorSnapshot all survive the edit; only the
+/// body — and a `failed` state, which resets to `draft` — changes.
+pub const DraftBodyEdit = struct {
+    temp_id: TempId,
+    expected_kind: draft_mod.DraftKind,
+    expected_parent: ?draft_mod.Parent,
+    body: []const u8,
+};
+
+pub const DraftEditError = error{
+    /// No Draft with that TempId under this ReviewIdentity.
+    DraftNotFound,
+    /// An active or recovered SubmissionRun owns it, or its publication
+    /// outcome is unresolved.
+    DraftLocked,
+    /// `submitting` or transient `posted`: Bitbucket, not the reviewer, owns
+    /// the next transition.
+    DraftNotEditable,
+    /// The persisted kind or parent relationship is not the one edited.
+    DraftEditConflict,
+};
+
 pub const PendingReviewStore = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -136,6 +162,9 @@ pub const PendingReviewStore = struct {
         put: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, draft: Draft) anyerror!void,
         /// Delete the Draft `(pr_id, local_id)`. Idempotent — a missing id is ok.
         remove: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, local_id: TempId) anyerror!void,
+        /// Atomically replace one existing Draft's body after rechecking its
+        /// identity, expected shape, editable state, and run participation.
+        edit_draft_body: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, edit: DraftBodyEdit) anyerror!void,
         /// Every Draft for `pr_id`, each with its strings duped into `allocator`.
         load: *const fn (ptr: *anyopaque, allocator: Allocator, key: RemoteReviewIdentity) anyerror![]Draft,
         begin_submission: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, source_commit: []const u8, items: []const SubmissionRunItem) anyerror!OperationId,
@@ -154,6 +183,12 @@ pub const PendingReviewStore = struct {
 
     pub fn remove(self: PendingReviewStore, key: RemoteReviewIdentity, local_id: TempId) !void {
         return self.vtable.remove(self.ptr, key, local_id);
+    }
+
+    /// Replace `edit.temp_id`'s body. A `failed` Draft returns to `draft`,
+    /// because a changed body is a new attempt rather than the failed one.
+    pub fn editDraftBody(self: PendingReviewStore, key: RemoteReviewIdentity, edit: DraftBodyEdit) !void {
+        return self.vtable.edit_draft_body(self.ptr, key, edit);
     }
 
     pub fn load(self: PendingReviewStore, allocator: Allocator, key: RemoteReviewIdentity) ![]Draft {
@@ -278,6 +313,8 @@ pub const InMemoryStore = struct {
     next_repository_id: ReviewRepositoryId = 1,
     repository_aliases: std.ArrayList(RepositoryAlias) = .empty,
     temp_counters: std.ArrayList(TempCounter) = .empty,
+    /// Deterministic adapter fault injection for Presentation edit tests.
+    fail_next_edit: bool = false,
     /// Deterministic adapter fault injection for Presentation checkpoint tests.
     fail_next_checkpoint: bool = false,
     /// Deterministic adapter fault injection after a terminal checkpoint.
@@ -307,6 +344,7 @@ pub const InMemoryStore = struct {
     const vtable: PendingReviewStore.VTable = .{
         .put = putImpl,
         .remove = removeImpl,
+        .edit_draft_body = editDraftBodyImpl,
         .load = loadImpl,
         .begin_submission = beginSubmissionImpl,
         .checkpoint_submission = checkpointSubmissionImpl,
@@ -411,6 +449,36 @@ pub const InMemoryStore = struct {
                 _ = self.entries.orderedRemove(i);
             } else i += 1;
         }
+    }
+
+    fn editDraftBodyImpl(ptr: *anyopaque, key: RemoteReviewIdentity, edit: DraftBodyEdit) anyerror!void {
+        const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        if (self.fail_next_edit) {
+            self.fail_next_edit = false;
+            return error.InjectedEditFailure;
+        }
+        // Everything below is one check-and-replace step: nothing between the
+        // rechecks can observe a partially edited Draft.
+        if (self.active_submission) |run| {
+            if (RemoteReviewIdentity.eql(run.key, key) and submissionItemIndex(run.items, edit.temp_id) != null)
+                return error.DraftLocked;
+        }
+        for (self.entries.items) |*entry| {
+            if (!RemoteReviewIdentity.eql(entry.key, key) or entry.draft.local_id != edit.temp_id) continue;
+            if (entry.draft.state == .outcome_unknown) return error.DraftLocked;
+            switch (entry.draft.state) {
+                .draft, .failed => {},
+                .submitting, .posted => return error.DraftNotEditable,
+                .outcome_unknown => unreachable,
+            }
+            if (entry.draft.kind != edit.expected_kind) return error.DraftEditConflict;
+            if (!parentEql(entry.draft.parent, edit.expected_parent)) return error.DraftEditConflict;
+            const owned_body = try self.arena.allocator().dupe(u8, edit.body);
+            entry.draft.body = owned_body;
+            if (entry.draft.state == .failed) entry.draft.state = .draft;
+            return;
+        }
+        return error.DraftNotFound;
     }
 
     fn loadImpl(ptr: *anyopaque, allocator: Allocator, key: RemoteReviewIdentity) anyerror![]Draft {
@@ -596,7 +664,9 @@ pub const InMemoryStore = struct {
     }
 };
 
-fn parentEql(a: ?draft_mod.Parent, b: ?draft_mod.Parent) bool {
+/// Structural parent equality, shared by every store adapter so a persisted
+/// Draft's parentage is compared identically wherever it is rechecked.
+pub fn parentEql(a: ?draft_mod.Parent, b: ?draft_mod.Parent) bool {
     if (a == null or b == null) return a == null and b == null;
     return switch (a.?) {
         .draft => |id| b.? == .draft and b.?.draft == id,
@@ -699,6 +769,148 @@ test "remove is scoped and idempotent" {
     const drafts = try s.load(arena.allocator(), testReviewKey(1));
     try testing.expectEqual(@as(usize, 1), drafts.len);
     try testing.expectEqual(@as(TempId, 2), drafts[0].local_id);
+}
+
+test "editing a Draft body preserves its identity, shape, and scope" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const s = mem.store();
+    const key = testReviewKey(4);
+    try s.put(key, .{
+        .local_id = 9,
+        .kind = .suggestion,
+        .scope = .{ .@"inline" = .{ .path = "src/f.zig", .to = 12, .commit = "abc" } },
+        .snapshot = .{ .text = "const x = 0;", .selection_start = 0, .selection_len = 12 },
+        .body = "```suggestion\nold\n```",
+    });
+
+    try s.editDraftBody(key, .{
+        .temp_id = 9,
+        .expected_kind = .suggestion,
+        .expected_parent = null,
+        .body = "```suggestion\nnew\n```",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try s.load(arena.allocator(), key);
+    try testing.expectEqual(@as(usize, 1), drafts.len);
+    const edited = drafts[0];
+    try testing.expectEqual(@as(TempId, 9), edited.local_id);
+    try testing.expect(edited.kind == .suggestion);
+    try testing.expect(edited.parent == null);
+    try testing.expectEqualStrings("```suggestion\nnew\n```", edited.body);
+    try testing.expectEqualStrings("src/f.zig", edited.effectiveScope().@"inline".path);
+    try testing.expectEqual(@as(?u32, 12), edited.effectiveScope().@"inline".to);
+    try testing.expectEqualStrings("const x = 0;", edited.snapshot.?.text);
+}
+
+test "editing a Reply keeps its parent and refuses a changed expectation" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const s = mem.store();
+    const key = testReviewKey(4);
+    try s.put(key, .{ .local_id = 1, .kind = .comment, .body = "root" });
+    try s.put(key, .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "reply" });
+
+    try testing.expectError(error.DraftEditConflict, s.editDraftBody(key, .{
+        .temp_id = 2,
+        .expected_kind = .comment,
+        .expected_parent = .{ .comment = 1 },
+        .body = "wrong parentage",
+    }));
+    try testing.expectError(error.DraftEditConflict, s.editDraftBody(key, .{
+        .temp_id = 2,
+        .expected_kind = .suggestion,
+        .expected_parent = .{ .draft = 1 },
+        .body = "wrong kind",
+    }));
+    try s.editDraftBody(key, .{
+        .temp_id = 2,
+        .expected_kind = .comment,
+        .expected_parent = .{ .draft = 1 },
+        .body = "edited reply",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try s.load(arena.allocator(), key);
+    try testing.expectEqualStrings("root", drafts[0].body);
+    try testing.expectEqualStrings("edited reply", drafts[1].body);
+    try testing.expect(drafts[1].parent.? == .draft and drafts[1].parent.?.draft == 1);
+}
+
+test "editing a failed Draft resets it to draft" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const s = mem.store();
+    const key = testReviewKey(4);
+    try s.put(key, .{ .local_id = 1, .kind = .comment, .body = "rejected", .state = .{ .failed = error.ServerError } });
+
+    try s.editDraftBody(key, .{ .temp_id = 1, .expected_kind = .comment, .expected_parent = null, .body = "reworded" });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try s.load(arena.allocator(), key);
+    try testing.expect(drafts[0].state == .draft);
+    try testing.expectEqualStrings("reworded", drafts[0].body);
+}
+
+test "editing refuses unknown, run-owned, in-flight, and unresolved Drafts" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const s = mem.store();
+    const key = testReviewKey(4);
+    const other = RemoteReviewIdentity{ .workspace = "workspace", .repository = "other", .pull_request_id = 4 };
+    try s.put(key, .{ .local_id = 1, .kind = .comment, .body = "participant" });
+    try s.put(key, .{ .local_id = 2, .kind = .comment, .body = "bystander" });
+    try s.put(key, .{ .local_id = 3, .kind = .comment, .body = "posted", .state = .{ .posted = 77 } });
+
+    const edit: DraftBodyEdit = .{ .temp_id = 1, .expected_kind = .comment, .expected_parent = null, .body = "changed" };
+    try testing.expectError(error.DraftNotFound, s.editDraftBody(key, .{
+        .temp_id = 99,
+        .expected_kind = .comment,
+        .expected_parent = null,
+        .body = "changed",
+    }));
+    try testing.expectError(error.DraftNotFound, s.editDraftBody(other, edit));
+
+    _ = try s.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
+    try testing.expectError(error.DraftLocked, s.editDraftBody(key, edit));
+    try testing.expectError(error.DraftNotEditable, s.editDraftBody(key, .{
+        .temp_id = 3,
+        .expected_kind = .comment,
+        .expected_parent = null,
+        .body = "changed",
+    }));
+    // A Draft outside the frozen participant graph stays editable.
+    try s.editDraftBody(key, .{ .temp_id = 2, .expected_kind = .comment, .expected_parent = null, .body = "still mine" });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try s.load(arena.allocator(), key);
+    try testing.expectEqualStrings("participant", drafts[0].body);
+    try testing.expectEqualStrings("still mine", drafts[1].body);
+}
+
+test "an unresolved outcome refuses editing until it is resolved" {
+    var mem = InMemoryStore.init(testing.allocator);
+    defer mem.deinit();
+    const s = mem.store();
+    const key = testReviewKey(4);
+    try s.put(key, .{ .local_id = 1, .kind = .comment, .body = "ambiguous" });
+    const operation_id = try s.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
+    try s.checkpointSubmission(operation_id, key, 1, .outcome_unknown, null);
+    try s.completeSubmission(operation_id, key, .partial);
+
+    const edit: DraftBodyEdit = .{ .temp_id = 1, .expected_kind = .comment, .expected_parent = null, .body = "changed" };
+    try testing.expectError(error.DraftLocked, s.editDraftBody(key, edit));
+    try s.resolveUnknown(key, 1, .unpublished);
+    try s.editDraftBody(key, edit);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("changed", (try s.load(arena.allocator(), key))[0].body);
 }
 
 test "loadReview rebuilds the graph and next_id for resume" {

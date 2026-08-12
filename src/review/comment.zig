@@ -142,23 +142,30 @@ pub const Comment = struct {
     /// newline). Suggestions are authored/displayed here; *applying* them stays
     /// in the Bitbucket web UI (design §6). Returns null when there is none.
     pub fn suggestion(self: Comment) ?[]const u8 {
-        const fence = "```suggestion";
-        const open = std.mem.indexOf(u8, self.body, fence) orelse return null;
-        // The content starts after the fence line's newline.
-        const after_fence = open + fence.len;
-        const nl = std.mem.indexOfScalarPos(u8, self.body, after_fence, '\n') orelse return null;
-        const body_start = nl + 1;
-        // Closing fence is the next ``` at a line start.
-        const rest = self.body[body_start..];
-        const close_rel = std.mem.indexOf(u8, rest, "```") orelse return null;
-        var content = rest[0..close_rel];
-        // Drop the newline that precedes the closing fence, if any.
-        if (content.len > 0 and content[content.len - 1] == '\n') {
-            content = content[0 .. content.len - 1];
-        }
-        return content;
+        return suggestionBody(self.body);
     }
 };
+
+/// The replacement code inside `body`'s fenced ```suggestion block, or null
+/// when the body carries none. Shared by Comments and Drafts so authoring,
+/// display, and editing all read the same fenced storage representation.
+pub fn suggestionBody(body: []const u8) ?[]const u8 {
+    const fence = "```suggestion";
+    const open = std.mem.indexOf(u8, body, fence) orelse return null;
+    // The content starts after the fence line's newline.
+    const after_fence = open + fence.len;
+    const nl = std.mem.indexOfScalarPos(u8, body, after_fence, '\n') orelse return null;
+    const body_start = nl + 1;
+    // Closing fence is the next ``` at a line start.
+    const rest = body[body_start..];
+    const close_rel = std.mem.indexOf(u8, rest, "```") orelse return null;
+    var content = rest[0..close_rel];
+    // Drop the newline that precedes the closing fence, if any.
+    if (content.len > 0 and content[content.len - 1] == '\n') {
+        content = content[0 .. content.len - 1];
+    }
+    return content;
+}
 
 // ---------------------------------------------------------------------------
 // Tests

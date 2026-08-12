@@ -90,7 +90,30 @@ pub const Draft = struct {
     pub fn isPosted(self: Draft) bool {
         return self.state == .posted;
     }
+
+    /// The reviewer-editable content of this Draft. A Suggestion exposes only
+    /// its replacement code; `storedBody` puts the fence back. Every other kind
+    /// edits its authored body directly.
+    pub fn editableBody(self: Draft) []const u8 {
+        if (self.kind != .suggestion) return self.body;
+        return comment.suggestionBody(self.body) orelse self.body;
+    }
 };
+
+/// The durable body for `editable` content authored as `kind`: a Suggestion is
+/// stored (and sent to Bitbucket) as a fenced ```suggestion block. Creation and
+/// editing share this so a round-trip never loses or doubles the fence.
+pub fn storedBody(alloc: Allocator, kind: DraftKind, editable: []const u8) ![]u8 {
+    return switch (kind) {
+        .suggestion => std.fmt.allocPrint(alloc, "```suggestion\n{s}\n```", .{editable}),
+        .comment => alloc.dupe(u8, editable),
+    };
+}
+
+/// Whether `editable` is worth saving — the same blank rule creation applies.
+pub fn isBlankBody(editable: []const u8) bool {
+    return std.mem.trim(u8, editable, " \t\r\n").len == 0;
+}
 
 /// Fields for a new Draft: everything but the `local_id`, which the review
 /// assigns, and `state`, which starts at `.draft`.
@@ -358,6 +381,33 @@ test "remove takes a draft's reply-descendants with it" {
     try testing.expectEqual(@as(usize, 1), pr.drafts.items.len);
     try testing.expect(pr.get(keep) != null);
     try testing.expect(pr.get(root) == null);
+}
+
+test "a Suggestion edits its replacement code and round-trips the fence" {
+    const stored = try storedBody(testing.allocator, .suggestion, "const x = 1;\nconst y = 2;");
+    defer testing.allocator.free(stored);
+    try testing.expectEqualStrings("```suggestion\nconst x = 1;\nconst y = 2;\n```", stored);
+
+    const d: Draft = .{ .local_id = 1, .kind = .suggestion, .body = stored };
+    try testing.expectEqualStrings("const x = 1;\nconst y = 2;", d.editableBody());
+
+    const again = try storedBody(testing.allocator, .suggestion, d.editableBody());
+    defer testing.allocator.free(again);
+    try testing.expectEqualStrings(stored, again);
+}
+
+test "a Comment edits its authored body unchanged" {
+    const d: Draft = .{ .local_id = 1, .kind = .comment, .body = "```suggestion\nnot a suggestion draft\n```" };
+    try testing.expectEqualStrings(d.body, d.editableBody());
+    const stored = try storedBody(testing.allocator, .comment, "plain prose");
+    defer testing.allocator.free(stored);
+    try testing.expectEqualStrings("plain prose", stored);
+}
+
+test "blank bodies are refused by the shared creation rule" {
+    try testing.expect(isBlankBody(""));
+    try testing.expect(isBlankBody("  \t\r\n "));
+    try testing.expect(!isBlankBody(" x "));
 }
 
 fn indexOf(ids: []const TempId, id: TempId) usize {

@@ -20,9 +20,19 @@ const Parent = bbr.review.draft.Parent;
 const NewDraft = bbr.review.NewDraft;
 const CommentScope = bbr.review.CommentScope;
 
+/// What an accepted Composer save mutates, when it is not creating something
+/// new. The two identities stay distinct all the way through the interaction:
+/// a local Draft is named by its TempId, a published Comment by its CommentId.
+pub const MutationTarget = union(enum) {
+    draft: bbr.review.TempId,
+    comment: bbr.review.CommentId,
+};
+
 /// The context an authoring action carries in from `app.zig`: everything a
 /// `NewDraft` needs except the body the reviewer types. `label` is a short
-/// header line ("New comment", "Reply", "Comment on f.zig:12").
+/// header line ("New comment", "Reply", "Edit local Draft"). `mutation` names
+/// an existing item to replace instead of creating one; editing reuses this
+/// same Composer, so its interaction and validation are creation's.
 pub const Request = struct {
     kind: DraftKind,
     target: CommentTarget = .bitbucket,
@@ -31,6 +41,7 @@ pub const Request = struct {
     snapshot: ?AnchorSnapshot = null,
     parent: ?Parent = null,
     label: []const u8,
+    mutation: ?MutationTarget = null,
 };
 
 pub const Composer = struct {
@@ -178,6 +189,24 @@ test "toNewDraft carries the request's kind, anchor, and parent" {
     try testing.expectEqualStrings("abc", nd.anchor.?.commit.?);
     try testing.expect(nd.parent.? == .draft and nd.parent.?.draft == 3);
     try testing.expectEqualStrings("agreed", nd.body);
+}
+
+test "an edit request carries its typed mutation target through the interaction" {
+    var comp = Composer.init(testing.allocator, .{
+        .kind = .suggestion,
+        .parent = .{ .draft = 3 },
+        .label = "Edit local Draft",
+        .mutation = .{ .draft = 9 },
+    });
+    defer comp.deinit();
+    try comp.seed("const x = 1;");
+    try comp.insert("\nconst y = 2;");
+
+    try testing.expect(comp.request.mutation.? == .draft);
+    try testing.expectEqual(@as(bbr.review.TempId, 9), comp.request.mutation.?.draft);
+    try testing.expectEqualStrings("const x = 1;\nconst y = 2;", comp.body());
+    // The mutation target does not disturb the NewDraft shape the body implies.
+    try testing.expect(comp.toNewDraft().parent.? == .draft);
 }
 
 test "backspace on an empty body is a no-op" {

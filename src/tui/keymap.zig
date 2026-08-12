@@ -181,6 +181,7 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one(']'), .action = .next_file, .help = "next file" },
     .{ .chord = Chord.one('['), .action = .prev_file, .help = "previous file" },
     .{ .chord = Chord.one('r'), .action = .reply, .help = "reply" },
+    .{ .chord = Chord.one('e'), .action = .edit_review_item, .help = "edit local Draft" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_disclosure, .help = "toggle disclosure" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_review_card, .help = "toggle ReviewCard" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_directory, .help = "toggle Directory" },
@@ -435,7 +436,7 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             else => supportsContext(action, .diff),
         },
         .diff_review_card => switch (action) {
-            .toggle_review_card, .reply => true,
+            .toggle_review_card, .reply, .edit_review_item => true,
             else => supportsContext(action, .diff),
         },
         .diff_source => switch (action) {

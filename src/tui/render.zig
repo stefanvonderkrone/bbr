@@ -1420,6 +1420,22 @@ test "local help projection marks remote-only commands unavailable" {
     for (rows.commands) |row| {
         if (!row.available) unavailable += 1;
     }
-    try testing.expectEqual(@as(usize, 5), unavailable);
+    // Four remote-only commands, plus edit — visible but refused away from a
+    // ReviewCard — and the Picker.
+    try testing.expectEqual(@as(usize, 6), unavailable);
     for (rows.motions) |row| try testing.expect(row.available);
+}
+
+test "edit stays discoverable in the help Overlay when it is refused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const refused = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .edit_refusal = .submission_owns_draft });
+    const editable = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .edit_refusal = null });
+    try testing.expect(!helpRowAvailable(refused.commands, "edit local Draft").?);
+    try testing.expect(helpRowAvailable(editable.commands, "edit local Draft").?);
+}
+
+fn helpRowAvailable(rows: []const HelpRow, help: []const u8) ?bool {
+    for (rows) |row| if (std.mem.indexOf(u8, row.text, help) != null) return row.available;
+    return null;
 }

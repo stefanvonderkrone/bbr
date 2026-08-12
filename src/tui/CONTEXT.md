@@ -53,6 +53,10 @@ _Avoid_: Pull Request search (also applies to LocalReview), repository search (o
 The Overlay for authoring or editing a Comment, Reply, or Suggestion body. Mutation uses the same interaction and validation as creation with the previous editable content prefilled; a Suggestion exposes its replacement code while bbr preserves the fenced Markdown representation.
 _Avoid_: editor, input, form.
 
+**MutationTarget**:
+The typed identity a Composer save mutates instead of creating: a local Draft's TempId or a Bitbucket Comment's CommentId. Every ReviewCard row resolves to one, and Presentation carries it through the whole interaction rather than flattening both provenances into one numeric id. A Composer without one is authoring something new.
+_Avoid_: selected item, comment id (only one of the two), edit mode.
+
 **External Edit**:
 The Composer Action that temporarily hands its exact authored body to a configured external editing program and, when accepted, returns the changed body to the same open Composer. It does not save or publish the Comment, Reply, or Suggestion.
 _Avoid_: external editor (the program, not the interaction), edit in place, direct Comment edit.
@@ -106,7 +110,7 @@ The active input surface and semantic target from the current Presentation Frame
 _Avoid_: mode (too broad), focus alone (omits the target), input state.
 
 **ActionAvailability**:
-Whether an Action is valid for the currently published Review. Unavailable Actions remain visible but greyed in the help Overlay; invoking one produces an explanatory status message, while Presentation alone decides availability.
+Whether an Action is valid for the currently published Review. Unavailable Actions remain visible but greyed in the help Overlay; invoking one produces an explanatory status message, while Presentation alone decides availability. A mutation Action carries the precise refusal reason for the item under the cursor — an active or recovered SubmissionRun owns it, its publication outcome is unresolved, it is in flight, it is already represented by Bitbucket, or there is no ReviewCard there at all.
 _Avoid_: mode check, hidden binding, silent no-op.
 
 **Leader**:

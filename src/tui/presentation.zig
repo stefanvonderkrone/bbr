@@ -658,11 +658,34 @@ pub const Projection = struct {
 
 pub const ClipboardStatus = enum { copied, failed };
 
+/// What a Composer save mutates instead of creating. Presentation carries the
+/// typed identity end to end and never flattens both into one numeric id.
+pub const MutationTarget = composer_mod.MutationTarget;
+
+/// Why the ReviewCard under the cursor refuses a mutation. The Action stays
+/// discoverable; this is the precise reason the reviewer is told.
+pub const MutationRefusal = enum {
+    /// The cursor is not on a ReviewCard at all.
+    no_review_item,
+    /// An active or recovered SubmissionRun froze this Draft's graph.
+    submission_owns_draft,
+    /// `outcome_unknown`: publication must be resolved before editing.
+    outcome_unresolved,
+    /// `submitting`: Bitbucket owns the next transition.
+    submission_in_flight,
+    /// Transient `posted`: Bitbucket, not this Draft, is now its home.
+    already_published,
+    /// A published Bitbucket Comment; remote mutation is its own contract.
+    published_comment,
+};
+
 pub const ActionAvailability = struct {
     remote: bool,
     has_review: bool = true,
     context: keymap_mod.InteractionContext = .diff,
     source: bool = true,
+    /// null means the ReviewCard under the cursor is editable.
+    edit_refusal: ?MutationRefusal = .no_review_item,
 
     pub fn available(self: ActionAvailability, action: Action) bool {
         if (!self.has_review) return switch (action) {
@@ -675,6 +698,7 @@ pub const ActionAvailability = struct {
         };
         return switch (action) {
             .inline_comment, .suggest, .yank => self.source,
+            .edit_review_item => self.edit_refusal == null,
             else => true,
         };
     }
@@ -734,10 +758,18 @@ pub const ActionError = enum {
     local_review_remote_action_unavailable,
     source_action_unavailable,
     target_action_unavailable,
+    draft_owned_by_submission,
+    draft_outcome_unresolved,
+    draft_submission_in_flight,
+    draft_already_published,
+    published_comment_edit_unsupported,
+    no_review_item,
+    draft_edit_conflict,
 };
 
 const BufferTransactionError = error{ BufferBuildFailed, OutOfMemory };
 const SaveDraftError = BufferTransactionError || error{PersistenceFailed};
+const EditDraftError = SaveDraftError || error{ DraftEditConflict, DraftLocked };
 
 pub const ReplacementError = enum {
     session_load_failed,
@@ -1000,10 +1032,7 @@ const Published = struct {
                 .selection_start = snapshot.selection_start,
                 .selection_len = snapshot.selection_len,
             } else null,
-            .body = if (new_draft.kind == .suggestion)
-                try std.fmt.allocPrint(review_allocator, "```suggestion\n{s}\n```", .{new_draft.body})
-            else
-                try review_allocator.dupe(u8, new_draft.body),
+            .body = try bbr.review.storedBody(review_allocator, new_draft.kind, new_draft.body),
         };
         if (draft.scope) |scope| switch (scope) {
             .review => {},
@@ -1044,6 +1073,50 @@ const Published = struct {
         var staged = try self.prepareBuffer(preferences, self.expanded_disclosures.items, self.isolated_file, self.geometry);
         defer staged.deinit();
         store.put(self.key.storeKey(), draft) catch return error.PersistenceFailed;
+        staged.publish();
+    }
+
+    /// Replace one Draft's body: stage the candidate graph and Buffer, persist
+    /// through the transaction-shaped store, then publish. A failure anywhere
+    /// leaves the previous Frame, graph, and ScopeProjection exactly as they
+    /// were. `editable` is the reviewer-facing content; a Suggestion is stored
+    /// re-fenced. Byte-identical content is a clean no-op: nothing is persisted
+    /// and any failure evidence survives.
+    fn editDraftBody(
+        self: *Published,
+        store: bbr.review.PendingReviewStore,
+        preferences: Preferences,
+        temp_id: bbr.review.TempId,
+        editable: []const u8,
+    ) EditDraftError!void {
+        const draft = self.review.get(temp_id) orelse return error.DraftEditConflict;
+        const review_allocator = self.review_arena.allocator();
+        const candidate_body = try bbr.review.storedBody(review_allocator, draft.kind, editable);
+        if (std.mem.eql(u8, draft.body, candidate_body)) return;
+
+        const previous_body = draft.body;
+        const previous_state = draft.state;
+        draft.body = candidate_body;
+        // A real body change is a new attempt, so a confirmed failure resets.
+        if (draft.state == .failed) draft.state = .draft;
+        errdefer {
+            const rollback = self.review.get(temp_id).?;
+            rollback.body = previous_body;
+            rollback.state = previous_state;
+        }
+
+        var staged = try self.prepareBuffer(preferences, self.expanded_disclosures.items, self.isolated_file, self.geometry);
+        defer staged.deinit();
+        store.editDraftBody(self.key.storeKey(), .{
+            .temp_id = temp_id,
+            .expected_kind = draft.kind,
+            .expected_parent = draft.parent,
+            .body = candidate_body,
+        }) catch |err| return switch (err) {
+            error.DraftLocked, error.DraftNotEditable => error.DraftLocked,
+            error.DraftEditConflict, error.DraftNotFound => error.DraftEditConflict,
+            else => error.PersistenceFailed,
+        };
         staged.publish();
     }
 
@@ -1561,6 +1634,10 @@ pub const Presentation = struct {
     durable_submission: ?*DurableSubmission = null,
     submission_result: ?SubmissionResultProjection = null,
     recovery: ?RecoveryNotice = null,
+    /// The recovered run's frozen participants, read only while `recovery` is
+    /// set. They make a recovered run's ownership of a Draft visible before the
+    /// store refuses the mutation.
+    recovery_participants: std.ArrayList(bbr.review.TempId) = .empty,
     unknown_resolution: ?UnknownResolutionEditor = null,
     shutdown_requested: bool = false,
     replacement_error: ?ReplacementError = null,
@@ -1620,6 +1697,7 @@ pub const Presentation = struct {
         self.commands.deinit(self.allocator);
         self.issued_commands.deinit(self.allocator);
         self.issued_enrichments.deinit(self.allocator);
+        self.recovery_participants.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -1935,6 +2013,12 @@ pub const Presentation = struct {
             self.action_error = .recovery_claim_failed;
             return;
         };
+        self.recovery_participants.ensureTotalCapacity(self.allocator, run.items.len) catch {
+            self.action_error = .recovery_claim_failed;
+            return;
+        };
+        self.recovery_participants.clearRetainingCapacity();
+        for (run.items) |item| self.recovery_participants.appendAssumeCapacity(item.temp_id);
         var probe = locks.tryAcquire(run.key) catch {
             self.action_error = .recovery_claim_failed;
             return;
@@ -2156,7 +2240,46 @@ pub const Presentation = struct {
                 if (lineAtRow(published.buffer.rows[index]) != null) break :blk true;
             break :blk false;
         };
-        return .{ .remote = published.key.isRemote(), .context = context, .source = source };
+        return .{
+            .remote = published.key.isRemote(),
+            .context = context,
+            .source = source,
+            .edit_refusal = self.editRefusal(published),
+        };
+    }
+
+    /// Why editing the ReviewCard under the cursor is refused, or null when it
+    /// is editable. Edit stays discoverable either way.
+    fn editRefusal(self: *const Presentation, published: *const Published) ?MutationRefusal {
+        const target = reviewCardTarget(published) orelse return .no_review_item;
+        const temp_id = switch (target) {
+            .comment => return .published_comment,
+            .draft => |id| id,
+        };
+        const draft = published.review.getConst(temp_id) orelse return .no_review_item;
+        switch (draft.state) {
+            .draft, .failed => {},
+            .submitting => return .submission_in_flight,
+            .posted => return .already_published,
+            .outcome_unknown => return .outcome_unresolved,
+        }
+        if (self.submissionOwnsDraft(published.key, temp_id)) return .submission_owns_draft;
+        return null;
+    }
+
+    /// True while an active or recovered SubmissionRun holds this Draft in its
+    /// frozen participant graph — immutable for the run's whole lifetime, not
+    /// only while the item itself carries `submitting`.
+    fn submissionOwnsDraft(self: *const Presentation, key: OwnedReviewIdentity, temp_id: bbr.review.TempId) bool {
+        if (self.durable_submission) |durable| {
+            if (OwnedReviewIdentity.eql(durable.key, key))
+                for (durable.machine.order) |participant| if (participant == temp_id) return true;
+        }
+        if (self.recovery) |notice| {
+            if (OwnedReviewIdentity.eql(notice.key, key))
+                for (self.recovery_participants.items) |participant| if (participant == temp_id) return true;
+        }
+        return false;
     }
 
     fn applyKey(self: *Presentation, key: keymap_mod.KeyStroke) !void {
@@ -2272,11 +2395,13 @@ pub const Presentation = struct {
             replacement.key
         else
             null;
-        if (visible_key != null and !self.actionAvailability().available(action)) {
+        const availability = self.actionAvailability();
+        if (visible_key != null and !availability.available(action)) {
             self.action_error = switch (action) {
                 .open_pull_request_picker => .local_review_no_picker,
                 .submit => .local_review_no_submission,
                 .inline_comment, .suggest, .yank => .source_action_unavailable,
+                .edit_review_item => mutationRefusalError(availability.edit_refusal),
                 else => .local_review_remote_action_unavailable,
             };
             return;
@@ -2360,6 +2485,7 @@ pub const Presentation = struct {
             .review_comment => self.openComposer(published, .{ .kind = .comment, .label = "New comment", .scope = .review }),
             .file_comment => self.openFileComposer(published),
             .reply => self.openReplyComposer(published),
+            .edit_review_item => self.openEditComposer(published),
             .inline_comment => self.openInlineComposer(published, .comment),
             .suggest => self.openInlineComposer(published, .suggestion),
             .submit => self.startSubmission(published),
@@ -2928,6 +3054,44 @@ pub const Presentation = struct {
         });
     }
 
+    /// `e` on a ReviewCard: the same Composer as creation, prefilled with the
+    /// item's editable content and carrying its typed mutation target.
+    fn openEditComposer(self: *Presentation, published: *Published) void {
+        if (published.composer != null) return;
+        const target = reviewCardTarget(published) orelse {
+            self.action_error = .no_review_item;
+            return;
+        };
+        const temp_id = switch (target) {
+            .comment => {
+                self.action_error = .published_comment_edit_unsupported;
+                return;
+            },
+            .draft => |id| id,
+        };
+        const draft = published.review.getConst(temp_id) orelse {
+            self.action_error = .no_review_item;
+            return;
+        };
+        _ = published.composer_arena.reset(.retain_capacity);
+        published.composer = Composer.init(published.composer_arena.allocator(), .{
+            .kind = draft.kind,
+            .target = draft.target,
+            .scope = draft.scope,
+            .anchor = draft.anchor,
+            .snapshot = draft.snapshot,
+            .parent = draft.parent,
+            .label = "Edit local Draft",
+            .mutation = .{ .draft = temp_id },
+        });
+        published.composer.?.seed(draft.editableBody()) catch {
+            published.composer = null;
+            self.action_error = .out_of_memory;
+            return;
+        };
+        self.action_error = null;
+    }
+
     fn openReplyComposer(self: *Presentation, published: *Published) void {
         if (published.navigation.cursor >= published.buffer.rows.len) {
             self.action_error = .action_refused;
@@ -3198,8 +3362,35 @@ pub const Presentation = struct {
     fn saveComposer(self: *Presentation, published: *Published) void {
         const composer = if (published.composer) |*value| value else return;
         if (composer.isBlank()) return;
+        if (composer.request.mutation) |target| return self.saveComposerEdit(published, target);
         published.saveDraft(self.dependencies.reviews, self.preferences, composer.toNewDraft()) catch |err| {
             self.action_error = switch (err) {
+                error.PersistenceFailed => .persistence_failed,
+                error.BufferBuildFailed => .buffer_build_failed,
+                error.OutOfMemory => .out_of_memory,
+            };
+            return;
+        };
+        composer.deinit();
+        published.composer = null;
+        self.action_error = null;
+    }
+
+    /// Save an edit rather than a creation. Every failure keeps the Composer
+    /// open with the reviewer's attempted bytes and the previous Frame intact.
+    fn saveComposerEdit(self: *Presentation, published: *Published, target: MutationTarget) void {
+        const composer = if (published.composer) |*value| value else return;
+        const temp_id = switch (target) {
+            .comment => {
+                self.action_error = .published_comment_edit_unsupported;
+                return;
+            },
+            .draft => |id| id,
+        };
+        published.editDraftBody(self.dependencies.reviews, self.preferences, temp_id, composer.body()) catch |err| {
+            self.action_error = switch (err) {
+                error.DraftLocked => .draft_owned_by_submission,
+                error.DraftEditConflict => .draft_edit_conflict,
                 error.PersistenceFailed => .persistence_failed,
                 error.BufferBuildFailed => .buffer_build_failed,
                 error.OutOfMemory => .out_of_memory,
@@ -3591,6 +3782,29 @@ fn normalizeActionError(err: BufferTransactionError) ActionError {
     return switch (err) {
         error.BufferBuildFailed => .buffer_build_failed,
         error.OutOfMemory => .out_of_memory,
+    };
+}
+
+fn mutationRefusalError(refusal: ?MutationRefusal) ActionError {
+    return switch (refusal orelse return .action_refused) {
+        .no_review_item => .no_review_item,
+        .submission_owns_draft => .draft_owned_by_submission,
+        .outcome_unresolved => .draft_outcome_unresolved,
+        .submission_in_flight => .draft_submission_in_flight,
+        .already_published => .draft_already_published,
+        .published_comment => .published_comment_edit_unsupported,
+    };
+}
+
+/// The typed owner of the ReviewCard row under the cursor. Every row of a card
+/// resolves to the same stable identity — a local TempId or a Bitbucket
+/// CommentId — never a generic numeric id.
+fn reviewCardTarget(published: *const Published) ?MutationTarget {
+    if (published.navigation.cursor >= published.buffer.rows.len) return null;
+    return switch (published.buffer.rows[published.navigation.cursor]) {
+        .comment => |row| .{ .comment = row.owner.comment },
+        .draft => |row| .{ .draft = row.owner.draft },
+        else => null,
     };
 }
 
@@ -4725,6 +4939,380 @@ test "Reply on a Draft row saves a child linked to that Draft" {
     try testing.expect(drafts[1].parent.? == .draft);
     try testing.expectEqual(@as(bbr.review.TempId, 7), drafts[1].parent.?.draft);
     try testing.expect(drafts[1].anchor == null);
+}
+
+/// Move the DiffPane cursor onto the header row of `temp_id`'s ReviewCard.
+fn cursorToDraftCard(presentation: *Presentation, temp_id: bbr.review.TempId) !void {
+    const rows = presentation.projection().review.?.buffer.rows;
+    for (rows, 0..) |row, index| {
+        if (row != .draft or row.draft.owner.draft != temp_id or row.draft.part != .header) continue;
+        const cursor = presentation.published.?.navigation.cursor;
+        const action: Action = if (index >= cursor) .down else .up;
+        const steps = if (index >= cursor) index - cursor else cursor - index;
+        for (0..steps) |_| try presentation.dispatch(.{ .action = action });
+        try testing.expectEqual(index, presentation.published.?.navigation.cursor);
+        return;
+    }
+    return error.DraftCardNotFound;
+}
+
+fn draftBody(presentation: *Presentation, temp_id: bbr.review.TempId) []const u8 {
+    for (presentation.projection().review.?.drafts) |draft| {
+        if (draft.local_id == temp_id) return draft.body;
+    }
+    return "";
+}
+
+test "editing a Draft Comment replaces its body and keeps its identity" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 5,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1, .commit = "source" } },
+        .body = "origin",
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 5);
+    // Every row of the card resolves to the same typed target, not just its
+    // header, so editing from a body row edits the same Draft.
+    try presentation.dispatch(.{ .action = .down });
+    try testing.expect(presentation.published.?.buffer.rows[presentation.published.?.navigation.cursor].draft.owner.draft == 5);
+    try testing.expect(presentation.projection().action_availability.available(.edit_review_item));
+
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    const composer = presentation.projection().composer.?;
+    try testing.expectEqualStrings("Edit local Draft", composer.label);
+    try testing.expectEqualStrings("origin", composer.body);
+
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init(" reworded") } });
+    try presentation.dispatch(.{ .composer = .save });
+
+    const drafts = presentation.projection().review.?.drafts;
+    try testing.expectEqual(@as(usize, 1), drafts.len);
+    try testing.expectEqual(@as(bbr.review.TempId, 5), drafts[0].local_id);
+    try testing.expectEqualStrings("origin reworded", drafts[0].body);
+    try testing.expect(drafts[0].parent == null);
+    try testing.expectEqualStrings("a.zig", drafts[0].effectiveScope().@"inline".path);
+    try testing.expect(presentation.projection().composer == null);
+    // Navigation follows the same TempId through the reprojection.
+    try testing.expect(presentation.published.?.buffer.rows[presentation.published.?.navigation.cursor].draft.owner.draft == 5);
+
+    var resumed = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer resumed.deinit();
+    try testing.expectEqualStrings("origin reworded", resumed.projection().review.?.drafts[0].body);
+}
+
+test "editing a Reply keeps its parent relationship" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "root" });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "child" });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 12,
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 2);
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try testing.expectEqualStrings("child", presentation.projection().composer.?.body);
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init(" again") } });
+    try presentation.dispatch(.{ .composer = .save });
+
+    const drafts = presentation.projection().review.?.drafts;
+    try testing.expectEqualStrings("root", draftBody(&presentation, 1));
+    try testing.expectEqualStrings("child again", draftBody(&presentation, 2));
+    try testing.expect(drafts[1].parent.? == .draft and drafts[1].parent.?.draft == 1);
+}
+
+test "editing a Suggestion exposes replacement code and restores the fence" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 3,
+        .kind = .suggestion,
+        .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1, .commit = "source" } },
+        .body = "```suggestion\nold code\n```",
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 10,
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 3);
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try testing.expectEqualStrings("old code", presentation.projection().composer.?.body);
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("r") } });
+    try presentation.dispatch(.{ .composer = .save });
+
+    const draft = presentation.projection().review.?.drafts[0];
+    try testing.expect(draft.kind == .suggestion);
+    try testing.expectEqualStrings("```suggestion\nold coder\n```", draft.body);
+}
+
+test "a blank edit is refused and an identical edit is a clean no-op" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .body = "keep",
+        .state = .{ .failed = error.ServerError },
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    for (0..4) |_| try presentation.dispatch(.{ .composer = .backspace });
+    try presentation.dispatch(.{ .composer = .save });
+    // Blank content is refused by creation's rule: the Composer stays open.
+    try testing.expect(presentation.projection().composer != null);
+
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("keep") } });
+    const before = presentation.projection().review.?;
+    try presentation.dispatch(.{ .composer = .save });
+
+    const after = presentation.projection();
+    try testing.expect(after.composer == null);
+    try testing.expect(after.action_error == null);
+    // No persistence and no state change: the failure evidence survives.
+    try testing.expectEqual(before.buffer.rows.ptr, after.review.?.buffer.rows.ptr);
+    try testing.expectEqual(bbr.bitbucket.ApiError.ServerError, after.review.?.drafts[0].state.failed);
+    try testing.expectEqualStrings("keep", after.review.?.drafts[0].body);
+}
+
+test "a real edit of a failed Draft resets it to draft" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .body = "rejected",
+        .state = .{ .failed = error.ServerError },
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init(" once more") } });
+    try presentation.dispatch(.{ .composer = .save });
+
+    try testing.expect(presentation.projection().review.?.drafts[0].state == .draft);
+
+    var resumed = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer resumed.deinit();
+    try testing.expect(resumed.projection().review.?.drafts[0].state == .draft);
+}
+
+test "edit stays discoverable but refuses Drafts an active SubmissionRun owns" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "first" });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .body = "second" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 12,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .submit });
+    const command = presentation.takeCommand().?.post_draft;
+    defer command.destroy();
+
+    // The in-flight item and the not-yet-posted participant are both immutable.
+    try cursorToDraftCard(&presentation, 1);
+    try testing.expect(!presentation.projection().action_availability.available(.edit_review_item));
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try testing.expectEqual(ActionError.draft_submission_in_flight, presentation.projection().action_error.?);
+    try testing.expect(presentation.projection().composer == null);
+
+    try cursorToDraftCard(&presentation, 2);
+    try testing.expect(!presentation.projection().action_availability.available(.edit_review_item));
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try testing.expectEqual(ActionError.draft_owned_by_submission, presentation.projection().action_error.?);
+    try testing.expect(presentation.projection().composer == null);
+    try testing.expectEqualStrings("second", draftBody(&presentation, 2));
+}
+
+test "edit refuses a Draft a recovered SubmissionRun still owns" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "in flight" });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .body = "queued" });
+    try store.store().put(key.storeKey(), .{ .local_id = 3, .kind = .comment, .body = "bystander" });
+    // An interrupted run left behind by a previous process.
+    _ = try store.store().beginSubmission(key.storeKey(), "source", &.{
+        .{ .temp_id = 1, .parent = null },
+        .{ .temp_id = 2, .parent = null },
+    });
+
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 14,
+    });
+    defer presentation.deinit();
+    try testing.expect(presentation.projection().recovery != null);
+
+    try cursorToDraftCard(&presentation, 2);
+    try testing.expect(!presentation.projection().action_availability.available(.edit_review_item));
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try testing.expectEqual(ActionError.draft_owned_by_submission, presentation.projection().action_error.?);
+
+    // A Draft outside the frozen graph stays editable.
+    try cursorToDraftCard(&presentation, 3);
+    try testing.expect(presentation.projection().action_availability.available(.edit_review_item));
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("!") } });
+    try presentation.dispatch(.{ .composer = .save });
+    try testing.expectEqualStrings("bystander!", draftBody(&presentation, 3));
+}
+
+test "edit refuses posted and unresolved Drafts with their own reasons" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "unknown", .state = .outcome_unknown });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .body = "in a batch" });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 12,
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try testing.expectEqual(ActionError.draft_outcome_unresolved, presentation.projection().action_error.?);
+
+    // The transient `posted` window of a partial batch, before Reconciliation
+    // replaces the Draft's row with the published Comment.
+    try cursorToDraftCard(&presentation, 2);
+    presentation.published.?.review.setState(2, .{ .posted = 42 });
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try testing.expectEqual(ActionError.draft_already_published, presentation.projection().action_error.?);
+    try testing.expect(presentation.projection().composer == null);
+}
+
+test "edit away from a ReviewCard reports having no target" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try testing.expect(!presentation.projection().action_availability.available(.edit_review_item));
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try testing.expectEqual(ActionError.no_review_item, presentation.projection().action_error.?);
+    try testing.expect(presentation.projection().composer == null);
+}
+
+test "a failed edit preserves the previous Frame and the attempted body" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .body = "original",
+        .state = .{ .failed = error.ServerError },
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init(" retried") } });
+    const before = presentation.projection().review.?;
+
+    store.fail_next_edit = true;
+    try presentation.dispatch(.{ .composer = .save });
+
+    const failed = presentation.projection();
+    try testing.expectEqual(ActionError.persistence_failed, failed.action_error.?);
+    try testing.expectEqualStrings("original retried", failed.composer.?.body);
+    try testing.expectEqualStrings("original", failed.review.?.drafts[0].body);
+    try testing.expectEqual(bbr.bitbucket.ApiError.ServerError, failed.review.?.drafts[0].state.failed);
+    try testing.expectEqual(before.buffer.rows.ptr, failed.review.?.buffer.rows.ptr);
+    try testing.expect(std.meta.eql(before.navigation, failed.review.?.navigation));
+
+    // The retained interaction retries successfully.
+    try presentation.dispatch(.{ .composer = .save });
+    try testing.expect(presentation.projection().composer == null);
+    try testing.expectEqualStrings("original retried", presentation.projection().review.?.drafts[0].body);
+    try testing.expect(presentation.projection().review.?.drafts[0].state == .draft);
+}
+
+test "an edit staged against a changed graph is refused, keeping the Composer" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "root" });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .parent = .{ .draft = 1 }, .body = "child" });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 12,
+    });
+    defer presentation.deinit();
+
+    try cursorToDraftCard(&presentation, 2);
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init(" edited") } });
+    // Another writer re-parents the same Draft under the staged edit.
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .parent = .{ .comment = 9 }, .body = "child" });
+    const before = presentation.projection().review.?;
+
+    try presentation.dispatch(.{ .composer = .save });
+
+    const failed = presentation.projection();
+    try testing.expectEqual(ActionError.draft_edit_conflict, failed.action_error.?);
+    try testing.expectEqualStrings("child edited", failed.composer.?.body);
+    try testing.expectEqualStrings("child", draftBody(&presentation, 2));
+    try testing.expectEqual(before.buffer.rows.ptr, failed.review.?.buffer.rows.ptr);
 }
 
 test "Suggest derives an Anchor and persists a fenced seeded Draft" {

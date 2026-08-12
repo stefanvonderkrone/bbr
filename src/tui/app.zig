@@ -313,6 +313,13 @@ fn presentationStatus(
         .local_review_remote_action_unavailable => "This action is unavailable for a local review",
         .source_action_unavailable => "This action requires a source line or Selection",
         .target_action_unavailable => "This action is unavailable for the current target",
+        .no_review_item => "This action requires a Comment or Draft under the cursor",
+        .draft_owned_by_submission => "an active Submission owns this local Draft",
+        .draft_submission_in_flight => "this local Draft is being submitted",
+        .draft_outcome_unresolved => "outcome unknown — resolve before editing",
+        .draft_already_published => "this Draft is published; Bitbucket owns the Comment",
+        .published_comment_edit_unsupported => "editing a Bitbucket Comment is not available yet",
+        .draft_edit_conflict => "this local Draft changed underneath the edit",
         else => @tagName(err),
     };
     if (projection.clipboard_status) |status| return switch (status) {
