@@ -48,6 +48,10 @@ pub const Session = struct {
     diff: bbr.diff.Diff,
     threads: []const bbr.review.Thread,
     enrichment: file_enrichment.Storage,
+    /// Independently acquired mutation capability. A missing UUID never makes
+    /// the read-only Session unusable.
+    authenticated_account_uuid: ?[]const u8 = null,
+    authenticated_account_unauthorized: bool = false,
 
     /// Free transferred File Enrichment sides, the Session arena, and finally
     /// the Session struct itself.
@@ -102,6 +106,11 @@ pub fn loadWith(backing: Allocator, bb: Client, repo: []const u8, id: u64) !*Ses
     s.arena = std.heap.ArenaAllocator.init(backing);
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
+
+    s.authenticated_account_uuid = bb.getAuthenticatedAccountUuid(a) catch |err| blk: {
+        s.authenticated_account_unauthorized = err == error.Unauthorized;
+        break :blk null;
+    };
 
     const pr = try bb.getPullRequest(a, repo, id);
     s.source = .{ .remote = pr };
@@ -217,8 +226,9 @@ test "loadWith builds a session in order and owns everything" {
         \\  { "id": 1, "content": { "raw": "nice" },
         \\    "user": { "display_name": "Ada" } } ] }
     ;
-    // getPullRequest, getDiff, getComments (one page) in that order.
+    // Authenticated Account capability is independent, then the read-only load.
     const responses = [_]Canned{
+        .{ .status = 200, .body = "{ \"uuid\": \"{ada}\" }" },
         .{ .status = 200, .body = pr_json },
         .{ .status = 200, .body = diff_text },
         .{ .status = 200, .body = comments_json },
@@ -234,7 +244,8 @@ test "loadWith builds a session in order and owns everything" {
     try testing.expect(s.remotePullRequestConst() != null);
     try testing.expectEqual(@as(usize, 1), s.diff.files.len);
     try testing.expectEqual(@as(usize, 1), s.threads.len);
-    try testing.expectEqual(@as(usize, 3), fake.call_count);
+    try testing.expectEqualStrings("{ada}", s.authenticated_account_uuid.?);
+    try testing.expectEqual(@as(usize, 4), fake.call_count);
 
     try testing.expectEqual(@as(usize, 1), s.enrichment.len());
     const projection = s.enrichment.projection();

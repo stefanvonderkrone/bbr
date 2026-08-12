@@ -212,6 +212,41 @@ pub fn postLaunchFailed(command: *presentation.PostDraft) presentation.OwnedInpu
     } };
 }
 
+pub fn executeCommentEdit(command: *presentation.UpdateComment, client: bbr.bitbucket.Client) presentation.OwnedInput {
+    defer command.destroy();
+    const outcome: presentation.CommentEditOutcome = if (client.updateComment(
+        command.allocator,
+        command.identity.repository(),
+        command.identity.pullRequestId(),
+        command.comment_id,
+        command.body,
+    )) |_| .updated else |err| switch (err) {
+        error.Unauthorized => .{ .definitive_failure = error.Unauthorized },
+        error.Forbidden => .{ .definitive_failure = error.Forbidden },
+        error.NotFound => .{ .definitive_failure = error.NotFound },
+        error.RateLimited => .{ .definitive_failure = error.RateLimited },
+        error.ServerError => .{ .definitive_failure = error.ServerError },
+        error.UnexpectedStatus => .{ .definitive_failure = error.UnexpectedStatus },
+        error.MalformedResponse => .{ .definitive_failure = error.MalformedResponse },
+        else => .outcome_unknown,
+    };
+    return .{ .comment_edit_completed = .{
+        .command_id = command.command_id,
+        .identity = command.identity,
+        .comment_id = command.comment_id,
+        .outcome = outcome,
+    } };
+}
+
+pub fn commentEditLaunchFailed(command: *presentation.UpdateComment) presentation.OwnedInput {
+    defer command.destroy();
+    return .{ .comment_edit_launch_failed = .{
+        .command_id = command.command_id,
+        .identity = command.identity,
+        .comment_id = command.comment_id,
+    } };
+}
+
 const testing = std.testing;
 
 test "editor resolution uses first non-empty configured value" {

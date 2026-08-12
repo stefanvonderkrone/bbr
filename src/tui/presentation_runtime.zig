@@ -36,6 +36,10 @@ pub fn rejectPostLaunch(sink: CompletionSink, command: *presentation.PostDraft) 
     deliver(sink, adapter.postLaunchFailed(command));
 }
 
+pub fn executeCommentEdit(sink: CompletionSink, command: *presentation.UpdateComment, client: bbr.bitbucket.Client) void {
+    deliver(sink, adapter.executeCommentEdit(command, client));
+}
+
 const std = @import("std");
 const testing = std.testing;
 

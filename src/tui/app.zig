@@ -346,6 +346,21 @@ fn presentationStatus(
                 result.skipped,
             }) catch "submission finished for another pull request";
     }
+    if (projection.comment_edit_result) |result| {
+        if (visible_key == null or !presentation.OwnedReviewIdentity.eql(result.key, visible_key.?))
+            return std.fmt.allocPrint(frame, "{s}#{d}: Comment {d} edit {s}", .{
+                result.key.repository(),
+                result.key.pull_request_id,
+                result.comment_id,
+                @tagName(result.outcome),
+            }) catch "Comment edit finished for another pull request";
+        return switch (result.outcome) {
+            .updated => "Bitbucket Comment updated",
+            .failed => "Bitbucket Comment edit failed",
+            .outcome_unknown => "Comment edit delivery unknown; reconciling",
+            .reload_required => "Comment updated, but authoritative reload is required",
+        };
+    }
     if (projection.recovery) |recovery| return switch (recovery.ownership) {
         .recoverable => std.fmt.allocPrint(frame, "interrupted Submission for {s}#{d} · Y resume", .{
             recovery.key.repository(),
@@ -372,7 +387,15 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .draft_submission_in_flight => "this local Draft is being submitted",
         .draft_outcome_unresolved => "outcome unknown — resolve before editing",
         .draft_already_published => "this Draft is published; Bitbucket owns the Comment",
-        .published_comment_edit_unsupported => "editing a Bitbucket Comment is not available yet",
+        .authenticated_account_unknown => "Authenticated Account identity is unavailable; reload to retry",
+        .comment_author_unknown => "this Comment has no author UUID; ownership cannot be proven",
+        .comment_owned_by_other => "only the author can edit this Bitbucket Comment",
+        .comment_deleted => "a Deleted Comment has no authored body to edit",
+        .remote_write_busy => "another remote write is already in progress",
+        .authoritative_reload_required => "Comment updated, but authoritative reload is required",
+        .comment_edit_failed => "Bitbucket refused the Comment edit",
+        .comment_edit_launch_failed => "could not start the Comment edit",
+        .published_comment_edit_unsupported => "this published Comment mutation is unavailable",
         .draft_edit_conflict => "this local Draft changed underneath the edit",
         .draft_reply_has_no_anchor => "a Reply inherits its root's placement",
         .draft_scope_not_inline => "only an inline root Draft has an Anchor to replace",
@@ -517,6 +540,24 @@ fn presentationPostWorker(
         .pr_id = command.identity.pullRequestId(),
     };
     presentation_runtime.executePost(presentationSink(&sink_context), command, poster.poster());
+}
+
+fn presentationCommentEditWorker(
+    loop: *Loop,
+    work_id: u64,
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+    cred: Credential,
+    command: *presentation.UpdateComment,
+) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
+    defer http.deinit();
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
+    presentation_runtime.executeCommentEdit(presentationSink(&sink_context), command, client);
 }
 
 fn presentationLoadWorker(
@@ -754,6 +795,7 @@ fn drainPresentationCommands(
             .load_session => |load| ctx.io.concurrent(presentationLoadWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, load }),
             .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, ctx.highlighter, enrich }),
             .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, post }),
+            .update_comment => |update| ctx.io.concurrent(presentationCommentEditWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, update }),
             .wait_submission => |wait| ctx.io.concurrent(presentationWaitWorker, .{ loop, work_id, ctx.io, wait }),
             .check_recovery => |check| ctx.io.concurrent(presentationRecoveryCheckWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, check }),
             .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, check }),
@@ -781,6 +823,7 @@ fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *p
             .outcome = .{ .failed = .launch_failed },
         } },
         .post_draft => |post| presentation_adapter.postLaunchFailed(post),
+        .update_comment => |update| presentation_adapter.commentEditLaunchFailed(update),
         .wait_submission => |wait| .{ .submission_wait_launch_failed = wait },
         .check_recovery => |check| .{ .recovery_checked = .{ .command_id = check.command_id, .operation_id = check.operation_id, .identity = check.identity, .outcome = .failed } },
         .find_duplicate => |check| blk: {

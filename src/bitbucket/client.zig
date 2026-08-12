@@ -285,6 +285,62 @@ pub const Client = struct {
         return parsed.value.id;
     }
 
+    /// GET /user and return the UUID proven by the current Credential.
+    pub fn getAuthenticatedAccountUuid(self: Client, allocator: Allocator) ![]u8 {
+        const url = base_url ++ "/user";
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        const res = try self.http.send(allocator, .{
+            .method = .GET,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "application/json" },
+            },
+        });
+        defer allocator.free(res.body);
+        try classify(res.status);
+        const parsed = std.json.parseFromSlice(struct { uuid: []const u8 }, allocator, res.body, .{
+            .ignore_unknown_fields = true,
+        }) catch return error.MalformedResponse;
+        defer parsed.deinit();
+        return allocator.dupe(u8, parsed.value.uuid);
+    }
+
+    /// PUT one published Comment body. The anti-corruption boundary exposes no
+    /// HTTP, JSON, or Atlassian field names to its caller.
+    pub fn updateComment(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        pull_request_id: u64,
+        comment_id: CommentId,
+        body_raw: []const u8,
+    ) !void {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/pullrequests/{d}/comments/{d}",
+            .{ base_url, self.cred.workspace, repo_slug, pull_request_id, comment_id },
+        );
+        defer allocator.free(url);
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        const body = try std.json.Stringify.valueAlloc(allocator, .{ .content = .{ .raw = body_raw } }, .{});
+        defer allocator.free(body);
+        const res = try self.http.send(allocator, .{
+            .method = .PUT,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "application/json" },
+                .{ .name = "content-type", .value = "application/json" },
+            },
+            .body = body,
+        });
+        defer allocator.free(res.body);
+        try classify(res.status);
+    }
+
     /// GET the first page of the comments *list* raw (debug aid), so we can see
     /// how the list endpoint shapes a comment vs. the single-comment endpoint.
     pub fn getCommentsRaw(
@@ -551,7 +607,10 @@ fn parsePullRequest(allocator: Allocator, body: []const u8) !PullRequest {
 const CommentJson = struct {
     id: u64,
     content: ?struct { raw: ?[]const u8 = null } = null,
-    user: ?struct { display_name: ?[]const u8 = null } = null,
+    user: ?struct {
+        display_name: ?[]const u8 = null,
+        uuid: ?[]const u8 = null,
+    } = null,
     deleted: bool = false,
     parent: ?struct { id: u64 } = null,
     // `inline` is a Zig keyword; @"inline" maps to the JSON key "inline".
@@ -590,6 +649,8 @@ fn dupeComment(allocator: Allocator, cj: CommentJson, head: HeadCommits) !Commen
     errdefer allocator.free(author_owned);
     const body_owned = try allocator.dupe(u8, raw);
     errdefer allocator.free(body_owned);
+    const author_uuid_owned = if (cj.user) |u| if (u.uuid) |uuid| try allocator.dupe(u8, uuid) else null else null;
+    errdefer if (author_uuid_owned) |uuid| allocator.free(uuid);
 
     const parent_id: ?CommentId = if (cj.parent) |p| p.id else null;
     var scope: ?review.CommentScope = null;
@@ -630,11 +691,13 @@ fn dupeComment(allocator: Allocator, cj: CommentJson, head: HeadCommits) !Commen
         .id = cj.id,
         .parent_id = parent_id,
         .author = author_owned,
+        .author_uuid = author_uuid_owned,
         .body = body_owned,
         .scope = scope,
         .anchor = anchor,
         .resolved = cj.resolution != null,
         .state = commentState(cj, head),
+        .deleted = cj.deleted,
     };
 }
 
@@ -684,6 +747,7 @@ fn hashMatches(a: []const u8, b: []const u8) bool {
 pub fn deinitComments(allocator: Allocator, comments: []Comment) void {
     for (comments) |c| {
         allocator.free(c.author);
+        if (c.author_uuid) |uuid| allocator.free(uuid);
         allocator.free(c.body);
         if (c.scope) |scope| switch (scope) {
             .review => {},
@@ -1045,6 +1109,52 @@ test "createComment surfaces ApiError on non-2xx" {
     var fake: FakeHttpClient = .{ .status = 400, .body = "bad anchor" };
     const bb = Client.init(fake.httpClient(), testCredential());
     try testing.expectError(error.UnexpectedStatus, bb.createComment(a, "myrepo", 7, .{ .body = "x" }));
+}
+
+test "authenticated account acquisition returns UUID and classifies unauthorized" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body =
+        \\{ "uuid": "{account-uuid}", "display_name": "Ignored" }
+    };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const uuid = try bb.getAuthenticatedAccountUuid(a);
+    defer a.free(uuid);
+    try testing.expectEqualStrings("{account-uuid}", uuid);
+    try testing.expectEqualStrings("https://api.bitbucket.org/2.0/user", fake.lastUrl().?);
+
+    fake.status = 401;
+    fake.body = "unauthorized";
+    try testing.expectError(error.Unauthorized, bb.getAuthenticatedAccountUuid(a));
+}
+
+test "updateComment PUTs only accepted bytes as content raw" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body = "{}" };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    try bb.updateComment(a, "myrepo", 7, 42, "```suggestion\nconst x = 2;\n```");
+
+    try testing.expectEqual(httpc.Method.PUT, fake.last_method.?);
+    try testing.expectEqualStrings(
+        "https://api.bitbucket.org/2.0/repositories/check24/myrepo/pullrequests/7/comments/42",
+        fake.lastUrl().?,
+    );
+    try testing.expectEqualStrings(
+        \\{"content":{"raw":"```suggestion\nconst x = 2;\n```"}}
+    , fake.lastBody().?);
+}
+
+test "comment decoding retains UUID ownership evidence" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body =
+        \\{ "values": [
+        \\  { "id": 1, "content": { "raw": "owned" },
+        \\    "user": { "display_name": "Ada", "uuid": "{ada}" } }
+        \\] }
+    };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const comments = try bb.getComments(a, "myrepo", 7, .{});
+    defer deinitComments(a, comments);
+    try testing.expectEqualStrings("{ada}", comments[0].author_uuid.?);
 }
 
 const comments_page_1 =

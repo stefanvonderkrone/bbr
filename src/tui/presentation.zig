@@ -216,6 +216,8 @@ pub const OwnedInput = union(enum) {
     file_enrichment_completed: FileEnrichmentCompleted,
     post_draft_completed: PostDraftCompleted,
     post_draft_launch_failed: PostDraftLaunchFailed,
+    comment_edit_completed: CommentEditCompleted,
+    comment_edit_launch_failed: CommentEditLaunchFailed,
     submission_wait_completed: WaitSubmission,
     submission_wait_launch_failed: WaitSubmission,
     recovery_checked: RecoveryChecked,
@@ -477,6 +479,25 @@ pub const LoadSession = struct {
 
 pub const SessionLoadCause = enum { picker, refresh, reconciliation };
 
+pub const CommentEditOutcome = union(enum) {
+    updated,
+    definitive_failure: bbr.bitbucket.ApiError,
+    outcome_unknown,
+};
+
+pub const CommentEditCompleted = struct {
+    command_id: CommandId,
+    identity: OwnedRemoteReviewIdentity,
+    comment_id: bbr.review.CommentId,
+    outcome: CommentEditOutcome,
+};
+
+pub const CommentEditLaunchFailed = struct {
+    command_id: CommandId,
+    identity: OwnedRemoteReviewIdentity,
+    comment_id: bbr.review.CommentId,
+};
+
 fn BoundedText(comptime capacity: usize) type {
     return struct {
         bytes: [capacity]u8 = undefined,
@@ -570,10 +591,37 @@ pub const PostDraft = struct {
     }
 };
 
+pub const UpdateComment = struct {
+    allocator: Allocator,
+    command_id: CommandId = 0,
+    identity: OwnedRemoteReviewIdentity,
+    comment_id: bbr.review.CommentId,
+    body: []u8,
+
+    fn create(allocator: Allocator, key: OwnedReviewIdentity, comment_id: bbr.review.CommentId, body: []const u8) !*UpdateComment {
+        const command = try allocator.create(UpdateComment);
+        errdefer allocator.destroy(command);
+        command.* = .{
+            .allocator = allocator,
+            .identity = .init(key),
+            .comment_id = comment_id,
+            .body = try allocator.dupe(u8, body),
+        };
+        return command;
+    }
+
+    pub fn destroy(self: *UpdateComment) void {
+        const allocator = self.allocator;
+        allocator.free(self.body);
+        allocator.destroy(self);
+    }
+};
+
 pub const OwnedCommand = union(enum) {
     load_session: LoadSession,
     enrich_file: EnrichFile,
     post_draft: *PostDraft,
+    update_comment: *UpdateComment,
     wait_submission: WaitSubmission,
     check_recovery: CheckRecovery,
     find_duplicate: *PostDraft,
@@ -584,6 +632,7 @@ pub const OwnedCommand = union(enum) {
     pub fn deinit(self: *OwnedCommand) void {
         switch (self.*) {
             .post_draft, .find_duplicate => |command| command.destroy(),
+            .update_comment => |command| command.destroy(),
             .copy_clipboard => |command| command.destroy(),
             .external_edit => |command| command.destroy(),
             .load_session, .enrich_file, .wait_submission, .check_recovery, .list_pull_requests => {},
@@ -608,6 +657,7 @@ fn setCommandId(command: *OwnedCommand, command_id: CommandId) void {
         .load_session => |*value| value.command_id = command_id,
         .enrich_file => |*value| value.command_id = command_id,
         .post_draft, .find_duplicate => |value| value.command_id = command_id,
+        .update_comment => |value| value.command_id = command_id,
         .wait_submission => |*value| value.command_id = command_id,
         .check_recovery => |*value| value.command_id = command_id,
         .list_pull_requests => |*value| value.command_id = command_id,
@@ -720,6 +770,7 @@ pub const Projection = struct {
     review: ?ReviewProjection,
     submission: ?SubmissionProjection,
     submission_result: ?SubmissionResultProjection,
+    comment_edit_result: ?CommentEditResultProjection,
     recovery: ?RecoveryNotice,
     unknown_resolution: ?UnknownResolutionProjection,
     reanchor: ?ReanchorProjection,
@@ -737,6 +788,12 @@ pub const Projection = struct {
     clipboard_status: ?ClipboardStatus,
     fatal_error: ?FatalError,
     shutting_down: bool,
+};
+
+pub const CommentEditResultProjection = struct {
+    key: OwnedReviewIdentity,
+    comment_id: bbr.review.CommentId,
+    outcome: enum { updated, failed, outcome_unknown, reload_required },
 };
 
 pub const ClipboardStatus = enum { copied, failed };
@@ -758,7 +815,19 @@ pub const MutationRefusal = enum {
     submission_in_flight,
     /// Transient `posted`: Bitbucket, not this Draft, is now its home.
     already_published,
-    /// A published Bitbucket Comment; remote mutation is its own contract.
+    /// The Session has no proven Authenticated Account UUID.
+    authenticated_account_unknown,
+    /// The Comment has no author UUID to compare.
+    comment_author_unknown,
+    /// The Authenticated Account did not author this Comment.
+    comment_owned_by_other,
+    /// A structural Deleted Comment has no authored body.
+    comment_deleted,
+    /// Submission or another published mutation owns the global write lane.
+    remote_write_busy,
+    /// Reconciliation failed after a write from this stale Session.
+    authoritative_reload_required,
+    /// Published mutation is not supported by this particular Action.
     published_comment,
     /// A Reply inherits its root's placement, so it has no Anchor of its own.
     reply_inherits_scope,
@@ -890,6 +959,14 @@ pub const ActionError = enum {
     draft_outcome_unresolved,
     draft_submission_in_flight,
     draft_already_published,
+    authenticated_account_unknown,
+    comment_author_unknown,
+    comment_owned_by_other,
+    comment_deleted,
+    remote_write_busy,
+    authoritative_reload_required,
+    comment_edit_failed,
+    comment_edit_launch_failed,
     published_comment_edit_unsupported,
     no_review_item,
     draft_edit_conflict,
@@ -1566,6 +1643,22 @@ const UnknownResolutionEditor = struct {
 const Replacement = struct {
     intent: LoadIntent,
     key: OwnedReviewIdentity,
+    cause: SessionLoadCause,
+};
+
+const DurableCommentEdit = struct {
+    allocator: Allocator,
+    key: OwnedReviewIdentity,
+    comment_id: bbr.review.CommentId,
+    initiating_epoch: SessionEpoch,
+    body: []u8,
+    outcome: ?CommentEditOutcome = null,
+
+    fn destroy(self: *DurableCommentEdit) void {
+        const allocator = self.allocator;
+        allocator.free(self.body);
+        allocator.destroy(self);
+    }
 };
 
 const IssuedEnrichment = struct {
@@ -1925,6 +2018,10 @@ pub const Presentation = struct {
     picker_work_id: ?WorkId = null,
     help_visible: bool = false,
     durable_submission: ?*DurableSubmission = null,
+    durable_comment_edit: ?*DurableCommentEdit = null,
+    authenticated_account_uuid: ?BoundedText(256) = null,
+    reload_required_epoch: ?SessionEpoch = null,
+    comment_edit_result: ?CommentEditResultProjection = null,
     submission_result: ?SubmissionResultProjection = null,
     recovery: ?RecoveryNotice = null,
     /// The recovered run's frozen participants, read only while `recovery` is
@@ -1983,6 +2080,9 @@ pub const Presentation = struct {
                 dependencies.cell_metrics,
                 dependencies.comments_collapsed_rows,
             );
+            if (initial.session.authenticated_account_uuid) |uuid|
+                self.authenticated_account_uuid = BoundedText(256).init(uuid) catch null;
+            if (initial.session.authenticated_account_unauthorized) self.authenticated_account_uuid = null;
         }
         self.discoverRecovery();
         return self;
@@ -1991,6 +2091,7 @@ pub const Presentation = struct {
     pub fn deinit(self: *Presentation) void {
         for (self.commands.items) |*command| command.deinit();
         if (self.durable_submission) |durable| durable.destroy();
+        if (self.durable_comment_edit) |edit| edit.destroy();
         if (self.picker) |*picker| picker.deinit();
         if (self.file_finder) |*finder| finder.deinit();
         if (self.picker_summaries) |summaries| summaries.destroy();
@@ -2030,6 +2131,8 @@ pub const Presentation = struct {
             .file_enrichment_completed => |completed| self.acceptFileEnrichment(completed),
             .post_draft_completed => |completed| self.acceptPostDraft(completed),
             .post_draft_launch_failed => |failed| self.acceptPostDraftLaunchFailure(failed),
+            .comment_edit_completed => |completed| self.acceptCommentEdit(completed),
+            .comment_edit_launch_failed => |failed| self.acceptCommentEditLaunchFailure(failed),
             .submission_wait_completed => |completed| self.acceptSubmissionWait(completed),
             .submission_wait_launch_failed => |failed| self.acceptSubmissionWaitLaunchFailure(failed),
             .recovery_checked => |checked| self.acceptRecoveryCheck(checked),
@@ -2073,6 +2176,7 @@ pub const Presentation = struct {
                 if (durable.operation_id == post.operation_id and durable.current_temp_id == post.draft.local_id and durable.phase == .post_queued)
                     durable.phase = .awaiting_post;
             },
+            .update_comment => {},
             .wait_submission => |wait| if (self.durable_submission) |durable| {
                 if (durable.operation_id == wait.operation_id and durable.current_temp_id == wait.temp_id and durable.phase == .wait_queued)
                     durable.phase = .awaiting_wait;
@@ -2119,6 +2223,7 @@ pub const Presentation = struct {
                 };
             } else null,
             .submission_result = self.submission_result,
+            .comment_edit_result = self.comment_edit_result,
             .recovery = self.recovery,
             .unknown_resolution = if (self.unknown_resolution) |*editor| .{
                 .temp_id = editor.temp_id,
@@ -2157,8 +2262,8 @@ pub const Presentation = struct {
     }
 
     pub fn readyToExit(self: *const Presentation) bool {
-        if (builtin.is_test) return self.shutdown_requested and self.durable_submission == null and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.outstanding_picker_loads == 0 and self.issued_enrichments.items.len == 0;
-        return self.shutdown_requested and self.durable_submission == null and self.commands.items.len == 0 and self.issued_commands.items.len == 0;
+        if (builtin.is_test) return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.outstanding_picker_loads == 0 and self.issued_enrichments.items.len == 0;
+        return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.commands.items.len == 0 and self.issued_commands.items.len == 0;
     }
 
     fn reviewProjection(self: *const Presentation, published: *const Published) ReviewProjection {
@@ -2498,7 +2603,7 @@ pub const Presentation = struct {
         var write: usize = 0;
         for (self.commands.items) |command_value| {
             var command = command_value;
-            if (command == .post_draft or command == .wait_submission or command == .check_recovery or command == .find_duplicate) {
+            if (command == .post_draft or command == .update_comment or command == .wait_submission or command == .check_recovery or command == .find_duplicate) {
                 self.commands.items[write] = command;
                 write += 1;
             } else {
@@ -2569,7 +2674,16 @@ pub const Presentation = struct {
     fn editRefusal(self: *const Presentation, published: *const Published) ?MutationRefusal {
         const target = reviewCardTarget(published) orelse return .no_review_item;
         const temp_id = switch (target) {
-            .comment => return .published_comment,
+            .comment => |comment_id| {
+                const comment = findPublishedComment(published, comment_id) orelse return .no_review_item;
+                if (comment.deleted) return .comment_deleted;
+                const account = self.authenticated_account_uuid orelse return .authenticated_account_unknown;
+                const author_uuid = comment.author_uuid orelse return .comment_author_unknown;
+                if (!std.mem.eql(u8, account.slice(), author_uuid)) return .comment_owned_by_other;
+                if (self.reload_required_epoch == published.epoch) return .authoritative_reload_required;
+                if (self.durable_submission != null or self.durable_comment_edit != null) return .remote_write_busy;
+                return null;
+            },
             .draft => |id| id,
         };
         const draft = published.review.getConst(temp_id) orelse return .no_review_item;
@@ -3270,6 +3384,10 @@ pub const Presentation = struct {
             self.action_error = .local_review_no_submission;
             return;
         }
+        if (self.durable_comment_edit != null) {
+            self.action_error = .remote_write_busy;
+            return;
+        }
         if (self.durable_submission) |durable| {
             if (durable.phase == .post_retry_paused) {
                 self.resumePostDraftLaunch(durable);
@@ -3380,6 +3498,65 @@ pub const Presentation = struct {
         if (durable.operation_id != failed.operation_id or !durableIdentityMatches(durable.key, failed.identity) or durable.current_temp_id != failed.temp_id or durable.phase != .awaiting_post) return;
         durable.phase = .post_retry_paused;
         self.action_error = .submission_launch_failed;
+    }
+
+    fn acceptCommentEdit(self: *Presentation, completed: CommentEditCompleted) void {
+        if (!self.consumeCommand(completed.command_id, .update_comment)) return;
+        const durable = self.durable_comment_edit orelse return;
+        if (!durableIdentityMatches(durable.key, completed.identity) or durable.comment_id != completed.comment_id) return;
+        if (completed.outcome == .definitive_failure) {
+            if (completed.outcome.definitive_failure == error.Unauthorized) self.authenticated_account_uuid = null;
+            self.restoreCommentEditComposer(durable);
+            self.comment_edit_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
+            self.durable_comment_edit = null;
+            durable.destroy();
+            self.action_error = .comment_edit_failed;
+            return;
+        }
+        durable.outcome = completed.outcome;
+        self.comment_edit_result = .{
+            .key = durable.key,
+            .comment_id = durable.comment_id,
+            .outcome = if (completed.outcome == .outcome_unknown) .outcome_unknown else .updated,
+        };
+        const visible = !self.shutdown_requested and self.published != null and OwnedReviewIdentity.eql(self.published.?.key, durable.key) and self.replacement == null;
+        if (visible) {
+            self.queueReconciliation(durable.key);
+            return;
+        }
+        self.durable_comment_edit = null;
+        durable.destroy();
+        self.action_error = null;
+    }
+
+    fn acceptCommentEditLaunchFailure(self: *Presentation, failed: CommentEditLaunchFailed) void {
+        if (!self.consumeCommand(failed.command_id, .update_comment)) return;
+        const durable = self.durable_comment_edit orelse return;
+        if (!durableIdentityMatches(durable.key, failed.identity) or durable.comment_id != failed.comment_id) return;
+        self.restoreCommentEditComposer(durable);
+        self.comment_edit_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
+        self.durable_comment_edit = null;
+        durable.destroy();
+        self.action_error = .comment_edit_launch_failed;
+    }
+
+    fn restoreCommentEditComposer(self: *Presentation, durable: *const DurableCommentEdit) void {
+        const current = self.published orelse return;
+        if (!OwnedReviewIdentity.eql(current.key, durable.key) or current.epoch != durable.initiating_epoch) return;
+        const comment = findPublishedComment(current, durable.comment_id);
+        _ = current.composer_arena.reset(.retain_capacity);
+        current.composer = Composer.init(current.composer_arena.allocator(), .{
+            .kind = .comment,
+            .target = .bitbucket,
+            .scope = if (comment) |value| value.scope else null,
+            .anchor = if (comment) |value| value.anchor else null,
+            .parent = if (comment) |value| if (value.parent_id) |parent_id| .{ .comment = parent_id } else null else null,
+            .label = "Edit Bitbucket Comment",
+            .mutation = .{ .comment = durable.comment_id },
+        });
+        current.composer.?.seed(durable.body) catch {
+            current.composer = null;
+        };
     }
 
     fn resumePostDraftLaunch(self: *Presentation, durable: *DurableSubmission) void {
@@ -3650,13 +3827,30 @@ pub const Presentation = struct {
             self.action_error = .no_review_item;
             return;
         };
-        const temp_id = switch (target) {
-            .comment => {
-                self.action_error = .published_comment_edit_unsupported;
+        if (target == .comment) {
+            const comment = findPublishedComment(published, target.comment) orelse {
+                self.action_error = .no_review_item;
                 return;
-            },
-            .draft => |id| id,
-        };
+            };
+            _ = published.composer_arena.reset(.retain_capacity);
+            published.composer = Composer.init(published.composer_arena.allocator(), .{
+                .kind = .comment,
+                .target = .bitbucket,
+                .scope = comment.scope,
+                .anchor = comment.anchor,
+                .parent = if (comment.parent_id) |parent_id| .{ .comment = parent_id } else null,
+                .label = "Edit Bitbucket Comment",
+                .mutation = .{ .comment = comment.id },
+            });
+            published.composer.?.seed(comment.body) catch {
+                published.composer = null;
+                self.action_error = .out_of_memory;
+                return;
+            };
+            self.action_error = null;
+            return;
+        }
+        const temp_id = target.draft;
         const draft = published.review.getConst(temp_id) orelse {
             self.action_error = .no_review_item;
             return;
@@ -4034,10 +4228,7 @@ pub const Presentation = struct {
     fn saveComposerEdit(self: *Presentation, published: *Published, target: MutationTarget) void {
         const composer = if (published.composer) |*value| value else return;
         const temp_id = switch (target) {
-            .comment => {
-                self.action_error = .published_comment_edit_unsupported;
-                return;
-            },
+            .comment => |comment_id| return self.startCommentEdit(published, comment_id, composer.body()),
             .draft => |id| id,
         };
         published.editDraftBody(self.dependencies.reviews, self.preferences, temp_id, composer.body()) catch |err| {
@@ -4052,6 +4243,52 @@ pub const Presentation = struct {
         };
         composer.deinit();
         published.composer = null;
+        self.action_error = null;
+    }
+
+    fn startCommentEdit(self: *Presentation, published: *Published, comment_id: bbr.review.CommentId, body: []const u8) void {
+        const comment = findPublishedComment(published, comment_id) orelse {
+            self.action_error = .no_review_item;
+            return;
+        };
+        if (std.mem.eql(u8, comment.body, body)) {
+            published.composer.?.deinit();
+            published.composer = null;
+            self.action_error = null;
+            return;
+        }
+        if (self.editRefusal(published)) |refusal| {
+            self.action_error = mutationRefusalError(refusal);
+            return;
+        }
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        const durable = self.allocator.create(DurableCommentEdit) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        durable.* = .{
+            .allocator = self.allocator,
+            .key = published.key,
+            .comment_id = comment_id,
+            .initiating_epoch = published.epoch,
+            .body = self.allocator.dupe(u8, body) catch {
+                self.allocator.destroy(durable);
+                self.action_error = .out_of_memory;
+                return;
+            },
+        };
+        const command = UpdateComment.create(self.allocator, published.key, comment_id, body) catch {
+            durable.destroy();
+            self.action_error = .out_of_memory;
+            return;
+        };
+        published.composer.?.deinit();
+        published.composer = null;
+        self.durable_comment_edit = durable;
+        self.commands.appendAssumeCapacity(.{ .update_comment = command });
         self.action_error = null;
     }
 
@@ -4290,13 +4527,20 @@ pub const Presentation = struct {
         // intent. Once one slot exists, superseding a not-yet-started load is
         // allocation-free and cannot strand Presentation in `.replacing`.
         try self.commands.ensureTotalCapacity(self.allocator, self.commands.items.len + 1);
+        // An explicit switch may supersede a queued Reconciliation after the
+        // write has settled. The qualified result survives; the global lane no
+        // longer waits on a Session the reviewer chose to replace.
+        if (self.durable_comment_edit) |durable| if (durable.outcome != null) {
+            self.durable_comment_edit = null;
+            durable.destroy();
+        };
         // Commands not yet transferred to the terminal adapter are still ours
         // to supersede. Already-taken commands complete normally and are
         // rejected later by their LoadIntent.
         self.removeQueuedSessionLoads();
         self.commands.appendAssumeCapacity(.{ .load_session = .{ .intent = intent, .key = key, .cause = .picker } });
         self.next_intent = intent;
-        self.replacement = .{ .intent = intent, .key = key };
+        self.replacement = .{ .intent = intent, .key = key, .cause = .picker };
         self.replacement_error = null;
     }
 
@@ -4305,7 +4549,7 @@ pub const Presentation = struct {
         self.removeQueuedSessionLoads();
         self.commands.appendAssumeCapacity(.{ .load_session = .{ .intent = intent, .key = key, .cause = .reconciliation } });
         self.next_intent = intent;
-        self.replacement = .{ .intent = intent, .key = key };
+        self.replacement = .{ .intent = intent, .key = key, .cause = .reconciliation };
         self.replacement_error = null;
     }
 
@@ -4318,7 +4562,7 @@ pub const Presentation = struct {
         self.removeQueuedSessionLoads();
         self.commands.appendAssumeCapacity(.{ .load_session = .{ .intent = intent, .key = key, .cause = .refresh } });
         self.next_intent = intent;
-        self.replacement = .{ .intent = intent, .key = key };
+        self.replacement = .{ .intent = intent, .key = key, .cause = .refresh };
         self.replacement_error = null;
         self.action_error = null;
     }
@@ -4350,6 +4594,17 @@ pub const Presentation = struct {
 
         switch (completed.outcome) {
             .failed => |err| {
+                if (replacement.cause == .reconciliation) if (self.durable_comment_edit) |durable| {
+                    if (OwnedReviewIdentity.eql(durable.key, replacement.key)) {
+                        if (self.published) |published| {
+                            if (OwnedReviewIdentity.eql(published.key, durable.key) and published.epoch == durable.initiating_epoch)
+                                self.reload_required_epoch = published.epoch;
+                        }
+                        self.comment_edit_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .reload_required };
+                        self.durable_comment_edit = null;
+                        durable.destroy();
+                    }
+                };
                 self.replacement = null;
                 self.replacement_error = if (err == error.OutOfMemory) .out_of_memory else .session_load_failed;
             },
@@ -4383,7 +4638,11 @@ pub const Presentation = struct {
 
                 const previous = self.published;
                 self.published = candidate;
+                if (candidate.session.authenticated_account_uuid) |uuid|
+                    self.authenticated_account_uuid = BoundedText(256).init(uuid) catch self.authenticated_account_uuid;
+                if (candidate.session.authenticated_account_unauthorized) self.authenticated_account_uuid = null;
                 self.next_session_epoch = epoch;
+                self.reload_required_epoch = null;
                 // The armed candidate named rows in the replaced Session, and
                 // the confirmed cascade described the replaced graph.
                 self.reanchor = null;
@@ -4394,6 +4653,12 @@ pub const Presentation = struct {
                 self.replacement = null;
                 self.replacement_error = null;
                 self.action_error = null;
+                if (replacement.cause == .reconciliation) if (self.durable_comment_edit) |durable| {
+                    if (OwnedReviewIdentity.eql(durable.key, replacement.key)) {
+                        self.durable_comment_edit = null;
+                        durable.destroy();
+                    }
+                };
                 if (previous) |published| published.destroy();
             },
         }
@@ -4450,6 +4715,12 @@ fn mutationRefusalError(refusal: ?MutationRefusal) ActionError {
         .submission_in_flight => .draft_submission_in_flight,
         .already_published => .draft_already_published,
         .published_comment => .published_comment_edit_unsupported,
+        .authenticated_account_unknown => .authenticated_account_unknown,
+        .comment_author_unknown => .comment_author_unknown,
+        .comment_owned_by_other => .comment_owned_by_other,
+        .comment_deleted => .comment_deleted,
+        .remote_write_busy => .remote_write_busy,
+        .authoritative_reload_required => .authoritative_reload_required,
         .reply_inherits_scope => .draft_reply_has_no_anchor,
         .scope_not_inline => .draft_scope_not_inline,
         .descendant_locked => .draft_descendant_locked,
@@ -4635,6 +4906,14 @@ fn reviewCardTarget(published: *const Published) ?MutationTarget {
         .draft => |row| .{ .draft = row.owner.draft },
         else => null,
     };
+}
+
+fn findPublishedComment(published: *const Published, id: bbr.review.CommentId) ?*const bbr.review.Comment {
+    for (published.session.threads) |thread| {
+        if (thread.root.id == id) return thread.root;
+        for (thread.replies) |reply| if (reply.id == id) return reply;
+    }
+    return null;
 }
 
 fn lineAtRow(row: buffer_mod.Row) ?*const bbr.diff.Line {
@@ -6214,11 +6493,190 @@ fn testCommentSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session
     comments[0] = .{
         .id = 99,
         .author = "Author",
+        .author_uuid = "{me}",
         .body = "published",
         .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1 } },
     };
     s.threads = try bbr.review.buildThreads(a, comments);
+    s.authenticated_account_uuid = "{me}";
     return s;
+}
+
+test "author-owned published Comment edit queues exact body and reconciles authoritatively" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testCommentSession(testing.allocator, 1) },
+        .viewport_rows = 12,
+    });
+    defer presentation.deinit();
+
+    try cursorToCommentCard(&presentation, 99);
+    try testing.expect(presentation.projection().action_availability.available(.edit_review_item));
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try testing.expectEqualStrings("Edit Bitbucket Comment", presentation.projection().composer.?.label);
+    try testing.expectEqualStrings("published", presentation.projection().composer.?.body);
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init(" edited") } });
+    try presentation.dispatch(.{ .composer = .save });
+
+    var command = presentation.takeCommand().?;
+    try testing.expect(command == .update_comment);
+    try testing.expectEqual(@as(bbr.review.CommentId, 99), command.update_comment.comment_id);
+    try testing.expectEqualStrings("published edited", command.update_comment.body);
+    try presentation.dispatch(.{ .comment_edit_completed = .{
+        .command_id = command.update_comment.command_id,
+        .identity = command.update_comment.identity,
+        .comment_id = 99,
+        .outcome = .updated,
+    } });
+    command.update_comment.destroy();
+    command = undefined;
+
+    const reconcile = presentation.takeCommand().?.load_session;
+    try testing.expect(reconcile.cause == .reconciliation);
+    try testing.expectEqualStrings("published", findPublishedComment(presentation.published.?, 99).?.body);
+}
+
+test "published edit ownership fails closed for missing evidence and other authors" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    const s = try testCommentSession(testing.allocator, 1);
+    s.authenticated_account_uuid = null;
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = s },
+        .viewport_rows = 12,
+    });
+    defer presentation.deinit();
+    try cursorToCommentCard(&presentation, 99);
+    try testing.expectEqual(MutationRefusal.authenticated_account_unknown, presentation.projection().action_availability.edit_refusal.?);
+
+    presentation.authenticated_account_uuid = try BoundedText(256).init("{other}");
+    try testing.expectEqual(MutationRefusal.comment_owned_by_other, presentation.projection().action_availability.edit_refusal.?);
+}
+
+test "definitive published edit failure restores exact attempted bytes" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testCommentSession(testing.allocator, 1) },
+        .viewport_rows = 12,
+    });
+    defer presentation.deinit();
+    try cursorToCommentCard(&presentation, 99);
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init(" attempted") } });
+    try presentation.dispatch(.{ .composer = .save });
+    var command = presentation.takeCommand().?;
+    try presentation.dispatch(.{ .comment_edit_completed = .{
+        .command_id = command.update_comment.command_id,
+        .identity = command.update_comment.identity,
+        .comment_id = 99,
+        .outcome = .{ .definitive_failure = error.Forbidden },
+    } });
+    command.update_comment.destroy();
+    command = undefined;
+
+    try testing.expectEqualStrings("Edit Bitbucket Comment", presentation.projection().composer.?.label);
+    try testing.expectEqualStrings("published attempted", presentation.projection().composer.?.body);
+    try testing.expectEqual(ActionError.comment_edit_failed, presentation.projection().action_error.?);
+}
+
+test "unknown edit delivery reconciles and failed Reconciliation gates the stale Session" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testCommentSession(testing.allocator, 1) },
+        .viewport_rows = 12,
+    });
+    defer presentation.deinit();
+    try cursorToCommentCard(&presentation, 99);
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init(" maybe") } });
+    try presentation.dispatch(.{ .composer = .save });
+    var update = presentation.takeCommand().?;
+    try presentation.dispatch(.{ .comment_edit_completed = .{
+        .command_id = update.update_comment.command_id,
+        .identity = update.update_comment.identity,
+        .comment_id = 99,
+        .outcome = .outcome_unknown,
+    } });
+    update.update_comment.destroy();
+    update = undefined;
+    try testing.expectEqual(.outcome_unknown, presentation.projection().comment_edit_result.?.outcome);
+
+    const reconcile = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = reconcile.command_id,
+        .intent = reconcile.intent,
+        .outcome = .{ .failed = error.NetworkFailure },
+    } });
+    try testing.expectEqual(.reload_required, presentation.projection().comment_edit_result.?.outcome);
+    try testing.expectEqual(MutationRefusal.authoritative_reload_required, presentation.projection().action_availability.edit_refusal.?);
+}
+
+test "published edit owns the global remote-write lane against Submission" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testCommentSession(testing.allocator, 1) },
+        .viewport_rows = 12,
+    });
+    defer presentation.deinit();
+    try cursorToCommentCard(&presentation, 99);
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init(" lane") } });
+    try presentation.dispatch(.{ .composer = .save });
+
+    try presentation.dispatch(.{ .action = .submit });
+    try testing.expectEqual(ActionError.remote_write_busy, presentation.projection().action_error.?);
+}
+
+test "published edit completion survives Session replacement as a qualified result" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const first_key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    const second_key = try OwnedReviewIdentity.init("workspace", "repo", 2);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = first_key, .session = try testCommentSession(testing.allocator, 1) },
+        .viewport_rows = 12,
+    });
+    defer presentation.deinit();
+    try cursorToCommentCard(&presentation, 99);
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init(" durable") } });
+    try presentation.dispatch(.{ .composer = .save });
+    var update = presentation.takeCommand().?;
+
+    try presentation.dispatch(.{ .choose_pull_request = second_key });
+    const load = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+    } });
+    try presentation.dispatch(.{ .comment_edit_completed = .{
+        .command_id = update.update_comment.command_id,
+        .identity = update.update_comment.identity,
+        .comment_id = 99,
+        .outcome = .updated,
+    } });
+    update.update_comment.destroy();
+    update = undefined;
+
+    const result = presentation.projection().comment_edit_result.?;
+    try testing.expect(OwnedReviewIdentity.eql(first_key, result.key));
+    try testing.expectEqual(.updated, result.outcome);
+    try testing.expect(presentation.takeCommand() == null);
 }
 
 fn sourceRow(presentation: *Presentation, side: AnchorSide, number: u32) !usize {

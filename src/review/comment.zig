@@ -148,6 +148,9 @@ pub const Comment = struct {
     /// The comment this one replies to, or null for a root comment.
     parent_id: ?CommentId = null,
     author: []const u8,
+    /// Bitbucket account UUID used as the sole mutation-ownership evidence.
+    /// Display names are intentionally never used for authorization decisions.
+    author_uuid: ?[]const u8 = null,
     /// Raw markdown body, as authored. Not rendered as markdown yet (M11).
     body: []const u8,
     /// Roots carry one exhaustive scope; Replies carry null and inherit it.
@@ -159,6 +162,8 @@ pub const Comment = struct {
     resolved: bool = false,
     /// Bitbucket's anchor verdict against the current diff.
     state: ScopeState = .current,
+    /// Structural tombstones have no authored body and cannot be mutated.
+    deleted: bool = false,
 
     pub fn isReply(self: Comment) bool {
         return self.parent_id != null;
