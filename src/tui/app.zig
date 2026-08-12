@@ -361,6 +361,21 @@ fn presentationStatus(
             .reload_required => "Comment updated, but authoritative reload is required",
         };
     }
+    if (projection.comment_delete_result) |result| {
+        if (visible_key == null or !presentation.OwnedReviewIdentity.eql(result.key, visible_key.?))
+            return std.fmt.allocPrint(frame, "{s}#{d}: Comment {d} deletion {s}", .{
+                result.key.repository(),
+                result.key.pull_request_id,
+                result.comment_id,
+                @tagName(result.outcome),
+            }) catch "Comment deletion finished for another pull request";
+        return switch (result.outcome) {
+            .deleted => "Bitbucket Comment deleted",
+            .failed => "Bitbucket Comment deletion failed",
+            .outcome_unknown => "Comment deletion delivery unknown; reconciling",
+            .reload_required => "Comment deleted, but authoritative reload is required",
+        };
+    }
     if (projection.recovery) |recovery| return switch (recovery.ownership) {
         .recoverable => std.fmt.allocPrint(frame, "interrupted Submission for {s}#{d} · Y resume", .{
             recovery.key.repository(),
@@ -389,12 +404,14 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .draft_already_published => "this Draft is published; Bitbucket owns the Comment",
         .authenticated_account_unknown => "Authenticated Account identity is unavailable; reload to retry",
         .comment_author_unknown => "this Comment has no author UUID; ownership cannot be proven",
-        .comment_owned_by_other => "only the author can edit this Bitbucket Comment",
-        .comment_deleted => "a Deleted Comment has no authored body to edit",
+        .comment_owned_by_other => "only the author can mutate this Bitbucket Comment",
+        .comment_deleted => "a Deleted Comment cannot be mutated",
         .remote_write_busy => "another remote write is already in progress",
-        .authoritative_reload_required => "Comment updated, but authoritative reload is required",
+        .authoritative_reload_required => "remote Comment changed, but authoritative reload is required",
         .comment_edit_failed => "Bitbucket refused the Comment edit",
         .comment_edit_launch_failed => "could not start the Comment edit",
+        .comment_delete_failed => "Bitbucket refused the Comment deletion",
+        .comment_delete_launch_failed => "could not start the Comment deletion",
         .published_comment_edit_unsupported => "this published Comment mutation is unavailable",
         .draft_edit_conflict => "this local Draft changed underneath the edit",
         .draft_reply_has_no_anchor => "a Reply inherits its root's placement",
@@ -413,6 +430,11 @@ fn deleteConfirmationText(
     frame: std.mem.Allocator,
     confirmation: presentation.DeleteConfirmationProjection,
 ) []const u8 {
+    if (confirmation.comment_id) |comment_id| {
+        if (confirmation.root_has_replies)
+            return std.fmt.allocPrint(frame, "Delete Bitbucket Comment {d}? Bitbucket removes its body, retains a Deleted Comment tombstone, and keeps {d} Reply/Replies.", .{ comment_id, confirmation.descendant_count }) catch "Delete this Bitbucket Comment remotely?";
+        return std.fmt.allocPrint(frame, "Delete Bitbucket Comment {d} from Bitbucket?", .{comment_id}) catch "Delete this Bitbucket Comment remotely?";
+    }
     const fallback = "Delete this local Draft and every Reply below it?";
     if (confirmation.descendant_count == 0)
         return std.fmt.allocPrint(frame, "Delete local Draft #{d}? It has no Replies.", .{confirmation.temp_id}) catch fallback;
@@ -558,6 +580,24 @@ fn presentationCommentEditWorker(
     http.initDefaultProxies(scratch.allocator(), env_map) catch {};
     const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     presentation_runtime.executeCommentEdit(presentationSink(&sink_context), command, client);
+}
+
+fn presentationCommentDeleteWorker(
+    loop: *Loop,
+    work_id: u64,
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+    cred: Credential,
+    command: *presentation.DeleteComment,
+) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
+    defer http.deinit();
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
+    presentation_runtime.executeCommentDelete(presentationSink(&sink_context), command, client);
 }
 
 fn presentationLoadWorker(
@@ -796,6 +836,7 @@ fn drainPresentationCommands(
             .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, ctx.highlighter, enrich }),
             .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, post }),
             .update_comment => |update| ctx.io.concurrent(presentationCommentEditWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, update }),
+            .delete_comment => |delete| ctx.io.concurrent(presentationCommentDeleteWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, delete }),
             .wait_submission => |wait| ctx.io.concurrent(presentationWaitWorker, .{ loop, work_id, ctx.io, wait }),
             .check_recovery => |check| ctx.io.concurrent(presentationRecoveryCheckWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, check }),
             .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, check }),
@@ -824,6 +865,7 @@ fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *p
         } },
         .post_draft => |post| presentation_adapter.postLaunchFailed(post),
         .update_comment => |update| presentation_adapter.commentEditLaunchFailed(update),
+        .delete_comment => |delete| presentation_adapter.commentDeleteLaunchFailed(delete),
         .wait_submission => |wait| .{ .submission_wait_launch_failed = wait },
         .check_recovery => |check| .{ .recovery_checked = .{ .command_id = check.command_id, .operation_id = check.operation_id, .identity = check.identity, .outcome = .failed } },
         .find_duplicate => |check| blk: {

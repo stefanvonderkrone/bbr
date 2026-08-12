@@ -1431,8 +1431,8 @@ test "delete stays discoverable in the help Overlay when it is refused" {
     defer arena.deinit();
     const refused = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .delete_refusal = .descendant_locked });
     const deletable = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .delete_refusal = null });
-    try testing.expect(!helpRowAvailable(refused.commands, "delete local Draft subtree").?);
-    try testing.expect(helpRowAvailable(deletable.commands, "delete local Draft subtree").?);
+    try testing.expect(!helpRowAvailable(refused.commands, "delete Comment or Draft").?);
+    try testing.expect(helpRowAvailable(deletable.commands, "delete Comment or Draft").?);
 }
 
 test "re-anchor stays discoverable in the help Overlay when it is refused" {

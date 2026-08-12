@@ -184,7 +184,7 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one('e'), .action = .edit_review_item, .help = "edit local Draft" },
     .{ .chord = Chord.modified('e', .{ .ctrl = true }), .action = .external_edit, .help = "External Edit" },
     .{ .chord = Chord.one('a'), .action = .reanchor_review_item, .help = "re-anchor local root Draft" },
-    .{ .chord = Chord.one('D'), .action = .delete_review_item, .help = "delete local Draft subtree" },
+    .{ .chord = Chord.one('D'), .action = .delete_review_item, .help = "delete Comment or Draft" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_disclosure, .help = "toggle disclosure" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_review_card, .help = "toggle ReviewCard" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_directory, .help = "toggle Directory" },

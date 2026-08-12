@@ -341,6 +341,35 @@ pub const Client = struct {
         try classify(res.status);
     }
 
+    /// DELETE one published Comment. Bitbucket may retain the Comment as a
+    /// structural tombstone when Replies still depend on it.
+    pub fn deleteComment(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        pull_request_id: u64,
+        comment_id: CommentId,
+    ) !void {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/pullrequests/{d}/comments/{d}",
+            .{ base_url, self.cred.workspace, repo_slug, pull_request_id, comment_id },
+        );
+        defer allocator.free(url);
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        const res = try self.http.send(allocator, .{
+            .method = .DELETE,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "application/json" },
+            },
+        });
+        defer allocator.free(res.body);
+        try classify(res.status);
+    }
+
     /// GET the first page of the comments *list* raw (debug aid), so we can see
     /// how the list endpoint shapes a comment vs. the single-comment endpoint.
     pub fn getCommentsRaw(
@@ -406,8 +435,9 @@ pub const Client = struct {
     }
 
     /// GET /repositories/{workspace}/{repo}/pullrequests/{id}/comments, following
-    /// Bitbucket's `next` links until the last page. Returns every non-deleted
-    /// comment flat (thread nesting is the review context's job, `buildThreads`).
+    /// Bitbucket's `next` links until the last page. Returns authored Comments
+    /// plus Deleted Comment tombstones required by surviving descendants, flat
+    /// (thread nesting is the review context's job, `buildThreads`).
     /// Each `Comment` and its strings are owned by `allocator`; free the batch
     /// with `deinitComments`. Callers should pass a PR-scoped arena.
     /// `head` is the PR's current source/destination commits: a comment whose
@@ -454,15 +484,23 @@ pub const Client = struct {
             }) catch return error.MalformedResponse;
             defer parsed.deinit();
 
-            for (parsed.value.values) |cj| {
-                if (cj.deleted) continue;
+            for (parsed.value.values) |cj|
                 try out.append(allocator, try dupeComment(allocator, cj, head));
-            }
 
             const next = parsed.value.next orelse break;
             url = try allocator.dupe(u8, next);
         }
 
+        var write: usize = 0;
+        for (out.items, 0..) |comment, index| {
+            if (comment.deleted and !hasSurvivingDescendant(out.items, comment.id)) {
+                deinitComment(allocator, comment);
+                continue;
+            }
+            if (write != index) out.items[write] = comment;
+            write += 1;
+        }
+        out.shrinkRetainingCapacity(write);
         return out.toOwnedSlice(allocator);
     }
 };
@@ -643,7 +681,7 @@ const CommentsPage = struct {
 /// is the PR's current revision, used to detect outdated inline comments.
 fn dupeComment(allocator: Allocator, cj: CommentJson, head: HeadCommits) !Comment {
     const author = if (cj.user) |u| (u.display_name orelse "") else "";
-    const raw = if (cj.content) |c| (c.raw orelse "") else "";
+    const raw = if (cj.deleted) "" else if (cj.content) |c| (c.raw orelse "") else "";
 
     const author_owned = try allocator.dupe(u8, author);
     errdefer allocator.free(author_owned);
@@ -745,20 +783,40 @@ fn hashMatches(a: []const u8, b: []const u8) bool {
 /// Free a batch returned by `getComments` (each comment's strings, then the
 /// slice). No-op-safe on an arena, but correct under any allocator.
 pub fn deinitComments(allocator: Allocator, comments: []Comment) void {
-    for (comments) |c| {
-        allocator.free(c.author);
-        if (c.author_uuid) |uuid| allocator.free(uuid);
-        allocator.free(c.body);
-        if (c.scope) |scope| switch (scope) {
-            .review => {},
-            .file => |file| {
-                allocator.free(file.path);
-                allocator.free(file.source_commit);
-            },
-            .@"inline" => |anchor| allocator.free(anchor.path),
-        } else if (c.anchor) |a| allocator.free(a.path);
-    }
+    for (comments) |c| deinitComment(allocator, c);
     allocator.free(comments);
+}
+
+fn deinitComment(allocator: Allocator, c: Comment) void {
+    allocator.free(c.author);
+    if (c.author_uuid) |uuid| allocator.free(uuid);
+    allocator.free(c.body);
+    if (c.scope) |scope| switch (scope) {
+        .review => {},
+        .file => |file| {
+            allocator.free(file.path);
+            allocator.free(file.source_commit);
+        },
+        .@"inline" => |anchor| allocator.free(anchor.path),
+    } else if (c.anchor) |a| allocator.free(a.path);
+}
+
+fn hasSurvivingDescendant(comments: []const Comment, ancestor_id: CommentId) bool {
+    for (comments) |candidate| {
+        if (candidate.deleted) continue;
+        var parent = candidate.parent_id;
+        var remaining = comments.len;
+        while (parent) |parent_id| : (remaining -= 1) {
+            if (parent_id == ancestor_id) return true;
+            if (remaining == 0) break;
+            parent = null;
+            for (comments) |possible_parent| if (possible_parent.id == parent_id) {
+                parent = possible_parent.parent_id;
+                break;
+            };
+        }
+    }
+    return false;
 }
 
 pub fn deinitPullRequest(allocator: Allocator, pr: PullRequest) void {
@@ -1143,6 +1201,20 @@ test "updateComment PUTs only accepted bytes as content raw" {
     , fake.lastBody().?);
 }
 
+test "deleteComment DELETEs the exact Comment without a body" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 204, .body = "" };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    try bb.deleteComment(a, "myrepo", 7, 42);
+
+    try testing.expectEqual(httpc.Method.DELETE, fake.last_method.?);
+    try testing.expectEqualStrings(
+        "https://api.bitbucket.org/2.0/repositories/check24/myrepo/pullrequests/7/comments/42",
+        fake.lastUrl().?,
+    );
+    try testing.expectEqualStrings("", fake.lastBody().?);
+}
+
 test "comment decoding retains UUID ownership evidence" {
     const a = testing.allocator;
     var fake: FakeHttpClient = .{ .status = 200, .body =
@@ -1165,6 +1237,11 @@ const comments_page_1 =
     \\    { "id": 2, "parent": { "id": 1 }, "content": { "raw": "agreed" },
     \\      "user": { "display_name": "Bob" } },
     \\    { "id": 3, "content": { "raw": "gone" }, "deleted": true,
+    \\      "user": { "display_name": "Sys", "uuid": "{sys}" },
+    \\      "inline": { "path": "src/deleted.zig", "to": 9 } },
+    \\    { "id": 6, "parent": { "id": 3 }, "content": { "raw": "survives" },
+    \\      "user": { "display_name": "Eve" } },
+    \\    { "id": 7, "content": { "raw": "unrelated deleted" }, "deleted": true,
     \\      "user": { "display_name": "Sys" } },
     \\    { "id": 4, "content": { "raw": "fix here" }, "user": { "display_name": "Cy" },
     \\      "inline": { "path": "src/foo.zig", "to": 42 },
@@ -1184,7 +1261,7 @@ const comments_page_2 =
     \\}
 ;
 
-test "getComments follows next links and returns non-deleted comments" {
+test "getComments follows next links and retains only structural Deleted Comments" {
     const a = testing.allocator;
     const pages = [_]@import("../http/fake_client.zig").Canned{
         .{ .status = 200, .body = comments_page_1 },
@@ -1196,9 +1273,10 @@ test "getComments follows next links and returns non-deleted comments" {
     const comments = try bb.getComments(a, "myrepo", 7, .{});
     defer @import("client.zig").deinitComments(a, comments);
 
-    // 5 wire comments, one deleted → 4 kept, across two pages.
+    // The deleted root with a surviving Reply remains; the unrelated tombstone
+    // is omitted.
     try testing.expectEqual(@as(usize, 2), fake.call_count);
-    try testing.expectEqual(@as(usize, 4), comments.len);
+    try testing.expectEqual(@as(usize, 6), comments.len);
 
     try testing.expectEqualStrings("Ada", comments[0].author);
     try testing.expect(comments[0].parent_id == null);
@@ -1206,15 +1284,22 @@ test "getComments follows next links and returns non-deleted comments" {
     // The reply keeps its parent link.
     try testing.expectEqual(@as(?review.CommentId, 1), comments[1].parent_id);
 
+    const tombstone = comments[2];
+    try testing.expect(tombstone.deleted);
+    try testing.expectEqualStrings("", tombstone.body);
+    try testing.expectEqualStrings("{sys}", tombstone.author_uuid.?);
+    try testing.expectEqual(@as(?u32, 9), tombstone.scope.?.@"inline".to);
+    try testing.expectEqual(@as(?review.CommentId, 3), comments[3].parent_id);
+
     // The inline+resolved comment.
-    try testing.expect(comments[2].isInline());
-    try testing.expectEqual(@as(?u32, 42), comments[2].anchor.?.to);
-    try testing.expect(comments[2].resolved);
-    try testing.expectEqual(review.AnchorState.current, comments[2].state);
+    try testing.expect(comments[4].isInline());
+    try testing.expectEqual(@as(?u32, 42), comments[4].anchor.?.to);
+    try testing.expect(comments[4].resolved);
+    try testing.expectEqual(review.AnchorState.current, comments[4].state);
 
     // Bitbucket's outdated verdict is honored.
-    try testing.expectEqual(review.AnchorState.outdated, comments[3].state);
-    try testing.expectEqual(@as(?u32, 10), comments[3].anchor.?.from);
+    try testing.expectEqual(review.AnchorState.outdated, comments[5].state);
+    try testing.expectEqual(@as(?u32, 10), comments[5].anchor.?.from);
 }
 
 test "getComments classifies Review File inline roots and strips Reply scope" {

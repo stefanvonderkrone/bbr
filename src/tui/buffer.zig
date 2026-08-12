@@ -441,12 +441,20 @@ const Weave = struct {
     fn emitComment(w: *Weave, c: *const Comment, is_reply: bool) !void {
         const owner: review_card.Owner = .{ .comment = c.id };
         const marker = if (c.suggestion() != null) "±" else if (is_reply) "↳" else "▸";
-        const header = try std.fmt.allocPrint(w.a, "{s} {s}", .{ marker, c.author });
+        const header = if (c.deleted)
+            try std.fmt.allocPrint(w.a, "{s} Deleted Comment", .{marker})
+        else
+            try std.fmt.allocPrint(w.a, "{s} {s}", .{ marker, c.author });
         const parsed = try review_card.ReviewBody.parse(w.a, c.body);
         const projected = try review_card.project(w.a, parsed, .{
             .owner = owner,
             .source = .{ .comment = c },
-            .role = if (is_reply) .comment_reply else .comment,
+            .role = if (c.deleted)
+                (if (is_reply) .deleted_reply else .deleted_comment)
+            else if (is_reply)
+                .comment_reply
+            else
+                .comment,
             .header = header,
             .content_width = cardContentWidth(w.opts.card_width, is_reply),
             .metrics = w.opts.cell_metrics,
@@ -1320,6 +1328,25 @@ test "an inline thread is woven right under its anchored line, replies indented"
     try testing.expectEqual(@as(review.CommentId, 1), buf.rows[5].comment.commentItem().id);
     try testing.expect(buf.rows[7] == .comment);
     try testing.expect(buf.rows[7].comment.isReply());
+}
+
+test "Deleted Comment tombstone retains its real Thread and neutral role" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try parse(a, anchor_diff);
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "", .deleted = true, .scope = .{ .@"inline" = .{ .path = "a.txt", .to = 2 } } },
+        .{ .id = 2, .parent_id = 1, .author = "Bo", .body = "survives" },
+    };
+    const threads = try bbr.review.thread.build(a, &comments);
+    const buf = try buildWithComments(a, diff, .unified, threads, .{});
+
+    try testing.expectEqualStrings("▸ Deleted Comment", buf.rows[5].comment.text());
+    try testing.expectEqual(review_card.CardRole.deleted_comment, buf.rows[5].comment.role);
+    try testing.expectEqual(@as(review.CommentId, 1), buf.rows[5].comment.commentItem().id);
+    try testing.expectEqual(review_card.CardRole.comment_reply, buf.rows[6].comment.role);
+    try testing.expectEqual(@as(?review.CommentId, 1), buf.rows[6].comment.commentItem().parent_id);
 }
 
 test "PR-level comments get a section at the top" {

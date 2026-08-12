@@ -247,6 +247,40 @@ pub fn commentEditLaunchFailed(command: *presentation.UpdateComment) presentatio
     } };
 }
 
+pub fn executeCommentDelete(command: *presentation.DeleteComment, client: bbr.bitbucket.Client) presentation.OwnedInput {
+    defer command.destroy();
+    const outcome: presentation.CommentDeleteOutcome = if (client.deleteComment(
+        command.allocator,
+        command.identity.repository(),
+        command.identity.pullRequestId(),
+        command.comment_id,
+    )) |_| .deleted else |err| switch (err) {
+        error.NotFound => .not_found,
+        error.Unauthorized => .{ .definitive_failure = error.Unauthorized },
+        error.Forbidden => .{ .definitive_failure = error.Forbidden },
+        error.RateLimited => .{ .definitive_failure = error.RateLimited },
+        error.ServerError => .{ .definitive_failure = error.ServerError },
+        error.UnexpectedStatus => .{ .definitive_failure = error.UnexpectedStatus },
+        error.MalformedResponse => .{ .definitive_failure = error.MalformedResponse },
+        else => .outcome_unknown,
+    };
+    return .{ .comment_delete_completed = .{
+        .command_id = command.command_id,
+        .identity = command.identity,
+        .comment_id = command.comment_id,
+        .outcome = outcome,
+    } };
+}
+
+pub fn commentDeleteLaunchFailed(command: *presentation.DeleteComment) presentation.OwnedInput {
+    defer command.destroy();
+    return .{ .comment_delete_launch_failed = .{
+        .command_id = command.command_id,
+        .identity = command.identity,
+        .comment_id = command.comment_id,
+    } };
+}
+
 const testing = std.testing;
 
 test "editor resolution uses first non-empty configured value" {
@@ -345,6 +379,33 @@ test "External Edit distinguishes size validation and restoration failure" {
     try testing.expect(failed.outcome == .restoration_failed);
     var retained = try std.Io.Dir.cwd().openFile(testing.io, failed.outcome.restoration_failed, .{});
     retained.close(testing.io);
+}
+
+fn testDeleteCommand() !*presentation.DeleteComment {
+    const command = try testing.allocator.create(presentation.DeleteComment);
+    command.* = .{
+        .allocator = testing.allocator,
+        .command_id = 17,
+        .identity = .{ .value = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1) },
+        .comment_id = 42,
+    };
+    return command;
+}
+
+test "Comment deletion adapter distinguishes not-found, definitive, and unknown outcomes" {
+    const cases = [_]struct { status: u16, send_error: ?anyerror, expected: std.meta.Tag(presentation.CommentDeleteOutcome) }{
+        .{ .status = 204, .send_error = null, .expected = .deleted },
+        .{ .status = 404, .send_error = null, .expected = .not_found },
+        .{ .status = 403, .send_error = null, .expected = .definitive_failure },
+        .{ .status = 200, .send_error = error.ConnectionReset, .expected = .outcome_unknown },
+    };
+    for (cases) |case| {
+        var fake: bbr.http.FakeHttpClient = .{ .status = case.status, .send_error = case.send_error };
+        const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+        const input = executeCommentDelete(try testDeleteCommand(), client).comment_delete_completed;
+        try testing.expectEqual(case.expected, std.meta.activeTag(input.outcome));
+        try testing.expectEqual(@as(bbr.review.CommentId, 42), input.comment_id);
+    }
 }
 
 const FakePoster = struct {

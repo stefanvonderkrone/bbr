@@ -40,6 +40,10 @@ pub fn executeCommentEdit(sink: CompletionSink, command: *presentation.UpdateCom
     deliver(sink, adapter.executeCommentEdit(command, client));
 }
 
+pub fn executeCommentDelete(sink: CompletionSink, command: *presentation.DeleteComment, client: bbr.bitbucket.Client) void {
+    deliver(sink, adapter.executeCommentDelete(command, client));
+}
+
 const std = @import("std");
 const testing = std.testing;
 

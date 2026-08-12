@@ -118,6 +118,11 @@ pub const Theme = struct {
         var style = switch (role) {
             .comment => self.comment,
             .comment_reply => self.comment_reply,
+            .deleted_comment, .deleted_reply => blk: {
+                var deleted = self.section;
+                deleted.dim = true;
+                break :blk deleted;
+            },
             .draft => self.draft,
             .draft_reply => self.draft_reply,
             .outcome_unknown => self.outcome_unknown,

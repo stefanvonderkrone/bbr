@@ -218,6 +218,8 @@ pub const OwnedInput = union(enum) {
     post_draft_launch_failed: PostDraftLaunchFailed,
     comment_edit_completed: CommentEditCompleted,
     comment_edit_launch_failed: CommentEditLaunchFailed,
+    comment_delete_completed: CommentDeleteCompleted,
+    comment_delete_launch_failed: CommentDeleteLaunchFailed,
     submission_wait_completed: WaitSubmission,
     submission_wait_launch_failed: WaitSubmission,
     recovery_checked: RecoveryChecked,
@@ -498,6 +500,26 @@ pub const CommentEditLaunchFailed = struct {
     comment_id: bbr.review.CommentId,
 };
 
+pub const CommentDeleteOutcome = union(enum) {
+    deleted,
+    not_found,
+    definitive_failure: bbr.bitbucket.ApiError,
+    outcome_unknown,
+};
+
+pub const CommentDeleteCompleted = struct {
+    command_id: CommandId,
+    identity: OwnedRemoteReviewIdentity,
+    comment_id: bbr.review.CommentId,
+    outcome: CommentDeleteOutcome,
+};
+
+pub const CommentDeleteLaunchFailed = struct {
+    command_id: CommandId,
+    identity: OwnedRemoteReviewIdentity,
+    comment_id: bbr.review.CommentId,
+};
+
 fn BoundedText(comptime capacity: usize) type {
     return struct {
         bytes: [capacity]u8 = undefined,
@@ -617,11 +639,29 @@ pub const UpdateComment = struct {
     }
 };
 
+pub const DeleteComment = struct {
+    allocator: Allocator,
+    command_id: CommandId = 0,
+    identity: OwnedRemoteReviewIdentity,
+    comment_id: bbr.review.CommentId,
+
+    fn create(allocator: Allocator, key: OwnedReviewIdentity, comment_id: bbr.review.CommentId) !*DeleteComment {
+        const command = try allocator.create(DeleteComment);
+        command.* = .{ .allocator = allocator, .identity = .init(key), .comment_id = comment_id };
+        return command;
+    }
+
+    pub fn destroy(self: *DeleteComment) void {
+        self.allocator.destroy(self);
+    }
+};
+
 pub const OwnedCommand = union(enum) {
     load_session: LoadSession,
     enrich_file: EnrichFile,
     post_draft: *PostDraft,
     update_comment: *UpdateComment,
+    delete_comment: *DeleteComment,
     wait_submission: WaitSubmission,
     check_recovery: CheckRecovery,
     find_duplicate: *PostDraft,
@@ -633,6 +673,7 @@ pub const OwnedCommand = union(enum) {
         switch (self.*) {
             .post_draft, .find_duplicate => |command| command.destroy(),
             .update_comment => |command| command.destroy(),
+            .delete_comment => |command| command.destroy(),
             .copy_clipboard => |command| command.destroy(),
             .external_edit => |command| command.destroy(),
             .load_session, .enrich_file, .wait_submission, .check_recovery, .list_pull_requests => {},
@@ -658,6 +699,7 @@ fn setCommandId(command: *OwnedCommand, command_id: CommandId) void {
         .enrich_file => |*value| value.command_id = command_id,
         .post_draft, .find_duplicate => |value| value.command_id = command_id,
         .update_comment => |value| value.command_id = command_id,
+        .delete_comment => |value| value.command_id = command_id,
         .wait_submission => |*value| value.command_id = command_id,
         .check_recovery => |*value| value.command_id = command_id,
         .list_pull_requests => |*value| value.command_id = command_id,
@@ -771,6 +813,7 @@ pub const Projection = struct {
     submission: ?SubmissionProjection,
     submission_result: ?SubmissionResultProjection,
     comment_edit_result: ?CommentEditResultProjection,
+    comment_delete_result: ?CommentDeleteResultProjection,
     recovery: ?RecoveryNotice,
     unknown_resolution: ?UnknownResolutionProjection,
     reanchor: ?ReanchorProjection,
@@ -794,6 +837,12 @@ pub const CommentEditResultProjection = struct {
     key: OwnedReviewIdentity,
     comment_id: bbr.review.CommentId,
     outcome: enum { updated, failed, outcome_unknown, reload_required },
+};
+
+pub const CommentDeleteResultProjection = struct {
+    key: OwnedReviewIdentity,
+    comment_id: bbr.review.CommentId,
+    outcome: enum { deleted, failed, outcome_unknown, reload_required },
 };
 
 pub const ClipboardStatus = enum { copied, failed };
@@ -931,7 +980,9 @@ pub const ReanchorProjection = struct {
 /// Reply-descendant consequence the reviewer is being asked to accept.
 pub const DeleteConfirmationProjection = struct {
     temp_id: bbr.review.TempId,
+    comment_id: ?bbr.review.CommentId = null,
     descendant_count: usize,
+    root_has_replies: bool = false,
 };
 
 pub const ActionError = enum {
@@ -967,6 +1018,8 @@ pub const ActionError = enum {
     authoritative_reload_required,
     comment_edit_failed,
     comment_edit_launch_failed,
+    comment_delete_failed,
+    comment_delete_launch_failed,
     published_comment_edit_unsupported,
     no_review_item,
     draft_edit_conflict,
@@ -1617,8 +1670,9 @@ const ReanchorCapture = struct {
 /// overlay is refused instead of silently deleting a different set.
 const DeleteConfirmation = struct {
     key: OwnedReviewIdentity,
-    temp_id: bbr.review.TempId,
+    target: MutationTarget,
     descendant_count: usize,
+    root_has_replies: bool = false,
 };
 
 /// Where the cursor goes once a deleted subtree's rows are gone: the identity
@@ -1658,6 +1712,18 @@ const DurableCommentEdit = struct {
         const allocator = self.allocator;
         allocator.free(self.body);
         allocator.destroy(self);
+    }
+};
+
+const DurableCommentDelete = struct {
+    allocator: Allocator,
+    key: OwnedReviewIdentity,
+    comment_id: bbr.review.CommentId,
+    initiating_epoch: SessionEpoch,
+    outcome: ?CommentDeleteOutcome = null,
+
+    fn destroy(self: *DurableCommentDelete) void {
+        self.allocator.destroy(self);
     }
 };
 
@@ -2019,9 +2085,11 @@ pub const Presentation = struct {
     help_visible: bool = false,
     durable_submission: ?*DurableSubmission = null,
     durable_comment_edit: ?*DurableCommentEdit = null,
+    durable_comment_delete: ?*DurableCommentDelete = null,
     authenticated_account_uuid: ?BoundedText(256) = null,
     reload_required_epoch: ?SessionEpoch = null,
     comment_edit_result: ?CommentEditResultProjection = null,
+    comment_delete_result: ?CommentDeleteResultProjection = null,
     submission_result: ?SubmissionResultProjection = null,
     recovery: ?RecoveryNotice = null,
     /// The recovered run's frozen participants, read only while `recovery` is
@@ -2092,6 +2160,7 @@ pub const Presentation = struct {
         for (self.commands.items) |*command| command.deinit();
         if (self.durable_submission) |durable| durable.destroy();
         if (self.durable_comment_edit) |edit| edit.destroy();
+        if (self.durable_comment_delete) |delete| delete.destroy();
         if (self.picker) |*picker| picker.deinit();
         if (self.file_finder) |*finder| finder.deinit();
         if (self.picker_summaries) |summaries| summaries.destroy();
@@ -2133,6 +2202,8 @@ pub const Presentation = struct {
             .post_draft_launch_failed => |failed| self.acceptPostDraftLaunchFailure(failed),
             .comment_edit_completed => |completed| self.acceptCommentEdit(completed),
             .comment_edit_launch_failed => |failed| self.acceptCommentEditLaunchFailure(failed),
+            .comment_delete_completed => |completed| self.acceptCommentDelete(completed),
+            .comment_delete_launch_failed => |failed| self.acceptCommentDeleteLaunchFailure(failed),
             .submission_wait_completed => |completed| self.acceptSubmissionWait(completed),
             .submission_wait_launch_failed => |failed| self.acceptSubmissionWaitLaunchFailure(failed),
             .recovery_checked => |checked| self.acceptRecoveryCheck(checked),
@@ -2176,7 +2247,7 @@ pub const Presentation = struct {
                 if (durable.operation_id == post.operation_id and durable.current_temp_id == post.draft.local_id and durable.phase == .post_queued)
                     durable.phase = .awaiting_post;
             },
-            .update_comment => {},
+            .update_comment, .delete_comment => {},
             .wait_submission => |wait| if (self.durable_submission) |durable| {
                 if (durable.operation_id == wait.operation_id and durable.current_temp_id == wait.temp_id and durable.phase == .wait_queued)
                     durable.phase = .awaiting_wait;
@@ -2224,6 +2295,7 @@ pub const Presentation = struct {
             } else null,
             .submission_result = self.submission_result,
             .comment_edit_result = self.comment_edit_result,
+            .comment_delete_result = self.comment_delete_result,
             .recovery = self.recovery,
             .unknown_resolution = if (self.unknown_resolution) |*editor| .{
                 .temp_id = editor.temp_id,
@@ -2231,8 +2303,10 @@ pub const Presentation = struct {
             } else null,
             .reanchor = self.reanchorProjection(),
             .delete_confirmation = if (self.delete_confirmation) |confirmation| .{
-                .temp_id = confirmation.temp_id,
+                .temp_id = if (confirmation.target == .draft) confirmation.target.draft else 0,
+                .comment_id = if (confirmation.target == .comment) confirmation.target.comment else null,
                 .descendant_count = confirmation.descendant_count,
+                .root_has_replies = confirmation.root_has_replies,
             } else null,
             .picker = if (self.picker) |*picker| picker else null,
             .picker_tick_scope = if (!self.shutdown_requested) if (self.picker) |*picker|
@@ -2262,8 +2336,8 @@ pub const Presentation = struct {
     }
 
     pub fn readyToExit(self: *const Presentation) bool {
-        if (builtin.is_test) return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.outstanding_picker_loads == 0 and self.issued_enrichments.items.len == 0;
-        return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.commands.items.len == 0 and self.issued_commands.items.len == 0;
+        if (builtin.is_test) return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.outstanding_picker_loads == 0 and self.issued_enrichments.items.len == 0;
+        return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.commands.items.len == 0 and self.issued_commands.items.len == 0;
     }
 
     fn reviewProjection(self: *const Presentation, published: *const Published) ReviewProjection {
@@ -2603,7 +2677,7 @@ pub const Presentation = struct {
         var write: usize = 0;
         for (self.commands.items) |command_value| {
             var command = command_value;
-            if (command == .post_draft or command == .update_comment or command == .wait_submission or command == .check_recovery or command == .find_duplicate) {
+            if (command == .post_draft or command == .update_comment or command == .delete_comment or command == .wait_submission or command == .check_recovery or command == .find_duplicate) {
                 self.commands.items[write] = command;
                 write += 1;
             } else {
@@ -2681,7 +2755,7 @@ pub const Presentation = struct {
                 const author_uuid = comment.author_uuid orelse return .comment_author_unknown;
                 if (!std.mem.eql(u8, account.slice(), author_uuid)) return .comment_owned_by_other;
                 if (self.reload_required_epoch == published.epoch) return .authoritative_reload_required;
-                if (self.durable_submission != null or self.durable_comment_edit != null) return .remote_write_busy;
+                if (self.remoteWriteBusy()) return .remote_write_busy;
                 return null;
             },
             .draft => |id| id,
@@ -2734,13 +2808,31 @@ pub const Presentation = struct {
     fn deleteRefusal(self: *const Presentation, published: *const Published) ?MutationRefusal {
         if (self.delete_confirmation) |confirmation| {
             if (!OwnedReviewIdentity.eql(published.key, confirmation.key)) return .no_review_item;
-            return self.draftDeleteRefusal(published, confirmation.temp_id);
+            return switch (confirmation.target) {
+                .comment => |comment_id| self.commentDeleteRefusal(published, comment_id),
+                .draft => |temp_id| self.draftDeleteRefusal(published, temp_id),
+            };
         }
         const target = reviewCardTarget(published) orelse return .no_review_item;
         return switch (target) {
-            .comment => .published_comment,
+            .comment => |comment_id| self.commentDeleteRefusal(published, comment_id),
             .draft => |temp_id| self.draftDeleteRefusal(published, temp_id),
         };
+    }
+
+    fn commentDeleteRefusal(self: *const Presentation, published: *const Published, comment_id: bbr.review.CommentId) ?MutationRefusal {
+        const comment = findPublishedComment(published, comment_id) orelse return .no_review_item;
+        if (comment.deleted) return .comment_deleted;
+        const account = self.authenticated_account_uuid orelse return .authenticated_account_unknown;
+        const author_uuid = comment.author_uuid orelse return .comment_author_unknown;
+        if (!std.mem.eql(u8, account.slice(), author_uuid)) return .comment_owned_by_other;
+        if (self.reload_required_epoch == published.epoch) return .authoritative_reload_required;
+        if (self.remoteWriteBusy()) return .remote_write_busy;
+        return null;
+    }
+
+    fn remoteWriteBusy(self: *const Presentation) bool {
+        return self.durable_submission != null or self.durable_comment_edit != null or self.durable_comment_delete != null;
     }
 
     /// The whole cascade must be deletable: one run-owned, in-flight, published,
@@ -2777,10 +2869,18 @@ pub const Presentation = struct {
             self.action_error = .no_review_item;
             return;
         };
-        self.delete_confirmation = .{
-            .key = published.key,
-            .temp_id = target.draft,
-            .descendant_count = descendantCount(published, target.draft),
+        self.delete_confirmation = switch (target) {
+            .draft => |temp_id| .{
+                .key = published.key,
+                .target = .{ .draft = temp_id },
+                .descendant_count = descendantCount(published, temp_id),
+            },
+            .comment => |comment_id| .{
+                .key = published.key,
+                .target = .{ .comment = comment_id },
+                .descendant_count = publishedReplyCount(published, comment_id),
+                .root_has_replies = (findPublishedComment(published, comment_id) orelse unreachable).parent_id == null and publishedReplyCount(published, comment_id) > 0,
+            },
         };
         self.action_error = null;
     }
@@ -2801,12 +2901,14 @@ pub const Presentation = struct {
             self.delete_confirmation = null;
             return;
         }
-        if (published.review.getConst(confirmation.temp_id) == null) {
+        if (confirmation.target == .comment) return self.confirmCommentDelete(published, confirmation);
+        const temp_id = confirmation.target.draft;
+        if (published.review.getConst(temp_id) == null) {
             self.delete_confirmation = null;
             self.action_error = .no_review_item;
             return;
         }
-        if (self.draftDeleteRefusal(published, confirmation.temp_id)) |refusal| {
+        if (self.draftDeleteRefusal(published, temp_id)) |refusal| {
             self.action_error = mutationRefusalError(refusal);
             return;
         }
@@ -2819,12 +2921,12 @@ pub const Presentation = struct {
         // The cascade is recomputed here rather than retained from the
         // confirmation, and the store rechecks it again inside its own write:
         // that transaction, not this snapshot, is what makes it authoritative.
-        const len = collectCascade(published, confirmation.temp_id, cascade);
+        const len = collectCascade(published, temp_id, cascade);
         const surviving = survivingRowAfterDeletion(published, cascade[0..len]);
         published.deleteDraftSubtree(
             self.dependencies.reviews,
             self.preferences,
-            confirmation.temp_id,
+            temp_id,
             cascade[0..len],
         ) catch |err| {
             self.action_error = switch (err) {
@@ -2839,6 +2941,38 @@ pub const Presentation = struct {
         self.delete_confirmation = null;
         published.navigation.clearMark();
         followSurvivingRow(published, surviving);
+        self.action_error = null;
+    }
+
+    fn confirmCommentDelete(self: *Presentation, published: *Published, confirmation: DeleteConfirmation) void {
+        const comment_id = confirmation.target.comment;
+        if (self.commentDeleteRefusal(published, comment_id)) |refusal| {
+            self.action_error = mutationRefusalError(refusal);
+            return;
+        }
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        const durable = self.allocator.create(DurableCommentDelete) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        durable.* = .{
+            .allocator = self.allocator,
+            .key = published.key,
+            .comment_id = comment_id,
+            .initiating_epoch = published.epoch,
+        };
+        const command = DeleteComment.create(self.allocator, published.key, comment_id) catch {
+            durable.destroy();
+            self.action_error = .out_of_memory;
+            return;
+        };
+        self.delete_confirmation = null;
+        self.comment_edit_result = null;
+        self.durable_comment_delete = durable;
+        self.commands.appendAssumeCapacity(.{ .delete_comment = command });
         self.action_error = null;
     }
 
@@ -3384,7 +3518,7 @@ pub const Presentation = struct {
             self.action_error = .local_review_no_submission;
             return;
         }
-        if (self.durable_comment_edit != null) {
+        if (self.durable_comment_edit != null or self.durable_comment_delete != null) {
             self.action_error = .remote_write_busy;
             return;
         }
@@ -3538,6 +3672,59 @@ pub const Presentation = struct {
         self.durable_comment_edit = null;
         durable.destroy();
         self.action_error = .comment_edit_launch_failed;
+    }
+
+    fn acceptCommentDelete(self: *Presentation, completed: CommentDeleteCompleted) void {
+        if (!self.consumeCommand(completed.command_id, .delete_comment)) return;
+        const durable = self.durable_comment_delete orelse return;
+        if (!durableIdentityMatches(durable.key, completed.identity) or durable.comment_id != completed.comment_id) return;
+        if (completed.outcome == .definitive_failure) {
+            if (completed.outcome.definitive_failure == error.Unauthorized) self.authenticated_account_uuid = null;
+            self.restoreCommentDeleteConfirmation(durable);
+            self.comment_delete_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
+            self.durable_comment_delete = null;
+            durable.destroy();
+            self.action_error = .comment_delete_failed;
+            return;
+        }
+        durable.outcome = completed.outcome;
+        self.comment_delete_result = .{
+            .key = durable.key,
+            .comment_id = durable.comment_id,
+            .outcome = if (completed.outcome == .outcome_unknown) .outcome_unknown else .deleted,
+        };
+        const visible = !self.shutdown_requested and self.published != null and OwnedReviewIdentity.eql(self.published.?.key, durable.key) and self.replacement == null;
+        if (visible) {
+            self.queueReconciliation(durable.key);
+            return;
+        }
+        self.durable_comment_delete = null;
+        durable.destroy();
+        self.action_error = null;
+    }
+
+    fn acceptCommentDeleteLaunchFailure(self: *Presentation, failed: CommentDeleteLaunchFailed) void {
+        if (!self.consumeCommand(failed.command_id, .delete_comment)) return;
+        const durable = self.durable_comment_delete orelse return;
+        if (!durableIdentityMatches(durable.key, failed.identity) or durable.comment_id != failed.comment_id) return;
+        self.restoreCommentDeleteConfirmation(durable);
+        self.comment_delete_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .failed };
+        self.durable_comment_delete = null;
+        durable.destroy();
+        self.action_error = .comment_delete_launch_failed;
+    }
+
+    fn restoreCommentDeleteConfirmation(self: *Presentation, durable: *const DurableCommentDelete) void {
+        const current = self.published orelse return;
+        if (!OwnedReviewIdentity.eql(current.key, durable.key) or current.epoch != durable.initiating_epoch) return;
+        const comment = findPublishedComment(current, durable.comment_id) orelse return;
+        const replies = publishedReplyCount(current, durable.comment_id);
+        self.delete_confirmation = .{
+            .key = durable.key,
+            .target = .{ .comment = durable.comment_id },
+            .descendant_count = replies,
+            .root_has_replies = comment.parent_id == null and replies > 0,
+        };
     }
 
     fn restoreCommentEditComposer(self: *Presentation, durable: *const DurableCommentEdit) void {
@@ -4287,6 +4474,7 @@ pub const Presentation = struct {
         };
         published.composer.?.deinit();
         published.composer = null;
+        self.comment_delete_result = null;
         self.durable_comment_edit = durable;
         self.commands.appendAssumeCapacity(.{ .update_comment = command });
         self.action_error = null;
@@ -4534,6 +4722,10 @@ pub const Presentation = struct {
             self.durable_comment_edit = null;
             durable.destroy();
         };
+        if (self.durable_comment_delete) |durable| if (durable.outcome != null) {
+            self.durable_comment_delete = null;
+            durable.destroy();
+        };
         // Commands not yet transferred to the terminal adapter are still ours
         // to supersede. Already-taken commands complete normally and are
         // rejected later by their LoadIntent.
@@ -4605,6 +4797,17 @@ pub const Presentation = struct {
                         durable.destroy();
                     }
                 };
+                if (replacement.cause == .reconciliation) if (self.durable_comment_delete) |durable| {
+                    if (OwnedReviewIdentity.eql(durable.key, replacement.key)) {
+                        if (self.published) |published| {
+                            if (OwnedReviewIdentity.eql(published.key, durable.key) and published.epoch == durable.initiating_epoch)
+                                self.reload_required_epoch = published.epoch;
+                        }
+                        self.comment_delete_result = .{ .key = durable.key, .comment_id = durable.comment_id, .outcome = .reload_required };
+                        self.durable_comment_delete = null;
+                        durable.destroy();
+                    }
+                };
                 self.replacement = null;
                 self.replacement_error = if (err == error.OutOfMemory) .out_of_memory else .session_load_failed;
             },
@@ -4656,6 +4859,12 @@ pub const Presentation = struct {
                 if (replacement.cause == .reconciliation) if (self.durable_comment_edit) |durable| {
                     if (OwnedReviewIdentity.eql(durable.key, replacement.key)) {
                         self.durable_comment_edit = null;
+                        durable.destroy();
+                    }
+                };
+                if (replacement.cause == .reconciliation) if (self.durable_comment_delete) |durable| {
+                    if (OwnedReviewIdentity.eql(durable.key, replacement.key)) {
+                        self.durable_comment_delete = null;
                         durable.destroy();
                     }
                 };
@@ -4914,6 +5123,17 @@ fn findPublishedComment(published: *const Published, id: bbr.review.CommentId) ?
         for (thread.replies) |reply| if (reply.id == id) return reply;
     }
     return null;
+}
+
+fn publishedReplyCount(published: *const Published, id: bbr.review.CommentId) usize {
+    var count: usize = 0;
+    for (published.session.threads) |thread| {
+        if (thread.root.id == id) return thread.replies.len;
+        for (thread.replies) |reply| {
+            if (reply.parent_id == id) count += 1;
+        }
+    }
+    return count;
 }
 
 fn lineAtRow(row: buffer_mod.Row) ?*const bbr.diff.Line {
@@ -6502,6 +6722,168 @@ fn testCommentSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session
     return s;
 }
 
+fn testCommentThreadSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
+    const s = try testSession(backing, id, 'a');
+    errdefer s.destroy();
+    const a = s.arena.allocator();
+    const comments = try a.alloc(bbr.review.Comment, 2);
+    comments[0] = .{
+        .id = 99,
+        .author = "Author",
+        .author_uuid = "{me}",
+        .body = "published",
+        .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1 } },
+    };
+    comments[1] = .{
+        .id = 100,
+        .parent_id = 99,
+        .author = "Author",
+        .author_uuid = "{me}",
+        .body = "reply",
+    };
+    s.threads = try bbr.review.buildThreads(a, comments);
+    s.authenticated_account_uuid = "{me}";
+    return s;
+}
+
+test "author-owned root deletion confirms tombstone consequence and reconciles without local cascade" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testCommentThreadSession(testing.allocator, 1) },
+        .viewport_rows = 12,
+    });
+    defer presentation.deinit();
+
+    try cursorToCommentCard(&presentation, 99);
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    const confirmation = presentation.projection().delete_confirmation.?;
+    try testing.expectEqual(@as(?bbr.review.CommentId, 99), confirmation.comment_id);
+    try testing.expectEqual(@as(usize, 1), confirmation.descendant_count);
+    try presentation.dispatch(.{ .delete_confirmation = .confirm });
+
+    var command = presentation.takeCommand().?;
+    try testing.expect(command == .delete_comment);
+    try testing.expectEqual(@as(bbr.review.CommentId, 99), command.delete_comment.comment_id);
+    try testing.expect(findPublishedComment(presentation.published.?, 99) != null);
+    try testing.expect(findPublishedComment(presentation.published.?, 100) != null);
+    try presentation.dispatch(.{ .comment_delete_completed = .{
+        .command_id = command.delete_comment.command_id,
+        .identity = command.delete_comment.identity,
+        .comment_id = 99,
+        .outcome = .deleted,
+    } });
+    command.delete_comment.destroy();
+    command = undefined;
+    try testing.expect(presentation.takeCommand().?.load_session.cause == .reconciliation);
+}
+
+test "Reply deletion confirms only the named Comment and definitive failure restores confirmation" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testCommentThreadSession(testing.allocator, 1) },
+        .viewport_rows = 12,
+    });
+    defer presentation.deinit();
+
+    try cursorToCommentCard(&presentation, 100);
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try testing.expectEqual(@as(?bbr.review.CommentId, 100), presentation.projection().delete_confirmation.?.comment_id);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().delete_confirmation.?.descendant_count);
+    try presentation.dispatch(.{ .delete_confirmation = .confirm });
+    var command = presentation.takeCommand().?;
+    try presentation.dispatch(.{ .comment_delete_completed = .{
+        .command_id = command.delete_comment.command_id,
+        .identity = command.delete_comment.identity,
+        .comment_id = 100,
+        .outcome = .{ .definitive_failure = error.Forbidden },
+    } });
+    command.delete_comment.destroy();
+    command = undefined;
+    try testing.expectEqual(ActionError.comment_delete_failed, presentation.projection().action_error.?);
+    try testing.expectEqual(@as(?bbr.review.CommentId, 100), presentation.projection().delete_confirmation.?.comment_id);
+}
+
+test "delete not-found and unknown outcomes reconcile and failed reload gates the stale Session" {
+    inline for (.{ CommentDeleteOutcome.not_found, CommentDeleteOutcome.outcome_unknown }) |outcome| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = key, .session = try testCommentSession(testing.allocator, 1) },
+            .viewport_rows = 12,
+        });
+        defer presentation.deinit();
+        try cursorToCommentCard(&presentation, 99);
+        try presentation.dispatch(.{ .action = .delete_review_item });
+        try presentation.dispatch(.{ .delete_confirmation = .confirm });
+        var command = presentation.takeCommand().?;
+        try presentation.dispatch(.{ .comment_delete_completed = .{
+            .command_id = command.delete_comment.command_id,
+            .identity = command.delete_comment.identity,
+            .comment_id = 99,
+            .outcome = outcome,
+        } });
+        command.delete_comment.destroy();
+        command = undefined;
+        const reconcile = presentation.takeCommand().?.load_session;
+        try presentation.dispatch(.{ .session_loaded = .{
+            .command_id = reconcile.command_id,
+            .intent = reconcile.intent,
+            .outcome = .{ .failed = error.NetworkFailure },
+        } });
+        try testing.expectEqual(.reload_required, presentation.projection().comment_delete_result.?.outcome);
+        try testing.expectEqual(MutationRefusal.authoritative_reload_required, presentation.projection().action_availability.delete_refusal.?);
+    }
+}
+
+test "published deletion owns the global lane and survives Session replacement" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const first_key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    const second_key = try OwnedReviewIdentity.init("workspace", "repo", 2);
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = first_key, .session = try testCommentSession(testing.allocator, 1) },
+        .viewport_rows = 12,
+    });
+    defer presentation.deinit();
+    try cursorToCommentCard(&presentation, 99);
+    try presentation.dispatch(.{ .action = .delete_review_item });
+    try presentation.dispatch(.{ .delete_confirmation = .confirm });
+    var deletion = presentation.takeCommand().?;
+
+    try presentation.dispatch(.{ .action = .submit });
+    try testing.expectEqual(ActionError.remote_write_busy, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .choose_pull_request = second_key });
+    const load = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+    } });
+    try presentation.dispatch(.{ .comment_delete_completed = .{
+        .command_id = deletion.delete_comment.command_id,
+        .identity = deletion.delete_comment.identity,
+        .comment_id = 99,
+        .outcome = .deleted,
+    } });
+    deletion.delete_comment.destroy();
+    deletion = undefined;
+
+    const result = presentation.projection().comment_delete_result.?;
+    try testing.expect(OwnedReviewIdentity.eql(first_key, result.key));
+    try testing.expectEqual(.deleted, result.outcome);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
 test "author-owned published Comment edit queues exact body and reconciles authoritatively" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -7471,10 +7853,11 @@ test "delete stays discoverable but names why each ineligible item refuses it" {
     try testing.expectEqual(ActionError.draft_already_published, presentation.projection().action_error.?);
     presentation.published.?.review.setState(3, .draft);
 
-    // A published Bitbucket Comment is Bitbucket's to remove, not this Action's.
+    // An author-owned published Comment gets a remote-effect confirmation.
     try cursorToCommentCard(&presentation, 99);
     try presentation.dispatch(.{ .action = .delete_review_item });
-    try testing.expectEqual(ActionError.published_comment_edit_unsupported, presentation.projection().action_error.?);
+    try testing.expectEqual(@as(?bbr.review.CommentId, 99), presentation.projection().delete_confirmation.?.comment_id);
+    try presentation.dispatch(.{ .delete_confirmation = .cancel });
 
     var ids: [8]bbr.review.TempId = undefined;
     try testing.expectEqualSlices(bbr.review.TempId, &.{ 1, 2, 3 }, draftTempIds(&presentation, &ids));

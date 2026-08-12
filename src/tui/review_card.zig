@@ -27,7 +27,7 @@ pub const Source = union(enum) {
     }
 };
 
-pub const CardRole = enum { comment, comment_reply, draft, draft_reply, outcome_unknown, outcome_unknown_reply };
+pub const CardRole = enum { comment, comment_reply, deleted_comment, deleted_reply, draft, draft_reply, outcome_unknown, outcome_unknown_reply };
 pub const Part = enum { header, body, suggestion_label, suggestion_body, disclosure_footer };
 
 pub const Segment = struct {
@@ -67,7 +67,7 @@ pub const ReviewCardRow = struct {
 
     pub fn isReply(self: ReviewCardRow) bool {
         return switch (self.role) {
-            .comment_reply, .draft_reply, .outcome_unknown_reply => true,
+            .comment_reply, .deleted_reply, .draft_reply, .outcome_unknown_reply => true,
             else => false,
         };
     }
