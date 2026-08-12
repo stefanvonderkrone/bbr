@@ -170,6 +170,7 @@ pub const Dependencies = struct {
     comments_collapsed_rows: usize = 6,
     mouse_enabled: bool = true,
     mouse_vertical_scroll_rows: usize = 3,
+    external_edit_max_bytes: usize = 1024 * 1024,
     require_source_check: bool = false,
     keymap: keymap_mod.Keymap = .default,
     remote_enabled: bool = true,
@@ -222,6 +223,7 @@ pub const OwnedInput = union(enum) {
     pull_requests_loaded: PullRequestsLoaded,
     picker_tick: WorkId,
     clipboard_completed: ClipboardCompleted,
+    external_edit_completed: *ExternalEditCompleted,
     dismiss_submission_result,
     request_shutdown,
 
@@ -235,6 +237,7 @@ pub const OwnedInput = union(enum) {
                 result.deinit();
             },
             .pull_requests_loaded => |loaded| if (loaded.outcome == .loaded) loaded.outcome.loaded.destroy(),
+            .external_edit_completed => |completed| completed.destroy(),
             else => {},
         }
         self.* = undefined;
@@ -425,6 +428,7 @@ pub const ComposerInput = union(enum) {
     delete_to_line_start,
     cancel,
     save,
+    external_edit,
 };
 
 pub const UnknownResolutionInput = union(enum) {
@@ -575,11 +579,13 @@ pub const OwnedCommand = union(enum) {
     find_duplicate: *PostDraft,
     list_pull_requests: ListPullRequests,
     copy_clipboard: *ClipboardCopy,
+    external_edit: *ExternalEdit,
 
     pub fn deinit(self: *OwnedCommand) void {
         switch (self.*) {
             .post_draft, .find_duplicate => |command| command.destroy(),
             .copy_clipboard => |command| command.destroy(),
+            .external_edit => |command| command.destroy(),
             .load_session, .enrich_file, .wait_submission, .check_recovery, .list_pull_requests => {},
         }
         self.* = undefined;
@@ -606,6 +612,7 @@ fn setCommandId(command: *OwnedCommand, command_id: CommandId) void {
         .check_recovery => |*value| value.command_id = command_id,
         .list_pull_requests => |*value| value.command_id = command_id,
         .copy_clipboard => |value| value.command_id = command_id,
+        .external_edit => |value| value.command_id = command_id,
     }
 }
 
@@ -624,6 +631,72 @@ pub const ClipboardCopy = struct {
 pub const ClipboardCompleted = struct {
     command_id: CommandId,
     success: bool,
+};
+
+pub const ExternalEdit = struct {
+    allocator: Allocator,
+    command_id: CommandId = 0,
+    session_epoch: SessionEpoch,
+    max_bytes: usize,
+    body: []u8,
+
+    fn create(allocator: Allocator, session_epoch: SessionEpoch, max_bytes: usize, body: []const u8) !*ExternalEdit {
+        const command = try allocator.create(ExternalEdit);
+        errdefer allocator.destroy(command);
+        command.* = .{
+            .allocator = allocator,
+            .session_epoch = session_epoch,
+            .max_bytes = max_bytes,
+            .body = try allocator.dupe(u8, body),
+        };
+        return command;
+    }
+
+    pub fn destroy(self: *ExternalEdit) void {
+        const allocator = self.allocator;
+        allocator.free(self.body);
+        allocator.destroy(self);
+    }
+};
+
+pub const ExternalEditOutcome = union(enum) {
+    changed: []const u8,
+    unchanged,
+    cancelled,
+    missing_editor,
+    invalid_editor,
+    too_large,
+    invalid_utf8,
+    contains_nul,
+    failed,
+    cleanup_failed: struct { body: []const u8, path: []const u8 },
+    restoration_failed: []const u8,
+};
+
+pub const ExternalEditCompleted = struct {
+    allocator: Allocator,
+    arena: std.heap.ArenaAllocator,
+    command_id: CommandId,
+    session_epoch: SessionEpoch,
+    outcome: ExternalEditOutcome,
+
+    pub fn create(allocator: Allocator, command_id: CommandId, session_epoch: SessionEpoch) !*ExternalEditCompleted {
+        const completed = try allocator.create(ExternalEditCompleted);
+        completed.* = .{
+            .allocator = allocator,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .command_id = command_id,
+            .session_epoch = session_epoch,
+            .outcome = .failed,
+        };
+        return completed;
+    }
+
+    pub fn destroy(self: *ExternalEditCompleted) void {
+        const allocator = self.allocator;
+        self.arena.deinit();
+        allocator.destroy(self);
+    }
 };
 
 pub const ReviewProjection = struct {
@@ -755,6 +828,8 @@ pub const FatalError = enum {
 pub const ComposerProjection = struct {
     label: []const u8,
     body: []const u8,
+    footer: ?[]const u8 = null,
+    pending_external_edit: bool = false,
 };
 
 pub const UnknownResolutionProjection = struct {
@@ -1868,6 +1943,8 @@ pub const Presentation = struct {
     action_error: ?ActionError = null,
     fatal_error: ?FatalError = null,
     clipboard_status: ?ClipboardStatus = null,
+    external_edit_pending: ?SessionEpoch = null,
+    composer_footer: std.ArrayList(u8) = .empty,
     interaction_revision: frame_mod.Revision = 1,
     mouse_press: ?MousePress = null,
 
@@ -1922,6 +1999,7 @@ pub const Presentation = struct {
         self.issued_commands.deinit(self.allocator);
         self.issued_enrichments.deinit(self.allocator);
         self.recovery_participants.deinit(self.allocator);
+        self.composer_footer.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -1965,6 +2043,7 @@ pub const Presentation = struct {
                 self.clipboard_status = if (completed.success) .copied else .failed;
                 self.action_error = null;
             },
+            .external_edit_completed => |completed| self.acceptExternalEdit(completed),
             .dismiss_submission_result => self.submission_result = null,
             .request_shutdown => self.requestShutdown(),
         }
@@ -2008,6 +2087,7 @@ pub const Presentation = struct {
             },
             .list_pull_requests => self.outstanding_picker_loads += 1,
             .copy_clipboard => {},
+            .external_edit => {},
         }
         return command;
     }
@@ -2064,6 +2144,8 @@ pub const Presentation = struct {
             .composer = if (self.published) |published| if (published.composer) |*composer| .{
                 .label = composer.request.label,
                 .body = composer.body(),
+                .footer = if (self.composer_footer.items.len > 0) self.composer_footer.items else null,
+                .pending_external_edit = self.external_edit_pending != null,
             } else null else null,
             .replacing = self.replacement != null,
             .replacement_error = self.replacement_error,
@@ -2791,6 +2873,9 @@ pub const Presentation = struct {
             return;
         }
         if (self.published) |published| if (published.composer != null) {
+            if (self.external_edit_pending != null) return;
+            if (self.resolver.feed(self.dependencies.keymap, .composer, key) == .action)
+                return self.applyComposerInput(.external_edit);
             if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.applyComposerInput(.cancel);
             if (key.matches('d', .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) return self.applyComposerInput(.save);
             if (key.matches(keymap_mod.special.enter, .{})) return self.applyComposerInput(.newline);
@@ -2986,6 +3071,7 @@ pub const Presentation = struct {
             .file_comment => self.openFileComposer(published),
             .reply => self.openReplyComposer(published),
             .edit_review_item => self.openEditComposer(published),
+            .external_edit => self.applyComposerInput(.external_edit),
             .reanchor_review_item => self.armReanchor(published),
             .delete_review_item => self.openDeleteConfirmation(published),
             .inline_comment => self.openInlineComposer(published, .comment),
@@ -3707,6 +3793,7 @@ pub const Presentation = struct {
         if (self.shutdown_requested or self.replacement != null) return;
         const published = self.published orelse return;
         const composer = if (published.composer) |*value| value else return;
+        if (self.external_edit_pending != null) return;
         switch (composer_input) {
             .insert => |chunk| {
                 composer.insert(chunk.slice()) catch {
@@ -3738,9 +3825,73 @@ pub const Presentation = struct {
                 composer.deinit();
                 published.composer = null;
                 self.action_error = null;
+                self.composer_footer.clearRetainingCapacity();
             },
             .save => self.saveComposer(published),
+            .external_edit => {
+                const command = ExternalEdit.create(
+                    self.allocator,
+                    published.epoch,
+                    self.dependencies.external_edit_max_bytes,
+                    composer.body(),
+                ) catch {
+                    self.setComposerFooter("External Edit could not allocate the body snapshot");
+                    return;
+                };
+                self.commands.append(self.allocator, .{ .external_edit = command }) catch {
+                    command.destroy();
+                    self.setComposerFooter("External Edit could not be started");
+                    return;
+                };
+                self.external_edit_pending = published.epoch;
+                self.composer_footer.clearRetainingCapacity();
+                self.action_error = null;
+            },
         }
+    }
+
+    fn acceptExternalEdit(self: *Presentation, completed: *ExternalEditCompleted) void {
+        defer completed.destroy();
+        if (!self.consumeCommand(completed.command_id, .external_edit)) return;
+        const expected_epoch = self.external_edit_pending orelse return;
+        self.external_edit_pending = null;
+        const published = self.published orelse return;
+        const composer = if (published.composer) |*value| value else return;
+        if (expected_epoch != completed.session_epoch or published.epoch != completed.session_epoch) return;
+        switch (completed.outcome) {
+            .changed => |body| composer.seed(body) catch {
+                self.setComposerFooter("External Edit returned content, but reseeding ran out of memory");
+                return;
+            },
+            .cleanup_failed => |retained| {
+                composer.seed(retained.body) catch {
+                    self.setComposerFooter("External Edit returned content, but reseeding ran out of memory");
+                    return;
+                };
+                self.setComposerFooterFmt("External Edit accepted; temporary file retained at {s}", .{retained.path});
+                return;
+            },
+            .unchanged => return self.setComposerFooter("External Edit made no changes"),
+            .cancelled => return self.setComposerFooter("External Edit was cancelled"),
+            .missing_editor => return self.setComposerFooter("External Edit needs GIT_EDITOR, VISUAL, or EDITOR"),
+            .invalid_editor => return self.setComposerFooter("External Edit refuses /bin/sh as the configured editor"),
+            .too_large => return self.setComposerFooter("External Edit returned a file above external_edit.max_bytes"),
+            .invalid_utf8 => return self.setComposerFooter("External Edit returned invalid UTF-8"),
+            .contains_nul => return self.setComposerFooter("External Edit returned a NUL byte"),
+            .failed => return self.setComposerFooter("External Edit failed"),
+            .restoration_failed => |path| return self.setComposerFooterFmt("Terminal restoration failed; temporary file retained at {s}", .{path}),
+        }
+        self.setComposerFooter("External Edit accepted");
+    }
+
+    fn setComposerFooter(self: *Presentation, text: []const u8) void {
+        self.composer_footer.clearRetainingCapacity();
+        self.composer_footer.appendSlice(self.allocator, text) catch {};
+    }
+
+    fn setComposerFooterFmt(self: *Presentation, comptime fmt: []const u8, args: anytype) void {
+        self.composer_footer.clearRetainingCapacity();
+        self.composer_footer.print(self.allocator, fmt, args) catch {};
     }
 
     fn ensureFocusedEnrichment(self: *Presentation) !void {
@@ -4712,6 +4863,43 @@ test "local inline authoring persists a local target and authored context" {
     try testing.expectEqualStrings("old\nnew", drafts[0].snapshot.?.text);
     try testing.expectEqual(@as(u32, 1), drafts[0].snapshot.?.selection_start);
     try testing.expectEqual(@as(u32, 1), drafts[0].snapshot.?.selection_len);
+}
+
+test "External Edit snapshots exactly once blocks input and accepts only matching completion" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testLocalSession(testing.allocator) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .review_comment });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("exact\nbody") } });
+    try presentation.dispatch(.{ .composer = .external_edit });
+    var command = presentation.takeCommand().?;
+    try testing.expect(command == .external_edit);
+    try testing.expectEqualStrings("exact\nbody", command.external_edit.body);
+    try testing.expect(presentation.projection().composer.?.pending_external_edit);
+
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("ignored") } });
+    try testing.expectEqualStrings("exact\nbody", presentation.projection().composer.?.body);
+
+    const stale = try ExternalEditCompleted.create(testing.allocator, command.external_edit.command_id + 1, command.external_edit.session_epoch);
+    stale.outcome = .{ .changed = try stale.arena.allocator().dupe(u8, "stale") };
+    try presentation.dispatch(.{ .external_edit_completed = stale });
+    try testing.expectEqualStrings("exact\nbody", presentation.projection().composer.?.body);
+    try testing.expect(presentation.projection().composer.?.pending_external_edit);
+
+    const accepted = try ExternalEditCompleted.create(testing.allocator, command.external_edit.command_id, command.external_edit.session_epoch);
+    accepted.outcome = .{ .changed = try accepted.arena.allocator().dupe(u8, "changed") };
+    command.external_edit.destroy();
+    command = undefined;
+    try presentation.dispatch(.{ .external_edit_completed = accepted });
+    try testing.expectEqualStrings("changed", presentation.projection().composer.?.body);
+    try testing.expect(!presentation.projection().composer.?.pending_external_edit);
+    try testing.expectEqualStrings("External Edit accepted", presentation.projection().composer.?.footer.?);
 }
 
 test "resize publishes one complete Presentation Frame revision" {

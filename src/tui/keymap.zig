@@ -182,6 +182,7 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one('['), .action = .prev_file, .help = "previous file" },
     .{ .chord = Chord.one('r'), .action = .reply, .help = "reply" },
     .{ .chord = Chord.one('e'), .action = .edit_review_item, .help = "edit local Draft" },
+    .{ .chord = Chord.modified('e', .{ .ctrl = true }), .action = .external_edit, .help = "External Edit" },
     .{ .chord = Chord.one('a'), .action = .reanchor_review_item, .help = "re-anchor local root Draft" },
     .{ .chord = Chord.one('D'), .action = .delete_review_item, .help = "delete local Draft subtree" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_disclosure, .help = "toggle disclosure" },
@@ -360,7 +361,8 @@ fn validateBindings(bindings: []const Binding) !void {
 
 pub fn supportsContext(action: Action, context: InteractionContext) bool {
     return switch (context) {
-        .composer, .help, .unknown_resolution, .delete_confirmation => false,
+        .composer => action == .external_edit,
+        .help, .unknown_resolution, .delete_confirmation => false,
         .file_finder, .pull_request_picker => switch (action) {
             .up, .down, .confirm_picker, .quit => true,
             else => false,
@@ -690,6 +692,13 @@ test "Enter resolves to the precise Action for mutually exclusive targets" {
     try testing.expectEqual(Action.focus_file, resolver.feed(.default, .sidebar_file, plain(vaxis.Key.enter)).action);
     try testing.expectEqual(Action.confirm_picker, resolver.feed(.default, .file_finder, plain(vaxis.Key.enter)).action);
     try testing.expect(resolver.feed(.default, .composer, plain(vaxis.Key.enter)) == .none);
+}
+
+test "ctrl-e resolves to External Edit only in Composer context" {
+    var resolver = Resolver{};
+    const key: KeyStroke = .{ .codepoint = 'e', .mods = .{ .ctrl = true } };
+    try testing.expectEqual(Action.external_edit, resolver.feed(.default, .composer, key).action);
+    try testing.expectEqual(Action.scroll_row_down, resolver.feed(.default, .diff, key).action);
 }
 
 test "the default bindings are themselves unambiguous and prefix-free" {

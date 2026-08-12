@@ -77,8 +77,11 @@ pub const Composer = struct {
     /// source lines a suggestion proposes to rewrite (M10b). The planned
     /// `$EDITOR` handoff will write its result back through this same seam.
     pub fn seed(self: *Composer, text: []const u8) !void {
-        self.body_buf.clearRetainingCapacity();
-        try self.body_buf.appendSlice(self.allocator, text);
+        var replacement: std.ArrayList(u8) = .empty;
+        errdefer replacement.deinit(self.allocator);
+        try replacement.appendSlice(self.allocator, text);
+        self.body_buf.deinit(self.allocator);
+        self.body_buf = replacement;
     }
 
     /// Insert a newline (Enter inside the composer edits, it does not submit).
@@ -163,6 +166,21 @@ test "seed prefills the body and can then be edited from the end" {
     // The prefill is editable at the tail (append-only composer).
     try comp.insert(" more");
     try testing.expectEqualStrings("just one line more", comp.body());
+}
+
+test "seed preserves the old body when replacement allocation fails" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var comp = Composer.init(failing.allocator(), .{ .kind = .comment, .label = "x" });
+    comp.body_buf = .empty;
+    try comp.body_buf.appendSlice(testing.allocator, "old body");
+    comp.allocator = failing.allocator();
+    defer {
+        comp.allocator = testing.allocator;
+        comp.deinit();
+    }
+
+    try testing.expectError(error.OutOfMemory, comp.seed("replacement that needs storage"));
+    try testing.expectEqualStrings("old body", comp.body());
 }
 
 test "blank detection ignores whitespace-only bodies" {

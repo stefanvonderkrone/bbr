@@ -29,6 +29,7 @@ pub const Action = enum {
     suggest,
     reply,
     edit_review_item,
+    external_edit,
     reanchor_review_item,
     delete_review_item,
     submit,

@@ -43,6 +43,7 @@ pub const RunCtx = struct {
     comments_collapsed_rows: usize,
     mouse_enabled: bool = true,
     mouse_vertical_scroll_rows: usize = 3,
+    external_edit_max_bytes: usize = 1024 * 1024,
     submission_locks: ?bbr.review.SubmissionLocks = null,
     online: bool = true,
 };
@@ -104,6 +105,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         .comments_collapsed_rows = ctx.comments_collapsed_rows,
         .mouse_enabled = ctx.mouse_enabled,
         .mouse_vertical_scroll_rows = ctx.mouse_vertical_scroll_rows,
+        .external_edit_max_bytes = ctx.external_edit_max_bytes,
         .require_source_check = ctx.online,
         .keymap = ctx.keymap,
         .remote_enabled = ctx.online,
@@ -120,7 +122,8 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
 
     var write_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(ctx.io, &write_buf);
-    defer tty.deinit();
+    var tty_active = true;
+    defer if (tty_active) tty.deinit();
     const writer = tty.writer();
     var vx = try vaxis.init(ctx.io, ctx.gpa, ctx.env_map, .{});
     defer vx.deinit(ctx.gpa, writer);
@@ -142,7 +145,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
     var frame_arena = std.heap.ArenaAllocator.init(ctx.gpa);
     defer frame_arena.deinit();
 
-    try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, vx, writer);
+    try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, &vx, &tty, &tty_active, &write_buf);
     try syncPickerTick(&state, ctx, &loop, &futures, &next_work_id, &picker_tick_work);
     while (true) {
         const event = try loop.nextEvent();
@@ -165,10 +168,10 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             },
         }
 
-        try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, vx, writer);
+        try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, &vx, &tty, &tty_active, &write_buf);
         if (state.projection().review != null) {
             try state.dispatch(.ensure_focused_enrichment);
-            try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, vx, writer);
+            try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, &vx, &tty, &tty_active, &write_buf);
         }
         try syncPickerTick(&state, ctx, &loop, &futures, &next_work_id, &picker_tick_work);
         // A completed worker may still own a payload queued for Presentation.
@@ -705,15 +708,40 @@ fn drainPresentationCommands(
     loop: *Loop,
     futures: *std.ArrayList(PresentationWork),
     next_work_id: *u64,
-    vx: vaxis.Vaxis,
-    writer: *std.Io.Writer,
+    vx: *vaxis.Vaxis,
+    tty: *vaxis.Tty,
+    tty_active: *bool,
+    write_buf: []u8,
 ) !void {
     while (state.takeCommand()) |command_value| {
         var command = command_value;
         if (command == .copy_clipboard) {
-            const input = presentation_adapter.copyToClipboard(vx, writer, command.copy_clipboard);
+            const input = presentation_adapter.copyToClipboard(vx.*, tty.writer(), command.copy_clipboard);
             command = undefined;
             try state.dispatch(input);
+            continue;
+        }
+        if (command == .external_edit) {
+            var handoff_context: TerminalHandoffContext = .{
+                .ctx = ctx,
+                .loop = loop,
+                .tty = tty,
+                .tty_active = tty_active,
+                .vx = vx,
+                .write_buf = write_buf,
+            };
+            const completed = presentation_adapter.externalEdit(ctx.io, ctx.env_map, handoff_context.handoff(), command.external_edit) catch {
+                command = undefined;
+                return error.OutOfMemory;
+            };
+            command = undefined;
+            const restoration_failed = completed.outcome == .restoration_failed;
+            const retained_path = if (restoration_failed) completed.outcome.restoration_failed else null;
+            if (retained_path) |path| {
+                std.debug.print("bbr: terminal restoration failed; External Edit file retained at {s}\n", .{path});
+                std.process.exit(1);
+            }
+            try state.dispatch(.{ .external_edit_completed = completed });
             continue;
         }
         futures.ensureUnusedCapacity(ctx.gpa, 1) catch {
@@ -731,6 +759,7 @@ fn drainPresentationCommands(
             .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, check }),
             .list_pull_requests => |list| ctx.io.concurrent(presentationListPullRequestsWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, list }),
             .copy_clipboard => unreachable,
+            .external_edit => unreachable,
         } catch {
             try admitPresentationLaunchFailure(state, &command);
             continue;
@@ -770,10 +799,49 @@ fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *p
             copy.destroy();
             break :blk .{ .clipboard_completed = .{ .command_id = copy.command_id, .success = false } };
         },
+        .external_edit => |edit| blk: {
+            const completed = try presentation.ExternalEditCompleted.create(edit.allocator, edit.command_id, edit.session_epoch);
+            completed.outcome = .failed;
+            edit.destroy();
+            break :blk .{ .external_edit_completed = completed };
+        },
     };
     command.* = undefined;
     try state.dispatch(input);
 }
+
+const TerminalHandoffContext = struct {
+    ctx: RunCtx,
+    loop: *Loop,
+    tty: *vaxis.Tty,
+    tty_active: *bool,
+    vx: *vaxis.Vaxis,
+    write_buf: []u8,
+
+    fn handoff(self: *TerminalHandoffContext) presentation_adapter.TerminalHandoff {
+        return .{ .ptr = self, .suspend_fn = suspendTerminal, .restore_fn = restoreTerminal };
+    }
+
+    fn suspendTerminal(ptr: *anyopaque) !void {
+        const self: *TerminalHandoffContext = @ptrCast(@alignCast(ptr));
+        self.loop.stop();
+        if (self.ctx.mouse_enabled) try self.vx.setMouseMode(self.tty.writer(), false);
+        try self.vx.exitAltScreen(self.tty.writer());
+        self.tty.deinit();
+        self.tty_active.* = false;
+    }
+
+    fn restoreTerminal(ptr: *anyopaque) !void {
+        const self: *TerminalHandoffContext = @ptrCast(@alignCast(ptr));
+        self.tty.* = try vaxis.Tty.init(self.ctx.io, self.write_buf);
+        self.tty_active.* = true;
+        const winsize = try self.tty.getWinsize();
+        try self.vx.resize(self.ctx.gpa, self.tty.writer(), winsize);
+        try self.vx.enterAltScreen(self.tty.writer());
+        if (self.ctx.mouse_enabled) try self.vx.setMouseMode(self.tty.writer(), true);
+        try self.loop.start();
+    }
+};
 
 fn reapPresentationWork(work: *std.ArrayList(PresentationWork), io: std.Io, id: u64) void {
     for (work.items, 0..) |item, index| {
@@ -877,6 +945,7 @@ test {
     _ = @import("arena_ring.zig");
     _ = @import("composer.zig");
     _ = @import("file_enrichment.zig");
+    _ = @import("presentation_adapter.zig");
 }
 
 test "content viewport reserves the bottom status row" {

@@ -104,6 +104,9 @@ max_bytes = 268435456
 [input.mouse]
 enabled = true
 vertical_scroll_rows = 3
+
+[external_edit]
+max_bytes = 1048576
 ```
 
 `system` is the default Theme and uses the terminal foreground, background, and ANSI palette.
@@ -129,6 +132,11 @@ open PullRequests, accepts input while loading, shows a small spinner, and repla
 only after Enter confirms a result; Escape dismisses either Overlay. Unavailable Actions remain
 visible but subdued in help and explain why they cannot run—for example, remote-only Actions in a
 local review or source-only Actions away from a source row.
+
+Inside any Composer, `Ctrl-E` hands the exact current body to the first non-empty `GIT_EDITOR`,
+`VISUAL`, or `EDITOR`. External Edit returns to the same open Composer without saving or publishing.
+`[external_edit].max_bytes` is the local limit for the file returned by that program; it defaults
+to 1 MiB and must be greater than zero.
 
 Enter also opens and closes the disclosure at the cursor: resolved Threads, context Folds,
 Outdated sections, and over-limit ReviewCards retain independent disclosure state within the

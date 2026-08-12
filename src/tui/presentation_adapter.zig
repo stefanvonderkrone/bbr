@@ -9,6 +9,165 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const presentation = @import("presentation.zig");
 
+pub const TerminalHandoff = struct {
+    ptr: *anyopaque,
+    suspend_fn: *const fn (*anyopaque) anyerror!void,
+    restore_fn: *const fn (*anyopaque) anyerror!void,
+
+    pub fn leaveTui(self: TerminalHandoff) !void {
+        return self.suspend_fn(self.ptr);
+    }
+
+    pub fn resumeTui(self: TerminalHandoff) !void {
+        return self.restore_fn(self.ptr);
+    }
+};
+
+pub fn resolveEditor(env: *const std.process.Environ.Map) ?[]const u8 {
+    inline for (.{ "GIT_EDITOR", "VISUAL", "EDITOR" }) |name| {
+        if (env.get(name)) |value| if (std.mem.trim(u8, value, " \t\r\n").len > 0) return value;
+    }
+    return null;
+}
+
+fn editorArgv(editor: []const u8, path: []const u8) [6][]const u8 {
+    return .{
+        "/bin/sh",
+        "-c",
+        "editor=$1; path=$2; eval \"set -- $editor\"; exec \"$@\" \"$path\"",
+        "bbr-external-edit",
+        editor,
+        path,
+    };
+}
+
+/// Consumes `command`. Terminal restoration errors are reported distinctly so
+/// the caller can leave the retained Markdown path visible before exiting.
+pub fn externalEdit(
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    handoff: TerminalHandoff,
+    command: *presentation.ExternalEdit,
+) !*presentation.ExternalEditCompleted {
+    defer command.destroy();
+    const completed = try presentation.ExternalEditCompleted.create(command.allocator, command.command_id, command.session_epoch);
+    const a = completed.arena.allocator();
+    const editor = resolveEditor(env) orelse {
+        completed.outcome = .missing_editor;
+        return completed;
+    };
+    if (std.mem.eql(u8, std.mem.trim(u8, editor, " \t\r\n"), "/bin/sh")) {
+        completed.outcome = .invalid_editor;
+        return completed;
+    }
+
+    const temp_base = env.get("TMPDIR") orelse "/tmp";
+    var random_bytes: [8]u8 = undefined;
+    io.randomSecure(&random_bytes) catch {
+        completed.outcome = .failed;
+        return completed;
+    };
+    const nonce = std.mem.readInt(u64, &random_bytes, .native);
+    const dir_path = std.fmt.allocPrint(a, "{s}/bbr-external-edit-{x}", .{ temp_base, nonce }) catch {
+        completed.outcome = .failed;
+        return completed;
+    };
+    const file_path = std.fmt.allocPrint(a, "{s}/body.md", .{dir_path}) catch {
+        completed.outcome = .failed;
+        return completed;
+    };
+    std.Io.Dir.cwd().createDir(io, dir_path, @enumFromInt(0o700)) catch {
+        completed.outcome = .failed;
+        return completed;
+    };
+    var retain = true;
+    defer if (!retain) std.Io.Dir.cwd().deleteTree(io, dir_path) catch {};
+    var file = std.Io.Dir.cwd().createFile(io, file_path, .{
+        .exclusive = true,
+        .permissions = @enumFromInt(0o600),
+    }) catch {
+        completed.outcome = .failed;
+        retain = false;
+        return completed;
+    };
+    file.writeStreamingAll(io, command.body) catch {
+        file.close(io);
+        completed.outcome = .failed;
+        retain = false;
+        return completed;
+    };
+    file.close(io);
+
+    handoff.leaveTui() catch {
+        completed.outcome = .{ .restoration_failed = file_path };
+        return completed;
+    };
+    const argv = editorArgv(editor, file_path);
+    var child = std.process.spawn(io, .{ .argv = &argv, .cwd = .inherit }) catch {
+        if (handoff.resumeTui()) |_| {
+            completed.outcome = .failed;
+            retain = false;
+        } else |_| completed.outcome = .{ .restoration_failed = file_path };
+        return completed;
+    };
+    const term = child.wait(io) catch {
+        if (handoff.resumeTui()) |_| {
+            completed.outcome = .failed;
+            retain = false;
+        } else |_| completed.outcome = .{ .restoration_failed = file_path };
+        return completed;
+    };
+    if (handoff.resumeTui()) |_| {} else |_| {
+        completed.outcome = .{ .restoration_failed = file_path };
+        return completed;
+    }
+    switch (term) {
+        .exited => |code| if (code != 0) {
+            completed.outcome = .cancelled;
+            retain = false;
+            return completed;
+        },
+        else => {
+            completed.outcome = .failed;
+            retain = false;
+            return completed;
+        },
+    }
+    const read_limit = if (command.max_bytes == std.math.maxInt(usize)) command.max_bytes else command.max_bytes + 1;
+    const returned = std.Io.Dir.cwd().readFileAlloc(io, file_path, a, .limited(read_limit)) catch |err| {
+        completed.outcome = if (err == error.StreamTooLong) .too_large else .failed;
+        retain = false;
+        return completed;
+    };
+    if (returned.len > command.max_bytes) {
+        completed.outcome = .too_large;
+        retain = false;
+        return completed;
+    }
+    if (std.mem.indexOfScalar(u8, returned, 0) != null) {
+        completed.outcome = .contains_nul;
+        retain = false;
+        return completed;
+    }
+    if (!std.unicode.utf8ValidateSlice(returned)) {
+        completed.outcome = .invalid_utf8;
+        retain = false;
+        return completed;
+    }
+    if (std.mem.eql(u8, returned, command.body)) {
+        completed.outcome = .unchanged;
+        retain = false;
+        return completed;
+    }
+    std.Io.Dir.cwd().deleteTree(io, dir_path) catch {
+        completed.outcome = .{ .cleanup_failed = .{ .body = returned, .path = file_path } };
+        return completed;
+    };
+    retain = true;
+    completed.outcome = .{ .changed = returned };
+    return completed;
+}
+
 /// Consumes Presentation-owned source bytes at the terminal boundary and
 /// reports whether OSC 52 was written successfully.
 pub fn copyToClipboard(vx: vaxis.Vaxis, tty: *std.Io.Writer, command: *presentation.ClipboardCopy) presentation.OwnedInput {
@@ -55,6 +214,104 @@ pub fn postLaunchFailed(command: *presentation.PostDraft) presentation.OwnedInpu
 
 const testing = std.testing;
 
+test "editor resolution uses first non-empty configured value" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("GIT_EDITOR", "   ");
+    try env.put("VISUAL", "code --wait");
+    try env.put("EDITOR", "vim");
+    try testing.expectEqualStrings("code --wait", resolveEditor(&env).?);
+    try env.put("GIT_EDITOR", "nvim");
+    try testing.expectEqualStrings("nvim", resolveEditor(&env).?);
+}
+
+test "editor shell script keeps the temporary path out of evaluated text" {
+    const argv = editorArgv("vim -f; touch /tmp/not-interpreted-here", "/tmp/a path/body.md");
+    try testing.expectEqualStrings("/bin/sh", argv[0]);
+    try testing.expectEqualStrings("bbr-external-edit", argv[3]);
+    try testing.expectEqualStrings("vim -f; touch /tmp/not-interpreted-here", argv[4]);
+    try testing.expectEqualStrings("/tmp/a path/body.md", argv[5]);
+    try testing.expect(std.mem.indexOf(u8, argv[2], "exec \"$@\" \"$path\"") != null);
+}
+
+const FakeHandoff = struct {
+    left: bool = false,
+    resumed: bool = false,
+    fail_resume: bool = false,
+
+    fn value(self: *FakeHandoff) TerminalHandoff {
+        return .{ .ptr = self, .suspend_fn = leaveTui, .restore_fn = resumeTui };
+    }
+
+    fn leaveTui(ptr: *anyopaque) !void {
+        const self: *FakeHandoff = @ptrCast(@alignCast(ptr));
+        self.left = true;
+    }
+
+    fn resumeTui(ptr: *anyopaque) !void {
+        const self: *FakeHandoff = @ptrCast(@alignCast(ptr));
+        self.resumed = true;
+        if (self.fail_resume) return error.RestoreFailed;
+    }
+};
+
+fn testExternalEditCommand(body: []const u8, max_bytes: usize) !*presentation.ExternalEdit {
+    const command = try testing.allocator.create(presentation.ExternalEdit);
+    command.* = .{
+        .allocator = testing.allocator,
+        .command_id = 17,
+        .session_epoch = 23,
+        .max_bytes = max_bytes,
+        .body = try testing.allocator.dupe(u8, body),
+    };
+    return command;
+}
+
+test "External Edit writes exact bytes and returns validated changed content" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer testing.allocator.free(base);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("TMPDIR", base);
+    try env.put("GIT_EDITOR", "sh -c 'test \"$(cat \"$1\")\" = exact && printf changed > \"$1\"' sh");
+    var handoff: FakeHandoff = .{};
+
+    const completed = try externalEdit(testing.io, &env, handoff.value(), try testExternalEditCommand("exact", 64));
+    defer completed.destroy();
+    try testing.expect(completed.outcome == .changed);
+    try testing.expectEqualStrings("changed", completed.outcome.changed);
+    try testing.expect(handoff.left and handoff.resumed);
+    try testing.expectEqual(@as(presentation.CommandId, 17), completed.command_id);
+}
+
+test "External Edit distinguishes size validation and restoration failure" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer testing.allocator.free(base);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("TMPDIR", base);
+    try env.put("EDITOR", "sh -c 'printf too-large > \"$1\"' sh");
+    var handoff: FakeHandoff = .{};
+    const too_large = try externalEdit(testing.io, &env, handoff.value(), try testExternalEditCommand("old", 3));
+    defer too_large.destroy();
+    try testing.expect(too_large.outcome == .too_large);
+
+    handoff = .{ .fail_resume = true };
+    const failed = try externalEdit(testing.io, &env, handoff.value(), try testExternalEditCommand("old", 64));
+    defer {
+        if (failed.outcome == .restoration_failed)
+            std.Io.Dir.cwd().deleteTree(testing.io, std.fs.path.dirname(failed.outcome.restoration_failed).?) catch {};
+        failed.destroy();
+    }
+    try testing.expect(failed.outcome == .restoration_failed);
+    var retained = try std.Io.Dir.cwd().openFile(testing.io, failed.outcome.restoration_failed, .{});
+    retained.close(testing.io);
+}
+
 const FakePoster = struct {
     existing: ?bbr.review.CommentId = null,
     posted: bbr.review.PostOutcome = .{ .posted = 900 },
@@ -91,7 +348,7 @@ fn testCommand(operation_id: bbr.review.OperationId, dedupe: bool) !*presentatio
         .allocator = testing.allocator,
         .arena = std.heap.ArenaAllocator.init(testing.allocator),
         .operation_id = operation_id,
-        .identity = .init(try presentation.OwnedReviewIdentity.init("workspace", "repo", 1)),
+        .identity = .{ .value = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1) },
         .draft = .{ .local_id = 41, .kind = .comment, .body = "body" },
         .parent = null,
         .dedupe = dedupe,

@@ -519,10 +519,10 @@ pub fn drawFileFinder(scratch: std.mem.Allocator, win: vaxis.Window, finder: *co
 /// line. Borrowed text (the label, the body) outlives render via the composer's
 /// own arena. `scratch` outlives render for the synthesized header/hint.
 pub fn drawComposerProjection(scratch: std.mem.Allocator, win: vaxis.Window, composer: presentation.ComposerProjection, theme: Theme) void {
-    drawComposerText(scratch, win, composer.label, composer.body, theme);
+    drawComposerText(scratch, win, composer.label, composer.body, composer.footer, composer.pending_external_edit, theme);
 }
 
-fn drawComposerText(scratch: std.mem.Allocator, win: vaxis.Window, label: []const u8, body: []const u8, theme: Theme) void {
+fn drawComposerText(scratch: std.mem.Allocator, win: vaxis.Window, label: []const u8, body: []const u8, footer: ?[]const u8, pending: bool, theme: Theme) void {
     const modal = centeredModal(win, 72, 14) orelse return;
     const h = modal.height;
 
@@ -534,7 +534,7 @@ fn drawComposerText(scratch: std.mem.Allocator, win: vaxis.Window, label: []cons
     const hint_row = h - 1;
     fillRow(modal, hint_row, theme.picker_query);
     _ = modal.printSegment(
-        .{ .text = "^D submit · ^W del word · ^U del line · esc cancel", .style = theme.picker_query },
+        .{ .text = footer orelse if (pending) "External Edit in progress…" else "^D submit · ^E external · ^W del word · ^U del line · esc cancel", .style = theme.picker_query },
         .{ .row_offset = hint_row, .wrap = .none },
     );
 

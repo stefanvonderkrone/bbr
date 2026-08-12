@@ -20,6 +20,7 @@ pub const Configuration = struct {
     pub const default_highlight_max_file_bytes: usize = 2 * 1024 * 1024;
     pub const default_inactive_file_cache_max_bytes: usize = 256 * 1024 * 1024;
     pub const default_comments_collapsed_rows: usize = 6;
+    pub const default_external_edit_max_bytes: usize = 1024 * 1024;
 
     theme_name: []const u8,
     active_theme: theme.Theme,
@@ -30,6 +31,7 @@ pub const Configuration = struct {
     comments_collapsed_rows: usize,
     mouse_enabled: bool,
     mouse_vertical_scroll_rows: usize,
+    external_edit_max_bytes: usize,
 
     pub fn deinit(self: *Configuration, allocator: std.mem.Allocator) void {
         allocator.free(self.theme_name);
@@ -97,6 +99,7 @@ fn defaults(allocator: std.mem.Allocator) !Configuration {
         .comments_collapsed_rows = Configuration.default_comments_collapsed_rows,
         .mouse_enabled = true,
         .mouse_vertical_scroll_rows = 3,
+        .external_edit_max_bytes = Configuration.default_external_edit_max_bytes,
     };
 }
 
@@ -162,7 +165,10 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
     var mouse_vertical_scroll_rows: usize = 3;
     var mouse_scroll_seen = false;
     var mouse_scroll_line: usize = 1;
-    var section: enum { root, keymap, highlight, files_cache, comments, input_mouse, unknown } = .root;
+    var external_edit_max_bytes = Configuration.default_external_edit_max_bytes;
+    var external_edit_seen = false;
+    var external_edit_line: usize = 1;
+    var section: enum { root, keymap, highlight, files_cache, comments, input_mouse, external_edit, unknown } = .root;
 
     var lines = std.mem.splitScalar(u8, source, '\n');
     var line_number: usize = 0;
@@ -173,15 +179,15 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
         if (parser.done() or parser.peek() == '#') continue;
         if (parser.peek() == '[') {
             const parsed_section = parser.section() catch {
-                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "malformed table header", .hint = "use [keymap], [highlight], [files.cache], [comments], or [input.mouse]" });
+                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "malformed table header", .hint = "use [keymap], [highlight], [files.cache], [comments], [input.mouse], or [external_edit]" });
                 section = .unknown;
                 continue;
             };
             parser.space();
             if (!parser.trailing()) try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "unexpected text after table header" });
-            if (std.mem.eql(u8, parsed_section, "keymap")) section = .keymap else if (std.mem.eql(u8, parsed_section, "highlight")) section = .highlight else if (std.mem.eql(u8, parsed_section, "files.cache")) section = .files_cache else if (std.mem.eql(u8, parsed_section, "comments")) section = .comments else if (std.mem.eql(u8, parsed_section, "input.mouse")) section = .input_mouse else {
+            if (std.mem.eql(u8, parsed_section, "keymap")) section = .keymap else if (std.mem.eql(u8, parsed_section, "highlight")) section = .highlight else if (std.mem.eql(u8, parsed_section, "files.cache")) section = .files_cache else if (std.mem.eql(u8, parsed_section, "comments")) section = .comments else if (std.mem.eql(u8, parsed_section, "input.mouse")) section = .input_mouse else if (std.mem.eql(u8, parsed_section, "external_edit")) section = .external_edit else {
                 section = .unknown;
-                try diagnostics.append(allocator, .{ .line = line_number, .column = 2, .message = "unknown table", .hint = "use [keymap], [highlight], [files.cache], [comments], or [input.mouse]" });
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 2, .message = "unknown table", .hint = "use [keymap], [highlight], [files.cache], [comments], [input.mouse], or [external_edit]" });
             }
             continue;
         }
@@ -237,7 +243,7 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
             continue;
         }
         const value: []const u8 = switch (section) {
-            .highlight, .comments => parser.unsigned() catch {
+            .highlight, .comments, .external_edit => parser.unsigned() catch {
                 try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a non-negative integer byte count" });
                 continue;
             },
@@ -335,12 +341,27 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
                 }
                 mouse_scroll_seen = true;
             } else try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown Mouse input key", .hint = "use enabled or vertical_scroll_rows" }),
+            .external_edit => if (!std.mem.eql(u8, key, "max_bytes")) {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown External Edit key", .hint = "use max_bytes" });
+            } else if (external_edit_seen) {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'max_bytes' key", .hint = "keep exactly one External Edit limit" });
+            } else {
+                external_edit_line = line_number;
+                external_edit_max_bytes = std.fmt.parseInt(usize, value, 10) catch {
+                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "External Edit byte limit is too large" });
+                    external_edit_seen = true;
+                    continue;
+                };
+                external_edit_seen = true;
+            },
             .unknown => {},
         }
     }
 
     if (mouse_vertical_scroll_rows == 0)
         try diagnostics.append(allocator, .{ .line = mouse_scroll_line, .column = 1, .message = "mouse vertical scroll rows must be greater than zero", .hint = "use enabled = false to disable mouse input" });
+    if (external_edit_max_bytes == 0)
+        try diagnostics.append(allocator, .{ .line = external_edit_line, .column = 1, .message = "External Edit max_bytes must be greater than zero", .hint = "use a positive local returned-file limit" });
 
     var owned_keymap = keymap.Keymap.fromOverrides(allocator, overrides.items) catch |err| {
         try diagnostics.append(allocator, .{ .line = if (override_lines.getLastOrNull()) |line| line else 1, .column = 1, .message = switch (err) {
@@ -365,6 +386,7 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
         .comments_collapsed_rows = comments_collapsed_rows,
         .mouse_enabled = mouse_enabled,
         .mouse_vertical_scroll_rows = mouse_vertical_scroll_rows,
+        .external_edit_max_bytes = external_edit_max_bytes,
     } };
 }
 
@@ -635,6 +657,27 @@ test "Mouse input defaults on with three-row scrolling and accepts opt-out and r
     try testing.expect(duplicate_after_zero == .invalid);
     try testing.expectEqual(@as(usize, 3), duplicate_after_zero.invalid[0].line);
     try testing.expectEqual(@as(usize, 2), duplicate_after_zero.invalid[1].line);
+}
+
+test "External Edit defaults to 1 MiB and rejects zero or unknown keys" {
+    var default_result = try parse(testing.allocator, "");
+    defer default_result.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1024 * 1024), default_result.ok.external_edit_max_bytes);
+
+    var configured = try parse(testing.allocator,
+        \\[external_edit]
+        \\max_bytes = 2048
+    );
+    defer configured.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2048), configured.ok.external_edit_max_bytes);
+
+    var zero = try parse(testing.allocator,
+        \\[external_edit]
+        \\max_bytes = 0
+    );
+    defer zero.deinit(testing.allocator);
+    try testing.expect(zero == .invalid);
+    try testing.expectEqualStrings("External Edit max_bytes must be greater than zero", zero.invalid[0].message);
 }
 
 test "configuration path prefers XDG and falls back to HOME" {

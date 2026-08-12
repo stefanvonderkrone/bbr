@@ -148,6 +148,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .comments_collapsed_rows = configuration.comments_collapsed_rows,
         .mouse_enabled = configuration.mouse_enabled,
         .mouse_vertical_scroll_rows = configuration.mouse_vertical_scroll_rows,
+        .external_edit_max_bytes = configuration.external_edit_max_bytes,
         .submission_locks = os_locks.locks(),
     }, null, try presentation.OwnedReviewIdentity.init(cred.workspace, target.repo, target.id)) catch |err| {
         if (tuiFatalMessage(err)) |message| {
@@ -233,6 +234,7 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
         .comments_collapsed_rows = configuration.comments_collapsed_rows,
         .mouse_enabled = configuration.mouse_enabled,
         .mouse_vertical_scroll_rows = configuration.mouse_vertical_scroll_rows,
+        .external_edit_max_bytes = configuration.external_edit_max_bytes,
         .online = false,
     }, null, key);
 }
@@ -514,6 +516,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
         .comments_collapsed_rows = configuration.comments_collapsed_rows,
         .mouse_enabled = configuration.mouse_enabled,
         .mouse_vertical_scroll_rows = configuration.mouse_vertical_scroll_rows,
+        .external_edit_max_bytes = configuration.external_edit_max_bytes,
         .online = false,
     }, s, try presentation.OwnedReviewIdentity.init("", "", pr.id));
 }
