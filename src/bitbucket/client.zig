@@ -596,24 +596,30 @@ fn dupeComment(allocator: Allocator, cj: CommentJson, head: HeadCommits) !Commen
     var anchor: ?Anchor = null;
     if (parent_id == null) {
         if (cj.@"inline") |inl| {
-            const has_old = inl.from != null or inl.start_from != null;
-            const has_new = inl.to != null or inl.start_to != null;
-            if (has_old and has_new) return error.MalformedResponse;
             const path = try allocator.dupe(u8, inl.path);
-            if (!has_old and !has_new) {
+            if (inl.to != null) {
+                // Bitbucket may return both old and new projections for a range.
+                // The domain Anchor is single-sided, so prefer the new side.
+                anchor = .{
+                    .path = path,
+                    .to = inl.to,
+                    .start_to = inl.start_to,
+                };
+                scope = .{ .@"inline" = anchor.? };
+            } else if (inl.from != null) {
+                anchor = .{
+                    .path = path,
+                    .from = inl.from,
+                    .start_from = inl.start_from,
+                };
+                scope = .{ .@"inline" = anchor.? };
+            } else if (inl.start_from != null or inl.start_to != null) {
+                return error.MalformedResponse;
+            } else {
                 scope = .{ .file = .{
                     .path = path,
                     .source_commit = try allocator.dupe(u8, head.source),
                 } };
-            } else {
-                anchor = .{
-                    .path = path,
-                    .from = inl.from,
-                    .to = inl.to,
-                    .start_from = inl.start_from,
-                    .start_to = inl.start_to,
-                };
-                scope = .{ .@"inline" = anchor.? };
             }
         } else {
             scope = .review;
@@ -1121,6 +1127,25 @@ test "getComments classifies Review File inline roots and strips Reply scope" {
     try testing.expect(comments[2].scope.? == .@"inline");
     try testing.expect(comments[3].scope == null);
     try testing.expect(comments[3].anchor == null);
+}
+
+test "getComments normalizes mixed-side inline ranges to the new side" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body =
+        \\{ "values": [
+        \\ { "id": 1, "content": { "raw": "range" }, "user": { "display_name": "A" },
+        \\   "inline": { "path": "src/f.zig", "from": 13, "to": 15, "start_from": 9, "start_to": 9 } }
+        \\] }
+    };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const comments = try bb.getComments(a, "repo", 1, .{});
+    defer deinitComments(a, comments);
+
+    const anchor = comments[0].anchor.?;
+    try testing.expectEqual(@as(?u32, null), anchor.from);
+    try testing.expectEqual(@as(?u32, 15), anchor.to);
+    try testing.expectEqual(@as(?u32, null), anchor.start_from);
+    try testing.expectEqual(@as(?u32, 9), anchor.start_to);
 }
 
 // A real single-comment shape captured from PR 1726 (comment 811927613): an

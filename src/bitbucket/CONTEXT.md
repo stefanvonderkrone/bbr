@@ -53,3 +53,9 @@ Bitbucket marks it outdated). What *does* distinguish them: each comment's
 otherwise **outdated**. We derive it that way — authoritative (Bitbucket's own
 commit metadata, per ADR-0001) and free (no per-comment fetch). Hashes may be
 abbreviated on one side, so compare by prefix.
+
+**Mixed-side ranges.** Bitbucket may return both old-file (`from`/`start_from`)
+and new-file (`to`/`start_to`) projections for one inline range. The adapter
+normalizes that wire shape to the new-file projection because the Review
+context models an Anchor as single-sided and renders context lines on the new
+side when one is available.
