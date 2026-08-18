@@ -158,14 +158,14 @@ Finish the visible interaction details deferred by M3–M14 before expanding the
 ## M16 — Review-item mutation & submission hardening  ·  M/L  ·  needs M10b
 Complete the repair and mutation workflows around the client-side Pending Review. The detailed
 acceptance criteria already live in `.scratch/review-item-mutation/issues/`.
-- [ ] Implement `.scratch/review-item-mutation/issues/01-edit-reanchor-delete-drafts.md`: edit Draft bodies without changing identity, re-anchor root Drafts, cascade deletion through Draft descendants, enforce active/recovered SubmissionRun immutability, and persist before publishing Presentation state.
-- [ ] Implement `.scratch/review-item-mutation/issues/02-edit-delete-owned-bitbucket-comments.md`: verify Bitbucket Cloud's authorship and mutation contract, expose edit/delete only for author-owned Comments, and reconcile after success.
-- [ ] Add an `$EDITOR` handoff for substantial or prefilled multi-line bodies: write a secure temporary file, suspend/restore the terminal safely, read the result through `Composer.seed`, and preserve cancel/error semantics. Keep the inline Composer for short edits.
-- [ ] Replace the status-bar-only Submission result with a per-item overlay showing posted/failed/skipped state, classified reason, reply dependency, and the selective-retry subtree.
-- [ ] Surface Bitbucket's `Retry-After` response header through `HttpClient`/`Poster`, and tune retry/backoff limits from observed rate-limit behavior while retaining the pure engine override tests.
-- [ ] Decide and document SourceCommit-change UX. Default to reload/re-anchor; add an explicit submit-anyway path only if its anchor and confirmation semantics can be made unambiguous.
-- [ ] Add deterministic integration coverage for the async Submission worker/event glue and vaxis selection input, including recovery and stale-epoch rejection.
-- [ ] Live-probe old-side multi-line Comment ranges and document the observed Bitbucket UI behavior for multi-line Suggestions; keep unsupported behavior out of the UI.
+- [x] Implement `.scratch/review-item-mutation/issues/01-edit-reanchor-delete-drafts.md`: edit Draft bodies without changing identity, re-anchor root Drafts, cascade deletion through Draft descendants, enforce active/recovered SubmissionRun immutability, and persist before publishing Presentation state.
+- [x] Implement `.scratch/review-item-mutation/issues/02-edit-delete-owned-bitbucket-comments.md`: verify Bitbucket Cloud's authorship and mutation contract, expose edit/delete only for author-owned Comments, and reconcile after success.
+- [x] Add an `$EDITOR` handoff for substantial or prefilled multi-line bodies: write a secure temporary file, suspend/restore the terminal safely, read the result through `Composer.seed`, and preserve cancel/error semantics. Keep the inline Composer for short edits.
+- [x] Replace the status-bar-only Submission result with a per-item overlay showing posted/failed/skipped state, classified reason, reply dependency, and the selective-retry subtree.
+- [x] Surface Bitbucket's `Retry-After` response header through `HttpClient`/`Poster`, and tune retry/backoff limits from observed rate-limit behavior while retaining the pure engine override tests.
+- [x] Decide and document SourceCommit-change UX. Default to reload/re-anchor; add an explicit submit-anyway path only if its anchor and confirmation semantics can be made unambiguous.
+- [x] Add deterministic integration coverage for the async Submission worker/event glue and vaxis selection input, including recovery and stale-epoch rejection.
+- [x] Live-probe old-side multi-line Comment ranges and document the observed Bitbucket UI behavior for multi-line Suggestions; keep unsupported behavior out of the UI.
 
 ## M17 — Diff, blob & highlighting completeness  ·  M/L  ·  needs M13
 Close fidelity gaps in the shared remote/local rendering pipeline.

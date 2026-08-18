@@ -36,6 +36,15 @@ pub fn main(init: std.process.Init) !void {
             };
         }
         if (std.mem.eql(u8, f, "local")) return localRun(init, gpa, &it);
+        if (std.mem.eql(u8, f, "external-edit-smoke")) {
+            if (!std.mem.eql(u8, init.environ_map.get("BBR_ALLOW_PTY_SMOKE") orelse "", "1")) {
+                std.debug.print("bbr: refusing PTY smoke without BBR_ALLOW_PTY_SMOKE=1\n", .{});
+                return;
+            }
+            try app.externalEditSmoke(init.io, gpa, init.environ_map);
+            std.debug.print("ok: External Edit PTY handoff, redraw, and recreated input verified\n", .{});
+            return;
+        }
     }
 
     const cred = bbr.bitbucket.Credential.fromEnv(init.environ_map) catch |err| {
@@ -52,6 +61,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, f, "raw-comment")) return rawComment(init, gpa, cred, &it);
         // Live smoke test: fetch + print, no TUI (scriptable, exits non-zero on failure).
         if (std.mem.eql(u8, f, "check")) return checkRun(init, gpa, cred, &it);
+        if (std.mem.eql(u8, f, "check-mutation")) return checkMutationRun(init, gpa, cred, &it);
         // Print startup resolution (branch/remote/PR list) without the TUI.
         if (std.mem.eql(u8, f, "detect")) return detectRun(init, gpa, cred, &it);
     }
@@ -361,6 +371,84 @@ fn checkRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.
     }
 }
 
+fn checkMutationRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
+    if (!std.mem.eql(u8, init.environ_map.get("BBR_ALLOW_LIVE_MUTATION") orelse "", "1")) {
+        std.debug.print("bbr: refusing destructive check without BBR_ALLOW_LIVE_MUTATION=1\n", .{});
+        return;
+    }
+    const repo = it.next() orelse return usage();
+    const pull_request_id = std.fmt.parseInt(u64, it.next() orelse return usage(), 10) catch return usage();
+    if (it.next() != null) return usage();
+
+    var client = bbr.http.StdHttpClient.init(gpa, init.io);
+    defer client.deinit();
+    try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
+    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred);
+    const author_uuid = try bb.getAuthenticatedAccountUuid(gpa);
+    defer gpa.free(author_uuid);
+
+    var nonce_bytes: [8]u8 = undefined;
+    try init.io.randomSecure(&nonce_bytes);
+    const nonce = std.mem.readInt(u64, &nonce_bytes, .native);
+    const created_body = try std.fmt.allocPrint(gpa, "bbr-m16-live-check-{x}-created", .{nonce});
+    defer gpa.free(created_body);
+    const updated_body = try std.fmt.allocPrint(gpa, "bbr-m16-live-check-{x}-updated", .{nonce});
+    defer gpa.free(updated_body);
+
+    const comment_id = try bb.createComment(gpa, repo, pull_request_id, .{ .body = created_body, .scope = .review });
+    var cleanup_needed = true;
+    defer if (cleanup_needed) bb.deleteComment(gpa, repo, pull_request_id, comment_id) catch {};
+
+    try verifyLiveComment(gpa, bb, repo, pull_request_id, comment_id, author_uuid, created_body);
+    try bb.updateComment(gpa, repo, pull_request_id, comment_id, updated_body);
+    try verifyLiveComment(gpa, bb, repo, pull_request_id, comment_id, author_uuid, updated_body);
+    try bb.deleteComment(gpa, repo, pull_request_id, comment_id);
+    cleanup_needed = false;
+    try verifyLiveCommentDeleted(gpa, bb, repo, pull_request_id, comment_id, author_uuid);
+    std.debug.print("ok: created, fetched, body-updated, and deleted disposable Comment #{d}\n", .{comment_id});
+}
+
+fn verifyLiveComment(
+    gpa: std.mem.Allocator,
+    client: bbr.bitbucket.Client,
+    repo: []const u8,
+    pull_request_id: u64,
+    comment_id: bbr.review.CommentId,
+    author_uuid: []const u8,
+    expected_body: []const u8,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const comments = try client.getComments(arena.allocator(), repo, pull_request_id, .{});
+    for (comments) |comment| {
+        if (comment.id != comment_id) continue;
+        if (comment.deleted or !std.mem.eql(u8, comment.body, expected_body)) return error.LiveMutationBodyMismatch;
+        if (comment.author_uuid == null or !std.mem.eql(u8, comment.author_uuid.?, author_uuid)) return error.LiveMutationAuthorMismatch;
+        if (comment.parent_id != null or comment.scope == null or comment.scope.? != .review) return error.LiveMutationScopeMismatch;
+        return;
+    }
+    return error.LiveMutationCommentMissing;
+}
+
+fn verifyLiveCommentDeleted(
+    gpa: std.mem.Allocator,
+    client: bbr.bitbucket.Client,
+    repo: []const u8,
+    pull_request_id: u64,
+    comment_id: bbr.review.CommentId,
+    author_uuid: []const u8,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const comments = try client.getComments(arena.allocator(), repo, pull_request_id, .{});
+    for (comments) |comment| {
+        if (comment.id != comment_id) continue;
+        if (!comment.deleted) return error.LiveMutationDeleteFailed;
+        if (comment.author_uuid == null or !std.mem.eql(u8, comment.author_uuid.?, author_uuid)) return error.LiveMutationAuthorMismatch;
+        if (comment.parent_id != null or comment.scope == null or comment.scope.? != .review) return error.LiveMutationScopeMismatch;
+    }
+}
+
 /// `detect [<repo>]`: run startup resolution and print the outcome, no TUI. A
 /// scriptable way to verify the GitClient + list pipeline against live data.
 fn detectRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
@@ -414,6 +502,8 @@ fn usage() void {
         \\  bbr <repo-slug> <pr-id>          open a specific PR in the TUI
         \\  bbr local [base-ref] [source-ref] review committed local Git changes
         \\  bbr check <repo-slug> <pr-id>    live smoke check (fetch + print, no TUI)
+        \\  bbr check-mutation <repo> <pr-id> destructive live Comment lifecycle check
+        \\  bbr external-edit-smoke          interactive PTY External Edit check
         \\  bbr demo                         open the TUI with synthetic data (no network)
         \\
         \\Remote review commands need BITBUCKET_USERNAME, BITBUCKET_TOKEN,

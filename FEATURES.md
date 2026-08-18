@@ -56,8 +56,8 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [x] **Persist PendingReview** — SQLite, survives crash / quit / PR switch. `M6`
 - [x] **Submit batch** — topological POST + temp-id remap. `M10`
 - [x] **Failure handling** — retry / abort-on-auth / mark-and-continue + dedupe guard. `M10`
-- [ ] **Mutate review items** — edit/re-anchor/delete Drafts and edit/delete owned Comments. `M16`
-- [ ] **Submission repair UX** — per-item outcomes, recovery, Retry-After, and stale-head decision. `M16`
+- [x] **Mutate review items** — edit/re-anchor/delete Drafts and edit/delete owned Comments. `M16`
+- [x] **Submission repair UX** — per-item outcomes, recovery, Retry-After, and stale-head decision. `M16`
 
 ## Local & offline review
 - [x] **Detect current branch/worktree** — read the WorkingCopy's branch and common Git directory. `M4` (branch+remote) · `M14` (worktree/diff)

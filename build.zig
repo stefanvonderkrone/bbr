@@ -48,6 +48,20 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step("check", "Live smoke check against Bitbucket: zig build check -- <repo> <id>");
     check_step.dependOn(&check_cmd.step);
 
+    // Destructive and PTY checks remain explicit opt-in tiers outside tests.
+    const mutation_cmd = b.addRunArtifact(exe);
+    mutation_cmd.step.dependOn(b.getInstallStep());
+    mutation_cmd.addArg("check-mutation");
+    if (b.args) |args| mutation_cmd.addArgs(args);
+    const mutation_step = b.step("check-mutation", "Destructive Bitbucket Comment lifecycle check (requires opt-in)");
+    mutation_step.dependOn(&mutation_cmd.step);
+
+    const external_edit_cmd = b.addRunArtifact(exe);
+    external_edit_cmd.step.dependOn(b.getInstallStep());
+    external_edit_cmd.addArg("external-edit-smoke");
+    const external_edit_step = b.step("check-external-edit", "Interactive External Edit PTY check (requires opt-in)");
+    external_edit_step.dependOn(&external_edit_cmd.step);
+
     // `zig build test` runs the core module's tests and the exe module's tests.
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);

@@ -510,6 +510,77 @@ pub fn run(ctx: RunCtx, initial: ?*Session, initial_key: presentation.OwnedRevie
     return runPresentation(ctx, initial, initial_key);
 }
 
+/// Opt-in interactive PTY check for the terminal behavior deterministic fakes
+/// cannot establish. The controlled editor validates inherited streams,
+/// canonical input, echo, and exact bytes while the handoff exercises the same
+/// suspend/restore sequence used by External Edit in the TUI.
+pub fn externalEditSmoke(io: std.Io, gpa: std.mem.Allocator, environment: *const std.process.Environ.Map) !void {
+    var env = try environment.clone(gpa);
+    defer env.deinit();
+    try env.put("GIT_EDITOR",
+        \\sh -c 'test -t 0 && test -t 1 && test -t 2 || exit 20; mode=$(stty -a </dev/tty) || exit 21; printf "%s" "$mode" | grep -Eq "(^|[ ;])icanon([ ;]|$)" || exit 22; printf "%s" "$mode" | grep -Eq "(^|[ ;])echo([ ;]|$)" || exit 23; test "$(cat "$1")" = bbr-pty-before || exit 24; printf bbr-pty-after > "$1"' sh
+    );
+
+    var write_buf: [4096]u8 = undefined;
+    var tty = try vaxis.Tty.init(io, &write_buf);
+    var tty_active = true;
+    defer if (tty_active) tty.deinit();
+    var vx = try vaxis.init(io, gpa, &env, .{});
+    defer vx.deinit(gpa, tty.writer());
+    var loop: Loop = .init(io, &tty, &vx);
+    try loop.start();
+    defer loop.stop();
+    try loop.installResizeHandler();
+    try vx.enterAltScreen(tty.writer());
+    try vx.setMouseMode(tty.writer(), true);
+
+    var handoff: SmokeHandoffContext = .{
+        .io = io,
+        .gpa = gpa,
+        .loop = &loop,
+        .tty = &tty,
+        .tty_active = &tty_active,
+        .vx = &vx,
+        .write_buf = &write_buf,
+    };
+    const command = try createSmokeExternalEdit(gpa);
+    const completed = try presentation_adapter.externalEdit(io, &env, handoff.handoff(), command);
+    defer completed.destroy();
+    if (completed.outcome == .restoration_failed) {
+        std.debug.print("bbr: PTY smoke restoration failed; file retained at {s}\n", .{completed.outcome.restoration_failed});
+        std.process.exit(1);
+    }
+    if (completed.outcome != .changed or !std.mem.eql(u8, completed.outcome.changed, "bbr-pty-after"))
+        return error.ExternalEditPtySmokeFailed;
+
+    const win = vx.window();
+    win.clear();
+    _ = win.printSegment(.{ .text = "External Edit PTY smoke passed. Press q to verify recreated input.", .style = .{} }, .{ .wrap = .word });
+    try vx.render(tty.writer());
+    while (true) switch (try loop.nextEvent()) {
+        .key_press => |key| if (key.matches('q', .{})) break,
+        .winsize => |winsize| try vx.resize(gpa, tty.writer(), winsize),
+        else => {},
+    };
+    try vx.setMouseMode(tty.writer(), false);
+    try vx.exitAltScreen(tty.writer());
+}
+
+fn createSmokeExternalEdit(allocator: std.mem.Allocator) !*presentation.ExternalEdit {
+    const body = try allocator.dupe(u8, "bbr-pty-before");
+    errdefer allocator.free(body);
+    const command = try allocator.create(presentation.ExternalEdit);
+    errdefer allocator.destroy(command);
+    command.* = .{
+        .allocator = allocator,
+        .command_id = 1,
+        .session_epoch = 1,
+        .max_bytes = 64,
+        .body = body,
+    };
+    return command;
+}
+
 const PresentationSinkContext = struct {
     loop: *Loop,
     work_id: u64,
@@ -931,6 +1002,40 @@ const TerminalHandoffContext = struct {
     }
 };
 
+const SmokeHandoffContext = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    loop: *Loop,
+    tty: *vaxis.Tty,
+    tty_active: *bool,
+    vx: *vaxis.Vaxis,
+    write_buf: []u8,
+
+    fn handoff(self: *SmokeHandoffContext) presentation_adapter.TerminalHandoff {
+        return .{ .ptr = self, .suspend_fn = suspendTui, .restore_fn = restoreTui };
+    }
+
+    fn suspendTui(ptr: *anyopaque) !void {
+        const self: *SmokeHandoffContext = @ptrCast(@alignCast(ptr));
+        self.loop.stop();
+        try self.vx.setMouseMode(self.tty.writer(), false);
+        try self.vx.exitAltScreen(self.tty.writer());
+        self.tty.deinit();
+        self.tty_active.* = false;
+    }
+
+    fn restoreTui(ptr: *anyopaque) !void {
+        const self: *SmokeHandoffContext = @ptrCast(@alignCast(ptr));
+        self.tty.* = try vaxis.Tty.init(self.io, self.write_buf);
+        self.tty_active.* = true;
+        const winsize = try self.tty.getWinsize();
+        try self.vx.resize(self.gpa, self.tty.writer(), winsize);
+        try self.vx.enterAltScreen(self.tty.writer());
+        try self.vx.setMouseMode(self.tty.writer(), true);
+        try self.loop.start();
+    }
+};
+
 fn reapPresentationWork(work: *std.ArrayList(PresentationWork), io: std.Io, id: u64) void {
     for (work.items, 0..) |item, index| {
         if (item.id != id) continue;
@@ -1034,6 +1139,25 @@ test {
     _ = @import("composer.zig");
     _ = @import("file_enrichment.zig");
     _ = @import("presentation_adapter.zig");
+    _ = @import("presentation_runtime.zig");
+}
+
+test "pinned vaxis fixtures preserve Shift Arrow selection input" {
+    const fixtures = [_]struct { bytes: []const u8, codepoint: u21 }{
+        .{ .bytes = "\x1b[1;2A", .codepoint = vaxis.Key.up },
+        .{ .bytes = "\x1b[1;2B", .codepoint = vaxis.Key.down },
+        .{ .bytes = "\x1b[57352;2u", .codepoint = vaxis.Key.up },
+        .{ .bytes = "\x1b[57353;2u", .codepoint = vaxis.Key.down },
+    };
+    for (fixtures) |fixture| {
+        var parser: vaxis.Parser = .{};
+        const parsed = try parser.parse(fixture.bytes, std.testing.allocator);
+        try std.testing.expectEqual(fixture.bytes.len, parsed.n);
+        const key = parsed.event.?.key_press;
+        const portable = portableKey(key);
+        try std.testing.expectEqual(fixture.codepoint, portable.codepoint);
+        try std.testing.expect(portable.mods.shift);
+    }
 }
 
 test "content viewport reserves the bottom status row" {

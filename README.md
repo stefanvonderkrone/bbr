@@ -4,7 +4,7 @@ A Zig terminal UI for reviewing **Bitbucket Cloud** pull requests: browse the di
 coloring and syntax highlighting, read comment threads, and compose comments, replies, and
 suggestions that stay **pending locally** until you submit them as a batch.
 
-> Status: **M14 (local/offline review) complete** — `bbr` reviews Bitbucket PullRequests or
+> Status: **M16 (review mutation and Submission hardening) complete** — `bbr` reviews Bitbucket PullRequests or
 > committed local Git refs through the same diff, authoring, highlighting, and rendering pipeline.
 > Local drafts persist in SQLite, share across linked worktrees/clones with the same repository
 > identity, and remain local-only. The implementation is exercised hermetically by `zig build test`.
@@ -18,6 +18,7 @@ suggestions that stay **pending locally** until you submit them as a batch.
 | `src/*/CONTEXT.md` | Per-context glossary (ubiquitous language). Pure vocabulary, no implementation. |
 | [`docs/adr/`](docs/adr/) | Architecture Decision Records for the hard-to-reverse choices. |
 | [`ZIG.md`](ZIG.md) | Zig 0.16.0 feature/API notes this project depends on. |
+| [`docs/m16-operations.md`](docs/m16-operations.md) | Mutation, Submission repair, External Edit, and opt-in checks. |
 | [`FEATURES.md`](FEATURES.md) | Feature set by area, tagged with delivering milestone. |
 | [`TODO.md`](TODO.md) | Near-term actionable work, per milestone. |
 
@@ -66,11 +67,13 @@ Full breakdown with dependencies in `docs/design.html` §14 and `TODO.md`.
 zig build                        # build the bbr executable
 zig build test                   # unit tests — hermetic, no network/disk (seams are faked)
 zig build check -- <repo> <id>   # live smoke check against real Bitbucket (needs creds)
+BBR_ALLOW_PTY_SMOKE=1 zig build check-external-edit
+BBR_ALLOW_LIVE_MUTATION=1 zig build check-mutation -- <repo> <id>
 zig build run -- local [base-ref] [source-ref]  # committed local review (no creds)
 ```
 
-`zig build test` is hermetic and CI-safe. `zig build check` is the opt-in live tier: it hits real
-Bitbucket, so it needs credentials and is never part of `test`.
+`zig build test` is hermetic and CI-safe. The `check*` commands are explicit opt-in tiers and are
+never part of `test`; see [`docs/m16-operations.md`](docs/m16-operations.md) for their gates and scope.
 
 Remote-review credentials come from the environment only (never a config file, never persisted):
 `BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, `BITBUCKET_WORKSPACE`. `bbr local` does not read or
