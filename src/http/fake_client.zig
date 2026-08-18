@@ -15,6 +15,7 @@ const Response = client.Response;
 pub const Canned = struct {
     status: u16 = 200,
     body: []const u8 = "",
+    retry_after_ms: ?u64 = null,
 };
 
 pub const FakeHttpClient = struct {
@@ -22,6 +23,7 @@ pub const FakeHttpClient = struct {
     status: u16 = 200,
     /// Body returned by `send` (copied into the caller's allocator).
     body: []const u8 = "",
+    retry_after_ms: ?u64 = null,
     /// Optional scripted sequence: the Nth `send` returns `responses[N]`, so a
     /// paginated fetch can be driven page by page. Falls back to `status`/`body`
     /// once exhausted (or when null).
@@ -72,14 +74,15 @@ pub const FakeHttpClient = struct {
         }
 
         const canned: Canned = if (self.responses) |seq|
-            (if (self.call_count < seq.len) seq[self.call_count] else .{ .status = self.status, .body = self.body })
+            (if (self.call_count < seq.len) seq[self.call_count] else .{ .status = self.status, .body = self.body, .retry_after_ms = self.retry_after_ms })
         else
-            .{ .status = self.status, .body = self.body };
+            .{ .status = self.status, .body = self.body, .retry_after_ms = self.retry_after_ms };
 
         self.call_count += 1;
         return .{
             .status = canned.status,
             .body = try allocator.dupe(u8, canned.body),
+            .retry_after_ms = if (canned.status == 429 or canned.status >= 500 and canned.status <= 599) canned.retry_after_ms else null,
         };
     }
 };

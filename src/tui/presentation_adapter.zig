@@ -183,21 +183,37 @@ pub fn postOutcome(
     dedupe: bool,
 ) !bbr.review.PostOutcome {
     if (dedupe) {
-        if (try poster.findExisting(draft, parent)) |existing| return .{ .posted = existing };
+        const checked = try poster.findExisting(draft, parent);
+        return switch (checked.outcome) {
+            .found => |id| .{ .posted = id },
+            .missing => (try poster.post(draft, parent)).outcome,
+            .rejected => |err| .{ .rejected = err },
+            .ambiguous => .ambiguous,
+        };
     }
-    return poster.post(draft, parent);
+    return (try poster.post(draft, parent)).outcome;
 }
 
 /// Consumes `command` whether execution succeeds or fails.
 pub fn executePost(command: *presentation.PostDraft, poster: bbr.review.CommentPoster) presentation.OwnedInput {
     defer command.destroy();
-    const outcome = postOutcome(poster, command.draft, command.parent, command.dedupe) catch .ambiguous;
+    const result = if (command.dedupe) blk: {
+        if (poster.findExisting(command.draft, command.parent)) |checked| {
+            break :blk switch (checked.outcome) {
+                .found => |id| bbr.review.PostResult{ .outcome = .{ .posted = id } },
+                .missing => poster.post(command.draft, command.parent) catch bbr.review.PostResult{ .outcome = .ambiguous },
+                .rejected => |err| bbr.review.PostResult{ .outcome = .{ .rejected = err }, .retry_after_ms = checked.retry_after_ms },
+                .ambiguous => bbr.review.PostResult{ .outcome = .ambiguous },
+            };
+        } else |_| break :blk bbr.review.PostResult{ .outcome = .ambiguous };
+    } else poster.post(command.draft, command.parent) catch bbr.review.PostResult{ .outcome = .ambiguous };
     return .{ .post_draft_completed = .{
         .command_id = command.command_id,
         .operation_id = command.operation_id,
         .identity = command.identity,
         .temp_id = command.draft.local_id,
-        .outcome = outcome,
+        .outcome = result.outcome,
+        .retry_after_ms = result.retry_after_ms,
     } };
 }
 
@@ -424,17 +440,17 @@ const FakePoster = struct {
         .findExisting = findExisting,
     };
 
-    fn post(ptr: *anyopaque, _: bbr.review.Draft, _: ?bbr.review.CommentId) anyerror!bbr.review.PostOutcome {
+    fn post(ptr: *anyopaque, _: bbr.review.Draft, _: ?bbr.review.CommentId) anyerror!bbr.review.PostResult {
         const self: *FakePoster = @ptrCast(@alignCast(ptr));
         self.post_calls += 1;
         if (self.fail_post) return error.TransportFailure;
-        return self.posted;
+        return .{ .outcome = self.posted };
     }
 
-    fn findExisting(ptr: *anyopaque, _: bbr.review.Draft, _: ?bbr.review.CommentId) anyerror!?bbr.review.CommentId {
+    fn findExisting(ptr: *anyopaque, _: bbr.review.Draft, _: ?bbr.review.CommentId) anyerror!bbr.review.CheckResult {
         const self: *FakePoster = @ptrCast(@alignCast(ptr));
         self.find_calls += 1;
-        return self.existing;
+        return if (self.existing) |id| .{ .outcome = .{ .found = id } } else .{ .outcome = .missing };
     }
 };
 

@@ -26,6 +26,9 @@ pub const Response = struct {
     status: u16,
     /// Response body, owned by the allocator passed to `send`.
     body: []u8,
+    /// Normalized Retry-After guidance. Raw response headers never cross this
+    /// seam, and only definite 429/5xx responses may populate this field.
+    retry_after_ms: ?u64 = null,
 };
 
 pub const HttpClient = struct {

@@ -245,6 +245,29 @@ pub const SqliteStore = struct {
                 \\COMMIT;
             );
         }
+        // v9 (M16): crash-safe bounded retry checkpoints. Durations are stored
+        // as integer milliseconds; null retry_phase means no retry checkpoint.
+        if (try self.userVersion() < 9) {
+            try self.exec(
+                \\BEGIN;
+                \\ALTER TABLE submission_runs ADD COLUMN retry_phase INTEGER;
+                \\ALTER TABLE submission_runs ADD COLUMN retry_attempt INTEGER;
+                \\ALTER TABLE submission_runs ADD COLUMN retry_reason INTEGER;
+                \\ALTER TABLE submission_runs ADD COLUMN retry_local_ms INTEGER;
+                \\ALTER TABLE submission_runs ADD COLUMN retry_server_ms INTEGER;
+                \\ALTER TABLE submission_runs ADD COLUMN retry_effective_ms INTEGER;
+                \\ALTER TABLE submission_runs ADD COLUMN retry_pending_wait INTEGER;
+                \\ALTER TABLE submission_run_items ADD COLUMN retry_reason INTEGER;
+                \\ALTER TABLE submission_run_items ADD COLUMN retry_after_ms INTEGER;
+                \\CREATE TABLE submission_retry_carryovers (
+                \\ workspace TEXT NOT NULL, repository TEXT NOT NULL, pr_id INTEGER NOT NULL,
+                \\ temp_id INTEGER NOT NULL, retry_reason INTEGER NOT NULL, retry_after_ms INTEGER NOT NULL,
+                \\ PRIMARY KEY (workspace, repository, pr_id, temp_id)
+                \\) WITHOUT ROWID;
+                \\PRAGMA user_version = 9;
+                \\COMMIT;
+            );
+        }
     }
 
     fn userVersion(self: *SqliteStore) SqliteError!i64 {
@@ -273,6 +296,7 @@ pub const SqliteStore = struct {
         .load = loadImpl,
         .begin_submission = beginSubmissionImpl,
         .checkpoint_submission = checkpointSubmissionImpl,
+        .checkpoint_submission_retry = checkpointSubmissionRetryImpl,
         .complete_submission = completeSubmissionImpl,
         .abandon_submission = abandonSubmissionImpl,
         .active_submission = activeSubmissionImpl,
@@ -780,11 +804,38 @@ pub const SqliteStore = struct {
         errdefer self.exec("ROLLBACK;") catch {};
         if (try self.hasActiveSubmission()) return error.SubmissionAlreadyActive;
 
+        var carryover: ?bbr.review.SubmissionRetryCheckpoint = null;
+        var carry: ?*c.sqlite3_stmt = null;
+        const carry_sql =
+            \\SELECT retry_reason,retry_after_ms FROM submission_retry_carryovers
+            \\ WHERE workspace=? AND repository=? AND pr_id=? AND temp_id=?;
+        ;
+        if (c.sqlite3_prepare_v2(self.db, carry_sql, -1, &carry, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(carry);
+        bindText(carry, 1, key.workspace);
+        bindText(carry, 2, key.repository);
+        bindInt(carry, 3, @intCast(key.pull_request_id));
+        bindInt(carry, 4, @intCast(first_temp_id));
+        if (c.sqlite3_step(carry) == c.SQLITE_ROW) {
+            const delay: u64 = @intCast(columnInt(carry, 1));
+            carryover = .{
+                .phase = .post,
+                .attempt = 0,
+                .reason = @enumFromInt(columnInt(carry, 0)),
+                .local_delay_ms = 0,
+                .server_delay_ms = delay,
+                .effective_delay_ms = delay,
+                .pending_wait = true,
+            };
+        }
+
         var insert: ?*c.sqlite3_stmt = null;
         const insert_sql =
             \\INSERT INTO submission_runs
-            \\ (workspace, repository, pr_id, source_commit, current_temp_id, state)
-            \\ VALUES (?, ?, ?, ?, ?, 0);
+            \\ (workspace, repository, pr_id, source_commit, current_temp_id, state,
+            \\  retry_phase,retry_attempt,retry_reason,retry_local_ms,retry_server_ms,
+            \\  retry_effective_ms,retry_pending_wait)
+            \\ VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?);
         ;
         if (c.sqlite3_prepare_v2(self.db, insert_sql, -1, &insert, null) != c.SQLITE_OK) return error.Prepare;
         defer _ = c.sqlite3_finalize(insert);
@@ -793,8 +844,27 @@ pub const SqliteStore = struct {
         bindInt(insert, 3, @intCast(key.pull_request_id));
         bindText(insert, 4, source_commit);
         bindInt(insert, 5, @intCast(first_temp_id));
+        if (carryover) |retry| {
+            bindInt(insert, 6, @intFromEnum(retry.phase));
+            bindInt(insert, 7, retry.attempt);
+            bindInt(insert, 8, @intFromEnum(retry.reason));
+            bindInt(insert, 9, @intCast(retry.local_delay_ms));
+            bindInt(insert, 10, @intCast(retry.server_delay_ms.?));
+            bindInt(insert, 11, @intCast(retry.effective_delay_ms));
+            bindInt(insert, 12, 1);
+        } else for (6..13) |index| bindNull(insert, @intCast(index));
         if (c.sqlite3_step(insert) != c.SQLITE_DONE) return error.Step;
         const operation_id: OperationId = @intCast(c.sqlite3_last_insert_rowid(self.db));
+        if (carryover != null) {
+            var consume: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, "DELETE FROM submission_retry_carryovers WHERE workspace=? AND repository=? AND pr_id=? AND temp_id=?;", -1, &consume, null) != c.SQLITE_OK) return error.Prepare;
+            defer _ = c.sqlite3_finalize(consume);
+            bindText(consume, 1, key.workspace);
+            bindText(consume, 2, key.repository);
+            bindInt(consume, 3, @intCast(key.pull_request_id));
+            bindInt(consume, 4, @intCast(first_temp_id));
+            if (c.sqlite3_step(consume) != c.SQLITE_DONE) return error.Step;
+        }
 
         for (items, 0..) |item, ordinal| {
             var participant: ?*c.sqlite3_stmt = null;
@@ -865,7 +935,9 @@ pub const SqliteStore = struct {
         var stmt: ?*c.sqlite3_stmt = null;
         const sql =
             \\SELECT operation_id, workspace, repository, pr_id,
-            \\       source_commit, current_temp_id
+            \\       source_commit, current_temp_id, retry_phase, retry_attempt,
+            \\       retry_reason, retry_local_ms, retry_server_ms,
+            \\       retry_effective_ms, retry_pending_wait
             \\ FROM submission_runs WHERE state=0 LIMIT 1;
         ;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
@@ -902,10 +974,48 @@ pub const SqliteStore = struct {
                     .source_commit = (try columnTextDup(allocator, stmt, 4)).?,
                     .current_temp_id = if (c.sqlite3_column_type(stmt, 5) == c.SQLITE_NULL) null else @intCast(columnInt(stmt, 5)),
                     .items = try items.toOwnedSlice(allocator),
+                    .retry = if (c.sqlite3_column_type(stmt, 6) == c.SQLITE_NULL) null else .{
+                        .phase = @enumFromInt(columnInt(stmt, 6)),
+                        .attempt = @intCast(columnInt(stmt, 7)),
+                        .reason = @enumFromInt(columnInt(stmt, 8)),
+                        .local_delay_ms = @intCast(columnInt(stmt, 9)),
+                        .server_delay_ms = if (c.sqlite3_column_type(stmt, 10) == c.SQLITE_NULL) null else @intCast(columnInt(stmt, 10)),
+                        .effective_delay_ms = @intCast(columnInt(stmt, 11)),
+                        .pending_wait = columnInt(stmt, 12) != 0,
+                    },
                 };
             },
             else => error.Step,
         };
+    }
+
+    fn checkpointSubmissionRetryImpl(ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity, temp_id: TempId, checkpoint: bbr.review.SubmissionRetryCheckpoint) anyerror!void {
+        const self: *SqliteStore = @ptrCast(@alignCast(ptr));
+        if (checkpoint.effective_delay_ms != @max(checkpoint.local_delay_ms, checkpoint.server_delay_ms orelse 0))
+            return error.InvalidSubmissionCheckpoint;
+        var stmt: ?*c.sqlite3_stmt = null;
+        const sql =
+            \\UPDATE submission_runs SET retry_phase=?, retry_attempt=?, retry_reason=?,
+            \\ retry_local_ms=?, retry_server_ms=?, retry_effective_ms=?, retry_pending_wait=?
+            \\ WHERE operation_id=? AND workspace=? AND repository=? AND pr_id=?
+            \\   AND current_temp_id=? AND state=0;
+        ;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(stmt);
+        bindInt(stmt, 1, @intFromEnum(checkpoint.phase));
+        bindInt(stmt, 2, checkpoint.attempt);
+        bindInt(stmt, 3, @intFromEnum(checkpoint.reason));
+        bindInt(stmt, 4, @intCast(checkpoint.local_delay_ms));
+        if (checkpoint.server_delay_ms) |delay| bindInt(stmt, 5, @intCast(delay)) else bindNull(stmt, 5);
+        bindInt(stmt, 6, @intCast(checkpoint.effective_delay_ms));
+        bindInt(stmt, 7, @intFromBool(checkpoint.pending_wait));
+        bindInt(stmt, 8, @intCast(operation_id));
+        bindText(stmt, 9, key.workspace);
+        bindText(stmt, 10, key.repository);
+        bindInt(stmt, 11, @intCast(key.pull_request_id));
+        bindInt(stmt, 12, @intCast(temp_id));
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
+        if (c.sqlite3_changes(self.db) != 1) return error.InvalidSubmissionCheckpoint;
     }
 
     fn resolveUnknownImpl(ptr: *anyopaque, key: RemoteReviewIdentity, temp_id: TempId, resolution: UnknownResolution) anyerror!void {
@@ -1017,6 +1127,28 @@ pub const SqliteStore = struct {
         bindInt(run, 6, @intCast(completed_temp_id));
         if (c.sqlite3_step(run) != c.SQLITE_DONE) return error.Step;
         if (c.sqlite3_changes(self.db) != 1) return error.InvalidSubmissionCheckpoint;
+
+        if (outcome == .failed) {
+            var retain: ?*c.sqlite3_stmt = null;
+            const retain_sql =
+                \\INSERT INTO submission_retry_carryovers
+                \\ (workspace,repository,pr_id,temp_id,retry_reason,retry_after_ms)
+                \\ SELECT workspace,repository,pr_id,?,retry_reason,retry_server_ms
+                \\ FROM submission_runs WHERE operation_id=? AND retry_server_ms IS NOT NULL
+                \\ ON CONFLICT(workspace,repository,pr_id,temp_id) DO UPDATE SET
+                \\ retry_reason=excluded.retry_reason,retry_after_ms=excluded.retry_after_ms;
+            ;
+            if (c.sqlite3_prepare_v2(self.db, retain_sql, -1, &retain, null) != c.SQLITE_OK) return error.Prepare;
+            defer _ = c.sqlite3_finalize(retain);
+            bindInt(retain, 1, @intCast(completed_temp_id));
+            bindInt(retain, 2, @intCast(operation_id));
+            if (c.sqlite3_step(retain) != c.SQLITE_DONE) return error.Step;
+        }
+        var clear: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "UPDATE submission_runs SET retry_phase=NULL,retry_attempt=NULL,retry_reason=NULL,retry_local_ms=NULL,retry_server_ms=NULL,retry_effective_ms=NULL,retry_pending_wait=NULL WHERE operation_id=?;", -1, &clear, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(clear);
+        bindInt(clear, 1, @intCast(operation_id));
+        if (c.sqlite3_step(clear) != c.SQLITE_DONE) return error.Step;
 
         try self.exec("COMMIT;");
     }
@@ -2040,6 +2172,66 @@ test "SQLite abandonment terminalizes the run and retains outcome evidence" {
     try testing.expect((try store.load(arena.allocator(), key))[0].state == .outcome_unknown);
 }
 
+test "SQLite reopens a pending retry wait with complete checkpoint evidence" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = try std.fmt.allocPrintSentinel(arena.allocator(), ".zig-cache/tmp/{s}/retry.db", .{&tmp.sub_path}, 0);
+    const key = testReviewKey(77);
+    var operation_id: OperationId = 0;
+    const checkpoint: bbr.review.SubmissionRetryCheckpoint = .{
+        .phase = .publication_check,
+        .attempt = 2,
+        .reason = .publication_check_server_error,
+        .local_delay_ms = 2_000,
+        .server_delay_ms = 7_000,
+        .effective_delay_ms = 7_000,
+        .pending_wait = true,
+    };
+    {
+        var sqlite = try SqliteStore.open(path);
+        defer sqlite.deinit();
+        const store = sqlite.store();
+        try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "retry" });
+        operation_id = try store.beginSubmission(key, "source", &.{.{ .temp_id = 1, .parent = null }});
+        try store.checkpointSubmissionRetry(operation_id, key, 1, checkpoint);
+    }
+
+    var reopened = try SqliteStore.open(path);
+    defer reopened.deinit();
+    const run = (try reopened.store().activeSubmission(arena.allocator())).?;
+    try testing.expectEqual(operation_id, run.operation_id);
+    try testing.expectEqualDeep(checkpoint, run.retry.?);
+}
+
+test "SQLite carries final server guidance into a fresh Submission budget" {
+    var sqlite = try SqliteStore.open(":memory:");
+    defer sqlite.deinit();
+    const store = sqlite.store();
+    const key = testReviewKey(78);
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "retry" });
+    const operation_id = try store.beginSubmission(key, "source", &.{.{ .temp_id = 1, .parent = null }});
+    try store.checkpointSubmissionRetry(operation_id, key, 1, .{
+        .phase = .post,
+        .attempt = 3,
+        .reason = .server_error,
+        .local_delay_ms = 0,
+        .server_delay_ms = 6_000,
+        .effective_delay_ms = 6_000,
+        .pending_wait = false,
+    });
+    try store.checkpointSubmission(operation_id, key, 1, .{ .failed = error.ServerError }, null);
+    try store.completeSubmission(operation_id, key, .partial);
+    _ = try store.beginSubmission(key, "source", &.{.{ .temp_id = 1, .parent = null }});
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const retry = (try store.activeSubmission(arena.allocator())).?.retry.?;
+    try testing.expectEqual(@as(u8, 0), retry.attempt);
+    try testing.expectEqual(@as(?u64, 6_000), retry.server_delay_ms);
+    try testing.expect(retry.pending_wait);
+}
+
 test "v8 migration preserves every authored Draft field and lifecycle state" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2066,7 +2258,18 @@ test "v8 migration preserves every authored Draft field and lifecycle state" {
             .body = "reply",
             .state = .outcome_unknown,
         });
-        try sqlite.exec("DROP TABLE submission_run_items; PRAGMA user_version = 7;");
+        try sqlite.exec(
+            \\DROP TABLE submission_run_items;
+            \\DROP TABLE submission_retry_carryovers;
+            \\ALTER TABLE submission_runs DROP COLUMN retry_phase;
+            \\ALTER TABLE submission_runs DROP COLUMN retry_attempt;
+            \\ALTER TABLE submission_runs DROP COLUMN retry_reason;
+            \\ALTER TABLE submission_runs DROP COLUMN retry_local_ms;
+            \\ALTER TABLE submission_runs DROP COLUMN retry_server_ms;
+            \\ALTER TABLE submission_runs DROP COLUMN retry_effective_ms;
+            \\ALTER TABLE submission_runs DROP COLUMN retry_pending_wait;
+            \\PRAGMA user_version = 7;
+        );
     }
 
     var upgraded = try SqliteStore.open(path);

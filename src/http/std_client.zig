@@ -48,21 +48,46 @@ pub const StdHttpClient = struct {
         defer allocator.free(extra);
         for (req.headers, extra) |h, *out| out.* = .{ .name = h.name, .value = h.value };
 
-        // fetch() writes the body into a writer; capture it into an owned slice.
+        const uri = try std.Uri.parse(req.url);
+        var request = try self.inner.request(toStdMethod(req.method), uri, .{
+            .extra_headers = extra,
+            .headers = .{ .accept_encoding = .omit },
+            .redirect_behavior = if (req.body == null) @enumFromInt(3) else .unhandled,
+        });
+        defer request.deinit();
+        request.accept_encoding = @splat(false);
+        request.accept_encoding[@intFromEnum(http.ContentEncoding.identity)] = true;
+        if (req.body) |payload| {
+            request.transfer_encoding = .{ .content_length = payload.len };
+            var request_body = try request.sendBodyUnflushed(&.{});
+            try request_body.writer.writeAll(payload);
+            try request_body.end();
+            try request.connection.?.flush();
+        } else {
+            try request.sendBodiless();
+        }
+
+        var redirect_buffer: [8 * 1024]u8 = undefined;
+        var response = try request.receiveHead(&redirect_buffer);
+        const status: u16 = @intFromEnum(response.head.status);
+        const retry_after_ms = if (status == 429 or status >= 500 and status <= 599)
+            retryAfterFromHead(response.head, Io.Clock.real.now(self.inner.io).toSeconds())
+        else
+            null;
+
         var body: Io.Writer.Allocating = .init(allocator);
         errdefer body.deinit();
-
-        const result = try self.inner.fetch(.{
-            .location = .{ .url = req.url },
-            .method = toStdMethod(req.method),
-            .payload = req.body,
-            .extra_headers = extra,
-            .response_writer = &body.writer,
-        });
+        var transfer_buffer: [64]u8 = undefined;
+        const reader = response.reader(&transfer_buffer);
+        _ = reader.streamRemaining(&body.writer) catch |err| switch (err) {
+            error.ReadFailed => return response.bodyErr().?,
+            else => |e| return e,
+        };
 
         return .{
-            .status = @intFromEnum(result.status),
+            .status = status,
             .body = try body.toOwnedSlice(),
+            .retry_after_ms = retry_after_ms,
         };
     }
 
@@ -75,3 +100,103 @@ pub const StdHttpClient = struct {
         };
     }
 };
+
+fn retryAfterFromHead(head: http.Client.Response.Head, now_seconds: i64) ?u64 {
+    var headers = head.iterateHeaders();
+    while (headers.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "retry-after"))
+            return parseRetryAfter(header.value, now_seconds);
+    }
+    return null;
+}
+
+/// Parse the two Retry-After wire forms from RFC 9110. `now_seconds` is passed
+/// in so parsing remains deterministic and the HTTP adapter is the only clock
+/// reader. Expired dates and values that cannot be represented in milliseconds
+/// are deliberately ignored.
+pub fn parseRetryAfter(value: []const u8, now_seconds: i64) ?u64 {
+    const trimmed = std.mem.trim(u8, value, " \t");
+    if (trimmed.len == 0) return null;
+    if (std.fmt.parseInt(u64, trimmed, 10)) |seconds| {
+        const milliseconds = std.math.mul(u64, seconds, std.time.ms_per_s) catch return null;
+        return if (milliseconds <= std.math.maxInt(i64)) milliseconds else null;
+    } else |_| {}
+
+    const target = parseHttpDate(trimmed) orelse return null;
+    if (target <= now_seconds) return null;
+    const delay: u64 = @intCast(target - now_seconds);
+    const milliseconds = std.math.mul(u64, delay, std.time.ms_per_s) catch return null;
+    return if (milliseconds <= std.math.maxInt(i64)) milliseconds else null;
+}
+
+fn parseHttpDate(value: []const u8) ?i64 {
+    // IMF-fixdate: Sun, 06 Nov 1994 08:49:37 GMT
+    if (value.len != 29 or !std.mem.eql(u8, value[3..5], ", ") or
+        value[7] != ' ' or value[11] != ' ' or value[16] != ' ' or
+        value[19] != ':' or value[22] != ':' or !std.mem.eql(u8, value[25..], " GMT")) return null;
+    const weekday = parseWeekday(value[0..3]) orelse return null;
+    const day = std.fmt.parseInt(u8, value[5..7], 10) catch return null;
+    const month = parseMonth(value[8..11]) orelse return null;
+    const year = std.fmt.parseInt(u16, value[12..16], 10) catch return null;
+    const hour = std.fmt.parseInt(u8, value[17..19], 10) catch return null;
+    const minute = std.fmt.parseInt(u8, value[20..22], 10) catch return null;
+    const second = std.fmt.parseInt(u8, value[23..25], 10) catch return null;
+    if (year < 1970 or day == 0 or day > daysInMonth(year, month) or hour > 23 or minute > 59 or second > 59) return null;
+
+    var days: i64 = 0;
+    var current_year: u16 = 1970;
+    while (current_year < year) : (current_year += 1) days += if (isLeap(current_year)) 366 else 365;
+    var current_month: u8 = 1;
+    while (current_month < month) : (current_month += 1) days += daysInMonth(year, current_month);
+    days += day - 1;
+    if (@as(u8, @intCast(@mod(days + 4, 7))) != weekday) return null;
+    return days * std.time.s_per_day + @as(i64, hour) * std.time.s_per_hour + @as(i64, minute) * std.time.s_per_min + second;
+}
+
+fn parseWeekday(value: []const u8) ?u8 {
+    const names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    for (names, 0..) |name, weekday| if (std.mem.eql(u8, value, name)) return @intCast(weekday);
+    return null;
+}
+
+fn parseMonth(value: []const u8) ?u8 {
+    const names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    for (names, 1..) |name, month| if (std.mem.eql(u8, value, name)) return @intCast(month);
+    return null;
+}
+
+fn isLeap(year: u16) bool {
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0);
+}
+
+fn daysInMonth(year: u16, month: u8) u8 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeap(year)) 29 else 28,
+        else => 0,
+    };
+}
+
+test "Retry-After parses delay-seconds and HTTP-date forms" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?u64, 12_000), parseRetryAfter("12", 0));
+    const now = parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT").?;
+    try testing.expectEqual(@as(?u64, 3_000), parseRetryAfter("Sun, 06 Nov 1994 08:49:40 GMT", now));
+}
+
+test "Retry-After rejects malformed overflowing and expired guidance" {
+    const testing = std.testing;
+    const now = parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT").?;
+    try testing.expectEqual(@as(?u64, null), parseRetryAfter("-1", now));
+    try testing.expectEqual(@as(?u64, null), parseRetryAfter("18446744073709551615", now));
+    try testing.expectEqual(@as(?u64, null), parseRetryAfter("Sun, 06 Nov 1994 08:49:37 GMT", now));
+    try testing.expectEqual(@as(?u64, null), parseRetryAfter("tomorrow", now));
+}
+
+test "Retry-After header matching is case-insensitive" {
+    const head = try http.Client.Response.Head.parse(
+        "HTTP/1.1 503 Service Unavailable\r\nrEtRy-AfTeR: 7\r\ncontent-length: 0\r\n\r\n",
+    );
+    try std.testing.expectEqual(@as(?u64, 7_000), retryAfterFromHead(head, 0));
+}

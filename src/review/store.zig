@@ -74,6 +74,28 @@ pub const ActiveSubmissionRun = struct {
     source_commit: []const u8,
     current_temp_id: ?TempId,
     items: []SubmissionRunItem,
+    retry: ?SubmissionRetryCheckpoint = null,
+};
+
+pub const SubmissionRetryPhase = enum { post, publication_check };
+
+pub const SubmissionRetryReason = enum {
+    rate_limited,
+    server_error,
+    ambiguous_post,
+    publication_check_rate_limited,
+    publication_check_server_error,
+    publication_check_transport,
+};
+
+pub const SubmissionRetryCheckpoint = struct {
+    phase: SubmissionRetryPhase,
+    attempt: u8,
+    reason: SubmissionRetryReason,
+    local_delay_ms: u64,
+    server_delay_ms: ?u64,
+    effective_delay_ms: u64,
+    pending_wait: bool,
 };
 
 pub const SubmissionRunItem = struct {
@@ -210,6 +232,7 @@ pub const PendingReviewStore = struct {
         load: *const fn (ptr: *anyopaque, allocator: Allocator, key: RemoteReviewIdentity) anyerror![]Draft,
         begin_submission: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, source_commit: []const u8, items: []const SubmissionRunItem) anyerror!OperationId,
         checkpoint_submission: *const fn (ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) anyerror!void,
+        checkpoint_submission_retry: *const fn (ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity, temp_id: TempId, checkpoint: SubmissionRetryCheckpoint) anyerror!void,
         complete_submission: *const fn (ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity, completion: SubmissionCompletion) anyerror!void,
         abandon_submission: *const fn (ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity) anyerror!void,
         active_submission: *const fn (ptr: *anyopaque, allocator: Allocator) anyerror!?ActiveSubmissionRun,
@@ -275,6 +298,10 @@ pub const PendingReviewStore = struct {
     /// No network operation belongs inside this call.
     pub fn checkpointSubmission(self: PendingReviewStore, operation_id: OperationId, key: RemoteReviewIdentity, completed_temp_id: TempId, outcome: SubmissionOutcome, next_temp_id: ?TempId) !void {
         return self.vtable.checkpoint_submission(self.ptr, operation_id, key, completed_temp_id, outcome, next_temp_id);
+    }
+
+    pub fn checkpointSubmissionRetry(self: PendingReviewStore, operation_id: OperationId, key: RemoteReviewIdentity, temp_id: TempId, checkpoint: SubmissionRetryCheckpoint) !void {
+        return self.vtable.checkpoint_submission_retry(self.ptr, operation_id, key, temp_id, checkpoint);
     }
 
     pub fn completeSubmission(self: PendingReviewStore, operation_id: OperationId, key: RemoteReviewIdentity, completion: SubmissionCompletion) !void {
@@ -350,6 +377,37 @@ test "ReviewIdentity equality distinguishes remote and local Reviews by canonica
     try std.testing.expect(ReviewIdentity.eql(local, same_local));
 }
 
+test "retry checkpoints round-trip and terminal guidance carries into a fresh budget" {
+    var memory = InMemoryStore.init(std.testing.allocator);
+    defer memory.deinit();
+    const store = memory.store();
+    const key = testReviewKey(99);
+    try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "retry" });
+    const operation_id = try store.beginSubmission(key, "source", &.{.{ .temp_id = 1, .parent = null }});
+    const terminal: SubmissionRetryCheckpoint = .{
+        .phase = .post,
+        .attempt = 3,
+        .reason = .rate_limited,
+        .local_delay_ms = 0,
+        .server_delay_ms = 4_000,
+        .effective_delay_ms = 4_000,
+        .pending_wait = false,
+    };
+    try store.checkpointSubmissionRetry(operation_id, key, 1, terminal);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualDeep(terminal, (try store.activeSubmission(arena.allocator())).?.retry.?);
+    try store.checkpointSubmission(operation_id, key, 1, .{ .failed = error.RateLimited }, null);
+    try store.completeSubmission(operation_id, key, .partial);
+
+    const fresh_id = try store.beginSubmission(key, "source", &.{.{ .temp_id = 1, .parent = null }});
+    const fresh = (try store.activeSubmission(arena.allocator())).?;
+    try std.testing.expectEqual(fresh_id, fresh.operation_id);
+    try std.testing.expectEqual(@as(u8, 0), fresh.retry.?.attempt);
+    try std.testing.expectEqual(@as(?u64, 4_000), fresh.retry.?.server_delay_ms);
+    try std.testing.expect(fresh.retry.?.pending_wait);
+}
+
 fn dupeAnchor(alloc: Allocator, a: Anchor) !Anchor {
     var copy = a;
     copy.path = try alloc.dupe(u8, a.path);
@@ -365,6 +423,7 @@ pub const InMemoryStore = struct {
     arena: std.heap.ArenaAllocator,
     entries: std.ArrayList(Entry),
     active_submission: ?ActiveSubmissionRun = null,
+    retry_carryovers: std.ArrayList(RetryCarryover) = .empty,
     next_operation_id: OperationId = 1,
     next_repository_id: ReviewRepositoryId = 1,
     repository_aliases: std.ArrayList(RepositoryAlias) = .empty,
@@ -383,6 +442,7 @@ pub const InMemoryStore = struct {
     const Entry = struct { key: RemoteReviewIdentity, draft: Draft };
     const RepositoryAlias = struct { alias: []const u8, repository_id: ReviewRepositoryId };
     const TempCounter = struct { key: RemoteReviewIdentity, next_id: TempId };
+    const RetryCarryover = struct { key: RemoteReviewIdentity, temp_id: TempId, checkpoint: SubmissionRetryCheckpoint };
 
     pub fn init(gpa: Allocator) InMemoryStore {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa), .entries = .empty };
@@ -393,6 +453,7 @@ pub const InMemoryStore = struct {
         self.entries.deinit(gpa);
         self.repository_aliases.deinit(gpa);
         self.temp_counters.deinit(gpa);
+        self.retry_carryovers.deinit(gpa);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -410,6 +471,7 @@ pub const InMemoryStore = struct {
         .load = loadImpl,
         .begin_submission = beginSubmissionImpl,
         .checkpoint_submission = checkpointSubmissionImpl,
+        .checkpoint_submission_retry = checkpointSubmissionRetryImpl,
         .complete_submission = completeSubmissionImpl,
         .abandon_submission = abandonSubmissionImpl,
         .active_submission = activeSubmissionImpl,
@@ -732,6 +794,20 @@ pub const InMemoryStore = struct {
             .current_temp_id = first_temp_id,
             .items = owned_items,
         };
+        for (self.retry_carryovers.items, 0..) |carry, index| if (RemoteReviewIdentity.eql(carry.key, key) and carry.temp_id == first_temp_id and carry.checkpoint.server_delay_ms != null) {
+            const delay = carry.checkpoint.server_delay_ms.?;
+            self.active_submission.?.retry = .{
+                .phase = .post,
+                .attempt = 0,
+                .reason = carry.checkpoint.reason,
+                .local_delay_ms = 0,
+                .server_delay_ms = delay,
+                .effective_delay_ms = delay,
+                .pending_wait = true,
+            };
+            _ = self.retry_carryovers.orderedRemove(index);
+            break;
+        };
         self.next_operation_id += 1;
         first.state = .submitting;
         return operation_id;
@@ -750,7 +826,22 @@ pub const InMemoryStore = struct {
             .source_commit = try allocator.dupe(u8, run.source_commit),
             .current_temp_id = run.current_temp_id,
             .items = try allocator.dupe(SubmissionRunItem, run.items),
+            .retry = run.retry,
         };
+    }
+
+    fn checkpointSubmissionRetryImpl(ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity, temp_id: TempId, checkpoint: SubmissionRetryCheckpoint) anyerror!void {
+        const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
+        if (self.fail_next_checkpoint) {
+            self.fail_next_checkpoint = false;
+            return error.InjectedCheckpointFailure;
+        }
+        const run = if (self.active_submission) |*active| active else return error.SubmissionNotActive;
+        if (run.operation_id != operation_id or !RemoteReviewIdentity.eql(run.key, key) or run.current_temp_id != temp_id)
+            return error.InvalidSubmissionCheckpoint;
+        if (checkpoint.effective_delay_ms != @max(checkpoint.local_delay_ms, checkpoint.server_delay_ms orelse 0))
+            return error.InvalidSubmissionCheckpoint;
+        run.retry = checkpoint;
     }
 
     fn resolveUnknownImpl(ptr: *anyopaque, key: RemoteReviewIdentity, temp_id: TempId, resolution: UnknownResolution) anyerror!void {
@@ -802,7 +893,21 @@ pub const InMemoryStore = struct {
 
         completed_draft.state = outcome.draftState();
         if (next_draft) |draft| draft.state = .submitting;
+        if (outcome == .failed and run.retry != null and !run.retry.?.pending_wait and run.retry.?.server_delay_ms != null) {
+            var retained = false;
+            for (self.retry_carryovers.items) |*carry| if (RemoteReviewIdentity.eql(carry.key, run.key) and carry.temp_id == completed_temp_id) {
+                carry.checkpoint = run.retry.?;
+                retained = true;
+                break;
+            };
+            if (!retained) try self.retry_carryovers.append(self.arena.child_allocator, .{
+                .key = run.key,
+                .temp_id = completed_temp_id,
+                .checkpoint = run.retry.?,
+            });
+        }
         run.current_temp_id = next_temp_id;
+        run.retry = null;
     }
 
     fn completeSubmissionImpl(ptr: *anyopaque, operation_id: OperationId, key: RemoteReviewIdentity, completion: SubmissionCompletion) anyerror!void {

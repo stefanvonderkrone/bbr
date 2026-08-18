@@ -220,6 +220,27 @@ pub const Client = struct {
         id: u64,
         nc: NewComment,
     ) !CommentId {
+        return switch (try self.createCommentAttempt(allocator, repo_slug, id, nc)) {
+            .posted => |comment_id| comment_id,
+            .rejected => |failure| failure.reason,
+        };
+    }
+
+    pub const CreateCommentAttempt = union(enum) {
+        posted: CommentId,
+        rejected: struct { reason: ApiError, retry_after_ms: ?u64 },
+    };
+
+    /// POST one Comment while preserving normalized server retry guidance for
+    /// Submission policy. Other Client methods intentionally keep their simpler
+    /// error-returning contracts.
+    pub fn createCommentAttempt(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        id: u64,
+        nc: NewComment,
+    ) !CreateCommentAttempt {
         const url = try std.fmt.allocPrint(
             allocator,
             "{s}/repositories/{s}/{s}/pullrequests/{d}/comments",
@@ -274,7 +295,10 @@ pub const Client = struct {
         });
         defer allocator.free(res.body);
 
-        try classify(res.status);
+        classify(res.status) catch |reason| return .{ .rejected = .{
+            .reason = reason,
+            .retry_after_ms = res.retry_after_ms,
+        } };
         const parsed = std.json.parseFromSlice(
             struct { id: u64 },
             allocator,
@@ -282,7 +306,7 @@ pub const Client = struct {
             .{ .ignore_unknown_fields = true },
         ) catch return error.MalformedResponse;
         defer parsed.deinit();
-        return parsed.value.id;
+        return .{ .posted = parsed.value.id };
     }
 
     /// GET /user and return the UUID proven by the current Credential.
@@ -451,6 +475,26 @@ pub const Client = struct {
         id: u64,
         head: HeadCommits,
     ) ![]Comment {
+        return switch (try self.getCommentsAttempt(allocator, repo_slug, id, head)) {
+            .comments => |comments| comments,
+            .rejected => |failure| failure.reason,
+        };
+    }
+
+    pub const GetCommentsAttempt = union(enum) {
+        comments: []Comment,
+        rejected: struct { reason: ApiError, retry_after_ms: ?u64 },
+    };
+
+    /// Duplicate-guard variant that preserves Retry-After on a definite failed
+    /// read instead of flattening it into an error value.
+    pub fn getCommentsAttempt(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        id: u64,
+        head: HeadCommits,
+    ) !GetCommentsAttempt {
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
 
@@ -477,7 +521,10 @@ pub const Client = struct {
             allocator.free(url); // request is sent; the slice is free to reuse.
             defer allocator.free(res.body);
 
-            try classify(res.status);
+            classify(res.status) catch |reason| return .{ .rejected = .{
+                .reason = reason,
+                .retry_after_ms = res.retry_after_ms,
+            } };
 
             const parsed = std.json.parseFromSlice(CommentsPage, allocator, res.body, .{
                 .ignore_unknown_fields = true,
@@ -501,7 +548,7 @@ pub const Client = struct {
             write += 1;
         }
         out.shrinkRetainingCapacity(write);
-        return out.toOwnedSlice(allocator);
+        return .{ .comments = try out.toOwnedSlice(allocator) };
     }
 };
 

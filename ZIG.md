@@ -109,6 +109,12 @@ the main thread; the Epoch token still guards against stale results.
   both variants hold a `[]const u8`, so `switch (c) { .raw, .percent_encoded => |s| s }` gets the
   string (or `component.toRawMaybeAlloc(arena)` to decode `%xx`). Used in `bitbucket/url.zig` for the
   scheme/host/path decomposition; only the domain-specific segment logic is hand-written.
+- **`fetch` does not expose response headers.** When a seam needs normalized header data (bbr's
+  `Retry-After` delay), use `Client.request` (`Client.zig:1681`), send the request body through
+  `Request.sendBodyUnflushed`/`BodyWriter.end` or call `sendBodiless`, then call
+  `Request.receiveHead` (`Client.zig:1133`). Inspect fields with
+  `Response.Head.iterateHeaders` (`Client.zig:644`) before calling `Response.reader`, because
+  initializing the body reader invalidates the head's borrowed strings (`Client.zig:736-741`).
 - **Proxy support** (see also `docs/adr/0003`):
   - Fields `http_proxy: ?*Proxy` / `https_proxy: ?*Proxy`.
   - `initDefaultProxies(arena, environ_map)` auto-reads `http_proxy`/`HTTP_PROXY`/`all_proxy`/

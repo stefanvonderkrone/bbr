@@ -733,16 +733,20 @@ fn presentationDuplicateCheckWorker(
         .repo_slug = command.identity.repository(),
         .pr_id = command.identity.pullRequestId(),
     };
-    const outcome: presentation.DuplicateCheckOutcome = if (poster.poster().findExisting(command.draft, command.parent)) |existing|
-        if (existing) |id| .{ .found = id } else .missing
-    else |_|
-        .failed;
+    const checked = poster.poster().findExisting(command.draft, command.parent) catch bbr.review.CheckResult{ .outcome = .ambiguous };
+    const outcome: presentation.DuplicateCheckOutcome = switch (checked.outcome) {
+        .found => |id| .{ .found = id },
+        .missing => .missing,
+        .rejected => |err| .{ .rejected = err },
+        .ambiguous => .failed,
+    };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .duplicate_checked = .{
         .command_id = command.command_id,
         .operation_id = command.operation_id,
         .identity = command.identity,
         .temp_id = command.draft.local_id,
         .outcome = outcome,
+        .retry_after_ms = checked.retry_after_ms,
     } });
 }
 

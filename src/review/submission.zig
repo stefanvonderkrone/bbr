@@ -28,20 +28,20 @@ const comment = @import("comment.zig");
 const CommentId = comment.CommentId;
 const ApiError = @import("../bitbucket/types.zig").ApiError;
 const SubmissionRunItem = @import("store.zig").SubmissionRunItem;
+const SubmissionRetryCheckpoint = @import("store.zig").SubmissionRetryCheckpoint;
+const SubmissionRetryPhase = @import("store.zig").SubmissionRetryPhase;
+const SubmissionRetryReason = @import("store.zig").SubmissionRetryReason;
 
 /// Total tries per retryable item (the first attempt plus retries). After this
 /// many failures the item is marked failed and its reply-descendants skipped.
 pub const max_attempts: u8 = 3;
-const backoff_base_ms: u64 = 200;
-const backoff_cap_ms: u64 = 5_000;
+const backoff_base_ms: u64 = 1_000;
 
 /// Backoff before the `n`-th retry (n = the failure count so far, 1-based):
-/// exponential from `backoff_base_ms`, doubling, capped at `backoff_cap_ms`.
-/// Deterministic — jitter is deferred (a caller can add it to the returned ms).
+/// one second, then two seconds. A third failure is terminal.
 pub fn backoffMs(attempt: u8) u64 {
     if (attempt == 0) return 0;
-    const shift: u6 = @intCast(@min(attempt - 1, 5));
-    return @min(backoff_base_ms << shift, backoff_cap_ms);
+    return if (attempt == 1) backoff_base_ms else backoff_base_ms * 2;
 }
 
 /// Stale-anchor guard (§9): true if the PR's source head moved since we loaded
@@ -64,6 +64,23 @@ pub const PostOutcome = union(enum) {
     ambiguous,
 };
 
+pub const PostResult = struct {
+    outcome: PostOutcome,
+    retry_after_ms: ?u64 = null,
+};
+
+pub const CheckOutcome = union(enum) {
+    found: CommentId,
+    missing,
+    rejected: ApiError,
+    ambiguous,
+};
+
+pub const CheckResult = struct {
+    outcome: CheckOutcome,
+    retry_after_ms: ?u64 = null,
+};
+
 /// The concrete action `advance()` asks the caller to take.
 pub const Step = union(enum) {
     /// POST this draft. `parent` is the resolved server `CommentId` for a reply
@@ -72,8 +89,11 @@ pub const Step = union(enum) {
     /// `CommentPoster.findExisting`) and, on a match, report `.posted{that id}`
     /// instead of re-POSTing.
     post: PostStep,
+    /// Read comments and establish whether an ambiguous POST published. This
+    /// effect never performs a POST itself.
+    check: PostStep,
     /// Sleep `ms`, then call `advance()` again (it re-issues the same post).
-    wait: struct { ms: u64, temp_id: TempId },
+    wait: WaitStep,
     /// Terminal: the batch finished. Some items may have failed or been skipped
     /// (see `summary`); the caller applies state and, on a clean batch, deletes
     /// the posted drafts (ADR-0007).
@@ -84,6 +104,12 @@ pub const Step = union(enum) {
 };
 
 pub const PostStep = struct { temp_id: TempId, parent: ?CommentId, dedupe: bool };
+
+pub const WaitStep = struct {
+    ms: u64,
+    temp_id: TempId,
+    checkpoint: SubmissionRetryCheckpoint,
+};
 
 /// The fate of one draft in a finished (or aborted) batch.
 pub const ItemStatus = enum { posted, failed, skipped, outcome_unknown };
@@ -131,13 +157,18 @@ pub const Submission = struct {
     idx: usize = 0,
     /// Failure count per `order` position (drives backoff and exhaustion).
     attempts: []u8,
+    /// Failed publication checks; independent from the POST attempt budget.
+    check_attempts: []u8,
     /// Whether the last failure at a position was `ambiguous` (→ dedupe on retry).
     ambiguous_last: []bool,
     /// The decided outcome per `order` position, filled as the batch runs.
     results: []?ItemResult,
     /// A retry is scheduled for the current item: `advance()` emits one `.wait`.
     must_wait: bool = false,
-    wait_ms: u64 = 0,
+    retry_checkpoint: SubmissionRetryCheckpoint = undefined,
+    /// Guidance attached to the final definite retryable rejection. A fresh
+    /// selective retry carries this delay to its first POST.
+    terminal_server_delay_ms: ?u64 = null,
     aborted_reason: ?ApiError = null,
     alloc: Allocator,
 
@@ -168,6 +199,9 @@ pub const Submission = struct {
         const amb = try alloc.alloc(bool, n);
         errdefer alloc.free(amb);
         @memset(amb, false);
+        const check_attempts = try alloc.alloc(u8, n);
+        errdefer alloc.free(check_attempts);
+        @memset(check_attempts, 0);
         const results = try alloc.alloc(?ItemResult, n);
         @memset(results, null);
         for (order, 0..) |temp_id, i| {
@@ -183,6 +217,7 @@ pub const Submission = struct {
             .review = review,
             .order = order,
             .attempts = attempts,
+            .check_attempts = check_attempts,
             .ambiguous_last = amb,
             .results = results,
             .alloc = alloc,
@@ -192,6 +227,7 @@ pub const Submission = struct {
     pub fn deinit(self: *Submission) void {
         self.alloc.free(self.order);
         self.alloc.free(self.attempts);
+        self.alloc.free(self.check_attempts);
         self.alloc.free(self.ambiguous_last);
         self.alloc.free(self.results);
         self.* = undefined;
@@ -238,19 +274,29 @@ pub const Submission = struct {
                 },
                 .ok => |parent| {
                     if (self.must_wait) {
-                        self.must_wait = false;
-                        return .{ .wait = .{ .ms = self.wait_ms, .temp_id = tid } };
+                        return .{ .wait = .{
+                            .ms = self.retry_checkpoint.effective_delay_ms,
+                            .temp_id = tid,
+                            .checkpoint = self.retry_checkpoint,
+                        } };
                     }
-                    return .{ .post = .{ .temp_id = tid, .parent = parent, .dedupe = self.ambiguous_last[i] } };
+                    const effect: PostStep = .{ .temp_id = tid, .parent = parent, .dedupe = self.ambiguous_last[i] };
+                    return if (self.ambiguous_last[i]) .{ .check = effect } else .{ .post = effect };
                 },
             }
         }
         return .done;
     }
 
+    pub fn completeWait(self: *Submission) void {
+        std.debug.assert(self.must_wait);
+        self.must_wait = false;
+    }
+
     /// Feed back the outcome of the `.post` step `advance()` last returned.
     /// `retry_after_ms` overrides the computed backoff (a 429's `Retry-After`).
     pub fn report(self: *Submission, outcome: PostOutcome, retry_after_ms: ?u64) void {
+        self.terminal_server_delay_ms = null;
         const i = self.idx;
         const tid = self.order[i];
         switch (outcome) {
@@ -261,10 +307,48 @@ pub const Submission = struct {
             },
             .rejected => |err| switch (classifyPolicy(err)) {
                 .abort => self.aborted_reason = err, // leave the item pending
-                .retry => self.scheduleRetryOrFail(i, err, false, retry_after_ms),
+                .retry => self.scheduleRetryOrFail(i, err, retry_after_ms),
                 .fail => self.failItem(i, tid, err),
             },
-            .ambiguous => self.scheduleRetryOrFail(i, null, true, retry_after_ms),
+            .ambiguous => {
+                self.attempts[i] += 1;
+                self.ambiguous_last[i] = true;
+                self.check_attempts[i] = 0;
+            },
+        }
+    }
+
+    /// Feed back one Duplicate-guard read. A failed read spends only the
+    /// publication-check budget; another POST is allowed only after a definite
+    /// `.missing` result.
+    pub fn reportCheck(self: *Submission, result: CheckResult) void {
+        const i = self.idx;
+        const tid = self.order[i];
+        switch (result.outcome) {
+            .found => |id| {
+                self.results[i] = .{ .temp_id = tid, .status = .posted, .id = id };
+                self.ambiguous_last[i] = false;
+                self.idx += 1;
+            },
+            .missing => {
+                self.ambiguous_last[i] = false;
+                self.check_attempts[i] = 0;
+                if (self.attempts[i] >= max_attempts) {
+                    self.results[i] = .{ .temp_id = tid, .status = .outcome_unknown };
+                    self.idx += 1;
+                } else {
+                    self.setWait(.post, self.attempts[i], .ambiguous_post, result.retry_after_ms);
+                    self.must_wait = true;
+                }
+            },
+            .rejected => |err| switch (classifyPolicy(err)) {
+                .retry => self.scheduleCheckRetryOrUnknown(i, checkReason(err), result.retry_after_ms),
+                .abort, .fail => {
+                    self.results[i] = .{ .temp_id = tid, .status = .outcome_unknown };
+                    self.idx += 1;
+                },
+            },
+            .ambiguous => self.scheduleCheckRetryOrUnknown(i, .publication_check_transport, result.retry_after_ms),
         }
     }
 
@@ -333,20 +417,70 @@ pub const Submission = struct {
         return if (parent.state == .failed) parent.state.failed else null;
     }
 
-    fn scheduleRetryOrFail(self: *Submission, i: usize, err: ?ApiError, ambiguous: bool, retry_after_ms: ?u64) void {
+    fn scheduleRetryOrFail(self: *Submission, i: usize, err: ApiError, retry_after_ms: ?u64) void {
         self.attempts[i] += 1;
         if (self.attempts[i] >= max_attempts) {
-            if (err) |api_error| {
-                self.failItem(i, self.order[i], api_error);
-            } else {
-                self.results[i] = .{ .temp_id = self.order[i], .status = .outcome_unknown };
-                self.idx += 1;
-            }
+            self.terminal_server_delay_ms = retry_after_ms;
+            self.failItem(i, self.order[i], err);
             return;
         }
-        self.ambiguous_last[i] = ambiguous;
-        self.wait_ms = retry_after_ms orelse backoffMs(self.attempts[i]);
+        self.ambiguous_last[i] = false;
+        self.setWait(.post, self.attempts[i], postReason(err), retry_after_ms);
         self.must_wait = true;
+    }
+
+    fn scheduleCheckRetryOrUnknown(self: *Submission, i: usize, reason: SubmissionRetryReason, retry_after_ms: ?u64) void {
+        self.check_attempts[i] += 1;
+        if (self.check_attempts[i] >= max_attempts) {
+            self.results[i] = .{ .temp_id = self.order[i], .status = .outcome_unknown };
+            self.idx += 1;
+            return;
+        }
+        self.setCheckWait(i, reason, retry_after_ms);
+        self.must_wait = true;
+    }
+
+    fn setWait(self: *Submission, phase: SubmissionRetryPhase, attempt: u8, reason: SubmissionRetryReason, server_delay_ms: ?u64) void {
+        const local = backoffMs(attempt);
+        self.retry_checkpoint = .{
+            .phase = phase,
+            .attempt = attempt,
+            .reason = reason,
+            .local_delay_ms = local,
+            .server_delay_ms = server_delay_ms,
+            .effective_delay_ms = @max(local, server_delay_ms orelse 0),
+            .pending_wait = true,
+        };
+    }
+
+    fn setCheckWait(self: *Submission, i: usize, reason: SubmissionRetryReason, server_delay_ms: ?u64) void {
+        const local = backoffMs(self.check_attempts[i]);
+        self.retry_checkpoint = .{
+            .phase = .publication_check,
+            // Preserve the independent POST budget. The exact 1s/2s local
+            // delay identifies the failed publication-check attempt on resume.
+            .attempt = self.attempts[i],
+            .reason = reason,
+            .local_delay_ms = local,
+            .server_delay_ms = server_delay_ms,
+            .effective_delay_ms = @max(local, server_delay_ms orelse 0),
+            .pending_wait = true,
+        };
+    }
+
+    /// Restore a durable retry point. A pending timer is intentionally replayed
+    /// in full; a cleared post-phase checkpoint becomes a publication check
+    /// because a crash cannot establish whether the POST launched.
+    pub fn restoreRetry(self: *Submission, checkpoint: SubmissionRetryCheckpoint) void {
+        const i = self.idx;
+        self.retry_checkpoint = checkpoint;
+        self.attempts[i] = checkpoint.attempt;
+        self.check_attempts[i] = if (checkpoint.phase == .publication_check)
+            (if (checkpoint.local_delay_ms == backoffMs(1)) 1 else 2)
+        else
+            0;
+        self.ambiguous_last[i] = checkpoint.phase == .publication_check or !checkpoint.pending_wait;
+        self.must_wait = checkpoint.pending_wait;
     }
 
     fn failItem(self: *Submission, i: usize, tid: TempId, err: ApiError) void {
@@ -354,6 +488,22 @@ pub const Submission = struct {
         self.idx += 1;
     }
 };
+
+fn postReason(err: ApiError) SubmissionRetryReason {
+    return switch (err) {
+        error.RateLimited => .rate_limited,
+        error.ServerError => .server_error,
+        else => unreachable,
+    };
+}
+
+fn checkReason(err: ApiError) SubmissionRetryReason {
+    return switch (err) {
+        error.RateLimited => .publication_check_rate_limited,
+        error.ServerError => .publication_check_server_error,
+        else => unreachable,
+    };
+}
 
 fn parentEql(a: ?draft_mod.Parent, b: ?draft_mod.Parent) bool {
     if (a == null or b == null) return a == null and b == null;
@@ -375,17 +525,17 @@ pub const CommentPoster = struct {
         /// for a root. Returns the classified `PostOutcome` (transport failures
         /// map to `.ambiguous`, not an error); errors are reserved for local
         /// faults (e.g. OOM building the request).
-        post: *const fn (ptr: *anyopaque, draft: Draft, parent: ?CommentId) anyerror!PostOutcome,
+        post: *const fn (ptr: *anyopaque, draft: Draft, parent: ?CommentId) anyerror!PostResult,
         /// Dedupe lookup for an ambiguous retry: the id of an already-posted
         /// comment matching this draft (path/line/body), or null if none.
-        findExisting: *const fn (ptr: *anyopaque, draft: Draft, parent: ?CommentId) anyerror!?CommentId,
+        findExisting: *const fn (ptr: *anyopaque, draft: Draft, parent: ?CommentId) anyerror!CheckResult,
     };
 
-    pub fn post(self: CommentPoster, draft: Draft, parent: ?CommentId) !PostOutcome {
+    pub fn post(self: CommentPoster, draft: Draft, parent: ?CommentId) !PostResult {
         return self.vtable.post(self.ptr, draft, parent);
     }
 
-    pub fn findExisting(self: CommentPoster, draft: Draft, parent: ?CommentId) !?CommentId {
+    pub fn findExisting(self: CommentPoster, draft: Draft, parent: ?CommentId) !CheckResult {
         return self.vtable.findExisting(self.ptr, draft, parent);
     }
 };
@@ -509,12 +659,14 @@ test "retryable failure schedules backoff waits then succeeds" {
     sub.report(.{ .rejected = error.ServerError }, null);
     const w1 = sub.advance();
     try testing.expectEqual(backoffMs(1), w1.wait.ms);
+    sub.completeWait();
     try testing.expect(sub.advance() == .post); // re-issued after the wait
 
     sub.report(.{ .rejected = error.ServerError }, null);
     const w2 = sub.advance();
     try testing.expectEqual(backoffMs(2), w2.wait.ms);
     try testing.expect(w2.wait.ms > w1.wait.ms);
+    sub.completeWait();
     _ = sub.advance(); // .post again
     sub.report(.{ .posted = 900 }, null);
 
@@ -536,7 +688,23 @@ test "429 Retry-After overrides the computed backoff" {
     try testing.expectEqual(@as(u64, 12_345), sub.advance().wait.ms);
 }
 
-test "ambiguous failure sets the dedupe flag on retry" {
+test "server guidance cannot shorten local fallback and wait exposes checkpoint evidence" {
+    var pr = PendingReview.init(1);
+    defer pr.deinit(testing.allocator);
+    _ = try pr.add(testing.allocator, .{ .kind = .comment, .body = "a" });
+    var sub = try Submission.init(testing.allocator, &pr);
+    defer sub.deinit();
+
+    _ = sub.advance();
+    sub.report(.{ .rejected = error.RateLimited }, 17);
+    const wait = sub.advance().wait;
+    try testing.expectEqual(@as(u64, 1_000), wait.ms);
+    try testing.expectEqual(@as(u64, 1_000), wait.checkpoint.local_delay_ms);
+    try testing.expectEqual(@as(?u64, 17), wait.checkpoint.server_delay_ms);
+    try testing.expect(wait.checkpoint.pending_wait);
+}
+
+test "ambiguous POST requires a publication check before another POST" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
     _ = try pr.add(testing.allocator, .{ .kind = .comment, .body = "a" });
@@ -546,9 +714,9 @@ test "ambiguous failure sets the dedupe flag on retry" {
     const first = sub.advance();
     try testing.expect(!first.post.dedupe);
     sub.report(.ambiguous, null);
-    _ = sub.advance(); // .wait
-    const retry = sub.advance();
-    try testing.expect(retry.post.dedupe); // caller must GET-and-match now
+    const check = sub.advance();
+    try testing.expect(check == .check);
+    try testing.expect(check.check.dedupe);
 }
 
 test "exhausted ambiguity remains unresolved across selective retry" {
@@ -559,8 +727,14 @@ test "exhausted ambiguity remains unresolved across selective retry" {
 
     var attempt: u8 = 0;
     while (attempt < max_attempts) : (attempt += 1) {
-        if (sub.advance() == .wait) _ = sub.advance();
         sub.report(.ambiguous, null);
+        try testing.expect(sub.advance() == .check);
+        sub.reportCheck(.{ .outcome = .missing });
+        if (attempt + 1 < max_attempts) {
+            try testing.expect(sub.advance() == .wait);
+            sub.completeWait();
+            try testing.expect(sub.advance() == .post);
+        }
     }
     try testing.expect(sub.advance() == .done);
     const sum = try sub.summary(testing.allocator);
@@ -575,6 +749,49 @@ test "exhausted ambiguity remains unresolved across selective retry" {
     try testing.expect(retry.advance() == .done);
 }
 
+test "publication checks have an independent three-attempt budget" {
+    var pr = PendingReview.init(1);
+    defer pr.deinit(testing.allocator);
+    _ = try pr.add(testing.allocator, .{ .kind = .comment, .body = "a" });
+    var sub = try Submission.init(testing.allocator, &pr);
+    defer sub.deinit();
+
+    _ = sub.advance();
+    sub.report(.ambiguous, null);
+    var check_attempt: u8 = 0;
+    while (check_attempt < max_attempts) : (check_attempt += 1) {
+        try testing.expect(sub.advance() == .check);
+        sub.reportCheck(.{ .outcome = .ambiguous });
+        if (check_attempt + 1 < max_attempts) {
+            try testing.expect(sub.advance() == .wait);
+            sub.completeWait();
+        }
+    }
+    try testing.expect(sub.advance() == .done);
+    try testing.expectEqual(@as(u8, 1), sub.attempts[0]);
+}
+
+test "publication-check recovery preserves both independent budgets" {
+    var pr = PendingReview.init(1);
+    defer pr.deinit(testing.allocator);
+    _ = try pr.add(testing.allocator, .{ .kind = .comment, .body = "a" });
+    var first = try Submission.init(testing.allocator, &pr);
+    _ = first.advance();
+    first.report(.ambiguous, null);
+    _ = first.advance();
+    first.reportCheck(.{ .outcome = .ambiguous });
+    const checkpoint = first.advance().wait.checkpoint;
+    first.deinit();
+
+    var recovered = try Submission.init(testing.allocator, &pr);
+    defer recovered.deinit();
+    recovered.restoreRetry(checkpoint);
+    try testing.expectEqual(@as(u8, 1), recovered.attempts[0]);
+    try testing.expectEqual(@as(u8, 1), recovered.check_attempts[0]);
+    recovered.completeWait();
+    try testing.expect(recovered.advance() == .check);
+}
+
 test "retries exhaust into an item failure" {
     var pr = PendingReview.init(1);
     defer pr.deinit(testing.allocator);
@@ -586,6 +803,7 @@ test "retries exhaust into an item failure" {
     while (attempt < max_attempts) : (attempt += 1) {
         const step = sub.advance();
         if (step == .wait) {
+            sub.completeWait();
             _ = sub.advance(); // consume the re-issued .post
         }
         sub.report(.{ .rejected = error.ServerError }, null);
@@ -666,12 +884,12 @@ test "local-only Drafts are never emitted as Submission posts" {
     try testing.expectEqual(remote, step.post.temp_id);
 }
 
-test "backoffMs is exponential, capped" {
+test "backoffMs has exact one-second and two-second fallback waits" {
     try testing.expectEqual(@as(u64, 0), backoffMs(0));
     try testing.expectEqual(backoff_base_ms, backoffMs(1));
     try testing.expectEqual(backoff_base_ms * 2, backoffMs(2));
-    try testing.expectEqual(backoff_base_ms * 4, backoffMs(3));
-    try testing.expectEqual(backoff_cap_ms, backoffMs(10)); // capped
+    try testing.expectEqual(backoff_base_ms * 2, backoffMs(3));
+    try testing.expectEqual(backoff_base_ms * 2, backoffMs(10));
 }
 
 test "headChanged detects a moved source head, tolerant of abbreviation" {
@@ -694,15 +912,15 @@ const FakeCommentPoster = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
     const vtable: CommentPoster.VTable = .{ .post = postImpl, .findExisting = findImpl };
-    fn postImpl(ptr: *anyopaque, _: Draft, _: ?CommentId) anyerror!PostOutcome {
+    fn postImpl(ptr: *anyopaque, _: Draft, _: ?CommentId) anyerror!PostResult {
         const self: *FakeCommentPoster = @ptrCast(@alignCast(ptr));
         defer self.calls += 1;
-        return self.outcomes[self.calls];
+        return .{ .outcome = self.outcomes[self.calls] };
     }
-    fn findImpl(ptr: *anyopaque, _: Draft, _: ?CommentId) anyerror!?CommentId {
+    fn findImpl(ptr: *anyopaque, _: Draft, _: ?CommentId) anyerror!CheckResult {
         const self: *FakeCommentPoster = @ptrCast(@alignCast(ptr));
         self.find_calls += 1;
-        return self.existing;
+        return if (self.existing) |id| .{ .outcome = .{ .found = id } } else .{ .outcome = .missing };
     }
 };
 
@@ -722,10 +940,14 @@ test "driver runs the engine through the CommentPoster seam" {
         switch (sub.advance()) {
             .post => |ps| {
                 const d = pr.getConst(ps.temp_id).?;
-                const outcome = try poster.post(d.*, ps.parent);
-                sub.report(outcome, null);
+                const result = try poster.post(d.*, ps.parent);
+                sub.report(result.outcome, result.retry_after_ms);
             },
-            .wait => {}, // a real worker sleeps here
+            .wait => sub.completeWait(),
+            .check => |check| {
+                const d = pr.getConst(check.temp_id).?;
+                sub.reportCheck(try poster.findExisting(d.*, check.parent));
+            },
             .done => break,
             .aborted => unreachable,
         }

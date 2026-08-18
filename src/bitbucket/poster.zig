@@ -25,6 +25,8 @@ const ApiError = types.ApiError;
 const submission = @import("../review/submission.zig");
 const CommentPoster = submission.CommentPoster;
 const PostOutcome = submission.PostOutcome;
+const PostResult = submission.PostResult;
+const CheckResult = submission.CheckResult;
 const Draft = @import("../review/draft.zig").Draft;
 const comment = @import("../review/comment.zig");
 const CommentId = comment.CommentId;
@@ -45,7 +47,7 @@ pub const Poster = struct {
 
     const vtable: CommentPoster.VTable = .{ .post = postImpl, .findExisting = findImpl };
 
-    fn postImpl(ptr: *anyopaque, d: Draft, parent: ?CommentId) anyerror!PostOutcome {
+    fn postImpl(ptr: *anyopaque, d: Draft, parent: ?CommentId) anyerror!PostResult {
         const self: *Poster = @ptrCast(@alignCast(ptr));
         const nc = NewComment{
             .body = d.body,
@@ -54,25 +56,31 @@ pub const Poster = struct {
             .scope = if (parent == null) d.effectiveScope() else null,
             .parent = parent,
         };
-        const cid = self.client.createComment(self.allocator, self.repo_slug, self.pr_id, nc) catch |err| switch (err) {
+        const attempt = self.client.createCommentAttempt(self.allocator, self.repo_slug, self.pr_id, nc) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            error.Unauthorized => return .{ .rejected = error.Unauthorized },
-            error.Forbidden => return .{ .rejected = error.Forbidden },
-            error.NotFound => return .{ .rejected = error.NotFound },
-            error.RateLimited => return .{ .rejected = error.RateLimited },
-            error.ServerError => return .{ .rejected = error.ServerError },
-            error.UnexpectedStatus => return .{ .rejected = error.UnexpectedStatus },
-            error.MalformedResponse => return .{ .rejected = error.MalformedResponse },
             // Any other error is a transport failure before a response arrived:
             // the POST may or may not have landed → ambiguous (dedupe on retry).
-            else => return .ambiguous,
+            else => return .{ .outcome = .ambiguous },
         };
-        return .{ .posted = cid };
+        return switch (attempt) {
+            .posted => |id| .{ .outcome = .{ .posted = id } },
+            .rejected => |failure| .{
+                .outcome = .{ .rejected = failure.reason },
+                .retry_after_ms = failure.retry_after_ms,
+            },
+        };
     }
 
-    fn findImpl(ptr: *anyopaque, d: Draft, parent: ?CommentId) anyerror!?CommentId {
+    fn findImpl(ptr: *anyopaque, d: Draft, parent: ?CommentId) anyerror!CheckResult {
         const self: *Poster = @ptrCast(@alignCast(ptr));
-        const comments = try self.client.getComments(self.allocator, self.repo_slug, self.pr_id, self.head);
+        const attempt = try self.client.getCommentsAttempt(self.allocator, self.repo_slug, self.pr_id, self.head);
+        const comments = switch (attempt) {
+            .comments => |comments| comments,
+            .rejected => |failure| return .{
+                .outcome = .{ .rejected = failure.reason },
+                .retry_after_ms = failure.retry_after_ms,
+            },
+        };
         defer deinitComments(self.allocator, comments);
         for (comments) |c| {
             if (!std.mem.eql(u8, c.body, d.body)) continue;
@@ -81,9 +89,9 @@ pub const Poster = struct {
             } else {
                 if (c.parent_id != null or !scopesMatch(c.effectiveScope(), d.effectiveScope())) continue;
             }
-            return c.id;
+            return .{ .outcome = .{ .found = c.id } };
         }
-        return null;
+        return .{ .outcome = .missing };
     }
 };
 
@@ -122,7 +130,7 @@ test "post maps a successful POST to .posted with the new id" {
     };
     var p = Poster{ .client = testClient(&fake), .allocator = a, .repo_slug = "myrepo", .pr_id = 7 };
     const outcome = try p.poster().post(.{ .local_id = 1, .kind = .comment, .body = "hi" }, null);
-    try testing.expectEqual(@as(CommentId, 4242), outcome.posted);
+    try testing.expectEqual(@as(CommentId, 4242), outcome.outcome.posted);
 }
 
 test "post maps a classified non-2xx to .rejected" {
@@ -130,7 +138,22 @@ test "post maps a classified non-2xx to .rejected" {
     var fake: FakeHttpClient = .{ .status = 401, .body = "nope" };
     var p = Poster{ .client = testClient(&fake), .allocator = a, .repo_slug = "myrepo", .pr_id = 7 };
     const outcome = try p.poster().post(.{ .local_id = 1, .kind = .comment, .body = "hi" }, null);
-    try testing.expectEqual(ApiError.Unauthorized, outcome.rejected);
+    try testing.expectEqual(ApiError.Unauthorized, outcome.outcome.rejected);
+}
+
+test "POST and publication checks propagate only normalized retry guidance" {
+    const a = testing.allocator;
+    var post_fake: FakeHttpClient = .{ .status = 503, .body = "down", .retry_after_ms = 8_000 };
+    var post = Poster{ .client = testClient(&post_fake), .allocator = a, .repo_slug = "repo", .pr_id = 7 };
+    const posted = try post.poster().post(.{ .local_id = 1, .kind = .comment, .body = "hi" }, null);
+    try testing.expectEqual(ApiError.ServerError, posted.outcome.rejected);
+    try testing.expectEqual(@as(?u64, 8_000), posted.retry_after_ms);
+
+    var check_fake: FakeHttpClient = .{ .status = 429, .body = "limited", .retry_after_ms = 9_000 };
+    var check = Poster{ .client = testClient(&check_fake), .allocator = a, .repo_slug = "repo", .pr_id = 7 };
+    const checked = try check.poster().findExisting(.{ .local_id = 1, .kind = .comment, .body = "hi" }, null);
+    try testing.expectEqual(ApiError.RateLimited, checked.outcome.rejected);
+    try testing.expectEqual(@as(?u64, 9_000), checked.retry_after_ms);
 }
 
 test "post maps a transport failure to .ambiguous" {
@@ -138,7 +161,7 @@ test "post maps a transport failure to .ambiguous" {
     var fake: FakeHttpClient = .{ .send_error = error.ConnectionResetByPeer };
     var p = Poster{ .client = testClient(&fake), .allocator = a, .repo_slug = "myrepo", .pr_id = 7 };
     const outcome = try p.poster().post(.{ .local_id = 1, .kind = .comment, .body = "hi" }, null);
-    try testing.expect(outcome == .ambiguous);
+    try testing.expect(outcome.outcome == .ambiguous);
 }
 
 test "findExisting returns the id of a matching comment (dedupe)" {
@@ -153,11 +176,11 @@ test "findExisting returns the id of a matching comment (dedupe)" {
 
     const draft = Draft{ .local_id = 1, .kind = .comment, .body = "needs a test", .anchor = .{ .path = "src/foo.zig", .to = 42 } };
     const hit = try p.poster().findExisting(draft, null);
-    try testing.expectEqual(@as(?CommentId, 12), hit);
+    try testing.expectEqual(@as(CommentId, 12), hit.outcome.found);
 
     // A body that isn't present yields no match.
     const miss = try p.poster().findExisting(.{ .local_id = 2, .kind = .comment, .body = "unseen" }, null);
-    try testing.expect(miss == null);
+    try testing.expect(miss.outcome == .missing);
 }
 
 test "dedupe distinguishes File and inline roots and matches Replies by resolved parent" {
@@ -172,8 +195,8 @@ test "dedupe distinguishes File and inline roots and matches Replies by resolved
     var p = Poster{ .client = testClient(&fake), .allocator = a, .repo_slug = "repo", .pr_id = 1, .head = .{ .source = "abc" } };
     const file = Draft{ .local_id = 1, .kind = .comment, .body = "same", .scope = .{ .file = .{ .path = "src/f.zig", .source_commit = "local" } } };
     const line = Draft{ .local_id = 2, .kind = .comment, .body = "same", .scope = .{ .@"inline" = .{ .path = "src/f.zig", .to = 7 } } };
-    try testing.expectEqual(@as(?CommentId, 20), try p.poster().findExisting(file, null));
-    try testing.expectEqual(@as(?CommentId, 21), try p.poster().findExisting(line, null));
-    try testing.expectEqual(@as(?CommentId, 22), try p.poster().findExisting(.{ .local_id = 3, .kind = .comment, .body = "reply", .parent = .{ .comment = 20 } }, 20));
-    try testing.expectEqual(@as(?CommentId, null), try p.poster().findExisting(.{ .local_id = 4, .kind = .comment, .body = "reply", .parent = .{ .comment = 21 } }, 21));
+    try testing.expectEqual(@as(CommentId, 20), (try p.poster().findExisting(file, null)).outcome.found);
+    try testing.expectEqual(@as(CommentId, 21), (try p.poster().findExisting(line, null)).outcome.found);
+    try testing.expectEqual(@as(CommentId, 22), (try p.poster().findExisting(.{ .local_id = 3, .kind = .comment, .body = "reply", .parent = .{ .comment = 20 } }, 20)).outcome.found);
+    try testing.expect((try p.poster().findExisting(.{ .local_id = 4, .kind = .comment, .body = "reply", .parent = .{ .comment = 21 } }, 21)).outcome == .missing);
 }

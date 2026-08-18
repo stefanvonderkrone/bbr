@@ -291,6 +291,7 @@ pub const WaitSubmission = struct {
     identity: ?OwnedRemoteReviewIdentity = null,
     temp_id: bbr.review.TempId,
     ms: u64,
+    checkpoint: ?bbr.review.SubmissionRetryCheckpoint = null,
 };
 
 pub const RecoveryOwnership = enum { running_elsewhere, recoverable };
@@ -329,6 +330,7 @@ pub const RecoveryChecked = struct {
 pub const DuplicateCheckOutcome = union(enum) {
     found: bbr.review.CommentId,
     missing,
+    rejected: bbr.bitbucket.ApiError,
     failed,
 };
 
@@ -338,6 +340,7 @@ pub const DuplicateChecked = struct {
     identity: ?OwnedRemoteReviewIdentity = null,
     temp_id: bbr.review.TempId,
     outcome: DuplicateCheckOutcome,
+    retry_after_ms: ?u64 = null,
 };
 
 pub const PullRequestSummaries = struct {
@@ -1750,10 +1753,11 @@ const DurableSubmission = struct {
     recovery_source_commit: ?BoundedText(64) = null,
     recovered: bool = false,
     pending_duplicate: ?struct { outcome: DuplicateCheckOutcome, checkpoint_done: bool = false } = null,
+    policy_check: bool = false,
 
     const Started = struct {
         durable: *DurableSubmission,
-        command: *PostDraft,
+        command: union(enum) { post: *PostDraft, wait: WaitSubmission },
     };
 
     const PersistedTransition = struct {
@@ -1766,6 +1770,8 @@ const DurableSubmission = struct {
         outcome: ?bbr.review.SubmissionOutcome,
         next: ?bbr.review.submission.PostStep = null,
         completion: ?bbr.review.SubmissionCompletion = null,
+        retry_checkpoint: ?bbr.review.SubmissionRetryCheckpoint = null,
+        retry_checkpoint_done: bool = false,
         checkpoint_done: bool = false,
     };
 
@@ -1776,6 +1782,7 @@ const DurableSubmission = struct {
 
     const AfterPost = union(enum) {
         next: struct { command: *PostDraft, transition: PersistedTransition },
+        check: *PostDraft,
         wait: WaitSubmission,
         finished: struct { result: SubmissionResultProjection, transition: PersistedTransition },
     };
@@ -1805,6 +1812,7 @@ const DurableSubmission = struct {
         durable.recovery_source_commit = null;
         durable.recovered = false;
         durable.pending_duplicate = null;
+        durable.policy_check = false;
         return durable;
     }
 
@@ -1826,13 +1834,14 @@ const DurableSubmission = struct {
                 durable.destroy();
                 return null;
             },
-            .wait, .aborted => unreachable,
+            .wait, .check, .aborted => unreachable,
         };
         const draft = durable.review.getConst(post.temp_id) orelse return error.DraftNotFound;
         const command = try PostDraft.create(allocator, durable.key, draft.*, post);
         errdefer command.destroy();
-        const items = try durable.arena.allocator().alloc(bbr.review.SubmissionRunItem, durable.machine.order.len);
-        for (durable.machine.order, items) |temp_id, *item| {
+        const remaining = durable.machine.order[durable.machine.idx..];
+        const items = try durable.arena.allocator().alloc(bbr.review.SubmissionRunItem, remaining.len);
+        for (remaining, items) |temp_id, *item| {
             const participant = durable.review.getConst(temp_id) orelse return error.DraftNotFound;
             item.* = .{ .temp_id = temp_id, .parent = participant.parent };
         }
@@ -1840,7 +1849,20 @@ const DurableSubmission = struct {
         durable.operation_id = operation_id;
         durable.current_temp_id = post.temp_id;
         command.operation_id = operation_id;
-        return .{ .durable = durable, .command = command };
+        if (try store.activeSubmission(durable.arena.allocator())) |run| if (run.retry) |retry| {
+            durable.machine.restoreRetry(retry);
+            command.destroy();
+            const wait = durable.machine.advance().wait;
+            durable.phase = .wait_queued;
+            return .{ .durable = durable, .command = .{ .wait = .{
+                .operation_id = operation_id,
+                .identity = .init(durable.key),
+                .temp_id = wait.temp_id,
+                .ms = wait.ms,
+                .checkpoint = wait.checkpoint,
+            } } };
+        };
+        return .{ .durable = durable, .command = .{ .post = command } };
     }
 
     fn recover(
@@ -1852,11 +1874,22 @@ const DurableSubmission = struct {
     ) !*DurableSubmission {
         const durable = try create(allocator, store, key, lock, run.items);
         errdefer durable.destroy();
-        const post = switch (durable.machine.advance()) {
-            .post => |value| value,
+        if (run.retry) |retry| durable.machine.restoreRetry(retry);
+        const current_temp_id = switch (durable.machine.advance()) {
+            .post, .check => |value| value.temp_id,
+            .wait => |wait| blk: {
+                durable.pending_wait_retry = .{
+                    .operation_id = run.operation_id,
+                    .identity = .init(key),
+                    .temp_id = wait.temp_id,
+                    .ms = wait.ms,
+                    .checkpoint = wait.checkpoint,
+                };
+                break :blk wait.temp_id;
+            },
             else => return error.InvalidRecoveryState,
         };
-        if (post.temp_id != run.current_temp_id.?) return error.InvalidRecoveryState;
+        if (current_temp_id != run.current_temp_id.?) return error.InvalidRecoveryState;
         durable.operation_id = run.operation_id;
         durable.current_temp_id = run.current_temp_id;
         durable.recovery_source_commit = try BoundedText(64).init(run.source_commit);
@@ -1872,6 +1905,22 @@ const DurableSubmission = struct {
         completed: PostDraftCompleted,
     ) !AfterPost {
         self.machine.report(completed.outcome, completed.retry_after_ms);
+        const terminal_retry: ?bbr.review.SubmissionRetryCheckpoint = if (self.machine.terminal_server_delay_ms) |server_delay| blk: {
+            const reason: bbr.review.SubmissionRetryReason = switch (completed.outcome.rejected) {
+                error.RateLimited => .rate_limited,
+                error.ServerError => .server_error,
+                else => unreachable,
+            };
+            break :blk .{
+                .phase = .post,
+                .attempt = bbr.review.submission.max_attempts,
+                .reason = reason,
+                .local_delay_ms = 0,
+                .server_delay_ms = server_delay,
+                .effective_delay_ms = server_delay,
+                .pending_wait = false,
+            };
+        } else null;
         if (completed.outcome == .posted) self.posted_any = true;
         const outcome: bbr.review.SubmissionOutcome = switch (completed.outcome) {
             .posted => |id| .{ .posted = id },
@@ -1884,6 +1933,7 @@ const DurableSubmission = struct {
                     .transition = .{ .temp_id = completed.temp_id, .state = outcome.draftState() },
                     .outcome = outcome,
                     .next = next,
+                    .retry_checkpoint = terminal_retry,
                 };
             },
             .done => {
@@ -1892,6 +1942,7 @@ const DurableSubmission = struct {
                     .transition = .{ .temp_id = completed.temp_id, .state = outcome.draftState() },
                     .outcome = outcome,
                     .completion = completion,
+                    .retry_checkpoint = terminal_retry,
                 };
             },
             .aborted => {
@@ -1910,13 +1961,23 @@ const DurableSubmission = struct {
                 };
             },
             .wait => |wait| {
-                self.phase = .wait_queued;
-                return .{ .wait = .{
+                const command: WaitSubmission = .{
                     .operation_id = self.operation_id,
                     .identity = .init(self.key),
                     .temp_id = wait.temp_id,
                     .ms = wait.ms,
-                } };
+                    .checkpoint = wait.checkpoint,
+                };
+                self.pending_wait_retry = command;
+                self.phase = .wait_retry_paused;
+                try store.checkpointSubmissionRetry(self.operation_id, self.key.storeKey(), wait.temp_id, wait.checkpoint);
+                self.pending_wait_retry = null;
+                self.phase = .wait_queued;
+                return .{ .wait = command };
+            },
+            .check => {
+                self.phase = .duplicate_queued;
+                return .{ .check = try self.materializeDuplicateCheck(allocator) };
             },
         }
         self.phase = .persistence_paused;
@@ -1932,6 +1993,16 @@ const DurableSubmission = struct {
             next_command.?.operation_id = self.operation_id;
         }
         errdefer if (next_command) |command| command.destroy();
+
+        if (!pending.retry_checkpoint_done) if (pending.retry_checkpoint) |checkpoint| {
+            try store.checkpointSubmissionRetry(
+                self.operation_id,
+                self.key.storeKey(),
+                pending.transition.temp_id,
+                checkpoint,
+            );
+            pending.retry_checkpoint_done = true;
+        };
 
         if (!pending.checkpoint_done) if (pending.outcome) |outcome| {
             try store.checkpointSubmission(
@@ -1958,9 +2029,15 @@ const DurableSubmission = struct {
         return .{ .next = .{ .command = command, .transition = transition } };
     }
 
-    fn completeWait(self: *DurableSubmission, allocator: Allocator, wait: WaitSubmission) !*PostDraft {
+    fn completeWait(self: *DurableSubmission, allocator: Allocator, store: bbr.review.PendingReviewStore, wait: WaitSubmission) !*PostDraft {
         if (self.operation_id != wait.operation_id or self.current_temp_id != wait.temp_id or self.phase != .awaiting_wait)
             return error.StaleSubmissionWait;
+        if (wait.checkpoint) |checkpoint| {
+            var completed = checkpoint;
+            completed.pending_wait = false;
+            try store.checkpointSubmissionRetry(self.operation_id, self.key.storeKey(), wait.temp_id, completed);
+        }
+        if (self.machine.must_wait) self.machine.completeWait();
         return self.materializeCurrentPost(allocator);
     }
 
@@ -1982,8 +2059,9 @@ const DurableSubmission = struct {
     }
 
     fn materializeDuplicateCheck(self: *DurableSubmission, allocator: Allocator) !*PostDraft {
-        const post = switch (self.machine.advance()) {
-            .post => |value| value,
+        const step = self.machine.advance();
+        const post = switch (step) {
+            .post, .check => |value| value,
             else => return error.InvalidRecoveryState,
         };
         if (self.current_temp_id != post.temp_id) return error.InvalidRecoveryState;
@@ -1991,6 +2069,7 @@ const DurableSubmission = struct {
         const command = try PostDraft.create(allocator, self.key, draft.*, post);
         command.operation_id = self.operation_id;
         command.dedupe = true;
+        self.policy_check = step == .check;
         self.phase = .duplicate_queued;
         return command;
     }
@@ -3578,7 +3657,10 @@ pub const Presentation = struct {
             return;
         };
         if (self.dependencies.require_source_check) {
-            started.command.destroy();
+            switch (started.command) {
+                .post => |command| command.destroy(),
+                .wait => {},
+            }
             started.durable.recovery_source_commit = source_check.?;
             started.durable.phase = .recovery_check_queued;
             self.commands.appendAssumeCapacity(.{ .check_recovery = .{
@@ -3587,7 +3669,10 @@ pub const Presentation = struct {
                 .source_commit = started.durable.recovery_source_commit.?,
             } });
         } else {
-            self.commands.appendAssumeCapacity(.{ .post_draft = started.command });
+            switch (started.command) {
+                .post => |command| self.commands.appendAssumeCapacity(.{ .post_draft = command }),
+                .wait => |wait| self.commands.appendAssumeCapacity(.{ .wait_submission = wait }),
+            }
         }
         self.durable_submission = started.durable;
         published.review.setState(started.durable.current_temp_id.?, .submitting);
@@ -3811,6 +3896,7 @@ pub const Presentation = struct {
                     published.review.setState(durable.current_temp_id.?, .submitting);
                 self.commands.appendAssumeCapacity(.{ .post_draft = next.command });
             },
+            .check => |command| self.commands.appendAssumeCapacity(.{ .find_duplicate = command }),
             .wait => |wait| self.commands.appendAssumeCapacity(.{ .wait_submission = wait }),
             .finished => |finished| {
                 self.recordVisibleTransition(durable, finished.transition);
@@ -3852,14 +3938,24 @@ pub const Presentation = struct {
             self.action_error = .out_of_memory;
             return;
         };
-        const command = durable.materializeCurrentPost(self.allocator) catch {
-            durable.phase = .recovery_check_paused;
-            self.action_error = .out_of_memory;
-            return;
-        };
-        command.dedupe = durable.recovered;
-        self.commands.appendAssumeCapacity(.{ .post_draft = command });
-        self.action_error = null;
+        switch (durable.machine.advance()) {
+            .wait => |wait| {
+                durable.phase = .wait_queued;
+                self.commands.appendAssumeCapacity(.{ .wait_submission = .{
+                    .operation_id = durable.operation_id,
+                    .identity = .init(durable.key),
+                    .temp_id = wait.temp_id,
+                    .ms = wait.ms,
+                    .checkpoint = wait.checkpoint,
+                } });
+                self.action_error = null;
+            },
+            .check, .post => self.queueDuplicateCheck(durable),
+            else => {
+                durable.phase = .recovery_check_paused;
+                self.action_error = .recovery_check_failed;
+            },
+        }
     }
 
     fn abortChangedSubmission(self: *Presentation, durable: *DurableSubmission) void {
@@ -3883,7 +3979,22 @@ pub const Presentation = struct {
         if (!self.consumeCommand(checked.command_id, .find_duplicate)) return;
         const durable = self.durable_submission orelse return;
         if (durable.operation_id != checked.operation_id or !durableIdentityMatches(durable.key, checked.identity) or durable.current_temp_id != checked.temp_id or durable.phase != .awaiting_duplicate) return;
-        if (checked.outcome == .failed) {
+        if (durable.policy_check) {
+            durable.policy_check = false;
+            const result: bbr.review.CheckResult = .{
+                .outcome = switch (checked.outcome) {
+                    .found => |id| .{ .found = id },
+                    .missing => .missing,
+                    .rejected => |err| .{ .rejected = err },
+                    .failed => .ambiguous,
+                },
+                .retry_after_ms = checked.retry_after_ms,
+            };
+            durable.machine.reportCheck(result);
+            self.advanceAfterPolicyCheck(durable, checked.temp_id);
+            return;
+        }
+        if (checked.outcome == .failed or checked.outcome == .rejected) {
             durable.phase = .duplicate_check_paused;
             self.action_error = .duplicate_check_failed;
             return;
@@ -3893,12 +4004,78 @@ pub const Presentation = struct {
         self.persistDuplicateResolution(durable);
     }
 
+    fn advanceAfterPolicyCheck(self: *Presentation, durable: *DurableSubmission, temp_id: bbr.review.TempId) void {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+            durable.phase = .duplicate_check_paused;
+            durable.policy_check = true;
+            self.action_error = .out_of_memory;
+            return;
+        };
+        switch (durable.machine.advance()) {
+            .post => |post| {
+                const draft = durable.review.getConst(post.temp_id) orelse return;
+                const command = PostDraft.create(self.allocator, durable.key, draft.*, post) catch {
+                    self.action_error = .out_of_memory;
+                    return;
+                };
+                command.operation_id = durable.operation_id;
+                durable.phase = .post_queued;
+                self.commands.appendAssumeCapacity(.{ .post_draft = command });
+                self.action_error = null;
+            },
+            .check => {
+                self.queueDuplicateCheck(durable);
+            },
+            .wait => |wait| {
+                const command: WaitSubmission = .{
+                    .operation_id = durable.operation_id,
+                    .identity = .init(durable.key),
+                    .temp_id = wait.temp_id,
+                    .ms = wait.ms,
+                    .checkpoint = wait.checkpoint,
+                };
+                durable.pending_wait_retry = command;
+                durable.phase = .wait_retry_paused;
+                self.dependencies.reviews.checkpointSubmissionRetry(durable.operation_id, durable.key.storeKey(), wait.temp_id, wait.checkpoint) catch {
+                    self.action_error = .persistence_failed;
+                    return;
+                };
+                durable.pending_wait_retry = null;
+                durable.phase = .wait_queued;
+                self.commands.appendAssumeCapacity(.{ .wait_submission = command });
+                self.action_error = null;
+            },
+            .done => {
+                const result = durable.machine.results[durable.machine.idx - 1].?;
+                const outcome: bbr.review.SubmissionOutcome = switch (result.status) {
+                    .posted => .{ .posted = result.id.? },
+                    .outcome_unknown => .outcome_unknown,
+                    .failed => .{ .failed = result.reason.? },
+                    .skipped => return,
+                };
+                durable.pending_persistence = .{
+                    .transition = .{ .temp_id = temp_id, .state = outcome.draftState() },
+                    .outcome = outcome,
+                    .completion = if (durable.machine.isClean()) .clean else .partial,
+                };
+                durable.phase = .persistence_paused;
+                const progress = durable.retryPersistence(self.allocator, self.dependencies.reviews) catch {
+                    self.action_error = .persistence_failed;
+                    return;
+                };
+                self.publishSubmissionProgress(durable, progress);
+            },
+            .aborted => unreachable,
+        }
+    }
+
     fn persistDuplicateResolution(self: *Presentation, durable: *DurableSubmission) void {
         const pending = if (durable.pending_duplicate) |*value| value else return;
         const temp_id = durable.current_temp_id orelse return;
         const outcome: bbr.review.SubmissionOutcome = switch (pending.outcome) {
             .found => |id| .{ .posted = id },
             .missing => .outcome_unknown,
+            .rejected => unreachable,
             .failed => unreachable,
         };
         if (!pending.checkpoint_done) {
@@ -3956,6 +4133,15 @@ pub const Presentation = struct {
             self.action_error = .out_of_memory;
             return;
         };
+        if (wait.checkpoint) |checkpoint| self.dependencies.reviews.checkpointSubmissionRetry(
+            durable.operation_id,
+            durable.key.storeKey(),
+            wait.temp_id,
+            checkpoint,
+        ) catch {
+            self.action_error = .persistence_failed;
+            return;
+        };
         durable.pending_wait_retry = null;
         durable.phase = .wait_queued;
         self.commands.appendAssumeCapacity(.{ .wait_submission = wait });
@@ -3963,10 +4149,10 @@ pub const Presentation = struct {
     }
 
     fn processSubmissionWait(self: *Presentation, durable: *DurableSubmission, completed: WaitSubmission) void {
-        const command = durable.completeWait(self.allocator, completed) catch {
+        const command = durable.completeWait(self.allocator, self.dependencies.reviews, completed) catch |err| {
             durable.pending_admission = .{ .wait = completed };
             durable.phase = .admission_paused;
-            self.action_error = .out_of_memory;
+            self.action_error = if (err == error.OutOfMemory) .out_of_memory else .persistence_failed;
             return;
         };
         self.commands.appendAssumeCapacity(.{ .post_draft = command });
@@ -8706,7 +8892,10 @@ test "startup discovers and explicitly claims an interrupted Submission" {
     var presentation = try Presentation.init(testing.allocator, .{
         .reviews = store.store(),
         .submission_locks = locks.locks(),
-    }, .{ .viewport_rows = 8 });
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
     defer presentation.deinit();
 
     const notice = presentation.projection().recovery.?;
@@ -8721,8 +8910,8 @@ test "startup discovers and explicitly claims an interrupted Submission" {
     try presentation.dispatch(recoveryCheckSucceeded(check.command_id, operation_id, null, "old-head"));
     var post = presentation.takeCommand().?;
     defer post.deinit();
-    try testing.expect(post.post_draft.dedupe);
-    try testing.expectEqual(@as(bbr.review.TempId, 1), post.post_draft.draft.local_id);
+    try testing.expect(post.find_duplicate.dedupe);
+    try testing.expectEqual(@as(bbr.review.TempId, 1), post.find_duplicate.draft.local_id);
 }
 
 test "recovery resumes only frozen participants and preserves parent remapping" {
@@ -8747,8 +8936,8 @@ test "recovery resumes only frozen participants and preserves parent remapping" 
     try presentation.dispatch(recoveryCheckSucceeded(check.command_id, operation_id, null, "old-head"));
     var command = presentation.takeCommand().?;
     defer command.deinit();
-    try testing.expectEqual(@as(bbr.review.TempId, 2), command.post_draft.draft.local_id);
-    try testing.expectEqual(@as(?bbr.review.CommentId, 900), command.post_draft.parent);
+    try testing.expectEqual(@as(bbr.review.TempId, 2), command.find_duplicate.draft.local_id);
+    try testing.expectEqual(@as(?bbr.review.CommentId, 900), command.find_duplicate.parent);
 }
 
 test "startup reports a live owner without stealing its Submission" {
@@ -9296,16 +9485,52 @@ test "retryable POST rejection waits and reissues without checkpointing an outco
     } });
 
     const wait = presentation.takeCommand().?.wait_submission;
-    try testing.expectEqual(@as(u64, 17), wait.ms);
+    try testing.expectEqual(@as(u64, 1_000), wait.ms);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const before_retry = try store.store().load(arena.allocator(), key.storeKey());
     try testing.expect(before_retry[0].state == .submitting);
+    const retry_checkpoint = (try store.store().activeSubmission(arena.allocator())).?.retry.?;
+    try testing.expectEqual(@as(u8, 1), retry_checkpoint.attempt);
+    try testing.expectEqual(bbr.review.SubmissionRetryReason.rate_limited, retry_checkpoint.reason);
+    try testing.expectEqual(@as(u64, 1_000), retry_checkpoint.local_delay_ms);
+    try testing.expectEqual(@as(?u64, 17), retry_checkpoint.server_delay_ms);
+    try testing.expectEqual(@as(u64, 1_000), retry_checkpoint.effective_delay_ms);
+    try testing.expect(retry_checkpoint.pending_wait);
     try presentation.dispatch(.{ .submission_wait_completed = wait });
     var retry = presentation.takeCommand().?;
     defer retry.deinit();
     try testing.expectEqual(@as(bbr.review.TempId, 1), retry.post_draft.draft.local_id);
     try testing.expect(!retry.post_draft.dedupe);
+}
+
+test "selective retry freezes the failed subtree without re-admitting posted ancestors" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "posted", .state = .{ .posted = 900 } });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .body = "retry", .parent = .{ .draft = 1 }, .state = .{ .failed = error.ServerError } });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .submit });
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqual(@as(bbr.review.TempId, 2), command.post_draft.draft.local_id);
+    try testing.expectEqual(@as(?bbr.review.CommentId, 900), command.post_draft.parent);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const run = (try store.store().activeSubmission(arena.allocator())).?;
+    try testing.expectEqual(@as(usize, 1), run.items.len);
+    try testing.expectEqual(@as(bbr.review.TempId, 2), run.items[0].temp_id);
 }
 
 test "wait launch failure pauses and submit retries the exact delay" {
@@ -9346,6 +9571,52 @@ test "wait launch failure pauses and submit retries the exact delay" {
     try testing.expectEqual(wait.ms, retry.ms);
 }
 
+test "recovery repeats a durably pending wait in full before any network effect" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "recover wait" });
+    const operation_id = try store.store().beginSubmission(key.storeKey(), "head", &.{.{ .temp_id = 1, .parent = null }});
+    try store.store().checkpointSubmissionRetry(operation_id, key.storeKey(), 1, .{
+        .phase = .post,
+        .attempt = 1,
+        .reason = .server_error,
+        .local_delay_ms = 1_000,
+        .server_delay_ms = 4_000,
+        .effective_delay_ms = 4_000,
+        .pending_wait = true,
+    });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .recover_submission });
+    const source_check = presentation.takeCommand().?.check_recovery;
+    try presentation.dispatch(recoveryCheckSucceeded(source_check.command_id, operation_id, null, "head"));
+    const wait = presentation.takeCommand().?.wait_submission;
+    try testing.expectEqual(@as(u64, 4_000), wait.ms);
+    try presentation.dispatch(.{ .submission_wait_launch_failed = wait });
+    try presentation.dispatch(.{ .action = .submit });
+    const repeated = presentation.takeCommand().?.wait_submission;
+    try testing.expectEqual(wait.ms, repeated.ms);
+    const run = (try store.store().activeSubmission(testing.allocator)).?;
+    defer {
+        testing.allocator.free(run.key.workspace);
+        testing.allocator.free(run.key.repository);
+        testing.allocator.free(run.source_commit);
+        testing.allocator.free(run.items);
+    }
+    try testing.expect(run.retry.?.pending_wait);
+    try testing.expectEqual(@as(u8, 1), run.retry.?.attempt);
+}
+
 test "exhausted ambiguous POST persists an immutable unresolved Draft" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -9372,6 +9643,14 @@ test "exhausted ambiguous POST persists an immutable unresolved Draft" {
             .operation_id = operation_id,
             .temp_id = 1,
             .outcome = .ambiguous,
+        } });
+        var check = presentation.takeCommand().?;
+        try testing.expect(check == .find_duplicate);
+        check.deinit();
+        try presentation.dispatch(.{ .duplicate_checked = .{
+            .operation_id = operation_id,
+            .temp_id = 1,
+            .outcome = .missing,
         } });
         if (attempt + 1 < bbr.review.submission.max_attempts) {
             const wait = presentation.takeCommand().?.wait_submission;
