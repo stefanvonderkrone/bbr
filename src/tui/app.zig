@@ -714,11 +714,23 @@ fn presentationDuplicateCheckWorker(
     defer http.deinit();
     http.initDefaultProxies(scratch.allocator(), env_map) catch {};
     const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
+    const author_uuid = client.getAuthenticatedAccountUuid(scratch.allocator()) catch {
+        presentation_runtime.deliver(presentationSink(&sink_context), .{ .duplicate_checked = .{
+            .command_id = command.command_id,
+            .operation_id = command.operation_id,
+            .identity = command.identity,
+            .temp_id = command.draft.local_id,
+            .outcome = .failed,
+        } });
+        return;
+    };
     var poster = bbr.bitbucket.Poster{
         .client = client,
         .allocator = scratch.allocator(),
         .repo_slug = command.identity.repository(),
         .pr_id = command.identity.pullRequestId(),
+        .author_uuid = author_uuid,
+        .require_author_match = true,
     };
     const checked = poster.poster().findExisting(command.draft, command.parent) catch bbr.review.CheckResult{ .outcome = .ambiguous };
     const outcome: presentation.DuplicateCheckOutcome = switch (checked.outcome) {

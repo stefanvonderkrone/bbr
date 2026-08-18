@@ -960,6 +960,7 @@ pub const SubmissionItemProjection = struct {
     publication_checks: u8 = 0,
     retry: ?bbr.review.SubmissionRetryCheckpoint = null,
     retry_eligible: bool = false,
+    repair_eligible: bool = false,
 };
 
 /// One Session-independent dependency-tree surface from authorization through
@@ -974,11 +975,18 @@ pub const SubmissionTreeProjection = struct {
     failed: usize,
     skipped: usize,
     outcome_unknown: usize,
+    stale_repair: ?StaleRepairProjection = null,
 
     pub fn selectedItem(self: SubmissionTreeProjection) ?SubmissionItemProjection {
         if (self.selected >= self.items.len) return null;
         return self.items[self.selected];
     }
+};
+
+pub const StaleRepairProjection = struct {
+    loaded_source_commit: []const u8,
+    observed_source_commit: []const u8,
+    reloaded: bool,
 };
 
 pub const SubmissionResultProjection = struct {
@@ -1188,7 +1196,7 @@ const Published = struct {
                 else => session.header.source_commit,
             };
             const resolution: bbr.review.ScopeResolution = if (key.isRemote())
-                .{ .resolved = .{ .state = .current, .scope = authored } }
+                resolveRemoteScope(authored, session)
             else if (scope_resolver) |resolver|
                 resolver.resolve(published.review_arena.allocator(), authored, current_commit) catch .unavailable
             else if (authored == .@"inline" and anchor_resolver != null) blk: {
@@ -1709,6 +1717,49 @@ const Published = struct {
     }
 };
 
+fn resolveRemoteScope(authored: bbr.review.CommentScope, session: *const Session) bbr.review.ScopeResolution {
+    return switch (authored) {
+        .review => .{ .resolved = .{ .state = .current, .scope = .review } },
+        .file => |file| .{ .resolved = .{
+            .state = if (scopeFileExists(session.diff, file.path, false)) .current else .outdated,
+            .scope = authored,
+        } },
+        .@"inline" => |anchor| .{ .resolved = .{
+            .state = if (scopeAnchorExists(session.diff, anchor)) .current else .outdated,
+            .scope = authored,
+        } },
+    };
+}
+
+fn scopeFileExists(diff: bbr.diff.Diff, path: []const u8, old_side: bool) bool {
+    for (diff.files) |file| {
+        const candidate = if (old_side) file.old_path else file.new_path;
+        if (std.mem.eql(u8, candidate, path) and !std.mem.eql(u8, candidate, "/dev/null")) return true;
+    }
+    return false;
+}
+
+fn scopeAnchorExists(diff: bbr.diff.Diff, anchor: bbr.review.Anchor) bool {
+    const old_side = anchor.to == null;
+    const top = anchor.top() orelse return false;
+    const bottom = anchor.line() orelse return false;
+    for (diff.files) |file| {
+        const path = if (old_side) file.old_path else file.new_path;
+        if (!std.mem.eql(u8, path, anchor.path)) continue;
+        for (file.hunks) |hunk| {
+            var wanted = top;
+            for (hunk.lines) |line| {
+                const number = if (old_side) line.old_no else line.new_no;
+                if (number == wanted) {
+                    if (wanted == bottom) return true;
+                    wanted += 1;
+                } else if (wanted > top and number != null and number.? > wanted) break;
+            }
+        }
+    }
+    return false;
+}
+
 /// Stage one of re-anchor: the retained typed identity. It deliberately carries
 /// no candidate — the candidate is whatever the source cursor names right now,
 /// so navigating re-reads it instead of accumulating interaction state.
@@ -1744,6 +1795,13 @@ const UnknownResolutionEditor = struct {
     fn text(self: *const UnknownResolutionEditor) []const u8 {
         return self.digits[0..self.len];
     }
+};
+
+const StaleRepairGate = struct {
+    key: OwnedReviewIdentity,
+    loaded_source_commit: BoundedText(64),
+    observed_source_commit: BoundedText(64),
+    reloaded: bool = false,
 };
 
 const Replacement = struct {
@@ -1819,6 +1877,8 @@ const DurableSubmission = struct {
     pending_wait_retry: ?WaitSubmission = null,
     posted_any: bool = false,
     recovery_source_commit: ?BoundedText(64) = null,
+    observed_source_commit: ?BoundedText(64) = null,
+    source_changed: bool = false,
     recovered: bool = false,
     pending_duplicate: ?struct { outcome: DuplicateCheckOutcome, checkpoint_done: bool = false } = null,
     policy_check: bool = false,
@@ -1893,6 +1953,8 @@ const DurableSubmission = struct {
         durable.pending_wait_retry = null;
         durable.posted_any = false;
         durable.recovery_source_commit = null;
+        durable.observed_source_commit = null;
+        durable.source_changed = false;
         durable.recovered = false;
         durable.pending_duplicate = null;
         durable.policy_check = false;
@@ -1961,7 +2023,15 @@ const DurableSubmission = struct {
     ) !Recovered {
         const durable = try create(allocator, store, key, lock, run.items, null);
         errdefer durable.destroy();
-        if (run.retry) |retry| durable.machine.restoreRetry(retry);
+        if (run.retry) |retry| {
+            durable.machine.restoreRetry(retry);
+        } else {
+            // Intent was durable before the process disappeared. With no
+            // response checkpoint, publication is ambiguous and recovery must
+            // read before it can issue another POST.
+            durable.machine.attempts[durable.machine.idx] = 1;
+            durable.machine.ambiguous_last[durable.machine.idx] = true;
+        }
         const current_temp_id = switch (durable.machine.advance()) {
             .post, .check => |value| value.temp_id,
             .wait => |wait| blk: {
@@ -2156,7 +2226,7 @@ const DurableSubmission = struct {
         const command = try PostDraft.create(allocator, self.key, draft.*, post);
         command.operation_id = self.operation_id;
         command.dedupe = true;
-        self.policy_check = step == .check;
+        self.policy_check = step == .check and !self.source_changed;
         self.phase = .duplicate_queued;
         return command;
     }
@@ -2235,6 +2305,7 @@ const SubmissionTree = struct {
     items: std.ArrayList(SubmissionItemProjection) = .empty,
     selected: usize = 0,
     completion: ?bbr.review.SubmissionCompletion = null,
+    stale_repair: ?StaleRepairProjection = null,
 
     fn create(allocator: Allocator, durable: *const DurableSubmission, order: []const bbr.review.TempId) !*SubmissionTree {
         const tree = try allocator.create(SubmissionTree);
@@ -2305,6 +2376,7 @@ const SubmissionTree = struct {
                 .posted_comment_id = if (draft.state == .posted) draft.state.posted else null,
                 .reply_descendants = submissionDescendantCount(review.drafts.items, temp_id, order),
                 .retry_eligible = state == .failed,
+                .repair_eligible = state == .failed,
             });
         }
         for (tree.items.items) |*item| {
@@ -2363,6 +2435,7 @@ const SubmissionTree = struct {
                 item.reason = result.reason;
                 item.posted_comment_id = result.id;
                 if (result.status == .failed) item.retry_eligible = true;
+                if (result.status == .failed) item.repair_eligible = true;
                 continue;
             }
             item.state = if (durable.current_temp_id != item.temp_id) .queued else submissionProgressState(durable.phase);
@@ -2460,6 +2533,7 @@ const SubmissionTree = struct {
                     item.state = .failed;
                     item.reason = reason;
                     item.retry_eligible = true;
+                    item.repair_eligible = true;
                 },
                 .draft => if (item.retry_eligible) {
                     item.state = .queued;
@@ -2469,10 +2543,12 @@ const SubmissionTree = struct {
                     item.state = .posted;
                     item.posted_comment_id = comment_id;
                     item.retry_eligible = false;
+                    item.repair_eligible = false;
                 },
                 .outcome_unknown => {
                     item.state = .outcome_unknown;
                     item.retry_eligible = false;
+                    item.repair_eligible = false;
                 },
                 .submitting => {},
             }
@@ -2510,6 +2586,7 @@ const SubmissionTree = struct {
             .failed = failed,
             .skipped = skipped,
             .outcome_unknown = outcome_unknown,
+            .stale_repair = self.stale_repair,
         };
     }
 };
@@ -2587,6 +2664,7 @@ pub const Presentation = struct {
     comment_edit_result: ?CommentEditResultProjection = null,
     comment_delete_result: ?CommentDeleteResultProjection = null,
     submission_result: ?SubmissionResultProjection = null,
+    stale_repair: ?StaleRepairGate = null,
     recovery: ?RecoveryNotice = null,
     /// The recovered run's frozen participants, read only while `recovery` is
     /// set. They make a recovered run's ownership of a Draft visible before the
@@ -3172,6 +3250,7 @@ pub const Presentation = struct {
     }
 
     fn queueDuplicateCheck(self: *Presentation, durable: *DurableSubmission) void {
+        const source_changed = durable.source_changed;
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
             durable.phase = .duplicate_check_paused;
             self.action_error = .out_of_memory;
@@ -3183,7 +3262,7 @@ pub const Presentation = struct {
             return;
         };
         self.commands.appendAssumeCapacity(.{ .find_duplicate = command });
-        self.action_error = .recovery_source_changed;
+        self.action_error = if (source_changed) .recovery_source_changed else null;
     }
 
     fn requestShutdown(self: *Presentation) void {
@@ -3460,6 +3539,7 @@ pub const Presentation = struct {
         published.navigation.clearMark();
         followSurvivingRow(published, surviving);
         if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) tree.refresh(&published.review);
+        self.refreshStaleRepairTree();
         self.action_error = null;
     }
 
@@ -3597,6 +3677,7 @@ pub const Presentation = struct {
         published.navigation.clearMark();
         followDraftCard(published, capture.temp_id);
         if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) tree.refresh(&published.review);
+        self.refreshStaleRepairTree();
         self.action_error = null;
     }
 
@@ -3715,17 +3796,29 @@ pub const Presentation = struct {
             tree.move(-1);
             return;
         }
-        if (tree.completion == null) return;
+        if (tree.completion == null) {
+            if (key.matches('A', .{})) self.abandonRecoveredSubmission();
+            return;
+        }
+        if (tree.stale_repair != null and key.matches('R', .{})) {
+            const published = self.published orelse return;
+            if (OwnedReviewIdentity.eql(published.key, tree.key)) self.queueRefresh(tree.key);
+            return;
+        }
         if (key.matches(keymap_mod.special.escape, .{}) or key.matches('q', .{})) {
             self.dismissSubmissionTree();
             return;
         }
         const item = tree.selectedItem() orelse return;
-        if (!item.retry_eligible) return;
         if (self.replacement != null) return;
         const published = self.published orelse return;
         if (!OwnedReviewIdentity.eql(published.key, tree.key)) return;
+        if (item.state == .outcome_unknown) {
+            if (key.matches('U', .{})) self.resolveUnknownAsUnpublished(published, item.temp_id) else if (key.matches('L', .{})) self.openUnknownResolutionEditorFor(published, item.temp_id) else if (key.matches('A', .{})) self.dismissSubmissionTree();
+            return;
+        }
         if (key.matches('e', .{})) {
+            if (!item.repair_eligible) return;
             const draft = published.review.getConst(item.temp_id) orelse return;
             switch (draft.state) {
                 .draft, .failed => {},
@@ -3735,6 +3828,7 @@ pub const Presentation = struct {
             }
             self.openDraftEditComposer(published, item.temp_id);
         } else if (key.matches('a', .{})) {
+            if (!item.repair_eligible) return;
             if (self.draftReanchorRefusal(published, item.temp_id)) |refusal| {
                 self.action_error = mutationRefusalError(refusal);
                 return;
@@ -3742,6 +3836,7 @@ pub const Presentation = struct {
             self.reanchor = .{ .key = published.key, .temp_id = item.temp_id };
             self.action_error = null;
         } else if (key.matches('D', .{})) {
+            if (!item.repair_eligible) return;
             if (self.draftDeleteRefusal(published, item.temp_id)) |refusal| {
                 self.action_error = mutationRefusalError(refusal);
                 return;
@@ -3753,6 +3848,7 @@ pub const Presentation = struct {
             };
             self.action_error = null;
         } else if (key.matches('X', .{})) {
+            if (!item.retry_eligible) return;
             self.startSubmissionSelection(published, item.temp_id);
         }
     }
@@ -3770,6 +3866,52 @@ pub const Presentation = struct {
         self.submission_tree = null;
         tree.destroy();
         self.submission_result = null;
+    }
+
+    fn abandonRecoveredSubmission(self: *Presentation) void {
+        const durable = self.durable_submission orelse return;
+        if (!durable.recovered) return;
+        const temp_id = durable.current_temp_id orelse return;
+        self.dependencies.reviews.abandonSubmission(durable.operation_id, durable.key.storeKey()) catch {
+            self.action_error = .persistence_failed;
+            return;
+        };
+        durable.review.setState(temp_id, .outcome_unknown);
+        const completion: bbr.review.SubmissionCompletion = .partial;
+        const result = durable.persistedResultProjection(completion);
+        if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, durable.key))
+            published.review.setState(temp_id, .outcome_unknown);
+        if (self.submission_tree) |tree| {
+            tree.finish(durable, completion);
+            if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, durable.key)) tree.refresh(&published.review);
+        }
+        self.removeQueuedSubmissionCommands(durable.operation_id);
+        self.durable_submission = null;
+        durable.destroy();
+        self.submission_result = result;
+        self.refreshStaleRepairTree();
+        self.action_error = null;
+    }
+
+    fn removeQueuedSubmissionCommands(self: *Presentation, operation_id: bbr.review.OperationId) void {
+        var write: usize = 0;
+        for (self.commands.items) |command_value| {
+            var command = command_value;
+            const matches = switch (command) {
+                .post_draft => |post| post.operation_id == operation_id,
+                .wait_submission => |wait| wait.operation_id == operation_id,
+                .check_recovery => |check| check.operation_id == operation_id,
+                .find_duplicate => |check| check.operation_id == operation_id,
+                else => false,
+            };
+            if (matches) {
+                command.deinit();
+            } else {
+                self.commands.items[write] = command;
+                write += 1;
+            }
+        }
+        self.commands.shrinkRetainingCapacity(write);
     }
 
     fn resizeViewport(self: *Presentation, rows: usize) void {
@@ -4044,11 +4186,36 @@ pub const Presentation = struct {
             self.action_error = .action_refused;
             return;
         };
-        self.dependencies.reviews.resolveUnknown(published.key.storeKey(), draft.local_id, .unpublished) catch {
+        self.resolveUnknownAsUnpublished(published, draft.local_id);
+    }
+
+    fn resolveUnknownAsUnpublished(self: *Presentation, published: *Published, temp_id: bbr.review.TempId) void {
+        const draft = published.review.get(temp_id) orelse {
+            self.action_error = .action_refused;
+            return;
+        };
+        if (draft.state != .outcome_unknown) {
+            self.action_error = .action_refused;
+            return;
+        }
+        self.dependencies.reviews.resolveUnknown(published.key.storeKey(), temp_id, .unpublished) catch {
             self.action_error = .persistence_failed;
             return;
         };
         draft.state = .draft;
+        if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) {
+            tree.refresh(&published.review);
+            if (tree.find(temp_id)) |item| {
+                item.state = .queued;
+                item.retry_eligible = true;
+                item.repair_eligible = true;
+            }
+        };
+        self.refreshStaleRepairTree();
+        published.rebuild(self.preferences, published.expanded_disclosures.items, published.isolated_file) catch |err| {
+            self.action_error = normalizeActionError(err);
+            return;
+        };
         self.action_error = null;
     }
 
@@ -4057,7 +4224,19 @@ pub const Presentation = struct {
             self.action_error = .action_refused;
             return;
         };
-        self.unknown_resolution = .{ .key = published.key, .temp_id = draft.local_id };
+        self.openUnknownResolutionEditorFor(published, draft.local_id);
+    }
+
+    fn openUnknownResolutionEditorFor(self: *Presentation, published: *Published, temp_id: bbr.review.TempId) void {
+        const draft = published.review.getConst(temp_id) orelse {
+            self.action_error = .action_refused;
+            return;
+        };
+        if (draft.state != .outcome_unknown) {
+            self.action_error = .action_refused;
+            return;
+        }
+        self.unknown_resolution = .{ .key = published.key, .temp_id = temp_id };
         self.action_error = null;
     }
 
@@ -4082,6 +4261,30 @@ pub const Presentation = struct {
                     self.action_error = .action_refused;
                     return;
                 }
+                const published = self.published orelse {
+                    self.action_error = .action_refused;
+                    return;
+                };
+                if (!OwnedReviewIdentity.eql(published.key, editor.key)) {
+                    self.action_error = .action_refused;
+                    return;
+                }
+                const comment = findPublishedComment(published, comment_id) orelse {
+                    self.action_error = .action_refused;
+                    return;
+                };
+                const account = self.authenticated_account_uuid orelse {
+                    self.action_error = .authenticated_account_unknown;
+                    return;
+                };
+                const author = comment.author_uuid orelse {
+                    self.action_error = .comment_author_unknown;
+                    return;
+                };
+                if (!std.mem.eql(u8, account.slice(), author)) {
+                    self.action_error = .comment_owned_by_other;
+                    return;
+                }
                 self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
                     self.action_error = .out_of_memory;
                     return;
@@ -4090,11 +4293,11 @@ pub const Presentation = struct {
                     self.action_error = .persistence_failed;
                     return;
                 };
-                if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, editor.key))
-                    published.review.setState(editor.temp_id, .{ .posted = comment_id });
+                if (self.published) |current| if (OwnedReviewIdentity.eql(current.key, editor.key))
+                    current.review.setState(editor.temp_id, .{ .posted = comment_id });
                 const key = editor.key;
                 self.unknown_resolution = null;
-                if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, key)) self.queueReconciliation(key);
+                if (self.published) |current| if (OwnedReviewIdentity.eql(current.key, key)) self.queueReconciliation(key);
                 self.action_error = null;
             },
         }
@@ -4113,6 +4316,16 @@ pub const Presentation = struct {
             self.action_error = .remote_write_busy;
             return;
         }
+        if (self.stale_repair) |gate| if (OwnedReviewIdentity.eql(gate.key, published.key)) {
+            const root = selected_root orelse {
+                self.action_error = .recovery_source_changed;
+                return;
+            };
+            if (!gate.reloaded or !staleSubtreeEligible(published, root)) {
+                self.action_error = .recovery_source_changed;
+                return;
+            }
+        };
         if (self.durable_submission) |durable| {
             if (selected_root != null) {
                 self.action_error = .submission_already_active;
@@ -4451,13 +4664,26 @@ pub const Presentation = struct {
         };
         const recovered_source = durable.recovery_source_commit orelse return;
         if (bbr.review.headChanged(recovered_source.slice(), current_source.slice())) {
+            durable.observed_source_commit = current_source;
             if (durable.recovered) {
+                self.stale_repair = .{
+                    .key = durable.key,
+                    .loaded_source_commit = recovered_source,
+                    .observed_source_commit = current_source,
+                };
+                durable.source_changed = true;
                 durable.phase = .recovery_source_changed;
                 self.queueDuplicateCheck(durable);
+                self.refreshStaleRepairTree();
             } else {
                 self.abortChangedSubmission(durable);
             }
             return;
+        }
+        if (!durable.recovered) {
+            if (self.stale_repair) |gate| {
+                if (OwnedReviewIdentity.eql(gate.key, durable.key)) self.stale_repair = null;
+            }
         }
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
             durable.phase = .recovery_check_paused;
@@ -4485,6 +4711,11 @@ pub const Presentation = struct {
     }
 
     fn abortChangedSubmission(self: *Presentation, durable: *DurableSubmission) void {
+        const observed = durable.observed_source_commit orelse {
+            durable.phase = .recovery_check_paused;
+            self.action_error = .recovery_check_failed;
+            return;
+        };
         const completion: bbr.review.SubmissionCompletion = .{ .aborted = .draft };
         self.dependencies.reviews.completeSubmission(durable.operation_id, durable.key.storeKey(), completion) catch {
             durable.phase = .recovery_check_paused;
@@ -4496,9 +4727,15 @@ pub const Presentation = struct {
         if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, durable.key) and durable.current_temp_id != null)
             published.review.setState(durable.current_temp_id.?, .draft);
         if (self.submission_tree) |tree| tree.finish(durable, completion);
+        self.stale_repair = .{
+            .key = durable.key,
+            .loaded_source_commit = durable.recovery_source_commit.?,
+            .observed_source_commit = observed,
+        };
         self.durable_submission = null;
         durable.destroy();
         self.submission_result = result;
+        self.refreshStaleRepairTree();
         self.action_error = .recovery_source_changed;
     }
 
@@ -4627,9 +4864,19 @@ pub const Presentation = struct {
         };
         const result = durable.persistedResultProjection(completion);
         if (self.submission_tree) |tree| tree.finish(durable, completion);
+        if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, durable.key)) {
+            published.review.setState(temp_id, outcome.draftState());
+            if (self.submission_tree) |tree| tree.refresh(&published.review);
+        };
+        const reconcile = outcome == .posted and !self.shutdown_requested and self.replacement == null and
+            (if (self.published) |published| OwnedReviewIdentity.eql(published.key, durable.key) else false);
+        const key = durable.key;
+        if (completion == .clean and durable.source_changed) self.stale_repair = null;
         self.durable_submission = null;
         durable.destroy();
         self.submission_result = result;
+        if (reconcile) self.queueReconciliation(key);
+        self.refreshStaleRepairTree();
         self.action_error = null;
     }
 
@@ -4694,6 +4941,24 @@ pub const Presentation = struct {
     fn syncSubmissionTree(self: *Presentation, durable: *const DurableSubmission) void {
         if (self.submission_tree) |tree| if (tree.operation_id == durable.operation_id and OwnedReviewIdentity.eql(tree.key, durable.key))
             tree.sync(durable);
+    }
+
+    fn refreshStaleRepairTree(self: *Presentation) void {
+        const gate = self.stale_repair orelse return;
+        const tree = self.submission_tree orelse return;
+        if (!OwnedReviewIdentity.eql(tree.key, gate.key)) return;
+        tree.stale_repair = .{
+            .loaded_source_commit = gate.loaded_source_commit.slice(),
+            .observed_source_commit = gate.observed_source_commit.slice(),
+            .reloaded = gate.reloaded,
+        };
+        const published = self.published orelse return;
+        if (!OwnedReviewIdentity.eql(published.key, gate.key)) return;
+        for (tree.items.items) |*item| {
+            const draft = published.review.getConst(item.temp_id);
+            item.repair_eligible = if (draft) |value| value.state == .draft or value.state == .failed else false;
+            item.retry_eligible = gate.reloaded and staleSubtreeEligible(published, item.temp_id);
+        }
     }
 
     fn recordVisibleTransition(self: *Presentation, durable: *const DurableSubmission, transition: DurableSubmission.PersistedTransition) void {
@@ -5158,6 +5423,8 @@ pub const Presentation = struct {
         };
         composer.deinit();
         published.composer = null;
+        if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) tree.refresh(&published.review);
+        self.refreshStaleRepairTree();
         self.action_error = null;
     }
 
@@ -5568,7 +5835,15 @@ pub const Presentation = struct {
                 };
 
                 const previous = self.published;
+                if (previous) |current| {
+                    if (OwnedReviewIdentity.eql(current.key, candidate.key))
+                        candidate.navigation = frame_mod.restoreNavigation(current.frameProjection(), candidate.targets, candidate.geometry);
+                }
                 self.published = candidate;
+                if (self.stale_repair) |*gate| if (OwnedReviewIdentity.eql(gate.key, candidate.key)) {
+                    gate.observed_source_commit = BoundedText(64).init(candidate.session.header.source_commit) catch gate.observed_source_commit;
+                    gate.reloaded = true;
+                };
                 if (candidate.session.authenticated_account_uuid) |uuid|
                     self.authenticated_account_uuid = BoundedText(256).init(uuid) catch self.authenticated_account_uuid;
                 if (candidate.session.authenticated_account_unauthorized) self.authenticated_account_uuid = null;
@@ -5597,6 +5872,7 @@ pub const Presentation = struct {
                     }
                 };
                 if (previous) |published| published.destroy();
+                self.refreshStaleRepairTree();
             },
         }
     }
@@ -5607,6 +5883,45 @@ fn recoveryMatches(notice: RecoveryNotice, active: bbr.review.ActiveSubmissionRu
         OwnedReviewIdentity.eql(notice.key, OwnedReviewIdentity.init(active.key.workspace, active.key.repository, active.key.pull_request_id) catch return false) and
         notice.current_temp_id == active.current_temp_id and
         std.mem.eql(u8, notice.source_commit.slice(), active.source_commit);
+}
+
+fn staleSubtreeEligible(published: *const Published, selected: bbr.review.TempId) bool {
+    const selected_draft = published.review.getConst(selected) orelse return false;
+    switch (selected_draft.state) {
+        .draft, .failed => {},
+        .submitting, .posted, .outcome_unknown => return false,
+    }
+    for (published.review.drafts.items) |draft| {
+        if (!bbr.review.descendsFrom(published.review.drafts.items, selected, draft.local_id)) continue;
+        switch (draft.state) {
+            .draft, .failed, .posted => {},
+            .submitting, .outcome_unknown => return false,
+        }
+    }
+
+    var root = selected_draft;
+    while (root.parent) |parent| switch (parent) {
+        .comment => |comment_id| return findPublishedComment(published, comment_id) != null,
+        .draft => |temp_id| {
+            root = published.review.getConst(temp_id) orelse return false;
+            switch (root.state) {
+                .draft, .failed => {},
+                .posted => return true,
+                .submitting, .outcome_unknown => return false,
+            }
+        },
+    };
+
+    return switch (root.effectiveScope()) {
+        .review => true,
+        .file => |file| !bbr.review.headChanged(file.source_commit, published.session.header.source_commit) and
+            scopeFileExists(published.session.diff, file.path, false),
+        .@"inline" => |anchor| blk: {
+            const commit = anchor.commit orelse break :blk false;
+            const expected = if (anchor.to != null) published.session.header.source_commit else published.session.header.base_commit;
+            break :blk !bbr.review.headChanged(commit, expected) and scopeAnchorExists(published.session.diff, anchor);
+        },
+    };
 }
 
 fn captureAnchorSnapshot(allocator: Allocator, file: bbr.diff.File, selected: []const *const bbr.diff.Line) !?bbr.review.AnchorSnapshot {
@@ -7448,6 +7763,16 @@ fn testCommentSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session
     s.threads = try bbr.review.buildThreads(a, comments);
     s.authenticated_account_uuid = "{me}";
     return s;
+}
+
+test "stale repair requires the exact authored old and new side ranges" {
+    const s = try testWideSession(testing.allocator, 1);
+    defer s.destroy();
+
+    try testing.expect(scopeAnchorExists(s.diff, .{ .path = "wide.zig", .start_from = 1, .from = 4, .commit = "destination" }));
+    try testing.expect(scopeAnchorExists(s.diff, .{ .path = "wide.zig", .start_to = 1, .to = 30, .commit = "source" }));
+    try testing.expect(!scopeAnchorExists(s.diff, .{ .path = "wide.zig", .start_to = 1, .to = 41, .commit = "source" }));
+    try testing.expect(!scopeAnchorExists(s.diff, .{ .path = "other.zig", .start_from = 1, .from = 4, .commit = "destination" }));
 }
 
 fn testCommentThreadSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
@@ -9732,7 +10057,7 @@ test "reviewer can link a selected unresolved Draft to an existing Comment" {
     const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "unknown", .state = .outcome_unknown });
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .initial = .{ .key = key, .session = try testCommentSession(testing.allocator, 1) },
         .viewport_rows = 8,
     });
     defer presentation.deinit();
@@ -9741,16 +10066,161 @@ test "reviewer can link a selected unresolved Draft to an existing Comment" {
         break;
     };
     try presentation.dispatch(.{ .action = .link_existing_comment });
-    try presentation.dispatch(.{ .unknown_resolution = .{ .digit = 8 } });
-    try presentation.dispatch(.{ .unknown_resolution = .{ .digit = 1 } });
-    try presentation.dispatch(.{ .unknown_resolution = .{ .digit = 2 } });
+    try presentation.dispatch(.{ .unknown_resolution = .{ .digit = 9 } });
+    try presentation.dispatch(.{ .unknown_resolution = .{ .digit = 9 } });
     try presentation.dispatch(.{ .unknown_resolution = .confirm });
 
     try testing.expect(presentation.projection().unknown_resolution == null);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    try testing.expectEqual(@as(bbr.review.CommentId, 812), (try store.store().load(arena.allocator(), key.storeKey()))[0].state.posted);
+    try testing.expectEqual(@as(bbr.review.CommentId, 99), (try store.store().load(arena.allocator(), key.storeKey()))[0].state.posted);
     try testing.expect(presentation.takeCommand().? == .load_session);
+}
+
+fn submissionTreeItem(tree: SubmissionTreeProjection, temp_id: bbr.review.TempId) SubmissionItemProjection {
+    for (tree.items) |item| if (item.temp_id == temp_id) return item;
+    unreachable;
+}
+
+test "stale repair reload evaluates each root scope independently and checks the refreshed source again" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "review", .scope = .review });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .body = "file", .scope = .{ .file = .{ .path = "a.zig", .source_commit = "source" } } });
+    try store.store().put(key.storeKey(), .{ .local_id = 3, .kind = .comment, .body = "new", .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1, .commit = "source" } } });
+    try store.store().put(key.storeKey(), .{ .local_id = 4, .kind = .comment, .body = "old", .scope = .{ .@"inline" = .{ .path = "a.zig", .from = 1, .commit = "destination" } } });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+        .require_source_check = true,
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .submit });
+    const first_check = presentation.takeCommand().?.check_recovery;
+    try presentation.dispatch(recoveryCheckSucceeded(first_check.command_id, first_check.operation_id, null, "new-head"));
+    var stale = presentation.projection().submission_tree.?;
+    try testing.expectEqualStrings("source", stale.stale_repair.?.loaded_source_commit);
+    try testing.expectEqualStrings("new-head", stale.stale_repair.?.observed_source_commit);
+    try testing.expect(!stale.stale_repair.?.reloaded);
+    for (stale.items) |item| try testing.expect(!item.retry_eligible);
+    try testing.expect(presentation.takeCommand() == null);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'R', .text = "R" } });
+    const reload = presentation.takeCommand().?.load_session;
+    const refreshed = try testSession(testing.allocator, 1, 'a');
+    refreshed.header.source_commit = "new-head";
+    refreshed.source.remote.source_commit = "new-head";
+    try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = reload.command_id,
+        .intent = reload.intent,
+        .outcome = .{ .loaded = refreshed },
+    } });
+
+    stale = presentation.projection().submission_tree.?;
+    try testing.expect(stale.stale_repair.?.reloaded);
+    try testing.expect(submissionTreeItem(stale, 1).retry_eligible);
+    try testing.expect(!submissionTreeItem(stale, 2).retry_eligible);
+    try testing.expect(!submissionTreeItem(stale, 3).retry_eligible);
+    try testing.expect(submissionTreeItem(stale, 4).retry_eligible);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'X', .text = "X" } });
+    const second_check = presentation.takeCommand().?.check_recovery;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const selected = (try store.store().activeSubmission(arena.allocator())).?;
+    try testing.expectEqual(@as(usize, 1), selected.items.len);
+    try testing.expectEqual(@as(bbr.review.TempId, 1), selected.items[0].temp_id);
+    try testing.expectEqualStrings("new-head", selected.source_commit);
+
+    try presentation.dispatch(recoveryCheckSucceeded(second_check.command_id, second_check.operation_id, null, "third-head"));
+    const changed_again = presentation.projection().submission_tree.?.stale_repair.?;
+    try testing.expectEqualStrings("new-head", changed_again.loaded_source_commit);
+    try testing.expectEqualStrings("third-head", changed_again.observed_source_commit);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "abandoning recovered ambiguity posts nothing and releases only settled Drafts" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 7);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "ambiguous" });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .body = "eligible" });
+    const operation_id = try store.store().beginSubmission(key.storeKey(), "source", &.{ .{ .temp_id = 1, .parent = null }, .{ .temp_id = 2, .parent = null } });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 7, 'a') } });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .recover_submission });
+    const source_check = presentation.takeCommand().?.check_recovery;
+    try presentation.dispatch(recoveryCheckSucceeded(source_check.command_id, operation_id, null, "source"));
+    var duplicate = presentation.takeCommand().?;
+    const duplicate_command_id = duplicate.find_duplicate.command_id;
+    duplicate.deinit();
+    try presentation.dispatch(.{ .duplicate_checked = .{
+        .command_id = duplicate_command_id,
+        .operation_id = operation_id,
+        .identity = .init(key),
+        .temp_id = 1,
+        .outcome = .failed,
+    } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'A', .text = "A" } });
+
+    try testing.expect(presentation.takeCommand() == null);
+    try testing.expect(presentation.projection().submission == null);
+    try testing.expect(presentation.projection().submission_tree.?.completion.? == .partial);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try store.store().load(arena.allocator(), key.storeKey());
+    try testing.expect(drafts[0].state == .outcome_unknown);
+    try testing.expect(drafts[1].state == .draft);
+    try testing.expect((try store.store().activeSubmission(arena.allocator())) == null);
+    var reacquired = (try locks.locks().tryAcquire(key.storeKey())).?;
+    reacquired.release();
+}
+
+test "current-source recovery checks publication before resuming with a new POST" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 7);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "resume" });
+    const operation_id = try store.store().beginSubmission(key.storeKey(), "source", &.{.{ .temp_id = 1, .parent = null }});
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 7, 'a') } });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .recover_submission });
+    const source_check = presentation.takeCommand().?.check_recovery;
+    try presentation.dispatch(recoveryCheckSucceeded(source_check.command_id, operation_id, null, "source"));
+    var duplicate = presentation.takeCommand().?;
+    const duplicate_command_id = duplicate.find_duplicate.command_id;
+    duplicate.deinit();
+    try presentation.dispatch(.{ .duplicate_checked = .{
+        .command_id = duplicate_command_id,
+        .operation_id = operation_id,
+        .identity = .init(key),
+        .temp_id = 1,
+        .outcome = .missing,
+    } });
+
+    const wait = presentation.takeCommand().?.wait_submission;
+    try testing.expectEqual(@as(u64, 1_000), wait.ms);
+    try presentation.dispatch(.{ .submission_wait_completed = wait });
+    var post = presentation.takeCommand().?;
+    defer post.deinit();
+    try testing.expect(post == .post_draft);
+    try testing.expectEqual(@as(bbr.review.TempId, 1), post.post_draft.draft.local_id);
 }
 
 test "portable key input owns help overlay capture" {

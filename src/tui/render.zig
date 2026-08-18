@@ -723,6 +723,15 @@ fn drawSubmissionDetail(
     const identity = std.fmt.allocPrint(scratch, " Draft #{d}: {s}; {d} Reply descendant(s)", .{ item.temp_id, item.context, item.reply_descendants }) catch " Draft detail";
     _ = modal.printSegment(.{ .text = identity, .style = theme.picker_query }, .{ .row_offset = start, .wrap = .none });
     var row = start + 1;
+    if (tree.stale_repair) |stale| if (row < modal.height) {
+        const source = std.fmt.allocPrint(scratch, " Stale repair: loaded {s}; observed {s}; {s}", .{
+            stale.loaded_source_commit,
+            stale.observed_source_commit,
+            if (stale.reloaded) "reloaded - repair this scope before retry" else "R reload PullRequest; no submit-anyway",
+        }) catch " Stale repair required";
+        _ = modal.printSegment(.{ .text = source, .style = theme.outcome_unknown }, .{ .row_offset = row, .wrap = .none });
+        row += 1;
+    };
     if (row < modal.height) {
         const reason = if (item.reason) |err|
             std.fmt.allocPrint(scratch, " Reason: {s}", .{@errorName(err)}) catch " Reason unavailable"
@@ -757,9 +766,13 @@ fn drawSubmissionDetail(
     if (row < modal.height) {
         fillRow(modal, row, theme.picker_query);
         const footer: []const u8 = if (tree.completion == null)
-            " In progress; this Overlay cannot cancel Submission"
+            " In progress; A abandons recovered ambiguity only"
         else if (item.retry_eligible)
             " e edit | a re-anchor | D delete | X retry selected subtree | Esc dismiss"
+        else if (item.repair_eligible)
+            " e edit | a re-anchor | D delete | R reload | repair before retry | Esc dismiss"
+        else if (item.state == .outcome_unknown)
+            " L link author-owned Comment | U confirm not published | A decide later"
         else if (item.state == .posted)
             " Posted items are inspectable, never retryable | Esc dismiss"
         else if (item.state == .skipped)

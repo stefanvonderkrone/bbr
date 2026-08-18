@@ -40,6 +40,10 @@ pub const Poster = struct {
     /// The PR's current head, for the dedupe fetch's outdated detection (unused
     /// by the match itself; safe to leave default).
     head: HeadCommits = .{},
+    /// Recovery must never attach a local Draft to another author's matching
+    /// Comment. Tests and non-recovery callers may leave this policy disabled.
+    author_uuid: ?[]const u8 = null,
+    require_author_match: bool = false,
 
     pub fn poster(self: *Poster) CommentPoster {
         return .{ .ptr = self, .vtable = &vtable };
@@ -83,6 +87,11 @@ pub const Poster = struct {
         };
         defer deinitComments(self.allocator, comments);
         for (comments) |c| {
+            if (self.require_author_match) {
+                const expected = self.author_uuid orelse continue;
+                const actual = c.author_uuid orelse continue;
+                if (!std.mem.eql(u8, expected, actual)) continue;
+            }
             if (!std.mem.eql(u8, c.body, d.body)) continue;
             if (parent) |parent_id| {
                 if (c.parent_id != parent_id) continue;
@@ -199,4 +208,28 @@ test "dedupe distinguishes File and inline roots and matches Replies by resolved
     try testing.expectEqual(@as(CommentId, 21), (try p.poster().findExisting(line, null)).outcome.found);
     try testing.expectEqual(@as(CommentId, 22), (try p.poster().findExisting(.{ .local_id = 3, .kind = .comment, .body = "reply", .parent = .{ .comment = 20 } }, 20)).outcome.found);
     try testing.expect((try p.poster().findExisting(.{ .local_id = 4, .kind = .comment, .body = "reply", .parent = .{ .comment = 21 } }, 21)).outcome == .missing);
+}
+
+test "recovery dedupe only links a matching Comment owned by the authenticated author" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body =
+        \\{ "values": [
+        \\ { "id": 20, "content": { "raw": "same" }, "user": { "display_name": "Other", "uuid": "{other}" } },
+        \\ { "id": 21, "content": { "raw": "same" }, "user": { "display_name": "Me", "uuid": "{me}" } }
+        \\] }
+    };
+    var p = Poster{
+        .client = testClient(&fake),
+        .allocator = a,
+        .repo_slug = "repo",
+        .pr_id = 1,
+        .author_uuid = "{me}",
+        .require_author_match = true,
+    };
+
+    try testing.expectEqual(@as(CommentId, 21), (try p.poster().findExisting(.{ .local_id = 1, .kind = .comment, .body = "same" }, null)).outcome.found);
+
+    fake.call_count = 0;
+    p.author_uuid = null;
+    try testing.expect((try p.poster().findExisting(.{ .local_id = 1, .kind = .comment, .body = "same" }, null)).outcome == .missing);
 }
