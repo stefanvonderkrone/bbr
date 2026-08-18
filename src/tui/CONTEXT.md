@@ -97,6 +97,10 @@ _Avoid_: persisted scope state, resolved Draft, mutable CommentScope, AnchorProj
 Reviewer-authorized work that belongs to a PullRequest rather than to the Session that started it. Submission and mutation of an author-owned published Comment remain valid when that Session is replaced; only projecting their progress or result into the current screen depends on which Session is published. M16 serializes these operations through one global remote-write lane.
 _Avoid_: Session work, background job, task.
 
+**Submission Overlay**:
+The PullRequest-qualified dependency-tree Overlay that follows one authorized SubmissionRun from queued work through terminal inspection. Its frozen forest shows typed Draft identities, scope or Reply context, explicit item states, retry evidence, and blocking ancestry; terminal repair and retry operate only on the selected eligible failed Draft subtree. Switching Reviews hides the Overlay without cancelling its Durable Operation.
+_Avoid_: submission result dialog, progress popup, retry-all.
+
 **Keymap**:
 The binding of key input to actions, supporting vim-style Motions and arrow keys side by side. Config-driven; the source the keybinding-help Overlay reads from.
 _Avoid_: bindings, shortcuts, hotkeys.

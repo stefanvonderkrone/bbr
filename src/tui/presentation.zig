@@ -815,6 +815,7 @@ pub const Projection = struct {
     review: ?ReviewProjection,
     submission: ?SubmissionProjection,
     submission_result: ?SubmissionResultProjection,
+    submission_tree: ?SubmissionTreeProjection,
     comment_edit_result: ?CommentEditResultProjection,
     comment_delete_result: ?CommentDeleteResultProjection,
     recovery: ?RecoveryNotice,
@@ -930,6 +931,54 @@ pub const SubmissionProjection = struct {
     persistence_paused: bool,
     completed: usize,
     total: usize,
+};
+
+pub const SubmissionItemState = enum {
+    queued,
+    posting,
+    waiting_to_retry,
+    checking_publication,
+    persisting,
+    posted,
+    failed,
+    skipped,
+    outcome_unknown,
+};
+
+pub const SubmissionItemProjection = struct {
+    temp_id: bbr.review.TempId,
+    parent: ?bbr.review.draft.Parent,
+    depth: usize,
+    body: []const u8,
+    context: []const u8,
+    state: SubmissionItemState,
+    reason: ?bbr.bitbucket.ApiError = null,
+    posted_comment_id: ?bbr.review.CommentId = null,
+    blocking_ancestor: ?bbr.review.TempId = null,
+    reply_descendants: usize = 0,
+    post_attempts: u8 = 0,
+    publication_checks: u8 = 0,
+    retry: ?bbr.review.SubmissionRetryCheckpoint = null,
+    retry_eligible: bool = false,
+};
+
+/// One Session-independent dependency-tree surface from authorization through
+/// terminal inspection. The strings and rows borrow Presentation-owned state.
+pub const SubmissionTreeProjection = struct {
+    operation_id: bbr.review.OperationId,
+    key: OwnedReviewIdentity,
+    items: []const SubmissionItemProjection,
+    selected: usize,
+    completion: ?bbr.review.SubmissionCompletion,
+    posted: usize,
+    failed: usize,
+    skipped: usize,
+    outcome_unknown: usize,
+
+    pub fn selectedItem(self: SubmissionTreeProjection) ?SubmissionItemProjection {
+        if (self.selected >= self.items.len) return null;
+        return self.items[self.selected];
+    }
 };
 
 pub const SubmissionResultProjection = struct {
@@ -1736,6 +1785,25 @@ const IssuedEnrichment = struct {
     file_index: usize,
 };
 
+const SubmissionPhase = enum {
+    post_queued,
+    awaiting_post,
+    post_retry_paused,
+    wait_queued,
+    awaiting_wait,
+    wait_retry_paused,
+    admission_paused,
+    persistence_paused,
+    recovery_check_queued,
+    awaiting_recovery_check,
+    recovery_check_paused,
+    recovery_source_changed,
+    duplicate_queued,
+    awaiting_duplicate,
+    duplicate_check_paused,
+    duplicate_persistence_paused,
+};
+
 const DurableSubmission = struct {
     allocator: Allocator,
     key: OwnedReviewIdentity,
@@ -1745,7 +1813,7 @@ const DurableSubmission = struct {
     arena: std.heap.ArenaAllocator,
     review: bbr.review.PendingReview,
     machine: bbr.review.Submission,
-    phase: enum { post_queued, awaiting_post, post_retry_paused, wait_queued, awaiting_wait, wait_retry_paused, admission_paused, persistence_paused, recovery_check_queued, awaiting_recovery_check, recovery_check_paused, recovery_source_changed, duplicate_queued, awaiting_duplicate, duplicate_check_paused, duplicate_persistence_paused } = .post_queued,
+    phase: SubmissionPhase = .post_queued,
     pending_admission: ?PendingAdmission = null,
     pending_persistence: ?PendingPersistence = null,
     pending_wait_retry: ?WaitSubmission = null,
@@ -1757,7 +1825,13 @@ const DurableSubmission = struct {
 
     const Started = struct {
         durable: *DurableSubmission,
+        tree: *SubmissionTree,
         command: union(enum) { post: *PostDraft, wait: WaitSubmission },
+    };
+
+    const Recovered = struct {
+        durable: *DurableSubmission,
+        tree: *SubmissionTree,
     };
 
     const PersistedTransition = struct {
@@ -1787,7 +1861,14 @@ const DurableSubmission = struct {
         finished: struct { result: SubmissionResultProjection, transition: PersistedTransition },
     };
 
-    fn create(allocator: Allocator, store: bbr.review.PendingReviewStore, key: OwnedReviewIdentity, lock: bbr.review.SubmissionLockGuard, frozen_items: ?[]const bbr.review.SubmissionRunItem) !*DurableSubmission {
+    fn create(
+        allocator: Allocator,
+        store: bbr.review.PendingReviewStore,
+        key: OwnedReviewIdentity,
+        lock: bbr.review.SubmissionLockGuard,
+        frozen_items: ?[]const bbr.review.SubmissionRunItem,
+        selected_root: ?bbr.review.TempId,
+    ) !*DurableSubmission {
         var owned_lock = lock;
         errdefer owned_lock.release();
         const durable = try allocator.create(DurableSubmission);
@@ -1802,6 +1883,8 @@ const DurableSubmission = struct {
         durable.review = try store.loadReview(durable.arena.allocator(), key.storeKey());
         durable.machine = if (frozen_items) |items|
             try bbr.review.Submission.initFrozen(durable.arena.allocator(), &durable.review, items)
+        else if (selected_root) |root|
+            try bbr.review.Submission.initSubtree(durable.arena.allocator(), &durable.review, root)
         else
             try bbr.review.Submission.init(durable.arena.allocator(), &durable.review);
         durable.phase = .post_queued;
@@ -1825,8 +1908,9 @@ const DurableSubmission = struct {
         key: OwnedReviewIdentity,
         source_commit: []const u8,
         lock: bbr.review.SubmissionLockGuard,
+        selected_root: ?bbr.review.TempId,
     ) !?Started {
-        const durable = try create(allocator, store, key, lock, null);
+        const durable = try create(allocator, store, key, lock, null, selected_root);
         errdefer durable.destroy();
         const post = switch (durable.machine.advance()) {
             .post => |value| value,
@@ -1845,8 +1929,11 @@ const DurableSubmission = struct {
             const participant = durable.review.getConst(temp_id) orelse return error.DraftNotFound;
             item.* = .{ .temp_id = temp_id, .parent = participant.parent };
         }
+        const tree = try SubmissionTree.create(allocator, durable, remaining);
+        errdefer tree.destroy();
         const operation_id = try store.beginSubmission(durable.key.storeKey(), source_commit, items);
         durable.operation_id = operation_id;
+        tree.operation_id = operation_id;
         durable.current_temp_id = post.temp_id;
         command.operation_id = operation_id;
         if (try store.activeSubmission(durable.arena.allocator())) |run| if (run.retry) |retry| {
@@ -1854,7 +1941,7 @@ const DurableSubmission = struct {
             command.destroy();
             const wait = durable.machine.advance().wait;
             durable.phase = .wait_queued;
-            return .{ .durable = durable, .command = .{ .wait = .{
+            return .{ .durable = durable, .tree = tree, .command = .{ .wait = .{
                 .operation_id = operation_id,
                 .identity = .init(durable.key),
                 .temp_id = wait.temp_id,
@@ -1862,7 +1949,7 @@ const DurableSubmission = struct {
                 .checkpoint = wait.checkpoint,
             } } };
         };
-        return .{ .durable = durable, .command = .{ .post = command } };
+        return .{ .durable = durable, .tree = tree, .command = .{ .post = command } };
     }
 
     fn recover(
@@ -1871,8 +1958,8 @@ const DurableSubmission = struct {
         run: bbr.review.ActiveSubmissionRun,
         key: OwnedReviewIdentity,
         lock: bbr.review.SubmissionLockGuard,
-    ) !*DurableSubmission {
-        const durable = try create(allocator, store, key, lock, run.items);
+    ) !Recovered {
+        const durable = try create(allocator, store, key, lock, run.items, null);
         errdefer durable.destroy();
         if (run.retry) |retry| durable.machine.restoreRetry(retry);
         const current_temp_id = switch (durable.machine.advance()) {
@@ -1895,7 +1982,7 @@ const DurableSubmission = struct {
         durable.recovery_source_commit = try BoundedText(64).init(run.source_commit);
         durable.recovered = true;
         durable.phase = .recovery_check_queued;
-        return durable;
+        return .{ .durable = durable, .tree = try SubmissionTree.create(allocator, durable, durable.machine.order) };
     }
 
     fn acceptPost(
@@ -2140,6 +2227,335 @@ const DurableSubmission = struct {
     }
 };
 
+const SubmissionTree = struct {
+    allocator: Allocator,
+    arena: std.heap.ArenaAllocator,
+    key: OwnedReviewIdentity,
+    operation_id: bbr.review.OperationId,
+    items: std.ArrayList(SubmissionItemProjection) = .empty,
+    selected: usize = 0,
+    completion: ?bbr.review.SubmissionCompletion = null,
+
+    fn create(allocator: Allocator, durable: *const DurableSubmission, order: []const bbr.review.TempId) !*SubmissionTree {
+        const tree = try allocator.create(SubmissionTree);
+        errdefer allocator.destroy(tree);
+        tree.* = .{
+            .allocator = allocator,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .key = durable.key,
+            .operation_id = durable.operation_id,
+        };
+        errdefer tree.arena.deinit();
+        const arena = tree.arena.allocator();
+        try tree.items.ensureTotalCapacity(arena, order.len);
+        for (order) |temp_id| {
+            const draft = durable.review.getConst(temp_id) orelse return error.DraftNotFound;
+            tree.items.appendAssumeCapacity(.{
+                .temp_id = temp_id,
+                .parent = draft.parent,
+                .depth = tree.depth(draft.parent),
+                .body = try arena.dupe(u8, draft.body),
+                .context = try submissionContext(arena, draft.*),
+                .state = .queued,
+                .reply_descendants = submissionDescendantCount(durable.review.drafts.items, temp_id, order),
+            });
+        }
+        tree.sync(durable);
+        return tree;
+    }
+
+    fn createPersisted(
+        allocator: Allocator,
+        key: OwnedReviewIdentity,
+        operation_id: bbr.review.OperationId,
+        review: *const bbr.review.PendingReview,
+        run_items: []const bbr.review.SubmissionRunItem,
+        completion: bbr.review.SubmissionCompletion,
+    ) !*SubmissionTree {
+        const tree = try allocator.create(SubmissionTree);
+        errdefer allocator.destroy(tree);
+        tree.* = .{
+            .allocator = allocator,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .key = key,
+            .operation_id = operation_id,
+            .completion = completion,
+        };
+        errdefer tree.arena.deinit();
+        const arena = tree.arena.allocator();
+        const order = try arena.alloc(bbr.review.TempId, run_items.len);
+        for (run_items, order) |run_item, *temp_id| temp_id.* = run_item.temp_id;
+        try tree.items.ensureTotalCapacity(arena, order.len);
+        for (order) |temp_id| {
+            const draft = review.getConst(temp_id) orelse return error.DraftNotFound;
+            const state: SubmissionItemState = switch (draft.state) {
+                .draft => .queued,
+                .submitting, .outcome_unknown => .outcome_unknown,
+                .posted => .posted,
+                .failed => .failed,
+            };
+            tree.items.appendAssumeCapacity(.{
+                .temp_id = temp_id,
+                .parent = draft.parent,
+                .depth = tree.depth(draft.parent),
+                .body = try arena.dupe(u8, draft.body),
+                .context = try submissionContext(arena, draft.*),
+                .state = state,
+                .reason = if (draft.state == .failed) draft.state.failed else null,
+                .posted_comment_id = if (draft.state == .posted) draft.state.posted else null,
+                .reply_descendants = submissionDescendantCount(review.drafts.items, temp_id, order),
+                .retry_eligible = state == .failed,
+            });
+        }
+        for (tree.items.items) |*item| {
+            if (item.state != .queued) continue;
+            if (tree.nearestBlockingAncestor(item.parent)) |ancestor| {
+                item.state = .skipped;
+                item.blocking_ancestor = ancestor;
+                if (tree.findConst(ancestor)) |blocked| item.reason = blocked.reason;
+            }
+        }
+        return tree;
+    }
+
+    fn destroy(self: *SubmissionTree) void {
+        const allocator = self.allocator;
+        self.arena.deinit();
+        allocator.destroy(self);
+    }
+
+    fn depth(self: *const SubmissionTree, parent: ?bbr.review.draft.Parent) usize {
+        var current = parent;
+        var result: usize = 0;
+        while (current) |value| {
+            const parent_id = switch (value) {
+                .comment => break,
+                .draft => |id| id,
+            };
+            var found: ?bbr.review.draft.Parent = null;
+            for (self.items.items) |item| if (item.temp_id == parent_id) {
+                result += 1;
+                found = item.parent;
+                break;
+            };
+            current = found;
+            if (found == null) break;
+        }
+        return result;
+    }
+
+    fn sync(self: *SubmissionTree, durable: *const DurableSubmission) void {
+        for (self.items.items) |*item| {
+            const machine_index = submissionOrderIndex(durable.machine.order, item.temp_id) orelse continue;
+            item.reason = null;
+            item.posted_comment_id = null;
+            item.blocking_ancestor = null;
+            item.post_attempts = durable.machine.attempts[machine_index];
+            item.publication_checks = durable.machine.check_attempts[machine_index];
+            item.retry = null;
+            if (durable.machine.results[machine_index]) |result| {
+                item.state = switch (result.status) {
+                    .posted => .posted,
+                    .failed => .failed,
+                    .skipped => .skipped,
+                    .outcome_unknown => .outcome_unknown,
+                };
+                item.reason = result.reason;
+                item.posted_comment_id = result.id;
+                if (result.status == .failed) item.retry_eligible = true;
+                continue;
+            }
+            item.state = if (durable.current_temp_id != item.temp_id) .queued else submissionProgressState(durable.phase);
+            if (item.state == .posting) item.post_attempts += 1;
+            if (durable.current_temp_id == item.temp_id and (durable.machine.must_wait or durable.pending_wait_retry != null))
+                item.retry = durable.machine.retry_checkpoint;
+        }
+        for (self.items.items) |*item| {
+            if (item.state == .skipped) item.blocking_ancestor = self.nearestBlockingAncestor(item.parent);
+        }
+    }
+
+    fn finish(self: *SubmissionTree, durable: *const DurableSubmission, completion: bbr.review.SubmissionCompletion) void {
+        self.sync(durable);
+        if (completion == .aborted) {
+            for (self.items.items) |*item| if (item.state != .posted) {
+                item.state = .queued;
+                if (durable.current_temp_id == item.temp_id) item.reason = durable.machine.aborted_reason;
+            };
+        }
+        if (durable.machine.terminal_server_delay_ms) |server_delay| {
+            for (self.items.items) |*item| {
+                if (item.state == .failed and item.post_attempts == bbr.review.submission.max_attempts) {
+                    item.retry = .{
+                        .phase = .post,
+                        .attempt = bbr.review.submission.max_attempts,
+                        .reason = switch (item.reason orelse error.ServerError) {
+                            error.RateLimited => .rate_limited,
+                            else => .server_error,
+                        },
+                        .local_delay_ms = 0,
+                        .server_delay_ms = server_delay,
+                        .effective_delay_ms = server_delay,
+                        .pending_wait = false,
+                    };
+                    break;
+                }
+            }
+        }
+        self.completion = completion;
+    }
+
+    fn nearestBlockingAncestor(self: *const SubmissionTree, parent: ?bbr.review.draft.Parent) ?bbr.review.TempId {
+        var current = parent;
+        while (current) |value| {
+            const temp_id = switch (value) {
+                .comment => return null,
+                .draft => |id| id,
+            };
+            const item = self.findConst(temp_id) orelse return null;
+            if (item.state == .failed or item.state == .outcome_unknown) return temp_id;
+            if (item.blocking_ancestor) |blocked| return blocked;
+            current = item.parent;
+        }
+        return null;
+    }
+
+    fn find(self: *SubmissionTree, temp_id: bbr.review.TempId) ?*SubmissionItemProjection {
+        for (self.items.items) |*item| if (item.temp_id == temp_id) return item;
+        return null;
+    }
+
+    fn findConst(self: *const SubmissionTree, temp_id: bbr.review.TempId) ?*const SubmissionItemProjection {
+        for (self.items.items) |*item| if (item.temp_id == temp_id) return item;
+        return null;
+    }
+
+    fn move(self: *SubmissionTree, delta: isize) void {
+        if (self.items.items.len == 0) return;
+        if (delta < 0) self.selected -|= 1 else self.selected = @min(self.selected + 1, self.items.items.len - 1);
+    }
+
+    fn selectedItem(self: *SubmissionTree) ?*SubmissionItemProjection {
+        if (self.selected >= self.items.items.len) return null;
+        return &self.items.items[self.selected];
+    }
+
+    /// Re-read authored fields after a terminal repair. The tree keeps its
+    /// logical TempId selection, removes a confirmed deleted subtree, and marks
+    /// a repaired failed root queued for a fresh selected-subtree run.
+    fn refresh(self: *SubmissionTree, review: *const bbr.review.PendingReview) void {
+        const selected_temp_id = if (self.selectedItem()) |item| item.temp_id else null;
+        var index: usize = 0;
+        while (index < self.items.items.len) {
+            const item = &self.items.items[index];
+            const draft = review.getConst(item.temp_id) orelse {
+                _ = self.items.orderedRemove(index);
+                continue;
+            };
+            const arena = self.arena.allocator();
+            item.body = arena.dupe(u8, draft.body) catch item.body;
+            item.context = submissionContext(arena, draft.*) catch item.context;
+            switch (draft.state) {
+                .failed => |reason| {
+                    item.state = .failed;
+                    item.reason = reason;
+                    item.retry_eligible = true;
+                },
+                .draft => if (item.retry_eligible) {
+                    item.state = .queued;
+                    item.reason = null;
+                },
+                .posted => |comment_id| {
+                    item.state = .posted;
+                    item.posted_comment_id = comment_id;
+                    item.retry_eligible = false;
+                },
+                .outcome_unknown => {
+                    item.state = .outcome_unknown;
+                    item.retry_eligible = false;
+                },
+                .submitting => {},
+            }
+            index += 1;
+        }
+        self.selected = 0;
+        if (selected_temp_id) |temp_id| for (self.items.items, 0..) |item, item_index| {
+            if (item.temp_id == temp_id) {
+                self.selected = item_index;
+                break;
+            }
+        };
+        if (self.items.items.len > 0) self.selected = @min(self.selected, self.items.items.len - 1);
+    }
+
+    fn projection(self: *const SubmissionTree) SubmissionTreeProjection {
+        var posted: usize = 0;
+        var failed: usize = 0;
+        var skipped: usize = 0;
+        var outcome_unknown: usize = 0;
+        for (self.items.items) |item| switch (item.state) {
+            .posted => posted += 1,
+            .failed => failed += 1,
+            .skipped => skipped += 1,
+            .outcome_unknown => outcome_unknown += 1,
+            else => {},
+        };
+        return .{
+            .operation_id = self.operation_id,
+            .key = self.key,
+            .items = self.items.items,
+            .selected = self.selected,
+            .completion = self.completion,
+            .posted = posted,
+            .failed = failed,
+            .skipped = skipped,
+            .outcome_unknown = outcome_unknown,
+        };
+    }
+};
+
+fn submissionOrderIndex(order: []const bbr.review.TempId, temp_id: bbr.review.TempId) ?usize {
+    for (order, 0..) |candidate, index| if (candidate == temp_id) return index;
+    return null;
+}
+
+fn submissionProgressState(phase: SubmissionPhase) SubmissionItemState {
+    return switch (phase) {
+        .post_queued, .post_retry_paused => .queued,
+        .awaiting_post => .posting,
+        .wait_queued, .awaiting_wait, .wait_retry_paused => .waiting_to_retry,
+        .recovery_check_queued,
+        .awaiting_recovery_check,
+        .recovery_check_paused,
+        .recovery_source_changed,
+        .duplicate_queued,
+        .awaiting_duplicate,
+        .duplicate_check_paused,
+        => .checking_publication,
+        .admission_paused, .persistence_paused, .duplicate_persistence_paused => .persisting,
+    };
+}
+
+fn submissionDescendantCount(drafts: []const bbr.review.Draft, root: bbr.review.TempId, order: []const bbr.review.TempId) usize {
+    var count: usize = 0;
+    for (order) |temp_id| if (temp_id != root and bbr.review.descendsFrom(drafts, root, temp_id)) {
+        count += 1;
+    };
+    return count;
+}
+
+fn submissionContext(allocator: Allocator, draft: bbr.review.Draft) ![]const u8 {
+    if (draft.parent) |parent| return switch (parent) {
+        .draft => |temp_id| std.fmt.allocPrint(allocator, "Reply to Draft #{d}", .{temp_id}),
+        .comment => |comment_id| std.fmt.allocPrint(allocator, "Reply to Comment {d}", .{comment_id}),
+    };
+    return switch (draft.effectiveScope()) {
+        .review => allocator.dupe(u8, "Review scope"),
+        .file => |file| std.fmt.allocPrint(allocator, "File {s}", .{file.path}),
+        .@"inline" => |anchor| std.fmt.allocPrint(allocator, "Inline {s}:{d}", .{ anchor.path, anchor.line() orelse 0 }),
+    };
+}
+
 pub const Presentation = struct {
     allocator: Allocator,
     dependencies: Dependencies,
@@ -2163,6 +2579,7 @@ pub const Presentation = struct {
     picker_work_id: ?WorkId = null,
     help_visible: bool = false,
     durable_submission: ?*DurableSubmission = null,
+    submission_tree: ?*SubmissionTree = null,
     durable_comment_edit: ?*DurableCommentEdit = null,
     durable_comment_delete: ?*DurableCommentDelete = null,
     authenticated_account_uuid: ?BoundedText(256) = null,
@@ -2238,6 +2655,7 @@ pub const Presentation = struct {
     pub fn deinit(self: *Presentation) void {
         for (self.commands.items) |*command| command.deinit();
         if (self.durable_submission) |durable| durable.destroy();
+        if (self.submission_tree) |tree| tree.destroy();
         if (self.durable_comment_edit) |edit| edit.destroy();
         if (self.durable_comment_delete) |delete| delete.destroy();
         if (self.picker) |*picker| picker.deinit();
@@ -2297,7 +2715,7 @@ pub const Presentation = struct {
                 self.action_error = null;
             },
             .external_edit_completed => |completed| self.acceptExternalEdit(completed),
-            .dismiss_submission_result => self.submission_result = null,
+            .dismiss_submission_result => self.dismissSubmissionTree(),
             .request_shutdown => self.requestShutdown(),
         }
     }
@@ -2343,6 +2761,7 @@ pub const Presentation = struct {
             .copy_clipboard => {},
             .external_edit => {},
         }
+        if (self.durable_submission) |durable| self.syncSubmissionTree(durable);
         return command;
     }
 
@@ -2373,6 +2792,10 @@ pub const Presentation = struct {
                 };
             } else null,
             .submission_result = self.submission_result,
+            .submission_tree = if (self.submission_tree) |tree| blk: {
+                if (self.submissionRepairInteractionActive()) break :blk null;
+                break :blk tree.projection();
+            } else null,
             .comment_edit_result = self.comment_edit_result,
             .comment_delete_result = self.comment_delete_result,
             .recovery = self.recovery,
@@ -2462,8 +2885,14 @@ pub const Presentation = struct {
 
     fn visibleSubmissionOverlay(self: *const Presentation) bool {
         const published = self.published orelse return false;
-        if (self.durable_submission) |submission| if (OwnedReviewIdentity.eql(submission.key, published.key)) return true;
-        if (self.submission_result) |result| if (OwnedReviewIdentity.eql(result.key, published.key)) return true;
+        if (self.submissionRepairInteractionActive()) return false;
+        if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) return true;
+        return false;
+    }
+
+    fn submissionRepairInteractionActive(self: *const Presentation) bool {
+        if (self.reanchor != null or self.delete_confirmation != null) return true;
+        if (self.published) |published| return published.composer != null;
         return false;
     }
 
@@ -2653,26 +3082,29 @@ pub const Presentation = struct {
             return;
         }
         if (notice.current_temp_id == null) {
-            self.completeRecoveredTerminal(notice, &lock);
+            self.completeRecoveredTerminal(notice, active, &lock);
             return;
         }
-        const durable = DurableSubmission.recover(self.allocator, self.dependencies.reviews, active, notice.key, lock) catch {
+        const recovered = DurableSubmission.recover(self.allocator, self.dependencies.reviews, active, notice.key, lock) catch {
             lock.ptr = null;
             self.action_error = .recovery_claim_failed;
             return;
         };
         lock.ptr = null;
-        self.durable_submission = durable;
+        if (self.submission_tree) |tree| tree.destroy();
+        self.durable_submission = recovered.durable;
+        self.submission_tree = recovered.tree;
         self.recovery = null;
         self.commands.appendAssumeCapacity(.{ .check_recovery = .{
             .operation_id = notice.operation_id,
             .identity = .init(notice.key),
             .source_commit = notice.source_commit,
         } });
+        self.syncSubmissionTree(recovered.durable);
         self.action_error = null;
     }
 
-    fn completeRecoveredTerminal(self: *Presentation, notice: RecoveryNotice, lock: *bbr.review.SubmissionLockGuard) void {
+    fn completeRecoveredTerminal(self: *Presentation, notice: RecoveryNotice, run: bbr.review.ActiveSubmissionRun, lock: *bbr.review.SubmissionLockGuard) void {
         defer lock.release();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -2708,10 +3140,17 @@ pub const Presentation = struct {
             }
         }
         result.completion = if (clean) .clean else .partial;
+        const tree = SubmissionTree.createPersisted(self.allocator, notice.key, notice.operation_id, &review, run.items, result.completion) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
         self.dependencies.reviews.completeSubmission(notice.operation_id, notice.key.storeKey(), result.completion) catch {
+            tree.destroy();
             self.action_error = .recovery_claim_failed;
             return;
         };
+        if (self.submission_tree) |previous| previous.destroy();
+        self.submission_tree = tree;
         self.recovery = null;
         self.submission_result = result;
         self.action_error = null;
@@ -3020,6 +3459,7 @@ pub const Presentation = struct {
         self.delete_confirmation = null;
         published.navigation.clearMark();
         followSurvivingRow(published, surviving);
+        if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) tree.refresh(&published.review);
         self.action_error = null;
     }
 
@@ -3156,6 +3596,7 @@ pub const Presentation = struct {
         self.reanchor = null;
         published.navigation.clearMark();
         followDraftCard(published, capture.temp_id);
+        if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) tree.refresh(&published.review);
         self.action_error = null;
     }
 
@@ -3175,8 +3616,8 @@ pub const Presentation = struct {
     }
 
     fn applyKey(self: *Presentation, key: keymap_mod.KeyStroke) !void {
-        if (self.submission_result != null) {
-            self.submission_result = null;
+        if (self.visibleSubmissionOverlay()) {
+            self.applySubmissionTreeKey(key);
             return;
         }
         if (self.help_visible) {
@@ -3262,6 +3703,73 @@ pub const Presentation = struct {
             .digit => |digit| self.pushCountDigit(digit),
             .action => |action| self.applyAction(action),
         }
+    }
+
+    fn applySubmissionTreeKey(self: *Presentation, key: keymap_mod.KeyStroke) void {
+        const tree = self.submission_tree orelse return;
+        if (key.matches('j', .{}) or key.matches(keymap_mod.special.down, .{})) {
+            tree.move(1);
+            return;
+        }
+        if (key.matches('k', .{}) or key.matches(keymap_mod.special.up, .{})) {
+            tree.move(-1);
+            return;
+        }
+        if (tree.completion == null) return;
+        if (key.matches(keymap_mod.special.escape, .{}) or key.matches('q', .{})) {
+            self.dismissSubmissionTree();
+            return;
+        }
+        const item = tree.selectedItem() orelse return;
+        if (!item.retry_eligible) return;
+        if (self.replacement != null) return;
+        const published = self.published orelse return;
+        if (!OwnedReviewIdentity.eql(published.key, tree.key)) return;
+        if (key.matches('e', .{})) {
+            const draft = published.review.getConst(item.temp_id) orelse return;
+            switch (draft.state) {
+                .draft, .failed => {},
+                .submitting => return self.setMutationActionError(.submission_in_flight),
+                .posted => return self.setMutationActionError(.already_published),
+                .outcome_unknown => return self.setMutationActionError(.outcome_unresolved),
+            }
+            self.openDraftEditComposer(published, item.temp_id);
+        } else if (key.matches('a', .{})) {
+            if (self.draftReanchorRefusal(published, item.temp_id)) |refusal| {
+                self.action_error = mutationRefusalError(refusal);
+                return;
+            }
+            self.reanchor = .{ .key = published.key, .temp_id = item.temp_id };
+            self.action_error = null;
+        } else if (key.matches('D', .{})) {
+            if (self.draftDeleteRefusal(published, item.temp_id)) |refusal| {
+                self.action_error = mutationRefusalError(refusal);
+                return;
+            }
+            self.delete_confirmation = .{
+                .key = published.key,
+                .target = .{ .draft = item.temp_id },
+                .descendant_count = descendantCount(published, item.temp_id),
+            };
+            self.action_error = null;
+        } else if (key.matches('X', .{})) {
+            self.startSubmissionSelection(published, item.temp_id);
+        }
+    }
+
+    fn setMutationActionError(self: *Presentation, refusal: MutationRefusal) void {
+        self.action_error = mutationRefusalError(refusal);
+    }
+
+    fn dismissSubmissionTree(self: *Presentation) void {
+        const tree = self.submission_tree orelse {
+            self.submission_result = null;
+            return;
+        };
+        if (tree.completion == null) return;
+        self.submission_tree = null;
+        tree.destroy();
+        self.submission_result = null;
     }
 
     fn resizeViewport(self: *Presentation, rows: usize) void {
@@ -3593,6 +4101,10 @@ pub const Presentation = struct {
     }
 
     fn startSubmission(self: *Presentation, published: *Published) void {
+        self.startSubmissionSelection(published, null);
+    }
+
+    fn startSubmissionSelection(self: *Presentation, published: *Published, selected_root: ?bbr.review.TempId) void {
         if (!published.key.isRemote()) {
             self.action_error = .local_review_no_submission;
             return;
@@ -3602,6 +4114,10 @@ pub const Presentation = struct {
             return;
         }
         if (self.durable_submission) |durable| {
+            if (selected_root != null) {
+                self.action_error = .submission_already_active;
+                return;
+            }
             if (durable.phase == .post_retry_paused) {
                 self.resumePostDraftLaunch(durable);
                 return;
@@ -3649,6 +4165,7 @@ pub const Presentation = struct {
             published.key,
             published.session.header.source_commit,
             lock,
+            selected_root,
         ) catch |err| {
             self.action_error = if (err == error.SubmissionAlreadyActive) .submission_already_active else .submission_start_failed;
             return;
@@ -3674,8 +4191,11 @@ pub const Presentation = struct {
                 .wait => |wait| self.commands.appendAssumeCapacity(.{ .wait_submission = wait }),
             }
         }
+        if (self.submission_tree) |tree| tree.destroy();
         self.durable_submission = started.durable;
+        self.submission_tree = started.tree;
         published.review.setState(started.durable.current_temp_id.?, .submitting);
+        self.syncSubmissionTree(started.durable);
         self.action_error = null;
     }
 
@@ -3705,6 +4225,7 @@ pub const Presentation = struct {
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
             durable.pending_admission = .{ .post = completed };
             durable.phase = .admission_paused;
+            self.syncSubmissionTree(durable);
             self.action_error = .out_of_memory;
             return;
         };
@@ -3716,6 +4237,7 @@ pub const Presentation = struct {
         const durable = self.durable_submission orelse return;
         if (durable.operation_id != failed.operation_id or !durableIdentityMatches(durable.key, failed.identity) or durable.current_temp_id != failed.temp_id or durable.phase != .awaiting_post) return;
         durable.phase = .post_retry_paused;
+        self.syncSubmissionTree(durable);
         self.action_error = .submission_launch_failed;
     }
 
@@ -3847,6 +4369,7 @@ pub const Presentation = struct {
     fn processPostDraft(self: *Presentation, durable: *DurableSubmission, completed: PostDraftCompleted) void {
         const progress = durable.acceptPost(self.allocator, self.dependencies.reviews, completed) catch {
             self.publishDurableCheckpoint(durable);
+            self.syncSubmissionTree(durable);
             self.action_error = .persistence_failed;
             return;
         };
@@ -3881,6 +4404,7 @@ pub const Presentation = struct {
         };
         const progress = durable.retryPersistence(self.allocator, self.dependencies.reviews) catch {
             self.publishDurableCheckpoint(durable);
+            self.syncSubmissionTree(durable);
             self.action_error = .persistence_failed;
             return;
         };
@@ -3900,6 +4424,7 @@ pub const Presentation = struct {
             .wait => |wait| self.commands.appendAssumeCapacity(.{ .wait_submission = wait }),
             .finished => |finished| {
                 self.recordVisibleTransition(durable, finished.transition);
+                if (self.submission_tree) |tree| tree.finish(durable, finished.result.completion);
                 const reconcile = durable.posted_any and !self.shutdown_requested and self.replacement == null and
                     (if (self.published) |published| OwnedReviewIdentity.eql(published.key, durable.key) else false);
                 const key = durable.key;
@@ -3909,6 +4434,7 @@ pub const Presentation = struct {
                 if (reconcile) self.queueReconciliation(key);
             },
         }
+        if (self.durable_submission) |active| self.syncSubmissionTree(active);
     }
 
     fn acceptRecoveryCheck(self: *Presentation, checked: RecoveryChecked) void {
@@ -3969,6 +4495,7 @@ pub const Presentation = struct {
         const result = durable.persistedResultProjection(completion);
         if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, durable.key) and durable.current_temp_id != null)
             published.review.setState(durable.current_temp_id.?, .draft);
+        if (self.submission_tree) |tree| tree.finish(durable, completion);
         self.durable_submission = null;
         durable.destroy();
         self.submission_result = result;
@@ -4099,6 +4626,7 @@ pub const Presentation = struct {
             return;
         };
         const result = durable.persistedResultProjection(completion);
+        if (self.submission_tree) |tree| tree.finish(durable, completion);
         self.durable_submission = null;
         durable.destroy();
         self.submission_result = result;
@@ -4112,6 +4640,7 @@ pub const Presentation = struct {
         self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
             durable.pending_admission = .{ .wait = completed };
             durable.phase = .admission_paused;
+            self.syncSubmissionTree(durable);
             self.action_error = .out_of_memory;
             return;
         };
@@ -4124,6 +4653,7 @@ pub const Presentation = struct {
         if (durable.operation_id != failed.operation_id or !durableIdentityMatches(durable.key, failed.identity) or durable.current_temp_id != failed.temp_id or durable.phase != .awaiting_wait) return;
         durable.pending_wait_retry = failed;
         durable.phase = .wait_retry_paused;
+        self.syncSubmissionTree(durable);
         self.action_error = .submission_launch_failed;
     }
 
@@ -4145,6 +4675,7 @@ pub const Presentation = struct {
         durable.pending_wait_retry = null;
         durable.phase = .wait_queued;
         self.commands.appendAssumeCapacity(.{ .wait_submission = wait });
+        self.syncSubmissionTree(durable);
         self.action_error = null;
     }
 
@@ -4156,7 +4687,13 @@ pub const Presentation = struct {
             return;
         };
         self.commands.appendAssumeCapacity(.{ .post_draft = command });
+        self.syncSubmissionTree(durable);
         self.action_error = null;
+    }
+
+    fn syncSubmissionTree(self: *Presentation, durable: *const DurableSubmission) void {
+        if (self.submission_tree) |tree| if (tree.operation_id == durable.operation_id and OwnedReviewIdentity.eql(tree.key, durable.key))
+            tree.sync(durable);
     }
 
     fn recordVisibleTransition(self: *Presentation, durable: *const DurableSubmission, transition: DurableSubmission.PersistedTransition) void {
@@ -4223,7 +4760,11 @@ pub const Presentation = struct {
             self.action_error = null;
             return;
         }
-        const temp_id = target.draft;
+        self.openDraftEditComposer(published, target.draft);
+    }
+
+    fn openDraftEditComposer(self: *Presentation, published: *Published, temp_id: bbr.review.TempId) void {
+        if (published.composer != null) return;
         const draft = published.review.getConst(temp_id) orelse {
             self.action_error = .no_review_item;
             return;
@@ -4593,6 +5134,7 @@ pub const Presentation = struct {
         };
         composer.deinit();
         published.composer = null;
+        if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) tree.refresh(&published.review);
         self.action_error = null;
     }
 
@@ -8784,6 +9326,143 @@ test "Submission start acquires ownership persists intent and emits one durable 
     try testing.expectEqual(@as(?bbr.review.TempId, 1), run.current_temp_id);
     try testing.expect((try locks.locks().tryAcquire(key.storeKey())) == null);
     try testing.expectEqual(run.operation_id, presentation.projection().submission.?.operation_id);
+}
+
+test "Submission dependency tree projects progress waits and publication checks explicitly" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "root body" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .submit });
+    try testing.expectEqual(SubmissionItemState.queued, presentation.projection().submission_tree.?.items[0].state);
+    var post = presentation.takeCommand().?;
+    const command_id = post.post_draft.command_id;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    try testing.expectEqual(SubmissionItemState.posting, presentation.projection().submission_tree.?.items[0].state);
+
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .command_id = command_id,
+        .operation_id = operation_id,
+        .identity = .init(key),
+        .temp_id = 1,
+        .outcome = .{ .rejected = error.RateLimited },
+        .retry_after_ms = 4_000,
+    } });
+    const waiting = presentation.projection().submission_tree.?.items[0];
+    try testing.expectEqual(SubmissionItemState.waiting_to_retry, waiting.state);
+    try testing.expectEqual(@as(u8, 1), waiting.post_attempts);
+    try testing.expectEqual(@as(u64, 1_000), waiting.retry.?.local_delay_ms);
+    try testing.expectEqual(@as(?u64, 4_000), waiting.retry.?.server_delay_ms);
+    try testing.expectEqual(@as(u64, 4_000), waiting.retry.?.effective_delay_ms);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expect(presentation.projection().submission_tree != null);
+}
+
+test "terminal dependency tree names blockers and retries only the selected failed subtree" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "failed root" });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .body = "blocked reply", .parent = .{ .draft = 1 } });
+    try store.store().put(key.storeKey(), .{ .local_id = 3, .kind = .comment, .body = "unrelated root" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .submit });
+    var root_post = presentation.takeCommand().?;
+    const root_command_id = root_post.post_draft.command_id;
+    const operation_id = root_post.post_draft.operation_id;
+    root_post.deinit();
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .command_id = root_command_id,
+        .operation_id = operation_id,
+        .identity = .init(key),
+        .temp_id = 1,
+        .outcome = .{ .rejected = error.NotFound },
+    } });
+    var unrelated = presentation.takeCommand().?;
+    const unrelated_command_id = unrelated.post_draft.command_id;
+    unrelated.deinit();
+    const progress = presentation.projection().submission_tree.?;
+    try testing.expectEqual(SubmissionItemState.failed, progress.items[0].state);
+    try testing.expectEqual(SubmissionItemState.skipped, progress.items[1].state);
+    try testing.expectEqual(@as(?bbr.review.TempId, 1), progress.items[1].blocking_ancestor);
+    try testing.expect(!progress.items[1].retry_eligible);
+    try testing.expectEqual(@as(usize, 1), progress.items[0].reply_descendants);
+
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .command_id = unrelated_command_id,
+        .operation_id = operation_id,
+        .identity = .init(key),
+        .temp_id = 3,
+        .outcome = .{ .posted = 903 },
+    } });
+    const terminal = presentation.projection().submission_tree.?;
+    try testing.expect(terminal.completion.? == .partial);
+    try testing.expectEqual(@as(usize, 3), terminal.items.len);
+
+    const reconciliation = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = reconciliation.command_id,
+        .intent = reconciliation.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 1, 'a') },
+    } });
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'X', .text = "X" } });
+    const retried = presentation.projection().submission_tree.?;
+    try testing.expect(retried.completion == null);
+    try testing.expectEqual(@as(usize, 2), retried.items.len);
+    try testing.expectEqual(@as(bbr.review.TempId, 1), retried.items[0].temp_id);
+    try testing.expectEqual(@as(bbr.review.TempId, 2), retried.items[1].temp_id);
+    try testing.expectEqual(@as(usize, 1), retried.items[1].depth);
+    var retry_post = presentation.takeCommand().?;
+    defer retry_post.deinit();
+    try testing.expectEqual(@as(bbr.review.TempId, 1), retry_post.post_draft.draft.local_id);
+}
+
+test "ambiguous POST projects checking publication before another POST" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "maybe posted" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var post = presentation.takeCommand().?;
+    const command_id = post.post_draft.command_id;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .command_id = command_id,
+        .operation_id = operation_id,
+        .identity = .init(key),
+        .temp_id = 1,
+        .outcome = .ambiguous,
+    } });
+    try testing.expectEqual(SubmissionItemState.checking_publication, presentation.projection().submission_tree.?.items[0].state);
+    var check = presentation.takeCommand().?;
+    defer check.deinit();
+    try testing.expect(check == .find_duplicate);
 }
 
 test "durable completion with wrong Review target is consumed and discarded" {

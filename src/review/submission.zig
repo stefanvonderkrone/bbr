@@ -177,6 +177,33 @@ pub const Submission = struct {
         return initOrder(alloc, review, order, false);
     }
 
+    /// Start a fresh Submission for exactly one selected Draft subtree. Posted
+    /// participants are omitted: a pending Reply below one can still resolve
+    /// that parent's durable CommentId from the PendingReview.
+    pub fn initSubtree(alloc: Allocator, review: *const PendingReview, root: TempId) !Submission {
+        const selected = review.getConst(root) orelse return error.DraftNotFound;
+        if (selected.target != .bitbucket or (selected.state != .failed and selected.state != .draft))
+            return error.DraftNotRetryable;
+
+        const all = try review.topologicalOrder(alloc);
+        defer alloc.free(all);
+        var order: std.ArrayList(TempId) = .empty;
+        errdefer order.deinit(alloc);
+        for (all) |temp_id| {
+            if (!draft_mod.descendsFrom(review.drafts.items, root, temp_id)) continue;
+            const draft = review.getConst(temp_id) orelse continue;
+            if (draft.target != .bitbucket) return error.DraftNotRetryable;
+            switch (draft.state) {
+                .posted => continue,
+                .draft, .failed => {},
+                .submitting, .outcome_unknown => return error.DraftNotRetryable,
+            }
+            try order.append(alloc, temp_id);
+        }
+        if (order.items.len == 0) return error.DraftNotRetryable;
+        return initOrder(alloc, review, try order.toOwnedSlice(alloc), false);
+    }
+
     /// Rebuild an interrupted Submission from its durable participant graph.
     /// Current PendingReview membership and ordering are deliberately ignored.
     pub fn initFrozen(alloc: Allocator, review: *const PendingReview, items: []const SubmissionRunItem) !Submission {
@@ -870,6 +897,39 @@ test "fresh Submission retries failed Drafts while frozen recovery preserves the
     var recovered = try Submission.initFrozen(testing.allocator, &pr, &.{.{ .temp_id = 1, .parent = null }});
     defer recovered.deinit();
     try testing.expect(recovered.advance() == .done);
+}
+
+test "selected subtree excludes ancestors siblings unrelated roots and posted descendants" {
+    var pr = PendingReview.init(1);
+    defer pr.deinit(testing.allocator);
+    try pr.addExisting(testing.allocator, .{ .local_id = 1, .kind = .comment, .body = "ancestor", .state = .{ .posted = 40 } });
+    try pr.addExisting(testing.allocator, .{ .local_id = 2, .kind = .comment, .body = "failed", .parent = .{ .draft = 1 }, .state = .{ .failed = error.ServerError } });
+    try pr.addExisting(testing.allocator, .{ .local_id = 3, .kind = .comment, .body = "child", .parent = .{ .draft = 2 } });
+    try pr.addExisting(testing.allocator, .{ .local_id = 4, .kind = .comment, .body = "published child", .parent = .{ .draft = 2 }, .state = .{ .posted = 41 } });
+    try pr.addExisting(testing.allocator, .{ .local_id = 5, .kind = .comment, .body = "below published", .parent = .{ .draft = 4 } });
+    try pr.addExisting(testing.allocator, .{ .local_id = 6, .kind = .comment, .body = "sibling", .parent = .{ .draft = 1 } });
+    try pr.addExisting(testing.allocator, .{ .local_id = 7, .kind = .comment, .body = "other root" });
+
+    var sub = try Submission.initSubtree(testing.allocator, &pr, 2);
+    defer sub.deinit();
+    try testing.expectEqualSlices(TempId, &.{ 2, 3, 5 }, sub.order);
+
+    try testing.expectEqual(@as(TempId, 2), sub.advance().post.temp_id);
+    sub.report(.{ .posted = 42 }, null);
+    try testing.expectEqual(@as(TempId, 3), sub.advance().post.temp_id);
+    sub.report(.{ .posted = 43 }, null);
+    const below_published = sub.advance().post;
+    try testing.expectEqual(@as(TempId, 5), below_published.temp_id);
+    try testing.expectEqual(@as(?CommentId, 41), below_published.parent);
+}
+
+test "selected subtree refuses unresolved descendants instead of silently excluding them" {
+    var pr = PendingReview.init(1);
+    defer pr.deinit(testing.allocator);
+    try pr.addExisting(testing.allocator, .{ .local_id = 1, .kind = .comment, .body = "failed", .state = .{ .failed = error.ServerError } });
+    try pr.addExisting(testing.allocator, .{ .local_id = 2, .kind = .comment, .body = "unknown", .parent = .{ .draft = 1 }, .state = .outcome_unknown });
+
+    try testing.expectError(error.DraftNotRetryable, Submission.initSubtree(testing.allocator, &pr, 1));
 }
 
 test "local-only Drafts are never emitted as Submission posts" {

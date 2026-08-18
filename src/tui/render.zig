@@ -633,6 +633,143 @@ pub fn drawSubmitResult(
     }
 }
 
+/// Draw one dependency-tree Overlay for both live progress and terminal
+/// inspection. Every state and consequence is textual; styles only reinforce
+/// information already present in the row and detail region.
+pub fn drawSubmissionTree(
+    scratch: std.mem.Allocator,
+    win: vaxis.Window,
+    theme: Theme,
+    tree: @import("presentation.zig").SubmissionTreeProjection,
+) void {
+    const modal = centeredModal(win, 78, 22) orelse return;
+    var row: u16 = 0;
+    while (row < modal.height) : (row += 1) fillRow(modal, row, theme.picker);
+
+    fillRow(modal, 0, theme.picker_query);
+    const title = std.fmt.allocPrint(scratch, " Submission for {s}#{d}", .{ tree.key.repository(), tree.key.pull_request_id }) catch " Submission";
+    _ = modal.printSegment(.{ .text = title, .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
+    if (modal.height < 4) return;
+    const summary = std.fmt.allocPrint(scratch, " {d} posted | {d} failed | {d} skipped | {d} outcome unknown", .{
+        tree.posted,
+        tree.failed,
+        tree.skipped,
+        tree.outcome_unknown,
+    }) catch " Submission progress";
+    _ = modal.printSegment(.{ .text = summary, .style = theme.picker }, .{ .row_offset = 1, .wrap = .none });
+
+    const detail_rows: u16 = @min(6, modal.height - 3);
+    const detail_start = modal.height - detail_rows;
+    const list_height = detail_start -| 2;
+    const selected: u16 = @intCast(@min(tree.selected, std.math.maxInt(u16)));
+    const top: usize = if (selected >= list_height and list_height > 0) selected - list_height + 1 else 0;
+    var item_row: u16 = 2;
+    var index = top;
+    while (index < tree.items.len and item_row < detail_start) : ({
+        index += 1;
+        item_row += 1;
+    }) {
+        const item = tree.items[index];
+        var body = std.mem.trim(u8, item.body, " \t\r\n");
+        if (std.mem.indexOfScalar(u8, body, '\n')) |newline| body = body[0..newline];
+        const indent = tryIndent(scratch, item.depth);
+        const text = std.fmt.allocPrint(scratch, "{s}{s}Draft #{d} [{s}] {s} - {s}", .{
+            if (index == tree.selected) "> " else "  ",
+            indent,
+            item.temp_id,
+            submissionStateText(item.state),
+            item.context,
+            body,
+        }) catch "Draft";
+        const style = if (index == tree.selected) theme.picker_selected else if (item.state == .outcome_unknown) theme.outcome_unknown else theme.picker;
+        fillRow(modal, item_row, style);
+        _ = modal.printSegment(.{ .text = text, .style = style }, .{ .row_offset = item_row, .wrap = .none });
+    }
+
+    if (tree.selectedItem()) |item| drawSubmissionDetail(scratch, modal, theme, tree, item, detail_start);
+}
+
+fn tryIndent(scratch: std.mem.Allocator, depth: usize) []const u8 {
+    const amount = @min(depth * 2, 20);
+    const result = scratch.alloc(u8, amount) catch return "";
+    @memset(result, ' ');
+    return result;
+}
+
+fn submissionStateText(state: @import("presentation.zig").SubmissionItemState) []const u8 {
+    return switch (state) {
+        .queued => "queued",
+        .posting => "posting",
+        .waiting_to_retry => "waiting to retry",
+        .checking_publication => "checking publication",
+        .persisting => "persisting",
+        .posted => "posted",
+        .failed => "failed",
+        .skipped => "skipped",
+        .outcome_unknown => "outcome unknown",
+    };
+}
+
+fn drawSubmissionDetail(
+    scratch: std.mem.Allocator,
+    modal: vaxis.Window,
+    theme: Theme,
+    tree: @import("presentation.zig").SubmissionTreeProjection,
+    item: @import("presentation.zig").SubmissionItemProjection,
+    start: u16,
+) void {
+    if (start >= modal.height) return;
+    fillRow(modal, start, theme.picker_query);
+    const identity = std.fmt.allocPrint(scratch, " Draft #{d}: {s}; {d} Reply descendant(s)", .{ item.temp_id, item.context, item.reply_descendants }) catch " Draft detail";
+    _ = modal.printSegment(.{ .text = identity, .style = theme.picker_query }, .{ .row_offset = start, .wrap = .none });
+    var row = start + 1;
+    if (row < modal.height) {
+        const reason = if (item.reason) |err|
+            std.fmt.allocPrint(scratch, " Reason: {s}", .{@errorName(err)}) catch " Reason unavailable"
+        else if (item.blocking_ancestor) |ancestor|
+            std.fmt.allocPrint(scratch, " Blocked by nearest ancestor Draft #{d}; no independent retry", .{ancestor}) catch " Blocked by ancestor"
+        else if (item.state == .outcome_unknown)
+            " outcome unknown - resolve before editing"
+        else
+            " Reason: none";
+        _ = modal.printSegment(.{ .text = reason, .style = if (item.state == .outcome_unknown) theme.outcome_unknown else theme.picker }, .{ .row_offset = row, .wrap = .none });
+        row += 1;
+    }
+    if (row < modal.height) {
+        const attempts = std.fmt.allocPrint(scratch, " Attempts: POST {d}/{d}; publication checks {d}/{d}", .{
+            item.post_attempts,
+            bbr.review.submission.max_attempts,
+            item.publication_checks,
+            bbr.review.submission.max_attempts,
+        }) catch " Attempts unavailable";
+        _ = modal.printSegment(.{ .text = attempts, .style = theme.picker }, .{ .row_offset = row, .wrap = .none });
+        row += 1;
+    }
+    if (row < modal.height) {
+        const delay = if (item.retry) |retry| std.fmt.allocPrint(scratch, " Static delay: local {d}ms; server {s}; effective {d}ms", .{
+            retry.local_delay_ms,
+            if (retry.server_delay_ms) |server| std.fmt.allocPrint(scratch, "{d}ms", .{server}) catch "set" else "none",
+            retry.effective_delay_ms,
+        }) catch " Static delay unavailable" else " Static delay: none";
+        _ = modal.printSegment(.{ .text = delay, .style = theme.picker }, .{ .row_offset = row, .wrap = .none });
+        row += 1;
+    }
+    if (row < modal.height) {
+        fillRow(modal, row, theme.picker_query);
+        const footer: []const u8 = if (tree.completion == null)
+            " In progress; this Overlay cannot cancel Submission"
+        else if (item.retry_eligible)
+            " e edit | a re-anchor | D delete | X retry selected subtree | Esc dismiss"
+        else if (item.state == .posted)
+            " Posted items are inspectable, never retryable | Esc dismiss"
+        else if (item.state == .skipped)
+            " Select its blocking ancestor to repair or retry | Esc dismiss"
+        else
+            " j/k select | Esc dismiss";
+        _ = modal.printSegment(.{ .text = footer, .style = theme.picker_query }, .{ .row_offset = row, .wrap = .none });
+    }
+}
+
 /// A short display label for a key codepoint: named for the special keys,
 /// otherwise the codepoint's own utf8. `scratch` outlives render.
 fn keyName(scratch: std.mem.Allocator, cp: u21) []const u8 {

@@ -225,22 +225,9 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             .label = "Delete local Draft · Enter delete · Esc cancel",
             .body = deleteConfirmationText(frame, confirmation),
         }, ctx.active_theme);
-        if (projection.submission) |submission| {
-            if (projection.review) |review_projection| if (presentation.OwnedReviewIdentity.eql(submission.key, review_projection.key))
-                render.drawSubmit(frame, content_win, ctx.active_theme, submission.completed, submission.total);
-        } else if (projection.submission_result) |result| {
-            if (projection.review) |review_projection| if (presentation.OwnedReviewIdentity.eql(result.key, review_projection.key))
-                render.drawSubmitResult(
-                    frame,
-                    content_win,
-                    ctx.active_theme,
-                    result.posted,
-                    result.failed + result.outcome_unknown,
-                    result.skipped,
-                    submissionAbortName(result.completion),
-                    false,
-                );
-        }
+        if (projection.submission_tree) |tree| if (projection.review) |review_projection|
+            if (presentation.OwnedReviewIdentity.eql(tree.key, review_projection.key))
+                render.drawSubmissionTree(frame, content_win, ctx.active_theme, tree);
         if (projection.help_visible) render.drawHelp(frame, content_win, ctx.active_theme, ctx.keymap, projection.action_availability);
         try vx.render(writer);
         _ = frame_arena.reset(.retain_capacity);
