@@ -233,41 +233,6 @@ pub const PendingReview = struct {
         if (self.get(id)) |d| d.state = state;
     }
 
-    /// Remove a Draft (and, transitively, every Draft that replies to it) so the
-    /// graph never dangles. `scratch` backs a short-lived work list. Returns the
-    /// number removed (0 on OOM — nothing is partially removed).
-    pub fn remove(self: *PendingReview, scratch: Allocator, id: TempId) usize {
-        // Collect the id and all its draft-descendants, then filter in place.
-        var doomed: std.ArrayList(TempId) = .empty;
-        defer doomed.deinit(scratch);
-        doomed.append(scratch, id) catch return 0;
-
-        var grew = true;
-        while (grew) {
-            grew = false;
-            for (self.drafts.items) |d| {
-                const pid = switch (d.parent orelse continue) {
-                    .draft => |p| p,
-                    .comment => continue,
-                };
-                if (contains(doomed.items, pid) and !contains(doomed.items, d.local_id)) {
-                    doomed.append(scratch, d.local_id) catch return 0;
-                    grew = true;
-                }
-            }
-        }
-
-        var w: usize = 0;
-        for (self.drafts.items) |d| {
-            if (contains(doomed.items, d.local_id)) continue;
-            self.drafts.items[w] = d;
-            w += 1;
-        }
-        const removed = self.drafts.items.len - w;
-        self.drafts.shrinkRetainingCapacity(w);
-        return removed;
-    }
-
     /// The Drafts in submission order: a Draft that replies to another Draft
     /// always appears *after* its parent (design §9). Roots (top-level, or
     /// replies to an already-posted Comment) keep their insertion order among
@@ -397,20 +362,6 @@ test "replies to already-posted comments are roots (no reordering needed)" {
     defer testing.allocator.free(order);
     try testing.expectEqual(a, order[0]);
     try testing.expectEqual(b, order[1]);
-}
-
-test "remove takes a draft's reply-descendants with it" {
-    var pr = PendingReview.init(1);
-    defer pr.deinit(testing.allocator);
-    const root = try pr.add(testing.allocator, .{ .kind = .comment, .body = "root" });
-    _ = try pr.add(testing.allocator, .{ .kind = .comment, .body = "re", .parent = .{ .draft = root } });
-    const keep = try pr.add(testing.allocator, .{ .kind = .comment, .body = "unrelated" });
-
-    const removed = pr.remove(testing.allocator, root);
-    try testing.expectEqual(@as(usize, 2), removed);
-    try testing.expectEqual(@as(usize, 1), pr.drafts.items.len);
-    try testing.expect(pr.get(keep) != null);
-    try testing.expect(pr.get(root) == null);
 }
 
 test "subtree membership follows Draft parentage and stops at published Comments" {

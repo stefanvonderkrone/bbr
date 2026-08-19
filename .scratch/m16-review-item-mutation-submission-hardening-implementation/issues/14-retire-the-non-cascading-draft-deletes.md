@@ -4,7 +4,7 @@
 
 **Blocked by:** 05 — Delete Draft subtrees atomically.
 
-**Status:** ready-for-agent
+**Status:** done
 
 ## Why
 
@@ -19,14 +19,14 @@ The hazard is the vtable one: it is a documented, implemented, seam-level operat
 
 ## Decisions to make while implementing
 
-- Whether `remove` goes entirely, or survives narrowed to leaf Drafts with an explicit in-transaction childlessness recheck. Deleting it shrinks the vtable every adapter implements; keeping it needs a caller that actually wants it.
-- Whether any later M16 ticket needs `remove`'s **idempotence** on a missing id. `deleteDraftSubtree` returns `DraftNotFound` instead, which is the right answer for a reviewer-confirmed deletion but may be wrong for a cleanup path — check 07, 08, and 11 before choosing.
-- Whether `PendingReview.remove` should be deleted or reimplemented on top of `descendsFrom`, given Presentation now computes the closure itself and the silent `0`-on-OOM return has no honest caller.
+- `PendingReviewStore.remove` is deleted entirely. It had no production caller, and removing it shrinks the vtable so future adapters cannot accidentally expose a non-cascading delete.
+- The missing-id behavior is intentionally not preserved: `deleteDraftSubtree` remains non-idempotent and returns `DraftNotFound`, matching reviewer-confirmed deletion rather than cleanup semantics. Existing adapter tests cover that contract.
+- `PendingReview.remove` is deleted entirely. The in-memory model has no independent deletion caller, and its silent `0`-on-OOM result was not an honest mutation contract.
 
 ## Acceptance
 
-- [ ] No delete path reachable through `PendingReviewStore` can remove a Draft while leaving a Draft that reaches it through parentage.
-- [ ] Whatever survives states its cascade contract in its doc comment, and `src/review/CONTEXT.md`'s Draft subtree entry matches the implemented rule.
-- [ ] Removing a vtable method leaves both adapters and every seam consumer compiling, with no behaviour change to submission, recovery, or resolution paths.
-- [ ] Tests that only exercised the retired paths are deleted rather than retargeted, and the per-step test count is confirmed to move as expected.
-- [ ] Deterministic tests cover the surviving contract, including the idempotence decision recorded above.
+- [x] No delete path reachable through `PendingReviewStore` can remove a Draft while leaving a Draft that reaches it through parentage.
+- [x] The surviving `deleteDraftSubtree` contract is documented, and `src/review/CONTEXT.md`'s Draft subtree entry matches the implemented rule.
+- [x] Removing the vtable method leaves both adapters and every seam consumer compiling, with no behaviour change to submission, recovery, or resolution paths.
+- [x] Tests that only exercised the retired paths were deleted rather than retargeted; verification reports 552/552 tests passed.
+- [x] Deterministic adapter tests cover the surviving contract, including `DraftNotFound` for a missing confirmed root rather than idempotent deletion.

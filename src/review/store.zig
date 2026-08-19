@@ -4,10 +4,10 @@
 //!
 //! The store is a per-Draft repository keyed by
 //! `(workspace, repository, pr_id, local_id)`: `put`
-//! inserts-or-replaces one Draft, `remove` deletes one, and `load` returns every
-//! Draft for a PR. Per-Draft writes mean a crash mid-edit loses at most the
-//! Draft being composed. The real implementation is `SqliteStore`; tests and the
-//! offline demo use `InMemoryStore`.
+//! inserts-or-replaces one Draft, `deleteDraftSubtree` deletes a complete Draft
+//! subtree, and `load` returns every Draft for a PR. Per-Draft writes mean a
+//! crash mid-edit loses at most the Draft being composed. The real implementation
+//! is `SqliteStore`; tests and the offline demo use `InMemoryStore`.
 //!
 //! Ownership: `load` dupes every string into the caller's allocator (the
 //! PR-scoped arena), so the returned Drafts outlive the store call. `put` copies
@@ -215,8 +215,6 @@ pub const PendingReviewStore = struct {
     pub const VTable = struct {
         /// Insert or replace a Draft under `pr_id` (keyed by `draft.local_id`).
         put: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, draft: Draft) anyerror!void,
-        /// Delete the Draft `(pr_id, local_id)`. Idempotent — a missing id is ok.
-        remove: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, local_id: TempId) anyerror!void,
         /// Atomically replace one existing Draft's body after rechecking its
         /// identity, expected shape, editable state, and run participation.
         edit_draft_body: *const fn (ptr: *anyopaque, key: RemoteReviewIdentity, edit: DraftBodyEdit) anyerror!void,
@@ -245,10 +243,6 @@ pub const PendingReviewStore = struct {
         return self.vtable.put(self.ptr, key, draft);
     }
 
-    pub fn remove(self: PendingReviewStore, key: RemoteReviewIdentity, local_id: TempId) !void {
-        return self.vtable.remove(self.ptr, key, local_id);
-    }
-
     /// Replace `edit.temp_id`'s body. A `failed` Draft returns to `draft`,
     /// because a changed body is a new attempt rather than the failed one.
     pub fn editDraftBody(self: PendingReviewStore, key: RemoteReviewIdentity, edit: DraftBodyEdit) !void {
@@ -263,9 +257,9 @@ pub const PendingReviewStore = struct {
     }
 
     /// Delete `deletion.root_temp_id` together with every Draft that reaches it
-    /// through Draft parentage. Unlike `remove`, which takes one row on trust,
-    /// this refuses unless the whole confirmed subtree is present and every
-    /// member is eligible — a partial cascade would strand a Reply.
+    /// through Draft parentage. This refuses unless the whole confirmed subtree
+    /// is present and every member is eligible — a partial cascade would strand
+    /// a Reply.
     pub fn deleteDraftSubtree(self: PendingReviewStore, key: RemoteReviewIdentity, deletion: DraftSubtreeDelete) !void {
         return self.vtable.delete_draft_subtree(self.ptr, key, deletion);
     }
@@ -464,7 +458,6 @@ pub const InMemoryStore = struct {
 
     const vtable: PendingReviewStore.VTable = .{
         .put = putImpl,
-        .remove = removeImpl,
         .edit_draft_body = editDraftBodyImpl,
         .reanchor_draft = reanchorDraftImpl,
         .delete_draft_subtree = deleteDraftSubtreeImpl,
@@ -553,26 +546,6 @@ pub const InMemoryStore = struct {
             .pull_request_id = key.pull_request_id,
         };
         try self.entries.append(self.arena.child_allocator, .{ .key = owned_key, .draft = owned });
-    }
-
-    fn removeImpl(ptr: *anyopaque, key: RemoteReviewIdentity, local_id: TempId) anyerror!void {
-        const self: *InMemoryStore = @ptrCast(@alignCast(ptr));
-        for (self.entries.items) |entry| {
-            if (RemoteReviewIdentity.eql(entry.key, key) and entry.draft.local_id == local_id and entry.draft.state == .outcome_unknown)
-                return error.DraftLocked;
-        }
-        if (self.active_submission) |run| {
-            if (RemoteReviewIdentity.eql(run.key, key)) {
-                if (submissionItemIndex(run.items, local_id) != null) return error.DraftLocked;
-            }
-        }
-        var i: usize = 0;
-        while (i < self.entries.items.len) {
-            const e = self.entries.items[i];
-            if (RemoteReviewIdentity.eql(e.key, key) and e.draft.local_id == local_id) {
-                _ = self.entries.orderedRemove(i);
-            } else i += 1;
-        }
     }
 
     fn editDraftBodyImpl(ptr: *anyopaque, key: RemoteReviewIdentity, edit: DraftBodyEdit) anyerror!void {
@@ -1090,24 +1063,6 @@ test "Pending Reviews with the same PullRequestId are scoped by Repository" {
     const beta_drafts = try s.load(arena.allocator(), beta);
     try testing.expectEqualStrings("alpha draft", alpha_drafts[0].body);
     try testing.expectEqualStrings("beta draft", beta_drafts[0].body);
-}
-
-test "remove is scoped and idempotent" {
-    var mem = InMemoryStore.init(testing.allocator);
-    defer mem.deinit();
-    const s = mem.store();
-    try s.put(testReviewKey(1), .{ .local_id = 1, .kind = .comment, .body = "a" });
-    try s.put(testReviewKey(1), .{ .local_id = 2, .kind = .comment, .body = "b" });
-
-    try s.remove(testReviewKey(1), 1);
-    try s.remove(testReviewKey(1), 1); // idempotent — no error
-    try s.remove(testReviewKey(1), 999); // unknown — no error
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const drafts = try s.load(arena.allocator(), testReviewKey(1));
-    try testing.expectEqual(@as(usize, 1), drafts.len);
-    try testing.expectEqual(@as(TempId, 2), drafts[0].local_id);
 }
 
 test "editing a Draft body preserves its identity, shape, and scope" {
@@ -1685,7 +1640,6 @@ test "unresolved outcome remains immutable after partial completion" {
     try store.completeSubmission(operation_id, key, .partial);
 
     try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 1, .kind = .comment, .body = "changed" }));
-    try testing.expectError(error.DraftLocked, store.remove(key, 1));
     try store.resolveUnknown(key, 1, .unpublished);
     try store.put(key, .{ .local_id = 1, .kind = .comment, .body = "changed" });
 }
@@ -1700,10 +1654,8 @@ test "active Submission locks Bitbucket Draft mutation but not local Drafts" {
     _ = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
 
     try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 1, .kind = .comment, .body = "changed" }));
-    try testing.expectError(error.DraftLocked, store.remove(key, 1));
     try store.put(key, .{ .local_id = 3, .kind = .comment, .body = "new remote" });
     try store.put(key, .{ .local_id = 2, .kind = .comment, .target = .local, .body = "changed local" });
-    try store.remove(key, 2);
 }
 
 test "clean completion rejects a Submission with failed Bitbucket Drafts" {

@@ -32,8 +32,9 @@ So the deletion is on **batch** success, not per-item success.
   double-representation window is confined to an in-progress (or crashed-mid-) Submission.
 - The render path needs `CommentId` dedup **only** for that transient window, not on every
   normal launch.
-- Submission (M10) owns the delete-on-batch-success step; the `PendingReviewStore` already
-  supports it via per-Draft `remove`.
+- Submission (M10) owns the delete-on-batch-success step; the
+  `PendingReviewStore.completeSubmission(.clean)` operation removes the posted
+  batch atomically.
 - Submission checkpoints each Draft around its network call; it does not POST the whole batch
   and persist all outcomes in one transaction at the end. Before a POST, the Draft's
   `submitting` intent is persisted. Before the next POST, the previous outcome (`posted` with

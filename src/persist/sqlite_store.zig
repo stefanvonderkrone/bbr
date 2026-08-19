@@ -289,7 +289,6 @@ pub const SqliteStore = struct {
 
     const vtable: PendingReviewStore.VTable = .{
         .put = putImpl,
-        .remove = removeImpl,
         .edit_draft_body = editDraftBodyImpl,
         .reanchor_draft = reanchorDraftImpl,
         .delete_draft_subtree = deleteDraftSubtreeImpl,
@@ -512,23 +511,6 @@ pub const SqliteStore = struct {
             bindNull(stmt, 23);
         }
 
-        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
-        try self.exec("COMMIT;");
-    }
-
-    fn removeImpl(ptr: *anyopaque, key: RemoteReviewIdentity, local_id: TempId) anyerror!void {
-        const self: *SqliteStore = @ptrCast(@alignCast(ptr));
-        try self.exec("BEGIN IMMEDIATE;");
-        errdefer self.exec("ROLLBACK;") catch {};
-        if (try self.draftMutationLocked(key, local_id, null)) return error.DraftLocked;
-        var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, "DELETE FROM drafts WHERE workspace=? AND repository=? AND pr_id=? AND local_id=?;", -1, &stmt, null) != c.SQLITE_OK)
-            return error.Prepare;
-        defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, key.workspace);
-        bindText(stmt, 2, key.repository);
-        bindInt(stmt, 3, @intCast(key.pull_request_id));
-        bindInt(stmt, 4, @intCast(local_id));
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
         try self.exec("COMMIT;");
     }
@@ -1854,7 +1836,7 @@ test "SQLite round-trip preserves exhaustive root scope and File authored commit
     try testing.expect(drafts[3].scope == null);
 }
 
-test "put replaces on key; remove deletes; both scope to the PR" {
+test "put replaces on key and scopes to the PR" {
     var s = try SqliteStore.open(":memory:");
     defer s.deinit();
     const store = s.store();
@@ -1863,13 +1845,10 @@ test "put replaces on key; remove deletes; both scope to the PR" {
     try store.put(testReviewKey(1), .{ .local_id = 1, .kind = .comment, .body = "edited" }); // replace
     try store.put(testReviewKey(1), .{ .local_id = 2, .kind = .comment, .body = "second" });
     try store.put(testReviewKey(2), .{ .local_id = 1, .kind = .comment, .body = "other pr" });
-    try store.remove(testReviewKey(1), 2);
-    try store.remove(testReviewKey(1), 999); // idempotent
-
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const drafts = try store.load(arena.allocator(), testReviewKey(1));
-    try testing.expectEqual(@as(usize, 1), drafts.len);
+    try testing.expectEqual(@as(usize, 2), drafts.len);
     try testing.expectEqualStrings("edited", drafts[0].body);
 }
 
@@ -2031,9 +2010,7 @@ test "SQLite locks Bitbucket Draft mutation during an active Submission" {
     try store.put(key, .{ .local_id = 2, .kind = .comment, .target = .local, .body = "local" });
     _ = try store.beginSubmission(key, "source-commit", &.{.{ .temp_id = 1, .parent = null }});
 
-    try testing.expectError(error.DraftLocked, store.remove(key, 1));
     try store.put(key, .{ .local_id = 2, .kind = .comment, .target = .local, .body = "changed local" });
-    try store.remove(key, 2);
 }
 
 test "SQLite keeps an unresolved outcome immutable after partial completion" {
@@ -2047,7 +2024,6 @@ test "SQLite keeps an unresolved outcome immutable after partial completion" {
     try store.completeSubmission(operation_id, key, .partial);
 
     try testing.expectError(error.DraftLocked, store.put(key, .{ .local_id = 1, .kind = .comment, .body = "changed" }));
-    try testing.expectError(error.DraftLocked, store.remove(key, 1));
     try store.resolveUnknown(key, 1, .{ .posted = 812 });
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
