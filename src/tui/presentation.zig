@@ -2969,7 +2969,8 @@ pub const Presentation = struct {
     }
 
     fn submissionRepairInteractionActive(self: *const Presentation) bool {
-        if (self.reanchor != null or self.delete_confirmation != null) return true;
+        if (self.help_visible or self.unknown_resolution != null or self.delete_confirmation != null or self.reanchor != null) return true;
+        if (self.picker != null or self.file_finder != null) return true;
         if (self.published) |published| return published.composer != null;
         return false;
     }
@@ -3788,6 +3789,12 @@ pub const Presentation = struct {
 
     fn applySubmissionTreeKey(self: *Presentation, key: keymap_mod.KeyStroke) void {
         const tree = self.submission_tree orelse return;
+        // The tree is the blocking surface, but Review switching remains
+        // available without dismissing or cancelling the durable run.
+        if (key.matches('p', .{})) {
+            self.openPicker();
+            return;
+        }
         if (key.matches('j', .{}) or key.matches(keymap_mod.special.down, .{})) {
             tree.move(1);
             return;
@@ -10080,6 +10087,32 @@ test "reviewer can link a selected unresolved Draft to an existing Comment" {
 fn submissionTreeItem(tree: SubmissionTreeProjection, temp_id: bbr.review.TempId) SubmissionItemProjection {
     for (tree.items) |item| if (item.temp_id == temp_id) return item;
     unreachable;
+}
+
+test "Submission Overlay permits Review switching without cancelling the run" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "queued" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .submit });
+    var post = presentation.takeCommand().?;
+    post.deinit();
+    try testing.expect(presentation.projection().submission_tree != null);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'p', .text = "p" } });
+    try testing.expect(presentation.projection().picker != null);
+    var list = presentation.takeCommand().?;
+    try testing.expect(list == .list_pull_requests);
+    list.deinit();
+    try testing.expect(presentation.projection().submission != null);
 }
 
 test "stale repair reload evaluates each root scope independently and checks the refreshed source again" {
