@@ -4,7 +4,7 @@
 
 **Blocked by:** 04 — Re-anchor inline root Drafts.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Why
 
@@ -19,9 +19,17 @@ That leaves one inconsistency: a 40-line Selection can still *create* an inline 
 
 ## Acceptance
 
-- [ ] An inline Comment or Suggestion authored over more than 30 inclusive lines is refused at creation with the same reason re-anchor reports, and the Composer does not open.
-- [ ] Exactly 30 inclusive lines is still accepted on both the new and old side, at creation and at re-anchor.
-- [ ] The refusal is discoverable the same way every other authoring refusal is: a precise ActionError, not a silent no-op or a truncated range.
-- [ ] Persisted Drafts whose Anchor predates the cap still load, project, and submit; the cap governs new authored Anchors, not stored history.
-- [ ] `src/review/CONTEXT.md`'s Selection entry matches the implemented rule in both directions.
-- [ ] Deterministic tests cover the creation boundary on both sides, the refusal reason, and the legacy-row load path.
+- [x] An inline Comment or Suggestion authored over more than 30 inclusive lines is refused at creation with the same reason re-anchor reports, and the Composer does not open.
+- [x] Exactly 30 inclusive lines is still accepted on both the new and old side, at creation and at re-anchor.
+- [x] The refusal is discoverable the same way every other authoring refusal is: a precise ActionError, not a silent no-op or a truncated range.
+- [x] Persisted Drafts whose Anchor predates the cap still load, project, and submit; the cap governs new authored Anchors, not stored history.
+- [x] `src/review/CONTEXT.md`'s Selection entry matches the implemented rule in both directions.
+- [x] Deterministic tests cover the creation boundary on both sides, the refusal reason, and the legacy-row load path.
+
+## Implementation
+
+- `spanFromLines` now enforces `max_anchor_lines`, shared by initial inline authoring and re-anchor candidate construction.
+- `NewDraft.validate` rechecks newly authored inline Anchor shape before reserving or persisting a Draft.
+- Store `put` and load paths do not validate existing rows, preserving legacy oversized Anchors.
+- Presentation reports oversized initial selections as `ActionError.anchor_range_too_long` and leaves the Composer closed.
+- Verification: `zig build test --summary all` passes with 554 tests.

@@ -1036,6 +1036,25 @@ test "round-trips a draft's fields, anchor, and state through the fake" {
     try testing.expectEqual(@as(u64, 555), d.state.posted);
 }
 
+test "loading preserves an oversized legacy Anchor" {
+    var store = InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = testReviewKey(1);
+    const legacy = comment.Anchor{ .path = "f", .start_to = 1, .to = comment.max_anchor_lines + 1 };
+    try store.store().put(key, .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = legacy },
+        .body = "legacy",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try store.store().load(arena.allocator(), key);
+    try testing.expectEqual(@as(usize, 1), drafts.len);
+    try testing.expectEqual(@as(?u32, comment.max_anchor_lines + 1), drafts[0].effectiveScope().@"inline".to);
+}
+
 test "put replaces the same key; load scopes to the PR" {
     var mem = InMemoryStore.init(testing.allocator);
     defer mem.deinit();

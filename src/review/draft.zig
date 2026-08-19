@@ -126,13 +126,19 @@ pub const NewDraft = struct {
     parent: ?Parent = null,
     body: []const u8,
 
-    pub fn validate(self: NewDraft) error{InvalidDraftScope}!void {
+    pub fn validate(self: NewDraft) error{ InvalidDraftScope, AnchorRangeTooLong }!void {
         if (self.parent != null) {
             if (self.scope != null or self.anchor != null or self.snapshot != null) return error.InvalidDraftScope;
             return;
         }
         const scope: CommentScope = self.scope orelse if (self.anchor) |anchor| .{ .@"inline" = anchor } else .review;
-        if (scope == .@"inline" and scope.@"inline".line() == null) return error.InvalidDraftScope;
+        if (scope == .@"inline") {
+            if (scope.@"inline".line() == null) return error.InvalidDraftScope;
+            scope.@"inline".validateShape() catch |err| switch (err) {
+                error.AnchorRangeTooLong => return error.AnchorRangeTooLong,
+                else => return error.InvalidDraftScope,
+            };
+        }
         if (self.kind == .suggestion and (scope != .@"inline" or scope.@"inline".to == null)) return error.InvalidDraftScope;
         if (scope != .@"inline" and self.snapshot != null) return error.InvalidDraftScope;
     }
@@ -461,6 +467,36 @@ test "blank bodies are refused by the shared creation rule" {
     try testing.expect(isBlankBody(""));
     try testing.expect(isBlankBody("  \t\r\n "));
     try testing.expect(!isBlankBody(" x "));
+}
+
+test "new inline Drafts use the thirty-line Anchor envelope" {
+    const at_limit = NewDraft{
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "f", .start_to = 1, .to = comment.max_anchor_lines } },
+        .body = "body",
+    };
+    try at_limit.validate();
+
+    const past_limit = NewDraft{
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "f", .start_to = 1, .to = comment.max_anchor_lines + 1 } },
+        .body = "body",
+    };
+    try testing.expectError(error.AnchorRangeTooLong, past_limit.validate());
+
+    const old_side = NewDraft{
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "f", .start_from = 1, .from = comment.max_anchor_lines } },
+        .body = "body",
+    };
+    try old_side.validate();
+
+    const old_side_past_limit = NewDraft{
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "f", .start_from = 1, .from = comment.max_anchor_lines + 1 } },
+        .body = "body",
+    };
+    try testing.expectError(error.AnchorRangeTooLong, old_side_past_limit.validate());
 }
 
 fn indexOf(ids: []const TempId, id: TempId) usize {

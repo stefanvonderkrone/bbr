@@ -1092,7 +1092,7 @@ pub const ActionError = enum {
 };
 
 const BufferTransactionError = error{ BufferBuildFailed, OutOfMemory };
-const SaveDraftError = BufferTransactionError || error{PersistenceFailed};
+const SaveDraftError = BufferTransactionError || error{ PersistenceFailed, AnchorRangeTooLong, InvalidDraftScope };
 const EditDraftError = SaveDraftError || error{ DraftEditConflict, DraftLocked };
 const ReanchorDraftError = EditDraftError || error{ DraftNotAnchorable, InvalidAnchor };
 const DeleteDraftError = EditDraftError;
@@ -1343,6 +1343,7 @@ const Published = struct {
         preferences: Preferences,
         new_draft: bbr.review.NewDraft,
     ) SaveDraftError!void {
+        new_draft.validate() catch |err| return err;
         const review_allocator = self.review_arena.allocator();
         const reserved_id = store.reserveTempId(self.key.storeKey()) catch return error.PersistenceFailed;
         try self.review.drafts.ensureUnusedCapacity(review_allocator, 1);
@@ -3528,6 +3529,8 @@ pub const Presentation = struct {
             cascade[0..len],
         ) catch |err| {
             self.action_error = switch (err) {
+                error.AnchorRangeTooLong => .anchor_range_too_long,
+                error.InvalidDraftScope => .action_refused,
                 error.DraftLocked => .draft_owned_by_submission,
                 error.DraftEditConflict => .draft_edit_conflict,
                 error.PersistenceFailed => .persistence_failed,
@@ -3664,6 +3667,8 @@ pub const Presentation = struct {
             snapshot,
         ) catch |err| {
             self.action_error = switch (err) {
+                error.AnchorRangeTooLong => .anchor_range_too_long,
+                error.InvalidDraftScope => .action_refused,
                 error.DraftLocked => .draft_owned_by_submission,
                 error.DraftEditConflict => .draft_edit_conflict,
                 error.DraftNotAnchorable => .draft_scope_not_inline,
@@ -5102,8 +5107,11 @@ pub const Presentation = struct {
                 return;
             };
         }
-        const span = spanFromLines(lines.items, kind == .suggestion) catch {
-            self.action_error = .invalid_selection;
+        const span = spanFromLines(lines.items, kind == .suggestion) catch |err| {
+            self.action_error = switch (err) {
+                error.RangeTooLong => .anchor_range_too_long,
+                else => .invalid_selection,
+            };
             return;
         };
         const file = published.session.diff.files[file_index];
@@ -5398,6 +5406,8 @@ pub const Presentation = struct {
         if (composer.request.mutation) |target| return self.saveComposerEdit(published, target);
         published.saveDraft(self.dependencies.reviews, self.preferences, composer.toNewDraft()) catch |err| {
             self.action_error = switch (err) {
+                error.AnchorRangeTooLong => .anchor_range_too_long,
+                error.InvalidDraftScope => .invalid_selection,
                 error.PersistenceFailed => .persistence_failed,
                 error.BufferBuildFailed => .buffer_build_failed,
                 error.OutOfMemory => .out_of_memory,
@@ -5420,6 +5430,8 @@ pub const Presentation = struct {
         };
         published.editDraftBody(self.dependencies.reviews, self.preferences, temp_id, composer.body()) catch |err| {
             self.action_error = switch (err) {
+                error.AnchorRangeTooLong => .anchor_range_too_long,
+                error.InvalidDraftScope => .action_refused,
                 error.DraftLocked => .draft_owned_by_submission,
                 error.DraftEditConflict => .draft_edit_conflict,
                 error.PersistenceFailed => .persistence_failed,
@@ -6203,6 +6215,7 @@ const AnchorSpan = struct {
 
 fn spanFromLines(lines: []const *const bbr.diff.Line, suggestion: bool) !AnchorSpan {
     if (lines.len == 0) return error.NotOnALine;
+    if (lines.len > bbr.review.max_anchor_lines) return error.RangeTooLong;
     var all_new = true;
     var all_old = true;
     for (lines) |line| {
@@ -6412,6 +6425,34 @@ test "local inline authoring persists a local target and authored context" {
     try testing.expectEqualStrings("old\nnew", drafts[0].snapshot.?.text);
     try testing.expectEqual(@as(u32, 1), drafts[0].snapshot.?.selection_start);
     try testing.expectEqual(@as(u32, 1), drafts[0].snapshot.?.selection_len);
+}
+
+test "initial inline authoring refuses oversized selections at the same boundary as re-anchor" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testWideSession(testing.allocator, 1) },
+        .viewport_rows = 20,
+    });
+    defer presentation.deinit();
+
+    try selectSource(&presentation, .new, 2, 32);
+    try presentation.dispatch(.{ .action = .inline_comment });
+    try testing.expectEqual(ActionError.anchor_range_too_long, presentation.projection().action_error.?);
+    try testing.expect(presentation.projection().composer == null);
+
+    try selectSource(&presentation, .new, 2, 31);
+    try presentation.dispatch(.{ .action = .inline_comment });
+    try testing.expect(presentation.projection().composer != null);
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("boundary") } });
+    try presentation.dispatch(.{ .composer = .save });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const drafts = try store.store().load(arena.allocator(), key.storeKey());
+    try testing.expectEqual(@as(usize, 1), drafts.len);
+    try testing.expectEqual(@as(?u32, bbr.review.max_anchor_lines), drafts[0].effectiveScope().@"inline".span());
 }
 
 test "External Edit snapshots exactly once blocks input and accepts only matching completion" {
