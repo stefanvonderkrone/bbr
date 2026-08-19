@@ -79,7 +79,7 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [x] **Config file** — TOML at the XDG config location. `M12`
 - [x] **Themes** — built-in Catppuccin / Gruvbox / Solarized + plain light/dark. `M12`
 - [ ] **Markdown comment bodies and long-body folding** `M15`
-- [ ] **External editor handoff** `M16`
+- [x] **External editor handoff** `M16`
 
 ## Explicit non-features (for now)
 - Bitbucket Server / Data Center · applying suggestions · editing files. Approve/merge/decline

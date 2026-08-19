@@ -59,7 +59,7 @@ _Follow-through:_ true **whole-file** scope shipped in M9. Fold re-collapse is s
 - [x] `DraftState` + `CommentTarget` persistence; resume on launch; render drafts distinctly. ✅ all four DraftStates + parent + anchor (with authored-against commit, ADR-0005) round-trip through SQLite; `app.run` loads the PR's Drafts on entry and re-loads on each PR switch (PR-scoped review arena). Drafts weave into the buffer (anchored under their line, unanchored in a "Pending" section) and render in a distinct amber band (`✎`/`↳`/`±`).
 - [x] Tests: store round-trip (fake + SQLite), draft graph construction. ✅ draft graph (add/topological-order/remove), fake + SQLite round-trip (fields/anchor/parent/state, replace, scoped remove, close-reopen durability), buffer draft weaving, headless composer + draft-row render, `commitDraft` round-trip. Suite green 155.
 
-_Follow-through:_ `AnchorState.moved` via local diff-walk shipped in M14. Side-by-side draft weaving works (via `weaveInline`), including removed-only Anchors on the old side. Full editing and an external-editor handoff are scheduled for M16.
+_Follow-through:_ `AnchorState.moved` via local diff-walk shipped in M14. Side-by-side draft weaving works (via `weaveInline`), including removed-only Anchors on the old side. Full editing and the external-editor handoff shipped in M16.
 
 ## M7 — Responsiveness (non-blocking loads)  ·  M  ·  ✅ done
 - [x] Async picker open: `p` shows the picker overlay instantly in a loading state; the `listPullRequests` fetch runs off-thread and populates the rows when it returns. ✅ done via a sibling `picker_done` event with its own `picker_epoch` generation; `Picker.initLoading`/`populate` let the overlay exist with no items yet.
@@ -94,7 +94,7 @@ _Follow-up (M17):_ add the **removed-file** old-side splice and live blob shape 
 - [x] Per-item summary + selective retry of failed subtrees. ✅ each item's fate streams back (`submit_progress`, persisted as it lands — ADR-0007 crash-safety) and rolls up into a status-bar summary (`N posted · M failed · K skipped`); a clean batch deletes its published Drafts, a partial one keeps failures pending so `X` again is selective retry (posted Drafts skipped). M16 adds the richer per-item overlay.
 - [x] Tests: submission ordering, remap, each failure class, dedupe. ✅ 15 engine tests (ordering, remap, abort, skip-descendants, backoff schedule + Retry-After, dedupe-on-ambiguous, retry exhaustion, selective retry, `headChanged`, driver-through-seam) + `createComment` URL/body/id/error tests + `Poster` posted/rejected/ambiguous mapping + dedupe hit/miss. Suite green.
 
-_Follow-up (M16):_ integration-test the async worker/event glue and surface live `Retry-After`. Submission intentionally remains single-batch-at-a-time. Bitbucket exposes no idempotency key, so the duplicate guard remains best-effort (Anchor + exact body).
+_Follow-through (M16):_ async worker/event glue integration coverage and live `Retry-After` handling shipped in M16. Submission intentionally remains single-batch-at-a-time. Bitbucket exposes no idempotency key, so the duplicate guard remains best-effort (Anchor + exact body).
 
 ## M10b — Multi-line anchors, suggestion prefill & post-submit reconcile  ·  M  ·  ✅ done
 - [x] Multi-line anchors: thread `start_from`/`start_to` through the `Anchor` model, the client (send null-omitted + parse back), the `Poster` dedupe, and the SQLite store (v2 migration). ✅ Field names/roles verified by live probes on PR 1856 (`{start_to, to}` new-side, `{start_from, from}` old-side; start_* = range top).
@@ -104,7 +104,7 @@ _Follow-up (M16):_ integration-test the async worker/event glue and surface live
 - [x] Post-submit reconciliation: re-fetch the PR after a batch that posted anything, so published Comments reappear (ADR-0001); hide a posted/submitting Draft's row (the fetched Comment represents it) while keeping its pending descendants (ADR-0007 render-path dedup). ✅
 - [x] Submit modal: float a "Submitting review — n/total" overlay over the viewer during a batch, then the loading frame covers the re-fetch. ✅ shared `centeredModal` helper extracted; picker/composer/submit all route through it.
 
-_Follow-up (M16):_ add the `$EDITOR` handoff, live-probe old-side ranges, document Bitbucket's multi-line Suggestion UI behavior, and drive the shift+arrow/selection glue through vaxis.
+_Follow-through (M16):_ the `$EDITOR` handoff, live old-side range probes, Bitbucket multi-line Suggestion UI documentation, and vaxis selection-input coverage shipped in M16.
 
 ## M11 — Keymap & motions  ·  S/M  ·  ✅ done
 - [x] Full vim motion set + numeric Count register (`5j`, `zz`, …); arrows side by side. ✅ Added `ctrl-f`/`ctrl-b` (full page), `zz`/`zt`/`zb` (center / cursor-to-top / cursor-to-bottom scroll positioning), and `H`/`M`/`L` (cursor to viewport top/middle/bottom) as pure `Nav` methods; the existing `hjkl`/arrows/`ctrl-d`/`ctrl-u`/`gg`/`G`/Count/shift-select carry over. Skipped search/paragraph/operator-pending (no meaning in a diff viewer). `PageUp`/`PageDown` stay half-page (unchanged); `ctrl-f`/`ctrl-b` are the full-page keys.
@@ -155,7 +155,7 @@ Finish the visible interaction details deferred by M3–M14 before expanding the
 - [ ] Add an event-loop tick only if an instrumented UX check shows the static loading frame feels stalled; use it for a loading spinner without weakening the blocking `nextEvent` model.
 - [ ] Decide whether opening the Picker should retain the current all-open list or initially filter to the adjacent branch; whichever behavior wins, make the active filter visible and easy to clear.
 
-## M16 — Review-item mutation & submission hardening  ·  M/L  ·  needs M10b
+## M16 — Review-item mutation & submission hardening  ·  M/L  ·  ✅ done
 Complete the repair and mutation workflows around the client-side Pending Review. The detailed
 acceptance criteria already live in `.scratch/review-item-mutation/issues/`.
 - [x] Implement `.scratch/review-item-mutation/issues/01-edit-reanchor-delete-drafts.md`: edit Draft bodies without changing identity, re-anchor root Drafts, cascade deletion through Draft descendants, enforce active/recovered SubmissionRun immutability, and persist before publishing Presentation state.
