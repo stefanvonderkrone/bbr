@@ -172,6 +172,7 @@ Close fidelity gaps in the shared remote/local rendering pipeline.
 - [ ] Detect binary Files from diff stubs and non-UTF-8 blobs, suppress text enrichment, and render a clear size/status placeholder. Treat terminal image protocols as a separately gated stretch, not baseline behavior.
 - [ ] Fetch the old-side blob for removed Files and splice a true whole-file deletion view. Add an opt-in live shape check for both old- and new-side Bitbucket blob endpoints; fixtures remain the hermetic test tier.
 - [ ] Replace index-based removed/added pairing in side-by-side change blocks with tested line-level matching so insertions do not misalign the rest of a block.
+- [ ] Add a user-toggleable DiffPane word-wrapping mode for long diff lines, defaulting to the current clipped presentation when disabled. Wrapped visual rows must preserve diff styling, side-by-side boundaries, cursor/selection navigation, and comment anchoring.
 - [ ] Decide whether Bitbucket `diffstat` adds metadata the parsed Diff cannot supply. Implement paginated `getDiffStat` only for a concrete consumer; otherwise record the M1 deferral as obsolete.
 - [ ] Evaluate focused-only whole-file fetching against sequential all-file review. Keep demand loading as the baseline, and add bounded prefetch only if measurements show it improves navigation without defeating the File cache budget.
 - [ ] Evaluate and implement the tree-sitter query predicates needed by the built-in queries, with fixtures proving captures are neither silently dropped nor incorrectly applied.
