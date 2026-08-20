@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Side-by-side Line matching prototype</title>
+  <style>
+    :root { color-scheme: dark; --bg:#111513; --panel:#1a201d; --line:#344039; --text:#e9eee9; --muted:#9caaa2; --accent:#e6b566; --old:#482927; --new:#193c2b; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:15px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    main { width:min(1100px, calc(100% - 32px)); margin:36px auto 80px; }
+    h1,h2 { font-family:Georgia, serif; font-weight:500; margin:0 0 10px; }
+    h1 { font-size:34px; } h2 { font-size:21px; margin-top:28px; }
+    p { color:var(--muted); max-width:860px; }
+    button, textarea { font:inherit; }
+    button { border:1px solid var(--line); border-radius:4px; background:var(--panel); color:var(--text); padding:8px 12px; cursor:pointer; }
+    button:hover, button.active { border-color:var(--accent); color:var(--accent); }
+    .controls,.tabs { display:flex; gap:8px; flex-wrap:wrap; margin:14px 0; }
+    .state { display:grid; grid-template-columns:repeat(3,1fr); gap:1px; border:1px solid var(--line); background:var(--line); }
+    .state div { background:var(--panel); padding:12px; }
+    .state strong { display:block; color:var(--accent); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+    .diff { border:1px solid var(--line); border-bottom:0; margin-top:14px; }
+    .row { display:grid; grid-template-columns:1fr 1fr; min-height:34px; border-bottom:1px solid var(--line); }
+    .cell { padding:7px 10px; white-space:pre-wrap; overflow-wrap:anywhere; }
+    .cell:first-child { background:var(--old); border-right:1px solid var(--line); }
+    .cell:last-child { background:var(--new); }
+    .empty { color:#718078; font-style:italic; }
+    .score { float:right; color:var(--muted); font-size:12px; }
+    .scenario { border-left:3px solid var(--accent); padding:1px 0 1px 14px; }
+    .editors { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    textarea { width:100%; min-height:150px; resize:vertical; background:var(--panel); color:var(--text); border:1px solid var(--line); padding:10px; }
+    label { color:var(--muted); }
+    @media (max-width:700px) { .state,.editors { grid-template-columns:1fr; } .row { grid-template-columns:1fr; } .cell:first-child { border-right:0; border-bottom:1px dashed var(--line); } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Side-by-side Line matching</h1>
+  <p><strong>Prototype question:</strong> which order-preserving strategy keeps related removed and added Lines together when one side contains an insertion or deletion, without changing the Diff, Anchors, or Unified Layout?</p>
+
+  <h2>Current state</h2>
+  <div class="state">
+    <div><strong>Strategy</strong><span id="strategy-state"></span></div>
+    <div><strong>Projected rows</strong><span id="row-state"></span></div>
+    <div><strong>Unmatched sides</strong><span id="gap-state"></span></div>
+  </div>
+
+  <div class="controls" id="strategies"></div>
+  <div class="diff" id="diff"></div>
+
+  <h2>Guided walkthroughs</h2>
+  <div class="tabs" id="scenarios"></div>
+  <div class="scenario">
+    <strong id="scenario-title"></strong>
+    <p id="scenario-note"></p>
+    <div class="controls">
+      <button data-walk="index">1. Show current index pairing</button>
+      <button data-walk="greedy">2. Try nearest good match</button>
+      <button data-walk="sequence">3. Preserve the complete order</button>
+    </div>
+  </div>
+
+  <h2>Free play</h2>
+  <p>Enter one Line per row. Empty Lines are significant.</p>
+  <div class="editors">
+    <label>Removed Lines<textarea id="old-input"></textarea></label>
+    <label>Added Lines<textarea id="new-input"></textarea></label>
+  </div>
+  <div class="controls"><button id="apply">Apply Lines</button></div>
+</main>
+<script>
+const Matching = (() => {
+  const words = text => text.match(/[A-Za-z0-9_]+|\s+|[^A-Za-z0-9_\s]/g) || [];
+
+  function similarity(a, b) {
+    if (a === b) return 1;
+    const old = words(a), next = words(b);
+    if (!old.length || !next.length) return 0;
+    const dp = Array.from({length: old.length + 1}, () => Array(next.length + 1).fill(0));
+    for (let i = old.length - 1; i >= 0; i--)
+      for (let j = next.length - 1; j >= 0; j--)
+        dp[i][j] = old[i] === next[j] ? dp[i + 1][j + 1] + old[i].length : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    return (2 * dp[0][0]) / (a.length + b.length);
+  }
+
+  const row = (left, right) => ({left, right, score:left !== null && right !== null ? similarity(left, right) : null});
+
+  function index(old, next) {
+    return Array.from({length:Math.max(old.length, next.length)}, (_, i) => row(old[i] ?? null, next[i] ?? null));
+  }
+
+  function greedy(old, next, threshold=.5) {
+    const unused = new Set(next.map((_, i) => i));
+    const pairs = old.map((left, oi) => {
+      let best = null, bestScore = threshold;
+      for (const ni of unused) {
+        const score = similarity(left, next[ni]);
+        if (score > bestScore || (score === bestScore && best !== null && Math.abs(ni - oi) < Math.abs(best - oi))) { best=ni; bestScore=score; }
+      }
+      if (best === null) return {oi, ni:null};
+      unused.delete(best); return {oi, ni:best};
+    });
+    const out=[];
+    for (let ni=0; ni<next.length; ni++) {
+      const found=pairs.find(p => p.ni===ni);
+      out.push(found ? row(old[found.oi], next[ni]) : row(null, next[ni]));
+    }
+    for (const p of pairs) if (p.ni===null) out.push(row(old[p.oi], null));
+    return out;
+  }
+
+  function sequence(old, next, threshold=.5) {
+    const n=old.length, m=next.length;
+    const dp=Array.from({length:n+1}, () => Array(m+1).fill(Infinity));
+    const from=Array.from({length:n+1}, () => Array(m+1).fill(null));
+    dp[0][0]=0;
+    for (let i=0;i<=n;i++) for (let j=0;j<=m;j++) {
+      const choices=[];
+      if (i<n) choices.push({cost:dp[i][j]+1, ni:i+1, nj:j, op:'left'});
+      if (j<m) choices.push({cost:dp[i][j]+1, ni:i, nj:j+1, op:'right'});
+      if (i<n && j<m) {
+        const score=similarity(old[i],next[j]);
+        if (score>=threshold) choices.push({cost:dp[i][j]+(1-score), ni:i+1, nj:j+1, op:'pair'});
+      }
+      for (const c of choices) if (c.cost < dp[c.ni][c.nj] - 1e-9) { dp[c.ni][c.nj]=c.cost; from[c.ni][c.nj]={i,j,op:c.op}; }
+    }
+    const out=[]; let i=n,j=m;
+    while (i||j) {
+      const step=from[i][j];
+      if (step.op==='pair') out.push(row(old[i-1],next[j-1]));
+      if (step.op==='left') out.push(row(old[i-1],null));
+      if (step.op==='right') out.push(row(null,next[j-1]));
+      i=step.i; j=step.j;
+    }
+    return out.reverse();
+  }
+
+  return {index, greedy, sequence};
+})();
+
+const scenarios = [
+  {title:'Insertion before related edits', note:'Watch whether one new Line shifts every later pair.', old:['const host = config.host;','const port = config.port;','server.start(host, port);'], next:['logger.info("starting");','const host = settings.host;','const port = settings.port;','server.start(host, port);']},
+  {title:'Deletion between related edits', note:'Watch whether the removed retry Line displaces the close call.', old:['client.open(source);','client.retry(source);','client.close(source);'], next:['client.open(target);','client.close(target);']},
+  {title:'Unrelated replacement', note:'A low-similarity replacement must not pretend to be a modified Line pair.', old:['import legacy','legacy.boot()'], next:['const service = createService()','return service.run()']},
+  {title:'Repeated and blank Lines', note:'Check deterministic order when identical blank and repeated Lines offer several valid matches.', old:['item.render()','','item.render()','return oldValue'], next:['','item.render()','item.render()','return newValue']}
+];
+const names={index:'Index pairing',greedy:'Greedy nearest match',sequence:'Order-preserving dynamic match'};
+let state={scenario:0,strategy:'index',old:scenarios[0].old,next:scenarios[0].next};
+
+function output() { return Matching[state.strategy](state.old,state.next); }
+function render() {
+  const rows=output(), gaps=rows.filter(r=>r.left===null||r.right===null).length;
+  document.querySelector('#strategy-state').textContent=names[state.strategy];
+  document.querySelector('#row-state').textContent=rows.length;
+  document.querySelector('#gap-state').textContent=gaps;
+  document.querySelector('#scenario-title').textContent=scenarios[state.scenario]?.title || 'Custom Lines';
+  document.querySelector('#scenario-note').textContent=scenarios[state.scenario]?.note || 'Compare the three strategies with your own change block.';
+  document.querySelector('#diff').innerHTML=rows.map(r=>`<div class="row"><div class="cell ${r.left===null?'empty':''}">${escapeHtml(r.left??'missing old side')}</div><div class="cell ${r.right===null?'empty':''}">${escapeHtml(r.right??'missing new side')}${r.score===null?'':`<span class="score">${Math.round(r.score*100)}%</span>`}</div></div>`).join('');
+  document.querySelectorAll('[data-strategy]').forEach(b=>b.classList.toggle('active',b.dataset.strategy===state.strategy));
+  document.querySelectorAll('[data-scenario]').forEach(b=>b.classList.toggle('active',Number(b.dataset.scenario)===state.scenario));
+  document.querySelector('#old-input').value=state.old.join('\n'); document.querySelector('#new-input').value=state.next.join('\n');
+}
+function escapeHtml(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+document.querySelector('#strategies').innerHTML=Object.entries(names).map(([id,name])=>`<button data-strategy="${id}">${name}</button>`).join('');
+document.querySelector('#scenarios').innerHTML=scenarios.map((s,i)=>`<button data-scenario="${i}">${s.title}</button>`).join('');
+document.addEventListener('click', e=>{
+  if(e.target.dataset.strategy){state.strategy=e.target.dataset.strategy;render();}
+  if(e.target.dataset.walk){state.strategy=e.target.dataset.walk;render();}
+  if(e.target.dataset.scenario){const i=Number(e.target.dataset.scenario);state={scenario:i,strategy:'index',old:scenarios[i].old,next:scenarios[i].next};render();}
+});
+document.querySelector('#apply').onclick=()=>{state={scenario:-1,strategy:state.strategy,old:document.querySelector('#old-input').value.split('\n'),next:document.querySelector('#new-input').value.split('\n')};render();};
+render();
+</script>
+</body>
+</html>
