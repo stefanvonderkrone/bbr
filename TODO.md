@@ -31,8 +31,8 @@ Sizes are relative effort (S/M/L), not calendar estimates. Dependencies noted pe
 - [x] Bitbucket: `getComments` (paginated), incl. resolved state + outdated verdict. ✅ `Client.getComments` follows `next` links; anchors carry path + old/new line; `resolved` from the resolution object; `AnchorState` honors Bitbucket's `inline.outdated`. `FakeHttpClient` gained a `responses` sequence for hermetic pagination tests.
 - [x] Thread builder: flat comments → nested `Thread`s (by `parent.id`). ✅ `src/review/thread.zig` — resolves each comment to its ultimate root, buckets replies in creation order, promotes orphans, handles out-of-order input. Zero-copy over the comment slice.
 - [x] ThreadPane: inline threads + PR-level comments; render ```suggestion``` blocks distinctly. ✅ woven in `buffer.buildWithComments` (PR-level section at top; inline threads under their anchored line; root/reply rows) and drawn in `render.zig` (`▸` root, `↳` reply, `±` suggestion with its own band). Multi-line bodies show the lead line + `…` (full markdown rendering is M11).
-- [x] `resolved` state + reveal-resolved toggle (whole thread). ✅ resolved-but-current threads hidden by default; `R` flips `show_resolved` and rebuilds the buffer, revealing the *whole* thread. Status bar shows the toggle state.
-- [x] AnchorState display (current/moved/outdated from Bitbucket verdict); per-file Outdated grouping. ✅ outdated threads grouped in a per-file "Outdated (N)" section and **never hidden** (even when resolved). Outdated is derived from each comment's `links.code` revision vs the PR's current source/destination commits — the list endpoint omits `inline.outdated` and it can't be recomputed from line numbers (see `bitbucket/CONTEXT.md`). Verified live on PR 1726 (8 outdated roots). `moved` isn't produced remotely; local diff-walk ships in M14. The Outdated group is always expanded — collapse/re-expand is scheduled for M15.
+- [x] `resolved` state + reveal-resolved toggle (whole thread). ✅ M15 replaced the global `show_resolved` toggle with an in-place, per-Thread disclosure row that reveals the *whole* thread; status and keymap behavior are Session-scoped.
+- [x] AnchorState display (current/moved/outdated from Bitbucket verdict); per-file Outdated grouping. ✅ outdated threads grouped in a per-file "Outdated (N)" section and **never hidden** (even when resolved). Outdated is derived from each comment's `links.code` revision vs the PR's current source/destination commits — the list endpoint omits `inline.outdated` and it can't be recomputed from line numbers (see `bitbucket/CONTEXT.md`). Verified live on PR 1726 (8 outdated roots). `moved` isn't produced remotely; local diff-walk ships in M14. M15 adds independent collapse/re-expand state for Outdated groups.
 - [x] Tests: thread nesting, resolved toggle, outdated grouping. ✅ thread nesting/orphan/out-of-order (`thread.zig`), weaving + resolved toggle + outdated grouping (`buffer.zig`), headless comment/suggestion render (`render.zig`), paginated `getComments` (`client.zig`). Suite green 62/62.
 
 ## M4 — PR discovery & switching  ·  M  ·  ✅ done
@@ -42,7 +42,7 @@ Sizes are relative effort (S/M/L), not calendar estimates. Dependencies noted pe
 - [x] PR Picker overlay (zf); URL parser; switch PRs with Epoch cancellation. ✅ `src/tui/picker.zig` (pure zf-ranked, navigable state machine), `src/bitbucket/url.zig` (web+API PR URL parser), and an async switch: `p` opens the picker, Enter bumps an Epoch and spawns a load worker (`std.Io.concurrent`) that builds the new `Session` off `page_allocator` and posts a `load_done` event; only the current epoch's result is applied (stale discarded). Futures are awaited before teardown.
 - [x] Tests: remote URL parsing, branch detection (fake GitClient), resolution branches. ✅ remote parser (8), GitClient fakes (4), url parser (6), listPullRequests (4), resolution branches (7), picker (6), session loader over fake http (2), picker-overlay headless render (1). Suite green. `bbr detect [<repo>]` prints the resolution without the TUI (scriptable live check).
 
-_Follow-through:_ SideBySide + folds shipped in M5, moved-anchor local diff-walk in M14, and async Picker loading in M7. Whether Picker-open should initially filter to the current branch is scheduled for M15.
+_Follow-through:_ SideBySide + folds shipped in M5, moved-anchor local diff-walk in M14, async Picker loading in M7, and Picker-open behavior resolved in M15.
 
 ## M5 — Diff polish  ·  M  ·  ✅ done
 - [x] Intra-line word-diff → emphasis `Segment`s; emphasized background. ✅ `src/diff/intraline.zig` (token-level LCS: word/whitespace/punct tokens, common tokens marked, the rest coalesced into emphasized runs; `similarity()` gates edit-vs-unrelated). Woven at buffer build: `computeEmphasis` pairs a removed run with the following added run by index and attaches segments when similar ≥ 0.5. `Row.line` is now a `LineRow` (line + emphasis); renderer draws the body as styled segments so only changed runs get the brighter `added_emphasis`/`removed_emphasis` band.
@@ -51,7 +51,7 @@ _Follow-through:_ SideBySide + folds shipped in M5, moved-anchor local diff-walk
 - [x] Arena pool/ring for multi-file view. ✅ `src/tui/arena_ring.zig` — a fixed ring of N arenas; `next()` rotates + resets. The viewer uses a ring of 2 to double-buffer the row-buffer rebuild (the displayed buffer stays valid while the next builds), replacing the single reset-and-reuse arena.
 - [x] Tests: intra-line segment cases; fold expansion; projection invariants. ✅ intraline (8: partition/emphasis/insertion/identical/disjoint/empty/similarity/indent), buffer emphasis + side-by-side pairing + fold/expand/whole-file/side-by-side-fold, renderer emphasis-band + side-by-side panes + fold-row, arena ring (3). Suite green 130/130.
 
-_Follow-through:_ true **whole-file** scope shipped in M9. Fold re-collapse is scheduled for M15; line-level side-by-side matching for change blocks is scheduled for M17.
+_Follow-through:_ true **whole-file** scope shipped in M9. Fold re-collapse shipped in M15; line-level side-by-side matching for change blocks is scheduled for M17.
 
 ## M6 — Pending review: authoring & persistence  ·  M  ·  ✅ done
 - [x] `PendingReviewStore` seam + in-memory fake + SQLite implementation (schema + migrations). ✅ `src/review/store.zig` (ptr+vtable seam mirroring `HttpClient`, `InMemoryStore` fake) + `src/persist/sqlite_store.zig` (vendored amalgamation, `vendors/sqlite`, compiled into the exe only so the pure module stays C-free — ADR-0006). One row per Draft keyed `(pr_id, local_id)`; `PRAGMA user_version` migrations.
@@ -67,7 +67,7 @@ _Follow-through:_ `AnchorState.moved` via local diff-walk shipped in M14. Side-b
 - [x] Scope parallel Session fetches and keep them out of M7 until live measurement justifies them. ✅ This is a single-load latency optimization, not responsiveness: the whole load already runs off the UI thread. `std.http.Client` reuses one keep-alive connection sequentially, while true fan-out needs another connection/TLS handshake. The measurement/implementation gate is scheduled for M19.
 - [x] Tests: async picker open (loading → populated over a fake) and boot loading-view render. ✅ M19 owns fan-out ordering/parity tests if its measurement gate selects parallel loading.
 
-_Follow-up:_ an animated spinner needs a tick thread because vaxis `nextEvent` blocks; its measured UX gate is scheduled for M15.
+_Follow-up:_ the scoped Picker tick and single-glyph spinner shipped in M15 without changing the blocking `nextEvent` model.
 
 ## M8 — File view scope (single-file)  ·  S/M  ·  ✅ done
 - [x] `only_file` scope in `BuildOptions`: project the Buffer to a single File's rows. ✅ `buffer.zig` `only_file: ?usize`; when set, only `diff.files[only_file]` is emitted (header, hunks, woven inline threads/drafts, outdated section) and the PR-level comment/pending sections plus other-file stranded drafts are suppressed (`draftInScope`). Reconciles the code with the domain language (`src/diff/CONTEXT.md` Buffer entry updated: whole-Diff scroll by default, single-File isolate view as the canonical review unit).
@@ -112,7 +112,7 @@ _Follow-through (M16):_ the `$EDITOR` handoff, live old-side range probes, Bitbu
 - [x] Keybinding-help Overlay (reads Keymap). ✅ `?` floats a centered "Keybindings" modal (`render.drawHelp`) built straight from `Keymap.default` — Motions in the left column, commands in the right, adjacent alternate bindings coalesced (`j ↓`), so it can't drift from the live table. Any key dismisses it (captures input while open); a `? help` hint sits in the status bar for discoverability.
 - [x] **Multi-line comment/draft/suggestion body rendering.** ✅ Kept the one-Row-per-screen-line invariant (so `Nav`/scroll are untouched): a multi-line body emits one `CommentRow`/`DraftRow` per visual line, all sharing the owner pointer, `is_first` marking the header row (option A2). `r`/reply resolves from any line for free (every row carries the owner). Bodies render **verbatim**, fences and all (§Q5-A) — the `±` marker + suggestion band still signal a suggestion. Full body, **no cap** — the pane already scrolls. M15 owns Markdown styling and optional folding. Continuation rows hang-indent two columns; a single trailing newline is trimmed so it emits no blank row.
 
-  _Follow-up (M15):_ Markdown rendering and a length cap/fold for pathological bodies.
+  _Follow-up (M15):_ Markdown rendering and bounded ReviewCard disclosure shipped in M15.
 
 ## M12 — Themes & config  ·  S  ·  ✅ done
 - [x] Config file. ✅ Strict, allocation-light TOML subset at `$XDG_CONFIG_HOME/bbr/config.toml` (fallback `$HOME/.config/bbr/config.toml`); a missing file uses defaults, while malformed/unknown entries produce collected path + line/column diagnostics before the TUI starts.
@@ -137,23 +137,25 @@ _Delivery notes:_ focused Files enrich lazily off-thread in one old/new pipeline
 - [x] Shared configurable `R` refresh Action: atomically reload the same PullRequest or re-resolve the same LocalReview's Refs. Remote-only Actions stay discoverable but grey in local help and report a status message when invoked.
 - [x] Tests: shell worktree/ref/diff/blob acquisition, DiffSource parity, repository aliases and concurrent TempIds, local authoring/snapshots/action gating, and local anchor mapping/projection (current/moved/outdated/unavailable).
 
-## M15 — Presentation & navigation polish  ·  M  ·  needs M14
+## M15 — Presentation & navigation polish  ·  M  ·  ✅ done
 Finish the visible interaction details deferred by M3–M14 before expanding the product surface.
 - [x] File-content cache configuration UX: `[files.cache]` exposes `enabled` and `max_bytes`, defaults to a 256 MiB inactive-content budget, treats zero as unlimited, excludes the focused File, and cleanly rejects the pre-release superseded key. User documentation distinguishes retention from `[highlight].max_file_bytes`; M17 separately decides whether to add persistent disk caching.
-- [ ] Resolved threads: show a collapsed **indicator** in place (not just hide-behind-toggle), e.g. `✓ resolved · N replies`, that expands the whole Thread on demand. **Note:** this reverses the current domain rule — the Thread entry in `src/review/CONTEXT.md` explicitly says "never a bare 'a resolved comment exists' marker". Confirm and update that glossary entry (and the `show_resolved` behaviour in `buffer.zig`) as part of this item. Reply count comes from `Thread.replies.len`.
-- [ ] Make both context Folds and per-file Outdated sections independently collapsible and re-collapsible. Preserve expansion state across Buffer rebuilds and clear it only when its Session identity is no longer valid. This closes the one-way Fold and always-expanded Outdated follow-ups from M3/M5.
-- [ ] Layout polish: borders/separators around panes and overlays (sidebar ↔ diff, the composer modal, section dividers). Today panes are separated by spacing only (`src/tui/render.zig`); add box-drawing borders styled via the active `Theme`.
-- [ ] Sidebar: the per-file comment/draft counts should be **right-aligned and always visible**, and the file name **truncated with an ellipsis** when the row is too narrow. Today the counts are printed immediately after the name using the name segment's `PrintResult.col` (`drawSidebar` in `render.zig`), so a long name pushes them off-screen. Reserve a fixed right-hand column for the counts, then truncate the name to fill the remaining width.
-- [ ] Keep the active File visible when navigating the Diff by automatically scrolling the Sidebar. Prefer positioning the active entry near the vertical center when enough surrounding entries exist, while handling the beginning and end of the list naturally.
-- [ ] Replace the Sidebar's flat File list with a collapsible File tree derived from repository paths. Preserve the active-File indicator, comment/draft counts, and keyboard navigation across collapsed directories.
-- [ ] Add fuzzy finding over the Files changed by the current Pull Request, with selection moving focus directly to the chosen File.
-- [ ] Tune Pull Request picker fuzzy matching so the Pull Request title is preferred over its id when ranking matches; keep id matching available for users who know the number.
-- [ ] Consider `c` for an inline Comment and `C` for a whole-File Comment. Evaluate the bindings against existing Actions and help text, then make the scope distinction clear in the composer.
-- [ ] Evaluate mouse support for high-value interactions such as focusing Files, scrolling panes, expanding/collapsing tree nodes and Threads, and placing or extending a selection. Define terminal/SSH compatibility and keyboard-parity expectations before committing to an implementation.
-- [ ] Yank to clipboard: a `y` Action that copies the current diff line (or, with an active selection, the selected lines) to the system clipboard. Add a `yank` Action to the Keymap and copy the underlying source text — the code content of each `BufferRow`, not the rendered gutter/marker decoration — joined by newlines. Use libvaxis's OSC 52 clipboard write (`vaxis.copyToSystemClipboard` / the `Vaxis.copy_to_clipboard` path) so it works over SSH without a local clipboard daemon; verify the exact API against the 0.6.0 source before wiring it. Count-aware like other Motions (`3y`).
-- [ ] Render Comment/Draft Markdown (at least headings, emphasis, links, and fence-aware Suggestions) and add a configurable collapsed summary for pathological body lengths, expandable in place.
-- [ ] Add an event-loop tick only if an instrumented UX check shows the static loading frame feels stalled; use it for a loading spinner without weakening the blocking `nextEvent` model.
-- [ ] Decide whether opening the Picker should retain the current all-open list or initially filter to the adjacent branch; whichever behavior wins, make the active filter visible and easy to clear.
+- [x] Resolved threads: show a persistent collapsed disclosure indicator with the reply count, expanding the whole Thread on demand. Updated the Thread glossary and replaced global `show_resolved` visibility with Session-scoped disclosure state.
+- [x] Make context Folds and per-file Outdated sections independently collapsible and re-collapsible. Expansion survives Buffer rebuilds and clears on Session replacement.
+- [x] Layout polish: Frame-owned borders and joined section rules around Panes and restrained single-line framing for Overlays, styled via the active `Theme`.
+- [x] Sidebar: right-align per-File Comment/Draft tallies and truncate long File names with a grapheme-safe ellipsis.
+- [x] Keep the active File visible when navigating the Diff by scrolling the Sidebar and centering the active entry where possible.
+- [x] Replace the flat Sidebar File list with a compacted, collapsible repository-path File Tree, preserving active-File state, tallies, and keyboard navigation.
+- [x] Add fuzzy finding over Files changed by the current PullRequest, with selection moving focus to the chosen File.
+- [x] Tune PullRequest Picker fuzzy matching to prefer title matches while retaining id matching.
+- [x] Use `i` for inline, `I` for File-level, and `C` for Review-level Comment creation; the scope is explicit in the Composer.
+- [x] Add default-on, configurable mouse support for Pane focus, vertical scrolling, File focus, Picker selection, and disclosure toggles with keyboard parity. Selection and less portable gestures remain keyboard-only.
+- [x] Yank source text with `y`, including Count and Selection behavior, through libvaxis OSC 52. The adapter reports clipboard success or failure.
+- [x] Render Comment/Draft Markdown through bounded ReviewCards with visible links, fence-aware Suggestions, and configurable in-place disclosure for long bodies.
+- [x] Add scoped Picker tick events and a single-glyph loading spinner without idle polling or weakening the blocking event loop.
+- [x] Keep Picker startup all-open, rank titles before ids, and expose the active query/filter with clear dismissal behavior.
+
+M15 verification: integrated acceptance matrix complete; `zig build test --summary all` passed 552/552 tests. Direct terminal and tmux smoke evidence is recorded in `.scratch/m15-presentation-navigation-polish/issues/23-verify-the-integrated-m15-acceptance-matrix.md`; SSH PTY was unavailable because no local `sshd` was running.
 
 ## M16 — Review-item mutation & submission hardening  ·  M/L  ·  ✅ done
 Complete the repair and mutation workflows around the client-side Pending Review. The detailed

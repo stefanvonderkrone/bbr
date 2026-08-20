@@ -69,7 +69,7 @@ A root Comment scoped through a FileScope to one File as a whole, without line c
 _Avoid_: whole-File Comment (confusable with the WholeFile Diff scope), unanchored inline Comment.
 
 **Thread**:
-A root Comment together with its ordered Replies, carrying a `resolved` flag. The unit the UI displays and collapses. Resolved Threads are hidden behind a toggle that reveals the *whole* Thread (comment + replies) — never a bare "a resolved comment exists" marker.
+A root Comment together with its ordered Replies, carrying a `resolved` flag. The unit the UI displays and collapses. A resolved Thread first renders a persistent disclosure row with its reply count; toggling it reveals or hides the *whole* Thread (comment + replies), never a bare "a resolved comment exists" marker.
 _Avoid_: conversation, discussion, chain.
 
 **Reply**:
