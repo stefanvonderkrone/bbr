@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PROTOTYPE - DiffPane line wrapping</title>
+<style>
+  :root { color-scheme: dark; --bg:#111318; --panel:#1a1e26; --rule:#343b49; --text:#d8dee9; --muted:#8f9bad; --accent:#83c5be; --add:#173c2c; --remove:#48262b; --cursor:#405269; --select:#5b4b25; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.45 system-ui,sans-serif; }
+  main { width:min(1180px, calc(100% - 32px)); margin:28px auto 60px; }
+  h1,h2 { margin:0 0 8px; }
+  h1 { font-size:24px; } h2 { font-size:16px; }
+  p { color:var(--muted); max-width:950px; }
+  .warning { color:#efb366; font-weight:700; letter-spacing:.04em; }
+  .grid { display:grid; grid-template-columns:minmax(0, 1.7fr) minmax(280px, .8fr); gap:16px; }
+  .panel { background:var(--panel); border:1px solid var(--rule); border-radius:8px; padding:16px; }
+  .controls { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0; }
+  button { color:var(--text); background:#252b36; border:1px solid #465064; border-radius:5px; padding:7px 10px; cursor:pointer; }
+  button:hover,button.active { border-color:var(--accent); color:var(--accent); }
+  .terminal { overflow:auto; background:#0b0d11; border:1px solid var(--rule); padding:8px; min-height:340px; font:14px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre; }
+  .row { display:block; min-height:19px; padding:0 4px; }
+  .context { background:#171a20; } .added { background:var(--add); } .removed { background:var(--remove); }
+  .cursor { outline:1px solid var(--accent); background-color:var(--cursor); }
+  .selected { box-shadow:inset 4px 0 var(--select); }
+  .gutter { color:#788397; } .continuation { color:#667080; } .divider { color:#617086; }
+  dl { display:grid; grid-template-columns:max-content 1fr; gap:5px 12px; margin:0; }
+  dt { color:var(--muted); } dd { margin:0; font-family:ui-monospace,monospace; overflow-wrap:anywhere; }
+  .tabs { display:flex; gap:6px; border-bottom:1px solid var(--rule); margin-bottom:12px; }
+  .tabs button { border-width:0 0 2px; border-radius:0; background:transparent; }
+  .step { margin-top:8px; } .step:disabled { opacity:.45; cursor:default; }
+  .verdict { border-left:3px solid var(--accent); padding-left:12px; }
+  @media (max-width:820px) { .grid { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <div class="warning">THROWAWAY PROTOTYPE</div>
+  <h1>DiffPane line-wrapping contract</h1>
+  <p>This demo tests where the cursor lives after one Diff Line becomes several visual rows. Compare <b>Line navigation</b>, where <code>j</code>/<code>k</code> move by semantic Line, with <b>Visual navigation</b>, where they move by displayed continuation row. In both choices, Selection and comment Anchors must still name Diff Lines, never fragments.</p>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>DiffPane</h2>
+      <div class="controls" id="choices"></div>
+      <div class="controls">
+        <button data-action="up">k / up</button>
+        <button data-action="down">j / down</button>
+        <button data-action="select">v Selection</button>
+        <button data-action="comment">i Comment</button>
+        <button data-action="resize">Resize narrower</button>
+        <button data-action="fold">Toggle fold</button>
+        <button data-action="reset">Reset</button>
+      </div>
+      <div class="terminal" id="terminal" aria-label="DiffPane projection"></div>
+    </section>
+
+    <aside class="panel">
+      <h2>Current state</h2>
+      <dl id="state"></dl>
+      <p id="change"></p>
+      <div class="verdict">
+        <b>Invariant under test</b>
+        <p>A resize can change visual rows, but it does not change the current semantic Line, Selection, Fold identity, or comment Anchor.</p>
+      </div>
+    </aside>
+  </div>
+
+  <section class="panel" style="margin-top:16px">
+    <h2>Guided walkthroughs</h2>
+    <div class="tabs" id="tabs"></div>
+    <p id="scenarioText"></p>
+    <div id="steps"></div>
+  </section>
+</main>
+
+<script>
+// Pure prototype module. It has no DOM access.
+const WrappingModel = (() => {
+  const lines = [
+    { id:'L40', old:40, next:40, kind:'context', text:'const summary = buildReviewSummary(pull_request, comments, drafts, file_enrichment);' },
+    { id:'L41-old', old:41, next:null, kind:'removed', text:'return renderSummary(summary, terminal_width, false);' },
+    { id:'L41-new', old:null, next:41, kind:'added', text:'return renderSummary(summary, terminal_width, options.wrap_diff_lines, active_theme);' },
+    { id:'FOLD', fold:true, text:'18 unchanged Lines' },
+    { id:'L60', old:60, next:60, kind:'context', text:'try publishCompletePresentationFrame(session_epoch, projection, navigation);' }
+  ];
+
+  const initial = () => ({ layout:'unified', wrap:true, navigation:'line', width:74, cursor:{ line:'L40', part:0 }, mark:null, foldOpen:false, anchor:null, last:'Reset to the first Diff Line.' });
+
+  function chunks(text, width) {
+    if (width < 1) return [''];
+    const out=[]; let rest=text;
+    while (rest.length > width) {
+      let cut=rest.lastIndexOf(' ', width);
+      if (cut < Math.floor(width * .45)) cut=width;
+      out.push(rest.slice(0, cut));
+      rest=rest.slice(cut);
+      if (rest.startsWith(' ')) rest=rest.slice(1);
+    }
+    out.push(rest); return out;
+  }
+
+  function visibleLines(state) {
+    if (!state.foldOpen) return lines;
+    const at=lines.findIndex(x => x.fold);
+    return [...lines.slice(0,at),
+      { id:'L42', old:42, next:42, kind:'context', text:'// unchanged context at the start of the expanded Fold' },
+      { id:'L59', old:59, next:59, kind:'context', text:'// unchanged context at the end of the expanded Fold' },
+      ...lines.slice(at+1)];
+  }
+
+  function projectUnified(state) {
+    const body=Math.max(8,state.width-11), rows=[];
+    for (const line of visibleLines(state)) {
+      if (line.fold) { rows.push({ line:line.id, part:0, text:`    ... ${line.text} ...`, kind:'context', fold:true }); continue; }
+      const parts=state.wrap ? chunks(line.text,body) : [line.text.slice(0,body)];
+      parts.forEach((text,part) => rows.push({ line:line.id, part, text, kind:line.kind, old:part ? null:line.old, next:part ? null:line.next }));
+    }
+    return rows;
+  }
+
+  function projectSideBySide(state) {
+    const source=visibleLines(state), pairs=[];
+    for (let i=0;i<source.length;i++) {
+      const line=source[i];
+      if (line.fold) { pairs.push({ id:'FOLD', fold:true, left:null, right:null }); continue; }
+      if (line.kind==='removed' && source[i+1]?.kind==='added') pairs.push({ id:line.id+'+'+source[i+1].id, left:line, right:source[++i] });
+      else pairs.push({ id:line.id, left:line.kind==='added'?null:line, right:line.kind==='removed'?null:line });
+    }
+    const half=Math.max(10,Math.floor((state.width-1)/2)), body=Math.max(5,half-6), rows=[];
+    for (const pair of pairs) {
+      if (pair.fold) { rows.push({line:'FOLD',part:0,fold:true,text:'... 18 unchanged Lines ...',kind:'context'}); continue; }
+      const left=pair.left ? (state.wrap?chunks(pair.left.text,body):[pair.left.text.slice(0,body)]) : [];
+      const right=pair.right ? (state.wrap?chunks(pair.right.text,body):[pair.right.text.slice(0,body)]) : [];
+      const count=Math.max(left.length,right.length,1);
+      for(let part=0;part<count;part++) rows.push({ line:pair.id, semantic:[pair.left?.id,pair.right?.id].filter(Boolean), part, left:left[part]??'', right:right[part]??'', leftNo:part?null:pair.left?.old, rightNo:part?null:pair.right?.next, kind:pair.right?.kind??pair.left?.kind??'context' });
+    }
+    return rows;
+  }
+
+  const project = state => state.layout==='unified' ? projectUnified(state) : projectSideBySide(state);
+  const rowLines = row => row.semantic ?? [row.line];
+  function cursorIndex(state, rows) {
+    let i=rows.findIndex(r => rowLines(r).includes(state.cursor.line) && r.part===state.cursor.part);
+    if (i<0) i=rows.findIndex(r => rowLines(r).includes(state.cursor.line));
+    return i<0?0:i;
+  }
+  function selectedLines(state, rows) {
+    if (!state.mark) return [];
+    const a=rows.findIndex(r=>rowLines(r).includes(state.mark));
+    const b=cursorIndex(state,rows), lo=Math.min(a,b), hi=Math.max(a,b), ids=[];
+    rows.slice(Math.max(0,lo),hi+1).forEach(r=>rowLines(r).forEach(id=>{ if(id!=='FOLD'&&!ids.includes(id)) ids.push(id); }));
+    return ids;
+  }
+
+  function move(state, delta) {
+    const rows=project(state), at=cursorIndex(state,rows);
+    if(state.navigation==='visual') {
+      const target=rows[Math.max(0,Math.min(rows.length-1,at+delta))];
+      const line=rowLines(target).find(id=>id!=='FOLD')??target.line;
+      return {...state,cursor:{line,part:target.part},last:'Moved by one visual row.'};
+    }
+    const semantic=[];
+    rows.forEach(r=>rowLines(r).forEach(id=>{if(!semantic.includes(id))semantic.push(id)}));
+    const current=semantic.indexOf(state.cursor.line), line=semantic[Math.max(0,Math.min(semantic.length-1,current+delta))];
+    return {...state,cursor:{line,part:0},last:'Moved by one semantic Diff Line; continuation rows were skipped.'};
+  }
+
+  function reduce(state, action) {
+    switch(action.type) {
+      case 'up': return move(state,-1);
+      case 'down': return move(state,1);
+      case 'select': return {...state,mark:state.mark?null:state.cursor.line,last:state.mark?'Selection cleared.':'Selection started on the current Diff Line.'};
+      case 'comment': return {...state,anchor:state.cursor.line==='FOLD'?null:state.cursor.line,last:state.cursor.line==='FOLD'?'A Fold cannot receive an Anchor.':'Comment Anchor uses the semantic Diff Line, not the continuation.'};
+      case 'resize': return {...state,width:state.width===74?48:74,cursor:{...state.cursor,part:0},last:'Reprojected at a new width; semantic state stayed stable.'};
+      case 'fold': return {...state,foldOpen:!state.foldOpen,last:'Fold projection changed; its identity stayed FOLD.'};
+      case 'layout': return {...state,layout:action.value,cursor:{line:'L40',part:0},last:`Changed to ${action.value} Layout.`};
+      case 'wrap': return {...state,wrap:action.value,cursor:{...state.cursor,part:0},last:action.value?'Wrapping enabled.':'Current clipped presentation restored.'};
+      case 'navigation': return {...state,navigation:action.value,cursor:{...state.cursor,part:0},last:`${action.value==='line'?'Semantic-Line':'Visual-row'} navigation selected.`};
+      case 'reset': return initial();
+    }
+    return state;
+  }
+  return { initial, reduce, project, selectedLines, rowLines, cursorIndex };
+})();
+
+let state=WrappingModel.initial();
+const scenarios=[
+  {name:'Long Unified Line', text:'Compare how many j presses it takes to leave a wrapped Line. Then start a Selection and resize. Watch that the selected Diff Lines do not change.', actions:[['wrap',true],['layout','unified'],['navigation','visual'],['select'],['down'],['resize']]},
+  {name:'Unequal SideBySide', text:'A matched old/new pair can wrap to different heights. Empty continuation cells preserve the center divider and pair alignment.', actions:[['wrap',true],['layout','side_by_side'],['navigation','visual'],['down'],['down'],['comment']]},
+  {name:'Fold and clipping', text:'Wrapping affects Diff Lines only. A Fold remains one row. Disabling wrapping restores clipping without changing its expansion state.', actions:[['fold'],['down'],['wrap',false],['resize']]}
+];
+let activeScenario=0, step=0;
+
+function dispatch(action){ state=WrappingModel.reduce(state,action); render(); }
+function esc(s){return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');}
+function no(n){return n==null?'    ':String(n).padStart(4,' ');}
+function render(){
+  const rows=WrappingModel.project(state), cursor=WrappingModel.cursorIndex(state,rows), selected=WrappingModel.selectedLines(state,rows);
+  document.querySelector('#terminal').innerHTML=rows.map((row,i)=>{
+    const classes=['row',row.kind??'context',i===cursor?'cursor':'',WrappingModel.rowLines(row).some(x=>selected.includes(x))?'selected':''].join(' ');
+    if(row.fold) return `<span class="${classes}"><span class="gutter">         </span>${esc(row.text)}</span>`;
+    if(state.layout==='unified') return `<span class="${classes}"><span class="gutter">${no(row.old)} ${no(row.next)} </span>${row.part?'<span class="continuation">↳ </span>':''}${esc(row.text)}</span>`;
+    const half=Math.max(10,Math.floor((state.width-1)/2)), left=`${no(row.leftNo)} ${row.part?'↳ ':''}${row.left}`, right=`${no(row.rightNo)} ${row.part?'↳ ':''}${row.right}`;
+    return `<span class="${classes}">${esc(left.padEnd(half).slice(0,half))}<span class="divider">│</span>${esc(right.padEnd(half).slice(0,half))}</span>`;
+  }).join('');
+  const choices=[['Layout','unified','Unified'],['Layout','side_by_side','SideBySide'],['Wrap',true,'Wrap on'],['Wrap',false,'Clip'],['Navigation','line','Line navigation'],['Navigation','visual','Visual navigation']];
+  document.querySelector('#choices').innerHTML=choices.map(([type,value,label])=>`<button class="${state[type.toLowerCase()]===value?'active':''}" data-choice="${type.toLowerCase()}" data-value="${value}">${label}</button>`).join('');
+  document.querySelectorAll('[data-choice]').forEach(b=>b.onclick=()=>dispatch({type:b.dataset.choice,value:b.dataset.value==='true'?true:b.dataset.value==='false'?false:b.dataset.value}));
+  document.querySelector('#state').innerHTML=[['Layout',state.layout],['Presentation',state.wrap?'wrapped':'clipped'],['Navigation unit',state.navigation],['DiffPane width',state.width+' cells'],['Cursor',state.cursor.line+' / visual part '+state.cursor.part],['Selection',selected.join(', ')||'none'],['Comment Anchor',state.anchor||'none'],['Fold',state.foldOpen?'expanded':'collapsed'],['Visual rows',rows.length]].map(([a,b])=>`<dt>${a}</dt><dd>${esc(String(b))}</dd>`).join('');
+  document.querySelector('#change').textContent=state.last;
+  renderScenario();
+}
+document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>dispatch({type:b.dataset.action}));
+function renderScenario(){
+  document.querySelector('#tabs').innerHTML=scenarios.map((x,i)=>`<button class="${i===activeScenario?'active':''}" data-tab="${i}">${x.name}</button>`).join('');
+  document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{activeScenario=Number(b.dataset.tab);step=0;state=WrappingModel.initial();render();});
+  const s=scenarios[activeScenario]; document.querySelector('#scenarioText').textContent=s.text;
+  document.querySelector('#steps').innerHTML=s.actions.map((a,i)=>`<button class="step" data-step="${i}" ${i!==step?'disabled':''}>${i+1}. ${a[0]} ${a[1]??''}</button>`).join('');
+  const next=document.querySelector(`[data-step="${step}"]`); if(next) next.onclick=()=>{const a=s.actions[step++];dispatch({type:a[0],value:a[1]});};
+}
+render();
+</script>
+</body>
+</html>
