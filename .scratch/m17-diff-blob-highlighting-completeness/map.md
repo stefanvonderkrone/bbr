@@ -18,6 +18,7 @@ An implementation-ready M17 specification and dependency map that resolves Diff,
 
 - [Define the binary File and placeholder contract](issues/01-define-binary-file-and-placeholder-contract.md) — classify RawDiff binary stubs at File level and invalid UTF-8 per side; preserve usable text, suppress unsafe enrichment and anchors, and render explicit status placeholders.
 - [Define removed-File enrichment and blob validation](issues/02-define-removed-file-old-side-and-blob-validation.md) — use destination commit plus old path for removed content, normalize and encode RawDiff paths, preserve typed per-side failures, splice old-side WholeFile Lines, and keep live metadata checks opt-in.
+- [Choose side-by-side line matching](issues/03-choose-side-by-side-line-matching.md) — use deterministic order-preserving dynamic matching with symmetric token similarity, a 50% pair threshold, explicit gaps, and unchanged Diff and Anchor identity.
 
 ## Not yet specified
 
