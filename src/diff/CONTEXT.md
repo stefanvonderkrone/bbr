@@ -17,6 +17,10 @@ _Avoid_: changeset, patch.
 One changed path within a Diff, carrying distinct old/new paths, its change status (added / modified / removed / renamed), and its Hunks. Old-side Anchors match the old path and new-side Anchors match the new path; the displayed path is the surviving side, or the old path for a removed File. Full old/new file text is fetched lazily and held in a Session-side table index-aligned with the Files.
 _Avoid_: buffer (that's the render-side term), document, blob.
 
+**File Content Status**:
+The per-side state of File content: `text`, `binary`, or `unavailable`, with optional byte size. A RawDiff binary stub marks the File binary; invalid UTF-8 makes only the affected side unavailable. Binary and unavailable content is not fetched, Highlighted, or an Anchor target.
+_Avoid_: blob status, file type.
+
 **Hunk**:
 A contiguous region of change plus its surrounding context lines, as delimited by Bitbucket's diff. Carries the old/new starting line numbers.
 _Avoid_: chunk, block, section.
@@ -24,6 +28,10 @@ _Avoid_: chunk, block, section.
 **Line**:
 A single row of the model: `{ old_no, new_no, kind, text, in_hunk }`. Either `old_no` or `new_no` is absent depending on `kind`. `in_hunk` is true for a Line from the fetched diff (a Hunk line) and false for a `context` line synthesized from the file blob to fill the gaps in the WholeFile view — **only Hunk lines are Anchor targets**, so a blob-sourced line never captures a comment or Draft.
 _Avoid_: row (that's a screen coordinate).
+
+**Status Placeholder**:
+A Presentation row for binary or unavailable File content. It shows the side status and known byte size, but is not a Hunk Line and cannot receive an Anchor, Selection, Fold, or Highlighting.
+_Avoid_: error row, binary line.
 
 **LineKind**:
 What happened to a Line: `context` (unchanged, present on both sides), `added` (green), or `removed` (red).
