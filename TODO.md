@@ -223,6 +223,10 @@ File to inherit an obsolete read decision.
 - [ ] Preserve matching read state across quit/reopen, PullRequest switching, Session replacement, and LocalReview Ref refresh. Keep receipts isolated by full ReviewIdentity so equal paths or PullRequestIds in different Reviews never share progress.
 - [ ] Add fingerprint fixtures and fake/SQLite round-trip tests, plus Presentation coverage for initial bold styling, successful and failed toggles, unchanged reload retention, selective invalidation when only one File changes, rename/removal/binary cases, storage failure fallback, and ReviewIdentity isolation.
 
+## M23 — Comment thread presentation fixes  ·  S  ·  needs M15
+- [ ] Indent each Reply one level deeper than its parent, including when the parent is a Reply. Add Presentation coverage for nested Replies.
+- [ ] Preserve Markdown emoji shortcodes in ReviewBody text. Presentation must render text such as `:white_check_mark:` without removing characters between the colons. Add parser and Presentation coverage.
+
 ### Closed historical deferrals
 
 The following notes remain in M0–M14 as implementation history but require no post-M14 work:
@@ -249,11 +253,12 @@ M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M10    (authoring → submission)
               ├─ M3 ─ M6 ─ M14 ─ M18 (local-review expansion)
               ├─ M14 ─ M19       (operational hardening & product gates)
               ├─ M15 ─ M17 ─ M20 ─ M21 (side-aware inspection → review search)
-              └─ M15 ─ M17 ─ M22 (durable File read state)
+              ├─ M15 ─ M17 ─ M22 (durable File read state)
+              └─ M15 ─ M23       (comment thread presentation fixes)
 ```
 
 **MVP line:** M0–M3 gives a usable read-only reviewer; M4 makes it ergonomic; M6+M10 make it
 write-capable (the headline). M5/M7/M8/M9/M11/M12/M13 are parallelizable polish once M2 lands; M14 is the
-largest standalone feature and depends only on read + authoring, not submission. M15–M22 gather
+largest standalone feature and depends only on read + authoring, not submission. M15–M23 gather
 all still-actionable follow-ups recorded by the completed milestones, design open questions,
 ADRs, domain docs, and the local issue tracker.
