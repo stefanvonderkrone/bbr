@@ -6,6 +6,7 @@ zig-pkg/
 # Local secrets — never commit. Source into your shell: set -a; source .env; set +a
 .env
 test.sh
+bbr-submit-response.log
 
 # Editor / OS
 .DS_Store

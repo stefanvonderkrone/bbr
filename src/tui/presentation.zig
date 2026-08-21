@@ -4714,7 +4714,27 @@ pub const Presentation = struct {
                 } });
                 self.action_error = null;
             },
-            .check, .post => self.queueDuplicateCheck(durable),
+            .post => |post| {
+                if (durable.recovered) {
+                    self.queueDuplicateCheck(durable);
+                    return;
+                }
+                const draft = durable.review.getConst(post.temp_id) orelse {
+                    durable.phase = .recovery_check_paused;
+                    self.action_error = .recovery_check_failed;
+                    return;
+                };
+                const command = PostDraft.create(self.allocator, durable.key, draft.*, post) catch {
+                    durable.phase = .recovery_check_paused;
+                    self.action_error = .out_of_memory;
+                    return;
+                };
+                command.operation_id = durable.operation_id;
+                durable.phase = .post_queued;
+                self.commands.appendAssumeCapacity(.{ .post_draft = command });
+                self.action_error = null;
+            },
+            .check => self.queueDuplicateCheck(durable),
             else => {
                 durable.phase = .recovery_check_paused;
                 self.action_error = .recovery_check_failed;
@@ -10291,6 +10311,29 @@ test "current-source recovery checks publication before resuming with a new POST
     const wait = presentation.takeCommand().?.wait_submission;
     try testing.expectEqual(@as(u64, 1_000), wait.ms);
     try presentation.dispatch(.{ .submission_wait_completed = wait });
+    var post = presentation.takeCommand().?;
+    defer post.deinit();
+    try testing.expect(post == .post_draft);
+    try testing.expectEqual(@as(bbr.review.TempId, 1), post.post_draft.draft.local_id);
+}
+
+test "current-source check sends a fresh Submission directly to POST" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 7);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "fresh" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+        .require_source_check = true,
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 7, 'a') } });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .submit });
+    const source_check = presentation.takeCommand().?.check_recovery;
+    try presentation.dispatch(recoveryCheckSucceeded(source_check.command_id, source_check.operation_id, null, "source"));
     var post = presentation.takeCommand().?;
     defer post.deinit();
     try testing.expect(post == .post_draft);

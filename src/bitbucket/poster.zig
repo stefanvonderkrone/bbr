@@ -62,6 +62,7 @@ pub const Poster = struct {
         };
         const attempt = self.client.createCommentAttempt(self.allocator, self.repo_slug, self.pr_id, nc) catch |err| switch (err) {
             error.OutOfMemory => return err,
+            error.MalformedResponse => return .{ .outcome = .{ .rejected = error.MalformedResponse } },
             // Any other error is a transport failure before a response arrived:
             // the POST may or may not have landed → ambiguous (dedupe on retry).
             else => return .{ .outcome = .ambiguous },
@@ -171,6 +172,14 @@ test "post maps a transport failure to .ambiguous" {
     var p = Poster{ .client = testClient(&fake), .allocator = a, .repo_slug = "myrepo", .pr_id = 7 };
     const outcome = try p.poster().post(.{ .local_id = 1, .kind = .comment, .body = "hi" }, null);
     try testing.expect(outcome.outcome == .ambiguous);
+}
+
+test "post maps a malformed 2xx response to a definite failure" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 201, .body = "{}" };
+    var p = Poster{ .client = testClient(&fake), .allocator = a, .repo_slug = "myrepo", .pr_id = 7 };
+    const outcome = try p.poster().post(.{ .local_id = 1, .kind = .comment, .body = "hi" }, null);
+    try testing.expectEqual(ApiError.MalformedResponse, outcome.outcome.rejected);
 }
 
 test "findExisting returns the id of a matching comment (dedupe)" {

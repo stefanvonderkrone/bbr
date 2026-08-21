@@ -38,7 +38,17 @@ pub const StdHttpClient = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable: HttpClient.VTable = .{ .send = send };
+    const vtable: HttpClient.VTable = .{ .send = sendLogged };
+
+    fn sendLogged(ptr: *anyopaque, allocator: Allocator, req: Request) anyerror!Response {
+        return send(ptr, allocator, req) catch |err| {
+            if (isSubmissionRequest(req)) {
+                const self: *StdHttpClient = @ptrCast(@alignCast(ptr));
+                writeSubmitError(self.inner.io, .cwd(), req.method, req.url, err) catch {};
+            }
+            return err;
+        };
+    }
 
     fn send(ptr: *anyopaque, allocator: Allocator, req: Request) anyerror!Response {
         const self: *StdHttpClient = @ptrCast(@alignCast(ptr));
@@ -84,9 +94,13 @@ pub const StdHttpClient = struct {
             else => |e| return e,
         };
 
+        const response_body = try body.toOwnedSlice();
+        if (isSubmissionRequest(req))
+            writeSubmitResponse(self.inner.io, .cwd(), req.method, req.url, status, response_body) catch {};
+
         return .{
             .status = status,
-            .body = try body.toOwnedSlice(),
+            .body = response_body,
             .retry_after_ms = retry_after_ms,
         };
     }
@@ -100,6 +114,50 @@ pub const StdHttpClient = struct {
         };
     }
 };
+
+fn isSubmissionRequest(req: Request) bool {
+    return std.mem.indexOf(u8, req.url, "/comments") != null and (req.method == .POST or req.method == .GET);
+}
+
+fn methodName(method: client.Method) []const u8 {
+    return switch (method) {
+        .GET => "GET",
+        .POST => "POST",
+        .PUT => "PUT",
+        .DELETE => "DELETE",
+    };
+}
+
+fn writeSubmitResponse(io: Io, dir: Io.Dir, method: client.Method, url: []const u8, status: u16, body: []const u8) !void {
+    var file = try dir.createFile(io, "bbr-submit-response.log", .{ .truncate = false, .lock = .exclusive, .permissions = @enumFromInt(0o600) });
+    defer file.close(io);
+    var offset = try file.length(io);
+    try appendLog(file, io, &offset, methodName(method));
+    try appendLog(file, io, &offset, " ");
+    try appendLog(file, io, &offset, url);
+    var status_buffer: [32]u8 = undefined;
+    const status_line = try std.fmt.bufPrint(&status_buffer, "\nstatus: {d}\n", .{status});
+    try appendLog(file, io, &offset, status_line);
+    try appendLog(file, io, &offset, body);
+    try appendLog(file, io, &offset, "\n");
+}
+
+fn writeSubmitError(io: Io, dir: Io.Dir, method: client.Method, url: []const u8, err: anyerror) !void {
+    var file = try dir.createFile(io, "bbr-submit-response.log", .{ .truncate = false, .lock = .exclusive, .permissions = @enumFromInt(0o600) });
+    defer file.close(io);
+    var offset = try file.length(io);
+    try appendLog(file, io, &offset, methodName(method));
+    try appendLog(file, io, &offset, " ");
+    try appendLog(file, io, &offset, url);
+    try appendLog(file, io, &offset, "\ntransport error: ");
+    try appendLog(file, io, &offset, @errorName(err));
+    try appendLog(file, io, &offset, "\n");
+}
+
+fn appendLog(file: Io.File, io: Io, offset: *u64, bytes: []const u8) !void {
+    try file.writePositionalAll(io, bytes, offset.*);
+    offset.* += bytes.len;
+}
 
 fn retryAfterFromHead(head: http.Client.Response.Head, now_seconds: i64) ?u64 {
     var headers = head.iterateHeaders();
@@ -199,4 +257,18 @@ test "Retry-After header matching is case-insensitive" {
         "HTTP/1.1 503 Service Unavailable\r\nrEtRy-AfTeR: 7\r\ncontent-length: 0\r\n\r\n",
     );
     try std.testing.expectEqual(@as(?u64, 7_000), retryAfterFromHead(head, 0));
+}
+
+test "Comment POST response is written to the submit response log" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeSubmitResponse(std.testing.io, tmp.dir, .POST, "https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/1/comments", 201, "{\"id\":42}");
+    try writeSubmitResponse(std.testing.io, tmp.dir, .GET, "https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/1/comments?page=2", 200, "{\"values\":[]}");
+    const logged = try tmp.dir.readFileAlloc(std.testing.io, "bbr-submit-response.log", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(logged);
+    try std.testing.expectEqualStrings(
+        "POST https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/1/comments\nstatus: 201\n{\"id\":42}\nGET https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/1/comments?page=2\nstatus: 200\n{\"values\":[]}\n",
+        logged,
+    );
 }
