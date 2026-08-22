@@ -20,6 +20,7 @@ An implementation-ready M17 specification and dependency map that resolves Diff,
 - [Define removed-File enrichment and blob validation](issues/02-define-removed-file-old-side-and-blob-validation.md) — use destination commit plus old path for removed content, normalize and encode RawDiff paths, preserve typed per-side failures, splice old-side WholeFile Lines, and keep live metadata checks opt-in.
 - [Choose side-by-side line matching](issues/03-choose-side-by-side-line-matching.md) — use deterministic order-preserving dynamic matching with symmetric token similarity, a 50% pair threshold, explicit gaps, and unchanged Diff and Anchor identity.
 - [Define the DiffPane line-wrapping contract](issues/04-define-diff-line-wrapping-contract.md) — wrap decorated Diff Lines into navigable visual rows, preserve semantic Selection and Anchors, independently balance SideBySide continuations, and keep clipping as the launch default.
+- [Decide whether Diffstat has a concrete consumer](issues/05-decide-diffstat-consumer-or-close-deferral.md) — close the obsolete deferral: M17 has no Diffstat consumer, and any future change totals must start as a source-neutral Diff summary.
 
 ## Not yet specified
 
