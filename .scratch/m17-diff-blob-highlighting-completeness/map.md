@@ -21,6 +21,7 @@ An implementation-ready M17 specification and dependency map that resolves Diff,
 - [Choose side-by-side line matching](issues/03-choose-side-by-side-line-matching.md) — use deterministic order-preserving dynamic matching with symmetric token similarity, a 50% pair threshold, explicit gaps, and unchanged Diff and Anchor identity.
 - [Define the DiffPane line-wrapping contract](issues/04-define-diff-line-wrapping-contract.md) — wrap decorated Diff Lines into navigable visual rows, preserve semantic Selection and Anchors, independently balance SideBySide continuations, and keep clipping as the launch default.
 - [Decide whether Diffstat has a concrete consumer](issues/05-decide-diffstat-consumer-or-close-deferral.md) — close the obsolete deferral: M17 has no Diffstat consumer, and any future change totals must start as a source-neutral Diff summary.
+- [Choose the File Enrichment prefetch policy](issues/06-choose-file-enrichment-prefetch-policy.md) — prefetch one remote successor only after explicit forward traversal; keep demand loading elsewhere, one speculative File maximum, and existing cache and Session Epoch rules.
 
 ## Not yet specified
 
