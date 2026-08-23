@@ -24,6 +24,7 @@ An implementation-ready M17 specification and dependency map that resolves Diff,
 - [Choose the File Enrichment prefetch policy](issues/06-choose-file-enrichment-prefetch-policy.md) — prefetch one remote successor only after explicit forward traversal; keep demand loading elsewhere, one speculative File maximum, and existing cache and Session Epoch rules.
 - [Define the tree-sitter query predicate contract](issues/07-define-tree-sitter-query-predicate-contract.md) — validate `#match?`, `#eq?`, and `#is-not? local` atomically, evaluate matches without losing fallback Captures, and prove behavior with exact predicate, locals, precedence, diagnostic, and cursor-loss fixtures.
 - [Decide whether to add a persistent File cache](issues/09-decide-persistent-file-cache.md) — keep File content and Highlighting Session-only; reconsider disk persistence only with measured cross-Session delay and a complete data-handling design.
+- [Choose the query regex engine](issues/11-choose-query-regex-engine.md) — use pinned RE2 through a C ABI wrapper, with one bounded UTF-8 dialect, atomic Grammar validation, and a Zig 0.16 smoke-test gate for each declared target.
 
 ## Not yet specified
 
