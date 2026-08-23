@@ -23,6 +23,7 @@ An implementation-ready M17 specification and dependency map that resolves Diff,
 - [Decide whether Diffstat has a concrete consumer](issues/05-decide-diffstat-consumer-or-close-deferral.md) — close the obsolete deferral: M17 has no Diffstat consumer, and any future change totals must start as a source-neutral Diff summary.
 - [Choose the File Enrichment prefetch policy](issues/06-choose-file-enrichment-prefetch-policy.md) — prefetch one remote successor only after explicit forward traversal; keep demand loading elsewhere, one speculative File maximum, and existing cache and Session Epoch rules.
 - [Define the tree-sitter query predicate contract](issues/07-define-tree-sitter-query-predicate-contract.md) — validate `#match?`, `#eq?`, and `#is-not? local` atomically, evaluate matches without losing fallback Captures, and prove behavior with exact predicate, locals, precedence, diagnostic, and cursor-loss fixtures.
+- [Decide whether to add a persistent File cache](issues/09-decide-persistent-file-cache.md) — keep File content and Highlighting Session-only; reconsider disk persistence only with measured cross-Session delay and a complete data-handling design.
 
 ## Not yet specified
 
