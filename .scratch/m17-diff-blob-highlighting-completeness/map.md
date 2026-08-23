@@ -26,10 +26,11 @@ An implementation-ready M17 specification and dependency map that resolves Diff,
 - [Define the UserGrammar lifecycle](issues/08-define-usergrammar-lifecycle.md) — install trusted local native bundles through a user-scoped CLI registry, activate deterministic GrammarMatch rules, validate and cache atomically, preserve BuiltInGrammar and plain-text fallback, and prove the workflow end to end.
 - [Decide whether to add a persistent File cache](issues/09-decide-persistent-file-cache.md) — keep File content and Highlighting Session-only; reconsider disk persistence only with measured cross-Session delay and a complete data-handling design.
 - [Choose the query regex engine](issues/11-choose-query-regex-engine.md) — use pinned RE2 through a C ABI wrapper, with one bounded UTF-8 dialect, atomic Grammar validation, and a Zig 0.16 smoke-test gate for each declared target.
+- [Define the integrated M17 contract](issues/10-define-integrated-m17-contract.md) — land independently correct slices, keep UserGrammar atomic, and require native macOS/Linux proof on x86_64 and aarch64 before integrated acceptance.
 
 ## Not yet specified
 
-- None. [Define the integrated M17 contract](issues/10-define-integrated-m17-contract.md) now owns the implementation slices, acceptance matrix, documentation, migration, configuration, and opt-in live checks.
+- None. The route to the implementation-ready M17 specification is complete.
 
 ## Out of scope
 
