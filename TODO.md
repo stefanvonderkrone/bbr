@@ -227,6 +227,69 @@ File to inherit an obsolete read decision.
 - [ ] Indent each Reply one level deeper than its parent, including when the parent is a Reply. Add Presentation coverage for nested Replies.
 - [ ] Preserve Markdown emoji shortcodes in ReviewBody text. Presentation must render text such as `:white_check_mark:` without removing characters between the colons. Add parser and Presentation coverage.
 
+## M24 - Remote-first Repository and PullRequest Browser  ·  L  ·  needs M4/M15
+Make `bbr` without arguments open a remote-first Browser for the configured Workspace. Keep direct
+PullRequest locators as fast entry points. Keep `bbr local` explicit and outside the Browser.
+
+The approved UX is one hierarchical Browser, comparable to a file manager. It shows Repositories
+and their open PullRequests in one navigable structure instead of adding unrelated full-screen
+choosers. Repository rows show Repository facts. PullRequest rows show review facts. This avoids
+putting an author or approval state on a Repository, where those values have no clear meaning.
+
+- [ ] Specify the Browser projection and Interaction Contexts before implementation: Repository hierarchy, expanded Repository, focused PullRequest, loading, empty, partial-failure, and stale-result states. Define keyboard and mouse parity through Actions and add Browser terms to the Presentation glossary.
+- [ ] Add paginated Bitbucket acquisition for every Repository the Credential can access in the configured Workspace. Do not hide Repositories with no open PullRequests; allow a filter for them if the full list is noisy.
+- [ ] Add paginated open-PullRequest acquisition per expanded Repository. Load on demand, retain usable Repository results when one request fails, and bound request concurrency to respect rate limits.
+- [ ] Cache Repository and PullRequest summaries for fast Browser startup. Scope cached data to the Workspace, show it immediately, refresh it in the background, and remove entries that the refreshed result no longer permits or contains.
+- [ ] Define summary models that contain only Browser data. A Repository row shows name, slug, and Repository update time. Show its open-PullRequest count only after that Repository's PullRequests load; show an unknown state before then. A PullRequest row shows id, title, author, updated time, source and destination branches, approval count, and changes-requested count.
+- [ ] Sort Repositories by Repository update time and PullRequests by PullRequest update time by default. Provide stable name and id sorts without changing the selected item.
+- [ ] Selecting a PullRequest prepares and publishes the existing review Session. Returning to the Browser must not discard its expanded Repository, selection, scroll position, or loaded summaries.
+- [ ] Replace no-argument WorkingCopy detection with Browser startup. Preserve explicit URL startup and the Repository plus PullRequestId pair for scripts and direct navigation. Decide whether `bbr detect` remains useful as a separate command.
+- [ ] Scope Repository and PullRequest loads with request identities and reject stale completions. Keep the terminal responsive while pages load and while a review Session is prepared.
+- [ ] Add deterministic Bitbucket pagination and Presentation tests for loading, expansion, selection, partial failures, stale completions, empty Workspaces, and return-state restoration. Add a live, credential-gated shape check for participant verdicts and Repository permissions.
+
+Do not remove LocalReview as part of this milestone. After the Browser has real usage, record an ADR
+that either keeps `bbr local` as an explicit secondary workflow or removes it with a migration plan
+for persisted local Drafts. Cancel M18 if that ADR removes LocalReview.
+
+## M25 - Browser navigation, finding, recents, and settings  ·  M/L  ·  needs M24
+Make the Browser and review Session feel like levels of one application, not separate launch modes.
+
+- [ ] Define hierarchical back and quit Actions. From a review Session, back returns to its Repository's PullRequest list. From that list, back returns to the Repository list. A separate global quit Action exits bbr from any Interaction Context.
+- [ ] Add direct Actions for the Repository list, the current Repository's PullRequest list, and the current review Session. Preserve each level's selection and scroll state when switching levels.
+- [ ] Replace the current PullRequest Picker with a Browser-aware Picker available from the Repository list, a PullRequest list, and a review Session. Repository-scoped finding remains the required baseline.
+- [ ] Measure cross-Repository PullRequest finding against live Workspace size, pagination cost, and rate limits. Add it only if bbr can search complete results without unbounded fan-out or misleading partial matches; otherwise keep Repository-scoped finding and show the scope in the Picker.
+- [ ] Persist a bounded recent-history list of opened Repositories and PullRequests. Show recent items before remote acquisition completes, verify access before opening them, and remove entries that no longer resolve.
+- [ ] Add a Settings Overlay only for settings that users need while bbr runs, such as Theme, Layout, Scope, mouse support, Browser sort, and Browser filter. Keep Credential management outside the TUI and show the config path and whether a restart is required.
+- [ ] Extend the help Overlay so each Interaction Context shows its available Actions, including back, direct navigation, finding, settings, and global quit.
+- [ ] Add Presentation integration coverage for every navigation path, state restoration, recent-item failures, Picker scope, settings persistence, and ActionAvailability.
+
+## M26 - Credential login and logout  ·  S/M  ·  needs M19
+Replace shell setup as the normal remote-review login flow. Keep Credential management outside the
+TUI and keep `bbr local` free of Credential reads.
+
+The baseline follows OpenCode: store one Bitbucket Credential as JSON at
+`$XDG_DATA_HOME/bbr/auth.json`, falling back to `$HOME/.local/share/bbr/auth.json`. OpenCode uses an
+XDG data file with mode `0600`. GitHub CLI prefers the system credential store and falls back to a
+plaintext file. bbr will use the portable file baseline first. A native credential-store adapter is
+not part of this milestone.
+
+- [ ] Add `bbr auth login`, `bbr auth status`, and `bbr auth logout`. Keep login, status, and logout under one `auth` command instead of adding top-level aliases.
+- [ ] Make `bbr auth login` read the Atlassian account email, API token, and Workspace interactively. Do not accept the API token as a command-line argument or display it. Permit standard input for non-interactive setup only through an explicit flag.
+- [ ] Validate the Credential against Bitbucket Cloud before saving it. Prove the Authenticated Account and access to the named Workspace. Report `unauthorized` and `forbidden` separately without printing request headers or response data that can contain the token.
+- [ ] Store a small JSON object containing `username`, `token`, and `workspace`. Create the parent directory with mode `0700`, write the file with mode `0600`, reject unsafe non-regular targets, and replace the file atomically so an interrupted login does not erase a valid Credential.
+- [ ] Resolve exactly one Credential source. A complete `BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, and `BITBUCKET_WORKSPACE` set overrides `auth.json` for automation. Reject a partial environment set instead of combining environment and file values. Missing both sources reports the `bbr auth login` command.
+- [ ] Make `bbr auth status` show the source, account email, Workspace, and validation result without showing the API token. Status must distinguish a stored Credential from an environment override.
+- [ ] Make `bbr auth logout` delete only `auth.json` and succeed when the file does not exist. Explain that logout does not revoke the Atlassian API token and cannot remove an environment override.
+- [ ] Keep Credential bytes out of logs, diagnostics, SQLite, config files, crash output, and test snapshots. Redact the value if an upstream error includes an Authorization header or token-bearing URL.
+- [ ] Update the Bitbucket glossary, README, startup diagnostics, and M19 token-rotation guidance when the behavior ships. Document token expiry and the minimum Bitbucket API-token scopes used by read, comment, and mutation operations.
+- [ ] Add hermetic tests for command parsing, hidden input, JSON round trips, precedence, partial environment failure, file modes, atomic replacement, unsafe targets, redaction, status output, idempotent logout, and `bbr local` isolation.
+
+Research checked 2026-08-23: [OpenCode CLI auth](https://opencode.ai/docs/cli/#auth),
+[OpenCode auth storage](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/auth/index.ts),
+[GitHub CLI login](https://cli.github.com/manual/gh_auth_login),
+[GitHub CLI logout](https://cli.github.com/manual/gh_auth_logout), and
+[Bitbucket Cloud authentication](https://developer.atlassian.com/cloud/bitbucket/rest/intro/#authentication).
+
 ### Closed historical deferrals
 
 The following notes remain in M0–M14 as implementation history but require no post-M14 work:
@@ -254,11 +317,13 @@ M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M10    (authoring → submission)
               ├─ M14 ─ M19       (operational hardening & product gates)
               ├─ M15 ─ M17 ─ M20 ─ M21 (side-aware inspection → review search)
               ├─ M15 ─ M17 ─ M22 (durable File read state)
-              └─ M15 ─ M23       (comment thread presentation fixes)
+              ├─ M15 ─ M23       (comment thread presentation fixes)
+              ├─ M4 ─ M15 ─ M24 ─ M25 (remote-first Browser and navigation)
+              └─ M19 ─ M26       (Credential login and logout)
 ```
 
 **MVP line:** M0–M3 gives a usable read-only reviewer; M4 makes it ergonomic; M6+M10 make it
 write-capable (the headline). M5/M7/M8/M9/M11/M12/M13 are parallelizable polish once M2 lands; M14 is the
-largest standalone feature and depends only on read + authoring, not submission. M15–M23 gather
+largest standalone feature and depends only on read + authoring, not submission. M15–M26 gather
 all still-actionable follow-ups recorded by the completed milestones, design open questions,
 ADRs, domain docs, and the local issue tracker.
