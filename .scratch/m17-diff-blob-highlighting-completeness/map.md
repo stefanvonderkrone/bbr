@@ -23,14 +23,13 @@ An implementation-ready M17 specification and dependency map that resolves Diff,
 - [Decide whether Diffstat has a concrete consumer](issues/05-decide-diffstat-consumer-or-close-deferral.md) — close the obsolete deferral: M17 has no Diffstat consumer, and any future change totals must start as a source-neutral Diff summary.
 - [Choose the File Enrichment prefetch policy](issues/06-choose-file-enrichment-prefetch-policy.md) — prefetch one remote successor only after explicit forward traversal; keep demand loading elsewhere, one speculative File maximum, and existing cache and Session Epoch rules.
 - [Define the tree-sitter query predicate contract](issues/07-define-tree-sitter-query-predicate-contract.md) — validate `#match?`, `#eq?`, and `#is-not? local` atomically, evaluate matches without losing fallback Captures, and prove behavior with exact predicate, locals, precedence, diagnostic, and cursor-loss fixtures.
+- [Define the UserGrammar lifecycle](issues/08-define-usergrammar-lifecycle.md) — install trusted local native bundles through a user-scoped CLI registry, activate deterministic GrammarMatch rules, validate and cache atomically, preserve BuiltInGrammar and plain-text fallback, and prove the workflow end to end.
 - [Decide whether to add a persistent File cache](issues/09-decide-persistent-file-cache.md) — keep File content and Highlighting Session-only; reconsider disk persistence only with measured cross-Session delay and a complete data-handling design.
 - [Choose the query regex engine](issues/11-choose-query-regex-engine.md) — use pinned RE2 through a C ABI wrapper, with one bounded UTF-8 dialect, atomic Grammar validation, and a Zig 0.16 smoke-test gate for each declared target.
 
 ## Not yet specified
 
-- The dependency-ordered implementation slices needed after the individual M17 decisions are closed.
-- The final acceptance matrix across remote/local DiffSource, binary and removed Files, Unified/SideBySide Layout, Changes/WholeFile Scope, File Enrichment, and UserGrammar failure paths.
-- Any follow-on changes revealed by the integrated M17 contract, including documentation, migration, configuration, and opt-in live checks.
+- None. [Define the integrated M17 contract](issues/10-define-integrated-m17-contract.md) now owns the implementation slices, acceptance matrix, documentation, migration, configuration, and opt-in live checks.
 
 ## Out of scope
 
@@ -40,3 +39,4 @@ An implementation-ready M17 specification and dependency map that resolves Diff,
 - Side-aware version inspection owned by M20.
 - Buffer and Review Search owned by M21.
 - Durable File Read Receipts owned by M22.
+- UserGrammar sandboxing; M17 documents trusted native execution, while M27 researches Wasm Grammars and confined helper processes.

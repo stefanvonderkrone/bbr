@@ -290,6 +290,18 @@ Research checked 2026-08-23: [OpenCode CLI auth](https://opencode.ai/docs/cli/#a
 [GitHub CLI logout](https://cli.github.com/manual/gh_auth_logout), and
 [Bitbucket Cloud authentication](https://developer.atlassian.com/cloud/bitbucket/rest/intro/#authentication).
 
+## M27 - UserGrammar sandbox research  ·  M  ·  needs M17
+Decide whether bbr can run a UserGrammar without giving its code bbr's memory and the user's
+permissions. M17 keeps trusted native UserGrammars in process. This milestone researches a safer
+replacement. It does not implement one before the evidence supports a design.
+
+- [ ] Define the threat model. Include File content, Credentials, environment variables, config and data files, process memory, network access, denial of service, and native-library initialization.
+- [ ] Evaluate Wasm Grammars with the current tree-sitter runtime. Verify the Grammar build format, Highlighting and query compatibility, memory and execution limits, supported targets, runtime dependency cost, and migration from M17 bundles.
+- [ ] Evaluate a helper process with native Grammars. Compare crash isolation with real confinement on Linux, macOS, and Windows. Identify which filesystem, network, process, and memory restrictions each supported target can enforce.
+- [ ] Build only the minimum prototypes needed to test feasibility. Measure install validation, first-use load, steady-state Highlighting, memory use, and failure containment against the M17 native baseline.
+- [ ] Test hostile fixtures for filesystem and network access, infinite work, excessive memory, crashes, malformed Spans, and protocol corruption. Do not call an unconfined helper process a sandbox.
+- [ ] Record the decision in an ADR. Specify the bundle and trust migration, target support, fallback behavior, and removal policy for native UserGrammars. If neither option gives useful confinement at acceptable cost, retain M17's explicit native-code warning.
+
 ### Closed historical deferrals
 
 The following notes remain in M0–M14 as implementation history but require no post-M14 work:
@@ -319,11 +331,12 @@ M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M10    (authoring → submission)
               ├─ M15 ─ M17 ─ M22 (durable File read state)
               ├─ M15 ─ M23       (comment thread presentation fixes)
               ├─ M4 ─ M15 ─ M24 ─ M25 (remote-first Browser and navigation)
-              └─ M19 ─ M26       (Credential login and logout)
+              ├─ M19 ─ M26       (Credential login and logout)
+              └─ M13 ─ M17 ─ M27 (UserGrammar sandbox research)
 ```
 
 **MVP line:** M0–M3 gives a usable read-only reviewer; M4 makes it ergonomic; M6+M10 make it
 write-capable (the headline). M5/M7/M8/M9/M11/M12/M13 are parallelizable polish once M2 lands; M14 is the
-largest standalone feature and depends only on read + authoring, not submission. M15–M26 gather
+largest standalone feature and depends only on read + authoring, not submission. M15–M27 gather
 all still-actionable follow-ups recorded by the completed milestones, design open questions,
 ADRs, domain docs, and the local issue tracker.

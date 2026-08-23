@@ -23,7 +23,7 @@ A Grammar installed and managed by the user for a file type bbr does not support
 _Avoid_: custom grammar, external grammar, plugin grammar.
 
 **GrammarMatch**:
-An ordered rule that selects a Grammar for a File: exact filename, compound suffix, simple extension, then shebang. The first match wins; conflicting rules are invalid unless a UserGrammar explicitly replaces a named BuiltInGrammar.
+An ordered rule that selects a Grammar for a File: exact filename, compound suffix, simple extension, then shebang. The first match wins. An active UserGrammar takes precedence over an overlapping BuiltInGrammar after installation reports the affected BuiltInGrammar; conflicts between UserGrammars are invalid.
 _Avoid_: file association, language detection, extension mapping.
 
 **Capture**:
