@@ -12,8 +12,9 @@
 pub const LineKind = enum { context, added, removed };
 
 /// A single row of the model. Exactly one of `old_no`/`new_no` is absent for a
-/// changed line; both are present for `context`. Line numbers are 1-based, as
-/// they appear in the file and in comment anchors.
+/// changed line. Hunk context has both; full-content context can have only the
+/// selected side when the other side does not exist. Line numbers are 1-based,
+/// as they appear in the file and in comment anchors.
 pub const Line = struct {
     old_no: ?u32,
     new_no: ?u32,

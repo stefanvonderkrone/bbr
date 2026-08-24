@@ -6281,6 +6281,7 @@ fn spanFromLines(lines: []const *const bbr.diff.Line, suggestion: bool) !AnchorS
     var all_new = true;
     var all_old = true;
     for (lines) |line| {
+        if (!line.in_hunk) return error.NotOnSource;
         if (line.new_no == null) all_new = false;
         if (line.old_no == null) all_old = false;
     }
@@ -6298,6 +6299,17 @@ fn spanFromLines(lines: []const *const bbr.diff.Line, suggestion: bool) !AnchorS
     }
     const last = lines[lines.len - 1].old_no.?;
     return if (lines.len == 1) .{ .from = last } else .{ .from = last, .start_from = lines[0].old_no.? };
+}
+
+test "full-content context Lines cannot become Anchors" {
+    const context: bbr.diff.Line = .{
+        .old_no = 1,
+        .new_no = null,
+        .kind = .context,
+        .text = "old context",
+        .in_hunk = false,
+    };
+    try testing.expectError(error.NotOnSource, spanFromLines(&.{&context}, false));
 }
 
 fn collectSelectedLines(

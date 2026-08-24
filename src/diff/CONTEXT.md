@@ -26,7 +26,7 @@ A contiguous region of change plus its surrounding context lines, as delimited b
 _Avoid_: chunk, block, section.
 
 **Line**:
-A single row of the model: `{ old_no, new_no, kind, text, in_hunk }`. Either `old_no` or `new_no` is absent depending on `kind`. `in_hunk` is true for a Line from the fetched diff (a Hunk line) and false for a `context` line synthesized from the file blob to fill the gaps in the WholeFile view — **only Hunk lines are Anchor targets**, so a blob-sourced line never captures a comment or Draft.
+A single row of the model: `{ old_no, new_no, kind, text, in_hunk }`. A changed Line has one side. Hunk context has both sides. Full-content context can have only the selected side when the other side does not exist. `in_hunk` is true for a Line from the fetched diff (a Hunk line) and false for a `context` line synthesized from the file blob to fill the gaps in the WholeFile view — **only Hunk lines are Anchor targets**, so a blob-sourced line never captures a comment or Draft.
 _Avoid_: row (that's a screen coordinate).
 
 **Status Placeholder**:
@@ -34,7 +34,7 @@ A Presentation row for binary or unavailable File content. It shows the side sta
 _Avoid_: error row, binary line.
 
 **LineKind**:
-What happened to a Line: `context` (unchanged, present on both sides), `added` (green), or `removed` (red).
+What happened to a Line: `context` (unchanged Hunk content or full-content gap), `added` (green), or `removed` (red). Hunk context is present on both sides. A full-content gap can exist only on the selected side.
 _Avoid_: unchanged (use `context`), insert/delete, type.
 
 **IntraLineSegment**:
