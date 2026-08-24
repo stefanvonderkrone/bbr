@@ -3,12 +3,12 @@
 //! model. Bitbucket's diff is the authoritative line model (ADR-0001), so the
 //! numbering this computes is what comment anchors point at.
 //!
-//! Zero-copy: every path, header, and line `text` borrows the `raw` slice, so
-//! `raw` must outlive the returned `Diff`. The parser allocates only the arrays
-//! that hold the model; callers pass an arena and free it wholesale.
+//! Headers and line text borrow `raw`. Git-quoted paths are decoded into the
+//! caller's allocator. Callers pass an arena and free the complete Diff there.
 
 const std = @import("std");
 const model = @import("model.zig");
+const git_path = @import("path.zig");
 
 const Diff = model.Diff;
 const File = model.File;
@@ -34,6 +34,8 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
     var have_file = false;
     var old_path: []const u8 = "";
     var new_path: []const u8 = "";
+    var old_path_valid = true;
+    var new_path_valid = true;
     var status: FileStatus = .modified;
     var binary = false;
     var binary_new_size: ?usize = null;
@@ -83,7 +85,7 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
                     .new_path = new_path,
                     .status = status,
                     .hunks = try hunks.toOwnedSlice(allocator),
-                    .content = fileContent(status, binary, binary_old_size, binary_new_size),
+                    .content = fileContent(status, binary, binary_old_size, binary_new_size, old_path_valid, new_path_valid),
                 });
                 hunks = .empty;
             }
@@ -94,11 +96,15 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
             binary_old_size = null;
             binary_block_count = 0;
             binary_expects_block = false;
+            old_path_valid = true;
+            new_path_valid = true;
             // Best-effort path guess from the `a/… b/…` operands; the `---`/`+++`
             // lines below refine it (and handle spaces/quoting more reliably).
-            const paths = parseGitPaths(line["diff --git ".len..]);
+            const paths = try parseGitPaths(allocator, line["diff --git ".len..]);
             old_path = paths.old;
             new_path = paths.new;
+            old_path_valid = paths.old_valid;
+            new_path_valid = paths.new_valid;
             continue;
         }
 
@@ -122,12 +128,16 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
                 continue;
             }
             if (std.mem.startsWith(u8, line, "--- ")) {
-                old_path = stripDiffPath(line["--- ".len..]);
+                const parsed_path = try normalizeDiffPath(allocator, line["--- ".len..]);
+                old_path = parsed_path.path;
+                old_path_valid = parsed_path.valid;
                 if (std.mem.eql(u8, old_path, "/dev/null")) status = .added;
                 continue;
             }
             if (std.mem.startsWith(u8, line, "+++ ")) {
-                new_path = stripDiffPath(line["+++ ".len..]);
+                const parsed_path = try normalizeDiffPath(allocator, line["+++ ".len..]);
+                new_path = parsed_path.path;
+                new_path_valid = parsed_path.valid;
                 if (std.mem.eql(u8, new_path, "/dev/null")) status = .removed;
                 continue;
             }
@@ -223,22 +233,26 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
             .new_path = new_path,
             .status = status,
             .hunks = try hunks.toOwnedSlice(allocator),
-            .content = fileContent(status, binary, binary_old_size, binary_new_size),
+            .content = fileContent(status, binary, binary_old_size, binary_new_size, old_path_valid, new_path_valid),
         });
     }
 
     return .{ .files = try files.toOwnedSlice(allocator) };
 }
 
-fn fileContent(status: FileStatus, binary: bool, old_size: ?usize, new_size: ?usize) model.FileContent {
+fn fileContent(status: FileStatus, binary: bool, old_size: ?usize, new_size: ?usize, old_path_valid: bool, new_path_valid: bool) model.FileContent {
     const old: ?model.FileContentStatus = if (status == .added)
         null
+    else if (!old_path_valid)
+        .{ .unavailable = .{ .reason = .invalid_path } }
     else if (binary)
         .{ .binary = old_size }
     else
         .{ .text = null };
     const new: ?model.FileContentStatus = if (status == .removed)
         null
+    else if (!new_path_valid)
+        .{ .unavailable = .{ .reason = .invalid_path } }
     else if (binary)
         .{ .binary = new_size }
     else
@@ -246,19 +260,61 @@ fn fileContent(status: FileStatus, binary: bool, old_size: ?usize, new_size: ?us
     return .{ .old = old, .new = new };
 }
 
-const GitPaths = struct { old: []const u8, new: []const u8 };
+const GitPaths = struct { old: []const u8, new: []const u8, old_valid: bool, new_valid: bool };
 
 /// Extract `old`/`new` from the `a/… b/…` operands of a `diff --git` line.
 /// Best-effort: assumes no spaces in the (unquoted) common case, splitting on
 /// the midpoint " b/". Refined by the `---`/`+++` lines when present.
-fn parseGitPaths(operands: []const u8) GitPaths {
-    // Find " b/" that separates the two operands.
-    if (std.mem.indexOf(u8, operands, " b/")) |sep| {
-        const a = operands[0..sep];
-        const b = operands[sep + 1 ..];
-        return .{ .old = stripPrefix(a, "a/"), .new = stripPrefix(b, "b/") };
+fn parseGitPaths(allocator: std.mem.Allocator, operands: []const u8) std.mem.Allocator.Error!GitPaths {
+    const first = parseGitOperand(operands, 0) orelse return invalidGitPaths(operands);
+    const second = parseGitOperand(operands, first.next) orelse return invalidGitPaths(operands);
+    if (std.mem.trim(u8, operands[second.next..], " ").len != 0) return invalidGitPaths(operands);
+    const old = try normalizeGitOperand(allocator, first.value, "a/");
+    const new = try normalizeGitOperand(allocator, second.value, "b/");
+    return .{ .old = old.path, .new = new.path, .old_valid = old.valid, .new_valid = new.valid };
+}
+
+const GitOperand = struct { value: []const u8, next: usize };
+
+fn parseGitOperand(input: []const u8, start: usize) ?GitOperand {
+    var begin = start;
+    while (begin < input.len and input[begin] == ' ') begin += 1;
+    if (begin == input.len) return null;
+    if (input[begin] != '"') {
+        const end = std.mem.findScalarPos(u8, input, begin, ' ') orelse input.len;
+        return .{ .value = input[begin..end], .next = end };
     }
-    return .{ .old = operands, .new = operands };
+    var escaped = false;
+    for (input[begin + 1 ..], begin + 1..) |byte, index| {
+        if (!escaped and byte == '"') return .{ .value = input[begin .. index + 1], .next = index + 1 };
+        if (!escaped and byte == '\\') {
+            escaped = true;
+        } else {
+            escaped = false;
+        }
+    }
+    return null;
+}
+
+fn normalizeGitOperand(allocator: std.mem.Allocator, operand: []const u8, prefix: []const u8) std.mem.Allocator.Error!ParsedPath {
+    if (operand.len > 0 and operand[0] == '"') return normalizePathOrOriginal(allocator, operand);
+    const stripped = stripPrefix(operand, prefix);
+    return .{ .path = stripped, .valid = git_path.isRepositoryRelative(stripped) };
+}
+
+fn invalidGitPaths(operands: []const u8) GitPaths {
+    return .{ .old = operands, .new = operands, .old_valid = false, .new_valid = false };
+}
+
+const ParsedPath = struct { path: []const u8, valid: bool };
+
+fn normalizePathOrOriginal(allocator: std.mem.Allocator, path: []const u8) std.mem.Allocator.Error!ParsedPath {
+    return if (git_path.normalize(allocator, path)) |normalized|
+        .{ .path = normalized, .valid = true }
+    else |err| switch (err) {
+        error.InvalidPath => .{ .path = path, .valid = false },
+        error.OutOfMemory => error.OutOfMemory,
+    };
 }
 
 /// Strip the `a/` or `b/` prefix and drop a trailing tab-delimited timestamp
@@ -271,6 +327,12 @@ fn stripDiffPath(rest: []const u8) []const u8 {
     path = stripPrefix(path, "a/");
     path = stripPrefix(path, "b/");
     return path;
+}
+
+fn normalizeDiffPath(allocator: std.mem.Allocator, rest: []const u8) std.mem.Allocator.Error!ParsedPath {
+    const stripped = stripDiffPath(rest);
+    if (std.mem.eql(u8, stripped, "/dev/null")) return .{ .path = stripped, .valid = true };
+    return normalizePathOrOriginal(allocator, stripped);
 }
 
 fn stripPrefix(s: []const u8, prefix: []const u8) []const u8 {
@@ -389,6 +451,47 @@ test "single modified file, one hunk, numbers assigned per kind" {
     try testing.expectEqual(LineKind.context, hunk.lines[4].kind);
     try testing.expectEqual(@as(?u32, 3), hunk.lines[4].old_no);
     try testing.expectEqual(@as(?u32, 4), hunk.lines[4].new_no);
+}
+
+test "Git-quoted paths are normalized in File identity" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const diff = try parseInArena(&arena, "diff --git \"a/src/old\\040name.txt\" \"b/src/new\\040name.txt\"\n" ++
+        "similarity index 90%\n" ++
+        "rename from src/old name.txt\n" ++
+        "rename to src/new name.txt\n" ++
+        "--- \"a/src/old\\040name.txt\"\n" ++
+        "+++ \"b/src/new\\040name.txt\"\n" ++
+        "@@ -1 +1 @@\n-old\n+new\n");
+    try testing.expectEqualStrings("src/old name.txt", diff.files[0].old_path);
+    try testing.expectEqualStrings("src/new name.txt", diff.files[0].new_path);
+}
+
+test "malformed quoted paths make File content unavailable" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const diff = try parseInArena(&arena, "diff --git a/file.txt b/file.txt\n" ++
+        "--- \"a/unterminated\n" ++
+        "+++ b/file.txt\n" ++
+        "@@ -1 +1 @@\n-old\n+new\n");
+    try testing.expect(diff.files[0].content.old.? == .unavailable);
+    try testing.expect(diff.files[0].content.old.?.unavailable.reason == .invalid_path);
+    try testing.expect(diff.files[0].content.new.? == .text);
+}
+
+test "mixed Git quoting preserves pure-rename File identity" {
+    const cases = [_]struct { operands: []const u8, old: []const u8, new: []const u8 }{
+        .{ .operands = "\"a/old\\040name.txt\" b/new.txt", .old = "old name.txt", .new = "new.txt" },
+        .{ .operands = "a/old.txt \"b/new\\040name.txt\"", .old = "old.txt", .new = "new name.txt" },
+    };
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const raw = try std.fmt.allocPrint(arena.allocator(), "diff --git {s}\nsimilarity index 100%\nrename from {s}\nrename to {s}\n", .{ case.operands, case.old, case.new });
+        const diff = try parseInArena(&arena, raw);
+        try testing.expectEqualStrings(case.old, diff.files[0].old_path);
+        try testing.expectEqualStrings(case.new, diff.files[0].new_path);
+    }
 }
 
 test "added file: /dev/null old side, status added" {

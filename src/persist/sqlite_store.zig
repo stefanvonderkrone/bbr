@@ -1467,7 +1467,9 @@ fn apiErrorFromName(name: []const u8) ApiError {
     const table = [_]struct { n: []const u8, e: ApiError }{
         .{ .n = "Unauthorized", .e = error.Unauthorized },
         .{ .n = "Forbidden", .e = error.Forbidden },
+        .{ .n = "BadRequest", .e = error.BadRequest },
         .{ .n = "NotFound", .e = error.NotFound },
+        .{ .n = "Conflict", .e = error.Conflict },
         .{ .n = "RateLimited", .e = error.RateLimited },
         .{ .n = "ServerError", .e = error.ServerError },
         .{ .n = "MalformedResponse", .e = error.MalformedResponse },

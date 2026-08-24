@@ -45,10 +45,14 @@ pub const ApiError = error{
     Unauthorized,
     /// 403 — authenticated but not permitted.
     Forbidden,
+    /// 400 — the request shape or value is invalid.
+    BadRequest,
     /// 404 — no such workspace/repo/PR.
     NotFound,
     /// 429 — rate limited; caller should back off.
     RateLimited,
+    /// 409 — the request conflicts with current server state.
+    Conflict,
     /// 5xx — Bitbucket-side failure; retryable.
     ServerError,
     /// Any other unexpected status.

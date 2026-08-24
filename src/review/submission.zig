@@ -141,7 +141,7 @@ fn classifyPolicy(err: ApiError) Policy {
     return switch (err) {
         error.Unauthorized, error.Forbidden => .abort,
         error.RateLimited, error.ServerError => .retry,
-        error.NotFound, error.UnexpectedStatus, error.MalformedResponse => .fail,
+        error.BadRequest, error.NotFound, error.Conflict, error.UnexpectedStatus, error.MalformedResponse => .fail,
     };
 }
 

@@ -163,8 +163,14 @@ fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight
     side.blob = source.read(allocator, commit, path) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         side.destroy();
+        if (err == error.InvalidPath) return .{ .unavailable = .{ .unavailable = .{ .reason = .invalid_path } } };
         return .{ .fetch_failed = err };
     };
+    if (!std.unicode.utf8ValidateSlice(side.blob)) {
+        const byte_size = side.blob.len;
+        side.destroy();
+        return .{ .unavailable = .{ .unavailable = .{ .reason = .invalid_utf8, .byte_size = byte_size } } };
+    }
     if (max_file_bytes != 0 and side.blob.len > max_file_bytes) {
         side.highlighting = .skipped_too_large;
         side.retained_bytes = retainedBytes(side);
@@ -623,6 +629,27 @@ const CountingBlobSource = struct {
     }
 };
 
+const ExpectedBlob = struct { commit: []const u8, path: []const u8, bytes: []const u8 };
+
+const ExpectedBlobSource = struct {
+    expected: []const ExpectedBlob,
+    calls: usize = 0,
+
+    fn source(self: *ExpectedBlobSource) BlobSource {
+        return .{ .ptr = self, .read_fn = read };
+    }
+
+    fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8) anyerror![]u8 {
+        const self: *ExpectedBlobSource = @ptrCast(@alignCast(ptr));
+        if (self.calls >= self.expected.len) return error.UnexpectedRead;
+        const expected = self.expected[self.calls];
+        self.calls += 1;
+        if (!std.mem.eql(u8, expected.commit, commit)) return error.UnexpectedCommit;
+        if (!std.mem.eql(u8, expected.path, path)) return error.UnexpectedPath;
+        return allocator.dupe(u8, expected.bytes);
+    }
+};
+
 test "an added File transfers its enriched new side into Session storage" {
     const responses = [_]bbr.http.Canned{.{ .status = 200, .body = "const answer = 42;\n" }};
     var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
@@ -735,6 +762,141 @@ test "a failed old-side fetch does not suppress the enriched new side" {
     try testing.expect(projected.new.content.highlighting == .ready);
 }
 
+test "File Enrichment requests each present side from its exact commit and path" {
+    const expected = [_]ExpectedBlob{
+        .{ .commit = "destination", .path = "src/old name.zig", .bytes = "old\n" },
+        .{ .commit = "source", .path = "src/new name.zig", .bytes = "new\n" },
+    };
+    var source: ExpectedBlobSource = .{ .expected = &expected };
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    var result = try enrichFrom(testing.allocator, source.source(), plain.highlighter(), .{
+        .repo = "",
+        .status = .renamed,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "src/old name.zig",
+        .new_path = "src/new name.zig",
+        .max_file_bytes = 0,
+    });
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 2), source.calls);
+    try testing.expectEqualStrings("old\n", result.old.owned.blob);
+    try testing.expectEqualStrings("new\n", result.new.owned.blob);
+}
+
+test "File Enrichment does not request absent sides" {
+    const added_expected = [_]ExpectedBlob{.{ .commit = "source", .path = "new.zig", .bytes = "new" }};
+    var added_source: ExpectedBlobSource = .{ .expected = &added_expected };
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    var added = try enrichFrom(testing.allocator, added_source.source(), plain.highlighter(), .{
+        .repo = "",
+        .status = .added,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "/dev/null",
+        .new_path = "new.zig",
+        .max_file_bytes = 0,
+    });
+    defer added.deinit();
+    try testing.expect(added.old == .absent);
+    try testing.expectEqual(@as(usize, 1), added_source.calls);
+
+    const removed_expected = [_]ExpectedBlob{.{ .commit = "destination", .path = "old.zig", .bytes = "old" }};
+    var removed_source: ExpectedBlobSource = .{ .expected = &removed_expected };
+    var removed = try enrichFrom(testing.allocator, removed_source.source(), plain.highlighter(), .{
+        .repo = "",
+        .status = .removed,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "old.zig",
+        .new_path = "/dev/null",
+        .max_file_bytes = 0,
+    });
+    defer removed.deinit();
+    try testing.expect(removed.new == .absent);
+    try testing.expectEqual(@as(usize, 1), removed_source.calls);
+}
+
+test "invalid UTF-8 makes only its side unavailable with exact byte size" {
+    const invalid = [_]u8{ 0xff, 0x80, 0x00 };
+    const expected = [_]ExpectedBlob{
+        .{ .commit = "destination", .path = "old.zig", .bytes = invalid[0..] },
+        .{ .commit = "source", .path = "new.zig", .bytes = "" },
+    };
+    var source: ExpectedBlobSource = .{ .expected = &expected };
+    var scripted = ScriptedHighlighter{};
+    var result = try enrichFrom(testing.allocator, source.source(), scripted.highlighter(), .{
+        .repo = "",
+        .status = .renamed,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "old.zig",
+        .new_path = "new.zig",
+        .max_file_bytes = 0,
+    });
+    defer result.deinit();
+    try testing.expect(result.old == .unavailable);
+    try testing.expect(result.old.unavailable.unavailable.reason == .invalid_utf8);
+    try testing.expectEqual(@as(?usize, 3), result.old.unavailable.unavailable.byte_size);
+    try testing.expectEqual(@as(usize, 0), result.new.owned.blob.len);
+    try testing.expectEqual(@as(usize, 1), scripted.calls);
+}
+
+test "invalid remote paths become typed unavailable sides" {
+    var fake: bbr.http.FakeHttpClient = .{ .body = "must not be read" };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    var result = try enrich(testing.allocator, bb, plain.highlighter(), .{
+        .repo = "repo",
+        .status = .renamed,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "../old.zig",
+        .new_path = "new.zig",
+        .max_file_bytes = 0,
+    });
+    defer result.deinit();
+    try testing.expect(result.old == .unavailable);
+    try testing.expect(result.old.unavailable.unavailable.reason == .invalid_path);
+    try testing.expectEqualStrings("must not be read", result.new.owned.blob);
+    try testing.expectEqual(@as(usize, 1), fake.call_count);
+}
+
+test "each classified ApiError stays on its failed side" {
+    const cases = [_]struct { status: u16, expected: anyerror }{
+        .{ .status = 400, .expected = error.BadRequest },
+        .{ .status = 401, .expected = error.Unauthorized },
+        .{ .status = 403, .expected = error.Forbidden },
+        .{ .status = 404, .expected = error.NotFound },
+        .{ .status = 409, .expected = error.Conflict },
+        .{ .status = 429, .expected = error.RateLimited },
+        .{ .status = 503, .expected = error.ServerError },
+        .{ .status = 302, .expected = error.UnexpectedStatus },
+    };
+    for (cases) |case| {
+        const responses = [_]bbr.http.Canned{
+            .{ .status = case.status, .body = "failure" },
+            .{ .status = 200, .body = "new" },
+        };
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+        var plain: bbr.highlight.PlainHighlighter = .{};
+        var result = try enrich(testing.allocator, bb, plain.highlighter(), .{
+            .repo = "repo",
+            .status = .modified,
+            .source_commit = "source",
+            .destination_commit = "destination",
+            .old_path = "file.zig",
+            .new_path = "file.zig",
+            .max_file_bytes = 0,
+        });
+        defer result.deinit();
+        try testing.expect(result.old == .fetch_failed);
+        try testing.expectEqual(case.expected, result.old.fetch_failed);
+        try testing.expectEqualStrings("new", result.new.owned.blob);
+    }
+}
+
 test "File Content Status is independent per expected side and from Highlighting" {
     const responses = [_]bbr.http.Canned{
         .{ .status = 404, .body = "" },
@@ -772,12 +934,11 @@ test "File Content Status is independent per expected side and from Highlighting
 test "remote and local RawDiff binary sides skip File Enrichment reads and Highlighting" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const diff = try bbr.diff.parse(arena.allocator(),
-        "diff --git a/image.bin b/image.bin\n" ++
-            "GIT binary patch\n" ++
-            "literal 4\nencoded\n" ++
-            "\n" ++
-            "literal 3\nencoded\n");
+    const diff = try bbr.diff.parse(arena.allocator(), "diff --git a/image.bin b/image.bin\n" ++
+        "GIT binary patch\n" ++
+        "literal 4\nencoded\n" ++
+        "\n" ++
+        "literal 3\nencoded\n");
     const file = diff.files[0];
 
     var storage = try Storage.init(testing.allocator, diff.files);

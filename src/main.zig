@@ -45,6 +45,13 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("ok: External Edit PTY handoff, redraw, and recreated input verified\n", .{});
             return;
         }
+        if (std.mem.eql(u8, f, "check-blobs")) {
+            const cred = bbr.bitbucket.Credential.fromEnv(init.environ_map) catch {
+                std.debug.print("skipped: blob checker needs BITBUCKET_USERNAME, BITBUCKET_TOKEN, and BITBUCKET_WORKSPACE\n", .{});
+                return;
+            };
+            return checkBlobsRun(init, gpa, cred, &it);
+        }
     }
 
     const cred = bbr.bitbucket.Credential.fromEnv(init.environ_map) catch |err| {
@@ -408,6 +415,56 @@ fn checkMutationRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bi
     std.debug.print("ok: created, fetched, body-updated, and deleted disposable Comment #{d}\n", .{comment_id});
 }
 
+fn checkBlobsRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
+    const repo = it.next() orelse return usage();
+    const pull_request_id = std.fmt.parseInt(u64, it.next() orelse return usage(), 10) catch return usage();
+    const fixture_classes = [_][]const u8{ "text", "empty", "binary", "path-special", "executable", "link" };
+    var checked: [fixture_classes.len]bool = @splat(false);
+
+    var client = bbr.http.StdHttpClient.init(gpa, init.io);
+    defer client.deinit();
+    try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
+    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred);
+    const pull_request = try bb.getPullRequest(gpa, repo, pull_request_id);
+    defer bbr.bitbucket.deinitPullRequest(gpa, pull_request);
+
+    while (it.next()) |class| {
+        const side = it.next() orelse return usage();
+        const path = it.next() orelse return usage();
+        const expected_attributes = it.next() orelse return usage();
+        const class_index = for (fixture_classes, 0..) |known, index| {
+            if (std.mem.eql(u8, known, class)) break index;
+        } else return error.UnknownBlobFixtureClass;
+        if (checked[class_index]) return error.DuplicateBlobFixtureClass;
+        checked[class_index] = true;
+
+        const commit = if (std.mem.eql(u8, side, "old"))
+            pull_request.destination_commit
+        else if (std.mem.eql(u8, side, "new"))
+            pull_request.source_commit
+        else
+            return error.InvalidBlobFixtureSide;
+        var attributes: std.ArrayList([]const u8) = .empty;
+        defer attributes.deinit(gpa);
+        if (!std.mem.eql(u8, expected_attributes, "-")) {
+            var values = std.mem.splitScalar(u8, expected_attributes, ',');
+            while (values.next()) |attribute| {
+                if (attribute.len == 0) return error.InvalidBlobFixtureAttributes;
+                try attributes.append(gpa, attribute);
+            }
+        }
+        const raw_len = try bb.checkFileBlob(gpa, repo, commit, path, attributes.items);
+        if (std.mem.eql(u8, class, "empty") and raw_len != 0) return error.BlobExpectedEmpty;
+        std.debug.print("ok: {s} {s} {s} commit={s} type=commit_file size={d} attributes={s} raw={d}\n", .{
+            class, side, path, commit, raw_len, expected_attributes, raw_len,
+        });
+    }
+
+    for (fixture_classes, checked) |class, present| {
+        if (!present) std.debug.print("skipped: blob fixture class {s} was not supplied\n", .{class});
+    }
+}
+
 fn verifyLiveComment(
     gpa: std.mem.Allocator,
     client: bbr.bitbucket.Client,
@@ -502,6 +559,7 @@ fn usage() void {
         \\  bbr <repo-slug> <pr-id>          open a specific PR in the TUI
         \\  bbr local [base-ref] [source-ref] review committed local Git changes
         \\  bbr check <repo-slug> <pr-id>    live smoke check (fetch + print, no TUI)
+        \\  bbr check-blobs <repo> <pr-id> [<class> <old|new> <path> <attrs|->]...
         \\  bbr check-mutation <repo> <pr-id> destructive live Comment lifecycle check
         \\  bbr external-edit-smoke          interactive PTY External Edit check
         \\  bbr demo                         open the TUI with synthetic data (no network)

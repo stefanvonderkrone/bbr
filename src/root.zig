@@ -15,6 +15,7 @@ pub const diff = struct {
     pub const parser = @import("diff/parser.zig");
     pub const intraline = @import("diff/intraline.zig");
     pub const source = @import("diff/source.zig");
+    pub const path = @import("diff/path.zig");
     pub const parse = parser.parse;
     pub const loadFromSource = source.load;
     pub const Diff = model.Diff;
@@ -168,6 +169,7 @@ test {
     _ = @import("diff/parser.zig");
     _ = @import("diff/intraline.zig");
     _ = @import("diff/source.zig");
+    _ = @import("diff/path.zig");
     _ = @import("highlight/highlighter.zig");
     _ = @import("highlight/decoration.zig");
     _ = @import("review/comment.zig");

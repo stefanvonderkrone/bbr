@@ -16,6 +16,7 @@ const review = @import("../review/comment.zig");
 const Comment = review.Comment;
 const Anchor = review.Anchor;
 const CommentId = review.CommentId;
+const git_path = @import("../diff/path.zig");
 
 pub const base_url = "https://api.bitbucket.org/2.0";
 
@@ -183,26 +184,62 @@ pub const Client = struct {
         commit: []const u8,
         path: []const u8,
     ) ![]u8 {
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/repositories/{s}/{s}/src/{s}/{s}",
-            .{ base_url, self.cred.workspace, repo_slug, commit, path },
-        );
+        return self.getSource(allocator, repo_slug, commit, path, false);
+    }
+
+    pub fn checkFileBlob(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        commit: []const u8,
+        path: []const u8,
+        expected_attributes: []const []const u8,
+    ) !usize {
+        const metadata_body = try self.getSource(allocator, repo_slug, commit, path, true);
+        defer allocator.free(metadata_body);
+
+        const Wire = struct {
+            type: []const u8,
+            path: []const u8,
+            commit: struct { hash: []const u8 },
+            size: usize,
+            attributes: []const []const u8,
+        };
+        const parsed = std.json.parseFromSlice(Wire, allocator, metadata_body, .{ .ignore_unknown_fields = true }) catch return error.MalformedResponse;
+        defer parsed.deinit();
+        const metadata = parsed.value;
+        if (!std.mem.eql(u8, metadata.type, "commit_file")) return error.BlobTypeMismatch;
+        if (!std.mem.eql(u8, metadata.path, path)) return error.BlobPathMismatch;
+        if (!std.mem.eql(u8, metadata.commit.hash, commit)) return error.BlobCommitMismatch;
+        if (!stringSlicesEqual(metadata.attributes, expected_attributes)) return error.BlobAttributesMismatch;
+
+        const raw = try self.getFileBlob(allocator, repo_slug, commit, path);
+        defer allocator.free(raw);
+        if (metadata.size != raw.len) return error.BlobSizeMismatch;
+        return raw.len;
+    }
+
+    fn getSource(self: Client, allocator: Allocator, repo_slug: []const u8, commit: []const u8, path: []const u8, metadata: bool) ![]u8 {
+        var url_buf: std.ArrayList(u8) = .empty;
+        defer url_buf.deinit(allocator);
+        try url_buf.print(allocator, "{s}/repositories/{s}/{s}/src/{s}/", .{ base_url, self.cred.workspace, repo_slug, commit });
+        if (!git_path.isRepositoryRelative(path)) return error.InvalidPath;
+        try appendEncodedPath(allocator, &url_buf, path);
+        if (metadata) try url_buf.appendSlice(allocator, "?format=meta");
+        const url = try url_buf.toOwnedSlice(allocator);
         defer allocator.free(url);
 
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
-
         const res = try self.http.send(allocator, .{
             .method = .GET,
             .url = url,
             .headers = &.{
                 .{ .name = "authorization", .value = auth },
-                .{ .name = "accept", .value = "text/plain" },
+                .{ .name = "accept", .value = if (metadata) "application/json" else "text/plain" },
             },
         });
         errdefer allocator.free(res.body);
-
         try classify(res.status);
         return res.body;
     }
@@ -556,9 +593,11 @@ pub const Client = struct {
 fn classify(status: u16) ApiError!void {
     return switch (status) {
         200...299 => {},
+        400 => error.BadRequest,
         401 => error.Unauthorized,
         403 => error.Forbidden,
         404 => error.NotFound,
+        409 => error.Conflict,
         429 => error.RateLimited,
         500...599 => error.ServerError,
         else => error.UnexpectedStatus,
@@ -612,6 +651,22 @@ fn isUnreserved(c: u8) bool {
         'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~' => true,
         else => false,
     };
+}
+
+fn appendEncodedPath(allocator: Allocator, out: *std.ArrayList(u8), path: []const u8) !void {
+    var segments = std.mem.splitScalar(u8, path, '/');
+    var first = true;
+    while (segments.next()) |segment| {
+        if (!first) try out.append(allocator, '/');
+        first = false;
+        try percentEncodeInto(allocator, out, segment);
+    }
+}
+
+fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| if (!std.mem.eql(u8, left, right)) return false;
+    return true;
 }
 
 /// The subset of a PR list entry we surface. Commit hashes are absent from the
@@ -926,9 +981,11 @@ test "getPullRequest builds the correct URL" {
 test "status codes map to the right ApiError" {
     const a = testing.allocator;
     const cases = [_]struct { status: u16, want: anyerror }{
+        .{ .status = 400, .want = error.BadRequest },
         .{ .status = 401, .want = error.Unauthorized },
         .{ .status = 403, .want = error.Forbidden },
         .{ .status = 404, .want = error.NotFound },
+        .{ .status = 409, .want = error.Conflict },
         .{ .status = 429, .want = error.RateLimited },
         .{ .status = 503, .want = error.ServerError },
         .{ .status = 302, .want = error.UnexpectedStatus },
@@ -1086,6 +1143,66 @@ test "getFileBlob returns the raw file text at the right URL" {
     );
 }
 
+test "getFileBlob encodes each normalized path segment" {
+    const cases = [_]struct { path: []const u8, encoded: []const u8 }{
+        .{ .path = "src/file with space.txt", .encoded = "src/file%20with%20space.txt" },
+        .{ .path = "src/Grüße.txt", .encoded = "src/Gr%C3%BC%C3%9Fe.txt" },
+        .{ .path = "src/a%?#\".txt", .encoded = "src/a%25%3F%23%22.txt" },
+        .{ .path = "\"leading quote.txt", .encoded = "%22leading%20quote.txt" },
+    };
+    for (cases) |case| {
+        var fake: FakeHttpClient = .{ .status = 200, .body = "bytes" };
+        const bb = Client.init(fake.httpClient(), testCredential());
+        const blob = try bb.getFileBlob(testing.allocator, "myrepo", "abc123", case.path);
+        defer testing.allocator.free(blob);
+        const expected = try std.fmt.allocPrint(testing.allocator, "{s}/repositories/check24/myrepo/src/abc123/{s}", .{ base_url, case.encoded });
+        defer testing.allocator.free(expected);
+        try testing.expectEqualStrings(expected, fake.lastUrl().?);
+    }
+}
+
+test "getFileBlob rejects malformed and non-repository-relative paths before HTTP" {
+    const paths = [_][]const u8{ "", "/src/main.zig", "../main.zig", "src/../main.zig", "src//main.zig", "src/" };
+    for (paths) |path| {
+        var fake: FakeHttpClient = .{ .status = 200, .body = "must not be read" };
+        const bb = Client.init(fake.httpClient(), testCredential());
+        try testing.expectError(error.InvalidPath, bb.getFileBlob(testing.allocator, "myrepo", "abc123", path));
+        try testing.expectEqual(@as(usize, 0), fake.call_count);
+    }
+}
+
+test "getFileBlob preserves opaque response bytes" {
+    const bytes = [_]u8{ 0xff, 0x00, 0x80 };
+    var fake: FakeHttpClient = .{ .status = 200, .body = &bytes };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const blob = try bb.getFileBlob(testing.allocator, "myrepo", "abc123", "raw.bin");
+    defer testing.allocator.free(blob);
+    try testing.expectEqualSlices(u8, &bytes, blob);
+}
+
+test "checkFileBlob compares exact metadata and raw shape" {
+    const body =
+        \\{"type":"commit_file","path":"src/run.sh","commit":{"hash":"abc123"},"size":17,"attributes":["executable"]}
+    ;
+    const responses = [_]@import("../http/fake_client.zig").Canned{
+        .{ .status = 200, .body = body },
+        .{ .status = 200, .body = "0123456789abcdefg" },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const raw_len = try bb.checkFileBlob(testing.allocator, "myrepo", "abc123", "src/run.sh", &.{"executable"});
+    try testing.expectEqual(@as(usize, 17), raw_len);
+    try testing.expectEqual(@as(usize, 2), fake.call_count);
+}
+
+test "getFileBlob accepts empty bytes as a successful response" {
+    var fake: FakeHttpClient = .{ .status = 200, .body = "" };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const blob = try bb.getFileBlob(testing.allocator, "myrepo", "abc123", "empty.txt");
+    defer testing.allocator.free(blob);
+    try testing.expectEqual(@as(usize, 0), blob.len);
+}
+
 test "getFileBlob surfaces ApiError on non-2xx and leaks nothing" {
     const a = testing.allocator;
     var fake: FakeHttpClient = .{ .status = 404, .body = "no such path" };
@@ -1213,7 +1330,7 @@ test "createComment surfaces ApiError on non-2xx" {
     const a = testing.allocator;
     var fake: FakeHttpClient = .{ .status = 400, .body = "bad anchor" };
     const bb = Client.init(fake.httpClient(), testCredential());
-    try testing.expectError(error.UnexpectedStatus, bb.createComment(a, "myrepo", 7, .{ .body = "x" }));
+    try testing.expectError(error.BadRequest, bb.createComment(a, "myrepo", 7, .{ .body = "x" }));
 }
 
 test "authenticated account acquisition returns UUID and classifies unauthorized" {

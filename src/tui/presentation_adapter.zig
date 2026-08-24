@@ -239,7 +239,9 @@ pub fn executeCommentEdit(command: *presentation.UpdateComment, client: bbr.bitb
     )) |_| .updated else |err| switch (err) {
         error.Unauthorized => .{ .definitive_failure = error.Unauthorized },
         error.Forbidden => .{ .definitive_failure = error.Forbidden },
+        error.BadRequest => .{ .definitive_failure = error.BadRequest },
         error.NotFound => .{ .definitive_failure = error.NotFound },
+        error.Conflict => .{ .definitive_failure = error.Conflict },
         error.RateLimited => .{ .definitive_failure = error.RateLimited },
         error.ServerError => .{ .definitive_failure = error.ServerError },
         error.UnexpectedStatus => .{ .definitive_failure = error.UnexpectedStatus },
@@ -274,6 +276,8 @@ pub fn executeCommentDelete(command: *presentation.DeleteComment, client: bbr.bi
         error.NotFound => .not_found,
         error.Unauthorized => .{ .definitive_failure = error.Unauthorized },
         error.Forbidden => .{ .definitive_failure = error.Forbidden },
+        error.BadRequest => .{ .definitive_failure = error.BadRequest },
+        error.Conflict => .{ .definitive_failure = error.Conflict },
         error.RateLimited => .{ .definitive_failure = error.RateLimited },
         error.ServerError => .{ .definitive_failure = error.ServerError },
         error.UnexpectedStatus => .{ .definitive_failure = error.UnexpectedStatus },
