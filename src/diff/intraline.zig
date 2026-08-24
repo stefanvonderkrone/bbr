@@ -63,6 +63,25 @@ fn tokEql(a_text: []const u8, a: Tok, b_text: []const u8, b: Tok) bool {
     return std.mem.eql(u8, a_text[a.start..a.end], b_text[b.start..b.end]);
 }
 
+fn commonTable(allocator: Allocator, old_text: []const u8, old_parts: []const Tok, new_text: []const u8, new_parts: []const Tok, byte_weight: bool) ![]usize {
+    const stride = new_parts.len + 1;
+    const table = try allocator.alloc(usize, (old_parts.len + 1) * stride);
+    @memset(table, 0);
+    var oi = old_parts.len;
+    while (oi > 0) : (oi -= 1) {
+        var ni = new_parts.len;
+        while (ni > 0) : (ni -= 1) {
+            const old_index = oi - 1;
+            const new_index = ni - 1;
+            table[old_index * stride + new_index] = if (tokEql(old_text, old_parts[old_index], new_text, new_parts[new_index]))
+                table[oi * stride + ni] + if (byte_weight) old_parts[old_index].end - old_parts[old_index].start else 1
+            else
+                @max(table[oi * stride + new_index], table[old_index * stride + ni]);
+        }
+    }
+    return table;
+}
+
 /// Coalesce a side's tokens into `Segment`s: consecutive tokens with the same
 /// emphasis verdict become one run (a contiguous slice of `text`).
 fn segmentsFor(allocator: Allocator, text: []const u8, toks: []const Tok, matched: []const bool) ![]Segment {
@@ -96,20 +115,7 @@ pub fn diff(allocator: Allocator, old_text: []const u8, new_text: []const u8) !P
     if (n != 0 and m != 0) {
         // dp[i*stride + j] = LCS length of old[i..] vs new[j..]. Fill backward.
         const stride = m + 1;
-        const dp = try allocator.alloc(usize, (n + 1) * stride);
-        @memset(dp, 0);
-        var i = n;
-        while (i > 0) : (i -= 1) {
-            var j = m;
-            while (j > 0) : (j -= 1) {
-                const ii = i - 1;
-                const jj = j - 1;
-                dp[ii * stride + jj] = if (tokEql(old_text, ot[ii], new_text, nt[jj]))
-                    dp[i * stride + j] + 1
-                else
-                    @max(dp[i * stride + jj], dp[ii * stride + j]);
-            }
-        }
+        const dp = try commonTable(allocator, old_text, ot, new_text, nt, false);
 
         // Walk forward along an LCS, marking the tokens it visits as common.
         var oi: usize = 0;
@@ -146,6 +152,25 @@ pub fn similarity(pair: Pair) f64 {
     }
     if (total == 0) return if (pairEmpty(pair.old)) 1.0 else 0.0;
     return @as(f64, @floatFromInt(common)) / @as(f64, @floatFromInt(total));
+}
+
+/// Symmetric similarity for matching changed Lines. The common byte count is
+/// the maximum-weight lexical subsequence shared by both Lines.
+pub fn matchingSimilarity(allocator: Allocator, old_text: []const u8, new_text: []const u8) !f64 {
+    if (std.mem.eql(u8, old_text, new_text)) return 1.0;
+
+    const old_parts = try tokenize(allocator, old_text);
+    defer allocator.free(old_parts);
+    const new_parts = try tokenize(allocator, new_text);
+    defer allocator.free(new_parts);
+    if (old_parts.len == 0 or new_parts.len == 0) return 0.0;
+
+    const table = try commonTable(allocator, old_text, old_parts, new_text, new_parts, true);
+    defer allocator.free(table);
+
+    const common: f64 = @floatFromInt(table[0]);
+    const total: f64 = @floatFromInt(old_text.len + new_text.len);
+    return 2.0 * common / total;
 }
 
 fn pairEmpty(segs: []const Segment) bool {
@@ -250,6 +275,15 @@ test "similarity distinguishes an edit from an unrelated pair" {
 
     const unrelated = try diff(a, "import std", "return 42;");
     try testing.expect(similarity(unrelated) < 0.3);
+}
+
+test "matching similarity is symmetric and treats blank Lines as exact" {
+    try testing.expectEqual(@as(f64, 1.0), try matchingSimilarity(testing.allocator, "", ""));
+    try testing.expectEqual(@as(f64, 0.0), try matchingSimilarity(testing.allocator, "", "text"));
+
+    const forward = try matchingSimilarity(testing.allocator, "const value = old;", "const value = new;");
+    const reverse = try matchingSimilarity(testing.allocator, "const value = new;", "const value = old;");
+    try testing.expectEqual(forward, reverse);
 }
 
 test "leading indentation change is isolated" {

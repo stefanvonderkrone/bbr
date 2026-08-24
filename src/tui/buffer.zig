@@ -75,6 +75,33 @@ pub const LinePair = struct {
     right: ?LineRow = null,
 };
 
+const MatchOperation = enum { pair, left, right, done };
+
+const MatchCell = struct {
+    cost: f64,
+    exact_pairs: usize,
+    first_old: usize = std.math.maxInt(usize),
+    first_new: usize = std.math.maxInt(usize),
+    operation: MatchOperation,
+};
+
+fn chooseMatch(best: *?MatchCell, candidate: MatchCell) void {
+    const current = best.* orelse {
+        best.* = candidate;
+        return;
+    };
+    const cost_delta = candidate.cost - current.cost;
+    const equal_cost = @abs(cost_delta) <= 1e-12;
+    const earlier_pair = candidate.first_old < current.first_old or
+        (candidate.first_old == current.first_old and candidate.first_new < current.first_new);
+    if (cost_delta < -1e-12 or
+        (equal_cost and candidate.exact_pairs > current.exact_pairs) or
+        (equal_cost and candidate.exact_pairs == current.exact_pairs and earlier_pair))
+    {
+        best.* = candidate;
+    }
+}
+
 pub const StatusPlaceholder = struct {
     file: *const model.File,
     old: ?model.FileContentStatus = null,
@@ -300,18 +327,16 @@ pub fn buildWithComments(
                 .old => try spliceOldSide(allocator, file.*, content.blob),
                 .new => try spliceNewSide(allocator, file.*, content.blob),
             };
-            const emphasis = try computeEmphasis(allocator, lines);
             switch (layout) {
-                .unified => try w.emitUnifiedHunk(fi, file, lines, emphasis, &.{}),
-                .side_by_side => try w.emitSideBySideHunk(fi, file, lines, emphasis, &.{}),
+                .unified => try w.emitUnifiedHunk(fi, file, lines, try computeEmphasis(allocator, lines), &.{}),
+                .side_by_side => try w.emitSideBySideHunk(fi, file, lines, &.{}),
             }
         } else for (file.hunks) |*hunk| {
             try rows.append(allocator, .{ .hunk_header = hunk });
-            const emphasis = try computeEmphasis(allocator, hunk.lines);
             const folds = try computeFolds(allocator, hunk.lines, opts);
             switch (layout) {
-                .unified => try w.emitUnifiedHunk(fi, file, hunk.lines, emphasis, folds),
-                .side_by_side => try w.emitSideBySideHunk(fi, file, hunk.lines, emphasis, folds),
+                .unified => try w.emitUnifiedHunk(fi, file, hunk.lines, try computeEmphasis(allocator, hunk.lines), folds),
+                .side_by_side => try w.emitSideBySideHunk(fi, file, hunk.lines, folds),
             }
         }
 
@@ -614,7 +639,6 @@ const Weave = struct {
         file_idx: usize,
         file: *const model.File,
         lines: []const model.Line,
-        emphasis: []const []const Segment,
         folds: []const Fold,
     ) !void {
         var i: usize = 0;
@@ -630,7 +654,7 @@ const Weave = struct {
             }
             switch (lines[i].kind) {
                 .context => {
-                    const line = try decoratedLine(w.a, &lines[i], lineSpans(w.opts.highlights, file_idx, lines[i]), emphasis[i]);
+                    const line = try decoratedLine(w.a, &lines[i], lineSpans(w.opts.highlights, file_idx, lines[i]), &.{});
                     const pair: LinePair = if (lines[i].new_no == null)
                         .{ .left = line }
                     else if (lines[i].old_no == null)
@@ -647,7 +671,7 @@ const Weave = struct {
                     while (i < lines.len and lines[i].kind == .added) i += 1;
                     var p = start;
                     while (p < i) : (p += 1) {
-                        try w.rows.append(w.a, .{ .line_pair = .{ .right = try decoratedLine(w.a, &lines[p], lineSpans(w.opts.highlights, file_idx, lines[p]), emphasis[p]) } });
+                        try w.rows.append(w.a, .{ .line_pair = .{ .right = try decoratedLine(w.a, &lines[p], lineSpans(w.opts.highlights, file_idx, lines[p]), &.{}) } });
                         try w.weaveInline(file, &lines[p]);
                     }
                 },
@@ -662,22 +686,104 @@ const Weave = struct {
                         while (i < lines.len and lines[i].kind == .added) i += 1;
                         add_end = i;
                     }
-                    const rn = rem_end - rem_start;
-                    const an = add_end - add_start;
-                    var p: usize = 0;
-                    while (p < @max(rn, an)) : (p += 1) {
-                        const left: ?LineRow = if (p < rn) try decoratedLine(w.a, &lines[rem_start + p], lineSpans(w.opts.highlights, file_idx, lines[rem_start + p]), emphasis[rem_start + p]) else null;
-                        const right: ?LineRow = if (p < an) try decoratedLine(w.a, &lines[add_start + p], lineSpans(w.opts.highlights, file_idx, lines[add_start + p]), emphasis[add_start + p]) else null;
-                        try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
-                        if (right) |rr| try w.weaveInline(file, rr.line);
-                        if (left) |ll| {
-                            // Only weave the old line separately when it isn't the
-                            // same line already woven on the right.
-                            if (right == null or ll.line != right.?.line)
-                                try w.weaveInline(file, ll.line);
-                        }
-                    }
+                    try w.emitSideBySideChangeBlock(file_idx, file, lines[rem_start..rem_end], lines[add_start..add_end]);
                 },
+            }
+        }
+    }
+
+    fn emitSideBySideChangeBlock(
+        w: *Weave,
+        file_idx: usize,
+        file: *const model.File,
+        removed: []const model.Line,
+        added: []const model.Line,
+    ) !void {
+        const stride = added.len + 1;
+        const similarities = try w.a.alloc(f64, removed.len * added.len);
+        for (removed, 0..) |old, old_index| {
+            for (added, 0..) |new, new_index| {
+                similarities[old_index * added.len + new_index] = try intraline.matchingSimilarity(std.heap.page_allocator, old.text, new.text);
+            }
+        }
+
+        const cells = try w.a.alloc(MatchCell, (removed.len + 1) * stride);
+        var old_cursor = removed.len + 1;
+        while (old_cursor > 0) {
+            old_cursor -= 1;
+            var new_cursor = added.len + 1;
+            while (new_cursor > 0) {
+                new_cursor -= 1;
+                if (old_cursor == removed.len and new_cursor == added.len) {
+                    cells[old_cursor * stride + new_cursor] = .{ .cost = 0, .exact_pairs = 0, .operation = .done };
+                    continue;
+                }
+
+                var best: ?MatchCell = null;
+                if (old_cursor < removed.len and new_cursor < added.len) {
+                    const score = similarities[old_cursor * added.len + new_cursor];
+                    if (score >= emphasis_threshold) {
+                        const next = cells[(old_cursor + 1) * stride + new_cursor + 1];
+                        chooseMatch(&best, .{
+                            .cost = next.cost + 1.0 - score,
+                            .exact_pairs = next.exact_pairs + @intFromBool(std.mem.eql(u8, removed[old_cursor].text, added[new_cursor].text)),
+                            .first_old = old_cursor,
+                            .first_new = new_cursor,
+                            .operation = .pair,
+                        });
+                    }
+                }
+                if (old_cursor < removed.len) {
+                    const next = cells[(old_cursor + 1) * stride + new_cursor];
+                    chooseMatch(&best, .{
+                        .cost = next.cost + 1.0,
+                        .exact_pairs = next.exact_pairs,
+                        .first_old = next.first_old,
+                        .first_new = next.first_new,
+                        .operation = .left,
+                    });
+                }
+                if (new_cursor < added.len) {
+                    const next = cells[old_cursor * stride + new_cursor + 1];
+                    chooseMatch(&best, .{
+                        .cost = next.cost + 1.0,
+                        .exact_pairs = next.exact_pairs,
+                        .first_old = next.first_old,
+                        .first_new = next.first_new,
+                        .operation = .right,
+                    });
+                }
+                cells[old_cursor * stride + new_cursor] = best.?;
+            }
+        }
+
+        old_cursor = 0;
+        var new_cursor: usize = 0;
+        while (old_cursor < removed.len or new_cursor < added.len) {
+            switch (cells[old_cursor * stride + new_cursor].operation) {
+                .pair => {
+                    const pair = try intraline.diff(w.a, removed[old_cursor].text, added[new_cursor].text);
+                    const left = try decoratedLine(w.a, &removed[old_cursor], lineSpans(w.opts.highlights, file_idx, removed[old_cursor]), pair.old);
+                    const right = try decoratedLine(w.a, &added[new_cursor], lineSpans(w.opts.highlights, file_idx, added[new_cursor]), pair.new);
+                    try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
+                    try w.weaveInline(file, right.line);
+                    try w.weaveInline(file, left.line);
+                    old_cursor += 1;
+                    new_cursor += 1;
+                },
+                .right => {
+                    const right = try decoratedLine(w.a, &added[new_cursor], lineSpans(w.opts.highlights, file_idx, added[new_cursor]), &.{});
+                    try w.rows.append(w.a, .{ .line_pair = .{ .right = right } });
+                    try w.weaveInline(file, right.line);
+                    new_cursor += 1;
+                },
+                .left => {
+                    const left = try decoratedLine(w.a, &removed[old_cursor], lineSpans(w.opts.highlights, file_idx, removed[old_cursor]), &.{});
+                    try w.rows.append(w.a, .{ .line_pair = .{ .left = left } });
+                    try w.weaveInline(file, left.line);
+                    old_cursor += 1;
+                },
+                .done => unreachable,
             }
         }
     }
@@ -1238,6 +1344,7 @@ test "side_by_side pairs context, aligns a modification, and fills add/remove" {
     ;
     const diff = try parse(a, raw);
     const buf = try build(a, diff, .side_by_side);
+    try expectChangedLinesExactlyOnce(diff, buf);
     try testing.expectEqual(Layout.side_by_side, buf.layout);
 
     // Rows: file_header, hunk_header, then 4 line_pairs.
@@ -1268,6 +1375,155 @@ test "side_by_side pairs context, aligns a modification, and fills add/remove" {
     try testing.expectEqual(@as(usize, 6), buf.rows.len);
 }
 
+test "side_by_side leaves an insertion before later related Lines" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const raw =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,2 +1,3 @@
+        \\-const host = config.host;
+        \\-const port = config.port;
+        \\+logger.info("starting");
+        \\+const host = settings.host;
+        \\+const port = settings.port;
+        \\
+    ;
+    const diff = try parse(a, raw);
+    const buf = try build(a, diff, .side_by_side);
+    try expectChangedLinesExactlyOnce(diff, buf);
+
+    const insertion = buf.rows[2].line_pair;
+    try testing.expect(insertion.left == null);
+    try testing.expectEqualStrings("logger.info(\"starting\");", insertion.right.?.line.text);
+    try testing.expectEqualStrings("const host = config.host;", buf.rows[3].line_pair.left.?.line.text);
+    try testing.expectEqualStrings("const host = settings.host;", buf.rows[3].line_pair.right.?.line.text);
+    try testing.expectEqualStrings("const port = config.port;", buf.rows[4].line_pair.left.?.line.text);
+    try testing.expectEqualStrings("const port = settings.port;", buf.rows[4].line_pair.right.?.line.text);
+}
+
+test "side_by_side leaves a deletion between related Lines" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const raw =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,3 +1,2 @@
+        \\-client.open(source);
+        \\-client.retry(source);
+        \\-client.close(source);
+        \\+client.open(target);
+        \\+client.close(target);
+        \\
+    ;
+    const diff = try parse(a, raw);
+    const buf = try build(a, diff, .side_by_side);
+    try expectChangedLinesExactlyOnce(diff, buf);
+
+    try testing.expectEqualStrings("client.open(target);", buf.rows[2].line_pair.right.?.line.text);
+    try testing.expectEqualStrings("client.retry(source);", buf.rows[3].line_pair.left.?.line.text);
+    try testing.expect(buf.rows[3].line_pair.right == null);
+    try testing.expectEqualStrings("client.close(source);", buf.rows[4].line_pair.left.?.line.text);
+    try testing.expectEqualStrings("client.close(target);", buf.rows[4].line_pair.right.?.line.text);
+}
+
+test "side_by_side leaves unrelated Lines unmatched and without IntraLineSegments" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const raw =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,2 +1,2 @@
+        \\-import legacy
+        \\-legacy.boot()
+        \\+const service = createService()
+        \\+return service.run()
+        \\
+    ;
+    const diff = try parse(a, raw);
+    const buf = try build(a, diff, .side_by_side);
+    try expectChangedLinesExactlyOnce(diff, buf);
+
+    try testing.expectEqual(@as(usize, 6), buf.rows.len);
+    try testing.expectEqualStrings("import legacy", buf.rows[2].line_pair.left.?.line.text);
+    try testing.expect(buf.rows[2].line_pair.right == null);
+    try testing.expectEqualStrings("legacy.boot()", buf.rows[3].line_pair.left.?.line.text);
+    try testing.expect(buf.rows[4].line_pair.left == null);
+    try testing.expectEqualStrings("const service = createService()", buf.rows[4].line_pair.right.?.line.text);
+    for (buf.rows[2..]) |row| {
+        const line = row.line_pair.left orelse row.line_pair.right.?;
+        try testing.expectEqual(@as(usize, 1), line.decoration.runs.len);
+    }
+}
+
+test "side_by_side matches the earliest repeated Line and rebuilds stably" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const raw =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,3 +1,2 @@
+        \\-same
+        \\-
+        \\-same
+        \\+same
+        \\+
+        \\
+    ;
+    const diff = try parse(a, raw);
+    const first = try build(a, diff, .side_by_side);
+    const second = try build(a, diff, .side_by_side);
+    try expectChangedLinesExactlyOnce(diff, first);
+
+    try testing.expectEqual(&diff.files[0].hunks[0].lines[0], first.rows[2].line_pair.left.?.line);
+    try testing.expectEqual(&diff.files[0].hunks[0].lines[3], first.rows[2].line_pair.right.?.line);
+    for (first.rows[2..], second.rows[2..]) |first_row, second_row| {
+        try testing.expectEqual(if (first_row.line_pair.left) |line| line.line else null, if (second_row.line_pair.left) |line| line.line else null);
+        try testing.expectEqual(if (first_row.line_pair.right) |line| line.line else null, if (second_row.line_pair.right) |line| line.line else null);
+    }
+}
+
+test "side_by_side pairs identical Lines while Unified keeps Diff order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const raw =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,2 +1,2 @@
+        \\-same
+        \\-same
+        \\+same
+        \\+same
+        \\
+    ;
+    const diff = try parse(a, raw);
+    const side_by_side = try build(a, diff, .side_by_side);
+    const unified = try build(a, diff, .unified);
+    try expectChangedLinesExactlyOnce(diff, side_by_side);
+
+    const lines = diff.files[0].hunks[0].lines;
+    try testing.expectEqual(&lines[0], side_by_side.rows[2].line_pair.left.?.line);
+    try testing.expectEqual(&lines[2], side_by_side.rows[2].line_pair.right.?.line);
+    try testing.expectEqual(&lines[1], side_by_side.rows[3].line_pair.left.?.line);
+    try testing.expectEqual(&lines[3], side_by_side.rows[3].line_pair.right.?.line);
+    for (lines, unified.rows[2..]) |*line, row| try testing.expectEqual(line, row.line.line);
+}
+
 test "side_by_side weaves an inline thread once, under its anchored pair" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1283,6 +1539,53 @@ test "side_by_side weaves an inline thread once, under its anchored pair" {
 
     // Exactly one comment row (not double-woven across the two panes).
     try testing.expectEqual(@as(usize, 1), countKind(buf, .comment));
+}
+
+test "side_by_side keeps old-side and new-side Comments and Drafts on their Lines" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const raw =
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,2 +1,2 @@
+        \\-old comment
+        \\-old draft
+        \\+new comment
+        \\+new draft
+        \\
+    ;
+    const diff = try parse(a, raw);
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "old", .anchor = .{ .path = "a.txt", .from = 1 } },
+        .{ .id = 2, .author = "Bo", .body = "new", .anchor = .{ .path = "a.txt", .to = 1 } },
+    };
+    const threads = try bbr.review.thread.build(a, &comments);
+    const drafts = [_]Draft{
+        .{ .local_id = 1, .kind = .comment, .body = "old", .anchor = .{ .path = "a.txt", .from = 2, .commit = "base" } },
+        .{ .local_id = 2, .kind = .comment, .body = "new", .anchor = .{ .path = "a.txt", .to = 2, .commit = "source" } },
+    };
+    const buf = try buildWithComments(a, diff, .side_by_side, threads, .{ .drafts = &drafts });
+
+    var latest_pair: ?LinePair = null;
+    for (buf.rows) |row| switch (row) {
+        .line_pair => |pair| latest_pair = pair,
+        .comment => |card| if (card.part == .header) {
+            const expected: []const u8 = if (card.commentItem().id == 1) "old comment" else "new comment";
+            const line = if (card.commentItem().id == 1) latest_pair.?.left.? else latest_pair.?.right.?;
+            try testing.expectEqualStrings(expected, line.line.text);
+        },
+        .draft => |card| if (card.part == .header) {
+            const expected: []const u8 = if (card.draftItem().local_id == 1) "old draft" else "new draft";
+            const line = if (card.draftItem().local_id == 1) latest_pair.?.left.? else latest_pair.?.right.?;
+            try testing.expectEqualStrings(expected, line.line.text);
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 2), countKind(buf, .comment));
+    try testing.expectEqual(@as(usize, 2), countKind(buf, .draft));
 }
 
 test "unavailable File sides project non-source Status Placeholders in every Layout and Scope" {
@@ -1435,6 +1738,18 @@ fn countKind(buf: Buffer, kind: RowKind) usize {
         }
     }
     return n;
+}
+
+fn expectChangedLinesExactlyOnce(diff: model.Diff, buf: Buffer) !void {
+    for (diff.files) |file| for (file.hunks) |hunk| for (hunk.lines) |*line| {
+        if (line.kind == .context) continue;
+        var count: usize = 0;
+        for (buf.rows) |row| if (row == .line_pair) {
+            if (row.line_pair.left) |left| count += @intFromBool(left.line == line);
+            if (row.line_pair.right) |right| count += @intFromBool(right.line == line);
+        };
+        try testing.expectEqual(@as(usize, 1), count);
+    };
 }
 
 // A hunk with a long unchanged middle: change, 10 context lines, change.

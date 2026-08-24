@@ -6969,7 +6969,7 @@ test "side-by-side yank applies provisional new-side-first source selection" {
     defer presentation.deinit();
     try presentation.dispatch(.{ .action = .toggle_layout });
     const published = presentation.published.?;
-    for (published.buffer.rows, 0..) |row, index| if (row == .line_pair) {
+    for (published.buffer.rows, 0..) |row, index| if (row == .line_pair and row.line_pair.right != null) {
         published.navigation.jumpTo(index);
         break;
     };
