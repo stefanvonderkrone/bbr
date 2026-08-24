@@ -164,6 +164,61 @@ Syntax highlighting is loaded lazily for the focused File. `max_file_bytes` limi
 file side independently; the 2 MiB default avoids expensive parsing of generated or minified
 files. Set it to `0` for no limit. Files above the limit remain readable as plain text.
 
+### Manage UserGrammars
+
+> **Warning:** A UserGrammar contains native code. It runs in the `bbr` process with your
+> permissions and can access the same memory and files. A SHA-256 digest proves the bundle's
+> identity and integrity. It does not prove that the code is safe.
+
+`bbr` installs only a local, prebuilt UserGrammar bundle. It does not download Grammar sources,
+compile a Grammar, discover packages, or update a UserGrammar automatically.
+
+Check a folder or `.tar.gz` archive before installation:
+
+```sh
+bbr grammar check ./tree-sitter-example-bundle
+```
+
+The output includes the UserGrammar identity, its GrammarMatch rules, affected BuiltInGrammars,
+and the canonical SHA-256 digest. Install the exact bundle interactively, or pass the reported
+digest in automation:
+
+```sh
+bbr grammar install ./tree-sitter-example-bundle
+bbr grammar install ./tree-sitter-example-bundle --trust-sha256 <digest>
+```
+
+Installation enables the bundle's default GrammarMatch rules. These commands manage the rest of
+the lifecycle:
+
+```sh
+bbr grammar list
+bbr grammar check <name>
+bbr grammar update <name> ./replacement-bundle --trust-sha256 <digest>
+bbr grammar disable <name>
+bbr grammar enable <name>
+bbr grammar remove <name>
+```
+
+`disable` keeps the installed files. `enable` checks all active GrammarMatch rules again. `remove`
+refuses a UserGrammar that still has a `[grammars.<name>]` table in `config.toml`. A failed install
+or update keeps the prior installation and registry. A running `bbr` process does not reload CLI
+changes.
+
+To replace all default GrammarMatch rules for one UserGrammar, add at least one field:
+
+```toml
+[grammars.example]
+filenames = ["Examplefile"]
+compound_suffixes = [".example.test"]
+extensions = [".example"]
+shebangs = ["#!/usr/bin/env example"]
+```
+
+An active missing, changed, or invalid UserGrammar stops a new `bbr` process. An invalid disabled
+UserGrammar appears as `invalid` in `bbr grammar list` and does not stop startup. If a UserGrammar
+fails during Highlighting, `bbr` uses a matching BuiltInGrammar or plain text.
+
 Full file content has no size limit. The focused File is always retained while it is being
 reviewed. Inactive file content uses a whole-File least-recently-used cache: it is enabled by
 default with a 256 MiB budget across the current review. Evicted Files are fetched again when

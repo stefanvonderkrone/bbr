@@ -14,6 +14,7 @@ const session = @import("tui/session.zig");
 const persist = @import("persist/sqlite_store.zig");
 const config = @import("tui/config.zig");
 const TreeSitterHighlighter = @import("highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter;
+const grammar_cli = @import("highlight/grammar_cli.zig");
 const presentation = @import("tui/presentation.zig");
 const buffer_mod = @import("tui/buffer.zig");
 
@@ -27,6 +28,7 @@ pub fn main(init: std.process.Init) !void {
     // `demo` needs no credentials: it feeds synthetic data through the real
     // buffer/renderer so the comment UI can be exercised entirely offline.
     if (first) |f| {
+        if (std.mem.eql(u8, f, "grammar")) return grammarRun(init, gpa, &it);
         if (std.mem.eql(u8, f, "demo")) {
             var loaded = try config.load(gpa, init.io, init.environ_map);
             defer loaded.deinit(gpa);
@@ -94,6 +96,44 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
+    var args: std.ArrayList([]const u8) = .empty;
+    defer args.deinit(gpa);
+    while (it.next()) |arg| try args.append(gpa, arg);
+
+    const needs_confirmation = args.items.len > 0 and
+        (std.mem.eql(u8, args.items[0], "install") or std.mem.eql(u8, args.items[0], "update")) and
+        !containsTrustArgument(args.items);
+    var interactive_digest: ?[32]u8 = null;
+    if (needs_confirmation) {
+        const path_index: usize = if (std.mem.eql(u8, args.items[0], "update")) 2 else 1;
+        if (args.items.len <= path_index) return usage();
+        var output_buffer: [4096]u8 = undefined;
+        var stdout = std.Io.File.stdout().writer(init.io, &output_buffer);
+        const previewed_digest = try grammar_cli.writeCandidateReport(gpa, init.io, args.items[path_index], &stdout.interface);
+        try stdout.interface.writeAll("Trust this exact bundle? [y/N] ");
+        try stdout.interface.flush();
+        var buffer: [16]u8 = undefined;
+        var stdin = std.Io.File.stdin().reader(init.io, &buffer);
+        const answer = (try stdin.interface.takeDelimiter('\n')) orelse "";
+        const approved = std.ascii.eqlIgnoreCase(std.mem.trim(u8, answer, " \t\r"), "y") or
+            std.ascii.eqlIgnoreCase(std.mem.trim(u8, answer, " \t\r"), "yes");
+        if (approved) interactive_digest = previewed_digest;
+    }
+    var output_buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &output_buffer);
+    grammar_cli.run(gpa, init.io, init.environ_map, args.items, interactive_digest, &stdout.interface) catch |err| {
+        std.debug.print("bbr grammar: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    try stdout.interface.flush();
+}
+
+fn containsTrustArgument(args: []const []const u8) bool {
+    for (args) |arg| if (std.mem.eql(u8, arg, "--trust-sha256")) return true;
+    return false;
+}
+
 /// Resolve the startup entry and hand off to the TUI. Uses a real GitClient and
 /// a StdHttpClient for resolution; the loaded PR (and any switch) get their own
 /// clients inside `app.run`.
@@ -147,7 +187,21 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
     defer lock_dir.close(init.io);
     var os_locks = bbr.review.OsSubmissionLocks.init(gpa, init.io, lock_dir);
     defer os_locks.deinit();
+    var grammar_store: ?grammar_cli.Store = grammar_cli.Store.open(gpa, init.io, init.environ_map) catch |err| switch (err) {
+        error.NoDataHome => null,
+        else => return err,
+    };
+    defer if (grammar_store) |*grammar_data_store| grammar_data_store.deinit();
+    var grammar_registry: ?@import("highlight/user_grammar.zig").Registry = null;
+    defer if (grammar_registry) |*registry| registry.deinit();
     var tree_sitter_highlighter: TreeSitterHighlighter = .{};
+    if (grammar_store) |*grammar_data_store| {
+        const grammar_entries = try grammar_data_store.registryEntries(a);
+        const grammar_overrides = try grammar_cli.loadOverrides(a, init.io, init.environ_map);
+        try grammar_data_store.validateOverrideNames(grammar_overrides);
+        grammar_registry = try @import("highlight/user_grammar.zig").Registry.init(gpa, init.io, grammar_entries, grammar_overrides, grammar_cli.bbr_identity);
+        tree_sitter_highlighter = TreeSitterHighlighter.init(&grammar_registry.?);
+    }
 
     app.run(.{
         .io = init.io,
@@ -234,7 +288,21 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
         return;
     };
 
+    var grammar_store: ?grammar_cli.Store = grammar_cli.Store.open(gpa, init.io, init.environ_map) catch |err| switch (err) {
+        error.NoDataHome => null,
+        else => return err,
+    };
+    defer if (grammar_store) |*grammar_data_store| grammar_data_store.deinit();
+    var grammar_registry: ?@import("highlight/user_grammar.zig").Registry = null;
+    defer if (grammar_registry) |*registry| registry.deinit();
     var tree_sitter_highlighter: TreeSitterHighlighter = .{};
+    if (grammar_store) |*grammar_data_store| {
+        const grammar_entries = try grammar_data_store.registryEntries(a);
+        const grammar_overrides = try grammar_cli.loadOverrides(a, init.io, init.environ_map);
+        try grammar_data_store.validateOverrideNames(grammar_overrides);
+        grammar_registry = try @import("highlight/user_grammar.zig").Registry.init(gpa, init.io, grammar_entries, grammar_overrides, grammar_cli.bbr_identity);
+        tree_sitter_highlighter = TreeSitterHighlighter.init(&grammar_registry.?);
+    }
     try app.run(.{
         .io = init.io,
         .gpa = gpa,
@@ -563,6 +631,7 @@ fn usage() void {
         \\  bbr check-mutation <repo> <pr-id> destructive live Comment lifecycle check
         \\  bbr external-edit-smoke          interactive PTY External Edit check
         \\  bbr demo                         open the TUI with synthetic data (no network)
+        \\  bbr grammar <command> ...        manage trusted local UserGrammars
         \\
         \\Remote review commands need BITBUCKET_USERNAME, BITBUCKET_TOKEN,
         \\BITBUCKET_WORKSPACE in the environment.
@@ -677,6 +746,7 @@ test {
     _ = @import("highlight/tree_sitter_highlighter.zig");
     _ = @import("highlight/query_regex.zig");
     _ = @import("highlight/user_grammar.zig");
+    _ = @import("highlight/grammar_cli.zig");
     _ = @import("tui/app.zig");
     _ = @import("tui/config.zig");
     _ = @import("tui/review_body.zig");

@@ -346,6 +346,13 @@ pub const Inspection = struct {
         try validateLanguage(self.arena.allocator(), language, self.manifest, self.files, &self.diagnostic);
     }
 
+    pub fn writeBundle(self: *const Inspection, dir: std.Io.Dir) !void {
+        for (self.files) |file| {
+            if (std.fs.path.dirname(file.path)) |parent| try dir.createDirPath(self.io, parent);
+            try dir.writeFile(self.io, .{ .sub_path = file.path, .data = file.bytes });
+        }
+    }
+
     fn writeTemporaryLibrary(self: *Inspection) !struct { root: []const u8, path: []const u8 } {
         var random: [16]u8 = undefined;
         try self.io.randomSecure(&random);

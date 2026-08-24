@@ -76,9 +76,31 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    const fixture_mod = b.createModule(.{
+        .root_source_file = b.path("tests/user_grammar_fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    fixture_mod.addIncludePath(b.path("vendors/tree-sitter/runtime/include"));
+    fixture_mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/javascript/src/parser.c"), .flags = &.{"-std=c11"} });
+    fixture_mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/javascript/src/scanner.c"), .flags = &.{"-std=c11"} });
+    const grammar_fixture = b.addLibrary(.{ .name = "bbr-user-grammar-fixture", .linkage = .dynamic, .root_module = fixture_mod });
+
+    const lifecycle_mod = b.createModule(.{
+        .root_source_file = b.path("tests/grammar_cli_integration.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const lifecycle_test = b.addExecutable(.{ .name = "grammar-cli-integration", .root_module = lifecycle_mod });
+    const run_lifecycle_test = b.addRunArtifact(lifecycle_test);
+    run_lifecycle_test.addArtifactArg(exe);
+    run_lifecycle_test.addArtifactArg(grammar_fixture);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_lifecycle_test.step);
 }
 
 fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {

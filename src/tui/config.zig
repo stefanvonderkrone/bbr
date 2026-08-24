@@ -168,7 +168,7 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
     var external_edit_max_bytes = Configuration.default_external_edit_max_bytes;
     var external_edit_seen = false;
     var external_edit_line: usize = 1;
-    var section: enum { root, keymap, highlight, files_cache, comments, input_mouse, external_edit, unknown } = .root;
+    var section: enum { root, keymap, highlight, files_cache, comments, input_mouse, external_edit, user_grammar, unknown } = .root;
 
     var lines = std.mem.splitScalar(u8, source, '\n');
     var line_number: usize = 0;
@@ -185,7 +185,7 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
             };
             parser.space();
             if (!parser.trailing()) try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "unexpected text after table header" });
-            if (std.mem.eql(u8, parsed_section, "keymap")) section = .keymap else if (std.mem.eql(u8, parsed_section, "highlight")) section = .highlight else if (std.mem.eql(u8, parsed_section, "files.cache")) section = .files_cache else if (std.mem.eql(u8, parsed_section, "comments")) section = .comments else if (std.mem.eql(u8, parsed_section, "input.mouse")) section = .input_mouse else if (std.mem.eql(u8, parsed_section, "external_edit")) section = .external_edit else {
+            if (std.mem.eql(u8, parsed_section, "keymap")) section = .keymap else if (std.mem.eql(u8, parsed_section, "highlight")) section = .highlight else if (std.mem.eql(u8, parsed_section, "files.cache")) section = .files_cache else if (std.mem.eql(u8, parsed_section, "comments")) section = .comments else if (std.mem.eql(u8, parsed_section, "input.mouse")) section = .input_mouse else if (std.mem.eql(u8, parsed_section, "external_edit")) section = .external_edit else if (std.mem.startsWith(u8, parsed_section, "grammars.") and parsed_section.len > "grammars.".len) section = .user_grammar else {
                 section = .unknown;
                 try diagnostics.append(allocator, .{ .line = line_number, .column = 2, .message = "unknown table", .hint = "use [keymap], [highlight], [files.cache], [comments], [input.mouse], or [external_edit]" });
             }
@@ -240,6 +240,20 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
             };
             try overrides.append(allocator, override);
             try override_lines.append(allocator, line_number);
+            continue;
+        }
+        if (section == .user_grammar) {
+            if (!std.mem.eql(u8, key, "filenames") and !std.mem.eql(u8, key, "compound_suffixes") and !std.mem.eql(u8, key, "extensions") and !std.mem.eql(u8, key, "shebangs")) {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown UserGrammar key", .hint = "use filenames, compound_suffixes, extensions, or shebangs" });
+                continue;
+            }
+            const parsed = parser.stringArray() catch {
+                try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "expected a non-empty array of quoted GrammarMatch values" });
+                continue;
+            };
+            if (parsed.len == 0) try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "GrammarMatch list cannot be empty" });
+            parser.space();
+            if (!parser.trailing()) try diagnostics.append(allocator, .{ .line = line_number, .column = parser.column(), .message = "unexpected text after value" });
             continue;
         }
         const value: []const u8 = switch (section) {
@@ -354,6 +368,7 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
                 };
                 external_edit_seen = true;
             },
+            .user_grammar => unreachable,
             .unknown => {},
         }
     }
