@@ -609,6 +609,20 @@ const FailingHighlighter = struct {
     }
 };
 
+const CountingBlobSource = struct {
+    calls: usize = 0,
+
+    fn source(self: *CountingBlobSource) BlobSource {
+        return .{ .ptr = self, .read_fn = read };
+    }
+
+    fn read(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8) anyerror![]u8 {
+        const self: *CountingBlobSource = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        return error.UnexpectedRead;
+    }
+};
+
 test "an added File transfers its enriched new side into Session storage" {
     const responses = [_]bbr.http.Canned{.{ .status = 200, .body = "const answer = 42;\n" }};
     var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
@@ -755,7 +769,7 @@ test "File Content Status is independent per expected side and from Highlighting
     try testing.expect(storage.file(0).new.content.highlighting == .failed);
 }
 
-test "RawDiff binary sides skip File Enrichment reads and Highlighting" {
+test "remote and local RawDiff binary sides skip File Enrichment reads and Highlighting" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const diff = try bbr.diff.parse(arena.allocator(),
@@ -777,7 +791,7 @@ test "RawDiff binary sides skip File Enrichment reads and Highlighting" {
     var fake: bbr.http.FakeHttpClient = .{ .body = "must not be read" };
     const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
     var scripted = ScriptedHighlighter{};
-    var result = try enrich(testing.allocator, bb, scripted.highlighter(), .{
+    const req: Request = .{
         .repo = "repo",
         .status = file.status,
         .source_commit = "source",
@@ -785,13 +799,36 @@ test "RawDiff binary sides skip File Enrichment reads and Highlighting" {
         .old_path = file.old_path,
         .new_path = file.new_path,
         .max_file_bytes = 0,
+        .content = file.content,
+    };
+    var remote_result = try enrich(testing.allocator, bb, scripted.highlighter(), req);
+    defer remote_result.deinit();
+    var local_source = CountingBlobSource{};
+    var local_result = try enrichFrom(testing.allocator, local_source.source(), scripted.highlighter(), req);
+    defer local_result.deinit();
+    try testing.expectEqual(@as(?usize, 3), remote_result.old.binary);
+    try testing.expectEqual(@as(?usize, 4), remote_result.new.binary);
+    try testing.expectEqual(@as(?usize, 3), local_result.old.binary);
+    try testing.expectEqual(@as(?usize, 4), local_result.new.binary);
+    try testing.expectEqual(@as(usize, 0), fake.call_count);
+    try testing.expectEqual(@as(usize, 0), local_source.calls);
+    try testing.expectEqual(@as(usize, 0), scripted.calls);
+
+    var unavailable_result = try enrich(testing.allocator, bb, scripted.highlighter(), .{
+        .repo = req.repo,
+        .status = req.status,
+        .source_commit = req.source_commit,
+        .destination_commit = req.destination_commit,
+        .old_path = req.old_path,
+        .new_path = req.new_path,
+        .max_file_bytes = req.max_file_bytes,
         .content = .{
             .old = .{ .unavailable = .{ .reason = .invalid_utf8, .byte_size = 3 } },
-            .new = file.content.new,
+            .new = req.content.new,
         },
     });
-    defer result.deinit();
-    try testing.expect(result.old == .unavailable);
+    defer unavailable_result.deinit();
+    try testing.expect(unavailable_result.old == .unavailable);
     try testing.expectEqual(@as(usize, 0), fake.call_count);
     try testing.expectEqual(@as(usize, 0), scripted.calls);
 }

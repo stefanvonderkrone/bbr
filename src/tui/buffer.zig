@@ -1336,6 +1336,27 @@ test "binary Files project independent sides in every Layout and Scope" {
             try testing.expectEqual(@as(usize, 2), countKind(projected, .comment));
             try testing.expectEqual(@as(usize, 0), countKind(projected, .line));
             try testing.expectEqual(@as(usize, 0), countKind(projected, .line_pair));
+            for (projected.rows) |row| if (row == .status_placeholder) {
+                const placeholder = row.status_placeholder;
+                switch (placeholder.file.status) {
+                    .modified => {
+                        if (placeholder.old) |old| try testing.expectEqual(@as(?usize, 3), old.binary);
+                        if (placeholder.new) |new| try testing.expectEqual(@as(?usize, 4), new.binary);
+                    },
+                    .added => {
+                        try testing.expect(placeholder.old == null);
+                        try testing.expectEqual(@as(?usize, null), placeholder.new.?.binary);
+                    },
+                    .removed => {
+                        try testing.expectEqual(@as(?usize, null), placeholder.old.?.binary);
+                        try testing.expect(placeholder.new == null);
+                    },
+                    .renamed => {
+                        if (placeholder.old) |old| try testing.expectEqual(@as(?usize, null), old.binary);
+                        if (placeholder.new) |new| try testing.expectEqual(@as(?usize, null), new.binary);
+                    },
+                }
+            };
         }
     }
 }

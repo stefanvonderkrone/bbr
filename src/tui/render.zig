@@ -1125,18 +1125,24 @@ test "binary Status Placeholder renders an unknown size" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const file: bbr.diff.File = .{ .old_path = "/dev/null", .new_path = "a.bin", .status = .added, .hunks = &.{} };
-    const rows = [_]buffer_mod.Row{.{ .status_placeholder = .{ .file = &file, .new = .{ .binary = null } } }};
+    const added: bbr.diff.File = .{ .old_path = "/dev/null", .new_path = "a.bin", .status = .added, .hunks = &.{} };
+    const removed: bbr.diff.File = .{ .old_path = "b.bin", .new_path = "/dev/null", .status = .removed, .hunks = &.{} };
+    const rows = [_]buffer_mod.Row{
+        .{ .status_placeholder = .{ .file = &added, .new = .{ .binary = null } } },
+        .{ .status_placeholder = .{ .file = &removed, .old = .{ .binary = 7 } } },
+    };
     const buf: Buffer = .{ .rows = &rows, .layout = .side_by_side };
-    var screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    var screen = try vaxis.Screen.init(a, .{ .rows = 2, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
 
-    drawPane(a, win, buf, theme_dark, Nav.init(1, 1));
+    drawPane(a, win, buf, theme_dark, Nav.init(2, 2));
 
     try expectScreenText(win, 0, "Old content absent");
-    const right = win.child(.{ .x_off = win.width / 2 + 1, .width = win.width - (win.width / 2 + 1), .height = 1 });
+    const right = win.child(.{ .x_off = win.width / 2 + 1, .width = win.width - (win.width / 2 + 1), .height = 2 });
     try expectScreenText(right, 0, "New content binary, size unavailable");
+    try expectScreenText(win, 1, "Old content binary, 7 bytes");
+    try expectScreenText(right, 1, "New content absent");
 }
 
 test "a modified line paints only its changed run with the emphasis band" {
