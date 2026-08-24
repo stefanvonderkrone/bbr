@@ -896,6 +896,7 @@ pub const ActionAvailability = struct {
     has_review: bool = true,
     context: keymap_mod.InteractionContext = .diff,
     source: bool = true,
+    selection: bool = true,
     /// null means the ReviewCard under the cursor is editable.
     edit_refusal: ?MutationRefusal = .no_review_item,
     /// null means the ReviewCard under the cursor — or, while re-anchor is
@@ -916,6 +917,7 @@ pub const ActionAvailability = struct {
         };
         return switch (action) {
             .inline_comment, .suggest, .yank => self.source,
+            .toggle_select => self.selection,
             .edit_review_item => self.edit_refusal == null,
             .reanchor_review_item => self.reanchor_refusal == null,
             .delete_review_item => self.delete_refusal == null,
@@ -1242,6 +1244,7 @@ const Published = struct {
                 .scope_projections = published.scope_projection.items,
                 .blobs = enrichment.blobs,
                 .highlights = enrichment.highlights,
+                .content_statuses = enrichment.content_statuses,
                 .fold_context = preferences.scope == .changes,
                 .whole_file = preferences.scope == .whole,
                 .card_width = frame_mod.paneRects(geometry).diff.width,
@@ -1603,6 +1606,7 @@ const Published = struct {
                 .only_file = isolated_file,
                 .blobs = enrichment.blobs,
                 .highlights = enrichment.highlights,
+                .content_statuses = enrichment.content_statuses,
                 .card_width = frame_mod.paneRects(geometry).diff.width,
                 .cell_metrics = self.cell_metrics,
                 .collapsed_rows = self.commentsCollapsedRows(),
@@ -3041,7 +3045,9 @@ pub const Presentation = struct {
                 const published = self.published orelse return;
                 if (index >= published.buffer.rows.len) return;
                 self.focusPane(published, .diff);
+                const previous_cursor = published.navigation.cursor;
                 published.navigation.jumpTo(index);
+                clampSelectionAtStatusPlaceholder(published, previous_cursor);
                 if (buffer_mod.disclosureKey(published.buffer.rows[index]) != null)
                     self.applyAction(.toggle_disclosure);
             },
@@ -3336,6 +3342,7 @@ pub const Presentation = struct {
             .remote = published.key.isRemote(),
             .context = context,
             .source = source,
+            .selection = published.navigation.hasSelection() or (published.navigation.cursor < published.buffer.rows.len and published.buffer.rows[published.navigation.cursor] != .status_placeholder),
             .edit_refusal = self.editRefusal(published),
             .reanchor_refusal = self.reanchorRefusal(published),
             .delete_refusal = self.deleteRefusal(published),
@@ -3972,7 +3979,7 @@ pub const Presentation = struct {
             self.action_error = switch (action) {
                 .open_pull_request_picker => .local_review_no_picker,
                 .submit => .local_review_no_submission,
-                .inline_comment, .suggest, .yank => .source_action_unavailable,
+                .inline_comment, .suggest, .yank, .toggle_select => .source_action_unavailable,
                 .edit_review_item => mutationRefusalError(availability.edit_refusal),
                 .reanchor_review_item => mutationRefusalError(availability.reanchor_refusal),
                 .delete_review_item => mutationRefusalError(availability.delete_refusal),
@@ -4004,6 +4011,7 @@ pub const Presentation = struct {
         const published = self.published orelse return;
         self.action_error = null;
         const active_before = published.activeFile();
+        const selection_cursor_before = published.navigation.cursor;
         switch (action) {
             .down => if (published.focus == .sidebar) published.sidebarVertical(1) else published.navigation.down(),
             .up => if (published.focus == .sidebar) published.sidebarVertical(-1) else published.navigation.up(),
@@ -4024,14 +4032,21 @@ pub const Presentation = struct {
             .scroll_row_up => self.scrollPane(published, published.focus, -1),
             .scroll_row_down => self.scrollPane(published, published.focus, 1),
             .select_down => {
-                published.navigation.ensureMark();
+                if (published.navigation.cursor < published.buffer.rows.len and published.buffer.rows[published.navigation.cursor] != .status_placeholder) published.navigation.ensureMark();
                 published.navigation.down();
             },
             .select_up => {
-                published.navigation.ensureMark();
+                if (published.navigation.cursor < published.buffer.rows.len and published.buffer.rows[published.navigation.cursor] != .status_placeholder) published.navigation.ensureMark();
                 published.navigation.up();
             },
-            .toggle_select => published.navigation.toggleMark(),
+            .toggle_select => {
+                if (published.navigation.hasSelection())
+                    published.navigation.clearMark()
+                else if (published.navigation.cursor < published.buffer.rows.len and published.buffer.rows[published.navigation.cursor] != .status_placeholder)
+                    published.navigation.toggleMark()
+                else
+                    self.action_error = .source_action_unavailable;
+            },
             .clear_selection => published.navigation.clearMark(),
             .refresh => self.queueRefresh(published.key),
             .toggle_layout => {
@@ -4073,6 +4088,7 @@ pub const Presentation = struct {
             .open_file_finder, .open_pull_request_picker, .confirm_picker, .help => unreachable,
             .quit => unreachable,
         }
+        clampSelectionAtStatusPlaceholder(published, selection_cursor_before);
         if (published.focus == .diff and active_before != published.activeFile()) self.revealActiveFile(published);
     }
 
@@ -6226,6 +6242,29 @@ fn lineAtRow(row: buffer_mod.Row) ?*const bbr.diff.Line {
     };
 }
 
+fn clampSelectionAtStatusPlaceholder(published: *Published, previous_cursor: usize) void {
+    if (!published.navigation.hasSelection()) return;
+    const cursor = published.navigation.cursor;
+    const target = selectionTarget(published.buffer.rows, previous_cursor, cursor);
+    if (target != cursor) published.navigation.jumpTo(target);
+}
+
+fn selectionTarget(rows: []const buffer_mod.Row, from: usize, to: usize) usize {
+    if (to > from) {
+        var index = from + 1;
+        while (index <= to and index < rows.len) : (index += 1) {
+            if (rows[index] == .status_placeholder) return index - 1;
+        }
+    } else if (to < from) {
+        var index = from;
+        while (index > to) {
+            index -= 1;
+            if (rows[index] == .status_placeholder) return index + 1;
+        }
+    }
+    return to;
+}
+
 const AnchorSpan = struct {
     from: ?u32 = null,
     to: ?u32 = null,
@@ -6385,6 +6424,63 @@ fn testLocalSession(backing: std.mem.Allocator) !*session_mod.Session {
     );
     try s.initializeEnrichment();
     return s;
+}
+
+test "Status Placeholder refuses Selection and clamps an active Selection before it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const command = presentation.takeCommand().?.enrich_file;
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 404, .body = "" },
+        .{ .status = 200, .body = "new\n" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+    var highlighter = TestNoopHighlighter{};
+    const result = try file_enrichment.enrich(testing.allocator, client, highlighter.highlighter(), command.request());
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = command.command_id,
+        .work_id = command.work_id,
+        .session_epoch = command.session_epoch,
+        .file_index = command.file_index,
+        .outcome = .{ .completed = result },
+    } });
+
+    try presentation.dispatch(.{ .action = .down });
+    var projected = presentation.projection();
+    try testing.expect(projected.review.?.buffer.rows[projected.review.?.navigation.cursor] == .status_placeholder);
+    try testing.expect(!projected.action_availability.available(.toggle_select));
+    try presentation.dispatch(.{ .action = .toggle_select });
+    projected = presentation.projection();
+    try testing.expect(projected.review.?.navigation.selection() == null);
+    try testing.expectEqual(ActionError.source_action_unavailable, projected.action_error.?);
+
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try presentation.dispatch(.{ .action = .to_top });
+    projected = presentation.projection();
+    const selection = projected.review.?.navigation.selection().?;
+    var index = selection[0];
+    while (index <= selection[1]) : (index += 1) {
+        try testing.expect(projected.review.?.buffer.rows[index] != .status_placeholder);
+    }
+
+    const content = projected.review.?.frame.panes.diff_content;
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 1, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 1, .button = .left, .type = .release } });
+    projected = presentation.projection();
+    try testing.expect(projected.review.?.buffer.rows[projected.review.?.navigation.cursor] != .status_placeholder);
 }
 
 test "local review gates remote actions and refreshes the same identity" {

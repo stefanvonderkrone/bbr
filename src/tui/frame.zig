@@ -55,6 +55,7 @@ pub const HitTarget = union(enum) {
 pub const RowOwner = union(enum) {
     file: *const bbr.diff.File,
     hunk: *const bbr.diff.model.Hunk,
+    status_placeholder: struct { file: *const bbr.diff.File, old: bool, new: bool },
     line: *const bbr.diff.Line,
     disclosure: buffer_mod.DisclosureKey,
     comment: struct { id: bbr.review.CommentId, source_offset: usize, part: ?@import("review_card.zig").Part = null },
@@ -67,6 +68,7 @@ pub const RowOwner = union(enum) {
         return switch (a) {
             .file => |value| value == b.file,
             .hunk => |value| value == b.hunk,
+            .status_placeholder => |value| value.file == b.status_placeholder.file and value.old == b.status_placeholder.old and value.new == b.status_placeholder.new,
             .line => |value| value == b.line,
             .disclosure => |value| std.meta.eql(value, b.disclosure),
             .comment => |value| value.id == b.comment.id and value.source_offset == b.comment.source_offset and value.part == b.comment.part,
@@ -227,6 +229,7 @@ fn owner(row: buffer_mod.Row) RowOwner {
     return switch (row) {
         .file_header => |file| .{ .file = file },
         .hunk_header => |hunk| .{ .hunk = hunk },
+        .status_placeholder => |value| .{ .status_placeholder = .{ .file = value.file, .old = value.old != null, .new = value.new != null } },
         .line => |line| .{ .line = line.line },
         .line_pair => |pair| .{ .line = if (pair.right) |right| right.line else pair.left.?.line },
         .disclosure => |value| .{ .disclosure = value.key },
@@ -262,6 +265,7 @@ fn rowText(row: buffer_mod.Row) []const u8 {
     return switch (row) {
         .file_header => |file| file.displayPath(),
         .hunk_header => |hunk| hunk.header,
+        .status_placeholder => "",
         .line => |line| line.line.text,
         .line_pair => |pair| if (pair.right) |right| right.line.text else if (pair.left) |left| left.line.text else "",
         .disclosure => "",

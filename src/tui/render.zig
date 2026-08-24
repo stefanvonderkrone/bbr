@@ -232,11 +232,11 @@ fn drawPane(scratch: std.mem.Allocator, win: vaxis.Window, buf: Buffer, theme: T
     while (r < win.height) : (r += 1) {
         const idx = nav.scroll + r;
         if (idx >= buf.rows.len) break;
-        drawRow(scratch, win, r, buf.rows[idx], theme);
+        drawRow(scratch, win, r, buf.layout, buf.rows[idx], theme);
         // Tint the whole visual-selection band; the cursor row takes the tint a
         // second time so it stays distinguishable within the band.
         if (sel) |s| {
-            if (idx >= s[0] and idx <= s[1]) highlightCursorRow(win, r, theme);
+            if (idx >= s[0] and idx <= s[1] and buf.rows[idx] != .status_placeholder) highlightCursorRow(win, r, theme);
         }
         if (idx == nav.cursor) highlightCursorRow(win, r, theme);
     }
@@ -261,7 +261,7 @@ fn highlightCursorRow(win: vaxis.Window, r: u16, theme: Theme) void {
 /// Gutter is two 4-wide line-number columns; body text starts after it.
 const gutter_cols: u16 = 10;
 
-fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, theme: Theme) void {
+fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, row: Row, theme: Theme) void {
     switch (row) {
         .file_header => |file| {
             fillRuleRow(win, r, theme.section_rule);
@@ -272,6 +272,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, them
             fillRow(win, r, theme.hunk_header);
             _ = win.printSegment(.{ .text = hunk.header, .style = theme.hunk_header }, .{ .row_offset = r, .wrap = .none });
         },
+        .status_placeholder => |value| drawStatusPlaceholder(scratch, win, r, layout, value, theme),
         .line => |lr| {
             const ln = lr.line;
             const style = theme.lineStyle(ln.kind);
@@ -291,6 +292,56 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, row: Row, them
         .snapshot => |snapshot| drawSnapshot(win, r, snapshot, theme),
         .section => |sec| drawSection(scratch, win, r, sec, theme),
     }
+}
+
+fn drawStatusPlaceholder(
+    scratch: std.mem.Allocator,
+    win: vaxis.Window,
+    row: u16,
+    layout: buffer_mod.Layout,
+    value: buffer_mod.StatusPlaceholder,
+    theme: Theme,
+) void {
+    fillRow(win, row, theme.section);
+    if (layout == .unified) {
+        const text = if (value.old) |status|
+            statusPlaceholderText(scratch, .old, status)
+        else if (value.new) |status|
+            statusPlaceholderText(scratch, .new, status)
+        else
+            return;
+        _ = win.printSegment(.{ .text = text, .style = theme.section }, .{ .row_offset = row, .wrap = .none });
+        return;
+    }
+
+    const half = win.width / 2;
+    if (half == 0) return;
+    if (value.old) |status| {
+        const left = win.child(.{ .x_off = 0, .y_off = row, .width = half, .height = 1 });
+        _ = left.printSegment(.{ .text = statusPlaceholderText(scratch, .old, status), .style = theme.section }, .{ .wrap = .none });
+    }
+    const right_x = half + 1;
+    if (value.new) |status| if (right_x < win.width) {
+        const right = win.child(.{ .x_off = right_x, .y_off = row, .width = win.width - right_x, .height = 1 });
+        _ = right.printSegment(.{ .text = statusPlaceholderText(scratch, .new, status), .style = theme.section }, .{ .wrap = .none });
+    };
+}
+
+fn statusPlaceholderText(scratch: std.mem.Allocator, side: Side, status: bbr.diff.FileContentStatus) []const u8 {
+    const side_name = if (side == .old) "Old" else "New";
+    const size = if (status.byteSize()) |bytes|
+        std.fmt.allocPrint(scratch, "{d} bytes", .{bytes}) catch "size unavailable"
+    else
+        "size unavailable";
+    return switch (status) {
+        .text => unreachable,
+        .binary => std.fmt.allocPrint(scratch, "{s} content binary, {s}", .{ side_name, size }) catch "Binary content",
+        .unavailable => |value| switch (value.reason) {
+            .invalid_utf8 => std.fmt.allocPrint(scratch, "{s} content unavailable: invalid UTF-8, {s}", .{ side_name, size }) catch "Content unavailable",
+            .invalid_path => std.fmt.allocPrint(scratch, "{s} content unavailable: invalid path, {s}", .{ side_name, size }) catch "Content unavailable",
+            .acquisition_failed => |err| std.fmt.allocPrint(scratch, "{s} content unavailable: acquisition failed ({s}), {s}", .{ side_name, @errorName(err), size }) catch "Content unavailable",
+        },
+    };
 }
 
 fn fillRuleRow(win: vaxis.Window, row: u16, style: vaxis.Style) void {
@@ -938,6 +989,13 @@ fn headlessWindow(screen: *vaxis.Screen) vaxis.Window {
     };
 }
 
+fn expectScreenText(win: vaxis.Window, row: u16, expected: []const u8) !void {
+    for (expected, 0..) |char, col| {
+        const cell = win.readCell(@intCast(col), row) orelse return error.MissingCell;
+        try testing.expectEqualStrings(&.{char}, cell.char.grapheme);
+    }
+}
+
 test "diff lines render with their band background at the text cells" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1005,6 +1063,54 @@ test "syntax foreground composes over an added Line background" {
     const cell = win.readCell(sidebar_width + 1 + gutter_cols, 3).?;
     try testing.expectEqual(theme_dark.syntax_keyword, cell.style.fg);
     try testing.expectEqual(theme_dark.added.bg, cell.style.bg);
+}
+
+test "Status Placeholder renders side, reason, and known or unavailable size" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file: bbr.diff.File = .{ .old_path = "a.txt", .new_path = "a.txt", .status = .modified, .hunks = &.{} };
+    const rows = [_]buffer_mod.Row{
+        .{ .status_placeholder = .{
+            .file = &file,
+            .old = .{ .unavailable = .{ .byte_size = 27, .reason = .{ .acquisition_failed = error.NotFound } } },
+        } },
+        .{ .status_placeholder = .{
+            .file = &file,
+            .new = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NetworkError } } },
+        } },
+    };
+    const buf: Buffer = .{ .rows = &rows, .layout = .unified };
+    var screen = try vaxis.Screen.init(a, .{ .rows = 2, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    drawPane(a, win, buf, theme_dark, Nav.init(rows.len, rows.len));
+
+    try expectScreenText(win, 0, "Old content unavailable: acquisition failed (NotFound), 27 bytes");
+    try expectScreenText(win, 1, "New content unavailable: acquisition failed (NetworkError), size unavailable");
+}
+
+test "SideBySide Status Placeholders render each side independently" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file: bbr.diff.File = .{ .old_path = "a.bin", .new_path = "a.bin", .status = .modified, .hunks = &.{} };
+    const rows = [_]buffer_mod.Row{.{ .status_placeholder = .{
+        .file = &file,
+        .old = .{ .binary = 3 },
+        .new = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NotFound } } },
+    } }};
+    const buf: Buffer = .{ .rows = &rows, .layout = .side_by_side };
+    var screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 100, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    drawPane(a, win, buf, theme_dark, Nav.init(1, 1));
+
+    try expectScreenText(win, 0, "Old content binary, 3 bytes");
+    const right = win.child(.{ .x_off = win.width / 2 + 1, .width = win.width - (win.width / 2 + 1), .height = 1 });
+    try expectScreenText(right, 0, "New content unavailable: acquisition failed");
 }
 
 test "a modified line paints only its changed run with the emphasis band" {

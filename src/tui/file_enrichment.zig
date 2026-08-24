@@ -80,6 +80,7 @@ pub const SideErrors = struct { old: ?anyerror = null, new: ?anyerror = null };
 pub const Projection = struct {
     blobs: []const bbr.diff.FileBlob,
     highlights: []const bbr.highlight.FileHighlights,
+    content_statuses: []const bbr.diff.FileContent,
 };
 
 const OwnedSide = struct {
@@ -222,6 +223,7 @@ pub const Storage = struct {
     files: []StoredFile,
     blobs: []bbr.diff.FileBlob,
     highlights: []bbr.highlight.FileHighlights,
+    content_statuses: []bbr.diff.FileContent,
     statuses: []bbr.highlight.FileHighlightStatus,
     errors: []SideErrors,
     cache: CachePolicy = .{},
@@ -239,6 +241,14 @@ pub const Storage = struct {
         const highlights = try allocator.alloc(bbr.highlight.FileHighlights, diff_files.len);
         errdefer allocator.free(highlights);
         @memset(highlights, .{});
+        const content_statuses = try allocator.alloc(bbr.diff.FileContent, diff_files.len);
+        errdefer allocator.free(content_statuses);
+        for (diff_files, 0..) |diff_file, i| {
+            content_statuses[i] = .{
+                .old = if (diff_file.status == .added) null else .{ .text = null },
+                .new = if (diff_file.status == .removed) null else .{ .text = null },
+            };
+        }
         const statuses = try allocator.alloc(bbr.highlight.FileHighlightStatus, diff_files.len);
         errdefer allocator.free(statuses);
         for (diff_files, 0..) |diff_file, i| {
@@ -255,6 +265,7 @@ pub const Storage = struct {
             .files = files,
             .blobs = blobs,
             .highlights = highlights,
+            .content_statuses = content_statuses,
             .statuses = statuses,
             .errors = errors,
         };
@@ -270,6 +281,7 @@ pub const Storage = struct {
         self.allocator.free(self.files);
         self.allocator.free(self.blobs);
         self.allocator.free(self.highlights);
+        self.allocator.free(self.content_statuses);
         self.allocator.free(self.statuses);
         self.allocator.free(self.errors);
         self.* = undefined;
@@ -285,7 +297,7 @@ pub const Storage = struct {
         if (file_idx >= self.files.len) return error.FileOutOfRange;
         if (result.old == .transferred or result.new == .transferred) return error.AlreadyTransferred;
         const stored = &self.files[file_idx];
-        if (stored.old != .pending or stored.new != .pending) return error.AlreadyAdmitted;
+        if ((stored.old != .pending and stored.old != .absent) or (stored.new != .pending and stored.new != .absent)) return error.AlreadyAdmitted;
 
         stored.old = transfer(&result.old);
         stored.new = transfer(&result.new);
@@ -366,27 +378,36 @@ pub const Storage = struct {
     }
 
     pub fn projection(self: *const Storage) Projection {
-        return .{ .blobs = self.blobs, .highlights = self.highlights };
+        return .{ .blobs = self.blobs, .highlights = self.highlights, .content_statuses = self.content_statuses };
     }
 
     fn projectSide(self: *Storage, file_idx: usize, comptime which: enum { old, new }) void {
         const stored = @field(self.files[file_idx], @tagName(which));
         const blob_slot = &@field(self.blobs[file_idx], @tagName(which));
         const highlight_slot = &@field(self.highlights[file_idx], @tagName(which));
+        const content_status_slot = &@field(self.content_statuses[file_idx], @tagName(which));
         const status_slot = &@field(self.statuses[file_idx], @tagName(which));
         const error_slot = &@field(self.errors[file_idx], @tagName(which));
         blob_slot.* = null;
         highlight_slot.* = null;
         error_slot.* = null;
         switch (stored) {
-            .pending => status_slot.* = .pending,
-            .absent => status_slot.* = .absent,
+            .pending => {
+                content_status_slot.* = .{ .text = null };
+                status_slot.* = .pending;
+            },
+            .absent => {
+                content_status_slot.* = null;
+                status_slot.* = .absent;
+            },
             .fetch_failed => |err| {
+                content_status_slot.* = .{ .unavailable = .{ .reason = .{ .acquisition_failed = err } } };
                 status_slot.* = .fetch_failed;
                 error_slot.* = err;
             },
             .content => |content| {
                 blob_slot.* = content.blob;
+                content_status_slot.* = .{ .text = content.blob.len };
                 switch (content.highlighting) {
                     .ready => |ready| {
                         highlight_slot.* = ready;
@@ -413,7 +434,11 @@ pub const Storage = struct {
         while (self.inactiveRetainedBytes() > budget) {
             const victim = self.leastRecentlyUsedInactive() orelse break;
             self.retired.appendAssumeCapacity(.{ .index = victim, .file = self.files[victim] });
-            self.files[victim] = .{ .last_used = self.files[victim].last_used };
+            self.files[victim] = .{
+                .old = if (self.files[victim].old == .absent) .absent else .pending,
+                .new = if (self.files[victim].new == .absent) .absent else .pending,
+                .last_used = self.files[victim].last_used,
+            };
             self.projectSide(victim, .old);
             self.projectSide(victim, .new);
             changed = true;
@@ -628,6 +653,40 @@ test "a failed old-side fetch does not suppress the enriched new side" {
     try testing.expectEqual(error.NotFound, projected.old.fetch_failed);
     try testing.expectEqualStrings("const current = true;\n", projected.new.content.blob);
     try testing.expect(projected.new.content.highlighting == .ready);
+}
+
+test "File Content Status is independent per expected side and from Highlighting" {
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 404, .body = "" },
+        .{ .status = 200, .body = "const current = true;\n" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var failing = FailingHighlighter{};
+    var result = try enrich(testing.allocator, bb, failing.highlighter(), .{
+        .repo = "repo",
+        .status = .modified,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "src/main.ts",
+        .new_path = "src/main.ts",
+        .max_file_bytes = 0,
+    });
+    defer result.deinit();
+
+    const files = oneTestFile(.modified);
+    var storage = try Storage.init(testing.allocator, &files);
+    defer storage.deinit();
+    try storage.admit(0, &result);
+
+    const content = storage.projection().content_statuses[0];
+    try testing.expect(content.old.? == .unavailable);
+    try testing.expect(content.old.?.unavailable.byte_size == null);
+    try testing.expect(content.old.?.unavailable.reason == .acquisition_failed);
+    try testing.expectEqual(error.NotFound, content.old.?.unavailable.reason.acquisition_failed);
+    try testing.expect(content.new.? == .text);
+    try testing.expectEqual(@as(?usize, "const current = true;\n".len), content.new.?.text);
+    try testing.expect(storage.file(0).new.content.highlighting == .failed);
 }
 
 fn exerciseAddedFileOwnership(allocator: Allocator) !void {

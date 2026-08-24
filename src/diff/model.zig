@@ -46,6 +46,37 @@ pub const Hunk = struct {
 /// (`new file mode` / `deleted file mode` / `rename …` / `/dev/null` sides).
 pub const FileStatus = enum { added, modified, removed, renamed };
 
+pub const UnavailableReason = union(enum) {
+    invalid_utf8,
+    invalid_path,
+    acquisition_failed: anyerror,
+};
+
+/// The independently renderable state of one expected File side. Text and
+/// binary sizes are optional until acquisition provides them.
+pub const FileContentStatus = union(enum) {
+    text: ?usize,
+    binary: ?usize,
+    unavailable: struct {
+        byte_size: ?usize = null,
+        reason: UnavailableReason,
+    },
+
+    pub fn byteSize(self: FileContentStatus) ?usize {
+        return switch (self) {
+            .text, .binary => |size| size,
+            .unavailable => |value| value.byte_size,
+        };
+    }
+};
+
+/// Index-aligned Session projection for one File. A null side is absent from
+/// the File, as for the old side of an added File.
+pub const FileContent = struct {
+    old: ?FileContentStatus = null,
+    new: ?FileContentStatus = null,
+};
+
 /// One changed path within a `Diff`. `old_path`/`new_path` are borrowed from the
 /// raw diff and differ only for renames; for adds `old_path` and for removes
 /// `new_path` may be `"/dev/null"`.

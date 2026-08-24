@@ -35,7 +35,7 @@ const emphasis_threshold: f64 = 0.5;
 /// `side_by_side` is the other axis (design §11) and lands later.
 pub const Layout = enum { unified, side_by_side };
 
-pub const RowKind = enum { file_header, hunk_header, line, line_pair, disclosure, comment, draft, snapshot, section };
+pub const RowKind = enum { file_header, hunk_header, status_placeholder, line, line_pair, disclosure, comment, draft, snapshot, section };
 
 pub const DisclosureKey = union(enum) {
     resolved_thread: review.CommentId,
@@ -73,6 +73,12 @@ pub const LineRow = struct {
 pub const LinePair = struct {
     left: ?LineRow = null,
     right: ?LineRow = null,
+};
+
+pub const StatusPlaceholder = struct {
+    file: *const model.File,
+    old: ?model.FileContentStatus = null,
+    new: ?model.FileContentStatus = null,
 };
 
 /// A comment woven into the diff: the comment itself plus whether it's a reply
@@ -113,6 +119,7 @@ pub const Section = struct {
 pub const Row = union(RowKind) {
     file_header: *const model.File,
     hunk_header: *const model.Hunk,
+    status_placeholder: StatusPlaceholder,
     line: LineRow,
     line_pair: LinePair,
     disclosure: Disclosure,
@@ -171,6 +178,8 @@ pub const BuildOptions = struct {
     blobs: []const model.FileBlob = &.{},
     /// Side-specific Highlighting results, index-aligned with `diff.files`.
     highlights: []const bbr.highlight.highlighter.FileHighlights = &.{},
+    /// Per-side File Content Status, index-aligned with `diff.files`.
+    content_statuses: []const model.FileContent = &.{},
     /// Shared terminal geometry for ReviewCard wrapping.
     card_width: usize = 80,
     cell_metrics: CellMetrics = .bytes,
@@ -280,6 +289,8 @@ pub fn buildWithComments(
         for (opts.drafts, 0..) |*draft, draft_index| {
             if (draft.parent == null and draftCurrentInFile(draft, opts, file.*)) try w.emitDraft(draft_index);
         }
+
+        try emitStatusPlaceholders(allocator, &rows, layout, file, contentStatus(opts.content_statuses, fi));
 
         // True-whole-file: splice the fetched Hunk lines into the blob's
         // unchanged lines and emit the file as one continuous sequence (no hunk
@@ -396,6 +407,38 @@ pub fn buildWithComments(
     }
 
     return .{ .rows = try rows.toOwnedSlice(allocator), .layout = layout, .file_tallies = try fileTallies(allocator, diff, threads, opts.drafts, opts) };
+}
+
+fn contentStatus(statuses: []const model.FileContent, file_index: usize) model.FileContent {
+    if (file_index >= statuses.len) return .{};
+    return statuses[file_index];
+}
+
+fn unavailableOrBinary(status: ?model.FileContentStatus) ?model.FileContentStatus {
+    const value = status orelse return null;
+    return switch (value) {
+        .binary, .unavailable => value,
+        .text => null,
+    };
+}
+
+fn emitStatusPlaceholders(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(Row),
+    layout: Layout,
+    file: *const model.File,
+    content: model.FileContent,
+) !void {
+    const old = unavailableOrBinary(content.old);
+    const new = unavailableOrBinary(content.new);
+    switch (layout) {
+        .unified => {
+            if (old) |status| try rows.append(allocator, .{ .status_placeholder = .{ .file = file, .old = status } });
+            if (new) |status| try rows.append(allocator, .{ .status_placeholder = .{ .file = file, .new = status } });
+        },
+        .side_by_side => if (old != null or new != null)
+            try rows.append(allocator, .{ .status_placeholder = .{ .file = file, .old = old, .new = new } }),
+    }
 }
 
 /// Mutable weaving context shared by the emit helpers: the row sink plus the
@@ -1195,6 +1238,55 @@ test "side_by_side weaves an inline thread once, under its anchored pair" {
 
     // Exactly one comment row (not double-woven across the two panes).
     try testing.expectEqual(@as(usize, 1), countKind(buf, .comment));
+}
+
+test "unavailable File sides project non-source Status Placeholders in every Layout and Scope" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try parse(a, anchor_diff);
+    const content_statuses = [_]model.FileContent{
+        .{
+            .old = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NotFound } } },
+            .new = .{ .text = 12 },
+        },
+    };
+
+    for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        for ([_]bool{ false, true }) |whole_file| {
+            const projected = try buildWithComments(a, diff, layout, &.{}, .{
+                .whole_file = whole_file,
+                .fold_context = !whole_file,
+                .content_statuses = &content_statuses,
+            });
+            try testing.expectEqual(@as(usize, 1), countKind(projected, .status_placeholder));
+            for (projected.rows) |row| if (row == .status_placeholder) {
+                try testing.expect(row.status_placeholder.old != null);
+                try testing.expect(row.status_placeholder.new == null);
+            };
+            try testing.expect(countKind(projected, if (layout == .unified) .line else .line_pair) > 0);
+        }
+    }
+}
+
+test "Status Placeholders do not hide Review-level or File-level Comments" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try parse(a, anchor_diff);
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "review", .scope = .review },
+        .{ .id = 2, .author = "Bo", .body = "file", .scope = .{ .file = .{ .path = "a.txt", .source_commit = "abc" } } },
+    };
+    const threads = try bbr.review.thread.build(a, &comments);
+    const content_statuses = [_]model.FileContent{.{
+        .old = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NotFound } } },
+        .new = .{ .text = 12 },
+    }};
+    const projected = try buildWithComments(a, diff, .unified, threads, .{ .content_statuses = &content_statuses });
+
+    try testing.expectEqual(@as(usize, 1), countKind(projected, .status_placeholder));
+    try testing.expectEqual(@as(usize, 2), countKind(projected, .comment));
 }
 
 // --- Comment weaving --------------------------------------------------------
