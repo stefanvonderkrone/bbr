@@ -85,6 +85,9 @@ pub const File = struct {
     new_path: []const u8,
     status: FileStatus,
     hunks: []const Hunk,
+    /// File Content Status known from the RawDiff. File Enrichment refines text
+    /// sizes and failures but must preserve binary sides.
+    content: FileContent = .{ .old = .{ .text = null }, .new = .{ .text = null } },
 
     /// The path to show a reviewer. For a removed file the new side is
     /// `/dev/null`, so the real name lives on `old_path`; every other status

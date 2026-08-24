@@ -50,6 +50,7 @@ pub const Request = struct {
     old_path: []const u8,
     new_path: []const u8,
     max_file_bytes: usize,
+    content: bbr.diff.FileContent = .{ .old = .{ .text = null }, .new = .{ .text = null } },
 };
 
 pub const HighlightingView = union(enum) {
@@ -66,6 +67,7 @@ pub const ContentView = struct {
 pub const SideView = union(enum) {
     pending,
     absent,
+    binary: ?usize,
     fetch_failed: anyerror,
     content: ContentView,
 };
@@ -102,6 +104,7 @@ const OwnedSide = struct {
 
 const SideResult = union(enum) {
     absent,
+    binary: ?usize,
     fetch_failed: anyerror,
     owned: *OwnedSide,
     transferred,
@@ -131,10 +134,16 @@ pub fn enrichFrom(backing: Allocator, source: BlobSource, highlighter: bbr.highl
     var result: Result = .{ .old = .absent, .new = .absent };
     errdefer result.deinit();
     if (req.status != .added) {
-        result.old = try enrichSide(backing, source, highlighter, req.max_file_bytes, req.destination_commit, req.old_path);
+        result.old = if (req.content.old != null and req.content.old.? == .binary)
+            .{ .binary = req.content.old.?.binary }
+        else
+            try enrichSide(backing, source, highlighter, req.max_file_bytes, req.destination_commit, req.old_path);
     }
     if (req.status != .removed) {
-        result.new = try enrichSide(backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path);
+        result.new = if (req.content.new != null and req.content.new.? == .binary)
+            .{ .binary = req.content.new.?.binary }
+        else
+            try enrichSide(backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path);
     }
     return result;
 }
@@ -177,6 +186,7 @@ fn retainedBytes(side: *const OwnedSide) usize {
 const StoredSide = union(enum) {
     pending,
     absent,
+    binary: ?usize,
     fetch_failed: anyerror,
     content: *OwnedSide,
 
@@ -189,6 +199,7 @@ const StoredSide = union(enum) {
         return switch (self) {
             .pending => .pending,
             .absent => .absent,
+            .binary => |size| .{ .binary = size },
             .fetch_failed => |err| .{ .fetch_failed = err },
             .content => |content| .{ .content = content.view() },
         };
@@ -234,7 +245,12 @@ pub const Storage = struct {
     pub fn init(allocator: Allocator, diff_files: []const bbr.diff.File) !Storage {
         const files = try allocator.alloc(StoredFile, diff_files.len);
         errdefer allocator.free(files);
-        @memset(files, .{});
+        for (diff_files, 0..) |diff_file, i| {
+            files[i] = .{
+                .old = initialStoredSide(diff_file, .old),
+                .new = initialStoredSide(diff_file, .new),
+            };
+        }
         const blobs = try allocator.alloc(bbr.diff.FileBlob, diff_files.len);
         errdefer allocator.free(blobs);
         @memset(blobs, .{});
@@ -245,16 +261,16 @@ pub const Storage = struct {
         errdefer allocator.free(content_statuses);
         for (diff_files, 0..) |diff_file, i| {
             content_statuses[i] = .{
-                .old = if (diff_file.status == .added) null else .{ .text = null },
-                .new = if (diff_file.status == .removed) null else .{ .text = null },
+                .old = if (diff_file.status == .added) null else diff_file.content.old,
+                .new = if (diff_file.status == .removed) null else diff_file.content.new,
             };
         }
         const statuses = try allocator.alloc(bbr.highlight.FileHighlightStatus, diff_files.len);
         errdefer allocator.free(statuses);
-        for (diff_files, 0..) |diff_file, i| {
+        for (diff_files, 0..) |_, i| {
             statuses[i] = .{
-                .old = if (diff_file.status == .added) .absent else .pending,
-                .new = if (diff_file.status == .removed) .absent else .pending,
+                .old = initialHighlightState(files[i].old),
+                .new = initialHighlightState(files[i].new),
             };
         }
         const errors = try allocator.alloc(SideErrors, diff_files.len);
@@ -297,7 +313,8 @@ pub const Storage = struct {
         if (file_idx >= self.files.len) return error.FileOutOfRange;
         if (result.old == .transferred or result.new == .transferred) return error.AlreadyTransferred;
         const stored = &self.files[file_idx];
-        if ((stored.old != .pending and stored.old != .absent) or (stored.new != .pending and stored.new != .absent)) return error.AlreadyAdmitted;
+        if ((stored.old != .pending and stored.old != .absent and stored.old != .binary) or
+            (stored.new != .pending and stored.new != .absent and stored.new != .binary)) return error.AlreadyAdmitted;
 
         stored.old = transfer(&result.old);
         stored.new = transfer(&result.new);
@@ -400,6 +417,10 @@ pub const Storage = struct {
                 content_status_slot.* = null;
                 status_slot.* = .absent;
             },
+            .binary => |size| {
+                content_status_slot.* = .{ .binary = size };
+                status_slot.* = .absent;
+            },
             .fetch_failed => |err| {
                 content_status_slot.* = .{ .unavailable = .{ .reason = .{ .acquisition_failed = err } } };
                 status_slot.* = .fetch_failed;
@@ -435,8 +456,8 @@ pub const Storage = struct {
             const victim = self.leastRecentlyUsedInactive() orelse break;
             self.retired.appendAssumeCapacity(.{ .index = victim, .file = self.files[victim] });
             self.files[victim] = .{
-                .old = if (self.files[victim].old == .absent) .absent else .pending,
-                .new = if (self.files[victim].new == .absent) .absent else .pending,
+                .old = retainedTerminalSide(self.files[victim].old),
+                .new = retainedTerminalSide(self.files[victim].new),
                 .last_used = self.files[victim].last_used,
             };
             self.projectSide(victim, .old);
@@ -481,12 +502,39 @@ fn sideNeedsEnrichment(state: bbr.highlight.SideState) bool {
 fn transfer(side: *SideResult) StoredSide {
     const stored: StoredSide = switch (side.*) {
         .absent => .absent,
+        .binary => |size| .{ .binary = size },
         .fetch_failed => |err| .{ .fetch_failed = err },
         .owned => |owned| .{ .content = owned },
         .transferred => unreachable,
     };
     side.* = .transferred;
     return stored;
+}
+
+fn initialStoredSide(file: bbr.diff.File, comptime which: enum { old, new }) StoredSide {
+    if (which == .old and file.status == .added or which == .new and file.status == .removed) return .absent;
+    const status = @field(file.content, @tagName(which)) orelse return .pending;
+    return switch (status) {
+        .binary => |size| .{ .binary = size },
+        .text, .unavailable => .pending,
+    };
+}
+
+fn initialHighlightState(side: StoredSide) bbr.highlight.SideState {
+    return switch (side) {
+        .absent, .binary => .absent,
+        .pending => .pending,
+        .fetch_failed => .fetch_failed,
+        .content => .ready,
+    };
+}
+
+fn retainedTerminalSide(side: StoredSide) StoredSide {
+    return switch (side) {
+        .absent => .absent,
+        .binary => |size| .{ .binary = size },
+        else => .pending,
+    };
 }
 
 const testing = std.testing;
@@ -513,13 +561,17 @@ fn ownedAddedResult(backing: Allocator, blob: []const u8) !Result {
 }
 
 const ScriptedHighlighter = struct {
+    calls: usize = 0,
+
     fn highlighter(self: *ScriptedHighlighter) bbr.highlight.Highlighter {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
     const vtable: bbr.highlight.Highlighter.VTable = .{ .highlight = highlight };
 
-    fn highlight(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
+    fn highlight(ptr: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
+        const self: *ScriptedHighlighter = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
         const spans = try allocator.alloc(bbr.highlight.Span, 1);
         spans[0] = .{
             .line = 1,
@@ -687,6 +739,43 @@ test "File Content Status is independent per expected side and from Highlighting
     try testing.expect(content.new.? == .text);
     try testing.expectEqual(@as(?usize, "const current = true;\n".len), content.new.?.text);
     try testing.expect(storage.file(0).new.content.highlighting == .failed);
+}
+
+test "RawDiff binary sides skip File Enrichment reads and Highlighting" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const diff = try bbr.diff.parse(arena.allocator(),
+        "diff --git a/image.bin b/image.bin\n" ++
+            "GIT binary patch\n" ++
+            "literal 4\nencoded\n" ++
+            "\n" ++
+            "literal 3\nencoded\n");
+    const file = diff.files[0];
+
+    var storage = try Storage.init(testing.allocator, diff.files);
+    defer storage.deinit();
+    try testing.expect(!storage.needsEnrichment(0));
+    try testing.expect(storage.file(0).old == .binary);
+    try testing.expect(storage.file(0).new == .binary);
+    try testing.expectEqual(@as(?usize, 3), storage.projection().content_statuses[0].old.?.binary);
+    try testing.expectEqual(@as(?usize, 4), storage.projection().content_statuses[0].new.?.binary);
+
+    var fake: bbr.http.FakeHttpClient = .{ .body = "must not be read" };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var scripted = ScriptedHighlighter{};
+    var result = try enrich(testing.allocator, bb, scripted.highlighter(), .{
+        .repo = "repo",
+        .status = file.status,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = file.old_path,
+        .new_path = file.new_path,
+        .max_file_bytes = 0,
+        .content = file.content,
+    });
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 0), fake.call_count);
+    try testing.expectEqual(@as(usize, 0), scripted.calls);
 }
 
 fn exerciseAddedFileOwnership(allocator: Allocator) !void {

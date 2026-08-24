@@ -1289,6 +1289,57 @@ test "Status Placeholders do not hide Review-level or File-level Comments" {
     try testing.expectEqual(@as(usize, 2), countKind(projected, .comment));
 }
 
+test "binary Files project independent sides in every Layout and Scope" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw =
+        \\diff --git a/modified.bin b/modified.bin
+        \\GIT binary patch
+        \\literal 4
+        \\payload
+        \\
+        \\literal 3
+        \\payload
+        \\diff --git a/added.bin b/added.bin
+        \\new file mode 100644
+        \\Binary files /dev/null and b/added.bin differ
+        \\diff --git a/removed.bin b/removed.bin
+        \\deleted file mode 100644
+        \\Binary files a/removed.bin and /dev/null differ
+        \\diff --git a/old.bin b/new.bin
+        \\rename from old.bin
+        \\rename to new.bin
+        \\Binary files a/old.bin and b/new.bin differ
+    ;
+    const diff = try parse(a, raw);
+    const content_statuses = [_]model.FileContent{
+        diff.files[0].content,
+        diff.files[1].content,
+        diff.files[2].content,
+        diff.files[3].content,
+    };
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "review", .scope = .review },
+        .{ .id = 2, .author = "Bo", .body = "file", .scope = .{ .file = .{ .path = "modified.bin", .source_commit = "abc" } } },
+    };
+    const threads = try bbr.review.thread.build(a, &comments);
+
+    for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        for ([_]bool{ false, true }) |whole_file| {
+            const projected = try buildWithComments(a, diff, layout, threads, .{
+                .whole_file = whole_file,
+                .fold_context = !whole_file,
+                .content_statuses = &content_statuses,
+            });
+            try testing.expectEqual(@as(usize, if (layout == .unified) 6 else 4), countKind(projected, .status_placeholder));
+            try testing.expectEqual(@as(usize, 2), countKind(projected, .comment));
+            try testing.expectEqual(@as(usize, 0), countKind(projected, .line));
+            try testing.expectEqual(@as(usize, 0), countKind(projected, .line_pair));
+        }
+    }
+}
+
 // --- Comment weaving --------------------------------------------------------
 
 /// A one-file diff whose new-side lines are 1 (keep), 1→gone, 2 (new).

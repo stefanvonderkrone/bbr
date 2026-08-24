@@ -1113,6 +1113,22 @@ test "SideBySide Status Placeholders render each side independently" {
     try expectScreenText(right, 0, "New content unavailable: acquisition failed");
 }
 
+test "binary Status Placeholder renders an unknown size" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file: bbr.diff.File = .{ .old_path = "/dev/null", .new_path = "a.bin", .status = .added, .hunks = &.{} };
+    const rows = [_]buffer_mod.Row{.{ .status_placeholder = .{ .file = &file, .new = .{ .binary = null } } }};
+    const buf: Buffer = .{ .rows = &rows, .layout = .unified };
+    var screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    drawPane(a, win, buf, theme_dark, Nav.init(1, 1));
+
+    try expectScreenText(win, 0, "New content binary, size unavailable");
+}
+
 test "a modified line paints only its changed run with the emphasis band" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

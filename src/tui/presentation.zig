@@ -552,6 +552,7 @@ pub const EnrichFile = struct {
     old_path: BoundedText(512),
     new_path: BoundedText(512),
     status: bbr.diff.FileStatus,
+    content: bbr.diff.FileContent = .{ .old = .{ .text = null }, .new = .{ .text = null } },
     max_file_bytes: usize,
 
     pub fn repository(self: *const EnrichFile) []const u8 {
@@ -574,6 +575,7 @@ pub const EnrichFile = struct {
             .old_path = self.old_path.slice(),
             .new_path = self.new_path.slice(),
             .max_file_bytes = self.max_file_bytes,
+            .content = self.content,
         };
     }
 };
@@ -5359,6 +5361,7 @@ pub const Presentation = struct {
                 return;
             },
             .status = file.status,
+            .content = file.content,
             .max_file_bytes = self.dependencies.highlight_max_file_bytes,
         };
         var queued_enrichments: usize = 0;

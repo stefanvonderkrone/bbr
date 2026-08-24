@@ -35,6 +35,11 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
     var old_path: []const u8 = "";
     var new_path: []const u8 = "";
     var status: FileStatus = .modified;
+    var binary = false;
+    var binary_new_size: ?usize = null;
+    var binary_old_size: ?usize = null;
+    var binary_block_count: usize = 0;
+    var binary_expects_block = false;
     var hunks: std.ArrayList(Hunk) = .empty;
 
     // Accumulators for the hunk currently being built.
@@ -78,11 +83,17 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
                     .new_path = new_path,
                     .status = status,
                     .hunks = try hunks.toOwnedSlice(allocator),
+                    .content = fileContent(status, binary, binary_old_size, binary_new_size),
                 });
                 hunks = .empty;
             }
             have_file = true;
             status = .modified;
+            binary = false;
+            binary_new_size = null;
+            binary_old_size = null;
+            binary_block_count = 0;
+            binary_expects_block = false;
             // Best-effort path guess from the `a/… b/…` operands; the `---`/`+++`
             // lines below refine it (and handle spaces/quoting more reliably).
             const paths = parseGitPaths(line["diff --git ".len..]);
@@ -118,6 +129,29 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
             if (std.mem.startsWith(u8, line, "+++ ")) {
                 new_path = stripDiffPath(line["+++ ".len..]);
                 if (std.mem.eql(u8, new_path, "/dev/null")) status = .removed;
+                continue;
+            }
+            if (std.mem.eql(u8, line, "GIT binary patch") or
+                (std.mem.startsWith(u8, line, "Binary files ") and std.mem.endsWith(u8, line, " differ")))
+            {
+                binary = true;
+                binary_expects_block = std.mem.eql(u8, line, "GIT binary patch");
+                continue;
+            }
+            if (binary and line.len == 0) {
+                binary_expects_block = true;
+                continue;
+            }
+            if (binary_expects_block and
+                (std.mem.startsWith(u8, line, "literal ") or std.mem.startsWith(u8, line, "delta ")))
+            {
+                if (std.mem.startsWith(u8, line, "literal ")) {
+                    const size = std.fmt.parseInt(usize, line["literal ".len..], 10) catch continue;
+                    if (binary_block_count == 0) binary_new_size = size;
+                    if (binary_block_count == 1) binary_old_size = size;
+                }
+                binary_block_count += 1;
+                binary_expects_block = false;
                 continue;
             }
         }
@@ -189,10 +223,27 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
             .new_path = new_path,
             .status = status,
             .hunks = try hunks.toOwnedSlice(allocator),
+            .content = fileContent(status, binary, binary_old_size, binary_new_size),
         });
     }
 
     return .{ .files = try files.toOwnedSlice(allocator) };
+}
+
+fn fileContent(status: FileStatus, binary: bool, old_size: ?usize, new_size: ?usize) model.FileContent {
+    const old: ?model.FileContentStatus = if (status == .added)
+        null
+    else if (binary)
+        .{ .binary = old_size }
+    else
+        .{ .text = null };
+    const new: ?model.FileContentStatus = if (status == .removed)
+        null
+    else if (binary)
+        .{ .binary = new_size }
+    else
+        .{ .text = null };
+    return .{ .old = old, .new = new };
 }
 
 const GitPaths = struct { old: []const u8, new: []const u8 };
@@ -472,4 +523,60 @@ test "empty input yields no files" {
     defer arena.deinit();
     const diff = try parseInArena(&arena, "");
     try testing.expectEqual(@as(usize, 0), diff.files.len);
+}
+
+test "Git binary stubs classify present File sides without Lines" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const raw =
+        \\diff --git a/modified.bin b/modified.bin
+        \\index 111..222 100644
+        \\GIT binary patch
+        \\literal 4
+        \\payload
+        \\
+        \\literal 3
+        \\payload
+        \\diff --git a/added.bin b/added.bin
+        \\new file mode 100644
+        \\index 000..333
+        \\Binary files /dev/null and b/added.bin differ
+        \\diff --git a/removed.bin b/removed.bin
+        \\deleted file mode 100644
+        \\index 444..000
+        \\GIT binary patch
+        \\literal 0
+        \\payload
+        \\
+        \\literal 8
+        \\payload
+        \\diff --git a/old.bin b/new.bin
+        \\similarity index 90%
+        \\rename from old.bin
+        \\rename to new.bin
+        \\Binary files a/old.bin and b/new.bin differ
+        \\diff --git a/delta.bin b/delta.bin
+        \\GIT binary patch
+        \\delta 12
+        \\payload
+        \\
+        \\literal 6
+        \\payload
+    ;
+
+    const diff = try parseInArena(&arena, raw);
+    try testing.expectEqual(@as(usize, 5), diff.files.len);
+    for (diff.files) |file| try testing.expectEqual(@as(usize, 0), file.hunks.len);
+
+    try testing.expectEqual(@as(?usize, 3), diff.files[0].content.old.?.binary);
+    try testing.expectEqual(@as(?usize, 4), diff.files[0].content.new.?.binary);
+    try testing.expect(diff.files[1].content.old == null);
+    try testing.expectEqual(@as(?usize, null), diff.files[1].content.new.?.binary);
+    try testing.expectEqual(@as(?usize, 8), diff.files[2].content.old.?.binary);
+    try testing.expect(diff.files[2].content.new == null);
+    try testing.expectEqual(@as(?usize, null), diff.files[3].content.old.?.binary);
+    try testing.expectEqual(@as(?usize, null), diff.files[3].content.new.?.binary);
+    try testing.expectEqual(@as(?usize, 6), diff.files[4].content.old.?.binary);
+    try testing.expectEqual(@as(?usize, null), diff.files[4].content.new.?.binary);
 }
