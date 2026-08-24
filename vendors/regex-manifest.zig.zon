@@ -1,0 +1,14 @@
+.{
+    .re2 = .{
+        .repository = "https://github.com/google/re2",
+        .release = "2025-11-05",
+        .commit = "927f5d53caf8111721e734cf24724686bb745f55",
+        .archive_sha256 = "87f6029d2f6de8aa023654240a03ada90e876ce9a4676e258dd01ea4c26ffd67",
+    },
+    .abseil = .{
+        .repository = "https://github.com/abseil/abseil-cpp",
+        .release = "20250512.1",
+        .commit = "76bb24329e8bf5f39704eb10d21b9a80befa7c81",
+        .archive_sha256 = "9b7a064305e9fd94d124ffa6cc358592eb42b5da588fb4e07d09254aa40086db",
+    },
+}

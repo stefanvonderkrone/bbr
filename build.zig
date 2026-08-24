@@ -29,6 +29,7 @@ pub fn build(b: *std.Build) void {
     });
     addSqlite(b, exe_mod);
     addTreeSitter(b, exe_mod);
+    addRe2(b, exe_mod, target);
 
     const exe = b.addExecutable(.{ .name = "bbr", .root_module = exe_mod });
     b.installArtifact(exe);
@@ -89,6 +90,8 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
     mod.addAnonymousImport("bash_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/bash/queries/highlights.scm") });
     mod.addAnonymousImport("json_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/json/queries/highlights.scm") });
     mod.addAnonymousImport("yaml_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/yaml/queries/highlights.scm") });
+    mod.addAnonymousImport("javascript_locals", .{ .root_source_file = b.path("vendors/tree-sitter/javascript/queries/locals.scm") });
+    mod.addAnonymousImport("typescript_locals", .{ .root_source_file = b.path("vendors/tree-sitter/typescript/queries/locals.scm") });
     mod.addIncludePath(b.path("vendors/tree-sitter/runtime/include"));
     mod.addIncludePath(b.path("vendors/tree-sitter/runtime/src"));
     mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/runtime/src/lib.c"), .flags = &.{ "-std=c11", "-fno-sanitize=undefined" } });
@@ -105,6 +108,123 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
     inline for (.{ "css", "bash", "yaml" }) |grammar| {
         mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/" ++ grammar ++ "/src/scanner.c"), .flags = &.{"-std=c11"} });
     }
+}
+
+fn addRe2(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    const sources = [_][]const u8{
+        "bbr_re2.cc",
+        "re2/bitmap256.cc",
+        "re2/bitstate.cc",
+        "re2/compile.cc",
+        "re2/dfa.cc",
+        "re2/filtered_re2.cc",
+        "re2/mimics_pcre.cc",
+        "re2/nfa.cc",
+        "re2/onepass.cc",
+        "re2/parse.cc",
+        "re2/perl_groups.cc",
+        "re2/prefilter.cc",
+        "re2/prefilter_tree.cc",
+        "re2/prog.cc",
+        "re2/re2.cc",
+        "re2/regexp.cc",
+        "re2/set.cc",
+        "re2/simplify.cc",
+        "re2/tostring.cc",
+        "re2/unicode_casefold.cc",
+        "re2/unicode_groups.cc",
+        "util/rune.cc",
+        "util/strutil.cc",
+    };
+    mod.addIncludePath(b.path("vendors/re2"));
+    mod.addIncludePath(b.path("vendors/abseil"));
+    mod.addCSourceFiles(.{
+        .root = b.path("vendors/re2"),
+        .files = &sources,
+        .flags = &.{ "-std=c++17", "-fno-sanitize=undefined" },
+        .language = .cpp,
+    });
+    const abseil_sources = [_][]const u8{
+        "absl/base/internal/cycleclock.cc",
+        "absl/base/internal/low_level_alloc.cc",
+        "absl/base/internal/raw_logging.cc",
+        "absl/base/internal/spinlock.cc",
+        "absl/base/internal/spinlock_wait.cc",
+        "absl/base/internal/strerror.cc",
+        "absl/base/internal/sysinfo.cc",
+        "absl/base/internal/thread_identity.cc",
+        "absl/base/internal/throw_delegate.cc",
+        "absl/base/internal/unscaledcycleclock.cc",
+        "absl/base/log_severity.cc",
+        "absl/container/internal/raw_hash_set.cc",
+        "absl/container/internal/hashtablez_sampler.cc",
+        "absl/container/internal/hashtablez_sampler_force_weak_definition.cc",
+        "absl/debugging/internal/demangle.cc",
+        "absl/debugging/internal/demangle_rust.cc",
+        "absl/debugging/internal/decode_rust_punycode.cc",
+        "absl/debugging/internal/utf8_for_code_point.cc",
+        "absl/debugging/internal/examine_stack.cc",
+        "absl/debugging/stacktrace.cc",
+        "absl/debugging/symbolize.cc",
+        "absl/debugging/leak_check.cc",
+        "absl/hash/internal/city.cc",
+        "absl/hash/internal/hash.cc",
+        "absl/hash/internal/low_level_hash.cc",
+        "absl/log/globals.cc",
+        "absl/log/log_sink.cc",
+        "absl/log/internal/check_op.cc",
+        "absl/log/internal/globals.cc",
+        "absl/log/internal/log_format.cc",
+        "absl/log/internal/log_message.cc",
+        "absl/log/internal/log_sink_set.cc",
+        "absl/log/internal/nullguard.cc",
+        "absl/log/internal/proto.cc",
+        "absl/log/internal/structured_proto.cc",
+        "absl/numeric/int128.cc",
+        "absl/strings/ascii.cc",
+        "absl/strings/charconv.cc",
+        "absl/strings/match.cc",
+        "absl/strings/numbers.cc",
+        "absl/strings/str_cat.cc",
+        "absl/strings/internal/charconv_bigint.cc",
+        "absl/strings/internal/charconv_parse.cc",
+        "absl/strings/internal/memutil.cc",
+        "absl/strings/internal/utf8.cc",
+        "absl/strings/internal/str_format/arg.cc",
+        "absl/strings/internal/str_format/bind.cc",
+        "absl/strings/internal/str_format/extension.cc",
+        "absl/strings/internal/str_format/float_conversion.cc",
+        "absl/strings/internal/str_format/output.cc",
+        "absl/strings/internal/str_format/parser.cc",
+        "absl/synchronization/internal/create_thread_identity.cc",
+        "absl/synchronization/internal/graphcycles.cc",
+        "absl/synchronization/internal/kernel_timeout.cc",
+        "absl/synchronization/internal/per_thread_sem.cc",
+        "absl/synchronization/internal/pthread_waiter.cc",
+        "absl/synchronization/internal/waiter_base.cc",
+        "absl/synchronization/mutex.cc",
+        "absl/time/clock.cc",
+        "absl/time/duration.cc",
+        "absl/time/time.cc",
+        "absl/time/internal/cctz/src/civil_time_detail.cc",
+        "absl/time/internal/cctz/src/time_zone_fixed.cc",
+        "absl/time/internal/cctz/src/time_zone_format.cc",
+        "absl/time/internal/cctz/src/time_zone_if.cc",
+        "absl/time/internal/cctz/src/time_zone_impl.cc",
+        "absl/time/internal/cctz/src/time_zone_info.cc",
+        "absl/time/internal/cctz/src/time_zone_libc.cc",
+        "absl/time/internal/cctz/src/time_zone_lookup.cc",
+        "absl/time/internal/cctz/src/time_zone_posix.cc",
+        "absl/time/internal/cctz/src/zone_info_source.cc",
+    };
+    mod.addCSourceFiles(.{
+        .root = b.path("vendors/abseil"),
+        .files = &abseil_sources,
+        .flags = &.{ "-std=c++17", "-fno-sanitize=undefined" },
+        .language = .cpp,
+    });
+    mod.link_libcpp = true;
+    if (target.result.os.tag == .macos) mod.linkFramework("CoreFoundation", .{});
 }
 
 /// Compile the vendored SQLite amalgamation into `mod`. Flags harden and trim
