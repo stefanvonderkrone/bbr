@@ -344,6 +344,13 @@ pub const ShellGitClient = struct {
 
 /// Test double: returns canned values (or errors) for each seam call.
 pub const FakeGitClient = struct {
+    pub const BlobOutcome = union(enum) { content: []const u8, failure: anyerror };
+    pub const BlobFixture = struct {
+        commit: []const u8,
+        path: []const u8,
+        outcome: BlobOutcome,
+    };
+
     branch: anyerror![]const u8 = error.NotAGitRepo,
     remote_result: anyerror!Remote = error.NoRemote,
     resolved_ref: anyerror!ResolvedRef = error.UnknownRef,
@@ -352,8 +359,10 @@ pub const FakeGitClient = struct {
     worktree_result: anyerror![]const Worktree = error.NotAGitRepo,
     diff_result: anyerror![]const u8 = error.UnknownRef,
     blob_result: anyerror![]const u8 = error.BlobNotFound,
+    blob_fixtures: []const BlobFixture = &.{},
     repository_remote_result: anyerror![]const u8 = error.NoRemote,
     diff_calls: usize = 0,
+    blob_calls: usize = 0,
 
     pub fn gitClient(self: *FakeGitClient) GitClient {
         return .{ .ptr = self, .vtable = &vtable };
@@ -421,8 +430,21 @@ pub const FakeGitClient = struct {
         return allocator.dupe(u8, try self.diff_result);
     }
 
-    fn blob(ptr: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8) anyerror![]u8 {
+    fn blob(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8) anyerror![]u8 {
         const self: *FakeGitClient = @ptrCast(@alignCast(ptr));
+        if (self.blob_fixtures.len > 0) {
+            const fixture_index = self.blob_calls;
+            self.blob_calls += 1;
+            if (fixture_index >= self.blob_fixtures.len) return error.UnexpectedBlobRead;
+            const fixture = self.blob_fixtures[fixture_index];
+            if (!std.mem.eql(u8, fixture.commit, commit)) return error.UnexpectedCommit;
+            if (!std.mem.eql(u8, fixture.path, path)) return error.UnexpectedPath;
+            return switch (fixture.outcome) {
+                .content => |content| allocator.dupe(u8, content),
+                .failure => |err| err,
+            };
+        }
+        self.blob_calls += 1;
         return allocator.dupe(u8, try self.blob_result);
     }
 

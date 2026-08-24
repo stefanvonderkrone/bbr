@@ -681,7 +681,12 @@ test "an added File transfers its enriched new side into Session storage" {
 }
 
 test "local Git blob source uses the same File Enrichment pipeline" {
-    var fake_git: bbr.git.FakeGitClient = .{ .blob_result = "const local = true;\n" };
+    const added_fixtures = [_]bbr.git.FakeGitClient.BlobFixture{.{
+        .commit = "source",
+        .path = "src/local.zig",
+        .outcome = .{ .content = "const local = true;\n" },
+    }};
+    var fake_git: bbr.git.FakeGitClient = .{ .blob_fixtures = &added_fixtures };
     var source: GitBlobSource = .{ .client = fake_git.gitClient() };
     var plain: bbr.highlight.PlainHighlighter = .{};
     var result = try enrichFrom(testing.allocator, source.source(), plain.highlighter(), .{
@@ -700,6 +705,135 @@ test "local Git blob source uses the same File Enrichment pipeline" {
     defer storage.deinit();
     try storage.admit(0, &result);
     try testing.expectEqualStrings("const local = true;\n", storage.file(0).new.content.blob);
+    try testing.expectEqual(@as(usize, 1), fake_git.blob_calls);
+
+    const removed_fixtures = [_]bbr.git.FakeGitClient.BlobFixture{.{
+        .commit = "destination",
+        .path = "src/removed.zig",
+        .outcome = .{ .content = "removed\n" },
+    }};
+    var removed_git: bbr.git.FakeGitClient = .{ .blob_fixtures = &removed_fixtures };
+    var removed_source: GitBlobSource = .{ .client = removed_git.gitClient() };
+    var removed = try enrichFrom(testing.allocator, removed_source.source(), plain.highlighter(), .{
+        .repo = "",
+        .status = .removed,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "src/removed.zig",
+        .new_path = "/dev/null",
+        .max_file_bytes = 0,
+    });
+    defer removed.deinit();
+    try testing.expectEqualStrings("removed\n", removed.old.owned.blob);
+    try testing.expect(removed.new == .absent);
+    try testing.expectEqual(@as(usize, 1), removed_git.blob_calls);
+
+    const removed_files = [_]bbr.diff.File{.{ .old_path = "src/removed.zig", .new_path = "/dev/null", .status = .removed, .hunks = &.{} }};
+    var removed_storage = try Storage.init(testing.allocator, &removed_files);
+    defer removed_storage.deinit();
+    try removed_storage.admit(0, &removed);
+    try testing.expectEqual(@as(?usize, "removed\n".len), removed_storage.projection().content_statuses[0].old.?.text);
+}
+
+test "empty local Git content is text with a zero byte size" {
+    const fixtures = [_]bbr.git.FakeGitClient.BlobFixture{.{
+        .commit = "source",
+        .path = "empty.txt",
+        .outcome = .{ .content = "" },
+    }};
+    var fake_git: bbr.git.FakeGitClient = .{ .blob_fixtures = &fixtures };
+    var source: GitBlobSource = .{ .client = fake_git.gitClient() };
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    var result = try enrichFrom(testing.allocator, source.source(), plain.highlighter(), .{
+        .repo = "",
+        .status = .added,
+        .source_commit = "source",
+        .destination_commit = "base",
+        .old_path = "/dev/null",
+        .new_path = "empty.txt",
+        .max_file_bytes = 0,
+    });
+    defer result.deinit();
+
+    const files = [_]bbr.diff.File{.{ .old_path = "/dev/null", .new_path = "empty.txt", .status = .added, .hunks = &.{} }};
+    var storage = try Storage.init(testing.allocator, &files);
+    defer storage.deinit();
+    try storage.admit(0, &result);
+    try testing.expectEqual(@as(?usize, 0), storage.projection().content_statuses[0].new.?.text);
+    try testing.expectEqual(@as(usize, 0), storage.file(0).new.content.blob.len);
+}
+
+test "local Git content keeps each side independent and uses exact commits and paths" {
+    const invalid = [_]u8{ 0xff, 0x80, 0x00 };
+    const fixtures = [_]bbr.git.FakeGitClient.BlobFixture{
+        .{ .commit = "base", .path = "src/old name.zig", .outcome = .{ .content = invalid[0..] } },
+        .{ .commit = "source", .path = "src/new name.zig", .outcome = .{ .content = "const current = true;\n" } },
+    };
+    var fake_git: bbr.git.FakeGitClient = .{ .blob_fixtures = &fixtures };
+    var source: GitBlobSource = .{ .client = fake_git.gitClient() };
+    var scripted = ScriptedHighlighter{};
+    var result = try enrichFrom(testing.allocator, source.source(), scripted.highlighter(), .{
+        .repo = "",
+        .status = .renamed,
+        .source_commit = "source",
+        .destination_commit = "base",
+        .old_path = "src/old name.zig",
+        .new_path = "src/new name.zig",
+        .max_file_bytes = 0,
+    });
+    defer result.deinit();
+
+    const files = [_]bbr.diff.File{.{
+        .old_path = "src/old name.zig",
+        .new_path = "src/new name.zig",
+        .status = .renamed,
+        .hunks = &.{},
+    }};
+    var storage = try Storage.init(testing.allocator, &files);
+    defer storage.deinit();
+    try storage.admit(0, &result);
+
+    const content = storage.projection().content_statuses[0];
+    try testing.expect(content.old.? == .unavailable);
+    try testing.expect(content.old.?.unavailable.reason == .invalid_utf8);
+    try testing.expectEqual(@as(?usize, invalid.len), content.old.?.unavailable.byte_size);
+    try testing.expectEqual(@as(?usize, "const current = true;\n".len), content.new.?.text);
+    try testing.expectEqualStrings("const current = true;\n", storage.file(0).new.content.blob);
+    try testing.expectEqual(@as(usize, 1), scripted.calls);
+    try testing.expectEqual(@as(usize, 2), fake_git.blob_calls);
+}
+
+test "local Git acquisition failure becomes a placeholder while readable text survives Highlighting failure" {
+    const fixtures = [_]bbr.git.FakeGitClient.BlobFixture{
+        .{ .commit = "base", .path = "src/main.zig", .outcome = .{ .failure = error.BlobNotFound } },
+        .{ .commit = "source", .path = "src/main.zig", .outcome = .{ .content = "readable\n" } },
+    };
+    var fake_git: bbr.git.FakeGitClient = .{ .blob_fixtures = &fixtures };
+    var source: GitBlobSource = .{ .client = fake_git.gitClient() };
+    var failing = FailingHighlighter{};
+    var result = try enrichFrom(testing.allocator, source.source(), failing.highlighter(), .{
+        .repo = "",
+        .status = .modified,
+        .source_commit = "source",
+        .destination_commit = "base",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
+        .max_file_bytes = 0,
+    });
+    defer result.deinit();
+
+    const files = oneTestFile(.modified);
+    var storage = try Storage.init(testing.allocator, &files);
+    defer storage.deinit();
+    try storage.admit(0, &result);
+
+    const content = storage.projection().content_statuses[0];
+    try testing.expect(content.old.? == .unavailable);
+    try testing.expect(content.old.?.unavailable.reason == .acquisition_failed);
+    try testing.expectEqual(error.BlobNotFound, content.old.?.unavailable.reason.acquisition_failed);
+    try testing.expectEqual(@as(?usize, "readable\n".len), content.new.?.text);
+    try testing.expectEqualStrings("readable\n", storage.file(0).new.content.blob);
+    try testing.expect(storage.file(0).new.content.highlighting == .failed);
 }
 
 test "fetched content remains usable when Highlighting fails" {

@@ -9393,6 +9393,43 @@ test "focused File Enrichment emits one Session Epoch command while in flight" {
     try testing.expect(presentation.takeCommand() == null);
 }
 
+test "LocalReview File Enrichment uses Git and OutOfMemory preserves pending Session sides" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testLocalSession(testing.allocator) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const command = presentation.takeCommand().?.enrich_file;
+    try testing.expect(command.source == .local);
+    try testing.expectEqualStrings("base", command.destination_commit.slice());
+    try testing.expectEqualStrings("source", command.source_commit.slice());
+    const before = presentation.projection().review.?.buffer.rows.ptr;
+    const loading = presentation.published.?.session.enrichment.status(0);
+    try testing.expect(loading.old == .loading);
+    try testing.expect(loading.new == .loading);
+
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = command.command_id,
+        .work_id = command.work_id,
+        .session_epoch = command.session_epoch,
+        .file_index = command.file_index,
+        .outcome = .{ .failed = .out_of_memory },
+    } });
+
+    const projected = presentation.projection();
+    try testing.expectEqual(FatalError.file_enrichment_out_of_memory, projected.fatal_error.?);
+    try testing.expectEqual(before, projected.review.?.buffer.rows.ptr);
+    try testing.expect(projected.shutting_down);
+    const after = presentation.published.?.session.enrichment.status(0);
+    try testing.expect(after.old == .pending);
+    try testing.expect(after.new == .pending);
+}
+
 test "external commands receive unique nonzero CommandIds" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
