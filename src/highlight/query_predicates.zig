@@ -189,6 +189,14 @@ pub const Set = struct {
         allocator.free(self.regexes);
     }
 
+    pub fn requiresLocals(self: Set) bool {
+        for (self.predicates) |predicate| switch (predicate) {
+            .local => return true,
+            else => {},
+        };
+        return false;
+    }
+
     pub fn accepts(self: Set, pattern: u32, match: c.TSQueryMatch, content: []const u8, locals: Locals) !bool {
         if (pattern >= self.ranges.len) return error.InvalidPatternIndex;
         const range = self.ranges[pattern];

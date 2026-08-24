@@ -676,6 +676,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
 test {
     _ = @import("highlight/tree_sitter_highlighter.zig");
     _ = @import("highlight/query_regex.zig");
+    _ = @import("highlight/user_grammar.zig");
     _ = @import("tui/app.zig");
     _ = @import("tui/config.zig");
     _ = @import("tui/review_body.zig");

@@ -30,6 +30,7 @@ const combined_tsx_query = javascript_query ++ "\n" ++ tsx_query;
 const combined_typescript_locals_query = javascript_locals_query ++ "\n" ++ typescript_locals_query;
 
 const Grammar = struct {
+    name: []const u8,
     language: *const c.TSLanguage,
     query: []const u8,
     locals_query: []const u8 = "",
@@ -49,18 +50,22 @@ pub const TreeSitterHighlighter = struct {
 };
 
 fn selectGrammar(path: []const u8, content: []const u8) ?Grammar {
-    if (hasAnySuffix(path, &.{".tsx"})) return .{ .language = tree_sitter_tsx() orelse return null, .query = combined_tsx_query, .locals_query = combined_typescript_locals_query };
-    if (hasAnySuffix(path, &.{ ".ts", ".mts", ".cts" })) return .{ .language = tree_sitter_typescript() orelse return null, .query = combined_typescript_query, .locals_query = combined_typescript_locals_query };
-    if (hasAnySuffix(path, &.{ ".js", ".jsx", ".mjs", ".cjs" })) return .{ .language = tree_sitter_javascript() orelse return null, .query = javascript_query, .locals_query = javascript_locals_query };
-    if (hasAnySuffix(path, &.{".css"})) return .{ .language = tree_sitter_css() orelse return null, .query = css_query };
-    if (hasAnySuffix(path, &.{".go"})) return .{ .language = tree_sitter_go() orelse return null, .query = go_query };
-    if (hasAnySuffix(path, &.{ ".sh", ".bash" })) return .{ .language = tree_sitter_bash() orelse return null, .query = bash_query };
-    if (hasAnySuffix(path, &.{".json"})) return .{ .language = tree_sitter_json() orelse return null, .query = json_query };
-    if (hasAnySuffix(path, &.{ ".yaml", ".yml" })) return .{ .language = tree_sitter_yaml() orelse return null, .query = yaml_query };
+    if (hasAnySuffix(path, &.{".tsx"})) return .{ .name = "TSX", .language = tree_sitter_tsx() orelse return null, .query = combined_tsx_query, .locals_query = combined_typescript_locals_query };
+    if (hasAnySuffix(path, &.{ ".ts", ".mts", ".cts" })) return .{ .name = "TypeScript", .language = tree_sitter_typescript() orelse return null, .query = combined_typescript_query, .locals_query = combined_typescript_locals_query };
+    if (hasAnySuffix(path, &.{ ".js", ".jsx", ".mjs", ".cjs" })) return .{ .name = "JavaScript", .language = tree_sitter_javascript() orelse return null, .query = javascript_query, .locals_query = javascript_locals_query };
+    if (hasAnySuffix(path, &.{".css"})) return .{ .name = "CSS", .language = tree_sitter_css() orelse return null, .query = css_query };
+    if (hasAnySuffix(path, &.{".go"})) return .{ .name = "Go", .language = tree_sitter_go() orelse return null, .query = go_query };
+    if (hasAnySuffix(path, &.{ ".sh", ".bash" })) return .{ .name = "Bash", .language = tree_sitter_bash() orelse return null, .query = bash_query };
+    if (hasAnySuffix(path, &.{".json"})) return .{ .name = "JSON", .language = tree_sitter_json() orelse return null, .query = json_query };
+    if (hasAnySuffix(path, &.{ ".yaml", ".yml" })) return .{ .name = "YAML", .language = tree_sitter_yaml() orelse return null, .query = yaml_query };
     const basename = std.fs.path.basename(path);
     if (std.mem.eql(u8, basename, ".bashrc") or std.mem.eql(u8, basename, "Bashfile") or bashShebang(content))
-        return .{ .language = tree_sitter_bash() orelse return null, .query = bash_query };
+        return .{ .name = "Bash", .language = tree_sitter_bash() orelse return null, .query = bash_query };
     return null;
+}
+
+pub fn builtInGrammarName(path: []const u8, content: []const u8) ?[]const u8 {
+    return (selectGrammar(path, content) orelse return null).name;
 }
 
 fn bashShebang(content: []const u8) bool {
