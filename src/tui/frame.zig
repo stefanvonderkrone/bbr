@@ -83,11 +83,19 @@ pub const RowOwner = union(enum) {
 /// Buffer owner while byte bounds and decoration describe this projection.
 pub const VisualRow = struct {
     row: buffer_mod.Row,
+    buffer_index: usize = 0,
     owner: RowOwner,
     measured_cells: usize,
     source_start: usize = 0,
     source_end: usize = 0,
     decoration: ?bbr.highlight.LineDecoration = null,
+    continuation: bool = false,
+};
+
+pub const VisualRowOptions = struct {
+    layout: buffer_mod.Layout,
+    width: usize,
+    wrap: bool,
 };
 
 pub const Projection = struct {
@@ -166,30 +174,147 @@ fn paneContent(rect: Rect) Rect {
     };
 }
 
-pub fn buildVisualRows(
+pub fn buildVisualRowsWithOptions(
     allocator: std.mem.Allocator,
     rows: []const buffer_mod.Row,
     metrics: CellMetrics,
+    options: VisualRowOptions,
 ) ![]const VisualRow {
-    // Wrapping starts disabled, so the initial projection is exactly one visual
-    // row per Buffer row. Later wrapping can split only Line and LinePair rows.
-    const visual_rows = try allocator.alloc(VisualRow, rows.len);
-    for (rows, visual_rows) |row, *visual_row| visual_row.* = .{
+    if (!options.wrap or options.layout != .unified or options.width <= unified_gutter_cols) {
+        return buildUnwrappedVisualRows(allocator, rows, metrics);
+    }
+
+    var visual_rows: std.ArrayList(VisualRow) = .empty;
+    errdefer {
+        for (visual_rows.items) |visual_row| if (visual_row.row == .line and visual_row.row.line.line.text.len > 0)
+            if (visual_row.decoration) |decoration| if (decoration.runs.len > 0) allocator.free(decoration.runs);
+        visual_rows.deinit(allocator);
+    }
+    const body_width = options.width - unified_gutter_cols;
+    for (rows, 0..) |row, buffer_index| switch (row) {
+        .line => |line_row| {
+            if (line_row.line.text.len == 0) {
+                try visual_rows.append(allocator, makeVisualRow(row, buffer_index, metrics));
+                continue;
+            }
+            var start: usize = 0;
+            while (start < line_row.line.text.len) {
+                const end = wrapEnd(line_row.line.text, start, body_width, metrics);
+                try appendWrappedVisualRow(allocator, &visual_rows, row, buffer_index, line_row, start, end, metrics);
+                start = end;
+            }
+        },
+        else => try visual_rows.append(allocator, makeVisualRow(row, buffer_index, metrics)),
+    };
+    return visual_rows.toOwnedSlice(allocator);
+}
+
+fn appendWrappedVisualRow(
+    allocator: std.mem.Allocator,
+    visual_rows: *std.ArrayList(VisualRow),
+    row: buffer_mod.Row,
+    buffer_index: usize,
+    line_row: buffer_mod.LineRow,
+    start: usize,
+    end: usize,
+    metrics: CellMetrics,
+) !void {
+    const decoration = try sliceDecoration(allocator, line_row.decoration, start, end);
+    errdefer if (decoration.runs.len > 0) allocator.free(decoration.runs);
+    try visual_rows.append(allocator, .{
         .row = row,
+        .buffer_index = buffer_index,
+        .owner = owner(row),
+        .measured_cells = metrics.width(line_row.line.text[start..end]),
+        .source_start = start,
+        .source_end = end,
+        .decoration = decoration,
+        .continuation = start != 0,
+    });
+}
+
+fn buildUnwrappedVisualRows(allocator: std.mem.Allocator, rows: []const buffer_mod.Row, metrics: CellMetrics) ![]const VisualRow {
+    const visual_rows = try allocator.alloc(VisualRow, rows.len);
+    for (rows, visual_rows, 0..) |row, *visual_row, buffer_index| visual_row.* = makeVisualRow(row, buffer_index, metrics);
+    return visual_rows;
+}
+
+fn makeVisualRow(row: buffer_mod.Row, buffer_index: usize, metrics: CellMetrics) VisualRow {
+    return .{
+        .row = row,
+        .buffer_index = buffer_index,
         .owner = owner(row),
         .measured_cells = rowWidth(row, metrics),
         .source_start = rowSourceStart(row),
         .source_end = rowSourceEnd(row),
         .decoration = rowDecoration(row),
     };
-    return visual_rows;
+}
+
+pub const unified_gutter_cols: usize = 10;
+
+fn wrapEnd(text: []const u8, start: usize, width: usize, metrics: CellMetrics) usize {
+    var pos = start;
+    var cells: usize = 0;
+    var whitespace_end: ?usize = null;
+    while (pos < text.len) {
+        const measured = metrics.next(text[pos..]);
+        if (cells + measured.cell_width > width) {
+            if (whitespace_end) |end| if (end > start) return end;
+            return if (pos > start) pos else @min(pos + measured.byte_len, text.len);
+        }
+        pos += measured.byte_len;
+        cells += measured.cell_width;
+        if (isUnicodeWhitespace(text[pos - measured.byte_len .. pos])) whitespace_end = pos;
+    }
+    return text.len;
+}
+
+fn isUnicodeWhitespace(grapheme: []const u8) bool {
+    const first_len = std.unicode.utf8ByteSequenceLength(grapheme[0]) catch return false;
+    if (first_len > grapheme.len) return false;
+    const cp = std.unicode.utf8Decode(grapheme[0..first_len]) catch return false;
+    return (cp >= 0x09 and cp <= 0x0d) or cp == 0x20 or cp == 0x85 or cp == 0xa0 or
+        cp == 0x1680 or (cp >= 0x2000 and cp <= 0x200a) or cp == 0x2028 or cp == 0x2029 or
+        cp == 0x202f or cp == 0x205f or cp == 0x3000;
+}
+
+fn sliceDecoration(
+    allocator: std.mem.Allocator,
+    decoration: bbr.highlight.LineDecoration,
+    start: usize,
+    end: usize,
+) !bbr.highlight.LineDecoration {
+    var count: usize = 0;
+    var offset: usize = 0;
+    for (decoration.runs) |run| {
+        const run_end = offset + run.text.len;
+        if (offset < end and run_end > start) count += 1;
+        offset = run_end;
+    }
+    if (count == 0) return .{ .runs = &.{} };
+    const runs = try allocator.alloc(bbr.highlight.decoration.Run, count);
+    offset = 0;
+    var index: usize = 0;
+    for (decoration.runs) |run| {
+        const run_end = offset + run.text.len;
+        const overlap_start = @max(offset, start);
+        const overlap_end = @min(run_end, end);
+        if (overlap_start < overlap_end) {
+            runs[index] = run;
+            runs[index].text = run.text[overlap_start - offset .. overlap_end - offset];
+            index += 1;
+        }
+        offset = run_end;
+    }
+    return .{ .runs = runs };
 }
 
 pub fn restoreNavigation(previous: Projection, visual_rows: []const VisualRow, geometry: Geometry) Nav {
     var restored = Nav.init(visual_rows.len, paneRects(geometry).diff_content.height);
     restored.count = previous.navigation.count;
-    const cursor_owner = visualRowOwner(previous.visual_rows, previous.navigation.cursor) orelse return restored;
-    const cursor = findOwner(visual_rows, cursor_owner) orelse return restored;
+    const cursor_row = visualRowAt(previous.visual_rows, previous.navigation.cursor) orelse return restored;
+    const cursor = findVisualRow(visual_rows, cursor_row) orelse return restored;
     restored.jumpTo(cursor);
     restored.count = previous.navigation.count;
 
@@ -198,13 +323,26 @@ pub fn restoreNavigation(previous: Projection, visual_rows: []const VisualRow, g
     restored.setViewport(paneRects(geometry).diff_content.height);
 
     if (previous.navigation.mark) |mark| {
-        const mark_owner = visualRowOwner(previous.visual_rows, mark) orelse return restored;
-        const restored_mark = findOwner(visual_rows, mark_owner) orelse return restored;
+        const mark_row = visualRowAt(previous.visual_rows, mark) orelse return restored;
+        const restored_mark = findVisualRow(visual_rows, mark_row) orelse return restored;
         const old_range = [2]usize{ @min(mark, previous.navigation.cursor), @max(mark, previous.navigation.cursor) };
         const new_range = [2]usize{ @min(restored_mark, cursor), @max(restored_mark, cursor) };
-        if (std.meta.eql(old_range, new_range)) restored.mark = restored_mark;
+        if ((mark_row.owner == .line and cursor_row.owner == .line) or std.meta.eql(old_range, new_range)) restored.mark = restored_mark;
     }
     return restored;
+}
+
+fn findVisualRow(visual_rows: []const VisualRow, wanted: VisualRow) ?usize {
+    if (wanted.owner != .line) return findOwner(visual_rows, wanted.owner);
+    var following: ?usize = null;
+    var final: ?usize = null;
+    for (visual_rows, 0..) |visual_row, index| {
+        if (!visual_row.owner.eql(wanted.owner)) continue;
+        final = index;
+        if (visual_row.source_start <= wanted.source_start and wanted.source_start < visual_row.source_end) return index;
+        if (following == null and visual_row.source_start >= wanted.source_start) following = index;
+    }
+    return following orelse final;
 }
 
 fn findOwner(visual_rows: []const VisualRow, wanted: RowOwner) ?usize {
@@ -230,9 +368,9 @@ fn findOwner(visual_rows: []const VisualRow, wanted: RowOwner) ?usize {
     return null;
 }
 
-fn visualRowOwner(visual_rows: []const VisualRow, index: usize) ?RowOwner {
+fn visualRowAt(visual_rows: []const VisualRow, index: usize) ?VisualRow {
     if (index >= visual_rows.len) return null;
-    return visual_rows[index].owner;
+    return visual_rows[index];
 }
 
 fn owner(row: buffer_mod.Row) RowOwner {
@@ -342,7 +480,7 @@ test "visual rows use the injected CellMetrics seam" {
     const metrics: CellMetrics = .{ .ptr = &metrics_context, .vtable = &vtable };
     const rows = [_]buffer_mod.Row{.{ .section = .{ .kind = .outdated, .count = 1, .path = "wide" } }};
 
-    const visual_rows = try buildVisualRows(testing.allocator, &rows, metrics);
+    const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, metrics, .{ .layout = .unified, .width = 0, .wrap = false });
     defer testing.allocator.free(visual_rows);
 
     try testing.expectEqual(@as(usize, 4), metrics_context.calls);
@@ -365,7 +503,7 @@ test "Presentation Frame projects Diff Lines as complete visual rows" {
         .{ .section = .{ .kind = .pending, .count = 1 } },
     };
 
-    const visual_rows = try buildVisualRows(testing.allocator, &rows, .bytes);
+    const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, .bytes, .{ .layout = .unified, .width = 0, .wrap = false });
     defer testing.allocator.free(visual_rows);
 
     try testing.expectEqual(rows.len, visual_rows.len);
@@ -390,8 +528,86 @@ test "Diff visual-row allocation fails before a partial projection escapes" {
     } }};
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
 
-    try testing.expectError(error.OutOfMemory, buildVisualRows(failing.allocator(), &rows, .bytes));
+    try testing.expectError(error.OutOfMemory, buildVisualRowsWithOptions(failing.allocator(), &rows, .bytes, .{ .layout = .unified, .width = 0, .wrap = false }));
     try testing.expect(failing.has_induced_failure);
+}
+
+test "Unified visual rows prefer whitespace and preserve decoration slices" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const line: bbr.diff.Line = .{ .old_no = null, .new_no = 1, .kind = .added, .text = "alpha beta" };
+    const runs = [_]bbr.highlight.decoration.Run{
+        .{ .text = line.text[0..3], .capture = .{ .name = "keyword" } },
+        .{ .text = line.text[3..8], .emphasis = true },
+        .{ .text = line.text[8..] },
+    };
+    const rows = [_]buffer_mod.Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &runs } } }};
+
+    const visual_rows = try buildVisualRowsWithOptions(arena.allocator(), &rows, .bytes, .{
+        .layout = .unified,
+        .width = 16,
+        .wrap = true,
+    });
+    try testing.expectEqual(@as(usize, 2), visual_rows.len);
+    try testing.expectEqual(@as(usize, 0), visual_rows[0].source_start);
+    try testing.expectEqual(@as(usize, 6), visual_rows[0].source_end);
+    try testing.expectEqual(@as(usize, 6), visual_rows[1].source_start);
+    try testing.expectEqual(line.text.len, visual_rows[1].source_end);
+    try testing.expect(!visual_rows[0].continuation);
+    try testing.expect(visual_rows[1].continuation);
+    try testing.expectEqualStrings("ha ", visual_rows[0].decoration.?.runs[1].text);
+    try testing.expect(visual_rows[0].decoration.?.runs[1].emphasis);
+    try testing.expectEqualStrings("be", visual_rows[1].decoration.?.runs[0].text);
+    try testing.expect(visual_rows[1].decoration.?.runs[0].emphasis);
+}
+
+test "Unified hard wrapping keeps wide and combining graphemes complete" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const Metrics = struct {
+        fn next(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
+            if (std.mem.startsWith(u8, text, "e\xcc\x81")) return .{ .byte_len = 3, .cell_width = 1 };
+            if (std.mem.startsWith(u8, text, "界")) return .{ .byte_len = 3, .cell_width = 2 };
+            return .{ .byte_len = 1, .cell_width = 1 };
+        }
+    };
+    const context: u8 = 0;
+    const vtable: CellMetrics.VTable = .{ .next = Metrics.next };
+    const metrics: CellMetrics = .{ .ptr = &context, .vtable = &vtable };
+    const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "e\xcc\x81界" };
+    const rows = [_]buffer_mod.Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &.{.{ .text = line.text }} } } }};
+
+    const visual_rows = try buildVisualRowsWithOptions(arena.allocator(), &rows, metrics, .{
+        .layout = .unified,
+        .width = 12,
+        .wrap = true,
+    });
+    try testing.expectEqual(@as(usize, 2), visual_rows.len);
+    try testing.expectEqualStrings("e\xcc\x81", visual_rows[0].decoration.?.runs[0].text);
+    try testing.expectEqualStrings("界", visual_rows[1].decoration.?.runs[0].text);
+    try testing.expectEqual(@as(usize, 3), visual_rows[0].source_end);
+    try testing.expectEqual(@as(usize, 6), visual_rows[1].source_end);
+}
+
+test "Unified wrapping keeps non-Line rows atomic when the body has no cells" {
+    const file: bbr.diff.File = .{ .old_path = "a.txt", .new_path = "a.txt", .status = .modified, .hunks = &.{} };
+    const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "long source" };
+    const rows = [_]buffer_mod.Row{
+        .{ .file_header = &file },
+        .{ .status_placeholder = .{ .file = &file, .new = .{ .binary = 12 } } },
+        .{ .disclosure = .{ .key = .{ .fold = &line }, .kind = .fold, .expanded = false, .count = 20 } },
+        .{ .line = .{ .line = &line, .decoration = .{ .runs = &.{.{ .text = line.text }} } } },
+    };
+
+    const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, .bytes, .{
+        .layout = .unified,
+        .width = unified_gutter_cols,
+        .wrap = true,
+    });
+    defer testing.allocator.free(visual_rows);
+
+    try testing.expectEqual(rows.len, visual_rows.len);
+    for (visual_rows, 0..) |visual_row, index| try testing.expectEqual(index, visual_row.buffer_index);
 }
 
 test "framed Pane geometry is bounded at zero narrow ordinary and wide sizes" {

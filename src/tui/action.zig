@@ -40,6 +40,7 @@ pub const Action = enum {
     toggle_select,
     clear_selection,
     toggle_layout,
+    toggle_diff_wrap,
     cycle_scope,
     isolate,
     next_file,

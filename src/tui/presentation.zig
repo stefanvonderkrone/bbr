@@ -473,6 +473,7 @@ pub const Scope = enum {
 pub const Preferences = struct {
     layout: Layout = .unified,
     scope: Scope = .changes,
+    diff_wrap: bool = false,
 };
 
 pub const LoadSession = struct {
@@ -1257,7 +1258,11 @@ const Published = struct {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return error.BufferBuildFailed;
         };
-        published.visual_rows = try frame_mod.buildVisualRows(buffer_allocator, published.buffer.rows, cell_metrics);
+        published.visual_rows = try frame_mod.buildVisualRowsWithOptions(buffer_allocator, published.buffer.rows, cell_metrics, .{
+            .layout = preferences.layout,
+            .width = frame_mod.paneRects(geometry).diff_content.width,
+            .wrap = preferences.diff_wrap,
+        });
         const panes = frame_mod.paneRects(geometry);
         published.tree = try file_tree.build(
             buffer_allocator,
@@ -1617,10 +1622,14 @@ const Published = struct {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return error.BufferBuildFailed;
         };
-        const visual_rows = try frame_mod.buildVisualRows(allocator, candidate.rows, self.cell_metrics);
+        const visual_rows = try frame_mod.buildVisualRowsWithOptions(allocator, candidate.rows, self.cell_metrics, .{
+            .layout = preferences.layout,
+            .width = frame_mod.paneRects(geometry).diff_content.width,
+            .wrap = preferences.diff_wrap,
+        });
         const panes = frame_mod.paneRects(geometry);
         const wanted_cursor = if (self.tree.entries.len == 0) null else self.tree.entries[self.tree.cursor].identity;
-        const active_file = if (self.session.diff.files.len == 0) null else isolated_file orelse fileIndexForRow(self.buffer, self.navigation.cursor);
+        const active_file = if (self.session.diff.files.len == 0) null else isolated_file orelse fileIndexForRow(self.buffer, self.cursorBufferIndex());
         const tree = try file_tree.build(
             allocator,
             self.session.diff,
@@ -1645,7 +1654,27 @@ const Published = struct {
 
     fn activeFile(self: *const Published) ?usize {
         if (self.session.diff.files.len == 0) return null;
-        return self.isolated_file orelse fileIndexForRow(self.buffer, self.navigation.cursor);
+        return self.isolated_file orelse fileIndexForRow(self.buffer, self.cursorBufferIndex());
+    }
+
+    fn cursorVisualRow(self: *const Published) ?frame_mod.VisualRow {
+        if (self.navigation.cursor >= self.visual_rows.len) return null;
+        return self.visual_rows[self.navigation.cursor];
+    }
+
+    fn cursorBufferIndex(self: *const Published) usize {
+        return if (self.cursorVisualRow()) |row| row.buffer_index else 0;
+    }
+
+    fn cursorRow(self: *const Published) ?buffer_mod.Row {
+        const visual_row = self.cursorVisualRow() orelse return null;
+        if (visual_row.buffer_index >= self.buffer.rows.len) return null;
+        return self.buffer.rows[visual_row.buffer_index];
+    }
+
+    fn visualIndexForBufferIndex(self: *const Published, buffer_index: usize) ?usize {
+        for (self.visual_rows, 0..) |visual_row, index| if (visual_row.buffer_index == buffer_index) return index;
+        return null;
     }
 
     fn sidebarEntry(self: *const Published) ?file_tree.Entry {
@@ -3045,12 +3074,12 @@ pub const Presentation = struct {
             },
             .diff_row => |index| {
                 const published = self.published orelse return;
-                if (index >= published.buffer.rows.len) return;
+                if (index >= published.visual_rows.len) return;
                 self.focusPane(published, .diff);
                 const previous_cursor = published.navigation.cursor;
                 published.navigation.jumpTo(index);
                 clampSelectionAtStatusPlaceholder(published, previous_cursor);
-                if (buffer_mod.disclosureKey(published.buffer.rows[index]) != null)
+                if (buffer_mod.disclosureKey(published.visual_rows[index].row) != null)
                     self.applyAction(.toggle_disclosure);
             },
         }
@@ -3317,8 +3346,7 @@ pub const Presentation = struct {
             const entry = published.sidebarEntry() orelse return .sidebar;
             return if (entry.identity == .directory) .sidebar_directory else .sidebar_file;
         }
-        if (published.navigation.cursor >= published.buffer.rows.len) return .diff;
-        return switch (published.buffer.rows[published.navigation.cursor]) {
+        return switch (published.cursorRow() orelse return .diff) {
             .line, .line_pair => .diff_source,
             .disclosure => .diff_disclosure,
             .comment, .draft => |card| if (card.part == .disclosure_footer) .diff_review_card else .diff_review_card,
@@ -3336,15 +3364,15 @@ pub const Presentation = struct {
         const source = context == .diff_source or published.navigation.count > 0 or blk: {
             const selection = published.navigation.selection() orelse break :blk false;
             var index = selection[0];
-            while (index <= selection[1] and index < published.buffer.rows.len) : (index += 1)
-                if (lineAtRow(published.buffer.rows[index]) != null) break :blk true;
+            while (index <= selection[1] and index < published.visual_rows.len) : (index += 1)
+                if (published.visual_rows[index].owner == .line) break :blk true;
             break :blk false;
         };
         return .{
             .remote = published.key.isRemote(),
             .context = context,
             .source = source,
-            .selection = published.navigation.hasSelection() or (published.navigation.cursor < published.buffer.rows.len and published.buffer.rows[published.navigation.cursor] != .status_placeholder),
+            .selection = published.navigation.hasSelection() or if (published.cursorRow()) |row| row != .status_placeholder else false,
             .edit_refusal = self.editRefusal(published),
             .reanchor_refusal = self.reanchorRefusal(published),
             .delete_refusal = self.deleteRefusal(published),
@@ -4034,26 +4062,32 @@ pub const Presentation = struct {
             .scroll_row_up => self.scrollPane(published, published.focus, -1),
             .scroll_row_down => self.scrollPane(published, published.focus, 1),
             .select_down => {
-                if (published.navigation.cursor < published.buffer.rows.len and published.buffer.rows[published.navigation.cursor] != .status_placeholder) published.navigation.ensureMark();
+                if (published.cursorRow()) |row| if (row != .status_placeholder) published.navigation.ensureMark();
                 published.navigation.down();
             },
             .select_up => {
-                if (published.navigation.cursor < published.buffer.rows.len and published.buffer.rows[published.navigation.cursor] != .status_placeholder) published.navigation.ensureMark();
+                if (published.cursorRow()) |row| if (row != .status_placeholder) published.navigation.ensureMark();
                 published.navigation.up();
             },
             .toggle_select => {
-                if (published.navigation.hasSelection())
-                    published.navigation.clearMark()
-                else if (published.navigation.cursor < published.buffer.rows.len and published.buffer.rows[published.navigation.cursor] != .status_placeholder)
-                    published.navigation.toggleMark()
-                else
+                if (published.navigation.hasSelection()) {
+                    published.navigation.clearMark();
+                } else if (published.cursorRow()) |row| {
+                    if (row != .status_placeholder) published.navigation.toggleMark() else self.action_error = .source_action_unavailable;
+                } else {
                     self.action_error = .source_action_unavailable;
+                }
             },
             .clear_selection => published.navigation.clearMark(),
             .refresh => self.queueRefresh(published.key),
             .toggle_layout => {
                 var candidate = self.preferences;
                 candidate.layout = if (candidate.layout == .unified) .side_by_side else .unified;
+                self.publishPreferences(published, candidate);
+            },
+            .toggle_diff_wrap => {
+                var candidate = self.preferences;
+                candidate.diff_wrap = !candidate.diff_wrap;
                 self.publishPreferences(published, candidate);
             },
             .cycle_scope => {
@@ -4171,8 +4205,8 @@ pub const Presentation = struct {
                 return;
             };
             published.isolated_file = file_index;
-            published.navigation = Nav.init(published.buffer.rows.len, frame_mod.paneRects(published.geometry).diff_content.height);
-        } else if (fileHeaderRow(published.buffer, file_index)) |row| published.navigation.jumpTo(row);
+            published.navigation = Nav.init(published.visual_rows.len, frame_mod.paneRects(published.geometry).diff_content.height);
+        } else if (fileHeaderRow(published.buffer, file_index)) |row| if (published.visualIndexForBufferIndex(row)) |visual_index| published.navigation.jumpTo(visual_index);
         self.revealActiveFile(published);
     }
 
@@ -4202,8 +4236,7 @@ pub const Presentation = struct {
     }
 
     fn selectedUnknownDraft(published: *Published) ?*bbr.review.Draft {
-        if (published.navigation.cursor >= published.buffer.rows.len) return null;
-        const row = switch (published.buffer.rows[published.navigation.cursor]) {
+        const row = switch (published.cursorRow() orelse return null) {
             .draft => |draft_row| draft_row,
             else => return null,
         };
@@ -5104,11 +5137,11 @@ pub const Presentation = struct {
     }
 
     fn openReplyComposer(self: *Presentation, published: *Published) void {
-        if (published.navigation.cursor >= published.buffer.rows.len) {
+        if (published.cursorRow() == null) {
             self.action_error = .action_refused;
             return;
         }
-        const parent: bbr.review.draft.Parent = switch (published.buffer.rows[published.navigation.cursor]) {
+        const parent: bbr.review.draft.Parent = switch (published.cursorRow().?) {
             .comment => |row| .{ .comment = row.commentItem().id },
             .draft => |row| .{ .draft = row.draftItem().local_id },
             else => {
@@ -5121,11 +5154,11 @@ pub const Presentation = struct {
 
     fn openInlineComposer(self: *Presentation, published: *Published, kind: bbr.review.DraftKind) void {
         if (published.composer != null) return;
-        if (published.navigation.cursor >= published.buffer.rows.len) {
+        if (published.cursorRow() == null) {
             self.action_error = .action_refused;
             return;
         }
-        const file_index = published.isolated_file orelse fileIndexForRow(published.buffer, published.navigation.cursor);
+        const file_index = published.isolated_file orelse fileIndexForRow(published.buffer, published.cursorBufferIndex());
         if (file_index >= published.session.diff.files.len) {
             self.action_error = .action_refused;
             return;
@@ -5135,11 +5168,11 @@ pub const Presentation = struct {
         const allocator = published.composer_arena.allocator();
         var lines: std.ArrayList(*const bbr.diff.Line) = .empty;
         if (published.navigation.selection()) |selection| {
-            collectSelectedLines(published.buffer, selection[0], selection[1], &lines, allocator) catch {
+            collectSelectedLines(published, selection[0], selection[1], &lines, allocator) catch {
                 self.action_error = .invalid_selection;
                 return;
             };
-        } else if (lineAtRow(published.buffer.rows[published.navigation.cursor])) |line| {
+        } else if (lineAtRow(published.cursorRow().?)) |line| {
             lines.append(allocator, line) catch {
                 self.action_error = .out_of_memory;
                 return;
@@ -5323,7 +5356,7 @@ pub const Presentation = struct {
     fn ensureFocusedEnrichment(self: *Presentation) !void {
         if (self.shutdown_requested) return;
         const published = self.published orelse return;
-        const file_index = published.isolated_file orelse fileIndexForRow(published.buffer, published.navigation.cursor);
+        const file_index = published.isolated_file orelse fileIndexForRow(published.buffer, published.cursorBufferIndex());
         if (file_index >= published.session.diff.files.len or file_index >= published.session.enrichment.len()) return;
         published.focusEnrichment(self.preferences, file_index) catch |err| {
             self.action_error = normalizeActionError(err);
@@ -5545,16 +5578,16 @@ pub const Presentation = struct {
     fn toggleIsolation(self: *Presentation, published: *Published) void {
         if (published.session.diff.files.len == 0) return;
         const previous = published.isolated_file;
-        const candidate = if (previous) |_| null else fileIndexForRow(published.buffer, published.navigation.cursor);
+        const candidate = if (previous) |_| null else fileIndexForRow(published.buffer, published.cursorBufferIndex());
         published.rebuild(self.preferences, published.expanded_disclosures.items, candidate) catch |err| {
             self.action_error = normalizeActionError(err);
             return;
         };
         published.isolated_file = candidate;
         if (previous) |file_index| {
-            if (fileHeaderRow(published.buffer, file_index)) |row| published.navigation.jumpTo(row);
+            if (fileHeaderRow(published.buffer, file_index)) |row| if (published.visualIndexForBufferIndex(row)) |visual_index| published.navigation.jumpTo(visual_index);
         } else {
-            published.navigation = Nav.init(published.buffer.rows.len, frame_mod.paneRects(self.geometry).diff_content.height);
+            published.navigation = Nav.init(published.visual_rows.len, frame_mod.paneRects(self.geometry).diff_content.height);
         }
         self.action_error = null;
     }
@@ -5572,20 +5605,19 @@ pub const Presentation = struct {
                 return;
             };
             published.isolated_file = candidate;
-            published.navigation = Nav.init(published.buffer.rows.len, frame_mod.paneRects(self.geometry).diff_content.height);
+            published.navigation = Nav.init(published.visual_rows.len, frame_mod.paneRects(self.geometry).diff_content.height);
             self.action_error = null;
             return;
         }
         const row = if (direction > 0)
-            nextFileHeaderRow(published.buffer, published.navigation.cursor)
+            nextFileHeaderRow(published.buffer, published.cursorBufferIndex())
         else
-            previousFileHeaderRow(published.buffer, published.navigation.cursor);
-        if (row) |target| published.navigation.jumpTo(target);
+            previousFileHeaderRow(published.buffer, published.cursorBufferIndex());
+        if (row) |target| if (published.visualIndexForBufferIndex(target)) |visual_index| published.navigation.jumpTo(visual_index);
     }
 
     fn toggleDisclosure(self: *Presentation, published: *Published) void {
-        if (published.navigation.cursor >= published.buffer.rows.len) return;
-        const key = buffer_mod.disclosureKey(published.buffer.rows[published.navigation.cursor]) orelse return;
+        const key = buffer_mod.disclosureKey(published.cursorRow() orelse return) orelse return;
         const old_len = published.expanded_disclosures.items.len;
         var removed_index: ?usize = null;
         for (published.expanded_disclosures.items, 0..) |candidate, index| if (std.meta.eql(candidate, key)) {
@@ -5653,23 +5685,27 @@ pub const Presentation = struct {
     }
 
     fn yank(self: *Presentation, published: *Published) void {
-        if (published.navigation.cursor >= published.buffer.rows.len) {
+        if (published.cursorVisualRow() == null) {
             self.action_error = .invalid_selection;
             return;
         }
-        const start_file = fileIndexForRow(published.buffer, published.navigation.cursor);
+        const start_file = fileIndexForRow(published.buffer, published.cursorBufferIndex());
         const selection = published.navigation.selection();
         const wanted = if (selection == null) @max(published.navigation.count, 1) else std.math.maxInt(usize);
         published.navigation.count = 0;
         const first = if (selection) |range| range[0] else published.navigation.cursor;
-        const last = if (selection) |range| range[1] else published.buffer.rows.len - 1;
+        const last = if (selection) |range| range[1] else published.visual_rows.len - 1;
         var bytes: std.ArrayList(u8) = .empty;
         defer bytes.deinit(self.allocator);
         var copied: usize = 0;
         var row_index = first;
-        while (row_index <= last and row_index < published.buffer.rows.len and copied < wanted) : (row_index += 1) {
-            if (fileIndexForRow(published.buffer, row_index) != start_file) break;
-            const source: ?[]const u8 = switch (published.buffer.rows[row_index]) {
+        var previous_buffer_index: ?usize = null;
+        while (row_index <= last and row_index < published.visual_rows.len and copied < wanted) : (row_index += 1) {
+            const visual_row = published.visual_rows[row_index];
+            if (fileIndexForRow(published.buffer, visual_row.buffer_index) != start_file) break;
+            if (previous_buffer_index == visual_row.buffer_index) continue;
+            previous_buffer_index = visual_row.buffer_index;
+            const source: ?[]const u8 = switch (visual_row.row) {
                 .line => |line| line.line.text,
                 .line_pair => |pair| if (pair.right) |right| right.line.text else if (pair.left) |left| left.line.text else null,
                 else => null,
@@ -6067,19 +6103,21 @@ const AnchorCandidatePlacement = struct {
 };
 
 fn candidateLines(published: *const Published) !CandidateLines {
-    if (published.navigation.cursor >= published.buffer.rows.len) return error.NotOnSource;
+    if (published.cursorVisualRow() == null) return error.NotOnSource;
     var lines: CandidateLines = .{};
     if (published.navigation.selection()) |selection| {
         var index = selection[0];
-        while (index <= selection[1] and index < published.buffer.rows.len) : (index += 1) {
+        while (index <= selection[1] and index < published.visual_rows.len) : (index += 1) {
+            const visual_row = published.visual_rows[index];
             // A File header inside the Selection means it left this File.
-            if (published.buffer.rows[index] == .file_header) return error.CrossesFile;
-            const line = lineAtRow(published.buffer.rows[index]) orelse continue;
+            if (visual_row.row == .file_header) return error.CrossesFile;
+            const line = lineAtRow(visual_row.row) orelse continue;
+            if (lines.len > 0 and lines.storage[lines.len - 1] == line) continue;
             if (lines.len == lines.storage.len) return error.RangeTooLong;
             lines.storage[lines.len] = line;
             lines.len += 1;
         }
-    } else if (lineAtRow(published.buffer.rows[published.navigation.cursor])) |line| {
+    } else if (lineAtRow(published.cursorRow().?)) |line| {
         lines.storage[0] = line;
         lines.len = 1;
     }
@@ -6092,7 +6130,7 @@ fn candidateLines(published: *const Published) !CandidateLines {
 /// the shared `max_anchor_lines` cap. Strings borrow the published Session.
 fn reanchorCandidate(published: *const Published, kind: bbr.review.DraftKind) !AnchorCandidatePlacement {
     const lines = try candidateLines(published);
-    const file_index = published.isolated_file orelse fileIndexForRow(published.buffer, published.navigation.cursor);
+    const file_index = published.isolated_file orelse fileIndexForRow(published.buffer, published.cursorBufferIndex());
     if (file_index >= published.session.diff.files.len) return error.NotOnSource;
     const span = try spanFromLines(lines.items(), kind == .suggestion);
     const file = published.session.diff.files[file_index];
@@ -6191,7 +6229,7 @@ fn followSurvivingRow(published: *Published, surviving: ?SurvivingRow) void {
             .line => |line| identity == .line and identity.line == line,
         };
         if (!matches) continue;
-        published.navigation.jumpTo(index);
+        if (published.visualIndexForBufferIndex(index)) |visual_index| published.navigation.jumpTo(visual_index);
         return;
     }
 }
@@ -6201,7 +6239,7 @@ fn followSurvivingRow(published: *Published, surviving: ?SurvivingRow) void {
 fn followDraftCard(published: *Published, temp_id: bbr.review.TempId) void {
     for (published.buffer.rows, 0..) |row, index| {
         if (row != .draft or row.draft.owner.draft != temp_id or row.draft.part != .header) continue;
-        published.navigation.jumpTo(index);
+        if (published.visualIndexForBufferIndex(index)) |visual_index| published.navigation.jumpTo(visual_index);
         return;
     }
 }
@@ -6210,8 +6248,7 @@ fn followDraftCard(published: *Published, temp_id: bbr.review.TempId) void {
 /// resolves to the same stable identity — a local TempId or a Bitbucket
 /// CommentId — never a generic numeric id.
 fn reviewCardTarget(published: *const Published) ?MutationTarget {
-    if (published.navigation.cursor >= published.buffer.rows.len) return null;
-    return switch (published.buffer.rows[published.navigation.cursor]) {
+    return switch (published.cursorRow() orelse return null) {
         .comment => |row| .{ .comment = row.owner.comment },
         .draft => |row| .{ .draft = row.owner.draft },
         else => null,
@@ -6248,21 +6285,21 @@ fn lineAtRow(row: buffer_mod.Row) ?*const bbr.diff.Line {
 fn clampSelectionAtStatusPlaceholder(published: *Published, previous_cursor: usize) void {
     if (!published.navigation.hasSelection()) return;
     const cursor = published.navigation.cursor;
-    const target = selectionTarget(published.buffer.rows, previous_cursor, cursor);
+    const target = selectionTarget(published.visual_rows, previous_cursor, cursor);
     if (target != cursor) published.navigation.jumpTo(target);
 }
 
-fn selectionTarget(rows: []const buffer_mod.Row, from: usize, to: usize) usize {
+fn selectionTarget(rows: []const frame_mod.VisualRow, from: usize, to: usize) usize {
     if (to > from) {
         var index = from + 1;
         while (index <= to and index < rows.len) : (index += 1) {
-            if (rows[index] == .status_placeholder) return index - 1;
+            if (rows[index].row == .status_placeholder) return index - 1;
         }
     } else if (to < from) {
         var index = from;
         while (index > to) {
             index -= 1;
-            if (rows[index] == .status_placeholder) return index + 1;
+            if (rows[index].row == .status_placeholder) return index + 1;
         }
     }
     return to;
@@ -6313,16 +6350,18 @@ test "full-content context Lines cannot become Anchors" {
 }
 
 fn collectSelectedLines(
-    buffer: buffer_mod.Buffer,
+    published: *const Published,
     low: usize,
     high: usize,
     lines: *std.ArrayList(*const bbr.diff.Line),
     allocator: Allocator,
 ) !void {
     var index = low;
-    while (index <= high and index < buffer.rows.len) : (index += 1) {
-        if (buffer.rows[index] == .file_header) return error.NonContiguous;
-        if (lineAtRow(buffer.rows[index])) |line| try lines.append(allocator, line);
+    while (index <= high and index < published.visual_rows.len) : (index += 1) {
+        const visual_row = published.visual_rows[index];
+        if (visual_row.row == .file_header) return error.NonContiguous;
+        const line = lineAtRow(visual_row.row) orelse continue;
+        if (lines.items.len == 0 or lines.items[lines.items.len - 1] != line) try lines.append(allocator, line);
     }
 }
 
@@ -6718,6 +6757,99 @@ fn testUnicodeSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session
     };
     s.threads = try bbr.review.buildThreads(s.arena.allocator(), comments);
     return s;
+}
+
+fn testWrappingSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
+    const s = try testSession(backing, id, 'w');
+    errdefer s.destroy();
+    s.diff = try bbr.diff.parse(s.arena.allocator(),
+        \\diff --git a/wrap.zig b/wrap.zig
+        \\--- a/wrap.zig
+        \\+++ b/wrap.zig
+        \\@@ -1 +1,2 @@
+        \\-old
+        \\+alpha beta gamma delta
+        \\+epsilon zeta eta theta
+    );
+    return s;
+}
+
+test "Unified wrapping uses visual-row navigation and semantic Anchors" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testWrappingSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 60, .rows = 10 },
+    });
+    defer presentation.deinit();
+
+    const disabled = presentation.projection().review.?;
+    try testing.expect(!disabled.preferences.diff_wrap);
+    try testing.expectEqual(disabled.buffer.rows.len, disabled.frame.visual_rows.len);
+    try presentation.dispatch(.{ .action = .toggle_diff_wrap });
+    const wrapped = presentation.projection().review.?;
+    try testing.expect(wrapped.preferences.diff_wrap);
+    try testing.expect(wrapped.frame.visual_rows.len > wrapped.buffer.rows.len);
+
+    var first: ?usize = null;
+    var second: ?usize = null;
+    for (wrapped.frame.visual_rows, 0..) |visual_row, index| {
+        if (visual_row.owner != .line or visual_row.owner.line.kind != .added) continue;
+        if (visual_row.owner.line.new_no == 1 and first == null) first = index;
+        if (visual_row.owner.line.new_no == 2 and second == null) second = index;
+    }
+    presentation.published.?.navigation.jumpTo(first.?);
+    const line_owner = presentation.projection().review.?.frame.visual_rows[first.?].owner;
+    try presentation.dispatch(.{ .action = .down });
+    var current = presentation.projection().review.?;
+    try testing.expect(current.frame.visual_rows[current.navigation.cursor].continuation);
+    try testing.expect(current.frame.visual_rows[current.navigation.cursor].owner.eql(line_owner));
+
+    try presentation.dispatch(.{ .action = .suggest });
+    const draft = presentation.published.?.composer.?.toNewDraft();
+    try testing.expectEqual(bbr.review.DraftKind.suggestion, draft.kind);
+    try testing.expectEqual(@as(?u32, 1), draft.anchor.?.to);
+    try testing.expect(draft.anchor.?.start_to == null);
+    try presentation.dispatch(.{ .composer = .cancel });
+
+    const toggle_offset = current.frame.visual_rows[current.navigation.cursor].source_start;
+    try presentation.dispatch(.{ .action = .toggle_diff_wrap });
+    current = presentation.projection().review.?;
+    try testing.expect(!current.preferences.diff_wrap);
+    try testing.expect(current.frame.visual_rows[current.navigation.cursor].owner.eql(line_owner));
+    try testing.expect(current.frame.visual_rows[current.navigation.cursor].source_start <= toggle_offset and toggle_offset < current.frame.visual_rows[current.navigation.cursor].source_end);
+    try presentation.dispatch(.{ .action = .toggle_diff_wrap });
+
+    presentation.published.?.navigation.jumpTo(first.?);
+    try presentation.dispatch(.{ .push_count_digit = 2 });
+    try presentation.dispatch(.{ .action = .down });
+    current = presentation.projection().review.?;
+    try testing.expectEqual(second.?, current.navigation.cursor);
+
+    presentation.published.?.navigation.jumpTo(first.?);
+    const viewport = presentation.projection().review.?.navigation.viewport;
+    try presentation.dispatch(.{ .action = .page_down });
+    current = presentation.projection().review.?;
+    try testing.expectEqual(@min(first.? + viewport, current.frame.visual_rows.len - 1), current.navigation.cursor);
+
+    presentation.published.?.navigation.jumpTo(first.?);
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try presentation.dispatch(.{ .push_count_digit = 3 });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .inline_comment });
+    const range_draft = presentation.published.?.composer.?.toNewDraft();
+    try testing.expectEqual(@as(?u32, 1), range_draft.anchor.?.start_to);
+    try testing.expectEqual(@as(?u32, 2), range_draft.anchor.?.to);
+    try presentation.dispatch(.{ .composer = .cancel });
+
+    current = presentation.projection().review.?;
+    const previous_owner = current.frame.visual_rows[current.navigation.cursor].owner;
+    const previous_offset = current.frame.visual_rows[current.navigation.cursor].source_start;
+    try presentation.dispatch(.{ .resize = .{ .cols = 80, .rows = 10 } });
+    current = presentation.projection().review.?;
+    const restored = current.frame.visual_rows[current.navigation.cursor];
+    try testing.expect(restored.owner.eql(previous_owner));
+    try testing.expect(restored.source_start <= previous_offset and previous_offset < restored.source_end);
 }
 
 const matrix_graphemes = [_]struct { text: []const u8, cell_width: usize }{
@@ -7399,7 +7531,7 @@ test "Session-relative Navigation is suspended during replacement" {
     try testing.expect(std.meta.eql(before, presentation.projection().review.?.navigation));
 }
 
-test "failed Buffer transaction preserves Buffer preferences and Navigation" {
+test "failed wrapping transaction preserves Frame preferences and Navigation" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
@@ -7415,7 +7547,7 @@ test "failed Buffer transaction preserves Buffer preferences and Navigation" {
     const before = presentation.projection().review.?;
 
     failing.fail_index = failing.alloc_index;
-    try presentation.dispatch(.{ .action = .toggle_layout });
+    try presentation.dispatch(.{ .action = .toggle_diff_wrap });
 
     const after = presentation.projection();
     try testing.expect(failing.has_induced_failure);
@@ -7442,11 +7574,13 @@ test "preferences survive replacement while file isolation resets" {
 
     try presentation.dispatch(.{ .action = .toggle_layout });
     try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .action = .toggle_diff_wrap });
     try presentation.dispatch(.{ .action = .isolate });
     const isolated = presentation.projection().review.?;
     try testing.expectEqual(@as(?usize, 0), isolated.isolated_file);
     try testing.expectEqual(Layout.side_by_side, isolated.preferences.layout);
     try testing.expectEqual(Scope.fetched, isolated.preferences.scope);
+    try testing.expect(isolated.preferences.diff_wrap);
 
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const command = presentation.takeCommand().?.load_session;
@@ -7458,6 +7592,7 @@ test "preferences survive replacement while file isolation resets" {
     const replaced = presentation.projection().review.?;
     try testing.expectEqual(Layout.side_by_side, replaced.preferences.layout);
     try testing.expectEqual(Scope.fetched, replaced.preferences.scope);
+    try testing.expect(replaced.preferences.diff_wrap);
     try testing.expectEqual(@as(?usize, null), replaced.isolated_file);
     try testing.expectEqual(@as(usize, 0), replaced.navigation.cursor);
 }

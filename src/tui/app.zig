@@ -189,7 +189,9 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         });
         const frame = frame_arena.allocator();
         if (projection.review) |review_projection| {
-            const selected_file = fileIndexForRow(review_projection.frame.buffer, review_projection.frame.navigation.cursor);
+            const visual_cursor = review_projection.frame.navigation.cursor;
+            const buffer_cursor = if (visual_cursor < review_projection.frame.visual_rows.len) review_projection.frame.visual_rows[visual_cursor].buffer_index else 0;
+            const selected_file = fileIndexForRow(review_projection.frame.buffer, buffer_cursor);
             render.drawReview(frame, content_win, review_projection, ctx.active_theme, selected_file);
             const status = presentationStatus(frame, projection, review_projection.key);
             drawStatus(

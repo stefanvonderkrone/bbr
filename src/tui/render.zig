@@ -248,12 +248,58 @@ fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, rows: anytyp
         const index = nav.scroll + screen_row;
         if (index >= rows.len) break;
         const row: Row = if (@TypeOf(rows) == []const Row) rows[index] else rows[index].row;
-        drawRow(scratch, win, screen_row, layout, row, theme);
+        if (@TypeOf(rows) == []const Row)
+            drawRow(scratch, win, screen_row, layout, row, theme)
+        else
+            drawVisualRow(scratch, win, screen_row, layout, rows[index], theme);
         if (sel) |selection| {
-            if (index >= selection[0] and index <= selection[1] and row != .status_placeholder) highlightCursorRow(win, screen_row, theme);
+            const selected = if (@TypeOf(rows) == []const Row)
+                index >= selection[0] and index <= selection[1]
+            else
+                visualRowSelected(rows, selection, index);
+            if (selected and row != .status_placeholder) highlightCursorRow(win, screen_row, theme);
         }
         if (index == nav.cursor) highlightCursorRow(win, screen_row, theme);
     }
+}
+
+fn visualRowSelected(rows: []const @import("frame.zig").VisualRow, selection: [2]usize, index: usize) bool {
+    if (index >= rows.len) return false;
+    const candidate = rows[index];
+    if (candidate.owner != .line) return index >= selection[0] and index <= selection[1];
+    var selected = selection[0];
+    while (selected <= selection[1] and selected < rows.len) : (selected += 1) {
+        if (rows[selected].owner.eql(candidate.owner)) return true;
+    }
+    return false;
+}
+
+fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, visual_row: @import("frame.zig").VisualRow, theme: Theme) void {
+    if (visual_row.row != .line or layout != .unified) {
+        drawRow(scratch, win, r, layout, visual_row.row, theme);
+        return;
+    }
+    const line_row = visual_row.row.line;
+    const style = theme.lineStyle(line_row.line.kind);
+    fillRow(win, r, style);
+    if (!visual_row.continuation) {
+        const gutter = std.fmt.allocPrint(scratch, "{s} {s} ", .{
+            numCol(scratch, line_row.line.old_no),
+            numCol(scratch, line_row.line.new_no),
+        }) catch "";
+        _ = win.printSegment(.{ .text = gutter, .style = theme.gutter }, .{ .row_offset = r, .wrap = .none });
+    }
+    drawLineBodyText(
+        scratch,
+        win,
+        r,
+        gutter_cols,
+        line_row.line,
+        line_row.line.text[visual_row.source_start..visual_row.source_end],
+        visual_row.decoration orelse .{ .runs = &.{} },
+        theme,
+        style,
+    );
 }
 
 /// Highlight the whole cursor row (TUI "cursorline" convention): re-tint every
@@ -273,7 +319,7 @@ fn highlightCursorRow(win: vaxis.Window, r: u16, theme: Theme) void {
 }
 
 /// Gutter is two 4-wide line-number columns; body text starts after it.
-const gutter_cols: u16 = 10;
+const gutter_cols: u16 = @intCast(@import("frame.zig").unified_gutter_cols);
 
 fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, row: Row, theme: Theme) void {
     switch (row) {
@@ -423,12 +469,16 @@ fn drawHalf(scratch: std.mem.Allocator, win: vaxis.Window, side_row: ?LineRow, t
 /// whole line prints in its band `style`; with emphasis, the line is drawn as a
 /// run of styled segments so only the changed runs get the brighter band.
 fn drawLineBody(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, body_col: u16, lr: LineRow, theme: Theme, style: vaxis.Style) void {
-    const emph = theme.emphasisStyle(lr.line.kind);
-    const segs = scratch.alloc(vaxis.Segment, lr.decoration.runs.len) catch {
-        _ = win.printSegment(.{ .text = lr.line.text, .style = style }, .{ .row_offset = r, .col_offset = body_col, .wrap = .none });
+    drawLineBodyText(scratch, win, r, body_col, lr.line, lr.line.text, lr.decoration, theme, style);
+}
+
+fn drawLineBodyText(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, body_col: u16, line: *const bbr.diff.Line, text: []const u8, decoration: bbr.highlight.LineDecoration, theme: Theme, style: vaxis.Style) void {
+    const emph = theme.emphasisStyle(line.kind);
+    const segs = scratch.alloc(vaxis.Segment, decoration.runs.len) catch {
+        _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = body_col, .wrap = .none });
         return;
     };
-    for (lr.decoration.runs, 0..) |run, i| {
+    for (decoration.runs, 0..) |run, i| {
         var run_style = if (run.emphasis) emph else style;
         if (run.capture) |capture| {
             if (theme.captureColor(capture)) |fg| run_style.fg = fg;
@@ -1098,7 +1148,7 @@ test "disabled Diff visual-row projection clips exactly like Buffer rendering" {
     };
     const rows = [_]Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &runs } } }};
     const buf: Buffer = .{ .rows = &rows, .layout = .unified };
-    const visual_rows = try @import("frame.zig").buildVisualRows(a, &rows, .bytes);
+    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{ .layout = .unified, .width = 0, .wrap = false });
     var buffer_screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 14, .x_pixel = 0, .y_pixel = 0 });
     defer buffer_screen.deinit(a);
     var frame_screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 14, .x_pixel = 0, .y_pixel = 0 });
@@ -1116,6 +1166,34 @@ test "disabled Diff visual-row projection clips exactly like Buffer rendering" {
         try testing.expectEqualStrings(expected.char.grapheme, actual.char.grapheme);
         try testing.expectEqual(expected.style, actual.style);
     }
+}
+
+test "Unified continuation rows keep decoration and use a blank gutter" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const line: bbr.diff.Line = .{ .old_no = null, .new_no = 7, .kind = .added, .text = "alpha beta" };
+    const rows = [_]Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &.{
+        .{ .text = line.text[0..6], .capture = .{ .name = "keyword" } },
+        .{ .text = line.text[6..], .emphasis = true },
+    } } } }};
+    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{
+        .layout = .unified,
+        .width = 16,
+        .wrap = true,
+    });
+    var screen = try vaxis.Screen.init(a, .{ .rows = 2, .cols = 16, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    var nav = Nav.init(visual_rows.len, 2);
+    nav.mark = 0;
+    drawVisualPane(a, win, visual_rows, .unified, theme_dark, nav);
+
+    try testing.expectEqualStrings("7", win.readCell(8, 0).?.char.grapheme);
+    for (0..gutter_cols) |col| try testing.expectEqualStrings(" ", win.readCell(@intCast(col), 1).?.char.grapheme);
+    try testing.expectEqualStrings("b", win.readCell(gutter_cols, 1).?.char.grapheme);
+    try testing.expectEqual(theme_dark.cursorBg(theme_dark.added_emphasis.bg), win.readCell(gutter_cols, 1).?.style.bg);
 }
 
 test "Status Placeholder renders side, reason, and known or unavailable size" {

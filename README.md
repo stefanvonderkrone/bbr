@@ -95,6 +95,7 @@ theme = "system"
 page_down = ["ctrl-f", "page-down"]
 quit = []
 review_comment = ["C", "space r c"]
+toggle_diff_wrap = ["w"]
 
 [highlight]
 max_file_bytes = 2097152
@@ -117,6 +118,8 @@ max_bytes = 1048576
 `system` is the default Theme and uses the terminal foreground, background, and ANSI palette.
 Fixed Themes are `dark`, `light`, all four `catppuccin-*` flavors, `gruvbox-light`,
 `gruvbox-dark`, `solarized-light`, and `solarized-dark`.
+
+Diff wrapping starts disabled. The `toggle_diff_wrap` Action changes wrapping for the current process.
 
 Keymap entries map each Action name to one or more one-to-eight-chord sequences.
 An empty list unbinds that Action. Contextual Actions may deliberately share a chord—Enter, for
