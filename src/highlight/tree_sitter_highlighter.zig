@@ -4,6 +4,8 @@ const std = @import("std");
 const bbr = @import("bbr");
 const Allocator = std.mem.Allocator;
 const predicate_mod = @import("query_predicates.zig");
+const grammar_match = @import("grammar_match.zig");
+const user_grammar = @import("user_grammar.zig");
 const c = predicate_mod.c;
 
 extern fn tree_sitter_javascript() callconv(.c) ?*const c.TSLanguage;
@@ -37,46 +39,54 @@ const Grammar = struct {
 };
 
 pub const TreeSitterHighlighter = struct {
+    registry: ?*user_grammar.Registry = null,
+
+    pub fn init(registry: *user_grammar.Registry) TreeSitterHighlighter {
+        return .{ .registry = registry };
+    }
+
     pub fn highlighter(self: *TreeSitterHighlighter) bbr.highlight.Highlighter {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
     const vtable: bbr.highlight.Highlighter.VTable = .{ .highlight = highlightImpl };
 
-    fn highlightImpl(_: *anyopaque, allocator: Allocator, path: []const u8, content: []const u8) anyerror!bbr.highlight.HighlightResult {
-        const grammar = selectGrammar(path, content) orelse return .{ .spans = &.{} };
-        return highlightWith(allocator, grammar, content);
+    fn highlightImpl(ptr: *anyopaque, allocator: Allocator, path: []const u8, content: []const u8) anyerror!bbr.highlight.HighlightResult {
+        const self: *TreeSitterHighlighter = @ptrCast(@alignCast(ptr));
+        if (self.registry) |registry| {
+            if (registry.matchName(path, content) != null) {
+                const grammar = registry.grammar(path, content) catch return highlightBuiltIn(allocator, path, content) catch .{ .spans = &.{} };
+                if (grammar) |selected| {
+                    return highlightWithQuery(allocator, selected.language, selected.query, selected.locals_query, content) catch
+                        highlightBuiltIn(allocator, path, content) catch .{ .spans = &.{} };
+                }
+            }
+        }
+        return highlightBuiltIn(allocator, path, content);
     }
 };
 
+fn highlightBuiltIn(allocator: Allocator, path: []const u8, content: []const u8) !bbr.highlight.HighlightResult {
+    const grammar = selectGrammar(path, content) orelse return .{ .spans = &.{} };
+    return highlightWith(allocator, grammar, content);
+}
+
 fn selectGrammar(path: []const u8, content: []const u8) ?Grammar {
-    if (hasAnySuffix(path, &.{".tsx"})) return .{ .name = "TSX", .language = tree_sitter_tsx() orelse return null, .query = combined_tsx_query, .locals_query = combined_typescript_locals_query };
-    if (hasAnySuffix(path, &.{ ".ts", ".mts", ".cts" })) return .{ .name = "TypeScript", .language = tree_sitter_typescript() orelse return null, .query = combined_typescript_query, .locals_query = combined_typescript_locals_query };
-    if (hasAnySuffix(path, &.{ ".js", ".jsx", ".mjs", ".cjs" })) return .{ .name = "JavaScript", .language = tree_sitter_javascript() orelse return null, .query = javascript_query, .locals_query = javascript_locals_query };
-    if (hasAnySuffix(path, &.{".css"})) return .{ .name = "CSS", .language = tree_sitter_css() orelse return null, .query = css_query };
-    if (hasAnySuffix(path, &.{".go"})) return .{ .name = "Go", .language = tree_sitter_go() orelse return null, .query = go_query };
-    if (hasAnySuffix(path, &.{ ".sh", ".bash" })) return .{ .name = "Bash", .language = tree_sitter_bash() orelse return null, .query = bash_query };
-    if (hasAnySuffix(path, &.{".json"})) return .{ .name = "JSON", .language = tree_sitter_json() orelse return null, .query = json_query };
-    if (hasAnySuffix(path, &.{ ".yaml", ".yml" })) return .{ .name = "YAML", .language = tree_sitter_yaml() orelse return null, .query = yaml_query };
-    const basename = std.fs.path.basename(path);
-    if (std.mem.eql(u8, basename, ".bashrc") or std.mem.eql(u8, basename, "Bashfile") or bashShebang(content))
-        return .{ .name = "Bash", .language = tree_sitter_bash() orelse return null, .query = bash_query };
-    return null;
+    const selected = grammar_match.selectBuiltIn(path, content) orelse return null;
+    return switch (selected) {
+        .tsx => .{ .name = selected.name(), .language = tree_sitter_tsx() orelse return null, .query = combined_tsx_query, .locals_query = combined_typescript_locals_query },
+        .typescript => .{ .name = selected.name(), .language = tree_sitter_typescript() orelse return null, .query = combined_typescript_query, .locals_query = combined_typescript_locals_query },
+        .javascript => .{ .name = selected.name(), .language = tree_sitter_javascript() orelse return null, .query = javascript_query, .locals_query = javascript_locals_query },
+        .css => .{ .name = selected.name(), .language = tree_sitter_css() orelse return null, .query = css_query },
+        .go => .{ .name = selected.name(), .language = tree_sitter_go() orelse return null, .query = go_query },
+        .bash => .{ .name = selected.name(), .language = tree_sitter_bash() orelse return null, .query = bash_query },
+        .json => .{ .name = selected.name(), .language = tree_sitter_json() orelse return null, .query = json_query },
+        .yaml => .{ .name = selected.name(), .language = tree_sitter_yaml() orelse return null, .query = yaml_query },
+    };
 }
 
 pub fn builtInGrammarName(path: []const u8, content: []const u8) ?[]const u8 {
-    return (selectGrammar(path, content) orelse return null).name;
-}
-
-fn bashShebang(content: []const u8) bool {
-    const first_line = content[0 .. std.mem.indexOfScalar(u8, content, '\n') orelse content.len];
-    if (!std.mem.startsWith(u8, first_line, "#!")) return false;
-    return std.mem.indexOf(u8, first_line, "bash") != null or std.mem.endsWith(u8, first_line, "/sh");
-}
-
-fn hasAnySuffix(path: []const u8, suffixes: []const []const u8) bool {
-    for (suffixes) |suffix| if (std.mem.endsWith(u8, path, suffix)) return true;
-    return false;
+    return grammar_match.builtInGrammarName(path, content);
 }
 
 fn highlightWith(allocator: Allocator, grammar: Grammar, content: []const u8) !bbr.highlight.HighlightResult {
@@ -196,6 +206,54 @@ test "BuiltInGrammar selection covers JavaScript TypeScript and TSX" {
     try testing.expect(selectGrammar("src/a.tsx", "") != null);
     try testing.expect(selectGrammar("src/a.zig", "") == null);
     try testing.expect(selectGrammar("scripts/release", "#!/usr/bin/env bash\n") != null);
+}
+
+test "UserGrammar runtime failure restores BuiltInGrammar or plain text" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    try tmp.dir.createDir(io, "fixture", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fixture/payload", .data = "not a library" });
+    const payload_digest = digestHex("not a library");
+    const manifest = try std.fmt.allocPrint(testing.allocator,
+        \\name = "fixture"
+        \\version = "1.0.0"
+        \\os = "{s}"
+        \\arch = "{s}"
+        \\tree_sitter_abi = 15
+        \\symbol = "tree_sitter_fixture"
+        \\library = "payload"
+        \\highlight_query = "payload"
+        \\[[payload]]
+        \\path = "payload"
+        \\sha256 = "{s}"
+        \\[matches]
+        \\extensions = [".js", ".fixture"]
+        \\
+    , .{ @tagName(@import("builtin").os.tag), @tagName(@import("builtin").cpu.arch), payload_digest });
+    defer testing.allocator.free(manifest);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fixture/grammar.toml", .data = manifest });
+    const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/fixture", .{&tmp.sub_path});
+    defer testing.allocator.free(path);
+    var inspection = try user_grammar.inspect(testing.allocator, io, path);
+    const digest = inspection.report.digest;
+    inspection.deinit();
+    const entries = [_]user_grammar.RegistryEntry{.{
+        .name = "fixture",
+        .path = path,
+        .enabled = true,
+        .trusted_digest = digest,
+        .receipt = .{ .bundle_digest = digest, .bbr_identity = "test-build", .tree_sitter_identity = c.TREE_SITTER_LANGUAGE_VERSION },
+    }};
+    var registry = try user_grammar.Registry.init(testing.allocator, io, &entries, &.{}, "test-build");
+    defer registry.deinit();
+    var highlighter = TreeSitterHighlighter.init(&registry);
+
+    const built_in = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", "const answer = 1;\n");
+    defer freeResult(built_in);
+    try testing.expect(built_in.spans.len > 0);
+    const plain = try highlighter.highlighter().highlight(testing.allocator, "src/a.fixture", "content\n");
+    try testing.expectEqual(@as(usize, 0), plain.spans.len);
 }
 
 test "JavaScript tracer produces ordered non-overlapping Captures" {
@@ -472,6 +530,14 @@ test "eq predicate accepts Capture comparison" {
 fn freeResult(result: bbr.highlight.HighlightResult) void {
     for (result.spans) |span| testing.allocator.free(span.capture.name);
     testing.allocator.free(result.spans);
+}
+
+fn digestHex(bytes: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    var result: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&result, "{x}", .{digest}) catch unreachable;
+    return result;
 }
 
 fn expectSpan(result: bbr.highlight.HighlightResult, line: u32, start: usize, end: usize, capture: []const u8) !void {

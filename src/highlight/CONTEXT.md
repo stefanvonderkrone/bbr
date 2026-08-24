@@ -7,7 +7,7 @@ diff backgrounds are composed over them per cell by Presentation.
 ## Language
 
 **Highlighter**:
-The seam that turns a File's full content into Spans. Implementations: `PlainHighlighter` (none) and `TreeSitterHighlighter` (built-in Grammars).
+The seam that turns a File's full content into Spans. Implementations: `PlainHighlighter` (none) and `TreeSitterHighlighter` (BuiltInGrammars and active UserGrammars).
 _Avoid_: colorizer, lexer, formatter.
 
 **Grammar**:

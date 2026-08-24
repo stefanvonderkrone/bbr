@@ -2,8 +2,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const grammar_match = @import("grammar_match.zig");
 const predicate_mod = @import("query_predicates.zig");
-const built_in_mod = @import("tree_sitter_highlighter.zig");
 const c = predicate_mod.c;
 
 const max_file_bytes = 64 * 1024 * 1024;
@@ -15,6 +15,279 @@ pub const GrammarMatches = struct {
     extensions: []const []const u8 = &.{},
     shebangs: []const []const u8 = &.{},
 };
+
+pub const ValidationReceipt = struct {
+    bundle_digest: [32]u8,
+    bbr_identity: []const u8,
+    tree_sitter_identity: u32,
+
+    pub fn matches(self: ValidationReceipt, digest: [32]u8, bbr_identity: []const u8) bool {
+        return std.crypto.timing_safe.eql([32]u8, self.bundle_digest, digest) and
+            std.mem.eql(u8, self.bbr_identity, bbr_identity) and
+            self.tree_sitter_identity == c.TREE_SITTER_LANGUAGE_VERSION;
+    }
+};
+
+pub const MatchOverride = struct {
+    name: []const u8,
+    rules: GrammarMatches,
+};
+
+pub fn effectiveRules(name: []const u8, defaults: GrammarMatches, overrides: []const MatchOverride) !GrammarMatches {
+    for (overrides) |override| {
+        if (!std.mem.eql(u8, override.name, name)) continue;
+        try validateRules(override.rules);
+        return override.rules;
+    }
+    return defaults;
+}
+
+pub fn matches(rules: GrammarMatches, path: []const u8, content: []const u8) bool {
+    inline for (std.meta.tags(MatchKind)) |kind| if (matchesKind(rules, kind, path, content)) return true;
+    return false;
+}
+
+const MatchKind = enum { filename, compound_suffix, extension, shebang };
+
+fn matchesKind(rules: GrammarMatches, kind: MatchKind, path: []const u8, content: []const u8) bool {
+    const basename = std.fs.path.basename(path);
+    const candidates = switch (kind) {
+        .filename => rules.filenames,
+        .compound_suffix => rules.compound_suffixes,
+        .extension => rules.extensions,
+        .shebang => rules.shebangs,
+    };
+    for (candidates) |candidate| {
+        const matched = switch (kind) {
+            .filename => std.mem.eql(u8, basename, candidate),
+            .compound_suffix => std.mem.endsWith(u8, basename, candidate),
+            .extension => std.mem.eql(u8, std.fs.path.extension(basename), candidate),
+            .shebang => std.mem.startsWith(u8, content[0 .. std.mem.indexOfScalar(u8, content, '\n') orelse content.len], candidate),
+        };
+        if (matched) return true;
+    }
+    return false;
+}
+
+pub fn validateActiveConflicts(names: []const []const u8, rules: []const GrammarMatches) !void {
+    std.debug.assert(names.len == rules.len);
+    for (rules, 0..) |left, left_index| {
+        for (rules[left_index + 1 ..], left_index + 1..) |right, right_index| {
+            if (rulesOverlap(left, right)) {
+                _ = names[right_index];
+                return error.UserGrammarConflict;
+            }
+        }
+    }
+}
+
+fn rulesOverlap(left: GrammarMatches, right: GrammarMatches) bool {
+    if (ruleListsOverlap(left.filenames, right.filenames) or
+        suffixListsOverlap(left.compound_suffixes, right.compound_suffixes) or
+        ruleListsOverlap(left.extensions, right.extensions) or
+        prefixListsOverlap(left.shebangs, right.shebangs)) return true;
+    for (left.filenames) |filename| {
+        for (right.compound_suffixes) |suffix| if (std.mem.endsWith(u8, filename, suffix)) return true;
+        for (right.extensions) |extension| if (std.mem.eql(u8, std.fs.path.extension(filename), extension)) return true;
+    }
+    for (right.filenames) |filename| {
+        for (left.compound_suffixes) |suffix| if (std.mem.endsWith(u8, filename, suffix)) return true;
+        for (left.extensions) |extension| if (std.mem.eql(u8, std.fs.path.extension(filename), extension)) return true;
+    }
+    for (left.compound_suffixes) |suffix| for (right.extensions) |extension| {
+        if (std.mem.eql(u8, std.fs.path.extension(suffix), extension)) return true;
+    };
+    for (right.compound_suffixes) |suffix| for (left.extensions) |extension| {
+        if (std.mem.eql(u8, std.fs.path.extension(suffix), extension)) return true;
+    };
+    const left_has_path_rules = left.filenames.len + left.compound_suffixes.len + left.extensions.len != 0;
+    const right_has_path_rules = right.filenames.len + right.compound_suffixes.len + right.extensions.len != 0;
+    return left_has_path_rules and right.shebangs.len != 0 or right_has_path_rules and left.shebangs.len != 0;
+}
+
+fn ruleListsOverlap(left: []const []const u8, right: []const []const u8) bool {
+    for (left) |left_rule| for (right) |right_rule| {
+        if (std.mem.eql(u8, left_rule, right_rule)) return true;
+    };
+    return false;
+}
+
+fn suffixListsOverlap(left: []const []const u8, right: []const []const u8) bool {
+    for (left) |left_rule| for (right) |right_rule| {
+        if (std.mem.endsWith(u8, left_rule, right_rule) or std.mem.endsWith(u8, right_rule, left_rule)) return true;
+    };
+    return false;
+}
+
+fn prefixListsOverlap(left: []const []const u8, right: []const []const u8) bool {
+    for (left) |left_rule| for (right) |right_rule| {
+        if (std.mem.startsWith(u8, left_rule, right_rule) or std.mem.startsWith(u8, right_rule, left_rule)) return true;
+    };
+    return false;
+}
+
+pub const RegistryEntry = struct {
+    name: []const u8,
+    path: []const u8,
+    enabled: bool,
+    trusted_digest: [32]u8,
+    receipt: ?ValidationReceipt = null,
+};
+
+pub const InstallationStatus = struct {
+    name: []const u8,
+    enabled: bool,
+    valid: bool,
+};
+
+pub const RuntimeGrammar = struct {
+    name: []const u8,
+    language: *const c.TSLanguage,
+    query: []const u8,
+    locals_query: []const u8,
+};
+
+pub const Registry = struct {
+    allocator: std.mem.Allocator,
+    installations: []Installation,
+
+    const Installation = struct {
+        name: []u8,
+        enabled: bool,
+        rules: GrammarMatches = .{},
+        inspection: ?Inspection = null,
+        loaded: ?Loaded = null,
+
+        const Loaded = struct {
+            library: std.DynLib,
+            language: *const c.TSLanguage,
+        };
+    };
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        entries: []const RegistryEntry,
+        overrides: []const MatchOverride,
+        bbr_identity: []const u8,
+    ) !Registry {
+        var installations: std.ArrayList(Installation) = .empty;
+        errdefer {
+            deinitInstallations(allocator, installations.items);
+            installations.deinit(allocator);
+        }
+
+        for (entries) |entry| {
+            const name = try allocator.dupe(u8, entry.name);
+            errdefer allocator.free(name);
+            var inspection = inspect(allocator, io, entry.path) catch |err| {
+                if (entry.enabled) return err;
+                try installations.append(allocator, .{ .name = name, .enabled = false });
+                continue;
+            };
+            errdefer inspection.deinit();
+            if (!std.mem.eql(u8, entry.name, inspection.report.name) or
+                !std.crypto.timing_safe.eql([32]u8, entry.trusted_digest, inspection.report.digest))
+            {
+                if (entry.enabled) {
+                    if (!std.mem.eql(u8, entry.name, inspection.report.name)) return error.UserGrammarIdentityMismatch;
+                    return error.UntrustedDigest;
+                }
+                try installations.append(allocator, .{ .name = name, .enabled = false });
+                inspection.deinit();
+                continue;
+            }
+
+            const rules = try effectiveRules(entry.name, inspection.report.rules, overrides);
+            if (entry.enabled and !(if (entry.receipt) |receipt| receipt.matches(inspection.report.digest, bbr_identity) else false)) {
+                var digest_buffer: [64]u8 = undefined;
+                try inspection.validateTrusted(inspection.report.digestHex(&digest_buffer));
+            }
+            try installations.append(allocator, .{
+                .name = name,
+                .enabled = entry.enabled,
+                .rules = rules,
+                .inspection = inspection,
+            });
+        }
+
+        for (installations.items, 0..) |*left, left_index| {
+            if (!left.enabled) continue;
+            for (installations.items[left_index + 1 ..]) |*right| {
+                if (!right.enabled) continue;
+                const names = [_][]const u8{ left.name, right.name };
+                const rules = [_]GrammarMatches{ left.rules, right.rules };
+                try validateActiveConflicts(&names, &rules);
+            }
+        }
+        return .{ .allocator = allocator, .installations = try installations.toOwnedSlice(allocator) };
+    }
+
+    pub fn deinit(self: *Registry) void {
+        deinitInstallations(self.allocator, self.installations);
+        self.allocator.free(self.installations);
+        self.* = undefined;
+    }
+
+    pub fn statuses(self: *const Registry, allocator: std.mem.Allocator) ![]InstallationStatus {
+        const result = try allocator.alloc(InstallationStatus, self.installations.len);
+        for (self.installations, result) |installation, *status| status.* = .{
+            .name = installation.name,
+            .enabled = installation.enabled,
+            .valid = installation.inspection != null,
+        };
+        return result;
+    }
+
+    pub fn grammar(self: *Registry, path: []const u8, content: []const u8) !?RuntimeGrammar {
+        const installation = self.select(path, content) orelse return null;
+        return try load(installation, self.allocator);
+    }
+
+    pub fn matchName(self: *Registry, path: []const u8, content: []const u8) ?[]const u8 {
+        return (self.select(path, content) orelse return null).name;
+    }
+
+    fn select(self: *Registry, path: []const u8, content: []const u8) ?*Installation {
+        inline for (std.meta.tags(MatchKind)) |kind| {
+            for (self.installations) |*installation| {
+                if (!installation.enabled or !matchesKind(installation.rules, kind, path, content)) continue;
+                return installation;
+            }
+        }
+        return null;
+    }
+
+    fn load(installation: *Installation, allocator: std.mem.Allocator) !RuntimeGrammar {
+        const inspection = &(installation.inspection orelse return error.InvalidUserGrammarInstallation);
+        if (installation.loaded == null) {
+            const temporary = try inspection.writeTemporaryLibrary();
+            defer std.Io.Dir.cwd().deleteTree(inspection.io, temporary.root) catch {};
+            var library = std.DynLib.open(temporary.path) catch return error.NativeLibraryLoadFailed;
+            errdefer library.close();
+            const symbol = try allocator.dupeZ(u8, inspection.manifest.symbol);
+            defer allocator.free(symbol);
+            const language_fn = library.lookup(*const fn () callconv(.c) ?*const c.TSLanguage, symbol) orelse return error.MissingLanguageSymbol;
+            const language = language_fn() orelse return error.InvalidLanguageSymbol;
+            if (c.ts_language_abi_version(language) != inspection.manifest.tree_sitter_abi.?) return error.TreeSitterAbiMismatch;
+            installation.loaded = .{ .library = library, .language = language };
+        }
+        return .{
+            .name = installation.name,
+            .language = installation.loaded.?.language,
+            .query = findFile(inspection.files, inspection.manifest.highlight_query).?.bytes,
+            .locals_query = if (inspection.manifest.locals_query) |path| findFile(inspection.files, path).?.bytes else "",
+        };
+    }
+};
+
+fn deinitInstallations(allocator: std.mem.Allocator, installations: []Registry.Installation) void {
+    for (installations) |*installation| {
+        if (installation.loaded) |*loaded| loaded.library.close();
+        if (installation.inspection) |*inspection| inspection.deinit();
+        allocator.free(installation.name);
+    }
+}
 
 pub const Report = struct {
     name: []const u8,
@@ -472,7 +745,7 @@ fn affectedBuiltIns(allocator: std.mem.Allocator, rules: GrammarMatches) ![]cons
 }
 
 fn appendAffected(allocator: std.mem.Allocator, affected: *std.ArrayList([]const u8), path: []const u8, content: []const u8) !void {
-    const name = built_in_mod.builtInGrammarName(path, content) orelse return;
+    const name = grammar_match.builtInGrammarName(path, content) orelse return;
     for (affected.items) |existing| if (std.mem.eql(u8, existing, name)) return;
     try affected.append(allocator, name);
 }
@@ -701,6 +974,136 @@ test "manifest rejects duplicate fields and terminal control GrammarMatches" {
     try testing.expectError(error.InvalidGrammarMatch, validateRules(unsafe_rules));
 }
 
+test "GrammarMatch uses category precedence and explicit configuration replaces defaults" {
+    const defaults: GrammarMatches = .{
+        .filenames = &.{"Dockerfile"},
+        .compound_suffixes = &.{".test.js"},
+        .extensions = &.{".js"},
+        .shebangs = &.{"#!/usr/bin/env fixture"},
+    };
+    try testing.expect(matches(defaults, "src/Dockerfile", ""));
+    try testing.expect(matches(defaults, "src/a.test.js", ""));
+    try testing.expect(matches(defaults, "src/a.js", ""));
+    try testing.expect(matches(defaults, "script", "#!/usr/bin/env fixture -x\n"));
+
+    const configured = try effectiveRules("fixture", defaults, &.{.{
+        .name = "fixture",
+        .rules = .{ .extensions = &.{".zig"} },
+    }});
+    try testing.expect(matches(configured, "src/a.zig", ""));
+    try testing.expect(!matches(configured, "src/a.js", ""));
+    try testing.expect(!matches(configured, "src/Dockerfile", ""));
+}
+
+test "active UserGrammar conflicts are errors" {
+    const names = [_][]const u8{ "first", "second" };
+    const conflicting = [_]GrammarMatches{
+        .{ .extensions = &.{".fixture"} },
+        .{ .extensions = &.{".fixture"} },
+    };
+    try testing.expectError(error.UserGrammarConflict, validateActiveConflicts(&names, &conflicting));
+
+    const distinct = [_]GrammarMatches{
+        .{ .extensions = &.{".first"} },
+        .{ .extensions = &.{".second"} },
+    };
+    try validateActiveConflicts(&names, &distinct);
+
+    const cross_category = [_]GrammarMatches{
+        .{ .compound_suffixes = &.{".test.js"} },
+        .{ .extensions = &.{".js"} },
+    };
+    try testing.expectError(error.UserGrammarConflict, validateActiveConflicts(&names, &cross_category));
+}
+
+test "validation receipt requires bundle bbr and tree-sitter identities" {
+    const digest = canonicalDigest(&.{.{ .path = "grammar.toml", .bytes = "fixture" }});
+    const receipt: ValidationReceipt = .{
+        .bundle_digest = digest,
+        .bbr_identity = "test-build",
+        .tree_sitter_identity = c.TREE_SITTER_LANGUAGE_VERSION,
+    };
+    try testing.expect(receipt.matches(digest, "test-build"));
+    var changed = digest;
+    changed[0] ^= 1;
+    try testing.expect(!receipt.matches(changed, "test-build"));
+    try testing.expect(!receipt.matches(digest, "other-build"));
+    var runtime_changed = receipt;
+    runtime_changed.tree_sitter_identity -= 1;
+    try testing.expect(!runtime_changed.matches(digest, "test-build"));
+}
+
+test "registry reuses exact receipts and loads a matching UserGrammar on first use" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const first_path = try writeRegistryBundle(&tmp, "first", ".first", "not a library");
+    defer testing.allocator.free(first_path);
+    const second_path = try writeRegistryBundle(&tmp, "second", ".other", "also not a library");
+    defer testing.allocator.free(second_path);
+    var first_inspection = try inspect(testing.allocator, testing.io, first_path);
+    const first_digest = first_inspection.report.digest;
+    first_inspection.deinit();
+    var second_inspection = try inspect(testing.allocator, testing.io, second_path);
+    const second_digest = second_inspection.report.digest;
+    second_inspection.deinit();
+    const entries = [_]RegistryEntry{
+        .{ .name = "first", .path = first_path, .enabled = true, .trusted_digest = first_digest, .receipt = .{ .bundle_digest = first_digest, .bbr_identity = "test-build", .tree_sitter_identity = c.TREE_SITTER_LANGUAGE_VERSION } },
+        .{ .name = "second", .path = second_path, .enabled = true, .trusted_digest = second_digest, .receipt = .{ .bundle_digest = second_digest, .bbr_identity = "test-build", .tree_sitter_identity = c.TREE_SITTER_LANGUAGE_VERSION } },
+    };
+    var registry = try Registry.init(testing.allocator, testing.io, &entries, &.{.{
+        .name = "second",
+        .rules = .{ .filenames = &.{"exact.fixture"} },
+    }}, "test-build");
+    defer registry.deinit();
+
+    try testing.expectEqualStrings("second", registry.matchName("src/exact.fixture", "").?);
+    try testing.expectEqualStrings("first", registry.matchName("src/other.first", "").?);
+    try testing.expectError(error.NativeLibraryLoadFailed, registry.grammar("src/other.first", ""));
+}
+
+test "registry rejects stale active receipts but lists invalid inactive installations" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try writeRegistryBundle(&tmp, "fixture", ".fixture", "not a library");
+    defer testing.allocator.free(path);
+    var inspection = try inspect(testing.allocator, testing.io, path);
+    const digest = inspection.report.digest;
+    inspection.deinit();
+
+    const stale = [_]RegistryEntry{.{
+        .name = "fixture",
+        .path = path,
+        .enabled = true,
+        .trusted_digest = digest,
+        .receipt = .{ .bundle_digest = digest, .bbr_identity = "old-build", .tree_sitter_identity = c.TREE_SITTER_LANGUAGE_VERSION },
+    }};
+    try testing.expectError(error.NativeLibraryLoadFailed, Registry.init(testing.allocator, testing.io, &stale, &.{}, "test-build"));
+
+    var payload = try tmp.dir.openFile(testing.io, "fixture/payload", .{ .mode = .write_only });
+    try payload.writeStreamingAll(testing.io, "tampered");
+    payload.close(testing.io);
+    const inactive = [_]RegistryEntry{.{ .name = "fixture", .path = path, .enabled = false, .trusted_digest = digest }};
+    var registry = try Registry.init(testing.allocator, testing.io, &inactive, &.{}, "test-build");
+    defer registry.deinit();
+    const statuses = try registry.statuses(testing.allocator);
+    defer testing.allocator.free(statuses);
+    try testing.expectEqual(@as(usize, 1), statuses.len);
+    try testing.expect(!statuses[0].enabled);
+    try testing.expect(!statuses[0].valid);
+
+    const untampered_path = try writeRegistryBundle(&tmp, "inactive", ".inactive", "bytes");
+    defer testing.allocator.free(untampered_path);
+    const untrusted_inactive = [_]RegistryEntry{.{ .name = "inactive", .path = untampered_path, .enabled = false, .trusted_digest = @splat(0) }};
+    var untrusted_registry = try Registry.init(testing.allocator, testing.io, &untrusted_inactive, &.{}, "test-build");
+    defer untrusted_registry.deinit();
+    const untrusted_statuses = try untrusted_registry.statuses(testing.allocator);
+    defer testing.allocator.free(untrusted_statuses);
+    try testing.expect(!untrusted_statuses[0].valid);
+
+    const active = [_]RegistryEntry{.{ .name = "fixture", .path = path, .enabled = true, .trusted_digest = digest }};
+    try testing.expectError(error.PayloadDigestMismatch, Registry.init(testing.allocator, testing.io, &active, &.{}, "test-build"));
+}
+
 fn digestHex(bytes: []const u8) [64]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
@@ -726,6 +1129,34 @@ fn minimalManifest(allocator: std.mem.Allocator, library: []const u8, query: []c
         \\extensions = ["{s}"]
         \\
     , .{ @tagName(builtin.os.tag), @tagName(builtin.cpu.arch), library, query, library, digest, extension });
+}
+
+fn writeRegistryBundle(tmp: *testing.TmpDir, name: []const u8, extension: []const u8, payload: []const u8) ![]u8 {
+    try tmp.dir.createDir(testing.io, name, .default_dir);
+    const payload_path = try std.fmt.allocPrint(testing.allocator, "{s}/payload", .{name});
+    defer testing.allocator.free(payload_path);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = payload_path, .data = payload });
+    const manifest = try std.fmt.allocPrint(testing.allocator,
+        \\name = "{s}"
+        \\version = "1.0.0"
+        \\os = "{s}"
+        \\arch = "{s}"
+        \\tree_sitter_abi = 15
+        \\symbol = "tree_sitter_fixture"
+        \\library = "payload"
+        \\highlight_query = "payload"
+        \\[[payload]]
+        \\path = "payload"
+        \\sha256 = "{s}"
+        \\[matches]
+        \\extensions = ["{s}"]
+        \\
+    , .{ name, @tagName(builtin.os.tag), @tagName(builtin.cpu.arch), digestHex(payload), extension });
+    defer testing.allocator.free(manifest);
+    const manifest_path = try std.fmt.allocPrint(testing.allocator, "{s}/grammar.toml", .{name});
+    defer testing.allocator.free(manifest_path);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = manifest_path, .data = manifest });
+    return std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/{s}", .{ &tmp.sub_path, name });
 }
 
 const TarTestEntry = struct { []const u8, u8, []const u8 };
