@@ -79,6 +79,10 @@ fn highlightWith(allocator: Allocator, grammar: Grammar, content: []const u8) !b
 }
 
 fn highlightWithQuery(allocator: Allocator, grammar_language: *const c.TSLanguage, query_source: []const u8, locals_query_source: []const u8, content: []const u8) !bbr.highlight.HighlightResult {
+    return highlightWithQueryLimit(allocator, grammar_language, query_source, locals_query_source, content, null);
+}
+
+fn highlightWithQueryLimit(allocator: Allocator, grammar_language: *const c.TSLanguage, query_source: []const u8, locals_query_source: []const u8, content: []const u8, match_limit: ?u32) !bbr.highlight.HighlightResult {
     if (content.len > std.math.maxInt(u32)) return error.FileTooLarge;
     if (!std.unicode.utf8ValidateSlice(content)) return error.InvalidUtf8;
     const parser = c.ts_parser_new() orelse return error.ParserInitFailed;
@@ -100,10 +104,17 @@ fn highlightWithQuery(allocator: Allocator, grammar_language: *const c.TSLanguag
         else => return err,
     };
     defer predicates.deinit(allocator);
-    const locals = try predicate_mod.Locals.collect(allocator, grammar_language, tree, locals_query_source, content);
+    const locals = predicate_mod.Locals.collect(allocator, grammar_language, tree, locals_query_source, content, &diagnostic) catch |err| switch (err) {
+        error.InvalidPredicate, error.InvalidLocalsQuery => {
+            diagnostic.report();
+            return err;
+        },
+        else => return err,
+    };
     defer locals.deinit(allocator);
     const cursor = c.ts_query_cursor_new() orelse return error.QueryCursorInitFailed;
     defer c.ts_query_cursor_delete(cursor);
+    c.ts_query_cursor_set_match_limit(cursor, match_limit orelse std.math.maxInt(u32));
     c.ts_query_cursor_exec(cursor, query, c.ts_tree_root_node(tree));
 
     // Capture id per byte. Later query matches take precedence; newlines are
@@ -121,10 +132,10 @@ fn highlightWithQuery(allocator: Allocator, grammar_language: *const c.TSLanguag
         if (!try predicates.accepts(match.pattern_index, match, content, locals)) continue;
         const captures = match.captures[0..match.capture_count];
         for (captures) |capture| {
-            const start: usize = c.ts_node_start_byte(capture.node);
-            const end: usize = c.ts_node_end_byte(capture.node);
+            const range = try predicate_mod.checkedRange(c.ts_node_start_byte(capture.node), c.ts_node_end_byte(capture.node), content);
+            const start = range.start;
+            const end = range.end;
             if (start == end) continue;
-            if (start > end or end > content.len or !predicate_mod.utf8Boundary(content, start) or !predicate_mod.utf8Boundary(content, end)) return error.InvalidCaptureRange;
             for (start..end) |byte| {
                 if (labels[byte] == none or match.pattern_index >= priorities[byte]) {
                     labels[byte] = capture.index;
@@ -232,6 +243,63 @@ test "JavaScript BuiltInGrammar rejects built-in Captures for local bindings" {
     try expectNoCapture(result, source, local_require, local_require + 7, "function.builtin");
 }
 
+test "JavaScript and TypeScript BuiltInGrammars track inherited and shadowed locals" {
+    const source =
+        \\console; require();
+        \\function outer(console) {
+        \\  console; require();
+        \\  {
+        \\    const require = () => {};
+        \\    console; require();
+        \\  }
+        \\  console; require();
+        \\}
+        \\console; require();
+    ;
+    var highlighter: TreeSitterHighlighter = .{};
+    for ([_][]const u8{ "src/a.js", "src/a.ts", "src/a.tsx" }) |path| {
+        const result = try highlighter.highlighter().highlight(testing.allocator, path, source);
+        defer freeResult(result);
+
+        try expectSpan(result, 1, 0, 7, "variable.builtin");
+        try expectSpan(result, 1, 9, 16, "function.builtin");
+        try expectSpan(result, 2, 15, 22, if (std.mem.endsWith(u8, path, ".js")) "variable" else "variable.parameter");
+        try expectSpan(result, 3, 2, 9, "variable");
+        try expectSpan(result, 3, 11, 18, "function.builtin");
+        try expectSpan(result, 6, 4, 11, "variable");
+        try expectSpan(result, 6, 13, 20, "function");
+        try expectSpan(result, 8, 2, 9, "variable");
+        try expectSpan(result, 8, 11, 18, "function.builtin");
+        try expectSpan(result, 10, 0, 7, "variable.builtin");
+        try expectSpan(result, 10, 9, 16, "function.builtin");
+    }
+}
+
+test "TypeScript BuiltInGrammars track optional parameter locals" {
+    const source = "function f(console?: unknown) { console; }\nconsole;\n";
+    var highlighter: TreeSitterHighlighter = .{};
+    for ([_][]const u8{ "src/a.ts", "src/a.tsx" }) |path| {
+        const result = try highlighter.highlighter().highlight(testing.allocator, path, source);
+        defer freeResult(result);
+
+        try expectSpan(result, 1, 11, 18, "variable.parameter");
+        try expectSpan(result, 1, 32, 39, "variable");
+        try expectSpan(result, 2, 0, 7, "variable.builtin");
+    }
+}
+
+test "local filtering keeps UTF-8 byte offsets" {
+    const source = "function f(console) { const π = 0; console; }\nconsole;\n";
+    var highlighter: TreeSitterHighlighter = .{};
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
+    defer freeResult(result);
+
+    const parameter = std.mem.indexOf(u8, source, "console").?;
+    const reference = std.mem.indexOfPos(u8, source, parameter + 7, "console").?;
+    try expectSpan(result, 1, reference, reference + 7, "variable");
+    try expectSpan(result, 2, 0, 7, "variable.builtin");
+}
+
 test "TypeScript and TSX BuiltInGrammars load their queries" {
     const cases = [_]struct { path: []const u8, source: []const u8 }{
         .{ .path = "src/a.ts", .source = "interface User { name: string }\n" },
@@ -313,6 +381,40 @@ test "Grammar validation atomically rejects unsupported predicate forms" {
     }
 }
 
+test "Grammar validation rejects malformed locals predicates" {
+    const locals_query = "((identifier) @local.reference (#unknown? @local.reference \"x\"))";
+    try expectInvalidLocalsQuery(locals_query, error.InvalidPredicate, .unknown_operator);
+}
+
+test "Grammar validation rejects malformed locals query syntax" {
+    try expectInvalidLocalsQuery("(identifier", error.InvalidLocalsQuery, .invalid_query);
+}
+
+test "zero-width Capture produces no Span" {
+    const query = "(function_declaration name: (identifier) @zero)";
+    const result = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?, query, "", "function () {}\n");
+    defer freeResult(result);
+
+    try testing.expectEqual(@as(usize, 0), result.spans.len);
+}
+
+test "invalid Capture ranges fail Highlighting" {
+    try testing.expectError(error.InvalidCaptureRange, predicate_mod.checkedRange(2, 1, "abc"));
+    try testing.expectError(error.InvalidCaptureRange, predicate_mod.checkedRange(0, 4, "abc"));
+    try testing.expectError(error.InvalidCaptureRange, predicate_mod.checkedRange(1, 2, "π"));
+}
+
+test "query cursor match loss fails Highlighting" {
+    try testing.expectError(error.QueryMatchLimitExceeded, highlightWithQueryLimit(
+        testing.allocator,
+        tree_sitter_javascript().?,
+        "(identifier) @variable",
+        "",
+        "one two\n",
+        0,
+    ));
+}
+
 test "invalid regex diagnostic points to the expression" {
     const source = "((identifier) @x (#match? @x \"(?=x)\"))";
     var query_error_offset: u32 = 0;
@@ -384,4 +486,21 @@ fn expectNoCapture(result: bbr.highlight.HighlightResult, source: []const u8, ab
         if (std.mem.eql(u8, span.capture.name, capture) and line_start + span.start == absolute_start and line_start + span.end == absolute_end)
             return error.UnexpectedCaptureFound;
     }
+}
+
+fn expectInvalidLocalsQuery(locals_query: []const u8, expected_error: anyerror, expected_kind: predicate_mod.Diagnostic.Kind) !void {
+    const language = tree_sitter_javascript().?;
+    const parser = c.ts_parser_new() orelse return error.ParserInitFailed;
+    defer c.ts_parser_delete(parser);
+    if (!c.ts_parser_set_language(parser, language)) return error.IncompatibleGrammar;
+    const source = "x\n";
+    const tree = c.ts_parser_parse_string(parser, null, source.ptr, source.len) orelse return error.ParseFailed;
+    defer c.ts_tree_delete(tree);
+
+    var diagnostic: predicate_mod.Diagnostic = undefined;
+    try testing.expectError(expected_error, predicate_mod.Locals.collect(testing.allocator, language, tree, locals_query, source, &diagnostic));
+    try testing.expectEqual(.locals, diagnostic.query_kind);
+    try testing.expectEqual(expected_kind, diagnostic.kind);
+    try testing.expectEqual(@as(u32, 1), diagnostic.line);
+    try testing.expect(diagnostic.column > 1);
 }

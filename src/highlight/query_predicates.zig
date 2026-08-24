@@ -12,6 +12,9 @@ pub const Diagnostic = struct {
     line: u32,
     column: u32,
     regex_failure: ?regex_mod.CompileFailure = null,
+    query_kind: QueryKind = .highlight,
+
+    pub const QueryKind = enum { highlight, locals };
 
     pub const Kind = enum {
         unknown_operator,
@@ -19,14 +22,18 @@ pub const Diagnostic = struct {
         malformed_arguments,
         invalid_regex,
         unsupported_property,
+        invalid_query,
     };
 
     pub fn report(self: Diagnostic) void {
+        const query_kind = @tagName(self.query_kind);
         if (self.regex_failure) |failure| {
-            std.log.err("highlight-query:{d}:{d}: invalid #match? expression for {s}: {s}", .{ self.line, self.column, regex_mod.engine, @tagName(failure.reason) });
+            std.log.err("{s}-query:{d}:{d}: invalid #match? expression for {s}: {s}", .{ query_kind, self.line, self.column, regex_mod.engine, @tagName(failure.reason) });
             std.log.err("engine-code: {d}; engine-fragment: {s}; dialect: {s}", .{ failure.engine_code, failure.fragment(), regex_mod.dialect });
+        } else if (self.kind == .invalid_query) {
+            std.log.err("{s}-query:{d}:{d}: invalid query", .{ query_kind, self.line, self.column });
         } else {
-            std.log.err("highlight-query:{d}:{d}: invalid predicate: {s}", .{ self.line, self.column, @tagName(self.kind) });
+            std.log.err("{s}-query:{d}:{d}: invalid predicate: {s}", .{ query_kind, self.line, self.column, @tagName(self.kind) });
         }
     }
 };
@@ -43,14 +50,24 @@ const Range = struct { start: usize, end: usize };
 pub const Locals = struct {
     ranges: []Range,
 
-    pub fn collect(allocator: Allocator, grammar_language: *const c.TSLanguage, tree: *const c.TSTree, query_source: []const u8, content: []const u8) !Locals {
+    pub fn collect(allocator: Allocator, grammar_language: *const c.TSLanguage, tree: *const c.TSTree, query_source: []const u8, content: []const u8, diagnostic: *Diagnostic) !Locals {
         if (query_source.len == 0) return .{ .ranges = &.{} };
         var query_error_offset: u32 = 0;
         var query_error_type: c.TSQueryError = undefined;
-        const query = c.ts_query_new(grammar_language, query_source.ptr, @intCast(query_source.len), &query_error_offset, &query_error_type) orelse return error.InvalidLocalsQuery;
+        const query = c.ts_query_new(grammar_language, query_source.ptr, @intCast(query_source.len), &query_error_offset, &query_error_type) orelse {
+            setDiagnostic(query_source, diagnostic, .invalid_query, null, query_error_offset);
+            diagnostic.query_kind = .locals;
+            return error.InvalidLocalsQuery;
+        };
         defer c.ts_query_delete(query);
+        const predicates = Set.validate(allocator, query, query_source, diagnostic) catch |err| {
+            diagnostic.query_kind = .locals;
+            return err;
+        };
+        defer predicates.deinit(allocator);
         const cursor = c.ts_query_cursor_new() orelse return error.QueryCursorInitFailed;
         defer c.ts_query_cursor_delete(cursor);
+        c.ts_query_cursor_set_match_limit(cursor, std.math.maxInt(u32));
         c.ts_query_cursor_exec(cursor, query, c.ts_tree_root_node(tree));
 
         const scope_id = captureId(query, "local.scope");
@@ -68,6 +85,7 @@ pub const Locals = struct {
         var match: c.TSQueryMatch = undefined;
         var capture_index: u32 = 0;
         while (c.ts_query_cursor_next_capture(cursor, &match, &capture_index)) {
+            if (!try predicates.accepts(match.pattern_index, match, content, .{ .ranges = &.{} })) continue;
             const capture = match.captures[capture_index];
             const range = try nodeRange(capture.node, content);
             while (scopes.items.len > 1 and range.start > scopes.items[scopes.items.len - 1].end) {
@@ -259,6 +277,11 @@ fn fail(source: []const u8, query: *const c.TSQuery, pattern: u32, diagnostic: *
 }
 
 fn failAt(source: []const u8, diagnostic: *Diagnostic, kind: Diagnostic.Kind, regex_failure: ?regex_mod.CompileFailure, source_offset: usize) error{InvalidPredicate} {
+    setDiagnostic(source, diagnostic, kind, regex_failure, source_offset);
+    return error.InvalidPredicate;
+}
+
+fn setDiagnostic(source: []const u8, diagnostic: *Diagnostic, kind: Diagnostic.Kind, regex_failure: ?regex_mod.CompileFailure, source_offset: usize) void {
     var offset = @min(source_offset, source.len);
     if (regex_failure != null) {
         if (std.mem.indexOfScalarPos(u8, source, offset, '"')) |quote| offset = quote + 1;
@@ -272,7 +295,6 @@ fn failAt(source: []const u8, diagnostic: *Diagnostic, kind: Diagnostic.Kind, re
         } else column += 1;
     }
     diagnostic.* = .{ .kind = kind, .source_offset = @intCast(offset), .line = line, .column = column, .regex_failure = regex_failure };
-    return error.InvalidPredicate;
 }
 
 fn stringValue(query: *const c.TSQuery, id: u32) ?[]const u8 {
@@ -297,6 +319,10 @@ fn captureRange(capture_id: u32, match: c.TSQueryMatch, content: []const u8) !?R
 fn nodeRange(node: c.TSNode, content: []const u8) !Range {
     const start: usize = c.ts_node_start_byte(node);
     const end: usize = c.ts_node_end_byte(node);
+    return checkedRange(start, end, content);
+}
+
+pub fn checkedRange(start: usize, end: usize, content: []const u8) !Range {
     if (start > end or end > content.len or !utf8Boundary(content, start) or !utf8Boundary(content, end)) return error.InvalidCaptureRange;
     return .{ .start = start, .end = end };
 }
