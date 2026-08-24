@@ -319,12 +319,20 @@ fn drawStatusPlaceholder(
     if (value.old) |status| {
         const left = win.child(.{ .x_off = 0, .y_off = row, .width = half, .height = 1 });
         _ = left.printSegment(.{ .text = statusPlaceholderText(scratch, .old, status), .style = theme.section }, .{ .wrap = .none });
+    } else if (value.file.status == .added) {
+        const left = win.child(.{ .x_off = 0, .y_off = row, .width = half, .height = 1 });
+        _ = left.printSegment(.{ .text = "Old content absent", .style = theme.section }, .{ .wrap = .none });
     }
     const right_x = half + 1;
-    if (value.new) |status| if (right_x < win.width) {
+    if (value.new) |status| {
+        if (right_x < win.width) {
+            const right = win.child(.{ .x_off = right_x, .y_off = row, .width = win.width - right_x, .height = 1 });
+            _ = right.printSegment(.{ .text = statusPlaceholderText(scratch, .new, status), .style = theme.section }, .{ .wrap = .none });
+        }
+    } else if (value.file.status == .removed and right_x < win.width) {
         const right = win.child(.{ .x_off = right_x, .y_off = row, .width = win.width - right_x, .height = 1 });
-        _ = right.printSegment(.{ .text = statusPlaceholderText(scratch, .new, status), .style = theme.section }, .{ .wrap = .none });
-    };
+        _ = right.printSegment(.{ .text = "New content absent", .style = theme.section }, .{ .wrap = .none });
+    }
 }
 
 fn statusPlaceholderText(scratch: std.mem.Allocator, side: Side, status: bbr.diff.FileContentStatus) []const u8 {
@@ -1119,14 +1127,16 @@ test "binary Status Placeholder renders an unknown size" {
     const a = arena.allocator();
     const file: bbr.diff.File = .{ .old_path = "/dev/null", .new_path = "a.bin", .status = .added, .hunks = &.{} };
     const rows = [_]buffer_mod.Row{.{ .status_placeholder = .{ .file = &file, .new = .{ .binary = null } } }};
-    const buf: Buffer = .{ .rows = &rows, .layout = .unified };
+    const buf: Buffer = .{ .rows = &rows, .layout = .side_by_side };
     var screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
 
     drawPane(a, win, buf, theme_dark, Nav.init(1, 1));
 
-    try expectScreenText(win, 0, "New content binary, size unavailable");
+    try expectScreenText(win, 0, "Old content absent");
+    const right = win.child(.{ .x_off = win.width / 2 + 1, .width = win.width - (win.width / 2 + 1), .height = 1 });
+    try expectScreenText(right, 0, "New content binary, size unavailable");
 }
 
 test "a modified line paints only its changed run with the emphasis band" {

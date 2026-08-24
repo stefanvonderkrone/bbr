@@ -146,7 +146,7 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
                 (std.mem.startsWith(u8, line, "literal ") or std.mem.startsWith(u8, line, "delta ")))
             {
                 if (std.mem.startsWith(u8, line, "literal ")) {
-                    const size = std.fmt.parseInt(usize, line["literal ".len..], 10) catch continue;
+                    const size = std.fmt.parseInt(usize, line["literal ".len..], 10) catch null;
                     if (binary_block_count == 0) binary_new_size = size;
                     if (binary_block_count == 1) binary_old_size = size;
                 }
@@ -563,10 +563,17 @@ test "Git binary stubs classify present File sides without Lines" {
         \\
         \\literal 6
         \\payload
+        \\diff --git a/malformed.bin b/malformed.bin
+        \\GIT binary patch
+        \\literal invalid
+        \\payload
+        \\
+        \\literal 9
+        \\payload
     ;
 
     const diff = try parseInArena(&arena, raw);
-    try testing.expectEqual(@as(usize, 5), diff.files.len);
+    try testing.expectEqual(@as(usize, 6), diff.files.len);
     for (diff.files) |file| try testing.expectEqual(@as(usize, 0), file.hunks.len);
 
     try testing.expectEqual(@as(?usize, 3), diff.files[0].content.old.?.binary);
@@ -579,4 +586,6 @@ test "Git binary stubs classify present File sides without Lines" {
     try testing.expectEqual(@as(?usize, null), diff.files[3].content.new.?.binary);
     try testing.expectEqual(@as(?usize, 6), diff.files[4].content.old.?.binary);
     try testing.expectEqual(@as(?usize, null), diff.files[4].content.new.?.binary);
+    try testing.expectEqual(@as(?usize, 9), diff.files[5].content.old.?.binary);
+    try testing.expectEqual(@as(?usize, null), diff.files[5].content.new.?.binary);
 }

@@ -68,6 +68,7 @@ pub const SideView = union(enum) {
     pending,
     absent,
     binary: ?usize,
+    unavailable: bbr.diff.FileContentStatus,
     fetch_failed: anyerror,
     content: ContentView,
 };
@@ -105,6 +106,7 @@ const OwnedSide = struct {
 const SideResult = union(enum) {
     absent,
     binary: ?usize,
+    unavailable: bbr.diff.FileContentStatus,
     fetch_failed: anyerror,
     owned: *OwnedSide,
     transferred,
@@ -134,18 +136,21 @@ pub fn enrichFrom(backing: Allocator, source: BlobSource, highlighter: bbr.highl
     var result: Result = .{ .old = .absent, .new = .absent };
     errdefer result.deinit();
     if (req.status != .added) {
-        result.old = if (req.content.old != null and req.content.old.? == .binary)
-            .{ .binary = req.content.old.?.binary }
-        else
-            try enrichSide(backing, source, highlighter, req.max_file_bytes, req.destination_commit, req.old_path);
+        result.old = try enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, req.destination_commit, req.old_path, req.content.old);
     }
     if (req.status != .removed) {
-        result.new = if (req.content.new != null and req.content.new.? == .binary)
-            .{ .binary = req.content.new.?.binary }
-        else
-            try enrichSide(backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path);
+        result.new = try enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new);
     }
     return result;
+}
+
+fn enrichExpectedSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, commit: []const u8, path: []const u8, known: ?bbr.diff.FileContentStatus) error{OutOfMemory}!SideResult {
+    const status: bbr.diff.FileContentStatus = known orelse .{ .text = null };
+    return switch (status) {
+        .binary => |size| .{ .binary = size },
+        .unavailable => .{ .unavailable = status },
+        .text => enrichSide(backing, source, highlighter, max_file_bytes, commit, path),
+    };
 }
 
 fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, commit: []const u8, path: []const u8) error{OutOfMemory}!SideResult {
@@ -187,6 +192,7 @@ const StoredSide = union(enum) {
     pending,
     absent,
     binary: ?usize,
+    unavailable: bbr.diff.FileContentStatus,
     fetch_failed: anyerror,
     content: *OwnedSide,
 
@@ -200,6 +206,7 @@ const StoredSide = union(enum) {
             .pending => .pending,
             .absent => .absent,
             .binary => |size| .{ .binary = size },
+            .unavailable => |status| .{ .unavailable = status },
             .fetch_failed => |err| .{ .fetch_failed = err },
             .content => |content| .{ .content = content.view() },
         };
@@ -313,8 +320,8 @@ pub const Storage = struct {
         if (file_idx >= self.files.len) return error.FileOutOfRange;
         if (result.old == .transferred or result.new == .transferred) return error.AlreadyTransferred;
         const stored = &self.files[file_idx];
-        if ((stored.old != .pending and stored.old != .absent and stored.old != .binary) or
-            (stored.new != .pending and stored.new != .absent and stored.new != .binary)) return error.AlreadyAdmitted;
+        if ((stored.old != .pending and stored.old != .absent and stored.old != .binary and stored.old != .unavailable) or
+            (stored.new != .pending and stored.new != .absent and stored.new != .binary and stored.new != .unavailable)) return error.AlreadyAdmitted;
 
         stored.old = transfer(&result.old);
         stored.new = transfer(&result.new);
@@ -421,6 +428,10 @@ pub const Storage = struct {
                 content_status_slot.* = .{ .binary = size };
                 status_slot.* = .absent;
             },
+            .unavailable => |known_status| {
+                content_status_slot.* = known_status;
+                status_slot.* = .absent;
+            },
             .fetch_failed => |err| {
                 content_status_slot.* = .{ .unavailable = .{ .reason = .{ .acquisition_failed = err } } };
                 status_slot.* = .fetch_failed;
@@ -503,6 +514,7 @@ fn transfer(side: *SideResult) StoredSide {
     const stored: StoredSide = switch (side.*) {
         .absent => .absent,
         .binary => |size| .{ .binary = size },
+        .unavailable => |status| .{ .unavailable = status },
         .fetch_failed => |err| .{ .fetch_failed = err },
         .owned => |owned| .{ .content = owned },
         .transferred => unreachable,
@@ -516,13 +528,14 @@ fn initialStoredSide(file: bbr.diff.File, comptime which: enum { old, new }) Sto
     const status = @field(file.content, @tagName(which)) orelse return .pending;
     return switch (status) {
         .binary => |size| .{ .binary = size },
-        .text, .unavailable => .pending,
+        .text => .pending,
+        .unavailable => .{ .unavailable = status },
     };
 }
 
 fn initialHighlightState(side: StoredSide) bbr.highlight.SideState {
     return switch (side) {
-        .absent, .binary => .absent,
+        .absent, .binary, .unavailable => .absent,
         .pending => .pending,
         .fetch_failed => .fetch_failed,
         .content => .ready,
@@ -533,6 +546,7 @@ fn retainedTerminalSide(side: StoredSide) StoredSide {
     return switch (side) {
         .absent => .absent,
         .binary => |size| .{ .binary = size },
+        .unavailable => |status| .{ .unavailable = status },
         else => .pending,
     };
 }
@@ -771,9 +785,13 @@ test "RawDiff binary sides skip File Enrichment reads and Highlighting" {
         .old_path = file.old_path,
         .new_path = file.new_path,
         .max_file_bytes = 0,
-        .content = file.content,
+        .content = .{
+            .old = .{ .unavailable = .{ .reason = .invalid_utf8, .byte_size = 3 } },
+            .new = file.content.new,
+        },
     });
     defer result.deinit();
+    try testing.expect(result.old == .unavailable);
     try testing.expectEqual(@as(usize, 0), fake.call_count);
     try testing.expectEqual(@as(usize, 0), scripted.calls);
 }
