@@ -5172,7 +5172,7 @@ pub const Presentation = struct {
                 self.action_error = .invalid_selection;
                 return;
             };
-        } else if (lineAtRow(published.cursorRow().?)) |line| {
+        } else if (lineAtVisualRow(published.cursorVisualRow().?)) |line| {
             lines.append(allocator, line) catch {
                 self.action_error = .out_of_memory;
                 return;
@@ -5705,11 +5705,7 @@ pub const Presentation = struct {
             if (fileIndexForRow(published.buffer, visual_row.buffer_index) != start_file) break;
             if (previous_buffer_index == visual_row.buffer_index) continue;
             previous_buffer_index = visual_row.buffer_index;
-            const source: ?[]const u8 = switch (visual_row.row) {
-                .line => |line| line.line.text,
-                .line_pair => |pair| if (pair.right) |right| right.line.text else if (pair.left) |left| left.line.text else null,
-                else => null,
-            };
+            const source = if (lineAtVisualRow(visual_row)) |line| line.text else null;
             if (source) |text_value| {
                 if (copied > 0) bytes.append(self.allocator, '\n') catch {
                     self.action_error = .out_of_memory;
@@ -6107,17 +6103,20 @@ fn candidateLines(published: *const Published) !CandidateLines {
     var lines: CandidateLines = .{};
     if (published.navigation.selection()) |selection| {
         var index = selection[0];
+        var previous_buffer_index: ?usize = null;
         while (index <= selection[1] and index < published.visual_rows.len) : (index += 1) {
             const visual_row = published.visual_rows[index];
             // A File header inside the Selection means it left this File.
             if (visual_row.row == .file_header) return error.CrossesFile;
-            const line = lineAtRow(visual_row.row) orelse continue;
+            if (previous_buffer_index == visual_row.buffer_index) continue;
+            previous_buffer_index = visual_row.buffer_index;
+            const line = lineAtVisualRow(visual_row) orelse continue;
             if (lines.len > 0 and lines.storage[lines.len - 1] == line) continue;
             if (lines.len == lines.storage.len) return error.RangeTooLong;
             lines.storage[lines.len] = line;
             lines.len += 1;
         }
-    } else if (lineAtRow(published.cursorRow().?)) |line| {
+    } else if (lineAtVisualRow(published.cursorVisualRow().?)) |line| {
         lines.storage[0] = line;
         lines.len = 1;
     }
@@ -6282,6 +6281,14 @@ fn lineAtRow(row: buffer_mod.Row) ?*const bbr.diff.Line {
     };
 }
 
+fn lineAtVisualRow(row: frame_mod.VisualRow) ?*const bbr.diff.Line {
+    if (row.halves) |halves| {
+        if (halves.right) |half| return half.line;
+        if (halves.left) |half| return half.line;
+    }
+    return lineAtRow(row.row);
+}
+
 fn clampSelectionAtStatusPlaceholder(published: *Published, previous_cursor: usize) void {
     if (!published.navigation.hasSelection()) return;
     const cursor = published.navigation.cursor;
@@ -6357,10 +6364,13 @@ fn collectSelectedLines(
     allocator: Allocator,
 ) !void {
     var index = low;
+    var previous_buffer_index: ?usize = null;
     while (index <= high and index < published.visual_rows.len) : (index += 1) {
         const visual_row = published.visual_rows[index];
         if (visual_row.row == .file_header) return error.NonContiguous;
-        const line = lineAtRow(visual_row.row) orelse continue;
+        if (previous_buffer_index == visual_row.buffer_index) continue;
+        previous_buffer_index = visual_row.buffer_index;
+        const line = lineAtVisualRow(visual_row) orelse continue;
         if (lines.items.len == 0 or lines.items[lines.items.len - 1] != line) try lines.append(allocator, line);
     }
 }
@@ -6772,6 +6782,51 @@ fn testWrappingSession(backing: std.mem.Allocator, id: u64) !*session_mod.Sessio
         \\+epsilon zeta eta theta
     );
     return s;
+}
+
+fn testSideWrappingSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
+    const s = try testSession(backing, id, 's');
+    errdefer s.destroy();
+    s.diff = try bbr.diff.parse(s.arena.allocator(),
+        \\diff --git a/wrap.zig b/wrap.zig
+        \\--- a/wrap.zig
+        \\+++ b/wrap.zig
+        \\@@ -1 +1 @@
+        \\-old one two three four five
+        \\+old one two three
+    );
+    return s;
+}
+
+test "SideBySide wrapping Anchors an active old-only continuation" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSideWrappingSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 60, .rows = 10 },
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .toggle_layout });
+    try presentation.dispatch(.{ .action = .toggle_diff_wrap });
+    const wrapped = presentation.projection().review.?;
+    var continuation: ?usize = null;
+    for (wrapped.frame.visual_rows, 0..) |visual_row, index| {
+        const halves = visual_row.halves orelse continue;
+        if (halves.left != null and halves.left.?.continuation and halves.right == null) continuation = index;
+    }
+    try testing.expect(continuation != null);
+    presentation.published.?.navigation.jumpTo(continuation.?);
+
+    try presentation.dispatch(.{ .action = .yank });
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqualStrings("old one two three four five", command.copy_clipboard.text);
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try presentation.dispatch(.{ .action = .inline_comment });
+    const draft = presentation.published.?.composer.?.toNewDraft();
+    try testing.expectEqual(@as(?u32, 1), draft.anchor.?.from);
+    try testing.expect(draft.anchor.?.to == null);
 }
 
 test "Unified wrapping uses visual-row navigation and semantic Anchors" {
@@ -7531,7 +7586,7 @@ test "Session-relative Navigation is suspended during replacement" {
     try testing.expect(std.meta.eql(before, presentation.projection().review.?.navigation));
 }
 
-test "failed wrapping transaction preserves Frame preferences and Navigation" {
+test "failed SideBySide wrapping transaction preserves Frame preferences and Navigation" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
@@ -7543,6 +7598,7 @@ test "failed wrapping transaction preserves Frame preferences and Navigation" {
         .viewport_rows = 2,
     });
     defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .toggle_layout });
     try presentation.dispatch(.{ .action = .down });
     const before = presentation.projection().review.?;
 

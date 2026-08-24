@@ -269,12 +269,17 @@ fn visualRowSelected(rows: []const @import("frame.zig").VisualRow, selection: [2
     if (candidate.owner != .line) return index >= selection[0] and index <= selection[1];
     var selected = selection[0];
     while (selected <= selection[1] and selected < rows.len) : (selected += 1) {
+        if (candidate.row == .line_pair and rows[selected].buffer_index == candidate.buffer_index) return true;
         if (rows[selected].owner.eql(candidate.owner)) return true;
     }
     return false;
 }
 
 fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, visual_row: @import("frame.zig").VisualRow, theme: Theme) void {
+    if (layout == .side_by_side and visual_row.halves != null) {
+        drawVisualLinePair(scratch, win, r, visual_row.halves.?, theme);
+        return;
+    }
     if (visual_row.row != .line or layout != .unified) {
         drawRow(scratch, win, r, layout, visual_row.row, theme);
         return;
@@ -424,7 +429,7 @@ fn drawSnapshot(win: vaxis.Window, row: u16, snapshot: buffer_mod.SnapshotRow, t
 }
 
 /// Side-by-side gutter: one 4-wide line-number column plus a trailing space.
-const side_gutter: u16 = 5;
+const side_gutter: u16 = @intCast(@import("frame.zig").side_gutter_cols);
 
 /// Draw one side-by-side row: the old line in the left half, the new line in the
 /// right half, split by a one-column divider. Each half is a 1-row child window
@@ -442,6 +447,39 @@ fn drawLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, pair: buf
         const right = win.child(.{ .x_off = right_x, .y_off = r, .width = right_w, .height = 1 });
         drawHalf(scratch, right, pair.right, theme, .new);
     }
+}
+
+fn drawVisualLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, halves: @import("frame.zig").Halves, theme: Theme) void {
+    const half = win.width / 2;
+    if (half == 0) return;
+    const right_x = half + @as(u16, @intCast(@import("frame.zig").side_divider_cols));
+    const right_w = if (win.width > right_x) win.width - right_x else 0;
+    drawVisualHalf(scratch, win.child(.{ .x_off = 0, .y_off = r, .width = half, .height = 1 }), halves.left, theme, .old);
+    if (right_w > 0) drawVisualHalf(scratch, win.child(.{ .x_off = right_x, .y_off = r, .width = right_w, .height = 1 }), halves.right, theme, .new);
+}
+
+fn drawVisualHalf(scratch: std.mem.Allocator, win: vaxis.Window, half: ?@import("frame.zig").VisualHalf, theme: Theme, side: Side) void {
+    const value = half orelse {
+        fillRow(win, 0, theme.context);
+        return;
+    };
+    const style = theme.lineStyle(value.line.kind);
+    fillRow(win, 0, style);
+    if (!value.continuation) {
+        const no = if (side == .old) value.line.old_no else value.line.new_no;
+        _ = win.printSegment(.{ .text = numCol(scratch, no), .style = theme.gutter }, .{ .wrap = .none });
+    }
+    drawLineBodyText(
+        scratch,
+        win,
+        0,
+        side_gutter,
+        value.line,
+        value.line.text[value.source_start..value.source_end],
+        value.decoration,
+        theme,
+        style,
+    );
 }
 
 /// Which line number a side shows: old for the left pane, new for the right.
@@ -1168,6 +1206,37 @@ test "disabled Diff visual-row projection clips exactly like Buffer rendering" {
     }
 }
 
+test "disabled SideBySide visual rows clip exactly like Buffer rendering" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const left: bbr.diff.Line = .{ .old_no = 1, .new_no = null, .kind = .removed, .text = "long old source" };
+    const right: bbr.diff.Line = .{ .old_no = null, .new_no = 1, .kind = .added, .text = "long new source" };
+    const rows = [_]Row{.{ .line_pair = .{
+        .left = .{ .line = &left, .decoration = .{ .runs = &.{.{ .text = left.text }} } },
+        .right = .{ .line = &right, .decoration = .{ .runs = &.{.{ .text = right.text }} } },
+    } }};
+    const buf: Buffer = .{ .rows = &rows, .layout = .side_by_side };
+    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{ .layout = .side_by_side, .width = 19, .wrap = false });
+    var buffer_screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 19, .x_pixel = 0, .y_pixel = 0 });
+    defer buffer_screen.deinit(a);
+    var frame_screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 19, .x_pixel = 0, .y_pixel = 0 });
+    defer frame_screen.deinit(a);
+    const buffer_window = headlessWindow(&buffer_screen);
+    const frame_window = headlessWindow(&frame_screen);
+    const nav = Nav.init(1, 1);
+
+    drawPane(a, buffer_window, buf, theme_dark, nav);
+    drawVisualPane(a, frame_window, visual_rows, .side_by_side, theme_dark, nav);
+
+    for (0..buffer_window.width) |col| {
+        const expected = buffer_window.readCell(@intCast(col), 0).?;
+        const actual = frame_window.readCell(@intCast(col), 0).?;
+        try testing.expectEqualStrings(expected.char.grapheme, actual.char.grapheme);
+        try testing.expectEqual(expected.style, actual.style);
+    }
+}
+
 test "Unified continuation rows keep decoration and use a blank gutter" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1194,6 +1263,36 @@ test "Unified continuation rows keep decoration and use a blank gutter" {
     for (0..gutter_cols) |col| try testing.expectEqualStrings(" ", win.readCell(@intCast(col), 1).?.char.grapheme);
     try testing.expectEqualStrings("b", win.readCell(gutter_cols, 1).?.char.grapheme);
     try testing.expectEqual(theme_dark.cursorBg(theme_dark.added_emphasis.bg), win.readCell(gutter_cols, 1).?.style.bg);
+}
+
+test "SideBySide continuation rows keep halves inside the fixed divider" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const left: bbr.diff.Line = .{ .old_no = 7, .new_no = null, .kind = .removed, .text = "old one two" };
+    const right: bbr.diff.Line = .{ .old_no = null, .new_no = 9, .kind = .added, .text = "new" };
+    const rows = [_]Row{.{ .line_pair = .{
+        .left = .{ .line = &left, .decoration = .{ .runs = &.{.{ .text = left.text, .emphasis = true }} } },
+        .right = .{ .line = &right, .decoration = .{ .runs = &.{.{ .text = right.text }} } },
+    } }};
+    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{
+        .layout = .side_by_side,
+        .width = 27,
+        .wrap = true,
+    });
+    var screen = try vaxis.Screen.init(a, .{ .rows = 2, .cols = 27, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    var nav = Nav.init(visual_rows.len, 2);
+    nav.mark = 0;
+    drawVisualPane(a, win, visual_rows, .side_by_side, theme_dark, nav);
+
+    try testing.expectEqualStrings("7", win.readCell(3, 0).?.char.grapheme);
+    try testing.expectEqualStrings("9", win.readCell(17, 0).?.char.grapheme);
+    try testing.expectEqualStrings("t", win.readCell(side_gutter, 1).?.char.grapheme);
+    try testing.expectEqualStrings(" ", win.readCell(17, 1).?.char.grapheme);
+    try testing.expectEqual(theme_dark.cursorBg(theme_dark.removed_emphasis.bg), win.readCell(side_gutter, 1).?.style.bg);
 }
 
 test "Status Placeholder renders side, reason, and known or unavailable size" {

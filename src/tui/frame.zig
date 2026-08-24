@@ -90,6 +90,21 @@ pub const VisualRow = struct {
     source_end: usize = 0,
     decoration: ?bbr.highlight.LineDecoration = null,
     continuation: bool = false,
+    halves: ?Halves = null,
+};
+
+pub const VisualHalf = struct {
+    line: *const bbr.diff.Line,
+    measured_cells: usize,
+    source_start: usize,
+    source_end: usize,
+    decoration: bbr.highlight.LineDecoration,
+    continuation: bool,
+};
+
+pub const Halves = struct {
+    left: ?VisualHalf = null,
+    right: ?VisualHalf = null,
 };
 
 pub const VisualRowOptions = struct {
@@ -180,16 +195,34 @@ pub fn buildVisualRowsWithOptions(
     metrics: CellMetrics,
     options: VisualRowOptions,
 ) ![]const VisualRow {
-    if (!options.wrap or options.layout != .unified or options.width <= unified_gutter_cols) {
+    if (!options.wrap or
+        (options.layout == .unified and options.width <= unified_gutter_cols) or
+        (options.layout == .side_by_side and sideBodyWidths(options.width) == null))
+    {
         return buildUnwrappedVisualRows(allocator, rows, metrics);
     }
 
     var visual_rows: std.ArrayList(VisualRow) = .empty;
     errdefer {
-        for (visual_rows.items) |visual_row| if (visual_row.row == .line and visual_row.row.line.line.text.len > 0)
-            if (visual_row.decoration) |decoration| if (decoration.runs.len > 0) allocator.free(decoration.runs);
+        for (visual_rows.items) |visual_row| {
+            if (visual_row.halves) |halves| {
+                if (halves.left) |half| if (half.decoration.runs.len > 0) allocator.free(half.decoration.runs);
+                if (halves.right) |half| if (half.decoration.runs.len > 0) allocator.free(half.decoration.runs);
+            } else if (visual_row.row == .line and visual_row.row.line.line.text.len > 0) {
+                if (visual_row.decoration) |decoration| if (decoration.runs.len > 0) allocator.free(decoration.runs);
+            }
+        }
         visual_rows.deinit(allocator);
     }
+    if (options.layout == .side_by_side) {
+        const widths = sideBodyWidths(options.width).?;
+        for (rows, 0..) |row, buffer_index| switch (row) {
+            .line_pair => |pair| try appendWrappedLinePair(allocator, &visual_rows, row, buffer_index, pair, widths, metrics),
+            else => try visual_rows.append(allocator, makeVisualRow(row, buffer_index, metrics)),
+        };
+        return visual_rows.toOwnedSlice(allocator);
+    }
+
     const body_width = options.width - unified_gutter_cols;
     for (rows, 0..) |row, buffer_index| switch (row) {
         .line => |line_row| {
@@ -207,6 +240,72 @@ pub fn buildVisualRowsWithOptions(
         else => try visual_rows.append(allocator, makeVisualRow(row, buffer_index, metrics)),
     };
     return visual_rows.toOwnedSlice(allocator);
+}
+
+const SideBodyWidths = struct { left: usize, right: usize };
+
+pub const side_gutter_cols: usize = 5;
+pub const side_divider_cols: usize = 1;
+
+fn sideBodyWidths(width: usize) ?SideBodyWidths {
+    if (width < side_divider_cols) return null;
+    const left_half = width / 2;
+    const right_half = width - left_half - side_divider_cols;
+    if (left_half <= side_gutter_cols or right_half <= side_gutter_cols) return null;
+    return .{ .left = left_half - side_gutter_cols, .right = right_half - side_gutter_cols };
+}
+
+fn appendWrappedLinePair(
+    allocator: std.mem.Allocator,
+    visual_rows: *std.ArrayList(VisualRow),
+    row: buffer_mod.Row,
+    buffer_index: usize,
+    pair: buffer_mod.LinePair,
+    widths: SideBodyWidths,
+    metrics: CellMetrics,
+) !void {
+    var left_start: usize = 0;
+    var right_start: usize = 0;
+    var left_done = pair.left == null;
+    var right_done = pair.right == null;
+    while (!left_done or !right_done) {
+        const left = if (!left_done) try makeVisualHalf(allocator, pair.left.?, left_start, widths.left, metrics) else null;
+        errdefer if (left) |half| if (half.decoration.runs.len > 0) allocator.free(half.decoration.runs);
+        const right = if (!right_done) try makeVisualHalf(allocator, pair.right.?, right_start, widths.right, metrics) else null;
+        errdefer if (right) |half| if (half.decoration.runs.len > 0) allocator.free(half.decoration.runs);
+        const target = right orelse left.?;
+        try visual_rows.append(allocator, .{
+            .row = row,
+            .buffer_index = buffer_index,
+            .owner = .{ .line = target.line },
+            .measured_cells = target.measured_cells,
+            .source_start = target.source_start,
+            .source_end = target.source_end,
+            .decoration = target.decoration,
+            .continuation = target.continuation,
+            .halves = .{ .left = left, .right = right },
+        });
+        if (left) |half| {
+            left_start = half.source_end;
+            left_done = left_start >= half.line.text.len;
+        }
+        if (right) |half| {
+            right_start = half.source_end;
+            right_done = right_start >= half.line.text.len;
+        }
+    }
+}
+
+fn makeVisualHalf(allocator: std.mem.Allocator, line_row: buffer_mod.LineRow, start: usize, width: usize, metrics: CellMetrics) !VisualHalf {
+    const end = if (line_row.line.text.len == 0) 0 else wrapEnd(line_row.line.text, start, width, metrics);
+    return .{
+        .line = line_row.line,
+        .measured_cells = metrics.width(line_row.line.text[start..end]),
+        .source_start = start,
+        .source_end = end,
+        .decoration = try sliceDecoration(allocator, line_row.decoration, start, end),
+        .continuation = start != 0,
+    };
 }
 
 fn appendWrappedVisualRow(
@@ -337,12 +436,24 @@ fn findVisualRow(visual_rows: []const VisualRow, wanted: VisualRow) ?usize {
     var following: ?usize = null;
     var final: ?usize = null;
     for (visual_rows, 0..) |visual_row, index| {
-        if (!visual_row.owner.eql(wanted.owner)) continue;
+        const range = lineRangeForOwner(visual_row, wanted.owner.line) orelse continue;
         final = index;
-        if (visual_row.source_start <= wanted.source_start and wanted.source_start < visual_row.source_end) return index;
-        if (following == null and visual_row.source_start >= wanted.source_start) following = index;
+        if (range.start <= wanted.source_start and wanted.source_start < range.end) return index;
+        if (following == null and range.start >= wanted.source_start) following = index;
     }
     return following orelse final;
+}
+
+const SourceRange = struct { start: usize, end: usize };
+
+fn lineRangeForOwner(visual_row: VisualRow, line: *const bbr.diff.Line) ?SourceRange {
+    if (visual_row.halves) |halves| {
+        if (halves.right) |half| if (half.line == line) return .{ .start = half.source_start, .end = half.source_end };
+        if (halves.left) |half| if (half.line == line) return .{ .start = half.source_start, .end = half.source_end };
+        return null;
+    }
+    if (!visual_row.owner.eql(.{ .line = line })) return null;
+    return .{ .start = visual_row.source_start, .end = visual_row.source_end };
 }
 
 fn findOwner(visual_rows: []const VisualRow, wanted: RowOwner) ?usize {
@@ -608,6 +719,77 @@ test "Unified wrapping keeps non-Line rows atomic when the body has no cells" {
 
     try testing.expectEqual(rows.len, visual_rows.len);
     for (visual_rows, 0..) |visual_row, index| try testing.expectEqual(index, visual_row.buffer_index);
+}
+
+test "SideBySide halves wrap independently and align absent continuations" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const left: bbr.diff.Line = .{ .old_no = 7, .new_no = null, .kind = .removed, .text = "old one two" };
+    const right: bbr.diff.Line = .{ .old_no = null, .new_no = 9, .kind = .added, .text = "new" };
+    const rows = [_]buffer_mod.Row{.{ .line_pair = .{
+        .left = .{ .line = &left, .decoration = .{ .runs = &.{.{ .text = left.text, .emphasis = true }} } },
+        .right = .{ .line = &right, .decoration = .{ .runs = &.{.{ .text = right.text, .capture = .{ .name = "keyword" } }} } },
+    } }};
+
+    const visual_rows = try buildVisualRowsWithOptions(arena.allocator(), &rows, .bytes, .{
+        .layout = .side_by_side,
+        .width = 27,
+        .wrap = true,
+    });
+
+    try testing.expectEqual(@as(usize, 2), visual_rows.len);
+    try testing.expectEqualStrings("old one ", visual_rows[0].halves.?.left.?.decoration.runs[0].text);
+    try testing.expect(visual_rows[0].halves.?.left.?.decoration.runs[0].emphasis);
+    try testing.expectEqualStrings("new", visual_rows[0].halves.?.right.?.decoration.runs[0].text);
+    try testing.expect(visual_rows[0].halves.?.right.?.decoration.runs[0].capture != null);
+    try testing.expect(visual_rows[1].halves.?.left.?.continuation);
+    try testing.expect(visual_rows[1].halves.?.right == null);
+    try testing.expect(visual_rows[1].owner.eql(.{ .line = &left }));
+    try testing.expectEqual(@as(usize, 8), visual_rows[1].source_start);
+}
+
+test "SideBySide wrapping keeps pairs atomic when halves have no body cells" {
+    const left: bbr.diff.Line = .{ .old_no = 1, .new_no = null, .kind = .removed, .text = "long old source" };
+    const rows = [_]buffer_mod.Row{.{ .line_pair = .{ .left = .{
+        .line = &left,
+        .decoration = .{ .runs = &.{.{ .text = left.text }} },
+    } } }};
+
+    const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, .bytes, .{
+        .layout = .side_by_side,
+        .width = 11,
+        .wrap = true,
+    });
+    defer testing.allocator.free(visual_rows);
+
+    try testing.expectEqual(@as(usize, 1), visual_rows.len);
+    try testing.expect(visual_rows[0].halves == null);
+}
+
+test "SideBySide resize restores an old-only continuation by source offset" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const left: bbr.diff.Line = .{ .old_no = 7, .new_no = null, .kind = .removed, .text = "old one two" };
+    const right: bbr.diff.Line = .{ .old_no = null, .new_no = 9, .kind = .added, .text = "new" };
+    const rows = [_]buffer_mod.Row{.{ .line_pair = .{
+        .left = .{ .line = &left, .decoration = .{ .runs = &.{.{ .text = left.text }} } },
+        .right = .{ .line = &right, .decoration = .{ .runs = &.{.{ .text = right.text }} } },
+    } }};
+    const old_rows = try buildVisualRowsWithOptions(arena.allocator(), &rows, .bytes, .{ .layout = .side_by_side, .width = 27, .wrap = true });
+    const new_rows = try buildVisualRowsWithOptions(arena.allocator(), &rows, .bytes, .{ .layout = .side_by_side, .width = 35, .wrap = true });
+    var navigation = Nav.init(old_rows.len, 2);
+    navigation.cursor = 1;
+    const previous: Projection = .{
+        .revision = 1,
+        .visual_rows_revision = 1,
+        .geometry = .{ .cols = 27, .rows = 5 },
+        .panes = paneRects(.{ .cols = 27, .rows = 5 }),
+        .visual_rows = old_rows,
+        .buffer = .{ .rows = &rows, .layout = .side_by_side },
+        .navigation = navigation,
+    };
+
+    try testing.expectEqual(@as(usize, 0), restoreNavigation(previous, new_rows, .{ .cols = 35, .rows = 5 }).cursor);
 }
 
 test "framed Pane geometry is bounded at zero narrow ordinary and wide sizes" {
