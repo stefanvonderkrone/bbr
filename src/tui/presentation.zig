@@ -1112,7 +1112,7 @@ const Published = struct {
     const StagedBuffer = struct {
         published: *Published,
         buffer: buffer_mod.Buffer,
-        targets: []const frame_mod.SemanticTarget,
+        visual_rows: []const frame_mod.VisualRow,
         tree: file_tree.Projection,
         geometry: frame_mod.Geometry,
         active: bool = true,
@@ -1127,10 +1127,10 @@ const Published = struct {
             const previous = self.published.frameProjection();
             self.published.buffers.commit();
             self.published.buffer = self.buffer;
-            self.published.targets = self.targets;
+            self.published.visual_rows = self.visual_rows;
             self.published.tree = self.tree;
             self.published.geometry = self.geometry;
-            self.published.navigation = frame_mod.restoreNavigation(previous, self.targets, self.geometry);
+            self.published.navigation = frame_mod.restoreNavigation(previous, self.visual_rows, self.geometry);
             self.published.frame_revision += 1;
             self.active = false;
         }
@@ -1145,7 +1145,7 @@ const Published = struct {
     scope_projection: std.ArrayList(bbr.review.ScopeProjectionEntry),
     buffers: ArenaRing(2),
     buffer: buffer_mod.Buffer,
-    targets: []const frame_mod.SemanticTarget,
+    visual_rows: []const frame_mod.VisualRow,
     tree: file_tree.Projection,
     geometry: frame_mod.Geometry,
     frame_revision: frame_mod.Revision,
@@ -1257,7 +1257,7 @@ const Published = struct {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return error.BufferBuildFailed;
         };
-        published.targets = try frame_mod.buildTargets(buffer_allocator, published.buffer.rows, cell_metrics);
+        published.visual_rows = try frame_mod.buildVisualRows(buffer_allocator, published.buffer.rows, cell_metrics);
         const panes = frame_mod.paneRects(geometry);
         published.tree = try file_tree.build(
             buffer_allocator,
@@ -1273,7 +1273,7 @@ const Published = struct {
             cell_metrics,
         );
         published.buffers.commit();
-        published.navigation = Nav.init(published.buffer.rows.len, panes.diff_content.height);
+        published.navigation = Nav.init(published.visual_rows.len, panes.diff_content.height);
         return published;
     }
 
@@ -1311,10 +1311,10 @@ const Published = struct {
     fn frameProjection(self: *const Published) frame_mod.Projection {
         return .{
             .revision = self.frame_revision,
-            .targets_revision = self.frame_revision,
+            .visual_rows_revision = self.frame_revision,
             .geometry = self.geometry,
             .panes = frame_mod.paneRects(self.geometry),
-            .targets = self.targets,
+            .visual_rows = self.visual_rows,
             .buffer = self.buffer,
             .navigation = self.navigation,
             .file_tree = self.tree,
@@ -1617,7 +1617,7 @@ const Published = struct {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return error.BufferBuildFailed;
         };
-        const targets = try frame_mod.buildTargets(allocator, candidate.rows, self.cell_metrics);
+        const visual_rows = try frame_mod.buildVisualRows(allocator, candidate.rows, self.cell_metrics);
         const panes = frame_mod.paneRects(geometry);
         const wanted_cursor = if (self.tree.entries.len == 0) null else self.tree.entries[self.tree.cursor].identity;
         const active_file = if (self.session.diff.files.len == 0) null else isolated_file orelse fileIndexForRow(self.buffer, self.navigation.cursor);
@@ -1634,7 +1634,7 @@ const Published = struct {
             self.tree.scroll,
             self.cell_metrics,
         );
-        return .{ .published = self, .buffer = candidate, .targets = targets, .tree = tree, .geometry = geometry };
+        return .{ .published = self, .buffer = candidate, .visual_rows = visual_rows, .tree = tree, .geometry = geometry };
     }
 
     fn commentsCollapsedRows(self: *const Published) usize {
@@ -2941,10 +2941,10 @@ pub const Presentation = struct {
         else
             .{
                 .revision = self.interaction_revision,
-                .targets_revision = self.interaction_revision,
+                .visual_rows_revision = self.interaction_revision,
                 .geometry = self.geometry,
                 .panes = frame_mod.paneRects(self.geometry),
-                .targets = &.{},
+                .visual_rows = &.{},
                 .buffer = .{ .rows = &.{}, .layout = .unified },
                 .navigation = Nav.init(0, frame_mod.paneRects(self.geometry).diff_content.height),
             };
@@ -5895,7 +5895,7 @@ pub const Presentation = struct {
                 const previous = self.published;
                 if (previous) |current| {
                     if (OwnedReviewIdentity.eql(current.key, candidate.key))
-                        candidate.navigation = frame_mod.restoreNavigation(current.frameProjection(), candidate.targets, candidate.geometry);
+                        candidate.navigation = frame_mod.restoreNavigation(current.frameProjection(), candidate.visual_rows, candidate.geometry);
                 }
                 self.published = candidate;
                 if (self.stale_repair) |*gate| if (OwnedReviewIdentity.eql(gate.key, candidate.key)) {
@@ -6640,15 +6640,15 @@ test "resize publishes one complete Presentation Frame revision" {
     try presentation.dispatch(.{ .action = .toggle_select });
     const navigated = presentation.projection().review.?.frame;
     try testing.expect(navigated.revision > before.revision);
-    const owner = navigated.targets[navigated.navigation.cursor].owner;
+    const owner = navigated.visual_rows[navigated.navigation.cursor].owner;
     try presentation.dispatch(.{ .resize = .{ .cols = 40, .rows = 4 } });
     const after = presentation.projection().review.?.frame;
 
     try testing.expectEqual(navigated.revision + 1, after.revision);
     try testing.expectEqual(@as(u16, 40), after.geometry.cols);
     try testing.expectEqual(@as(u16, 4), after.geometry.rows);
-    try testing.expect(after.targets_revision <= after.revision);
-    try testing.expect(owner.eql(after.targets[after.navigation.cursor].owner));
+    try testing.expect(after.visual_rows_revision <= after.revision);
+    try testing.expect(owner.eql(after.visual_rows[after.navigation.cursor].owner));
     try testing.expectEqual(navigated.navigation.mark, after.navigation.mark);
     try testing.expectEqual(@as(usize, after.panes.sidebar_content.height), after.file_tree.viewport);
     try testing.expect(after.file_tree.entries[after.file_tree.cursor].active);
@@ -6773,7 +6773,7 @@ test "M15 Layout Scope and geometry matrix restores a Unicode source row" {
         }
     }
     try moveToRow(&presentation, source_row);
-    const owner = presentation.projection().review.?.frame.targets[source_row].owner;
+    const owner = presentation.projection().review.?.frame.visual_rows[source_row].owner;
     const geometries = [_]frame_mod.Geometry{
         .{ .cols = 0, .rows = 0 },
         .{ .cols = 8, .rows = 2 },
@@ -6790,9 +6790,9 @@ test "M15 Layout Scope and geometry matrix restores a Unicode source row" {
                 try presentation.dispatch(.{ .resize = geometry });
                 const review = presentation.projection().review.?;
                 try testing.expectEqual(geometry, review.frame.geometry);
-                try testing.expect(review.frame.targets_revision <= review.frame.revision);
-                try testing.expect(review.navigation.cursor < review.frame.targets.len);
-                try testing.expect(owner.eql(review.frame.targets[review.navigation.cursor].owner));
+                try testing.expect(review.frame.visual_rows_revision <= review.frame.revision);
+                try testing.expect(review.navigation.cursor < review.frame.visual_rows.len);
+                try testing.expect(owner.eql(review.frame.visual_rows[review.navigation.cursor].owner));
                 try testing.expectEqualStrings("é界👩‍💻", lineAtRow(review.buffer.rows[review.navigation.cursor]).?.text);
                 var saw_projected_body = false;
                 for (review.buffer.rows) |row| if (row == .comment and row.comment.part == .body) {
@@ -7420,6 +7420,8 @@ test "failed Buffer transaction preserves Buffer preferences and Navigation" {
     const after = presentation.projection();
     try testing.expect(failing.has_induced_failure);
     try testing.expectEqual(before.buffer.rows.ptr, after.review.?.buffer.rows.ptr);
+    try testing.expectEqual(before.frame.visual_rows.ptr, after.review.?.frame.visual_rows.ptr);
+    try testing.expectEqual(before.frame.visual_rows_revision, after.review.?.frame.visual_rows_revision);
     try testing.expectEqual(before.buffer.layout, after.review.?.buffer.layout);
     try testing.expect(std.meta.eql(before.preferences, after.review.?.preferences));
     try testing.expect(std.meta.eql(before.navigation, after.review.?.navigation));

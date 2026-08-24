@@ -79,19 +79,24 @@ pub const RowOwner = union(enum) {
     }
 };
 
-pub const SemanticTarget = struct {
+/// One geometry-dependent DiffPane row. `row` retains the width-independent
+/// Buffer owner while byte bounds and decoration describe this projection.
+pub const VisualRow = struct {
+    row: buffer_mod.Row,
     owner: RowOwner,
     measured_cells: usize,
+    source_start: usize = 0,
     source_end: usize = 0,
+    decoration: ?bbr.highlight.LineDecoration = null,
 };
 
 pub const Projection = struct {
     revision: Revision,
-    targets_revision: Revision,
+    visual_rows_revision: Revision,
     geometry: Geometry,
     panes: PaneRects,
     overlay: ?OverlayTarget = null,
-    targets: []const SemanticTarget,
+    visual_rows: []const VisualRow,
     buffer: buffer_mod.Buffer,
     navigation: Nav,
     file_tree: file_tree.Projection = .{},
@@ -117,7 +122,7 @@ pub fn hitTest(frame: Projection, col: u16, row: u16) ?HitTarget {
     }
     if (frame.panes.diff_content.contains(col, row)) {
         const index = frame.navigation.scroll + row - frame.panes.diff_content.y;
-        if (index < frame.targets.len) return .{ .diff_row = index };
+        if (index < frame.visual_rows.len) return .{ .diff_row = index };
         return .diff;
     }
     return null;
@@ -161,25 +166,30 @@ fn paneContent(rect: Rect) Rect {
     };
 }
 
-pub fn buildTargets(
+pub fn buildVisualRows(
     allocator: std.mem.Allocator,
     rows: []const buffer_mod.Row,
     metrics: CellMetrics,
-) ![]const SemanticTarget {
-    const targets = try allocator.alloc(SemanticTarget, rows.len);
-    for (rows, targets) |row, *target| target.* = .{
+) ![]const VisualRow {
+    // Wrapping starts disabled, so the initial projection is exactly one visual
+    // row per Buffer row. Later wrapping can split only Line and LinePair rows.
+    const visual_rows = try allocator.alloc(VisualRow, rows.len);
+    for (rows, visual_rows) |row, *visual_row| visual_row.* = .{
+        .row = row,
         .owner = owner(row),
         .measured_cells = rowWidth(row, metrics),
+        .source_start = rowSourceStart(row),
         .source_end = rowSourceEnd(row),
+        .decoration = rowDecoration(row),
     };
-    return targets;
+    return visual_rows;
 }
 
-pub fn restoreNavigation(previous: Projection, targets: []const SemanticTarget, geometry: Geometry) Nav {
-    var restored = Nav.init(targets.len, paneRects(geometry).diff_content.height);
+pub fn restoreNavigation(previous: Projection, visual_rows: []const VisualRow, geometry: Geometry) Nav {
+    var restored = Nav.init(visual_rows.len, paneRects(geometry).diff_content.height);
     restored.count = previous.navigation.count;
-    const cursor_owner = targetOwner(previous.targets, previous.navigation.cursor) orelse return restored;
-    const cursor = findOwner(targets, cursor_owner) orelse return restored;
+    const cursor_owner = visualRowOwner(previous.visual_rows, previous.navigation.cursor) orelse return restored;
+    const cursor = findOwner(visual_rows, cursor_owner) orelse return restored;
     restored.jumpTo(cursor);
     restored.count = previous.navigation.count;
 
@@ -188,8 +198,8 @@ pub fn restoreNavigation(previous: Projection, targets: []const SemanticTarget, 
     restored.setViewport(paneRects(geometry).diff_content.height);
 
     if (previous.navigation.mark) |mark| {
-        const mark_owner = targetOwner(previous.targets, mark) orelse return restored;
-        const restored_mark = findOwner(targets, mark_owner) orelse return restored;
+        const mark_owner = visualRowOwner(previous.visual_rows, mark) orelse return restored;
+        const restored_mark = findOwner(visual_rows, mark_owner) orelse return restored;
         const old_range = [2]usize{ @min(mark, previous.navigation.cursor), @max(mark, previous.navigation.cursor) };
         const new_range = [2]usize{ @min(restored_mark, cursor), @max(restored_mark, cursor) };
         if (std.meta.eql(old_range, new_range)) restored.mark = restored_mark;
@@ -197,22 +207,22 @@ pub fn restoreNavigation(previous: Projection, targets: []const SemanticTarget, 
     return restored;
 }
 
-fn findOwner(targets: []const SemanticTarget, wanted: RowOwner) ?usize {
-    for (targets, 0..) |target, index| if (target.owner.eql(wanted)) return index;
+fn findOwner(visual_rows: []const VisualRow, wanted: RowOwner) ?usize {
+    for (visual_rows, 0..) |visual_row, index| if (visual_row.owner.eql(wanted)) return index;
     // Width changes alter projected row starts. Restore a ReviewCard to the
     // same source offset's containing row, or the nearest following row. A
     // collapsed card's footer uses the body-end offset, so hidden content lands
     // on that disclosure instead of another item.
     var nearest: ?usize = null;
     var nearest_offset: usize = std.math.maxInt(usize);
-    for (targets, 0..) |target, index| switch (wanted) {
-        .comment => |value| if (target.owner == .comment and target.owner.comment.id == value.id and target.owner.comment.part != .header and ((target.owner.comment.source_offset <= value.source_offset and value.source_offset < target.source_end) or target.owner.comment.source_offset >= value.source_offset) and target.owner.comment.source_offset < nearest_offset) {
+    for (visual_rows, 0..) |visual_row, index| switch (wanted) {
+        .comment => |value| if (visual_row.owner == .comment and visual_row.owner.comment.id == value.id and visual_row.owner.comment.part != .header and ((visual_row.owner.comment.source_offset <= value.source_offset and value.source_offset < visual_row.source_end) or visual_row.owner.comment.source_offset >= value.source_offset) and visual_row.owner.comment.source_offset < nearest_offset) {
             nearest = index;
-            nearest_offset = target.owner.comment.source_offset;
+            nearest_offset = visual_row.owner.comment.source_offset;
         },
-        .draft => |value| if (target.owner == .draft and target.owner.draft.id == value.id and target.owner.draft.part != .header and ((target.owner.draft.source_offset <= value.source_offset and value.source_offset < target.source_end) or target.owner.draft.source_offset >= value.source_offset) and target.owner.draft.source_offset < nearest_offset) {
+        .draft => |value| if (visual_row.owner == .draft and visual_row.owner.draft.id == value.id and visual_row.owner.draft.part != .header and ((visual_row.owner.draft.source_offset <= value.source_offset and value.source_offset < visual_row.source_end) or visual_row.owner.draft.source_offset >= value.source_offset) and visual_row.owner.draft.source_offset < nearest_offset) {
             nearest = index;
-            nearest_offset = target.owner.draft.source_offset;
+            nearest_offset = visual_row.owner.draft.source_offset;
         },
         else => {},
     };
@@ -220,9 +230,9 @@ fn findOwner(targets: []const SemanticTarget, wanted: RowOwner) ?usize {
     return null;
 }
 
-fn targetOwner(targets: []const SemanticTarget, index: usize) ?RowOwner {
-    if (index >= targets.len) return null;
-    return targets[index].owner;
+fn visualRowOwner(visual_rows: []const VisualRow, index: usize) ?RowOwner {
+    if (index >= visual_rows.len) return null;
+    return visual_rows[index].owner;
 }
 
 fn owner(row: buffer_mod.Row) RowOwner {
@@ -255,9 +265,27 @@ fn anchorPart(part: @import("review_card.zig").Part) ?@import("review_card.zig")
 
 fn rowSourceEnd(row: buffer_mod.Row) usize {
     return switch (row) {
+        .line => |line| line.line.text.len,
+        .line_pair => |pair| if (pair.right) |right| right.line.text.len else if (pair.left) |left| left.line.text.len else 0,
         .comment => |card| card.source_range.end,
         .draft => |card| card.source_range.end,
         else => 0,
+    };
+}
+
+fn rowSourceStart(row: buffer_mod.Row) usize {
+    return switch (row) {
+        .comment => |card| card.source_range.start,
+        .draft => |card| card.source_range.start,
+        else => 0,
+    };
+}
+
+fn rowDecoration(row: buffer_mod.Row) ?bbr.highlight.LineDecoration {
+    return switch (row) {
+        .line => |line| line.decoration,
+        .line_pair => |pair| if (pair.right) |right| right.decoration else if (pair.left) |left| left.decoration else null,
+        else => null,
     };
 }
 
@@ -299,7 +327,7 @@ fn sourceOffset(source: []const u8, part: []const u8) usize {
 
 const testing = std.testing;
 
-test "semantic targets use the injected CellMetrics seam" {
+test "visual rows use the injected CellMetrics seam" {
     const Metrics = struct {
         calls: usize = 0,
 
@@ -314,11 +342,56 @@ test "semantic targets use the injected CellMetrics seam" {
     const metrics: CellMetrics = .{ .ptr = &metrics_context, .vtable = &vtable };
     const rows = [_]buffer_mod.Row{.{ .section = .{ .kind = .outdated, .count = 1, .path = "wide" } }};
 
-    const targets = try buildTargets(testing.allocator, &rows, metrics);
-    defer testing.allocator.free(targets);
+    const visual_rows = try buildVisualRows(testing.allocator, &rows, metrics);
+    defer testing.allocator.free(visual_rows);
 
     try testing.expectEqual(@as(usize, 4), metrics_context.calls);
-    try testing.expectEqual(@as(usize, 5), targets[0].measured_cells);
+    try testing.expectEqual(@as(usize, 5), visual_rows[0].measured_cells);
+}
+
+test "Presentation Frame projects Diff Lines as complete visual rows" {
+    const line: bbr.diff.Line = .{ .old_no = null, .new_no = 1, .kind = .added, .text = "const answer = 42" };
+    const old_line: bbr.diff.Line = .{ .old_no = 1, .new_no = null, .kind = .removed, .text = "const answer = 41" };
+    const runs = [_]bbr.highlight.decoration.Run{
+        .{ .text = line.text[0..5], .capture = .{ .name = "keyword" } },
+        .{ .text = line.text[5..], .emphasis = true },
+    };
+    const rows = [_]buffer_mod.Row{
+        .{ .line = .{ .line = &line, .decoration = .{ .runs = &runs } } },
+        .{ .line_pair = .{
+            .left = .{ .line = &old_line, .decoration = .{ .runs = &.{.{ .text = old_line.text }} } },
+            .right = .{ .line = &line, .decoration = .{ .runs = &runs } },
+        } },
+        .{ .section = .{ .kind = .pending, .count = 1 } },
+    };
+
+    const visual_rows = try buildVisualRows(testing.allocator, &rows, .bytes);
+    defer testing.allocator.free(visual_rows);
+
+    try testing.expectEqual(rows.len, visual_rows.len);
+    try testing.expect(visual_rows[0].owner.eql(.{ .line = &line }));
+    try testing.expectEqual(@as(usize, 0), visual_rows[0].source_start);
+    try testing.expectEqual(line.text.len, visual_rows[0].source_end);
+    try testing.expectEqualStrings("const", visual_rows[0].decoration.?.runs[0].text);
+    try testing.expectEqual(rows[0], visual_rows[0].row);
+    try testing.expect(visual_rows[1].owner.eql(.{ .line = &line }));
+    try testing.expectEqual(line.text.len, visual_rows[1].source_end);
+    try testing.expectEqualStrings("const", visual_rows[1].decoration.?.runs[0].text);
+    try testing.expectEqual(rows[1], visual_rows[1].row);
+    try testing.expect(visual_rows[2].decoration == null);
+    try testing.expectEqual(rows[2], visual_rows[2].row);
+}
+
+test "Diff visual-row allocation fails before a partial projection escapes" {
+    const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "same" };
+    const rows = [_]buffer_mod.Row{.{ .line = .{
+        .line = &line,
+        .decoration = .{ .runs = &.{.{ .text = line.text }} },
+    } }};
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+
+    try testing.expectError(error.OutOfMemory, buildVisualRows(failing.allocator(), &rows, .bytes));
+    try testing.expect(failing.has_induced_failure);
 }
 
 test "framed Pane geometry is bounded at zero narrow ordinary and wide sizes" {
@@ -348,10 +421,10 @@ test "published Frame hit testing gives Overlay rows precedence and clips blank 
     }};
     var projection: Projection = .{
         .revision = 7,
-        .targets_revision = 7,
+        .visual_rows_revision = 7,
         .geometry = .{ .cols = 20, .rows = 8 },
         .panes = paneRects(.{ .cols = 20, .rows = 8 }),
-        .targets = &.{},
+        .visual_rows = &.{},
         .buffer = .{ .rows = &.{}, .layout = .unified },
         .navigation = Nav.init(0, 5),
         .file_tree = .{ .entries = &entries, .viewport = 5 },
@@ -370,12 +443,12 @@ test "published Frame hit testing gives Overlay rows precedence and clips blank 
 }
 
 test "navigation restoration follows stable owners and clears a shifted Selection" {
-    const old_targets = [_]SemanticTarget{
-        .{ .owner = .{ .section = .{ .kind = .pr_comments, .path = "" } }, .measured_cells = 0 },
-        .{ .owner = .{ .section = .{ .kind = .outdated, .path = "a.zig" } }, .measured_cells = 5 },
+    const old_targets = [_]VisualRow{
+        .{ .row = .{ .section = .{ .kind = .pr_comments, .count = 1 } }, .owner = .{ .section = .{ .kind = .pr_comments, .path = "" } }, .measured_cells = 0 },
+        .{ .row = .{ .section = .{ .kind = .outdated, .count = 1, .path = "a.zig" } }, .owner = .{ .section = .{ .kind = .outdated, .path = "a.zig" } }, .measured_cells = 5 },
     };
-    const new_targets = [_]SemanticTarget{
-        .{ .owner = .{ .section = .{ .kind = .pending, .path = "" } }, .measured_cells = 0 },
+    const new_targets = [_]VisualRow{
+        .{ .row = .{ .section = .{ .kind = .pending, .count = 1 } }, .owner = .{ .section = .{ .kind = .pending, .path = "" } }, .measured_cells = 0 },
         old_targets[0],
         old_targets[1],
     };
@@ -385,10 +458,10 @@ test "navigation restoration follows stable owners and clears a shifted Selectio
     navigation.count = 7;
     const previous: Projection = .{
         .revision = 4,
-        .targets_revision = 4,
+        .visual_rows_revision = 4,
         .geometry = .{ .cols = 80, .rows = 4 },
         .panes = paneRects(.{ .cols = 80, .rows = 4 }),
-        .targets = &old_targets,
+        .visual_rows = &old_targets,
         .buffer = .{ .rows = &.{}, .layout = .unified },
         .navigation = navigation,
     };
@@ -402,31 +475,31 @@ test "navigation restoration follows stable owners and clears a shifted Selectio
 }
 
 test "ReviewCard restoration follows containing source offset and collapsed footer" {
-    const old_targets = [_]SemanticTarget{
-        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 0, .part = .header } }, .measured_cells = 5 },
-        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 8 } }, .measured_cells = 10, .source_end = 18 },
+    const old_targets = [_]VisualRow{
+        .{ .row = .{ .section = .{ .kind = .pr_comments, .count = 1 } }, .owner = .{ .comment = .{ .id = 7, .source_offset = 0, .part = .header } }, .measured_cells = 5 },
+        .{ .row = .{ .section = .{ .kind = .pr_comments, .count = 1 } }, .owner = .{ .comment = .{ .id = 7, .source_offset = 8 } }, .measured_cells = 10, .source_end = 18 },
     };
     var navigation = Nav.init(old_targets.len, 3);
     navigation.cursor = 1;
     const previous: Projection = .{
         .revision = 1,
-        .targets_revision = 1,
+        .visual_rows_revision = 1,
         .geometry = .{ .cols = 40, .rows = 3 },
         .panes = paneRects(.{ .cols = 40, .rows = 3 }),
-        .targets = &old_targets,
+        .visual_rows = &old_targets,
         .buffer = .{ .rows = &.{}, .layout = .unified },
         .navigation = navigation,
     };
-    const resized = [_]SemanticTarget{
-        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 0, .part = .header } }, .measured_cells = 5 },
-        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 4 } }, .measured_cells = 18, .source_end = 14 },
-        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 14 } }, .measured_cells = 4, .source_end = 18 },
+    const resized = [_]VisualRow{
+        .{ .row = .{ .section = .{ .kind = .pr_comments, .count = 1 } }, .owner = .{ .comment = .{ .id = 7, .source_offset = 0, .part = .header } }, .measured_cells = 5 },
+        .{ .row = .{ .section = .{ .kind = .pr_comments, .count = 1 } }, .owner = .{ .comment = .{ .id = 7, .source_offset = 4 } }, .measured_cells = 18, .source_end = 14 },
+        .{ .row = .{ .section = .{ .kind = .pr_comments, .count = 1 } }, .owner = .{ .comment = .{ .id = 7, .source_offset = 14 } }, .measured_cells = 4, .source_end = 18 },
     };
     try testing.expectEqual(@as(usize, 1), restoreNavigation(previous, &resized, .{ .cols = 60, .rows = 3 }).cursor);
 
-    const collapsed = [_]SemanticTarget{
+    const collapsed = [_]VisualRow{
         resized[0],
-        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 18, .part = .disclosure_footer } }, .measured_cells = 20, .source_end = 18 },
+        .{ .row = .{ .section = .{ .kind = .pr_comments, .count = 1 } }, .owner = .{ .comment = .{ .id = 7, .source_offset = 18, .part = .disclosure_footer } }, .measured_cells = 20, .source_end = 18 },
     };
     try testing.expectEqual(@as(usize, 1), restoreNavigation(previous, &collapsed, .{ .cols = 30, .rows = 3 }).cursor);
 }

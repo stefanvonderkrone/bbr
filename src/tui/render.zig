@@ -91,17 +91,17 @@ pub fn drawReview(
     const sidebar = childRect(win, review.frame.panes.sidebar_content);
     const diff_pane = childRect(win, review.frame.panes.diff_content);
     drawFileTree(sidebar, review.frame.file_tree, theme);
-    drawPane(scratch, diff_pane, review.frame.buffer, theme, review.frame.navigation);
-    joinSectionRules(win, review.frame.panes.diff, review.frame.panes.diff_content, review.frame.buffer, review.frame.navigation, theme);
+    drawVisualPane(scratch, diff_pane, review.frame.visual_rows, review.frame.buffer.layout, theme, review.frame.navigation);
+    joinSectionRules(win, review.frame.panes.diff, review.frame.panes.diff_content, review.frame.visual_rows, review.frame.navigation, theme);
 }
 
-fn joinSectionRules(win: vaxis.Window, outer: @import("frame.zig").Rect, content: @import("frame.zig").Rect, buf: Buffer, nav: Nav, theme: Theme) void {
+fn joinSectionRules(win: vaxis.Window, outer: @import("frame.zig").Rect, content: @import("frame.zig").Rect, visual_rows: []const @import("frame.zig").VisualRow, nav: Nav, theme: Theme) void {
     if (outer.width == 0) return;
     var screen_row: u16 = 0;
     while (screen_row < content.height) : (screen_row += 1) {
         const index = nav.scroll + screen_row;
-        if (index >= buf.rows.len) break;
-        const joined = switch (buf.rows[index]) {
+        if (index >= visual_rows.len) break;
+        const joined = switch (visual_rows[index].row) {
             .file_header, .section => true,
             else => false,
         };
@@ -227,18 +227,32 @@ fn fileAnchoredCount(comptime T: type, items: []const T, file: bbr.diff.File) us
 }
 
 fn drawPane(scratch: std.mem.Allocator, win: vaxis.Window, buf: Buffer, theme: Theme, nav: Nav) void {
+    drawProjectedRows(scratch, win, buf.rows, buf.layout, theme, nav);
+}
+
+fn drawVisualPane(
+    scratch: std.mem.Allocator,
+    win: vaxis.Window,
+    visual_rows: []const @import("frame.zig").VisualRow,
+    layout: buffer_mod.Layout,
+    theme: Theme,
+    nav: Nav,
+) void {
+    drawProjectedRows(scratch, win, visual_rows, layout, theme, nav);
+}
+
+fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, rows: anytype, layout: buffer_mod.Layout, theme: Theme, nav: Nav) void {
     const sel = nav.selection();
-    var r: u16 = 0;
-    while (r < win.height) : (r += 1) {
-        const idx = nav.scroll + r;
-        if (idx >= buf.rows.len) break;
-        drawRow(scratch, win, r, buf.layout, buf.rows[idx], theme);
-        // Tint the whole visual-selection band; the cursor row takes the tint a
-        // second time so it stays distinguishable within the band.
-        if (sel) |s| {
-            if (idx >= s[0] and idx <= s[1] and buf.rows[idx] != .status_placeholder) highlightCursorRow(win, r, theme);
+    var screen_row: u16 = 0;
+    while (screen_row < win.height) : (screen_row += 1) {
+        const index = nav.scroll + screen_row;
+        if (index >= rows.len) break;
+        const row: Row = if (@TypeOf(rows) == []const Row) rows[index] else rows[index].row;
+        drawRow(scratch, win, screen_row, layout, row, theme);
+        if (sel) |selection| {
+            if (index >= selection[0] and index <= selection[1] and row != .status_placeholder) highlightCursorRow(win, screen_row, theme);
         }
-        if (idx == nav.cursor) highlightCursorRow(win, r, theme);
+        if (index == nav.cursor) highlightCursorRow(win, screen_row, theme);
     }
 }
 
@@ -1071,6 +1085,37 @@ test "syntax foreground composes over an added Line background" {
     const cell = win.readCell(sidebar_width + 1 + gutter_cols, 3).?;
     try testing.expectEqual(theme_dark.syntax_keyword, cell.style.fg);
     try testing.expectEqual(theme_dark.added.bg, cell.style.bg);
+}
+
+test "disabled Diff visual-row projection clips exactly like Buffer rendering" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const line: bbr.diff.Line = .{ .old_no = null, .new_no = 1, .kind = .added, .text = "long highlighted source" };
+    const runs = [_]bbr.highlight.decoration.Run{
+        .{ .text = line.text[0..4], .capture = .{ .name = "keyword" } },
+        .{ .text = line.text[4..], .emphasis = true },
+    };
+    const rows = [_]Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &runs } } }};
+    const buf: Buffer = .{ .rows = &rows, .layout = .unified };
+    const visual_rows = try @import("frame.zig").buildVisualRows(a, &rows, .bytes);
+    var buffer_screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 14, .x_pixel = 0, .y_pixel = 0 });
+    defer buffer_screen.deinit(a);
+    var frame_screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 14, .x_pixel = 0, .y_pixel = 0 });
+    defer frame_screen.deinit(a);
+    const buffer_window = headlessWindow(&buffer_screen);
+    const frame_window = headlessWindow(&frame_screen);
+    const nav = Nav.init(1, 1);
+
+    drawPane(a, buffer_window, buf, theme_dark, nav);
+    drawVisualPane(a, frame_window, visual_rows, .unified, theme_dark, nav);
+
+    for (0..buffer_window.width) |col| {
+        const expected = buffer_window.readCell(@intCast(col), 0).?;
+        const actual = frame_window.readCell(@intCast(col), 0).?;
+        try testing.expectEqualStrings(expected.char.grapheme, actual.char.grapheme);
+        try testing.expectEqual(expected.style, actual.style);
+    }
 }
 
 test "Status Placeholder renders side, reason, and known or unavailable size" {
