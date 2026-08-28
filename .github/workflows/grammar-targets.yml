@@ -36,8 +36,8 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@v7.0.1
+      - uses: step-security/setup-zig@v2.2.2
         with:
           version: 0.16.0
       - name: Verify native target
