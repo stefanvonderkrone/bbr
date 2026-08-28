@@ -76,6 +76,15 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    const re2_tests = b.addTest(.{
+        .name = "re2-wrapper-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"RE2 wrapper"},
+    });
+    const run_re2_tests = b.addRunArtifact(re2_tests);
+    const re2_test_step = b.step("test-re2", "Run the native RE2 wrapper smoke tests");
+    re2_test_step.dependOn(&run_re2_tests.step);
+
     const fixture_mod = b.createModule(.{
         .root_source_file = b.path("tests/user_grammar_fixture.zig"),
         .target = target,
@@ -104,10 +113,19 @@ pub fn build(b: *std.Build) void {
     addRe2(b, highlight_runtime, target);
     lifecycle_mod.addImport("highlight_runtime", highlight_runtime);
     const lifecycle_test = b.addExecutable(.{ .name = "grammar-cli-integration", .root_module = lifecycle_mod });
+    const run_user_grammar_load_test = b.addRunArtifact(lifecycle_test);
+    run_user_grammar_load_test.addArtifactArg(exe);
+    run_user_grammar_load_test.addArtifactArg(grammar_fixture);
+    run_user_grammar_load_test.addArtifactArg(lifecycle_test);
+    run_user_grammar_load_test.addArg("load-smoke");
+    const user_grammar_load_test_step = b.step("test-user-grammar-load", "Run the native UserGrammar fixture load smoke test");
+    user_grammar_load_test_step.dependOn(&run_user_grammar_load_test.step);
     const run_lifecycle_test = b.addRunArtifact(lifecycle_test);
     run_lifecycle_test.addArtifactArg(exe);
     run_lifecycle_test.addArtifactArg(grammar_fixture);
     run_lifecycle_test.addArtifactArg(lifecycle_test);
+    const user_grammar_test_step = b.step("test-user-grammar", "Run the native UserGrammar load and CLI lifecycle fixture");
+    user_grammar_test_step.dependOn(&run_lifecycle_test.step);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);

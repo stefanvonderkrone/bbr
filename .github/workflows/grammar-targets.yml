@@ -1,0 +1,57 @@
+name: Grammar Targets
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  grammar-target:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-x86_64
+            runner: macos-15-intel
+            runner_os: macOS
+            runner_arch: X64
+          - target: macos-aarch64
+            runner: macos-15
+            runner_os: macOS
+            runner_arch: ARM64
+          - target: linux-x86_64
+            runner: ubuntu-24.04
+            runner_os: Linux
+            runner_arch: X64
+          - target: linux-aarch64
+            runner: ubuntu-24.04-arm
+            runner_os: Linux
+            runner_arch: ARM64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Verify native target
+        env:
+          EXPECTED_OS: ${{ matrix.runner_os }}
+          EXPECTED_ARCH: ${{ matrix.runner_arch }}
+        run: |
+          test "$RUNNER_OS" = "$EXPECTED_OS"
+          test "$RUNNER_ARCH" = "$EXPECTED_ARCH"
+      - name: RE2 wrapper
+        run: zig build test-re2 --summary all
+      - name: Dynamic UserGrammar load
+        run: zig build test-user-grammar-load --summary all
+      - name: UserGrammar CLI lifecycle
+        run: zig build test-user-grammar --summary all
+      - name: Complete hermetic suite
+        run: zig build test --summary all

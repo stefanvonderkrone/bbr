@@ -12,6 +12,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, bbr, "probe")) return probe(init, args.next() orelse return error.MissingProbePath, args.next() orelse return error.MissingProbeExpectation);
     const library = args.next() orelse return error.MissingFixturePath;
     const self = args.next() orelse return error.MissingSelfPath;
+    const mode = args.next() orelse "lifecycle";
+    if (!std.mem.eql(u8, mode, "lifecycle") and !std.mem.eql(u8, mode, "load-smoke")) return error.InvalidMode;
 
     var tmp = try std.Io.Dir.cwd().createDirPathOpen(init.io, ".zig-cache/grammar-cli-integration", .{});
     defer tmp.close(init.io);
@@ -86,6 +88,7 @@ pub fn main(init: std.process.Init) !void {
     try expectSuccess(install);
     try expectList(init, &env, bbr, "fixture\tenabled\tvalid");
     try expectProbe(init, &env, self, "src/a.fixture", "highlighted");
+    if (std.mem.eql(u8, mode, "load-smoke")) return;
 
     const digest_update = try command(init, &env, &.{ bbr, "grammar", "update", "fixture", ".zig-cache/grammar-cli-integration/bundle", "--trust-sha256", digest });
     defer freeResult(init.gpa, digest_update);
