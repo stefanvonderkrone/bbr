@@ -146,7 +146,7 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
     mod.addAnonymousImport("typescript_locals", .{ .root_source_file = b.path("vendors/tree-sitter/typescript/queries/locals.scm") });
     mod.addIncludePath(b.path("vendors/tree-sitter/runtime/include"));
     mod.addIncludePath(b.path("vendors/tree-sitter/runtime/src"));
-    mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/runtime/src/lib.c"), .flags = &.{ "-std=c11", "-fno-sanitize=undefined" } });
+    mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/runtime/src/lib.c"), .flags = &.{ "-std=c11", "-D_DEFAULT_SOURCE", "-fno-sanitize=undefined" } });
 
     inline for (.{ "javascript", "typescript", "tsx" }) |grammar| {
         mod.addIncludePath(b.path("vendors/tree-sitter/" ++ grammar ++ "/src"));
@@ -214,8 +214,11 @@ fn addRe2(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarge
         "absl/debugging/internal/demangle.cc",
         "absl/debugging/internal/demangle_rust.cc",
         "absl/debugging/internal/decode_rust_punycode.cc",
+        "absl/debugging/internal/elf_mem_image.cc",
         "absl/debugging/internal/utf8_for_code_point.cc",
+        "absl/debugging/internal/address_is_readable.cc",
         "absl/debugging/internal/examine_stack.cc",
+        "absl/debugging/internal/vdso_support.cc",
         "absl/debugging/stacktrace.cc",
         "absl/debugging/symbolize.cc",
         "absl/debugging/leak_check.cc",
@@ -249,6 +252,7 @@ fn addRe2(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarge
         "absl/strings/internal/str_format/output.cc",
         "absl/strings/internal/str_format/parser.cc",
         "absl/synchronization/internal/create_thread_identity.cc",
+        "absl/synchronization/internal/futex_waiter.cc",
         "absl/synchronization/internal/graphcycles.cc",
         "absl/synchronization/internal/kernel_timeout.cc",
         "absl/synchronization/internal/per_thread_sem.cc",
