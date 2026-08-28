@@ -227,6 +227,11 @@ unlimited inactive caching, or `enabled = false` to retain only the focused File
 controls retained inactive content; `[highlight].max_file_bytes` separately limits Highlighting
 work and never makes oversized content unreadable.
 
+After an explicit move to the next File in a remote review, `bbr` prefetches only that File's
+immediate successor. Other File focus changes and LocalReviews use demand loading. Disabling the
+inactive File cache also disables prefetch. File content and Highlighting stay in memory and are
+never written to SQLite, the state directory, or the data directory.
+
 ## Reference
 
 High-quality Zig codebase used as a reference for structure and idioms:

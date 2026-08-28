@@ -407,6 +407,12 @@ pub const Storage = struct {
         return sideNeedsEnrichment(file_status.old) or sideNeedsEnrichment(file_status.new);
     }
 
+    pub fn isTerminal(self: *const Storage, file_idx: usize) bool {
+        std.debug.assert(file_idx < self.statuses.len);
+        const file_status = self.statuses[file_idx];
+        return sideIsTerminal(file_status.old) and sideIsTerminal(file_status.new);
+    }
+
     pub fn projection(self: *const Storage) Projection {
         return .{ .blobs = self.blobs, .highlights = self.highlights, .content_statuses = self.content_statuses };
     }
@@ -513,6 +519,13 @@ fn sideNeedsEnrichment(state: bbr.highlight.SideState) bool {
     return switch (state) {
         .pending => true,
         .loading, .absent, .ready, .skipped_too_large, .fetch_failed, .highlight_failed => false,
+    };
+}
+
+fn sideIsTerminal(state: bbr.highlight.SideState) bool {
+    return switch (state) {
+        .pending, .loading => false,
+        .absent, .ready, .skipped_too_large, .fetch_failed, .highlight_failed => true,
     };
 }
 
