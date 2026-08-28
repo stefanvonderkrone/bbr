@@ -4,10 +4,10 @@
 
 **Blocked by:** 14 — Acquire Remote File Sides Safely; 15 — Apply File Content Status to LocalReview.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] WholeFile Scope selects old content for removed Files and new content for all other Files.
-- [ ] Old-side splicing uses authoritative old line numbers and preserves every Hunk Line unchanged.
-- [ ] Context Lines sourced from full content are non-anchorable and cannot receive inline Comments or Drafts.
-- [ ] Empty text content produces a complete zero-Line WholeFile projection instead of falling back to Changes Scope.
-- [ ] Remote and LocalReview fixtures prove equivalent removed, added, renamed, empty, unavailable, and path-special behavior.
+- [x] WholeFile Scope selects old content for removed Files and new content for all other Files.
+- [x] Old-side splicing uses authoritative old line numbers and preserves every Hunk Line unchanged.
+- [x] Context Lines sourced from full content are non-anchorable and cannot receive inline Comments or Drafts.
+- [x] Empty text content produces a complete zero-Line WholeFile projection instead of falling back to Changes Scope.
+- [x] Remote and LocalReview fixtures prove equivalent removed, added, renamed, empty, unavailable, and path-special behavior.

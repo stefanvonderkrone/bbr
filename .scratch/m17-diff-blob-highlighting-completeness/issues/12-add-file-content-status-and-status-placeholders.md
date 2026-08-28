@@ -4,10 +4,10 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Each expected side exposes its File Content Status, optional byte size, and typed unavailable reason independently of Highlighting status.
-- [ ] Existing acquisition failures render distinct non-anchorable Status Placeholders in Unified and SideBySide Layout and in Changes and WholeFile Scope.
-- [ ] A Status Placeholder cannot receive an Anchor, Selection, Fold, or Highlighting, while File-level and Review-level Comments remain visible.
-- [ ] A known size is shown in bytes, and an unknown size is shown as `size unavailable`.
-- [ ] A usable opposite side remains visible when one side is unavailable.
+- [x] Each expected side exposes its File Content Status, optional byte size, and typed unavailable reason independently of Highlighting status.
+- [x] Existing acquisition failures render distinct non-anchorable Status Placeholders in Unified and SideBySide Layout and in Changes and WholeFile Scope.
+- [x] A Status Placeholder cannot receive an Anchor, Selection, Fold, or Highlighting, while File-level and Review-level Comments remain visible.
+- [x] A known size is shown in bytes, and an unknown size is shown as `size unavailable`.
+- [x] A usable opposite side remains visible when one side is unavailable.

@@ -4,10 +4,10 @@
 
 **Blocked by:** 21 — Execute BuiltInGrammar Match Predicates.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] JavaScript and TypeScript use pinned locals queries rather than inferred Highlighting Captures.
-- [ ] `#is-not? local` accepts global identifiers and rejects local identifiers, including shadowed names in nested scopes.
-- [ ] Locals filtering composes with `#match?`, `#eq?`, fallback Captures, and later-pattern precedence.
-- [ ] Malformed locals predicates or locals queries reject the complete Grammar with a source diagnostic.
-- [ ] Exact-Capture fixtures cover local declarations, references, shadowing, UTF-8, zero-width Captures, invalid ranges, and cursor match loss.
+- [x] JavaScript and TypeScript use pinned locals queries rather than inferred Highlighting Captures.
+- [x] `#is-not? local` accepts global identifiers and rejects local identifiers, including shadowed names in nested scopes.
+- [x] Locals filtering composes with `#match?`, `#eq?`, fallback Captures, and later-pattern precedence.
+- [x] Malformed locals predicates or locals queries reject the complete Grammar with a source diagnostic.
+- [x] Exact-Capture fixtures cover local declarations, references, shadowing, UTF-8, zero-width Captures, invalid ranges, and cursor match loss.

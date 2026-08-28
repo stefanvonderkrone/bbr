@@ -1,11 +1,17 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const highlight_runtime = @import("highlight_runtime");
+const grammar_cli = highlight_runtime.grammar_cli;
+const user_grammar = highlight_runtime.user_grammar;
+const TreeSitterHighlighter = highlight_runtime.TreeSitterHighlighter;
 
 pub fn main(init: std.process.Init) !void {
     var args = init.minimal.args.iterate();
     _ = args.next();
     const bbr = args.next() orelse return error.MissingBbrPath;
+    if (std.mem.eql(u8, bbr, "probe")) return probe(init, args.next() orelse return error.MissingProbePath, args.next() orelse return error.MissingProbeExpectation);
     const library = args.next() orelse return error.MissingFixturePath;
+    const self = args.next() orelse return error.MissingSelfPath;
 
     var tmp = try std.Io.Dir.cwd().createDirPathOpen(init.io, ".zig-cache/grammar-cli-integration", .{});
     defer tmp.close(init.io);
@@ -70,14 +76,25 @@ pub fn main(init: std.process.Init) !void {
     try expectSuccess(archive_check);
     if (!std.mem.eql(u8, digest, try reportedDigest(archive_check.stdout))) return error.ArchiveDigestMismatch;
 
-    const install = try command(init, &env, &.{ bbr, "grammar", "install", ".zig-cache/grammar-cli-integration/bundle", "--trust-sha256", digest });
+    const declined = try interactiveInstall(init, &env, bbr, ".zig-cache/grammar-cli-integration/bundle.tar.gz", "n");
+    defer freeResult(init.gpa, declined);
+    if (declined.term != .exited or declined.term.exited == 0) return error.DeclinedTrustInstalledBundle;
+    try expectList(init, &env, bbr, "");
+
+    const install = try interactiveInstall(init, &env, bbr, ".zig-cache/grammar-cli-integration/bundle.tar.gz", "y");
     defer freeResult(init.gpa, install);
     try expectSuccess(install);
+    try expectList(init, &env, bbr, "fixture\tenabled\tvalid");
+    try expectProbe(init, &env, self, "src/a.fixture", "highlighted");
+
+    const digest_update = try command(init, &env, &.{ bbr, "grammar", "update", "fixture", ".zig-cache/grammar-cli-integration/bundle", "--trust-sha256", digest });
+    defer freeResult(init.gpa, digest_update);
+    try expectSuccess(digest_update);
     try expectList(init, &env, bbr, "fixture\tenabled\tvalid");
 
     const invalid_query = "(not-a-node) @variable\n";
     try tmp.writeFile(init.io, .{ .sub_path = "bundle/queries/highlights.scm", .data = invalid_query });
-    const invalid_manifest = try manifestFor(init.gpa, library_digest, digestHex(invalid_query), "2.0.0");
+    const invalid_manifest = try manifestFor(init.gpa, "fixture", "2.0.0", ".fixture", library_digest, digestHex(invalid_query));
     defer init.gpa.free(invalid_manifest);
     try tmp.writeFile(init.io, .{ .sub_path = "bundle/grammar.toml", .data = invalid_manifest });
     const invalid_check = try command(init, &env, &.{ bbr, "grammar", "check", ".zig-cache/grammar-cli-integration/bundle" });
@@ -91,6 +108,35 @@ pub fn main(init: std.process.Init) !void {
 
     try expectCommandSuccess(init, &env, &.{ bbr, "grammar", "disable", "fixture" });
     try expectList(init, &env, bbr, "fixture\tdisabled\tvalid");
+    try expectProbe(init, &env, self, "src/a.fixture", "plain");
+
+    try tmp.createDirPath(init.io, "second/lib");
+    try tmp.createDirPath(init.io, "second/queries");
+    try std.Io.Dir.cwd().copyFile(library, std.Io.Dir.cwd(), ".zig-cache/grammar-cli-integration/second/lib/grammar", init.io, .{});
+    try tmp.writeFile(init.io, .{ .sub_path = "second/queries/highlights.scm", .data = query });
+    const second_manifest = try manifestFor(init.gpa, "second", "1.0.0", ".second", library_digest, query_digest);
+    defer init.gpa.free(second_manifest);
+    try tmp.writeFile(init.io, .{ .sub_path = "second/grammar.toml", .data = second_manifest });
+    const second_check = try command(init, &env, &.{ bbr, "grammar", "check", ".zig-cache/grammar-cli-integration/second" });
+    defer freeResult(init.gpa, second_check);
+    try expectSuccess(second_check);
+    const second_digest = try reportedDigest(second_check.stdout);
+    try expectCommandSuccess(init, &env, &.{ bbr, "grammar", "install", ".zig-cache/grammar-cli-integration/second", "--trust-sha256", second_digest });
+    try expectCommandSuccess(init, &env, &.{ bbr, "grammar", "disable", "second" });
+    try expectCommandSuccess(init, &env, &.{ bbr, "grammar", "enable", "fixture" });
+
+    try tmp.writeFile(init.io, .{ .sub_path = "config/bbr/config.toml", .data = "[grammars.second]\nextensions = [\".fixture\"]\n" });
+    const conflict = try command(init, &env, &.{ bbr, "grammar", "enable", "second" });
+    defer freeResult(init.gpa, conflict);
+    if (conflict.term != .exited or conflict.term.exited == 0) return error.UserGrammarConflictAccepted;
+    try expectList(init, &env, bbr, "fixture\tenabled\tvalid\nsecond\tdisabled\tvalid");
+
+    try tmp.writeFile(init.io, .{ .sub_path = "config/bbr/config.toml", .data = "[grammars.second]\nextensions = [\".configured\"]\n" });
+    try expectCommandSuccess(init, &env, &.{ bbr, "grammar", "enable", "second" });
+    try expectCommandSuccess(init, &env, &.{ bbr, "grammar", "disable", "second" });
+    try tmp.writeFile(init.io, .{ .sub_path = "config/bbr/config.toml", .data = "# no UserGrammar overrides\n" });
+    try expectCommandSuccess(init, &env, &.{ bbr, "grammar", "remove", "second" });
+
     try tmp.writeFile(init.io, .{ .sub_path = "config/bbr/config.toml", .data = "[grammars.fixture]\nextensions = [\".configured\"] # replaces defaults\n" });
     try expectCommandSuccess(init, &env, &.{ bbr, "grammar", "enable", "fixture" });
     const refused_remove = try command(init, &env, &.{ bbr, "grammar", "remove", "fixture" });
@@ -104,6 +150,21 @@ pub fn main(init: std.process.Init) !void {
     try expectList(init, &env, bbr, "");
 }
 
+fn probe(init: std.process.Init, path: []const u8, expectation: []const u8) !void {
+    var store = try grammar_cli.Store.open(init.gpa, init.io, init.environ_map);
+    defer store.deinit();
+    const entries = try store.registryEntries(init.arena.allocator());
+    const overrides = try grammar_cli.loadOverrides(init.arena.allocator(), init.io, init.environ_map);
+    try store.validateOverrideNames(overrides);
+    var registry = try user_grammar.Registry.init(init.gpa, init.io, entries, overrides, grammar_cli.bbr_identity);
+    defer registry.deinit();
+    var tree_sitter = TreeSitterHighlighter.init(&registry);
+    const result = try tree_sitter.highlighter().highlight(init.arena.allocator(), path, "identifier\n");
+    const highlighted = result.spans.len != 0;
+    const expected = if (std.mem.eql(u8, expectation, "highlighted")) true else if (std.mem.eql(u8, expectation, "plain")) false else return error.InvalidProbeExpectation;
+    if (highlighted != expected) return error.UnexpectedHighlighting;
+}
+
 fn reportedDigest(output: []const u8) ![]const u8 {
     const marker = "SHA-256: ";
     const start = (std.mem.indexOf(u8, output, marker) orelse return error.MissingDigest) + marker.len;
@@ -111,9 +172,9 @@ fn reportedDigest(output: []const u8) ![]const u8 {
     return output[start .. start + 64];
 }
 
-fn manifestFor(allocator: std.mem.Allocator, library_digest: [64]u8, query_digest: [64]u8, version: []const u8) ![]u8 {
+fn manifestFor(allocator: std.mem.Allocator, name: []const u8, version: []const u8, extension: []const u8, library_digest: [64]u8, query_digest: [64]u8) ![]u8 {
     return std.fmt.allocPrint(allocator,
-        \\name = "fixture"
+        \\name = "{s}"
         \\version = "{s}"
         \\os = "{s}"
         \\arch = "{s}"
@@ -128,9 +189,17 @@ fn manifestFor(allocator: std.mem.Allocator, library_digest: [64]u8, query_diges
         \\path = "queries/highlights.scm"
         \\sha256 = "{s}"
         \\[matches]
-        \\extensions = [".fixture"]
+        \\extensions = ["{s}"]
         \\
-    , .{ version, @tagName(builtin.os.tag), @tagName(builtin.cpu.arch), library_digest, query_digest });
+    , .{ name, version, @tagName(builtin.os.tag), @tagName(builtin.cpu.arch), library_digest, query_digest, extension });
+}
+
+fn interactiveInstall(init: std.process.Init, env: *const std.process.Environ.Map, bbr: []const u8, bundle: []const u8, answer: []const u8) !std.process.RunResult {
+    return command(init, env, &.{ "/bin/sh", "-c", "printf '%s\\n' \"$3\" | \"$1\" grammar install \"$2\"", "bbr-interactive-install", bbr, bundle, answer });
+}
+
+fn expectProbe(init: std.process.Init, env: *const std.process.Environ.Map, self: []const u8, path: []const u8, expectation: []const u8) !void {
+    try expectCommandSuccess(init, env, &.{ self, "probe", path, expectation });
 }
 
 fn command(init: std.process.Init, env: *const std.process.Environ.Map, argv: []const []const u8) !std.process.RunResult {

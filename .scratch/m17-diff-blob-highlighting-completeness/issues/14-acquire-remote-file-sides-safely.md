@@ -4,11 +4,11 @@
 
 **Blocked by:** 12 — Add File Content Status and Status Placeholders.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Old content uses the destination commit and old path, new content uses the source commit and new path, and absent sides are not requested.
-- [ ] Git-quoted paths are normalized, repository-relative paths are required, and each path segment is percent-encoded while `/` separators remain intact.
-- [ ] Spaces, Unicode, quotes, and reserved URL characters work, while malformed and non-repository-relative paths become a typed unavailable reason.
-- [ ] Successful responses remain opaque bytes until UTF-8 validation; empty bytes are valid text and invalid UTF-8 makes only that side unavailable with its byte size.
-- [ ] `not_found` and each classified ApiError remain distinct from an absent side, and a successful opposite side stays usable.
-- [ ] The opt-in credential-gated blob checker compares exact commit, path, type, size, attributes, and raw length and reports skipped fixture classes outside the default suite.
+- [x] Old content uses the destination commit and old path, new content uses the source commit and new path, and absent sides are not requested.
+- [x] Git-quoted paths are normalized, repository-relative paths are required, and each path segment is percent-encoded while `/` separators remain intact.
+- [x] Spaces, Unicode, quotes, and reserved URL characters work, while malformed and non-repository-relative paths become a typed unavailable reason.
+- [x] Successful responses remain opaque bytes until UTF-8 validation; empty bytes are valid text and invalid UTF-8 makes only that side unavailable with its byte size.
+- [x] `not_found` and each classified ApiError remain distinct from an absent side, and a successful opposite side stays usable.
+- [x] The opt-in credential-gated blob checker compares exact commit, path, type, size, attributes, and raw length and reports skipped fixture classes outside the default suite.

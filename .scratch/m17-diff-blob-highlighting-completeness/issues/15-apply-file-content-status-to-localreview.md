@@ -4,10 +4,10 @@
 
 **Blocked by:** 12 — Add File Content Status and Status Placeholders.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Git content uses the same text, binary, and unavailable states, byte-size rules, and typed reasons as remote File Enrichment.
-- [ ] Invalid UTF-8 prevents Highlighting and makes only the affected side unavailable while the opposite side remains usable.
-- [ ] Added, removed, modified, and renamed Files request only their expected sides from the correct commits and paths.
-- [ ] Highlighting failure preserves readable text, while acquisition failure produces a Status Placeholder.
-- [ ] `OutOfMemory` transfers neither pending side and leaves the published Session ownership consistent.
+- [x] Git content uses the same text, binary, and unavailable states, byte-size rules, and typed reasons as remote File Enrichment.
+- [x] Invalid UTF-8 prevents Highlighting and makes only the affected side unavailable while the opposite side remains usable.
+- [x] Added, removed, modified, and renamed Files request only their expected sides from the correct commits and paths.
+- [x] Highlighting failure preserves readable text, while acquisition failure produces a Status Placeholder.
+- [x] `OutOfMemory` transfers neither pending side and leaves the published Session ownership consistent.

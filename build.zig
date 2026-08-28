@@ -91,11 +91,23 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tests/grammar_cli_integration.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    const highlight_runtime = b.createModule(.{
+        .root_source_file = b.path("src/highlight/runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "bbr", .module = mod }},
+    });
+    addTreeSitter(b, highlight_runtime);
+    addRe2(b, highlight_runtime, target);
+    lifecycle_mod.addImport("highlight_runtime", highlight_runtime);
     const lifecycle_test = b.addExecutable(.{ .name = "grammar-cli-integration", .root_module = lifecycle_mod });
     const run_lifecycle_test = b.addRunArtifact(lifecycle_test);
     run_lifecycle_test.addArtifactArg(exe);
     run_lifecycle_test.addArtifactArg(grammar_fixture);
+    run_lifecycle_test.addArtifactArg(lifecycle_test);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
