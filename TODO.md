@@ -15,7 +15,7 @@ Sizes are relative effort (S/M/L), not calendar estimates. Dependencies noted pe
 - [x] Test: FakeHttpClient fixture → parsed PullRequest; 401/429/5xx → correct `ApiError`. (8/8 pass)
 
 ## M1 — Diff model & parser (pure, no UI)  ·  S/M  ·  ✅ done
-- [x] Bitbucket: `getDiff` (raw unified text). ✅ done. The parser supplies the File list used by the viewer; M17 will either give paginated `getDiffStat` a concrete metadata consumer or close the original deferral as obsolete.
+- [x] Bitbucket: `getDiff` (raw unified text). ✅ done. The parser supplies the File list used by the viewer; M17 closed the paginated `getDiffStat` deferral as obsolete because no accepted workflow needs its remote-only metadata.
 - [x] Diff parser: RawDiff → `Diff`/`File`/`Hunk`/`Line` (Bitbucket line numbers authoritative). ✅ done — `src/diff/parser.zig`, zero-copy over the raw text.
 - [x] `File` status (added/modified/removed/renamed). ✅ done. Full blob acquisition later shipped lazily in M9 because Bitbucket serves blobs from a separate endpoint.
 - [x] Tests: fixtures — hunk boundaries, line numbering, adds/removes, `\ No newline`, count-omitted ranges, malformed headers, end-to-end getDiff→parse. **No UI.** ✅ 8 diff tests + 3 getDiff tests (19 total green).
@@ -51,7 +51,7 @@ _Follow-through:_ SideBySide + folds shipped in M5, moved-anchor local diff-walk
 - [x] Arena pool/ring for multi-file view. ✅ `src/tui/arena_ring.zig` — a fixed ring of N arenas; `next()` rotates + resets. The viewer uses a ring of 2 to double-buffer the row-buffer rebuild (the displayed buffer stays valid while the next builds), replacing the single reset-and-reuse arena.
 - [x] Tests: intra-line segment cases; fold expansion; projection invariants. ✅ intraline (8: partition/emphasis/insertion/identical/disjoint/empty/similarity/indent), buffer emphasis + side-by-side pairing + fold/expand/whole-file/side-by-side-fold, renderer emphasis-band + side-by-side panes + fold-row, arena ring (3). Suite green 130/130.
 
-_Follow-through:_ true **whole-file** scope shipped in M9. Fold re-collapse shipped in M15; line-level side-by-side matching for change blocks is scheduled for M17.
+_Follow-through:_ true **whole-file** scope shipped in M9. Fold re-collapse shipped in M15. M17 replaced index pairing with deterministic line-level SideBySide matching.
 
 ## M6 — Pending review: authoring & persistence  ·  M  ·  ✅ done
 - [x] `PendingReviewStore` seam + in-memory fake + SQLite implementation (schema + migrations). ✅ `src/review/store.zig` (ptr+vtable seam mirroring `HttpClient`, `InMemoryStore` fake) + `src/persist/sqlite_store.zig` (vendored amalgamation, `vendors/sqlite`, compiled into the exe only so the pure module stays C-free — ADR-0006). One row per Draft keyed `(pr_id, local_id)`; `PRAGMA user_version` migrations.
@@ -78,13 +78,13 @@ _Follow-up:_ the scoped Picker tick and single-glyph spinner shipped in M15 with
 
 ## M9 — True whole-file view (Bitbucket blobs)  ·  M  ·  ✅ done
 Today's `WholeFile` scope shows every *fetched* diff line but not the unchanged regions **outside** the hunks — the diff endpoint only returns hunks + context. True whole-file needs the full file blob, which Bitbucket serves from a separate endpoint.
-- [x] Bitbucket: fetch a file's blob at a commit. ✅ `Client.getFileBlob(repo, commit, path)` → `GET /repositories/{ws}/{repo}/src/{commit}/{path}`, raw text owned by the caller, same `classify`/`ApiError` mapping as `getDiff`. M17 owns the opt-in live shape check; M9's hermetic contract is complete.
+- [x] Bitbucket: fetch a file's blob at a commit. ✅ `Client.getFileBlob(repo, commit, path)` → `GET /repositories/{ws}/{repo}/src/{commit}/{path}`, raw text owned by the caller, same `classify`/`ApiError` mapping as `getDiff`. M17 shipped the opt-in live shape check; M9's hermetic contract is complete.
 - [x] Populate blobs **lazily per file** on the Epoch-per-file seam anticipated by M8. ✅ `Session.blobs: []FileBlob` (side table, index-aligned with `diff.files`, empty at load — blobs can't live on the const `File` the parser yields). `app.ensureBlob` fetches the *focused* file's new-side blob on a worker thread when scope is whole-file, keyed by `(pr_id, file_idx)` so each file fetches at most once; the result posts a `blob_done` event and re-weaves. Stale results (superseded PR / filled slot) are discarded; in-flight fetches are awaited before teardown.
 - [x] `buffer.zig`: true-whole-file splice. ✅ `BuildOptions.whole_file` + `blobs`; `spliceNewSide` fills the gaps before/between/after hunks with `.context` lines drawn from the blob, keyed off the authoritative hunk line numbers (ADR-0001); hunk lines are copied verbatim. No hunk headers/folds in this scope. `f` cycles Changes → fetched-whole → whole-file (per the chosen 3-state model); whole-file falls back to the fetched rendering when the blob isn't loaded or the file is removed.
 - [x] Anchor safety: blob-sourced context lines get `Line.in_hunk = false` and `weaveInline` refuses to attach comments/drafts to them — only hunk lines anchor.
 - [x] Tests: blob fetch + `ApiError` (fake http, `client.zig`); splice invariants (hunk lines preserved, gaps filled from the blob, `in_hunk` flags, fallback to per-hunk when no blob) + anchor-safety (`buffer.zig`); `Session.blobs` alloc (`session.zig`).
 
-_Follow-up (M17):_ add the **removed-file** old-side splice and live blob shape checks. Whole-file remains demand-loaded for the focused File; M17 also owns the measurement gate for bounded prefetch.
+_Follow-through (M17):_ removed Files now use the old-side WholeFile splice, and the opt-in live checker validates both blob sides. WholeFile remains demand-loaded for the focused File, with one-successor remote prefetch after explicit forward File traversal.
 
 ## M10 — Pending review: submission & failures  ·  M  ·  ✅ done
 - [x] `Submission`: topological order, temp-id → CommentId remap. ✅ `src/review/submission.zig` — a pure, clock-free state machine (`advance` returns the next action as data — post/wait/done/aborted — `report` feeds outcomes back). Reply parents remap to the parent's freshly-posted `CommentId` (or a `Parent.comment`'s existing id). The network is the new `CommentPoster` ptr+vtable seam (`Poster` in `src/bitbucket/poster.zig` implements it; `Client.createComment` POSTs).
@@ -125,7 +125,7 @@ _Follow-through (M16):_ the `$EDITOR` handoff, live old-side range probes, Bitbu
 - [x] Grammars: tsx/jsx, css, go, bash, json, yaml + highlight queries. ✅ JavaScript/TypeScript/TSX, CSS, Go, Bash, JSON, and YAML are vendored with commits/checksums and fixture tests; unsupported Files stay plain.
 - [x] Compose syntax foreground over diff background per cell; wire into `Theme`. ✅ Buffer constructs `LineDecoration`s from side-specific Spans + intra-line emphasis; Presentation maps Capture foregrounds while retaining diff/emphasis/cursor backgrounds.
 
-_Delivery notes:_ focused Files enrich lazily off-thread in one old/new pipeline; partial side failures remain usable and report context in the status bar. `[highlight].max_file_bytes` defaults to 2 MiB per side (`0` = unlimited). M17 owns query-predicate support and the `UserGrammar` lifecycle.
+_Delivery notes:_ focused Files enrich lazily off-thread in one old/new pipeline; partial side failures remain usable and report context in the status bar. `[highlight].max_file_bytes` defaults to 2 MiB per side (`0` = unlimited). M17 shipped BuiltInGrammar query predicates and the complete `UserGrammar` lifecycle.
 
 ## M14 — Local / offline review  ·  M/L  ·  ✅ done
 - [x] Explicit `bbr local [base-ref] [source-ref]` entry with no credential requirement: SourceRef defaults to the current Worktree branch; BaseRef defaults to Git's locally recorded remote default and otherwise requires an argument.
@@ -139,7 +139,7 @@ _Delivery notes:_ focused Files enrich lazily off-thread in one old/new pipeline
 
 ## M15 — Presentation & navigation polish  ·  M  ·  ✅ done
 Finish the visible interaction details deferred by M3–M14 before expanding the product surface.
-- [x] File-content cache configuration UX: `[files.cache]` exposes `enabled` and `max_bytes`, defaults to a 256 MiB inactive-content budget, treats zero as unlimited, excludes the focused File, and cleanly rejects the pre-release superseded key. User documentation distinguishes retention from `[highlight].max_file_bytes`; M17 separately decides whether to add persistent disk caching.
+- [x] File-content cache configuration UX: `[files.cache]` exposes `enabled` and `max_bytes`, defaults to a 256 MiB inactive-content budget, treats zero as unlimited, excludes the focused File, and cleanly rejects the pre-release superseded key. User documentation distinguishes retention from `[highlight].max_file_bytes`; M17 rejected persistent disk caching because measured one-successor prefetch removes the demonstrated delay without storing reviewed source code.
 - [x] Resolved threads: show a persistent collapsed disclosure indicator with the reply count, expanding the whole Thread on demand. Updated the Thread glossary and replaced global `show_resolved` visibility with Session-scoped disclosure state.
 - [x] Make context Folds and per-file Outdated sections independently collapsible and re-collapsible. Expansion survives Buffer rebuilds and clears on Session replacement.
 - [x] Layout polish: Frame-owned borders and joined section rules around Panes and restrained single-line framing for Overlays, styled via the active `Theme`.
@@ -169,17 +169,19 @@ acceptance criteria already live in `.scratch/review-item-mutation/issues/`.
 - [x] Add deterministic integration coverage for the async Submission worker/event glue and vaxis selection input, including recovery and stale-epoch rejection.
 - [x] Live-probe old-side multi-line Comment ranges and document the observed Bitbucket UI behavior for multi-line Suggestions; keep unsupported behavior out of the UI.
 
-## M17 — Diff, blob & highlighting completeness  ·  M/L  ·  needs M13
+## M17 — Diff, blob & highlighting completeness  ·  M/L  ·  ✅ done
 Close fidelity gaps in the shared remote/local rendering pipeline.
-- [ ] Detect binary Files from diff stubs and non-UTF-8 blobs, suppress text enrichment, and render a clear size/status placeholder. Treat terminal image protocols as a separately gated stretch, not baseline behavior.
-- [ ] Fetch the old-side blob for removed Files and splice a true whole-file deletion view. Add an opt-in live shape check for both old- and new-side Bitbucket blob endpoints; fixtures remain the hermetic test tier.
-- [ ] Replace index-based removed/added pairing in side-by-side change blocks with tested line-level matching so insertions do not misalign the rest of a block.
-- [ ] Add a user-toggleable DiffPane word-wrapping mode for long diff lines, defaulting to the current clipped presentation when disabled. Wrapped visual rows must preserve diff styling, side-by-side boundaries, cursor/selection navigation, and comment anchoring.
-- [ ] Decide whether Bitbucket `diffstat` adds metadata the parsed Diff cannot supply. Implement paginated `getDiffStat` only for a concrete consumer; otherwise record the M1 deferral as obsolete.
-- [ ] Evaluate focused-only whole-file fetching against sequential all-file review. Keep demand loading as the baseline, and add bounded prefetch only if measurements show it improves navigation without defeating the File cache budget.
-- [ ] Evaluate and implement the tree-sitter query predicates needed by the built-in queries, with fixtures proving captures are neither silently dropped nor incorrectly applied.
-- [ ] Deliver the `UserGrammar` workflow anticipated by ADR-0009: installation/update/removal, trust and ABI checks, query validation, ordered GrammarMatch configuration, and cache lifecycle without changing the `Highlighter` seam.
-- [ ] Decide whether a persistent disk cache earns its storage/invalidation complexity; document a no-go decision or introduce it behind the existing in-memory File cache policy.
+- [x] Detect binary Files from diff stubs and non-UTF-8 blobs, suppress text enrichment, and render a clear size/status placeholder. Treat terminal image protocols as a separately gated stretch, not baseline behavior.
+- [x] Fetch the old-side blob for removed Files and splice a true whole-file deletion view. Add an opt-in live shape check for both old- and new-side Bitbucket blob endpoints; fixtures remain the hermetic test tier.
+- [x] Replace index-based removed/added pairing in side-by-side change blocks with tested line-level matching so insertions do not misalign the rest of a block.
+- [x] Add a user-toggleable DiffPane word-wrapping mode for long diff lines, defaulting to the current clipped presentation when disabled. Wrapped visual rows must preserve diff styling, side-by-side boundaries, cursor/selection navigation, and comment anchoring.
+- [x] Decide whether Bitbucket `diffstat` adds metadata the parsed Diff cannot supply. Implement paginated `getDiffStat` only for a concrete consumer; otherwise record the M1 deferral as obsolete.
+- [x] Evaluate focused-only whole-file fetching against sequential all-file review. Keep demand loading as the baseline, and add bounded prefetch only if measurements show it improves navigation without defeating the File cache budget.
+- [x] Evaluate and implement the tree-sitter query predicates needed by the built-in queries, with fixtures proving captures are neither silently dropped nor incorrectly applied.
+- [x] Deliver the `UserGrammar` workflow anticipated by ADR-0009: installation/update/removal, trust and ABI checks, query validation, ordered GrammarMatch configuration, and cache lifecycle without changing the `Highlighter` seam.
+- [x] Decide whether a persistent disk cache earns its storage/invalidation complexity; document a no-go decision or introduce it behind the existing in-memory File cache policy.
+
+M17 verification: all 27 tickets are resolved or done. `zig build test --summary all` passed 649/649 tests. Native macOS and Linux jobs passed on `x86_64` and `aarch64`, including RE2, dynamic UserGrammar loading, the CLI lifecycle, and the complete hermetic suite.
 
 ## M18 — Local-review expansion  ·  L  ·  needs M14
 Address the workflows intentionally excluded from the committed-ref MVP.
