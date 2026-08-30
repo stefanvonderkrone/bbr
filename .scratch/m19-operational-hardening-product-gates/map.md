@@ -4,7 +4,7 @@ Label: wayfinder:map
 
 ## Destination
 
-An implementation-ready M19 specification and dependency map that resolves CI policy, Credential containment, corporate proxy support, Session load concurrency, and remote PullRequest lifecycle Actions without implementing the milestone.
+An implementation-ready M19 specification and dependency map that resolves CI policy, bbr version identity, Credential containment, corporate proxy support, Session load concurrency, and remote PullRequest lifecycle Actions without implementing the milestone.
 
 ## Notes
 
@@ -23,7 +23,7 @@ An implementation-ready M19 specification and dependency map that resolves CI po
 
 ## Not yet specified
 
-- The dependency-ordered implementation slices and integrated acceptance matrix depend on the CI, proxy, loading, and lifecycle-Action decisions.
+- The dependency-ordered implementation slices and integrated acceptance matrix depend on the CI, version identity, proxy, loading, and lifecycle-Action decisions.
 - Documentation changes depend on the selected Credential injection and transport policies.
 
 ## Out of scope

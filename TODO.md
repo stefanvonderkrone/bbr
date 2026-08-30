@@ -193,6 +193,7 @@ Address the workflows intentionally excluded from the committed-ref MVP.
 ## M19 — Operational hardening & product gates  ·  S/M  ·  needs M14
 Turn the remaining environment-dependent questions into measured decisions.
 - [ ] Add CI for `zig build test` on Zig 0.16.0 plus `zig fmt --check`; keep live Bitbucket checks opt-in and credential-gated.
+- [ ] Define a reproducible CalVer identity for bbr builds, including the date source, commit hash, release tags, dirty-worktree behavior, and user-visible version output.
 - [ ] Rotate the API token currently present in plaintext `opencode.jsonc`, remove it from tracked/local plaintext configuration, and document environment/keychain injection without logging secret values.
 - [ ] Identify the corporate proxy/authentication type and run a representative connectivity check. Add a libcurl adapter only if `std.http.Client` cannot support the observed requirement; otherwise close the fallback decision.
 - [ ] Benchmark sequential versus parallel PR/diff/comment loading against the live API, including TLS handshakes and rate-limit behavior. Implement fan-out and order-independent fakes only when the measured latency gain justifies the second connection.
