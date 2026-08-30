@@ -17,6 +17,7 @@ An implementation-ready M19 specification and dependency map that resolves CI po
 
 ## Decisions so far
 
+- [Contain the exposed Credential](./issues/01-contain-the-exposed-credential.md): Both exposed Atlassian tokens are revoked, plaintext copies are removed, and `bbr` receives its replacement token from macOS Keychain.
 - [Research Bitbucket PullRequest lifecycle Actions](./issues/07-research-bitbucket-lifecycle-actions.md): Gate every Action on the current SourceCommit, confirm high-impact Actions, and reconcile uncertain results before retry.
 
 ## Not yet specified
