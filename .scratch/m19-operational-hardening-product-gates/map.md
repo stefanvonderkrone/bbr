@@ -20,6 +20,7 @@ An implementation-ready M19 specification and dependency map that resolves CI po
 - [Contain the exposed Credential](./issues/01-contain-the-exposed-credential.md): Both exposed Atlassian tokens are revoked, plaintext copies are removed, and `bbr` receives its replacement token from macOS Keychain.
 - [Define the M19 CI gate](./issues/02-define-the-ci-gate.md): Require four native macOS and Linux checks with exact Zig and action pins, bounded target caches, one Linux format step, and no live Credentials.
 - [Research Bitbucket PullRequest lifecycle Actions](./issues/07-research-bitbucket-lifecycle-actions.md): Gate every Action on the current SourceCommit, confirm high-impact Actions, and reconcile uncertain results before retry.
+- [Identify the corporate proxy requirement](./issues/03-identify-the-corporate-proxy-requirement.md): The representative environment needs no proxy, and `StdHttpClient` reached Bitbucket Cloud through direct HTTPS.
 
 ## Not yet specified
 
