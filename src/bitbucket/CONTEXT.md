@@ -27,7 +27,7 @@ The unified-diff text returned by the diff endpoint. The authoritative input to 
 _Avoid_: patch, diff text.
 
 **ApiError**:
-A classified failure from an API call, distinct from a transport error: `network`, `rate_limited`, `server`, `unauthorized`, `forbidden`, `bad_request`, `not_found`, `conflict`. The classification, not the raw status code, drives retry/abort/continue decisions.
+A classified Bitbucket response failure, distinct from a transport error: `rate_limited`, `server`, `unauthorized`, `forbidden`, `bad_request`, `not_found`, `conflict`. The classification, not the raw status code, drives retry, abort, or continue decisions.
 _Avoid_: HTTP error, status, exception.
 
 **Credential**:
