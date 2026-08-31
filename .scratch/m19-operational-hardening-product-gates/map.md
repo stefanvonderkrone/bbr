@@ -26,11 +26,11 @@ An implementation-ready M19 specification and dependency map that resolves CI po
 - [Choose the Session load policy](./issues/06-choose-the-session-load-policy.md): Use two-request Candidate Session fan-out only if the full Zig load clears a 30 percent live median-latency gate on both representative PullRequests.
 - [Decide PullRequest lifecycle Action product scope](./issues/08-decide-lifecycle-action-product-scope.md): Add a three-state Reviewer Verdict for Approved, Changes Requested, and No Verdict; keep merge and decline as durable non-goals.
 - [Define the bbr version identity](./issues/10-define-the-bbr-version-identity.md): Use a reproducible, Zig-compatible CalVer from the UTC commit date, same-day release sequence, and 12-character commit hash.
+- [Define the integrated M19 contract](./issues/09-define-the-integrated-m19-contract.md): Land eight ordered slices with required native CI, reproducible version and release checks, documented Credential handling, gated fan-out, Reviewer Verdict Actions, and one acceptance matrix.
 
 ## Not yet specified
 
-- The dependency-ordered implementation slices and integrated acceptance matrix depend on the CI, version identity, proxy, loading, and lifecycle-Action decisions.
-- Documentation changes depend on the selected Credential injection and transport policies.
+None.
 
 ## Out of scope
 
