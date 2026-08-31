@@ -23,6 +23,7 @@ An implementation-ready M19 specification and dependency map that resolves CI po
 - [Identify the corporate proxy requirement](./issues/03-identify-the-corporate-proxy-requirement.md): The representative environment needs no proxy, and `StdHttpClient` reached Bitbucket Cloud through direct HTTPS.
 - [Choose the Bitbucket HTTP transport](./issues/04-choose-the-bitbucket-http-transport.md): Keep `StdHttpClient` as the only production adapter, retain environment proxy loading, and add no libcurl dependency without a measured need.
 - [Measure Session load concurrency](./issues/05-measure-session-load-concurrency.md): Two-connection fan-out cut median live acquisition latency by 47.6% and 72.4% across two PullRequests, with one extra 31 ms TLS handshake and no failures or rate-limit responses.
+- [Choose the Session load policy](./issues/06-choose-the-session-load-policy.md): Use two-request Candidate Session fan-out only if the full Zig load clears a 30 percent live median-latency gate on both representative PullRequests.
 
 ## Not yet specified
 
