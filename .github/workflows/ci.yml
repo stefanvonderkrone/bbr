@@ -1,4 +1,4 @@
-name: Grammar Targets
+name: CI
 
 on:
   pull_request:
@@ -9,9 +9,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  grammar-target:
-    name: ${{ matrix.target }}
+  test:
+    name: test (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
@@ -36,10 +40,14 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: step-security/setup-zig@v2.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: step-security/setup-zig@1e9fbd457bcc3587b58845344a267f12f151709c # v2.2.2
         with:
           version: 0.16.0
+          cache-key: ${{ matrix.target }}
+          cache-size-limit: 2048
       - name: Verify native target
         env:
           EXPECTED_OS: ${{ matrix.runner_os }}
@@ -47,6 +55,9 @@ jobs:
         run: |
           test "$RUNNER_OS" = "$EXPECTED_OS"
           test "$RUNNER_ARCH" = "$EXPECTED_ARCH"
+      - name: Check formatting
+        if: matrix.target == 'linux-x86_64'
+        run: zig fmt --check build.zig src tests
       - name: RE2 wrapper
         run: zig build test-re2 --summary all
       - name: Dynamic UserGrammar load
