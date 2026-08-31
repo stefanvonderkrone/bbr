@@ -18,6 +18,10 @@ _Avoid_: repo slug (that's just the identifier), project.
 A proposed set of changes from a source branch to a destination branch, identified by a `PullRequestId` (integer, unique per Repository). The aggregate root a review is about.
 _Avoid_: PR (fine in prose, not as a type name), merge request, changeset.
 
+**PullRequest Author**:
+The Bitbucket account that opened the PullRequest. This account cannot set a Reviewer Verdict on its own PullRequest.
+_Avoid_: reviewer, owner (the Workspace owns the Repository).
+
 **SourceCommit**:
 The head commit hash of the PR's source branch at the moment we loaded it. Captured so we can detect that the PR "moved under us" before submitting.
 _Avoid_: head, tip, revision.
@@ -37,6 +41,10 @@ _Avoid_: password, app password, secret, key.
 **Authenticated Account**:
 The Bitbucket account proven by the current Credential, identified for mutation ownership by its UUID. Acquisition is an independent capability: failure to acquire it does not fail Review loading, but published Comment mutation remains unavailable until ownership can be proven. A `401` invalidates the cached identity.
 _Avoid_: reviewer identity (a reviewer may read without proven mutation ownership), display name, credential owner.
+
+**Reviewer Verdict**:
+The Authenticated Account's current review decision for a PullRequest: Approved, Changes Requested, or No Verdict. Setting No Verdict removes the account's current Approved or Changes Requested state. A PullRequest Author cannot set a Reviewer Verdict on that PullRequest.
+_Avoid_: approval state (omits Changes Requested), participant state (Bitbucket wire vocabulary), review status (too broad).
 
 ## API quirks (verified against live PRs)
 
