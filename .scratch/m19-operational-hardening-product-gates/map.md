@@ -25,6 +25,7 @@ An implementation-ready M19 specification and dependency map that resolves CI po
 - [Measure Session load concurrency](./issues/05-measure-session-load-concurrency.md): Two-connection fan-out cut median live acquisition latency by 47.6% and 72.4% across two PullRequests, with one extra 31 ms TLS handshake and no failures or rate-limit responses.
 - [Choose the Session load policy](./issues/06-choose-the-session-load-policy.md): Use two-request Candidate Session fan-out only if the full Zig load clears a 30 percent live median-latency gate on both representative PullRequests.
 - [Decide PullRequest lifecycle Action product scope](./issues/08-decide-lifecycle-action-product-scope.md): Add a three-state Reviewer Verdict for Approved, Changes Requested, and No Verdict; keep merge and decline as durable non-goals.
+- [Define the bbr version identity](./issues/10-define-the-bbr-version-identity.md): Use a reproducible, Zig-compatible CalVer from the UTC commit date, same-day release sequence, and 12-character commit hash.
 
 ## Not yet specified
 
