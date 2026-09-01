@@ -31,6 +31,7 @@ pub const StdHttpClient = struct {
         arena: Allocator,
         environ_map: *const std.process.Environ.Map,
     ) !void {
+        try validateProxyEnvironment(environ_map);
         try self.inner.initDefaultProxies(arena, environ_map);
     }
 
@@ -96,7 +97,7 @@ pub const StdHttpClient = struct {
 
         const response_body = try body.toOwnedSlice();
         if (isSubmissionRequest(req))
-            writeSubmitResponse(self.inner.io, .cwd(), req.method, req.url, status, response_body) catch {};
+            writeSubmitResponse(self.inner.io, .cwd(), req.method, req.url, status) catch {};
 
         return .{
             .status = status,
@@ -115,6 +116,32 @@ pub const StdHttpClient = struct {
     }
 };
 
+fn validateProxyEnvironment(environ_map: *const std.process.Environ.Map) !void {
+    const proxy_names = [_][]const u8{
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+    };
+    for (proxy_names) |name| {
+        const value = environ_map.get(name) orelse continue;
+        if (value.len == 0) continue;
+        const uri = std.Uri.parse(value) catch std.Uri.parseAfterScheme("http", value) catch
+            return error.InvalidProxyConfiguration;
+        if (uri.host == null or
+            !(std.mem.eql(u8, uri.scheme, "http") or std.mem.eql(u8, uri.scheme, "https")))
+            return error.InvalidProxyConfiguration;
+    }
+    const bypass_names = [_][]const u8{ "no_proxy", "NO_PROXY" };
+    for (bypass_names) |name| {
+        if (environ_map.get(name)) |value| {
+            if (value.len != 0) return error.InvalidProxyConfiguration;
+        }
+    }
+}
+
 fn isSubmissionRequest(req: Request) bool {
     return std.mem.indexOf(u8, req.url, "/comments") != null and (req.method == .POST or req.method == .GET);
 }
@@ -128,18 +155,16 @@ fn methodName(method: client.Method) []const u8 {
     };
 }
 
-fn writeSubmitResponse(io: Io, dir: Io.Dir, method: client.Method, url: []const u8, status: u16, body: []const u8) !void {
+fn writeSubmitResponse(io: Io, dir: Io.Dir, method: client.Method, url: []const u8, status: u16) !void {
     var file = try dir.createFile(io, "bbr-submit-response.log", .{ .truncate = false, .lock = .exclusive, .permissions = @enumFromInt(0o600) });
     defer file.close(io);
     var offset = try file.length(io);
     try appendLog(file, io, &offset, methodName(method));
     try appendLog(file, io, &offset, " ");
-    try appendLog(file, io, &offset, url);
+    try appendRequestLocation(file, io, &offset, url);
     var status_buffer: [32]u8 = undefined;
     const status_line = try std.fmt.bufPrint(&status_buffer, "\nstatus: {d}\n", .{status});
     try appendLog(file, io, &offset, status_line);
-    try appendLog(file, io, &offset, body);
-    try appendLog(file, io, &offset, "\n");
 }
 
 fn writeSubmitError(io: Io, dir: Io.Dir, method: client.Method, url: []const u8, err: anyerror) !void {
@@ -148,10 +173,30 @@ fn writeSubmitError(io: Io, dir: Io.Dir, method: client.Method, url: []const u8,
     var offset = try file.length(io);
     try appendLog(file, io, &offset, methodName(method));
     try appendLog(file, io, &offset, " ");
-    try appendLog(file, io, &offset, url);
+    try appendRequestLocation(file, io, &offset, url);
     try appendLog(file, io, &offset, "\ntransport error: ");
     try appendLog(file, io, &offset, @errorName(err));
     try appendLog(file, io, &offset, "\n");
+}
+
+fn appendRequestLocation(file: Io.File, io: Io, offset: *u64, url: []const u8) !void {
+    const uri = std.Uri.parse(url) catch {
+        return appendLog(file, io, offset, "<invalid request location>");
+    };
+    try appendLog(file, io, offset, uri.scheme);
+    try appendLog(file, io, offset, "://");
+    try appendLog(file, io, offset, componentText(uri.host orelse return error.InvalidRequestLocation));
+    if (uri.port) |port| {
+        var port_buffer: [8]u8 = undefined;
+        try appendLog(file, io, offset, try std.fmt.bufPrint(&port_buffer, ":{d}", .{port}));
+    }
+    try appendLog(file, io, offset, componentText(uri.path));
+}
+
+fn componentText(component: std.Uri.Component) []const u8 {
+    return switch (component) {
+        .raw, .percent_encoded => |text| text,
+    };
 }
 
 fn appendLog(file: Io.File, io: Io, offset: *u64, bytes: []const u8) !void {
@@ -259,16 +304,72 @@ test "Retry-After header matching is case-insensitive" {
     try std.testing.expectEqual(@as(?u64, 7_000), retryAfterFromHead(head, 0));
 }
 
-test "Comment POST response is written to the submit response log" {
+test "default proxies load lowercase and uppercase standard variables" {
+    const testing = std.testing;
+    const cases = [_]struct { name: []const u8, http: bool, https: bool }{
+        .{ .name = "http_proxy", .http = true, .https = false },
+        .{ .name = "HTTP_PROXY", .http = true, .https = false },
+        .{ .name = "https_proxy", .http = false, .https = true },
+        .{ .name = "HTTPS_PROXY", .http = false, .https = true },
+        .{ .name = "all_proxy", .http = true, .https = true },
+        .{ .name = "ALL_PROXY", .http = true, .https = true },
+    };
+    for (cases) |case| {
+        var environment = std.process.Environ.Map.init(testing.allocator);
+        defer environment.deinit();
+        try environment.put(case.name, "http://proxy.example:8080");
+        var transport = StdHttpClient.init(testing.allocator, testing.io);
+        defer transport.deinit();
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+
+        try transport.initDefaultProxies(arena.allocator(), &environment);
+
+        try testing.expectEqual(case.http, transport.inner.http_proxy != null);
+        try testing.expectEqual(case.https, transport.inner.https_proxy != null);
+        if (transport.inner.http_proxy) |proxy|
+            try testing.expectEqualStrings("proxy.example", proxy.host.bytes);
+        if (transport.inner.https_proxy) |proxy|
+            try testing.expectEqualStrings("proxy.example", proxy.host.bytes);
+    }
+}
+
+test "invalid and unsupported proxy configuration stops without a direct fallback" {
+    const testing = std.testing;
+    const cases = [_]struct { name: []const u8, value: []const u8 }{
+        .{ .name = "HTTP_PROXY", .value = "ftp://proxy.example" },
+        .{ .name = "https_proxy", .value = "http://[" },
+        .{ .name = "NO_PROXY", .value = "api.bitbucket.org" },
+    };
+    for (cases) |case| {
+        var environment = std.process.Environ.Map.init(testing.allocator);
+        defer environment.deinit();
+        try environment.put(case.name, case.value);
+        var transport = StdHttpClient.init(testing.allocator, testing.io);
+        defer transport.deinit();
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+
+        try testing.expectError(
+            error.InvalidProxyConfiguration,
+            transport.initDefaultProxies(arena.allocator(), &environment),
+        );
+        try testing.expect(transport.inner.http_proxy == null);
+        try testing.expect(transport.inner.https_proxy == null);
+    }
+}
+
+test "submission diagnostics omit credentials query values and response bodies" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeSubmitResponse(std.testing.io, tmp.dir, .POST, "https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/1/comments", 201, "{\"id\":42}");
-    try writeSubmitResponse(std.testing.io, tmp.dir, .GET, "https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/1/comments?page=2", 200, "{\"values\":[]}");
+    try writeSubmitResponse(std.testing.io, tmp.dir, .POST, "https://account:credential@api.bitbucket.org/2.0/comments?token=credential", 201);
+    try writeSubmitError(std.testing.io, tmp.dir, .GET, "https://api.bitbucket.org/2.0/comments?access_token=credential", error.ConnectionResetByPeer);
     const logged = try tmp.dir.readFileAlloc(std.testing.io, "bbr-submit-response.log", std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(logged);
     try std.testing.expectEqualStrings(
-        "POST https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/1/comments\nstatus: 201\n{\"id\":42}\nGET https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/1/comments?page=2\nstatus: 200\n{\"values\":[]}\n",
+        "POST https://api.bitbucket.org/2.0/comments\nstatus: 201\nGET https://api.bitbucket.org/2.0/comments\ntransport error: ConnectionResetByPeer\n",
         logged,
     );
+    try std.testing.expect(std.mem.indexOf(u8, logged, "credential") == null);
 }

@@ -1,16 +1,18 @@
 # External dependencies sit behind swappable seams
 
-The three external-facing dependencies — the HTTP client, the pending-review store, and the
-syntax highlighter — are each accessed only through a narrow interface (vtable erasure, the
-same idiom as `std.mem.Allocator`). Concretely: `HttpClient` (`std.http.Client` now, libcurl
-later), `PendingReviewStore` (SQLite/libSQL now), and `Highlighter` (plain now, tree-sitter later).
+The HTTP client, the pending-review store, and the syntax highlighter each use a narrow
+interface. The interfaces use the same vtable-erasure form as `std.mem.Allocator`.
+The interfaces are `HttpClient`, `PendingReviewStore`, and `Highlighter`.
 
 ## Why
 
-- **std.http.Client** covers the common proxy case (env-var autoload, CONNECT tunneling,
-  Basic-auth proxies) with zero C dependencies, but *cannot* handle NTLM/Kerberos or
-  TLS-intercepting corporate proxies. If check24's network turns out to need those, libcurl
-  swaps in behind the seam without touching the Bitbucket adapter.
+- `std.http.Client` loads standard proxy environment variables. It supports CONNECT tunnels
+  and Basic proxy authentication without a C dependency.
+- The representative corporate environment needs no proxy, proxy authentication, or TLS
+  interception. A live `StdHttpClient` check reached Bitbucket Cloud through direct HTTPS.
+  A libcurl adapter would add a C dependency without meeting a measured requirement.
+- `std.http.Client` does not support proxy bypass lists, NTLM, or Kerberos. A future measured
+  requirement for one of these features can replace `StdHttpClient` behind `HttpClient`.
 - Every seam has a **fake implementation** (canned JSON, in-memory store, no-op highlighter),
   which is what makes the domain logic — diff parsing, thread building, submission ordering,
   failure handling — testable with no network, no disk, and no C toolchain. This is the
@@ -18,5 +20,8 @@ later), `PendingReviewStore` (SQLite/libSQL now), and `Highlighter` (plain now, 
 
 ## Consequences
 
-Callers depend on the interface by value; the concrete implementation is chosen at one
-construction site (or a `build.zig` option). Swapping any of the three is a localized change.
+`StdHttpClient` is the only production `HttpClient` adapter. It rejects invalid or unsupported
+proxy configuration before a request and never retries through a direct connection.
+
+Callers depend on each interface by value. Production chooses each implementation at its
+construction site. `HttpClient` remains the replacement boundary for a future measured need.

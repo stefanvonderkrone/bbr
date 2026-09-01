@@ -1,4 +1,4 @@
-# M16 operations
+# Operations
 
 M16 hardens review-item mutation and Submission around one rule: Presentation
 authorizes work and owns projection, Review owns local mutation and Submission
@@ -107,3 +107,39 @@ It creates a uniquely marked Review-level Comment, fetches it, verifies stable
 identity, author UUID, body, and CommentScope, updates only its body, verifies it
 again, deletes it, and accepts either absence or a valid Deleted Comment. Cleanup
 is best-effort on every post-create failure. Credential material is never logged.
+
+## Credential-gated checks
+
+Remote checks read these three environment variables:
+
+- `BITBUCKET_USERNAME` contains the Atlassian account email.
+- `BITBUCKET_TOKEN` contains the Atlassian API token.
+- `BITBUCKET_WORKSPACE` contains the Bitbucket Workspace.
+
+Do not store these values in the repository or type them on a command line. On macOS,
+store each value as a generic password with Keychain Access. Then use this launch pattern:
+
+```sh
+env \
+  BITBUCKET_USERNAME="$(security find-generic-password -w -s '<username-service>' -a '<keychain-account>')" \
+  BITBUCKET_TOKEN="$(security find-generic-password -w -s '<token-service>' -a '<keychain-account>')" \
+  BITBUCKET_WORKSPACE="$(security find-generic-password -w -s '<workspace-service>' -a '<keychain-account>')" \
+  zig build check -- <repository> <pull-request-id>
+```
+
+Replace only the placeholders. Do not enable shell tracing for this command. Shell tracing can
+print the values after command substitution.
+
+## Proxy behavior
+
+`StdHttpClient` reads `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` through
+`initDefaultProxies`. It also reads their lowercase forms. bbr has no proxy setting.
+
+An invalid proxy URL stops startup. Unsupported proxy schemes and non-empty `NO_PROXY` or
+`no_proxy` values also stop startup. bbr does not retry through a direct connection.
+
+## CI and live checks
+
+Required CI receives no Credential. It runs only the hermetic suite and native build checks.
+Direct connectivity, blob, Comment mutation, Reviewer Verdict mutation, and all other live
+checks remain explicit local opt-ins. GitHub Actions does not run these checks.

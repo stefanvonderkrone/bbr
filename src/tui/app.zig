@@ -613,7 +613,10 @@ fn presentationPostWorker(
     defer scratch.deinit();
     var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
     defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {
+        presentation_runtime.rejectPostLaunch(presentationSink(&sink_context), command);
+        return;
+    };
     const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     var poster = bbr.bitbucket.Poster{
         .client = client,
@@ -637,7 +640,10 @@ fn presentationCommentEditWorker(
     defer scratch.deinit();
     var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
     defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {
+        presentation_runtime.rejectCommentEditLaunch(presentationSink(&sink_context), command);
+        return;
+    };
     const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     presentation_runtime.executeCommentEdit(presentationSink(&sink_context), command, client);
 }
@@ -655,7 +661,10 @@ fn presentationCommentDeleteWorker(
     defer scratch.deinit();
     var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
     defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {
+        presentation_runtime.rejectCommentDeleteLaunch(presentationSink(&sink_context), command);
+        return;
+    };
     const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     presentation_runtime.executeCommentDelete(presentationSink(&sink_context), command, client);
 }
@@ -711,7 +720,7 @@ fn presentationEnrichmentWorker(
         .remote => blk: {
             var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
             defer http.deinit();
-            http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+            http.initDefaultProxies(scratch.allocator(), env_map) catch break :blk .{ .failed = .launch_failed };
             const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
             break :blk if (file_enrichment.enrich(
                 std.heap.page_allocator,
@@ -762,7 +771,15 @@ fn presentationRecoveryCheckWorker(
     defer scratch.deinit();
     var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
     defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {
+        presentation_runtime.deliver(presentationSink(&sink_context), .{ .recovery_checked = .{
+            .command_id = check.command_id,
+            .operation_id = check.operation_id,
+            .identity = check.identity,
+            .outcome = .failed,
+        } });
+        return;
+    };
     const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     const input = if (client.getPullRequest(scratch.allocator(), check.identity.repository(), check.identity.pullRequestId())) |pr|
         presentation.recoveryCheckSucceeded(check.command_id, check.operation_id, check.identity, pr.source_commit)
@@ -785,7 +802,16 @@ fn presentationDuplicateCheckWorker(
     defer scratch.deinit();
     var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
     defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {
+        presentation_runtime.deliver(presentationSink(&sink_context), .{ .duplicate_checked = .{
+            .command_id = command.command_id,
+            .operation_id = command.operation_id,
+            .identity = command.identity,
+            .temp_id = command.draft.local_id,
+            .outcome = .failed,
+        } });
+        return;
+    };
     const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     const author_uuid = client.getAuthenticatedAccountUuid(scratch.allocator()) catch {
         presentation_runtime.deliver(presentationSink(&sink_context), .{ .duplicate_checked = .{
@@ -839,11 +865,7 @@ fn presentationListPullRequestsWorker(
         } });
         return;
     };
-    var http = bbr.http.StdHttpClient.init(summaries.arena.allocator(), io);
-    defer http.deinit();
-    http.initDefaultProxies(summaries.arena.allocator(), env_map) catch {};
-    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
-    summaries.prs = client.listPullRequests(summaries.arena.allocator(), command.repositoryName(), .{}) catch {
+    loadPullRequestSummaries(io, env_map, cred, command.repositoryName(), summaries) catch {
         summaries.destroy();
         presentation_runtime.deliver(presentationSink(&sink_context), .{ .pull_requests_loaded = .{
             .command_id = command.command_id,
@@ -857,6 +879,20 @@ fn presentationListPullRequestsWorker(
         .work_id = command.work_id,
         .outcome = .{ .loaded = summaries },
     } });
+}
+
+fn loadPullRequestSummaries(
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+    cred: Credential,
+    repository: []const u8,
+    summaries: *presentation.PullRequestSummaries,
+) !void {
+    var http = bbr.http.StdHttpClient.init(summaries.arena.allocator(), io);
+    defer http.deinit();
+    try http.initDefaultProxies(summaries.arena.allocator(), env_map);
+    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
+    summaries.prs = try client.listPullRequests(summaries.arena.allocator(), repository, .{});
 }
 
 fn drainPresentationCommands(

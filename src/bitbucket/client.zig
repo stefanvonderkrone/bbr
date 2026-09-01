@@ -997,6 +997,14 @@ test "status codes map to the right ApiError" {
     }
 }
 
+test "transport failures remain distinct from ApiError values and are not retried" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .send_error = error.ConnectionResetByPeer };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    try testing.expectError(error.ConnectionResetByPeer, bb.getPullRequest(a, "myrepo", 1));
+    try testing.expectEqual(@as(usize, 1), fake.call_count);
+}
+
 test "malformed 2xx body is a MalformedResponse" {
     const a = testing.allocator;
     var fake: FakeHttpClient = .{ .status = 200, .body = "{ not json" };

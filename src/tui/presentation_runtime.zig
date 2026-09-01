@@ -64,8 +64,16 @@ pub fn executeCommentEdit(sink: CompletionSink, command: *presentation.UpdateCom
     deliver(sink, adapter.executeCommentEdit(command, client));
 }
 
+pub fn rejectCommentEditLaunch(sink: CompletionSink, command: *presentation.UpdateComment) void {
+    deliver(sink, adapter.commentEditLaunchFailed(command));
+}
+
 pub fn executeCommentDelete(sink: CompletionSink, command: *presentation.DeleteComment, client: bbr.bitbucket.Client) void {
     deliver(sink, adapter.executeCommentDelete(command, client));
+}
+
+pub fn rejectCommentDeleteLaunch(sink: CompletionSink, command: *presentation.DeleteComment) void {
+    deliver(sink, adapter.commentDeleteLaunchFailed(command));
 }
 
 const std = @import("std");
