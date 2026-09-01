@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const bbr = @import("bbr");
+const build_options = @import("build_options");
 const app = @import("tui/app.zig");
 const session = @import("tui/session.zig");
 const persist = @import("persist/sqlite_store.zig");
@@ -24,6 +25,15 @@ pub fn main(init: std.process.Init) !void {
     var it = init.minimal.args.iterate();
     _ = it.next(); // executable name
     const first = it.next();
+
+    if (first) |argument| {
+        if (std.mem.eql(u8, argument, "--version")) {
+            var output_buffer: [128]u8 = undefined;
+            var stdout = std.Io.File.stdout().writer(init.io, &output_buffer);
+            try stdout.interface.print("bbr {s}\n", .{build_options.version});
+            return stdout.interface.flush();
+        }
+    }
 
     // `demo` needs no credentials: it feeds synthetic data through the real
     // buffer/renderer so the comment UI can be exercised entirely offline.

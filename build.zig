@@ -1,8 +1,10 @@
 const std = @import("std");
+const version_identity = @import("build/version.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const version = resolveVersion(b);
 
     // The network-free core, exposed as the `bbr` module (no TUI deps → testable).
     const mod = b.addModule("bbr", .{
@@ -27,6 +29,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zf", .module = zf.module("zf") },
         },
     });
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+    exe_mod.addOptions("build_options", build_options);
     addSqlite(b, exe_mod);
     addTreeSitter(b, exe_mod);
     addRe2(b, exe_mod, target);
@@ -75,6 +80,22 @@ pub fn build(b: *std.Build) void {
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    const version_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build/version.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_version_tests = b.addRunArtifact(version_tests);
+    const version_command = b.addRunArtifact(exe);
+    version_command.addArg("--version");
+    inline for (.{ "BITBUCKET_USERNAME", "BITBUCKET_TOKEN", "BITBUCKET_WORKSPACE", "HOME", "XDG_CONFIG_HOME" }) |name| {
+        version_command.removeEnvironmentVariable(name);
+    }
+    version_command.expectStdOutEqual(b.fmt("bbr {s}\n", .{version}));
+    const version_integration = b.addSystemCommand(&.{ "sh", "tests/version_identity_test.sh" });
+    version_integration.setCwd(b.path("."));
 
     const re2_tests = b.addTest(.{
         .name = "re2-wrapper-tests",
@@ -130,7 +151,58 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_version_tests.step);
+    test_step.dependOn(&version_command.step);
+    test_step.dependOn(&version_integration.step);
     test_step.dependOn(&run_lifecycle_test.step);
+}
+
+fn resolveVersion(b: *std.Build) []const u8 {
+    const environment = &b.graph.environ_map;
+    const explicit: version_identity.Explicit = .{
+        .epoch = environment.get("SOURCE_DATE_EPOCH"),
+        .commit = environment.get("BBR_VERSION_COMMIT"),
+        .sequence = environment.get("BBR_VERSION_SEQUENCE"),
+        .dirty = environment.get("BBR_VERSION_DIRTY"),
+    };
+    const git: version_identity.Git = if (explicit.active()) .{} else .{
+        .epoch = runGit(b, &.{ "log", "-1", "--format=%ct", "HEAD" }),
+        .commit = runGit(b, &.{ "rev-parse", "HEAD" }),
+        .tags = runGit(b, &.{ "for-each-ref", "--points-at=HEAD", "--format=%(refname:short)%09%(objecttype)", "refs/tags" }),
+        .status = runGit(b, &.{
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=no",
+            "--",
+            "build.zig",
+            "build.zig.zon",
+            "build",
+            "src",
+            "tests",
+            "vendors",
+            ".github/workflows",
+        }),
+    };
+    return version_identity.resolve(b.allocator, explicit, git) catch |err| switch (err) {
+        error.IncompleteExplicitMetadata => std.process.fatal(
+            "explicit version metadata requires SOURCE_DATE_EPOCH, BBR_VERSION_COMMIT, BBR_VERSION_SEQUENCE, and BBR_VERSION_DIRTY together",
+            .{},
+        ),
+        error.MissingGitMetadata => std.process.fatal(
+            "Git metadata is unavailable; set SOURCE_DATE_EPOCH, BBR_VERSION_COMMIT, BBR_VERSION_SEQUENCE, and BBR_VERSION_DIRTY together",
+            .{},
+        ),
+        else => std.process.fatal("cannot determine bbr version: {s}", .{@errorName(err)}),
+    };
+}
+
+fn runGit(b: *std.Build, arguments: []const []const u8) ?[]const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    argv.appendSlice(b.allocator, &.{ "git", "-C", b.build_root.path orelse "." }) catch @panic("OOM");
+    argv.appendSlice(b.allocator, arguments) catch @panic("OOM");
+    var exit_code: u8 = 0;
+    return b.runAllowFail(argv.items, &exit_code, .ignore) catch null;
 }
 
 fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {

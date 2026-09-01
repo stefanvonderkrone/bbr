@@ -146,6 +146,12 @@ the main thread; the Epoch token still guards against stale results.
 - `b.standardTargetOptions(.{})` / `b.standardOptimizeOption(.{})`.
 - Modules: `b.addModule` / `b.createModule(.{ .root_source_file, .imports })`;
   wire deps with `mod.addImport("vaxis", dep.module("vaxis"))`.
+- Build scripts read the inherited environment from `b.graph.environ_map` (`std/Build.zig:121`).
+  `b.runAllowFail(argv, &exit_code, stderr_behavior)` runs Git during build configuration and
+  returns owned standard output (`std/Build.zig:1862-1900`).
+- `b.addOptions()` creates generated Zig declarations. Add values with
+  `options.addOption(T, name, value)`, then inject them with `module.addOptions(name, options)`
+  (`std/Build/Step/Options.zig:39-45`, `std/Build/Module.zig:340`).
 - Dependencies declared in `build.zig.zon` with `url` + `hash`; consumed via
   `b.dependency(name, .{})` or `b.lazyDependency(name, .{})` (libvaxis uses lazy deps).
 - `minimum_zig_version` in `build.zig.zon` guards the toolchain.
