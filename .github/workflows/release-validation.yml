@@ -1,0 +1,26 @@
+name: Release validation
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: validate identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: step-security/setup-zig@1e9fbd457bcc3587b58845344a267f12f151709c # v2.2.2
+        with:
+          version: 0.16.0
+          use-cache: false
+      - name: Validate release identity
+        run: sh tests/validate_release.sh "$GITHUB_REF_NAME"

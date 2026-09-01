@@ -96,6 +96,8 @@ pub fn build(b: *std.Build) void {
     version_command.expectStdOutEqual(b.fmt("bbr {s}\n", .{version}));
     const version_integration = b.addSystemCommand(&.{ "sh", "tests/version_identity_test.sh" });
     version_integration.setCwd(b.path("."));
+    const release_validation = b.addSystemCommand(&.{ "sh", "tests/release_validation_test.sh" });
+    release_validation.setCwd(b.path("."));
 
     const re2_tests = b.addTest(.{
         .name = "re2-wrapper-tests",
@@ -154,6 +156,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_version_tests.step);
     test_step.dependOn(&version_command.step);
     test_step.dependOn(&version_integration.step);
+    test_step.dependOn(&release_validation.step);
     test_step.dependOn(&run_lifecycle_test.step);
 }
 
