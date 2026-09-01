@@ -13,6 +13,7 @@ const Response = client.Response;
 
 pub const StdHttpClient = struct {
     inner: http.Client,
+    max_connection_count: std.atomic.Value(usize) = .init(0),
 
     /// `gpa` must be thread-safe (std.http.Client requires it). `io` is the
     /// runtime's `Io` (the default is backed by `std.Io.Threaded`).
@@ -37,6 +38,10 @@ pub const StdHttpClient = struct {
 
     pub fn httpClient(self: *StdHttpClient) HttpClient {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    pub fn maxConnectionCount(self: *StdHttpClient) usize {
+        return self.max_connection_count.load(.acquire);
     }
 
     const vtable: HttpClient.VTable = .{ .send = sendLogged };
@@ -65,6 +70,7 @@ pub const StdHttpClient = struct {
             .headers = .{ .accept_encoding = .omit },
             .redirect_behavior = if (req.body == null) @enumFromInt(3) else .unhandled,
         });
+        self.recordConnectionCount();
         defer request.deinit();
         request.accept_encoding = @splat(false);
         request.accept_encoding[@intFromEnum(http.ContentEncoding.identity)] = true;
@@ -113,6 +119,17 @@ pub const StdHttpClient = struct {
             .PUT => .PUT,
             .DELETE => .DELETE,
         };
+    }
+
+    fn recordConnectionCount(self: *StdHttpClient) void {
+        const pool = &self.inner.connection_pool;
+        pool.mutex.lockUncancelable(self.inner.io);
+        defer pool.mutex.unlock(self.inner.io);
+        var count = pool.free_len;
+        var node = pool.used.first;
+        while (node) |current| : (node = current.next) count += 1;
+        const previous = self.max_connection_count.load(.monotonic);
+        if (count > previous) self.max_connection_count.store(count, .release);
     }
 };
 
@@ -372,4 +389,65 @@ test "submission diagnostics omit credentials query values and response bodies" 
         logged,
     );
     try std.testing.expect(std.mem.indexOf(u8, logged, "credential") == null);
+}
+
+test "one StdHttpClient overlaps two local requests and cleans up" {
+    const net = std.Io.net;
+    var address = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    var release: std.atomic.Value(bool) = .init(false);
+    var accepted: std.atomic.Value(usize) = .init(0);
+    var server_future = try std.testing.io.concurrent(serveTwo, .{ &server, &release, &accepted, std.testing.io });
+    defer server_future.await(std.testing.io) catch {};
+
+    var transport = StdHttpClient.init(std.testing.allocator, std.testing.io);
+    defer transport.deinit();
+    const port = server.socket.address.getPort();
+    const first_url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/first", .{port});
+    defer std.testing.allocator.free(first_url);
+    const second_url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/second", .{port});
+    defer std.testing.allocator.free(second_url);
+    const http_client = transport.httpClient();
+    var first = try std.testing.io.concurrent(localGet, .{ http_client, first_url });
+    defer first.await(std.testing.io) catch {};
+    var second = try std.testing.io.concurrent(localGet, .{ http_client, second_url });
+    defer second.await(std.testing.io) catch {};
+    defer release.store(true, .release);
+
+    while (accepted.load(.acquire) < 2) std.atomic.spinLoopHint();
+    release.store(true, .release);
+    try first.await(std.testing.io);
+    try second.await(std.testing.io);
+    try server_future.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 2), transport.maxConnectionCount());
+}
+
+fn localGet(http_client: HttpClient, url: []const u8) !void {
+    const response = try http_client.send(std.heap.page_allocator, .{ .method = .GET, .url = url });
+    defer std.heap.page_allocator.free(response.body);
+    if (response.status != 200) return error.UnexpectedStatus;
+}
+
+fn serveTwo(server: *std.Io.net.Server, release: *std.atomic.Value(bool), accepted: *std.atomic.Value(usize), io: Io) !void {
+    var first = try io.concurrent(serveOne, .{ try server.accept(io), release, accepted, io });
+    var second = try io.concurrent(serveOne, .{ try server.accept(io), release, accepted, io });
+    try first.await(io);
+    try second.await(io);
+}
+
+fn serveOne(stream: std.Io.net.Stream, release: *std.atomic.Value(bool), accepted: *std.atomic.Value(usize), io: Io) !void {
+    defer stream.close(io);
+    var read_buffer: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    while (true) {
+        const line = try reader.interface.takeDelimiterInclusive('\n');
+        if (std.mem.eql(u8, line, "\r\n")) break;
+    }
+    _ = accepted.fetchAdd(1, .release);
+    while (!release.load(.acquire)) std.atomic.spinLoopHint();
+    var write_buffer: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    try writer.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    try writer.interface.flush();
 }

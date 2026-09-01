@@ -13,9 +13,14 @@ const Response = client.Response;
 
 /// One canned response in a scripted sequence.
 pub const Canned = struct {
+    /// Optional URL substring used instead of call order.
+    request_key: ?[]const u8 = null,
     status: u16 = 200,
     body: []const u8 = "",
     retry_after_ms: ?u64 = null,
+    /// A request waits until this flag becomes true. Tests use it to choose
+    /// completion order without coupling responses to start order.
+    released: ?*std.atomic.Value(bool) = null,
 };
 
 pub const FakeHttpClient = struct {
@@ -40,6 +45,9 @@ pub const FakeHttpClient = struct {
     body_buf: [4096]u8 = undefined,
     body_len: usize = 0,
     call_count: usize = 0,
+    active_requests: usize = 0,
+    max_active_requests: usize = 0,
+    mutex: std.atomic.Mutex = .unlocked,
 
     pub fn httpClient(self: *FakeHttpClient) HttpClient {
         return .{ .ptr = self, .vtable = &vtable };
@@ -56,10 +64,30 @@ pub const FakeHttpClient = struct {
         return self.body_buf[0..self.body_len];
     }
 
+    pub fn callCount(self: *FakeHttpClient) usize {
+        self.lock();
+        defer self.mutex.unlock();
+        return self.call_count;
+    }
+
+    pub fn maxActiveRequests(self: *FakeHttpClient) usize {
+        self.lock();
+        defer self.mutex.unlock();
+        return self.max_active_requests;
+    }
+
+    pub fn activeRequestCount(self: *FakeHttpClient) usize {
+        self.lock();
+        defer self.mutex.unlock();
+        return self.active_requests;
+    }
+
     const vtable: HttpClient.VTable = .{ .send = send };
 
     fn send(ptr: *anyopaque, allocator: Allocator, req: Request) anyerror!Response {
         const self: *FakeHttpClient = @ptrCast(@alignCast(ptr));
+        self.lock();
+        defer self.mutex.unlock();
         self.last_method = req.method;
         self.url_len = @min(req.url.len, self.url_buf.len);
         @memcpy(self.url_buf[0..self.url_len], req.url[0..self.url_len]);
@@ -68,21 +96,56 @@ pub const FakeHttpClient = struct {
             @memcpy(self.body_buf[0..self.body_len], body[0..self.body_len]);
         } else self.body_len = 0;
 
-        if (self.send_error) |e| {
-            self.call_count += 1;
-            return e;
+        const call_index = self.call_count;
+        self.call_count += 1;
+        self.active_requests += 1;
+        self.max_active_requests = @max(self.max_active_requests, self.active_requests);
+        const canned: Canned = self.responseFor(req.url, call_index);
+        const send_error = self.send_error;
+        self.mutex.unlock();
+        defer {
+            self.lock();
+            self.active_requests -= 1;
         }
 
-        const canned: Canned = if (self.responses) |seq|
-            (if (self.call_count < seq.len) seq[self.call_count] else .{ .status = self.status, .body = self.body, .retry_after_ms = self.retry_after_ms })
-        else
-            .{ .status = self.status, .body = self.body, .retry_after_ms = self.retry_after_ms };
-
-        self.call_count += 1;
+        if (canned.released) |released|
+            while (!released.load(.acquire)) std.atomic.spinLoopHint();
+        if (send_error) |e| return e;
         return .{
             .status = canned.status,
             .body = try allocator.dupe(u8, canned.body),
             .retry_after_ms = if (canned.status == 429 or canned.status >= 500 and canned.status <= 599) canned.retry_after_ms else null,
         };
     }
+
+    fn responseFor(self: *const FakeHttpClient, url: []const u8, call_index: usize) Canned {
+        if (self.responses) |seq| {
+            for (seq) |canned| {
+                const key = canned.request_key orelse continue;
+                if (std.mem.indexOf(u8, url, key) != null) return canned;
+            }
+            if (call_index < seq.len and seq[call_index].request_key == null) return seq[call_index];
+        }
+        return .{ .status = self.status, .body = self.body, .retry_after_ms = self.retry_after_ms };
+    }
+
+    fn lock(self: *FakeHttpClient) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
 };
+
+test "request-keyed responses do not depend on call order" {
+    const responses = [_]Canned{
+        .{ .request_key = "/slow", .status = 201, .body = "slow" },
+        .{ .request_key = "/fast", .status = 202, .body = "fast" },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const http = fake.httpClient();
+    const fast = try http.send(std.testing.allocator, .{ .method = .GET, .url = "https://example.test/fast" });
+    defer std.testing.allocator.free(fast.body);
+    const slow = try http.send(std.testing.allocator, .{ .method = .GET, .url = "https://example.test/slow" });
+    defer std.testing.allocator.free(slow.body);
+
+    try std.testing.expectEqual(@as(u16, 202), fast.status);
+    try std.testing.expectEqualStrings("slow", slow.body);
+}

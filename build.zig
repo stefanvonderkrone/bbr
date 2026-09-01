@@ -61,6 +61,12 @@ pub fn build(b: *std.Build) void {
     const blob_check_step = b.step("check-blobs", "Opt-in Bitbucket file metadata/raw checker");
     blob_check_step.dependOn(&blob_check_cmd.step);
 
+    const acquisition_check_cmd = b.addRunArtifact(exe);
+    acquisition_check_cmd.step.dependOn(b.getInstallStep());
+    acquisition_check_cmd.addArg("check-acquisition");
+    const acquisition_check_step = b.step("check-acquisition", "Opt-in Candidate Session acquisition gate");
+    acquisition_check_step.dependOn(&acquisition_check_cmd.step);
+
     // Destructive and PTY checks remain explicit opt-in tiers outside tests.
     const mutation_cmd = b.addRunArtifact(exe);
     mutation_cmd.step.dependOn(b.getInstallStep());

@@ -80,6 +80,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, f, "raw-comment")) return rawComment(init, gpa, cred, &it);
         // Live smoke test: fetch + print, no TUI (scriptable, exits non-zero on failure).
         if (std.mem.eql(u8, f, "check")) return checkRun(init, gpa, cred, &it);
+        if (std.mem.eql(u8, f, "check-acquisition")) return checkAcquisitionRun(init, gpa, cred);
         if (std.mem.eql(u8, f, "check-mutation")) return checkMutationRun(init, gpa, cred, &it);
         // Print startup resolution (branch/remote/PR list) without the TUI.
         if (std.mem.eql(u8, f, "detect")) return detectRun(init, gpa, cred, &it);
@@ -456,6 +457,65 @@ fn checkRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.
     }
 }
 
+fn checkAcquisitionRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential) !void {
+    if (!std.mem.eql(u8, init.environ_map.get("BBR_ALLOW_LIVE_ACQUISITION_GATE") orelse "", "1")) {
+        std.debug.print("bbr: refusing live acquisition gate without BBR_ALLOW_LIVE_ACQUISITION_GATE=1\n", .{});
+        return;
+    }
+    const ids = [_]u64{ 1856, 1726 };
+    for (ids) |id| {
+        var sequential: [10]u64 = undefined;
+        var bounded: [10]u64 = undefined;
+        var failures: usize = 0;
+        var rate_limited: usize = 0;
+        var max_connections: usize = 0;
+        for (0..10) |sample_index| {
+            sequential[sample_index] = runAcquisitionSample(init, gpa, cred, id, false, &failures, &rate_limited, &max_connections) catch 0;
+            bounded[sample_index] = runAcquisitionSample(init, gpa, cred, id, true, &failures, &rate_limited, &max_connections) catch 0;
+        }
+        std.mem.sort(u64, &sequential, {}, std.sort.asc(u64));
+        std.mem.sort(u64, &bounded, {}, std.sort.asc(u64));
+        const sequential_median = (sequential[4] + sequential[5]) / 2;
+        const bounded_median = (bounded[4] + bounded[5]) / 2;
+        const reduction = if (sequential_median == 0) 0 else (sequential_median -| bounded_median) * 100 / sequential_median;
+        std.debug.print("PullRequest {d}: sequential={d}ms bounded={d}ms reduction={d}% connections={d} failures={d} rate-limited={d}\n", .{
+            id, sequential_median, bounded_median, reduction, max_connections, failures, rate_limited,
+        });
+        if (reduction < 30 or max_connections > 2 or failures != 0 or rate_limited != 0) return error.AcquisitionGateFailed;
+    }
+}
+
+fn runAcquisitionSample(
+    init: std.process.Init,
+    gpa: std.mem.Allocator,
+    cred: bbr.bitbucket.Credential,
+    id: u64,
+    bounded: bool,
+    failures: *usize,
+    rate_limited: *usize,
+    max_connections: *usize,
+) !u64 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var transport = bbr.http.StdHttpClient.init(std.heap.page_allocator, init.io);
+    defer transport.deinit();
+    try transport.initDefaultProxies(arena.allocator(), init.environ_map);
+    const bb = bbr.bitbucket.Client.init(transport.httpClient(), cred);
+    const start = std.Io.Clock.awake.now(init.io);
+    const loaded = if (bounded)
+        session.loadWith(init.io, std.heap.page_allocator, bb, "pr-webapp", id)
+    else
+        session.loadSequentialWith(std.heap.page_allocator, bb, "pr-webapp", id);
+    const candidate = loaded catch |err| {
+        failures.* += 1;
+        if (err == error.RateLimited) rate_limited.* += 1;
+        return err;
+    };
+    defer candidate.destroy();
+    max_connections.* = @max(max_connections.*, transport.maxConnectionCount());
+    return @intCast(@divFloor(start.untilNow(init.io, .awake).toNanoseconds(), std.time.ns_per_ms));
+}
+
 fn checkMutationRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
     if (!std.mem.eql(u8, init.environ_map.get("BBR_ALLOW_LIVE_MUTATION") orelse "", "1")) {
         std.debug.print("bbr: refusing destructive check without BBR_ALLOW_LIVE_MUTATION=1\n", .{});
@@ -638,6 +698,7 @@ fn usage() void {
         \\  bbr local [base-ref] [source-ref] review committed local Git changes
         \\  bbr check <repo-slug> <pr-id>    live smoke check (fetch + print, no TUI)
         \\  bbr check-blobs <repo> <pr-id> [<class> <old|new> <path> <attrs|->]...
+        \\  bbr check-acquisition             opt-in Candidate Session acquisition gate
         \\  bbr check-mutation <repo> <pr-id> destructive live Comment lifecycle check
         \\  bbr external-edit-smoke          interactive PTY External Edit check
         \\  bbr demo                         open the TUI with synthetic data (no network)

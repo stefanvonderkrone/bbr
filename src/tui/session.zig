@@ -43,6 +43,7 @@ pub const SourceContext = union(enum) {
 
 pub const Session = struct {
     arena: std.heap.ArenaAllocator,
+    acquisition_arenas: [4]?std.heap.ArenaAllocator = @splat(null),
     header: ReviewHeader,
     source: SourceContext,
     diff: bbr.diff.Diff,
@@ -59,6 +60,7 @@ pub const Session = struct {
         const backing = self.arena.child_allocator;
         self.enrichment.deinit();
         self.arena.deinit();
+        for (&self.acquisition_arenas) |*arena| if (arena.*) |*owned| owned.deinit();
         backing.destroy(self);
     }
 
@@ -90,6 +92,7 @@ pub fn create(backing: Allocator) !*Session {
     const s = try backing.create(Session);
     errdefer backing.destroy(s);
     s.arena = std.heap.ArenaAllocator.init(backing);
+    s.acquisition_arenas = @splat(null);
     errdefer s.arena.deinit();
     s.threads = &.{};
     s.enrichment = try file_enrichment.Storage.init(s.arena.allocator(), &.{});
@@ -100,19 +103,79 @@ pub fn create(backing: Allocator) !*Session {
 /// the PR, its diff, and its comments, parses the diff, and nests the comment
 /// threads — all into the Session's own arena. On any error the partial Session
 /// is torn down and the error propagates.
-pub fn loadWith(backing: Allocator, bb: Client, repo: []const u8, id: u64) !*Session {
+pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u64) !*Session {
+    var pr_branch: Branch(PullRequest) = .init(backing);
+    var account_branch: Branch([]u8) = .init(backing);
+    var diff_branch: Branch([]u8) = .init(backing);
+    var comments_branch: Branch([]bbr.review.Comment) = .init(backing);
+    var transfer = false;
+    defer if (!transfer) {
+        pr_branch.arena.deinit();
+        account_branch.arena.deinit();
+        diff_branch.arena.deinit();
+        comments_branch.arena.deinit();
+    };
+
+    const Completion = union(enum) { pull_request: void, account: void, raw_diff: void, comments: void };
+    var completion_buffer: [4]Completion = undefined;
+    var select = Io.Select(Completion).init(io, &completion_buffer);
+    defer select.group.await(io) catch {};
+    var active: usize = 0;
+    var comments_ready = false;
+    var raw_diff_started = false;
+    var comments_started = false;
+    var required_failed = false;
+
+    try select.concurrent(.pull_request, acquirePullRequest, .{ &pr_branch, bb, repo, id });
+    active += 1;
+    try select.concurrent(.account, acquireAccount, .{ &account_branch, bb });
+    active += 1;
+
+    while (active > 0) {
+        switch (try select.await()) {
+            .pull_request => {
+                active -= 1;
+                if (pr_branch.err != null) required_failed = true else comments_ready = true;
+            },
+            .account => active -= 1,
+            .raw_diff => {
+                active -= 1;
+                if (diff_branch.err != null) required_failed = true;
+            },
+            .comments => {
+                active -= 1;
+                if (comments_branch.err != null) required_failed = true;
+            },
+        }
+        while (active < 2 and !required_failed) {
+            if (comments_ready and !comments_started) {
+                const pr = pr_branch.value.?;
+                try select.concurrent(.comments, acquireComments, .{ &comments_branch, bb, repo, id, pr.source_commit, pr.destination_commit });
+                comments_started = true;
+                active += 1;
+            } else if (!raw_diff_started) {
+                try select.concurrent(.raw_diff, acquireRawDiff, .{ &diff_branch, bb, repo, id });
+                raw_diff_started = true;
+                active += 1;
+            } else break;
+        }
+    }
+
+    if (pr_branch.err) |err| return err;
+    if (diff_branch.err) |err| return err;
+    if (comments_branch.err) |err| return err;
+
     const s = try backing.create(Session);
     errdefer backing.destroy(s);
     s.arena = std.heap.ArenaAllocator.init(backing);
+    s.acquisition_arenas = @splat(null);
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
 
-    s.authenticated_account_uuid = bb.getAuthenticatedAccountUuid(a) catch |err| blk: {
-        s.authenticated_account_unauthorized = err == error.Unauthorized;
-        break :blk null;
-    };
+    s.authenticated_account_uuid = account_branch.value;
+    s.authenticated_account_unauthorized = if (account_branch.err) |err| err == error.Unauthorized else false;
 
-    const pr = try bb.getPullRequest(a, repo, id);
+    const pr = pr_branch.value.?;
     s.source = .{ .remote = pr };
     s.header = .{
         .title = pr.title,
@@ -125,18 +188,104 @@ pub fn loadWith(backing: Allocator, bb: Client, repo: []const u8, id: u64) !*Ses
         .source_label = "Bitbucket",
         .pull_request_id = pr.id,
     };
+    const raw = diff_branch.value.?;
+    var diff_source: bbr.diff.TextDiffSource = .{ .text = raw };
+    s.diff = try bbr.diff.loadFromSource(a, diff_source.source());
+    s.enrichment = try file_enrichment.Storage.init(a, s.diff.files);
+    errdefer s.enrichment.deinit();
+    const comments = comments_branch.value.?;
+    s.threads = try bbr.review.buildThreads(a, comments);
+    const account_arena: ?std.heap.ArenaAllocator = if (account_branch.err == null)
+        account_branch.arena
+    else blk: {
+        account_branch.arena.deinit();
+        break :blk null;
+    };
+    s.acquisition_arenas = .{ pr_branch.arena, account_arena, diff_branch.arena, comments_branch.arena };
+    transfer = true;
+
+    return s;
+}
+
+/// Benchmark control for the opt-in acquisition gate. Production calls only
+/// `loadWith`, so the repository has one production policy.
+pub fn loadSequentialWith(backing: Allocator, bb: Client, repo: []const u8, id: u64) !*Session {
+    const s = try backing.create(Session);
+    errdefer backing.destroy(s);
+    s.arena = std.heap.ArenaAllocator.init(backing);
+    s.acquisition_arenas = @splat(null);
+    errdefer s.arena.deinit();
+    const a = s.arena.allocator();
+
+    s.authenticated_account_uuid = bb.getAuthenticatedAccountUuid(a) catch |err| blk: {
+        s.authenticated_account_unauthorized = err == error.Unauthorized;
+        break :blk null;
+    };
+    const pr = try bb.getPullRequest(a, repo, id);
+    s.source = .{ .remote = pr };
+    s.header = remoteHeader(pr, repo);
     const raw = try bb.getDiff(a, repo, id);
     var diff_source: bbr.diff.TextDiffSource = .{ .text = raw };
     s.diff = try bbr.diff.loadFromSource(a, diff_source.source());
     s.enrichment = try file_enrichment.Storage.init(a, s.diff.files);
     errdefer s.enrichment.deinit();
-    const comments = try bb.getComments(a, repo, id, .{
-        .source = pr.source_commit,
-        .destination = pr.destination_commit,
-    });
+    const comments = try bb.getComments(a, repo, id, .{ .source = pr.source_commit, .destination = pr.destination_commit });
     s.threads = try bbr.review.buildThreads(a, comments);
-
     return s;
+}
+
+fn remoteHeader(pr: PullRequest, repo: []const u8) ReviewHeader {
+    return .{
+        .title = pr.title,
+        .source_ref = pr.source_branch,
+        .base_ref = pr.destination_branch,
+        .source_commit = pr.source_commit,
+        .base_commit = pr.destination_commit,
+        .author = pr.author_display_name,
+        .locator = repo,
+        .source_label = "Bitbucket",
+        .pull_request_id = pr.id,
+    };
+}
+
+fn Branch(comptime T: type) type {
+    return struct {
+        arena: std.heap.ArenaAllocator,
+        value: ?T = null,
+        err: ?anyerror = null,
+
+        fn init(backing: Allocator) @This() {
+            return .{ .arena = std.heap.ArenaAllocator.init(backing) };
+        }
+    };
+}
+
+fn acquirePullRequest(branch: *Branch(PullRequest), bb: Client, repo: []const u8, id: u64) void {
+    branch.value = bb.getPullRequest(branch.arena.allocator(), repo, id) catch |err| {
+        branch.err = err;
+        return;
+    };
+}
+
+fn acquireAccount(branch: *Branch([]u8), bb: Client) void {
+    branch.value = bb.getAuthenticatedAccountUuid(branch.arena.allocator()) catch |err| {
+        branch.err = err;
+        return;
+    };
+}
+
+fn acquireRawDiff(branch: *Branch([]u8), bb: Client, repo: []const u8, id: u64) void {
+    branch.value = bb.getDiff(branch.arena.allocator(), repo, id) catch |err| {
+        branch.err = err;
+        return;
+    };
+}
+
+fn acquireComments(branch: *Branch([]bbr.review.Comment), bb: Client, repo: []const u8, id: u64, source: []const u8, destination: []const u8) void {
+    branch.value = bb.getComments(branch.arena.allocator(), repo, id, .{ .source = source, .destination = destination }) catch |err| {
+        branch.err = err;
+        return;
+    };
 }
 
 /// Build a committed local Session through the same DiffSource/parser path.
@@ -151,6 +300,7 @@ pub fn loadLocalWith(
     const s = try backing.create(Session);
     errdefer backing.destroy(s);
     s.arena = std.heap.ArenaAllocator.init(backing);
+    s.acquisition_arenas = @splat(null);
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
 
@@ -202,7 +352,7 @@ pub fn load(
     try stdhttp.initDefaultProxies(proxy_arena.allocator(), env_map);
 
     const bb = Client.init(stdhttp.httpClient(), cred);
-    return loadWith(backing, bb, repo, id);
+    return loadWith(io, backing, bb, repo, id);
 }
 
 // ---------------------------------------------------------------------------
@@ -228,15 +378,15 @@ test "loadWith builds a session in order and owns everything" {
     ;
     // Authenticated Account capability is independent, then the read-only load.
     const responses = [_]Canned{
-        .{ .status = 200, .body = "{ \"uuid\": \"{ada}\" }" },
-        .{ .status = 200, .body = pr_json },
-        .{ .status = 200, .body = diff_text },
-        .{ .status = 200, .body = comments_json },
+        .{ .request_key = "/user", .status = 200, .body = "{ \"uuid\": \"{ada}\" }" },
+        .{ .request_key = "/pullrequests/7/diff", .status = 200, .body = diff_text },
+        .{ .request_key = "/pullrequests/7/comments", .status = 200, .body = comments_json },
+        .{ .request_key = "/pullrequests/7", .status = 200, .body = pr_json },
     };
     var fake: FakeHttpClient = .{ .responses = &responses };
     const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
 
-    const s = try loadWith(std.heap.page_allocator, bb, "repo", 7);
+    const s = try loadWith(testing.io, std.heap.page_allocator, bb, "repo", 7);
     defer s.destroy();
 
     try testing.expectEqual(@as(?u64, 7), s.header.pull_request_id);
@@ -246,6 +396,7 @@ test "loadWith builds a session in order and owns everything" {
     try testing.expectEqual(@as(usize, 1), s.threads.len);
     try testing.expectEqualStrings("{ada}", s.authenticated_account_uuid.?);
     try testing.expectEqual(@as(usize, 4), fake.call_count);
+    try testing.expect(fake.maxActiveRequests() <= 2);
 
     try testing.expectEqual(@as(usize, 1), s.enrichment.len());
     const projection = s.enrichment.projection();
@@ -280,7 +431,142 @@ test "loadLocalWith resolves defaults and builds a source-neutral Session" {
 }
 
 test "loadWith surfaces an error and leaks nothing" {
-    var fake: FakeHttpClient = .{ .status = 404, .body = "" };
+    const responses = [_]Canned{
+        .{ .request_key = "/user", .status = 200, .body = "{}" },
+        .{ .request_key = "/pullrequests/7", .status = 404 },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
     const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
-    try testing.expectError(error.NotFound, loadWith(std.heap.page_allocator, bb, "repo", 7));
+    try testing.expectError(error.NotFound, loadWith(testing.io, std.heap.page_allocator, bb, "repo", 7));
+    try testing.expect(fake.callCount() >= 2);
+    try testing.expect(fake.callCount() <= 3);
+}
+
+test "Authenticated Account failure preserves a read-only Candidate Session" {
+    const responses = testRemoteResponses(401);
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+
+    const s = try loadWith(testing.io, std.heap.page_allocator, bb, "repo", 7);
+    defer s.destroy();
+
+    try testing.expect(s.authenticated_account_uuid == null);
+    try testing.expect(s.authenticated_account_unauthorized);
+    try testing.expectEqual(@as(usize, 1), s.diff.files.len);
+}
+
+test "each required acquisition failure rejects the Candidate Session" {
+    for ([_]usize{ 1, 2, 3 }) |failed_index| {
+        var responses = testRemoteResponses(200);
+        responses[failed_index].status = 404;
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+        try testing.expectError(error.NotFound, loadWith(testing.io, std.heap.page_allocator, bb, "repo", 7));
+    }
+}
+
+test "required failure reporting follows logical acquisition order" {
+    var responses = testRemoteResponses(200);
+    responses[1].status = 403;
+    responses[2].status = 404;
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    try testing.expectError(error.Forbidden, loadWith(testing.io, std.heap.page_allocator, bb, "repo", 7));
+}
+
+test "required failure awaits started Authenticated Account acquisition" {
+    var release_pr: std.atomic.Value(bool) = .init(false);
+    var release_account: std.atomic.Value(bool) = .init(false);
+    var done: std.atomic.Value(bool) = .init(false);
+    var responses = testRemoteResponses(200);
+    responses[0].released = &release_account;
+    responses[3].released = &release_pr;
+    responses[3].status = 404;
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var future = try testing.io.concurrent(loadFailureAndSignal, .{ testing.io, bb, &done });
+    defer future.await(testing.io);
+    defer {
+        release_pr.store(true, .release);
+        release_account.store(true, .release);
+    }
+
+    while (fake.callCount() < 2) std.atomic.spinLoopHint();
+    release_pr.store(true, .release);
+    while (fake.activeRequestCount() == 2) std.atomic.spinLoopHint();
+    try testing.expect(!done.load(.acquire));
+    release_account.store(true, .release);
+    future.await(testing.io);
+    try testing.expect(done.load(.acquire));
+}
+
+test "PullRequest completion gives Comments priority over RawDiff" {
+    var release_pr: std.atomic.Value(bool) = .init(false);
+    var release_account: std.atomic.Value(bool) = .init(false);
+    var release_comments: std.atomic.Value(bool) = .init(false);
+    var release_diff: std.atomic.Value(bool) = .init(false);
+    const base = testRemoteResponses(200);
+    const responses = [_]Canned{
+        withRelease(base[0], &release_account),
+        withRelease(base[1], &release_diff),
+        withRelease(base[2], &release_comments),
+        withRelease(base[3], &release_pr),
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var claimed = false;
+    var future = try testing.io.concurrent(loadTestSession, .{ testing.io, bb });
+    defer {
+        release_pr.store(true, .release);
+        release_account.store(true, .release);
+        release_comments.store(true, .release);
+        release_diff.store(true, .release);
+        if (future.await(testing.io)) |candidate| {
+            if (!claimed) candidate.destroy();
+        } else |_| {}
+    }
+
+    while (fake.callCount() < 2) std.atomic.spinLoopHint();
+    release_pr.store(true, .release);
+    while (fake.callCount() < 3) std.atomic.spinLoopHint();
+    try testing.expect(std.mem.indexOf(u8, fake.lastUrl().?, "/comments") != null);
+    release_account.store(true, .release);
+    release_comments.store(true, .release);
+    while (fake.callCount() < 4) std.atomic.spinLoopHint();
+    release_diff.store(true, .release);
+
+    const s = try future.await(testing.io);
+    claimed = true;
+    defer s.destroy();
+    try testing.expectEqual(@as(usize, 2), fake.maxActiveRequests());
+}
+
+fn loadTestSession(io: Io, bb: Client) !*Session {
+    return loadWith(io, std.heap.page_allocator, bb, "repo", 7);
+}
+
+fn loadFailureAndSignal(io: Io, bb: Client, done: *std.atomic.Value(bool)) void {
+    if (loadWith(io, std.heap.page_allocator, bb, "repo", 7)) |candidate| candidate.destroy() else |_| {}
+    done.store(true, .release);
+}
+
+fn withRelease(canned: Canned, released: *std.atomic.Value(bool)) Canned {
+    var controlled = canned;
+    controlled.released = released;
+    return controlled;
+}
+
+fn testRemoteResponses(account_status: u16) [4]Canned {
+    const pr_json =
+        \\{ "id": 7, "title": "T", "state": "OPEN", "author": { "display_name": "Ada" },
+        \\  "source": { "branch": { "name": "feature/x" }, "commit": { "hash": "aaaa" } },
+        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "bbbb" } } }
+    ;
+    const diff_text = "diff --git a/f.zig b/f.zig\n--- a/f.zig\n+++ b/f.zig\n@@ -1 +1 @@\n-a\n+b\n";
+    return .{
+        .{ .request_key = "/user", .status = account_status, .body = "{ \"uuid\": \"{ada}\" }" },
+        .{ .request_key = "/pullrequests/7/diff", .body = diff_text },
+        .{ .request_key = "/pullrequests/7/comments", .body = "{ \"values\": [] }" },
+        .{ .request_key = "/pullrequests/7", .body = pr_json },
+    };
 }
