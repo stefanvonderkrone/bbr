@@ -4,14 +4,14 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] CI exposes four stable jobs named `CI / test (<target>)` for macOS x86_64, macOS aarch64, Linux x86_64, and Linux aarch64 on the specified native runners.
-- [ ] Every job uses Zig 0.16.0 and runs the native target check, RE2 wrapper check, dynamic UserGrammar load, UserGrammar CLI lifecycle, and complete test suite.
-- [ ] Linux x86_64 also checks the format of build, source, and test inputs.
-- [ ] CI runs for pull requests, pushes to `main`, and manual dispatch. A newer run cancels an obsolete run for the same change.
-- [ ] One target failure does not cancel the other targets. Each job has a 45-minute timeout, no retry, no `continue-on-error`, and no artifact upload.
-- [ ] Required CI has read-only repository permission and receives no Bitbucket Credential.
-- [ ] Checkout and Zig setup actions use the specified immutable commits, with version comments beside each commit.
-- [ ] Each target has a separate cache key and a 2 GiB cache limit. Native artifacts cannot cross target boundaries.
-- [ ] Branch protection requires all four stable job names.
+- [x] CI exposes four stable jobs named `CI / test (<target>)` for macOS x86_64, macOS aarch64, Linux x86_64, and Linux aarch64 on the specified native runners.
+- [x] Every job uses Zig 0.16.0 and runs the native target check, RE2 wrapper check, dynamic UserGrammar load, UserGrammar CLI lifecycle, and complete test suite.
+- [x] Linux x86_64 also checks the format of build, source, and test inputs.
+- [x] CI runs for pull requests, pushes to `main`, and manual dispatch. A newer run cancels an obsolete run for the same change.
+- [x] One target failure does not cancel the other targets. Each job has a 45-minute timeout, no retry, no `continue-on-error`, and no artifact upload.
+- [x] Required CI has read-only repository permission and receives no Bitbucket Credential.
+- [x] Checkout and Zig setup actions use the specified immutable commits, with version comments beside each commit.
+- [x] Each target has a separate cache key and a 2 GiB cache limit. Native artifacts cannot cross target boundaries.
+- [x] Branch protection requires all four stable job names.
