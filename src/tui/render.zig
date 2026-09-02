@@ -1930,9 +1930,8 @@ test "local help projection marks remote-only commands unavailable" {
     for (rows.commands) |row| {
         if (!row.available) unavailable += 1;
     }
-    // Four remote-only commands, plus edit, re-anchor, and delete — visible but
-    // refused away from a ReviewCard — and the Picker.
-    try testing.expectEqual(@as(usize, 8), unavailable);
+    // Remote-only commands, plus edit, re-anchor, and delete, stay visible.
+    try testing.expectEqual(@as(usize, 11), unavailable);
     for (rows.motions) |row| try testing.expect(row.available);
 }
 

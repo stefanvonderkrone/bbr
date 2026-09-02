@@ -186,6 +186,9 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.modified('e', .{ .ctrl = true }), .action = .external_edit, .help = "External Edit" },
     .{ .chord = Chord.one('a'), .action = .reanchor_review_item, .help = "re-anchor local root Draft" },
     .{ .chord = Chord.one('D'), .action = .delete_review_item, .help = "delete Comment or Draft" },
+    .{ .chord = Chord.two('g', 'a'), .action = .set_verdict_approved, .help = "set Reviewer Verdict to Approved" },
+    .{ .chord = Chord.two('g', 'c'), .action = .set_verdict_changes_requested, .help = "set Reviewer Verdict to Changes requested" },
+    .{ .chord = Chord.two('g', 'n'), .action = .set_verdict_none, .help = "set Reviewer Verdict to No verdict" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_disclosure, .help = "toggle disclosure" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_review_card, .help = "toggle ReviewCard" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_directory, .help = "toggle Directory" },
@@ -382,6 +385,9 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .open_pull_request_picker,
             .refresh,
             .review_comment,
+            .set_verdict_approved,
+            .set_verdict_changes_requested,
+            .set_verdict_none,
             .submit,
             .recover_submission,
             .resolve_unpublished,
@@ -410,6 +416,9 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .refresh,
             .file_comment,
             .review_comment,
+            .set_verdict_approved,
+            .set_verdict_changes_requested,
+            .set_verdict_none,
             .submit,
             .recover_submission,
             .resolve_unpublished,
@@ -433,6 +442,9 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .open_pull_request_picker,
             .refresh,
             .review_comment,
+            .set_verdict_approved,
+            .set_verdict_changes_requested,
+            .set_verdict_none,
             .help,
             .focus_next_pane,
             => true,
@@ -477,6 +489,9 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .file_comment,
             .review_comment,
             .suggest,
+            .set_verdict_approved,
+            .set_verdict_changes_requested,
+            .set_verdict_none,
             .yank,
             .submit,
             .recover_submission,
@@ -712,6 +727,23 @@ test "the default bindings are themselves unambiguous and prefix-free" {
     try testing.expectEqual(Action.reanchor_review_item, resolver.feed(.default, .diff_review_card, plain('a')).action);
     // Re-anchor belongs to a ReviewCard, not to bare source.
     try testing.expect(resolver.feed(.default, .diff_source, plain('a')) == .none);
+}
+
+test "default Reviewer Verdict Actions resolve and remain configurable" {
+    var resolver: Resolver = .{};
+    try testing.expect(resolver.feed(Keymap.default, .diff, plain('g')) == .none);
+    try testing.expectEqual(Action.set_verdict_approved, resolver.feed(Keymap.default, .diff, plain('a')).action);
+    try testing.expect(resolver.feed(Keymap.default, .diff, plain('g')) == .none);
+    try testing.expectEqual(Action.set_verdict_changes_requested, resolver.feed(Keymap.default, .diff, plain('c')).action);
+    try testing.expect(resolver.feed(Keymap.default, .diff, plain('g')) == .none);
+    try testing.expectEqual(Action.set_verdict_none, resolver.feed(Keymap.default, .diff, plain('n')).action);
+
+    const overrides = [_]Override{.{ .action = "set_verdict_approved", .sequences = &.{"space a"} }};
+    var configured = try Keymap.fromOverrides(testing.allocator, &overrides);
+    defer configured.deinit(testing.allocator);
+    resolver = .{};
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain(' ')) == .none);
+    try testing.expectEqual(Action.set_verdict_approved, resolver.feed(configured.keymap(), .diff, plain('a')).action);
 }
 
 test "same chord is rejected when Actions overlap in an Interaction Context" {

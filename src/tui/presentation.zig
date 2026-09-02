@@ -220,6 +220,7 @@ pub const OwnedInput = union(enum) {
     comment_edit_launch_failed: CommentEditLaunchFailed,
     comment_delete_completed: CommentDeleteCompleted,
     comment_delete_launch_failed: CommentDeleteLaunchFailed,
+    reviewer_verdict_changed: ReviewerVerdictChanged,
     submission_wait_completed: WaitSubmission,
     submission_wait_launch_failed: WaitSubmission,
     recovery_checked: RecoveryChecked,
@@ -524,6 +525,19 @@ pub const CommentDeleteLaunchFailed = struct {
     comment_id: bbr.review.CommentId,
 };
 
+pub const ReviewerVerdictChanged = struct {
+    command_id: CommandId,
+    identity: OwnedRemoteReviewIdentity,
+    target: bbr.bitbucket.ReviewerVerdict,
+    outcome: ReviewerVerdictCommandOutcome,
+};
+
+pub const ReviewerVerdictCommandOutcome = union(enum) {
+    completed: bbr.bitbucket.ReviewerVerdictChangeResult,
+    launch_failed,
+    adapter_failed,
+};
+
 fn BoundedText(comptime capacity: usize) type {
     return struct {
         bytes: [capacity]u8 = undefined,
@@ -663,12 +677,29 @@ pub const DeleteComment = struct {
     }
 };
 
+pub const ChangeReviewerVerdict = struct {
+    command_id: CommandId = 0,
+    identity: OwnedRemoteReviewIdentity,
+    expected_source_commit: BoundedText(64),
+    authenticated_account_uuid: BoundedText(256),
+    target: bbr.bitbucket.ReviewerVerdict,
+
+    pub fn expectedSourceCommit(self: *const ChangeReviewerVerdict) []const u8 {
+        return self.expected_source_commit.slice();
+    }
+
+    pub fn authenticatedAccountUuid(self: *const ChangeReviewerVerdict) []const u8 {
+        return self.authenticated_account_uuid.slice();
+    }
+};
+
 pub const OwnedCommand = union(enum) {
     load_session: LoadSession,
     enrich_file: EnrichFile,
     post_draft: *PostDraft,
     update_comment: *UpdateComment,
     delete_comment: *DeleteComment,
+    change_reviewer_verdict: ChangeReviewerVerdict,
     wait_submission: WaitSubmission,
     check_recovery: CheckRecovery,
     find_duplicate: *PostDraft,
@@ -683,7 +714,7 @@ pub const OwnedCommand = union(enum) {
             .delete_comment => |command| command.destroy(),
             .copy_clipboard => |command| command.destroy(),
             .external_edit => |command| command.destroy(),
-            .load_session, .enrich_file, .wait_submission, .check_recovery, .list_pull_requests => {},
+            .load_session, .enrich_file, .change_reviewer_verdict, .wait_submission, .check_recovery, .list_pull_requests => {},
         }
         self.* = undefined;
     }
@@ -707,6 +738,7 @@ fn setCommandId(command: *OwnedCommand, command_id: CommandId) void {
         .post_draft, .find_duplicate => |value| value.command_id = command_id,
         .update_comment => |value| value.command_id = command_id,
         .delete_comment => |value| value.command_id = command_id,
+        .change_reviewer_verdict => |*value| value.command_id = command_id,
         .wait_submission => |*value| value.command_id = command_id,
         .check_recovery => |*value| value.command_id = command_id,
         .list_pull_requests => |*value| value.command_id = command_id,
@@ -804,6 +836,7 @@ pub const ReviewProjection = struct {
     session_epoch: SessionEpoch,
     header: session_mod.ReviewHeader,
     pull_request: ?*const bbr.bitbucket.PullRequest,
+    reviewer_verdict: ?bbr.bitbucket.ReviewerVerdict,
     diff: *const bbr.diff.Diff,
     threads: []const bbr.review.Thread,
     drafts: []const bbr.review.Draft,
@@ -822,6 +855,7 @@ pub const Projection = struct {
     submission_tree: ?SubmissionTreeProjection,
     comment_edit_result: ?CommentEditResultProjection,
     comment_delete_result: ?CommentDeleteResultProjection,
+    reviewer_verdict_result: ?ReviewerVerdictResultProjection,
     recovery: ?RecoveryNotice,
     unknown_resolution: ?UnknownResolutionProjection,
     reanchor: ?ReanchorProjection,
@@ -851,6 +885,12 @@ pub const CommentDeleteResultProjection = struct {
     key: OwnedReviewIdentity,
     comment_id: bbr.review.CommentId,
     outcome: enum { deleted, failed, outcome_unknown, reload_required },
+};
+
+pub const ReviewerVerdictResultProjection = struct {
+    key: OwnedReviewIdentity,
+    target: bbr.bitbucket.ReviewerVerdict,
+    outcome: ReviewerVerdictCommandOutcome,
 };
 
 pub const ClipboardStatus = enum { copied, failed };
@@ -895,6 +935,17 @@ pub const MutationRefusal = enum {
     descendant_locked,
 };
 
+pub const ReviewerVerdictRefusal = enum {
+    local_review,
+    pull_request_not_open,
+    authenticated_account_unknown,
+    reviewer_verdict_unknown,
+    pull_request_author_unknown,
+    pull_request_author,
+    unchanged,
+    remote_write_busy,
+};
+
 pub const ActionAvailability = struct {
     remote: bool,
     has_review: bool = true,
@@ -909,6 +960,17 @@ pub const ActionAvailability = struct {
     /// null means the ReviewCard under the cursor — and its complete Draft
     /// Reply-descendant closure — can be deleted.
     delete_refusal: ?MutationRefusal = .no_review_item,
+    approved_refusal: ?ReviewerVerdictRefusal = .local_review,
+    changes_requested_refusal: ?ReviewerVerdictRefusal = .local_review,
+    no_verdict_refusal: ?ReviewerVerdictRefusal = .local_review,
+
+    pub fn verdictRefusal(self: ActionAvailability, target: bbr.bitbucket.ReviewerVerdict) ?ReviewerVerdictRefusal {
+        return switch (target) {
+            .approved => self.approved_refusal,
+            .changes_requested => self.changes_requested_refusal,
+            .no_verdict => self.no_verdict_refusal,
+        };
+    }
 
     pub fn available(self: ActionAvailability, action: Action) bool {
         if (!self.has_review) return switch (action) {
@@ -925,6 +987,9 @@ pub const ActionAvailability = struct {
             .edit_review_item => self.edit_refusal == null,
             .reanchor_review_item => self.reanchor_refusal == null,
             .delete_review_item => self.delete_refusal == null,
+            .set_verdict_approved => self.approved_refusal == null,
+            .set_verdict_changes_requested => self.changes_requested_refusal == null,
+            .set_verdict_none => self.no_verdict_refusal == null,
             else => true,
         };
     }
@@ -1086,6 +1151,16 @@ pub const ActionError = enum {
     comment_edit_launch_failed,
     comment_delete_failed,
     comment_delete_launch_failed,
+    reviewer_verdict_local_review,
+    pull_request_not_open,
+    reviewer_verdict_unknown,
+    pull_request_author_unknown,
+    pull_request_author,
+    reviewer_verdict_unchanged,
+    reviewer_verdict_failed,
+    reviewer_verdict_source_changed,
+    reviewer_verdict_unresolved,
+    reviewer_verdict_launch_failed,
     published_comment_edit_unsupported,
     no_review_item,
     draft_edit_conflict,
@@ -1175,9 +1250,9 @@ const Published = struct {
         cell_metrics: frame_mod.CellMetrics,
         comments_collapsed_rows: usize,
     ) !*Published {
+        errdefer session.destroy();
         const published = try allocator.create(Published);
         errdefer allocator.destroy(published);
-        errdefer session.destroy();
 
         published.allocator = allocator;
         published.key = key;
@@ -1303,6 +1378,7 @@ const Published = struct {
             .session_epoch = self.epoch,
             .header = self.session.header,
             .pull_request = self.session.remotePullRequestConst(),
+            .reviewer_verdict = null,
             .diff = &self.session.diff,
             .threads = self.session.threads,
             .drafts = self.review.drafts.items,
@@ -1872,6 +1948,13 @@ const DurableCommentDelete = struct {
     fn destroy(self: *DurableCommentDelete) void {
         self.allocator.destroy(self);
     }
+};
+
+const DurableReviewerVerdict = struct {
+    key: OwnedReviewIdentity,
+    initiating_epoch: SessionEpoch,
+    target: bbr.bitbucket.ReviewerVerdict,
+    result: ?bbr.bitbucket.ReviewerVerdictChangeResult = null,
 };
 
 const IssuedEnrichment = struct {
@@ -2710,10 +2793,12 @@ pub const Presentation = struct {
     submission_tree: ?*SubmissionTree = null,
     durable_comment_edit: ?*DurableCommentEdit = null,
     durable_comment_delete: ?*DurableCommentDelete = null,
+    durable_reviewer_verdict: ?DurableReviewerVerdict = null,
     authenticated_account_uuid: ?BoundedText(256) = null,
     reload_required_epoch: ?SessionEpoch = null,
     comment_edit_result: ?CommentEditResultProjection = null,
     comment_delete_result: ?CommentDeleteResultProjection = null,
+    reviewer_verdict_result: ?ReviewerVerdictResultProjection = null,
     submission_result: ?SubmissionResultProjection = null,
     stale_repair: ?StaleRepairGate = null,
     recovery: ?RecoveryNotice = null,
@@ -2830,6 +2915,7 @@ pub const Presentation = struct {
             .comment_edit_launch_failed => |failed| self.acceptCommentEditLaunchFailure(failed),
             .comment_delete_completed => |completed| self.acceptCommentDelete(completed),
             .comment_delete_launch_failed => |failed| self.acceptCommentDeleteLaunchFailure(failed),
+            .reviewer_verdict_changed => |completed| self.acceptReviewerVerdict(completed),
             .submission_wait_completed => |completed| self.acceptSubmissionWait(completed),
             .submission_wait_launch_failed => |failed| self.acceptSubmissionWaitLaunchFailure(failed),
             .recovery_checked => |checked| self.acceptRecoveryCheck(checked),
@@ -2851,17 +2937,17 @@ pub const Presentation = struct {
 
     pub fn takeCommand(self: *Presentation) ?OwnedCommand {
         if (self.commands.items.len == 0) return null;
+        self.issued_commands.ensureUnusedCapacity(self.allocator, 1) catch {
+            self.fatal_error = .out_of_memory;
+            self.requestShutdown();
+            return null;
+        };
         var command = self.commands.orderedRemove(0);
         self.next_command_id +%= 1;
         if (self.next_command_id == 0) self.next_command_id = 1;
         const command_id = self.next_command_id;
         setCommandId(&command, command_id);
-        self.issued_commands.append(self.allocator, .{ .id = command_id, .target = commandTarget(command) }) catch {
-            command.deinit();
-            self.fatal_error = .out_of_memory;
-            self.requestShutdown();
-            return null;
-        };
+        self.issued_commands.appendAssumeCapacity(.{ .id = command_id, .target = commandTarget(command) });
         switch (command) {
             .load_session => self.outstanding_loads += 1,
             .enrich_file => |enrich| self.issued_enrichments.appendAssumeCapacity(.{
@@ -2874,7 +2960,7 @@ pub const Presentation = struct {
                 if (durable.operation_id == post.operation_id and durable.current_temp_id == post.draft.local_id and durable.phase == .post_queued)
                     durable.phase = .awaiting_post;
             },
-            .update_comment, .delete_comment => {},
+            .update_comment, .delete_comment, .change_reviewer_verdict => {},
             .wait_submission => |wait| if (self.durable_submission) |durable| {
                 if (durable.operation_id == wait.operation_id and durable.current_temp_id == wait.temp_id and durable.phase == .wait_queued)
                     durable.phase = .awaiting_wait;
@@ -2928,6 +3014,7 @@ pub const Presentation = struct {
             } else null,
             .comment_edit_result = self.comment_edit_result,
             .comment_delete_result = self.comment_delete_result,
+            .reviewer_verdict_result = self.reviewer_verdict_result,
             .recovery = self.recovery,
             .unknown_resolution = if (self.unknown_resolution) |*editor| .{
                 .temp_id = editor.temp_id,
@@ -2968,12 +3055,13 @@ pub const Presentation = struct {
     }
 
     pub fn readyToExit(self: *const Presentation) bool {
-        if (builtin.is_test) return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.outstanding_picker_loads == 0 and self.issued_enrichments.items.len == 0;
-        return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.commands.items.len == 0 and self.issued_commands.items.len == 0;
+        if (builtin.is_test) return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.durable_reviewer_verdict == null and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.outstanding_picker_loads == 0 and self.issued_enrichments.items.len == 0;
+        return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.durable_reviewer_verdict == null and self.commands.items.len == 0 and self.issued_commands.items.len == 0;
     }
 
     fn reviewProjection(self: *const Presentation, published: *const Published) ReviewProjection {
         var review = published.projection(self.preferences);
+        review.reviewer_verdict = self.currentReviewerVerdict(published);
         review.frame = self.frameProjection();
         return review;
     }
@@ -3330,7 +3418,7 @@ pub const Presentation = struct {
         var write: usize = 0;
         for (self.commands.items) |command_value| {
             var command = command_value;
-            if (command == .post_draft or command == .update_comment or command == .delete_comment or command == .wait_submission or command == .check_recovery or command == .find_duplicate) {
+            if (command == .post_draft or command == .update_comment or command == .delete_comment or command == .change_reviewer_verdict or command == .wait_submission or command == .check_recovery or command == .find_duplicate) {
                 self.commands.items[write] = command;
                 write += 1;
             } else {
@@ -3393,7 +3481,33 @@ pub const Presentation = struct {
             .edit_refusal = self.editRefusal(published),
             .reanchor_refusal = self.reanchorRefusal(published),
             .delete_refusal = self.deleteRefusal(published),
+            .approved_refusal = self.reviewerVerdictRefusal(published, .approved),
+            .changes_requested_refusal = self.reviewerVerdictRefusal(published, .changes_requested),
+            .no_verdict_refusal = self.reviewerVerdictRefusal(published, .no_verdict),
         };
+    }
+
+    fn currentReviewerVerdict(self: *const Presentation, published: *const Published) ?bbr.bitbucket.ReviewerVerdict {
+        const pull_request = published.session.remotePullRequestConst() orelse return null;
+        const account = self.authenticated_account_uuid orelse return null;
+        if (pull_request.reviewer_verdicts == null) return null;
+        return pull_request.reviewerVerdict(account.slice());
+    }
+
+    fn reviewerVerdictRefusal(
+        self: *const Presentation,
+        published: *const Published,
+        target: bbr.bitbucket.ReviewerVerdict,
+    ) ?ReviewerVerdictRefusal {
+        const pull_request = published.session.remotePullRequestConst() orelse return .local_review;
+        if (!std.mem.eql(u8, pull_request.state, "OPEN")) return .pull_request_not_open;
+        const account = self.authenticated_account_uuid orelse return .authenticated_account_unknown;
+        if (pull_request.reviewer_verdicts == null) return .reviewer_verdict_unknown;
+        if (pull_request.author_uuid.len == 0) return .pull_request_author_unknown;
+        if (std.mem.eql(u8, pull_request.author_uuid, account.slice())) return .pull_request_author;
+        if (pull_request.reviewerVerdict(account.slice()) == target) return .unchanged;
+        if (self.remoteWriteBusy()) return .remote_write_busy;
+        return null;
     }
 
     /// Why editing the ReviewCard under the cursor is refused, or null when it
@@ -3485,7 +3599,7 @@ pub const Presentation = struct {
     }
 
     fn remoteWriteBusy(self: *const Presentation) bool {
-        return self.durable_submission != null or self.durable_comment_edit != null or self.durable_comment_delete != null;
+        return self.durable_submission != null or self.durable_comment_edit != null or self.durable_comment_delete != null or self.durable_reviewer_verdict != null;
     }
 
     /// The whole cascade must be deletable: one run-owned, in-flight, published,
@@ -3628,6 +3742,7 @@ pub const Presentation = struct {
         };
         self.delete_confirmation = null;
         self.comment_edit_result = null;
+        self.reviewer_verdict_result = null;
         self.durable_comment_delete = durable;
         self.commands.appendAssumeCapacity(.{ .delete_comment = command });
         self.action_error = null;
@@ -4035,6 +4150,9 @@ pub const Presentation = struct {
                 .edit_review_item => mutationRefusalError(availability.edit_refusal),
                 .reanchor_review_item => mutationRefusalError(availability.reanchor_refusal),
                 .delete_review_item => mutationRefusalError(availability.delete_refusal),
+                .set_verdict_approved => reviewerVerdictRefusalError(availability.approved_refusal),
+                .set_verdict_changes_requested => reviewerVerdictRefusalError(availability.changes_requested_refusal),
+                .set_verdict_none => reviewerVerdictRefusalError(availability.no_verdict_refusal),
                 else => .local_review_remote_action_unavailable,
             };
             return;
@@ -4136,6 +4254,9 @@ pub const Presentation = struct {
             .external_edit => self.applyComposerInput(.external_edit),
             .reanchor_review_item => self.armReanchor(published),
             .delete_review_item => self.openDeleteConfirmation(published),
+            .set_verdict_approved => self.startReviewerVerdictChange(published, .approved),
+            .set_verdict_changes_requested => self.startReviewerVerdictChange(published, .changes_requested),
+            .set_verdict_none => self.startReviewerVerdictChange(published, .no_verdict),
             .inline_comment => self.openInlineComposer(published, .comment),
             .suggest => self.openInlineComposer(published, .suggestion),
             .submit => self.startSubmission(published),
@@ -4404,7 +4525,7 @@ pub const Presentation = struct {
             self.action_error = .local_review_no_submission;
             return;
         }
-        if (self.durable_comment_edit != null or self.durable_comment_delete != null) {
+        if (self.durable_comment_edit != null or self.durable_comment_delete != null or self.durable_reviewer_verdict != null) {
             self.action_error = .remote_write_busy;
             return;
         }
@@ -4624,6 +4745,88 @@ pub const Presentation = struct {
         self.durable_comment_delete = null;
         durable.destroy();
         self.action_error = .comment_delete_launch_failed;
+    }
+
+    fn startReviewerVerdictChange(self: *Presentation, published: *Published, target: bbr.bitbucket.ReviewerVerdict) void {
+        if (self.reviewerVerdictRefusal(published, target)) |refusal| {
+            self.action_error = reviewerVerdictRefusalError(refusal);
+            return;
+        }
+        const account = self.authenticated_account_uuid.?;
+        const expected_source_commit = BoundedText(64).init(published.session.header.source_commit) catch {
+            self.action_error = .reviewer_verdict_failed;
+            return;
+        };
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        self.durable_reviewer_verdict = .{
+            .key = published.key,
+            .initiating_epoch = published.epoch,
+            .target = target,
+        };
+        self.comment_edit_result = null;
+        self.comment_delete_result = null;
+        self.commands.appendAssumeCapacity(.{ .change_reviewer_verdict = .{
+            .identity = .init(published.key),
+            .expected_source_commit = expected_source_commit,
+            .authenticated_account_uuid = account,
+            .target = target,
+        } });
+        self.action_error = null;
+    }
+
+    fn acceptReviewerVerdict(self: *Presentation, completed: ReviewerVerdictChanged) void {
+        const durable = self.durable_reviewer_verdict orelse return;
+        if (!durableIdentityMatches(durable.key, completed.identity) or durable.target != completed.target) return;
+        if (!self.consumeCommand(completed.command_id, .change_reviewer_verdict)) return;
+        self.reviewer_verdict_result = .{ .key = durable.key, .target = durable.target, .outcome = completed.outcome };
+        const result = switch (completed.outcome) {
+            .completed => |result| result,
+            .launch_failed => {
+                self.durable_reviewer_verdict = null;
+                self.action_error = .reviewer_verdict_launch_failed;
+                return;
+            },
+            .adapter_failed => {
+                self.durable_reviewer_verdict = null;
+                self.action_error = .reviewer_verdict_failed;
+                return;
+            },
+        };
+        if (result.invalidatesAuthenticatedAccount()) self.authenticated_account_uuid = null;
+        switch (result) {
+            .success, .reconciled_success => {
+                const visible = !self.shutdown_requested and self.published != null and
+                    OwnedReviewIdentity.eql(self.published.?.key, durable.key) and
+                    (self.replacement == null or OwnedReviewIdentity.eql(self.replacement.?.key, durable.key));
+                if (!visible) {
+                    self.durable_reviewer_verdict = null;
+                    self.action_error = null;
+                    return;
+                }
+                self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+                    self.durable_reviewer_verdict = null;
+                    self.action_error = .out_of_memory;
+                    return;
+                };
+                self.durable_reviewer_verdict.?.result = result;
+                self.queueReconciliation(durable.key);
+            },
+            .stale_source_commit => {
+                self.durable_reviewer_verdict = null;
+                self.action_error = .reviewer_verdict_source_changed;
+            },
+            .api_error => {
+                self.durable_reviewer_verdict = null;
+                self.action_error = .reviewer_verdict_failed;
+            },
+            .unresolved => {
+                self.durable_reviewer_verdict = null;
+                self.action_error = .reviewer_verdict_unresolved;
+            },
+        }
     }
 
     fn restoreCommentDeleteConfirmation(self: *Presentation, durable: *const DurableCommentDelete) void {
@@ -5655,6 +5858,7 @@ pub const Presentation = struct {
         published.composer.?.deinit();
         published.composer = null;
         self.comment_delete_result = null;
+        self.reviewer_verdict_result = null;
         self.durable_comment_edit = durable;
         self.commands.appendAssumeCapacity(.{ .update_comment = command });
         self.action_error = null;
@@ -5906,6 +6110,9 @@ pub const Presentation = struct {
             self.durable_comment_delete = null;
             durable.destroy();
         };
+        if (self.durable_reviewer_verdict) |durable| {
+            if (durable.result != null) self.durable_reviewer_verdict = null;
+        }
         // Commands not yet transferred to the terminal adapter are still ours
         // to supersede. Already-taken commands complete normally and are
         // rejected later by their LoadIntent.
@@ -5990,6 +6197,7 @@ pub const Presentation = struct {
                         durable.destroy();
                     }
                 };
+                if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
                 self.replacement = null;
                 self.replacement_error = if (err == error.OutOfMemory) .out_of_memory else .session_load_failed;
             },
@@ -6018,6 +6226,7 @@ pub const Presentation = struct {
                         error.PendingReviewLoadFailed => .pending_review_load_failed,
                         error.BufferBuildFailed => .buffer_build_failed,
                     };
+                    if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
                     return;
                 };
 
@@ -6058,9 +6267,16 @@ pub const Presentation = struct {
                         durable.destroy();
                     }
                 };
+                if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
                 if (previous) |published| published.destroy();
                 self.refreshStaleRepairTree();
             },
+        }
+    }
+
+    fn finishReviewerVerdictReconciliation(self: *Presentation, key: OwnedReviewIdentity) void {
+        if (self.durable_reviewer_verdict) |durable| {
+            if (OwnedReviewIdentity.eql(durable.key, key)) self.durable_reviewer_verdict = null;
         }
     }
 };
@@ -6163,6 +6379,19 @@ fn mutationRefusalError(refusal: ?MutationRefusal) ActionError {
         .reply_inherits_scope => .draft_reply_has_no_anchor,
         .scope_not_inline => .draft_scope_not_inline,
         .descendant_locked => .draft_descendant_locked,
+    };
+}
+
+fn reviewerVerdictRefusalError(refusal: ?ReviewerVerdictRefusal) ActionError {
+    return switch (refusal orelse return .action_refused) {
+        .local_review => .reviewer_verdict_local_review,
+        .pull_request_not_open => .pull_request_not_open,
+        .authenticated_account_unknown => .authenticated_account_unknown,
+        .reviewer_verdict_unknown => .reviewer_verdict_unknown,
+        .pull_request_author_unknown => .pull_request_author_unknown,
+        .pull_request_author => .pull_request_author,
+        .unchanged => .reviewer_verdict_unchanged,
+        .remote_write_busy => .remote_write_busy,
     };
 }
 
@@ -6669,11 +6898,317 @@ test "local review gates remote actions and refreshes the same identity" {
     try testing.expectEqual(ActionError.local_review_no_submission, presentation.projection().action_error.?);
     try presentation.dispatch(.{ .action = .recover_submission });
     try testing.expectEqual(ActionError.local_review_remote_action_unavailable, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .action = .set_verdict_approved });
+    try testing.expectEqual(ActionError.reviewer_verdict_local_review, presentation.projection().action_error.?);
 
     try presentation.dispatch(.{ .action = .refresh });
     const refresh = presentation.takeCommand().?.load_session;
     try testing.expectEqual(SessionLoadCause.refresh, refresh.cause);
     try testing.expect(OwnedReviewIdentity.eql(key, refresh.key));
+}
+
+test "Reviewer Verdict availability gives every refusal and emits one qualified command" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    const loaded = try testSession(testing.allocator, 1, 'a');
+    loaded.authenticated_account_uuid = "{me}";
+    loaded.source.remote.author_uuid = "{author}";
+    loaded.source.remote.reviewer_verdicts = &.{};
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = loaded },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    var availability = presentation.projection().action_availability;
+    try testing.expect(availability.available(.set_verdict_approved));
+    try testing.expectEqual(ReviewerVerdictRefusal.unchanged, availability.verdictRefusal(.no_verdict).?);
+
+    presentation.published.?.session.source.remote.state = "MERGED";
+    try testing.expectEqual(ReviewerVerdictRefusal.pull_request_not_open, presentation.projection().action_availability.verdictRefusal(.approved).?);
+    presentation.published.?.session.source.remote.state = "OPEN";
+    presentation.authenticated_account_uuid = null;
+    try testing.expectEqual(ReviewerVerdictRefusal.authenticated_account_unknown, presentation.projection().action_availability.verdictRefusal(.approved).?);
+    presentation.authenticated_account_uuid = try BoundedText(256).init("{me}");
+    presentation.published.?.session.source.remote.reviewer_verdicts = null;
+    try testing.expectEqual(ReviewerVerdictRefusal.reviewer_verdict_unknown, presentation.projection().action_availability.verdictRefusal(.approved).?);
+    presentation.published.?.session.source.remote.reviewer_verdicts = &.{};
+    presentation.published.?.session.source.remote.author_uuid = "";
+    try testing.expectEqual(ReviewerVerdictRefusal.pull_request_author_unknown, presentation.projection().action_availability.verdictRefusal(.approved).?);
+    presentation.published.?.session.source.remote.author_uuid = "{me}";
+    try testing.expectEqual(ReviewerVerdictRefusal.pull_request_author, presentation.projection().action_availability.verdictRefusal(.approved).?);
+    presentation.published.?.session.source.remote.author_uuid = "{author}";
+
+    try presentation.dispatch(.{ .action = .set_verdict_approved });
+    const command = presentation.takeCommand().?;
+    try testing.expect(command == .change_reviewer_verdict);
+    try testing.expectEqual(bbr.bitbucket.ReviewerVerdict.approved, command.change_reviewer_verdict.target);
+    try testing.expectEqualStrings("source", command.change_reviewer_verdict.expectedSourceCommit());
+    try testing.expect(OwnedRemoteReviewIdentity.eql(.init(key), command.change_reviewer_verdict.identity));
+    availability = presentation.projection().action_availability;
+    try testing.expectEqual(ReviewerVerdictRefusal.remote_write_busy, availability.verdictRefusal(.changes_requested).?);
+    try presentation.dispatch(.{ .action = .submit });
+    try testing.expectEqual(ActionError.remote_write_busy, presentation.projection().action_error.?);
+
+    try presentation.dispatch(.{ .reviewer_verdict_changed = .{
+        .command_id = command.change_reviewer_verdict.command_id,
+        .identity = command.change_reviewer_verdict.identity,
+        .target = .approved,
+        .outcome = .{ .completed = .success },
+    } });
+    const reconciliation = presentation.takeCommand().?.load_session;
+    try testing.expectEqual(SessionLoadCause.reconciliation, reconciliation.cause);
+    try testing.expect(presentation.projection().reviewer_verdict_result.?.outcome.completed == .success);
+
+    const candidate = try testSession(testing.allocator, 1, 'b');
+    candidate.authenticated_account_uuid = "{me}";
+    candidate.source.remote.author_uuid = "{author}";
+    candidate.source.remote.reviewer_verdicts = &.{.{ .account_uuid = "{me}", .verdict = .approved }};
+    try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = reconciliation.command_id,
+        .intent = reconciliation.intent,
+        .outcome = .{ .loaded = candidate },
+    } });
+    try testing.expectEqual(bbr.bitbucket.ReviewerVerdict.approved, presentation.projection().review.?.reviewer_verdict.?);
+    try testing.expect(!presentation.remoteWriteBusy());
+}
+
+test "Reviewer Verdict rejects stale completions and keeps every terminal result qualified" {
+    const cases = [_]struct {
+        result: bbr.bitbucket.ReviewerVerdictChangeResult,
+        action_error: ActionError,
+    }{
+        .{ .result = .stale_source_commit, .action_error = .reviewer_verdict_source_changed },
+        .{ .result = .{ .api_error = error.Forbidden }, .action_error = .reviewer_verdict_failed },
+        .{ .result = .{ .unresolved = null }, .action_error = .reviewer_verdict_unresolved },
+    };
+    for (cases) |case| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        const loaded = try testSession(testing.allocator, 1, 'a');
+        loaded.authenticated_account_uuid = "{me}";
+        loaded.source.remote.author_uuid = "{author}";
+        loaded.source.remote.reviewer_verdicts = &.{};
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = key, .session = loaded },
+            .viewport_rows = 8,
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .set_verdict_changes_requested });
+        const command = presentation.takeCommand().?.change_reviewer_verdict;
+
+        try presentation.dispatch(.{ .reviewer_verdict_changed = .{
+            .command_id = command.command_id + 1,
+            .identity = command.identity,
+            .target = command.target,
+            .outcome = .{ .completed = .success },
+        } });
+        try testing.expect(presentation.projection().reviewer_verdict_result == null);
+        try testing.expect(presentation.remoteWriteBusy());
+
+        try presentation.dispatch(.{ .reviewer_verdict_changed = .{
+            .command_id = command.command_id,
+            .identity = command.identity,
+            .target = command.target,
+            .outcome = .{ .completed = case.result },
+        } });
+        try testing.expectEqual(case.action_error, presentation.projection().action_error.?);
+        const result = presentation.projection().reviewer_verdict_result.?;
+        try testing.expect(OwnedReviewIdentity.eql(key, result.key));
+        try testing.expectEqual(command.target, result.target);
+        try testing.expect(!presentation.remoteWriteBusy());
+        try testing.expect(presentation.takeCommand() == null);
+    }
+}
+
+test "Reviewer Verdict survives a Session switch without projecting into the new PullRequest" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const first_key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    const first = try testSession(testing.allocator, 1, 'a');
+    first.authenticated_account_uuid = "{me}";
+    first.source.remote.author_uuid = "{author}";
+    first.source.remote.reviewer_verdicts = &.{};
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = first_key, .session = first },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .set_verdict_approved });
+    const verdict = presentation.takeCommand().?.change_reviewer_verdict;
+    const second_key = try OwnedReviewIdentity.init("workspace", "repo", 2);
+    try presentation.dispatch(.{ .choose_pull_request = second_key });
+    const load = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+    } });
+    try presentation.dispatch(.{ .reviewer_verdict_changed = .{
+        .command_id = verdict.command_id,
+        .identity = verdict.identity,
+        .target = verdict.target,
+        .outcome = .{ .completed = .reconciled_success },
+    } });
+
+    try testing.expect(OwnedReviewIdentity.eql(second_key, presentation.projection().review.?.key));
+    try testing.expect(OwnedReviewIdentity.eql(first_key, presentation.projection().reviewer_verdict_result.?.key));
+    try testing.expect(presentation.takeCommand() == null);
+    try testing.expect(!presentation.remoteWriteBusy());
+}
+
+test "Reviewer Verdict replacement failure preserves the Session and qualified result" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    const loaded = try testSession(testing.allocator, 1, 'a');
+    loaded.authenticated_account_uuid = "{me}";
+    loaded.source.remote.author_uuid = "{author}";
+    loaded.source.remote.reviewer_verdicts = &.{};
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = loaded },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    const epoch = presentation.projection().review.?.session_epoch;
+
+    try presentation.dispatch(.{ .action = .set_verdict_approved });
+    const verdict = presentation.takeCommand().?.change_reviewer_verdict;
+    try presentation.dispatch(.{ .reviewer_verdict_changed = .{
+        .command_id = verdict.command_id,
+        .identity = verdict.identity,
+        .target = verdict.target,
+        .outcome = .{ .completed = .reconciled_success },
+    } });
+    const replacement = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = replacement.command_id,
+        .intent = replacement.intent,
+        .outcome = .{ .failed = error.TransportFailure },
+    } });
+
+    try testing.expectEqual(epoch, presentation.projection().review.?.session_epoch);
+    try testing.expect(presentation.projection().reviewer_verdict_result.?.outcome.completed == .reconciled_success);
+    try testing.expect(OwnedReviewIdentity.eql(key, presentation.projection().reviewer_verdict_result.?.key));
+    try testing.expect(!presentation.remoteWriteBusy());
+}
+
+test "Reviewer Verdict queue allocation failure leaves no Durable Operation" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const loaded = try testSession(failing.allocator(), 1, 'a');
+    loaded.authenticated_account_uuid = "{me}";
+    loaded.source.remote.author_uuid = "{author}";
+    loaded.source.remote.reviewer_verdicts = &.{};
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = loaded },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    failing.fail_index = failing.alloc_index;
+
+    try presentation.dispatch(.{ .action = .set_verdict_approved });
+    try testing.expect(failing.has_induced_failure);
+    try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+    try testing.expect(!presentation.remoteWriteBusy());
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "shutdown drains a queued Reviewer Verdict Durable Operation" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const loaded = try testSession(testing.allocator, 1, 'a');
+    loaded.authenticated_account_uuid = "{me}";
+    loaded.source.remote.author_uuid = "{author}";
+    loaded.source.remote.reviewer_verdicts = &.{};
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = loaded },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .set_verdict_approved });
+    try presentation.dispatch(.request_shutdown);
+    try testing.expect(!presentation.readyToExit());
+    const command = presentation.takeCommand().?.change_reviewer_verdict;
+    try presentation.dispatch(.{ .reviewer_verdict_changed = .{
+        .command_id = command.command_id,
+        .identity = command.identity,
+        .target = command.target,
+        .outcome = .launch_failed,
+    } });
+    try testing.expect(presentation.readyToExit());
+}
+
+test "Reviewer Verdict command-tracking allocation failure remains drainable" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const loaded = try testSession(failing.allocator(), 1, 'a');
+    loaded.authenticated_account_uuid = "{me}";
+    loaded.source.remote.author_uuid = "{author}";
+    loaded.source.remote.reviewer_verdicts = &.{};
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = loaded },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .set_verdict_approved });
+    failing.fail_index = failing.alloc_index;
+
+    try testing.expect(presentation.takeCommand() == null);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(!presentation.readyToExit());
+    failing.fail_index = std.math.maxInt(usize);
+    const command = presentation.takeCommand().?.change_reviewer_verdict;
+    try presentation.dispatch(.{ .reviewer_verdict_changed = .{
+        .command_id = command.command_id,
+        .identity = command.identity,
+        .target = command.target,
+        .outcome = .launch_failed,
+    } });
+    try testing.expect(presentation.readyToExit());
+}
+
+test "Reviewer Verdict Candidate Session allocation failure releases the global lane" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    const loaded = try testSession(failing.allocator(), 1, 'a');
+    loaded.authenticated_account_uuid = "{me}";
+    loaded.source.remote.author_uuid = "{author}";
+    loaded.source.remote.reviewer_verdicts = &.{};
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = loaded },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    const epoch = presentation.projection().review.?.session_epoch;
+    try presentation.dispatch(.{ .action = .set_verdict_approved });
+    const command = presentation.takeCommand().?.change_reviewer_verdict;
+    try presentation.dispatch(.{ .reviewer_verdict_changed = .{
+        .command_id = command.command_id,
+        .identity = command.identity,
+        .target = command.target,
+        .outcome = .{ .completed = .success },
+    } });
+    const replacement = presentation.takeCommand().?.load_session;
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = replacement.command_id,
+        .intent = replacement.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 1, 'b') },
+    } });
+
+    try testing.expect(failing.has_induced_failure);
+    try testing.expectEqual(epoch, presentation.projection().review.?.session_epoch);
+    try testing.expect(presentation.projection().reviewer_verdict_result.?.outcome.completed == .success);
+    try testing.expect(!presentation.remoteWriteBusy());
 }
 
 test "local inline authoring persists a local target and authored context" {

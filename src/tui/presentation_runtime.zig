@@ -95,7 +95,7 @@ const CapturingSink = struct {
 };
 
 const ScriptedSink = struct {
-    inputs: [11]?presentation.OwnedInput = .{null} ** 11,
+    inputs: [12]?presentation.OwnedInput = .{null} ** 12,
     count: usize = 0,
 
     fn sink(self: *ScriptedSink) CompletionSink {
@@ -119,7 +119,7 @@ const ScriptedSink = struct {
 };
 
 const ScriptedExecutor = struct {
-    tags: [11]std.meta.Tag(presentation.OwnedCommand) = undefined,
+    tags: [12]std.meta.Tag(presentation.OwnedCommand) = undefined,
     count: usize = 0,
 
     fn executor(self: *ScriptedExecutor) CommandExecutor {
@@ -142,6 +142,7 @@ const ScriptedExecutor = struct {
             .post_draft => |value| adapter.postLaunchFailed(value),
             .update_comment => |value| adapter.commentEditLaunchFailed(value),
             .delete_comment => |value| adapter.commentDeleteLaunchFailed(value),
+            .change_reviewer_verdict => |value| adapter.reviewerVerdictLaunchFailed(value),
             .wait_submission => |value| .{ .submission_wait_completed = value },
             .check_recovery => |value| .{ .recovery_checked = .{
                 .command_id = value.command_id,
@@ -276,12 +277,13 @@ test "scripted terminal adapter drains every command family through the producti
         .{ .post_draft = try scriptedPost(3, 30) },
         .{ .update_comment = try scriptedUpdate(4) },
         .{ .delete_comment = try scriptedDelete(5) },
-        .{ .wait_submission = .{ .command_id = 6, .operation_id = 30, .identity = remote_identity, .temp_id = 41, .ms = 1000 } },
-        .{ .check_recovery = .{ .command_id = 7, .operation_id = 30, .identity = remote_identity, .source_commit = undefined } },
-        .{ .find_duplicate = try scriptedPost(8, 30) },
-        .{ .list_pull_requests = .{ .command_id = 9, .work_id = 19, .repository = undefined } },
-        .{ .copy_clipboard = try scriptedClipboard(10) },
-        .{ .external_edit = try scriptedExternalEdit(11) },
+        .{ .change_reviewer_verdict = .{ .command_id = 6, .identity = remote_identity, .expected_source_commit = undefined, .authenticated_account_uuid = undefined, .target = .approved } },
+        .{ .wait_submission = .{ .command_id = 7, .operation_id = 30, .identity = remote_identity, .temp_id = 41, .ms = 1000 } },
+        .{ .check_recovery = .{ .command_id = 8, .operation_id = 30, .identity = remote_identity, .source_commit = undefined } },
+        .{ .find_duplicate = try scriptedPost(9, 30) },
+        .{ .list_pull_requests = .{ .command_id = 10, .work_id = 19, .repository = undefined } },
+        .{ .copy_clipboard = try scriptedClipboard(11) },
+        .{ .external_edit = try scriptedExternalEdit(12) },
     };
     var drained = false;
     defer if (!drained) for (&commands) |*command| command.deinit();
@@ -299,10 +301,11 @@ test "scripted terminal adapter drains every command family through the producti
     try testing.expectEqual(@as(presentation.CommandId, 3), sink.inputs[2].?.post_draft_launch_failed.command_id);
     try testing.expectEqual(@as(presentation.CommandId, 4), sink.inputs[3].?.comment_edit_launch_failed.command_id);
     try testing.expectEqual(@as(presentation.CommandId, 5), sink.inputs[4].?.comment_delete_launch_failed.command_id);
-    try testing.expectEqual(@as(presentation.CommandId, 6), sink.inputs[5].?.submission_wait_completed.command_id);
-    try testing.expectEqual(@as(presentation.CommandId, 7), sink.inputs[6].?.recovery_checked.command_id);
-    try testing.expectEqual(@as(presentation.CommandId, 8), sink.inputs[7].?.duplicate_checked.command_id);
-    try testing.expectEqual(@as(presentation.CommandId, 9), sink.inputs[8].?.pull_requests_loaded.command_id);
-    try testing.expectEqual(@as(presentation.CommandId, 10), sink.inputs[9].?.clipboard_completed.command_id);
-    try testing.expectEqual(@as(presentation.CommandId, 11), sink.inputs[10].?.external_edit_completed.command_id);
+    try testing.expectEqual(@as(presentation.CommandId, 6), sink.inputs[5].?.reviewer_verdict_changed.command_id);
+    try testing.expectEqual(@as(presentation.CommandId, 7), sink.inputs[6].?.submission_wait_completed.command_id);
+    try testing.expectEqual(@as(presentation.CommandId, 8), sink.inputs[7].?.recovery_checked.command_id);
+    try testing.expectEqual(@as(presentation.CommandId, 9), sink.inputs[8].?.duplicate_checked.command_id);
+    try testing.expectEqual(@as(presentation.CommandId, 10), sink.inputs[9].?.pull_requests_loaded.command_id);
+    try testing.expectEqual(@as(presentation.CommandId, 11), sink.inputs[10].?.clipboard_completed.command_id);
+    try testing.expectEqual(@as(presentation.CommandId, 12), sink.inputs[11].?.external_edit_completed.command_id);
 }

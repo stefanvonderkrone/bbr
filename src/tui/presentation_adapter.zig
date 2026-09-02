@@ -301,6 +301,41 @@ pub fn commentDeleteLaunchFailed(command: *presentation.DeleteComment) presentat
     } };
 }
 
+pub fn executeReviewerVerdict(
+    allocator: std.mem.Allocator,
+    command: presentation.ChangeReviewerVerdict,
+    client: bbr.bitbucket.Client,
+) presentation.OwnedInput {
+    const result = client.changeReviewerVerdict(
+        allocator,
+        command.identity.repository(),
+        command.identity.pullRequestId(),
+        command.expectedSourceCommit(),
+        command.authenticatedAccountUuid(),
+        command.target,
+    ) catch return .{ .reviewer_verdict_changed = .{
+        .command_id = command.command_id,
+        .identity = command.identity,
+        .target = command.target,
+        .outcome = .adapter_failed,
+    } };
+    return .{ .reviewer_verdict_changed = .{
+        .command_id = command.command_id,
+        .identity = command.identity,
+        .target = command.target,
+        .outcome = .{ .completed = result },
+    } };
+}
+
+pub fn reviewerVerdictLaunchFailed(command: presentation.ChangeReviewerVerdict) presentation.OwnedInput {
+    return .{ .reviewer_verdict_changed = .{
+        .command_id = command.command_id,
+        .identity = command.identity,
+        .target = command.target,
+        .outcome = .launch_failed,
+    } };
+}
+
 const testing = std.testing;
 
 test "editor resolution uses first non-empty configured value" {
