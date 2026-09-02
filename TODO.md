@@ -190,14 +190,18 @@ Address the workflows intentionally excluded from the committed-ref MVP.
 - [ ] Design an explicit copy workflow from a LocalReview's Drafts to an AdjacentPullRequest's PendingReview. Never retarget or silently mix `CommentTarget`s; preview every Anchor translation and leave the source Review intact.
 - [ ] Evaluate live synchronization between concurrent bbr processes. Keep explicit refresh as the documented baseline unless a watcher/notification design preserves atomic Session replacement.
 
-## M19 — Operational hardening & product gates  ·  S/M  ·  needs M14
+## M19 — Operational hardening & product gates  ·  S/M  ·  ✅ done
 Turn the remaining environment-dependent questions into measured decisions.
-- [ ] Add CI for `zig build test` on Zig 0.16.0 plus `zig fmt --check`; keep live Bitbucket checks opt-in and credential-gated.
-- [ ] Define a reproducible CalVer identity for bbr builds, including the date source, commit hash, release tags, dirty-worktree behavior, and user-visible version output.
-- [ ] Rotate the API token currently present in plaintext `opencode.jsonc`, remove it from tracked/local plaintext configuration, and document environment/keychain injection without logging secret values.
-- [ ] Identify the corporate proxy/authentication type and run a representative connectivity check. Add a libcurl adapter only if `std.http.Client` cannot support the observed requirement; otherwise close the fallback decision.
-- [ ] Benchmark sequential versus parallel PR/diff/comment loading against the live API, including TLS handshakes and rate-limit behavior. Implement fan-out and order-independent fakes only when the measured latency gain justifies the second connection.
-- [ ] Decide whether approve/merge/decline belongs in bbr after the review workflow is stable. If accepted, specify permissions, confirmation, stale-head, and failure behavior before adding Actions; otherwise record it as a durable non-goal.
+- [x] Require four stable native CI jobs on Zig 0.16.0. Keep live Bitbucket checks opt-in and Credential-gated.
+- [x] Add a reproducible CalVer source identity and `bbr --version`.
+- [x] Remove the exposed API token, rotate it, and document environment and macOS Keychain injection.
+- [x] Keep `StdHttpClient` after direct connectivity passed. Reject unsafe proxy fallback and retain `HttpClient` as the replacement boundary.
+- [x] Select two-request Candidate Session acquisition after both live cases passed the 30% latency gate without failures or 429 responses.
+- [x] Add Reviewer Verdict Actions for Approved, Changes Requested, and No Verdict. Keep merge and decline out of M19.
+
+M19 verification: the fan-out gate passed with 36% and 38% median reductions, two maximum
+connections, no failures, and no 429 responses. Required CI remains Credential-free, and release
+validation publishes no artifact. See `docs/m19-operations.md`.
 
 ## M20 — Side-aware version inspection  ·  M  ·  needs M15/M17
 Make old-versus-new File version choice explicit after M15 establishes the Presentation contract

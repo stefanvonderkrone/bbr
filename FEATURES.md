@@ -74,7 +74,8 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [x] **Overlay: Composer** — write a Draft. `M6`
 - [x] **Non-blocking startup** — boot the TUI with a "Loading PR #N…" view; fetch the initial Session off-thread. `M7`
 - [x] **Non-blocking picker** — `p` opens the picker instantly; the PR list loads off-thread and fills in. `M7`
-- [ ] **Measured parallel Session fetch** — overlap PR/diff/comment requests only if live measurements beat sequential keep-alive loading. `M19`
+- [x] **Bounded Candidate Session acquisition** — overlap at most two remote requests after the live gate proved 36% and 38% median reductions. `M19`
+- [x] **Reviewer Verdict Actions** — show and set Approved, Changes Requested, or No Verdict for an eligible remote PullRequest. `M19`
 - [x] **Overlay: keybinding help** `M11`
 - [x] **Config file** — TOML at the XDG config location. `M12`
 - [x] **Themes** — built-in Catppuccin / Gruvbox / Solarized + plain light/dark. `M12`
@@ -83,6 +84,6 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [x] **External editor handoff** `M16`
 
 ## Explicit non-features (for now)
-- Bitbucket Server / Data Center · applying suggestions · editing files. Approve/merge/decline
-  has a product gate in `M19`; dirty working-tree review is planned for `M18`. See
+- Bitbucket Server / Data Center · applying suggestions · editing files · merge · decline.
+  Reviewer Verdict Actions include Approved, Changes Requested, and No Verdict. Dirty working-tree review is planned for `M18`. See
   `docs/design.html` §2.

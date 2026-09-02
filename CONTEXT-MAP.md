@@ -33,7 +33,7 @@ bbr reviews changes from one of two sources, sharing all rendering and comment m
 
 ## Seams (dependency-inversion boundaries)
 
-- `HttpClient` — vtable seam under Bitbucket; `std.http.Client` now, libcurl later, fake in tests.
+- `HttpClient` — concurrent-send vtable seam under Bitbucket; `StdHttpClient` in production and `FakeHttpClient` in tests. Another adapter requires a measured proxy need.
 - `GitClient` — seam under Git; shells out to `git` now, fakeable with fixtures in tests.
 - `PendingReviewStore` — repository seam under Review; SQLite/libSQL now, in-memory fake in tests.
 - `SubmissionLocks` — live local ownership seam under Review; OS advisory locks in production, an in-memory lock table in deterministic tests.
