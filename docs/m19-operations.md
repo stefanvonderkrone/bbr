@@ -47,7 +47,7 @@ Git metadata. Documentation changes and ignored files do not mark a build dirty.
 
 ## Release validation
 
-`.github/workflows/release-validation.yml` runs for a `v*` tag push. It requires an annotated
+`.github/workflows/release.yml` runs for a `v*` tag push. It requires an annotated
 `vYYYY.M.D-N` tag that points directly at `HEAD`. The tag date must match the commit's UTC date, and
 the sequence must be the next sequence for that date.
 
