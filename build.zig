@@ -75,6 +75,13 @@ pub fn build(b: *std.Build) void {
     const mutation_step = b.step("check-mutation", "Destructive Bitbucket Comment lifecycle check (requires opt-in)");
     mutation_step.dependOn(&mutation_cmd.step);
 
+    const verdict_cmd = b.addRunArtifact(exe);
+    verdict_cmd.step.dependOn(b.getInstallStep());
+    verdict_cmd.addArg("check-verdict");
+    if (b.args) |args| verdict_cmd.addArgs(args);
+    const verdict_step = b.step("check-verdict", "Destructive Bitbucket Reviewer Verdict check (requires opt-in)");
+    verdict_step.dependOn(&verdict_cmd.step);
+
     const external_edit_cmd = b.addRunArtifact(exe);
     external_edit_cmd.step.dependOn(b.getInstallStep());
     external_edit_cmd.addArg("external-edit-smoke");

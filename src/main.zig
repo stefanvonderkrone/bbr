@@ -82,6 +82,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, f, "check")) return checkRun(init, gpa, cred, &it);
         if (std.mem.eql(u8, f, "check-acquisition")) return checkAcquisitionRun(init, gpa, cred);
         if (std.mem.eql(u8, f, "check-mutation")) return checkMutationRun(init, gpa, cred, &it);
+        if (std.mem.eql(u8, f, "check-verdict")) return checkVerdictRun(init, gpa, cred, &it);
         // Print startup resolution (branch/remote/PR list) without the TUI.
         if (std.mem.eql(u8, f, "detect")) return detectRun(init, gpa, cred, &it);
     }
@@ -553,6 +554,60 @@ fn checkMutationRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bi
     std.debug.print("ok: created, fetched, body-updated, and deleted disposable Comment #{d}\n", .{comment_id});
 }
 
+fn checkVerdictRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
+    if (!std.mem.eql(u8, init.environ_map.get("BBR_ALLOW_LIVE_MUTATION") orelse "", "1")) {
+        std.debug.print("bbr: refusing destructive check without BBR_ALLOW_LIVE_MUTATION=1\n", .{});
+        return;
+    }
+    const repo = it.next() orelse return usage();
+    const pull_request_id = std.fmt.parseInt(u64, it.next() orelse return usage(), 10) catch return usage();
+    if (it.next() != null) return usage();
+
+    var transport = bbr.http.StdHttpClient.init(gpa, init.io);
+    defer transport.deinit();
+    try transport.initDefaultProxies(init.arena.allocator(), init.environ_map);
+    const bb = bbr.bitbucket.Client.init(transport.httpClient(), cred);
+    const account_uuid = try bb.getAuthenticatedAccountUuid(gpa);
+    defer gpa.free(account_uuid);
+    const initial_pull_request = try bb.getPullRequest(gpa, repo, pull_request_id);
+    defer bbr.bitbucket.deinitPullRequest(gpa, initial_pull_request);
+    if (std.mem.eql(u8, account_uuid, initial_pull_request.author_uuid)) return error.PullRequestAuthorCannotSetReviewerVerdict;
+
+    const initial = initial_pull_request.reviewerVerdict(account_uuid);
+    const target: bbr.bitbucket.ReviewerVerdict = if (initial == .approved) .changes_requested else .approved;
+    var restored = false;
+    defer if (!restored) {
+        _ = restoreReviewerVerdict(gpa, bb, repo, pull_request_id, account_uuid, initial) catch {};
+    };
+
+    const changed = try bb.changeReviewerVerdict(gpa, repo, pull_request_id, initial_pull_request.source_commit, account_uuid, target);
+    if (!verdictChangeSucceeded(changed)) return error.ReviewerVerdictChangeFailed;
+    const restore_result = try restoreReviewerVerdict(gpa, bb, repo, pull_request_id, account_uuid, initial);
+    if (!verdictChangeSucceeded(restore_result)) return error.ReviewerVerdictRestoreFailed;
+    restored = true;
+    std.debug.print("ok: changed Reviewer Verdict from {s} to {s} and restored it\n", .{ @tagName(initial), @tagName(target) });
+}
+
+fn restoreReviewerVerdict(
+    gpa: std.mem.Allocator,
+    bb: bbr.bitbucket.Client,
+    repo: []const u8,
+    pull_request_id: u64,
+    account_uuid: []const u8,
+    target: bbr.bitbucket.ReviewerVerdict,
+) !bbr.bitbucket.ReviewerVerdictChangeResult {
+    const current = try bb.getPullRequest(gpa, repo, pull_request_id);
+    defer bbr.bitbucket.deinitPullRequest(gpa, current);
+    return bb.changeReviewerVerdict(gpa, repo, pull_request_id, current.source_commit, account_uuid, target);
+}
+
+fn verdictChangeSucceeded(result: bbr.bitbucket.ReviewerVerdictChangeResult) bool {
+    return switch (result) {
+        .success, .reconciled_success => true,
+        else => false,
+    };
+}
+
 fn checkBlobsRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
     const repo = it.next() orelse return usage();
     const pull_request_id = std.fmt.parseInt(u64, it.next() orelse return usage(), 10) catch return usage();
@@ -700,6 +755,7 @@ fn usage() void {
         \\  bbr check-blobs <repo> <pr-id> [<class> <old|new> <path> <attrs|->]...
         \\  bbr check-acquisition             opt-in Candidate Session acquisition gate
         \\  bbr check-mutation <repo> <pr-id> destructive live Comment lifecycle check
+        \\  bbr check-verdict <repo> <pr-id>  destructive live Reviewer Verdict check
         \\  bbr external-edit-smoke          interactive PTY External Edit check
         \\  bbr demo                         open the TUI with synthetic data (no network)
         \\  bbr grammar <command> ...        manage trusted local UserGrammars

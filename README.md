@@ -71,6 +71,7 @@ zig build test                   # unit tests — hermetic, no network/disk (sea
 zig build check -- <repo> <id>   # live smoke check against real Bitbucket (needs creds)
 BBR_ALLOW_PTY_SMOKE=1 zig build check-external-edit
 BBR_ALLOW_LIVE_MUTATION=1 zig build check-mutation -- <repo> <id>
+BBR_ALLOW_LIVE_MUTATION=1 zig build check-verdict -- <repo> <id>
 zig build run -- local [base-ref] [source-ref]  # committed local review (no creds)
 ```
 

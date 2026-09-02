@@ -108,6 +108,20 @@ identity, author UUID, body, and CommentScope, updates only its body, verifies i
 again, deletes it, and accepts either absence or a valid Deleted Comment. Cleanup
 is best-effort on every post-create failure. Credential material is never logged.
 
+Use the same gate to change and restore the Authenticated Account's Reviewer Verdict:
+
+```sh
+BITBUCKET_USERNAME='account@example.com' \
+BITBUCKET_TOKEN='...' \
+BITBUCKET_WORKSPACE='workspace' \
+BBR_ALLOW_LIVE_MUTATION=1 \
+zig build check-verdict -- <repo> <pull-request-id>
+```
+
+The check refuses a PullRequest opened by the Authenticated Account. It changes the
+Reviewer Verdict once, reacquires the PullRequest, and restores the initial verdict.
+Cleanup makes a best-effort restore after a failure. The command prints no Credential data.
+
 ## Credential-gated checks
 
 Remote checks read these three environment variables:

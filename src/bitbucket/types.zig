@@ -8,6 +8,7 @@ pub const PullRequest = struct {
     title: []const u8,
     state: []const u8,
     author_display_name: []const u8,
+    author_uuid: []const u8 = "",
     source_branch: []const u8,
     destination_branch: []const u8,
     /// Head commit of the source branch as we loaded it. Combined with
@@ -16,6 +17,43 @@ pub const PullRequest = struct {
     source_commit: []const u8,
     /// Head commit of the destination branch as we loaded it.
     destination_commit: []const u8,
+    reviewer_verdicts: ?[]const ReviewerVerdictEntry = null,
+
+    pub fn reviewerVerdict(self: PullRequest, authenticated_account_uuid: []const u8) ReviewerVerdict {
+        for (self.reviewer_verdicts orelse &.{}) |entry| {
+            if (std.mem.eql(u8, entry.account_uuid, authenticated_account_uuid)) return entry.verdict;
+        }
+        return .no_verdict;
+    }
+};
+
+const std = @import("std");
+
+pub const ReviewerVerdict = enum {
+    approved,
+    changes_requested,
+    no_verdict,
+};
+
+pub const ReviewerVerdictEntry = struct {
+    account_uuid: []const u8,
+    verdict: ReviewerVerdict,
+};
+
+pub const ReviewerVerdictChangeResult = union(enum) {
+    success,
+    reconciled_success,
+    api_error: ApiError,
+    stale_source_commit,
+    unresolved: ?ApiError,
+
+    pub fn invalidatesAuthenticatedAccount(self: ReviewerVerdictChangeResult) bool {
+        return switch (self) {
+            .api_error => |err| err == error.Unauthorized,
+            .unresolved => |err| if (err) |api_error| api_error == error.Unauthorized else false,
+            else => false,
+        };
+    }
 };
 
 /// A pull request as it appears in a *list* result — enough to populate the

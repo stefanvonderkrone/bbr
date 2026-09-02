@@ -152,6 +152,8 @@ pub const bitbucket = struct {
     pub const PullRequest = types.PullRequest;
     pub const PullRequestSummary = types.PullRequestSummary;
     pub const ApiError = types.ApiError;
+    pub const ReviewerVerdict = types.ReviewerVerdict;
+    pub const ReviewerVerdictChangeResult = types.ReviewerVerdictChangeResult;
     pub const url = @import("bitbucket/url.zig");
 };
 

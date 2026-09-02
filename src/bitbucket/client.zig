@@ -368,6 +368,85 @@ pub const Client = struct {
         return allocator.dupe(u8, parsed.value.uuid);
     }
 
+    /// Change the Authenticated Account's Reviewer Verdict only while the
+    /// PullRequest still has the expected SourceCommit. The mutation is never
+    /// retried. A lost mutation response is reconciled with one fresh read.
+    pub fn changeReviewerVerdict(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        pull_request_id: u64,
+        expected_source_commit: []const u8,
+        authenticated_account_uuid: []const u8,
+        target: types.ReviewerVerdict,
+    ) !types.ReviewerVerdictChangeResult {
+        const before = self.getPullRequest(allocator, repo_slug, pull_request_id) catch |err| {
+            if (asApiError(err)) |api_error| return .{ .api_error = api_error };
+            return err;
+        };
+        defer deinitPullRequest(allocator, before);
+        if (!std.mem.eql(u8, before.source_commit, expected_source_commit)) return .stale_source_commit;
+
+        const current = before.reviewerVerdict(authenticated_account_uuid);
+        if (current == target) return .success;
+        const endpoint: []const u8 = switch (target) {
+            .approved => "approve",
+            .changes_requested => "request-changes",
+            .no_verdict => switch (current) {
+                .approved => "approve",
+                .changes_requested => "request-changes",
+                .no_verdict => return .success,
+            },
+        };
+        const method: httpc.Method = if (target == .no_verdict) .DELETE else .POST;
+
+        const mutation_url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/pullrequests/{d}/{s}",
+            .{ base_url, self.cred.workspace, repo_slug, pull_request_id, endpoint },
+        );
+        defer allocator.free(mutation_url);
+        const mutation_auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(mutation_auth);
+
+        var uncertain = false;
+        var uncertain_reason: ?ApiError = null;
+        self.sendReviewerVerdictMutation(allocator, method, mutation_url, mutation_auth) catch |err| {
+            if (asApiError(err)) |api_error| switch (api_error) {
+                error.RateLimited, error.ServerError => uncertain_reason = api_error,
+                else => return .{ .api_error = api_error },
+            };
+            uncertain = true;
+        };
+
+        const after = self.getPullRequest(allocator, repo_slug, pull_request_id) catch |err| {
+            return .{ .unresolved = asApiError(err) };
+        };
+        defer deinitPullRequest(allocator, after);
+        if (after.reviewerVerdict(authenticated_account_uuid) != target) return .{ .unresolved = uncertain_reason };
+        if (uncertain or !std.mem.eql(u8, after.source_commit, expected_source_commit)) return .reconciled_success;
+        return .success;
+    }
+
+    fn sendReviewerVerdictMutation(
+        self: Client,
+        allocator: Allocator,
+        method: httpc.Method,
+        url: []const u8,
+        auth: []const u8,
+    ) !void {
+        const res = try self.http.send(allocator, .{
+            .method = method,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "application/json" },
+            },
+        });
+        defer allocator.free(res.body);
+        try classify(res.status);
+    }
+
     /// PUT one published Comment body. The anti-corruption boundary exposes no
     /// HTTP, JSON, or Atlassian field names to its caller.
     pub fn updateComment(
@@ -604,6 +683,21 @@ fn classify(status: u16) ApiError!void {
     };
 }
 
+fn asApiError(err: anyerror) ?ApiError {
+    return switch (err) {
+        error.Unauthorized => error.Unauthorized,
+        error.Forbidden => error.Forbidden,
+        error.BadRequest => error.BadRequest,
+        error.NotFound => error.NotFound,
+        error.RateLimited => error.RateLimited,
+        error.Conflict => error.Conflict,
+        error.ServerError => error.ServerError,
+        error.UnexpectedStatus => error.UnexpectedStatus,
+        error.MalformedResponse => error.MalformedResponse,
+        else => null,
+    };
+}
+
 /// Filter for `listPullRequests`. `state` is a Bitbucket PR state string
 /// (OPEN, MERGED, DECLINED, SUPERSEDED); `source_branch` restricts to PRs
 /// opened from that branch (the AdjacentPullRequest lookup).
@@ -716,9 +810,14 @@ const PrJson = struct {
     id: u64,
     title: []const u8,
     state: []const u8,
-    author: struct { display_name: []const u8 },
+    author: struct { display_name: []const u8, uuid: []const u8 },
     source: struct { branch: struct { name: []const u8 }, commit: struct { hash: []const u8 } },
     destination: struct { branch: struct { name: []const u8 }, commit: struct { hash: []const u8 } },
+    participants: []const struct {
+        user: struct { uuid: []const u8 },
+        approved: bool = false,
+        state: ?[]const u8 = null,
+    },
 };
 
 fn parsePullRequest(allocator: Allocator, body: []const u8) !PullRequest {
@@ -728,16 +827,41 @@ fn parsePullRequest(allocator: Allocator, body: []const u8) !PullRequest {
     defer parsed.deinit();
     const v = parsed.value;
 
+    var verdicts: std.ArrayList(types.ReviewerVerdictEntry) = .empty;
+    errdefer {
+        for (verdicts.items) |entry| allocator.free(entry.account_uuid);
+        verdicts.deinit(allocator);
+    }
+    for (v.participants) |participant| {
+        const verdict: types.ReviewerVerdict = if (participant.approved) blk: {
+            if (participant.state) |state| {
+                if (!std.mem.eql(u8, state, "approved")) return error.MalformedResponse;
+            }
+            break :blk .approved;
+        } else if (participant.state) |state| blk: {
+            if (!std.mem.eql(u8, state, "changes_requested")) return error.MalformedResponse;
+            break :blk .changes_requested;
+        } else .no_verdict;
+        const account_uuid = try allocator.dupe(u8, participant.user.uuid);
+        errdefer allocator.free(account_uuid);
+        try verdicts.append(allocator, .{
+            .account_uuid = account_uuid,
+            .verdict = verdict,
+        });
+    }
+
     // Duplicate the strings out of the parse arena into the caller's allocator.
     return .{
         .id = v.id,
         .title = try allocator.dupe(u8, v.title),
         .state = try allocator.dupe(u8, v.state),
         .author_display_name = try allocator.dupe(u8, v.author.display_name),
+        .author_uuid = try allocator.dupe(u8, v.author.uuid),
         .source_branch = try allocator.dupe(u8, v.source.branch.name),
         .destination_branch = try allocator.dupe(u8, v.destination.branch.name),
         .source_commit = try allocator.dupe(u8, v.source.commit.hash),
         .destination_commit = try allocator.dupe(u8, v.destination.commit.hash),
+        .reviewer_verdicts = try verdicts.toOwnedSlice(allocator),
     };
 }
 
@@ -925,10 +1049,15 @@ pub fn deinitPullRequest(allocator: Allocator, pr: PullRequest) void {
     allocator.free(pr.title);
     allocator.free(pr.state);
     allocator.free(pr.author_display_name);
+    if (pr.author_uuid.len > 0) allocator.free(pr.author_uuid);
     allocator.free(pr.source_branch);
     allocator.free(pr.destination_branch);
     allocator.free(pr.source_commit);
     allocator.free(pr.destination_commit);
+    if (pr.reviewer_verdicts) |verdicts| {
+        for (verdicts) |entry| allocator.free(entry.account_uuid);
+        allocator.free(verdicts);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -961,6 +1090,277 @@ test "getPullRequest parses a well-formed fixture" {
     try testing.expectEqualStrings("main", pr.destination_branch);
     try testing.expectEqualStrings("abc123def456", pr.source_commit);
     try testing.expectEqualStrings("0011223344ff", pr.destination_commit);
+}
+
+test "getPullRequest translates PullRequest Author and Reviewer Verdicts" {
+    const body =
+        \\{ "id": 42, "title": "Review", "state": "OPEN",
+        \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
+        \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "abc123" } },
+        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
+        \\  "participants": [
+        \\    { "user": { "uuid": "{approved}" }, "approved": true, "state": "approved" },
+        \\    { "user": { "uuid": "{changes}" }, "approved": false, "state": "changes_requested" },
+        \\    { "user": { "uuid": "{none}" }, "approved": false, "state": null }
+        \\  ] }
+    ;
+    var fake: FakeHttpClient = .{ .status = 200, .body = body };
+    const bb = Client.init(fake.httpClient(), testCredential());
+
+    const pr = try bb.getPullRequest(testing.allocator, "myrepo", 42);
+    defer deinitPullRequest(testing.allocator, pr);
+
+    try testing.expectEqualStrings("{ada}", pr.author_uuid);
+    try testing.expectEqual(types.ReviewerVerdict.approved, pr.reviewerVerdict("{approved}"));
+    try testing.expectEqual(types.ReviewerVerdict.changes_requested, pr.reviewerVerdict("{changes}"));
+    try testing.expectEqual(types.ReviewerVerdict.no_verdict, pr.reviewerVerdict("{none}"));
+    try testing.expectEqual(types.ReviewerVerdict.no_verdict, pr.reviewerVerdict("{missing}"));
+}
+
+test "changeReviewerVerdict POSTs Approved after a fresh SourceCommit check" {
+    const before =
+        \\{ "id": 42, "title": "Review", "state": "OPEN",
+        \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
+        \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "abc123" } },
+        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
+        \\  "participants": [] }
+    ;
+    const after =
+        \\{ "id": 42, "title": "Review", "state": "OPEN",
+        \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
+        \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "abc123" } },
+        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
+        \\  "participants": [ { "user": { "uuid": "{me}" }, "approved": true, "state": "approved" } ] }
+    ;
+    const responses = [_]@import("../http/fake_client.zig").Canned{
+        .{ .status = 200, .body = before },
+        .{ .status = 200, .body = "{}" },
+        .{ .status = 200, .body = after },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), testCredential());
+
+    const result = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
+
+    try testing.expectEqual(types.ReviewerVerdictChangeResult.success, result);
+    try testing.expectEqual(httpc.Method.GET, fake.methodAt(0).?);
+    try testing.expectEqual(httpc.Method.POST, fake.methodAt(1).?);
+    try testing.expectEqualStrings(
+        "https://api.bitbucket.org/2.0/repositories/check24/myrepo/pullrequests/42/approve",
+        fake.urlAt(1).?,
+    );
+    try testing.expectEqual(httpc.Method.GET, fake.methodAt(2).?);
+}
+
+const verdict_none =
+    \\{ "id": 42, "title": "Review", "state": "OPEN",
+    \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
+    \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "abc123" } },
+    \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
+    \\  "participants": [] }
+;
+const verdict_approved =
+    \\{ "id": 42, "title": "Review", "state": "OPEN",
+    \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
+    \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "abc123" } },
+    \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
+    \\  "participants": [ { "user": { "uuid": "{me}" }, "approved": true, "state": "approved" } ] }
+;
+const verdict_changes_requested =
+    \\{ "id": 42, "title": "Review", "state": "OPEN",
+    \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
+    \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "abc123" } },
+    \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
+    \\  "participants": [ { "user": { "uuid": "{me}" }, "approved": false, "state": "changes_requested" } ] }
+;
+const verdict_approved_new_source =
+    \\{ "id": 42, "title": "Review", "state": "OPEN",
+    \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
+    \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "new456" } },
+    \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
+    \\  "participants": [ { "user": { "uuid": "{me}" }, "approved": true, "state": "approved" } ] }
+;
+
+test "changeReviewerVerdict uses all replacement and removal endpoints" {
+    const cases = [_]struct {
+        before: []const u8,
+        after: []const u8,
+        target: types.ReviewerVerdict,
+        method: httpc.Method,
+        endpoint: []const u8,
+    }{
+        .{ .before = verdict_changes_requested, .after = verdict_approved, .target = .approved, .method = .POST, .endpoint = "approve" },
+        .{ .before = verdict_approved, .after = verdict_changes_requested, .target = .changes_requested, .method = .POST, .endpoint = "request-changes" },
+        .{ .before = verdict_approved, .after = verdict_none, .target = .no_verdict, .method = .DELETE, .endpoint = "approve" },
+        .{ .before = verdict_changes_requested, .after = verdict_none, .target = .no_verdict, .method = .DELETE, .endpoint = "request-changes" },
+    };
+    for (cases) |case| {
+        const responses = [_]@import("../http/fake_client.zig").Canned{
+            .{ .status = 200, .body = case.before },
+            .{ .status = 200, .body = "{}" },
+            .{ .status = 200, .body = case.after },
+        };
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        const bb = Client.init(fake.httpClient(), testCredential());
+        const result = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", case.target);
+        try testing.expectEqual(types.ReviewerVerdictChangeResult.success, result);
+        try testing.expectEqual(case.method, fake.methodAt(1).?);
+        const expected_url = try std.fmt.allocPrint(
+            testing.allocator,
+            "https://api.bitbucket.org/2.0/repositories/check24/myrepo/pullrequests/42/{s}",
+            .{case.endpoint},
+        );
+        defer testing.allocator.free(expected_url);
+        try testing.expectEqualStrings(expected_url, fake.urlAt(1).?);
+        try testing.expectEqual(@as(usize, 3), fake.call_count);
+    }
+}
+
+test "changeReviewerVerdict refuses a stale SourceCommit without mutation" {
+    var fake: FakeHttpClient = .{ .status = 200, .body = verdict_none };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const result = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "old", "{me}", .approved);
+    try testing.expectEqual(types.ReviewerVerdictChangeResult.stale_source_commit, result);
+    try testing.expectEqual(@as(usize, 1), fake.call_count);
+}
+
+test "changeReviewerVerdict classifies every ApiError without retry" {
+    const cases = [_]struct { status: u16, expected: ApiError, uncertain: bool = false }{
+        .{ .status = 400, .expected = error.BadRequest },
+        .{ .status = 401, .expected = error.Unauthorized },
+        .{ .status = 403, .expected = error.Forbidden },
+        .{ .status = 404, .expected = error.NotFound },
+        .{ .status = 409, .expected = error.Conflict },
+        .{ .status = 429, .expected = error.RateLimited, .uncertain = true },
+        .{ .status = 503, .expected = error.ServerError, .uncertain = true },
+        .{ .status = 302, .expected = error.UnexpectedStatus },
+    };
+    for (cases) |case| {
+        const responses = [_]@import("../http/fake_client.zig").Canned{
+            .{ .status = 200, .body = verdict_none },
+            .{ .status = case.status, .body = "failure" },
+            .{ .status = 200, .body = verdict_none },
+        };
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        const bb = Client.init(fake.httpClient(), testCredential());
+        const result = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
+        if (case.uncertain) {
+            try testing.expectEqual(case.expected, result.unresolved.?);
+        } else {
+            try testing.expectEqual(case.expected, result.api_error);
+        }
+        try testing.expectEqual(@as(usize, if (case.uncertain) 3 else 2), fake.call_count);
+        try testing.expectEqual(case.expected == error.Unauthorized, result.invalidatesAuthenticatedAccount());
+    }
+}
+
+test "changeReviewerVerdict reconciles an uncertain one-shot mutation" {
+    const responses = [_]@import("../http/fake_client.zig").Canned{
+        .{ .status = 200, .body = verdict_none },
+        .{ .send_error = error.ConnectionResetByPeer },
+        .{ .status = 200, .body = verdict_approved },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const result = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
+    try testing.expectEqual(types.ReviewerVerdictChangeResult.reconciled_success, result);
+    try testing.expectEqual(@as(usize, 3), fake.call_count);
+}
+
+test "changeReviewerVerdict reports unresolved reconciliation and malformed responses" {
+    const responses = [_]@import("../http/fake_client.zig").Canned{
+        .{ .status = 200, .body = verdict_none },
+        .{ .send_error = error.ConnectionResetByPeer },
+        .{ .status = 200, .body = verdict_none },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const unresolved = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
+    try testing.expect(unresolved.unresolved == null);
+
+    var malformed: FakeHttpClient = .{ .status = 200, .body = "not-json" };
+    const malformed_bb = Client.init(malformed.httpClient(), testCredential());
+    const malformed_result = try malformed_bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
+    try testing.expectEqual(error.MalformedResponse, malformed_result.api_error);
+
+    const malformed_after = [_]@import("../http/fake_client.zig").Canned{
+        .{ .status = 200, .body = verdict_none },
+        .{ .status = 200, .body = "{}" },
+        .{ .status = 200, .body = "not-json" },
+    };
+    var malformed_reconciliation: FakeHttpClient = .{ .responses = &malformed_after };
+    const malformed_reconciliation_bb = Client.init(malformed_reconciliation.httpClient(), testCredential());
+    const malformed_reconciliation_result = try malformed_reconciliation_bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
+    try testing.expectEqual(error.MalformedResponse, malformed_reconciliation_result.unresolved.?);
+}
+
+test "changeReviewerVerdict keeps transport failure distinct and invalidates identity on reconciled 401" {
+    var transport_failure: FakeHttpClient = .{ .send_error = error.ConnectionResetByPeer };
+    const transport_bb = Client.init(transport_failure.httpClient(), testCredential());
+    try testing.expectError(
+        error.ConnectionResetByPeer,
+        transport_bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved),
+    );
+
+    const responses = [_]@import("../http/fake_client.zig").Canned{
+        .{ .status = 200, .body = verdict_none },
+        .{ .send_error = error.ConnectionResetByPeer },
+        .{ .status = 401, .body = "unauthorized" },
+    };
+    var unauthorized: FakeHttpClient = .{ .responses = &responses };
+    const unauthorized_bb = Client.init(unauthorized.httpClient(), testCredential());
+    const result = try unauthorized_bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
+    try testing.expectEqual(error.Unauthorized, result.unresolved.?);
+    try testing.expect(result.invalidatesAuthenticatedAccount());
+    try testing.expectEqual(@as(usize, 3), unauthorized.call_count);
+}
+
+test "changeReviewerVerdict reconciles response allocation failure once" {
+    const responses = [_]@import("../http/fake_client.zig").Canned{
+        .{ .status = 200, .body = verdict_none },
+        .{ .send_error = error.OutOfMemory },
+        .{ .status = 200, .body = verdict_none },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const result = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
+    try testing.expect(result.unresolved == null);
+    try testing.expectEqual(@as(usize, 3), fake.call_count);
+}
+
+test "getPullRequest rejects missing or unknown Reviewer Verdict wire data" {
+    const missing =
+        \\{ "id": 42, "title": "Review", "state": "OPEN",
+        \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
+        \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "abc123" } },
+        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } } }
+    ;
+    var missing_fake: FakeHttpClient = .{ .status = 200, .body = missing };
+    const missing_bb = Client.init(missing_fake.httpClient(), testCredential());
+    try testing.expectError(error.MalformedResponse, missing_bb.getPullRequest(testing.allocator, "myrepo", 42));
+
+    const unknown =
+        \\{ "id": 42, "title": "Review", "state": "OPEN",
+        \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
+        \\  "source": { "branch": { "name": "feature" }, "commit": { "hash": "abc123" } },
+        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "def456" } },
+        \\  "participants": [ { "user": { "uuid": "{me}" }, "approved": false, "state": "pending" } ] }
+    ;
+    var unknown_fake: FakeHttpClient = .{ .status = 200, .body = unknown };
+    const unknown_bb = Client.init(unknown_fake.httpClient(), testCredential());
+    try testing.expectError(error.MalformedResponse, unknown_bb.getPullRequest(testing.allocator, "myrepo", 42));
+}
+
+test "changeReviewerVerdict reconciles a SourceCommit change during mutation" {
+    const responses = [_]@import("../http/fake_client.zig").Canned{
+        .{ .status = 200, .body = verdict_none },
+        .{ .status = 200, .body = "{}" },
+        .{ .status = 200, .body = verdict_approved_new_source },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const result = try bb.changeReviewerVerdict(testing.allocator, "myrepo", 42, "abc123", "{me}", .approved);
+    try testing.expectEqual(types.ReviewerVerdictChangeResult.reconciled_success, result);
 }
 
 test "getPullRequest builds the correct URL" {

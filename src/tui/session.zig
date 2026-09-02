@@ -365,9 +365,10 @@ const Canned = bbr.http.Canned;
 test "loadWith builds a session in order and owns everything" {
     const pr_json =
         \\{ "id": 7, "title": "T", "state": "OPEN",
-        \\  "author": { "display_name": "Ada" },
+        \\  "author": { "display_name": "Ada", "uuid": "{ada}" },
         \\  "source": { "branch": { "name": "feature/x" }, "commit": { "hash": "aaaa" } },
-        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "bbbb" } } }
+        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "bbbb" } },
+        \\  "participants": [] }
     ;
     const diff_text =
         "diff --git a/f.zig b/f.zig\n--- a/f.zig\n+++ b/f.zig\n@@ -1 +1 @@\n-a\n+b\n";
@@ -558,9 +559,10 @@ fn withRelease(canned: Canned, released: *std.atomic.Value(bool)) Canned {
 
 fn testRemoteResponses(account_status: u16) [4]Canned {
     const pr_json =
-        \\{ "id": 7, "title": "T", "state": "OPEN", "author": { "display_name": "Ada" },
+        \\{ "id": 7, "title": "T", "state": "OPEN", "author": { "display_name": "Ada", "uuid": "{ada}" },
         \\  "source": { "branch": { "name": "feature/x" }, "commit": { "hash": "aaaa" } },
-        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "bbbb" } } }
+        \\  "destination": { "branch": { "name": "main" }, "commit": { "hash": "bbbb" } },
+        \\  "participants": [] }
     ;
     const diff_text = "diff --git a/f.zig b/f.zig\n--- a/f.zig\n+++ b/f.zig\n@@ -1 +1 @@\n-a\n+b\n";
     return .{

@@ -18,6 +18,7 @@ pub const Canned = struct {
     status: u16 = 200,
     body: []const u8 = "",
     retry_after_ms: ?u64 = null,
+    send_error: ?anyerror = null,
     /// A request waits until this flag becomes true. Tests use it to choose
     /// completion order without coupling responses to start order.
     released: ?*std.atomic.Value(bool) = null,
@@ -44,6 +45,9 @@ pub const FakeHttpClient = struct {
     url_len: usize = 0,
     body_buf: [4096]u8 = undefined,
     body_len: usize = 0,
+    method_history: [32]client.Method = undefined,
+    url_history: [32][1024]u8 = undefined,
+    url_history_len: [32]usize = @splat(0),
     call_count: usize = 0,
     active_requests: usize = 0,
     max_active_requests: usize = 0,
@@ -62,6 +66,16 @@ pub const FakeHttpClient = struct {
     pub fn lastBody(self: *const FakeHttpClient) ?[]const u8 {
         if (self.call_count == 0) return null;
         return self.body_buf[0..self.body_len];
+    }
+
+    pub fn methodAt(self: *const FakeHttpClient, index: usize) ?client.Method {
+        if (index >= @min(self.call_count, self.method_history.len)) return null;
+        return self.method_history[index];
+    }
+
+    pub fn urlAt(self: *const FakeHttpClient, index: usize) ?[]const u8 {
+        if (index >= @min(self.call_count, self.url_history.len)) return null;
+        return self.url_history[index][0..self.url_history_len[index]];
     }
 
     pub fn callCount(self: *FakeHttpClient) usize {
@@ -91,6 +105,11 @@ pub const FakeHttpClient = struct {
         self.last_method = req.method;
         self.url_len = @min(req.url.len, self.url_buf.len);
         @memcpy(self.url_buf[0..self.url_len], req.url[0..self.url_len]);
+        if (self.call_count < self.method_history.len) {
+            self.method_history[self.call_count] = req.method;
+            self.url_history_len[self.call_count] = @min(req.url.len, self.url_history[self.call_count].len);
+            @memcpy(self.url_history[self.call_count][0..self.url_history_len[self.call_count]], req.url[0..self.url_history_len[self.call_count]]);
+        }
         if (req.body) |body| {
             self.body_len = @min(body.len, self.body_buf.len);
             @memcpy(self.body_buf[0..self.body_len], body[0..self.body_len]);
@@ -101,7 +120,7 @@ pub const FakeHttpClient = struct {
         self.active_requests += 1;
         self.max_active_requests = @max(self.max_active_requests, self.active_requests);
         const canned: Canned = self.responseFor(req.url, call_index);
-        const send_error = self.send_error;
+        const send_error: ?anyerror = if (canned.send_error) |err| err else self.send_error;
         self.mutex.unlock();
         defer {
             self.lock();
