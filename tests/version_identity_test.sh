@@ -28,6 +28,7 @@ assert_dirty() {
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/bbr-version.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
+export ZIG_LOCAL_CACHE_DIR="$tmp/zig-cache"
 
 git ls-files -co --exclude-standard >"$tmp/files"
 tar -cf "$tmp/source.tar" -T "$tmp/files"

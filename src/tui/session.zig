@@ -124,7 +124,6 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
     var comments_ready = false;
     var raw_diff_started = false;
     var comments_started = false;
-    var required_failed = false;
 
     try select.concurrent(.pull_request, acquirePullRequest, .{ &pr_branch, bb, repo, id });
     active += 1;
@@ -135,19 +134,12 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
         switch (try select.await()) {
             .pull_request => {
                 active -= 1;
-                if (pr_branch.err != null) required_failed = true else comments_ready = true;
+                if (pr_branch.err == null) comments_ready = true;
             },
             .account => active -= 1,
-            .raw_diff => {
-                active -= 1;
-                if (diff_branch.err != null) required_failed = true;
-            },
-            .comments => {
-                active -= 1;
-                if (comments_branch.err != null) required_failed = true;
-            },
+            .raw_diff, .comments => active -= 1,
         }
-        while (active < 2 and !required_failed) {
+        while (active < 2) {
             if (comments_ready and !comments_started) {
                 const pr = pr_branch.value.?;
                 try select.concurrent(.comments, acquireComments, .{ &comments_branch, bb, repo, id, pr.source_commit, pr.destination_commit });
