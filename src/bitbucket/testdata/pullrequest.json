@@ -21,6 +21,7 @@
     "commit": { "hash": "0011223344ff", "type": "commit" },
     "repository": { "type": "repository", "name": "bbr", "full_name": "check24/bbr" }
   },
+  "participants": [],
   "comment_count": 3,
   "task_count": 0,
   "close_source_branch": true,

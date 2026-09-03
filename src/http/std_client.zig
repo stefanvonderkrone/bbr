@@ -13,6 +13,8 @@ const Response = client.Response;
 
 pub const StdHttpClient = struct {
     inner: http.Client,
+    max_connection_count: std.atomic.Value(usize) = .init(0),
+    track_connection_count: bool = false,
 
     /// `gpa` must be thread-safe (std.http.Client requires it). `io` is the
     /// runtime's `Io` (the default is backed by `std.Io.Threaded`).
@@ -31,11 +33,21 @@ pub const StdHttpClient = struct {
         arena: Allocator,
         environ_map: *const std.process.Environ.Map,
     ) !void {
+        try validateProxyEnvironment(environ_map);
         try self.inner.initDefaultProxies(arena, environ_map);
     }
 
     pub fn httpClient(self: *StdHttpClient) HttpClient {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    pub fn maxConnectionCount(self: *StdHttpClient) usize {
+        return self.max_connection_count.load(.acquire);
+    }
+
+    /// Enable Zig-internal pool inspection for the opt-in acquisition check.
+    pub fn enableConnectionCountTracking(self: *StdHttpClient) void {
+        self.track_connection_count = true;
     }
 
     const vtable: HttpClient.VTable = .{ .send = sendLogged };
@@ -64,6 +76,7 @@ pub const StdHttpClient = struct {
             .headers = .{ .accept_encoding = .omit },
             .redirect_behavior = if (req.body == null) @enumFromInt(3) else .unhandled,
         });
+        if (self.track_connection_count) self.recordConnectionCount();
         defer request.deinit();
         request.accept_encoding = @splat(false);
         request.accept_encoding[@intFromEnum(http.ContentEncoding.identity)] = true;
@@ -96,7 +109,7 @@ pub const StdHttpClient = struct {
 
         const response_body = try body.toOwnedSlice();
         if (isSubmissionRequest(req))
-            writeSubmitResponse(self.inner.io, .cwd(), req.method, req.url, status, response_body) catch {};
+            writeSubmitResponse(self.inner.io, .cwd(), req.method, req.url, status) catch {};
 
         return .{
             .status = status,
@@ -113,7 +126,46 @@ pub const StdHttpClient = struct {
             .DELETE => .DELETE,
         };
     }
+
+    fn recordConnectionCount(self: *StdHttpClient) void {
+        const pool = &self.inner.connection_pool;
+        pool.mutex.lockUncancelable(self.inner.io);
+        defer pool.mutex.unlock(self.inner.io);
+        var count = pool.free_len;
+        var node = pool.used.first;
+        while (node) |current| : (node = current.next) count += 1;
+        const previous = self.max_connection_count.load(.monotonic);
+        if (count > previous) self.max_connection_count.store(count, .release);
+    }
 };
+
+fn validateProxyEnvironment(environ_map: *const std.process.Environ.Map) !void {
+    const proxy_names = [_][]const u8{
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+    };
+    var proxy_configured = false;
+    for (proxy_names) |name| {
+        const value = environ_map.get(name) orelse continue;
+        if (value.len == 0) continue;
+        proxy_configured = true;
+        const uri = std.Uri.parse(value) catch std.Uri.parseAfterScheme("http", value) catch
+            return error.InvalidProxyConfiguration;
+        if (uri.host == null or
+            !(std.mem.eql(u8, uri.scheme, "http") or std.mem.eql(u8, uri.scheme, "https")))
+            return error.InvalidProxyConfiguration;
+    }
+    const bypass_names = [_][]const u8{ "no_proxy", "NO_PROXY" };
+    for (bypass_names) |name| {
+        if (environ_map.get(name)) |value| {
+            if (proxy_configured and value.len != 0) return error.InvalidProxyConfiguration;
+        }
+    }
+}
 
 fn isSubmissionRequest(req: Request) bool {
     return std.mem.indexOf(u8, req.url, "/comments") != null and (req.method == .POST or req.method == .GET);
@@ -128,18 +180,16 @@ fn methodName(method: client.Method) []const u8 {
     };
 }
 
-fn writeSubmitResponse(io: Io, dir: Io.Dir, method: client.Method, url: []const u8, status: u16, body: []const u8) !void {
+fn writeSubmitResponse(io: Io, dir: Io.Dir, method: client.Method, url: []const u8, status: u16) !void {
     var file = try dir.createFile(io, "bbr-submit-response.log", .{ .truncate = false, .lock = .exclusive, .permissions = @enumFromInt(0o600) });
     defer file.close(io);
     var offset = try file.length(io);
     try appendLog(file, io, &offset, methodName(method));
     try appendLog(file, io, &offset, " ");
-    try appendLog(file, io, &offset, url);
+    try appendRequestLocation(file, io, &offset, url);
     var status_buffer: [32]u8 = undefined;
     const status_line = try std.fmt.bufPrint(&status_buffer, "\nstatus: {d}\n", .{status});
     try appendLog(file, io, &offset, status_line);
-    try appendLog(file, io, &offset, body);
-    try appendLog(file, io, &offset, "\n");
 }
 
 fn writeSubmitError(io: Io, dir: Io.Dir, method: client.Method, url: []const u8, err: anyerror) !void {
@@ -148,10 +198,30 @@ fn writeSubmitError(io: Io, dir: Io.Dir, method: client.Method, url: []const u8,
     var offset = try file.length(io);
     try appendLog(file, io, &offset, methodName(method));
     try appendLog(file, io, &offset, " ");
-    try appendLog(file, io, &offset, url);
+    try appendRequestLocation(file, io, &offset, url);
     try appendLog(file, io, &offset, "\ntransport error: ");
     try appendLog(file, io, &offset, @errorName(err));
     try appendLog(file, io, &offset, "\n");
+}
+
+fn appendRequestLocation(file: Io.File, io: Io, offset: *u64, url: []const u8) !void {
+    const uri = std.Uri.parse(url) catch {
+        return appendLog(file, io, offset, "<invalid request location>");
+    };
+    try appendLog(file, io, offset, uri.scheme);
+    try appendLog(file, io, offset, "://");
+    try appendLog(file, io, offset, componentText(uri.host orelse return error.InvalidRequestLocation));
+    if (uri.port) |port| {
+        var port_buffer: [8]u8 = undefined;
+        try appendLog(file, io, offset, try std.fmt.bufPrint(&port_buffer, ":{d}", .{port}));
+    }
+    try appendLog(file, io, offset, componentText(uri.path));
+}
+
+fn componentText(component: std.Uri.Component) []const u8 {
+    return switch (component) {
+        .raw, .percent_encoded => |text| text,
+    };
 }
 
 fn appendLog(file: Io.File, io: Io, offset: *u64, bytes: []const u8) !void {
@@ -259,16 +329,177 @@ test "Retry-After header matching is case-insensitive" {
     try std.testing.expectEqual(@as(?u64, 7_000), retryAfterFromHead(head, 0));
 }
 
-test "Comment POST response is written to the submit response log" {
+test "default proxies load lowercase and uppercase standard variables" {
+    const testing = std.testing;
+    const cases = [_]struct { name: []const u8, http: bool, https: bool }{
+        .{ .name = "http_proxy", .http = true, .https = false },
+        .{ .name = "HTTP_PROXY", .http = true, .https = false },
+        .{ .name = "https_proxy", .http = false, .https = true },
+        .{ .name = "HTTPS_PROXY", .http = false, .https = true },
+        .{ .name = "all_proxy", .http = true, .https = true },
+        .{ .name = "ALL_PROXY", .http = true, .https = true },
+    };
+    for (cases) |case| {
+        var environment = std.process.Environ.Map.init(testing.allocator);
+        defer environment.deinit();
+        try environment.put(case.name, "http://proxy.example:8080");
+        var transport = StdHttpClient.init(testing.allocator, testing.io);
+        defer transport.deinit();
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+
+        try transport.initDefaultProxies(arena.allocator(), &environment);
+
+        try testing.expectEqual(case.http, transport.inner.http_proxy != null);
+        try testing.expectEqual(case.https, transport.inner.https_proxy != null);
+        if (transport.inner.http_proxy) |proxy|
+            try testing.expectEqualStrings("proxy.example", proxy.host.bytes);
+        if (transport.inner.https_proxy) |proxy|
+            try testing.expectEqualStrings("proxy.example", proxy.host.bytes);
+    }
+}
+
+test "invalid and unsupported proxy configuration stops without a direct fallback" {
+    const testing = std.testing;
+    const cases = [_]struct { name: []const u8, value: []const u8 }{
+        .{ .name = "HTTP_PROXY", .value = "ftp://proxy.example" },
+        .{ .name = "https_proxy", .value = "http://[" },
+    };
+    for (cases) |case| {
+        var environment = std.process.Environ.Map.init(testing.allocator);
+        defer environment.deinit();
+        try environment.put(case.name, case.value);
+        var transport = StdHttpClient.init(testing.allocator, testing.io);
+        defer transport.deinit();
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+
+        try testing.expectError(
+            error.InvalidProxyConfiguration,
+            transport.initDefaultProxies(arena.allocator(), &environment),
+        );
+        try testing.expect(transport.inner.http_proxy == null);
+        try testing.expect(transport.inner.https_proxy == null);
+    }
+}
+
+test "bypass-only proxy environment permits direct access" {
+    const testing = std.testing;
+    for ([_][]const u8{ "no_proxy", "NO_PROXY" }) |name| {
+        var environment = std.process.Environ.Map.init(testing.allocator);
+        defer environment.deinit();
+        try environment.put(name, "localhost,127.0.0.1");
+        var transport = StdHttpClient.init(testing.allocator, testing.io);
+        defer transport.deinit();
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+
+        try transport.initDefaultProxies(arena.allocator(), &environment);
+        try testing.expect(transport.inner.http_proxy == null);
+        try testing.expect(transport.inner.https_proxy == null);
+    }
+}
+
+test "proxy with unsupported bypass list stops without a direct fallback" {
+    const testing = std.testing;
+    var environment = std.process.Environ.Map.init(testing.allocator);
+    defer environment.deinit();
+    try environment.put("HTTP_PROXY", "http://proxy.example:8080");
+    try environment.put("NO_PROXY", "api.bitbucket.org");
+    var transport = StdHttpClient.init(testing.allocator, testing.io);
+    defer transport.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    try testing.expectError(
+        error.InvalidProxyConfiguration,
+        transport.initDefaultProxies(arena.allocator(), &environment),
+    );
+    try testing.expect(transport.inner.http_proxy == null);
+    try testing.expect(transport.inner.https_proxy == null);
+}
+
+test "submission diagnostics omit credentials query values and response bodies" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeSubmitResponse(std.testing.io, tmp.dir, .POST, "https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/1/comments", 201, "{\"id\":42}");
-    try writeSubmitResponse(std.testing.io, tmp.dir, .GET, "https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/1/comments?page=2", 200, "{\"values\":[]}");
+    try writeSubmitResponse(std.testing.io, tmp.dir, .POST, "https://account:credential@api.bitbucket.org/2.0/comments?token=credential", 201);
+    try writeSubmitError(std.testing.io, tmp.dir, .GET, "https://api.bitbucket.org/2.0/comments?access_token=credential", error.ConnectionResetByPeer);
     const logged = try tmp.dir.readFileAlloc(std.testing.io, "bbr-submit-response.log", std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(logged);
     try std.testing.expectEqualStrings(
-        "POST https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/1/comments\nstatus: 201\n{\"id\":42}\nGET https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/1/comments?page=2\nstatus: 200\n{\"values\":[]}\n",
+        "POST https://api.bitbucket.org/2.0/comments\nstatus: 201\nGET https://api.bitbucket.org/2.0/comments\ntransport error: ConnectionResetByPeer\n",
         logged,
     );
+    try std.testing.expect(std.mem.indexOf(u8, logged, "credential") == null);
+}
+
+test "one StdHttpClient overlaps two local requests and cleans up" {
+    const net = std.Io.net;
+    var address = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    var release: std.atomic.Value(bool) = .init(false);
+    var accepted: std.atomic.Value(usize) = .init(0);
+    var server_future = try std.testing.io.concurrent(serveTwo, .{ &server, &release, &accepted, std.testing.io });
+    defer server_future.await(std.testing.io) catch {};
+
+    var transport = StdHttpClient.init(std.testing.allocator, std.testing.io);
+    defer transport.deinit();
+    transport.enableConnectionCountTracking();
+    const port = server.socket.address.getPort();
+    const first_url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/first", .{port});
+    defer std.testing.allocator.free(first_url);
+    const second_url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/second", .{port});
+    defer std.testing.allocator.free(second_url);
+    const http_client = transport.httpClient();
+    var first = try std.testing.io.concurrent(localGet, .{ http_client, first_url });
+    defer first.await(std.testing.io) catch {};
+    var second = try std.testing.io.concurrent(localGet, .{ http_client, second_url });
+    defer second.await(std.testing.io) catch {};
+    defer release.store(true, .release);
+
+    try spinUntilAtLeast(&accepted, 2);
+    release.store(true, .release);
+    try first.await(std.testing.io);
+    try second.await(std.testing.io);
+    try server_future.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 2), transport.maxConnectionCount());
+}
+
+fn localGet(http_client: HttpClient, url: []const u8) !void {
+    const response = try http_client.send(std.heap.page_allocator, .{ .method = .GET, .url = url });
+    defer std.heap.page_allocator.free(response.body);
+    if (response.status != 200) return error.UnexpectedStatus;
+}
+
+fn spinUntilAtLeast(value: *std.atomic.Value(usize), minimum: usize) !void {
+    for (0..100_000_000) |_| {
+        if (value.load(.acquire) >= minimum) return;
+        std.atomic.spinLoopHint();
+    }
+    return error.TestTimeout;
+}
+
+fn serveTwo(server: *std.Io.net.Server, release: *std.atomic.Value(bool), accepted: *std.atomic.Value(usize), io: Io) !void {
+    var first = try io.concurrent(serveOne, .{ try server.accept(io), release, accepted, io });
+    var second = try io.concurrent(serveOne, .{ try server.accept(io), release, accepted, io });
+    try first.await(io);
+    try second.await(io);
+}
+
+fn serveOne(stream: std.Io.net.Stream, release: *std.atomic.Value(bool), accepted: *std.atomic.Value(usize), io: Io) !void {
+    defer stream.close(io);
+    var read_buffer: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    while (true) {
+        const line = try reader.interface.takeDelimiterInclusive('\n');
+        if (std.mem.eql(u8, line, "\r\n")) break;
+    }
+    _ = accepted.fetchAdd(1, .release);
+    while (!release.load(.acquire)) std.atomic.spinLoopHint();
+    var write_buffer: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    try writer.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    try writer.interface.flush();
 }

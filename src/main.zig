@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const bbr = @import("bbr");
+const build_options = @import("build_options");
 const app = @import("tui/app.zig");
 const session = @import("tui/session.zig");
 const persist = @import("persist/sqlite_store.zig");
@@ -24,6 +25,15 @@ pub fn main(init: std.process.Init) !void {
     var it = init.minimal.args.iterate();
     _ = it.next(); // executable name
     const first = it.next();
+
+    if (first) |argument| {
+        if (std.mem.eql(u8, argument, "--version")) {
+            var output_buffer: [128]u8 = undefined;
+            var stdout = std.Io.File.stdout().writer(init.io, &output_buffer);
+            try stdout.interface.print("bbr {s}\n", .{build_options.version});
+            return stdout.interface.flush();
+        }
+    }
 
     // `demo` needs no credentials: it feeds synthetic data through the real
     // buffer/renderer so the comment UI can be exercised entirely offline.
@@ -70,7 +80,9 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, f, "raw-comment")) return rawComment(init, gpa, cred, &it);
         // Live smoke test: fetch + print, no TUI (scriptable, exits non-zero on failure).
         if (std.mem.eql(u8, f, "check")) return checkRun(init, gpa, cred, &it);
+        if (std.mem.eql(u8, f, "check-acquisition")) return checkAcquisitionRun(init, gpa, cred);
         if (std.mem.eql(u8, f, "check-mutation")) return checkMutationRun(init, gpa, cred, &it);
+        if (std.mem.eql(u8, f, "check-verdict")) return checkVerdictRun(init, gpa, cred, &it);
         // Print startup resolution (branch/remote/PR list) without the TUI.
         if (std.mem.eql(u8, f, "detect")) return detectRun(init, gpa, cred, &it);
     }
@@ -446,6 +458,66 @@ fn checkRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.
     }
 }
 
+fn checkAcquisitionRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential) !void {
+    if (!std.mem.eql(u8, init.environ_map.get("BBR_ALLOW_LIVE_ACQUISITION_GATE") orelse "", "1")) {
+        std.debug.print("bbr: refusing live acquisition gate without BBR_ALLOW_LIVE_ACQUISITION_GATE=1\n", .{});
+        return;
+    }
+    const ids = [_]u64{ 1856, 1726 };
+    for (ids) |id| {
+        var sequential: [10]u64 = undefined;
+        var bounded: [10]u64 = undefined;
+        var failures: usize = 0;
+        var rate_limited: usize = 0;
+        var max_connections: usize = 0;
+        for (0..10) |sample_index| {
+            sequential[sample_index] = runAcquisitionSample(init, gpa, cred, id, false, &failures, &rate_limited, &max_connections) catch 0;
+            bounded[sample_index] = runAcquisitionSample(init, gpa, cred, id, true, &failures, &rate_limited, &max_connections) catch 0;
+        }
+        std.mem.sort(u64, &sequential, {}, std.sort.asc(u64));
+        std.mem.sort(u64, &bounded, {}, std.sort.asc(u64));
+        const sequential_median = (sequential[4] + sequential[5]) / 2;
+        const bounded_median = (bounded[4] + bounded[5]) / 2;
+        const reduction = if (sequential_median == 0) 0 else (sequential_median -| bounded_median) * 100 / sequential_median;
+        std.debug.print("PullRequest {d}: sequential={d}ms bounded={d}ms reduction={d}% connections={d} failures={d} rate-limited={d}\n", .{
+            id, sequential_median, bounded_median, reduction, max_connections, failures, rate_limited,
+        });
+        if (reduction < 30 or max_connections > 2 or failures != 0 or rate_limited != 0) return error.AcquisitionGateFailed;
+    }
+}
+
+fn runAcquisitionSample(
+    init: std.process.Init,
+    gpa: std.mem.Allocator,
+    cred: bbr.bitbucket.Credential,
+    id: u64,
+    bounded: bool,
+    failures: *usize,
+    rate_limited: *usize,
+    max_connections: *usize,
+) !u64 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var transport = bbr.http.StdHttpClient.init(std.heap.page_allocator, init.io);
+    defer transport.deinit();
+    transport.enableConnectionCountTracking();
+    try transport.initDefaultProxies(arena.allocator(), init.environ_map);
+    const bb = bbr.bitbucket.Client.init(transport.httpClient(), cred);
+    const start = std.Io.Clock.awake.now(init.io);
+    const loaded = if (bounded)
+        session.loadWith(init.io, std.heap.page_allocator, bb, "pr-webapp", id)
+    else
+        session.loadSequentialWith(std.heap.page_allocator, bb, "pr-webapp", id);
+    const candidate = loaded catch |err| {
+        failures.* += 1;
+        if (err == error.RateLimited) rate_limited.* += 1;
+        return err;
+    };
+    defer candidate.destroy();
+    max_connections.* = @max(max_connections.*, transport.maxConnectionCount());
+    return @intCast(@divFloor(start.untilNow(init.io, .awake).toNanoseconds(), std.time.ns_per_ms));
+}
+
 fn checkMutationRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
     if (!std.mem.eql(u8, init.environ_map.get("BBR_ALLOW_LIVE_MUTATION") orelse "", "1")) {
         std.debug.print("bbr: refusing destructive check without BBR_ALLOW_LIVE_MUTATION=1\n", .{});
@@ -481,6 +553,60 @@ fn checkMutationRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bi
     cleanup_needed = false;
     try verifyLiveCommentDeleted(gpa, bb, repo, pull_request_id, comment_id, author_uuid);
     std.debug.print("ok: created, fetched, body-updated, and deleted disposable Comment #{d}\n", .{comment_id});
+}
+
+fn checkVerdictRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
+    if (!std.mem.eql(u8, init.environ_map.get("BBR_ALLOW_LIVE_MUTATION") orelse "", "1")) {
+        std.debug.print("bbr: refusing destructive check without BBR_ALLOW_LIVE_MUTATION=1\n", .{});
+        return;
+    }
+    const repo = it.next() orelse return usage();
+    const pull_request_id = std.fmt.parseInt(u64, it.next() orelse return usage(), 10) catch return usage();
+    if (it.next() != null) return usage();
+
+    var transport = bbr.http.StdHttpClient.init(gpa, init.io);
+    defer transport.deinit();
+    try transport.initDefaultProxies(init.arena.allocator(), init.environ_map);
+    const bb = bbr.bitbucket.Client.init(transport.httpClient(), cred);
+    const account_uuid = try bb.getAuthenticatedAccountUuid(gpa);
+    defer gpa.free(account_uuid);
+    const initial_pull_request = try bb.getPullRequest(gpa, repo, pull_request_id);
+    defer bbr.bitbucket.deinitPullRequest(gpa, initial_pull_request);
+    if (std.mem.eql(u8, account_uuid, initial_pull_request.author_uuid)) return error.PullRequestAuthorCannotSetReviewerVerdict;
+
+    const initial = initial_pull_request.reviewerVerdict(account_uuid);
+    const target: bbr.bitbucket.ReviewerVerdict = if (initial == .approved) .changes_requested else .approved;
+    var restored = false;
+    defer if (!restored) {
+        _ = restoreReviewerVerdict(gpa, bb, repo, pull_request_id, account_uuid, initial) catch {};
+    };
+
+    const changed = try bb.changeReviewerVerdict(gpa, repo, pull_request_id, initial_pull_request.source_commit, account_uuid, target);
+    if (!verdictChangeSucceeded(changed)) return error.ReviewerVerdictChangeFailed;
+    const restore_result = try restoreReviewerVerdict(gpa, bb, repo, pull_request_id, account_uuid, initial);
+    if (!verdictChangeSucceeded(restore_result)) return error.ReviewerVerdictRestoreFailed;
+    restored = true;
+    std.debug.print("ok: changed Reviewer Verdict from {s} to {s} and restored it\n", .{ @tagName(initial), @tagName(target) });
+}
+
+fn restoreReviewerVerdict(
+    gpa: std.mem.Allocator,
+    bb: bbr.bitbucket.Client,
+    repo: []const u8,
+    pull_request_id: u64,
+    account_uuid: []const u8,
+    target: bbr.bitbucket.ReviewerVerdict,
+) !bbr.bitbucket.ReviewerVerdictChangeResult {
+    const current = try bb.getPullRequest(gpa, repo, pull_request_id);
+    defer bbr.bitbucket.deinitPullRequest(gpa, current);
+    return bb.changeReviewerVerdict(gpa, repo, pull_request_id, current.source_commit, account_uuid, target);
+}
+
+fn verdictChangeSucceeded(result: bbr.bitbucket.ReviewerVerdictChangeResult) bool {
+    return switch (result) {
+        .success, .reconciled_success => true,
+        else => false,
+    };
 }
 
 fn checkBlobsRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
@@ -628,7 +754,9 @@ fn usage() void {
         \\  bbr local [base-ref] [source-ref] review committed local Git changes
         \\  bbr check <repo-slug> <pr-id>    live smoke check (fetch + print, no TUI)
         \\  bbr check-blobs <repo> <pr-id> [<class> <old|new> <path> <attrs|->]...
+        \\  bbr check-acquisition             opt-in Candidate Session acquisition gate
         \\  bbr check-mutation <repo> <pr-id> destructive live Comment lifecycle check
+        \\  bbr check-verdict <repo> <pr-id>  destructive live Reviewer Verdict check
         \\  bbr external-edit-smoke          interactive PTY External Edit check
         \\  bbr demo                         open the TUI with synthetic data (no network)
         \\  bbr grammar <command> ...        manage trusted local UserGrammars

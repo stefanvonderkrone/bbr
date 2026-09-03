@@ -431,6 +431,9 @@ test "unbinding a default can free its Leader for a shorter Action" {
     const source =
         \\[keymap]
         \\link_existing_comment = []
+        \\set_verdict_approved = []
+        \\set_verdict_changes_requested = []
+        \\set_verdict_none = []
         \\to_top = ["g"]
     ;
     var result = try parse(testing.allocator, source);

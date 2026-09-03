@@ -1,4 +1,4 @@
-# M16 operations
+# Operations
 
 M16 hardens review-item mutation and Submission around one rule: Presentation
 authorizes work and owns projection, Review owns local mutation and Submission
@@ -96,9 +96,6 @@ The Bitbucket mutation tier is credential-gated and destructive. Use only a
 disposable PullRequest:
 
 ```sh
-BITBUCKET_USERNAME='account@example.com' \
-BITBUCKET_TOKEN='...' \
-BITBUCKET_WORKSPACE='workspace' \
 BBR_ALLOW_LIVE_MUTATION=1 \
 zig build check-mutation -- <repo> <pull-request-id>
 ```
@@ -107,3 +104,7 @@ It creates a uniquely marked Review-level Comment, fetches it, verifies stable
 identity, author UUID, body, and CommentScope, updates only its body, verifies it
 again, deletes it, and accepts either absence or a valid Deleted Comment. Cleanup
 is best-effort on every post-create failure. Credential material is never logged.
+
+Configure the Credential before this command. See
+[`docs/m19-operations.md`](m19-operations.md) for Credential handling, proxy behavior,
+required CI, Candidate Session acquisition, and the Reviewer Verdict live check.

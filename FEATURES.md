@@ -11,7 +11,7 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [x] **Open PR by URL** — parse a `bitbucket.org/check24/<repo>/pull-requests/<id>` link. `M4`
 - [x] **Auto-detect PR from CWD** — on launch, read the git branch + remote and open the matching open PR; no-PR chooser / pre-filtered picker otherwise. `M4`
 - [x] **PR Picker** — fuzzy-find a PullRequest by id or title (zf) and switch. `M4`
-- [x] **Epoch cancellation** — switching PRs / files cancels in-flight loads. `M4` (Session) · `M9`/`M13` (File Enrichment)
+- [x] **Epoch isolation** — switching PRs / files rejects stale Session and File Enrichment results. Started Candidate Session branches still finish. `M4` (Session) · `M9`/`M13` (File Enrichment)
 
 ## Diff viewing
 - [x] **Unified layout** — one column, removed above added, colored backgrounds. `M2`
@@ -74,7 +74,8 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [x] **Overlay: Composer** — write a Draft. `M6`
 - [x] **Non-blocking startup** — boot the TUI with a "Loading PR #N…" view; fetch the initial Session off-thread. `M7`
 - [x] **Non-blocking picker** — `p` opens the picker instantly; the PR list loads off-thread and fills in. `M7`
-- [ ] **Measured parallel Session fetch** — overlap PR/diff/comment requests only if live measurements beat sequential keep-alive loading. `M19`
+- [x] **Bounded Candidate Session acquisition** — overlap at most two remote requests after the live gate proved 36% and 38% median reductions. `M19`
+- [x] **Reviewer Verdict Actions** — show and set Approved, Changes Requested, or No Verdict for an eligible remote PullRequest. `M19`
 - [x] **Overlay: keybinding help** `M11`
 - [x] **Config file** — TOML at the XDG config location. `M12`
 - [x] **Themes** — built-in Catppuccin / Gruvbox / Solarized + plain light/dark. `M12`
@@ -83,6 +84,6 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [x] **External editor handoff** `M16`
 
 ## Explicit non-features (for now)
-- Bitbucket Server / Data Center · applying suggestions · editing files. Approve/merge/decline
-  has a product gate in `M19`; dirty working-tree review is planned for `M18`. See
+- Bitbucket Server / Data Center · applying suggestions · editing files · merge · decline.
+  Reviewer Verdict Actions include Approved, Changes Requested, and No Verdict. Dirty working-tree review is planned for `M18`. See
   `docs/design.html` §2.

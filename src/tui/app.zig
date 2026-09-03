@@ -198,6 +198,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
                 frame,
                 win,
                 review_projection.header,
+                review_projection.reviewer_verdict,
                 review_projection.navigation,
                 review_projection.buffer,
                 review_projection.preferences.layout,
@@ -335,6 +336,24 @@ fn presentationStatus(
                 result.skipped,
             }) catch "submission finished for another pull request";
     }
+    if (projection.reviewer_verdict_result) |result| {
+        if (visible_key == null or !presentation.OwnedReviewIdentity.eql(result.key, visible_key.?))
+            return std.fmt.allocPrint(frame, "{s}#{d}: Reviewer Verdict {s}", .{
+                result.key.repository(),
+                result.key.pull_request_id,
+                reviewerVerdictOutcomeLabel(result.outcome),
+            }) catch "Reviewer Verdict changed for another pull request";
+        return switch (result.outcome) {
+            .completed => |completed| switch (completed) {
+                .success, .reconciled_success => "Reviewer Verdict changed",
+                .api_error => "Reviewer Verdict change failed",
+                .stale_source_commit => "Reviewer Verdict unchanged; SourceCommit changed",
+                .unresolved => "Reviewer Verdict outcome unresolved",
+            },
+            .launch_failed => "Reviewer Verdict change could not start",
+            .adapter_failed => "Reviewer Verdict change failed",
+        };
+    }
     if (projection.comment_edit_result) |result| {
         if (visible_key == null or !presentation.OwnedReviewIdentity.eql(result.key, visible_key.?))
             return std.fmt.allocPrint(frame, "{s}#{d}: Comment {d} edit {s}", .{
@@ -379,6 +398,20 @@ fn presentationStatus(
     return null;
 }
 
+fn reviewerVerdictOutcomeLabel(outcome: presentation.ReviewerVerdictCommandOutcome) []const u8 {
+    return switch (outcome) {
+        .completed => |result| switch (result) {
+            .success => "changed",
+            .reconciled_success => "changed after reconciliation",
+            .api_error => "failed",
+            .stale_source_commit => "refused because SourceCommit changed",
+            .unresolved => "outcome unresolved",
+        },
+        .launch_failed => "could not start",
+        .adapter_failed => "failed",
+    };
+}
+
 fn actionErrorText(err: presentation.ActionError) []const u8 {
     return switch (err) {
         .local_review_no_picker => "Pull Request Picker is unavailable for a local review",
@@ -396,6 +429,16 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .comment_owned_by_other => "only the author can mutate this Bitbucket Comment",
         .comment_deleted => "a Deleted Comment cannot be mutated",
         .remote_write_busy => "another remote write is already in progress",
+        .reviewer_verdict_local_review => "Reviewer Verdict is unavailable for a LocalReview",
+        .pull_request_not_open => "Reviewer Verdict requires an open PullRequest",
+        .reviewer_verdict_unknown => "Reviewer Verdict data is unavailable; reload to retry",
+        .pull_request_author_unknown => "PullRequest Author identity is unavailable; reload to retry",
+        .pull_request_author => "the PullRequest Author cannot set a Reviewer Verdict",
+        .reviewer_verdict_unchanged => "the PullRequest already has this Reviewer Verdict",
+        .reviewer_verdict_failed => "Bitbucket refused the Reviewer Verdict change",
+        .reviewer_verdict_source_changed => "Reviewer Verdict unchanged; SourceCommit changed",
+        .reviewer_verdict_unresolved => "Reviewer Verdict outcome is unresolved; reload to inspect",
+        .reviewer_verdict_launch_failed => "could not start the Reviewer Verdict change",
         .authoritative_reload_required => "remote Comment changed, but authoritative reload is required",
         .comment_edit_failed => "Bitbucket refused the Comment edit",
         .comment_edit_launch_failed => "could not start the Comment edit",
@@ -613,7 +656,10 @@ fn presentationPostWorker(
     defer scratch.deinit();
     var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
     defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {
+        presentation_runtime.rejectPostLaunch(presentationSink(&sink_context), command);
+        return;
+    };
     const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     var poster = bbr.bitbucket.Poster{
         .client = client,
@@ -637,7 +683,10 @@ fn presentationCommentEditWorker(
     defer scratch.deinit();
     var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
     defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {
+        presentation_runtime.rejectCommentEditLaunch(presentationSink(&sink_context), command);
+        return;
+    };
     const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     presentation_runtime.executeCommentEdit(presentationSink(&sink_context), command, client);
 }
@@ -655,9 +704,33 @@ fn presentationCommentDeleteWorker(
     defer scratch.deinit();
     var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
     defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {
+        presentation_runtime.rejectCommentDeleteLaunch(presentationSink(&sink_context), command);
+        return;
+    };
     const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     presentation_runtime.executeCommentDelete(presentationSink(&sink_context), command, client);
+}
+
+fn presentationReviewerVerdictWorker(
+    loop: *Loop,
+    work_id: u64,
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+    cred: Credential,
+    command: presentation.ChangeReviewerVerdict,
+) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
+    defer http.deinit();
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {
+        presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.reviewerVerdictLaunchFailed(command));
+        return;
+    };
+    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
+    presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.executeReviewerVerdict(scratch.allocator(), command, client));
 }
 
 fn presentationLoadWorker(
@@ -711,7 +784,7 @@ fn presentationEnrichmentWorker(
         .remote => blk: {
             var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
             defer http.deinit();
-            http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+            http.initDefaultProxies(scratch.allocator(), env_map) catch break :blk .{ .failed = .launch_failed };
             const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
             break :blk if (file_enrichment.enrich(
                 std.heap.page_allocator,
@@ -762,7 +835,15 @@ fn presentationRecoveryCheckWorker(
     defer scratch.deinit();
     var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
     defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {
+        presentation_runtime.deliver(presentationSink(&sink_context), .{ .recovery_checked = .{
+            .command_id = check.command_id,
+            .operation_id = check.operation_id,
+            .identity = check.identity,
+            .outcome = .failed,
+        } });
+        return;
+    };
     const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     const input = if (client.getPullRequest(scratch.allocator(), check.identity.repository(), check.identity.pullRequestId())) |pr|
         presentation.recoveryCheckSucceeded(check.command_id, check.operation_id, check.identity, pr.source_commit)
@@ -785,7 +866,16 @@ fn presentationDuplicateCheckWorker(
     defer scratch.deinit();
     var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
     defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {};
+    http.initDefaultProxies(scratch.allocator(), env_map) catch {
+        presentation_runtime.deliver(presentationSink(&sink_context), .{ .duplicate_checked = .{
+            .command_id = command.command_id,
+            .operation_id = command.operation_id,
+            .identity = command.identity,
+            .temp_id = command.draft.local_id,
+            .outcome = .failed,
+        } });
+        return;
+    };
     const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     const author_uuid = client.getAuthenticatedAccountUuid(scratch.allocator()) catch {
         presentation_runtime.deliver(presentationSink(&sink_context), .{ .duplicate_checked = .{
@@ -839,11 +929,7 @@ fn presentationListPullRequestsWorker(
         } });
         return;
     };
-    var http = bbr.http.StdHttpClient.init(summaries.arena.allocator(), io);
-    defer http.deinit();
-    http.initDefaultProxies(summaries.arena.allocator(), env_map) catch {};
-    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
-    summaries.prs = client.listPullRequests(summaries.arena.allocator(), command.repositoryName(), .{}) catch {
+    loadPullRequestSummaries(io, env_map, cred, command.repositoryName(), summaries) catch {
         summaries.destroy();
         presentation_runtime.deliver(presentationSink(&sink_context), .{ .pull_requests_loaded = .{
             .command_id = command.command_id,
@@ -857,6 +943,20 @@ fn presentationListPullRequestsWorker(
         .work_id = command.work_id,
         .outcome = .{ .loaded = summaries },
     } });
+}
+
+fn loadPullRequestSummaries(
+    io: std.Io,
+    env_map: *std.process.Environ.Map,
+    cred: Credential,
+    repository: []const u8,
+    summaries: *presentation.PullRequestSummaries,
+) !void {
+    var http = bbr.http.StdHttpClient.init(summaries.arena.allocator(), io);
+    defer http.deinit();
+    try http.initDefaultProxies(summaries.arena.allocator(), env_map);
+    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
+    summaries.prs = try client.listPullRequests(summaries.arena.allocator(), repository, .{});
 }
 
 fn drainPresentationCommands(
@@ -913,6 +1013,7 @@ fn drainPresentationCommands(
             .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, post }),
             .update_comment => |update| ctx.io.concurrent(presentationCommentEditWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, update }),
             .delete_comment => |delete| ctx.io.concurrent(presentationCommentDeleteWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, delete }),
+            .change_reviewer_verdict => |verdict| ctx.io.concurrent(presentationReviewerVerdictWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, verdict }),
             .wait_submission => |wait| ctx.io.concurrent(presentationWaitWorker, .{ loop, work_id, ctx.io, wait }),
             .check_recovery => |check| ctx.io.concurrent(presentationRecoveryCheckWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, check }),
             .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, check }),
@@ -942,6 +1043,7 @@ fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *p
         .post_draft => |post| presentation_adapter.postLaunchFailed(post),
         .update_comment => |update| presentation_adapter.commentEditLaunchFailed(update),
         .delete_comment => |delete| presentation_adapter.commentDeleteLaunchFailed(delete),
+        .change_reviewer_verdict => |verdict| presentation_adapter.reviewerVerdictLaunchFailed(verdict),
         .wait_submission => |wait| .{ .submission_wait_launch_failed = wait },
         .check_recovery => |check| .{ .recovery_checked = .{ .command_id = check.command_id, .operation_id = check.operation_id, .identity = check.identity, .outcome = .failed } },
         .find_duplicate => |check| blk: {
@@ -1078,6 +1180,7 @@ fn drawStatus(
     frame: std.mem.Allocator,
     win: vaxis.Window,
     header: session.ReviewHeader,
+    reviewer_verdict: ?bbr.bitbucket.ReviewerVerdict,
     nav: Nav,
     buf: buffer_mod.Buffer,
     layout: buffer_mod.Layout,
@@ -1106,7 +1209,7 @@ fn drawStatus(
         "c/i comment  ·  [ ] file  ·  p switch  ·  ? help  ·  q quit";
     const tail: []const u8 = if (status_msg) |m| m else if (submitting) "submitting…" else if (loading) "loading…" else default_tail;
     const identity = if (header.pull_request_id) |id|
-        (std.fmt.allocPrint(frame, "#{d} {s}", .{ id, header.title }) catch header.title)
+        (std.fmt.allocPrint(frame, "#{d} {s}  ·  {s}", .{ id, header.title, reviewerVerdictLabel(reviewer_verdict) }) catch header.title)
     else
         header.title;
     const text = std.fmt.allocPrint(frame, " {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s}  ·  {s}  ·  {s} ", .{
@@ -1124,6 +1227,14 @@ fn drawStatus(
     var c: u16 = 0;
     while (c < win.width) : (c += 1) win.writeCell(c, row, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
     _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = row, .wrap = .none });
+}
+
+fn reviewerVerdictLabel(verdict: ?bbr.bitbucket.ReviewerVerdict) []const u8 {
+    return if (verdict) |value| switch (value) {
+        .approved => "Approved",
+        .changes_requested => "Changes requested",
+        .no_verdict => "No verdict",
+    } else "Verdict unavailable";
 }
 
 // Force the presentation modules' tests into the exe test binary.
@@ -1160,6 +1271,19 @@ test "pinned vaxis fixtures preserve Shift Arrow selection input" {
         try std.testing.expectEqual(fixture.codepoint, portable.codepoint);
         try std.testing.expect(portable.mods.shift);
     }
+}
+
+test "status labels project every Reviewer Verdict" {
+    try std.testing.expectEqualStrings("Approved", reviewerVerdictLabel(.approved));
+    try std.testing.expectEqualStrings("Changes requested", reviewerVerdictLabel(.changes_requested));
+    try std.testing.expectEqualStrings("No verdict", reviewerVerdictLabel(.no_verdict));
+    try std.testing.expectEqualStrings("Verdict unavailable", reviewerVerdictLabel(null));
+}
+
+test "qualified Reviewer Verdict results retain their outcome" {
+    try std.testing.expectEqualStrings("changed", reviewerVerdictOutcomeLabel(.{ .completed = .success }));
+    try std.testing.expectEqualStrings("refused because SourceCommit changed", reviewerVerdictOutcomeLabel(.{ .completed = .stale_source_commit }));
+    try std.testing.expectEqualStrings("outcome unresolved", reviewerVerdictOutcomeLabel(.{ .completed = .{ .unresolved = null } }));
 }
 
 test "content viewport reserves the bottom status row" {
