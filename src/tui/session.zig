@@ -126,6 +126,7 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
     var comments_ready = false;
     var raw_diff_started = false;
     var comments_started = false;
+    var required_failed = false;
 
     try select.concurrent(.pull_request, acquirePullRequest, .{ &pr_branch, bb, repo, id });
     active += 1;
@@ -136,12 +137,23 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
         switch (try select.await()) {
             .pull_request => {
                 active -= 1;
-                if (pr_branch.err == null) comments_ready = true;
+                if (pr_branch.err == null) {
+                    comments_ready = true;
+                } else {
+                    required_failed = true;
+                }
             },
             .account => active -= 1,
-            .raw_diff, .comments => active -= 1,
+            .raw_diff => {
+                active -= 1;
+                required_failed = required_failed or diff_branch.err != null;
+            },
+            .comments => {
+                active -= 1;
+                required_failed = required_failed or comments_branch.err != null;
+            },
         }
-        while (active < 2) {
+        while (!required_failed and active < 2) {
             if (comments_ready and !comments_started) {
                 const pr = pr_branch.value.?;
                 try select.concurrent(.comments, acquireComments, .{ &comments_branch, bb, repo, id, pr.source_commit, pr.destination_commit });
@@ -494,6 +506,62 @@ test "required failure awaits started Authenticated Account acquisition" {
     release_account.store(true, .release);
     future.await(testing.io);
     try testing.expect(done.load(.acquire));
+    try testing.expectEqual(@as(usize, 2), fake.callCount());
+}
+
+test "RawDiff failure prevents later Comments acquisition" {
+    var release_pr: std.atomic.Value(bool) = .init(false);
+    var release_diff: std.atomic.Value(bool) = .init(false);
+    var responses = testRemoteResponses(200);
+    responses[1].status = 404;
+    responses[1].released = &release_diff;
+    responses[3].released = &release_pr;
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var future = try testing.io.concurrent(loadTestSession, .{ testing.io, bb });
+    defer {
+        release_pr.store(true, .release);
+        release_diff.store(true, .release);
+        if (future.await(testing.io)) |candidate| candidate.destroy() else |_| {}
+    }
+
+    try spinUntil(&fake, .{ .call_count = 3 });
+    release_diff.store(true, .release);
+    try spinUntil(&fake, .{ .active_request_count_not = 2 });
+    release_pr.store(true, .release);
+
+    try testing.expectError(error.NotFound, future.await(testing.io));
+    try testing.expectEqual(@as(usize, 3), fake.callCount());
+}
+
+test "Comments failure prevents later RawDiff acquisition" {
+    var release_pr: std.atomic.Value(bool) = .init(false);
+    var release_account: std.atomic.Value(bool) = .init(false);
+    var release_comments: std.atomic.Value(bool) = .init(false);
+    var responses = testRemoteResponses(200);
+    responses[0].released = &release_account;
+    responses[2].status = 404;
+    responses[2].released = &release_comments;
+    responses[3].released = &release_pr;
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var future = try testing.io.concurrent(loadTestSession, .{ testing.io, bb });
+    defer {
+        release_pr.store(true, .release);
+        release_account.store(true, .release);
+        release_comments.store(true, .release);
+        if (future.await(testing.io)) |candidate| candidate.destroy() else |_| {}
+    }
+
+    try spinUntil(&fake, .{ .call_count = 2 });
+    release_pr.store(true, .release);
+    try spinUntil(&fake, .{ .call_count = 3 });
+    release_comments.store(true, .release);
+    try spinUntil(&fake, .{ .active_request_count_not = 2 });
+    release_account.store(true, .release);
+
+    try testing.expectError(error.NotFound, future.await(testing.io));
+    try testing.expectEqual(@as(usize, 3), fake.callCount());
 }
 
 test "PullRequest completion gives Comments priority over RawDiff" {
