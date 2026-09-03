@@ -1,11 +1,13 @@
 #!/bin/sh
 set -eu
 
+# Report a fixture test failure and stop.
 fail() {
     printf '%s\n' "release validation test: $1" >&2
     exit 1
 }
 
+# Create a tagged Git repository for one release validation scenario.
 make_fixture() {
     name=$1
     tag=$2
@@ -35,6 +37,7 @@ make_fixture() {
     git -C "$fixture" -c user.name=bbr -c user.email=bbr@example.invalid tag -a "$tag" -m release
 }
 
+# Require the validator to accept a fixture.
 expect_pass() {
     name=$1
     tag=$2
@@ -43,6 +46,7 @@ expect_pass() {
     fi
 }
 
+# Require the validator to reject a fixture.
 expect_fail() {
     name=$1
     tag=$2

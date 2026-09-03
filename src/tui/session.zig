@@ -474,12 +474,32 @@ test "each required acquisition failure rejects the Candidate Session" {
 }
 
 test "required failure reporting follows logical acquisition order" {
+    var release_account: std.atomic.Value(bool) = .init(false);
+    var release_diff: std.atomic.Value(bool) = .init(false);
+    var release_comments: std.atomic.Value(bool) = .init(false);
     var responses = testRemoteResponses(200);
+    responses[0].released = &release_account;
     responses[1].status = 403;
+    responses[1].released = &release_diff;
     responses[2].status = 404;
+    responses[2].released = &release_comments;
     var fake: FakeHttpClient = .{ .responses = &responses };
     const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
-    try testing.expectError(error.Forbidden, loadWith(testing.io, std.heap.page_allocator, bb, "repo", 7));
+    var future = try testing.io.concurrent(loadTestSession, .{ testing.io, bb });
+    defer {
+        release_account.store(true, .release);
+        release_diff.store(true, .release);
+        release_comments.store(true, .release);
+        if (future.await(testing.io)) |candidate| candidate.destroy() else |_| {}
+    }
+
+    try spinUntil(&fake, .{ .call_count = 3 });
+    release_account.store(true, .release);
+    try spinUntil(&fake, .{ .call_count = 4 });
+    release_comments.store(true, .release);
+    release_diff.store(true, .release);
+
+    try testing.expectError(error.Forbidden, future.await(testing.io));
 }
 
 test "required failure awaits started Authenticated Account acquisition" {

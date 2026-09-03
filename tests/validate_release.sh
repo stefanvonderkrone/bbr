@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 
+# Report a release validation failure and stop.
 fail() {
     printf '%s\n' "release validation: $1" >&2
     exit 1

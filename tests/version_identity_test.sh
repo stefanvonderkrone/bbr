@@ -1,11 +1,13 @@
 #!/bin/sh
 set -eu
 
+# Report a version identity test failure and stop.
 fail() {
     printf '%s\n' "version identity test: $1" >&2
     exit 1
 }
 
+# Modify one version input and require a dirty version suffix.
 assert_dirty() {
     path=$1
     if [ "$path" = tests/version-input.tmp ]; then
