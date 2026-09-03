@@ -500,6 +500,7 @@ fn runAcquisitionSample(
     defer arena.deinit();
     var transport = bbr.http.StdHttpClient.init(std.heap.page_allocator, init.io);
     defer transport.deinit();
+    transport.enableConnectionCountTracking();
     try transport.initDefaultProxies(arena.allocator(), init.environ_map);
     const bb = bbr.bitbucket.Client.init(transport.httpClient(), cred);
     const start = std.Io.Clock.awake.now(init.io);

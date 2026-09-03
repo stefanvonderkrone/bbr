@@ -86,9 +86,11 @@ bridge until M26.
 `StdHttpClient` is the only production `HttpClient` adapter. It loads `HTTP_PROXY`, `HTTPS_PROXY`,
 and `ALL_PROXY`, including lowercase forms, through `initDefaultProxies`. bbr has no proxy setting.
 
-Invalid proxy URLs, unsupported proxy schemes, and non-empty `NO_PROXY` or `no_proxy` values stop
-the operation. A configured proxy failure never retries through a direct connection. Transport
-failures remain distinct from Bitbucket `ApiError` values.
+Invalid proxy URLs and unsupported proxy schemes stop the operation. A non-empty `NO_PROXY` or
+`no_proxy` value also stops the operation when a proxy is configured because Zig does not apply the
+bypass list. A bypass-only environment permits direct access. A configured proxy failure never
+retries through a direct connection. Transport failures remain distinct from Bitbucket `ApiError`
+values.
 
 M19 adds no libcurl adapter. `HttpClient` remains the replacement boundary if a measured proxy
 requirement later needs another adapter.

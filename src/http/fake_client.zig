@@ -100,30 +100,34 @@ pub const FakeHttpClient = struct {
 
     fn send(ptr: *anyopaque, allocator: Allocator, req: Request) anyerror!Response {
         const self: *FakeHttpClient = @ptrCast(@alignCast(ptr));
-        self.lock();
-        defer self.mutex.unlock();
-        self.last_method = req.method;
-        self.url_len = @min(req.url.len, self.url_buf.len);
-        @memcpy(self.url_buf[0..self.url_len], req.url[0..self.url_len]);
-        if (self.call_count < self.method_history.len) {
-            self.method_history[self.call_count] = req.method;
-            self.url_history_len[self.call_count] = @min(req.url.len, self.url_history[self.call_count].len);
-            @memcpy(self.url_history[self.call_count][0..self.url_history_len[self.call_count]], req.url[0..self.url_history_len[self.call_count]]);
-        }
-        if (req.body) |body| {
-            self.body_len = @min(body.len, self.body_buf.len);
-            @memcpy(self.body_buf[0..self.body_len], body[0..self.body_len]);
-        } else self.body_len = 0;
+        var canned: Canned = undefined;
+        var send_error: ?anyerror = null;
+        {
+            self.lock();
+            defer self.mutex.unlock();
+            self.last_method = req.method;
+            self.url_len = @min(req.url.len, self.url_buf.len);
+            @memcpy(self.url_buf[0..self.url_len], req.url[0..self.url_len]);
+            if (self.call_count < self.method_history.len) {
+                self.method_history[self.call_count] = req.method;
+                self.url_history_len[self.call_count] = @min(req.url.len, self.url_history[self.call_count].len);
+                @memcpy(self.url_history[self.call_count][0..self.url_history_len[self.call_count]], req.url[0..self.url_history_len[self.call_count]]);
+            }
+            if (req.body) |body| {
+                self.body_len = @min(body.len, self.body_buf.len);
+                @memcpy(self.body_buf[0..self.body_len], body[0..self.body_len]);
+            } else self.body_len = 0;
 
-        const call_index = self.call_count;
-        self.call_count += 1;
-        self.active_requests += 1;
-        self.max_active_requests = @max(self.max_active_requests, self.active_requests);
-        const canned: Canned = self.responseFor(req.url, call_index);
-        const send_error: ?anyerror = if (canned.send_error) |err| err else self.send_error;
-        self.mutex.unlock();
+            const call_index = self.call_count;
+            self.call_count += 1;
+            self.active_requests += 1;
+            self.max_active_requests = @max(self.max_active_requests, self.active_requests);
+            canned = self.responseFor(req.url, call_index);
+            send_error = if (canned.send_error) |err| err else self.send_error;
+        }
         defer {
             self.lock();
+            defer self.mutex.unlock();
             self.active_requests -= 1;
         }
 

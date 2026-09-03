@@ -103,6 +103,8 @@ pub fn create(backing: Allocator) !*Session {
 /// the PR, its diff, and its comments, parses the diff, and nests the comment
 /// threads — all into the Session's own arena. On any error the partial Session
 /// is torn down and the error propagates.
+/// `backing` must be thread-safe because branch arenas allocate concurrently.
+/// Production passes `std.heap.page_allocator`.
 pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u64) !*Session {
     var pr_branch: Branch(PullRequest) = .init(backing);
     var account_branch: Branch([]u8) = .init(backing);
@@ -209,6 +211,7 @@ pub fn loadSequentialWith(backing: Allocator, bb: Client, repo: []const u8, id: 
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
 
+    s.authenticated_account_unauthorized = false;
     s.authenticated_account_uuid = bb.getAuthenticatedAccountUuid(a) catch |err| blk: {
         s.authenticated_account_unauthorized = err == error.Unauthorized;
         break :blk null;
@@ -484,9 +487,9 @@ test "required failure awaits started Authenticated Account acquisition" {
         release_account.store(true, .release);
     }
 
-    while (fake.callCount() < 2) std.atomic.spinLoopHint();
+    try spinUntil(&fake, .{ .call_count = 2 });
     release_pr.store(true, .release);
-    while (fake.activeRequestCount() == 2) std.atomic.spinLoopHint();
+    try spinUntil(&fake, .{ .active_request_count_not = 2 });
     try testing.expect(!done.load(.acquire));
     release_account.store(true, .release);
     future.await(testing.io);
@@ -519,13 +522,13 @@ test "PullRequest completion gives Comments priority over RawDiff" {
         } else |_| {}
     }
 
-    while (fake.callCount() < 2) std.atomic.spinLoopHint();
+    try spinUntil(&fake, .{ .call_count = 2 });
     release_pr.store(true, .release);
-    while (fake.callCount() < 3) std.atomic.spinLoopHint();
+    try spinUntil(&fake, .{ .call_count = 3 });
     try testing.expect(std.mem.indexOf(u8, fake.lastUrl().?, "/comments") != null);
     release_account.store(true, .release);
     release_comments.store(true, .release);
-    while (fake.callCount() < 4) std.atomic.spinLoopHint();
+    try spinUntil(&fake, .{ .call_count = 4 });
     release_diff.store(true, .release);
 
     const s = try future.await(testing.io);
@@ -541,6 +544,23 @@ fn loadTestSession(io: Io, bb: Client) !*Session {
 fn loadFailureAndSignal(io: Io, bb: Client, done: *std.atomic.Value(bool)) void {
     if (loadWith(io, std.heap.page_allocator, bb, "repo", 7)) |candidate| candidate.destroy() else |_| {}
     done.store(true, .release);
+}
+
+const TestWait = union(enum) {
+    call_count: usize,
+    active_request_count_not: usize,
+};
+
+fn spinUntil(fake: *FakeHttpClient, wait: TestWait) !void {
+    for (0..100_000_000) |_| {
+        const ready = switch (wait) {
+            .call_count => |count| fake.callCount() >= count,
+            .active_request_count_not => |count| fake.activeRequestCount() != count,
+        };
+        if (ready) return;
+        std.atomic.spinLoopHint();
+    }
+    return error.TestTimeout;
 }
 
 fn withRelease(canned: Canned, released: *std.atomic.Value(bool)) Canned {

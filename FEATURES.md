@@ -11,7 +11,7 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [x] **Open PR by URL** — parse a `bitbucket.org/check24/<repo>/pull-requests/<id>` link. `M4`
 - [x] **Auto-detect PR from CWD** — on launch, read the git branch + remote and open the matching open PR; no-PR chooser / pre-filtered picker otherwise. `M4`
 - [x] **PR Picker** — fuzzy-find a PullRequest by id or title (zf) and switch. `M4`
-- [x] **Epoch cancellation** — switching PRs / files cancels in-flight loads. `M4` (Session) · `M9`/`M13` (File Enrichment)
+- [x] **Epoch isolation** — switching PRs / files rejects stale Session and File Enrichment results. Started Candidate Session branches still finish. `M4` (Session) · `M9`/`M13` (File Enrichment)
 
 ## Diff viewing
 - [x] **Unified layout** — one column, removed above added, colored backgrounds. `M2`

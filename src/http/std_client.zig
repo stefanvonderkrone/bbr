@@ -14,6 +14,7 @@ const Response = client.Response;
 pub const StdHttpClient = struct {
     inner: http.Client,
     max_connection_count: std.atomic.Value(usize) = .init(0),
+    track_connection_count: bool = false,
 
     /// `gpa` must be thread-safe (std.http.Client requires it). `io` is the
     /// runtime's `Io` (the default is backed by `std.Io.Threaded`).
@@ -44,6 +45,11 @@ pub const StdHttpClient = struct {
         return self.max_connection_count.load(.acquire);
     }
 
+    /// Enable Zig-internal pool inspection for the opt-in acquisition check.
+    pub fn enableConnectionCountTracking(self: *StdHttpClient) void {
+        self.track_connection_count = true;
+    }
+
     const vtable: HttpClient.VTable = .{ .send = sendLogged };
 
     fn sendLogged(ptr: *anyopaque, allocator: Allocator, req: Request) anyerror!Response {
@@ -70,7 +76,7 @@ pub const StdHttpClient = struct {
             .headers = .{ .accept_encoding = .omit },
             .redirect_behavior = if (req.body == null) @enumFromInt(3) else .unhandled,
         });
-        self.recordConnectionCount();
+        if (self.track_connection_count) self.recordConnectionCount();
         defer request.deinit();
         request.accept_encoding = @splat(false);
         request.accept_encoding[@intFromEnum(http.ContentEncoding.identity)] = true;
@@ -142,9 +148,11 @@ fn validateProxyEnvironment(environ_map: *const std.process.Environ.Map) !void {
         "all_proxy",
         "ALL_PROXY",
     };
+    var proxy_configured = false;
     for (proxy_names) |name| {
         const value = environ_map.get(name) orelse continue;
         if (value.len == 0) continue;
+        proxy_configured = true;
         const uri = std.Uri.parse(value) catch std.Uri.parseAfterScheme("http", value) catch
             return error.InvalidProxyConfiguration;
         if (uri.host == null or
@@ -154,7 +162,7 @@ fn validateProxyEnvironment(environ_map: *const std.process.Environ.Map) !void {
     const bypass_names = [_][]const u8{ "no_proxy", "NO_PROXY" };
     for (bypass_names) |name| {
         if (environ_map.get(name)) |value| {
-            if (value.len != 0) return error.InvalidProxyConfiguration;
+            if (proxy_configured and value.len != 0) return error.InvalidProxyConfiguration;
         }
     }
 }
@@ -356,7 +364,6 @@ test "invalid and unsupported proxy configuration stops without a direct fallbac
     const cases = [_]struct { name: []const u8, value: []const u8 }{
         .{ .name = "HTTP_PROXY", .value = "ftp://proxy.example" },
         .{ .name = "https_proxy", .value = "http://[" },
-        .{ .name = "NO_PROXY", .value = "api.bitbucket.org" },
     };
     for (cases) |case| {
         var environment = std.process.Environ.Map.init(testing.allocator);
@@ -374,6 +381,42 @@ test "invalid and unsupported proxy configuration stops without a direct fallbac
         try testing.expect(transport.inner.http_proxy == null);
         try testing.expect(transport.inner.https_proxy == null);
     }
+}
+
+test "bypass-only proxy environment permits direct access" {
+    const testing = std.testing;
+    for ([_][]const u8{ "no_proxy", "NO_PROXY" }) |name| {
+        var environment = std.process.Environ.Map.init(testing.allocator);
+        defer environment.deinit();
+        try environment.put(name, "localhost,127.0.0.1");
+        var transport = StdHttpClient.init(testing.allocator, testing.io);
+        defer transport.deinit();
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+
+        try transport.initDefaultProxies(arena.allocator(), &environment);
+        try testing.expect(transport.inner.http_proxy == null);
+        try testing.expect(transport.inner.https_proxy == null);
+    }
+}
+
+test "proxy with unsupported bypass list stops without a direct fallback" {
+    const testing = std.testing;
+    var environment = std.process.Environ.Map.init(testing.allocator);
+    defer environment.deinit();
+    try environment.put("HTTP_PROXY", "http://proxy.example:8080");
+    try environment.put("NO_PROXY", "api.bitbucket.org");
+    var transport = StdHttpClient.init(testing.allocator, testing.io);
+    defer transport.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    try testing.expectError(
+        error.InvalidProxyConfiguration,
+        transport.initDefaultProxies(arena.allocator(), &environment),
+    );
+    try testing.expect(transport.inner.http_proxy == null);
+    try testing.expect(transport.inner.https_proxy == null);
 }
 
 test "submission diagnostics omit credentials query values and response bodies" {
@@ -403,6 +446,7 @@ test "one StdHttpClient overlaps two local requests and cleans up" {
 
     var transport = StdHttpClient.init(std.testing.allocator, std.testing.io);
     defer transport.deinit();
+    transport.enableConnectionCountTracking();
     const port = server.socket.address.getPort();
     const first_url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/first", .{port});
     defer std.testing.allocator.free(first_url);
@@ -415,7 +459,7 @@ test "one StdHttpClient overlaps two local requests and cleans up" {
     defer second.await(std.testing.io) catch {};
     defer release.store(true, .release);
 
-    while (accepted.load(.acquire) < 2) std.atomic.spinLoopHint();
+    try spinUntilAtLeast(&accepted, 2);
     release.store(true, .release);
     try first.await(std.testing.io);
     try second.await(std.testing.io);
@@ -427,6 +471,14 @@ fn localGet(http_client: HttpClient, url: []const u8) !void {
     const response = try http_client.send(std.heap.page_allocator, .{ .method = .GET, .url = url });
     defer std.heap.page_allocator.free(response.body);
     if (response.status != 200) return error.UnexpectedStatus;
+}
+
+fn spinUntilAtLeast(value: *std.atomic.Value(usize), minimum: usize) !void {
+    for (0..100_000_000) |_| {
+        if (value.load(.acquire) >= minimum) return;
+        std.atomic.spinLoopHint();
+    }
+    return error.TestTimeout;
 }
 
 fn serveTwo(server: *std.Io.net.Server, release: *std.atomic.Value(bool), accepted: *std.atomic.Value(usize), io: Io) !void {

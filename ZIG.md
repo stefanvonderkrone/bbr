@@ -122,7 +122,8 @@ the main thread; the Epoch token still guards against stale results.
   - `Proxy = struct { protocol, host: HostName, authorization: ?[]const u8, port: u16, supports_connect: bool }`
     — so **CONNECT tunneling** and **Basic-auth proxies** are supported.
   - **Not supported:** `NO_PROXY`/`no_proxy` exclusion lists; NTLM/Kerberos proxy auth;
-    TLS-intercepting proxies (would need the corporate root added to `ca_bundle`).
+    TLS-intercepting proxies (would need the corporate root added to `ca_bundle`). bbr permits a
+    bypass-only environment, but rejects a non-empty bypass list when a proxy is configured.
 - We wrap all of this behind our `HttpClient` seam so callers never see the std shape.
 
 ## 4. Allocators — arenas & the vtable idiom
