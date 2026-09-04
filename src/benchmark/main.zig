@@ -19,11 +19,14 @@ pub fn main(init: std.process.Init) !void {
     if (arguments.next() != null) return error.TooManyArguments;
 
     const calibrations = try harness.calibrate(init.gpa, init.io);
+    const host_cpu = try hostCpu(init.gpa, init.io);
+    defer init.gpa.free(host_cpu);
     try writer.print(
-        "host_os={s} host_arch={s} cpu={s} zig={s} mode={s} samples={d} warmups={d} instruction_ceiling={d:.2} memory_ceiling_bytes_per_second={d:.2}\n",
+        "host_os={s} host_arch={s} host_cpu={s} target_cpu={s} zig={s} mode={s} samples={d} warmups={d} instruction_ceiling={d:.2} memory_ceiling_bytes_per_second={d:.2}\n",
         .{
             @tagName(builtin.os.tag),
             @tagName(builtin.cpu.arch),
+            host_cpu,
             builtin.cpu.model.name,
             builtin.zig_version_string,
             @tagName(builtin.mode),
@@ -105,4 +108,14 @@ pub fn main(init: std.process.Init) !void {
     }
     if (!matched) return error.UnknownBenchmark;
     try writer.flush();
+}
+
+fn hostCpu(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
+    if (builtin.os.tag != .macos) return allocator.dupe(u8, "unknown");
+    const result = std.process.run(allocator, io, .{ .argv = &.{ "sysctl", "-n", "machdep.cpu.brand_string" } }) catch
+        return allocator.dupe(u8, "unknown");
+    defer allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
+    if (result.term != .exited or result.term.exited != 0) return allocator.dupe(u8, "unknown");
+    return allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \t\r\n"));
 }

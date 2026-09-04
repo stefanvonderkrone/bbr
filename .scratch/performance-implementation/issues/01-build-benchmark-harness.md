@@ -16,7 +16,7 @@ The harness generates all fixtures before timing. It runs two warmups and 15 mea
 
 The harness measures an instruction-throughput ceiling and a memory-bandwidth ceiling on each host. Every benchmark selects one ceiling and reports its measured rate and gap. The first benchmark files cover Diff parsing, Buffer projection, and intraline diff. They use the 300-File and 50,000-Line Diff fixture plus a deterministic 500-part minified Line pair.
 
-ReleaseFast baseline on macOS arm64, Apple M1, Zig 0.16.0:
+ReleaseFast baseline on an Apple M5 Pro host with Zig's `apple_m1` compilation target, macOS arm64, and Zig 0.16.0:
 
 | Stage | Median | p95 | Allocations | Peak bytes | Retained bytes | Checksum | Ceiling gap |
 |---|---:|---:|---:|---:|---:|---|---:|
