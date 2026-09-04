@@ -1,7 +1,7 @@
 # Add the ASCII cell-width fast path
 
 Type: task
-Blocked by: 01
+Blocked by: 01, 29
 
 ## Question
 

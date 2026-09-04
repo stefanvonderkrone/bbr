@@ -14,7 +14,7 @@ How will `zig build bench` provide deterministic ReleaseFast measurements for th
 
 The harness generates all fixtures before timing. It runs two warmups and 15 measured samples per stage. Each result reports median and p95 time, allocation count, peak requested bytes, retained arena capacity, and a stable semantic output checksum. The harness rejects a run when its checksum changes between samples.
 
-The harness measures an instruction-throughput ceiling and a memory-bandwidth ceiling on each host. Every benchmark selects one ceiling and reports its measured rate and gap. The first benchmark files cover Diff parsing, Buffer projection, and intraline diff. They use the 300-File and 50,000-Line Diff fixture plus a deterministic 500-part minified Line pair.
+The harness measures host-local synthetic instruction and memory-copy calibration rates. Every benchmark selects one proxy and reports its measured rate and gap. These gaps compare unlike work units and do not classify a real hardware ceiling. The first benchmark files cover Diff parsing, Buffer projection, and intraline diff. They use the 300-File and 50,000-Line Diff fixture plus a deterministic 500-part minified Line pair.
 
 ReleaseFast baseline on an Apple M5 Pro host with Zig's `apple_m1` compilation target, macOS arm64, and Zig 0.16.0:
 
@@ -25,3 +25,9 @@ ReleaseFast baseline on an Apple M5 Pro host with Zig's `apple_m1` compilation t
 | Intraline diff | 1,345,542 ns | 1,407,333 ns | 11 | 8,053,392 | 12,149,508 | `1ea2acca84a12f65` | 79.58% instruction throughput |
 
 `zig build test --summary all` passes all 695 tests. `zig fmt --check build.zig src/benchmark` and `git diff --check` also pass.
+
+## Comments
+
+Rechecked on 2026-09-04 after Choose and bound side-by-side matching. All 697 tests pass, all benchmark checksums remain stable, and the ReleaseFast binary retains Zig symbols and source locations. A Time Profiler trial symbolicated `diff.intraline.commonTable` at `src/diff/intraline.zig:93`.
+
+The trial also exposed two limits. The selected benchmark stage ran for only about 23 ms, which is too short for a stable sampled profile. The reported ceiling gaps are calibration proxies, not hardware-counter measurements. Build repeatable performance profiles must close both gaps before the next optimization.

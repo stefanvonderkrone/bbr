@@ -23,3 +23,7 @@ The required replacement-block benchmarks all stay below the cap after the limit
 - 500x500 index fallback: 140,417 ns median, 146,375 ns p95, checksum `5cd31b929822a442`.
 
 `zig build test --summary all` passes all 697 tests.
+
+## Comments
+
+Rechecked on 2026-09-04. All 697 tests pass and all required benchmark checksums match the resolution. Current p95 results are 101,667 ns for 10x10, 42,750 ns for 100x100, and 207,250 ns for 500x500. All remain below the 332,137 ns cap.

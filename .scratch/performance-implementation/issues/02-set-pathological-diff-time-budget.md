@@ -10,8 +10,12 @@ What measured rebuild-time budget must side-by-side matching and intraline compa
 
 ## Answer
 
-Each algorithm has a p95 cap of 332,137 ns on the baseline Apple M5 Pro host in ReleaseFast mode. Zig used its `apple_m1` compilation target. The cap is 1.25 times the provisional theoretical time for 250,000 work units at the measured ceiling of 940,881,277 units per second.
+Each algorithm has a p95 cap of 332,137 ns on the baseline Apple M5 Pro host in ReleaseFast mode. Zig used its `apple_m1` compilation target. The cap is 1.25 times the provisional time for 250,000 work units at the host calibration rate of 940,881,277 units per second.
 
 The implementation tickets must benchmark their own work because one calibration unit does not equal one algorithm cell. Each ticket must select the largest input limit whose measured p95 stays at or below the cap. The intraline limit uses the product of the old and new lexical-part counts. The side-by-side limit includes both the removed-Line by added-Line area and all lexical comparison work.
 
 Above the side-by-side limit, pair removed and added Lines by index and leave extra Lines unmatched. Above the intraline limit, preserve both Lines and emphasize each complete Line.
+
+## Comments
+
+Rechecked on 2026-09-04. The budget and deterministic fallbacks remain valid planning decisions. The rate used to derive the provisional cap is a synthetic host calibration, not a measured hardware ceiling, so implementation tickets must still use stage profiles and direct p95 measurements.

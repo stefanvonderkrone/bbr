@@ -13,6 +13,9 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - Use `zig` and `ponytail` for every implementation task. Use `diagnosing-bugs` when a benchmark or regression needs diagnosis.
 - Use ReleaseFast benchmarks on the current macOS host as the first baseline. Record enough host data to reproduce each comparison, but keep production code portable.
 - Keep an optimization only when repeated measurements show a clear gain, output checksums stay stable, and related benchmarks show no material regression.
+- Before each optimization, capture stage-isolated ReleaseFast CPU and memory profiles. Run the stage long enough for stable samples, record the hot stacks and allocation or VM call sites, then repeat the same profiles after the change.
+- On macOS, use `xctrace` with Time Profiler or CPU Profiler and Allocations. Keep benchmark code and production code portable.
+- Treat the harness instruction and memory rates as host calibration proxies. Use hardware-counter evidence when classifying a stage as instruction-throughput-bound or memory-bandwidth-bound.
 - For each hot stage, identify whether instruction throughput or memory bandwidth sets the useful hardware ceiling. Report the measured gap to that ceiling and optimize the largest supported gap.
 - Preserve current output for normal inputs. For pathological replacement blocks or minified lines, first measure a time budget. Inputs above that budget keep all text but use deterministic simpler pairing or whole-line emphasis.
 - For Diff work, compare suitable replacement algorithms. Do not keep the current dynamic-programming or LCS algorithm when another algorithm gives better measured performance within the behavior contract.
