@@ -20,6 +20,8 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 
 ## Decisions so far
 
+- [Build the benchmark harness](issues/01-build-benchmark-harness.md) — `zig build bench` now provides deterministic ReleaseFast stage measurements, allocation data, stable checksums, and host-calibrated ceiling gaps.
+
 ## Not yet specified
 
 - A release-level end-to-end latency target may become useful after stage timers expose the dominant costs.
