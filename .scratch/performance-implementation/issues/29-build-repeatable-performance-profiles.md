@@ -1,7 +1,7 @@
 # Build repeatable performance profiles
 
 Type: task
-Status: claimed
+Status: resolved
 Blocked by: 03
 
 ## Question
@@ -21,3 +21,17 @@ The Buffer Time Profiler trace runs for more than 10 seconds. Its hot stacks inc
 CPU Counters completed for both workloads on the Apple M5 Pro host. These traces are hardware evidence. The `ceiling_rate` and `gap_percent` fields from `zig build bench` remain synthetic calibration proxies.
 
 Allocations cannot attach to `bbr-bench` while macOS Developer Mode is disabled. `DevToolsSecurity -status` reports `Developer mode is currently disabled.` This ticket remains claimed until an Allocations trace completes.
+
+Developer Mode was enabled. Allocations then required an ad-hoc `com.apple.security.get-task-allow` entitlement on the generated `zig-out/bin/bbr-bench` binary. Both 8,000-repetition workloads completed after that temporary signing step.
+
+## Answer
+
+Use `bbr-bench --repeat <count> <benchmark>` to profile one stage. The command builds each fixture once, runs the selected stage with a fresh arena for each repetition, rejects checksum changes, and reports the final checksum. Normal `zig build bench` measurements are unchanged.
+
+Each P0 ticket must add its named stage benchmark before it changes production code. The ticket must use repeat mode to capture the baseline and the changed stage. A repeat count must keep the stage active for at least 10 seconds under Time Profiler or CPU Profiler. The same workload must run under Allocations and CPU Counters when the host supports them.
+
+The baseline assets are in `../profiles/`: Time Profiler, Allocations, and CPU Counters traces for `intraline_500_parts` and `buffer_projection_300_files_50000_lines`. These workloads cover the current Diff intraline and Buffer projection stages. The remaining P0 tickets own their narrower Highlighting, navigation, Span, Comment anchor, cell-width, and paint workloads.
+
+The current host is an Apple M5 Pro running macOS arm64 with Zig 0.16.0 and the `apple_m1` target. The Time Profiler traces identify the hot stacks recorded above. The Allocations traces capture heap and VM events for the same stages. CPU Counters provides the hardware evidence. Harness ceiling rates remain calibration proxies and cannot classify a hardware ceiling.
+
+All benchmark checksums stayed stable. `zig build test --summary all` passes all 697 tests. `zig fmt --check build.zig src/benchmark` and `git diff --check` pass.
