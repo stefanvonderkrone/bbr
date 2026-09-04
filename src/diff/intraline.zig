@@ -59,6 +59,20 @@ fn tokenize(allocator: Allocator, text: []const u8) ![]Tok {
     return toks.toOwnedSlice(allocator);
 }
 
+pub fn lexicalPartCount(text: []const u8) usize {
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) : (count += 1) {
+        const c = classOf(text[i]);
+        if (c == .other) {
+            i += 1;
+        } else {
+            while (i < text.len and classOf(text[i]) == c) i += 1;
+        }
+    }
+    return count;
+}
+
 fn tokEql(a_text: []const u8, a: Tok, b_text: []const u8, b: Tok) bool {
     return std.mem.eql(u8, a_text[a.start..a.end], b_text[b.start..b.end]);
 }
@@ -284,6 +298,13 @@ test "matching similarity is symmetric and treats blank Lines as exact" {
     const forward = try matchingSimilarity(testing.allocator, "const value = old;", "const value = new;");
     const reverse = try matchingSimilarity(testing.allocator, "const value = new;", "const value = old;");
     try testing.expectEqual(forward, reverse);
+}
+
+test "lexical part count matches tokenization" {
+    const text = "const value = source();";
+    const parts = try tokenize(testing.allocator, text);
+    defer testing.allocator.free(parts);
+    try testing.expectEqual(parts.len, lexicalPartCount(text));
 }
 
 test "leading indentation change is isolated" {

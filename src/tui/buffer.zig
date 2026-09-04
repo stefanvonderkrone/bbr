@@ -31,6 +31,9 @@ pub const Segment = intraline.Segment;
 /// unrelated lines rather than an edit, so no intra-line emphasis is attached.
 const emphasis_threshold: f64 = 0.5;
 
+// This host-calibrated cap keeps exact matching below the 332,137 ns p95 budget.
+const side_by_side_work_limit: usize = 131_625;
+
 /// How a `Buffer` is arranged on screen. Only `unified` is built today;
 /// `side_by_side` is the other axis (design §11) and lands later.
 pub const Layout = enum { unified, side_by_side };
@@ -699,15 +702,28 @@ const Weave = struct {
         removed: []const model.Line,
         added: []const model.Line,
     ) !void {
+        var old_parts: usize = 0;
+        for (removed) |line| old_parts +|= intraline.lexicalPartCount(line.text);
+        var new_parts: usize = 0;
+        for (added) |line| new_parts +|= intraline.lexicalPartCount(line.text);
+        const work = removed.len *| added.len +| old_parts *| new_parts;
+        if (work > side_by_side_work_limit) return w.emitIndexedChangeBlock(file_idx, file, removed, added);
+
+        var match_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer match_scratch.deinit();
+        const scratch = match_scratch.allocator();
         const stride = added.len + 1;
-        const similarities = try w.a.alloc(f64, removed.len * added.len);
+        const similarities = try scratch.alloc(f64, removed.len * added.len);
+        var lexical_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer lexical_scratch.deinit();
         for (removed, 0..) |old, old_index| {
             for (added, 0..) |new, new_index| {
-                similarities[old_index * added.len + new_index] = try intraline.matchingSimilarity(std.heap.page_allocator, old.text, new.text);
+                _ = lexical_scratch.reset(.retain_capacity);
+                similarities[old_index * added.len + new_index] = try intraline.matchingSimilarity(lexical_scratch.allocator(), old.text, new.text);
             }
         }
 
-        const cells = try w.a.alloc(MatchCell, (removed.len + 1) * stride);
+        const cells = try scratch.alloc(MatchCell, (removed.len + 1) * stride);
         var old_cursor = removed.len + 1;
         while (old_cursor > 0) {
             old_cursor -= 1;
@@ -785,6 +801,34 @@ const Weave = struct {
                 },
                 .done => unreachable,
             }
+        }
+    }
+
+    fn emitIndexedChangeBlock(
+        w: *Weave,
+        file_idx: usize,
+        file: *const model.File,
+        removed: []const model.Line,
+        added: []const model.Line,
+    ) !void {
+        const pair_count = @min(removed.len, added.len);
+        for (0..pair_count) |i| {
+            const pair = try intraline.diff(w.a, removed[i].text, added[i].text);
+            const left = try decoratedLine(w.a, &removed[i], lineSpans(w.opts.highlights, file_idx, removed[i]), pair.old);
+            const right = try decoratedLine(w.a, &added[i], lineSpans(w.opts.highlights, file_idx, added[i]), pair.new);
+            try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
+            try w.weaveInline(file, right.line);
+            try w.weaveInline(file, left.line);
+        }
+        for (removed[pair_count..]) |*line| {
+            const left = try decoratedLine(w.a, line, lineSpans(w.opts.highlights, file_idx, line.*), &.{});
+            try w.rows.append(w.a, .{ .line_pair = .{ .left = left } });
+            try w.weaveInline(file, left.line);
+        }
+        for (added[pair_count..]) |*line| {
+            const right = try decoratedLine(w.a, line, lineSpans(w.opts.highlights, file_idx, line.*), &.{});
+            try w.rows.append(w.a, .{ .line_pair = .{ .right = right } });
+            try w.weaveInline(file, right.line);
         }
     }
 
@@ -1522,6 +1566,25 @@ test "side_by_side pairs identical Lines while Unified keeps Diff order" {
     try testing.expectEqual(&lines[1], side_by_side.rows[3].line_pair.left.?.line);
     try testing.expectEqual(&lines[3], side_by_side.rows[3].line_pair.right.?.line);
     for (lines, unified.rows[2..]) |*line, row| try testing.expectEqual(line, row.line.line);
+}
+
+test "side_by_side uses deterministic index pairing above the work limit" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const line_count = 260;
+    var raw: std.ArrayList(u8) = .empty;
+    try raw.print(a, "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,{d} +1,{d} @@\n", .{ line_count, line_count });
+    for (0..line_count) |i| try raw.print(a, "-line_{d}\n", .{i});
+    for (0..line_count) |i| try raw.print(a, "+line_{d}\n", .{(i + 1) % line_count});
+
+    const diff = try parse(a, raw.items);
+    const buffer = try build(a, diff, .side_by_side);
+    try expectChangedLinesExactlyOnce(diff, buffer);
+    try testing.expectEqual(@as(usize, line_count + 2), buffer.rows.len);
+    try testing.expectEqualStrings("line_0", buffer.rows[2].line_pair.left.?.line.text);
+    try testing.expectEqualStrings("line_1", buffer.rows[2].line_pair.right.?.line.text);
 }
 
 test "side_by_side weaves an inline thread once, under its anchored pair" {

@@ -48,3 +48,16 @@ pub fn minifiedLinePair(allocator: std.mem.Allocator, part_count: usize) !LinePa
         .new = try new.toOwnedSlice(allocator),
     };
 }
+
+pub fn replacementBlock(allocator: std.mem.Allocator, line_count: usize) ![]u8 {
+    var raw: std.ArrayList(u8) = .empty;
+    errdefer raw.deinit(allocator);
+    try raw.print(
+        allocator,
+        "diff --git a/src/replacement.zig b/src/replacement.zig\n--- a/src/replacement.zig\n+++ b/src/replacement.zig\n@@ -1,{d} +1,{d} @@\n",
+        .{ line_count, line_count },
+    );
+    for (0..line_count) |i| try raw.print(allocator, "-const value_{d} = source_{d};\n", .{ i, i });
+    for (0..line_count) |i| try raw.print(allocator, "+const value_{d} = target_{d};\n", .{ i, i });
+    return raw.toOwnedSlice(allocator);
+}

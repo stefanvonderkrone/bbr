@@ -6,6 +6,7 @@ const synthetic = @import("synthetic.zig");
 const diff_parse = @import("diff_parse.zig");
 const buffer_projection = @import("buffer_projection.zig");
 const intraline = @import("intraline.zig");
+const side_by_side_matching = @import("side_by_side_matching.zig");
 
 pub fn main(init: std.process.Init) !void {
     var output_buffer: [4096]u8 = undefined;
@@ -76,6 +77,31 @@ pub fn main(init: std.process.Init) !void {
             intraline.run,
             intraline.checksum,
         );
+    }
+    for ([_]usize{ 10, 100, 500 }) |line_count| {
+        var name_buffer: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "side_by_side_matching_{d}x{d}", .{ line_count, line_count });
+        if (selected == null or std.mem.eql(u8, selected.?, name)) {
+            matched = true;
+            const replacement = try synthetic.replacementBlock(init.gpa, line_count);
+            defer init.gpa.free(replacement);
+            var replacement_arena = std.heap.ArenaAllocator.init(init.gpa);
+            defer replacement_arena.deinit();
+            const replacement_diff = try bbr.diff.parse(replacement_arena.allocator(), replacement);
+            const context: side_by_side_matching.Context = .{ .diff = replacement_diff };
+            try harness.run(
+                writer,
+                init.io,
+                init.gpa,
+                calibrations,
+                name,
+                .instruction_throughput,
+                line_count * line_count,
+                &context,
+                side_by_side_matching.run,
+                side_by_side_matching.checksum,
+            );
+        }
     }
     if (!matched) return error.UnknownBenchmark;
     try writer.flush();
