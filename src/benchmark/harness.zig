@@ -180,6 +180,31 @@ pub fn run(
     );
 }
 
+pub fn repeat(
+    writer: *std.Io.Writer,
+    gpa: std.mem.Allocator,
+    name: []const u8,
+    count: usize,
+    context: anytype,
+    comptime benchmark: anytype,
+    comptime checksumOutput: anytype,
+) !void {
+    var expected_checksum: ?u64 = null;
+    for (0..count) |_| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const output = try benchmark(arena.allocator(), context);
+        const checksum = checksumOutput(output);
+        std.mem.doNotOptimizeAway(checksum);
+        if (expected_checksum) |expected| {
+            if (checksum != expected) return error.UnstableBenchmarkOutput;
+        } else {
+            expected_checksum = checksum;
+        }
+    }
+    try writer.print("profile={s} repetitions={d} checksum={x}\n", .{ name, count, expected_checksum.? });
+}
+
 fn elapsedNanoseconds(start: std.Io.Timestamp, io: std.Io) u64 {
     return @intCast(start.untilNow(io, .awake).toNanoseconds());
 }

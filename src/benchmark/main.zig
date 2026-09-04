@@ -15,7 +15,13 @@ pub fn main(init: std.process.Init) !void {
 
     var arguments = init.minimal.args.iterate();
     _ = arguments.next();
-    const selected = arguments.next();
+    var selected = arguments.next();
+    var repeat_count: ?usize = null;
+    if (selected != null and std.mem.eql(u8, selected.?, "--repeat")) {
+        repeat_count = try std.fmt.parseInt(usize, arguments.next() orelse return error.MissingRepeatCount, 10);
+        if (repeat_count.? == 0) return error.InvalidRepeatCount;
+        selected = arguments.next() orelse return error.MissingBenchmark;
+    }
     if (arguments.next() != null) return error.TooManyArguments;
 
     const calibrations = try harness.calibrate(init.gpa, init.io);
@@ -49,11 +55,22 @@ pub fn main(init: std.process.Init) !void {
     var matched = false;
     if (selected == null or std.mem.eql(u8, selected.?, diff_parse.name)) {
         matched = true;
-        try harness.run(writer, init.io, init.gpa, calibrations, diff_parse.name, .memory_bandwidth, raw.len, raw, diff_parse.run, diff_parse.checksum);
+        if (repeat_count) |count|
+            try harness.repeat(writer, init.gpa, diff_parse.name, count, raw, diff_parse.run, diff_parse.checksum)
+        else
+            try harness.run(writer, init.io, init.gpa, calibrations, diff_parse.name, .memory_bandwidth, raw.len, raw, diff_parse.run, diff_parse.checksum);
     }
     if (selected == null or std.mem.eql(u8, selected.?, buffer_projection.name)) {
         matched = true;
-        try harness.run(
+        if (repeat_count) |count| try harness.repeat(
+            writer,
+            init.gpa,
+            buffer_projection.name,
+            count,
+            &projection_context,
+            buffer_projection.run,
+            buffer_projection.checksum,
+        ) else try harness.run(
             writer,
             init.io,
             init.gpa,
@@ -68,7 +85,15 @@ pub fn main(init: std.process.Init) !void {
     }
     if (selected == null or std.mem.eql(u8, selected.?, intraline.name)) {
         matched = true;
-        try harness.run(
+        if (repeat_count) |count| try harness.repeat(
+            writer,
+            init.gpa,
+            intraline.name,
+            count,
+            &line_pair,
+            intraline.run,
+            intraline.checksum,
+        ) else try harness.run(
             writer,
             init.io,
             init.gpa,
@@ -92,7 +117,15 @@ pub fn main(init: std.process.Init) !void {
             defer replacement_arena.deinit();
             const replacement_diff = try bbr.diff.parse(replacement_arena.allocator(), replacement);
             const context: side_by_side_matching.Context = .{ .diff = replacement_diff };
-            try harness.run(
+            if (repeat_count) |count| try harness.repeat(
+                writer,
+                init.gpa,
+                name,
+                count,
+                &context,
+                side_by_side_matching.run,
+                side_by_side_matching.checksum,
+            ) else try harness.run(
                 writer,
                 init.io,
                 init.gpa,

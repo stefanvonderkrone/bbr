@@ -12,3 +12,4 @@ bbr-submit-response.log
 # Editor / OS
 .DS_Store
 .opencode
+.scratch/performance-implementation/profiles
