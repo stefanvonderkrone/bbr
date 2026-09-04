@@ -26,6 +26,7 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - [Build the benchmark harness](issues/01-build-benchmark-harness.md) — `zig build bench` now provides deterministic ReleaseFast stage measurements, allocation data, stable checksums, and host-calibrated ceiling gaps.
 - [Set the pathological diff time budget](issues/02-set-pathological-diff-time-budget.md) — Each algorithm gets a 332,137 ns p95 cap; benchmarks derive input limits, then deterministic fallbacks preserve all Lines.
 - [Choose and bound side-by-side matching](issues/03-bound-side-by-side-matching.md) — Weighted matching uses reusable bounded scratch through 131,625 work units, then index pairing keeps required fixtures below the p95 cap.
+- [Choose and bound the intraline diff](issues/04-bound-intraline-lcs.md) — Compact-direction LCS runs through 250,000 lexical-part products, then whole-line emphasis bounds larger Lines.
 - [Build repeatable performance profiles](issues/29-build-repeatable-performance-profiles.md) — Repeat mode now gives each P0 stage stable Time Profiler, Allocations, and CPU Counters runs with checksum checks.
 
 ## Not yet specified

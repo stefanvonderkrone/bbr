@@ -10,12 +10,14 @@
 //! partitioned into a handful of runs — concatenating a side's `Segment.text`
 //! reconstructs that side's line exactly.
 //!
-//! Pure and zero-copy: `Segment.text` borrows the line text passed in; only the
-//! `Segment` arrays are allocated, so pass an arena. Lines here are short (one
-//! source line), so the O(n·m) LCS table is cheap.
+//! `Segment.text` borrows the line text passed in. Work is bounded by the product
+//! of both lexical-part counts; larger pairs use whole-line emphasis.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+
+// Largest measured lexical-part product below the 332,137 ns p95 budget.
+const work_limit: usize = 500 * 500;
 
 /// A run of bytes within one side of the pair. `emphasis` is true when the run
 /// differs from the other side, false when it is common to both. Segments are
@@ -29,6 +31,7 @@ pub const Segment = struct {
 pub const Pair = struct {
     old: []const Segment,
     new: []const Segment,
+    whole_line: bool = false,
 };
 
 const Class = enum { word, space, other };
@@ -43,9 +46,12 @@ fn classOf(b: u8) Class {
 /// every other byte is its own token (punctuation shouldn't glue together).
 const Tok = struct { start: usize, end: usize };
 
-fn tokenize(allocator: Allocator, text: []const u8) ![]Tok {
-    var toks: std.ArrayList(Tok) = .empty;
+const Direction = enum(u8) { match, skip_old, skip_new };
+
+fn tokenize(allocator: Allocator, text: []const u8, count: usize) ![]Tok {
+    const toks = try allocator.alloc(Tok, count);
     var i: usize = 0;
+    var index: usize = 0;
     while (i < text.len) {
         const start = i;
         const c = classOf(text[i]);
@@ -54,9 +60,10 @@ fn tokenize(allocator: Allocator, text: []const u8) ![]Tok {
         } else {
             while (i < text.len and classOf(text[i]) == c) i += 1;
         }
-        try toks.append(allocator, .{ .start = start, .end = i });
+        toks[index] = .{ .start = start, .end = i };
+        index += 1;
     }
-    return toks.toOwnedSlice(allocator);
+    return toks;
 }
 
 pub fn lexicalPartCount(text: []const u8) usize {
@@ -116,8 +123,16 @@ fn segmentsFor(allocator: Allocator, text: []const u8, toks: []const Tok, matche
 /// Word-diff `old_text` against `new_text`. When the lines share no tokens every
 /// segment is emphasized on both sides; when identical, none are.
 pub fn diff(allocator: Allocator, old_text: []const u8, new_text: []const u8) !Pair {
-    const ot = try tokenize(allocator, old_text);
-    const nt = try tokenize(allocator, new_text);
+    const old_count = lexicalPartCount(old_text);
+    const new_count = lexicalPartCount(new_text);
+    if (old_count *| new_count > work_limit) return .{
+        .old = try wholeLine(allocator, old_text),
+        .new = try wholeLine(allocator, new_text),
+        .whole_line = true,
+    };
+
+    const ot = try tokenize(allocator, old_text, old_count);
+    const nt = try tokenize(allocator, new_text, new_count);
     const n = ot.len;
     const m = nt.len;
 
@@ -127,23 +142,46 @@ pub fn diff(allocator: Allocator, old_text: []const u8, new_text: []const u8) !P
     @memset(new_matched, false);
 
     if (n != 0 and m != 0) {
-        // dp[i*stride + j] = LCS length of old[i..] vs new[j..]. Fill backward.
-        const stride = m + 1;
-        const dp = try commonTable(allocator, old_text, ot, new_text, nt, false);
+        const directions = try allocator.alloc(Direction, n * m);
+        var next = try allocator.alloc(u32, m + 1);
+        @memset(next, 0);
+        var current = try allocator.alloc(u32, m + 1);
 
-        // Walk forward along an LCS, marking the tokens it visits as common.
+        var row = n;
+        while (row > 0) {
+            row -= 1;
+            current[m] = 0;
+            var column = m;
+            while (column > 0) {
+                column -= 1;
+                if (tokEql(old_text, ot[row], new_text, nt[column])) {
+                    current[column] = next[column + 1] + 1;
+                    directions[row * m + column] = .match;
+                } else if (next[column] >= current[column + 1]) {
+                    current[column] = next[column];
+                    directions[row * m + column] = .skip_old;
+                } else {
+                    current[column] = current[column + 1];
+                    directions[row * m + column] = .skip_new;
+                }
+            }
+            const swap = next;
+            next = current;
+            current = swap;
+        }
+
         var oi: usize = 0;
         var ni: usize = 0;
         while (oi < n and ni < m) {
-            if (tokEql(old_text, ot[oi], new_text, nt[ni])) {
-                old_matched[oi] = true;
-                new_matched[ni] = true;
-                oi += 1;
-                ni += 1;
-            } else if (dp[(oi + 1) * stride + ni] >= dp[oi * stride + (ni + 1)]) {
-                oi += 1;
-            } else {
-                ni += 1;
+            switch (directions[oi * m + ni]) {
+                .match => {
+                    old_matched[oi] = true;
+                    new_matched[ni] = true;
+                    oi += 1;
+                    ni += 1;
+                },
+                .skip_old => oi += 1,
+                .skip_new => ni += 1,
             }
         }
     }
@@ -173,9 +211,9 @@ pub fn similarity(pair: Pair) f64 {
 pub fn matchingSimilarity(allocator: Allocator, old_text: []const u8, new_text: []const u8) !f64 {
     if (std.mem.eql(u8, old_text, new_text)) return 1.0;
 
-    const old_parts = try tokenize(allocator, old_text);
+    const old_parts = try tokenize(allocator, old_text, lexicalPartCount(old_text));
     defer allocator.free(old_parts);
-    const new_parts = try tokenize(allocator, new_text);
+    const new_parts = try tokenize(allocator, new_text, lexicalPartCount(new_text));
     defer allocator.free(new_parts);
     if (old_parts.len == 0 or new_parts.len == 0) return 0.0;
 
@@ -192,6 +230,13 @@ fn pairEmpty(segs: []const Segment) bool {
         if (s.text.len != 0) return false;
     }
     return true;
+}
+
+fn wholeLine(allocator: Allocator, text: []const u8) ![]const Segment {
+    if (text.len == 0) return &.{};
+    const segments = try allocator.alloc(Segment, 1);
+    segments[0] = .{ .text = text, .emphasis = true };
+    return segments;
 }
 
 // ---------------------------------------------------------------------------
@@ -302,9 +347,35 @@ test "matching similarity is symmetric and treats blank Lines as exact" {
 
 test "lexical part count matches tokenization" {
     const text = "const value = source();";
-    const parts = try tokenize(testing.allocator, text);
+    const parts = try tokenize(testing.allocator, text, lexicalPartCount(text));
     defer testing.allocator.free(parts);
     try testing.expectEqual(parts.len, lexicalPartCount(text));
+}
+
+test "work above the limit uses whole-line emphasis" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var old: std.ArrayList(u8) = .empty;
+    var new: std.ArrayList(u8) = .empty;
+    for (0..501) |i| {
+        if (i % 2 == 0) {
+            try old.print(a, "o{d}", .{i});
+            try new.print(a, "n{d}", .{i});
+        } else {
+            try old.append(a, '+');
+            try new.append(a, '+');
+        }
+    }
+
+    const pair = try diff(a, old.items, new.items);
+    try testing.expectEqual(@as(usize, 1), pair.old.len);
+    try testing.expectEqual(@as(usize, 1), pair.new.len);
+    try testing.expect(pair.old[0].emphasis);
+    try testing.expect(pair.new[0].emphasis);
+    try testing.expect(pair.whole_line);
+    try testing.expectEqualStrings(old.items, pair.old[0].text);
+    try testing.expectEqualStrings(new.items, pair.new[0].text);
 }
 
 test "leading indentation change is isolated" {

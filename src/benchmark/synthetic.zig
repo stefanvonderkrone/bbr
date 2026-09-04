@@ -40,8 +40,13 @@ pub fn minifiedLinePair(allocator: std.mem.Allocator, part_count: usize) !LinePa
     var new: std.ArrayList(u8) = .empty;
     errdefer new.deinit(allocator);
     for (0..part_count) |i| {
-        try old.print(allocator, "v{d}+", .{i});
-        try new.print(allocator, "v{d}{s}+", .{ i, if (i % 17 == 0) "x" else "" });
+        if (i % 2 == 0) {
+            try old.print(allocator, "v{d}", .{i});
+            try new.print(allocator, "v{d}{s}", .{ i, if (i % 34 == 0) "x" else "" });
+        } else {
+            try old.append(allocator, '+');
+            try new.append(allocator, '+');
+        }
     }
     return .{
         .old = try old.toOwnedSlice(allocator),

@@ -49,9 +49,6 @@ pub fn main(init: std.process.Init) !void {
     defer parsed_arena.deinit();
     const parsed = try bbr.diff.parse(parsed_arena.allocator(), raw);
     const projection_context: buffer_projection.Context = .{ .diff = parsed };
-    const line_pair = try synthetic.minifiedLinePair(init.gpa, 500);
-    defer line_pair.deinit(init.gpa);
-
     var matched = false;
     if (selected == null or std.mem.eql(u8, selected.?, diff_parse.name)) {
         matched = true;
@@ -83,28 +80,34 @@ pub fn main(init: std.process.Init) !void {
             buffer_projection.checksum,
         );
     }
-    if (selected == null or std.mem.eql(u8, selected.?, intraline.name)) {
-        matched = true;
-        if (repeat_count) |count| try harness.repeat(
-            writer,
-            init.gpa,
-            intraline.name,
-            count,
-            &line_pair,
-            intraline.run,
-            intraline.checksum,
-        ) else try harness.run(
-            writer,
-            init.io,
-            init.gpa,
-            calibrations,
-            intraline.name,
-            .instruction_throughput,
-            500 * 500,
-            &line_pair,
-            intraline.run,
-            intraline.checksum,
-        );
+    for ([_]usize{ 10, 100, 250, 500, 550, 575, 600, 1_000, 2_000, 4_000 }) |part_count| {
+        var name_buffer: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "intraline_{d}_parts", .{part_count});
+        if (selected == null or std.mem.eql(u8, selected.?, name)) {
+            matched = true;
+            const line_pair = try synthetic.minifiedLinePair(init.gpa, part_count);
+            defer line_pair.deinit(init.gpa);
+            if (repeat_count) |count| try harness.repeat(
+                writer,
+                init.gpa,
+                name,
+                count,
+                &line_pair,
+                intraline.run,
+                intraline.checksum,
+            ) else try harness.run(
+                writer,
+                init.io,
+                init.gpa,
+                calibrations,
+                name,
+                .instruction_throughput,
+                part_count * part_count,
+                &line_pair,
+                intraline.run,
+                intraline.checksum,
+            );
+        }
     }
     for ([_]usize{ 10, 100, 500 }) |line_count| {
         var name_buffer: [64]u8 = undefined;

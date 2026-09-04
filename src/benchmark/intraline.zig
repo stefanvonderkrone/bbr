@@ -10,6 +10,7 @@ pub fn run(allocator: std.mem.Allocator, pair: *const synthetic.LinePair) !bbr.d
 
 pub fn checksum(result: bbr.diff.intraline.Pair) u64 {
     var hash = std.hash.Wyhash.init(0);
+    hash.update(&.{@intFromBool(result.whole_line)});
     for (result.old) |segment| {
         hash.update(segment.text);
         hash.update(&.{@intFromBool(segment.emphasis)});

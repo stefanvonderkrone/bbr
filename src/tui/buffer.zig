@@ -1105,7 +1105,7 @@ fn computeEmphasis(allocator: std.mem.Allocator, lines: []const model.Line) ![]c
         var k: usize = 0;
         while (k < pairs) : (k += 1) {
             const pair = try intraline.diff(allocator, lines[rem_start + k].text, lines[add_start + k].text);
-            if (intraline.similarity(pair) >= emphasis_threshold) {
+            if (pair.whole_line or intraline.similarity(pair) >= emphasis_threshold) {
                 out[rem_start + k] = pair.old;
                 out[add_start + k] = pair.new;
             }
@@ -1346,6 +1346,33 @@ test "a modified line pair carries intra-line emphasis; unrelated lines do not" 
     // The wholesale replacement shares nothing → treated as unrelated, no emphasis.
     try testing.expectEqual(@as(usize, 1), buf.rows[6].line.decoration.runs.len);
     try testing.expectEqual(@as(usize, 1), buf.rows[7].line.decoration.runs.len);
+}
+
+test "bounded intraline work keeps whole-line emphasis" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var old: std.ArrayList(u8) = .empty;
+    var new: std.ArrayList(u8) = .empty;
+    for (0..501) |i| {
+        if (i % 2 == 0) {
+            try old.print(a, "o{d}", .{i});
+            try new.print(a, "n{d}", .{i});
+        } else {
+            try old.append(a, '+');
+            try new.append(a, '+');
+        }
+    }
+    const lines = [_]model.Line{
+        .{ .old_no = 1, .new_no = null, .kind = .removed, .text = old.items },
+        .{ .old_no = null, .new_no = 1, .kind = .added, .text = new.items },
+    };
+
+    const emphasis = try computeEmphasis(a, &lines);
+    try testing.expectEqual(@as(usize, 1), emphasis[0].len);
+    try testing.expectEqual(@as(usize, 1), emphasis[1].len);
+    try testing.expect(emphasis[0][0].emphasis);
+    try testing.expect(emphasis[1][0].emphasis);
 }
 
 test "rows borrow the diff (pointer identity, not copies)" {
