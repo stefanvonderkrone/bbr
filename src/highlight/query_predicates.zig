@@ -65,14 +65,14 @@ pub const Locals = struct {
             return err;
         };
         defer predicates.deinit(allocator);
+        return collectPrepared(allocator, tree, query, predicates, captureId(query, "local.scope"), captureId(query, "local.definition"), captureId(query, "local.reference"), content);
+    }
+
+    pub fn collectPrepared(allocator: Allocator, tree: *const c.TSTree, query: *const c.TSQuery, predicates: Set, scope_id: ?u32, definition_id: ?u32, reference_id: ?u32, content: []const u8) !Locals {
         const cursor = c.ts_query_cursor_new() orelse return error.QueryCursorInitFailed;
         defer c.ts_query_cursor_delete(cursor);
         c.ts_query_cursor_set_match_limit(cursor, std.math.maxInt(u32));
         c.ts_query_cursor_exec(cursor, query, c.ts_tree_root_node(tree));
-
-        const scope_id = captureId(query, "local.scope");
-        const definition_id = captureId(query, "local.definition");
-        const reference_id = captureId(query, "local.reference");
         var scopes: std.ArrayList(Scope) = .empty;
         defer {
             for (scopes.items) |*scope| scope.definitions.deinit(allocator);
@@ -305,6 +305,11 @@ fn setDiagnostic(source: []const u8, diagnostic: *Diagnostic, kind: Diagnostic.K
     diagnostic.* = .{ .kind = kind, .source_offset = @intCast(offset), .line = line, .column = column, .regex_failure = regex_failure };
 }
 
+pub fn setInvalidQueryDiagnostic(source: []const u8, diagnostic: *Diagnostic, source_offset: usize, query_kind: Diagnostic.QueryKind) void {
+    setDiagnostic(source, diagnostic, .invalid_query, null, source_offset);
+    diagnostic.query_kind = query_kind;
+}
+
 fn stringValue(query: *const c.TSQuery, id: u32) ?[]const u8 {
     var len: u32 = 0;
     const ptr = c.ts_query_string_value_for_id(query, id, &len) orelse return null;
@@ -335,7 +340,7 @@ pub fn checkedRange(start: usize, end: usize, content: []const u8) !Range {
     return .{ .start = start, .end = end };
 }
 
-fn captureId(query: *const c.TSQuery, name: []const u8) ?u32 {
+pub fn captureId(query: *const c.TSQuery, name: []const u8) ?u32 {
     const count = c.ts_query_capture_count(query);
     for (0..count) |id_usize| {
         const id: u32 = @intCast(id_usize);

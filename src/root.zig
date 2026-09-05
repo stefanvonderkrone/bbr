@@ -39,6 +39,7 @@ pub const highlight = struct {
     pub const Highlighter = highlighter.Highlighter;
     pub const PlainHighlighter = highlighter.PlainHighlighter;
     pub const Capture = highlighter.Capture;
+    pub const CaptureRole = highlighter.CaptureRole;
     pub const Span = highlighter.Span;
     pub const HighlightResult = highlighter.Result;
     pub const FileHighlights = highlighter.FileHighlights;

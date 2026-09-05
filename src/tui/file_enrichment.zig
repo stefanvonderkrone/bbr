@@ -190,7 +190,7 @@ fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight
 fn retainedBytes(side: *const OwnedSide) usize {
     // ArenaAllocator.queryCapacity excludes its internal linked-list nodes but
     // includes every allocation the owned side keeps alive: blob, Highlight
-    // output, Capture names, and any scratch capacity not individually freed.
+    // output and any scratch capacity not individually freed.
     return side.arena.queryCapacity();
 }
 
@@ -610,7 +610,7 @@ const ScriptedHighlighter = struct {
             .line = 1,
             .start = 0,
             .end = 5,
-            .capture = .{ .name = try allocator.dupe(u8, "keyword") },
+            .capture = bbr.highlight.Capture.init(0, "keyword"),
         };
         return .{ .spans = spans };
     }
@@ -689,7 +689,7 @@ test "an added File transfers its enriched new side into Session storage" {
     try testing.expect(projected.old == .absent);
     try testing.expectEqualStrings("const answer = 42;\n", projected.new.content.blob);
     try testing.expectEqual(@as(usize, 1), projected.new.content.highlighting.ready.spans.len);
-    try testing.expectEqualStrings("keyword", projected.new.content.highlighting.ready.spans[0].capture.name);
+    try testing.expectEqual(bbr.highlight.CaptureRole.keyword, projected.new.content.highlighting.ready.spans[0].capture.role);
     try testing.expectError(error.AlreadyTransferred, storage.admit(0, &result));
 }
 
@@ -1195,7 +1195,7 @@ test "File content cache evicts the least-recently-focused whole File and refetc
     try testing.expectEqualStrings("AAAAAA", storage.file(0).new.content.blob);
 }
 
-test "File content cache budget includes Highlight Spans and Capture names" {
+test "File content cache budget includes Highlight Spans" {
     const responses = [_]bbr.http.Canned{.{ .status = 200, .body = "const" }};
     var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
     const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
@@ -1216,7 +1216,7 @@ test "File content cache budget includes Highlight Spans and Capture names" {
     storage.configureCache(.{ .enabled = true, .max_retained_bytes = "const".len });
     storage.focus(0);
     try storage.admit(0, &result);
-    try testing.expectEqualStrings("keyword", storage.file(0).new.content.highlighting.ready.spans[0].capture.name);
+    try testing.expectEqual(bbr.highlight.CaptureRole.keyword, storage.file(0).new.content.highlighting.ready.spans[0].capture.role);
 
     storage.focus(1);
     try testing.expect(storage.file(0).new == .pending);

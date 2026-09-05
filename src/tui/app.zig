@@ -191,7 +191,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         if (projection.review) |review_projection| {
             const visual_cursor = review_projection.frame.navigation.cursor;
             const buffer_cursor = if (visual_cursor < review_projection.frame.visual_rows.len) review_projection.frame.visual_rows[visual_cursor].buffer_index else 0;
-            const selected_file = fileIndexForRow(review_projection.frame.buffer, buffer_cursor);
+            const selected_file = review_projection.frame.buffer.fileIndexForRow(buffer_cursor) orelse 0;
             render.drawReview(frame, content_win, review_projection, ctx.active_theme, selected_file);
             const status = presentationStatus(frame, projection, review_projection.key);
             drawStatus(
@@ -282,7 +282,7 @@ fn syncPickerTick(
 }
 
 const metrics_context: u8 = 0;
-const metrics_vtable: @import("cell_metrics.zig").CellMetrics.VTable = .{ .next = nextVaxisGrapheme };
+const metrics_vtable: @import("cell_metrics.zig").CellMetrics.VTable = .{ .next = nextVaxisGrapheme, .width = widthVaxisText };
 const vaxis_cell_metrics: @import("cell_metrics.zig").CellMetrics = .{ .ptr = &metrics_context, .vtable = &metrics_vtable };
 
 fn nextVaxisGrapheme(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
@@ -292,6 +292,10 @@ fn nextVaxisGrapheme(_: *const anyopaque, text: []const u8) @import("cell_metric
         .byte_len = grapheme.len,
         .cell_width = vaxis.gwidth.gwidth(grapheme.bytes(text), .unicode),
     };
+}
+
+fn widthVaxisText(_: *const anyopaque, text: []const u8) usize {
+    return vaxis.gwidth.gwidth(text, .unicode);
 }
 
 fn contentGeometry(win: vaxis.Window) presentation.FrameGeometry {
@@ -1158,18 +1162,6 @@ fn cancelPresentationWork(work: *std.ArrayList(PresentationWork), io: std.Io, id
     }
 }
 
-fn fileIndexForRow(buf: buffer_mod.Buffer, cursor: usize) usize {
-    var idx: usize = 0;
-    var seen_any = false;
-    var i: usize = 0;
-    while (i <= cursor and i < buf.rows.len) : (i += 1) {
-        if (buf.rows[i] == .file_header) {
-            if (seen_any) idx += 1 else seen_any = true;
-        }
-    }
-    return idx;
-}
-
 fn contentViewportRows(window_rows: u16) usize {
     return @max(window_rows -| 1, 1);
 }
@@ -1239,6 +1231,7 @@ fn reviewerVerdictLabel(verdict: ?bbr.bitbucket.ReviewerVerdict) []const u8 {
 
 // Force the presentation modules' tests into the exe test binary.
 test {
+    _ = @import("cell_metrics.zig");
     _ = @import("buffer.zig");
     _ = @import("frame.zig");
     _ = @import("file_tree.zig");
@@ -1253,6 +1246,19 @@ test {
     _ = @import("file_enrichment.zig");
     _ = @import("presentation_adapter.zig");
     _ = @import("presentation_runtime.zig");
+}
+
+test "whole-text vaxis width matches grapheme measurement" {
+    for ([_][]const u8{ "plain", "\x00", "\t", "\x7f", "e\xcc\x81", "\xe7\x95\x8c", "\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb", "\xff" }) |text| {
+        var scalar_width: usize = 0;
+        var rest = text;
+        while (rest.len > 0) {
+            const measured = vaxis_cell_metrics.next(rest);
+            scalar_width += measured.cell_width;
+            rest = rest[measured.byte_len..];
+        }
+        try std.testing.expectEqual(scalar_width, vaxis_cell_metrics.width(text));
+    }
 }
 
 test "pinned vaxis fixtures preserve Shift Arrow selection input" {

@@ -173,22 +173,22 @@ pub const Theme = struct {
         };
     }
 
-    /// Resolve a hierarchical Capture by its general root. Unknown Captures
-    /// preserve the line style's existing foreground.
+    /// Resolve a preclassified Capture role. Unknown Captures preserve the
+    /// line style's existing foreground.
     pub fn captureColor(self: Theme, capture: bbr.highlight.Capture) ?Color {
-        const dot = std.mem.indexOfScalar(u8, capture.name, '.') orelse capture.name.len;
-        const root = capture.name[0..dot];
-        if (std.mem.eql(u8, root, "comment")) return self.syntax_comment;
-        if (std.mem.eql(u8, root, "string")) return self.syntax_string;
-        if (std.mem.eql(u8, root, "keyword") or std.mem.eql(u8, root, "operator")) return self.syntax_keyword;
-        if (std.mem.eql(u8, root, "function") or std.mem.eql(u8, root, "method") or std.mem.eql(u8, root, "constructor")) return self.syntax_function;
-        if (std.mem.eql(u8, root, "type")) return self.syntax_type;
-        if (std.mem.eql(u8, root, "constant") or std.mem.eql(u8, root, "number") or std.mem.eql(u8, root, "boolean")) return self.syntax_constant;
-        if (std.mem.eql(u8, root, "variable") or std.mem.eql(u8, root, "label")) return self.syntax_variable;
-        if (std.mem.eql(u8, root, "property") or std.mem.eql(u8, root, "attribute")) return self.syntax_property;
-        if (std.mem.eql(u8, root, "punctuation")) return self.syntax_punctuation;
-        if (std.mem.eql(u8, root, "tag")) return self.syntax_tag;
-        return null;
+        return switch (capture.role) {
+            .unknown => null,
+            .comment => self.syntax_comment,
+            .string => self.syntax_string,
+            .keyword => self.syntax_keyword,
+            .function => self.syntax_function,
+            .type => self.syntax_type,
+            .constant => self.syntax_constant,
+            .variable => self.syntax_variable,
+            .property => self.syntax_property,
+            .punctuation => self.syntax_punctuation,
+            .tag => self.syntax_tag,
+        };
     }
 };
 
@@ -444,7 +444,7 @@ test "every built-in Theme composes every ReviewCard role and Markdown refinemen
 }
 
 test "Capture colors resolve hierarchical names and preserve unknown foregrounds" {
-    try testing.expectEqual(dark.syntax_function, dark.captureColor(.{ .name = "function.call.builtin" }).?);
-    try testing.expectEqual(dark.syntax_keyword, dark.captureColor(.{ .name = "operator" }).?);
-    try testing.expect(dark.captureColor(.{ .name = "unrecognized.future.capture" }) == null);
+    try testing.expectEqual(dark.syntax_function, dark.captureColor(bbr.highlight.Capture.init(0, "function.call.builtin")).?);
+    try testing.expectEqual(dark.syntax_keyword, dark.captureColor(bbr.highlight.Capture.init(1, "operator")).?);
+    try testing.expect(dark.captureColor(bbr.highlight.Capture.init(2, "unrecognized.future.capture")) == null);
 }

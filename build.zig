@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("bbr", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .optimize = optimize,
     });
 
     const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
@@ -44,6 +45,47 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run bbr");
     run_step.dependOn(&run_cmd.step);
+
+    const bench_optimize: std.builtin.OptimizeMode = if (optimize == .Debug) .ReleaseFast else optimize;
+    const bench_core_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    const bench_buffer_mod = b.createModule(.{
+        .root_source_file = b.path("src/tui/buffer.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = &.{.{ .name = "bbr", .module = bench_core_mod }},
+    });
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/benchmark/main.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = &.{
+            .{ .name = "bbr", .module = bench_core_mod },
+            .{ .name = "benchmark_buffer", .module = bench_buffer_mod },
+            .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+        },
+    });
+    const bench_highlight_mod = b.createModule(.{
+        .root_source_file = b.path("src/highlight/tree_sitter_highlighter.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "bbr", .module = bench_core_mod }},
+    });
+    addTreeSitter(b, bench_highlight_mod);
+    addRe2(b, bench_highlight_mod, target);
+    bench_mod.addImport("benchmark_highlight", bench_highlight_mod);
+    const bench_exe = b.addExecutable(.{ .name = "bbr-bench", .root_module = bench_mod });
+    const install_bench = b.addInstallArtifact(bench_exe, .{});
+    b.getInstallStep().dependOn(&install_bench.step);
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |args| run_bench.addArgs(args);
+    const bench_step = b.step("bench", "Run deterministic ReleaseFast benchmarks");
+    bench_step.dependOn(&install_bench.step);
+    bench_step.dependOn(&run_bench.step);
 
     // Live smoke check against real Bitbucket (opt-in; needs BITBUCKET_* env):
     //   zig build check -- <repo-slug> <pr-id>

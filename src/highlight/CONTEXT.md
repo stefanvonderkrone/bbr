@@ -27,7 +27,7 @@ An ordered rule that selects a Grammar for a File: exact filename, compound suff
 _Avoid_: file association, language detection, extension mapping.
 
 **Capture**:
-A hierarchical syntax role assigned by a Grammar, such as `function.call`, `keyword`, or `comment`. A Theme resolves an unknown specific Capture through its less-specific parents and finally the default foreground.
+A query-local `u16` identity for a hierarchical syntax role assigned by a Grammar. Each Grammar classifies Capture names once into Theme roles such as function, keyword, or comment. Unknown roles use the default foreground.
 _Avoid_: scope, token type, syntax class.
 
 **Span**:

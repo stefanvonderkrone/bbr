@@ -21,7 +21,8 @@ const Draft = bbr.review.Draft;
 const Parent = bbr.review.draft.Parent;
 const anchor_projection = bbr.review.anchor;
 const review_card = @import("review_card.zig");
-const CellMetrics = @import("cell_metrics.zig").CellMetrics;
+pub const CellMetrics = @import("cell_metrics.zig").CellMetrics;
+pub const CellMeasurement = @import("cell_metrics.zig").Measurement;
 
 /// Re-export so the renderer can name the segment type without reaching into
 /// `intraline` directly.
@@ -30,6 +31,9 @@ pub const Segment = intraline.Segment;
 /// Below this common-byte fraction a removed/added pair is treated as two
 /// unrelated lines rather than an edit, so no intra-line emphasis is attached.
 const emphasis_threshold: f64 = 0.5;
+
+// This host-calibrated cap keeps exact matching below the 332,137 ns p95 budget.
+const side_by_side_work_limit: usize = 131_625;
 
 /// How a `Buffer` is arranged on screen. Only `unified` is built today;
 /// `side_by_side` is the other axis (design §11) and lands later.
@@ -220,18 +224,115 @@ pub fn disclosureKey(row: Row) ?DisclosureKey {
     };
 }
 
-fn disclosureExpanded(keys: []const DisclosureKey, key: DisclosureKey) bool {
-    for (keys) |candidate| if (std.meta.eql(candidate, key)) return true;
-    return false;
+const DisclosureId = struct { kind: u8, value: u64 };
+const DisclosureSet = std.AutoHashMapUnmanaged(DisclosureId, void);
+
+fn disclosureId(key: DisclosureKey) DisclosureId {
+    return switch (key) {
+        .resolved_thread => |id| .{ .kind = 0, .value = @intCast(id) },
+        .fold => |line| .{ .kind = 1, .value = @intFromPtr(line) },
+        .outdated_file => |file| .{ .kind = 2, .value = @intFromPtr(file) },
+        .outdated_review => .{ .kind = 3, .value = 0 },
+        .review_card => |owner| switch (owner) {
+            .comment => |id| .{ .kind = 4, .value = @intCast(id) },
+            .draft => |id| .{ .kind = 5, .value = @intCast(id) },
+        },
+    };
+}
+
+fn expandedDisclosureSet(allocator: std.mem.Allocator, keys: []const DisclosureKey) !DisclosureSet {
+    var set: DisclosureSet = .empty;
+    try set.ensureTotalCapacity(allocator, @intCast(keys.len));
+    for (keys) |key| set.putAssumeCapacity(disclosureId(key), {});
+    return set;
+}
+
+const AnchorSide = enum { old, new };
+const AnchorKey = struct {
+    path: []const u8,
+    line: u32,
+    side: AnchorSide,
+};
+
+const AnchorKeyContext = struct {
+    pub fn hash(_: AnchorKeyContext, key: AnchorKey) u64 {
+        var value = std.hash.Wyhash.init(0);
+        value.update(key.path);
+        value.update(std.mem.asBytes(&key.line));
+        value.update(&.{@intFromEnum(key.side)});
+        return value.final();
+    }
+
+    pub fn eql(_: AnchorKeyContext, a: AnchorKey, b: AnchorKey) bool {
+        return a.line == b.line and a.side == b.side and std.mem.eql(u8, a.path, b.path);
+    }
+};
+
+const AnchorBucket = struct {
+    threads: std.ArrayList(usize) = .empty,
+    drafts: std.ArrayList(usize) = .empty,
+};
+const AnchorIndex = std.HashMapUnmanaged(AnchorKey, AnchorBucket, AnchorKeyContext, 80);
+
+fn anchorKey(anchor: review.Anchor) ?AnchorKey {
+    if (anchor.to) |line| return .{ .path = anchor.path, .line = line, .side = .new };
+    if (anchor.from) |line| return .{ .path = anchor.path, .line = line, .side = .old };
+    return null;
+}
+
+fn addAnchorIndex(allocator: std.mem.Allocator, index: *AnchorIndex, key: AnchorKey, item: usize, comptime field: enum { threads, drafts }) !void {
+    const result = try index.getOrPut(allocator, key);
+    if (!result.found_existing) result.value_ptr.* = .{};
+    try @field(result.value_ptr, @tagName(field)).append(allocator, item);
+}
+
+const ParentKey = struct { kind: u8, id: u64 };
+const ReplyIndex = std.AutoHashMapUnmanaged(ParentKey, std.ArrayList(usize));
+
+fn parentKey(parent: Parent) ParentKey {
+    return switch (parent) {
+        .comment => |id| .{ .kind = 0, .id = id },
+        .draft => |id| .{ .kind = 1, .id = id },
+    };
 }
 
 pub const Buffer = struct {
     rows: []const Row,
     layout: Layout,
     file_tallies: []const FileTally = &.{},
+    file_rows: []const FileRow = &.{},
+
+    pub fn fileIndexForRow(self: Buffer, row: usize) ?usize {
+        if (self.file_rows.len == 0) return null;
+        var low: usize = 0;
+        var high = self.file_rows.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.file_rows[middle].first_row <= row) low = middle + 1 else high = middle;
+        }
+        return self.file_rows[low -| 1].file_index;
+    }
+
+    pub fn fileHeaderRow(self: Buffer, file_index: usize) ?usize {
+        var low: usize = 0;
+        var high = self.file_rows.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const candidate = self.file_rows[middle];
+            if (candidate.file_index < file_index) {
+                low = middle + 1;
+            } else if (candidate.file_index > file_index) {
+                high = middle;
+            } else {
+                return candidate.first_row;
+            }
+        }
+        return null;
+    }
 };
 
 pub const FileTally = struct { comments: usize = 0, drafts: usize = 0 };
+pub const FileRow = struct { file_index: usize, first_row: usize };
 
 pub const BuildError = error{
     /// The requested `Layout` is not implemented yet.
@@ -258,6 +359,7 @@ pub fn buildWithComments(
     opts: BuildOptions,
 ) BuildError!Buffer {
     var rows: std.ArrayList(Row) = .empty;
+    var file_rows: std.ArrayList(FileRow) = .empty;
 
     // A Draft is placed exactly once: a root Draft by its anchor (inline line, or
     // the PR-level "Pending" section); a reply Draft after its parent's row (a
@@ -269,6 +371,24 @@ pub fn buildWithComments(
     @memset(emitted, false);
     const emitted_threads = try allocator.alloc(bool, threads.len);
     @memset(emitted_threads, false);
+    var anchors: AnchorIndex = .empty;
+    try anchors.ensureTotalCapacity(allocator, @intCast(threads.len + opts.drafts.len));
+    for (threads, 0..) |thread, thread_index| {
+        if (thread.root.state == .outdated) continue;
+        if (thread.anchor()) |anchor| if (anchorKey(anchor)) |key|
+            try addAnchorIndex(allocator, &anchors, key, thread_index, .threads);
+    }
+    var replies: ReplyIndex = .empty;
+    try replies.ensureTotalCapacity(allocator, @intCast(opts.drafts.len));
+    for (opts.drafts, 0..) |*draft, draft_index| {
+        if (draft.parent) |parent| {
+            const result = replies.getOrPutAssumeCapacity(parentKey(parent));
+            if (!result.found_existing) result.value_ptr.* = .empty;
+            try result.value_ptr.append(allocator, draft_index);
+        } else if (projectedDraftAnchor(draft, opts)) |anchor| if (anchorKey(anchor)) |key| {
+            try addAnchorIndex(allocator, &anchors, key, draft_index, .drafts);
+        };
+    }
     var w: Weave = .{
         .a = allocator,
         .rows = &rows,
@@ -276,6 +396,9 @@ pub fn buildWithComments(
         .drafts = opts.drafts,
         .emitted = emitted,
         .emitted_threads = emitted_threads,
+        .anchors = anchors,
+        .replies = replies,
+        .expanded_disclosures = try expandedDisclosureSet(allocator, opts.expanded_disclosures),
         .opts = opts,
     };
 
@@ -306,6 +429,8 @@ pub fn buildWithComments(
         if (opts.only_file) |only| {
             if (fi != only) continue;
         }
+        w.span_cursors = .init(opts.highlights, fi);
+        try file_rows.append(allocator, .{ .file_index = fi, .first_row = rows.items.len });
         try rows.append(allocator, .{ .file_header = file });
 
         // File-level roots live at the File header, before hunks/folds/lines.
@@ -328,15 +453,15 @@ pub fn buildWithComments(
                 .new => try spliceNewSide(allocator, file.*, content.blob),
             };
             switch (layout) {
-                .unified => try w.emitUnifiedHunk(fi, file, lines, try computeEmphasis(allocator, lines), &.{}),
-                .side_by_side => try w.emitSideBySideHunk(fi, file, lines, &.{}),
+                .unified => try w.emitUnifiedHunk(file, lines, try computeEmphasis(allocator, lines), &.{}),
+                .side_by_side => try w.emitSideBySideHunk(file, lines, &.{}),
             }
         } else for (file.hunks) |*hunk| {
             try rows.append(allocator, .{ .hunk_header = hunk });
             const folds = try computeFolds(allocator, hunk.lines, opts);
             switch (layout) {
-                .unified => try w.emitUnifiedHunk(fi, file, hunk.lines, try computeEmphasis(allocator, hunk.lines), folds),
-                .side_by_side => try w.emitSideBySideHunk(fi, file, hunk.lines, folds),
+                .unified => try w.emitUnifiedHunk(file, hunk.lines, try computeEmphasis(allocator, hunk.lines), folds),
+                .side_by_side => try w.emitSideBySideHunk(file, hunk.lines, folds),
             }
         }
 
@@ -344,7 +469,7 @@ pub fn buildWithComments(
         const od_count = fileOutdatedCount(threads, file.*) + draftOutdatedCount(opts.drafts, opts, file.*);
         if (od_count > 0) {
             const key: DisclosureKey = .{ .outdated_file = file };
-            const expanded = disclosureExpanded(opts.expanded_disclosures, key);
+            const expanded = w.expanded_disclosures.contains(disclosureId(key));
             try rows.append(allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = od_count, .path = file.displayPath() } });
             if (expanded) {
                 for (threads) |*t| {
@@ -382,7 +507,7 @@ pub fn buildWithComments(
     }
     if (fallback_outdated_count > 0) {
         const key: DisclosureKey = .outdated_review;
-        const expanded = disclosureExpanded(opts.expanded_disclosures, key);
+        const expanded = w.expanded_disclosures.contains(disclosureId(key));
         try rows.append(allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = fallback_outdated_count } });
         if (expanded) {
             if (opts.only_file == null) for (threads, 0..) |*thread, thread_index| {
@@ -432,7 +557,12 @@ pub fn buildWithComments(
         }
     }
 
-    return .{ .rows = try rows.toOwnedSlice(allocator), .layout = layout, .file_tallies = try fileTallies(allocator, diff, threads, opts.drafts, opts) };
+    return .{
+        .rows = try rows.toOwnedSlice(allocator),
+        .layout = layout,
+        .file_tallies = try fileTallies(allocator, diff, threads, opts.drafts, opts),
+        .file_rows = try file_rows.toOwnedSlice(allocator),
+    };
 }
 
 fn contentStatus(statuses: []const model.FileContent, file_index: usize) model.FileContent {
@@ -479,14 +609,18 @@ const Weave = struct {
     /// Index-aligned with `drafts`; set once the Draft has been placed.
     emitted: []bool,
     emitted_threads: []bool,
+    anchors: AnchorIndex,
+    replies: ReplyIndex,
+    expanded_disclosures: DisclosureSet,
     opts: BuildOptions,
+    span_cursors: SpanCursors = .{},
 
     /// Append a thread's rows: root, then any pending reply-Drafts to the root,
     /// then each published reply followed by its own pending reply-Drafts.
     fn emitThread(w: *Weave, t: *const Thread) !void {
         if (t.resolved) {
             const key: DisclosureKey = .{ .resolved_thread = t.root.id };
-            const expanded = disclosureExpanded(w.opts.expanded_disclosures, key);
+            const expanded = w.expanded_disclosures.contains(disclosureId(key));
             try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .resolved_thread, .expanded = expanded, .count = t.replies.len } });
             if (!expanded) return;
         }
@@ -528,7 +662,7 @@ const Weave = struct {
             .content_width = cardContentWidth(w.opts.card_width, is_reply),
             .metrics = w.opts.cell_metrics,
             .collapsed_rows = w.opts.collapsed_rows,
-            .expanded = disclosureExpanded(w.opts.expanded_disclosures, .{ .review_card = owner }),
+            .expanded = w.expanded_disclosures.contains(disclosureId(.{ .review_card = owner })),
         });
         for (projected) |row| try w.rows.append(w.a, .{ .comment = row });
     }
@@ -569,7 +703,7 @@ const Weave = struct {
                 .content_width = cardContentWidth(w.opts.card_width, is_reply),
                 .metrics = w.opts.cell_metrics,
                 .collapsed_rows = w.opts.collapsed_rows,
-                .expanded = disclosureExpanded(w.opts.expanded_disclosures, .{ .review_card = owner }),
+                .expanded = w.expanded_disclosures.contains(disclosureId(.{ .review_card = owner })),
             });
             for (projected) |row| try w.rows.append(w.a, .{ .draft = row });
         }
@@ -596,18 +730,14 @@ const Weave = struct {
     /// (so a reply-to-a-reply-Draft nests correctly). The `emitted` guard bounds
     /// the recursion even if the parent graph contains a cycle.
     fn emitRepliesTo(w: *Weave, parent: Parent) std.mem.Allocator.Error!void {
-        for (w.drafts, 0..) |*d, i| {
-            if (w.emitted[i]) continue;
-            const p = d.parent orelse continue;
-            if (parentEql(p, parent)) try w.emitDraft(i);
-        }
+        const children = w.replies.get(parentKey(parent)) orelse return;
+        for (children.items) |index| try w.emitDraft(index);
     }
 
     /// Emit a hunk's lines in unified layout: one row per line, each followed by
     /// any inline threads and root Drafts anchored to it.
     fn emitUnifiedHunk(
         w: *Weave,
-        file_idx: usize,
         file: *const model.File,
         lines: []const model.Line,
         emphasis: []const []const Segment,
@@ -617,14 +747,14 @@ const Weave = struct {
         while (i < lines.len) {
             if (foldStartingAt(folds, &lines[i])) |f| {
                 const key: DisclosureKey = .{ .fold = f.id };
-                const expanded = disclosureExpanded(w.opts.expanded_disclosures, key);
+                const expanded = w.expanded_disclosures.contains(disclosureId(key));
                 try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
                 if (!expanded) {
                     i += f.lines.len;
                     continue;
                 }
             }
-            try w.rows.append(w.a, .{ .line = try decoratedLine(w.a, &lines[i], lineSpans(w.opts.highlights, file_idx, lines[i]), emphasis[i]) });
+            try w.rows.append(w.a, .{ .line = try decoratedLine(w.a, &lines[i], w.span_cursors.lineSpans(lines[i]), emphasis[i]) });
             try w.weaveInline(file, &lines[i]);
             i += 1;
         }
@@ -636,7 +766,6 @@ const Weave = struct {
     /// context line — present on both sides — doesn't double-emit).
     fn emitSideBySideHunk(
         w: *Weave,
-        file_idx: usize,
         file: *const model.File,
         lines: []const model.Line,
         folds: []const Fold,
@@ -645,7 +774,7 @@ const Weave = struct {
         while (i < lines.len) {
             if (foldStartingAt(folds, &lines[i])) |f| {
                 const key: DisclosureKey = .{ .fold = f.id };
-                const expanded = disclosureExpanded(w.opts.expanded_disclosures, key);
+                const expanded = w.expanded_disclosures.contains(disclosureId(key));
                 try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
                 if (!expanded) {
                     i += f.lines.len;
@@ -654,7 +783,7 @@ const Weave = struct {
             }
             switch (lines[i].kind) {
                 .context => {
-                    const line = try decoratedLine(w.a, &lines[i], lineSpans(w.opts.highlights, file_idx, lines[i]), &.{});
+                    const line = try decoratedLine(w.a, &lines[i], w.span_cursors.lineSpans(lines[i]), &.{});
                     const pair: LinePair = if (lines[i].new_no == null)
                         .{ .left = line }
                     else if (lines[i].old_no == null)
@@ -671,7 +800,7 @@ const Weave = struct {
                     while (i < lines.len and lines[i].kind == .added) i += 1;
                     var p = start;
                     while (p < i) : (p += 1) {
-                        try w.rows.append(w.a, .{ .line_pair = .{ .right = try decoratedLine(w.a, &lines[p], lineSpans(w.opts.highlights, file_idx, lines[p]), &.{}) } });
+                        try w.rows.append(w.a, .{ .line_pair = .{ .right = try decoratedLine(w.a, &lines[p], w.span_cursors.lineSpans(lines[p]), &.{}) } });
                         try w.weaveInline(file, &lines[p]);
                     }
                 },
@@ -686,7 +815,7 @@ const Weave = struct {
                         while (i < lines.len and lines[i].kind == .added) i += 1;
                         add_end = i;
                     }
-                    try w.emitSideBySideChangeBlock(file_idx, file, lines[rem_start..rem_end], lines[add_start..add_end]);
+                    try w.emitSideBySideChangeBlock(file, lines[rem_start..rem_end], lines[add_start..add_end]);
                 },
             }
         }
@@ -694,20 +823,32 @@ const Weave = struct {
 
     fn emitSideBySideChangeBlock(
         w: *Weave,
-        file_idx: usize,
         file: *const model.File,
         removed: []const model.Line,
         added: []const model.Line,
     ) !void {
+        var old_parts: usize = 0;
+        for (removed) |line| old_parts +|= intraline.lexicalPartCount(line.text);
+        var new_parts: usize = 0;
+        for (added) |line| new_parts +|= intraline.lexicalPartCount(line.text);
+        const work = removed.len *| added.len +| old_parts *| new_parts;
+        if (work > side_by_side_work_limit) return w.emitIndexedChangeBlock(file, removed, added);
+
+        var match_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer match_scratch.deinit();
+        const scratch = match_scratch.allocator();
         const stride = added.len + 1;
-        const similarities = try w.a.alloc(f64, removed.len * added.len);
+        const similarities = try scratch.alloc(f64, removed.len * added.len);
+        var lexical_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer lexical_scratch.deinit();
         for (removed, 0..) |old, old_index| {
             for (added, 0..) |new, new_index| {
-                similarities[old_index * added.len + new_index] = try intraline.matchingSimilarity(std.heap.page_allocator, old.text, new.text);
+                _ = lexical_scratch.reset(.retain_capacity);
+                similarities[old_index * added.len + new_index] = try intraline.matchingSimilarity(lexical_scratch.allocator(), old.text, new.text);
             }
         }
 
-        const cells = try w.a.alloc(MatchCell, (removed.len + 1) * stride);
+        const cells = try scratch.alloc(MatchCell, (removed.len + 1) * stride);
         var old_cursor = removed.len + 1;
         while (old_cursor > 0) {
             old_cursor -= 1;
@@ -763,8 +904,8 @@ const Weave = struct {
             switch (cells[old_cursor * stride + new_cursor].operation) {
                 .pair => {
                     const pair = try intraline.diff(w.a, removed[old_cursor].text, added[new_cursor].text);
-                    const left = try decoratedLine(w.a, &removed[old_cursor], lineSpans(w.opts.highlights, file_idx, removed[old_cursor]), pair.old);
-                    const right = try decoratedLine(w.a, &added[new_cursor], lineSpans(w.opts.highlights, file_idx, added[new_cursor]), pair.new);
+                    const left = try decoratedLine(w.a, &removed[old_cursor], w.span_cursors.lineSpans(removed[old_cursor]), pair.old);
+                    const right = try decoratedLine(w.a, &added[new_cursor], w.span_cursors.lineSpans(added[new_cursor]), pair.new);
                     try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
                     try w.weaveInline(file, right.line);
                     try w.weaveInline(file, left.line);
@@ -772,19 +913,46 @@ const Weave = struct {
                     new_cursor += 1;
                 },
                 .right => {
-                    const right = try decoratedLine(w.a, &added[new_cursor], lineSpans(w.opts.highlights, file_idx, added[new_cursor]), &.{});
+                    const right = try decoratedLine(w.a, &added[new_cursor], w.span_cursors.lineSpans(added[new_cursor]), &.{});
                     try w.rows.append(w.a, .{ .line_pair = .{ .right = right } });
                     try w.weaveInline(file, right.line);
                     new_cursor += 1;
                 },
                 .left => {
-                    const left = try decoratedLine(w.a, &removed[old_cursor], lineSpans(w.opts.highlights, file_idx, removed[old_cursor]), &.{});
+                    const left = try decoratedLine(w.a, &removed[old_cursor], w.span_cursors.lineSpans(removed[old_cursor]), &.{});
                     try w.rows.append(w.a, .{ .line_pair = .{ .left = left } });
                     try w.weaveInline(file, left.line);
                     old_cursor += 1;
                 },
                 .done => unreachable,
             }
+        }
+    }
+
+    fn emitIndexedChangeBlock(
+        w: *Weave,
+        file: *const model.File,
+        removed: []const model.Line,
+        added: []const model.Line,
+    ) !void {
+        const pair_count = @min(removed.len, added.len);
+        for (0..pair_count) |i| {
+            const pair = try intraline.diff(w.a, removed[i].text, added[i].text);
+            const left = try decoratedLine(w.a, &removed[i], w.span_cursors.lineSpans(removed[i]), pair.old);
+            const right = try decoratedLine(w.a, &added[i], w.span_cursors.lineSpans(added[i]), pair.new);
+            try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
+            try w.weaveInline(file, right.line);
+            try w.weaveInline(file, left.line);
+        }
+        for (removed[pair_count..]) |*line| {
+            const left = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
+            try w.rows.append(w.a, .{ .line_pair = .{ .left = left } });
+            try w.weaveInline(file, left.line);
+        }
+        for (added[pair_count..]) |*line| {
+            const right = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
+            try w.rows.append(w.a, .{ .line_pair = .{ .right = right } });
+            try w.weaveInline(file, right.line);
         }
     }
 
@@ -795,19 +963,30 @@ const Weave = struct {
         // Blob-synthesized context lines (whole-file gaps) carry no diff anchor —
         // only Hunk lines bind comments/Drafts (M9 anchor safety).
         if (!ln.in_hunk) return;
-        for (w.threads) |*t| {
-            const anc = t.anchor() orelse continue;
-            if (t.root.state == .outdated) continue; // grouped below
-            if (!anchorMatchesFile(anc, file.*)) continue;
-            if (anchorMatchesLine(anc, ln)) try w.emitThread(t);
+        if (w.anchors.count() == 0) return;
+        const new = if (ln.new_no) |line| w.anchors.get(.{ .path = file.new_path, .line = line, .side = .new }) else null;
+        const old = if (ln.old_no) |line| w.anchors.get(.{ .path = file.old_path, .line = line, .side = .old }) else null;
+        const new_threads = if (new) |bucket| bucket.threads.items else &.{};
+        const old_threads = if (old) |bucket| bucket.threads.items else &.{};
+        var new_index: usize = 0;
+        var old_index: usize = 0;
+        while (new_index < new_threads.len or old_index < old_threads.len) {
+            const take_new = old_index == old_threads.len or (new_index < new_threads.len and new_threads[new_index] < old_threads[old_index]);
+            const index = if (take_new) new_threads[new_index] else old_threads[old_index];
+            if (take_new) new_index += 1 else old_index += 1;
+            try w.emitThread(&w.threads[index]);
         }
         // Root anchored Drafts hang off the same line, after any published
         // thread. Reply Drafts are placed under their parent, not by anchor.
-        for (w.drafts, 0..) |*d, i| {
-            if (d.parent != null) continue;
-            const anc = projectedDraftAnchor(d, w.opts) orelse continue;
-            if (!anchorMatchesFile(anc, file.*)) continue;
-            if (anchorMatchesLine(anc, ln)) try w.emitDraft(i);
+        const new_drafts = if (new) |bucket| bucket.drafts.items else &.{};
+        const old_drafts = if (old) |bucket| bucket.drafts.items else &.{};
+        new_index = 0;
+        old_index = 0;
+        while (new_index < new_drafts.len or old_index < old_drafts.len) {
+            const take_new = old_index == old_drafts.len or (new_index < new_drafts.len and new_drafts[new_index] < old_drafts[old_index]);
+            const index = if (take_new) new_drafts[new_index] else old_drafts[old_index];
+            if (take_new) new_index += 1 else old_index += 1;
+            try w.emitDraft(index);
         }
     }
 };
@@ -815,14 +994,6 @@ const Weave = struct {
 fn cardContentWidth(width: usize, is_reply: bool) usize {
     const indent: usize = if (is_reply) 8 else 4;
     return @max(width -| indent, 1);
-}
-
-/// True when two `Parent` references name the same target.
-fn parentEql(a: Parent, b: Parent) bool {
-    return switch (a) {
-        .draft => |x| b == .draft and b.draft == x,
-        .comment => |x| b == .comment and b.comment == x,
-    };
 }
 
 fn decoratedLine(allocator: std.mem.Allocator, line: *const model.Line, spans: []const decoration.Span, emphasis: []const Segment) decoration.Error!LineRow {
@@ -838,27 +1009,45 @@ fn decoratedLine(allocator: std.mem.Allocator, line: *const model.Line, spans: [
     return .{ .line = line, .decoration = decorated };
 }
 
-/// Select the agreed file side, then return only the ordered Spans for `line`.
-fn lineSpans(highlights: []const bbr.highlight.highlighter.FileHighlights, file_idx: usize, line: model.Line) []const decoration.Span {
-    if (file_idx >= highlights.len) return &.{};
-    const file = highlights[file_idx];
-    const selected = switch (line.kind) {
-        .removed => file.old,
-        .added => file.new,
-        .context => file.new orelse file.old,
-    } orelse return &.{};
-    const number = switch (line.kind) {
-        .removed => line.old_no,
-        .added => line.new_no,
-        .context => if (file.new != null) line.new_no else line.old_no,
-    } orelse return &.{};
+const SpanCursor = struct {
+    spans: []const decoration.Span = &.{},
+    next: usize = 0,
 
-    var first: usize = 0;
-    while (first < selected.spans.len and selected.spans[first].line < number) first += 1;
-    var end = first;
-    while (end < selected.spans.len and selected.spans[end].line == number) end += 1;
-    return selected.spans[first..end];
-}
+    fn lineSpans(cursor: *SpanCursor, number: ?u32) []const decoration.Span {
+        const line = number orelse return &.{};
+        while (cursor.next < cursor.spans.len and cursor.spans[cursor.next].line < line) cursor.next += 1;
+        const first = cursor.next;
+        while (cursor.next < cursor.spans.len and cursor.spans[cursor.next].line == line) cursor.next += 1;
+        return cursor.spans[first..cursor.next];
+    }
+};
+
+const SpanCursors = struct {
+    old: ?SpanCursor = null,
+    new: ?SpanCursor = null,
+
+    fn init(highlights: []const bbr.highlight.highlighter.FileHighlights, file_idx: usize) SpanCursors {
+        if (file_idx >= highlights.len) return .{};
+        const file = highlights[file_idx];
+        return .{
+            .old = if (file.old) |result| .{ .spans = result.spans } else null,
+            .new = if (file.new) |result| .{ .spans = result.spans } else null,
+        };
+    }
+
+    fn lineSpans(cursors: *SpanCursors, line: model.Line) []const decoration.Span {
+        return switch (line.kind) {
+            .removed => if (cursors.old) |*cursor| cursor.lineSpans(line.old_no) else &.{},
+            .added => if (cursors.new) |*cursor| cursor.lineSpans(line.new_no) else &.{},
+            .context => if (cursors.new) |*cursor|
+                cursor.lineSpans(line.new_no)
+            else if (cursors.old) |*cursor|
+                cursor.lineSpans(line.old_no)
+            else
+                &.{},
+        };
+    }
+};
 
 const WholeFileContent = struct {
     side: enum { old, new },
@@ -1061,7 +1250,7 @@ fn computeEmphasis(allocator: std.mem.Allocator, lines: []const model.Line) ![]c
         var k: usize = 0;
         while (k < pairs) : (k += 1) {
             const pair = try intraline.diff(allocator, lines[rem_start + k].text, lines[add_start + k].text);
-            if (intraline.similarity(pair) >= emphasis_threshold) {
+            if (pair.whole_line or intraline.similarity(pair) >= emphasis_threshold) {
                 out[rem_start + k] = pair.old;
                 out[add_start + k] = pair.new;
             }
@@ -1208,14 +1397,6 @@ fn countWhere(threads: []const Thread, pred: fn (Thread) bool) usize {
     return n;
 }
 
-/// Does `anchor` bind to this diff line? Prefer the new side (`to` ↔ `new_no`),
-/// falling back to the old side (`from` ↔ `old_no`).
-fn anchorMatchesLine(anchor: review.Anchor, ln: *const model.Line) bool {
-    if (anchor.to) |to| return ln.new_no != null and ln.new_no.? == to;
-    if (anchor.from) |from| return ln.old_no != null and ln.old_no.? == from;
-    return false;
-}
-
 // ---------------------------------------------------------------------------
 // Tests — hermetic; build a Diff via the parser, then flatten it.
 // ---------------------------------------------------------------------------
@@ -1302,6 +1483,33 @@ test "a modified line pair carries intra-line emphasis; unrelated lines do not" 
     // The wholesale replacement shares nothing → treated as unrelated, no emphasis.
     try testing.expectEqual(@as(usize, 1), buf.rows[6].line.decoration.runs.len);
     try testing.expectEqual(@as(usize, 1), buf.rows[7].line.decoration.runs.len);
+}
+
+test "bounded intraline work keeps whole-line emphasis" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var old: std.ArrayList(u8) = .empty;
+    var new: std.ArrayList(u8) = .empty;
+    for (0..501) |i| {
+        if (i % 2 == 0) {
+            try old.print(a, "o{d}", .{i});
+            try new.print(a, "n{d}", .{i});
+        } else {
+            try old.append(a, '+');
+            try new.append(a, '+');
+        }
+    }
+    const lines = [_]model.Line{
+        .{ .old_no = 1, .new_no = null, .kind = .removed, .text = old.items },
+        .{ .old_no = null, .new_no = 1, .kind = .added, .text = new.items },
+    };
+
+    const emphasis = try computeEmphasis(a, &lines);
+    try testing.expectEqual(@as(usize, 1), emphasis[0].len);
+    try testing.expectEqual(@as(usize, 1), emphasis[1].len);
+    try testing.expect(emphasis[0][0].emphasis);
+    try testing.expect(emphasis[1][0].emphasis);
 }
 
 test "rows borrow the diff (pointer identity, not copies)" {
@@ -1522,6 +1730,25 @@ test "side_by_side pairs identical Lines while Unified keeps Diff order" {
     try testing.expectEqual(&lines[1], side_by_side.rows[3].line_pair.left.?.line);
     try testing.expectEqual(&lines[3], side_by_side.rows[3].line_pair.right.?.line);
     for (lines, unified.rows[2..]) |*line, row| try testing.expectEqual(line, row.line.line);
+}
+
+test "side_by_side uses deterministic index pairing above the work limit" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const line_count = 260;
+    var raw: std.ArrayList(u8) = .empty;
+    try raw.print(a, "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,{d} +1,{d} @@\n", .{ line_count, line_count });
+    for (0..line_count) |i| try raw.print(a, "-line_{d}\n", .{i});
+    for (0..line_count) |i| try raw.print(a, "+line_{d}\n", .{(i + 1) % line_count});
+
+    const diff = try parse(a, raw.items);
+    const buffer = try build(a, diff, .side_by_side);
+    try expectChangedLinesExactlyOnce(diff, buffer);
+    try testing.expectEqual(@as(usize, line_count + 2), buffer.rows.len);
+    try testing.expectEqualStrings("line_0", buffer.rows[2].line_pair.left.?.line.text);
+    try testing.expectEqualStrings("line_1", buffer.rows[2].line_pair.right.?.line.text);
 }
 
 test "side_by_side weaves an inline thread once, under its anchored pair" {
@@ -2169,6 +2396,8 @@ test "only_file projects a single file's rows, nothing else" {
     for (only_b.rows) |r| {
         if (r == .file_header) try testing.expectEqualStrings("b.txt", r.file_header.new_path);
     }
+    try testing.expectEqual(@as(usize, 1), only_b.fileIndexForRow(0));
+    try testing.expectEqual(@as(usize, 0), only_b.fileHeaderRow(1));
     // b.txt alone: header + hunk header + 2 lines = 4 rows.
     try testing.expectEqual(@as(usize, 4), only_b.rows.len);
 
@@ -2442,10 +2671,10 @@ test "a trailing newline does not emit a spurious blank last row" {
 }
 
 test "Line decoration selects old Spans for removed and new Spans for added and context Lines" {
-    const old_spans = [_]decoration.Span{.{ .line = 4, .start = 0, .end = 3, .capture = .{ .name = "old.capture" } }};
+    const old_spans = [_]decoration.Span{.{ .line = 4, .start = 0, .end = 3, .capture = decoration.Capture.init(1, "old.capture") }};
     const new_spans = [_]decoration.Span{
-        .{ .line = 7, .start = 0, .end = 3, .capture = .{ .name = "new.added" } },
-        .{ .line = 8, .start = 0, .end = 3, .capture = .{ .name = "new.context" } },
+        .{ .line = 7, .start = 0, .end = 3, .capture = decoration.Capture.init(2, "new.added") },
+        .{ .line = 8, .start = 0, .end = 3, .capture = decoration.Capture.init(3, "new.context") },
     };
     const highlights = [_]bbr.highlight.highlighter.FileHighlights{.{
         .old = .{ .spans = &old_spans },
@@ -2455,9 +2684,10 @@ test "Line decoration selects old Spans for removed and new Spans for added and 
     const removed: model.Line = .{ .old_no = 4, .new_no = null, .kind = .removed, .text = "old" };
     const added: model.Line = .{ .old_no = null, .new_no = 7, .kind = .added, .text = "new" };
     const context: model.Line = .{ .old_no = 6, .new_no = 8, .kind = .context, .text = "ctx" };
-    try testing.expectEqualStrings("old.capture", lineSpans(&highlights, 0, removed)[0].capture.name);
-    try testing.expectEqualStrings("new.added", lineSpans(&highlights, 0, added)[0].capture.name);
-    try testing.expectEqualStrings("new.context", lineSpans(&highlights, 0, context)[0].capture.name);
+    var cursors = SpanCursors.init(&highlights, 0);
+    try testing.expectEqual(@as(u16, 1), cursors.lineSpans(removed)[0].capture.id);
+    try testing.expectEqual(@as(u16, 2), cursors.lineSpans(added)[0].capture.id);
+    try testing.expectEqual(@as(u16, 3), cursors.lineSpans(context)[0].capture.id);
 }
 
 test "an incompatible blob Span leaves only that diff Line plain" {
@@ -2469,7 +2699,7 @@ test "an incompatible blob Span leaves only that diff Line plain" {
         .line = 52,
         .start = 5,
         .end = 6,
-        .capture = .{ .name = "punctuation.bracket" },
+        .capture = decoration.Capture.init(0, "punctuation.bracket"),
     }};
 
     const row = try decoratedLine(arena.allocator(), &line, &incompatible, &.{});
