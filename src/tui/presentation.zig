@@ -7458,7 +7458,7 @@ const PersistenceTestHighlighter = struct {
             .line = 1,
             .start = 0,
             .end = 8,
-            .capture = .{ .name = try allocator.dupe(u8, "prefetch-capture-sentinel") },
+            .capture = bbr.highlight.Capture.init(0, "prefetch-capture-sentinel"),
         };
         return .{ .spans = spans };
     }

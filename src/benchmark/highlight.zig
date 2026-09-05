@@ -19,7 +19,7 @@ pub fn checksum(result: bbr.highlight.HighlightResult) u64 {
         hash.update(std.mem.asBytes(&span.line));
         hash.update(std.mem.asBytes(&span.start));
         hash.update(std.mem.asBytes(&span.end));
-        hash.update(span.capture.name);
+        hash.update(std.mem.asBytes(&span.capture));
     }
     return hash.final();
 }

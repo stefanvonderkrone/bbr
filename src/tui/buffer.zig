@@ -2532,10 +2532,10 @@ test "a trailing newline does not emit a spurious blank last row" {
 }
 
 test "Line decoration selects old Spans for removed and new Spans for added and context Lines" {
-    const old_spans = [_]decoration.Span{.{ .line = 4, .start = 0, .end = 3, .capture = .{ .name = "old.capture" } }};
+    const old_spans = [_]decoration.Span{.{ .line = 4, .start = 0, .end = 3, .capture = decoration.Capture.init(1, "old.capture") }};
     const new_spans = [_]decoration.Span{
-        .{ .line = 7, .start = 0, .end = 3, .capture = .{ .name = "new.added" } },
-        .{ .line = 8, .start = 0, .end = 3, .capture = .{ .name = "new.context" } },
+        .{ .line = 7, .start = 0, .end = 3, .capture = decoration.Capture.init(2, "new.added") },
+        .{ .line = 8, .start = 0, .end = 3, .capture = decoration.Capture.init(3, "new.context") },
     };
     const highlights = [_]bbr.highlight.highlighter.FileHighlights{.{
         .old = .{ .spans = &old_spans },
@@ -2545,9 +2545,9 @@ test "Line decoration selects old Spans for removed and new Spans for added and 
     const removed: model.Line = .{ .old_no = 4, .new_no = null, .kind = .removed, .text = "old" };
     const added: model.Line = .{ .old_no = null, .new_no = 7, .kind = .added, .text = "new" };
     const context: model.Line = .{ .old_no = 6, .new_no = 8, .kind = .context, .text = "ctx" };
-    try testing.expectEqualStrings("old.capture", lineSpans(&highlights, 0, removed)[0].capture.name);
-    try testing.expectEqualStrings("new.added", lineSpans(&highlights, 0, added)[0].capture.name);
-    try testing.expectEqualStrings("new.context", lineSpans(&highlights, 0, context)[0].capture.name);
+    try testing.expectEqual(@as(u16, 1), lineSpans(&highlights, 0, removed)[0].capture.id);
+    try testing.expectEqual(@as(u16, 2), lineSpans(&highlights, 0, added)[0].capture.id);
+    try testing.expectEqual(@as(u16, 3), lineSpans(&highlights, 0, context)[0].capture.id);
 }
 
 test "an incompatible blob Span leaves only that diff Line plain" {
@@ -2559,7 +2559,7 @@ test "an incompatible blob Span leaves only that diff Line plain" {
         .line = 52,
         .start = 5,
         .end = 6,
-        .capture = .{ .name = "punctuation.bracket" },
+        .capture = decoration.Capture.init(0, "punctuation.bracket"),
     }};
 
     const row = try decoratedLine(arena.allocator(), &line, &incompatible, &.{});

@@ -602,7 +602,7 @@ test "Presentation Frame projects Diff Lines as complete visual rows" {
     const line: bbr.diff.Line = .{ .old_no = null, .new_no = 1, .kind = .added, .text = "const answer = 42" };
     const old_line: bbr.diff.Line = .{ .old_no = 1, .new_no = null, .kind = .removed, .text = "const answer = 41" };
     const runs = [_]bbr.highlight.decoration.Run{
-        .{ .text = line.text[0..5], .capture = .{ .name = "keyword" } },
+        .{ .text = line.text[0..5], .capture = bbr.highlight.Capture.init(0, "keyword") },
         .{ .text = line.text[5..], .emphasis = true },
     };
     const rows = [_]buffer_mod.Row{
@@ -648,7 +648,7 @@ test "Unified visual rows prefer whitespace and preserve decoration slices" {
     defer arena.deinit();
     const line: bbr.diff.Line = .{ .old_no = null, .new_no = 1, .kind = .added, .text = "alpha beta" };
     const runs = [_]bbr.highlight.decoration.Run{
-        .{ .text = line.text[0..3], .capture = .{ .name = "keyword" } },
+        .{ .text = line.text[0..3], .capture = bbr.highlight.Capture.init(0, "keyword") },
         .{ .text = line.text[3..8], .emphasis = true },
         .{ .text = line.text[8..] },
     };
@@ -728,7 +728,7 @@ test "SideBySide halves wrap independently and align absent continuations" {
     const right: bbr.diff.Line = .{ .old_no = null, .new_no = 9, .kind = .added, .text = "new" };
     const rows = [_]buffer_mod.Row{.{ .line_pair = .{
         .left = .{ .line = &left, .decoration = .{ .runs = &.{.{ .text = left.text, .emphasis = true }} } },
-        .right = .{ .line = &right, .decoration = .{ .runs = &.{.{ .text = right.text, .capture = .{ .name = "keyword" } }} } },
+        .right = .{ .line = &right, .decoration = .{ .runs = &.{.{ .text = right.text, .capture = bbr.highlight.Capture.init(0, "keyword") }} } },
     } }};
 
     const visual_rows = try buildVisualRowsWithOptions(arena.allocator(), &rows, .bytes, .{

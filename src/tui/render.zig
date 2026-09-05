@@ -1161,7 +1161,7 @@ test "syntax foreground composes over an added Line background" {
         \\
     ;
     const diff = try bbr.diff.parse(a, raw);
-    const spans = [_]bbr.highlight.Span{.{ .line = 1, .start = 0, .end = 3, .capture = .{ .name = "keyword" } }};
+    const spans = [_]bbr.highlight.Span{.{ .line = 1, .start = 0, .end = 3, .capture = bbr.highlight.Capture.init(0, "keyword") }};
     const highlights = [_]bbr.highlight.FileHighlights{.{ .new = .{ .spans = &spans } }};
     const buf = try buffer_mod.buildWithComments(a, diff, .unified, &.{}, .{ .highlights = &highlights });
 
@@ -1181,7 +1181,7 @@ test "disabled Diff visual-row projection clips exactly like Buffer rendering" {
     const a = arena.allocator();
     const line: bbr.diff.Line = .{ .old_no = null, .new_no = 1, .kind = .added, .text = "long highlighted source" };
     const runs = [_]bbr.highlight.decoration.Run{
-        .{ .text = line.text[0..4], .capture = .{ .name = "keyword" } },
+        .{ .text = line.text[0..4], .capture = bbr.highlight.Capture.init(0, "keyword") },
         .{ .text = line.text[4..], .emphasis = true },
     };
     const rows = [_]Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &runs } } }};
@@ -1243,7 +1243,7 @@ test "Unified continuation rows keep decoration and use a blank gutter" {
     const a = arena.allocator();
     const line: bbr.diff.Line = .{ .old_no = null, .new_no = 7, .kind = .added, .text = "alpha beta" };
     const rows = [_]Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &.{
-        .{ .text = line.text[0..6], .capture = .{ .name = "keyword" } },
+        .{ .text = line.text[0..6], .capture = bbr.highlight.Capture.init(0, "keyword") },
         .{ .text = line.text[6..], .emphasis = true },
     } } } }};
     const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{

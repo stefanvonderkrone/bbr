@@ -189,13 +189,12 @@ fn highlightWithPackage(allocator: Allocator, package: *const RuntimePackage, co
             const capture_id = labels[at];
             var end = at + 1;
             while (end < i and labels[end] == capture_id) end += 1;
-            if (capture_id >= package.capture_names.len) return error.InvalidCapture;
-            const name = try allocator.dupe(u8, package.capture_names[capture_id]);
+            if (capture_id >= package.captures.len) return error.InvalidCapture;
             try spans.append(allocator, .{
                 .line = line,
                 .start = at - line_start,
                 .end = end - line_start,
-                .capture = .{ .name = name },
+                .capture = package.captures[capture_id],
             });
             at = end;
         }
@@ -271,7 +270,6 @@ test "JavaScript tracer produces ordered non-overlapping Captures" {
     defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", "const answer = \"yes\";\n");
     defer {
-        for (result.spans) |span| testing.allocator.free(span.capture.name);
         testing.allocator.free(result.spans);
     }
     try testing.expect(result.spans.len > 0);
@@ -314,9 +312,9 @@ test "JavaScript BuiltInGrammar rejects built-in Captures for local bindings" {
     const require_parameter = std.mem.indexOfPos(u8, source, global_require + 1, "require").?;
     const local_require = std.mem.indexOfPos(u8, source, require_parameter + 1, "require").?;
     try expectSpan(result, 1, global_console, global_console + 7, "variable.builtin");
-    try expectNoCapture(result, source, local_console, local_console + 7, "variable.builtin");
+    try expectNoCapture(result, source, local_console, local_console + 7, captureAt(result, source, global_console, global_console + 7).?);
     try expectSpan(result, 3, 0, 7, "function.builtin");
-    try expectNoCapture(result, source, local_require, local_require + 7, "function.builtin");
+    try expectNoCapture(result, source, local_require, local_require + 7, captureAt(result, source, global_require, global_require + 7).?);
 }
 
 test "JavaScript and TypeScript BuiltInGrammars track inherited and shadowed locals" {
@@ -389,7 +387,6 @@ test "TypeScript and TSX BuiltInGrammars load their queries" {
     for (cases) |case| {
         const result = try highlighter.highlighter().highlight(testing.allocator, case.path, case.source);
         defer {
-            for (result.spans) |span| testing.allocator.free(span.capture.name);
             testing.allocator.free(result.spans);
         }
         try testing.expect(result.spans.len > 0);
@@ -409,7 +406,6 @@ test "remaining BuiltInGrammars load their queries and produce Captures" {
     for (cases) |case| {
         const result = try highlighter.highlighter().highlight(testing.allocator, case.path, case.source);
         defer {
-            for (result.spans) |span| testing.allocator.free(span.capture.name);
             testing.allocator.free(result.spans);
         }
         try testing.expect(result.spans.len > 0);
@@ -546,7 +542,6 @@ test "eq predicate accepts Capture comparison" {
 }
 
 fn freeResult(result: bbr.highlight.HighlightResult) void {
-    for (result.spans) |span| testing.allocator.free(span.capture.name);
     testing.allocator.free(result.spans);
 }
 
@@ -560,20 +555,26 @@ fn digestHex(bytes: []const u8) [64]u8 {
 
 fn expectSpan(result: bbr.highlight.HighlightResult, line: u32, start: usize, end: usize, capture: []const u8) !void {
     for (result.spans) |span| {
-        if (span.line == line and span.start == start and span.end == end and std.mem.eql(u8, span.capture.name, capture)) return;
+        if (span.line == line and span.start == start and span.end == end and span.capture.role == bbr.highlight.Capture.init(0, capture).role) return;
     }
     return error.ExpectedSpanNotFound;
 }
 
-fn expectNoCapture(result: bbr.highlight.HighlightResult, source: []const u8, absolute_start: usize, absolute_end: usize, capture: []const u8) !void {
+fn captureAt(result: bbr.highlight.HighlightResult, source: []const u8, absolute_start: usize, absolute_end: usize) ?bbr.highlight.Capture {
     for (result.spans) |span| {
         var line: u32 = 1;
         var line_start: usize = 0;
         while (line < span.line) : (line += 1) {
             line_start = std.mem.indexOfScalarPos(u8, source, line_start, '\n').? + 1;
         }
-        if (std.mem.eql(u8, span.capture.name, capture) and line_start + span.start == absolute_start and line_start + span.end == absolute_end)
-            return error.UnexpectedCaptureFound;
+        if (line_start + span.start == absolute_start and line_start + span.end == absolute_end) return span.capture;
+    }
+    return null;
+}
+
+fn expectNoCapture(result: bbr.highlight.HighlightResult, source: []const u8, absolute_start: usize, absolute_end: usize, capture: bbr.highlight.Capture) !void {
+    if (captureAt(result, source, absolute_start, absolute_end)) |found| {
+        if (found.id == capture.id) return error.UnexpectedCaptureFound;
     }
 }
 
