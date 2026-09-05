@@ -67,6 +67,16 @@ pub fn build(b: *std.Build) void {
             .{ .name = "benchmark_buffer", .module = bench_buffer_mod },
         },
     });
+    const bench_highlight_mod = b.createModule(.{
+        .root_source_file = b.path("src/highlight/tree_sitter_highlighter.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "bbr", .module = bench_core_mod }},
+    });
+    addTreeSitter(b, bench_highlight_mod);
+    addRe2(b, bench_highlight_mod, target);
+    bench_mod.addImport("benchmark_highlight", bench_highlight_mod);
     const bench_exe = b.addExecutable(.{ .name = "bbr-bench", .root_module = bench_mod });
     const install_bench = b.addInstallArtifact(bench_exe, .{});
     b.getInstallStep().dependOn(&install_bench.step);

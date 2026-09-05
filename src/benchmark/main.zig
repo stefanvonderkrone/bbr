@@ -7,6 +7,8 @@ const diff_parse = @import("diff_parse.zig");
 const buffer_projection = @import("buffer_projection.zig");
 const intraline = @import("intraline.zig");
 const side_by_side_matching = @import("side_by_side_matching.zig");
+const highlight = @import("highlight.zig");
+const TreeSitterHighlighter = @import("benchmark_highlight").TreeSitterHighlighter;
 
 pub fn main(init: std.process.Init) !void {
     var output_buffer: [4096]u8 = undefined;
@@ -49,7 +51,35 @@ pub fn main(init: std.process.Init) !void {
     defer parsed_arena.deinit();
     const parsed = try bbr.diff.parse(parsed_arena.allocator(), raw);
     const projection_context: buffer_projection.Context = .{ .diff = parsed };
+    const highlight_content = try javascriptFixture(init.gpa, 100 * 1024);
+    defer init.gpa.free(highlight_content);
+    var tree_sitter_highlighter = try TreeSitterHighlighter.init(init.gpa, null);
+    defer tree_sitter_highlighter.deinit();
+    const highlight_context: highlight.Context = .{ .highlighter = &tree_sitter_highlighter, .content = highlight_content };
     var matched = false;
+    if (selected == null or std.mem.eql(u8, selected.?, highlight.name)) {
+        matched = true;
+        if (repeat_count) |count| try harness.repeat(
+            writer,
+            init.gpa,
+            highlight.name,
+            count,
+            &highlight_context,
+            highlight.run,
+            highlight.checksum,
+        ) else try harness.run(
+            writer,
+            init.io,
+            init.gpa,
+            calibrations,
+            highlight.name,
+            .instruction_throughput,
+            highlight_content.len,
+            &highlight_context,
+            highlight.run,
+            highlight.checksum,
+        );
+    }
     if (selected == null or std.mem.eql(u8, selected.?, diff_parse.name)) {
         matched = true;
         if (repeat_count) |count|
@@ -144,6 +174,14 @@ pub fn main(init: std.process.Init) !void {
     }
     if (!matched) return error.UnknownBenchmark;
     try writer.flush();
+}
+
+fn javascriptFixture(allocator: std.mem.Allocator, minimum_bytes: usize) ![]u8 {
+    const line = "export function calculate(value) { return value + 1; }\n";
+    const line_count = (minimum_bytes + line.len - 1) / line.len;
+    const content = try allocator.alloc(u8, line_count * line.len);
+    for (0..line_count) |index| @memcpy(content[index * line.len ..][0..line.len], line);
+    return content;
 }
 
 fn hostCpu(allocator: std.mem.Allocator, io: std.Io) ![]u8 {

@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const predicate_mod = @import("query_predicates.zig");
 const grammar_match = @import("grammar_match.zig");
 const user_grammar = @import("user_grammar.zig");
+const RuntimePackage = @import("runtime_package.zig").RuntimePackage;
 const c = predicate_mod.c;
 
 extern fn tree_sitter_javascript() callconv(.c) ?*const c.TSLanguage;
@@ -31,8 +32,7 @@ const combined_typescript_query = javascript_query ++ "\n" ++ typescript_query;
 const combined_tsx_query = javascript_query ++ "\n" ++ tsx_query;
 const combined_typescript_locals_query = javascript_locals_query ++ "\n" ++ typescript_locals_query;
 
-const Grammar = struct {
-    name: []const u8,
+const GrammarSource = struct {
     language: *const c.TSLanguage,
     query: []const u8,
     locals_query: []const u8 = "",
@@ -40,9 +40,27 @@ const Grammar = struct {
 
 pub const TreeSitterHighlighter = struct {
     registry: ?*user_grammar.Registry = null,
+    packages: [std.meta.tags(grammar_match.BuiltInGrammar).len]RuntimePackage = undefined,
+    package_count: usize = 0,
 
-    pub fn init(registry: *user_grammar.Registry) TreeSitterHighlighter {
-        return .{ .registry = registry };
+    pub fn init(allocator: Allocator, registry: ?*user_grammar.Registry) !TreeSitterHighlighter {
+        var self: TreeSitterHighlighter = .{ .registry = registry };
+        errdefer self.deinit();
+        inline for (std.meta.tags(grammar_match.BuiltInGrammar)) |grammar| {
+            const source = grammarSource(grammar) orelse return error.MissingBuiltInGrammar;
+            var diagnostic: predicate_mod.Diagnostic = undefined;
+            self.packages[self.package_count] = RuntimePackage.init(allocator, source.language, source.query, source.locals_query, &diagnostic) catch |err| {
+                if (err == error.InvalidHighlightQuery or err == error.InvalidLocalsQuery or err == error.InvalidPredicate) diagnostic.report();
+                return err;
+            };
+            self.package_count += 1;
+        }
+        return self;
+    }
+
+    pub fn deinit(self: *TreeSitterHighlighter) void {
+        for (self.packages[0..self.package_count]) |*package| package.deinit();
+        self.* = undefined;
     }
 
     pub fn highlighter(self: *TreeSitterHighlighter) bbr.highlight.Highlighter {
@@ -55,33 +73,32 @@ pub const TreeSitterHighlighter = struct {
         const self: *TreeSitterHighlighter = @ptrCast(@alignCast(ptr));
         if (self.registry) |registry| {
             if (registry.matchName(path, content) != null) {
-                const grammar = registry.grammar(path, content) catch return highlightBuiltIn(allocator, path, content) catch .{ .spans = &.{} };
+                const grammar = registry.grammar(path, content) catch return self.highlightBuiltIn(allocator, path, content) catch .{ .spans = &.{} };
                 if (grammar) |selected| {
-                    return highlightWithQuery(allocator, selected.language, selected.query, selected.locals_query, content) catch
-                        highlightBuiltIn(allocator, path, content) catch .{ .spans = &.{} };
+                    return highlightWithPackage(allocator, selected.package, content, null) catch
+                        self.highlightBuiltIn(allocator, path, content) catch .{ .spans = &.{} };
                 }
             }
         }
-        return highlightBuiltIn(allocator, path, content);
+        return self.highlightBuiltIn(allocator, path, content);
+    }
+
+    fn highlightBuiltIn(self: *TreeSitterHighlighter, allocator: Allocator, path: []const u8, content: []const u8) !bbr.highlight.HighlightResult {
+        const selected = grammar_match.selectBuiltIn(path, content) orelse return .{ .spans = &.{} };
+        return highlightWithPackage(allocator, &self.packages[@intFromEnum(selected)], content, null);
     }
 };
 
-fn highlightBuiltIn(allocator: Allocator, path: []const u8, content: []const u8) !bbr.highlight.HighlightResult {
-    const grammar = selectGrammar(path, content) orelse return .{ .spans = &.{} };
-    return highlightWith(allocator, grammar, content);
-}
-
-fn selectGrammar(path: []const u8, content: []const u8) ?Grammar {
-    const selected = grammar_match.selectBuiltIn(path, content) orelse return null;
+fn grammarSource(selected: grammar_match.BuiltInGrammar) ?GrammarSource {
     return switch (selected) {
-        .tsx => .{ .name = selected.name(), .language = tree_sitter_tsx() orelse return null, .query = combined_tsx_query, .locals_query = combined_typescript_locals_query },
-        .typescript => .{ .name = selected.name(), .language = tree_sitter_typescript() orelse return null, .query = combined_typescript_query, .locals_query = combined_typescript_locals_query },
-        .javascript => .{ .name = selected.name(), .language = tree_sitter_javascript() orelse return null, .query = javascript_query, .locals_query = javascript_locals_query },
-        .css => .{ .name = selected.name(), .language = tree_sitter_css() orelse return null, .query = css_query },
-        .go => .{ .name = selected.name(), .language = tree_sitter_go() orelse return null, .query = go_query },
-        .bash => .{ .name = selected.name(), .language = tree_sitter_bash() orelse return null, .query = bash_query },
-        .json => .{ .name = selected.name(), .language = tree_sitter_json() orelse return null, .query = json_query },
-        .yaml => .{ .name = selected.name(), .language = tree_sitter_yaml() orelse return null, .query = yaml_query },
+        .tsx => .{ .language = tree_sitter_tsx() orelse return null, .query = combined_tsx_query, .locals_query = combined_typescript_locals_query },
+        .typescript => .{ .language = tree_sitter_typescript() orelse return null, .query = combined_typescript_query, .locals_query = combined_typescript_locals_query },
+        .javascript => .{ .language = tree_sitter_javascript() orelse return null, .query = javascript_query, .locals_query = javascript_locals_query },
+        .css => .{ .language = tree_sitter_css() orelse return null, .query = css_query },
+        .go => .{ .language = tree_sitter_go() orelse return null, .query = go_query },
+        .bash => .{ .language = tree_sitter_bash() orelse return null, .query = bash_query },
+        .json => .{ .language = tree_sitter_json() orelse return null, .query = json_query },
+        .yaml => .{ .language = tree_sitter_yaml() orelse return null, .query = yaml_query },
     };
 }
 
@@ -89,48 +106,41 @@ pub fn builtInGrammarName(path: []const u8, content: []const u8) ?[]const u8 {
     return grammar_match.builtInGrammarName(path, content);
 }
 
-fn highlightWith(allocator: Allocator, grammar: Grammar, content: []const u8) !bbr.highlight.HighlightResult {
-    return highlightWithQuery(allocator, grammar.language, grammar.query, grammar.locals_query, content);
-}
-
 fn highlightWithQuery(allocator: Allocator, grammar_language: *const c.TSLanguage, query_source: []const u8, locals_query_source: []const u8, content: []const u8) !bbr.highlight.HighlightResult {
     return highlightWithQueryLimit(allocator, grammar_language, query_source, locals_query_source, content, null);
 }
 
 fn highlightWithQueryLimit(allocator: Allocator, grammar_language: *const c.TSLanguage, query_source: []const u8, locals_query_source: []const u8, content: []const u8, match_limit: ?u32) !bbr.highlight.HighlightResult {
+    var diagnostic: predicate_mod.Diagnostic = undefined;
+    var package = try RuntimePackage.init(allocator, grammar_language, query_source, locals_query_source, &diagnostic);
+    defer package.deinit();
+    return highlightWithPackage(allocator, &package, content, match_limit);
+}
+
+fn highlightWithPackage(allocator: Allocator, package: *const RuntimePackage, content: []const u8, match_limit: ?u32) !bbr.highlight.HighlightResult {
     if (content.len > std.math.maxInt(u32)) return error.FileTooLarge;
     if (!std.unicode.utf8ValidateSlice(content)) return error.InvalidUtf8;
     const parser = c.ts_parser_new() orelse return error.ParserInitFailed;
     defer c.ts_parser_delete(parser);
-    if (!c.ts_parser_set_language(parser, grammar_language)) return error.IncompatibleGrammar;
+    if (!c.ts_parser_set_language(parser, package.language)) return error.IncompatibleGrammar;
     const tree = c.ts_parser_parse_string(parser, null, content.ptr, @intCast(content.len)) orelse return error.ParseFailed;
     defer c.ts_tree_delete(tree);
 
-    var query_error_offset: u32 = 0;
-    var query_error_type: c.TSQueryError = undefined;
-    const query = c.ts_query_new(grammar_language, query_source.ptr, @intCast(query_source.len), &query_error_offset, &query_error_type) orelse return error.InvalidHighlightQuery;
-    defer c.ts_query_delete(query);
-    var diagnostic: predicate_mod.Diagnostic = undefined;
-    const predicates = predicate_mod.Set.validate(allocator, query, query_source, &diagnostic) catch |err| switch (err) {
-        error.InvalidPredicate => {
-            diagnostic.report();
-            return err;
-        },
-        else => return err,
-    };
-    defer predicates.deinit(allocator);
-    const locals = predicate_mod.Locals.collect(allocator, grammar_language, tree, locals_query_source, content, &diagnostic) catch |err| switch (err) {
-        error.InvalidPredicate, error.InvalidLocalsQuery => {
-            diagnostic.report();
-            return err;
-        },
-        else => return err,
-    };
+    const locals = if (package.locals) |locals_query| try predicate_mod.Locals.collectPrepared(
+        allocator,
+        tree,
+        locals_query.query,
+        locals_query.predicates,
+        package.local_scope_id,
+        package.local_definition_id,
+        package.local_reference_id,
+        content,
+    ) else predicate_mod.Locals{ .ranges = &.{} };
     defer locals.deinit(allocator);
     const cursor = c.ts_query_cursor_new() orelse return error.QueryCursorInitFailed;
     defer c.ts_query_cursor_delete(cursor);
     c.ts_query_cursor_set_match_limit(cursor, match_limit orelse std.math.maxInt(u32));
-    c.ts_query_cursor_exec(cursor, query, c.ts_tree_root_node(tree));
+    c.ts_query_cursor_exec(cursor, package.highlight.query, c.ts_tree_root_node(tree));
 
     // Capture id per byte. Later query matches take precedence; newlines are
     // ignored when the labels are converted into Line-relative Spans.
@@ -144,7 +154,7 @@ fn highlightWithQueryLimit(allocator: Allocator, grammar_language: *const c.TSLa
 
     var match: c.TSQueryMatch = undefined;
     while (c.ts_query_cursor_next_match(cursor, &match)) {
-        if (!try predicates.accepts(match.pattern_index, match, content, locals)) continue;
+        if (!try package.highlight.predicates.accepts(match.pattern_index, match, content, locals)) continue;
         const captures = match.captures[0..match.capture_count];
         for (captures) |capture| {
             const range = try predicate_mod.checkedRange(c.ts_node_start_byte(capture.node), c.ts_node_end_byte(capture.node), content);
@@ -179,9 +189,8 @@ fn highlightWithQueryLimit(allocator: Allocator, grammar_language: *const c.TSLa
             const capture_id = labels[at];
             var end = at + 1;
             while (end < i and labels[end] == capture_id) end += 1;
-            var name_len: u32 = 0;
-            const name_ptr = c.ts_query_capture_name_for_id(query, capture_id, &name_len) orelse return error.InvalidCapture;
-            const name = try allocator.dupe(u8, name_ptr[0..name_len]);
+            if (capture_id >= package.capture_names.len) return error.InvalidCapture;
+            const name = try allocator.dupe(u8, package.capture_names[capture_id]);
             try spans.append(allocator, .{
                 .line = line,
                 .start = at - line_start,
@@ -201,11 +210,11 @@ fn highlightWithQueryLimit(allocator: Allocator, grammar_language: *const c.TSLa
 const testing = std.testing;
 
 test "BuiltInGrammar selection covers JavaScript TypeScript and TSX" {
-    try testing.expect(selectGrammar("src/a.js", "") != null);
-    try testing.expect(selectGrammar("src/a.mts", "") != null);
-    try testing.expect(selectGrammar("src/a.tsx", "") != null);
-    try testing.expect(selectGrammar("src/a.zig", "") == null);
-    try testing.expect(selectGrammar("scripts/release", "#!/usr/bin/env bash\n") != null);
+    try testing.expect(grammar_match.selectBuiltIn("src/a.js", "") != null);
+    try testing.expect(grammar_match.selectBuiltIn("src/a.mts", "") != null);
+    try testing.expect(grammar_match.selectBuiltIn("src/a.tsx", "") != null);
+    try testing.expect(grammar_match.selectBuiltIn("src/a.zig", "") == null);
+    try testing.expect(grammar_match.selectBuiltIn("scripts/release", "#!/usr/bin/env bash\n") != null);
 }
 
 test "UserGrammar runtime failure restores BuiltInGrammar or plain text" {
@@ -247,7 +256,8 @@ test "UserGrammar runtime failure restores BuiltInGrammar or plain text" {
     }};
     var registry = try user_grammar.Registry.init(testing.allocator, io, &entries, &.{}, "test-build");
     defer registry.deinit();
-    var highlighter = TreeSitterHighlighter.init(&registry);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, &registry);
+    defer highlighter.deinit();
 
     const built_in = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", "const answer = 1;\n");
     defer freeResult(built_in);
@@ -257,7 +267,8 @@ test "UserGrammar runtime failure restores BuiltInGrammar or plain text" {
 }
 
 test "JavaScript tracer produces ordered non-overlapping Captures" {
-    var highlighter: TreeSitterHighlighter = .{};
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", "const answer = \"yes\";\n");
     defer {
         for (result.spans) |span| testing.allocator.free(span.capture.name);
@@ -271,7 +282,8 @@ test "JavaScript tracer produces ordered non-overlapping Captures" {
 }
 
 test "JavaScript BuiltInGrammar executes conditional Captures" {
-    var highlighter: TreeSitterHighlighter = .{};
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", "Widget widget SCREAM console require other\n");
     defer freeResult(result);
 
@@ -290,7 +302,8 @@ test "JavaScript BuiltInGrammar rejects built-in Captures for local bindings" {
         \\require("x");
         \\function g(require) { require("y"); }
     ;
-    var highlighter: TreeSitterHighlighter = .{};
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
     defer freeResult(result);
 
@@ -319,7 +332,8 @@ test "JavaScript and TypeScript BuiltInGrammars track inherited and shadowed loc
         \\}
         \\console; require();
     ;
-    var highlighter: TreeSitterHighlighter = .{};
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
     for ([_][]const u8{ "src/a.js", "src/a.ts", "src/a.tsx" }) |path| {
         const result = try highlighter.highlighter().highlight(testing.allocator, path, source);
         defer freeResult(result);
@@ -340,7 +354,8 @@ test "JavaScript and TypeScript BuiltInGrammars track inherited and shadowed loc
 
 test "TypeScript BuiltInGrammars track optional parameter locals" {
     const source = "function f(console?: unknown) { console; }\nconsole;\n";
-    var highlighter: TreeSitterHighlighter = .{};
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
     for ([_][]const u8{ "src/a.ts", "src/a.tsx" }) |path| {
         const result = try highlighter.highlighter().highlight(testing.allocator, path, source);
         defer freeResult(result);
@@ -353,7 +368,8 @@ test "TypeScript BuiltInGrammars track optional parameter locals" {
 
 test "local filtering keeps UTF-8 byte offsets" {
     const source = "function f(console) { const π = 0; console; }\nconsole;\n";
-    var highlighter: TreeSitterHighlighter = .{};
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
     const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
     defer freeResult(result);
 
@@ -368,7 +384,8 @@ test "TypeScript and TSX BuiltInGrammars load their queries" {
         .{ .path = "src/a.ts", .source = "interface User { name: string }\n" },
         .{ .path = "src/a.tsx", .source = "const App = () => <main>Hello</main>;\n" },
     };
-    var highlighter: TreeSitterHighlighter = .{};
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
     for (cases) |case| {
         const result = try highlighter.highlighter().highlight(testing.allocator, case.path, case.source);
         defer {
@@ -387,7 +404,8 @@ test "remaining BuiltInGrammars load their queries and produce Captures" {
         .{ .path = "data.json", .source = "{\"ready\": true}\n" },
         .{ .path = "config.yaml", .source = "ready: true\n" },
     };
-    var highlighter: TreeSitterHighlighter = .{};
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
     for (cases) |case| {
         const result = try highlighter.highlighter().highlight(testing.allocator, case.path, case.source);
         defer {

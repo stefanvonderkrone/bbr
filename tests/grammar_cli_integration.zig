@@ -161,7 +161,8 @@ fn probe(init: std.process.Init, path: []const u8, expectation: []const u8) !voi
     try store.validateOverrideNames(overrides);
     var registry = try user_grammar.Registry.init(init.gpa, init.io, entries, overrides, grammar_cli.bbr_identity);
     defer registry.deinit();
-    var tree_sitter = TreeSitterHighlighter.init(&registry);
+    var tree_sitter = try TreeSitterHighlighter.init(init.gpa, &registry);
+    defer tree_sitter.deinit();
     const result = try tree_sitter.highlighter().highlight(init.arena.allocator(), path, "identifier\n");
     const highlighted = result.spans.len != 0;
     const expected = if (std.mem.eql(u8, expectation, "highlighted")) true else if (std.mem.eql(u8, expectation, "plain")) false else return error.InvalidProbeExpectation;

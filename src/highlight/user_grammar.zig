@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const grammar_match = @import("grammar_match.zig");
 const predicate_mod = @import("query_predicates.zig");
+const RuntimePackage = @import("runtime_package.zig").RuntimePackage;
 const c = predicate_mod.c;
 
 const max_file_bytes = 64 * 1024 * 1024;
@@ -142,9 +143,7 @@ pub const InstallationStatus = struct {
 
 pub const RuntimeGrammar = struct {
     name: []const u8,
-    language: *const c.TSLanguage,
-    query: []const u8,
-    locals_query: []const u8,
+    package: *const RuntimePackage,
 };
 
 pub const Registry = struct {
@@ -157,10 +156,12 @@ pub const Registry = struct {
         rules: GrammarMatches = .{},
         inspection: ?Inspection = null,
         loaded: ?Loaded = null,
+        load_error: ?anyerror = null,
 
         const Loaded = struct {
             library: std.DynLib,
             language: *const c.TSLanguage,
+            package: RuntimePackage,
         };
     };
 
@@ -220,6 +221,11 @@ pub const Registry = struct {
                 try validateActiveConflicts(&names, &rules);
             }
         }
+        for (installations.items) |*installation| if (installation.enabled) {
+            _ = load(installation, allocator) catch |err| {
+                installation.load_error = err;
+            };
+        };
         return .{ .allocator = allocator, .installations = try installations.toOwnedSlice(allocator) };
     }
 
@@ -259,6 +265,7 @@ pub const Registry = struct {
     }
 
     fn load(installation: *Installation, allocator: std.mem.Allocator) !RuntimeGrammar {
+        if (installation.load_error) |err| return err;
         const inspection = &(installation.inspection orelse return error.InvalidUserGrammarInstallation);
         if (installation.loaded == null) {
             const temporary = try inspection.writeTemporaryLibrary();
@@ -270,20 +277,32 @@ pub const Registry = struct {
             const language_fn = library.lookup(*const fn () callconv(.c) ?*const c.TSLanguage, symbol) orelse return error.MissingLanguageSymbol;
             const language = language_fn() orelse return error.InvalidLanguageSymbol;
             if (c.ts_language_abi_version(language) != inspection.manifest.tree_sitter_abi.?) return error.TreeSitterAbiMismatch;
-            installation.loaded = .{ .library = library, .language = language };
+            var diagnostic: predicate_mod.Diagnostic = undefined;
+            const package = RuntimePackage.init(
+                allocator,
+                language,
+                findFile(inspection.files, inspection.manifest.highlight_query).?.bytes,
+                if (inspection.manifest.locals_query) |path| findFile(inspection.files, path).?.bytes else "",
+                &diagnostic,
+            ) catch |err| {
+                if (err == error.InvalidHighlightQuery or err == error.InvalidLocalsQuery or err == error.InvalidPredicate) diagnostic.report();
+                return err;
+            };
+            installation.loaded = .{ .library = library, .language = language, .package = package };
         }
         return .{
             .name = installation.name,
-            .language = installation.loaded.?.language,
-            .query = findFile(inspection.files, inspection.manifest.highlight_query).?.bytes,
-            .locals_query = if (inspection.manifest.locals_query) |path| findFile(inspection.files, path).?.bytes else "",
+            .package = &installation.loaded.?.package,
         };
     }
 };
 
 fn deinitInstallations(allocator: std.mem.Allocator, installations: []Registry.Installation) void {
     for (installations) |*installation| {
-        if (installation.loaded) |*loaded| loaded.library.close();
+        if (installation.loaded) |*loaded| {
+            loaded.package.deinit();
+            loaded.library.close();
+        }
         if (installation.inspection) |*inspection| inspection.deinit();
         allocator.free(installation.name);
     }

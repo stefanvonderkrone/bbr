@@ -28,6 +28,7 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - [Choose and bound side-by-side matching](issues/03-bound-side-by-side-matching.md) — Weighted matching uses reusable bounded scratch through 131,625 work units, then index pairing keeps required fixtures below the p95 cap.
 - [Choose and bound the intraline diff](issues/04-bound-intraline-lcs.md) — Compact-direction LCS runs through 250,000 lexical-part products, then whole-line emphasis bounds larger Lines.
 - [Build repeatable performance profiles](issues/29-build-repeatable-performance-profiles.md) — Repeat mode now gives each P0 stage stable Time Profiler, Allocations, and CPU Counters runs with checksum checks.
+- [Cache Grammar runtime packages](issues/05-cache-grammar-runtime-packages.md) — Immutable packages move query, predicate, RE2, Capture, and UserGrammar setup out of worker calls, cutting warm Highlighting median latency by 23.4%.
 
 ## Not yet specified
 
