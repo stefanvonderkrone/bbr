@@ -223,9 +223,76 @@ pub fn disclosureKey(row: Row) ?DisclosureKey {
     };
 }
 
-fn disclosureExpanded(keys: []const DisclosureKey, key: DisclosureKey) bool {
-    for (keys) |candidate| if (std.meta.eql(candidate, key)) return true;
-    return false;
+const DisclosureId = struct { kind: u8, value: u64 };
+const DisclosureSet = std.AutoHashMapUnmanaged(DisclosureId, void);
+
+fn disclosureId(key: DisclosureKey) DisclosureId {
+    return switch (key) {
+        .resolved_thread => |id| .{ .kind = 0, .value = @intCast(id) },
+        .fold => |line| .{ .kind = 1, .value = @intFromPtr(line) },
+        .outdated_file => |file| .{ .kind = 2, .value = @intFromPtr(file) },
+        .outdated_review => .{ .kind = 3, .value = 0 },
+        .review_card => |owner| switch (owner) {
+            .comment => |id| .{ .kind = 4, .value = @intCast(id) },
+            .draft => |id| .{ .kind = 5, .value = @intCast(id) },
+        },
+    };
+}
+
+fn expandedDisclosureSet(allocator: std.mem.Allocator, keys: []const DisclosureKey) !DisclosureSet {
+    var set: DisclosureSet = .empty;
+    try set.ensureTotalCapacity(allocator, @intCast(keys.len));
+    for (keys) |key| set.putAssumeCapacity(disclosureId(key), {});
+    return set;
+}
+
+const AnchorSide = enum { old, new };
+const AnchorKey = struct {
+    path: []const u8,
+    line: u32,
+    side: AnchorSide,
+};
+
+const AnchorKeyContext = struct {
+    pub fn hash(_: AnchorKeyContext, key: AnchorKey) u64 {
+        var value = std.hash.Wyhash.init(0);
+        value.update(key.path);
+        value.update(std.mem.asBytes(&key.line));
+        value.update(&.{@intFromEnum(key.side)});
+        return value.final();
+    }
+
+    pub fn eql(_: AnchorKeyContext, a: AnchorKey, b: AnchorKey) bool {
+        return a.line == b.line and a.side == b.side and std.mem.eql(u8, a.path, b.path);
+    }
+};
+
+const AnchorBucket = struct {
+    threads: std.ArrayList(usize) = .empty,
+    drafts: std.ArrayList(usize) = .empty,
+};
+const AnchorIndex = std.HashMapUnmanaged(AnchorKey, AnchorBucket, AnchorKeyContext, 80);
+
+fn anchorKey(anchor: review.Anchor) ?AnchorKey {
+    if (anchor.to) |line| return .{ .path = anchor.path, .line = line, .side = .new };
+    if (anchor.from) |line| return .{ .path = anchor.path, .line = line, .side = .old };
+    return null;
+}
+
+fn addAnchorIndex(allocator: std.mem.Allocator, index: *AnchorIndex, key: AnchorKey, item: usize, comptime field: enum { threads, drafts }) !void {
+    const result = try index.getOrPut(allocator, key);
+    if (!result.found_existing) result.value_ptr.* = .{};
+    try @field(result.value_ptr, @tagName(field)).append(allocator, item);
+}
+
+const ParentKey = struct { kind: u8, id: u64 };
+const ReplyIndex = std.AutoHashMapUnmanaged(ParentKey, std.ArrayList(usize));
+
+fn parentKey(parent: Parent) ParentKey {
+    return switch (parent) {
+        .comment => |id| .{ .kind = 0, .id = id },
+        .draft => |id| .{ .kind = 1, .id = id },
+    };
 }
 
 pub const Buffer = struct {
@@ -303,6 +370,24 @@ pub fn buildWithComments(
     @memset(emitted, false);
     const emitted_threads = try allocator.alloc(bool, threads.len);
     @memset(emitted_threads, false);
+    var anchors: AnchorIndex = .empty;
+    try anchors.ensureTotalCapacity(allocator, @intCast(threads.len + opts.drafts.len));
+    for (threads, 0..) |thread, thread_index| {
+        if (thread.root.state == .outdated) continue;
+        if (thread.anchor()) |anchor| if (anchorKey(anchor)) |key|
+            try addAnchorIndex(allocator, &anchors, key, thread_index, .threads);
+    }
+    var replies: ReplyIndex = .empty;
+    try replies.ensureTotalCapacity(allocator, @intCast(opts.drafts.len));
+    for (opts.drafts, 0..) |*draft, draft_index| {
+        if (draft.parent) |parent| {
+            const result = replies.getOrPutAssumeCapacity(parentKey(parent));
+            if (!result.found_existing) result.value_ptr.* = .empty;
+            try result.value_ptr.append(allocator, draft_index);
+        } else if (projectedDraftAnchor(draft, opts)) |anchor| if (anchorKey(anchor)) |key| {
+            try addAnchorIndex(allocator, &anchors, key, draft_index, .drafts);
+        };
+    }
     var w: Weave = .{
         .a = allocator,
         .rows = &rows,
@@ -310,6 +395,9 @@ pub fn buildWithComments(
         .drafts = opts.drafts,
         .emitted = emitted,
         .emitted_threads = emitted_threads,
+        .anchors = anchors,
+        .replies = replies,
+        .expanded_disclosures = try expandedDisclosureSet(allocator, opts.expanded_disclosures),
         .opts = opts,
     };
 
@@ -380,7 +468,7 @@ pub fn buildWithComments(
         const od_count = fileOutdatedCount(threads, file.*) + draftOutdatedCount(opts.drafts, opts, file.*);
         if (od_count > 0) {
             const key: DisclosureKey = .{ .outdated_file = file };
-            const expanded = disclosureExpanded(opts.expanded_disclosures, key);
+            const expanded = w.expanded_disclosures.contains(disclosureId(key));
             try rows.append(allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = od_count, .path = file.displayPath() } });
             if (expanded) {
                 for (threads) |*t| {
@@ -418,7 +506,7 @@ pub fn buildWithComments(
     }
     if (fallback_outdated_count > 0) {
         const key: DisclosureKey = .outdated_review;
-        const expanded = disclosureExpanded(opts.expanded_disclosures, key);
+        const expanded = w.expanded_disclosures.contains(disclosureId(key));
         try rows.append(allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = fallback_outdated_count } });
         if (expanded) {
             if (opts.only_file == null) for (threads, 0..) |*thread, thread_index| {
@@ -520,6 +608,9 @@ const Weave = struct {
     /// Index-aligned with `drafts`; set once the Draft has been placed.
     emitted: []bool,
     emitted_threads: []bool,
+    anchors: AnchorIndex,
+    replies: ReplyIndex,
+    expanded_disclosures: DisclosureSet,
     opts: BuildOptions,
     span_cursors: SpanCursors = .{},
 
@@ -528,7 +619,7 @@ const Weave = struct {
     fn emitThread(w: *Weave, t: *const Thread) !void {
         if (t.resolved) {
             const key: DisclosureKey = .{ .resolved_thread = t.root.id };
-            const expanded = disclosureExpanded(w.opts.expanded_disclosures, key);
+            const expanded = w.expanded_disclosures.contains(disclosureId(key));
             try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .resolved_thread, .expanded = expanded, .count = t.replies.len } });
             if (!expanded) return;
         }
@@ -570,7 +661,7 @@ const Weave = struct {
             .content_width = cardContentWidth(w.opts.card_width, is_reply),
             .metrics = w.opts.cell_metrics,
             .collapsed_rows = w.opts.collapsed_rows,
-            .expanded = disclosureExpanded(w.opts.expanded_disclosures, .{ .review_card = owner }),
+            .expanded = w.expanded_disclosures.contains(disclosureId(.{ .review_card = owner })),
         });
         for (projected) |row| try w.rows.append(w.a, .{ .comment = row });
     }
@@ -611,7 +702,7 @@ const Weave = struct {
                 .content_width = cardContentWidth(w.opts.card_width, is_reply),
                 .metrics = w.opts.cell_metrics,
                 .collapsed_rows = w.opts.collapsed_rows,
-                .expanded = disclosureExpanded(w.opts.expanded_disclosures, .{ .review_card = owner }),
+                .expanded = w.expanded_disclosures.contains(disclosureId(.{ .review_card = owner })),
             });
             for (projected) |row| try w.rows.append(w.a, .{ .draft = row });
         }
@@ -638,11 +729,8 @@ const Weave = struct {
     /// (so a reply-to-a-reply-Draft nests correctly). The `emitted` guard bounds
     /// the recursion even if the parent graph contains a cycle.
     fn emitRepliesTo(w: *Weave, parent: Parent) std.mem.Allocator.Error!void {
-        for (w.drafts, 0..) |*d, i| {
-            if (w.emitted[i]) continue;
-            const p = d.parent orelse continue;
-            if (parentEql(p, parent)) try w.emitDraft(i);
-        }
+        const children = w.replies.get(parentKey(parent)) orelse return;
+        for (children.items) |index| try w.emitDraft(index);
     }
 
     /// Emit a hunk's lines in unified layout: one row per line, each followed by
@@ -658,7 +746,7 @@ const Weave = struct {
         while (i < lines.len) {
             if (foldStartingAt(folds, &lines[i])) |f| {
                 const key: DisclosureKey = .{ .fold = f.id };
-                const expanded = disclosureExpanded(w.opts.expanded_disclosures, key);
+                const expanded = w.expanded_disclosures.contains(disclosureId(key));
                 try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
                 if (!expanded) {
                     i += f.lines.len;
@@ -685,7 +773,7 @@ const Weave = struct {
         while (i < lines.len) {
             if (foldStartingAt(folds, &lines[i])) |f| {
                 const key: DisclosureKey = .{ .fold = f.id };
-                const expanded = disclosureExpanded(w.opts.expanded_disclosures, key);
+                const expanded = w.expanded_disclosures.contains(disclosureId(key));
                 try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
                 if (!expanded) {
                     i += f.lines.len;
@@ -874,19 +962,30 @@ const Weave = struct {
         // Blob-synthesized context lines (whole-file gaps) carry no diff anchor —
         // only Hunk lines bind comments/Drafts (M9 anchor safety).
         if (!ln.in_hunk) return;
-        for (w.threads) |*t| {
-            const anc = t.anchor() orelse continue;
-            if (t.root.state == .outdated) continue; // grouped below
-            if (!anchorMatchesFile(anc, file.*)) continue;
-            if (anchorMatchesLine(anc, ln)) try w.emitThread(t);
+        if (w.anchors.count() == 0) return;
+        const new = if (ln.new_no) |line| w.anchors.get(.{ .path = file.new_path, .line = line, .side = .new }) else null;
+        const old = if (ln.old_no) |line| w.anchors.get(.{ .path = file.old_path, .line = line, .side = .old }) else null;
+        const new_threads = if (new) |bucket| bucket.threads.items else &.{};
+        const old_threads = if (old) |bucket| bucket.threads.items else &.{};
+        var new_index: usize = 0;
+        var old_index: usize = 0;
+        while (new_index < new_threads.len or old_index < old_threads.len) {
+            const take_new = old_index == old_threads.len or (new_index < new_threads.len and new_threads[new_index] < old_threads[old_index]);
+            const index = if (take_new) new_threads[new_index] else old_threads[old_index];
+            if (take_new) new_index += 1 else old_index += 1;
+            try w.emitThread(&w.threads[index]);
         }
         // Root anchored Drafts hang off the same line, after any published
         // thread. Reply Drafts are placed under their parent, not by anchor.
-        for (w.drafts, 0..) |*d, i| {
-            if (d.parent != null) continue;
-            const anc = projectedDraftAnchor(d, w.opts) orelse continue;
-            if (!anchorMatchesFile(anc, file.*)) continue;
-            if (anchorMatchesLine(anc, ln)) try w.emitDraft(i);
+        const new_drafts = if (new) |bucket| bucket.drafts.items else &.{};
+        const old_drafts = if (old) |bucket| bucket.drafts.items else &.{};
+        new_index = 0;
+        old_index = 0;
+        while (new_index < new_drafts.len or old_index < old_drafts.len) {
+            const take_new = old_index == old_drafts.len or (new_index < new_drafts.len and new_drafts[new_index] < old_drafts[old_index]);
+            const index = if (take_new) new_drafts[new_index] else old_drafts[old_index];
+            if (take_new) new_index += 1 else old_index += 1;
+            try w.emitDraft(index);
         }
     }
 };
@@ -894,14 +993,6 @@ const Weave = struct {
 fn cardContentWidth(width: usize, is_reply: bool) usize {
     const indent: usize = if (is_reply) 8 else 4;
     return @max(width -| indent, 1);
-}
-
-/// True when two `Parent` references name the same target.
-fn parentEql(a: Parent, b: Parent) bool {
-    return switch (a) {
-        .draft => |x| b == .draft and b.draft == x,
-        .comment => |x| b == .comment and b.comment == x,
-    };
 }
 
 fn decoratedLine(allocator: std.mem.Allocator, line: *const model.Line, spans: []const decoration.Span, emphasis: []const Segment) decoration.Error!LineRow {
@@ -1303,14 +1394,6 @@ fn countWhere(threads: []const Thread, pred: fn (Thread) bool) usize {
         if (pred(t.*)) n += 1;
     }
     return n;
-}
-
-/// Does `anchor` bind to this diff line? Prefer the new side (`to` ↔ `new_no`),
-/// falling back to the old side (`from` ↔ `old_no`).
-fn anchorMatchesLine(anchor: review.Anchor, ln: *const model.Line) bool {
-    if (anchor.to) |to| return ln.new_no != null and ln.new_no.? == to;
-    if (anchor.from) |from| return ln.old_no != null and ln.old_no.? == from;
-    return false;
 }
 
 // ---------------------------------------------------------------------------

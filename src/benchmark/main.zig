@@ -6,6 +6,7 @@ const synthetic = @import("synthetic.zig");
 const diff_parse = @import("diff_parse.zig");
 const buffer_projection = @import("buffer_projection.zig");
 const buffer_navigation = @import("buffer_navigation.zig");
+const comment_anchors = @import("comment_anchors.zig");
 const intraline = @import("intraline.zig");
 const side_by_side_matching = @import("side_by_side_matching.zig");
 const span_projection = @import("span_projection.zig");
@@ -67,6 +68,9 @@ pub fn main(init: std.process.Init) !void {
     const navigation_context: buffer_navigation.Context = .{
         .buffer = try buffer_projection.run(navigation_arena.allocator(), &projection_context),
     };
+    var comment_arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer comment_arena.deinit();
+    const comment_contexts = try commentAnchorContexts(comment_arena.allocator(), parsed);
     const highlight_content = try javascriptFixture(init.gpa, 100 * 1024);
     defer init.gpa.free(highlight_content);
     var tree_sitter_highlighter = try TreeSitterHighlighter.init(init.gpa, null);
@@ -148,6 +152,33 @@ pub fn main(init: std.process.Init) !void {
             buffer_navigation.run,
             buffer_navigation.checksum,
         );
+    }
+    for (&comment_contexts) |*context| {
+        var name_buffer: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "comment_anchors_{d}", .{context.threads.len});
+        if (selected == null or std.mem.eql(u8, selected.?, name)) {
+            matched = true;
+            if (repeat_count) |count| try harness.repeat(
+                writer,
+                init.gpa,
+                name,
+                count,
+                context,
+                comment_anchors.run,
+                comment_anchors.checksum,
+            ) else try harness.run(
+                writer,
+                init.io,
+                init.gpa,
+                calibrations,
+                name,
+                .instruction_throughput,
+                parsed.files.len * (context.threads.len + context.drafts.len),
+                context,
+                comment_anchors.run,
+                comment_anchors.checksum,
+            );
+        }
     }
     const span_benchmarks = [_]struct { name: []const u8, context: span_projection.Context }{
         .{ .name = "span_projection_unified_sparse", .context = .{ .diff = span_diff, .highlights = &sparse_highlights, .layout = .unified } },
@@ -263,6 +294,34 @@ fn fixtureSpans(allocator: std.mem.Allocator, line_count: usize, stride: usize) 
         .capture = bbr.highlight.Capture.init(1, "keyword"),
     };
     return spans;
+}
+
+fn commentAnchorContexts(allocator: std.mem.Allocator, diff: bbr.diff.Diff) ![3]comment_anchors.Context {
+    var contexts: [3]comment_anchors.Context = undefined;
+    for ([_]usize{ 0, 100, 2_000 }, 0..) |count, context_index| {
+        const comments = try allocator.alloc(bbr.review.Comment, count);
+        const threads = try allocator.alloc(bbr.review.Thread, count);
+        const drafts = try allocator.alloc(bbr.review.Draft, count);
+        const disclosures = try allocator.alloc(comment_anchors.DisclosureKey, count * 2);
+        for (0..count) |index| {
+            const file = &diff.files[index % diff.files.len];
+            const line_count = file.hunks[0].lines.len;
+            const line: u32 = @intCast(index % line_count + 1);
+            const id: u64 = @intCast(index + 1);
+            comments[index] = .{ .id = id, .author = "A", .body = "comment", .anchor = .{ .path = file.new_path, .to = line } };
+            threads[index] = .{ .root = &comments[index], .replies = &.{}, .resolved = false };
+            drafts[index] = .{ .local_id = id, .kind = .comment, .body = "draft", .anchor = .{ .path = file.new_path, .to = line } };
+            disclosures[index * 2] = .{ .review_card = .{ .comment = id } };
+            disclosures[index * 2 + 1] = .{ .review_card = .{ .draft = id } };
+        }
+        contexts[context_index] = .{
+            .diff = diff,
+            .threads = threads,
+            .drafts = drafts,
+            .expanded_disclosures = disclosures,
+        };
+    }
+    return contexts;
 }
 
 fn hostCpu(allocator: std.mem.Allocator, io: std.Io) ![]u8 {

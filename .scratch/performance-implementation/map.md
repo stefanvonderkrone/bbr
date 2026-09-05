@@ -33,6 +33,7 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - [Merge Capture intervals](issues/07-merge-capture-intervals.md) — Sorted Capture intervals preserve Span output while cutting Highlighting peak scratch bytes by 15.8%.
 - [Index Buffer rows by File](issues/08-index-buffer-rows-by-file.md) — Compact per-File row starts replace duplicate full-prefix scans with binary lookup, cutting 1,000 bottom-row lookups by at least 3,914x.
 - [Advance a monotonic Span cursor](issues/09-advance-a-monotonic-span-cursor.md) — Per-File side cursors scan each Span once, cutting dense 5,000-Line projection latency by 95% in both Layouts.
+- [Index Comment anchors](issues/10-index-comment-anchors.md) — Transaction-local Anchor, Reply, and disclosure indexes preserve Buffer output while cutting 2,000-item projection latency by at least 98.8%.
 
 ## Not yet specified
 
