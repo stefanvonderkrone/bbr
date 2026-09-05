@@ -11,6 +11,7 @@ const intraline = @import("intraline.zig");
 const side_by_side_matching = @import("side_by_side_matching.zig");
 const span_projection = @import("span_projection.zig");
 const highlight = @import("highlight.zig");
+const cell_width = @import("cell_width.zig");
 const TreeSitterHighlighter = @import("benchmark_highlight").TreeSitterHighlighter;
 
 pub fn main(init: std.process.Init) !void {
@@ -73,10 +74,35 @@ pub fn main(init: std.process.Init) !void {
     const comment_contexts = try commentAnchorContexts(comment_arena.allocator(), parsed);
     const highlight_content = try javascriptFixture(init.gpa, 100 * 1024);
     defer init.gpa.free(highlight_content);
+    const cell_width_content = try asciiFixture(init.gpa, 1024 * 1024);
+    defer init.gpa.free(cell_width_content);
     var tree_sitter_highlighter = try TreeSitterHighlighter.init(init.gpa, null);
     defer tree_sitter_highlighter.deinit();
     const highlight_context: highlight.Context = .{ .highlighter = &tree_sitter_highlighter, .content = highlight_content };
     var matched = false;
+    if (selected == null or std.mem.eql(u8, selected.?, cell_width.name)) {
+        matched = true;
+        if (repeat_count) |count| try harness.repeat(
+            writer,
+            init.gpa,
+            cell_width.name,
+            count,
+            cell_width_content,
+            cell_width.run,
+            cell_width.checksum,
+        ) else try harness.run(
+            writer,
+            init.io,
+            init.gpa,
+            calibrations,
+            cell_width.name,
+            .instruction_throughput,
+            cell_width_content.len,
+            cell_width_content,
+            cell_width.run,
+            cell_width.checksum,
+        );
+    }
     if (selected == null or std.mem.eql(u8, selected.?, highlight.name)) {
         matched = true;
         if (repeat_count) |count| try harness.repeat(
@@ -282,6 +308,12 @@ fn javascriptFixture(allocator: std.mem.Allocator, minimum_bytes: usize) ![]u8 {
     const line_count = (minimum_bytes + line.len - 1) / line.len;
     const content = try allocator.alloc(u8, line_count * line.len);
     for (0..line_count) |index| @memcpy(content[index * line.len ..][0..line.len], line);
+    return content;
+}
+
+fn asciiFixture(allocator: std.mem.Allocator, byte_count: usize) ![]u8 {
+    const content = try allocator.alloc(u8, byte_count);
+    for (content, 0..) |*byte, index| byte.* = "abcdefghijklmnopqrstuvwxyz0123456789"[index % 36];
     return content;
 }
 

@@ -21,7 +21,8 @@ const Draft = bbr.review.Draft;
 const Parent = bbr.review.draft.Parent;
 const anchor_projection = bbr.review.anchor;
 const review_card = @import("review_card.zig");
-const CellMetrics = @import("cell_metrics.zig").CellMetrics;
+pub const CellMetrics = @import("cell_metrics.zig").CellMetrics;
+pub const CellMeasurement = @import("cell_metrics.zig").Measurement;
 
 /// Re-export so the renderer can name the segment type without reaching into
 /// `intraline` directly.

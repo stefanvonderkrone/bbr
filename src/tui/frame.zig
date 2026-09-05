@@ -589,7 +589,7 @@ test "visual rows use the injected CellMetrics seam" {
     const vtable: CellMetrics.VTable = .{ .next = Metrics.next };
     var metrics_context: Metrics = .{};
     const metrics: CellMetrics = .{ .ptr = &metrics_context, .vtable = &vtable };
-    const rows = [_]buffer_mod.Row{.{ .section = .{ .kind = .outdated, .count = 1, .path = "wide" } }};
+    const rows = [_]buffer_mod.Row{.{ .section = .{ .kind = .outdated, .count = 1, .path = "w\x7fde" } }};
 
     const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, metrics, .{ .layout = .unified, .width = 0, .wrap = false });
     defer testing.allocator.free(visual_rows);

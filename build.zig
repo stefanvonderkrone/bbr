@@ -65,6 +65,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "bbr", .module = bench_core_mod },
             .{ .name = "benchmark_buffer", .module = bench_buffer_mod },
+            .{ .name = "vaxis", .module = vaxis.module("vaxis") },
         },
     });
     const bench_highlight_mod = b.createModule(.{

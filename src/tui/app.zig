@@ -282,7 +282,7 @@ fn syncPickerTick(
 }
 
 const metrics_context: u8 = 0;
-const metrics_vtable: @import("cell_metrics.zig").CellMetrics.VTable = .{ .next = nextVaxisGrapheme };
+const metrics_vtable: @import("cell_metrics.zig").CellMetrics.VTable = .{ .next = nextVaxisGrapheme, .width = widthVaxisText };
 const vaxis_cell_metrics: @import("cell_metrics.zig").CellMetrics = .{ .ptr = &metrics_context, .vtable = &metrics_vtable };
 
 fn nextVaxisGrapheme(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
@@ -292,6 +292,10 @@ fn nextVaxisGrapheme(_: *const anyopaque, text: []const u8) @import("cell_metric
         .byte_len = grapheme.len,
         .cell_width = vaxis.gwidth.gwidth(grapheme.bytes(text), .unicode),
     };
+}
+
+fn widthVaxisText(_: *const anyopaque, text: []const u8) usize {
+    return vaxis.gwidth.gwidth(text, .unicode);
 }
 
 fn contentGeometry(win: vaxis.Window) presentation.FrameGeometry {
@@ -1227,6 +1231,7 @@ fn reviewerVerdictLabel(verdict: ?bbr.bitbucket.ReviewerVerdict) []const u8 {
 
 // Force the presentation modules' tests into the exe test binary.
 test {
+    _ = @import("cell_metrics.zig");
     _ = @import("buffer.zig");
     _ = @import("frame.zig");
     _ = @import("file_tree.zig");
@@ -1241,6 +1246,19 @@ test {
     _ = @import("file_enrichment.zig");
     _ = @import("presentation_adapter.zig");
     _ = @import("presentation_runtime.zig");
+}
+
+test "whole-text vaxis width matches grapheme measurement" {
+    for ([_][]const u8{ "plain", "\x00", "\t", "\x7f", "e\xcc\x81", "\xe7\x95\x8c", "\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb", "\xff" }) |text| {
+        var scalar_width: usize = 0;
+        var rest = text;
+        while (rest.len > 0) {
+            const measured = vaxis_cell_metrics.next(rest);
+            scalar_width += measured.cell_width;
+            rest = rest[measured.byte_len..];
+        }
+        try std.testing.expectEqual(scalar_width, vaxis_cell_metrics.width(text));
+    }
 }
 
 test "pinned vaxis fixtures preserve Shift Arrow selection input" {
