@@ -24,6 +24,18 @@ pub fn largeDiff(allocator: std.mem.Allocator) ![]u8 {
     return raw.toOwnedSlice(allocator);
 }
 
+pub fn highlightedDiff(allocator: std.mem.Allocator, line_count: usize) ![]u8 {
+    var raw: std.ArrayList(u8) = .empty;
+    errdefer raw.deinit(allocator);
+    try raw.print(
+        allocator,
+        "diff --git a/src/highlighted.zig b/src/highlighted.zig\n--- a/src/highlighted.zig\n+++ b/src/highlighted.zig\n@@ -1,{d} +1,{d} @@\n",
+        .{ line_count, line_count },
+    );
+    for (0..line_count) |_| try raw.appendSlice(allocator, " const value = 1;\n");
+    return raw.toOwnedSlice(allocator);
+}
+
 pub const LinePair = struct {
     old: []u8,
     new: []u8,

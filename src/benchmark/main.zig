@@ -8,6 +8,7 @@ const buffer_projection = @import("buffer_projection.zig");
 const buffer_navigation = @import("buffer_navigation.zig");
 const intraline = @import("intraline.zig");
 const side_by_side_matching = @import("side_by_side_matching.zig");
+const span_projection = @import("span_projection.zig");
 const highlight = @import("highlight.zig");
 const TreeSitterHighlighter = @import("benchmark_highlight").TreeSitterHighlighter;
 
@@ -52,6 +53,15 @@ pub fn main(init: std.process.Init) !void {
     defer parsed_arena.deinit();
     const parsed = try bbr.diff.parse(parsed_arena.allocator(), raw);
     const projection_context: buffer_projection.Context = .{ .diff = parsed };
+    const span_raw = try synthetic.highlightedDiff(init.gpa, 5_000);
+    defer init.gpa.free(span_raw);
+    var span_arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer span_arena.deinit();
+    const span_diff = try bbr.diff.parse(span_arena.allocator(), span_raw);
+    const sparse_spans = try fixtureSpans(span_arena.allocator(), 5_000, 20);
+    const dense_spans = try fixtureSpans(span_arena.allocator(), 5_000, 1);
+    const sparse_highlights = [_]bbr.highlight.FileHighlights{.{ .old = .{ .spans = sparse_spans }, .new = .{ .spans = sparse_spans } }};
+    const dense_highlights = [_]bbr.highlight.FileHighlights{.{ .old = .{ .spans = dense_spans }, .new = .{ .spans = dense_spans } }};
     var navigation_arena = std.heap.ArenaAllocator.init(init.gpa);
     defer navigation_arena.deinit();
     const navigation_context: buffer_navigation.Context = .{
@@ -139,6 +149,37 @@ pub fn main(init: std.process.Init) !void {
             buffer_navigation.checksum,
         );
     }
+    const span_benchmarks = [_]struct { name: []const u8, context: span_projection.Context }{
+        .{ .name = "span_projection_unified_sparse", .context = .{ .diff = span_diff, .highlights = &sparse_highlights, .layout = .unified } },
+        .{ .name = "span_projection_unified_dense", .context = .{ .diff = span_diff, .highlights = &dense_highlights, .layout = .unified } },
+        .{ .name = "span_projection_side_by_side_sparse", .context = .{ .diff = span_diff, .highlights = &sparse_highlights, .layout = .side_by_side } },
+        .{ .name = "span_projection_side_by_side_dense", .context = .{ .diff = span_diff, .highlights = &dense_highlights, .layout = .side_by_side } },
+    };
+    for (&span_benchmarks) |*benchmark| {
+        if (selected == null or std.mem.eql(u8, selected.?, benchmark.name)) {
+            matched = true;
+            if (repeat_count) |count| try harness.repeat(
+                writer,
+                init.gpa,
+                benchmark.name,
+                count,
+                &benchmark.context,
+                span_projection.run,
+                span_projection.checksum,
+            ) else try harness.run(
+                writer,
+                init.io,
+                init.gpa,
+                calibrations,
+                benchmark.name,
+                .instruction_throughput,
+                benchmark.context.highlights[0].new.?.spans.len * 5_000,
+                &benchmark.context,
+                span_projection.run,
+                span_projection.checksum,
+            );
+        }
+    }
     for ([_]usize{ 10, 100, 250, 500, 550, 575, 600, 1_000, 2_000, 4_000 }) |part_count| {
         var name_buffer: [64]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buffer, "intraline_{d}_parts", .{part_count});
@@ -211,6 +252,17 @@ fn javascriptFixture(allocator: std.mem.Allocator, minimum_bytes: usize) ![]u8 {
     const content = try allocator.alloc(u8, line_count * line.len);
     for (0..line_count) |index| @memcpy(content[index * line.len ..][0..line.len], line);
     return content;
+}
+
+fn fixtureSpans(allocator: std.mem.Allocator, line_count: usize, stride: usize) ![]bbr.highlight.Span {
+    const spans = try allocator.alloc(bbr.highlight.Span, (line_count + stride - 1) / stride);
+    for (spans, 0..) |*span, index| span.* = .{
+        .line = @intCast(index * stride + 1),
+        .start = 0,
+        .end = 5,
+        .capture = bbr.highlight.Capture.init(1, "keyword"),
+    };
+    return spans;
 }
 
 fn hostCpu(allocator: std.mem.Allocator, io: std.Io) ![]u8 {

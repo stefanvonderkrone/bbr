@@ -340,6 +340,7 @@ pub fn buildWithComments(
         if (opts.only_file) |only| {
             if (fi != only) continue;
         }
+        w.span_cursors = .init(opts.highlights, fi);
         try file_rows.append(allocator, .{ .file_index = fi, .first_row = rows.items.len });
         try rows.append(allocator, .{ .file_header = file });
 
@@ -363,15 +364,15 @@ pub fn buildWithComments(
                 .new => try spliceNewSide(allocator, file.*, content.blob),
             };
             switch (layout) {
-                .unified => try w.emitUnifiedHunk(fi, file, lines, try computeEmphasis(allocator, lines), &.{}),
-                .side_by_side => try w.emitSideBySideHunk(fi, file, lines, &.{}),
+                .unified => try w.emitUnifiedHunk(file, lines, try computeEmphasis(allocator, lines), &.{}),
+                .side_by_side => try w.emitSideBySideHunk(file, lines, &.{}),
             }
         } else for (file.hunks) |*hunk| {
             try rows.append(allocator, .{ .hunk_header = hunk });
             const folds = try computeFolds(allocator, hunk.lines, opts);
             switch (layout) {
-                .unified => try w.emitUnifiedHunk(fi, file, hunk.lines, try computeEmphasis(allocator, hunk.lines), folds),
-                .side_by_side => try w.emitSideBySideHunk(fi, file, hunk.lines, folds),
+                .unified => try w.emitUnifiedHunk(file, hunk.lines, try computeEmphasis(allocator, hunk.lines), folds),
+                .side_by_side => try w.emitSideBySideHunk(file, hunk.lines, folds),
             }
         }
 
@@ -520,6 +521,7 @@ const Weave = struct {
     emitted: []bool,
     emitted_threads: []bool,
     opts: BuildOptions,
+    span_cursors: SpanCursors = .{},
 
     /// Append a thread's rows: root, then any pending reply-Drafts to the root,
     /// then each published reply followed by its own pending reply-Drafts.
@@ -647,7 +649,6 @@ const Weave = struct {
     /// any inline threads and root Drafts anchored to it.
     fn emitUnifiedHunk(
         w: *Weave,
-        file_idx: usize,
         file: *const model.File,
         lines: []const model.Line,
         emphasis: []const []const Segment,
@@ -664,7 +665,7 @@ const Weave = struct {
                     continue;
                 }
             }
-            try w.rows.append(w.a, .{ .line = try decoratedLine(w.a, &lines[i], lineSpans(w.opts.highlights, file_idx, lines[i]), emphasis[i]) });
+            try w.rows.append(w.a, .{ .line = try decoratedLine(w.a, &lines[i], w.span_cursors.lineSpans(lines[i]), emphasis[i]) });
             try w.weaveInline(file, &lines[i]);
             i += 1;
         }
@@ -676,7 +677,6 @@ const Weave = struct {
     /// context line — present on both sides — doesn't double-emit).
     fn emitSideBySideHunk(
         w: *Weave,
-        file_idx: usize,
         file: *const model.File,
         lines: []const model.Line,
         folds: []const Fold,
@@ -694,7 +694,7 @@ const Weave = struct {
             }
             switch (lines[i].kind) {
                 .context => {
-                    const line = try decoratedLine(w.a, &lines[i], lineSpans(w.opts.highlights, file_idx, lines[i]), &.{});
+                    const line = try decoratedLine(w.a, &lines[i], w.span_cursors.lineSpans(lines[i]), &.{});
                     const pair: LinePair = if (lines[i].new_no == null)
                         .{ .left = line }
                     else if (lines[i].old_no == null)
@@ -711,7 +711,7 @@ const Weave = struct {
                     while (i < lines.len and lines[i].kind == .added) i += 1;
                     var p = start;
                     while (p < i) : (p += 1) {
-                        try w.rows.append(w.a, .{ .line_pair = .{ .right = try decoratedLine(w.a, &lines[p], lineSpans(w.opts.highlights, file_idx, lines[p]), &.{}) } });
+                        try w.rows.append(w.a, .{ .line_pair = .{ .right = try decoratedLine(w.a, &lines[p], w.span_cursors.lineSpans(lines[p]), &.{}) } });
                         try w.weaveInline(file, &lines[p]);
                     }
                 },
@@ -726,7 +726,7 @@ const Weave = struct {
                         while (i < lines.len and lines[i].kind == .added) i += 1;
                         add_end = i;
                     }
-                    try w.emitSideBySideChangeBlock(file_idx, file, lines[rem_start..rem_end], lines[add_start..add_end]);
+                    try w.emitSideBySideChangeBlock(file, lines[rem_start..rem_end], lines[add_start..add_end]);
                 },
             }
         }
@@ -734,7 +734,6 @@ const Weave = struct {
 
     fn emitSideBySideChangeBlock(
         w: *Weave,
-        file_idx: usize,
         file: *const model.File,
         removed: []const model.Line,
         added: []const model.Line,
@@ -744,7 +743,7 @@ const Weave = struct {
         var new_parts: usize = 0;
         for (added) |line| new_parts +|= intraline.lexicalPartCount(line.text);
         const work = removed.len *| added.len +| old_parts *| new_parts;
-        if (work > side_by_side_work_limit) return w.emitIndexedChangeBlock(file_idx, file, removed, added);
+        if (work > side_by_side_work_limit) return w.emitIndexedChangeBlock(file, removed, added);
 
         var match_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer match_scratch.deinit();
@@ -816,8 +815,8 @@ const Weave = struct {
             switch (cells[old_cursor * stride + new_cursor].operation) {
                 .pair => {
                     const pair = try intraline.diff(w.a, removed[old_cursor].text, added[new_cursor].text);
-                    const left = try decoratedLine(w.a, &removed[old_cursor], lineSpans(w.opts.highlights, file_idx, removed[old_cursor]), pair.old);
-                    const right = try decoratedLine(w.a, &added[new_cursor], lineSpans(w.opts.highlights, file_idx, added[new_cursor]), pair.new);
+                    const left = try decoratedLine(w.a, &removed[old_cursor], w.span_cursors.lineSpans(removed[old_cursor]), pair.old);
+                    const right = try decoratedLine(w.a, &added[new_cursor], w.span_cursors.lineSpans(added[new_cursor]), pair.new);
                     try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
                     try w.weaveInline(file, right.line);
                     try w.weaveInline(file, left.line);
@@ -825,13 +824,13 @@ const Weave = struct {
                     new_cursor += 1;
                 },
                 .right => {
-                    const right = try decoratedLine(w.a, &added[new_cursor], lineSpans(w.opts.highlights, file_idx, added[new_cursor]), &.{});
+                    const right = try decoratedLine(w.a, &added[new_cursor], w.span_cursors.lineSpans(added[new_cursor]), &.{});
                     try w.rows.append(w.a, .{ .line_pair = .{ .right = right } });
                     try w.weaveInline(file, right.line);
                     new_cursor += 1;
                 },
                 .left => {
-                    const left = try decoratedLine(w.a, &removed[old_cursor], lineSpans(w.opts.highlights, file_idx, removed[old_cursor]), &.{});
+                    const left = try decoratedLine(w.a, &removed[old_cursor], w.span_cursors.lineSpans(removed[old_cursor]), &.{});
                     try w.rows.append(w.a, .{ .line_pair = .{ .left = left } });
                     try w.weaveInline(file, left.line);
                     old_cursor += 1;
@@ -843,7 +842,6 @@ const Weave = struct {
 
     fn emitIndexedChangeBlock(
         w: *Weave,
-        file_idx: usize,
         file: *const model.File,
         removed: []const model.Line,
         added: []const model.Line,
@@ -851,19 +849,19 @@ const Weave = struct {
         const pair_count = @min(removed.len, added.len);
         for (0..pair_count) |i| {
             const pair = try intraline.diff(w.a, removed[i].text, added[i].text);
-            const left = try decoratedLine(w.a, &removed[i], lineSpans(w.opts.highlights, file_idx, removed[i]), pair.old);
-            const right = try decoratedLine(w.a, &added[i], lineSpans(w.opts.highlights, file_idx, added[i]), pair.new);
+            const left = try decoratedLine(w.a, &removed[i], w.span_cursors.lineSpans(removed[i]), pair.old);
+            const right = try decoratedLine(w.a, &added[i], w.span_cursors.lineSpans(added[i]), pair.new);
             try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
             try w.weaveInline(file, right.line);
             try w.weaveInline(file, left.line);
         }
         for (removed[pair_count..]) |*line| {
-            const left = try decoratedLine(w.a, line, lineSpans(w.opts.highlights, file_idx, line.*), &.{});
+            const left = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
             try w.rows.append(w.a, .{ .line_pair = .{ .left = left } });
             try w.weaveInline(file, left.line);
         }
         for (added[pair_count..]) |*line| {
-            const right = try decoratedLine(w.a, line, lineSpans(w.opts.highlights, file_idx, line.*), &.{});
+            const right = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
             try w.rows.append(w.a, .{ .line_pair = .{ .right = right } });
             try w.weaveInline(file, right.line);
         }
@@ -919,27 +917,45 @@ fn decoratedLine(allocator: std.mem.Allocator, line: *const model.Line, spans: [
     return .{ .line = line, .decoration = decorated };
 }
 
-/// Select the agreed file side, then return only the ordered Spans for `line`.
-fn lineSpans(highlights: []const bbr.highlight.highlighter.FileHighlights, file_idx: usize, line: model.Line) []const decoration.Span {
-    if (file_idx >= highlights.len) return &.{};
-    const file = highlights[file_idx];
-    const selected = switch (line.kind) {
-        .removed => file.old,
-        .added => file.new,
-        .context => file.new orelse file.old,
-    } orelse return &.{};
-    const number = switch (line.kind) {
-        .removed => line.old_no,
-        .added => line.new_no,
-        .context => if (file.new != null) line.new_no else line.old_no,
-    } orelse return &.{};
+const SpanCursor = struct {
+    spans: []const decoration.Span = &.{},
+    next: usize = 0,
 
-    var first: usize = 0;
-    while (first < selected.spans.len and selected.spans[first].line < number) first += 1;
-    var end = first;
-    while (end < selected.spans.len and selected.spans[end].line == number) end += 1;
-    return selected.spans[first..end];
-}
+    fn lineSpans(cursor: *SpanCursor, number: ?u32) []const decoration.Span {
+        const line = number orelse return &.{};
+        while (cursor.next < cursor.spans.len and cursor.spans[cursor.next].line < line) cursor.next += 1;
+        const first = cursor.next;
+        while (cursor.next < cursor.spans.len and cursor.spans[cursor.next].line == line) cursor.next += 1;
+        return cursor.spans[first..cursor.next];
+    }
+};
+
+const SpanCursors = struct {
+    old: ?SpanCursor = null,
+    new: ?SpanCursor = null,
+
+    fn init(highlights: []const bbr.highlight.highlighter.FileHighlights, file_idx: usize) SpanCursors {
+        if (file_idx >= highlights.len) return .{};
+        const file = highlights[file_idx];
+        return .{
+            .old = if (file.old) |result| .{ .spans = result.spans } else null,
+            .new = if (file.new) |result| .{ .spans = result.spans } else null,
+        };
+    }
+
+    fn lineSpans(cursors: *SpanCursors, line: model.Line) []const decoration.Span {
+        return switch (line.kind) {
+            .removed => if (cursors.old) |*cursor| cursor.lineSpans(line.old_no) else &.{},
+            .added => if (cursors.new) |*cursor| cursor.lineSpans(line.new_no) else &.{},
+            .context => if (cursors.new) |*cursor|
+                cursor.lineSpans(line.new_no)
+            else if (cursors.old) |*cursor|
+                cursor.lineSpans(line.old_no)
+            else
+                &.{},
+        };
+    }
+};
 
 const WholeFileContent = struct {
     side: enum { old, new },
@@ -2584,9 +2600,10 @@ test "Line decoration selects old Spans for removed and new Spans for added and 
     const removed: model.Line = .{ .old_no = 4, .new_no = null, .kind = .removed, .text = "old" };
     const added: model.Line = .{ .old_no = null, .new_no = 7, .kind = .added, .text = "new" };
     const context: model.Line = .{ .old_no = 6, .new_no = 8, .kind = .context, .text = "ctx" };
-    try testing.expectEqual(@as(u16, 1), lineSpans(&highlights, 0, removed)[0].capture.id);
-    try testing.expectEqual(@as(u16, 2), lineSpans(&highlights, 0, added)[0].capture.id);
-    try testing.expectEqual(@as(u16, 3), lineSpans(&highlights, 0, context)[0].capture.id);
+    var cursors = SpanCursors.init(&highlights, 0);
+    try testing.expectEqual(@as(u16, 1), cursors.lineSpans(removed)[0].capture.id);
+    try testing.expectEqual(@as(u16, 2), cursors.lineSpans(added)[0].capture.id);
+    try testing.expectEqual(@as(u16, 3), cursors.lineSpans(context)[0].capture.id);
 }
 
 test "an incompatible blob Span leaves only that diff Line plain" {

@@ -32,6 +32,7 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - [Intern Capture identities](issues/06-intern-capture-identities.md) — Query-local identities remove per-Span Capture names, cutting Highlighting allocations by 92.8% and median latency by 2.4%.
 - [Merge Capture intervals](issues/07-merge-capture-intervals.md) — Sorted Capture intervals preserve Span output while cutting Highlighting peak scratch bytes by 15.8%.
 - [Index Buffer rows by File](issues/08-index-buffer-rows-by-file.md) — Compact per-File row starts replace duplicate full-prefix scans with binary lookup, cutting 1,000 bottom-row lookups by at least 3,914x.
+- [Advance a monotonic Span cursor](issues/09-advance-a-monotonic-span-cursor.md) — Per-File side cursors scan each Span once, cutting dense 5,000-Line projection latency by 95% in both Layouts.
 
 ## Not yet specified
 
