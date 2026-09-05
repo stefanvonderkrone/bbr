@@ -30,6 +30,7 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - [Build repeatable performance profiles](issues/29-build-repeatable-performance-profiles.md) — Repeat mode now gives each P0 stage stable Time Profiler, Allocations, and CPU Counters runs with checksum checks.
 - [Cache Grammar runtime packages](issues/05-cache-grammar-runtime-packages.md) — Immutable packages move query, predicate, RE2, Capture, and UserGrammar setup out of worker calls, cutting warm Highlighting median latency by 23.4%.
 - [Intern Capture identities](issues/06-intern-capture-identities.md) — Query-local identities remove per-Span Capture names, cutting Highlighting allocations by 92.8% and median latency by 2.4%.
+- [Merge Capture intervals](issues/07-merge-capture-intervals.md) — Sorted Capture intervals preserve Span output while cutting Highlighting peak scratch bytes by 15.8%.
 
 ## Not yet specified
 

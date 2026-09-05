@@ -118,6 +118,20 @@ fn highlightWithQueryLimit(allocator: Allocator, grammar_language: *const c.TSLa
 }
 
 fn highlightWithPackage(allocator: Allocator, package: *const RuntimePackage, content: []const u8, match_limit: ?u32) !bbr.highlight.HighlightResult {
+    const intervals = try collectCaptureIntervals(allocator, package, content, match_limit);
+    defer allocator.free(intervals);
+    return .{ .spans = try mergeCaptureIntervals(allocator, package, content, intervals) };
+}
+
+const CaptureInterval = struct {
+    start: u32,
+    end: u32,
+    capture_id: u16,
+    pattern_index: u32,
+    order: usize,
+};
+
+fn collectCaptureIntervals(allocator: Allocator, package: *const RuntimePackage, content: []const u8, match_limit: ?u32) ![]CaptureInterval {
     if (content.len > std.math.maxInt(u32)) return error.FileTooLarge;
     if (!std.unicode.utf8ValidateSlice(content)) return error.InvalidUtf8;
     const parser = c.ts_parser_new() orelse return error.ParserInitFailed;
@@ -142,16 +156,9 @@ fn highlightWithPackage(allocator: Allocator, package: *const RuntimePackage, co
     c.ts_query_cursor_set_match_limit(cursor, match_limit orelse std.math.maxInt(u32));
     c.ts_query_cursor_exec(cursor, package.highlight.query, c.ts_tree_root_node(tree));
 
-    // Capture id per byte. Later query matches take precedence; newlines are
-    // ignored when the labels are converted into Line-relative Spans.
-    const none = std.math.maxInt(u32);
-    const labels = try allocator.alloc(u32, content.len);
-    defer allocator.free(labels);
-    @memset(labels, none);
-    const priorities = try allocator.alloc(u32, content.len);
-    defer allocator.free(priorities);
-    @memset(priorities, 0);
-
+    var intervals: std.ArrayList(CaptureInterval) = .empty;
+    errdefer intervals.deinit(allocator);
+    var order: usize = 0;
     var match: c.TSQueryMatch = undefined;
     while (c.ts_query_cursor_next_match(cursor, &match)) {
         if (!try package.highlight.predicates.accepts(match.pattern_index, match, content, locals)) continue;
@@ -161,49 +168,120 @@ fn highlightWithPackage(allocator: Allocator, package: *const RuntimePackage, co
             const start = range.start;
             const end = range.end;
             if (start == end) continue;
-            for (start..end) |byte| {
-                if (labels[byte] == none or match.pattern_index >= priorities[byte]) {
-                    labels[byte] = capture.index;
-                    priorities[byte] = match.pattern_index;
-                }
-            }
+            if (capture.index >= package.captures.len) return error.InvalidCapture;
+            try intervals.append(allocator, .{
+                .start = @intCast(start),
+                .end = @intCast(end),
+                .capture_id = @intCast(capture.index),
+                .pattern_index = match.pattern_index,
+                .order = order,
+            });
+            order += 1;
         }
     }
     if (c.ts_query_cursor_did_exceed_match_limit(cursor)) return error.QueryMatchLimitExceeded;
+    return intervals.toOwnedSlice(allocator);
+}
 
-    var spans: std.ArrayList(bbr.highlight.Span) = .empty;
-    var line: u32 = 1;
-    var line_start: usize = 0;
-    var i: usize = 0;
-    while (i <= content.len) {
-        if (i < content.len and content[i] != '\n') {
-            i += 1;
-            continue;
-        }
-        var at = line_start;
-        while (at < i) {
-            if (labels[at] == none) {
-                at += 1;
-                continue;
-            }
-            const capture_id = labels[at];
-            var end = at + 1;
-            while (end < i and labels[end] == capture_id) end += 1;
-            if (capture_id >= package.captures.len) return error.InvalidCapture;
-            try spans.append(allocator, .{
-                .line = line,
-                .start = at - line_start,
-                .end = end - line_start,
-                .capture = package.captures[capture_id],
-            });
-            at = end;
-        }
-        if (i == content.len) break;
-        i += 1;
-        line_start = i;
-        line += 1;
+fn mergeCaptureIntervals(allocator: Allocator, package: *const RuntimePackage, content: []const u8, intervals: []CaptureInterval) ![]bbr.highlight.Span {
+    if (!std.sort.isSorted(CaptureInterval, intervals, {}, intervalLessThan)) {
+        std.mem.sort(CaptureInterval, intervals, {}, intervalLessThan);
     }
-    return .{ .spans = try spans.toOwnedSlice(allocator) };
+    var spans: std.ArrayList(bbr.highlight.Span) = .empty;
+    errdefer spans.deinit(allocator);
+    var line_state: LineState = .{};
+    var cluster_start: usize = 0;
+    // ponytail: Grammar overlap is shallow; use a priority heap if profiles show deep overlap.
+    while (cluster_start < intervals.len) {
+        var cluster_end = intervals[cluster_start].end;
+        var cluster_limit = cluster_start + 1;
+        while (cluster_limit < intervals.len and intervals[cluster_limit].start < cluster_end) : (cluster_limit += 1) {
+            cluster_end = @max(cluster_end, intervals[cluster_limit].end);
+        }
+        const cluster = intervals[cluster_start..cluster_limit];
+        var position = cluster[0].start;
+        while (position < cluster_end) {
+            var winner: ?CaptureInterval = null;
+            var next_start = cluster_end;
+            for (cluster) |interval| {
+                if (interval.start > position) {
+                    next_start = @min(next_start, interval.start);
+                } else if (interval.end > position and (winner == null or higherPrecedence({}, interval, winner.?) == .lt)) {
+                    winner = interval;
+                }
+            }
+            if (winner) |selected| {
+                const end = @min(selected.end, next_start);
+                try appendIntervalSpans(allocator, &spans, package, content, &line_state, position, end, selected.capture_id);
+                position = end;
+            } else {
+                position = next_start;
+            }
+        }
+        cluster_start = cluster_limit;
+    }
+    return spans.toOwnedSlice(allocator);
+}
+
+const LineState = struct {
+    line: u32 = 1,
+    line_start: usize = 0,
+    scanned_to: usize = 0,
+};
+
+fn appendIntervalSpans(
+    allocator: Allocator,
+    spans: *std.ArrayList(bbr.highlight.Span),
+    package: *const RuntimePackage,
+    content: []const u8,
+    state: *LineState,
+    absolute_start: u32,
+    absolute_end: u32,
+    capture_id: u16,
+) !void {
+    const start: usize = absolute_start;
+    const end: usize = absolute_end;
+    while (std.mem.indexOfScalarPos(u8, content, state.scanned_to, '\n')) |newline| {
+        if (newline >= start) break;
+        state.line += 1;
+        state.line_start = newline + 1;
+        state.scanned_to = newline + 1;
+    }
+
+    var at = start;
+    while (at < end) {
+        const newline = std.mem.indexOfScalarPos(u8, content, at, '\n');
+        const part_end = @min(end, newline orelse end);
+        if (at < part_end) {
+            const relative_start = at - state.line_start;
+            const relative_end = part_end - state.line_start;
+            if (spans.items.len != 0) {
+                const previous = &spans.items[spans.items.len - 1];
+                if (previous.line == state.line and previous.end == relative_start and previous.capture.id == capture_id) {
+                    previous.end = relative_end;
+                } else {
+                    try spans.append(allocator, .{ .line = state.line, .start = relative_start, .end = relative_end, .capture = package.captures[capture_id] });
+                }
+            } else {
+                try spans.append(allocator, .{ .line = state.line, .start = relative_start, .end = relative_end, .capture = package.captures[capture_id] });
+            }
+        }
+        if (newline == null or newline.? >= end) break;
+        at = newline.? + 1;
+        state.line += 1;
+        state.line_start = at;
+        state.scanned_to = at;
+    }
+    state.scanned_to = @max(state.scanned_to, end);
+}
+
+fn intervalLessThan(_: void, a: CaptureInterval, b: CaptureInterval) bool {
+    return a.start < b.start or (a.start == b.start and a.order < b.order);
+}
+
+fn higherPrecedence(_: void, a: CaptureInterval, b: CaptureInterval) std.math.Order {
+    if (a.pattern_index != b.pattern_index) return std.math.order(b.pattern_index, a.pattern_index);
+    return std.math.order(b.order, a.order);
 }
 
 const testing = std.testing;
@@ -412,6 +490,35 @@ test "remaining BuiltInGrammars load their queries and produce Captures" {
     }
 }
 
+test "interval merge matches byte planes for every BuiltInGrammar fixture" {
+    const cases = [_]struct { path: []const u8, source: []const u8 }{
+        .{ .path = "valid.js", .source = "const answer = value ?? 42;\nconsole.log(answer);\n" },
+        .{ .path = "invalid.js", .source = "function broken( { return console.\n" },
+        .{ .path = "minified.js", .source = "const f=(x)=>x?{value:x}:null;console.log(f(1));\n" },
+        .{ .path = "predicates.js", .source = "Widget widget SCREAM console require other\n" },
+        .{ .path = "nested.ts", .source = "interface Box<T> { value: T }\nconst box: Box<string> = { value: 'x' };\n" },
+        .{ .path = "component.tsx", .source = "const App = ({name}: {name: string}) => <main className=\"card\">{name}</main>;\n" },
+        .{ .path = "style.css", .source = ".card:hover { color: rgb(1, 2, 3); }\n" },
+        .{ .path = "main.go", .source = "package main\nfunc main() { println(\"hello\") }\n" },
+        .{ .path = "run.sh", .source = "#!/bin/bash\nname=world\necho \"hello ${name}\"\n" },
+        .{ .path = "data.json", .source = "{\"nested\": {\"ready\": true}, \"items\": [1, 2]}\n" },
+        .{ .path = "config.yaml", .source = "service:\n  enabled: true\n  ports: [80, 443]\n" },
+    };
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    for (cases) |case| {
+        const grammar = grammar_match.selectBuiltIn(case.path, case.source).?;
+        const package = &highlighter.packages[@intFromEnum(grammar)];
+        const intervals = try collectCaptureIntervals(testing.allocator, package, case.source, null);
+        defer testing.allocator.free(intervals);
+        const expected = try spansFromBytePlanes(testing.allocator, package, case.source, intervals);
+        defer testing.allocator.free(expected);
+        const actual = try mergeCaptureIntervals(testing.allocator, package, case.source, intervals);
+        defer testing.allocator.free(actual);
+        try testing.expectEqualDeep(expected, actual);
+    }
+}
+
 test "match predicate filters one match and preserves fallback Capture" {
     const query =
         \\(identifier) @variable
@@ -576,6 +683,59 @@ fn expectNoCapture(result: bbr.highlight.HighlightResult, source: []const u8, ab
     if (captureAt(result, source, absolute_start, absolute_end)) |found| {
         if (found.id == capture.id) return error.UnexpectedCaptureFound;
     }
+}
+
+fn spansFromBytePlanes(allocator: Allocator, package: *const RuntimePackage, content: []const u8, intervals: []const CaptureInterval) ![]bbr.highlight.Span {
+    const none = std.math.maxInt(u32);
+    const labels = try allocator.alloc(u32, content.len);
+    defer allocator.free(labels);
+    @memset(labels, none);
+    const priorities = try allocator.alloc(u32, content.len);
+    defer allocator.free(priorities);
+    @memset(priorities, 0);
+
+    for (intervals) |interval| {
+        for (interval.start..interval.end) |byte| {
+            if (labels[byte] == none or interval.pattern_index >= priorities[byte]) {
+                labels[byte] = interval.capture_id;
+                priorities[byte] = interval.pattern_index;
+            }
+        }
+    }
+
+    var spans: std.ArrayList(bbr.highlight.Span) = .empty;
+    errdefer spans.deinit(allocator);
+    var line: u32 = 1;
+    var line_start: usize = 0;
+    var i: usize = 0;
+    while (i <= content.len) {
+        if (i < content.len and content[i] != '\n') {
+            i += 1;
+            continue;
+        }
+        var at = line_start;
+        while (at < i) {
+            if (labels[at] == none) {
+                at += 1;
+                continue;
+            }
+            const capture_id = labels[at];
+            var end = at + 1;
+            while (end < i and labels[end] == capture_id) end += 1;
+            try spans.append(allocator, .{
+                .line = line,
+                .start = at - line_start,
+                .end = end - line_start,
+                .capture = package.captures[capture_id],
+            });
+            at = end;
+        }
+        if (i == content.len) break;
+        i += 1;
+        line_start = i;
+        line += 1;
+    }
+    return spans.toOwnedSlice(allocator);
 }
 
 fn expectInvalidLocalsQuery(locals_query: []const u8, expected_error: anyerror, expected_kind: predicate_mod.Diagnostic.Kind) !void {
