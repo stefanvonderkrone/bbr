@@ -232,9 +232,39 @@ pub const Buffer = struct {
     rows: []const Row,
     layout: Layout,
     file_tallies: []const FileTally = &.{},
+    file_rows: []const FileRow = &.{},
+
+    pub fn fileIndexForRow(self: Buffer, row: usize) ?usize {
+        if (self.file_rows.len == 0) return null;
+        var low: usize = 0;
+        var high = self.file_rows.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.file_rows[middle].first_row <= row) low = middle + 1 else high = middle;
+        }
+        return self.file_rows[low -| 1].file_index;
+    }
+
+    pub fn fileHeaderRow(self: Buffer, file_index: usize) ?usize {
+        var low: usize = 0;
+        var high = self.file_rows.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const candidate = self.file_rows[middle];
+            if (candidate.file_index < file_index) {
+                low = middle + 1;
+            } else if (candidate.file_index > file_index) {
+                high = middle;
+            } else {
+                return candidate.first_row;
+            }
+        }
+        return null;
+    }
 };
 
 pub const FileTally = struct { comments: usize = 0, drafts: usize = 0 };
+pub const FileRow = struct { file_index: usize, first_row: usize };
 
 pub const BuildError = error{
     /// The requested `Layout` is not implemented yet.
@@ -261,6 +291,7 @@ pub fn buildWithComments(
     opts: BuildOptions,
 ) BuildError!Buffer {
     var rows: std.ArrayList(Row) = .empty;
+    var file_rows: std.ArrayList(FileRow) = .empty;
 
     // A Draft is placed exactly once: a root Draft by its anchor (inline line, or
     // the PR-level "Pending" section); a reply Draft after its parent's row (a
@@ -309,6 +340,7 @@ pub fn buildWithComments(
         if (opts.only_file) |only| {
             if (fi != only) continue;
         }
+        try file_rows.append(allocator, .{ .file_index = fi, .first_row = rows.items.len });
         try rows.append(allocator, .{ .file_header = file });
 
         // File-level roots live at the File header, before hunks/folds/lines.
@@ -435,7 +467,12 @@ pub fn buildWithComments(
         }
     }
 
-    return .{ .rows = try rows.toOwnedSlice(allocator), .layout = layout, .file_tallies = try fileTallies(allocator, diff, threads, opts.drafts, opts) };
+    return .{
+        .rows = try rows.toOwnedSlice(allocator),
+        .layout = layout,
+        .file_tallies = try fileTallies(allocator, diff, threads, opts.drafts, opts),
+        .file_rows = try file_rows.toOwnedSlice(allocator),
+    };
 }
 
 fn contentStatus(statuses: []const model.FileContent, file_index: usize) model.FileContent {
@@ -2259,6 +2296,8 @@ test "only_file projects a single file's rows, nothing else" {
     for (only_b.rows) |r| {
         if (r == .file_header) try testing.expectEqualStrings("b.txt", r.file_header.new_path);
     }
+    try testing.expectEqual(@as(usize, 1), only_b.fileIndexForRow(0));
+    try testing.expectEqual(@as(usize, 0), only_b.fileHeaderRow(1));
     // b.txt alone: header + hunk header + 2 lines = 4 rows.
     try testing.expectEqual(@as(usize, 4), only_b.rows.len);
 

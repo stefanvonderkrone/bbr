@@ -31,6 +31,7 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - [Cache Grammar runtime packages](issues/05-cache-grammar-runtime-packages.md) — Immutable packages move query, predicate, RE2, Capture, and UserGrammar setup out of worker calls, cutting warm Highlighting median latency by 23.4%.
 - [Intern Capture identities](issues/06-intern-capture-identities.md) — Query-local identities remove per-Span Capture names, cutting Highlighting allocations by 92.8% and median latency by 2.4%.
 - [Merge Capture intervals](issues/07-merge-capture-intervals.md) — Sorted Capture intervals preserve Span output while cutting Highlighting peak scratch bytes by 15.8%.
+- [Index Buffer rows by File](issues/08-index-buffer-rows-by-file.md) — Compact per-File row starts replace duplicate full-prefix scans with binary lookup, cutting 1,000 bottom-row lookups by at least 3,914x.
 
 ## Not yet specified
 

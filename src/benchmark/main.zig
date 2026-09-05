@@ -5,6 +5,7 @@ const harness = @import("harness.zig");
 const synthetic = @import("synthetic.zig");
 const diff_parse = @import("diff_parse.zig");
 const buffer_projection = @import("buffer_projection.zig");
+const buffer_navigation = @import("buffer_navigation.zig");
 const intraline = @import("intraline.zig");
 const side_by_side_matching = @import("side_by_side_matching.zig");
 const highlight = @import("highlight.zig");
@@ -51,6 +52,11 @@ pub fn main(init: std.process.Init) !void {
     defer parsed_arena.deinit();
     const parsed = try bbr.diff.parse(parsed_arena.allocator(), raw);
     const projection_context: buffer_projection.Context = .{ .diff = parsed };
+    var navigation_arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer navigation_arena.deinit();
+    const navigation_context: buffer_navigation.Context = .{
+        .buffer = try buffer_projection.run(navigation_arena.allocator(), &projection_context),
+    };
     const highlight_content = try javascriptFixture(init.gpa, 100 * 1024);
     defer init.gpa.free(highlight_content);
     var tree_sitter_highlighter = try TreeSitterHighlighter.init(init.gpa, null);
@@ -108,6 +114,29 @@ pub fn main(init: std.process.Init) !void {
             &projection_context,
             buffer_projection.run,
             buffer_projection.checksum,
+        );
+    }
+    if (selected == null or std.mem.eql(u8, selected.?, buffer_navigation.name)) {
+        matched = true;
+        if (repeat_count) |count| try harness.repeat(
+            writer,
+            init.gpa,
+            buffer_navigation.name,
+            count,
+            &navigation_context,
+            buffer_navigation.run,
+            buffer_navigation.checksum,
+        ) else try harness.run(
+            writer,
+            init.io,
+            init.gpa,
+            calibrations,
+            buffer_navigation.name,
+            .instruction_throughput,
+            1_000,
+            &navigation_context,
+            buffer_navigation.run,
+            buffer_navigation.checksum,
         );
     }
     for ([_]usize{ 10, 100, 250, 500, 550, 575, 600, 1_000, 2_000, 4_000 }) |part_count| {

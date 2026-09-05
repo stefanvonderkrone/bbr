@@ -1706,7 +1706,7 @@ const Published = struct {
         });
         const panes = frame_mod.paneRects(geometry);
         const wanted_cursor = if (self.tree.entries.len == 0) null else self.tree.entries[self.tree.cursor].identity;
-        const active_file = if (self.session.diff.files.len == 0) null else isolated_file orelse fileIndexForRow(self.buffer, self.cursorBufferIndex());
+        const active_file = if (self.session.diff.files.len == 0) null else isolated_file orelse self.buffer.fileIndexForRow(self.cursorBufferIndex());
         const tree = try file_tree.build(
             allocator,
             self.session.diff,
@@ -1731,7 +1731,7 @@ const Published = struct {
 
     fn activeFile(self: *const Published) ?usize {
         if (self.session.diff.files.len == 0) return null;
-        return self.isolated_file orelse fileIndexForRow(self.buffer, self.cursorBufferIndex());
+        return self.isolated_file orelse self.buffer.fileIndexForRow(self.cursorBufferIndex());
     }
 
     fn cursorVisualRow(self: *const Published) ?frame_mod.VisualRow {
@@ -5390,7 +5390,10 @@ pub const Presentation = struct {
             self.action_error = .action_refused;
             return;
         }
-        const file_index = published.isolated_file orelse fileIndexForRow(published.buffer, published.cursorBufferIndex());
+        const file_index = published.isolated_file orelse published.buffer.fileIndexForRow(published.cursorBufferIndex()) orelse {
+            self.action_error = .action_refused;
+            return;
+        };
         if (file_index >= published.session.diff.files.len) {
             self.action_error = .action_refused;
             return;
@@ -5588,7 +5591,7 @@ pub const Presentation = struct {
     fn ensureFocusedEnrichment(self: *Presentation) !void {
         if (self.shutdown_requested) return;
         const published = self.published orelse return;
-        const file_index = published.isolated_file orelse fileIndexForRow(published.buffer, published.cursorBufferIndex());
+        const file_index = published.isolated_file orelse published.buffer.fileIndexForRow(published.cursorBufferIndex()) orelse return;
         if (file_index >= published.session.diff.files.len or file_index >= published.session.enrichment.len()) return;
         published.focusEnrichment(self.preferences, file_index) catch |err| {
             self.action_error = normalizeActionError(err);
@@ -5876,7 +5879,7 @@ pub const Presentation = struct {
     fn toggleIsolation(self: *Presentation, published: *Published) void {
         if (published.session.diff.files.len == 0) return;
         const previous = published.isolated_file;
-        const candidate = if (previous) |_| null else fileIndexForRow(published.buffer, published.cursorBufferIndex());
+        const candidate = if (previous) |_| null else published.buffer.fileIndexForRow(published.cursorBufferIndex());
         published.rebuild(self.preferences, published.expanded_disclosures.items, candidate) catch |err| {
             self.action_error = normalizeActionError(err);
             return;
@@ -5987,7 +5990,10 @@ pub const Presentation = struct {
             self.action_error = .invalid_selection;
             return;
         }
-        const start_file = fileIndexForRow(published.buffer, published.cursorBufferIndex());
+        const start_file = published.buffer.fileIndexForRow(published.cursorBufferIndex()) orelse {
+            self.action_error = .invalid_selection;
+            return;
+        };
         const selection = published.navigation.selection();
         const wanted = if (selection == null) @max(published.navigation.count, 1) else std.math.maxInt(usize);
         published.navigation.count = 0;
@@ -6000,7 +6006,7 @@ pub const Presentation = struct {
         var previous_buffer_index: ?usize = null;
         while (row_index <= last and row_index < published.visual_rows.len and copied < wanted) : (row_index += 1) {
             const visual_row = published.visual_rows[row_index];
-            if (fileIndexForRow(published.buffer, visual_row.buffer_index) != start_file) break;
+            if (published.buffer.fileIndexForRow(visual_row.buffer_index) != start_file) break;
             if (previous_buffer_index == visual_row.buffer_index) continue;
             previous_buffer_index = visual_row.buffer_index;
             const source = if (lineAtVisualRow(visual_row)) |line| line.text else null;
@@ -6455,7 +6461,7 @@ fn candidateLines(published: *const Published) !CandidateLines {
 /// the shared `max_anchor_lines` cap. Strings borrow the published Session.
 fn reanchorCandidate(published: *const Published, kind: bbr.review.DraftKind) !AnchorCandidatePlacement {
     const lines = try candidateLines(published);
-    const file_index = published.isolated_file orelse fileIndexForRow(published.buffer, published.cursorBufferIndex());
+    const file_index = published.isolated_file orelse published.buffer.fileIndexForRow(published.cursorBufferIndex()) orelse return error.NotOnSource;
     if (file_index >= published.session.diff.files.len) return error.NotOnSource;
     const span = try spanFromLines(lines.items(), kind == .suggestion);
     const file = published.session.diff.files[file_index];
@@ -6711,18 +6717,6 @@ fn pickerTop(selected: usize, visible_rows: usize) usize {
     return selected - visible_rows + 1;
 }
 
-fn fileIndexForRow(buffer: buffer_mod.Buffer, cursor: usize) usize {
-    var file_index: usize = 0;
-    var seen_file = false;
-    var row: usize = 0;
-    while (row <= cursor and row < buffer.rows.len) : (row += 1) {
-        if (buffer.rows[row] == .file_header) {
-            if (seen_file) file_index += 1 else seen_file = true;
-        }
-    }
-    return file_index;
-}
-
 fn nextFileHeaderRow(buffer: buffer_mod.Buffer, cursor: usize) ?usize {
     var row = cursor +| 1;
     while (row < buffer.rows.len) : (row += 1) {
@@ -6742,14 +6736,7 @@ fn previousFileHeaderRow(buffer: buffer_mod.Buffer, cursor: usize) ?usize {
 }
 
 fn fileHeaderRow(buffer: buffer_mod.Buffer, file_index: usize) ?usize {
-    var seen: usize = 0;
-    for (buffer.rows, 0..) |row, index| {
-        if (row == .file_header) {
-            if (seen == file_index) return index;
-            seen += 1;
-        }
-    }
-    return null;
+    return buffer.fileHeaderRow(file_index);
 }
 
 const testing = std.testing;
@@ -7762,16 +7749,16 @@ test "Pane focus gives the Sidebar an independent cursor while DiffPane File mot
     try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 1 }));
     try presentation.dispatch(.{ .action = .toggle_directory });
     frame = presentation.projection().review.?.frame;
-    try testing.expectEqual(@as(usize, 1), fileIndexForRow(frame.buffer, frame.navigation.cursor));
+    try testing.expectEqual(@as(usize, 1), frame.buffer.fileIndexForRow(frame.navigation.cursor));
 
     // File Actions are scoped to the DiffPane and do not consume Sidebar state.
     try presentation.dispatch(.{ .action = .prev_file });
     frame = presentation.projection().review.?.frame;
-    try testing.expectEqual(@as(usize, 1), fileIndexForRow(frame.buffer, frame.navigation.cursor));
+    try testing.expectEqual(@as(usize, 1), frame.buffer.fileIndexForRow(frame.navigation.cursor));
     try presentation.dispatch(.{ .action = .focus_next_pane });
     try presentation.dispatch(.{ .action = .prev_file });
     frame = presentation.projection().review.?.frame;
-    try testing.expectEqual(@as(usize, 0), fileIndexForRow(frame.buffer, frame.navigation.cursor));
+    try testing.expectEqual(@as(usize, 0), frame.buffer.fileIndexForRow(frame.navigation.cursor));
     try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 1 }));
 }
 
@@ -7799,7 +7786,7 @@ test "File finder filters synchronously and confirms within the same Session" {
     const projection = presentation.projection();
     try testing.expect(projection.file_finder == null);
     try testing.expectEqual(epoch, projection.review.?.session_epoch);
-    try testing.expectEqual(@as(usize, 1), fileIndexForRow(projection.review.?.buffer, projection.review.?.navigation.cursor));
+    try testing.expectEqual(@as(usize, 1), projection.review.?.buffer.fileIndexForRow(projection.review.?.navigation.cursor));
     try testing.expectEqual(frame_mod.PaneFocus.diff, projection.review.?.frame.focus);
 }
 

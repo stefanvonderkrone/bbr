@@ -191,7 +191,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         if (projection.review) |review_projection| {
             const visual_cursor = review_projection.frame.navigation.cursor;
             const buffer_cursor = if (visual_cursor < review_projection.frame.visual_rows.len) review_projection.frame.visual_rows[visual_cursor].buffer_index else 0;
-            const selected_file = fileIndexForRow(review_projection.frame.buffer, buffer_cursor);
+            const selected_file = review_projection.frame.buffer.fileIndexForRow(buffer_cursor) orelse 0;
             render.drawReview(frame, content_win, review_projection, ctx.active_theme, selected_file);
             const status = presentationStatus(frame, projection, review_projection.key);
             drawStatus(
@@ -1156,18 +1156,6 @@ fn cancelPresentationWork(work: *std.ArrayList(PresentationWork), io: std.Io, id
         _ = canceled.future.cancel(io);
         return;
     }
-}
-
-fn fileIndexForRow(buf: buffer_mod.Buffer, cursor: usize) usize {
-    var idx: usize = 0;
-    var seen_any = false;
-    var i: usize = 0;
-    while (i <= cursor and i < buf.rows.len) : (i += 1) {
-        if (buf.rows[i] == .file_header) {
-            if (seen_any) idx += 1 else seen_any = true;
-        }
-    }
-    return idx;
 }
 
 fn contentViewportRows(window_rows: u16) usize {
