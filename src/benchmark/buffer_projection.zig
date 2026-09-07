@@ -1,6 +1,6 @@
 const std = @import("std");
 const bbr = @import("bbr");
-const buffer_mod = @import("benchmark_buffer");
+const buffer_mod = @import("benchmark_tui").buffer;
 
 pub const name = "buffer_projection_300_files_50000_lines";
 

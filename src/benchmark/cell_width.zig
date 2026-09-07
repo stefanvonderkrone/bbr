@@ -1,6 +1,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
-const CellMetrics = @import("benchmark_buffer").CellMetrics;
+const buffer_mod = @import("benchmark_tui").buffer;
+const CellMetrics = buffer_mod.CellMetrics;
 
 pub const name = "cell_width_ascii_1m";
 
@@ -16,7 +17,7 @@ pub fn checksum(width: usize) u64 {
     return width;
 }
 
-fn nextVaxisGrapheme(_: *const anyopaque, text: []const u8) @import("benchmark_buffer").CellMeasurement {
+fn nextVaxisGrapheme(_: *const anyopaque, text: []const u8) buffer_mod.CellMeasurement {
     var iterator = vaxis.unicode.graphemeIterator(text);
     const grapheme = iterator.next() orelse return .{ .byte_len = 1, .cell_width = 1 };
     return .{

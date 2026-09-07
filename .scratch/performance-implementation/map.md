@@ -36,6 +36,7 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - [Index Comment anchors](issues/10-index-comment-anchors.md) — Transaction-local Anchor, Reply, and disclosure indexes preserve Buffer output while cutting 2,000-item projection latency by at least 98.8%.
 - [Add the ASCII cell-width fast path](issues/11-add-ascii-cell-width-fast-path.md) — SIMD printable-ASCII detection and batched vaxis width measurement preserve terminal geometry while cutting one MiB ASCII measurement latency by 99.86%.
 - [Remove frame paint allocation](issues/12-remove-frame-paint-allocation.md) — Static gutter glyphs and first-pass cursor styling remove all measured frame allocations and cut median paint latency by 6.7%.
+- [Select P1 actions from the P0 profile](issues/13-select-p1-actions.md) — Actions 11, 13, 14, 15, 16, and 18 pass; measured costs reject Actions 12 and 17.
 
 ## Not yet specified
 
@@ -48,3 +49,5 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - A required cross-platform benchmark matrix. The first baseline uses the current macOS host.
 - The non-actions listed in `PERFORMANCE.md`, unless new profile evidence overturns their stated reasons.
 - Product behavior unrelated to review performance.
+- [Cache ReviewBody and File line starts](issues/15-cache-review-bodies-and-line-starts.md) — Measured rebuild costs are too small to justify cache state and invalidation rules.
+- [Cache Highlighting results](issues/20-cache-highlight-results.md) — No measured Session workload establishes a useful cache hit rate.

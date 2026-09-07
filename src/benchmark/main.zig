@@ -13,6 +13,7 @@ const span_projection = @import("span_projection.zig");
 const highlight = @import("highlight.zig");
 const cell_width = @import("cell_width.zig");
 const frame_paint = @import("frame_paint.zig");
+const p1_actions = @import("p1_actions.zig");
 const TreeSitterHighlighter = @import("benchmark_highlight").TreeSitterHighlighter;
 
 pub fn main(init: std.process.Init) !void {
@@ -35,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
     const host_cpu = try hostCpu(init.gpa, init.io);
     defer init.gpa.free(host_cpu);
     try writer.print(
-        "host_os={s} host_arch={s} host_cpu={s} target_cpu={s} zig={s} mode={s} samples={d} warmups={d} instruction_ceiling={d:.2} memory_ceiling_bytes_per_second={d:.2}\n",
+        "host_os={s} host_arch={s} host_cpu={s} target_cpu={s} zig={s} mode={s} samples={d} warmups={d} instruction_ceiling={d:.2} memory_ceiling_bytes_per_second={d:.2} sizeof_line={d} sizeof_span={d} sizeof_row={d} sizeof_visual_row={d}\n",
         .{
             @tagName(builtin.os.tag),
             @tagName(builtin.cpu.arch),
@@ -47,6 +48,10 @@ pub fn main(init: std.process.Init) !void {
             harness.warmup_count,
             calibrations.instruction_units_per_second,
             calibrations.memory_bytes_per_second,
+            p1_actions.line_size,
+            p1_actions.span_size,
+            p1_actions.row_size,
+            p1_actions.visual_row_size,
         },
     );
 
@@ -73,15 +78,62 @@ pub fn main(init: std.process.Init) !void {
     var comment_arena = std.heap.ArenaAllocator.init(init.gpa);
     defer comment_arena.deinit();
     const comment_contexts = try commentAnchorContexts(comment_arena.allocator(), parsed);
-    const highlight_content = try javascriptFixture(init.gpa, 100 * 1024);
-    defer init.gpa.free(highlight_content);
+    const highlight_javascript_4k = try sourceFixture(init.gpa, 4 * 1024, "export function calculate(value) { return value + 1; }\n");
+    defer init.gpa.free(highlight_javascript_4k);
+    const highlight_javascript_100k = try sourceFixture(init.gpa, 100 * 1024, "export function calculate(value) { return value + 1; }\n");
+    defer init.gpa.free(highlight_javascript_100k);
+    const highlight_javascript_1m = try sourceFixture(init.gpa, 1024 * 1024, "export function calculate(value) { return value + 1; }\n");
+    defer init.gpa.free(highlight_javascript_1m);
+    const highlight_javascript_2m = try sourceFixture(init.gpa, 2 * 1024 * 1024, "export function calculate(value) { return value + 1; }\n");
+    defer init.gpa.free(highlight_javascript_2m);
+    const highlight_typescript_2m = try sourceFixture(init.gpa, 2 * 1024 * 1024, "interface Value { count: number }\nconst value: Value = { count: 1 };\n");
+    defer init.gpa.free(highlight_typescript_2m);
+    const highlight_tsx_2m = try sourceFixture(init.gpa, 2 * 1024 * 1024, "const App = ({name}: {name: string}) => <main>{name}</main>;\n");
+    defer init.gpa.free(highlight_tsx_2m);
+    const highlight_css_2m = try sourceFixture(init.gpa, 2 * 1024 * 1024, ".card:hover { color: rgb(1, 2, 3); }\n");
+    defer init.gpa.free(highlight_css_2m);
+    const highlight_go_2m = try sourceFixture(init.gpa, 2 * 1024 * 1024, "package main\nfunc value() int { return 1 }\n");
+    defer init.gpa.free(highlight_go_2m);
+    const highlight_bash_2m = try sourceFixture(init.gpa, 2 * 1024 * 1024, "name=world\necho \"hello ${name}\"\n");
+    defer init.gpa.free(highlight_bash_2m);
+    const highlight_json_2m = try sourceFixture(init.gpa, 2 * 1024 * 1024, "{\"nested\": {\"ready\": true}, \"items\": [1, 2]}\n");
+    defer init.gpa.free(highlight_json_2m);
+    const highlight_yaml_2m = try sourceFixture(init.gpa, 2 * 1024 * 1024, "service:\n  enabled: true\n  ports: [80, 443]\n");
+    defer init.gpa.free(highlight_yaml_2m);
     const cell_width_content = try asciiFixture(init.gpa, 1024 * 1024);
     defer init.gpa.free(cell_width_content);
     var frame_paint_context = try frame_paint.Context.init(init.gpa);
     defer frame_paint_context.deinit(init.gpa);
     var tree_sitter_highlighter = try TreeSitterHighlighter.init(init.gpa, null);
     defer tree_sitter_highlighter.deinit();
-    const highlight_context: highlight.Context = .{ .highlighter = &tree_sitter_highlighter, .content = highlight_content };
+    const highlight_benchmarks = [_]struct { name: []const u8, context: highlight.Context }{
+        .{ .name = "highlight_javascript_4k", .context = .{ .highlighter = &tree_sitter_highlighter, .path = "benchmark.js", .content = highlight_javascript_4k } },
+        .{ .name = highlight.name, .context = .{ .highlighter = &tree_sitter_highlighter, .path = "benchmark.js", .content = highlight_javascript_100k } },
+        .{ .name = "highlight_javascript_1m", .context = .{ .highlighter = &tree_sitter_highlighter, .path = "benchmark.js", .content = highlight_javascript_1m } },
+        .{ .name = "highlight_javascript_2m", .context = .{ .highlighter = &tree_sitter_highlighter, .path = "benchmark.js", .content = highlight_javascript_2m } },
+        .{ .name = "highlight_typescript_2m", .context = .{ .highlighter = &tree_sitter_highlighter, .path = "benchmark.ts", .content = highlight_typescript_2m } },
+        .{ .name = "highlight_tsx_2m", .context = .{ .highlighter = &tree_sitter_highlighter, .path = "benchmark.tsx", .content = highlight_tsx_2m } },
+        .{ .name = "highlight_css_2m", .context = .{ .highlighter = &tree_sitter_highlighter, .path = "benchmark.css", .content = highlight_css_2m } },
+        .{ .name = "highlight_go_2m", .context = .{ .highlighter = &tree_sitter_highlighter, .path = "benchmark.go", .content = highlight_go_2m } },
+        .{ .name = "highlight_bash_2m", .context = .{ .highlighter = &tree_sitter_highlighter, .path = "benchmark.sh", .content = highlight_bash_2m } },
+        .{ .name = "highlight_json_2m", .context = .{ .highlighter = &tree_sitter_highlighter, .path = "benchmark.json", .content = highlight_json_2m } },
+        .{ .name = "highlight_yaml_2m", .context = .{ .highlighter = &tree_sitter_highlighter, .path = "benchmark.yaml", .content = highlight_yaml_2m } },
+    };
+    const whole_file_blob = try sourceFixture(init.gpa, 100 * 1024, "const value = 1;\n");
+    defer init.gpa.free(whole_file_blob);
+    const whole_file_blobs = [_]bbr.diff.FileBlob{.{ .new = whole_file_blob }};
+    const whole_file_context: p1_actions.WholeFileContext = .{ .diff = span_diff, .blobs = &whole_file_blobs };
+    const review_bodies_context: p1_actions.ReviewBodiesContext = .{
+        .body = "## Review\n\nThis **change** keeps [the contract](https://example.test).\n\n```suggestion\nconst value = 2;\n```\n",
+        .count = 4_000,
+    };
+    const visual_rows_unwrapped_context: p1_actions.VisualRowsContext = .{ .rows = navigation_context.buffer.rows, .wrap = false };
+    const visual_rows_wrapped_context: p1_actions.VisualRowsContext = .{ .rows = navigation_context.buffer.rows, .wrap = true, .width = 24 };
+    const file_tree_context: p1_actions.FileTreeContext = .{
+        .diff = parsed,
+        .threads = comment_contexts[2].threads,
+        .drafts = comment_contexts[2].drafts,
+    };
     var matched = false;
     if (selected == null or std.mem.eql(u8, selected.?, frame_paint.name)) {
         matched = true;
@@ -129,28 +181,56 @@ pub fn main(init: std.process.Init) !void {
             cell_width.checksum,
         );
     }
-    if (selected == null or std.mem.eql(u8, selected.?, highlight.name)) {
+    for (&highlight_benchmarks) |*benchmark| {
+        if (selected == null or std.mem.eql(u8, selected.?, benchmark.name)) {
+            matched = true;
+            if (repeat_count) |count| try harness.repeat(
+                writer,
+                init.gpa,
+                benchmark.name,
+                count,
+                &benchmark.context,
+                highlight.run,
+                highlight.checksum,
+            ) else try harness.run(
+                writer,
+                init.io,
+                init.gpa,
+                calibrations,
+                benchmark.name,
+                .instruction_throughput,
+                benchmark.context.content.len,
+                &benchmark.context,
+                highlight.run,
+                highlight.checksum,
+            );
+        }
+    }
+    if (selected == null or std.mem.eql(u8, selected.?, "highlight_equal_javascript_100k")) {
         matched = true;
-        if (repeat_count) |count| try harness.repeat(
-            writer,
-            init.gpa,
-            highlight.name,
-            count,
-            &highlight_context,
-            highlight.run,
-            highlight.checksum,
-        ) else try harness.run(
-            writer,
-            init.io,
-            init.gpa,
-            calibrations,
-            highlight.name,
-            .instruction_throughput,
-            highlight_content.len,
-            &highlight_context,
-            highlight.run,
-            highlight.checksum,
-        );
+        if (repeat_count) |count| try harness.repeat(writer, init.gpa, "highlight_equal_javascript_100k", count, &highlight_benchmarks[1].context, highlight.runEqualPair, highlight.pairChecksum) else try harness.run(writer, init.io, init.gpa, calibrations, "highlight_equal_javascript_100k", .instruction_throughput, highlight_javascript_100k.len * 2, &highlight_benchmarks[1].context, highlight.runEqualPair, highlight.pairChecksum);
+    }
+    if (selected == null or std.mem.eql(u8, selected.?, "review_body_parse_4000")) {
+        matched = true;
+        if (repeat_count) |count| try harness.repeat(writer, init.gpa, "review_body_parse_4000", count, &review_bodies_context, p1_actions.reviewBodies, p1_actions.scalarChecksum) else try harness.run(writer, init.io, init.gpa, calibrations, "review_body_parse_4000", .instruction_throughput, review_bodies_context.body.len * review_bodies_context.count, &review_bodies_context, p1_actions.reviewBodies, p1_actions.scalarChecksum);
+    }
+    if (selected == null or std.mem.eql(u8, selected.?, "whole_file_line_starts_5000")) {
+        matched = true;
+        if (repeat_count) |count| try harness.repeat(writer, init.gpa, "whole_file_line_starts_5000", count, &whole_file_context, p1_actions.wholeFile, p1_actions.bufferChecksum) else try harness.run(writer, init.io, init.gpa, calibrations, "whole_file_line_starts_5000", .memory_bandwidth, whole_file_blob.len, &whole_file_context, p1_actions.wholeFile, p1_actions.bufferChecksum);
+    }
+    const visual_benchmarks = [_]struct { name: []const u8, context: p1_actions.VisualRowsContext }{
+        .{ .name = "visual_rows_unwrapped_50000", .context = visual_rows_unwrapped_context },
+        .{ .name = "visual_rows_wrapped_50000", .context = visual_rows_wrapped_context },
+    };
+    for (&visual_benchmarks) |*benchmark| {
+        if (selected == null or std.mem.eql(u8, selected.?, benchmark.name)) {
+            matched = true;
+            if (repeat_count) |count| try harness.repeat(writer, init.gpa, benchmark.name, count, &benchmark.context, p1_actions.visualRows, p1_actions.visualRowsChecksum) else try harness.run(writer, init.io, init.gpa, calibrations, benchmark.name, .instruction_throughput, benchmark.context.rows.len, &benchmark.context, p1_actions.visualRows, p1_actions.visualRowsChecksum);
+        }
+    }
+    if (selected == null or std.mem.eql(u8, selected.?, "file_tree_tallies_2000")) {
+        matched = true;
+        if (repeat_count) |count| try harness.repeat(writer, init.gpa, "file_tree_tallies_2000", count, &file_tree_context, p1_actions.fileTree, p1_actions.fileTreeChecksum) else try harness.run(writer, init.io, init.gpa, calibrations, "file_tree_tallies_2000", .instruction_throughput, parsed.files.len * (file_tree_context.threads.len + file_tree_context.drafts.len), &file_tree_context, p1_actions.fileTree, p1_actions.fileTreeChecksum);
     }
     if (selected == null or std.mem.eql(u8, selected.?, diff_parse.name)) {
         matched = true;
@@ -329,8 +409,7 @@ pub fn main(init: std.process.Init) !void {
     try writer.flush();
 }
 
-fn javascriptFixture(allocator: std.mem.Allocator, minimum_bytes: usize) ![]u8 {
-    const line = "export function calculate(value) { return value + 1; }\n";
+fn sourceFixture(allocator: std.mem.Allocator, minimum_bytes: usize, line: []const u8) ![]u8 {
     const line_count = (minimum_bytes + line.len - 1) / line.len;
     const content = try allocator.alloc(u8, line_count * line.len);
     for (0..line_count) |index| @memcpy(content[index * line.len ..][0..line.len], line);

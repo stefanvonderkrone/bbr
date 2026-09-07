@@ -52,8 +52,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = bench_optimize,
     });
-    const bench_buffer_mod = b.createModule(.{
-        .root_source_file = b.path("src/tui/buffer.zig"),
+    const bench_tui_mod = b.createModule(.{
+        .root_source_file = b.path("src/tui/benchmark.zig"),
         .target = target,
         .optimize = bench_optimize,
         .imports = &.{.{ .name = "bbr", .module = bench_core_mod }},
@@ -64,7 +64,7 @@ pub fn build(b: *std.Build) void {
         .optimize = bench_optimize,
         .imports = &.{
             .{ .name = "bbr", .module = bench_core_mod },
-            .{ .name = "benchmark_buffer", .module = bench_buffer_mod },
+            .{ .name = "benchmark_tui", .module = bench_tui_mod },
             .{ .name = "vaxis", .module = vaxis.module("vaxis") },
         },
     });

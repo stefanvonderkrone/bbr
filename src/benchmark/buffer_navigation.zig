@@ -1,5 +1,5 @@
 const std = @import("std");
-const buffer_mod = @import("benchmark_buffer");
+const buffer_mod = @import("benchmark_tui").buffer;
 
 pub const name = "buffer_navigation_300_files_50000_lines";
 

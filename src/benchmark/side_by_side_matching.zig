@@ -1,6 +1,6 @@
 const std = @import("std");
 const bbr = @import("bbr");
-const buffer_mod = @import("benchmark_buffer");
+const buffer_mod = @import("benchmark_tui").buffer;
 
 pub const Context = struct {
     diff: bbr.diff.Diff,
