@@ -92,7 +92,7 @@ pub fn drawReview(
     const sidebar = childRect(win, review.frame.panes.sidebar_content);
     const diff_pane = childRect(win, review.frame.panes.diff_content);
     drawFileTree(sidebar, review.frame.file_tree, theme);
-    drawVisualPane(scratch, diff_pane, review.frame.visual_rows, review.frame.buffer.layout, theme, review.frame.navigation);
+    drawVisualPane(scratch, diff_pane, review.frame.buffer, review.frame.visual_rows, theme, review.frame.navigation);
     joinSectionRules(win, review.frame.panes.diff, review.frame.panes.diff_content, review.frame.visual_rows, review.frame.navigation, theme);
 }
 
@@ -102,7 +102,7 @@ fn joinSectionRules(win: vaxis.Window, outer: @import("frame.zig").Rect, content
     while (screen_row < content.height) : (screen_row += 1) {
         const index = nav.scroll + screen_row;
         if (index >= visual_rows.len) break;
-        const joined = switch (visual_rows[index].row) {
+        const joined = switch (visual_rows[index].kind) {
             .file_header, .section => true,
             else => false,
         };
@@ -234,33 +234,40 @@ fn drawPane(scratch: std.mem.Allocator, win: vaxis.Window, buf: Buffer, theme: T
 fn drawVisualPane(
     scratch: std.mem.Allocator,
     win: vaxis.Window,
+    buf: Buffer,
     visual_rows: []const @import("frame.zig").VisualRow,
-    layout: buffer_mod.Layout,
     theme: Theme,
     nav: Nav,
 ) void {
-    drawProjectedRows(scratch, win, visual_rows, layout, theme, nav);
+    const sel = nav.selection();
+    var screen_row: u16 = 0;
+    while (screen_row < win.height) : (screen_row += 1) {
+        const index = nav.scroll + screen_row;
+        if (index >= visual_rows.len) break;
+        const visual_row = visual_rows[index];
+        const row = buf.rows[visual_row.buffer_index];
+        const selected = if (sel) |selection|
+            visual_row.kind != .status_placeholder and visualRowSelected(visual_rows, selection, index)
+        else
+            false;
+        const row_theme = if (selected or index == nav.cursor) cursorRowTheme(theme) else theme;
+        drawVisualRow(scratch, win, screen_row, buf.layout, row, visual_row, row_theme);
+    }
 }
 
-fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, rows: anytype, layout: buffer_mod.Layout, theme: Theme, nav: Nav) void {
+fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, rows: []const Row, layout: buffer_mod.Layout, theme: Theme, nav: Nav) void {
     const sel = nav.selection();
     var screen_row: u16 = 0;
     while (screen_row < win.height) : (screen_row += 1) {
         const index = nav.scroll + screen_row;
         if (index >= rows.len) break;
-        const row: Row = if (@TypeOf(rows) == []const Row) rows[index] else rows[index].row;
+        const row = rows[index];
         const selected = if (sel) |selection|
-            row != .status_placeholder and if (@TypeOf(rows) == []const Row)
-                index >= selection[0] and index <= selection[1]
-            else
-                visualRowSelected(rows, selection, index)
+            row != .status_placeholder and index >= selection[0] and index <= selection[1]
         else
             false;
         const row_theme = if (selected or index == nav.cursor) cursorRowTheme(theme) else theme;
-        if (@TypeOf(rows) == []const Row)
-            drawRow(scratch, win, screen_row, layout, row, row_theme)
-        else
-            drawVisualRow(scratch, win, screen_row, layout, rows[index], row_theme);
+        drawRow(scratch, win, screen_row, layout, row, row_theme);
     }
 }
 
@@ -270,22 +277,22 @@ fn visualRowSelected(rows: []const @import("frame.zig").VisualRow, selection: [2
     if (candidate.owner != .line) return index >= selection[0] and index <= selection[1];
     var selected = selection[0];
     while (selected <= selection[1] and selected < rows.len) : (selected += 1) {
-        if (candidate.row == .line_pair and rows[selected].buffer_index == candidate.buffer_index) return true;
+        if (candidate.kind == .line_pair and rows[selected].buffer_index == candidate.buffer_index) return true;
         if (rows[selected].owner.eql(candidate.owner)) return true;
     }
     return false;
 }
 
-fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, visual_row: @import("frame.zig").VisualRow, theme: Theme) void {
+fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, row: Row, visual_row: @import("frame.zig").VisualRow, theme: Theme) void {
     if (layout == .side_by_side and visual_row.halves != null) {
         drawVisualLinePair(scratch, win, r, visual_row.halves.?, theme);
         return;
     }
-    if (visual_row.row != .line or layout != .unified) {
-        drawRow(scratch, win, r, layout, visual_row.row, theme);
+    if (row != .line or layout != .unified) {
+        drawRow(scratch, win, r, layout, row, theme);
         return;
     }
-    const line_row = visual_row.row.line;
+    const line_row = row.line;
     const style = theme.lineStyle(line_row.line.kind);
     fillRow(win, r, style);
     if (!visual_row.continuation) {
@@ -1237,7 +1244,7 @@ test "disabled Diff visual-row projection clips exactly like Buffer rendering" {
     const nav = Nav.init(1, 1);
 
     drawPane(a, buffer_window, buf, theme_dark, nav);
-    drawVisualPane(a, frame_window, visual_rows, .unified, theme_dark, nav);
+    drawVisualPane(a, frame_window, buf, visual_rows, theme_dark, nav);
 
     for (0..buffer_window.width) |col| {
         const expected = buffer_window.readCell(@intCast(col), 0).?;
@@ -1268,7 +1275,7 @@ test "disabled SideBySide visual rows clip exactly like Buffer rendering" {
     const nav = Nav.init(1, 1);
 
     drawPane(a, buffer_window, buf, theme_dark, nav);
-    drawVisualPane(a, frame_window, visual_rows, .side_by_side, theme_dark, nav);
+    drawVisualPane(a, frame_window, buf, visual_rows, theme_dark, nav);
 
     for (0..buffer_window.width) |col| {
         const expected = buffer_window.readCell(@intCast(col), 0).?;
@@ -1298,7 +1305,7 @@ test "Unified continuation rows keep decoration and use a blank gutter" {
 
     var nav = Nav.init(visual_rows.len, 2);
     nav.mark = 0;
-    drawVisualPane(a, win, visual_rows, .unified, theme_dark, nav);
+    drawVisualPane(a, win, .{ .rows = &rows, .layout = .unified }, visual_rows, theme_dark, nav);
 
     try testing.expectEqualStrings("7", win.readCell(8, 0).?.char.grapheme);
     for (0..gutter_cols) |col| try testing.expectEqualStrings(" ", win.readCell(@intCast(col), 1).?.char.grapheme);
@@ -1327,7 +1334,7 @@ test "SideBySide continuation rows keep halves inside the fixed divider" {
 
     var nav = Nav.init(visual_rows.len, 2);
     nav.mark = 0;
-    drawVisualPane(a, win, visual_rows, .side_by_side, theme_dark, nav);
+    drawVisualPane(a, win, .{ .rows = &rows, .layout = .side_by_side }, visual_rows, theme_dark, nav);
 
     try testing.expectEqualStrings("7", win.readCell(3, 0).?.char.grapheme);
     try testing.expectEqualStrings("9", win.readCell(17, 0).?.char.grapheme);

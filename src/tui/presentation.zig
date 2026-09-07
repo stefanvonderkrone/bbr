@@ -3184,7 +3184,7 @@ pub const Presentation = struct {
                 const previous_cursor = published.navigation.cursor;
                 published.navigation.jumpTo(index);
                 clampSelectionAtStatusPlaceholder(published, previous_cursor);
-                if (buffer_mod.disclosureKey(published.visual_rows[index].row) != null)
+                if (buffer_mod.disclosureKey(published.buffer.rows[published.visual_rows[index].buffer_index]) != null)
                     self.applyAction(.toggle_disclosure);
             },
         }
@@ -5407,7 +5407,7 @@ pub const Presentation = struct {
                 self.action_error = .invalid_selection;
                 return;
             };
-        } else if (lineAtVisualRow(published.cursorVisualRow().?)) |line| {
+        } else if (lineAtVisualRow(published.buffer, published.cursorVisualRow().?)) |line| {
             lines.append(allocator, line) catch {
                 self.action_error = .out_of_memory;
                 return;
@@ -6009,7 +6009,7 @@ pub const Presentation = struct {
             if (published.buffer.fileIndexForRow(visual_row.buffer_index) != start_file) break;
             if (previous_buffer_index == visual_row.buffer_index) continue;
             previous_buffer_index = visual_row.buffer_index;
-            const source = if (lineAtVisualRow(visual_row)) |line| line.text else null;
+            const source = if (lineAtVisualRow(published.buffer, visual_row)) |line| line.text else null;
             if (source) |text_value| {
                 if (copied > 0) bytes.append(self.allocator, '\n') catch {
                     self.action_error = .out_of_memory;
@@ -6439,16 +6439,16 @@ fn candidateLines(published: *const Published) !CandidateLines {
         while (index <= selection[1] and index < published.visual_rows.len) : (index += 1) {
             const visual_row = published.visual_rows[index];
             // A File header inside the Selection means it left this File.
-            if (visual_row.row == .file_header) return error.CrossesFile;
+            if (visual_row.kind == .file_header) return error.CrossesFile;
             if (previous_buffer_index == visual_row.buffer_index) continue;
             previous_buffer_index = visual_row.buffer_index;
-            const line = lineAtVisualRow(visual_row) orelse continue;
+            const line = lineAtVisualRow(published.buffer, visual_row) orelse continue;
             if (lines.len > 0 and lines.storage[lines.len - 1] == line) continue;
             if (lines.len == lines.storage.len) return error.RangeTooLong;
             lines.storage[lines.len] = line;
             lines.len += 1;
         }
-    } else if (lineAtVisualRow(published.cursorVisualRow().?)) |line| {
+    } else if (lineAtVisualRow(published.buffer, published.cursorVisualRow().?)) |line| {
         lines.storage[0] = line;
         lines.len = 1;
     }
@@ -6613,12 +6613,12 @@ fn lineAtRow(row: buffer_mod.Row) ?*const bbr.diff.Line {
     };
 }
 
-fn lineAtVisualRow(row: frame_mod.VisualRow) ?*const bbr.diff.Line {
+fn lineAtVisualRow(buffer: buffer_mod.Buffer, row: frame_mod.VisualRow) ?*const bbr.diff.Line {
     if (row.halves) |halves| {
         if (halves.right) |half| return half.line;
         if (halves.left) |half| return half.line;
     }
-    return lineAtRow(row.row);
+    return lineAtRow(buffer.rows[row.buffer_index]);
 }
 
 fn clampSelectionAtStatusPlaceholder(published: *Published, previous_cursor: usize) void {
@@ -6632,13 +6632,13 @@ fn selectionTarget(rows: []const frame_mod.VisualRow, from: usize, to: usize) us
     if (to > from) {
         var index = from + 1;
         while (index <= to and index < rows.len) : (index += 1) {
-            if (rows[index].row == .status_placeholder) return index - 1;
+            if (rows[index].kind == .status_placeholder) return index - 1;
         }
     } else if (to < from) {
         var index = from;
         while (index > to) {
             index -= 1;
-            if (rows[index].row == .status_placeholder) return index + 1;
+            if (rows[index].kind == .status_placeholder) return index + 1;
         }
     }
     return to;
@@ -6699,10 +6699,10 @@ fn collectSelectedLines(
     var previous_buffer_index: ?usize = null;
     while (index <= high and index < published.visual_rows.len) : (index += 1) {
         const visual_row = published.visual_rows[index];
-        if (visual_row.row == .file_header) return error.NonContiguous;
+        if (visual_row.kind == .file_header) return error.NonContiguous;
         if (previous_buffer_index == visual_row.buffer_index) continue;
         previous_buffer_index = visual_row.buffer_index;
-        const line = lineAtVisualRow(visual_row) orelse continue;
+        const line = lineAtVisualRow(published.buffer, visual_row) orelse continue;
         if (lines.items.len == 0 or lines.items[lines.items.len - 1] != line) try lines.append(allocator, line);
     }
 }
@@ -6720,7 +6720,7 @@ fn pickerTop(selected: usize, visible_rows: usize) usize {
 fn nextFileHeaderRow(buffer: buffer_mod.Buffer, cursor: usize) ?usize {
     var row = cursor +| 1;
     while (row < buffer.rows.len) : (row += 1) {
-        if (buffer.rows[row] == .file_header) return row;
+        if (buffer.kindAt(row) == .file_header) return row;
     }
     return null;
 }
@@ -6730,7 +6730,7 @@ fn previousFileHeaderRow(buffer: buffer_mod.Buffer, cursor: usize) ?usize {
     var row = cursor;
     while (row > 0) {
         row -= 1;
-        if (buffer.rows[row] == .file_header) return row;
+        if (buffer.kindAt(row) == .file_header) return row;
     }
     return null;
 }

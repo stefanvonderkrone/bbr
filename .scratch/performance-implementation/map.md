@@ -38,6 +38,7 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - [Remove frame paint allocation](issues/12-remove-frame-paint-allocation.md) — Static gutter glyphs and first-pass cursor styling remove all measured frame allocations and cut median paint latency by 6.7%.
 - [Select P1 actions from the P0 profile](issues/13-select-p1-actions.md) — Actions 11, 13, 14, 15, 16, and 18 pass; measured costs reject Actions 12 and 17.
 - [Release Highlighter scratch memory](issues/14-release-highlighter-scratch-memory.md) — File Enrichment releases per-side scratch, retains exact Spans, and caps retained Buffer and frame arena capacity.
+- [Shrink VisualRow hot data](issues/16-shrink-visual-row-hot-data.md) — Buffer-indexed cold Rows and byte-sized RowKind indexes cut 50,000-row Presentation Frame memory by 31.0% and median latency by 16.2%.
 
 ## Not yet specified
 

@@ -79,11 +79,11 @@ pub const RowOwner = union(enum) {
     }
 };
 
-/// One geometry-dependent DiffPane row. `row` retains the width-independent
-/// Buffer owner while byte bounds and decoration describe this projection.
+/// One geometry-dependent DiffPane row. `buffer_index` resolves the cold Row
+/// through the Buffer while the remaining fields describe this projection.
 pub const VisualRow = struct {
-    row: buffer_mod.Row,
     buffer_index: usize = 0,
+    kind: buffer_mod.RowKind = .line,
     owner: RowOwner,
     measured_cells: usize,
     source_start: usize = 0,
@@ -208,7 +208,7 @@ pub fn buildVisualRowsWithOptions(
             if (visual_row.halves) |halves| {
                 if (halves.left) |half| if (half.decoration.runs.len > 0) allocator.free(half.decoration.runs);
                 if (halves.right) |half| if (half.decoration.runs.len > 0) allocator.free(half.decoration.runs);
-            } else if (visual_row.row == .line and visual_row.row.line.line.text.len > 0) {
+            } else {
                 if (visual_row.decoration) |decoration| if (decoration.runs.len > 0) allocator.free(decoration.runs);
             }
         }
@@ -217,7 +217,7 @@ pub fn buildVisualRowsWithOptions(
     if (options.layout == .side_by_side) {
         const widths = sideBodyWidths(options.width).?;
         for (rows, 0..) |row, buffer_index| switch (row) {
-            .line_pair => |pair| try appendWrappedLinePair(allocator, &visual_rows, row, buffer_index, pair, widths, metrics),
+            .line_pair => |pair| try appendWrappedLinePair(allocator, &visual_rows, buffer_index, pair, widths, metrics),
             else => try visual_rows.append(allocator, makeVisualRow(row, buffer_index, metrics)),
         };
         return visual_rows.toOwnedSlice(allocator);
@@ -258,7 +258,6 @@ fn sideBodyWidths(width: usize) ?SideBodyWidths {
 fn appendWrappedLinePair(
     allocator: std.mem.Allocator,
     visual_rows: *std.ArrayList(VisualRow),
-    row: buffer_mod.Row,
     buffer_index: usize,
     pair: buffer_mod.LinePair,
     widths: SideBodyWidths,
@@ -275,8 +274,8 @@ fn appendWrappedLinePair(
         errdefer if (right) |half| if (half.decoration.runs.len > 0) allocator.free(half.decoration.runs);
         const target = right orelse left.?;
         try visual_rows.append(allocator, .{
-            .row = row,
             .buffer_index = buffer_index,
+            .kind = .line_pair,
             .owner = .{ .line = target.line },
             .measured_cells = target.measured_cells,
             .source_start = target.source_start,
@@ -321,8 +320,8 @@ fn appendWrappedVisualRow(
     const decoration = try sliceDecoration(allocator, line_row.decoration, start, end);
     errdefer if (decoration.runs.len > 0) allocator.free(decoration.runs);
     try visual_rows.append(allocator, .{
-        .row = row,
         .buffer_index = buffer_index,
+        .kind = .line,
         .owner = owner(row),
         .measured_cells = metrics.width(line_row.line.text[start..end]),
         .source_start = start,
@@ -340,8 +339,8 @@ fn buildUnwrappedVisualRows(allocator: std.mem.Allocator, rows: []const buffer_m
 
 fn makeVisualRow(row: buffer_mod.Row, buffer_index: usize, metrics: CellMetrics) VisualRow {
     return .{
-        .row = row,
         .buffer_index = buffer_index,
+        .kind = std.meta.activeTag(row),
         .owner = owner(row),
         .measured_cells = rowWidth(row, metrics),
         .source_start = rowSourceStart(row),
@@ -622,13 +621,13 @@ test "Presentation Frame projects Diff Lines as complete visual rows" {
     try testing.expectEqual(@as(usize, 0), visual_rows[0].source_start);
     try testing.expectEqual(line.text.len, visual_rows[0].source_end);
     try testing.expectEqualStrings("const", visual_rows[0].decoration.?.runs[0].text);
-    try testing.expectEqual(rows[0], visual_rows[0].row);
+    try testing.expectEqual(@as(usize, 0), visual_rows[0].buffer_index);
     try testing.expect(visual_rows[1].owner.eql(.{ .line = &line }));
     try testing.expectEqual(line.text.len, visual_rows[1].source_end);
     try testing.expectEqualStrings("const", visual_rows[1].decoration.?.runs[0].text);
-    try testing.expectEqual(rows[1], visual_rows[1].row);
+    try testing.expectEqual(@as(usize, 1), visual_rows[1].buffer_index);
     try testing.expect(visual_rows[2].decoration == null);
-    try testing.expectEqual(rows[2], visual_rows[2].row);
+    try testing.expectEqual(@as(usize, 2), visual_rows[2].buffer_index);
 }
 
 test "Diff visual-row allocation fails before a partial projection escapes" {
@@ -842,11 +841,11 @@ test "published Frame hit testing gives Overlay rows precedence and clips blank 
 
 test "navigation restoration follows stable owners and clears a shifted Selection" {
     const old_targets = [_]VisualRow{
-        .{ .row = .{ .section = .{ .kind = .pr_comments, .count = 1 } }, .owner = .{ .section = .{ .kind = .pr_comments, .path = "" } }, .measured_cells = 0 },
-        .{ .row = .{ .section = .{ .kind = .outdated, .count = 1, .path = "a.zig" } }, .owner = .{ .section = .{ .kind = .outdated, .path = "a.zig" } }, .measured_cells = 5 },
+        .{ .owner = .{ .section = .{ .kind = .pr_comments, .path = "" } }, .measured_cells = 0 },
+        .{ .owner = .{ .section = .{ .kind = .outdated, .path = "a.zig" } }, .measured_cells = 5 },
     };
     const new_targets = [_]VisualRow{
-        .{ .row = .{ .section = .{ .kind = .pending, .count = 1 } }, .owner = .{ .section = .{ .kind = .pending, .path = "" } }, .measured_cells = 0 },
+        .{ .owner = .{ .section = .{ .kind = .pending, .path = "" } }, .measured_cells = 0 },
         old_targets[0],
         old_targets[1],
     };
@@ -874,8 +873,8 @@ test "navigation restoration follows stable owners and clears a shifted Selectio
 
 test "ReviewCard restoration follows containing source offset and collapsed footer" {
     const old_targets = [_]VisualRow{
-        .{ .row = .{ .section = .{ .kind = .pr_comments, .count = 1 } }, .owner = .{ .comment = .{ .id = 7, .source_offset = 0, .part = .header } }, .measured_cells = 5 },
-        .{ .row = .{ .section = .{ .kind = .pr_comments, .count = 1 } }, .owner = .{ .comment = .{ .id = 7, .source_offset = 8 } }, .measured_cells = 10, .source_end = 18 },
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 0, .part = .header } }, .measured_cells = 5 },
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 8 } }, .measured_cells = 10, .source_end = 18 },
     };
     var navigation = Nav.init(old_targets.len, 3);
     navigation.cursor = 1;
@@ -889,15 +888,15 @@ test "ReviewCard restoration follows containing source offset and collapsed foot
         .navigation = navigation,
     };
     const resized = [_]VisualRow{
-        .{ .row = .{ .section = .{ .kind = .pr_comments, .count = 1 } }, .owner = .{ .comment = .{ .id = 7, .source_offset = 0, .part = .header } }, .measured_cells = 5 },
-        .{ .row = .{ .section = .{ .kind = .pr_comments, .count = 1 } }, .owner = .{ .comment = .{ .id = 7, .source_offset = 4 } }, .measured_cells = 18, .source_end = 14 },
-        .{ .row = .{ .section = .{ .kind = .pr_comments, .count = 1 } }, .owner = .{ .comment = .{ .id = 7, .source_offset = 14 } }, .measured_cells = 4, .source_end = 18 },
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 0, .part = .header } }, .measured_cells = 5 },
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 4 } }, .measured_cells = 18, .source_end = 14 },
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 14 } }, .measured_cells = 4, .source_end = 18 },
     };
     try testing.expectEqual(@as(usize, 1), restoreNavigation(previous, &resized, .{ .cols = 60, .rows = 3 }).cursor);
 
     const collapsed = [_]VisualRow{
         resized[0],
-        .{ .row = .{ .section = .{ .kind = .pr_comments, .count = 1 } }, .owner = .{ .comment = .{ .id = 7, .source_offset = 18, .part = .disclosure_footer } }, .measured_cells = 20, .source_end = 18 },
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 18, .part = .disclosure_footer } }, .measured_cells = 20, .source_end = 18 },
     };
     try testing.expectEqual(@as(usize, 1), restoreNavigation(previous, &collapsed, .{ .cols = 30, .rows = 3 }).cursor);
 }

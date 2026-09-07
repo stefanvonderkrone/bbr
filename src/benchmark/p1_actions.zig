@@ -67,7 +67,7 @@ pub fn visualRows(allocator: std.mem.Allocator, context: *const VisualRowsContex
 pub fn visualRowsChecksum(rows: []const tui.frame.VisualRow) u64 {
     var hash = std.hash.Wyhash.init(0);
     for (rows) |row| {
-        hash.update(&.{@intFromEnum(row.row)});
+        hash.update(&.{@intFromEnum(row.kind)});
         hash.update(std.mem.asBytes(&row.buffer_index));
         hash.update(std.mem.asBytes(&row.measured_cells));
         hash.update(std.mem.asBytes(&row.source_start));

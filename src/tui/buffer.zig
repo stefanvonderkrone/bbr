@@ -298,9 +298,14 @@ fn parentKey(parent: Parent) ParentKey {
 
 pub const Buffer = struct {
     rows: []const Row,
+    row_kinds: []const RowKind = &.{},
     layout: Layout,
     file_tallies: []const FileTally = &.{},
     file_rows: []const FileRow = &.{},
+
+    pub fn kindAt(self: Buffer, index: usize) RowKind {
+        return if (self.row_kinds.len == self.rows.len) self.row_kinds[index] else std.meta.activeTag(self.rows[index]);
+    }
 
     pub fn fileIndexForRow(self: Buffer, row: usize) ?usize {
         if (self.file_rows.len == 0) return null;
@@ -557,8 +562,12 @@ pub fn buildWithComments(
         }
     }
 
+    const owned_rows = try rows.toOwnedSlice(allocator);
+    const row_kinds = try allocator.alloc(RowKind, owned_rows.len);
+    for (owned_rows, row_kinds) |row, *kind| kind.* = std.meta.activeTag(row);
     return .{
-        .rows = try rows.toOwnedSlice(allocator),
+        .rows = owned_rows,
+        .row_kinds = row_kinds,
         .layout = layout,
         .file_tallies = try fileTallies(allocator, diff, threads, opts.drafts, opts),
         .file_rows = try file_rows.toOwnedSlice(allocator),
@@ -1432,6 +1441,9 @@ test "build flattens files → hunks → lines in order" {
     try testing.expectEqual(Layout.unified, buf.layout);
     // file A: header + hunk header + 3 lines = 5; file B: header + hunk + 2 = 4.
     try testing.expectEqual(@as(usize, 9), buf.rows.len);
+    try testing.expectEqual(buf.rows.len, buf.row_kinds.len);
+    try testing.expectEqual(RowKind.file_header, buf.kindAt(0));
+    try testing.expectEqual(RowKind.line, buf.kindAt(2));
 
     try testing.expect(buf.rows[0] == .file_header);
     try testing.expectEqualStrings("a.txt", buf.rows[0].file_header.new_path);
