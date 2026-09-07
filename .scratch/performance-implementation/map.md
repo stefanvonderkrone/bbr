@@ -35,6 +35,7 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - [Advance a monotonic Span cursor](issues/09-advance-a-monotonic-span-cursor.md) — Per-File side cursors scan each Span once, cutting dense 5,000-Line projection latency by 95% in both Layouts.
 - [Index Comment anchors](issues/10-index-comment-anchors.md) — Transaction-local Anchor, Reply, and disclosure indexes preserve Buffer output while cutting 2,000-item projection latency by at least 98.8%.
 - [Add the ASCII cell-width fast path](issues/11-add-ascii-cell-width-fast-path.md) — SIMD printable-ASCII detection and batched vaxis width measurement preserve terminal geometry while cutting one MiB ASCII measurement latency by 99.86%.
+- [Remove frame paint allocation](issues/12-remove-frame-paint-allocation.md) — Static gutter glyphs and first-pass cursor styling remove all measured frame allocations and cut median paint latency by 6.7%.
 
 ## Not yet specified
 

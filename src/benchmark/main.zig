@@ -12,6 +12,7 @@ const side_by_side_matching = @import("side_by_side_matching.zig");
 const span_projection = @import("span_projection.zig");
 const highlight = @import("highlight.zig");
 const cell_width = @import("cell_width.zig");
+const frame_paint = @import("frame_paint.zig");
 const TreeSitterHighlighter = @import("benchmark_highlight").TreeSitterHighlighter;
 
 pub fn main(init: std.process.Init) !void {
@@ -76,10 +77,35 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(highlight_content);
     const cell_width_content = try asciiFixture(init.gpa, 1024 * 1024);
     defer init.gpa.free(cell_width_content);
+    var frame_paint_context = try frame_paint.Context.init(init.gpa);
+    defer frame_paint_context.deinit(init.gpa);
     var tree_sitter_highlighter = try TreeSitterHighlighter.init(init.gpa, null);
     defer tree_sitter_highlighter.deinit();
     const highlight_context: highlight.Context = .{ .highlighter = &tree_sitter_highlighter, .content = highlight_content };
     var matched = false;
+    if (selected == null or std.mem.eql(u8, selected.?, frame_paint.name)) {
+        matched = true;
+        if (repeat_count) |count| try harness.repeat(
+            writer,
+            init.gpa,
+            frame_paint.name,
+            count,
+            &frame_paint_context,
+            frame_paint.run,
+            frame_paint.checksum,
+        ) else try harness.run(
+            writer,
+            init.io,
+            init.gpa,
+            calibrations,
+            frame_paint.name,
+            .instruction_throughput,
+            @as(usize, frame_paint_context.screen.width) * frame_paint_context.screen.height,
+            &frame_paint_context,
+            frame_paint.run,
+            frame_paint.checksum,
+        );
+    }
     if (selected == null or std.mem.eql(u8, selected.?, cell_width.name)) {
         matched = true;
         if (repeat_count) |count| try harness.repeat(

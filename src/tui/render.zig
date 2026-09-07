@@ -5,8 +5,9 @@
 //!
 //! Cell text is *borrowed* by vaxis until the frame is rendered. Line body text
 //! borrows the raw diff (long-lived); the only text we synthesize per frame is
-//! the gutter (line numbers), so `draw` takes a `scratch` allocator that must
-//! outlive the render/read that follows (a per-frame arena, reset after render).
+//! dynamic labels, so `draw` takes a `scratch` allocator that must outlive the
+//! render/read that follows (a per-frame arena, reset after render). Gutters use
+//! stack formatting but write static digit glyphs into vaxis cells.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -248,18 +249,18 @@ fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, rows: anytyp
         const index = nav.scroll + screen_row;
         if (index >= rows.len) break;
         const row: Row = if (@TypeOf(rows) == []const Row) rows[index] else rows[index].row;
-        if (@TypeOf(rows) == []const Row)
-            drawRow(scratch, win, screen_row, layout, row, theme)
-        else
-            drawVisualRow(scratch, win, screen_row, layout, rows[index], theme);
-        if (sel) |selection| {
-            const selected = if (@TypeOf(rows) == []const Row)
+        const selected = if (sel) |selection|
+            row != .status_placeholder and if (@TypeOf(rows) == []const Row)
                 index >= selection[0] and index <= selection[1]
             else
-                visualRowSelected(rows, selection, index);
-            if (selected and row != .status_placeholder) highlightCursorRow(win, screen_row, theme);
-        }
-        if (index == nav.cursor) highlightCursorRow(win, screen_row, theme);
+                visualRowSelected(rows, selection, index)
+        else
+            false;
+        const row_theme = if (selected or index == nav.cursor) cursorRowTheme(theme) else theme;
+        if (@TypeOf(rows) == []const Row)
+            drawRow(scratch, win, screen_row, layout, row, row_theme)
+        else
+            drawVisualRow(scratch, win, screen_row, layout, rows[index], row_theme);
     }
 }
 
@@ -288,11 +289,7 @@ fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: 
     const style = theme.lineStyle(line_row.line.kind);
     fillRow(win, r, style);
     if (!visual_row.continuation) {
-        const gutter = std.fmt.allocPrint(scratch, "{s} {s} ", .{
-            numCol(scratch, line_row.line.old_no),
-            numCol(scratch, line_row.line.new_no),
-        }) catch "";
-        _ = win.printSegment(.{ .text = gutter, .style = theme.gutter }, .{ .row_offset = r, .wrap = .none });
+        drawUnifiedGutter(win, r, line_row.line.old_no, line_row.line.new_no, theme.gutter);
     }
     drawLineBodyText(
         scratch,
@@ -307,20 +304,27 @@ fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: 
     );
 }
 
-/// Highlight the whole cursor row (TUI "cursorline" convention): re-tint every
-/// cell's background after the row is drawn, so the diff band colors show
-/// through — a context row gets the neutral cursor tint, a banded row keeps its
-/// hue nudged lighter. Runs after `drawRow` so it also covers a `line_pair`'s
-/// two halves and the divider gap.
-fn highlightCursorRow(win: vaxis.Window, r: u16, theme: Theme) void {
-    var c: u16 = 0;
-    while (c < win.width) : (c += 1) {
-        if (win.readCell(c, r)) |cell| {
-            var lit = cell;
-            lit.style.bg = theme.cursorBg(cell.style.bg);
-            win.writeCell(c, r, lit);
-        }
-    }
+fn cursorRowTheme(theme: Theme) Theme {
+    var result = theme;
+    result.context.bg = theme.cursorBg(theme.context.bg);
+    result.added.bg = theme.cursorBg(theme.added.bg);
+    result.removed.bg = theme.cursorBg(theme.removed.bg);
+    result.added_emphasis.bg = theme.cursorBg(theme.added_emphasis.bg);
+    result.removed_emphasis.bg = theme.cursorBg(theme.removed_emphasis.bg);
+    result.gutter.bg = theme.cursorBg(theme.gutter.bg);
+    result.file_header.bg = theme.cursorBg(theme.file_header.bg);
+    result.hunk_header.bg = theme.cursorBg(theme.hunk_header.bg);
+    result.fold.bg = theme.cursorBg(theme.fold.bg);
+    result.comment.bg = theme.cursorBg(theme.comment.bg);
+    result.comment_reply.bg = theme.cursorBg(theme.comment_reply.bg);
+    result.suggestion.bg = theme.cursorBg(theme.suggestion.bg);
+    result.draft.bg = theme.cursorBg(theme.draft.bg);
+    result.draft_reply.bg = theme.cursorBg(theme.draft_reply.bg);
+    result.outcome_unknown.bg = theme.cursorBg(theme.outcome_unknown.bg);
+    result.outcome_unknown_reply.bg = theme.cursorBg(theme.outcome_unknown_reply.bg);
+    result.section.bg = theme.cursorBg(theme.section.bg);
+    result.section_rule.bg = theme.cursorBg(theme.section_rule.bg);
+    return result;
 }
 
 /// Gutter is two 4-wide line-number columns; body text starts after it.
@@ -343,11 +347,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer
             const style = theme.lineStyle(ln.kind);
             fillRow(win, r, style);
 
-            const gutter = std.fmt.allocPrint(scratch, "{s} {s} ", .{
-                numCol(scratch, ln.old_no),
-                numCol(scratch, ln.new_no),
-            }) catch "";
-            _ = win.printSegment(.{ .text = gutter, .style = theme.gutter }, .{ .row_offset = r, .wrap = .none });
+            drawUnifiedGutter(win, r, ln.old_no, ln.new_no, theme.gutter);
             drawLineBody(scratch, win, r, gutter_cols, lr, theme, style);
         },
         .line_pair => |pair| drawLinePair(scratch, win, r, pair, theme),
@@ -440,6 +440,7 @@ fn drawLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, pair: buf
     if (half == 0) return;
     const right_x = half + 1; // divider column sits at `half`
     const right_w = if (win.width > right_x) win.width - right_x else 0;
+    fillRow(win, r, theme.context);
 
     const left = win.child(.{ .x_off = 0, .y_off = r, .width = half, .height = 1 });
     drawHalf(scratch, left, pair.left, theme, .old);
@@ -454,6 +455,7 @@ fn drawVisualLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, hal
     if (half == 0) return;
     const right_x = half + @as(u16, @intCast(@import("frame.zig").side_divider_cols));
     const right_w = if (win.width > right_x) win.width - right_x else 0;
+    fillRow(win, r, theme.context);
     drawVisualHalf(scratch, win.child(.{ .x_off = 0, .y_off = r, .width = half, .height = 1 }), halves.left, theme, .old);
     if (right_w > 0) drawVisualHalf(scratch, win.child(.{ .x_off = right_x, .y_off = r, .width = right_w, .height = 1 }), halves.right, theme, .new);
 }
@@ -467,7 +469,7 @@ fn drawVisualHalf(scratch: std.mem.Allocator, win: vaxis.Window, half: ?@import(
     fillRow(win, 0, style);
     if (!value.continuation) {
         const no = if (side == .old) value.line.old_no else value.line.new_no;
-        _ = win.printSegment(.{ .text = numCol(scratch, no), .style = theme.gutter }, .{ .wrap = .none });
+        drawSideGutter(win, 0, no, theme.gutter);
     }
     drawLineBodyText(
         scratch,
@@ -499,7 +501,7 @@ fn drawHalf(scratch: std.mem.Allocator, win: vaxis.Window, side_row: ?LineRow, t
         .old => lr.line.old_no,
         .new => lr.line.new_no,
     };
-    _ = win.printSegment(.{ .text = numCol(scratch, no), .style = theme.gutter }, .{ .row_offset = 0, .wrap = .none });
+    drawSideGutter(win, 0, no, theme.gutter);
     drawLineBody(scratch, win, 0, side_gutter, lr, theme, style);
 }
 
@@ -576,7 +578,7 @@ fn drawDisclosure(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, value: 
 
 /// A section divider: "── PR comments (N) ──" or "── Outdated · path (N) ──".
 fn drawSection(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, sec: Section, theme: Theme) void {
-    fillRow(win, r, .{});
+    fillRow(win, r, theme.context);
     const text = switch (sec.kind) {
         .pr_comments => std.fmt.allocPrint(scratch, "── PR comments ({d}) ──", .{sec.count}) catch "── PR comments ──",
         .pending => std.fmt.allocPrint(scratch, "── Pending ({d}) ──", .{sec.count}) catch "── Pending ──",
@@ -1066,10 +1068,49 @@ pub fn drawLoading(scratch: std.mem.Allocator, win: vaxis.Window, id: ?u64, them
     _ = modal.printSegment(.{ .text = text, .style = theme.picker_query }, .{ .row_offset = row, .wrap = .none });
 }
 
-/// Render an optional line number right-justified in 4 columns (blank if absent).
-fn numCol(scratch: std.mem.Allocator, no: ?u32) []const u8 {
-    const n = no orelse return "    ";
-    return std.fmt.allocPrint(scratch, "{d: >4}", .{n}) catch "    ";
+fn drawUnifiedGutter(win: vaxis.Window, row: u16, old_no: ?u32, new_no: ?u32, style: vaxis.Style) void {
+    var text: [32]u8 = undefined;
+    var length = formatNumCol(&text, old_no);
+    text[length] = ' ';
+    length += 1;
+    length += formatNumCol(text[length..], new_no);
+    text[length] = ' ';
+    paintStaticDigits(win, row, text[0 .. length + 1], style);
+}
+
+fn drawSideGutter(win: vaxis.Window, row: u16, no: ?u32, style: vaxis.Style) void {
+    var text: [16]u8 = undefined;
+    const length = formatNumCol(&text, no);
+    paintStaticDigits(win, row, text[0..length], style);
+}
+
+fn formatNumCol(output: []u8, no: ?u32) usize {
+    if (no) |number| return (std.fmt.bufPrint(output, "{d: >4}", .{number}) catch return 0).len;
+    @memcpy(output[0..4], "    ");
+    return 4;
+}
+
+fn paintStaticDigits(win: vaxis.Window, row: u16, text: []const u8, style: vaxis.Style) void {
+    for (text, 0..) |byte, column| {
+        if (column >= win.width) break;
+        win.writeCell(@intCast(column), row, .{ .char = .{ .grapheme = digitGlyph(byte), .width = 1 }, .style = style });
+    }
+}
+
+fn digitGlyph(byte: u8) []const u8 {
+    return switch (byte) {
+        '0' => "0",
+        '1' => "1",
+        '2' => "2",
+        '3' => "3",
+        '4' => "4",
+        '5' => "5",
+        '6' => "6",
+        '7' => "7",
+        '8' => "8",
+        '9' => "9",
+        else => " ",
+    };
 }
 
 fn fillRow(win: vaxis.Window, row: u16, style: vaxis.Style) void {
