@@ -69,23 +69,23 @@ pub const TreeSitterHighlighter = struct {
 
     const vtable: bbr.highlight.Highlighter.VTable = .{ .highlight = highlightImpl };
 
-    fn highlightImpl(ptr: *anyopaque, allocator: Allocator, path: []const u8, content: []const u8) anyerror!bbr.highlight.HighlightResult {
+    fn highlightImpl(ptr: *anyopaque, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8) anyerror!bbr.highlight.HighlightResult {
         const self: *TreeSitterHighlighter = @ptrCast(@alignCast(ptr));
         if (self.registry) |registry| {
             if (registry.matchName(path, content) != null) {
-                const grammar = registry.grammar(path, content) catch return self.highlightBuiltIn(allocator, path, content) catch .{ .spans = &.{} };
+                const grammar = registry.grammar(path, content) catch return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content) catch .{ .spans = &.{} };
                 if (grammar) |selected| {
-                    return highlightWithPackage(allocator, selected.package, content, null) catch
-                        self.highlightBuiltIn(allocator, path, content) catch .{ .spans = &.{} };
+                    return highlightWithPackage(result_allocator, scratch_allocator, selected.package, content, null) catch
+                        self.highlightBuiltIn(result_allocator, scratch_allocator, path, content) catch .{ .spans = &.{} };
                 }
             }
         }
-        return self.highlightBuiltIn(allocator, path, content);
+        return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content);
     }
 
-    fn highlightBuiltIn(self: *TreeSitterHighlighter, allocator: Allocator, path: []const u8, content: []const u8) !bbr.highlight.HighlightResult {
+    fn highlightBuiltIn(self: *TreeSitterHighlighter, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8) !bbr.highlight.HighlightResult {
         const selected = grammar_match.selectBuiltIn(path, content) orelse return .{ .spans = &.{} };
-        return highlightWithPackage(allocator, &self.packages[@intFromEnum(selected)], content, null);
+        return highlightWithPackage(result_allocator, scratch_allocator, &self.packages[@intFromEnum(selected)], content, null);
     }
 };
 
@@ -114,13 +114,15 @@ fn highlightWithQueryLimit(allocator: Allocator, grammar_language: *const c.TSLa
     var diagnostic: predicate_mod.Diagnostic = undefined;
     var package = try RuntimePackage.init(allocator, grammar_language, query_source, locals_query_source, &diagnostic);
     defer package.deinit();
-    return highlightWithPackage(allocator, &package, content, match_limit);
+    return highlightWithPackage(allocator, allocator, &package, content, match_limit);
 }
 
-fn highlightWithPackage(allocator: Allocator, package: *const RuntimePackage, content: []const u8, match_limit: ?u32) !bbr.highlight.HighlightResult {
-    const intervals = try collectCaptureIntervals(allocator, package, content, match_limit);
-    defer allocator.free(intervals);
-    return .{ .spans = try mergeCaptureIntervals(allocator, package, content, intervals) };
+fn highlightWithPackage(result_allocator: Allocator, scratch_allocator: Allocator, package: *const RuntimePackage, content: []const u8, match_limit: ?u32) !bbr.highlight.HighlightResult {
+    const intervals = try collectCaptureIntervals(scratch_allocator, package, content, match_limit);
+    defer scratch_allocator.free(intervals);
+    const spans = try mergeCaptureIntervals(scratch_allocator, package, content, intervals);
+    defer scratch_allocator.free(spans);
+    return .{ .spans = try result_allocator.dupe(bbr.highlight.Span, spans) };
 }
 
 const CaptureInterval = struct {

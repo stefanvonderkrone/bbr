@@ -37,6 +37,7 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - [Add the ASCII cell-width fast path](issues/11-add-ascii-cell-width-fast-path.md) — SIMD printable-ASCII detection and batched vaxis width measurement preserve terminal geometry while cutting one MiB ASCII measurement latency by 99.86%.
 - [Remove frame paint allocation](issues/12-remove-frame-paint-allocation.md) — Static gutter glyphs and first-pass cursor styling remove all measured frame allocations and cut median paint latency by 6.7%.
 - [Select P1 actions from the P0 profile](issues/13-select-p1-actions.md) — Actions 11, 13, 14, 15, 16, and 18 pass; measured costs reject Actions 12 and 17.
+- [Release Highlighter scratch memory](issues/14-release-highlighter-scratch-memory.md) — File Enrichment releases per-side scratch, retains exact Spans, and caps retained Buffer and frame arena capacity.
 
 ## Not yet specified
 

@@ -180,6 +180,73 @@ pub fn run(
     );
 }
 
+pub fn runSplit(
+    writer: *std.Io.Writer,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    calibrations: Calibrations,
+    name: []const u8,
+    ceiling: Ceiling,
+    units_per_sample: usize,
+    context: anytype,
+    comptime benchmark: anytype,
+    comptime checksumOutput: anytype,
+) !void {
+    for (0..warmup_count) |_| {
+        var counting: CountingAllocator = .{ .backing = gpa };
+        var result_arena = std.heap.ArenaAllocator.init(counting.allocator());
+        defer result_arena.deinit();
+        var scratch_arena = std.heap.ArenaAllocator.init(counting.allocator());
+        const output = try benchmark(result_arena.allocator(), scratch_arena.allocator(), context);
+        scratch_arena.deinit();
+        std.mem.doNotOptimizeAway(checksumOutput(output));
+    }
+
+    var durations: [sample_count]u64 = undefined;
+    var allocations: [sample_count]usize = undefined;
+    var peaks: [sample_count]usize = undefined;
+    var retained: [sample_count]usize = undefined;
+    var expected_checksum: ?u64 = null;
+
+    for (0..sample_count) |sample| {
+        var counting: CountingAllocator = .{ .backing = gpa };
+        var result_arena = std.heap.ArenaAllocator.init(counting.allocator());
+        var scratch_arena = std.heap.ArenaAllocator.init(counting.allocator());
+        const start = std.Io.Clock.awake.now(io);
+        const output = try benchmark(result_arena.allocator(), scratch_arena.allocator(), context);
+        scratch_arena.deinit();
+        durations[sample] = elapsedNanoseconds(start, io);
+        const checksum = checksumOutput(output);
+        allocations[sample] = counting.allocation_count;
+        peaks[sample] = counting.peak_bytes;
+        retained[sample] = result_arena.queryCapacity();
+        result_arena.deinit();
+
+        if (expected_checksum) |expected| {
+            if (checksum != expected) return error.UnstableBenchmarkOutput;
+        } else {
+            expected_checksum = checksum;
+        }
+    }
+
+    std.mem.sort(u64, &durations, {}, std.sort.asc(u64));
+    std.mem.sort(usize, &allocations, {}, std.sort.asc(usize));
+    std.mem.sort(usize, &peaks, {}, std.sort.asc(usize));
+    std.mem.sort(usize, &retained, {}, std.sort.asc(usize));
+    const median_ns = durations[sample_count / 2];
+    const p95_ns = durations[(sample_count * 95 + 99) / 100 - 1];
+    const ceiling_rate = switch (ceiling) {
+        .instruction_throughput => calibrations.instruction_units_per_second,
+        .memory_bandwidth => calibrations.memory_bytes_per_second,
+    };
+    const measured_rate = rate(units_per_sample, median_ns);
+    const gap = if (measured_rate < ceiling_rate) (ceiling_rate - measured_rate) * 100.0 / ceiling_rate else 0;
+    try writer.print(
+        "benchmark={s} median_ns={d} p95_ns={d} allocations={d} peak_bytes={d} retained_bytes={d} checksum={x} ceiling={s} ceiling_rate={d:.2} measured_rate={d:.2} gap_percent={d:.2}\n",
+        .{ name, median_ns, p95_ns, allocations[sample_count / 2], peaks[sample_count / 2], retained[sample_count / 2], expected_checksum.?, @tagName(ceiling), ceiling_rate, measured_rate, gap },
+    );
+}
+
 pub fn repeat(
     writer: *std.Io.Writer,
     gpa: std.mem.Allocator,
@@ -194,6 +261,33 @@ pub fn repeat(
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const output = try benchmark(arena.allocator(), context);
+        const checksum = checksumOutput(output);
+        std.mem.doNotOptimizeAway(checksum);
+        if (expected_checksum) |expected| {
+            if (checksum != expected) return error.UnstableBenchmarkOutput;
+        } else {
+            expected_checksum = checksum;
+        }
+    }
+    try writer.print("profile={s} repetitions={d} checksum={x}\n", .{ name, count, expected_checksum.? });
+}
+
+pub fn repeatSplit(
+    writer: *std.Io.Writer,
+    gpa: std.mem.Allocator,
+    name: []const u8,
+    count: usize,
+    context: anytype,
+    comptime benchmark: anytype,
+    comptime checksumOutput: anytype,
+) !void {
+    var expected_checksum: ?u64 = null;
+    for (0..count) |_| {
+        var result_arena = std.heap.ArenaAllocator.init(gpa);
+        defer result_arena.deinit();
+        var scratch_arena = std.heap.ArenaAllocator.init(gpa);
+        const output = try benchmark(result_arena.allocator(), scratch_arena.allocator(), context);
+        scratch_arena.deinit();
         const checksum = checksumOutput(output);
         std.mem.doNotOptimizeAway(checksum);
         if (expected_checksum) |expected| {

@@ -7439,7 +7439,7 @@ const PersistenceTestHighlighter = struct {
 
     const vtable: bbr.highlight.Highlighter.VTable = .{ .highlight = highlight };
 
-    fn highlight(_: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
+    fn highlight(_: *anyopaque, allocator: Allocator, _: Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
         const spans = try allocator.alloc(bbr.highlight.Span, 1);
         spans[0] = .{
             .line = 1,
@@ -10800,7 +10800,7 @@ const TestNoopHighlighter = struct {
 
     const vtable: bbr.highlight.Highlighter.VTable = .{ .highlight = highlight };
 
-    fn highlight(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
+    fn highlight(_: *anyopaque, _: Allocator, _: Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
         return .{ .spans = &.{} };
     }
 };

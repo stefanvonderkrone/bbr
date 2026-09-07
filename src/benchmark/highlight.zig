@@ -14,6 +14,10 @@ pub fn run(allocator: std.mem.Allocator, context: *const Context) !bbr.highlight
     return context.highlighter.highlighter().highlight(allocator, context.path, context.content);
 }
 
+pub fn runSplit(result_allocator: std.mem.Allocator, scratch_allocator: std.mem.Allocator, context: *const Context) !bbr.highlight.HighlightResult {
+    return context.highlighter.highlighter().highlightWithScratch(result_allocator, scratch_allocator, context.path, context.content);
+}
+
 pub fn checksum(result: bbr.highlight.HighlightResult) u64 {
     var hash = std.hash.Wyhash.init(0);
     for (result.spans) |span| {

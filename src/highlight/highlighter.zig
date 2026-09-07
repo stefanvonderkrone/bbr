@@ -82,11 +82,15 @@ pub const Highlighter = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        highlight: *const fn (ptr: *anyopaque, allocator: Allocator, path: []const u8, content: []const u8) anyerror!Result,
+        highlight: *const fn (ptr: *anyopaque, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8) anyerror!Result,
     };
 
     pub fn highlight(self: Highlighter, allocator: Allocator, path: []const u8, content: []const u8) !Result {
-        return self.vtable.highlight(self.ptr, allocator, path, content);
+        return self.highlightWithScratch(allocator, allocator, path, content);
+    }
+
+    pub fn highlightWithScratch(self: Highlighter, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8) !Result {
+        return self.vtable.highlight(self.ptr, result_allocator, scratch_allocator, path, content);
     }
 };
 
@@ -98,7 +102,7 @@ pub const PlainHighlighter = struct {
 
     const vtable: Highlighter.VTable = .{ .highlight = highlightImpl };
 
-    fn highlightImpl(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) anyerror!Result {
+    fn highlightImpl(_: *anyopaque, _: Allocator, _: Allocator, _: []const u8, _: []const u8) anyerror!Result {
         return .{ .spans = &.{} };
     }
 };

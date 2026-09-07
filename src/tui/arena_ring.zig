@@ -7,8 +7,9 @@
 //!
 //! With `n = 2` you get classic double-buffering — enough for the viewer, which
 //! only ever holds one live buffer plus the one being built. Each arena keeps
-//! its backing pages across resets (`.retain_capacity`), so steady-state
-//! rebuilds don't churn the OS allocator.
+//! its backing pages across resets up to a limit, so steady-state rebuilds do
+//! not churn the OS allocator and an unusually large review does not set the
+//! retained baseline forever.
 //!
 //! The ring must live at a stable address once `next()` has handed out an
 //! allocator (the returned `Allocator` points into the ring); take a `*Ring`
@@ -16,6 +17,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const default_retained_limit = 64 * 1024 * 1024;
 
 pub fn ArenaRing(comptime n: usize) type {
     comptime std.debug.assert(n >= 1);
@@ -25,11 +27,16 @@ pub fn ArenaRing(comptime n: usize) type {
         arenas: [n]std.heap.ArenaAllocator,
         idx: usize = 0,
         staging_idx: ?usize = null,
+        retained_limit: usize,
 
         /// Build a ring of `n` arenas over `backing`. Safe to move the returned
         /// value into its final home before the first `begin()`.
         pub fn init(backing: Allocator) Self {
-            var self: Self = .{ .arenas = undefined, .idx = 0, .staging_idx = null };
+            return initWithRetainedLimit(backing, default_retained_limit);
+        }
+
+        pub fn initWithRetainedLimit(backing: Allocator, retained_limit: usize) Self {
+            var self: Self = .{ .arenas = undefined, .retained_limit = retained_limit };
             for (&self.arenas) |*a| a.* = std.heap.ArenaAllocator.init(backing);
             return self;
         }
@@ -45,7 +52,7 @@ pub fn ArenaRing(comptime n: usize) type {
         pub fn begin(self: *Self) Allocator {
             std.debug.assert(self.staging_idx == null);
             const next_idx = (self.idx + 1) % n;
-            _ = self.arenas[next_idx].reset(.retain_capacity);
+            _ = self.arenas[next_idx].reset(.{ .retain_with_limit = self.retained_limit });
             self.staging_idx = next_idx;
             return self.arenas[next_idx].allocator();
         }
@@ -101,6 +108,17 @@ test "rotation cycles through all arenas and retains capacity" {
         _ = try a.alloc(u8, 4096);
         ring.commit();
     }
+}
+
+test "rotation caps retained capacity after an unusually large build" {
+    var ring = ArenaRing(1).initWithRetainedLimit(testing.allocator, 1024);
+    defer ring.deinit();
+
+    _ = try ring.begin().alloc(u8, 4096);
+    ring.commit();
+    _ = ring.begin();
+    try testing.expect(ring.arenas[0].queryCapacity() <= 1024);
+    ring.abort();
 }
 
 test "a ring of 1 degrades to a single reset-reuse arena" {

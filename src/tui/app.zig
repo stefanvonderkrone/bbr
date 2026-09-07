@@ -23,6 +23,7 @@ const Session = session.Session;
 
 const Credential = bbr.bitbucket.Credential;
 const PendingReviewStore = bbr.review.PendingReviewStore;
+const frame_arena_retained_limit = 4 * 1024 * 1024;
 
 /// Everything `run` needs to fetch and switch PRs. `online` is false for the
 /// offline `demo`, which disables the network-backed Picker. `store` persists
@@ -233,7 +234,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
                 render.drawSubmissionTree(frame, content_win, ctx.active_theme, tree);
         if (projection.help_visible) render.drawHelp(frame, content_win, ctx.active_theme, ctx.keymap, projection.action_availability);
         try vx.render(writer);
-        _ = frame_arena.reset(.retain_capacity);
+        _ = frame_arena.reset(.{ .retain_with_limit = frame_arena_retained_limit });
     }
 }
 

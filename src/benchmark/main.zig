@@ -184,15 +184,15 @@ pub fn main(init: std.process.Init) !void {
     for (&highlight_benchmarks) |*benchmark| {
         if (selected == null or std.mem.eql(u8, selected.?, benchmark.name)) {
             matched = true;
-            if (repeat_count) |count| try harness.repeat(
+            if (repeat_count) |count| try harness.repeatSplit(
                 writer,
                 init.gpa,
                 benchmark.name,
                 count,
                 &benchmark.context,
-                highlight.run,
+                highlight.runSplit,
                 highlight.checksum,
-            ) else try harness.run(
+            ) else try harness.runSplit(
                 writer,
                 init.io,
                 init.gpa,
@@ -201,7 +201,7 @@ pub fn main(init: std.process.Init) !void {
                 .instruction_throughput,
                 benchmark.context.content.len,
                 &benchmark.context,
-                highlight.run,
+                highlight.runSplit,
                 highlight.checksum,
             );
         }

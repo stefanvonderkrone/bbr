@@ -176,7 +176,9 @@ fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight
         side.retained_bytes = retainedBytes(side);
         return .{ .owned = side };
     }
-    const highlights = highlighter.highlight(allocator, path, side.blob) catch |err| {
+    var scratch = std.heap.ArenaAllocator.init(backing);
+    defer scratch.deinit();
+    const highlights = highlighter.highlightWithScratch(allocator, scratch.allocator(), path, side.blob) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         side.highlighting = .{ .failed = err };
         side.retained_bytes = retainedBytes(side);
@@ -190,7 +192,7 @@ fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight
 fn retainedBytes(side: *const OwnedSide) usize {
     // ArenaAllocator.queryCapacity excludes its internal linked-list nodes but
     // includes every allocation the owned side keeps alive: blob, Highlight
-    // output and any scratch capacity not individually freed.
+    // output. Highlighter scratch has already been released.
     return side.arena.queryCapacity();
 }
 
@@ -595,6 +597,7 @@ fn ownedAddedResult(backing: Allocator, blob: []const u8) !Result {
 
 const ScriptedHighlighter = struct {
     calls: usize = 0,
+    scratch_bytes: usize = 0,
 
     fn highlighter(self: *ScriptedHighlighter) bbr.highlight.Highlighter {
         return .{ .ptr = self, .vtable = &vtable };
@@ -602,9 +605,11 @@ const ScriptedHighlighter = struct {
 
     const vtable: bbr.highlight.Highlighter.VTable = .{ .highlight = highlight };
 
-    fn highlight(ptr: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
+    fn highlight(ptr: *anyopaque, allocator: std.mem.Allocator, scratch_allocator: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
         const self: *ScriptedHighlighter = @ptrCast(@alignCast(ptr));
         self.calls += 1;
+        const scratch = try scratch_allocator.alloc(u8, self.scratch_bytes);
+        std.mem.doNotOptimizeAway(scratch);
         const spans = try allocator.alloc(bbr.highlight.Span, 1);
         spans[0] = .{
             .line = 1,
@@ -623,7 +628,7 @@ const FailingHighlighter = struct {
 
     const vtable: bbr.highlight.Highlighter.VTable = .{ .highlight = highlight };
 
-    fn highlight(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
+    fn highlight(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
         return error.InvalidCapture;
     }
 };
@@ -691,6 +696,28 @@ test "an added File transfers its enriched new side into Session storage" {
     try testing.expectEqual(@as(usize, 1), projected.new.content.highlighting.ready.spans.len);
     try testing.expectEqual(bbr.highlight.CaptureRole.keyword, projected.new.content.highlighting.ready.spans[0].capture.role);
     try testing.expectError(error.AlreadyTransferred, storage.admit(0, &result));
+}
+
+test "File Enrichment releases Highlighter scratch before it retains a side" {
+    const responses = [_]bbr.http.Canned{.{ .status = 200, .body = "const answer = 42;\n" }};
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var scripted: ScriptedHighlighter = .{ .scratch_bytes = 1024 * 1024 };
+
+    var result = try enrich(testing.allocator, bb, scripted.highlighter(), .{
+        .repo = "repo",
+        .status = .added,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "/dev/null",
+        .new_path = "src/main.ts",
+        .max_file_bytes = 0,
+    });
+    defer result.deinit();
+
+    try testing.expect(result.new.owned.retained_bytes < scripted.scratch_bytes);
+    try testing.expectEqualStrings("const answer = 42;\n", result.new.owned.blob);
+    try testing.expectEqual(@as(usize, 1), result.new.owned.highlighting.ready.spans.len);
 }
 
 test "local Git blob source uses the same File Enrichment pipeline" {
