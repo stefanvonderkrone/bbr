@@ -793,9 +793,9 @@ const Weave = struct {
             switch (lines[i].kind) {
                 .context => {
                     const line = try decoratedLine(w.a, &lines[i], w.span_cursors.lineSpans(lines[i]), &.{});
-                    const pair: LinePair = if (lines[i].new_no == null)
+                    const pair: LinePair = if (lines[i].new_no == 0)
                         .{ .left = line }
-                    else if (lines[i].old_no == null)
+                    else if (lines[i].old_no == 0)
                         .{ .right = line }
                     else
                         .{ .left = line, .right = line };
@@ -973,8 +973,8 @@ const Weave = struct {
         // only Hunk lines bind comments/Drafts (M9 anchor safety).
         if (!ln.in_hunk) return;
         if (w.anchors.count() == 0) return;
-        const new = if (ln.new_no) |line| w.anchors.get(.{ .path = file.new_path, .line = line, .side = .new }) else null;
-        const old = if (ln.old_no) |line| w.anchors.get(.{ .path = file.old_path, .line = line, .side = .old }) else null;
+        const new = if (ln.newNo()) |line| w.anchors.get(.{ .path = file.new_path, .line = line, .side = .new }) else null;
+        const old = if (ln.oldNo()) |line| w.anchors.get(.{ .path = file.old_path, .line = line, .side = .old }) else null;
         const new_threads = if (new) |bucket| bucket.threads.items else &.{};
         const old_threads = if (old) |bucket| bucket.threads.items else &.{};
         var new_index: usize = 0;
@@ -1046,12 +1046,12 @@ const SpanCursors = struct {
 
     fn lineSpans(cursors: *SpanCursors, line: model.Line) []const decoration.Span {
         return switch (line.kind) {
-            .removed => if (cursors.old) |*cursor| cursor.lineSpans(line.old_no) else &.{},
-            .added => if (cursors.new) |*cursor| cursor.lineSpans(line.new_no) else &.{},
+            .removed => if (cursors.old) |*cursor| cursor.lineSpans(line.oldNo()) else &.{},
+            .added => if (cursors.new) |*cursor| cursor.lineSpans(line.newNo()) else &.{},
             .context => if (cursors.new) |*cursor|
-                cursor.lineSpans(line.new_no)
+                cursor.lineSpans(line.newNo())
             else if (cursors.old) |*cursor|
-                cursor.lineSpans(line.old_no)
+                cursor.lineSpans(line.oldNo())
             else
                 &.{},
         };
@@ -1084,7 +1084,7 @@ fn spliceOldSide(allocator: std.mem.Allocator, file: model.File, blob: []const u
             const text = blobLine(lines.items, old_cursor) orelse break;
             try out.append(allocator, .{
                 .old_no = old_cursor,
-                .new_no = null,
+                .new_no = 0,
                 .kind = .context,
                 .text = text,
                 .in_hunk = false,
@@ -1097,7 +1097,7 @@ fn spliceOldSide(allocator: std.mem.Allocator, file: model.File, blob: []const u
     while (blobLine(lines.items, old_cursor)) |text| : (old_cursor += 1) {
         try out.append(allocator, .{
             .old_no = old_cursor,
-            .new_no = null,
+            .new_no = 0,
             .kind = .context,
             .text = text,
             .in_hunk = false,
@@ -1166,9 +1166,9 @@ fn trimTrailingNewline(s: []const u8) []const u8 {
 
 /// old_no for an unchanged new line, clamped to a non-negative u32 (a mismatched
 /// blob could in theory drive it negative; a wrong gutter number beats a crash).
-fn offsetOldNo(new_no: u32, old_off: i64) ?u32 {
+fn offsetOldNo(new_no: u32, old_off: i64) u32 {
     const v = @as(i64, new_no) + old_off;
-    return if (v < 1) null else @intCast(v);
+    return if (v < 1) 0 else @intCast(v);
 }
 
 /// The 1-based `n`th line of a blob already split into lines, or null if out of
@@ -1513,8 +1513,8 @@ test "bounded intraline work keeps whole-line emphasis" {
         }
     }
     const lines = [_]model.Line{
-        .{ .old_no = 1, .new_no = null, .kind = .removed, .text = old.items },
-        .{ .old_no = null, .new_no = 1, .kind = .added, .text = new.items },
+        .{ .old_no = 1, .new_no = 0, .kind = .removed, .text = old.items },
+        .{ .old_no = 0, .new_no = 1, .kind = .added, .text = new.items },
     };
 
     const emphasis = try computeEmphasis(a, &lines);
@@ -2085,7 +2085,7 @@ test "an inline thread is woven right under its anchored line, replies indented"
     // Each ReviewCard has a header followed by its projected body.
     try testing.expectEqual(@as(usize, 9), buf.rows.len);
     try testing.expect(buf.rows[4] == .line);
-    try testing.expectEqual(@as(?u32, 2), buf.rows[4].line.line.new_no);
+    try testing.expectEqual(@as(?u32, 2), buf.rows[4].line.line.newNo());
     try testing.expect(buf.rows[5] == .comment);
     try testing.expect(!buf.rows[5].comment.isReply());
     try testing.expectEqual(@as(review.CommentId, 1), buf.rows[5].comment.commentItem().id);
@@ -2249,7 +2249,7 @@ test "an anchored draft is woven under its line; a PR-level draft gets a pending
     for (buf.rows, 0..) |r, i| {
         if (r == .draft and r.draft.draftItem().local_id == 2 and r.draft.part == .header) {
             try testing.expect(buf.rows[i - 1] == .line);
-            try testing.expectEqual(@as(?u32, 2), buf.rows[i - 1].line.line.new_no);
+            try testing.expectEqual(@as(?u32, 2), buf.rows[i - 1].line.line.newNo());
         }
     }
 }
@@ -2498,7 +2498,7 @@ test "whole_file splices blob gaps around the hunk, hunk lines preserved" {
     try testing.expectEqual(@as(usize, 7), buf.rows.len);
     const first = buf.rows[1].line;
     try testing.expectEqualStrings("a", first.line.text);
-    try testing.expectEqual(@as(?u32, 1), first.line.new_no);
+    try testing.expectEqual(@as(?u32, 1), first.line.newNo());
     try testing.expect(!first.line.in_hunk); // blob-sourced gap line
 
     // The hunk's context "b" is a real Hunk line.
@@ -2512,7 +2512,7 @@ test "whole_file splices blob gaps around the hunk, hunk lines preserved" {
     // The trailing gap line "e" comes from the blob.
     const last = buf.rows[6].line;
     try testing.expectEqualStrings("e", last.line.text);
-    try testing.expectEqual(@as(?u32, 5), last.line.new_no);
+    try testing.expectEqual(@as(?u32, 5), last.line.newNo());
     try testing.expect(!last.line.in_hunk);
 }
 
@@ -2531,12 +2531,12 @@ test "whole_file splices removed Files from old content without changing Hunk Li
     try testing.expectEqual(@as(usize, 0), countKind(buf, .hunk_header));
     try testing.expectEqual(@as(usize, 4), countKind(buf, .line));
     try testing.expectEqualStrings("a", buf.rows[1].line.line.text);
-    try testing.expectEqual(@as(?u32, 1), buf.rows[1].line.line.old_no);
+    try testing.expectEqual(@as(?u32, 1), buf.rows[1].line.line.oldNo());
     try testing.expect(!buf.rows[1].line.line.in_hunk);
     try testing.expectEqual(diff.files[0].hunks[0].lines[0], buf.rows[2].line.line.*);
     try testing.expectEqual(diff.files[0].hunks[0].lines[1], buf.rows[3].line.line.*);
     try testing.expectEqualStrings("d", buf.rows[4].line.line.text);
-    try testing.expectEqual(@as(?u32, 4), buf.rows[4].line.line.old_no);
+    try testing.expectEqual(@as(?u32, 4), buf.rows[4].line.line.oldNo());
     try testing.expect(!buf.rows[4].line.line.in_hunk);
     try testing.expectEqual(@as(usize, 0), countKind(buf, .comment));
     try testing.expectEqual(SectionKind.pending, buf.rows[5].section.kind);
@@ -2693,8 +2693,8 @@ test "Line decoration selects old Spans for removed and new Spans for added and 
         .new = .{ .spans = &new_spans },
     }};
 
-    const removed: model.Line = .{ .old_no = 4, .new_no = null, .kind = .removed, .text = "old" };
-    const added: model.Line = .{ .old_no = null, .new_no = 7, .kind = .added, .text = "new" };
+    const removed: model.Line = .{ .old_no = 4, .new_no = 0, .kind = .removed, .text = "old" };
+    const added: model.Line = .{ .old_no = 0, .new_no = 7, .kind = .added, .text = "new" };
     const context: model.Line = .{ .old_no = 6, .new_no = 8, .kind = .context, .text = "ctx" };
     var cursors = SpanCursors.init(&highlights, 0);
     try testing.expectEqual(@as(u16, 1), cursors.lineSpans(removed)[0].capture.id);
@@ -2706,7 +2706,7 @@ test "an incompatible blob Span leaves only that diff Line plain" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const line: model.Line = .{ .old_no = null, .new_no = 52, .kind = .added, .text = "short" };
+    const line: model.Line = .{ .old_no = 0, .new_no = 52, .kind = .added, .text = "short" };
     const incompatible = [_]decoration.Span{.{
         .line = 52,
         .start = 5,
@@ -2746,7 +2746,7 @@ test "a moved local Draft is woven at its projected Anchor" {
     });
     for (buf.rows, 0..) |row, index| if (row == .draft and row.draft.part == .header) {
         try testing.expect(buf.rows[index - 1] == .line);
-        try testing.expectEqual(@as(?u32, 1), buf.rows[index - 1].line.line.new_no);
+        try testing.expectEqual(@as(?u32, 1), buf.rows[index - 1].line.line.newNo());
     };
 }
 

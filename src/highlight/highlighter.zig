@@ -54,8 +54,8 @@ pub const Capture = struct {
 /// A half-open UTF-8 byte range within one numbered file line.
 pub const Span = struct {
     line: u32,
-    start: usize,
-    end: usize,
+    start: u32,
+    end: u32,
     capture: Capture,
 };
 
@@ -113,6 +113,10 @@ test "Capture classifies hierarchical names once" {
     try testing.expectEqual(CaptureRole.function, Capture.init(7, "function.call.builtin").role);
     try testing.expectEqual(CaptureRole.keyword, Capture.init(8, "operator").role);
     try testing.expectEqual(CaptureRole.unknown, Capture.init(9, "future.capture").role);
+}
+
+test "Span uses compact offsets and Capture identity" {
+    try testing.expectEqual(@as(usize, 16), @sizeOf(Span));
 }
 
 test "PlainHighlighter satisfies the seam with no Spans" {

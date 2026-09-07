@@ -249,7 +249,7 @@ fn mapOldLine(file: diff_mod.File, target: u32) ?u32 {
         if (target < old_end) {
             for (hunk.lines) |line| {
                 if (line.old_no != target) continue;
-                return line.new_no;
+                return line.newNo();
             }
             return null;
         }

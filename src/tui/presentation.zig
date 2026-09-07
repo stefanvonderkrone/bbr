@@ -1862,7 +1862,7 @@ fn scopeAnchorExists(diff: bbr.diff.Diff, anchor: bbr.review.Anchor) bool {
         for (file.hunks) |hunk| {
             var wanted = top;
             for (hunk.lines) |line| {
-                const number = if (old_side) line.old_no else line.new_no;
+                const number = if (old_side) line.oldNo() else line.newNo();
                 if (number == wanted) {
                     if (wanted == bottom) return true;
                     wanted += 1;
@@ -6658,29 +6658,29 @@ fn spanFromLines(lines: []const *const bbr.diff.Line, suggestion: bool) !AnchorS
     var all_old = true;
     for (lines) |line| {
         if (!line.in_hunk) return error.NotOnSource;
-        if (line.new_no == null) all_new = false;
-        if (line.old_no == null) all_old = false;
+        if (line.new_no == 0) all_new = false;
+        if (line.old_no == 0) all_old = false;
     }
     if (!all_new and !all_old) return error.MixedSides;
     if (all_new) {
         for (lines[1..], 1..) |line, index| {
-            if (line.new_no.? != lines[index - 1].new_no.? + 1) return error.NonContiguous;
+            if (line.new_no != lines[index - 1].new_no + 1) return error.NonContiguous;
         }
-        const last = lines[lines.len - 1].new_no.?;
-        return if (lines.len == 1) .{ .to = last } else .{ .to = last, .start_to = lines[0].new_no.? };
+        const last = lines[lines.len - 1].new_no;
+        return if (lines.len == 1) .{ .to = last } else .{ .to = last, .start_to = lines[0].new_no };
     }
     if (suggestion) return error.SuggestionOnRemoved;
     for (lines[1..], 1..) |line, index| {
-        if (line.old_no.? != lines[index - 1].old_no.? + 1) return error.NonContiguous;
+        if (line.old_no != lines[index - 1].old_no + 1) return error.NonContiguous;
     }
-    const last = lines[lines.len - 1].old_no.?;
-    return if (lines.len == 1) .{ .from = last } else .{ .from = last, .start_from = lines[0].old_no.? };
+    const last = lines[lines.len - 1].old_no;
+    return if (lines.len == 1) .{ .from = last } else .{ .from = last, .start_from = lines[0].old_no };
 }
 
 test "full-content context Lines cannot become Anchors" {
     const context: bbr.diff.Line = .{
         .old_no = 1,
-        .new_no = null,
+        .new_no = 0,
         .kind = .context,
         .text = "old context",
         .in_hunk = false,
@@ -9207,7 +9207,7 @@ fn sourceRow(presentation: *Presentation, side: AnchorSide, number: u32) !usize 
         const line = lineAtRow(row) orelse continue;
         switch (side) {
             .new => if (line.new_no == number) return index,
-            .old => if (line.old_no == number and line.new_no == null) return index,
+            .old => if (line.old_no == number and line.new_no == 0) return index,
         }
     }
     return error.SourceRowNotFound;
@@ -10092,7 +10092,7 @@ test "success selects the next surviving semantic row and falls back to the prev
     try presentation.dispatch(.{ .action = .delete_review_item });
     try presentation.dispatch(.{ .delete_confirmation = .confirm });
     const forward = presentation.published.?.buffer.rows[presentation.published.?.navigation.cursor];
-    try testing.expectEqual(@as(?u32, 2), lineAtRow(forward).?.new_no);
+    try testing.expectEqual(@as(?u32, 2), lineAtRow(forward).?.newNo());
 
     // Nothing semantic follows the last Draft, so the cursor falls back to the
     // nearest source row before it.
@@ -10100,7 +10100,7 @@ test "success selects the next surviving semantic row and falls back to the prev
     try presentation.dispatch(.{ .action = .delete_review_item });
     try presentation.dispatch(.{ .delete_confirmation = .confirm });
     const back = presentation.published.?.buffer.rows[presentation.published.?.navigation.cursor];
-    try testing.expectEqual(@as(?u32, 40), lineAtRow(back).?.new_no);
+    try testing.expectEqual(@as(?u32, 40), lineAtRow(back).?.newNo());
 }
 
 test "a Session replacement disarms a delete confirmation and a deleted subtree stays gone" {
@@ -10148,7 +10148,7 @@ test "Suggest derives an Anchor and persists a fenced seeded Draft" {
     const review = presentation.projection().review.?;
     var added_row: usize = 0;
     for (review.buffer.rows, 0..) |row, index| switch (row) {
-        .line => |line| if (line.line.new_no != null) {
+        .line => |line| if (line.line.new_no != 0) {
             added_row = index;
             break;
         },
@@ -10242,7 +10242,7 @@ test "inline Composer allocation failure publishes no invalid Overlay" {
     const rows = presentation.projection().review.?.buffer.rows;
     var added_row: usize = 0;
     for (rows, 0..) |row, index| switch (row) {
-        .line => |line| if (line.line.new_no != null) {
+        .line => |line| if (line.line.new_no != 0) {
             added_row = index;
             break;
         },

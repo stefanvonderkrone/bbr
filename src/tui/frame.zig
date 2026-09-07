@@ -598,8 +598,8 @@ test "visual rows use the injected CellMetrics seam" {
 }
 
 test "Presentation Frame projects Diff Lines as complete visual rows" {
-    const line: bbr.diff.Line = .{ .old_no = null, .new_no = 1, .kind = .added, .text = "const answer = 42" };
-    const old_line: bbr.diff.Line = .{ .old_no = 1, .new_no = null, .kind = .removed, .text = "const answer = 41" };
+    const line: bbr.diff.Line = .{ .old_no = 0, .new_no = 1, .kind = .added, .text = "const answer = 42" };
+    const old_line: bbr.diff.Line = .{ .old_no = 1, .new_no = 0, .kind = .removed, .text = "const answer = 41" };
     const runs = [_]bbr.highlight.decoration.Run{
         .{ .text = line.text[0..5], .capture = bbr.highlight.Capture.init(0, "keyword") },
         .{ .text = line.text[5..], .emphasis = true },
@@ -645,7 +645,7 @@ test "Diff visual-row allocation fails before a partial projection escapes" {
 test "Unified visual rows prefer whitespace and preserve decoration slices" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const line: bbr.diff.Line = .{ .old_no = null, .new_no = 1, .kind = .added, .text = "alpha beta" };
+    const line: bbr.diff.Line = .{ .old_no = 0, .new_no = 1, .kind = .added, .text = "alpha beta" };
     const runs = [_]bbr.highlight.decoration.Run{
         .{ .text = line.text[0..3], .capture = bbr.highlight.Capture.init(0, "keyword") },
         .{ .text = line.text[3..8], .emphasis = true },
@@ -723,8 +723,8 @@ test "Unified wrapping keeps non-Line rows atomic when the body has no cells" {
 test "SideBySide halves wrap independently and align absent continuations" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const left: bbr.diff.Line = .{ .old_no = 7, .new_no = null, .kind = .removed, .text = "old one two" };
-    const right: bbr.diff.Line = .{ .old_no = null, .new_no = 9, .kind = .added, .text = "new" };
+    const left: bbr.diff.Line = .{ .old_no = 7, .new_no = 0, .kind = .removed, .text = "old one two" };
+    const right: bbr.diff.Line = .{ .old_no = 0, .new_no = 9, .kind = .added, .text = "new" };
     const rows = [_]buffer_mod.Row{.{ .line_pair = .{
         .left = .{ .line = &left, .decoration = .{ .runs = &.{.{ .text = left.text, .emphasis = true }} } },
         .right = .{ .line = &right, .decoration = .{ .runs = &.{.{ .text = right.text, .capture = bbr.highlight.Capture.init(0, "keyword") }} } },
@@ -748,7 +748,7 @@ test "SideBySide halves wrap independently and align absent continuations" {
 }
 
 test "SideBySide wrapping keeps pairs atomic when halves have no body cells" {
-    const left: bbr.diff.Line = .{ .old_no = 1, .new_no = null, .kind = .removed, .text = "long old source" };
+    const left: bbr.diff.Line = .{ .old_no = 1, .new_no = 0, .kind = .removed, .text = "long old source" };
     const rows = [_]buffer_mod.Row{.{ .line_pair = .{ .left = .{
         .line = &left,
         .decoration = .{ .runs = &.{.{ .text = left.text }} },
@@ -768,8 +768,8 @@ test "SideBySide wrapping keeps pairs atomic when halves have no body cells" {
 test "SideBySide resize restores an old-only continuation by source offset" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const left: bbr.diff.Line = .{ .old_no = 7, .new_no = null, .kind = .removed, .text = "old one two" };
-    const right: bbr.diff.Line = .{ .old_no = null, .new_no = 9, .kind = .added, .text = "new" };
+    const left: bbr.diff.Line = .{ .old_no = 7, .new_no = 0, .kind = .removed, .text = "old one two" };
+    const right: bbr.diff.Line = .{ .old_no = 0, .new_no = 9, .kind = .added, .text = "new" };
     const rows = [_]buffer_mod.Row{.{ .line_pair = .{
         .left = .{ .line = &left, .decoration = .{ .runs = &.{.{ .text = left.text }} } },
         .right = .{ .line = &right, .decoration = .{ .runs = &.{.{ .text = right.text }} } },

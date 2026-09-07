@@ -39,6 +39,7 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - [Select P1 actions from the P0 profile](issues/13-select-p1-actions.md) — Actions 11, 13, 14, 15, 16, and 18 pass; measured costs reject Actions 12 and 17.
 - [Release Highlighter scratch memory](issues/14-release-highlighter-scratch-memory.md) — File Enrichment releases per-side scratch, retains exact Spans, and caps retained Buffer and frame arena capacity.
 - [Shrink VisualRow hot data](issues/16-shrink-visual-row-hot-data.md) — Buffer-indexed cold Rows and byte-sized RowKind indexes cut 50,000-row Presentation Frame memory by 31.0% and median latency by 16.2%.
+- [Shrink Line and Span layouts](issues/17-shrink-line-and-span-layouts.md) — Zero-sentinel Line numbers and `u32` Span offsets cut their layouts by 20% and 33% without a material latency change.
 
 ## Not yet specified
 

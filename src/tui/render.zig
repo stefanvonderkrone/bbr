@@ -296,7 +296,7 @@ fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: 
     const style = theme.lineStyle(line_row.line.kind);
     fillRow(win, r, style);
     if (!visual_row.continuation) {
-        drawUnifiedGutter(win, r, line_row.line.old_no, line_row.line.new_no, theme.gutter);
+        drawUnifiedGutter(win, r, line_row.line.oldNo(), line_row.line.newNo(), theme.gutter);
     }
     drawLineBodyText(
         scratch,
@@ -354,7 +354,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer
             const style = theme.lineStyle(ln.kind);
             fillRow(win, r, style);
 
-            drawUnifiedGutter(win, r, ln.old_no, ln.new_no, theme.gutter);
+            drawUnifiedGutter(win, r, ln.oldNo(), ln.newNo(), theme.gutter);
             drawLineBody(scratch, win, r, gutter_cols, lr, theme, style);
         },
         .line_pair => |pair| drawLinePair(scratch, win, r, pair, theme),
@@ -475,7 +475,7 @@ fn drawVisualHalf(scratch: std.mem.Allocator, win: vaxis.Window, half: ?@import(
     const style = theme.lineStyle(value.line.kind);
     fillRow(win, 0, style);
     if (!value.continuation) {
-        const no = if (side == .old) value.line.old_no else value.line.new_no;
+        const no = if (side == .old) value.line.oldNo() else value.line.newNo();
         drawSideGutter(win, 0, no, theme.gutter);
     }
     drawLineBodyText(
@@ -505,8 +505,8 @@ fn drawHalf(scratch: std.mem.Allocator, win: vaxis.Window, side_row: ?LineRow, t
     const style = theme.lineStyle(lr.line.kind);
     fillRow(win, 0, style);
     const no = switch (side) {
-        .old => lr.line.old_no,
-        .new => lr.line.new_no,
+        .old => lr.line.oldNo(),
+        .new => lr.line.newNo(),
     };
     drawSideGutter(win, 0, no, theme.gutter);
     drawLineBody(scratch, win, 0, side_gutter, lr, theme, style);
@@ -1227,7 +1227,7 @@ test "disabled Diff visual-row projection clips exactly like Buffer rendering" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const line: bbr.diff.Line = .{ .old_no = null, .new_no = 1, .kind = .added, .text = "long highlighted source" };
+    const line: bbr.diff.Line = .{ .old_no = 0, .new_no = 1, .kind = .added, .text = "long highlighted source" };
     const runs = [_]bbr.highlight.decoration.Run{
         .{ .text = line.text[0..4], .capture = bbr.highlight.Capture.init(0, "keyword") },
         .{ .text = line.text[4..], .emphasis = true },
@@ -1258,8 +1258,8 @@ test "disabled SideBySide visual rows clip exactly like Buffer rendering" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const left: bbr.diff.Line = .{ .old_no = 1, .new_no = null, .kind = .removed, .text = "long old source" };
-    const right: bbr.diff.Line = .{ .old_no = null, .new_no = 1, .kind = .added, .text = "long new source" };
+    const left: bbr.diff.Line = .{ .old_no = 1, .new_no = 0, .kind = .removed, .text = "long old source" };
+    const right: bbr.diff.Line = .{ .old_no = 0, .new_no = 1, .kind = .added, .text = "long new source" };
     const rows = [_]Row{.{ .line_pair = .{
         .left = .{ .line = &left, .decoration = .{ .runs = &.{.{ .text = left.text }} } },
         .right = .{ .line = &right, .decoration = .{ .runs = &.{.{ .text = right.text }} } },
@@ -1289,7 +1289,7 @@ test "Unified continuation rows keep decoration and use a blank gutter" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const line: bbr.diff.Line = .{ .old_no = null, .new_no = 7, .kind = .added, .text = "alpha beta" };
+    const line: bbr.diff.Line = .{ .old_no = 0, .new_no = 7, .kind = .added, .text = "alpha beta" };
     const rows = [_]Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &.{
         .{ .text = line.text[0..6], .capture = bbr.highlight.Capture.init(0, "keyword") },
         .{ .text = line.text[6..], .emphasis = true },
@@ -1317,8 +1317,8 @@ test "SideBySide continuation rows keep halves inside the fixed divider" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const left: bbr.diff.Line = .{ .old_no = 7, .new_no = null, .kind = .removed, .text = "old one two" };
-    const right: bbr.diff.Line = .{ .old_no = null, .new_no = 9, .kind = .added, .text = "new" };
+    const left: bbr.diff.Line = .{ .old_no = 7, .new_no = 0, .kind = .removed, .text = "old one two" };
+    const right: bbr.diff.Line = .{ .old_no = 0, .new_no = 9, .kind = .added, .text = "new" };
     const rows = [_]Row{.{ .line_pair = .{
         .left = .{ .line = &left, .decoration = .{ .runs = &.{.{ .text = left.text, .emphasis = true }} } },
         .right = .{ .line = &right, .decoration = .{ .runs = &.{.{ .text = right.text }} } },

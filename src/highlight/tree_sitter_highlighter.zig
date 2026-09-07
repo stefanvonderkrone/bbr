@@ -260,12 +260,12 @@ fn appendIntervalSpans(
             if (spans.items.len != 0) {
                 const previous = &spans.items[spans.items.len - 1];
                 if (previous.line == state.line and previous.end == relative_start and previous.capture.id == capture_id) {
-                    previous.end = relative_end;
+                    previous.end = @intCast(relative_end);
                 } else {
-                    try spans.append(allocator, .{ .line = state.line, .start = relative_start, .end = relative_end, .capture = package.captures[capture_id] });
+                    try spans.append(allocator, .{ .line = state.line, .start = @intCast(relative_start), .end = @intCast(relative_end), .capture = package.captures[capture_id] });
                 }
             } else {
-                try spans.append(allocator, .{ .line = state.line, .start = relative_start, .end = relative_end, .capture = package.captures[capture_id] });
+                try spans.append(allocator, .{ .line = state.line, .start = @intCast(relative_start), .end = @intCast(relative_end), .capture = package.captures[capture_id] });
             }
         }
         if (newline == null or newline.? >= end) break;
@@ -726,8 +726,8 @@ fn spansFromBytePlanes(allocator: Allocator, package: *const RuntimePackage, con
             while (end < i and labels[end] == capture_id) end += 1;
             try spans.append(allocator, .{
                 .line = line,
-                .start = at - line_start,
-                .end = end - line_start,
+                .start = @intCast(at - line_start),
+                .end = @intCast(end - line_start),
                 .capture = package.captures[capture_id],
             });
             at = end;
