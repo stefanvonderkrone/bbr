@@ -145,6 +145,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
     var picker_tick_work: ?PickerTickWork = null;
     var frame_arena = std.heap.ArenaAllocator.init(ctx.gpa);
     defer frame_arena.deinit();
+    var painted_revision: ?presentation.PaintRevision = null;
 
     try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, &vx, &tty, &tty_active, &write_buf);
     try syncPickerTick(&state, ctx, &loop, &futures, &next_work_id, &picker_tick_work);
@@ -181,6 +182,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         if (state.readyToExit() and futures.items.len == 0) break;
 
         const projection = state.projection();
+        if (painted_revision) |revision| if (std.meta.eql(revision, projection.revision)) continue;
         const win = vx.window();
         const content_win = win.child(.{
             .x_off = 0,
@@ -234,6 +236,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
                 render.drawSubmissionTree(frame, content_win, ctx.active_theme, tree);
         if (projection.help_visible) render.drawHelp(frame, content_win, ctx.active_theme, ctx.keymap, projection.action_availability);
         try vx.render(writer);
+        painted_revision = projection.revision;
         _ = frame_arena.reset(.{ .retain_with_limit = frame_arena_retained_limit });
     }
 }

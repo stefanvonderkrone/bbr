@@ -848,7 +848,13 @@ pub const ReviewProjection = struct {
     frame: frame_mod.Projection,
 };
 
+pub const PaintRevision = struct {
+    interaction: frame_mod.Revision,
+    frame: frame_mod.Revision,
+};
+
 pub const Projection = struct {
+    revision: PaintRevision,
     review: ?ReviewProjection,
     submission: ?SubmissionProjection,
     submission_result: ?SubmissionResultProjection,
@@ -2897,7 +2903,7 @@ pub const Presentation = struct {
         // A candidate completion is not itself an interaction or a Frame
         // change. Keep a press across rollback; a committed replacement
         // invalidates it below when the new Session becomes published.
-        if (input != .mouse and input != .session_loaded) {
+        if (input != .mouse and input != .session_loaded and input != .ensure_focused_enrichment) {
             self.mouse_press = null;
             self.interaction_revision +%= 1;
         }
@@ -3002,6 +3008,10 @@ pub const Presentation = struct {
 
     pub fn projection(self: *const Presentation) Projection {
         return .{
+            .revision = .{
+                .interaction = self.interaction_revision,
+                .frame = if (self.published) |published| published.frame_revision else 0,
+            },
             .review = if (self.published) |published| self.reviewProjection(published) else null,
             .submission = if (self.durable_submission) |durable| blk: {
                 const progress = durable.progress();
@@ -7359,6 +7369,24 @@ test "height resize keeps cached Buffer and visual rows" {
     try testing.expectEqual(before.revision + 1, after.revision);
     try testing.expectEqual(@as(usize, after.panes.diff_content.height), after.navigation.viewport);
     try testing.expectEqual(@as(usize, after.panes.sidebar_content.height), after.file_tree.viewport);
+}
+
+test "no-op input keeps the paint revision stable" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+    });
+    defer presentation.deinit();
+
+    const before = presentation.projection().revision;
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try testing.expectEqual(before, presentation.projection().revision);
+    try presentation.dispatch(.{ .mouse = .{ .col = 0, .row = 0, .button = .unsupported, .type = .motion } });
+    try testing.expectEqual(before, presentation.projection().revision);
 }
 
 fn testTwoFileSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {

@@ -45,6 +45,7 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - [Pre-size Diff parser lists](issues/21-pre-size-diff-parser-lists.md) — Action 18 is rejected because count hints cut allocations by 1.4% without a latency or peak-memory gain.
 - [Select P2 actions from the post-P1 profile](issues/22-select-p2-actions.md) — Actions 20, 21, 22, and 23 pass; measured costs reject Actions 19 and 24.
 - [Limit Highlight query ranges](issues/24-limit-highlight-query-ranges.md) — Action 20 is rejected because visible ranges cannot preserve complete File Spans under the current Highlighter contract.
+- [Split Presentation invalidation](issues/25-split-presentation-invalidation.md) — A composite revision skips unchanged paints while Buffer, visual rows, and File Tree keep atomic publication.
 
 ## Not yet specified
 
