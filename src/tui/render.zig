@@ -20,6 +20,7 @@ const ReviewProjection = presentation.ReviewProjection;
 const Buffer = buffer_mod.Buffer;
 const Row = buffer_mod.Row;
 const LineRow = buffer_mod.LineRow;
+const LinePair = buffer_mod.LinePair;
 const CommentRow = buffer_mod.CommentRow;
 const DraftRow = buffer_mod.DraftRow;
 const Section = buffer_mod.Section;
@@ -285,7 +286,7 @@ fn visualRowSelected(rows: []const @import("frame.zig").VisualRow, selection: [2
 
 fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, row: Row, visual_row: @import("frame.zig").VisualRow, theme: Theme) void {
     if (layout == .side_by_side and visual_row.halves != null) {
-        drawVisualLinePair(scratch, win, r, visual_row.halves.?, theme);
+        drawVisualLinePair(scratch, win, r, visual_row.halves.?, row.line_pair, theme);
         return;
     }
     if (row != .line or layout != .unified) {
@@ -305,7 +306,7 @@ fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: 
         gutter_cols,
         line_row.line,
         line_row.line.text[visual_row.source_start..visual_row.source_end],
-        visual_row.decoration orelse .{ .runs = &.{} },
+        line_row.decoration,
         theme,
         style,
     );
@@ -457,21 +458,22 @@ fn drawLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, pair: buf
     }
 }
 
-fn drawVisualLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, halves: @import("frame.zig").Halves, theme: Theme) void {
+fn drawVisualLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, halves: @import("frame.zig").Halves, pair: LinePair, theme: Theme) void {
     const half = win.width / 2;
     if (half == 0) return;
     const right_x = half + @as(u16, @intCast(@import("frame.zig").side_divider_cols));
     const right_w = if (win.width > right_x) win.width - right_x else 0;
     fillRow(win, r, theme.context);
-    drawVisualHalf(scratch, win.child(.{ .x_off = 0, .y_off = r, .width = half, .height = 1 }), halves.left, theme, .old);
-    if (right_w > 0) drawVisualHalf(scratch, win.child(.{ .x_off = right_x, .y_off = r, .width = right_w, .height = 1 }), halves.right, theme, .new);
+    drawVisualHalf(scratch, win.child(.{ .x_off = 0, .y_off = r, .width = half, .height = 1 }), halves.left, pair.left, theme, .old);
+    if (right_w > 0) drawVisualHalf(scratch, win.child(.{ .x_off = right_x, .y_off = r, .width = right_w, .height = 1 }), halves.right, pair.right, theme, .new);
 }
 
-fn drawVisualHalf(scratch: std.mem.Allocator, win: vaxis.Window, half: ?@import("frame.zig").VisualHalf, theme: Theme, side: Side) void {
+fn drawVisualHalf(scratch: std.mem.Allocator, win: vaxis.Window, half: ?@import("frame.zig").VisualHalf, line_row: ?LineRow, theme: Theme, side: Side) void {
     const value = half orelse {
         fillRow(win, 0, theme.context);
         return;
     };
+    const decoration = line_row.?.decoration;
     const style = theme.lineStyle(value.line.kind);
     fillRow(win, 0, style);
     if (!value.continuation) {
@@ -485,7 +487,7 @@ fn drawVisualHalf(scratch: std.mem.Allocator, win: vaxis.Window, half: ?@import(
         side_gutter,
         value.line,
         value.line.text[value.source_start..value.source_end],
-        value.decoration,
+        decoration,
         theme,
         style,
     );
@@ -521,16 +523,36 @@ fn drawLineBody(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, body_col:
 
 fn drawLineBodyText(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, body_col: u16, line: *const bbr.diff.Line, text: []const u8, decoration: bbr.highlight.LineDecoration, theme: Theme, style: vaxis.Style) void {
     const emph = theme.emphasisStyle(line.kind);
-    const segs = scratch.alloc(vaxis.Segment, decoration.runs.len) catch {
+    const source_start = @intFromPtr(text.ptr) - @intFromPtr(line.text.ptr);
+    const source_end = source_start + text.len;
+    var count: usize = 0;
+    var offset: usize = 0;
+    for (decoration.runs) |run| {
+        const run_end = offset + run.text.len;
+        if (offset < source_end and run_end > source_start) count += 1;
+        offset = run_end;
+    }
+    const segs = scratch.alloc(vaxis.Segment, count) catch {
         _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = body_col, .wrap = .none });
         return;
     };
-    for (decoration.runs, 0..) |run, i| {
+    offset = 0;
+    var index: usize = 0;
+    for (decoration.runs) |run| {
+        const run_end = offset + run.text.len;
+        const overlap_start = @max(offset, source_start);
+        const overlap_end = @min(run_end, source_end);
+        if (overlap_start >= overlap_end) {
+            offset = run_end;
+            continue;
+        }
         var run_style = if (run.emphasis) emph else style;
         if (run.capture) |capture| {
             if (theme.captureColor(capture)) |fg| run_style.fg = fg;
         }
-        segs[i] = .{ .text = run.text, .style = run_style };
+        segs[index] = .{ .text = run.text[overlap_start - offset .. overlap_end - offset], .style = run_style };
+        index += 1;
+        offset = run_end;
     }
     _ = win.print(segs, .{ .row_offset = r, .col_offset = body_col, .wrap = .none });
 }
@@ -1291,8 +1313,9 @@ test "Unified continuation rows keep decoration and use a blank gutter" {
     const a = arena.allocator();
     const line: bbr.diff.Line = .{ .old_no = 0, .new_no = 7, .kind = .added, .text = "alpha beta" };
     const rows = [_]Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &.{
-        .{ .text = line.text[0..6], .capture = bbr.highlight.Capture.init(0, "keyword") },
-        .{ .text = line.text[6..], .emphasis = true },
+        .{ .text = line.text[0..3], .capture = bbr.highlight.Capture.init(0, "keyword") },
+        .{ .text = line.text[3..8], .emphasis = true },
+        .{ .text = line.text[8..] },
     } } } }};
     const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{
         .layout = .unified,
@@ -1311,6 +1334,7 @@ test "Unified continuation rows keep decoration and use a blank gutter" {
     for (0..gutter_cols) |col| try testing.expectEqualStrings(" ", win.readCell(@intCast(col), 1).?.char.grapheme);
     try testing.expectEqualStrings("b", win.readCell(gutter_cols, 1).?.char.grapheme);
     try testing.expectEqual(theme_dark.cursorBg(theme_dark.added_emphasis.bg), win.readCell(gutter_cols, 1).?.style.bg);
+    try testing.expectEqual(theme_dark.cursorBg(theme_dark.added.bg), win.readCell(gutter_cols + 2, 1).?.style.bg);
 }
 
 test "SideBySide continuation rows keep halves inside the fixed divider" {

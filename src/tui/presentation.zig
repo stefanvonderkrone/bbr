@@ -1209,6 +1209,7 @@ const Published = struct {
             self.published.geometry = self.geometry;
             self.published.navigation = frame_mod.restoreNavigation(previous, self.visual_rows, self.geometry);
             self.published.frame_revision += 1;
+            self.published.visual_rows_revision = self.published.frame_revision;
             self.active = false;
         }
     };
@@ -1226,6 +1227,7 @@ const Published = struct {
     tree: file_tree.Projection,
     geometry: frame_mod.Geometry,
     frame_revision: frame_mod.Revision,
+    visual_rows_revision: frame_mod.Revision,
     cell_metrics: frame_mod.CellMetrics,
     comments_collapsed_rows: usize,
     navigation: Nav,
@@ -1305,6 +1307,7 @@ const Published = struct {
         published.composer = null;
         published.geometry = geometry;
         published.frame_revision = 1;
+        published.visual_rows_revision = 1;
         published.cell_metrics = cell_metrics;
         published.comments_collapsed_rows = comments_collapsed_rows;
         session.enrichment.configureCache(cache_policy);
@@ -1392,7 +1395,7 @@ const Published = struct {
     fn frameProjection(self: *const Published) frame_mod.Projection {
         return .{
             .revision = self.frame_revision,
-            .visual_rows_revision = self.frame_revision,
+            .visual_rows_revision = self.visual_rows_revision,
             .geometry = self.geometry,
             .panes = frame_mod.paneRects(self.geometry),
             .visual_rows = self.visual_rows,
@@ -1730,6 +1733,12 @@ const Published = struct {
     fn activeFile(self: *const Published) ?usize {
         if (self.session.diff.files.len == 0) return null;
         return self.isolated_file orelse self.buffer.fileIndexForRow(self.cursorBufferIndex());
+    }
+
+    fn resizeHeight(self: *Published, geometry: frame_mod.Geometry) void {
+        self.geometry = geometry;
+        frame_mod.resizeViewports(&self.navigation, &self.tree, geometry);
+        self.frame_revision += 1;
     }
 
     fn cursorVisualRow(self: *const Published) ?frame_mod.VisualRow {
@@ -4106,6 +4115,13 @@ pub const Presentation = struct {
             self.geometry = geometry;
             return;
         };
+        if (self.geometry.cols == geometry.cols) {
+            published.resizeHeight(geometry);
+            published.centerActiveFile();
+            self.geometry = geometry;
+            self.action_error = null;
+            return;
+        }
         var staged = published.prepareBuffer(
             self.preferences,
             published.expanded_disclosures.items,
@@ -7313,11 +7329,36 @@ test "resize publishes one complete Presentation Frame revision" {
     try testing.expectEqual(navigated.revision + 1, after.revision);
     try testing.expectEqual(@as(u16, 40), after.geometry.cols);
     try testing.expectEqual(@as(u16, 4), after.geometry.rows);
-    try testing.expect(after.visual_rows_revision <= after.revision);
+    try testing.expect(after.visual_rows_revision > navigated.visual_rows_revision);
     try testing.expect(owner.eql(after.visual_rows[after.navigation.cursor].owner));
     try testing.expectEqual(navigated.navigation.mark, after.navigation.mark);
     try testing.expectEqual(@as(usize, after.panes.sidebar_content.height), after.file_tree.viewport);
     try testing.expect(after.file_tree.entries[after.file_tree.cursor].active);
+}
+
+test "height resize keeps cached Buffer and visual rows" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .geometry = .{ .cols = 80, .rows = 8 },
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .toggle_diff_wrap });
+    const before = presentation.projection().review.?.frame;
+    try presentation.dispatch(.{ .resize = .{ .cols = 80, .rows = 4 } });
+    const after = presentation.projection().review.?.frame;
+
+    try testing.expectEqual(@intFromPtr(before.buffer.rows.ptr), @intFromPtr(after.buffer.rows.ptr));
+    try testing.expectEqual(@intFromPtr(before.visual_rows.ptr), @intFromPtr(after.visual_rows.ptr));
+    try testing.expectEqual(before.visual_rows_revision, after.visual_rows_revision);
+    try testing.expectEqual(before.revision + 1, after.revision);
+    try testing.expectEqual(@as(usize, after.panes.diff_content.height), after.navigation.viewport);
+    try testing.expectEqual(@as(usize, after.panes.sidebar_content.height), after.file_tree.viewport);
 }
 
 fn testTwoFileSession(backing: std.mem.Allocator, id: u64) !*session_mod.Session {
