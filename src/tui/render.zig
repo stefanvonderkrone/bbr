@@ -1143,10 +1143,7 @@ fn digitGlyph(byte: u8) []const u8 {
 }
 
 fn fillRow(win: vaxis.Window, row: u16, style: vaxis.Style) void {
-    var c: u16 = 0;
-    while (c < win.width) : (c += 1) {
-        win.writeCell(c, row, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
-    }
+    win.child(.{ .y_off = row, .height = 1 }).fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
 }
 
 // ---------------------------------------------------------------------------

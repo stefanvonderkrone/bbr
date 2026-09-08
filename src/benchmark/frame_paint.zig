@@ -39,7 +39,7 @@ pub fn checksum(output: u64) u64 {
 }
 
 fn fillRow(win: vaxis.Window, row: u16, style: vaxis.Style) void {
-    for (0..win.width) |column| win.writeCell(@intCast(column), row, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
+    win.child(.{ .y_off = row, .height = 1 }).fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
 }
 
 fn drawGutter(win: vaxis.Window, row: u16, no: u32) void {

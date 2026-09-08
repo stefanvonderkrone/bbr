@@ -46,6 +46,7 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - [Select P2 actions from the post-P1 profile](issues/22-select-p2-actions.md) — Actions 20, 21, 22, and 23 pass; measured costs reject Actions 19 and 24.
 - [Limit Highlight query ranges](issues/24-limit-highlight-query-ranges.md) — Action 20 is rejected because visible ranges cannot preserve complete File Spans under the current Highlighter contract.
 - [Split Presentation invalidation](issues/25-split-presentation-invalidation.md) — A composite revision skips unchanged paints while Buffer, visual rows, and File Tree keep atomic publication.
+- [Own a compact cell row](issues/26-own-a-compact-cell-row.md) — Native vaxis row fills replace checked per-cell fills, cutting paint median latency by at least 13.9% without duplicate cell storage.
 
 ## Not yet specified
 
