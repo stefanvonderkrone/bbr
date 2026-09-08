@@ -43,6 +43,7 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - [Remove duplicate projection work](issues/18-remove-duplicate-projection-work.md) — Shared File tallies and removal of unused width data cut File Tree latency by 96.1% and unwrapped Presentation Frame latency by 31.0%.
 - [Limit or cache viewport wrapping](issues/19-limit-or-cache-viewport-wrapping.md). Height-only resize reuses complete visual rows. Render-time decoration clipping cuts full-wrap median latency by at least 27% and allocations from 120,026 to 10.
 - [Pre-size Diff parser lists](issues/21-pre-size-diff-parser-lists.md) — Action 18 is rejected because count hints cut allocations by 1.4% without a latency or peak-memory gain.
+- [Select P2 actions from the post-P1 profile](issues/22-select-p2-actions.md) — Actions 20, 21, 22, and 23 pass; measured costs reject Actions 19 and 24.
 
 ## Not yet specified
 
