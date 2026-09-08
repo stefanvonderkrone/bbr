@@ -14,6 +14,7 @@ const highlight = @import("highlight.zig");
 const cell_width = @import("cell_width.zig");
 const frame_paint = @import("frame_paint.zig");
 const p1_actions = @import("p1_actions.zig");
+const tui = @import("benchmark_tui");
 const TreeSitterHighlighter = @import("benchmark_highlight").TreeSitterHighlighter;
 
 pub fn main(init: std.process.Init) !void {
@@ -129,11 +130,8 @@ pub fn main(init: std.process.Init) !void {
     };
     const visual_rows_unwrapped_context: p1_actions.VisualRowsContext = .{ .rows = navigation_context.buffer.rows, .wrap = false };
     const visual_rows_wrapped_context: p1_actions.VisualRowsContext = .{ .rows = navigation_context.buffer.rows, .wrap = true, .width = 24 };
-    const file_tree_context: p1_actions.FileTreeContext = .{
-        .diff = parsed,
-        .threads = comment_contexts[2].threads,
-        .drafts = comment_contexts[2].drafts,
-    };
+    const file_tree_tallies = try tui.buffer.fileTallies(comment_arena.allocator(), parsed, comment_contexts[2].threads, comment_contexts[2].drafts, .{ .drafts = comment_contexts[2].drafts });
+    const file_tree_context: p1_actions.FileTreeContext = .{ .diff = parsed, .tallies = file_tree_tallies };
     var matched = false;
     if (selected == null or std.mem.eql(u8, selected.?, frame_paint.name)) {
         matched = true;
@@ -230,7 +228,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (selected == null or std.mem.eql(u8, selected.?, "file_tree_tallies_2000")) {
         matched = true;
-        if (repeat_count) |count| try harness.repeat(writer, init.gpa, "file_tree_tallies_2000", count, &file_tree_context, p1_actions.fileTree, p1_actions.fileTreeChecksum) else try harness.run(writer, init.io, init.gpa, calibrations, "file_tree_tallies_2000", .instruction_throughput, parsed.files.len * (file_tree_context.threads.len + file_tree_context.drafts.len), &file_tree_context, p1_actions.fileTree, p1_actions.fileTreeChecksum);
+        if (repeat_count) |count| try harness.repeat(writer, init.gpa, "file_tree_tallies_2000", count, &file_tree_context, p1_actions.fileTree, p1_actions.fileTreeChecksum) else try harness.run(writer, init.io, init.gpa, calibrations, "file_tree_tallies_2000", .instruction_throughput, parsed.files.len, &file_tree_context, p1_actions.fileTree, p1_actions.fileTreeChecksum);
     }
     if (selected == null or std.mem.eql(u8, selected.?, diff_parse.name)) {
         matched = true;

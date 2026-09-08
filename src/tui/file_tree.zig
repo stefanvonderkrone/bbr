@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const bbr = @import("bbr");
+const buffer_mod = @import("buffer.zig");
 const CellMetrics = @import("cell_metrics.zig").CellMetrics;
 
 pub const Identity = union(enum) {
@@ -50,8 +51,7 @@ const Node = struct {
 pub fn build(
     allocator: std.mem.Allocator,
     diff: bbr.diff.Diff,
-    threads: []const bbr.review.Thread,
-    drafts: []const bbr.review.Draft,
+    tallies: []const buffer_mod.FileTally,
     collapsed: []const []const u8,
     active_file: ?usize,
     content_width: usize,
@@ -66,7 +66,7 @@ pub fn build(
     sortChildren(&nodes, 0);
 
     var entries: std.ArrayList(Entry) = .empty;
-    for (nodes.items[0].children.items) |child| try emit(allocator, &nodes, child, null, 0, diff, threads, drafts, collapsed, active_file, content_width, metrics, &entries);
+    for (nodes.items[0].children.items) |child| try emit(allocator, &nodes, child, null, 0, diff, tallies, collapsed, active_file, content_width, metrics, &entries);
 
     var cursor: usize = 0;
     if (wanted_cursor) |wanted| cursor = findVisible(entries.items, wanted) orelse nearestVisibleAncestor(entries.items, nodes.items, wanted) orelse 0;
@@ -127,8 +127,7 @@ fn emit(
     parent_identity: ?Identity,
     depth: usize,
     diff: bbr.diff.Diff,
-    threads: []const bbr.review.Thread,
-    drafts: []const bbr.review.Draft,
+    tallies: []const buffer_mod.FileTally,
     collapsed: []const []const u8,
     active_file: ?usize,
     content_width: usize,
@@ -138,9 +137,8 @@ fn emit(
     const start = nodes.items[start_index];
     if (start.kind == .file) {
         const file = diff.files[start.file_index];
-        const comments = anchoredThreadCount(threads, file);
-        const draft_count = anchoredDraftCount(drafts, file);
-        const tally = try makeTally(allocator, comments, draft_count);
+        const file_tally = tallies[start.file_index];
+        const tally = try makeTally(allocator, file_tally.comments, file_tally.drafts);
         const fixed = 3 + metrics.width(tally);
         const indent = @min(depth * 2, content_width -| fixed);
         const available = content_width -| fixed -| indent;
@@ -151,8 +149,8 @@ fn emit(
             .label = try truncate(allocator, leaf(start.path), available, metrics),
             .active = active_file != null and active_file.? == start.file_index,
             .status = file.status,
-            .comments = comments,
-            .drafts = draft_count,
+            .comments = file_tally.comments,
+            .drafts = file_tally.drafts,
             .tally = tally,
             .tally_width = metrics.width(tally),
         });
@@ -184,7 +182,7 @@ fn emit(
         .active_descendant = if (active_file) |index| pathDescends(diff.files[index].displayPath(), end.path) else false,
     });
     if (!expanded) return;
-    for (end.children.items) |child| try emit(allocator, nodes, child, identity, depth + 1, diff, threads, drafts, collapsed, active_file, content_width, metrics, entries);
+    for (end.children.items) |child| try emit(allocator, nodes, child, identity, depth + 1, diff, tallies, collapsed, active_file, content_width, metrics, entries);
 }
 
 fn truncate(allocator: std.mem.Allocator, text: []const u8, width: usize, metrics: CellMetrics) ![]const u8 {
@@ -223,32 +221,6 @@ fn pathDescends(path: []const u8, directory: []const u8) bool {
     return path.len > directory.len and std.mem.startsWith(u8, path, directory) and path[directory.len] == '/';
 }
 
-fn anchoredThreadCount(items: []const bbr.review.Thread, file: bbr.diff.File) usize {
-    var count: usize = 0;
-    for (items) |thread| if (thread.root.anchor) |anchor| if (matches(anchor.path, file)) {
-        count += 1;
-    };
-    return count;
-}
-
-fn anchoredDraftCount(items: []const bbr.review.Draft, file: bbr.diff.File) usize {
-    var count: usize = 0;
-    for (items) |draft| {
-        if (draft.parent != null) continue;
-        const path = switch (draft.effectiveScope()) {
-            .review => continue,
-            .file => |scope| scope.path,
-            .@"inline" => |anchor| anchor.path,
-        };
-        if (matches(path, file)) count += 1;
-    }
-    return count;
-}
-
-fn matches(path: []const u8, file: bbr.diff.File) bool {
-    return std.mem.eql(u8, path, file.new_path) or std.mem.eql(u8, path, file.displayPath());
-}
-
 fn findVisible(entries: []const Entry, wanted: Identity) ?usize {
     for (entries, 0..) |entry, index| if (entry.identity.eql(wanted)) return index;
     return null;
@@ -267,7 +239,7 @@ test "empty File Tree is a valid stable projection" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const empty_diff: bbr.diff.Diff = .{ .files = &.{} };
-    const tree = try build(arena.allocator(), empty_diff, &.{}, &.{}, &.{}, null, 0, 0, null, 0, .bytes);
+    const tree = try build(arena.allocator(), empty_diff, &.{}, &.{}, null, 0, 0, null, 0, .bytes);
     try testing.expectEqual(@as(usize, 0), tree.entries.len);
     try testing.expectEqual(@as(usize, 0), tree.cursor);
     try testing.expectEqual(@as(usize, 0), tree.scroll);
@@ -278,7 +250,7 @@ test "compacted File Tree is deterministic and keeps stable identities" {
     defer arena.deinit();
     const diff = try bbr.diff.parse(arena.allocator(), "diff --git a/docs/adr/a.md b/docs/adr/a.md\n--- a/docs/adr/a.md\n+++ b/docs/adr/a.md\n@@ -1 +1 @@\n-a\n+b\n" ++
         "diff --git a/src/z.zig b/src/z.zig\n--- a/src/z.zig\n+++ b/src/z.zig\n@@ -1 +1 @@\n-a\n+b\n");
-    const tree = try build(arena.allocator(), diff, &.{}, &.{}, &.{}, 0, 28, 8, .{ .file = 0 }, 0, .bytes);
+    const tree = try build(arena.allocator(), diff, &.{ .{}, .{} }, &.{}, 0, 28, 8, .{ .file = 0 }, 0, .bytes);
     try testing.expectEqual(@as(usize, 4), tree.entries.len);
     try testing.expectEqualStrings("docs/adr/", tree.entries[0].label);
     try testing.expect(tree.entries[0].identity.eql(.{ .directory = "docs/adr" }));
@@ -291,8 +263,6 @@ test "File Tree truncation respects injected grapheme boundaries and fixed talli
     defer arena.deinit();
     const a = arena.allocator();
     const diff = try bbr.diff.parse(a, "diff --git a/very-long-🙂.zig b/very-long-🙂.zig\n--- a/very-long-🙂.zig\n+++ b/very-long-🙂.zig\n@@ -1 +1 @@\n-a\n+b\n");
-    const comments = [_]bbr.review.Comment{.{ .id = 1, .author = "A", .body = "x", .anchor = .{ .path = "very-long-🙂.zig", .to = 1 } }};
-    const threads = try bbr.review.buildThreads(a, &comments);
     const Metrics = struct {
         fn next(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
             const byte_len: usize = if (text[0] & 0xf8 == 0xf0) 4 else if (text[0] & 0xf0 == 0xe0) 3 else if (text[0] & 0xe0 == 0xc0) 2 else 1;
@@ -302,7 +272,7 @@ test "File Tree truncation respects injected grapheme boundaries and fixed talli
     const metrics_vtable: CellMetrics.VTable = .{ .next = Metrics.next };
     const metrics_context: u8 = 0;
     const metrics: CellMetrics = .{ .ptr = &metrics_context, .vtable = &metrics_vtable };
-    const tree = try build(a, diff, threads, &.{}, &.{}, 0, 12, 4, .{ .file = 0 }, 0, metrics);
+    const tree = try build(a, diff, &.{.{ .comments = 1 }}, &.{}, 0, 12, 4, .{ .file = 0 }, 0, metrics);
     try testing.expectEqualStrings("●1", tree.entries[0].tally);
     try testing.expect(std.mem.endsWith(u8, tree.entries[0].label, "…"));
     try testing.expect(std.unicode.utf8ValidateSlice(tree.entries[0].label));

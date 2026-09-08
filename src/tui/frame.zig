@@ -85,7 +85,6 @@ pub const VisualRow = struct {
     buffer_index: usize = 0,
     kind: buffer_mod.RowKind = .line,
     owner: RowOwner,
-    measured_cells: usize,
     source_start: usize = 0,
     source_end: usize = 0,
     decoration: ?bbr.highlight.LineDecoration = null,
@@ -95,7 +94,6 @@ pub const VisualRow = struct {
 
 pub const VisualHalf = struct {
     line: *const bbr.diff.Line,
-    measured_cells: usize,
     source_start: usize,
     source_end: usize,
     decoration: bbr.highlight.LineDecoration,
@@ -199,7 +197,7 @@ pub fn buildVisualRowsWithOptions(
         (options.layout == .unified and options.width <= unified_gutter_cols) or
         (options.layout == .side_by_side and sideBodyWidths(options.width) == null))
     {
-        return buildUnwrappedVisualRows(allocator, rows, metrics);
+        return buildUnwrappedVisualRows(allocator, rows);
     }
 
     var visual_rows: std.ArrayList(VisualRow) = .empty;
@@ -218,7 +216,7 @@ pub fn buildVisualRowsWithOptions(
         const widths = sideBodyWidths(options.width).?;
         for (rows, 0..) |row, buffer_index| switch (row) {
             .line_pair => |pair| try appendWrappedLinePair(allocator, &visual_rows, buffer_index, pair, widths, metrics),
-            else => try visual_rows.append(allocator, makeVisualRow(row, buffer_index, metrics)),
+            else => try visual_rows.append(allocator, makeVisualRow(row, buffer_index)),
         };
         return visual_rows.toOwnedSlice(allocator);
     }
@@ -227,17 +225,17 @@ pub fn buildVisualRowsWithOptions(
     for (rows, 0..) |row, buffer_index| switch (row) {
         .line => |line_row| {
             if (line_row.line.text.len == 0) {
-                try visual_rows.append(allocator, makeVisualRow(row, buffer_index, metrics));
+                try visual_rows.append(allocator, makeVisualRow(row, buffer_index));
                 continue;
             }
             var start: usize = 0;
             while (start < line_row.line.text.len) {
                 const end = wrapEnd(line_row.line.text, start, body_width, metrics);
-                try appendWrappedVisualRow(allocator, &visual_rows, row, buffer_index, line_row, start, end, metrics);
+                try appendWrappedVisualRow(allocator, &visual_rows, row, buffer_index, line_row, start, end);
                 start = end;
             }
         },
-        else => try visual_rows.append(allocator, makeVisualRow(row, buffer_index, metrics)),
+        else => try visual_rows.append(allocator, makeVisualRow(row, buffer_index)),
     };
     return visual_rows.toOwnedSlice(allocator);
 }
@@ -277,7 +275,6 @@ fn appendWrappedLinePair(
             .buffer_index = buffer_index,
             .kind = .line_pair,
             .owner = .{ .line = target.line },
-            .measured_cells = target.measured_cells,
             .source_start = target.source_start,
             .source_end = target.source_end,
             .decoration = target.decoration,
@@ -299,7 +296,6 @@ fn makeVisualHalf(allocator: std.mem.Allocator, line_row: buffer_mod.LineRow, st
     const end = if (line_row.line.text.len == 0) 0 else wrapEnd(line_row.line.text, start, width, metrics);
     return .{
         .line = line_row.line,
-        .measured_cells = metrics.width(line_row.line.text[start..end]),
         .source_start = start,
         .source_end = end,
         .decoration = try sliceDecoration(allocator, line_row.decoration, start, end),
@@ -315,7 +311,6 @@ fn appendWrappedVisualRow(
     line_row: buffer_mod.LineRow,
     start: usize,
     end: usize,
-    metrics: CellMetrics,
 ) !void {
     const decoration = try sliceDecoration(allocator, line_row.decoration, start, end);
     errdefer if (decoration.runs.len > 0) allocator.free(decoration.runs);
@@ -323,7 +318,6 @@ fn appendWrappedVisualRow(
         .buffer_index = buffer_index,
         .kind = .line,
         .owner = owner(row),
-        .measured_cells = metrics.width(line_row.line.text[start..end]),
         .source_start = start,
         .source_end = end,
         .decoration = decoration,
@@ -331,18 +325,17 @@ fn appendWrappedVisualRow(
     });
 }
 
-fn buildUnwrappedVisualRows(allocator: std.mem.Allocator, rows: []const buffer_mod.Row, metrics: CellMetrics) ![]const VisualRow {
+fn buildUnwrappedVisualRows(allocator: std.mem.Allocator, rows: []const buffer_mod.Row) ![]const VisualRow {
     const visual_rows = try allocator.alloc(VisualRow, rows.len);
-    for (rows, visual_rows, 0..) |row, *visual_row, buffer_index| visual_row.* = makeVisualRow(row, buffer_index, metrics);
+    for (rows, visual_rows, 0..) |row, *visual_row, buffer_index| visual_row.* = makeVisualRow(row, buffer_index);
     return visual_rows;
 }
 
-fn makeVisualRow(row: buffer_mod.Row, buffer_index: usize, metrics: CellMetrics) VisualRow {
+fn makeVisualRow(row: buffer_mod.Row, buffer_index: usize) VisualRow {
     return .{
         .buffer_index = buffer_index,
         .kind = std.meta.activeTag(row),
         .owner = owner(row),
-        .measured_cells = rowWidth(row, metrics),
         .source_start = rowSourceStart(row),
         .source_end = rowSourceEnd(row),
         .decoration = rowDecoration(row),
@@ -537,35 +530,6 @@ fn rowDecoration(row: buffer_mod.Row) ?bbr.highlight.LineDecoration {
     };
 }
 
-fn rowText(row: buffer_mod.Row) []const u8 {
-    return switch (row) {
-        .file_header => |file| file.displayPath(),
-        .hunk_header => |hunk| hunk.header,
-        .status_placeholder => "",
-        .line => |line| line.line.text,
-        .line_pair => |pair| if (pair.right) |right| right.line.text else if (pair.left) |left| left.line.text else "",
-        .disclosure => "",
-        .comment => |card| card.text(),
-        .draft => |card| card.text(),
-        .snapshot => |snapshot| snapshot.line,
-        .section => |section| section.path,
-    };
-}
-
-fn rowWidth(row: buffer_mod.Row, metrics: CellMetrics) usize {
-    return switch (row) {
-        .comment => |card| segmentsWidth(card.segments, metrics),
-        .draft => |card| segmentsWidth(card.segments, metrics),
-        else => metrics.width(rowText(row)),
-    };
-}
-
-fn segmentsWidth(segments: []const @import("review_card.zig").Segment, metrics: CellMetrics) usize {
-    var width: usize = 0;
-    for (segments) |segment| width += metrics.width(segment.text);
-    return width;
-}
-
 fn sourceOffset(source: []const u8, part: []const u8) usize {
     const source_start = @intFromPtr(source.ptr);
     const part_start = @intFromPtr(part.ptr);
@@ -575,7 +539,7 @@ fn sourceOffset(source: []const u8, part: []const u8) usize {
 
 const testing = std.testing;
 
-test "visual rows use the injected CellMetrics seam" {
+test "unwrapped visual rows skip CellMetrics" {
     const Metrics = struct {
         calls: usize = 0,
 
@@ -593,8 +557,7 @@ test "visual rows use the injected CellMetrics seam" {
     const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, metrics, .{ .layout = .unified, .width = 0, .wrap = false });
     defer testing.allocator.free(visual_rows);
 
-    try testing.expectEqual(@as(usize, 4), metrics_context.calls);
-    try testing.expectEqual(@as(usize, 5), visual_rows[0].measured_cells);
+    try testing.expectEqual(@as(usize, 0), metrics_context.calls);
 }
 
 test "Presentation Frame projects Diff Lines as complete visual rows" {
@@ -841,11 +804,11 @@ test "published Frame hit testing gives Overlay rows precedence and clips blank 
 
 test "navigation restoration follows stable owners and clears a shifted Selection" {
     const old_targets = [_]VisualRow{
-        .{ .owner = .{ .section = .{ .kind = .pr_comments, .path = "" } }, .measured_cells = 0 },
-        .{ .owner = .{ .section = .{ .kind = .outdated, .path = "a.zig" } }, .measured_cells = 5 },
+        .{ .owner = .{ .section = .{ .kind = .pr_comments, .path = "" } } },
+        .{ .owner = .{ .section = .{ .kind = .outdated, .path = "a.zig" } } },
     };
     const new_targets = [_]VisualRow{
-        .{ .owner = .{ .section = .{ .kind = .pending, .path = "" } }, .measured_cells = 0 },
+        .{ .owner = .{ .section = .{ .kind = .pending, .path = "" } } },
         old_targets[0],
         old_targets[1],
     };
@@ -873,8 +836,8 @@ test "navigation restoration follows stable owners and clears a shifted Selectio
 
 test "ReviewCard restoration follows containing source offset and collapsed footer" {
     const old_targets = [_]VisualRow{
-        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 0, .part = .header } }, .measured_cells = 5 },
-        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 8 } }, .measured_cells = 10, .source_end = 18 },
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 0, .part = .header } } },
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 8 } }, .source_end = 18 },
     };
     var navigation = Nav.init(old_targets.len, 3);
     navigation.cursor = 1;
@@ -888,15 +851,15 @@ test "ReviewCard restoration follows containing source offset and collapsed foot
         .navigation = navigation,
     };
     const resized = [_]VisualRow{
-        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 0, .part = .header } }, .measured_cells = 5 },
-        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 4 } }, .measured_cells = 18, .source_end = 14 },
-        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 14 } }, .measured_cells = 4, .source_end = 18 },
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 0, .part = .header } } },
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 4 } }, .source_end = 14 },
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 14 } }, .source_end = 18 },
     };
     try testing.expectEqual(@as(usize, 1), restoreNavigation(previous, &resized, .{ .cols = 60, .rows = 3 }).cursor);
 
     const collapsed = [_]VisualRow{
         resized[0],
-        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 18, .part = .disclosure_footer } }, .measured_cells = 20, .source_end = 18 },
+        .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 18, .part = .disclosure_footer } }, .source_end = 18 },
     };
     try testing.expectEqual(@as(usize, 1), restoreNavigation(previous, &collapsed, .{ .cols = 30, .rows = 3 }).cursor);
 }

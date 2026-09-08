@@ -1343,8 +1343,7 @@ const Published = struct {
         published.tree = try file_tree.build(
             buffer_allocator,
             session.diff,
-            session.threads,
-            published.review.drafts.items,
+            published.buffer.file_tallies,
             published.collapsed_directories.items,
             if (session.diff.files.len == 0) null else 0,
             panes.sidebar_content.width,
@@ -1710,8 +1709,7 @@ const Published = struct {
         const tree = try file_tree.build(
             allocator,
             self.session.diff,
-            self.session.threads,
-            self.review.drafts.items,
+            candidate.file_tallies,
             self.collapsed_directories.items,
             active_file,
             panes.sidebar_content.width,

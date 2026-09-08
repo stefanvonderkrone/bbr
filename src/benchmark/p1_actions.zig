@@ -69,7 +69,6 @@ pub fn visualRowsChecksum(rows: []const tui.frame.VisualRow) u64 {
     for (rows) |row| {
         hash.update(&.{@intFromEnum(row.kind)});
         hash.update(std.mem.asBytes(&row.buffer_index));
-        hash.update(std.mem.asBytes(&row.measured_cells));
         hash.update(std.mem.asBytes(&row.source_start));
         hash.update(std.mem.asBytes(&row.source_end));
     }
@@ -78,16 +77,14 @@ pub fn visualRowsChecksum(rows: []const tui.frame.VisualRow) u64 {
 
 pub const FileTreeContext = struct {
     diff: bbr.diff.Diff,
-    threads: []const bbr.review.Thread,
-    drafts: []const bbr.review.Draft,
+    tallies: []const tui.buffer.FileTally,
 };
 
 pub fn fileTree(allocator: std.mem.Allocator, context: *const FileTreeContext) !tui.file_tree.Projection {
     return tui.file_tree.build(
         allocator,
         context.diff,
-        context.threads,
-        context.drafts,
+        context.tallies,
         &.{},
         null,
         40,

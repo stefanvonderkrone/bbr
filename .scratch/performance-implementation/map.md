@@ -40,6 +40,7 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - [Release Highlighter scratch memory](issues/14-release-highlighter-scratch-memory.md) — File Enrichment releases per-side scratch, retains exact Spans, and caps retained Buffer and frame arena capacity.
 - [Shrink VisualRow hot data](issues/16-shrink-visual-row-hot-data.md) — Buffer-indexed cold Rows and byte-sized RowKind indexes cut 50,000-row Presentation Frame memory by 31.0% and median latency by 16.2%.
 - [Shrink Line and Span layouts](issues/17-shrink-line-and-span-layouts.md) — Zero-sentinel Line numbers and `u32` Span offsets cut their layouts by 20% and 33% without a material latency change.
+- [Remove duplicate projection work](issues/18-remove-duplicate-projection-work.md) — Shared File tallies and removal of unused width data cut File Tree latency by 96.1% and unwrapped Presentation Frame latency by 31.0%.
 
 ## Not yet specified
 
