@@ -21,7 +21,6 @@ const presentation = @import("presentation.zig");
 const buffer_mod = @import("buffer.zig");
 const Session = session.Session;
 
-const Credential = bbr.bitbucket.Credential;
 const PendingReviewStore = bbr.review.PendingReviewStore;
 const frame_arena_retained_limit = 4 * 1024 * 1024;
 
@@ -32,7 +31,7 @@ pub const RunCtx = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
     env_map: *std.process.Environ.Map,
-    cred: Credential,
+    bitbucket: ?bbr.bitbucket.Client = null,
     repo: []const u8,
     store: PendingReviewStore,
     active_theme: theme.Theme,
@@ -654,21 +653,12 @@ fn postPresentationInput(ptr: *anyopaque, input: presentation.OwnedInput) anyerr
 fn presentationPostWorker(
     loop: *Loop,
     work_id: u64,
-    io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     command: *presentation.PostDraft,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
-    defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {
-        presentation_runtime.rejectPostLaunch(presentationSink(&sink_context), command);
-        return;
-    };
-    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     var poster = bbr.bitbucket.Poster{
         .client = client,
         .allocator = scratch.allocator(),
@@ -681,63 +671,36 @@ fn presentationPostWorker(
 fn presentationCommentEditWorker(
     loop: *Loop,
     work_id: u64,
-    io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     command: *presentation.UpdateComment,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
-    defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {
-        presentation_runtime.rejectCommentEditLaunch(presentationSink(&sink_context), command);
-        return;
-    };
-    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     presentation_runtime.executeCommentEdit(presentationSink(&sink_context), command, client);
 }
 
 fn presentationCommentDeleteWorker(
     loop: *Loop,
     work_id: u64,
-    io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     command: *presentation.DeleteComment,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
-    defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {
-        presentation_runtime.rejectCommentDeleteLaunch(presentationSink(&sink_context), command);
-        return;
-    };
-    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     presentation_runtime.executeCommentDelete(presentationSink(&sink_context), command, client);
 }
 
 fn presentationReviewerVerdictWorker(
     loop: *Loop,
     work_id: u64,
-    io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     command: presentation.ChangeReviewerVerdict,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
-    defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {
-        presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.reviewerVerdictLaunchFailed(command));
-        return;
-    };
-    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.executeReviewerVerdict(scratch.allocator(), command, client));
 }
 
@@ -745,17 +708,15 @@ fn presentationLoadWorker(
     loop: *Loop,
     work_id: u64,
     io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     command: presentation.LoadSession,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     const outcome: presentation.SessionLoadOutcome = switch (command.key.kind) {
-        .remote => if (session.load(
+        .remote => if (session.loadWith(
             io,
             std.heap.page_allocator,
-            env_map,
-            cred,
+            client,
             command.key.repository(),
             command.key.pull_request_id,
         )) |loaded| .{ .loaded = loaded } else |err| .{ .failed = err },
@@ -780,8 +741,7 @@ fn presentationEnrichmentWorker(
     loop: *Loop,
     work_id: u64,
     io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     highlighter: bbr.highlight.Highlighter,
     command: presentation.EnrichFile,
 ) void {
@@ -790,11 +750,8 @@ fn presentationEnrichmentWorker(
     defer scratch.deinit();
     const outcome: presentation.FileEnrichmentOutcome = switch (command.source) {
         .remote => blk: {
-            var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
-            defer http.deinit();
-            http.initDefaultProxies(scratch.allocator(), env_map) catch break :blk .{ .failed = .launch_failed };
-            const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
-            break :blk if (file_enrichment.enrich(
+            break :blk if (file_enrichment.enrichConcurrent(
+                io,
                 std.heap.page_allocator,
                 client,
                 highlighter,
@@ -833,26 +790,12 @@ fn presentationWaitWorker(loop: *Loop, work_id: u64, io: std.Io, wait: presentat
 fn presentationRecoveryCheckWorker(
     loop: *Loop,
     work_id: u64,
-    io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     check: presentation.CheckRecovery,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
-    defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {
-        presentation_runtime.deliver(presentationSink(&sink_context), .{ .recovery_checked = .{
-            .command_id = check.command_id,
-            .operation_id = check.operation_id,
-            .identity = check.identity,
-            .outcome = .failed,
-        } });
-        return;
-    };
-    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     const input = if (client.getPullRequest(scratch.allocator(), check.identity.repository(), check.identity.pullRequestId())) |pr|
         presentation.recoveryCheckSucceeded(check.command_id, check.operation_id, check.identity, pr.source_commit)
     else |_|
@@ -863,28 +806,13 @@ fn presentationRecoveryCheckWorker(
 fn presentationDuplicateCheckWorker(
     loop: *Loop,
     work_id: u64,
-    io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     command: *presentation.PostDraft,
 ) void {
     defer command.destroy();
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
-    defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {
-        presentation_runtime.deliver(presentationSink(&sink_context), .{ .duplicate_checked = .{
-            .command_id = command.command_id,
-            .operation_id = command.operation_id,
-            .identity = command.identity,
-            .temp_id = command.draft.local_id,
-            .outcome = .failed,
-        } });
-        return;
-    };
-    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     const author_uuid = client.getAuthenticatedAccountUuid(scratch.allocator()) catch {
         presentation_runtime.deliver(presentationSink(&sink_context), .{ .duplicate_checked = .{
             .command_id = command.command_id,
@@ -923,9 +851,7 @@ fn presentationDuplicateCheckWorker(
 fn presentationListPullRequestsWorker(
     loop: *Loop,
     work_id: u64,
-    io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     command: presentation.ListPullRequests,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
@@ -937,7 +863,7 @@ fn presentationListPullRequestsWorker(
         } });
         return;
     };
-    loadPullRequestSummaries(io, env_map, cred, command.repositoryName(), summaries) catch {
+    loadPullRequestSummaries(client, command.repositoryName(), summaries) catch {
         summaries.destroy();
         presentation_runtime.deliver(presentationSink(&sink_context), .{ .pull_requests_loaded = .{
             .command_id = command.command_id,
@@ -954,16 +880,10 @@ fn presentationListPullRequestsWorker(
 }
 
 fn loadPullRequestSummaries(
-    io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     repository: []const u8,
     summaries: *presentation.PullRequestSummaries,
 ) !void {
-    var http = bbr.http.StdHttpClient.init(summaries.arena.allocator(), io);
-    defer http.deinit();
-    try http.initDefaultProxies(summaries.arena.allocator(), env_map);
-    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     summaries.prs = try client.listPullRequests(summaries.arena.allocator(), repository, .{});
 }
 
@@ -1016,16 +936,16 @@ fn drainPresentationCommands(
         const work_id = next_work_id.*;
         next_work_id.* +%= 1;
         const future = switch (command) {
-            .load_session => |load| ctx.io.concurrent(presentationLoadWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, load }),
-            .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, ctx.highlighter, enrich }),
-            .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, post }),
-            .update_comment => |update| ctx.io.concurrent(presentationCommentEditWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, update }),
-            .delete_comment => |delete| ctx.io.concurrent(presentationCommentDeleteWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, delete }),
-            .change_reviewer_verdict => |verdict| ctx.io.concurrent(presentationReviewerVerdictWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, verdict }),
+            .load_session => |load| ctx.io.concurrent(presentationLoadWorker, .{ loop, work_id, ctx.io, ctx.bitbucket.?, load }),
+            .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, ctx.io, ctx.bitbucket.?, ctx.highlighter, enrich }),
+            .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, ctx.bitbucket.?, post }),
+            .update_comment => |update| ctx.io.concurrent(presentationCommentEditWorker, .{ loop, work_id, ctx.bitbucket.?, update }),
+            .delete_comment => |delete| ctx.io.concurrent(presentationCommentDeleteWorker, .{ loop, work_id, ctx.bitbucket.?, delete }),
+            .change_reviewer_verdict => |verdict| ctx.io.concurrent(presentationReviewerVerdictWorker, .{ loop, work_id, ctx.bitbucket.?, verdict }),
             .wait_submission => |wait| ctx.io.concurrent(presentationWaitWorker, .{ loop, work_id, ctx.io, wait }),
-            .check_recovery => |check| ctx.io.concurrent(presentationRecoveryCheckWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, check }),
-            .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, check }),
-            .list_pull_requests => |list| ctx.io.concurrent(presentationListPullRequestsWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, list }),
+            .check_recovery => |check| ctx.io.concurrent(presentationRecoveryCheckWorker, .{ loop, work_id, ctx.bitbucket.?, check }),
+            .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, ctx.bitbucket.?, check }),
+            .list_pull_requests => |list| ctx.io.concurrent(presentationListPullRequestsWorker, .{ loop, work_id, ctx.bitbucket.?, list }),
             .copy_clipboard => unreachable,
             .external_edit => unreachable,
         } catch {

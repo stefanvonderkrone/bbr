@@ -132,6 +132,43 @@ pub fn enrich(backing: Allocator, bb: bbr.bitbucket.Client, highlighter: bbr.hig
     return enrichFrom(backing, remote.source(), highlighter, req);
 }
 
+/// Fetch both present remote sides at the same time. Each side retains its own
+/// outcome and owned arena, as in the sequential path.
+pub fn enrichConcurrent(io: std.Io, backing: Allocator, bb: bbr.bitbucket.Client, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
+    var remote: RemoteBlobSource = .{ .client = bb, .repo = req.repo };
+    return enrichFromConcurrent(io, backing, remote.source(), highlighter, req);
+}
+
+fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
+    if (req.status == .added or req.status == .removed)
+        return enrichFrom(backing, source, highlighter, req);
+
+    var old_future = io.concurrent(enrichExpectedSide, .{ backing, source, highlighter, req.max_file_bytes, req.destination_commit, req.old_path, req.content.old }) catch
+        return enrichFrom(backing, source, highlighter, req);
+    var new_future = io.concurrent(enrichExpectedSide, .{ backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new }) catch {
+        const old = old_future.await(io) catch return error.OutOfMemory;
+        return .{
+            .old = old,
+            .new = enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new) catch |err| {
+                var cleanup = old;
+                cleanup.deinit();
+                return err;
+            },
+        };
+    };
+    const old = old_future.await(io) catch |err| {
+        var new = new_future.await(io) catch return error.OutOfMemory;
+        new.deinit();
+        return err;
+    };
+    errdefer {
+        var cleanup = old;
+        cleanup.deinit();
+    }
+    const new = new_future.await(io) catch return error.OutOfMemory;
+    return .{ .old = old, .new = new };
+}
+
 pub fn enrichFrom(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
     var result: Result = .{ .old = .absent, .new = .absent };
     errdefer result.deinit();
@@ -668,6 +705,28 @@ const ExpectedBlobSource = struct {
     }
 };
 
+const OverlapBlobSource = struct {
+    calls: std.atomic.Value(usize) = .init(0),
+    active: std.atomic.Value(usize) = .init(0),
+    max_active: std.atomic.Value(usize) = .init(0),
+
+    fn source(self: *OverlapBlobSource) BlobSource {
+        return .{ .ptr = self, .read_fn = read };
+    }
+
+    fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, _: []const u8) anyerror![]u8 {
+        const self: *OverlapBlobSource = @ptrCast(@alignCast(ptr));
+        _ = self.calls.fetchAdd(1, .acq_rel);
+        const active = self.active.fetchAdd(1, .acq_rel) + 1;
+        defer _ = self.active.fetchSub(1, .acq_rel);
+        if (active == 2) self.max_active.store(2, .release);
+        if (std.mem.eql(u8, commit, "destination")) {
+            while (self.calls.load(.acquire) < 2) std.atomic.spinLoopHint();
+        }
+        return allocator.dupe(u8, if (std.mem.eql(u8, commit, "destination")) "old\n" else "new\n");
+    }
+};
+
 test "an added File transfers its enriched new side into Session storage" {
     const responses = [_]bbr.http.Canned{.{ .status = 200, .body = "const answer = 42;\n" }};
     var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
@@ -954,6 +1013,26 @@ test "File Enrichment requests each present side from its exact commit and path"
     });
     defer result.deinit();
     try testing.expectEqual(@as(usize, 2), source.calls);
+    try testing.expectEqualStrings("old\n", result.old.owned.blob);
+    try testing.expectEqualStrings("new\n", result.new.owned.blob);
+}
+
+test "remote File Enrichment overlaps at most two present sides" {
+    var source: OverlapBlobSource = .{};
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    var result = try enrichFromConcurrent(testing.io, std.heap.page_allocator, source.source(), plain.highlighter(), .{
+        .repo = "repo",
+        .status = .renamed,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "old.zig",
+        .new_path = "new.zig",
+        .max_file_bytes = 0,
+    });
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 2), source.calls.load(.acquire));
+    try testing.expectEqual(@as(usize, 2), source.max_active.load(.acquire));
     try testing.expectEqualStrings("old\n", result.old.owned.blob);
     try testing.expectEqualStrings("new\n", result.new.owned.blob);
 }

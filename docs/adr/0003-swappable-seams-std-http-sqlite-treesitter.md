@@ -15,7 +15,7 @@ The interfaces are `HttpClient`, `PendingReviewStore`, and `Highlighter`.
   requirement for one of these features can replace `StdHttpClient` behind `HttpClient`.
 - The Candidate Session live gate passed with two active requests. `HttpClient` therefore permits
   concurrent `send` calls up to the caller's fixed bound. One `StdHttpClient` owns the shared
-  connection pool for one Candidate Session attempt.
+  connection pool for the TUI lifetime.
 - Every seam has a **fake implementation** (canned JSON, in-memory store, no-op highlighter),
   which is what makes the domain logic — diff parsing, thread building, submission ordering,
   failure handling — testable with no network, no disk, and no C toolchain. This is the
@@ -28,6 +28,10 @@ proxy configuration before a request and never retries through a direct connecti
 
 Remote Candidate Session acquisition uses at most two active requests. This limit is not
 configurable. Every started request completes before the adapter or branch-owned data is destroyed.
+
+Remote File Enrichment fetches its old and new sides concurrently. Each File uses at most two
+requests. LocalReview File Enrichment stays sequential. Both started sides finish before the worker
+returns a result. Session Epoch checks reject a result from an old Session.
 
 Callers depend on each interface by value. Production chooses each implementation at its
 construction site. `HttpClient` remains the replacement boundary for a future measured need.

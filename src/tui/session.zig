@@ -7,8 +7,7 @@
 //! off-thread (the async Picker switch, app.zig), that backing is the stateless
 //! `page_allocator` so the worker never races the main thread's allocator.
 //!
-//! `loadWith` takes an HttpClient seam and is therefore testable with a fake;
-//! `load` wraps it with a real StdHttpClient for production use.
+//! `loadWith` takes an HttpClient seam and is therefore testable with a fake.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -18,7 +17,6 @@ const file_enrichment = @import("file_enrichment.zig");
 
 const PullRequest = bbr.bitbucket.PullRequest;
 const Client = bbr.bitbucket.Client;
-const Credential = bbr.bitbucket.Credential;
 
 pub const ReviewHeader = struct {
     title: []const u8,
@@ -337,29 +335,6 @@ pub fn loadLocalWith(
         .source_label = "Git",
     };
     return s;
-}
-
-/// Production entry: construct a real StdHttpClient (backed by `backing`, which
-/// must be thread-safe — pass `std.heap.page_allocator` from a worker) and load.
-pub fn load(
-    io: Io,
-    backing: Allocator,
-    env_map: *const std.process.Environ.Map,
-    cred: Credential,
-    repo: []const u8,
-    id: u64,
-) !*Session {
-    var stdhttp = bbr.http.StdHttpClient.init(backing, io);
-    defer stdhttp.deinit();
-
-    // Proxy structs must outlive the client; a short-lived arena spanning the
-    // fetch is enough (the client is deinited before we return).
-    var proxy_arena = std.heap.ArenaAllocator.init(backing);
-    defer proxy_arena.deinit();
-    try stdhttp.initDefaultProxies(proxy_arena.allocator(), env_map);
-
-    const bb = Client.init(stdhttp.httpClient(), cred);
-    return loadWith(io, backing, bb, repo, id);
 }
 
 // ---------------------------------------------------------------------------

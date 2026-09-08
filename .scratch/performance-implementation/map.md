@@ -47,11 +47,11 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - [Limit Highlight query ranges](issues/24-limit-highlight-query-ranges.md) — Action 20 is rejected because visible ranges cannot preserve complete File Spans under the current Highlighter contract.
 - [Split Presentation invalidation](issues/25-split-presentation-invalidation.md) — A composite revision skips unchanged paints while Buffer, visual rows, and File Tree keep atomic publication.
 - [Own a compact cell row](issues/26-own-a-compact-cell-row.md) — Native vaxis row fills replace checked per-cell fills, cutting paint median latency by at least 13.9% without duplicate cell storage.
+- [Reuse HTTP connections](issues/27-reuse-http-connections.md) — One TUI-lifetime pool now serves remote work, and each File overlaps at most two side requests without weakening Session Epoch or rate-limit handling.
 
 ## Not yet specified
 
-- A release-level end-to-end latency target may become useful after stage timers expose the dominant costs.
-- Benchmark evidence may reveal a bottleneck not listed in `PERFORMANCE.md`. Add a ticket only when the question and proof are precise.
+None. The completed profiles did not support another action or require a release-level latency target.
 
 ## Out of scope
 
