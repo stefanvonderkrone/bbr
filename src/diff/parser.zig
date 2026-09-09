@@ -202,11 +202,11 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
                 new_no += 1;
             },
             '+' => {
-                try lines.append(allocator, .{ .old_no = null, .new_no = new_no, .kind = .added, .text = line[1..] });
+                try lines.append(allocator, .{ .old_no = 0, .new_no = new_no, .kind = .added, .text = line[1..] });
                 new_no += 1;
             },
             '-' => {
-                try lines.append(allocator, .{ .old_no = old_no, .new_no = null, .kind = .removed, .text = line[1..] });
+                try lines.append(allocator, .{ .old_no = old_no, .new_no = 0, .kind = .removed, .text = line[1..] });
                 old_no += 1;
             },
             '\\' => {
@@ -430,27 +430,27 @@ test "single modified file, one hunk, numbers assigned per kind" {
 
     // context: both sides
     try testing.expectEqual(LineKind.context, hunk.lines[0].kind);
-    try testing.expectEqual(@as(?u32, 1), hunk.lines[0].old_no);
-    try testing.expectEqual(@as(?u32, 1), hunk.lines[0].new_no);
+    try testing.expectEqual(@as(?u32, 1), hunk.lines[0].oldNo());
+    try testing.expectEqual(@as(?u32, 1), hunk.lines[0].newNo());
     try testing.expectEqualStrings("const a = 1;", hunk.lines[0].text);
 
     // removed: old only
     try testing.expectEqual(LineKind.removed, hunk.lines[1].kind);
-    try testing.expectEqual(@as(?u32, 2), hunk.lines[1].old_no);
-    try testing.expectEqual(@as(?u32, null), hunk.lines[1].new_no);
+    try testing.expectEqual(@as(?u32, 2), hunk.lines[1].oldNo());
+    try testing.expectEqual(@as(?u32, null), hunk.lines[1].newNo());
 
     // added: new only
     try testing.expectEqual(LineKind.added, hunk.lines[2].kind);
-    try testing.expectEqual(@as(?u32, null), hunk.lines[2].old_no);
-    try testing.expectEqual(@as(?u32, 2), hunk.lines[2].new_no);
+    try testing.expectEqual(@as(?u32, null), hunk.lines[2].oldNo());
+    try testing.expectEqual(@as(?u32, 2), hunk.lines[2].newNo());
 
     try testing.expectEqual(LineKind.added, hunk.lines[3].kind);
-    try testing.expectEqual(@as(?u32, 3), hunk.lines[3].new_no);
+    try testing.expectEqual(@as(?u32, 3), hunk.lines[3].newNo());
 
     // trailing context: old resumes at 3 (1 context + 1 removed), new at 4
     try testing.expectEqual(LineKind.context, hunk.lines[4].kind);
-    try testing.expectEqual(@as(?u32, 3), hunk.lines[4].old_no);
-    try testing.expectEqual(@as(?u32, 4), hunk.lines[4].new_no);
+    try testing.expectEqual(@as(?u32, 3), hunk.lines[4].oldNo());
+    try testing.expectEqual(@as(?u32, 4), hunk.lines[4].newNo());
 }
 
 test "Git-quoted paths are normalized in File identity" {
@@ -517,8 +517,8 @@ test "added file: /dev/null old side, status added" {
     try testing.expectEqualStrings("/dev/null", file.old_path);
     try testing.expectEqualStrings("new.txt", file.new_path);
     try testing.expectEqual(@as(usize, 2), file.hunks[0].lines.len);
-    try testing.expectEqual(@as(?u32, 1), file.hunks[0].lines[0].new_no);
-    try testing.expectEqual(@as(?u32, 2), file.hunks[0].lines[1].new_no);
+    try testing.expectEqual(@as(?u32, 1), file.hunks[0].lines[0].newNo());
+    try testing.expectEqual(@as(?u32, 2), file.hunks[0].lines[1].newNo());
 }
 
 test "deleted file: /dev/null new side, status removed" {
@@ -540,8 +540,8 @@ test "deleted file: /dev/null new side, status removed" {
     const file = diff.files[0];
     try testing.expectEqual(FileStatus.removed, file.status);
     try testing.expectEqual(LineKind.removed, file.hunks[0].lines[0].kind);
-    try testing.expectEqual(@as(?u32, 1), file.hunks[0].lines[0].old_no);
-    try testing.expectEqual(@as(?u32, null), file.hunks[0].lines[0].new_no);
+    try testing.expectEqual(@as(?u32, 1), file.hunks[0].lines[0].oldNo());
+    try testing.expectEqual(@as(?u32, null), file.hunks[0].lines[0].newNo());
 }
 
 test "multiple files, multiple hunks" {
@@ -576,8 +576,8 @@ test "multiple files, multiple hunks" {
     // Second hunk of first file: count omitted-vs-present, numbering from 10.
     const h2 = diff.files[0].hunks[1];
     try testing.expectEqual(@as(u32, 10), h2.old_start);
-    try testing.expectEqual(@as(?u32, 10), h2.lines[0].old_no);
-    try testing.expectEqual(@as(?u32, 10), h2.lines[0].new_no);
+    try testing.expectEqual(@as(?u32, 10), h2.lines[0].oldNo());
+    try testing.expectEqual(@as(?u32, 10), h2.lines[0].newNo());
 
     // First file's first hunk used the count-omitted form "@@ -1 +1 @@".
     const h1 = diff.files[0].hunks[0];

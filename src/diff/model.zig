@@ -16,8 +16,9 @@ pub const LineKind = enum { context, added, removed };
 /// selected side when the other side does not exist. Line numbers are 1-based,
 /// as they appear in the file and in comment anchors.
 pub const Line = struct {
-    old_no: ?u32,
-    new_no: ?u32,
+    /// Zero represents an absent side; file line numbers start at one.
+    old_no: u32,
+    new_no: u32,
     kind: LineKind,
     /// Text content with the diff prefix (` `/`+`/`-`) stripped, borrowed from
     /// the raw diff. Excludes the trailing newline.
@@ -28,6 +29,14 @@ pub const Line = struct {
     /// blob-sourced line never captures a comment or Draft (M9). Defaults true so
     /// the parser and every existing construction stay Hunk lines.
     in_hunk: bool = true,
+
+    pub fn oldNo(self: Line) ?u32 {
+        return if (self.old_no == 0) null else self.old_no;
+    }
+
+    pub fn newNo(self: Line) ?u32 {
+        return if (self.new_no == 0) null else self.new_no;
+    }
 };
 
 /// A contiguous region of change plus surrounding context, as delimited by the
@@ -114,6 +123,13 @@ pub const FileBlob = struct {
 };
 
 const std = @import("std");
+
+test "Line stores absent numbers without optional padding" {
+    const line: Line = .{ .old_no = 0, .new_no = 7, .kind = .added, .text = "new" };
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(Line));
+    try std.testing.expectEqual(@as(?u32, null), line.oldNo());
+    try std.testing.expectEqual(@as(?u32, 7), line.newNo());
+}
 
 test "displayPath uses the real name for a removed file, not /dev/null" {
     const removed: File = .{ .old_path = "src/gone.zig", .new_path = "/dev/null", .status = .removed, .hunks = &.{} };

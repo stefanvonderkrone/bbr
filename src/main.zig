@@ -146,9 +146,8 @@ fn containsTrustArgument(args: []const []const u8) bool {
     return false;
 }
 
-/// Resolve the startup entry and hand off to the TUI. Uses a real GitClient and
-/// a StdHttpClient for resolution; the loaded PR (and any switch) get their own
-/// clients inside `app.run`.
+/// Resolve the startup entry and hand off to the TUI. One StdHttpClient serves
+/// startup and every remote worker so its connection pool lives for the TUI.
 fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, input: bbr.startup.Input, configuration: *const config.Configuration) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -156,7 +155,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
 
     var git = bbr.git.ShellGitClient.init(gpa, init.io);
 
-    var client = bbr.http.StdHttpClient.init(gpa, init.io);
+    var client = bbr.http.StdHttpClient.init(std.heap.page_allocator, init.io);
     defer client.deinit();
     try client.initDefaultProxies(a, init.environ_map);
     const bb = bbr.bitbucket.Client.init(client.httpClient(), cred);
@@ -206,20 +205,20 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
     defer if (grammar_store) |*grammar_data_store| grammar_data_store.deinit();
     var grammar_registry: ?@import("highlight/user_grammar.zig").Registry = null;
     defer if (grammar_registry) |*registry| registry.deinit();
-    var tree_sitter_highlighter: TreeSitterHighlighter = .{};
     if (grammar_store) |*grammar_data_store| {
         const grammar_entries = try grammar_data_store.registryEntries(a);
         const grammar_overrides = try grammar_cli.loadOverrides(a, init.io, init.environ_map);
         try grammar_data_store.validateOverrideNames(grammar_overrides);
         grammar_registry = try @import("highlight/user_grammar.zig").Registry.init(gpa, init.io, grammar_entries, grammar_overrides, grammar_cli.bbr_identity);
-        tree_sitter_highlighter = TreeSitterHighlighter.init(&grammar_registry.?);
     }
+    var tree_sitter_highlighter = try TreeSitterHighlighter.init(gpa, if (grammar_registry) |*registry| registry else null);
+    defer tree_sitter_highlighter.deinit();
 
     app.run(.{
         .io = init.io,
         .gpa = gpa,
         .env_map = init.environ_map,
-        .cred = cred,
+        .bitbucket = bb,
         .repo = repo_buf[0..repo_len],
         .store = store.store(),
         .active_theme = configuration.active_theme,
@@ -307,19 +306,18 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
     defer if (grammar_store) |*grammar_data_store| grammar_data_store.deinit();
     var grammar_registry: ?@import("highlight/user_grammar.zig").Registry = null;
     defer if (grammar_registry) |*registry| registry.deinit();
-    var tree_sitter_highlighter: TreeSitterHighlighter = .{};
     if (grammar_store) |*grammar_data_store| {
         const grammar_entries = try grammar_data_store.registryEntries(a);
         const grammar_overrides = try grammar_cli.loadOverrides(a, init.io, init.environ_map);
         try grammar_data_store.validateOverrideNames(grammar_overrides);
         grammar_registry = try @import("highlight/user_grammar.zig").Registry.init(gpa, init.io, grammar_entries, grammar_overrides, grammar_cli.bbr_identity);
-        tree_sitter_highlighter = TreeSitterHighlighter.init(&grammar_registry.?);
     }
+    var tree_sitter_highlighter = try TreeSitterHighlighter.init(gpa, if (grammar_registry) |*registry| registry else null);
+    defer tree_sitter_highlighter.deinit();
     try app.run(.{
         .io = init.io,
         .gpa = gpa,
         .env_map = init.environ_map,
-        .cred = .{ .username = "", .token = "", .workspace = "" },
         .repo = "",
         .store = store.store(),
         .active_theme = configuration.active_theme,
@@ -849,7 +847,6 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
         .io = io,
         .gpa = gpa,
         .env_map = env_map,
-        .cred = .{ .username = "", .token = "", .workspace = "" },
         .repo = "",
         .store = store.store(),
         .active_theme = configuration.active_theme,

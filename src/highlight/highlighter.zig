@@ -3,22 +3,59 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// A hierarchical syntax role. Names use dot-separated specificity, for
-/// example `function.call`; Theme resolution may fall back to `function`.
-pub const Capture = struct {
-    name: []const u8,
+pub const CaptureRole = enum(u8) {
+    unknown,
+    comment,
+    string,
+    keyword,
+    function,
+    type,
+    constant,
+    variable,
+    property,
+    punctuation,
+    tag,
+};
 
-    pub fn parent(self: Capture) ?Capture {
-        const at = std.mem.lastIndexOfScalar(u8, self.name, '.') orelse return null;
-        return .{ .name = self.name[0..at] };
+/// A query-local Capture identity with its preclassified Theme role.
+pub const Capture = struct {
+    id: u16,
+    role: CaptureRole,
+
+    pub fn init(id: u16, name: []const u8) Capture {
+        const dot = std.mem.indexOfScalar(u8, name, '.') orelse name.len;
+        const root = name[0..dot];
+        const role: CaptureRole = if (std.mem.eql(u8, root, "comment"))
+            .comment
+        else if (std.mem.eql(u8, root, "string"))
+            .string
+        else if (std.mem.eql(u8, root, "keyword") or std.mem.eql(u8, root, "operator"))
+            .keyword
+        else if (std.mem.eql(u8, root, "function") or std.mem.eql(u8, root, "method") or std.mem.eql(u8, root, "constructor"))
+            .function
+        else if (std.mem.eql(u8, root, "type"))
+            .type
+        else if (std.mem.eql(u8, root, "constant") or std.mem.eql(u8, root, "number") or std.mem.eql(u8, root, "boolean"))
+            .constant
+        else if (std.mem.eql(u8, root, "variable") or std.mem.eql(u8, root, "label"))
+            .variable
+        else if (std.mem.eql(u8, root, "property") or std.mem.eql(u8, root, "attribute"))
+            .property
+        else if (std.mem.eql(u8, root, "punctuation"))
+            .punctuation
+        else if (std.mem.eql(u8, root, "tag"))
+            .tag
+        else
+            .unknown;
+        return .{ .id = id, .role = role };
     }
 };
 
 /// A half-open UTF-8 byte range within one numbered file line.
 pub const Span = struct {
     line: u32,
-    start: usize,
-    end: usize,
+    start: u32,
+    end: u32,
     capture: Capture,
 };
 
@@ -45,11 +82,15 @@ pub const Highlighter = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        highlight: *const fn (ptr: *anyopaque, allocator: Allocator, path: []const u8, content: []const u8) anyerror!Result,
+        highlight: *const fn (ptr: *anyopaque, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8) anyerror!Result,
     };
 
     pub fn highlight(self: Highlighter, allocator: Allocator, path: []const u8, content: []const u8) !Result {
-        return self.vtable.highlight(self.ptr, allocator, path, content);
+        return self.highlightWithScratch(allocator, allocator, path, content);
+    }
+
+    pub fn highlightWithScratch(self: Highlighter, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8) !Result {
+        return self.vtable.highlight(self.ptr, result_allocator, scratch_allocator, path, content);
     }
 };
 
@@ -61,19 +102,21 @@ pub const PlainHighlighter = struct {
 
     const vtable: Highlighter.VTable = .{ .highlight = highlightImpl };
 
-    fn highlightImpl(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) anyerror!Result {
+    fn highlightImpl(_: *anyopaque, _: Allocator, _: Allocator, _: []const u8, _: []const u8) anyerror!Result {
         return .{ .spans = &.{} };
     }
 };
 
 const testing = std.testing;
 
-test "Capture walks hierarchical parents" {
-    const specific: Capture = .{ .name = "function.call.builtin" };
-    const parent = specific.parent().?;
-    try testing.expectEqualStrings("function.call", parent.name);
-    try testing.expectEqualStrings("function", parent.parent().?.name);
-    try testing.expect(parent.parent().?.parent() == null);
+test "Capture classifies hierarchical names once" {
+    try testing.expectEqual(CaptureRole.function, Capture.init(7, "function.call.builtin").role);
+    try testing.expectEqual(CaptureRole.keyword, Capture.init(8, "operator").role);
+    try testing.expectEqual(CaptureRole.unknown, Capture.init(9, "future.capture").role);
+}
+
+test "Span uses compact offsets and Capture identity" {
+    try testing.expectEqual(@as(usize, 16), @sizeOf(Span));
 }
 
 test "PlainHighlighter satisfies the seam with no Spans" {

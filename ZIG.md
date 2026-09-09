@@ -103,6 +103,13 @@ the main thread; the Epoch token still guards against stale results.
 - **`initDefaultProxies(&client, arena, environ_map)`** takes the `*const Environ.Map` directly —
   pairs cleanly with `init.environ_map`.
 - **TLS** is built in (own `ca_bundle`); no external OpenSSL needed.
+- **One Client can serve concurrent requests.** `Client.request` and `Client.fetch` are thread-safe
+  (`std/http/Client.zig:1675-1686`, `1798-1801`), and the connection pool has its own mutex. The
+  allocator stored in `Client` must be thread-safe (`Client.zig:27-28`). Individual `Request`
+  values are not thread-safe (`Client.zig:1-4`), so each worker owns and deinitializes its own
+  `Request`. Await all workers before `Client.deinit`; deinit requires no active requests
+  (`Client.zig:1304-1315`). bbr keeps one TUI-lifetime Client backed by `page_allocator` and shares
+  only the Client, never a Request.
 - **Don't hand-roll URL parsing — `std.Uri.parse(text) !Uri` exists** (`std/Uri.zig`), splitting
   `scheme` / `host` / `port` / `path` / `query` / `fragment`. It **requires a scheme** (a bare
   `host/path` errors). `host`/`path`/… are `std.Uri.Component = union(enum){ raw, percent_encoded }`;
@@ -132,13 +139,18 @@ the main thread; the Epoch token still guards against stale results.
   pattern our seams (`HttpClient`, `PendingReviewStore`, `Highlighter`) copy — idiomatic, not a hack.
 - **`std.heap.ArenaAllocator`** (`std/heap/ArenaAllocator.zig`):
   - `init(child_allocator)`; `allocator()` returns the `Allocator` interface.
-  - `reset(mode: ResetMode) bool` where `ResetMode = union(enum){ free_all, retain_capacity, /* shrink-to-N */ }`.
+  - `reset(mode: ResetMode) bool` where
+    `ResetMode = union(enum){ free_all, retain_capacity, retain_with_limit: usize }`.
   - `queryCapacity() usize` reports arena allocation capacity without the allocator's internal
     linked-list node storage. File-content cache accounting uses it because an arena can retain
     scratch allocations even after individual `free` calls; only the most recent allocation is
     freed individually.
   - **`reset(.retain_capacity)`** keeps the backing pages — this is what makes our
     buffer-scoped arena cheap to reuse on file switch (§11 of the design doc).
+  - **`reset(.{ .retain_with_limit = bytes })`** keeps capacity up to a bound and shrinks larger
+    arenas (`std/heap/ArenaAllocator.zig:86-112`). It can return `false` when shrinking fails, but
+    the arena remains usable and releases its old memory. bbr uses this for Buffer and frame arenas
+    so one unusually large review does not become the retained baseline.
 - **`std.heap.GeneralPurposeAllocator`** (or `c_allocator` when we link C) backs the global tier
   and provides leak detection in debug builds.
 
@@ -209,6 +221,27 @@ the main thread; the Epoch token still guards against stale results.
   "name shadows primitive 'i2'". Loop/scratch variables that would naturally be `i2`, `j2`, `u1`
   must be renamed (`oi`, `ni`, …) or written `@"i2"`.
 
+## 6.5 Benchmarking and SIMD
+
+- Use `std.Io.Clock.awake.now(io)` for elapsed time. `awake` is monotonic and excludes suspended
+  time when the platform supports that distinction (`std/Io.zig:739-756`). An `Io.Timestamp` can
+  use `start.untilNow(io, .awake).toNanoseconds()` (`std/Io.zig:906-962`, `1002`). Use the real
+  clock only for wall-clock data such as HTTP dates.
+- Feed each measured result or semantic checksum to `std.mem.doNotOptimizeAway`. Zig documents it
+  as the way to stop discarded work from being optimized away (`std/mem.zig:4785-4789`). A stable
+  checksum also detects benchmark behavior changes between samples.
+- `std.simd.suggestVectorLength(T)` returns a target-dependent `?comptime_int`; `null` means use
+  scalar code (`std/simd.zig:85-89`). Keep a scalar tail and compare the fast path with the scalar
+  path across short lengths and unaligned starts. bbr uses this only as an early-exit scan for
+  narrow ASCII. Controls, DEL, and non-ASCII bytes stay on the terminal-width path.
+- Put deterministic fixture construction outside the timed region. Use a fresh arena per sample
+  and record both requested allocation data and `ArenaAllocator.queryCapacity()`. Place a counting
+  allocator at the same layer in every benchmark. Moving it outside an arena changes the metric
+  from workload allocation calls to arena backing allocations.
+- Bound quadratic work with saturating arithmetic (`*|` and `+|`) before allocation. Keep exact
+  behavior below the measured budget and use a deterministic fallback above it. bbr applies this
+  to intra-line LCS and SideBySide Line matching.
+
 ## 7. libvaxis (TUI) — 0.16 integration facts
 
 **Verified by building bbr's M0** against pinned commit `ca781b3` (`vaxis-0.6.0`).
@@ -270,7 +303,11 @@ the main thread; the Epoch token still guards against stale results.
 - [ ] `initDefaultProxies` + `Proxy` struct shape unchanged?
 - [ ] `std.Io.Threaded.init` options (esp. `async_limit`) unchanged?
 - [ ] `ArenaAllocator.ResetMode` variants unchanged?
+- [ ] `ArenaAllocator.reset(.{ .retain_with_limit = bytes })` failure semantics unchanged?
 - [ ] `ArenaAllocator.queryCapacity` semantics still exclude internal node storage?
 - [ ] `std.Io.Reader`/`Writer` method surface we use unchanged?
 - [ ] libvaxis still builds against the new toolchain; re-pin its commit.
 - [ ] libvaxis `Vaxis.copyToSystemClipboard` signature and OSC 52 behavior unchanged?
+- [ ] `Io.Clock.awake` / `Timestamp.untilNow` / `Duration.toNanoseconds` unchanged?
+- [ ] `std.simd.suggestVectorLength` still returns a target-dependent optional comptime length?
+- [ ] `std.http.Client` request concurrency and thread-safe allocator requirements unchanged?

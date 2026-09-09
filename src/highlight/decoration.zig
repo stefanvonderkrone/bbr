@@ -93,7 +93,7 @@ fn validateSpans(text: []const u8, spans: []const Span) error{InvalidSpan}!void 
         if (line) |expected| {
             if (span.line != expected) return error.InvalidSpan;
         } else line = span.line;
-        if (span.capture.name.len == 0 or span.start >= span.end or span.start < previous_end or span.end > text.len) return error.InvalidSpan;
+        if (span.start >= span.end or span.start < previous_end or span.end > text.len) return error.InvalidSpan;
         if (!utf8Boundary(text, span.start) or !utf8Boundary(text, span.end)) return error.InvalidSpan;
         previous_end = span.end;
     }
@@ -119,8 +119,8 @@ const testing = std.testing;
 test "LineDecoration intersects Captures and emphasis without copying text" {
     const text = "const answer = 42";
     const spans = [_]Span{
-        .{ .line = 1, .start = 0, .end = 5, .capture = .{ .name = "keyword" } },
-        .{ .line = 1, .start = 15, .end = 17, .capture = .{ .name = "number" } },
+        .{ .line = 1, .start = 0, .end = 5, .capture = Capture.init(0, "keyword") },
+        .{ .line = 1, .start = 15, .end = 17, .capture = Capture.init(1, "number") },
     };
     const emphasis = [_]intraline.Segment{
         .{ .text = text[0..6], .emphasis = false },
@@ -132,13 +132,13 @@ test "LineDecoration intersects Captures and emphasis without copying text" {
 
     try testing.expectEqual(@as(usize, 5), result.runs.len);
     try testing.expectEqualStrings("const", result.runs[0].text);
-    try testing.expectEqualStrings("keyword", result.runs[0].capture.?.name);
+    try testing.expectEqual(highlighter.CaptureRole.keyword, result.runs[0].capture.?.role);
     try testing.expect(!result.runs[0].emphasis);
     try testing.expectEqualStrings("answer", result.runs[2].text);
     try testing.expect(result.runs[2].capture == null);
     try testing.expect(result.runs[2].emphasis);
     try testing.expectEqualStrings("42", result.runs[4].text);
-    try testing.expectEqualStrings("number", result.runs[4].capture.?.name);
+    try testing.expectEqual(highlighter.CaptureRole.constant, result.runs[4].capture.?.role);
 }
 
 test "LineDecoration reconstructs plain and syntax-only Lines" {
@@ -148,20 +148,20 @@ test "LineDecoration reconstructs plain and syntax-only Lines" {
     try testing.expectEqual(@as(usize, 1), plain.runs.len);
     try testing.expectEqualStrings(text, plain.runs[0].text);
 
-    const syntax = try decorate(testing.allocator, text, &.{.{ .line = 8, .start = 1, .end = 4, .capture = .{ .name = "string" } }}, &.{});
+    const syntax = try decorate(testing.allocator, text, &.{.{ .line = 8, .start = 1, .end = 4, .capture = Capture.init(0, "string") }}, &.{});
     defer testing.allocator.free(syntax.runs);
     try testing.expectEqual(@as(usize, 3), syntax.runs.len);
     try testing.expectEqualStrings("ell", syntax.runs[1].text);
-    try testing.expectEqualStrings("string", syntax.runs[1].capture.?.name);
+    try testing.expectEqual(highlighter.CaptureRole.string, syntax.runs[1].capture.?.role);
 }
 
 test "LineDecoration rejects overlap and UTF-8 splits" {
     const overlap = [_]Span{
-        .{ .line = 1, .start = 0, .end = 2, .capture = .{ .name = "a" } },
-        .{ .line = 1, .start = 1, .end = 3, .capture = .{ .name = "b" } },
+        .{ .line = 1, .start = 0, .end = 2, .capture = Capture.init(0, "a") },
+        .{ .line = 1, .start = 1, .end = 3, .capture = Capture.init(1, "b") },
     };
     try testing.expectError(error.InvalidSpan, decorate(testing.allocator, "abc", &overlap, &.{}));
-    try testing.expectError(error.InvalidSpan, decorate(testing.allocator, "é", &.{.{ .line = 1, .start = 1, .end = 2, .capture = .{ .name = "string" } }}, &.{}));
+    try testing.expectError(error.InvalidSpan, decorate(testing.allocator, "é", &.{.{ .line = 1, .start = 1, .end = 2, .capture = Capture.init(0, "string") }}, &.{}));
 }
 
 test "LineDecoration rejects emphasis that does not reconstruct the Line" {

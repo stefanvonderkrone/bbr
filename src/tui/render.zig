@@ -5,8 +5,9 @@
 //!
 //! Cell text is *borrowed* by vaxis until the frame is rendered. Line body text
 //! borrows the raw diff (long-lived); the only text we synthesize per frame is
-//! the gutter (line numbers), so `draw` takes a `scratch` allocator that must
-//! outlive the render/read that follows (a per-frame arena, reset after render).
+//! dynamic labels, so `draw` takes a `scratch` allocator that must outlive the
+//! render/read that follows (a per-frame arena, reset after render). Gutters use
+//! stack formatting but write static digit glyphs into vaxis cells.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -19,6 +20,7 @@ const ReviewProjection = presentation.ReviewProjection;
 const Buffer = buffer_mod.Buffer;
 const Row = buffer_mod.Row;
 const LineRow = buffer_mod.LineRow;
+const LinePair = buffer_mod.LinePair;
 const CommentRow = buffer_mod.CommentRow;
 const DraftRow = buffer_mod.DraftRow;
 const Section = buffer_mod.Section;
@@ -91,7 +93,7 @@ pub fn drawReview(
     const sidebar = childRect(win, review.frame.panes.sidebar_content);
     const diff_pane = childRect(win, review.frame.panes.diff_content);
     drawFileTree(sidebar, review.frame.file_tree, theme);
-    drawVisualPane(scratch, diff_pane, review.frame.visual_rows, review.frame.buffer.layout, theme, review.frame.navigation);
+    drawVisualPane(scratch, diff_pane, review.frame.buffer, review.frame.visual_rows, theme, review.frame.navigation);
     joinSectionRules(win, review.frame.panes.diff, review.frame.panes.diff_content, review.frame.visual_rows, review.frame.navigation, theme);
 }
 
@@ -101,7 +103,7 @@ fn joinSectionRules(win: vaxis.Window, outer: @import("frame.zig").Rect, content
     while (screen_row < content.height) : (screen_row += 1) {
         const index = nav.scroll + screen_row;
         if (index >= visual_rows.len) break;
-        const joined = switch (visual_rows[index].row) {
+        const joined = switch (visual_rows[index].kind) {
             .file_header, .section => true,
             else => false,
         };
@@ -233,33 +235,40 @@ fn drawPane(scratch: std.mem.Allocator, win: vaxis.Window, buf: Buffer, theme: T
 fn drawVisualPane(
     scratch: std.mem.Allocator,
     win: vaxis.Window,
+    buf: Buffer,
     visual_rows: []const @import("frame.zig").VisualRow,
-    layout: buffer_mod.Layout,
     theme: Theme,
     nav: Nav,
 ) void {
-    drawProjectedRows(scratch, win, visual_rows, layout, theme, nav);
+    const sel = nav.selection();
+    var screen_row: u16 = 0;
+    while (screen_row < win.height) : (screen_row += 1) {
+        const index = nav.scroll + screen_row;
+        if (index >= visual_rows.len) break;
+        const visual_row = visual_rows[index];
+        const row = buf.rows[visual_row.buffer_index];
+        const selected = if (sel) |selection|
+            visual_row.kind != .status_placeholder and visualRowSelected(visual_rows, selection, index)
+        else
+            false;
+        const row_theme = if (selected or index == nav.cursor) cursorRowTheme(theme) else theme;
+        drawVisualRow(scratch, win, screen_row, buf.layout, row, visual_row, row_theme);
+    }
 }
 
-fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, rows: anytype, layout: buffer_mod.Layout, theme: Theme, nav: Nav) void {
+fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, rows: []const Row, layout: buffer_mod.Layout, theme: Theme, nav: Nav) void {
     const sel = nav.selection();
     var screen_row: u16 = 0;
     while (screen_row < win.height) : (screen_row += 1) {
         const index = nav.scroll + screen_row;
         if (index >= rows.len) break;
-        const row: Row = if (@TypeOf(rows) == []const Row) rows[index] else rows[index].row;
-        if (@TypeOf(rows) == []const Row)
-            drawRow(scratch, win, screen_row, layout, row, theme)
+        const row = rows[index];
+        const selected = if (sel) |selection|
+            row != .status_placeholder and index >= selection[0] and index <= selection[1]
         else
-            drawVisualRow(scratch, win, screen_row, layout, rows[index], theme);
-        if (sel) |selection| {
-            const selected = if (@TypeOf(rows) == []const Row)
-                index >= selection[0] and index <= selection[1]
-            else
-                visualRowSelected(rows, selection, index);
-            if (selected and row != .status_placeholder) highlightCursorRow(win, screen_row, theme);
-        }
-        if (index == nav.cursor) highlightCursorRow(win, screen_row, theme);
+            false;
+        const row_theme = if (selected or index == nav.cursor) cursorRowTheme(theme) else theme;
+        drawRow(scratch, win, screen_row, layout, row, row_theme);
     }
 }
 
@@ -269,30 +278,26 @@ fn visualRowSelected(rows: []const @import("frame.zig").VisualRow, selection: [2
     if (candidate.owner != .line) return index >= selection[0] and index <= selection[1];
     var selected = selection[0];
     while (selected <= selection[1] and selected < rows.len) : (selected += 1) {
-        if (candidate.row == .line_pair and rows[selected].buffer_index == candidate.buffer_index) return true;
+        if (candidate.kind == .line_pair and rows[selected].buffer_index == candidate.buffer_index) return true;
         if (rows[selected].owner.eql(candidate.owner)) return true;
     }
     return false;
 }
 
-fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, visual_row: @import("frame.zig").VisualRow, theme: Theme) void {
+fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, row: Row, visual_row: @import("frame.zig").VisualRow, theme: Theme) void {
     if (layout == .side_by_side and visual_row.halves != null) {
-        drawVisualLinePair(scratch, win, r, visual_row.halves.?, theme);
+        drawVisualLinePair(scratch, win, r, visual_row.halves.?, row.line_pair, theme);
         return;
     }
-    if (visual_row.row != .line or layout != .unified) {
-        drawRow(scratch, win, r, layout, visual_row.row, theme);
+    if (row != .line or layout != .unified) {
+        drawRow(scratch, win, r, layout, row, theme);
         return;
     }
-    const line_row = visual_row.row.line;
+    const line_row = row.line;
     const style = theme.lineStyle(line_row.line.kind);
     fillRow(win, r, style);
     if (!visual_row.continuation) {
-        const gutter = std.fmt.allocPrint(scratch, "{s} {s} ", .{
-            numCol(scratch, line_row.line.old_no),
-            numCol(scratch, line_row.line.new_no),
-        }) catch "";
-        _ = win.printSegment(.{ .text = gutter, .style = theme.gutter }, .{ .row_offset = r, .wrap = .none });
+        drawUnifiedGutter(win, r, line_row.line.oldNo(), line_row.line.newNo(), theme.gutter);
     }
     drawLineBodyText(
         scratch,
@@ -301,26 +306,33 @@ fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: 
         gutter_cols,
         line_row.line,
         line_row.line.text[visual_row.source_start..visual_row.source_end],
-        visual_row.decoration orelse .{ .runs = &.{} },
+        line_row.decoration,
         theme,
         style,
     );
 }
 
-/// Highlight the whole cursor row (TUI "cursorline" convention): re-tint every
-/// cell's background after the row is drawn, so the diff band colors show
-/// through — a context row gets the neutral cursor tint, a banded row keeps its
-/// hue nudged lighter. Runs after `drawRow` so it also covers a `line_pair`'s
-/// two halves and the divider gap.
-fn highlightCursorRow(win: vaxis.Window, r: u16, theme: Theme) void {
-    var c: u16 = 0;
-    while (c < win.width) : (c += 1) {
-        if (win.readCell(c, r)) |cell| {
-            var lit = cell;
-            lit.style.bg = theme.cursorBg(cell.style.bg);
-            win.writeCell(c, r, lit);
-        }
-    }
+fn cursorRowTheme(theme: Theme) Theme {
+    var result = theme;
+    result.context.bg = theme.cursorBg(theme.context.bg);
+    result.added.bg = theme.cursorBg(theme.added.bg);
+    result.removed.bg = theme.cursorBg(theme.removed.bg);
+    result.added_emphasis.bg = theme.cursorBg(theme.added_emphasis.bg);
+    result.removed_emphasis.bg = theme.cursorBg(theme.removed_emphasis.bg);
+    result.gutter.bg = theme.cursorBg(theme.gutter.bg);
+    result.file_header.bg = theme.cursorBg(theme.file_header.bg);
+    result.hunk_header.bg = theme.cursorBg(theme.hunk_header.bg);
+    result.fold.bg = theme.cursorBg(theme.fold.bg);
+    result.comment.bg = theme.cursorBg(theme.comment.bg);
+    result.comment_reply.bg = theme.cursorBg(theme.comment_reply.bg);
+    result.suggestion.bg = theme.cursorBg(theme.suggestion.bg);
+    result.draft.bg = theme.cursorBg(theme.draft.bg);
+    result.draft_reply.bg = theme.cursorBg(theme.draft_reply.bg);
+    result.outcome_unknown.bg = theme.cursorBg(theme.outcome_unknown.bg);
+    result.outcome_unknown_reply.bg = theme.cursorBg(theme.outcome_unknown_reply.bg);
+    result.section.bg = theme.cursorBg(theme.section.bg);
+    result.section_rule.bg = theme.cursorBg(theme.section_rule.bg);
+    return result;
 }
 
 /// Gutter is two 4-wide line-number columns; body text starts after it.
@@ -343,11 +355,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer
             const style = theme.lineStyle(ln.kind);
             fillRow(win, r, style);
 
-            const gutter = std.fmt.allocPrint(scratch, "{s} {s} ", .{
-                numCol(scratch, ln.old_no),
-                numCol(scratch, ln.new_no),
-            }) catch "";
-            _ = win.printSegment(.{ .text = gutter, .style = theme.gutter }, .{ .row_offset = r, .wrap = .none });
+            drawUnifiedGutter(win, r, ln.oldNo(), ln.newNo(), theme.gutter);
             drawLineBody(scratch, win, r, gutter_cols, lr, theme, style);
         },
         .line_pair => |pair| drawLinePair(scratch, win, r, pair, theme),
@@ -440,6 +448,7 @@ fn drawLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, pair: buf
     if (half == 0) return;
     const right_x = half + 1; // divider column sits at `half`
     const right_w = if (win.width > right_x) win.width - right_x else 0;
+    fillRow(win, r, theme.context);
 
     const left = win.child(.{ .x_off = 0, .y_off = r, .width = half, .height = 1 });
     drawHalf(scratch, left, pair.left, theme, .old);
@@ -449,25 +458,27 @@ fn drawLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, pair: buf
     }
 }
 
-fn drawVisualLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, halves: @import("frame.zig").Halves, theme: Theme) void {
+fn drawVisualLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, halves: @import("frame.zig").Halves, pair: LinePair, theme: Theme) void {
     const half = win.width / 2;
     if (half == 0) return;
     const right_x = half + @as(u16, @intCast(@import("frame.zig").side_divider_cols));
     const right_w = if (win.width > right_x) win.width - right_x else 0;
-    drawVisualHalf(scratch, win.child(.{ .x_off = 0, .y_off = r, .width = half, .height = 1 }), halves.left, theme, .old);
-    if (right_w > 0) drawVisualHalf(scratch, win.child(.{ .x_off = right_x, .y_off = r, .width = right_w, .height = 1 }), halves.right, theme, .new);
+    fillRow(win, r, theme.context);
+    drawVisualHalf(scratch, win.child(.{ .x_off = 0, .y_off = r, .width = half, .height = 1 }), halves.left, pair.left, theme, .old);
+    if (right_w > 0) drawVisualHalf(scratch, win.child(.{ .x_off = right_x, .y_off = r, .width = right_w, .height = 1 }), halves.right, pair.right, theme, .new);
 }
 
-fn drawVisualHalf(scratch: std.mem.Allocator, win: vaxis.Window, half: ?@import("frame.zig").VisualHalf, theme: Theme, side: Side) void {
+fn drawVisualHalf(scratch: std.mem.Allocator, win: vaxis.Window, half: ?@import("frame.zig").VisualHalf, line_row: ?LineRow, theme: Theme, side: Side) void {
     const value = half orelse {
         fillRow(win, 0, theme.context);
         return;
     };
+    const decoration = line_row.?.decoration;
     const style = theme.lineStyle(value.line.kind);
     fillRow(win, 0, style);
     if (!value.continuation) {
-        const no = if (side == .old) value.line.old_no else value.line.new_no;
-        _ = win.printSegment(.{ .text = numCol(scratch, no), .style = theme.gutter }, .{ .wrap = .none });
+        const no = if (side == .old) value.line.oldNo() else value.line.newNo();
+        drawSideGutter(win, 0, no, theme.gutter);
     }
     drawLineBodyText(
         scratch,
@@ -476,7 +487,7 @@ fn drawVisualHalf(scratch: std.mem.Allocator, win: vaxis.Window, half: ?@import(
         side_gutter,
         value.line,
         value.line.text[value.source_start..value.source_end],
-        value.decoration,
+        decoration,
         theme,
         style,
     );
@@ -496,10 +507,10 @@ fn drawHalf(scratch: std.mem.Allocator, win: vaxis.Window, side_row: ?LineRow, t
     const style = theme.lineStyle(lr.line.kind);
     fillRow(win, 0, style);
     const no = switch (side) {
-        .old => lr.line.old_no,
-        .new => lr.line.new_no,
+        .old => lr.line.oldNo(),
+        .new => lr.line.newNo(),
     };
-    _ = win.printSegment(.{ .text = numCol(scratch, no), .style = theme.gutter }, .{ .row_offset = 0, .wrap = .none });
+    drawSideGutter(win, 0, no, theme.gutter);
     drawLineBody(scratch, win, 0, side_gutter, lr, theme, style);
 }
 
@@ -512,16 +523,36 @@ fn drawLineBody(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, body_col:
 
 fn drawLineBodyText(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, body_col: u16, line: *const bbr.diff.Line, text: []const u8, decoration: bbr.highlight.LineDecoration, theme: Theme, style: vaxis.Style) void {
     const emph = theme.emphasisStyle(line.kind);
-    const segs = scratch.alloc(vaxis.Segment, decoration.runs.len) catch {
+    const source_start = @intFromPtr(text.ptr) - @intFromPtr(line.text.ptr);
+    const source_end = source_start + text.len;
+    var count: usize = 0;
+    var offset: usize = 0;
+    for (decoration.runs) |run| {
+        const run_end = offset + run.text.len;
+        if (offset < source_end and run_end > source_start) count += 1;
+        offset = run_end;
+    }
+    const segs = scratch.alloc(vaxis.Segment, count) catch {
         _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = body_col, .wrap = .none });
         return;
     };
-    for (decoration.runs, 0..) |run, i| {
+    offset = 0;
+    var index: usize = 0;
+    for (decoration.runs) |run| {
+        const run_end = offset + run.text.len;
+        const overlap_start = @max(offset, source_start);
+        const overlap_end = @min(run_end, source_end);
+        if (overlap_start >= overlap_end) {
+            offset = run_end;
+            continue;
+        }
         var run_style = if (run.emphasis) emph else style;
         if (run.capture) |capture| {
             if (theme.captureColor(capture)) |fg| run_style.fg = fg;
         }
-        segs[i] = .{ .text = run.text, .style = run_style };
+        segs[index] = .{ .text = run.text[overlap_start - offset .. overlap_end - offset], .style = run_style };
+        index += 1;
+        offset = run_end;
     }
     _ = win.print(segs, .{ .row_offset = r, .col_offset = body_col, .wrap = .none });
 }
@@ -576,7 +607,7 @@ fn drawDisclosure(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, value: 
 
 /// A section divider: "── PR comments (N) ──" or "── Outdated · path (N) ──".
 fn drawSection(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, sec: Section, theme: Theme) void {
-    fillRow(win, r, .{});
+    fillRow(win, r, theme.context);
     const text = switch (sec.kind) {
         .pr_comments => std.fmt.allocPrint(scratch, "── PR comments ({d}) ──", .{sec.count}) catch "── PR comments ──",
         .pending => std.fmt.allocPrint(scratch, "── Pending ({d}) ──", .{sec.count}) catch "── Pending ──",
@@ -1066,17 +1097,53 @@ pub fn drawLoading(scratch: std.mem.Allocator, win: vaxis.Window, id: ?u64, them
     _ = modal.printSegment(.{ .text = text, .style = theme.picker_query }, .{ .row_offset = row, .wrap = .none });
 }
 
-/// Render an optional line number right-justified in 4 columns (blank if absent).
-fn numCol(scratch: std.mem.Allocator, no: ?u32) []const u8 {
-    const n = no orelse return "    ";
-    return std.fmt.allocPrint(scratch, "{d: >4}", .{n}) catch "    ";
+fn drawUnifiedGutter(win: vaxis.Window, row: u16, old_no: ?u32, new_no: ?u32, style: vaxis.Style) void {
+    var text: [32]u8 = undefined;
+    var length = formatNumCol(&text, old_no);
+    text[length] = ' ';
+    length += 1;
+    length += formatNumCol(text[length..], new_no);
+    text[length] = ' ';
+    paintStaticDigits(win, row, text[0 .. length + 1], style);
+}
+
+fn drawSideGutter(win: vaxis.Window, row: u16, no: ?u32, style: vaxis.Style) void {
+    var text: [16]u8 = undefined;
+    const length = formatNumCol(&text, no);
+    paintStaticDigits(win, row, text[0..length], style);
+}
+
+fn formatNumCol(output: []u8, no: ?u32) usize {
+    if (no) |number| return (std.fmt.bufPrint(output, "{d: >4}", .{number}) catch return 0).len;
+    @memcpy(output[0..4], "    ");
+    return 4;
+}
+
+fn paintStaticDigits(win: vaxis.Window, row: u16, text: []const u8, style: vaxis.Style) void {
+    for (text, 0..) |byte, column| {
+        if (column >= win.width) break;
+        win.writeCell(@intCast(column), row, .{ .char = .{ .grapheme = digitGlyph(byte), .width = 1 }, .style = style });
+    }
+}
+
+fn digitGlyph(byte: u8) []const u8 {
+    return switch (byte) {
+        '0' => "0",
+        '1' => "1",
+        '2' => "2",
+        '3' => "3",
+        '4' => "4",
+        '5' => "5",
+        '6' => "6",
+        '7' => "7",
+        '8' => "8",
+        '9' => "9",
+        else => " ",
+    };
 }
 
 fn fillRow(win: vaxis.Window, row: u16, style: vaxis.Style) void {
-    var c: u16 = 0;
-    while (c < win.width) : (c += 1) {
-        win.writeCell(c, row, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
-    }
+    win.child(.{ .y_off = row, .height = 1 }).fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,7 +1228,7 @@ test "syntax foreground composes over an added Line background" {
         \\
     ;
     const diff = try bbr.diff.parse(a, raw);
-    const spans = [_]bbr.highlight.Span{.{ .line = 1, .start = 0, .end = 3, .capture = .{ .name = "keyword" } }};
+    const spans = [_]bbr.highlight.Span{.{ .line = 1, .start = 0, .end = 3, .capture = bbr.highlight.Capture.init(0, "keyword") }};
     const highlights = [_]bbr.highlight.FileHighlights{.{ .new = .{ .spans = &spans } }};
     const buf = try buffer_mod.buildWithComments(a, diff, .unified, &.{}, .{ .highlights = &highlights });
 
@@ -1179,9 +1246,9 @@ test "disabled Diff visual-row projection clips exactly like Buffer rendering" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const line: bbr.diff.Line = .{ .old_no = null, .new_no = 1, .kind = .added, .text = "long highlighted source" };
+    const line: bbr.diff.Line = .{ .old_no = 0, .new_no = 1, .kind = .added, .text = "long highlighted source" };
     const runs = [_]bbr.highlight.decoration.Run{
-        .{ .text = line.text[0..4], .capture = .{ .name = "keyword" } },
+        .{ .text = line.text[0..4], .capture = bbr.highlight.Capture.init(0, "keyword") },
         .{ .text = line.text[4..], .emphasis = true },
     };
     const rows = [_]Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &runs } } }};
@@ -1196,7 +1263,7 @@ test "disabled Diff visual-row projection clips exactly like Buffer rendering" {
     const nav = Nav.init(1, 1);
 
     drawPane(a, buffer_window, buf, theme_dark, nav);
-    drawVisualPane(a, frame_window, visual_rows, .unified, theme_dark, nav);
+    drawVisualPane(a, frame_window, buf, visual_rows, theme_dark, nav);
 
     for (0..buffer_window.width) |col| {
         const expected = buffer_window.readCell(@intCast(col), 0).?;
@@ -1210,8 +1277,8 @@ test "disabled SideBySide visual rows clip exactly like Buffer rendering" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const left: bbr.diff.Line = .{ .old_no = 1, .new_no = null, .kind = .removed, .text = "long old source" };
-    const right: bbr.diff.Line = .{ .old_no = null, .new_no = 1, .kind = .added, .text = "long new source" };
+    const left: bbr.diff.Line = .{ .old_no = 1, .new_no = 0, .kind = .removed, .text = "long old source" };
+    const right: bbr.diff.Line = .{ .old_no = 0, .new_no = 1, .kind = .added, .text = "long new source" };
     const rows = [_]Row{.{ .line_pair = .{
         .left = .{ .line = &left, .decoration = .{ .runs = &.{.{ .text = left.text }} } },
         .right = .{ .line = &right, .decoration = .{ .runs = &.{.{ .text = right.text }} } },
@@ -1227,7 +1294,7 @@ test "disabled SideBySide visual rows clip exactly like Buffer rendering" {
     const nav = Nav.init(1, 1);
 
     drawPane(a, buffer_window, buf, theme_dark, nav);
-    drawVisualPane(a, frame_window, visual_rows, .side_by_side, theme_dark, nav);
+    drawVisualPane(a, frame_window, buf, visual_rows, theme_dark, nav);
 
     for (0..buffer_window.width) |col| {
         const expected = buffer_window.readCell(@intCast(col), 0).?;
@@ -1241,10 +1308,11 @@ test "Unified continuation rows keep decoration and use a blank gutter" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const line: bbr.diff.Line = .{ .old_no = null, .new_no = 7, .kind = .added, .text = "alpha beta" };
+    const line: bbr.diff.Line = .{ .old_no = 0, .new_no = 7, .kind = .added, .text = "alpha beta" };
     const rows = [_]Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &.{
-        .{ .text = line.text[0..6], .capture = .{ .name = "keyword" } },
-        .{ .text = line.text[6..], .emphasis = true },
+        .{ .text = line.text[0..3], .capture = bbr.highlight.Capture.init(0, "keyword") },
+        .{ .text = line.text[3..8], .emphasis = true },
+        .{ .text = line.text[8..] },
     } } } }};
     const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{
         .layout = .unified,
@@ -1257,20 +1325,21 @@ test "Unified continuation rows keep decoration and use a blank gutter" {
 
     var nav = Nav.init(visual_rows.len, 2);
     nav.mark = 0;
-    drawVisualPane(a, win, visual_rows, .unified, theme_dark, nav);
+    drawVisualPane(a, win, .{ .rows = &rows, .layout = .unified }, visual_rows, theme_dark, nav);
 
     try testing.expectEqualStrings("7", win.readCell(8, 0).?.char.grapheme);
     for (0..gutter_cols) |col| try testing.expectEqualStrings(" ", win.readCell(@intCast(col), 1).?.char.grapheme);
     try testing.expectEqualStrings("b", win.readCell(gutter_cols, 1).?.char.grapheme);
     try testing.expectEqual(theme_dark.cursorBg(theme_dark.added_emphasis.bg), win.readCell(gutter_cols, 1).?.style.bg);
+    try testing.expectEqual(theme_dark.cursorBg(theme_dark.added.bg), win.readCell(gutter_cols + 2, 1).?.style.bg);
 }
 
 test "SideBySide continuation rows keep halves inside the fixed divider" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const left: bbr.diff.Line = .{ .old_no = 7, .new_no = null, .kind = .removed, .text = "old one two" };
-    const right: bbr.diff.Line = .{ .old_no = null, .new_no = 9, .kind = .added, .text = "new" };
+    const left: bbr.diff.Line = .{ .old_no = 7, .new_no = 0, .kind = .removed, .text = "old one two" };
+    const right: bbr.diff.Line = .{ .old_no = 0, .new_no = 9, .kind = .added, .text = "new" };
     const rows = [_]Row{.{ .line_pair = .{
         .left = .{ .line = &left, .decoration = .{ .runs = &.{.{ .text = left.text, .emphasis = true }} } },
         .right = .{ .line = &right, .decoration = .{ .runs = &.{.{ .text = right.text }} } },
@@ -1286,7 +1355,7 @@ test "SideBySide continuation rows keep halves inside the fixed divider" {
 
     var nav = Nav.init(visual_rows.len, 2);
     nav.mark = 0;
-    drawVisualPane(a, win, visual_rows, .side_by_side, theme_dark, nav);
+    drawVisualPane(a, win, .{ .rows = &rows, .layout = .side_by_side }, visual_rows, theme_dark, nav);
 
     try testing.expectEqualStrings("7", win.readCell(3, 0).?.char.grapheme);
     try testing.expectEqualStrings("9", win.readCell(17, 0).?.char.grapheme);

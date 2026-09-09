@@ -21,8 +21,8 @@ const presentation = @import("presentation.zig");
 const buffer_mod = @import("buffer.zig");
 const Session = session.Session;
 
-const Credential = bbr.bitbucket.Credential;
 const PendingReviewStore = bbr.review.PendingReviewStore;
+const frame_arena_retained_limit = 4 * 1024 * 1024;
 
 /// Everything `run` needs to fetch and switch PRs. `online` is false for the
 /// offline `demo`, which disables the network-backed Picker. `store` persists
@@ -31,7 +31,7 @@ pub const RunCtx = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
     env_map: *std.process.Environ.Map,
-    cred: Credential,
+    bitbucket: ?bbr.bitbucket.Client = null,
     repo: []const u8,
     store: PendingReviewStore,
     active_theme: theme.Theme,
@@ -144,6 +144,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
     var picker_tick_work: ?PickerTickWork = null;
     var frame_arena = std.heap.ArenaAllocator.init(ctx.gpa);
     defer frame_arena.deinit();
+    var painted_revision: ?presentation.PaintRevision = null;
 
     try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, &vx, &tty, &tty_active, &write_buf);
     try syncPickerTick(&state, ctx, &loop, &futures, &next_work_id, &picker_tick_work);
@@ -180,6 +181,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         if (state.readyToExit() and futures.items.len == 0) break;
 
         const projection = state.projection();
+        if (painted_revision) |revision| if (std.meta.eql(revision, projection.revision)) continue;
         const win = vx.window();
         const content_win = win.child(.{
             .x_off = 0,
@@ -191,7 +193,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         if (projection.review) |review_projection| {
             const visual_cursor = review_projection.frame.navigation.cursor;
             const buffer_cursor = if (visual_cursor < review_projection.frame.visual_rows.len) review_projection.frame.visual_rows[visual_cursor].buffer_index else 0;
-            const selected_file = fileIndexForRow(review_projection.frame.buffer, buffer_cursor);
+            const selected_file = review_projection.frame.buffer.fileIndexForRow(buffer_cursor) orelse 0;
             render.drawReview(frame, content_win, review_projection, ctx.active_theme, selected_file);
             const status = presentationStatus(frame, projection, review_projection.key);
             drawStatus(
@@ -233,7 +235,8 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
                 render.drawSubmissionTree(frame, content_win, ctx.active_theme, tree);
         if (projection.help_visible) render.drawHelp(frame, content_win, ctx.active_theme, ctx.keymap, projection.action_availability);
         try vx.render(writer);
-        _ = frame_arena.reset(.retain_capacity);
+        painted_revision = projection.revision;
+        _ = frame_arena.reset(.{ .retain_with_limit = frame_arena_retained_limit });
     }
 }
 
@@ -282,7 +285,7 @@ fn syncPickerTick(
 }
 
 const metrics_context: u8 = 0;
-const metrics_vtable: @import("cell_metrics.zig").CellMetrics.VTable = .{ .next = nextVaxisGrapheme };
+const metrics_vtable: @import("cell_metrics.zig").CellMetrics.VTable = .{ .next = nextVaxisGrapheme, .width = widthVaxisText };
 const vaxis_cell_metrics: @import("cell_metrics.zig").CellMetrics = .{ .ptr = &metrics_context, .vtable = &metrics_vtable };
 
 fn nextVaxisGrapheme(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
@@ -292,6 +295,10 @@ fn nextVaxisGrapheme(_: *const anyopaque, text: []const u8) @import("cell_metric
         .byte_len = grapheme.len,
         .cell_width = vaxis.gwidth.gwidth(grapheme.bytes(text), .unicode),
     };
+}
+
+fn widthVaxisText(_: *const anyopaque, text: []const u8) usize {
+    return vaxis.gwidth.gwidth(text, .unicode);
 }
 
 fn contentGeometry(win: vaxis.Window) presentation.FrameGeometry {
@@ -646,21 +653,12 @@ fn postPresentationInput(ptr: *anyopaque, input: presentation.OwnedInput) anyerr
 fn presentationPostWorker(
     loop: *Loop,
     work_id: u64,
-    io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     command: *presentation.PostDraft,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
-    defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {
-        presentation_runtime.rejectPostLaunch(presentationSink(&sink_context), command);
-        return;
-    };
-    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     var poster = bbr.bitbucket.Poster{
         .client = client,
         .allocator = scratch.allocator(),
@@ -673,63 +671,36 @@ fn presentationPostWorker(
 fn presentationCommentEditWorker(
     loop: *Loop,
     work_id: u64,
-    io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     command: *presentation.UpdateComment,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
-    defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {
-        presentation_runtime.rejectCommentEditLaunch(presentationSink(&sink_context), command);
-        return;
-    };
-    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     presentation_runtime.executeCommentEdit(presentationSink(&sink_context), command, client);
 }
 
 fn presentationCommentDeleteWorker(
     loop: *Loop,
     work_id: u64,
-    io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     command: *presentation.DeleteComment,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
-    defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {
-        presentation_runtime.rejectCommentDeleteLaunch(presentationSink(&sink_context), command);
-        return;
-    };
-    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     presentation_runtime.executeCommentDelete(presentationSink(&sink_context), command, client);
 }
 
 fn presentationReviewerVerdictWorker(
     loop: *Loop,
     work_id: u64,
-    io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     command: presentation.ChangeReviewerVerdict,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
-    defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {
-        presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.reviewerVerdictLaunchFailed(command));
-        return;
-    };
-    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.executeReviewerVerdict(scratch.allocator(), command, client));
 }
 
@@ -737,17 +708,15 @@ fn presentationLoadWorker(
     loop: *Loop,
     work_id: u64,
     io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: ?bbr.bitbucket.Client,
     command: presentation.LoadSession,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     const outcome: presentation.SessionLoadOutcome = switch (command.key.kind) {
-        .remote => if (session.load(
+        .remote => if (session.loadWith(
             io,
             std.heap.page_allocator,
-            env_map,
-            cred,
+            client.?,
             command.key.repository(),
             command.key.pull_request_id,
         )) |loaded| .{ .loaded = loaded } else |err| .{ .failed = err },
@@ -772,8 +741,7 @@ fn presentationEnrichmentWorker(
     loop: *Loop,
     work_id: u64,
     io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: ?bbr.bitbucket.Client,
     highlighter: bbr.highlight.Highlighter,
     command: presentation.EnrichFile,
 ) void {
@@ -782,13 +750,10 @@ fn presentationEnrichmentWorker(
     defer scratch.deinit();
     const outcome: presentation.FileEnrichmentOutcome = switch (command.source) {
         .remote => blk: {
-            var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
-            defer http.deinit();
-            http.initDefaultProxies(scratch.allocator(), env_map) catch break :blk .{ .failed = .launch_failed };
-            const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
-            break :blk if (file_enrichment.enrich(
+            break :blk if (file_enrichment.enrichConcurrent(
+                io,
                 std.heap.page_allocator,
-                client,
+                client.?,
                 highlighter,
                 command.request(),
             )) |result| .{ .completed = result } else |err| .{ .failed = if (err == error.OutOfMemory) .out_of_memory else .launch_failed };
@@ -825,26 +790,12 @@ fn presentationWaitWorker(loop: *Loop, work_id: u64, io: std.Io, wait: presentat
 fn presentationRecoveryCheckWorker(
     loop: *Loop,
     work_id: u64,
-    io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     check: presentation.CheckRecovery,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
-    defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {
-        presentation_runtime.deliver(presentationSink(&sink_context), .{ .recovery_checked = .{
-            .command_id = check.command_id,
-            .operation_id = check.operation_id,
-            .identity = check.identity,
-            .outcome = .failed,
-        } });
-        return;
-    };
-    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     const input = if (client.getPullRequest(scratch.allocator(), check.identity.repository(), check.identity.pullRequestId())) |pr|
         presentation.recoveryCheckSucceeded(check.command_id, check.operation_id, check.identity, pr.source_commit)
     else |_|
@@ -855,28 +806,13 @@ fn presentationRecoveryCheckWorker(
 fn presentationDuplicateCheckWorker(
     loop: *Loop,
     work_id: u64,
-    io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     command: *presentation.PostDraft,
 ) void {
     defer command.destroy();
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    var http = bbr.http.StdHttpClient.init(scratch.allocator(), io);
-    defer http.deinit();
-    http.initDefaultProxies(scratch.allocator(), env_map) catch {
-        presentation_runtime.deliver(presentationSink(&sink_context), .{ .duplicate_checked = .{
-            .command_id = command.command_id,
-            .operation_id = command.operation_id,
-            .identity = command.identity,
-            .temp_id = command.draft.local_id,
-            .outcome = .failed,
-        } });
-        return;
-    };
-    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     const author_uuid = client.getAuthenticatedAccountUuid(scratch.allocator()) catch {
         presentation_runtime.deliver(presentationSink(&sink_context), .{ .duplicate_checked = .{
             .command_id = command.command_id,
@@ -915,9 +851,7 @@ fn presentationDuplicateCheckWorker(
 fn presentationListPullRequestsWorker(
     loop: *Loop,
     work_id: u64,
-    io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     command: presentation.ListPullRequests,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
@@ -929,7 +863,7 @@ fn presentationListPullRequestsWorker(
         } });
         return;
     };
-    loadPullRequestSummaries(io, env_map, cred, command.repositoryName(), summaries) catch {
+    loadPullRequestSummaries(client, command.repositoryName(), summaries) catch {
         summaries.destroy();
         presentation_runtime.deliver(presentationSink(&sink_context), .{ .pull_requests_loaded = .{
             .command_id = command.command_id,
@@ -946,16 +880,10 @@ fn presentationListPullRequestsWorker(
 }
 
 fn loadPullRequestSummaries(
-    io: std.Io,
-    env_map: *std.process.Environ.Map,
-    cred: Credential,
+    client: bbr.bitbucket.Client,
     repository: []const u8,
     summaries: *presentation.PullRequestSummaries,
 ) !void {
-    var http = bbr.http.StdHttpClient.init(summaries.arena.allocator(), io);
-    defer http.deinit();
-    try http.initDefaultProxies(summaries.arena.allocator(), env_map);
-    const client = bbr.bitbucket.Client.init(http.httpClient(), cred);
     summaries.prs = try client.listPullRequests(summaries.arena.allocator(), repository, .{});
 }
 
@@ -1008,16 +936,16 @@ fn drainPresentationCommands(
         const work_id = next_work_id.*;
         next_work_id.* +%= 1;
         const future = switch (command) {
-            .load_session => |load| ctx.io.concurrent(presentationLoadWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, load }),
-            .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, ctx.highlighter, enrich }),
-            .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, post }),
-            .update_comment => |update| ctx.io.concurrent(presentationCommentEditWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, update }),
-            .delete_comment => |delete| ctx.io.concurrent(presentationCommentDeleteWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, delete }),
-            .change_reviewer_verdict => |verdict| ctx.io.concurrent(presentationReviewerVerdictWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, verdict }),
+            .load_session => |load| ctx.io.concurrent(presentationLoadWorker, .{ loop, work_id, ctx.io, workerBitbucketForReviewKind(ctx.bitbucket, load.key.kind), load }),
+            .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, ctx.io, workerBitbucketForEnrichment(ctx.bitbucket, enrich.source), ctx.highlighter, enrich }),
+            .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, ctx.bitbucket.?, post }),
+            .update_comment => |update| ctx.io.concurrent(presentationCommentEditWorker, .{ loop, work_id, ctx.bitbucket.?, update }),
+            .delete_comment => |delete| ctx.io.concurrent(presentationCommentDeleteWorker, .{ loop, work_id, ctx.bitbucket.?, delete }),
+            .change_reviewer_verdict => |verdict| ctx.io.concurrent(presentationReviewerVerdictWorker, .{ loop, work_id, ctx.bitbucket.?, verdict }),
             .wait_submission => |wait| ctx.io.concurrent(presentationWaitWorker, .{ loop, work_id, ctx.io, wait }),
-            .check_recovery => |check| ctx.io.concurrent(presentationRecoveryCheckWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, check }),
-            .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, check }),
-            .list_pull_requests => |list| ctx.io.concurrent(presentationListPullRequestsWorker, .{ loop, work_id, ctx.io, ctx.env_map, ctx.cred, list }),
+            .check_recovery => |check| ctx.io.concurrent(presentationRecoveryCheckWorker, .{ loop, work_id, ctx.bitbucket.?, check }),
+            .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, ctx.bitbucket.?, check }),
+            .list_pull_requests => |list| ctx.io.concurrent(presentationListPullRequestsWorker, .{ loop, work_id, ctx.bitbucket.?, list }),
             .copy_clipboard => unreachable,
             .external_edit => unreachable,
         } catch {
@@ -1028,6 +956,17 @@ fn drainPresentationCommands(
         // A POST pointer moved into its worker. Value commands need no cleanup.
         command = undefined;
     }
+}
+
+fn workerBitbucketForReviewKind(client: ?bbr.bitbucket.Client, kind: presentation.ReviewKind) ?bbr.bitbucket.Client {
+    return if (kind == .remote) client.? else null;
+}
+
+fn workerBitbucketForEnrichment(client: ?bbr.bitbucket.Client, source: presentation.EnrichmentSource) ?bbr.bitbucket.Client {
+    return switch (source) {
+        .remote => client.?,
+        .local => null,
+    };
 }
 
 fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *presentation.OwnedCommand) !void {
@@ -1158,18 +1097,6 @@ fn cancelPresentationWork(work: *std.ArrayList(PresentationWork), io: std.Io, id
     }
 }
 
-fn fileIndexForRow(buf: buffer_mod.Buffer, cursor: usize) usize {
-    var idx: usize = 0;
-    var seen_any = false;
-    var i: usize = 0;
-    while (i <= cursor and i < buf.rows.len) : (i += 1) {
-        if (buf.rows[i] == .file_header) {
-            if (seen_any) idx += 1 else seen_any = true;
-        }
-    }
-    return idx;
-}
-
 fn contentViewportRows(window_rows: u16) usize {
     return @max(window_rows -| 1, 1);
 }
@@ -1239,6 +1166,7 @@ fn reviewerVerdictLabel(verdict: ?bbr.bitbucket.ReviewerVerdict) []const u8 {
 
 // Force the presentation modules' tests into the exe test binary.
 test {
+    _ = @import("cell_metrics.zig");
     _ = @import("buffer.zig");
     _ = @import("frame.zig");
     _ = @import("file_tree.zig");
@@ -1253,6 +1181,19 @@ test {
     _ = @import("file_enrichment.zig");
     _ = @import("presentation_adapter.zig");
     _ = @import("presentation_runtime.zig");
+}
+
+test "whole-text vaxis width matches grapheme measurement" {
+    for ([_][]const u8{ "plain", "\x00", "\t", "\x7f", "e\xcc\x81", "\xe7\x95\x8c", "\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb", "\xff" }) |text| {
+        var scalar_width: usize = 0;
+        var rest = text;
+        while (rest.len > 0) {
+            const measured = vaxis_cell_metrics.next(rest);
+            scalar_width += measured.cell_width;
+            rest = rest[measured.byte_len..];
+        }
+        try std.testing.expectEqual(scalar_width, vaxis_cell_metrics.width(text));
+    }
 }
 
 test "pinned vaxis fixtures preserve Shift Arrow selection input" {
@@ -1290,6 +1231,11 @@ test "content viewport reserves the bottom status row" {
     try std.testing.expectEqual(@as(usize, 9), contentViewportRows(10));
     try std.testing.expectEqual(@as(usize, 1), contentViewportRows(1));
     try std.testing.expectEqual(@as(usize, 1), contentViewportRows(0));
+}
+
+test "LocalReview worker dispatch does not require Bitbucket" {
+    try std.testing.expect(workerBitbucketForReviewKind(null, .local) == null);
+    try std.testing.expect(workerBitbucketForEnrichment(null, .local) == null);
 }
 
 test "Picker tick scheduler starts only while loading and stops on every scope end" {

@@ -132,6 +132,43 @@ pub fn enrich(backing: Allocator, bb: bbr.bitbucket.Client, highlighter: bbr.hig
     return enrichFrom(backing, remote.source(), highlighter, req);
 }
 
+/// Fetch both present remote sides at the same time. Each side retains its own
+/// outcome and owned arena, as in the sequential path.
+pub fn enrichConcurrent(io: std.Io, backing: Allocator, bb: bbr.bitbucket.Client, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
+    var remote: RemoteBlobSource = .{ .client = bb, .repo = req.repo };
+    return enrichFromConcurrent(io, backing, remote.source(), highlighter, req);
+}
+
+fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
+    if (req.status == .added or req.status == .removed)
+        return enrichFrom(backing, source, highlighter, req);
+
+    var old_future = io.concurrent(enrichExpectedSide, .{ backing, source, highlighter, req.max_file_bytes, req.destination_commit, req.old_path, req.content.old }) catch
+        return enrichFrom(backing, source, highlighter, req);
+    var new_future = io.concurrent(enrichExpectedSide, .{ backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new }) catch {
+        const old = old_future.await(io) catch return error.OutOfMemory;
+        return .{
+            .old = old,
+            .new = enrichExpectedSide(backing, source, highlighter, req.max_file_bytes, req.source_commit, req.new_path, req.content.new) catch |err| {
+                var cleanup = old;
+                cleanup.deinit();
+                return err;
+            },
+        };
+    };
+    const old = old_future.await(io) catch |err| {
+        var new = new_future.await(io) catch return error.OutOfMemory;
+        new.deinit();
+        return err;
+    };
+    errdefer {
+        var cleanup = old;
+        cleanup.deinit();
+    }
+    const new = new_future.await(io) catch return error.OutOfMemory;
+    return .{ .old = old, .new = new };
+}
+
 pub fn enrichFrom(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
     var result: Result = .{ .old = .absent, .new = .absent };
     errdefer result.deinit();
@@ -176,7 +213,9 @@ fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight
         side.retained_bytes = retainedBytes(side);
         return .{ .owned = side };
     }
-    const highlights = highlighter.highlight(allocator, path, side.blob) catch |err| {
+    var scratch = std.heap.ArenaAllocator.init(backing);
+    defer scratch.deinit();
+    const highlights = highlighter.highlightWithScratch(allocator, scratch.allocator(), path, side.blob) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         side.highlighting = .{ .failed = err };
         side.retained_bytes = retainedBytes(side);
@@ -190,7 +229,7 @@ fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight
 fn retainedBytes(side: *const OwnedSide) usize {
     // ArenaAllocator.queryCapacity excludes its internal linked-list nodes but
     // includes every allocation the owned side keeps alive: blob, Highlight
-    // output, Capture names, and any scratch capacity not individually freed.
+    // output. Highlighter scratch has already been released.
     return side.arena.queryCapacity();
 }
 
@@ -595,6 +634,7 @@ fn ownedAddedResult(backing: Allocator, blob: []const u8) !Result {
 
 const ScriptedHighlighter = struct {
     calls: usize = 0,
+    scratch_bytes: usize = 0,
 
     fn highlighter(self: *ScriptedHighlighter) bbr.highlight.Highlighter {
         return .{ .ptr = self, .vtable = &vtable };
@@ -602,15 +642,17 @@ const ScriptedHighlighter = struct {
 
     const vtable: bbr.highlight.Highlighter.VTable = .{ .highlight = highlight };
 
-    fn highlight(ptr: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
+    fn highlight(ptr: *anyopaque, allocator: std.mem.Allocator, scratch_allocator: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
         const self: *ScriptedHighlighter = @ptrCast(@alignCast(ptr));
         self.calls += 1;
+        const scratch = try scratch_allocator.alloc(u8, self.scratch_bytes);
+        std.mem.doNotOptimizeAway(scratch);
         const spans = try allocator.alloc(bbr.highlight.Span, 1);
         spans[0] = .{
             .line = 1,
             .start = 0,
             .end = 5,
-            .capture = .{ .name = try allocator.dupe(u8, "keyword") },
+            .capture = bbr.highlight.Capture.init(0, "keyword"),
         };
         return .{ .spans = spans };
     }
@@ -623,7 +665,7 @@ const FailingHighlighter = struct {
 
     const vtable: bbr.highlight.Highlighter.VTable = .{ .highlight = highlight };
 
-    fn highlight(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
+    fn highlight(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!bbr.highlight.HighlightResult {
         return error.InvalidCapture;
     }
 };
@@ -663,6 +705,28 @@ const ExpectedBlobSource = struct {
     }
 };
 
+const OverlapBlobSource = struct {
+    calls: std.atomic.Value(usize) = .init(0),
+    active: std.atomic.Value(usize) = .init(0),
+    max_active: std.atomic.Value(usize) = .init(0),
+
+    fn source(self: *OverlapBlobSource) BlobSource {
+        return .{ .ptr = self, .read_fn = read };
+    }
+
+    fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, _: []const u8) anyerror![]u8 {
+        const self: *OverlapBlobSource = @ptrCast(@alignCast(ptr));
+        _ = self.calls.fetchAdd(1, .acq_rel);
+        const active = self.active.fetchAdd(1, .acq_rel) + 1;
+        defer _ = self.active.fetchSub(1, .acq_rel);
+        if (active == 2) self.max_active.store(2, .release);
+        if (std.mem.eql(u8, commit, "destination")) {
+            while (self.calls.load(.acquire) < 2) std.atomic.spinLoopHint();
+        }
+        return allocator.dupe(u8, if (std.mem.eql(u8, commit, "destination")) "old\n" else "new\n");
+    }
+};
+
 test "an added File transfers its enriched new side into Session storage" {
     const responses = [_]bbr.http.Canned{.{ .status = 200, .body = "const answer = 42;\n" }};
     var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
@@ -689,8 +753,30 @@ test "an added File transfers its enriched new side into Session storage" {
     try testing.expect(projected.old == .absent);
     try testing.expectEqualStrings("const answer = 42;\n", projected.new.content.blob);
     try testing.expectEqual(@as(usize, 1), projected.new.content.highlighting.ready.spans.len);
-    try testing.expectEqualStrings("keyword", projected.new.content.highlighting.ready.spans[0].capture.name);
+    try testing.expectEqual(bbr.highlight.CaptureRole.keyword, projected.new.content.highlighting.ready.spans[0].capture.role);
     try testing.expectError(error.AlreadyTransferred, storage.admit(0, &result));
+}
+
+test "File Enrichment releases Highlighter scratch before it retains a side" {
+    const responses = [_]bbr.http.Canned{.{ .status = 200, .body = "const answer = 42;\n" }};
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var scripted: ScriptedHighlighter = .{ .scratch_bytes = 1024 * 1024 };
+
+    var result = try enrich(testing.allocator, bb, scripted.highlighter(), .{
+        .repo = "repo",
+        .status = .added,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "/dev/null",
+        .new_path = "src/main.ts",
+        .max_file_bytes = 0,
+    });
+    defer result.deinit();
+
+    try testing.expect(result.new.owned.retained_bytes < scripted.scratch_bytes);
+    try testing.expectEqualStrings("const answer = 42;\n", result.new.owned.blob);
+    try testing.expectEqual(@as(usize, 1), result.new.owned.highlighting.ready.spans.len);
 }
 
 test "local Git blob source uses the same File Enrichment pipeline" {
@@ -927,6 +1013,26 @@ test "File Enrichment requests each present side from its exact commit and path"
     });
     defer result.deinit();
     try testing.expectEqual(@as(usize, 2), source.calls);
+    try testing.expectEqualStrings("old\n", result.old.owned.blob);
+    try testing.expectEqualStrings("new\n", result.new.owned.blob);
+}
+
+test "remote File Enrichment overlaps at most two present sides" {
+    var source: OverlapBlobSource = .{};
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    var result = try enrichFromConcurrent(testing.io, std.heap.page_allocator, source.source(), plain.highlighter(), .{
+        .repo = "repo",
+        .status = .renamed,
+        .source_commit = "source",
+        .destination_commit = "destination",
+        .old_path = "old.zig",
+        .new_path = "new.zig",
+        .max_file_bytes = 0,
+    });
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 2), source.calls.load(.acquire));
+    try testing.expect(source.max_active.load(.acquire) <= 2);
     try testing.expectEqualStrings("old\n", result.old.owned.blob);
     try testing.expectEqualStrings("new\n", result.new.owned.blob);
 }
@@ -1195,7 +1301,7 @@ test "File content cache evicts the least-recently-focused whole File and refetc
     try testing.expectEqualStrings("AAAAAA", storage.file(0).new.content.blob);
 }
 
-test "File content cache budget includes Highlight Spans and Capture names" {
+test "File content cache budget includes Highlight Spans" {
     const responses = [_]bbr.http.Canned{.{ .status = 200, .body = "const" }};
     var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
     const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
@@ -1216,7 +1322,7 @@ test "File content cache budget includes Highlight Spans and Capture names" {
     storage.configureCache(.{ .enabled = true, .max_retained_bytes = "const".len });
     storage.focus(0);
     try storage.admit(0, &result);
-    try testing.expectEqualStrings("keyword", storage.file(0).new.content.highlighting.ready.spans[0].capture.name);
+    try testing.expectEqual(bbr.highlight.CaptureRole.keyword, storage.file(0).new.content.highlighting.ready.spans[0].capture.role);
 
     storage.focus(1);
     try testing.expect(storage.file(0).new == .pending);
