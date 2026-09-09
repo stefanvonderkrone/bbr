@@ -117,10 +117,10 @@ pub fn run(
     comptime checksumOutput: anytype,
 ) !void {
     for (0..warmup_count) |_| {
-        var arena = std.heap.ArenaAllocator.init(gpa);
+        var counting: CountingAllocator = .{ .backing = gpa };
+        var arena = std.heap.ArenaAllocator.init(counting.allocator());
         defer arena.deinit();
-        var counting: CountingAllocator = .{ .backing = arena.allocator() };
-        const output = try benchmark(counting.allocator(), context);
+        const output = try benchmark(arena.allocator(), context);
         std.mem.doNotOptimizeAway(checksumOutput(output));
     }
 
@@ -131,10 +131,10 @@ pub fn run(
     var expected_checksum: ?u64 = null;
 
     for (0..sample_count) |sample| {
-        var arena = std.heap.ArenaAllocator.init(gpa);
-        var counting: CountingAllocator = .{ .backing = arena.allocator() };
+        var counting: CountingAllocator = .{ .backing = gpa };
+        var arena = std.heap.ArenaAllocator.init(counting.allocator());
         const start = std.Io.Clock.awake.now(io);
-        const output = try benchmark(counting.allocator(), context);
+        const output = try benchmark(arena.allocator(), context);
         durations[sample] = elapsedNanoseconds(start, io);
         const checksum = checksumOutput(output);
         allocations[sample] = counting.allocation_count;
@@ -214,8 +214,8 @@ pub fn runSplit(
         var scratch_arena = std.heap.ArenaAllocator.init(counting.allocator());
         const start = std.Io.Clock.awake.now(io);
         const output = try benchmark(result_arena.allocator(), scratch_arena.allocator(), context);
-        scratch_arena.deinit();
         durations[sample] = elapsedNanoseconds(start, io);
+        scratch_arena.deinit();
         const checksum = checksumOutput(output);
         allocations[sample] = counting.allocation_count;
         peaks[sample] = counting.peak_bytes;

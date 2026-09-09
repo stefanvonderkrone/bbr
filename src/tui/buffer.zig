@@ -947,8 +947,9 @@ const Weave = struct {
         const pair_count = @min(removed.len, added.len);
         for (0..pair_count) |i| {
             const pair = try intraline.diff(w.a, removed[i].text, added[i].text);
-            const left = try decoratedLine(w.a, &removed[i], w.span_cursors.lineSpans(removed[i]), pair.old);
-            const right = try decoratedLine(w.a, &added[i], w.span_cursors.lineSpans(added[i]), pair.new);
+            const emphasize = pair.whole_line or intraline.similarity(pair) >= emphasis_threshold;
+            const left = try decoratedLine(w.a, &removed[i], w.span_cursors.lineSpans(removed[i]), if (emphasize) pair.old else &.{});
+            const right = try decoratedLine(w.a, &added[i], w.span_cursors.lineSpans(added[i]), if (emphasize) pair.new else &.{});
             try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
             try w.weaveInline(file, right.line);
             try w.weaveInline(file, left.line);
@@ -1744,7 +1745,7 @@ test "side_by_side pairs identical Lines while Unified keeps Diff order" {
     for (lines, unified.rows[2..]) |*line, row| try testing.expectEqual(line, row.line.line);
 }
 
-test "side_by_side uses deterministic index pairing above the work limit" {
+test "side_by_side indexed fallback leaves unrelated pairs without IntraLineSegments" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1761,6 +1762,8 @@ test "side_by_side uses deterministic index pairing above the work limit" {
     try testing.expectEqual(@as(usize, line_count + 2), buffer.rows.len);
     try testing.expectEqualStrings("line_0", buffer.rows[2].line_pair.left.?.line.text);
     try testing.expectEqualStrings("line_1", buffer.rows[2].line_pair.right.?.line.text);
+    try testing.expect(!buffer.rows[2].line_pair.left.?.decoration.runs[0].emphasis);
+    try testing.expect(!buffer.rows[2].line_pair.right.?.decoration.runs[0].emphasis);
 }
 
 test "side_by_side weaves an inline thread once, under its anchored pair" {

@@ -20,17 +20,17 @@ Time Profiler traces kept Diff parser list growth, LineDecoration, and Buffer em
 
 Profile assets:
 
-- [Baseline Line Time Profiler](../profiles/line-span-baseline-line-time.trace)
-- [Baseline Line Allocations](../profiles/line-span-baseline-line-allocations.trace)
-- [Baseline Line CPU Counters](../profiles/line-span-baseline-line-counters.trace)
-- [Compact Line Time Profiler](../profiles/line-span-compact-line-time.trace)
-- [Compact Line Allocations](../profiles/line-span-compact-line-allocations.trace)
-- [Compact Line CPU Counters](../profiles/line-span-compact-line-counters.trace)
-- [Baseline Span Time Profiler](../profiles/line-span-baseline-span-time.trace)
-- [Baseline Span Allocations](../profiles/line-span-baseline-span-allocations.trace)
-- [Baseline Span CPU Counters](../profiles/line-span-baseline-span-counters.trace)
-- [Compact Span Time Profiler](../profiles/line-span-compact-span-time.trace)
-- [Compact Span Allocations](../profiles/line-span-compact-span-allocations.trace)
-- [Compact Span CPU Counters](../profiles/line-span-compact-span-counters.trace)
+- Baseline Line Time Profiler: `line-span-baseline-line-time.trace`
+- Baseline Line Allocations: `line-span-baseline-line-allocations.trace`
+- Baseline Line CPU Counters: `line-span-baseline-line-counters.trace`
+- Compact Line Time Profiler: `line-span-compact-line-time.trace`
+- Compact Line Allocations: `line-span-compact-line-allocations.trace`
+- Compact Line CPU Counters: `line-span-compact-line-counters.trace`
+- Baseline Span Time Profiler: `line-span-baseline-span-time.trace`
+- Baseline Span Allocations: `line-span-baseline-span-allocations.trace`
+- Baseline Span CPU Counters: `line-span-baseline-span-counters.trace`
+- Compact Span Time Profiler: `line-span-compact-span-time.trace`
+- Compact Span Allocations: `line-span-compact-span-allocations.trace`
+- Compact Span CPU Counters: `line-span-compact-span-counters.trace`
 
 `zig build bench`, `zig build test --summary all`, `zig fmt --check build.zig src/benchmark src/diff src/highlight src/review src/tui`, and `git diff --check` pass. The test suite reports 707 passing tests.

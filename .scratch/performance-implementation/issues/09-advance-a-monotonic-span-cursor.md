@@ -16,7 +16,7 @@ Four ReleaseFast benchmarks cover a 5,000-Line File with sparse and dense Spans 
 
 Dense Unified median latency fell from 3,010,167 ns to 147,916 ns, a 95.1% reduction. Dense SideBySide fell from 3,163,958 ns to 158,083 ns, a 95.0% reduction. Sparse Unified fell from 273,709 ns to 111,292 ns. Sparse SideBySide fell from 287,584 ns to 120,000 ns. Allocation counts and peak bytes did not change.
 
-The 13.27-second [baseline Time Profiler trace](../profiles/span-projection-baseline-time.trace) shows the zero-based `lineSpans` scan in the hot stack. The 13.09-second [changed Time Profiler trace](../profiles/span-projection-changed-time.trace) shows LineDecoration and Buffer emission as the remaining hot work. The [baseline CPU Counters trace](../profiles/span-projection-baseline-counters.trace) and [changed CPU Counters trace](../profiles/span-projection-changed-counters.trace) provide hardware evidence for an instruction-throughput workload. Harness ceiling rates remain calibration proxies.
+The 13.27-second baseline Time Profiler trace (`span-projection-baseline-time.trace`) shows the zero-based `lineSpans` scan in the hot stack. The 13.09-second changed Time Profiler trace (`span-projection-changed-time.trace`) shows LineDecoration and Buffer emission as the remaining hot work. The baseline CPU Counters trace (`span-projection-baseline-counters.trace`) and changed CPU Counters trace (`span-projection-changed-counters.trace`) provide hardware evidence for an instruction-throughput workload. Harness ceiling rates remain calibration proxies.
 
 The macOS Allocations template did not finalize before timeout for the baseline, changed, or single-repetition runs. The benchmark allocator still confirms unchanged allocation behavior.
 

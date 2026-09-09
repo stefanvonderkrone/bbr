@@ -22,15 +22,15 @@ The File Tree Time Profiler baseline shows the removed count scans. The changed 
 
 Profile assets:
 
-- [File Tree baseline Time Profiler](../profiles/projection-tallies-baseline-time-final.trace)
-- [File Tree baseline Allocations](../profiles/projection-tallies-baseline-allocations-final.trace)
-- [File Tree baseline CPU Counters](../profiles/projection-tallies-baseline-counters.trace)
-- [File Tree changed Time Profiler](../profiles/projection-tallies-changed-time.trace)
-- [File Tree changed Allocations](../profiles/projection-tallies-changed-allocations.trace)
-- [File Tree changed CPU Counters](../profiles/projection-tallies-changed-counters.trace)
+- File Tree baseline Time Profiler: `projection-tallies-baseline-time-final.trace`
+- File Tree baseline Allocations: `projection-tallies-baseline-allocations-final.trace`
+- File Tree baseline CPU Counters: `projection-tallies-baseline-counters.trace`
+- File Tree changed Time Profiler: `projection-tallies-changed-time.trace`
+- File Tree changed Allocations: `projection-tallies-changed-allocations.trace`
+- File Tree changed CPU Counters: `projection-tallies-changed-counters.trace`
 - [Presentation Frame baseline profiles](16-shrink-visual-row-hot-data.md#answer)
-- [Presentation Frame changed Time Profiler](../profiles/projection-width-changed-time.trace)
-- [Presentation Frame changed Allocations](../profiles/projection-width-changed-allocations.trace)
-- [Presentation Frame changed CPU Counters](../profiles/projection-width-changed-counters.trace)
+- Presentation Frame changed Time Profiler: `projection-width-changed-time.trace`
+- Presentation Frame changed Allocations: `projection-width-changed-allocations.trace`
+- Presentation Frame changed CPU Counters: `projection-width-changed-counters.trace`
 
 `zig build bench`, `zig build test --summary all`, `zig fmt --check build.zig src/benchmark src/tui`, and `git diff --check` pass. The test suite reports 707 passing tests.

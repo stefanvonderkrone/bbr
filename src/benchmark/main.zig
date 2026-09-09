@@ -21,6 +21,7 @@ pub fn main(init: std.process.Init) !void {
     var output_buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(init.io, &output_buffer);
     const writer = &stdout.interface;
+    errdefer writer.flush() catch {};
 
     var arguments = init.minimal.args.iterate();
     _ = arguments.next();

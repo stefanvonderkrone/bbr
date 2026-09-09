@@ -121,7 +121,8 @@ fn segmentsFor(allocator: Allocator, text: []const u8, toks: []const Tok, matche
 }
 
 /// Word-diff `old_text` against `new_text`. When the lines share no tokens every
-/// segment is emphasized on both sides; when identical, none are.
+/// segment is emphasized on both sides; when identical, none are. `allocator`
+/// owns only the returned segment arrays; all LCS scratch is released here.
 pub fn diff(allocator: Allocator, old_text: []const u8, new_text: []const u8) !Pair {
     const old_count = lexicalPartCount(old_text);
     const new_count = lexicalPartCount(new_text);
@@ -131,21 +132,25 @@ pub fn diff(allocator: Allocator, old_text: []const u8, new_text: []const u8) !P
         .whole_line = true,
     };
 
-    const ot = try tokenize(allocator, old_text, old_count);
-    const nt = try tokenize(allocator, new_text, new_count);
+    var scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch_arena.deinit();
+    const scratch = scratch_arena.allocator();
+
+    const ot = try tokenize(scratch, old_text, old_count);
+    const nt = try tokenize(scratch, new_text, new_count);
     const n = ot.len;
     const m = nt.len;
 
-    const old_matched = try allocator.alloc(bool, n);
+    const old_matched = try scratch.alloc(bool, n);
     @memset(old_matched, false);
-    const new_matched = try allocator.alloc(bool, m);
+    const new_matched = try scratch.alloc(bool, m);
     @memset(new_matched, false);
 
     if (n != 0 and m != 0) {
-        const directions = try allocator.alloc(Direction, n * m);
-        var next = try allocator.alloc(u32, m + 1);
+        const directions = try scratch.alloc(Direction, n * m);
+        var next = try scratch.alloc(u32, m + 1);
         @memset(next, 0);
-        var current = try allocator.alloc(u32, m + 1);
+        var current = try scratch.alloc(u32, m + 1);
 
         var row = n;
         while (row > 0) {
@@ -350,6 +355,17 @@ test "lexical part count matches tokenization" {
     const parts = try tokenize(testing.allocator, text, lexicalPartCount(text));
     defer testing.allocator.free(parts);
     try testing.expectEqual(parts.len, lexicalPartCount(text));
+}
+
+test "result allocator does not retain LCS scratch" {
+    var result_memory: [1024]u8 = undefined;
+    var results = std.heap.FixedBufferAllocator.init(&result_memory);
+
+    const text = "+" ** 500;
+    const pair = try diff(results.allocator(), text, text);
+
+    try testing.expectEqual(@as(usize, 1), pair.old.len);
+    try testing.expectEqual(@as(usize, 1), pair.new.len);
 }
 
 test "work above the limit uses whole-line emphasis" {

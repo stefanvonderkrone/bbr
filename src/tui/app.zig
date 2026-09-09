@@ -708,7 +708,7 @@ fn presentationLoadWorker(
     loop: *Loop,
     work_id: u64,
     io: std.Io,
-    client: bbr.bitbucket.Client,
+    client: ?bbr.bitbucket.Client,
     command: presentation.LoadSession,
 ) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
@@ -716,7 +716,7 @@ fn presentationLoadWorker(
         .remote => if (session.loadWith(
             io,
             std.heap.page_allocator,
-            client,
+            client.?,
             command.key.repository(),
             command.key.pull_request_id,
         )) |loaded| .{ .loaded = loaded } else |err| .{ .failed = err },
@@ -741,7 +741,7 @@ fn presentationEnrichmentWorker(
     loop: *Loop,
     work_id: u64,
     io: std.Io,
-    client: bbr.bitbucket.Client,
+    client: ?bbr.bitbucket.Client,
     highlighter: bbr.highlight.Highlighter,
     command: presentation.EnrichFile,
 ) void {
@@ -753,7 +753,7 @@ fn presentationEnrichmentWorker(
             break :blk if (file_enrichment.enrichConcurrent(
                 io,
                 std.heap.page_allocator,
-                client,
+                client.?,
                 highlighter,
                 command.request(),
             )) |result| .{ .completed = result } else |err| .{ .failed = if (err == error.OutOfMemory) .out_of_memory else .launch_failed };
@@ -936,8 +936,8 @@ fn drainPresentationCommands(
         const work_id = next_work_id.*;
         next_work_id.* +%= 1;
         const future = switch (command) {
-            .load_session => |load| ctx.io.concurrent(presentationLoadWorker, .{ loop, work_id, ctx.io, ctx.bitbucket.?, load }),
-            .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, ctx.io, ctx.bitbucket.?, ctx.highlighter, enrich }),
+            .load_session => |load| ctx.io.concurrent(presentationLoadWorker, .{ loop, work_id, ctx.io, workerBitbucketForReviewKind(ctx.bitbucket, load.key.kind), load }),
+            .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, ctx.io, workerBitbucketForEnrichment(ctx.bitbucket, enrich.source), ctx.highlighter, enrich }),
             .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, ctx.bitbucket.?, post }),
             .update_comment => |update| ctx.io.concurrent(presentationCommentEditWorker, .{ loop, work_id, ctx.bitbucket.?, update }),
             .delete_comment => |delete| ctx.io.concurrent(presentationCommentDeleteWorker, .{ loop, work_id, ctx.bitbucket.?, delete }),
@@ -956,6 +956,17 @@ fn drainPresentationCommands(
         // A POST pointer moved into its worker. Value commands need no cleanup.
         command = undefined;
     }
+}
+
+fn workerBitbucketForReviewKind(client: ?bbr.bitbucket.Client, kind: presentation.ReviewKind) ?bbr.bitbucket.Client {
+    return if (kind == .remote) client.? else null;
+}
+
+fn workerBitbucketForEnrichment(client: ?bbr.bitbucket.Client, source: presentation.EnrichmentSource) ?bbr.bitbucket.Client {
+    return switch (source) {
+        .remote => client.?,
+        .local => null,
+    };
 }
 
 fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *presentation.OwnedCommand) !void {
@@ -1220,6 +1231,11 @@ test "content viewport reserves the bottom status row" {
     try std.testing.expectEqual(@as(usize, 9), contentViewportRows(10));
     try std.testing.expectEqual(@as(usize, 1), contentViewportRows(1));
     try std.testing.expectEqual(@as(usize, 1), contentViewportRows(0));
+}
+
+test "LocalReview worker dispatch does not require Bitbucket" {
+    try std.testing.expect(workerBitbucketForReviewKind(null, .local) == null);
+    try std.testing.expect(workerBitbucketForEnrichment(null, .local) == null);
 }
 
 test "Picker tick scheduler starts only while loading and stops on every scope end" {

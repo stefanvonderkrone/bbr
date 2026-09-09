@@ -22,11 +22,11 @@ The baseline and changed Time Profiler traces ran `visual_rows_unwrapped_50000` 
 
 Profiles:
 
-- [Baseline Time Profiler](../profiles/visual-row-baseline-time.trace)
-- [Baseline Allocations](../profiles/visual-row-baseline-allocations.trace)
-- [Baseline CPU Counters](../profiles/visual-row-baseline-counters.trace)
-- [Changed Time Profiler](../profiles/visual-row-changed-final-time.trace)
-- [Changed Allocations](../profiles/visual-row-changed-final-allocations.trace)
-- [Changed CPU Counters](../profiles/visual-row-changed-final-counters.trace)
+- Baseline Time Profiler: `visual-row-baseline-time.trace`
+- Baseline Allocations: `visual-row-baseline-allocations.trace`
+- Baseline CPU Counters: `visual-row-baseline-counters.trace`
+- Changed Time Profiler: `visual-row-changed-final-time.trace`
+- Changed Allocations: `visual-row-changed-final-allocations.trace`
+- Changed CPU Counters: `visual-row-changed-final-counters.trace`
 
 The baseline and changed output checksum is `adc122d5073b6b50`. `zig build bench`, `zig build test --summary all`, `zig fmt --check build.zig src/benchmark src/tui/benchmark.zig`, and `git diff --check` pass. The test suite reports 705 passing tests.

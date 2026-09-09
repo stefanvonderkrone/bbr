@@ -18,6 +18,6 @@ The same-host ReleaseFast baseline measured a 2,202,250 ns median and a 2,317,66
 
 Keep `win.clear()`. A Presentation Frame can leave unused Pane rows, so removing the clear can retain cells from the prior frame.
 
-The 12.38-second [Time Profiler trace](../profiles/cell-row-changed-time.trace) shows `Window.fill`, gutter writes, and checksum work after the change. The 10.37-second [CPU Counters trace](../profiles/cell-row-changed-counters-5000.trace) records the post-change hardware counters. The [Allocations trace](../profiles/cell-row-changed-allocations.trace) confirms the stage does not add frame allocations.
+The 12.38-second Time Profiler trace (`cell-row-changed-time.trace`) shows `Window.fill`, gutter writes, and checksum work after the change. The 10.37-second CPU Counters trace (`cell-row-changed-counters-5000.trace`) records the post-change hardware counters. The Allocations trace (`cell-row-changed-allocations.trace`) confirms the stage does not add frame allocations.
 
 `zig build test --summary all` passes all 709 tests. `zig fmt --check src/tui/render.zig src/benchmark/frame_paint.zig` and `git diff --check` pass.

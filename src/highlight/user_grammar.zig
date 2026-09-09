@@ -240,7 +240,7 @@ pub const Registry = struct {
         for (self.installations, result) |installation, *status| status.* = .{
             .name = installation.name,
             .enabled = installation.enabled,
-            .valid = installation.inspection != null,
+            .valid = installation.inspection != null and installation.load_error == null,
         };
         return result;
     }
@@ -1085,6 +1085,10 @@ test "registry reuses exact receipts and loads a matching UserGrammar on first u
     try testing.expectEqualStrings("second", registry.matchName("src/exact.fixture", "").?);
     try testing.expectEqualStrings("first", registry.matchName("src/other.first", "").?);
     try testing.expectError(error.NativeLibraryLoadFailed, registry.grammar("src/other.first", ""));
+    const statuses = try registry.statuses(testing.allocator);
+    defer testing.allocator.free(statuses);
+    try testing.expect(!statuses[0].valid);
+    try testing.expect(!statuses[1].valid);
 }
 
 test "registry rejects stale active receipts but lists invalid inactive installations" {

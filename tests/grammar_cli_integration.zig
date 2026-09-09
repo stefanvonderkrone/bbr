@@ -151,6 +151,22 @@ pub fn main(init: std.process.Init) !void {
     try expectList(init, &env, bbr, "fixture\tdisabled\tinvalid");
     try expectCommandSuccess(init, &env, &.{ bbr, "grammar", "remove", "fixture" });
     try expectList(init, &env, bbr, "");
+
+    try tmp.createDirPath(init.io, "data/bbr/grammars/broken/lib");
+    try tmp.createDirPath(init.io, "data/bbr/grammars/broken/queries");
+    const broken_library = "not a native library";
+    try tmp.writeFile(init.io, .{ .sub_path = "data/bbr/grammars/broken/lib/grammar", .data = broken_library });
+    try tmp.writeFile(init.io, .{ .sub_path = "data/bbr/grammars/broken/queries/highlights.scm", .data = query });
+    const broken_manifest = try manifestFor(init.gpa, "broken", "1.0.0", ".broken", digestHex(broken_library), query_digest);
+    defer init.gpa.free(broken_manifest);
+    try tmp.writeFile(init.io, .{ .sub_path = "data/bbr/grammars/broken/grammar.toml", .data = broken_manifest });
+    const broken_check = try command(init, &env, &.{ bbr, "grammar", "check", ".zig-cache/grammar-cli-integration/data/bbr/grammars/broken" });
+    defer freeResult(init.gpa, broken_check);
+    try expectSuccess(broken_check);
+    const broken_registry = try std.fmt.allocPrint(init.gpa, "broken\t1\t{s}\t{s}\t15\n", .{ try reportedDigest(broken_check.stdout), grammar_cli.bbr_identity });
+    defer init.gpa.free(broken_registry);
+    try tmp.writeFile(init.io, .{ .sub_path = "data/bbr/grammars/registry", .data = broken_registry });
+    try expectList(init, &env, bbr, "broken\tenabled\tinvalid");
 }
 
 fn probe(init: std.process.Init, path: []const u8, expectation: []const u8) !void {
