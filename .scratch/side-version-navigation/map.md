@@ -21,6 +21,8 @@ An implementation-ready M20 specification and dependency map for explicit old/ne
 
 ## Decisions so far
 
+- [Define the Selected Version projection](issues/01-choose-old-new-side-inspection-and-yank.md): Keep diff scopes unchanged. Project explicit WholeFile versions without fallback. Preserve all review discussion. Restrict authoring to valid selected-version Hunk Lines.
+
 ## Not yet specified
 
 None. The four child tickets cover the current route to the M20 specification.
