@@ -55,8 +55,10 @@ from repeating past mistakes. The version-pinned API catalog bbr relies on lives
   own buffer.** The old generic `std.io.Reader`/`Writer` are gone. You hand the interface a `[]u8`;
   formatting goes through `writer.print(...)`. Take `*std.Io.Reader`, not a concrete stream type.
 - **`ArenaAllocator.reset` takes a `ResetMode` union**, not a bool:
-  `union(enum){ free_all, retain_capacity, /* shrink-to-N */ }`. `reset(.retain_capacity)` keeps
-  backing pages — the cheap-reuse path for buffer-scoped arenas.
+  `union(enum){ free_all, retain_capacity, retain_with_limit: usize }`.
+  `reset(.{ .retain_with_limit = bytes })` keeps bounded capacity. Use it for reused Buffer and
+  frame arenas so one large review does not remain resident. A `false` result means shrinking
+  failed, but the arena remains usable with its old memory released.
 - **`@ptrFromInt` to a *function-pointer* type fails the alignment check** ("pointer type … requires
   aligned address") because fn pointers carry an alignment and an arbitrary int like `maxInt(usize)`
   or `-1` isn't aligned. This blocks the classic `SQLITE_TRANSIENT = (sqlite3_destructor_type)-1`
@@ -109,6 +111,26 @@ from repeating past mistakes. The version-pinned API catalog bbr relies on lives
   `list.appendSlice(gpa, bytes)` (the managed variant's `.writer()`/`.print()` take no allocator —
   don't confuse them). `std.process.run(gpa, io, .{.argv,.cwd})` → `RunResult{term,stdout,stderr}`;
   `Term` is `union(enum){exited:u8,…}`, `Cwd` is `union(enum){inherit,dir,path}`.
+- **Share `std.http.Client`, not a `Request`.** `Client.request` and `fetch` are thread-safe, and
+  the connection pool locks itself. The Client allocator must be thread-safe. Give every worker
+  its own Request, deinitialize that Request in the same worker, await all workers, then deinitialize
+  the Client. bbr uses one TUI-lifetime Client backed by `page_allocator` to reuse connections.
+- **Use `std.Io.Clock.awake` for benchmark duration.** Take the start with `.now(io)`, then use
+  `start.untilNow(io, .awake).toNanoseconds()`. Pass the result or a semantic checksum to
+  `std.mem.doNotOptimizeAway`. Build fixtures before timing and reject checksum drift.
+- **Treat `std.simd.suggestVectorLength(T)` as optional and target-dependent.** Use the suggested
+  comptime length when present, then run a scalar tail. Keep a scalar reference test over short
+  lengths, unaligned starts, controls, and non-ASCII input. SIMD is an early-exit tool here, not a
+  reason to vectorize dependent algorithms such as LCS.
+- **Count allocations at one allocator layer.** A counter inside an arena measures workload
+  allocation calls. A counter outside an arena measures backing allocations. Do not compare or
+  label those as one metric. Record arena `queryCapacity()` separately for retained memory.
+- **Destroy cached C objects before unloading their dynamic library.** A cached tree-sitter query
+  and its language pointer depend on the UserGrammar library. Deinitialize the runtime package,
+  then call `DynLib.close`.
+- **Bound quadratic work before allocating its table.** Use saturating `*|` and `+|` for the work
+  estimate. Preserve exact results below a measured limit and choose a deterministic fallback
+  above it. This applies to intra-line LCS and SideBySide Line matching.
 
 ## Idioms that are correct here (not hacks)
 
