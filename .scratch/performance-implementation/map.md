@@ -44,10 +44,12 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 - [Limit or cache viewport wrapping](issues/19-limit-or-cache-viewport-wrapping.md). Height-only resize reuses complete visual rows. Render-time decoration clipping cuts full-wrap median latency by at least 27% and allocations from 120,026 to 10.
 - [Pre-size Diff parser lists](issues/21-pre-size-diff-parser-lists.md) — Action 18 is rejected because count hints cut allocations by 1.4% without a latency or peak-memory gain.
 - [Select P2 actions from the post-P1 profile](issues/22-select-p2-actions.md) — Actions 20, 21, 22, and 23 pass; measured costs reject Actions 19 and 24.
+- [Pool tree-sitter runtime state](issues/23-pool-tree-sitter-runtime-state.md) — Action 19 is rejected because profiles show parsing and query execution are hot, not parser or cursor setup.
 - [Limit Highlight query ranges](issues/24-limit-highlight-query-ranges.md) — Action 20 is rejected because visible ranges cannot preserve complete File Spans under the current Highlighter contract.
 - [Split Presentation invalidation](issues/25-split-presentation-invalidation.md) — A composite revision skips unchanged paints while Buffer, visual rows, and File Tree keep atomic publication.
 - [Own a compact cell row](issues/26-own-a-compact-cell-row.md) — Native vaxis row fills replace checked per-cell fills, cutting paint median latency by at least 13.9% without duplicate cell storage.
 - [Reuse HTTP connections](issues/27-reuse-http-connections.md) — One TUI-lifetime pool now serves remote work, and each File overlaps at most two side requests without weakening Session Epoch or rate-limit handling.
+- [Inspect ReleaseFast memset](issues/28-inspect-releasefast-memset.md) — Action 24 is rejected because post-P1 profiles show no material scalar `memset` cost.
 
 ## Not yet specified
 
