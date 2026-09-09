@@ -22,6 +22,7 @@ An implementation-ready M20 specification and dependency map for explicit old/ne
 ## Decisions so far
 
 - [Define the Selected Version projection](issues/01-choose-old-new-side-inspection-and-yank.md): Keep diff scopes unchanged. Project explicit WholeFile versions without fallback. Preserve all review discussion. Restrict authoring to valid selected-version Hunk Lines.
+- [Prototype the Selected Version indication](issues/02-prototype-selected-version-indication.md): Put an accented `g< OLD` or `NEW g>` segmented control in the DiffPane title and accent the matching SideBySide column without changing focus or Anchor targeting.
 
 ## Not yet specified
 
