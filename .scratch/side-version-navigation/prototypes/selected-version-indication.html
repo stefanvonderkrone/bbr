@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prototype: Selected Version indication</title>
+  <!-- Three DiffPane variants, switchable via ?variant=A, in a browser-hosted terminal mock. -->
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #11111b;
+      --surface: #181825;
+      --surface2: #313244;
+      --text: #cdd6f4;
+      --muted: #9399b2;
+      --blue: #89b4fa;
+      --yellow: #f9e2af;
+      --green: #a6e3a1;
+      --red: #f38ba8;
+      --focus: #f5c2e7;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #08080d;
+      color: var(--text);
+      font: 14px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    button, select { font: inherit; }
+    .lab {
+      display: grid;
+      grid-template-columns: 18rem minmax(0, 1fr);
+      min-height: 100vh;
+      padding-bottom: 5rem;
+    }
+    .controls {
+      border-right: 1px solid #313244;
+      background: #11111b;
+      padding: 1.25rem;
+    }
+    h1 { margin: 0 0 .35rem; font-size: 1rem; color: white; }
+    .controls p { margin: 0 0 1rem; color: var(--muted); font-size: .78rem; }
+    fieldset { border: 0; border-top: 1px solid #313244; margin: 1rem 0; padding: .8rem 0 0; }
+    legend { padding: 0 .5rem 0 0; color: var(--yellow); font-size: .75rem; text-transform: uppercase; }
+    label { display: block; margin: .6rem 0 .2rem; color: var(--muted); font-size: .75rem; }
+    select, .controls button {
+      width: 100%;
+      border: 1px solid #45475a;
+      border-radius: 4px;
+      background: #1e1e2e;
+      color: var(--text);
+      padding: .45rem .55rem;
+    }
+    .key { border: 1px solid #585b70; border-radius: 3px; padding: 0 .28rem; color: white; }
+    .stage { display: grid; place-items: center; min-width: 0; padding: 2rem; overflow: auto; }
+    .terminal {
+      width: min(100%, 1120px);
+      min-width: 360px;
+      height: 650px;
+      border: 1px solid #45475a;
+      border-radius: 8px;
+      background: var(--bg);
+      box-shadow: 0 24px 70px #000b;
+      overflow: hidden;
+      transition: width 180ms ease;
+    }
+    .terminal.narrow { width: 470px; }
+    .review-header { height: 32px; padding: 7px 12px; background: #1e1e2e; color: white; }
+    .review-header .branch { float: right; color: var(--muted); }
+    .panes { display: grid; grid-template-columns: 28% 72%; height: calc(100% - 58px); }
+    .terminal.narrow .panes { grid-template-columns: 0 100%; }
+    .sidebar { border-right: 1px solid #45475a; overflow: hidden; }
+    .sidebar-title, .pane-title { height: 30px; white-space: nowrap; overflow: hidden; }
+    .sidebar-title { padding: 6px 10px; color: var(--muted); border-bottom: 1px solid #45475a; }
+    .tree { padding: 8px 6px; }
+    .tree div { padding: 3px 6px; white-space: nowrap; }
+    .tree .active { color: white; background: #313244; }
+    .status { height: 26px; padding: 5px 10px; border-top: 1px solid #45475a; color: var(--muted); white-space: nowrap; overflow: hidden; }
+    .diff-pane { min-width: 0; overflow: hidden; position: relative; }
+    .pane-title {
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+      border-bottom: 1px solid #45475a;
+      color: white;
+      padding: 0 10px;
+    }
+    .pane-title button, .version-ribbon button, .command-dock button {
+      border: 0;
+      background: transparent;
+      color: inherit;
+      padding: 2px 5px;
+      cursor: pointer;
+    }
+    .pane-title button:hover, .version-ribbon button:hover, .command-dock button:hover { background: #45475a; }
+    button:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+    .crumbs { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .spacer { flex: 1; }
+    .segmented { display: flex; border: 1px solid #585b70; border-radius: 3px; }
+    .segmented button + button { border-left: 1px solid #585b70; }
+    .segmented .selected { color: #11111b; background: var(--blue); font-weight: 700; }
+    .version-ribbon {
+      display: flex;
+      align-items: center;
+      gap: .7rem;
+      height: 29px;
+      padding: 4px 10px;
+      background: #242436;
+      border-bottom: 1px solid #45475a;
+    }
+    .version-ribbon .selected { color: var(--yellow); font-weight: 700; }
+    .version-ribbon .hint { color: var(--muted); font-size: .78rem; }
+    .version-mark { color: var(--blue); font-weight: 700; }
+    .buffer { height: calc(100% - 30px); overflow: hidden; padding-top: 6px; }
+    .variant-b .buffer { height: calc(100% - 59px); }
+    .line, .pair { min-height: 23px; }
+    .line { display: grid; grid-template-columns: 4ch 4ch 2ch minmax(0, 1fr); padding: 2px 8px; white-space: pre; }
+    .pair { display: grid; grid-template-columns: 1fr 1px 1fr; }
+    .half { display: grid; grid-template-columns: 4ch 2ch minmax(0, 1fr); padding: 2px 7px; white-space: pre; overflow: hidden; }
+    .divider { background: #45475a; }
+    .no { color: #6c7086; text-align: right; padding-right: 1ch; }
+    .code { overflow: hidden; text-overflow: clip; }
+    .context { background: transparent; }
+    .removed { background: #3c1f2c; }
+    .added { background: #193326; }
+    .file { color: var(--blue); font-weight: 700; background: #1e1e2e; }
+    .placeholder { margin: 16px; padding: 12px; border: 1px dashed #585b70; color: var(--yellow); text-align: center; }
+    .selected-half { box-shadow: inset 3px 0 var(--blue); background-color: #1d2940; }
+    .unselected-half { opacity: .62; }
+    .column-head { color: var(--muted); background: #181825; }
+    .column-head.selected-half { color: var(--blue); font-weight: 700; }
+    .command-dock {
+      position: absolute;
+      right: 12px;
+      bottom: 12px;
+      display: flex;
+      gap: 2px;
+      padding: 3px;
+      border: 1px solid #585b70;
+      border-radius: 4px;
+      background: #181825ee;
+      box-shadow: 0 4px 18px #0009;
+    }
+    .command-dock .selected { background: var(--blue); color: #11111b; font-weight: 700; }
+    .prototype-switcher {
+      position: fixed;
+      z-index: 10;
+      left: 50%;
+      bottom: 18px;
+      transform: translateX(-50%);
+      display: flex;
+      align-items: center;
+      gap: .7rem;
+      min-width: 290px;
+      justify-content: space-between;
+      padding: 8px 10px;
+      border: 1px solid #9399b2;
+      border-radius: 999px;
+      background: #f5e0dc;
+      color: #11111b;
+      box-shadow: 0 8px 30px #000b;
+    }
+    .prototype-switcher button { border: 0; border-radius: 50%; background: #313244; color: white; width: 30px; height: 30px; cursor: pointer; }
+    .prototype-switcher strong { font-size: .82rem; }
+    @media (max-width: 800px) {
+      .lab { grid-template-columns: 1fr; }
+      .controls { border-right: 0; border-bottom: 1px solid #313244; }
+      .stage { padding: 1rem .4rem 6rem; }
+      .terminal { min-width: 350px; height: 600px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="lab">
+    <aside class="controls">
+      <h1>Selected Version prototype</h1>
+      <p>Click version targets or press <span class="key">g</span><span class="key">&lt;</span> and <span class="key">g</span><span class="key">&gt;</span>.</p>
+      <fieldset>
+        <legend>Review state</legend>
+        <label for="layout">Layout</label>
+        <select id="layout"><option value="unified">Unified</option><option value="side">SideBySide</option></select>
+        <label for="scope">Scope</label>
+        <select id="scope"><option value="changes">Changes</option><option value="whole">WholeFile</option></select>
+        <label for="content">Selected content</label>
+        <select id="content"><option value="ready">Ready</option><option value="loading">Loading</option><option value="unavailable">Unavailable</option></select>
+        <label for="width">Terminal width</label>
+        <select id="width"><option value="wide">Wide</option><option value="narrow">Narrow</option></select>
+      </fieldset>
+      <fieldset>
+        <legend>Checks</legend>
+        <p>Can you name the Selected Version in one glance?</p>
+        <p>Does Pane focus remain separate from version choice?</p>
+        <p>Is the old or new mouse target clear?</p>
+        <p>Does the narrow title keep enough context?</p>
+      </fieldset>
+    </aside>
+    <section class="stage">
+      <div class="terminal" id="terminal" tabindex="0" aria-label="Interactive terminal prototype"></div>
+    </section>
+  </main>
+  <nav class="prototype-switcher" aria-label="Prototype variants">
+    <button id="previous" aria-label="Previous variant">←</button>
+    <strong id="variant-label"></strong>
+    <button id="next" aria-label="Next variant">→</button>
+  </nav>
+  <script>
+    const variants = {
+      A: 'Title toggle',
+      B: 'Context ribbon',
+      C: 'Action dock',
+    };
+    const params = new URLSearchParams(location.search);
+    const state = {
+      variant: variants[params.get('variant')] ? params.get('variant') : 'A',
+      version: 'new',
+      layout: 'unified',
+      scope: 'changes',
+      content: 'ready',
+      width: 'wide',
+    };
+    const terminal = document.querySelector('#terminal');
+    const controls = ['layout', 'scope', 'content', 'width'];
+    for (const id of controls) document.querySelector(`#${id}`).addEventListener('change', event => {
+      state[id] = event.target.value;
+      render();
+    });
+
+    function selectVersion(version) {
+      state.version = version;
+      render();
+    }
+
+    function title() {
+      const scope = state.scope === 'whole' ? 'WholeFile' : 'Changes';
+      if (state.variant === 'A') return `
+        <div class="pane-title">
+          <span class="crumbs">src/tui/render.zig · ${scope}</span><span class="spacer"></span>
+          <span class="segmented" aria-label="Selected Version">
+            <button data-version="old" class="${state.version === 'old' ? 'selected' : ''}">g&lt; OLD</button>
+            <button data-version="new" class="${state.version === 'new' ? 'selected' : ''}">NEW g&gt;</button>
+          </span>
+        </div>`;
+      if (state.variant === 'B') return `
+        <div class="pane-title"><span class="crumbs">src/tui/render.zig · ${scope}</span></div>
+        <div class="version-ribbon">
+          <span>Selected Version</span>
+          <button data-version="old" class="${state.version === 'old' ? 'selected' : ''}">OLD <span class="hint">g&lt;</span></button>
+          <button data-version="new" class="${state.version === 'new' ? 'selected' : ''}">NEW <span class="hint">g&gt;</span></button>
+          <span class="spacer"></span><span class="hint">source actions use ${state.version}</span>
+        </div>`;
+      return `
+        <div class="pane-title">
+          <span class="crumbs">src/tui/render.zig · ${scope}</span><span class="spacer"></span>
+          <span class="version-mark">VIEWING ${state.version.toUpperCase()}</span>
+        </div>`;
+    }
+
+    function sourceLines(side) {
+      const oldLines = [
+        ['18', ' ', 'fn drawPane(win: Window) void {'],
+        ['19', '-', '    drawTitle(win, "Diff");'],
+        ['20', '-', '    drawRows(win);'],
+        ['21', ' ', '}'],
+      ];
+      const newLines = [
+        ['18', ' ', 'fn drawPane(win: Window) void {'],
+        ['19', '+', '    drawTitle(win, selected_version);'],
+        ['20', '+', '    drawRows(win, frame);'],
+        ['21', '+', '    drawStatus(win);'],
+        ['22', ' ', '}'],
+      ];
+      return side === 'old' ? oldLines : newLines;
+    }
+
+    function unifiedBuffer() {
+      if (state.scope === 'whole' && state.content !== 'ready') {
+        const text = state.content === 'loading' ? 'Loading old File content…' : 'Old File content unavailable · acquisition failed';
+        return `<div class="line file"><span></span><span></span><span></span><span>src/tui/render.zig</span></div><div class="placeholder">${text.replace('Old', state.version === 'old' ? 'Old' : 'New')}</div>`;
+      }
+      const lines = state.scope === 'whole' ? sourceLines(state.version) : [
+        ['18', '18', ' ', 'fn drawPane(win: Window) void {'],
+        ['19', '', '-', '    drawTitle(win, "Diff");'],
+        ['', '19', '+', '    drawTitle(win, selected_version);'],
+        ['20', '', '-', '    drawRows(win);'],
+        ['', '20', '+', '    drawRows(win, frame);'],
+        ['', '21', '+', '    drawStatus(win);'],
+        ['21', '22', ' ', '}'],
+      ];
+      const rows = lines.map(line => {
+        const values = state.scope === 'whole'
+          ? [state.version === 'old' ? line[0] : '', state.version === 'new' ? line[0] : '', line[1], line[2]]
+          : line;
+        const cls = values[2] === '-' ? 'removed' : values[2] === '+' ? 'added' : 'context';
+        return `<div class="line ${cls}"><span class="no">${values[0]}</span><span class="no">${values[1]}</span><span>${values[2]}</span><span class="code">${escapeHtml(values[3])}</span></div>`;
+      }).join('');
+      return `<div class="line file"><span></span><span></span><span></span><span>src/tui/render.zig</span></div>${rows}`;
+    }
+
+    function sideBuffer() {
+      const selected = side => state.version === side ? 'selected-half' : 'unselected-half';
+      const old = sourceLines('old');
+      const fresh = sourceLines('new');
+      const count = Math.max(old.length, fresh.length);
+      let rows = `<div class="pair column-head"><div class="half ${selected('old')}">OLD · destination</div><div class="divider"></div><div class="half ${selected('new')}">NEW · source</div></div>`;
+      for (let index = 0; index < count; index++) {
+        rows += pairHalf(old[index], 'old', selected, index) + pairHalf(fresh[index], 'new', selected, index, true);
+      }
+      return rows;
+    }
+
+    function pairHalf(line, side, selected, index, close = false) {
+      const unavailable = state.scope === 'whole' && state.content !== 'ready' && state.version === side;
+      const value = unavailable
+        ? (index === 0 ? ['', '!', state.content === 'loading' ? `Loading ${side} content…` : `${side} content unavailable`] : ['', ' ', ''])
+        : (line || ['', ' ', '']);
+      const cls = value[1] === '-' ? 'removed' : value[1] === '+' ? 'added' : 'context';
+      const half = `<div class="half ${cls} ${selected(side)}"><span class="no">${value[0]}</span><span>${value[1]}</span><span class="code">${escapeHtml(value[2])}</span></div>`;
+      return close ? `<div class="divider"></div>${half}</div>` : `<div class="pair">${half}`;
+    }
+
+    function escapeHtml(value) {
+      return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+    }
+
+    function render() {
+      terminal.className = `terminal ${state.width === 'narrow' ? 'narrow' : ''}`;
+      const dock = state.variant === 'C' ? `
+        <div class="command-dock" aria-label="Selected Version Actions">
+          <button data-version="old" class="${state.version === 'old' ? 'selected' : ''}">g&lt; OLD</button>
+          <button data-version="new" class="${state.version === 'new' ? 'selected' : ''}">NEW g&gt;</button>
+        </div>` : '';
+      terminal.innerHTML = `
+        <div class="review-header">#1726 Side-aware version inspection <span class="branch">feature/m20 → main</span></div>
+        <div class="panes">
+          <aside class="sidebar"><div class="sidebar-title">Files 3</div><div class="tree"><div>▼ src</div><div>  ▼ tui</div><div class="active">    M render.zig  2</div><div>    M frame.zig</div><div>  M diff.zig</div></div></aside>
+          <section class="diff-pane variant-${state.variant.toLowerCase()}">${title()}<div class="buffer">${state.layout === 'side' ? sideBuffer() : unifiedBuffer()}</div>${dock}</section>
+        </div>
+        <div class="status">DiffPane focused · ${state.layout === 'side' ? 'SideBySide' : 'Unified'} · ${state.scope === 'whole' ? 'WholeFile' : 'Changes'} · Selected Version ${state.version}</div>`;
+      terminal.querySelectorAll('[data-version]').forEach(button => button.addEventListener('click', () => selectVersion(button.dataset.version)));
+      document.querySelector('#variant-label').textContent = `${state.variant} · ${variants[state.variant]}`;
+    }
+
+    function switchVariant(step) {
+      const keys = Object.keys(variants);
+      state.variant = keys[(keys.indexOf(state.variant) + step + keys.length) % keys.length];
+      params.set('variant', state.variant);
+      history.replaceState(null, '', `${location.pathname}?${params}`);
+      render();
+    }
+
+    document.querySelector('#previous').addEventListener('click', () => switchVariant(-1));
+    document.querySelector('#next').addEventListener('click', () => switchVariant(1));
+    let leader = false;
+    addEventListener('keydown', event => {
+      if (['SELECT', 'INPUT', 'TEXTAREA'].includes(event.target.tagName)) return;
+      if (event.key === 'ArrowLeft') return switchVariant(-1);
+      if (event.key === 'ArrowRight') return switchVariant(1);
+      if (leader && event.key === '<') selectVersion('old');
+      if (leader && event.key === '>') selectVersion('new');
+      leader = event.key === 'g';
+    });
+    render();
+  </script>
+</body>
+</html>
