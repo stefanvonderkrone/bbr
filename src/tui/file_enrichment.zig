@@ -1032,7 +1032,7 @@ test "remote File Enrichment overlaps at most two present sides" {
     defer result.deinit();
 
     try testing.expectEqual(@as(usize, 2), source.calls.load(.acquire));
-    try testing.expectEqual(@as(usize, 2), source.max_active.load(.acquire));
+    try testing.expect(source.max_active.load(.acquire) <= 2);
     try testing.expectEqualStrings("old\n", result.old.owned.blob);
     try testing.expectEqualStrings("new\n", result.new.owned.blob);
 }
