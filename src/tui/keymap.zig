@@ -503,6 +503,8 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .toggle_layout,
             .toggle_diff_wrap,
             .cycle_scope,
+            .select_old_version,
+            .select_new_version,
             .isolate,
             .next_file,
             .prev_file,
@@ -727,6 +729,13 @@ test "the default bindings are themselves unambiguous and prefix-free" {
     try testing.expectEqual(Action.reanchor_review_item, resolver.feed(.default, .diff_review_card, plain('a')).action);
     // Re-anchor belongs to a ReviewCard, not to bare source.
     try testing.expect(resolver.feed(.default, .diff_source, plain('a')) == .none);
+}
+
+test "Selected Version Actions have no default binding" {
+    for (default_bindings) |binding| {
+        try testing.expect(binding.action != .select_old_version);
+        try testing.expect(binding.action != .select_new_version);
+    }
 }
 
 test "default Reviewer Verdict Actions resolve and remain configurable" {

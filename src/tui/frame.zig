@@ -35,6 +35,13 @@ pub const PaneRects = struct {
 
 pub const PaneFocus = enum { sidebar, diff };
 
+pub const SelectedVersion = enum { old, new };
+
+pub const VersionTitleTargets = struct {
+    old: ?Rect = null,
+    new: ?Rect = null,
+};
+
 pub const OverlayKind = enum { picker, other };
 
 pub const OverlayTarget = struct {
@@ -45,6 +52,8 @@ pub const OverlayTarget = struct {
 };
 
 pub const HitTarget = union(enum) {
+    select_old_version,
+    select_new_version,
     sidebar,
     diff,
     sidebar_entry: usize,
@@ -89,6 +98,12 @@ pub const VisualRow = struct {
     source_end: usize = 0,
     continuation: bool = false,
     halves: ?Halves = null,
+    yank_candidates: YankCandidates = .{},
+};
+
+pub const YankCandidates = struct {
+    old: ?*const bbr.diff.Line = null,
+    new: ?*const bbr.diff.Line = null,
 };
 
 pub const VisualHalf = struct {
@@ -120,6 +135,8 @@ pub const Projection = struct {
     navigation: Nav,
     file_tree: file_tree.Projection = .{},
     focus: PaneFocus = .diff,
+    selected_version: SelectedVersion = .new,
+    version_title_targets: VersionTitleTargets = .{},
 };
 
 /// Resolve a cell solely against the immutable, already-published Frame. An
@@ -133,6 +150,9 @@ pub fn hitTest(frame: Projection, col: u16, row: u16) ?HitTarget {
         if (index >= overlay.row_count) return null;
         return .{ .picker_entry = index };
     }
+
+    if (frame.version_title_targets.old) |rect| if (rect.contains(col, row)) return .select_old_version;
+    if (frame.version_title_targets.new) |rect| if (rect.contains(col, row)) return .select_new_version;
 
     if (frame.panes.sidebar_content.contains(col, row)) {
         const index = frame.file_tree.scroll + row - frame.panes.sidebar_content.y;
@@ -265,6 +285,10 @@ fn appendWrappedLinePair(
             .source_end = target.source_end,
             .continuation = target.continuation,
             .halves = .{ .left = left, .right = right },
+            .yank_candidates = .{
+                .old = if (left) |half| half.line else null,
+                .new = if (right) |half| half.line else null,
+            },
         });
         if (left) |half| {
             left_start = half.source_end;
@@ -302,6 +326,7 @@ fn appendWrappedVisualRow(
         .source_start = start,
         .source_end = end,
         .continuation = start != 0,
+        .yank_candidates = yankCandidates(row),
     });
 }
 
@@ -318,6 +343,25 @@ fn makeVisualRow(row: buffer_mod.Row, buffer_index: usize) VisualRow {
         .owner = owner(row),
         .source_start = rowSourceStart(row),
         .source_end = rowSourceEnd(row),
+        .yank_candidates = yankCandidates(row),
+    };
+}
+
+fn yankCandidates(row: buffer_mod.Row) YankCandidates {
+    return switch (row) {
+        .line => |value| candidatesForLine(value.line),
+        .line_pair => |pair| .{
+            .old = if (pair.left) |left| left.line else null,
+            .new = if (pair.right) |right| right.line else null,
+        },
+        else => .{},
+    };
+}
+
+fn candidatesForLine(line: *const bbr.diff.Line) YankCandidates {
+    return .{
+        .old = if (line.old_no != 0) line else null,
+        .new = if (line.new_no != 0) line else null,
     };
 }
 
@@ -541,6 +585,26 @@ test "Presentation Frame projects Diff Lines as complete visual rows" {
     try testing.expectEqual(@as(usize, 2), visual_rows[2].buffer_index);
 }
 
+test "semantic row ownership exposes old and new yank candidates without changing Line identity" {
+    const old_line: bbr.diff.Line = .{ .old_no = 1, .new_no = 0, .kind = .removed, .text = "old" };
+    const new_line: bbr.diff.Line = .{ .old_no = 0, .new_no = 1, .kind = .added, .text = "new" };
+    const context: bbr.diff.Line = .{ .old_no = 2, .new_no = 2, .kind = .context, .text = "same" };
+    const rows = [_]buffer_mod.Row{
+        .{ .line_pair = .{ .left = .{ .line = &old_line, .decoration = .{ .runs = &.{} } }, .right = .{ .line = &new_line, .decoration = .{ .runs = &.{} } } } },
+        .{ .line = .{ .line = &context, .decoration = .{ .runs = &.{} } } },
+    };
+
+    const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, .bytes, .{ .layout = .side_by_side, .width = 40, .wrap = false });
+    defer testing.allocator.free(visual_rows);
+
+    try testing.expect(visual_rows[0].owner.eql(.{ .line = &new_line }));
+    try testing.expectEqual(&old_line, visual_rows[0].yank_candidates.old.?);
+    try testing.expectEqual(&new_line, visual_rows[0].yank_candidates.new.?);
+    try testing.expect(visual_rows[1].owner.eql(.{ .line = &context }));
+    try testing.expectEqual(&context, visual_rows[1].yank_candidates.old.?);
+    try testing.expectEqual(&context, visual_rows[1].yank_candidates.new.?);
+}
+
 test "Diff visual-row allocation fails before a partial projection escapes" {
     const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "same" };
     const rows = [_]buffer_mod.Row{.{ .line = .{
@@ -746,6 +810,28 @@ test "published Frame hit testing gives Overlay rows precedence and clips blank 
     try testing.expectEqual(HitTarget{ .sidebar_entry = 0 }, hitTest(projection, 1, 2).?);
     try testing.expectEqual(HitTarget.sidebar, hitTest(projection, 1, 3).?);
     try testing.expect(hitTest(projection, 0, 2) == null); // Pane border.
+}
+
+test "Presentation Frame metadata exposes exact version title targets" {
+    var projection: Projection = .{
+        .revision = 1,
+        .visual_rows_revision = 1,
+        .geometry = .{ .cols = 80, .rows = 8 },
+        .panes = paneRects(.{ .cols = 80, .rows = 8 }),
+        .visual_rows = &.{},
+        .buffer = .{ .rows = &.{}, .layout = .unified },
+        .navigation = Nav.init(0, 5),
+        .selected_version = .old,
+        .version_title_targets = .{
+            .old = .{ .x = 31, .y = 0, .width = 6, .height = 1 },
+            .new = .{ .x = 38, .y = 0, .width = 6, .height = 1 },
+        },
+    };
+
+    try testing.expectEqual(HitTarget.select_old_version, hitTest(projection, 31, 0).?);
+    try testing.expectEqual(HitTarget.select_new_version, hitTest(projection, 43, 0).?);
+    projection.overlay = .{ .kind = .other, .rect = .{ .x = 0, .y = 0, .width = 80, .height = 8 } };
+    try testing.expect(hitTest(projection, 31, 0) == null);
 }
 
 test "navigation restoration follows stable owners and clears a shifted Selection" {

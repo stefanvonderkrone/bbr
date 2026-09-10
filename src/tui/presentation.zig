@@ -471,10 +471,13 @@ pub const Scope = enum {
     }
 };
 
+pub const SelectedVersion = frame_mod.SelectedVersion;
+
 pub const Preferences = struct {
     layout: Layout = .unified,
     scope: Scope = .changes,
     diff_wrap: bool = false,
+    selected_version: SelectedVersion = .new,
 };
 
 pub const LoadSession = struct {
@@ -844,6 +847,7 @@ pub const ReviewProjection = struct {
     /// A value snapshot. Mutating this copy cannot affect Presentation.
     navigation: Nav,
     preferences: Preferences,
+    selected_version: SelectedVersion,
     isolated_file: ?usize,
     frame: frame_mod.Projection,
 };
@@ -952,11 +956,17 @@ pub const ReviewerVerdictRefusal = enum {
     remote_write_busy,
 };
 
+pub const YankRefusal = enum { no_source };
+pub const InlineCommentRefusal = enum { no_source };
+pub const SuggestionRefusal = enum { no_source };
+
 pub const ActionAvailability = struct {
     remote: bool,
     has_review: bool = true,
     context: keymap_mod.InteractionContext = .diff,
-    source: bool = true,
+    yank_refusal: ?YankRefusal = null,
+    inline_comment_refusal: ?InlineCommentRefusal = null,
+    suggestion_refusal: ?SuggestionRefusal = null,
     selection: bool = true,
     /// null means the ReviewCard under the cursor is editable.
     edit_refusal: ?MutationRefusal = .no_review_item,
@@ -988,7 +998,9 @@ pub const ActionAvailability = struct {
             else => {},
         };
         return switch (action) {
-            .inline_comment, .suggest, .yank => self.source,
+            .inline_comment => self.inline_comment_refusal == null,
+            .suggest => self.suggestion_refusal == null,
+            .yank => self.yank_refusal == null,
             .toggle_select => self.selection,
             .edit_review_item => self.edit_refusal == null,
             .reanchor_review_item => self.reanchor_refusal == null,
@@ -1198,6 +1210,7 @@ const Published = struct {
         visual_rows: []const frame_mod.VisualRow,
         tree: file_tree.Projection,
         geometry: frame_mod.Geometry,
+        selected_version: SelectedVersion,
         active: bool = true,
 
         fn deinit(self: *StagedBuffer) void {
@@ -1213,6 +1226,7 @@ const Published = struct {
             self.published.visual_rows = self.visual_rows;
             self.published.tree = self.tree;
             self.published.geometry = self.geometry;
+            self.published.selected_version = self.selected_version;
             self.published.navigation = frame_mod.restoreNavigation(previous, self.visual_rows, self.geometry);
             self.published.frame_revision += 1;
             self.published.visual_rows_revision = self.published.frame_revision;
@@ -1232,6 +1246,7 @@ const Published = struct {
     visual_rows: []const frame_mod.VisualRow,
     tree: file_tree.Projection,
     geometry: frame_mod.Geometry,
+    selected_version: SelectedVersion,
     frame_revision: frame_mod.Revision,
     visual_rows_revision: frame_mod.Revision,
     cell_metrics: frame_mod.CellMetrics,
@@ -1312,6 +1327,7 @@ const Published = struct {
         errdefer published.composer_arena.deinit();
         published.composer = null;
         published.geometry = geometry;
+        published.selected_version = preferences.selected_version;
         published.frame_revision = 1;
         published.visual_rows_revision = 1;
         published.cell_metrics = cell_metrics;
@@ -1393,6 +1409,7 @@ const Published = struct {
             .buffer = self.buffer,
             .navigation = self.navigation,
             .preferences = preferences,
+            .selected_version = self.selected_version,
             .isolated_file = self.isolated_file,
             .frame = self.frameProjection(),
         };
@@ -1409,6 +1426,7 @@ const Published = struct {
             .navigation = self.navigation,
             .file_tree = self.tree,
             .focus = self.focus,
+            .selected_version = self.selected_version,
         };
     }
 
@@ -1727,7 +1745,7 @@ const Published = struct {
             self.tree.scroll,
             self.cell_metrics,
         );
-        return .{ .published = self, .buffer = candidate, .visual_rows = visual_rows, .tree = tree, .geometry = geometry };
+        return .{ .published = self, .buffer = candidate, .visual_rows = visual_rows, .tree = tree, .geometry = geometry, .selected_version = preferences.selected_version };
     }
 
     fn commentsCollapsedRows(self: *const Published) usize {
@@ -3173,6 +3191,8 @@ pub const Presentation = struct {
     fn activateMouseTarget(self: *Presentation, target: frame_mod.HitTarget) void {
         self.prefetch_arm = null;
         switch (target) {
+            .select_old_version => self.applyAction(.select_old_version),
+            .select_new_version => self.applyAction(.select_new_version),
             .picker_entry => |index| {
                 if (self.file_finder) |*finder| finder.select(index) else if (self.picker) |*picker| picker.select(index) else return;
             },
@@ -3213,6 +3233,7 @@ pub const Presentation = struct {
         const rows = self.dependencies.mouse_vertical_scroll_rows;
         if (rows == 0) return;
         switch (target) {
+            .select_old_version, .select_new_version => return,
             .picker_entry => {
                 var remaining = rows;
                 while (remaining > 0) : (remaining -= 1) {
@@ -3493,7 +3514,9 @@ pub const Presentation = struct {
         return .{
             .remote = published.key.isRemote(),
             .context = context,
-            .source = source,
+            .yank_refusal = if (source) null else .no_source,
+            .inline_comment_refusal = if (source) null else .no_source,
+            .suggestion_refusal = if (source) null else .no_source,
             .selection = published.navigation.hasSelection() or if (published.cursorRow()) |row| row != .status_placeholder else false,
             .edit_refusal = self.editRefusal(published),
             .reanchor_refusal = self.reanchorRefusal(published),
@@ -4263,6 +4286,11 @@ pub const Presentation = struct {
                 };
                 self.preferences = candidate;
                 self.action_error = null;
+            },
+            .select_old_version, .select_new_version => {
+                var candidate = self.preferences;
+                candidate.selected_version = if (action == .select_old_version) .old else .new;
+                if (candidate.selected_version != self.preferences.selected_version) self.publishPreferences(published, candidate);
             },
             .isolate => self.toggleIsolation(published),
             .next_file => if (published.focus == .diff) self.moveFile(published, 1),
@@ -7910,6 +7938,52 @@ test "source-only Action reports availability instead of silently doing nothing"
     try testing.expect(!presentation.projection().action_availability.available(.yank));
     try presentation.dispatch(.{ .action = .yank });
     try testing.expectEqual(ActionError.source_action_unavailable, presentation.projection().action_error.?);
+}
+
+test "Selected Version defaults to new and survives preference and Session replacement changes" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+
+    var projected = presentation.projection().review.?;
+    try testing.expectEqual(SelectedVersion.new, projected.selected_version);
+    try testing.expectEqual(SelectedVersion.new, projected.frame.selected_version);
+
+    try presentation.dispatch(.{ .action = .select_old_version });
+    try presentation.dispatch(.{ .action = .toggle_layout });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    const command = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = command.command_id,
+        .intent = command.intent,
+        .outcome = .{ .loaded = try testTwoFileSession(testing.allocator, 2) },
+    } });
+
+    projected = presentation.projection().review.?;
+    try testing.expectEqual(SelectedVersion.old, projected.preferences.selected_version);
+    try testing.expectEqual(SelectedVersion.old, projected.selected_version);
+    try testing.expectEqual(SelectedVersion.old, projected.frame.selected_version);
+}
+
+test "source Action availability publishes separate typed refusals" {
+    const unavailable: ActionAvailability = .{
+        .remote = true,
+        .yank_refusal = .no_source,
+        .inline_comment_refusal = .no_source,
+        .suggestion_refusal = .no_source,
+    };
+    try testing.expect(!unavailable.available(.yank));
+    try testing.expect(!unavailable.available(.inline_comment));
+    try testing.expect(!unavailable.available(.suggest));
+
+    const available: ActionAvailability = .{ .remote = true };
+    try testing.expect(available.available(.yank));
+    try testing.expect(available.available(.inline_comment));
+    try testing.expect(available.available(.suggest));
 }
 
 test "yank Count skips Presentation rows and stops at the File boundary" {
