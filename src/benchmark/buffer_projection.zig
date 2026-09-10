@@ -19,7 +19,10 @@ pub fn checksum(buffer: buffer_mod.Buffer) u64 {
     for (buffer.rows) |row| {
         hashScalar(&hash, @intFromEnum(row));
         switch (row) {
-            .file_header => |file| hashFile(&hash, file),
+            .file_header => |header| {
+                hashFile(&hash, header.file);
+                hashText(&hash, header.path);
+            },
             .hunk_header => |hunk| {
                 hashScalar(&hash, hunk.old_start);
                 hashScalar(&hash, hunk.old_count);
@@ -87,7 +90,7 @@ fn hashFile(hash: *std.hash.Wyhash, file: *const bbr.diff.File) void {
     hashScalar(hash, @intFromEnum(file.status));
 }
 
-fn hashContentStatus(hash: *std.hash.Wyhash, status: ?bbr.diff.FileContentStatus) void {
+fn hashContentStatus(hash: *std.hash.Wyhash, status: ?buffer_mod.VersionContentState) void {
     const value = status orelse {
         hashScalar(hash, false);
         return;
@@ -95,8 +98,13 @@ fn hashContentStatus(hash: *std.hash.Wyhash, status: ?bbr.diff.FileContentStatus
     hashScalar(hash, true);
     hashScalar(hash, @intFromEnum(value));
     switch (value) {
-        .text, .binary => |size| hashOptionalScalar(hash, size),
-        .unavailable => |unavailable| {
+        .loading => |size| {
+            hashOptionalScalar(hash, size);
+        },
+        .absent, .empty => {},
+        .binary => |size| hashOptionalScalar(hash, size),
+        .unavailable => |status_value| {
+            const unavailable = status_value.unavailable;
             hashOptionalScalar(hash, unavailable.byte_size);
             hashScalar(hash, @intFromEnum(unavailable.reason));
             if (unavailable.reason == .acquisition_failed) hashText(hash, @errorName(unavailable.reason.acquisition_failed));
@@ -151,7 +159,7 @@ fn hashDisclosureKey(hash: *std.hash.Wyhash, key: buffer_mod.DisclosureKey) void
             hashScalar(hash, line.new_no);
             hashText(hash, line.text);
         },
-        .outdated_file => |file| hashFile(hash, file),
+        .outdated_file, .opposite_version => |file| hashFile(hash, file),
         .outdated_review => {},
         .review_card => |owner| {
             hashScalar(hash, @intFromEnum(owner));

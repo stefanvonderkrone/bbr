@@ -297,7 +297,7 @@ fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: 
     const style = theme.lineStyle(line_row.line.kind);
     fillRow(win, r, style);
     if (!visual_row.continuation) {
-        drawUnifiedGutter(win, r, line_row.line.oldNo(), line_row.line.newNo(), theme.gutter);
+        drawUnifiedGutter(win, r, line_row.oldNo(), line_row.newNo(), theme.gutter);
     }
     drawLineBodyText(
         scratch,
@@ -340,9 +340,9 @@ const gutter_cols: u16 = @intCast(@import("frame.zig").unified_gutter_cols);
 
 fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, row: Row, theme: Theme) void {
     switch (row) {
-        .file_header => |file| {
+        .file_header => |header| {
             fillRuleRow(win, r, theme.section_rule);
-            const text = std.fmt.allocPrint(scratch, "─ {s} {s} ", .{ statusChar(file.status), file.displayPath() }) catch file.displayPath();
+            const text = std.fmt.allocPrint(scratch, "─ {s} {s} ", .{ statusChar(header.file.status), header.path }) catch header.path;
             _ = win.printSegment(.{ .text = text, .style = theme.file_header }, .{ .row_offset = r, .wrap = .none });
         },
         .hunk_header => |hunk| {
@@ -355,7 +355,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer
             const style = theme.lineStyle(ln.kind);
             fillRow(win, r, style);
 
-            drawUnifiedGutter(win, r, ln.oldNo(), ln.newNo(), theme.gutter);
+            drawUnifiedGutter(win, r, lr.oldNo(), lr.newNo(), theme.gutter);
             drawLineBody(scratch, win, r, gutter_cols, lr, theme, style);
         },
         .line_pair => |pair| drawLinePair(scratch, win, r, pair, theme),
@@ -408,21 +408,27 @@ fn drawStatusPlaceholder(
     }
 }
 
-fn statusPlaceholderText(scratch: std.mem.Allocator, side: Side, status: bbr.diff.FileContentStatus) []const u8 {
+fn statusPlaceholderText(scratch: std.mem.Allocator, side: Side, state: buffer_mod.VersionContentState) []const u8 {
     const side_name = if (side == .old) "Old" else "New";
-    const size = if (status.byteSize()) |bytes|
-        std.fmt.allocPrint(scratch, "{d} bytes", .{bytes}) catch "size unavailable"
-    else
-        "size unavailable";
-    return switch (status) {
-        .text => unreachable,
-        .binary => std.fmt.allocPrint(scratch, "{s} content binary, {s}", .{ side_name, size }) catch "Binary content",
-        .unavailable => |value| switch (value.reason) {
-            .invalid_utf8 => std.fmt.allocPrint(scratch, "{s} content unavailable: invalid UTF-8, {s}", .{ side_name, size }) catch "Content unavailable",
-            .invalid_path => std.fmt.allocPrint(scratch, "{s} content unavailable: invalid path, {s}", .{ side_name, size }) catch "Content unavailable",
-            .acquisition_failed => |err| std.fmt.allocPrint(scratch, "{s} content unavailable: acquisition failed ({s}), {s}", .{ side_name, @errorName(err), size }) catch "Content unavailable",
+    return switch (state) {
+        .loading => |bytes| statusPlaceholderDetail(scratch, side_name, "loading", bytes),
+        .absent => std.fmt.allocPrint(scratch, "{s} content absent", .{side_name}) catch "Content absent",
+        .empty => std.fmt.allocPrint(scratch, "{s} Empty file", .{side_name}) catch "Empty file",
+        .binary => |bytes| statusPlaceholderDetail(scratch, side_name, "binary", bytes),
+        .unavailable => |status| switch (status.unavailable.reason) {
+            .invalid_utf8 => statusPlaceholderDetail(scratch, side_name, "unavailable: invalid UTF-8", status.byteSize()),
+            .invalid_path => statusPlaceholderDetail(scratch, side_name, "unavailable: invalid path", status.byteSize()),
+            .acquisition_failed => |err| blk: {
+                const reason = std.fmt.allocPrint(scratch, "unavailable: acquisition failed ({s})", .{@errorName(err)}) catch "unavailable: acquisition failed";
+                break :blk statusPlaceholderDetail(scratch, side_name, reason, status.byteSize());
+            },
         },
     };
+}
+
+fn statusPlaceholderDetail(scratch: std.mem.Allocator, side: []const u8, state: []const u8, bytes: ?usize) []const u8 {
+    if (bytes) |size| return std.fmt.allocPrint(scratch, "{s} content {s}, {d} bytes", .{ side, state, size }) catch "Content unavailable";
+    return std.fmt.allocPrint(scratch, "{s} content {s}, size unavailable", .{ side, state }) catch "Content unavailable";
 }
 
 fn fillRuleRow(win: vaxis.Window, row: u16, style: vaxis.Style) void {
@@ -600,6 +606,7 @@ fn drawDisclosure(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, value: 
             std.fmt.allocPrint(scratch, "{s} Outdated · {s} · {d} threads", .{ glyph, value.path, value.count }) catch glyph
         else
             std.fmt.allocPrint(scratch, "{s} Outdated · {d} threads", .{ glyph, value.count }) catch glyph,
+        .opposite_version => std.fmt.allocPrint(scratch, "{s} {s} · {d} threads", .{ glyph, value.path, value.count }) catch glyph,
         .review_card => unreachable,
     };
     _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = gutter_cols, .wrap = .none });
@@ -1372,11 +1379,11 @@ test "Status Placeholder renders side, reason, and known or unavailable size" {
     const rows = [_]buffer_mod.Row{
         .{ .status_placeholder = .{
             .file = &file,
-            .old = .{ .unavailable = .{ .byte_size = 27, .reason = .{ .acquisition_failed = error.NotFound } } },
+            .old = .{ .unavailable = .{ .unavailable = .{ .byte_size = 27, .reason = .{ .acquisition_failed = error.NotFound } } } },
         } },
         .{ .status_placeholder = .{
             .file = &file,
-            .new = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NetworkError } } },
+            .new = .{ .unavailable = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NetworkError } } } },
         } },
     };
     const buf: Buffer = .{ .rows = &rows, .layout = .unified };
@@ -1398,7 +1405,7 @@ test "SideBySide Status Placeholders render each side independently" {
     const rows = [_]buffer_mod.Row{.{ .status_placeholder = .{
         .file = &file,
         .old = .{ .binary = 3 },
-        .new = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NotFound } } },
+        .new = .{ .unavailable = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NotFound } } } },
     } }};
     const buf: Buffer = .{ .rows = &rows, .layout = .side_by_side };
     var screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 100, .x_pixel = 0, .y_pixel = 0 });

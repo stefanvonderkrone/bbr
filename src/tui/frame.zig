@@ -35,7 +35,7 @@ pub const PaneRects = struct {
 
 pub const PaneFocus = enum { sidebar, diff };
 
-pub const SelectedVersion = enum { old, new };
+pub const SelectedVersion = buffer_mod.SelectedVersion;
 
 pub const VersionTitleTargets = struct {
     old: ?Rect = null,
@@ -481,7 +481,7 @@ fn visualRowAt(visual_rows: []const VisualRow, index: usize) ?VisualRow {
 
 fn owner(row: buffer_mod.Row) RowOwner {
     return switch (row) {
-        .file_header => |file| .{ .file = file },
+        .file_header => |header| .{ .file = header.file },
         .hunk_header => |hunk| .{ .hunk = hunk },
         .status_placeholder => |value| .{ .status_placeholder = .{ .file = value.file, .old = value.old != null, .new = value.new != null } },
         .line => |line| .{ .line = line.line },
@@ -676,7 +676,7 @@ test "Unified wrapping keeps non-Line rows atomic when the body has no cells" {
     const file: bbr.diff.File = .{ .old_path = "a.txt", .new_path = "a.txt", .status = .modified, .hunks = &.{} };
     const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "long source" };
     const rows = [_]buffer_mod.Row{
-        .{ .file_header = &file },
+        .{ .file_header = .{ .file = &file, .path = file.new_path } },
         .{ .status_placeholder = .{ .file = &file, .new = .{ .binary = 12 } } },
         .{ .disclosure = .{ .key = .{ .fold = &line }, .kind = .fold, .expanded = false, .count = 20 } },
         .{ .line = .{ .line = &line, .decoration = .{ .runs = &.{.{ .text = line.text }} } } },
