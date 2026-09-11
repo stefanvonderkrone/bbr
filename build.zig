@@ -163,6 +163,15 @@ pub fn build(b: *std.Build) void {
     const re2_test_step = b.step("test-re2", "Run the native RE2 wrapper smoke tests");
     re2_test_step.dependOn(&run_re2_tests.step);
 
+    const selected_version_hardening_tests = b.addTest(.{
+        .name = "selected-version-hardening-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M20 hardening"},
+    });
+    const run_selected_version_hardening_tests = b.addRunArtifact(selected_version_hardening_tests);
+    const selected_version_hardening_test_step = b.step("test-selected-version-hardening", "Run Selected Version hardening tests");
+    selected_version_hardening_test_step.dependOn(&run_selected_version_hardening_tests.step);
+
     const fixture_mod = b.createModule(.{
         .root_source_file = b.path("tests/user_grammar_fixture.zig"),
         .target = target,

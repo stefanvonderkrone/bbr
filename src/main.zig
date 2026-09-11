@@ -938,4 +938,5 @@ test "demo data weaves through the real pipeline" {
 
 test {
     _ = @import("tui/presentation.zig");
+    _ = @import("tui/selected_version_hardening_test.zig");
 }
