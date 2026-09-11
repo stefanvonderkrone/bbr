@@ -964,6 +964,7 @@ pub const ActionAvailability = struct {
     remote: bool,
     has_review: bool = true,
     context: keymap_mod.InteractionContext = .diff,
+    selected_version: SelectedVersion = .new,
     yank_refusal: ?YankRefusal = null,
     inline_comment_refusal: ?InlineCommentRefusal = null,
     suggestion_refusal: ?SuggestionRefusal = null,
@@ -1434,6 +1435,7 @@ const Published = struct {
             .file_tree = self.tree,
             .focus = self.focus,
             .selected_version = self.selected_version,
+            .version_title_targets = frame_mod.versionTitleTargets(frame_mod.paneRects(self.geometry).diff),
         };
     }
 
@@ -3541,6 +3543,7 @@ pub const Presentation = struct {
         return .{
             .remote = published.key.isRemote(),
             .context = context,
+            .selected_version = published.selected_version,
             .yank_refusal = yankRefusal(published),
             .inline_comment_refusal = if (self.preferences.scope == .whole) wholeFileInlineRefusal(published) else if (source) null else .no_source,
             .suggestion_refusal = if (self.preferences.scope == .whole) wholeFileSuggestionRefusal(published) else if (source) null else .no_source,
@@ -13614,6 +13617,34 @@ test "mouse click uses the published Frame target and a Motion cancels a pending
     try presentation.dispatch(.{ .action = .down });
     try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 3, .button = .left, .type = .release } });
     try testing.expectEqual(@as(usize, 1), presentation.projection().review.?.navigation.cursor);
+}
+
+test "Selected Version title targets dispatch Actions but source clicks do not change selection" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 10 },
+    });
+    defer presentation.deinit();
+
+    var frame = presentation.projection().review.?.frame;
+    const old = frame.version_title_targets.old.?;
+    try presentation.dispatch(.{ .mouse = .{ .col = old.x, .row = old.y, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = old.x, .row = old.y, .button = .left, .type = .release } });
+    try testing.expectEqual(SelectedVersion.old, presentation.projection().review.?.selected_version);
+
+    frame = presentation.projection().review.?.frame;
+    const source = frame.panes.diff_content;
+    try presentation.dispatch(.{ .mouse = .{ .col = source.x, .row = source.y + 2, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = source.x, .row = source.y + 2, .button = .left, .type = .release } });
+    try testing.expectEqual(SelectedVersion.old, presentation.projection().review.?.selected_version);
+
+    const new = frame.version_title_targets.new.?;
+    try presentation.dispatch(.{ .mouse = .{ .col = new.x, .row = new.y, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .mouse = .{ .col = new.x, .row = new.y, .button = .left, .type = .release } });
+    try testing.expectEqual(SelectedVersion.old, presentation.projection().review.?.selected_version);
 }
 
 test "mouse wheel uses configured rows without focus changes and ignored gestures are inert" {

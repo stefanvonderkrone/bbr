@@ -20,6 +20,8 @@ pub const Theme = struct {
     pane_border_focused: Style = .{ .bold = true },
     overlay_border: Style = .{ .bold = true },
     overlay_title: Style = .{ .bold = true },
+    /// Selected Version chrome. It never replaces diff or syntax colors.
+    accent: Color,
     section_rule: Style = .{ .dim = true },
     /// Unchanged lines — terminal default background.
     context: Style,
@@ -208,6 +210,7 @@ pub const dark: Theme = .{
     .pane_border_focused = .{ .fg = rgb(0xd0_d0_d0), .bold = true },
     .overlay_border = .{ .fg = rgb(0xd0_d0_d0), .bold = true },
     .overlay_title = .{ .fg = rgb(0xff_ff_ff), .bold = true },
+    .accent = rgb(0x6c_9c_d0),
     .section_rule = .{ .fg = rgb(0x70_70_80), .dim = true },
     .context = .{},
     .added = .{ .bg = rgb(0x18_32_18) },
@@ -255,6 +258,7 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
         .pane_border_focused = .{ .fg = rgb(p.fg), .bg = rgb(p.bg), .bold = true },
         .overlay_border = .{ .fg = rgb(p.fg), .bg = rgb(p.surface), .bold = true },
         .overlay_title = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2), .bold = true },
+        .accent = rgb(p.blue),
         .section_rule = .{ .fg = rgb(p.muted), .bg = rgb(p.bg), .dim = true },
         .context = .{ .fg = rgb(p.fg), .bg = rgb(p.bg) },
         .added = .{ .fg = rgb(p.fg), .bg = rgb(if (p.light) 0xd8_ef_d0 else 0x1f_3a_28) },
@@ -302,6 +306,7 @@ pub const system: Theme = .{
     .pane_border_focused = .{ .bold = true },
     .overlay_border = .{ .bold = true },
     .overlay_title = .{ .reverse = true, .bold = true },
+    .accent = .{ .index = 4 },
     .section_rule = .{ .fg = .{ .index = 8 }, .dim = true },
     .context = .{},
     .added = .{ .bg = .{ .index = 2 } },

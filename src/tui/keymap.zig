@@ -172,6 +172,8 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one('s'), .action = .toggle_layout, .help = "toggle unified / side-by-side" },
     .{ .chord = Chord.one('w'), .action = .toggle_diff_wrap, .help = "toggle diff wrapping" },
     .{ .chord = Chord.one('f'), .action = .cycle_scope, .help = "cycle diff scope" },
+    .{ .chord = Chord.two('g', '<'), .action = .select_old_version, .help = "select old File version" },
+    .{ .chord = Chord.two('g', '>'), .action = .select_new_version, .help = "select new File version" },
     .{ .chord = Chord.one('v'), .action = .toggle_select, .help = "toggle visual selection" },
     .{ .chord = Chord.one(vaxis.Key.escape), .action = .clear_selection, .help = "clear selection" },
     .{ .chord = Chord.one('i'), .action = .inline_comment, .help = "inline comment" },
@@ -731,11 +733,25 @@ test "the default bindings are themselves unambiguous and prefix-free" {
     try testing.expect(resolver.feed(.default, .diff_source, plain('a')) == .none);
 }
 
-test "Selected Version Actions have no default binding" {
-    for (default_bindings) |binding| {
-        try testing.expect(binding.action != .select_old_version);
-        try testing.expect(binding.action != .select_new_version);
-    }
+test "Selected Version Actions resolve by default and remain strictly configurable" {
+    var resolver: Resolver = .{};
+    try testing.expect(resolver.feed(.default, .diff, plain('g')) == .none);
+    try testing.expectEqual(Action.select_old_version, resolver.feed(.default, .diff, plain('<')).action);
+    try testing.expect(resolver.feed(.default, .diff, plain('g')) == .none);
+    try testing.expectEqual(Action.select_new_version, resolver.feed(.default, .diff, plain('>')).action);
+
+    const overrides = [_]Override{
+        .{ .action = "select_old_version", .sequences = &.{} },
+        .{ .action = "select_new_version", .sequences = &.{"space n"} },
+    };
+    var configured = try Keymap.fromOverrides(testing.allocator, &overrides);
+    defer configured.deinit(testing.allocator);
+    resolver = .{};
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain('g')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain('<')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain(' ')) == .none);
+    try testing.expectEqual(Action.select_new_version, resolver.feed(configured.keymap(), .diff, plain('n')).action);
+    try testing.expectError(error.UnknownAction, validateOverride(.{ .action = "select_previous_version" }));
 }
 
 test "default Reviewer Verdict Actions resolve and remain configurable" {

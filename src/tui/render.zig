@@ -89,12 +89,49 @@ pub fn drawReview(
     _ = selected_file;
     win.clear();
     drawPaneFrame(win, review.frame.panes.sidebar, "Files", theme, review.frame.focus == .sidebar);
-    drawPaneFrame(win, review.frame.panes.diff, "Diff", theme, review.frame.focus == .diff);
+    const frame = review.frame;
+    const cursor = frame.navigation.cursor;
+    const buffer_index = if (cursor < frame.visual_rows.len) frame.visual_rows[cursor].buffer_index else 0;
+    const path = if (frame.buffer.fileIndexForRow(buffer_index)) |index| review.diff.files[index].displayPath() else "Diff";
+    drawDiffPaneFrame(scratch, win, frame, path, review.preferences.scope, theme);
     const sidebar = childRect(win, review.frame.panes.sidebar_content);
     const diff_pane = childRect(win, review.frame.panes.diff_content);
     drawFileTree(sidebar, review.frame.file_tree, theme);
     drawVisualPane(scratch, diff_pane, review.frame.buffer, review.frame.visual_rows, theme, review.frame.navigation);
     joinSectionRules(win, review.frame.panes.diff, review.frame.panes.diff_content, review.frame.visual_rows, review.frame.navigation, theme);
+}
+
+fn drawDiffPaneFrame(scratch: std.mem.Allocator, win: vaxis.Window, frame: @import("frame.zig").Projection, path: []const u8, scope: presentation.Scope, theme: Theme) void {
+    const focused = frame.focus == .diff;
+    drawPaneFrame(win, frame.panes.diff, "", theme, focused);
+    const title_x = frame.panes.diff.x +| @min(frame.panes.diff.width, 2);
+    const control_x = if (frame.version_title_targets.old) |old| old.x else if (frame.version_title_targets.new) |new| new.x else frame.panes.diff.x +| frame.panes.diff.width -| 2;
+    const title_width = control_x -| title_x -| 1;
+    if (title_width > 0) {
+        const title = std.fmt.allocPrint(scratch, "{s} · {s}", .{ path, scopeLabel(scope) }) catch path;
+        const style = if (focused) theme.pane_border_focused else theme.pane_border;
+        _ = childRect(win, .{ .x = title_x, .y = frame.panes.diff.y, .width = title_width, .height = 1 }).printSegment(.{ .text = title, .style = style }, .{ .wrap = .none });
+    }
+    drawVersionTitleSegment(win, frame.version_title_targets.old, "g< OLD", frame.selected_version == .old, theme, focused);
+    drawVersionTitleSegment(win, frame.version_title_targets.new, "NEW g>", frame.selected_version == .new, theme, focused);
+}
+
+fn scopeLabel(scope: presentation.Scope) []const u8 {
+    return switch (scope) {
+        .changes => "Changes",
+        .fetched => "Fetched",
+        .whole => "WholeFile",
+    };
+}
+
+fn drawVersionTitleSegment(win: vaxis.Window, target: ?@import("frame.zig").Rect, text: []const u8, selected: bool, theme: Theme, focused: bool) void {
+    const rect = target orelse return;
+    var style = if (focused) theme.pane_border_focused else theme.pane_border;
+    if (selected) {
+        style.fg = theme.accent;
+        style.bold = true;
+    }
+    _ = childRect(win, rect).printSegment(.{ .text = text, .style = style }, .{ .wrap = .none });
 }
 
 fn joinSectionRules(win: vaxis.Window, outer: @import("frame.zig").Rect, content: @import("frame.zig").Rect, visual_rows: []const @import("frame.zig").VisualRow, nav: Nav, theme: Theme) void {
@@ -229,7 +266,7 @@ fn fileAnchoredCount(comptime T: type, items: []const T, file: bbr.diff.File) us
 }
 
 fn drawPane(scratch: std.mem.Allocator, win: vaxis.Window, buf: Buffer, theme: Theme, nav: Nav) void {
-    drawProjectedRows(scratch, win, buf.rows, buf.layout, theme, nav);
+    drawProjectedRows(scratch, win, buf.rows, buf.layout, buf.selected_column, theme, nav);
 }
 
 fn drawVisualPane(
@@ -252,11 +289,11 @@ fn drawVisualPane(
         else
             false;
         const row_theme = if (selected or index == nav.cursor) cursorRowTheme(theme) else theme;
-        drawVisualRow(scratch, win, screen_row, buf.layout, row, visual_row, row_theme);
+        drawVisualRow(scratch, win, screen_row, buf.layout, buf.selected_column, row, visual_row, row_theme);
     }
 }
 
-fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, rows: []const Row, layout: buffer_mod.Layout, theme: Theme, nav: Nav) void {
+fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, rows: []const Row, layout: buffer_mod.Layout, selected_column: ?buffer_mod.SelectedColumn, theme: Theme, nav: Nav) void {
     const sel = nav.selection();
     var screen_row: u16 = 0;
     while (screen_row < win.height) : (screen_row += 1) {
@@ -268,7 +305,7 @@ fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, rows: []cons
         else
             false;
         const row_theme = if (selected or index == nav.cursor) cursorRowTheme(theme) else theme;
-        drawRow(scratch, win, screen_row, layout, row, row_theme);
+        drawRow(scratch, win, screen_row, layout, selected_column, row, row_theme);
     }
 }
 
@@ -284,13 +321,14 @@ fn visualRowSelected(rows: []const @import("frame.zig").VisualRow, selection: [2
     return false;
 }
 
-fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, row: Row, visual_row: @import("frame.zig").VisualRow, theme: Theme) void {
+fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, selected_column: ?buffer_mod.SelectedColumn, row: Row, visual_row: @import("frame.zig").VisualRow, theme: Theme) void {
     if (layout == .side_by_side and visual_row.halves != null) {
         drawVisualLinePair(scratch, win, r, visual_row.halves.?, row.line_pair, theme);
+        drawSelectedColumnEdge(win, r, selected_column, theme);
         return;
     }
     if (row != .line or layout != .unified) {
-        drawRow(scratch, win, r, layout, row, theme);
+        drawRow(scratch, win, r, layout, selected_column, row, theme);
         return;
     }
     const line_row = row.line;
@@ -338,12 +376,16 @@ fn cursorRowTheme(theme: Theme) Theme {
 /// Gutter is two 4-wide line-number columns; body text starts after it.
 const gutter_cols: u16 = @intCast(@import("frame.zig").unified_gutter_cols);
 
-fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, row: Row, theme: Theme) void {
+fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, selected_column: ?buffer_mod.SelectedColumn, row: Row, theme: Theme) void {
     switch (row) {
         .file_header => |header| {
-            fillRuleRow(win, r, theme.section_rule);
-            const text = std.fmt.allocPrint(scratch, "─ {s} {s} ", .{ statusChar(header.file.status), header.path }) catch header.path;
-            _ = win.printSegment(.{ .text = text, .style = theme.file_header }, .{ .row_offset = r, .wrap = .none });
+            if (selected_column) |selected| {
+                drawSideFileHeader(scratch, win, r, header, selected, theme);
+            } else {
+                fillRuleRow(win, r, theme.section_rule);
+                const text = std.fmt.allocPrint(scratch, "─ {s} {s} ", .{ statusChar(header.file.status), header.path }) catch header.path;
+                _ = win.printSegment(.{ .text = text, .style = theme.file_header }, .{ .row_offset = r, .wrap = .none });
+            }
         },
         .hunk_header => |hunk| {
             fillRow(win, r, theme.hunk_header);
@@ -365,6 +407,37 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer
         .snapshot => |snapshot| drawSnapshot(win, r, snapshot, theme),
         .section => |sec| drawSection(scratch, win, r, sec, theme),
     }
+    if (layout == .side_by_side) drawSelectedColumnEdge(win, r, selected_column, theme);
+}
+
+fn drawSideFileHeader(scratch: std.mem.Allocator, win: vaxis.Window, row: u16, header: buffer_mod.FileHeader, selected: buffer_mod.SelectedColumn, theme: Theme) void {
+    fillRuleRow(win, row, theme.section_rule);
+    const half = win.width / 2;
+    const right_x = half + 1;
+    var old_style = theme.file_header;
+    var new_style = theme.file_header;
+    if (selected.version == .old) {
+        old_style.fg = theme.accent;
+        old_style.bold = true;
+    } else {
+        new_style.fg = theme.accent;
+        new_style.bold = true;
+    }
+    const old = std.fmt.allocPrint(scratch, "OLD {s}", .{header.file.old_path}) catch "OLD";
+    const new = std.fmt.allocPrint(scratch, "NEW {s}", .{header.file.new_path}) catch "NEW";
+    if (half > 0) _ = win.child(.{ .x_off = 0, .y_off = row, .width = half, .height = 1 }).printSegment(.{ .text = old, .style = old_style }, .{ .wrap = .none });
+    if (right_x < win.width) _ = win.child(.{ .x_off = right_x, .y_off = row, .width = win.width - right_x, .height = 1 }).printSegment(.{ .text = new, .style = new_style }, .{ .wrap = .none });
+}
+
+fn drawSelectedColumnEdge(win: vaxis.Window, row: u16, selected: ?buffer_mod.SelectedColumn, theme: Theme) void {
+    const column = selected orelse return;
+    const divider = win.width / 2;
+    if (divider >= win.width) return;
+    const current = win.readCell(divider, row) orelse return;
+    win.writeCell(divider, row, .{
+        .char = .{ .grapheme = if (column.inner_gutter_edge == .right) "▐" else "▌", .width = 1 },
+        .style = .{ .fg = theme.accent, .bg = current.style.bg, .bold = true },
+    });
 }
 
 fn drawStatusPlaceholder(
@@ -1036,13 +1109,40 @@ fn buildHelpRows(scratch: std.mem.Allocator, km: keymap.Keymap, availability: pr
             if (keys.items.len > 0) keys.append(scratch, ' ') catch {};
             keys.appendSlice(scratch, chordLabel(scratch, km.bindings[i].chord)) catch {};
         }
-        const line = std.fmt.allocPrint(scratch, "{s:<8}{s}", .{ keys.items, help }) catch help;
+        const reason = sourceRefusalLabel(availability, act);
+        const line = if (reason) |label|
+            std.fmt.allocPrint(scratch, "{s:<8}{s} ({s})", .{ keys.items, help, label }) catch help
+        else
+            std.fmt.allocPrint(scratch, "{s:<8}{s}", .{ keys.items, help }) catch help;
         (if (keymap.isMotion(act)) &motions else &commands).append(scratch, .{
             .text = line,
             .available = availability.available(act),
         }) catch {};
     }
     return .{ .motions = motions.items, .commands = commands.items };
+}
+
+fn sourceRefusalLabel(availability: presentation.ActionAvailability, action: keymap.Action) ?[]const u8 {
+    return switch (action) {
+        .yank => if (availability.yank_refusal) |refusal| switch (refusal) {
+            .no_source => "no source",
+            .selected_content_unavailable => if (availability.selected_version == .old) "old content unavailable" else "new content unavailable",
+        } else null,
+        .inline_comment => if (availability.inline_comment_refusal) |refusal| switch (refusal) {
+            .no_source => "no source",
+            .selected_content_unavailable => if (availability.selected_version == .old) "old content unavailable" else "new content unavailable",
+            .not_hunk_line => "not a Hunk Line",
+            .opposite_version => "opposite File version",
+        } else null,
+        .suggest => if (availability.suggestion_refusal) |refusal| switch (refusal) {
+            .no_source => "no source",
+            .selected_content_unavailable => if (availability.selected_version == .old) "old content unavailable" else "new content unavailable",
+            .not_hunk_line => "not a Hunk Line",
+            .opposite_version => "opposite File version",
+            .old_version => "requires new File version",
+        } else null,
+        else => null,
+    };
 }
 
 /// Draw the keybinding-help Overlay: a centered modal with Motions in the left
@@ -1932,6 +2032,70 @@ test "focused Pane frames and File Tree tallies use Frame-owned geometry" {
     try testing.expectEqualStrings("●", content.readCell(content.width - 5, 0).?.char.grapheme);
 }
 
+test "DiffPane title reserves and renders published Selected Version targets" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var screen = try vaxis.Screen.init(arena.allocator(), .{ .rows = 8, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(arena.allocator());
+    const win = headlessWindow(&screen);
+    const panes = @import("frame.zig").paneRects(.{ .cols = 80, .rows = 8 });
+    const targets = @import("frame.zig").versionTitleTargets(panes.diff);
+    const frame: @import("frame.zig").Projection = .{
+        .revision = 1,
+        .visual_rows_revision = 1,
+        .geometry = .{ .cols = 80, .rows = 8 },
+        .panes = panes,
+        .visual_rows = &.{},
+        .buffer = .{ .rows = &.{}, .layout = .unified },
+        .navigation = Nav.init(0, panes.diff_content.height),
+        .focus = .sidebar,
+        .selected_version = .old,
+        .version_title_targets = targets,
+    };
+
+    drawDiffPaneFrame(arena.allocator(), win, frame, "src/a-very-long-file-name.zig", .whole, theme_dark);
+
+    try testing.expectEqualStrings("g", win.readCell(targets.old.?.x, 0).?.char.grapheme);
+    try testing.expectEqualStrings("D", win.readCell(targets.old.?.x + 5, 0).?.char.grapheme);
+    try testing.expectEqualStrings("N", win.readCell(targets.new.?.x, 0).?.char.grapheme);
+    try testing.expectEqual(theme_dark.accent, win.readCell(targets.old.?.x, 0).?.style.fg);
+    try testing.expect(win.readCell(targets.old.?.x, 0).?.style.bold);
+    try testing.expect(!std.meta.eql(win.readCell(targets.new.?.x, 0).?.style.fg, theme_dark.accent));
+    try testing.expectEqualStrings("─", win.readCell(targets.old.?.x - 1, 0).?.char.grapheme);
+}
+
+test "SideBySide WholeFile accents only the selected header and inner gutter edge" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try bbr.diff.parse(a,
+        \\diff --git a/old.txt b/new.txt
+        \\similarity index 80%
+        \\rename from old.txt
+        \\rename to new.txt
+        \\--- a/old.txt
+        \\+++ b/new.txt
+        \\@@ -1 +1 @@
+        \\-let value = 1
+        \\+let value = 2
+    );
+    const blobs = [_]bbr.diff.FileBlob{.{ .old = "let value = 1\n", .new = "let value = 2\n" }};
+    const buf = try buffer_mod.buildWithComments(a, diff, .side_by_side, &.{}, .{ .whole_file = true, .selected_version = .old, .blobs = &blobs });
+    var screen = try vaxis.Screen.init(a, .{ .rows = 6, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    drawPane(a, win, buf, theme_dark, Nav.init(buf.rows.len, 6));
+
+    const half = win.width / 2;
+    try testing.expectEqual(theme_dark.accent, win.readCell(0, 0).?.style.fg);
+    try testing.expect(!std.meta.eql(win.readCell(half + 1, 0).?.style.fg, theme_dark.accent));
+    try testing.expectEqualStrings("▐", win.readCell(half, 1).?.char.grapheme);
+    try testing.expectEqual(theme_dark.accent, win.readCell(half, 1).?.style.fg);
+    try testing.expectEqual(theme_dark.removed.bg, win.readCell(side_gutter, 1).?.style.bg);
+    try testing.expectEqual(theme_dark.added.bg, win.readCell(half + 1 + side_gutter, 1).?.style.bg);
+}
+
 test "a woven comment renders with its marker and style; a suggestion is distinct" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2009,6 +2173,21 @@ test "local help projection marks remote-only commands unavailable" {
     // Remote-only commands, plus edit, re-anchor, and delete, stay visible.
     try testing.expectEqual(@as(usize, 11), unavailable);
     for (rows.motions) |row| try testing.expect(row.available);
+}
+
+test "help keeps refused source Actions visible with typed reasons" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const rows = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{
+        .remote = true,
+        .selected_version = .old,
+        .yank_refusal = .selected_content_unavailable,
+        .inline_comment_refusal = .not_hunk_line,
+        .suggestion_refusal = .old_version,
+    });
+    try testing.expect(!helpRowAvailable(rows.commands, "yank source text (old content unavailable)").?);
+    try testing.expect(!helpRowAvailable(rows.commands, "inline comment (not a Hunk Line)").?);
+    try testing.expect(!helpRowAvailable(rows.commands, "suggestion (requires new File version)").?);
 }
 
 test "delete stays discoverable in the help Overlay when it is refused" {

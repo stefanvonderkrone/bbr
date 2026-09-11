@@ -42,6 +42,25 @@ pub const VersionTitleTargets = struct {
     new: ?Rect = null,
 };
 
+const version_title_segment_width: u16 = 6;
+
+/// Place the Selected Version control inside the DiffPane's top border. The
+/// path title receives only the cells before these published rectangles.
+pub fn versionTitleTargets(diff: Rect) VersionTitleTargets {
+    if (diff.height == 0 or diff.width <= 4) return .{};
+    const start = diff.x + 2;
+    const available = diff.width - 4;
+    const full_width = version_title_segment_width * 2 + 1;
+    const control_x = if (available >= full_width) start + available - full_width else start;
+    const old_width = @min(version_title_segment_width, available);
+    const remaining = available - old_width;
+    const new_width = if (remaining > 1) @min(version_title_segment_width, remaining - 1) else 0;
+    return .{
+        .old = if (old_width > 0) .{ .x = control_x, .y = diff.y, .width = old_width, .height = 1 } else null,
+        .new = if (new_width > 0) .{ .x = control_x + version_title_segment_width + 1, .y = diff.y, .width = new_width, .height = 1 } else null,
+    };
+}
+
 pub const OverlayKind = enum { picker, other };
 
 pub const OverlayTarget = struct {
@@ -813,6 +832,10 @@ test "published Frame hit testing gives Overlay rows precedence and clips blank 
 }
 
 test "Presentation Frame metadata exposes exact version title targets" {
+    const targets = versionTitleTargets(.{ .x = 29, .y = 0, .width = 51, .height = 8 });
+    try testing.expectEqual(Rect{ .x = 65, .y = 0, .width = 6, .height = 1 }, targets.old.?);
+    try testing.expectEqual(Rect{ .x = 72, .y = 0, .width = 6, .height = 1 }, targets.new.?);
+
     var projection: Projection = .{
         .revision = 1,
         .visual_rows_revision = 1,
@@ -832,6 +855,10 @@ test "Presentation Frame metadata exposes exact version title targets" {
     try testing.expectEqual(HitTarget.select_new_version, hitTest(projection, 43, 0).?);
     projection.overlay = .{ .kind = .other, .rect = .{ .x = 0, .y = 0, .width = 80, .height = 8 } };
     try testing.expect(hitTest(projection, 31, 0) == null);
+
+    const clipped = versionTitleTargets(.{ .x = 3, .y = 0, .width = 9, .height = 4 });
+    try testing.expectEqual(Rect{ .x = 5, .y = 0, .width = 5, .height = 1 }, clipped.old.?);
+    try testing.expect(clipped.new == null);
 }
 
 test "navigation restoration follows stable owners and clears a shifted Selection" {
