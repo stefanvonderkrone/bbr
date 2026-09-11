@@ -1999,6 +1999,7 @@ const DurableReviewerVerdict = struct {
 };
 
 const IssuedEnrichment = struct {
+    command_id: CommandId,
     work_id: WorkId,
     session_epoch: SessionEpoch,
     file_index: usize,
@@ -3007,6 +3008,7 @@ pub const Presentation = struct {
         switch (command) {
             .load_session => self.outstanding_loads += 1,
             .enrich_file => |enrich| self.issued_enrichments.appendAssumeCapacity(.{
+                .command_id = command_id,
                 .work_id = enrich.work_id,
                 .session_epoch = enrich.session_epoch,
                 .file_index = enrich.file_index,
@@ -5807,21 +5809,23 @@ pub const Presentation = struct {
     }
 
     fn acceptFileEnrichment(self: *Presentation, completed: FileEnrichmentCompleted) void {
-        if (!self.consumeCommand(completed.command_id, .enrich_file)) {
+        var issued_index: ?usize = null;
+        for (self.issued_enrichments.items, 0..) |issued, index| {
+            if (issued.work_id == completed.work_id and
+                (completed.command_id == 0 and builtin.is_test or issued.command_id == completed.command_id))
+            {
+                issued_index = index;
+                break;
+            }
+        }
+        if (issued_index == null) {
             if (completed.outcome == .completed) {
                 var result = completed.outcome.completed;
                 result.deinit();
             }
             return;
         }
-        var issued_index: ?usize = null;
-        for (self.issued_enrichments.items, 0..) |issued, index| {
-            if (issued.work_id == completed.work_id) {
-                issued_index = index;
-                break;
-            }
-        }
-        if (issued_index == null) {
+        if (!self.consumeCommand(completed.command_id, .enrich_file)) {
             if (completed.outcome == .completed) {
                 var result = completed.outcome.completed;
                 result.deinit();
@@ -7295,6 +7299,116 @@ fn testLocalSession(backing: std.mem.Allocator) !*session_mod.Session {
     return s;
 }
 
+fn testCrossSourceVersionSession(backing: std.mem.Allocator, local: bool) !*session_mod.Session {
+    const s = if (local) try testLocalSession(backing) else try testSession(backing, 1, 'a');
+    const a = s.arena.allocator();
+    s.diff = try bbr.diff.parse(a,
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-old one
+        \\+new one
+        \\@@ -4 +4 @@
+        \\-old four
+        \\+new four
+    );
+    try s.initializeEnrichment();
+    return s;
+}
+
+fn completeCrossSourceVersionEnrichment(presentation: *Presentation, command: EnrichFile, old_ok: bool) !void {
+    var highlighter = TestNoopHighlighter{};
+    const result = switch (command.source) {
+        .remote => blk: {
+            const responses = if (old_ok)
+                [_]bbr.http.Canned{
+                    .{ .status = 200, .body = "old one\ngap two\ngap three\nold four\n" },
+                    .{ .status = 200, .body = "new one\ngap two\ngap three\nnew four\n" },
+                }
+            else
+                [_]bbr.http.Canned{
+                    .{ .status = 404, .body = "" },
+                    .{ .status = 200, .body = "new one\ngap two\ngap three\nnew four\n" },
+                };
+            var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+            const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+            break :blk try file_enrichment.enrich(testing.allocator, client, highlighter.highlighter(), command.request());
+        },
+        .local => blk: {
+            const fixtures = if (old_ok)
+                [_]bbr.git.FakeGitClient.BlobFixture{
+                    .{ .commit = "base", .path = "a.zig", .outcome = .{ .content = "old one\ngap two\ngap three\nold four\n" } },
+                    .{ .commit = "source", .path = "a.zig", .outcome = .{ .content = "new one\ngap two\ngap three\nnew four\n" } },
+                }
+            else
+                [_]bbr.git.FakeGitClient.BlobFixture{
+                    .{ .commit = "base", .path = "a.zig", .outcome = .{ .failure = error.BlobNotFound } },
+                    .{ .commit = "source", .path = "a.zig", .outcome = .{ .content = "new one\ngap two\ngap three\nnew four\n" } },
+                };
+            var fake = bbr.git.FakeGitClient{ .blob_fixtures = &fixtures };
+            var source: file_enrichment.GitBlobSource = .{ .client = fake.gitClient() };
+            break :blk try file_enrichment.enrichFrom(testing.allocator, source.source(), highlighter.highlighter(), command.request());
+        },
+    };
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = command.command_id,
+        .work_id = command.work_id,
+        .session_epoch = command.session_epoch,
+        .file_index = command.file_index,
+        .outcome = .{ .completed = result },
+    } });
+}
+
+fn expectVersionLines(review: ReviewProjection, old: []const []const u8, new: []const []const u8) !void {
+    var old_index: usize = 0;
+    var new_index: usize = 0;
+    for (review.buffer.rows) |row| switch (row) {
+        .line => |line| {
+            if (line.line.old_no != 0) {
+                try testing.expect(old_index < old.len);
+                try testing.expectEqualStrings(old[old_index], line.line.text);
+                old_index += 1;
+            }
+            if (line.line.new_no != 0) {
+                try testing.expect(new_index < new.len);
+                try testing.expectEqualStrings(new[new_index], line.line.text);
+                new_index += 1;
+            }
+        },
+        .line_pair => |pair| {
+            if (pair.left) |line| {
+                try testing.expect(old_index < old.len);
+                try testing.expectEqualStrings(old[old_index], line.line.text);
+                old_index += 1;
+            }
+            if (pair.right) |line| {
+                try testing.expect(new_index < new.len);
+                try testing.expectEqualStrings(new[new_index], line.line.text);
+                new_index += 1;
+            }
+        },
+        else => {},
+    };
+    try testing.expectEqual(old.len, old_index);
+    try testing.expectEqual(new.len, new_index);
+}
+
+fn expectRowKinds(review: ReviewProjection, expected: []const buffer_mod.RowKind) !void {
+    try testing.expectEqual(expected.len, review.buffer.rows.len);
+    for (review.buffer.rows, expected) |row, kind| try testing.expectEqual(kind, std.meta.activeTag(row));
+}
+
+fn expectVersionYank(presentation: *Presentation, expected: []const u8) !void {
+    try presentation.dispatch(.{ .action = .to_top });
+    try presentation.dispatch(.{ .push_count_digit = 9 });
+    try presentation.dispatch(.{ .action = .yank });
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqualStrings(expected, command.copy_clipboard.text);
+    try presentation.dispatch(.{ .clipboard_completed = .{ .command_id = command.copy_clipboard.command_id, .success = true } });
+}
+
 test "Status Placeholder refuses Selection and clamps an active Selection before it" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -8456,6 +8570,164 @@ test "yank skips a generated cursor row without Count" {
     var command = presentation.takeCommand().?;
     defer command.deinit();
     try testing.expectEqualStrings("new a", command.copy_clipboard.text);
+}
+
+test "RemoteReview and LocalReview share Selected Version behavior in every Layout and Scope" {
+    const hunk_old = &.{ "old one", "old four" };
+    const hunk_new = &.{ "new one", "new four" };
+    const whole_old = &.{ "old one", "gap two", "gap three", "old four" };
+    const whole_new = &.{ "new one", "gap two", "gap three", "new four" };
+
+    for ([_]bool{ false, true }) |local| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = if (local)
+            try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature")
+        else
+            try OwnedReviewIdentity.init("workspace", "repo", 1);
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = key, .session = try testCrossSourceVersionSession(testing.allocator, local) },
+            .geometry = .{ .cols = 100, .rows = 16 },
+        });
+        defer presentation.deinit();
+
+        try presentation.dispatch(.ensure_focused_enrichment);
+        const enrichment = presentation.takeCommand().?.enrich_file;
+        try testing.expectEqual(local, enrichment.source == .local);
+        try completeCrossSourceVersionEnrichment(&presentation, enrichment, true);
+
+        for (0..2) |layout_index| {
+            if (layout_index > 0) try presentation.dispatch(.{ .action = .toggle_layout });
+            for (0..3) |scope_index| {
+                if (scope_index > 0) try presentation.dispatch(.{ .action = .cycle_scope });
+                const whole = presentation.projection().review.?.preferences.scope == .whole;
+
+                var review = presentation.projection().review.?;
+                try testing.expectEqual(SelectedVersion.new, review.selected_version);
+                try testing.expectEqual(SelectedVersion.new, review.frame.selected_version);
+                if (whole and layout_index == 0)
+                    try expectVersionLines(review, &.{}, whole_new)
+                else if (whole)
+                    try expectVersionLines(review, whole_old, whole_new)
+                else
+                    try expectVersionLines(review, hunk_old, hunk_new);
+                if (!whole) try expectRowKinds(review, if (layout_index == 0)
+                    &.{ .file_header, .hunk_header, .line, .line, .hunk_header, .line, .line }
+                else
+                    &.{ .file_header, .hunk_header, .line_pair, .hunk_header, .line_pair });
+                try expectVersionYank(&presentation, if (whole) "new one\ngap two\ngap three\nnew four" else "new one\nnew four");
+
+                try presentation.dispatch(.{ .action = .select_old_version });
+                review = presentation.projection().review.?;
+                try testing.expectEqual(SelectedVersion.old, review.preferences.selected_version);
+                try testing.expectEqual(SelectedVersion.old, review.selected_version);
+                try testing.expectEqual(SelectedVersion.old, review.frame.selected_version);
+                if (whole and layout_index == 0)
+                    try expectVersionLines(review, whole_old, &.{})
+                else if (whole)
+                    try expectVersionLines(review, whole_old, whole_new)
+                else
+                    try expectVersionLines(review, hunk_old, hunk_new);
+                if (!whole) try expectRowKinds(review, if (layout_index == 0)
+                    &.{ .file_header, .hunk_header, .line, .line, .hunk_header, .line, .line }
+                else
+                    &.{ .file_header, .hunk_header, .line_pair, .hunk_header, .line_pair });
+                try expectVersionYank(&presentation, if (whole) "old one\ngap two\ngap three\nold four" else "old one\nold four");
+
+                try presentation.dispatch(.{ .action = .select_new_version });
+                try testing.expect(presentation.takeCommand() == null);
+            }
+            try presentation.dispatch(.{ .action = .cycle_scope });
+        }
+    }
+}
+
+test "partial File Enrichment keeps usable content and only refresh replaces its failure" {
+    const whole_new = &.{ "new one", "gap two", "gap three", "new four" };
+    for ([_]bool{ false, true }) |local| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = if (local)
+            try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature")
+        else
+            try OwnedReviewIdentity.init("workspace", "repo", 1);
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = key, .session = try testCrossSourceVersionSession(testing.allocator, local) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .select_old_version });
+        try presentation.dispatch(.{ .action = .cycle_scope });
+        try presentation.dispatch(.{ .action = .cycle_scope });
+        try presentation.dispatch(.ensure_focused_enrichment);
+        const enrichment = presentation.takeCommand().?.enrich_file;
+        try completeCrossSourceVersionEnrichment(&presentation, enrichment, false);
+
+        var review = presentation.projection().review.?;
+        try testing.expectEqual(SelectedVersion.old, review.frame.selected_version);
+        try testing.expect(review.buffer.rows[1] == .status_placeholder);
+        try testing.expect(review.buffer.rows[1].status_placeholder.old.? == .unavailable);
+        try testing.expectEqual(YankRefusal.selected_content_unavailable, presentation.projection().action_availability.yank_refusal.?);
+        try presentation.dispatch(.ensure_focused_enrichment);
+        try testing.expect(presentation.takeCommand() == null);
+
+        try presentation.dispatch(.{ .action = .select_new_version });
+        try expectVersionLines(presentation.projection().review.?, &.{}, whole_new);
+        try expectVersionYank(&presentation, "new one\ngap two\ngap three\nnew four");
+        try presentation.dispatch(.{ .action = .select_old_version });
+        const before = presentation.projection().review.?;
+        const before_navigation = before.navigation;
+        const before_geometry = before.frame.geometry;
+        const before_targets = before.frame.version_title_targets;
+
+        try presentation.dispatch(.{ .action = .refresh });
+        const failed_refresh = presentation.takeCommand().?.load_session;
+        try testing.expectEqual(SessionLoadCause.refresh, failed_refresh.cause);
+        try testing.expect(OwnedReviewIdentity.eql(key, failed_refresh.key));
+        try presentation.dispatch(.{ .session_loaded = .{
+            .command_id = failed_refresh.command_id,
+            .intent = failed_refresh.intent,
+            .outcome = .{ .failed = error.TransportFailure },
+        } });
+        review = presentation.projection().review.?;
+        try testing.expectEqual(before.session_epoch, review.session_epoch);
+        try testing.expect(std.meta.eql(before_navigation, review.navigation));
+        try testing.expectEqual(before_geometry, review.frame.geometry);
+        try testing.expectEqual(before_targets, review.frame.version_title_targets);
+        try testing.expectEqual(SelectedVersion.old, review.selected_version);
+        try testing.expect(review.buffer.rows[1] == .status_placeholder);
+
+        try presentation.dispatch(.{ .action = .refresh });
+        const successful_refresh = presentation.takeCommand().?.load_session;
+        try presentation.dispatch(.{ .session_loaded = .{
+            .command_id = successful_refresh.command_id,
+            .intent = successful_refresh.intent,
+            .outcome = .{ .loaded = try testCrossSourceVersionSession(testing.allocator, local) },
+        } });
+        review = presentation.projection().review.?;
+        try testing.expectEqual(before.session_epoch + 1, review.session_epoch);
+        try testing.expectEqual(SelectedVersion.old, review.preferences.selected_version);
+        try testing.expectEqual(SelectedVersion.old, review.frame.selected_version);
+        try testing.expect(review.buffer.rows[1] == .status_placeholder);
+    }
+}
+
+test "a new Presentation resets Selected Version to new" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    {
+        var first = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        });
+        defer first.deinit();
+        try first.dispatch(.{ .action = .select_old_version });
+        try testing.expectEqual(SelectedVersion.old, first.projection().review.?.selected_version);
+    }
+    var restarted = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'b') },
+    });
+    defer restarted.deinit();
+    try testing.expectEqual(SelectedVersion.new, restarted.projection().review.?.selected_version);
 }
 
 test "Selected Version defaults to new and survives preference and Session replacement changes" {
@@ -11992,8 +12264,12 @@ test "File Enrichment launch failure restores retryable pending state" {
         .viewport_rows = 8,
     });
     defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .select_old_version });
     try presentation.dispatch(.ensure_focused_enrichment);
     const first = presentation.takeCommand().?.enrich_file;
+    const before = presentation.projection().review.?;
+    const before_navigation = before.navigation;
+    const before_geometry = before.frame.geometry;
     try presentation.dispatch(.{ .file_enrichment_completed = .{
         .work_id = first.work_id,
         .session_epoch = first.session_epoch,
@@ -12001,6 +12277,11 @@ test "File Enrichment launch failure restores retryable pending state" {
         .outcome = .{ .failed = .launch_failed },
     } });
     try testing.expectEqual(ActionError.file_enrichment_launch_failed, presentation.projection().action_error.?);
+    const after = presentation.projection().review.?;
+    try testing.expect(std.meta.eql(before_navigation, after.navigation));
+    try testing.expectEqual(before_geometry, after.frame.geometry);
+    try expectVersionLines(after, &.{"old"}, &.{"new"});
+    try testing.expectEqual(SelectedVersion.old, after.selected_version);
 
     try presentation.dispatch(.ensure_focused_enrichment);
     const retry = presentation.takeCommand().?.enrich_file;
@@ -12021,6 +12302,7 @@ test "duplicate File Enrichment completion cannot drain a newer WorkId" {
     try presentation.dispatch(.ensure_focused_enrichment);
     const first = presentation.takeCommand().?.enrich_file;
     const first_failure: FileEnrichmentCompleted = .{
+        .command_id = first.command_id,
         .work_id = first.work_id,
         .session_epoch = first.session_epoch,
         .file_index = first.file_index,
@@ -12029,11 +12311,25 @@ test "duplicate File Enrichment completion cannot drain a newer WorkId" {
     try presentation.dispatch(.{ .file_enrichment_completed = first_failure });
     try presentation.dispatch(.ensure_focused_enrichment);
     const retry = presentation.takeCommand().?.enrich_file;
+    try presentation.dispatch(.{ .action = .select_old_version });
+    const before_duplicate = presentation.projection().review.?;
+    const before_navigation = before_duplicate.navigation;
+    const before_geometry = before_duplicate.frame.geometry;
+    const before_targets = before_duplicate.frame.version_title_targets;
 
-    try presentation.dispatch(.{ .file_enrichment_completed = first_failure });
+    var stale = first_failure;
+    stale.command_id = retry.command_id;
+    try presentation.dispatch(.{ .file_enrichment_completed = stale });
+    const after_duplicate = presentation.projection().review.?;
+    try testing.expect(std.meta.eql(before_navigation, after_duplicate.navigation));
+    try testing.expectEqual(before_geometry, after_duplicate.frame.geometry);
+    try testing.expectEqual(before_targets, after_duplicate.frame.version_title_targets);
+    try expectVersionLines(after_duplicate, &.{"old"}, &.{"new"});
+    try testing.expectEqual(SelectedVersion.old, after_duplicate.selected_version);
     try presentation.dispatch(.request_shutdown);
     try testing.expect(!presentation.readyToExit());
     try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = retry.command_id,
         .work_id = retry.work_id,
         .session_epoch = retry.session_epoch,
         .file_index = retry.file_index,

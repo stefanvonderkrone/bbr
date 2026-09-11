@@ -2760,6 +2760,17 @@ test "Unified WholeFile projects only the selected old version with its path and
     try testing.expectEqual(@as(?u32, null), buf.rows[2].line.newNo());
     try testing.expectEqualStrings("e", buf.rows[5].line.line.text);
     try testing.expectEqual(@as(?u32, 5), buf.rows[5].line.line.oldNo());
+
+    const new = try buildWithComments(a, diff, .unified, &.{}, .{
+        .whole_file = true,
+        .selected_version = .new,
+        .blobs = &blobs,
+    });
+    try testing.expectEqualStrings("new.txt", new.rows[0].file_header.path);
+    try testing.expectEqual(@as(?u32, 1), new.rows[1].line.line.newNo());
+    try testing.expectEqual(@as(?u32, null), new.rows[1].line.line.oldNo());
+    try testing.expectEqual(&renamed.hunks[0].lines[2], new.rows[3].line.line);
+    try testing.expectEqual(@as(?u32, 5), new.rows[5].line.line.newNo());
 }
 
 test "Unified WholeFile fills gaps before between and after Hunks" {
