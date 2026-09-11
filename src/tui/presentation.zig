@@ -7974,7 +7974,7 @@ test "M15 Layout Scope and geometry matrix restores a Unicode source row" {
                 try testing.expectEqual(geometry, review.frame.geometry);
                 try testing.expect(review.frame.visual_rows_revision <= review.frame.revision);
                 try testing.expect(review.navigation.cursor < review.frame.visual_rows.len);
-                if (review.preferences.layout == .unified and review.preferences.scope == .whole) {
+                if (review.preferences.scope == .whole) {
                     var saw_placeholder = false;
                     for (review.buffer.rows) |row| if (row == .status_placeholder) {
                         saw_placeholder = true;
@@ -7990,7 +7990,7 @@ test "M15 Layout Scope and geometry matrix restores a Unicode source row" {
                     saw_projected_body = true;
                     for (row.comment.segments) |segment| try expectCompleteMatrixGraphemes(segment.text);
                 };
-                if (review.preferences.layout != .unified or review.preferences.scope != .whole) try testing.expect(saw_projected_body);
+                if (review.preferences.scope != .whole) try testing.expect(saw_projected_body);
             }
         }
         try presentation.dispatch(.{ .action = .cycle_scope });
