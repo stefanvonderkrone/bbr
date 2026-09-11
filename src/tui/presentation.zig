@@ -956,7 +956,7 @@ pub const ReviewerVerdictRefusal = enum {
     remote_write_busy,
 };
 
-pub const YankRefusal = enum { no_source };
+pub const YankRefusal = enum { no_source, selected_content_unavailable };
 pub const InlineCommentRefusal = enum { no_source, selected_content_unavailable, not_hunk_line, opposite_version };
 pub const SuggestionRefusal = enum { no_source, selected_content_unavailable, not_hunk_line, opposite_version, old_version };
 
@@ -1154,6 +1154,7 @@ pub const ActionError = enum {
     local_review_no_submission,
     local_review_remote_action_unavailable,
     source_action_unavailable,
+    yank_no_source,
     old_content_unavailable,
     new_content_unavailable,
     source_not_hunk_line,
@@ -3540,7 +3541,7 @@ pub const Presentation = struct {
         return .{
             .remote = published.key.isRemote(),
             .context = context,
-            .yank_refusal = if (source) null else .no_source,
+            .yank_refusal = yankRefusal(published),
             .inline_comment_refusal = if (self.preferences.scope == .whole) wholeFileInlineRefusal(published) else if (source) null else .no_source,
             .suggestion_refusal = if (self.preferences.scope == .whole) wholeFileSuggestionRefusal(published) else if (source) null else .no_source,
             .selection = published.navigation.hasSelection() or canStartSelection(self.preferences.scope, published.cursorRow()),
@@ -4224,6 +4225,12 @@ pub const Presentation = struct {
         else
             null;
         const availability = self.actionAvailability();
+        const yank_count = if (action == .yank) blk: {
+            const published = self.published orelse break :blk 0;
+            const count = published.navigation.count;
+            published.navigation.count = 0;
+            break :blk count;
+        } else 0;
         const selected_version = if (self.published) |published| published.selected_version else self.preferences.selected_version;
         if (visible_key != null and !availability.available(action)) {
             self.action_error = switch (action) {
@@ -4231,7 +4238,8 @@ pub const Presentation = struct {
                 .submit => .local_review_no_submission,
                 .inline_comment => inlineCommentRefusalError(availability.inline_comment_refusal, selected_version),
                 .suggest => suggestionRefusalError(availability.suggestion_refusal, selected_version),
-                .yank, .toggle_select => .source_action_unavailable,
+                .yank => yankRefusalError(availability.yank_refusal, selected_version),
+                .toggle_select => .source_action_unavailable,
                 .edit_review_item => mutationRefusalError(availability.edit_refusal),
                 .reanchor_review_item => mutationRefusalError(availability.reanchor_refusal),
                 .delete_review_item => mutationRefusalError(availability.delete_refusal),
@@ -4359,7 +4367,7 @@ pub const Presentation = struct {
             .recover_submission => unreachable,
             .resolve_unpublished => self.resolveSelectedUnknownAsUnpublished(published),
             .link_existing_comment => self.openUnknownResolutionEditor(published),
-            .yank => self.yank(published),
+            .yank => self.yank(published, yank_count),
             .open_file_finder, .open_pull_request_picker, .confirm_picker, .help => unreachable,
             .quit => unreachable,
         }
@@ -6120,7 +6128,7 @@ pub const Presentation = struct {
         self.action_error = null;
     }
 
-    fn yank(self: *Presentation, published: *Published) void {
+    fn yank(self: *Presentation, published: *Published, count: usize) void {
         if (published.cursorVisualRow() == null) {
             self.action_error = .invalid_selection;
             return;
@@ -6130,36 +6138,46 @@ pub const Presentation = struct {
             return;
         };
         const selection = published.navigation.selection();
-        const wanted = if (selection == null) @max(published.navigation.count, 1) else std.math.maxInt(usize);
-        published.navigation.count = 0;
+        const wanted = if (selection == null) @max(count, 1) else std.math.maxInt(usize);
         const first = if (selection) |range| range[0] else published.navigation.cursor;
         const last = if (selection) |range| range[1] else published.visual_rows.len - 1;
+        var candidates: std.ArrayList(YankCandidate) = .empty;
+        defer candidates.deinit(self.allocator);
+        var row_index = first;
+        while (row_index <= last and row_index < published.visual_rows.len and candidates.items.len < wanted) : (row_index += 1) {
+            const visual_row = published.visual_rows[row_index];
+            if (published.buffer.fileIndexForRow(visual_row.buffer_index) != start_file) {
+                if (selection == null) break;
+                continue;
+            }
+            const candidate = selectedYankCandidate(visual_row, published.selected_version) orelse continue;
+            var duplicate = false;
+            for (candidates.items) |existing| if (existing.number == candidate.number) {
+                duplicate = true;
+                break;
+            };
+            if (!duplicate) candidates.append(self.allocator, candidate) catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
+        }
+        if (candidates.items.len == 0) {
+            self.action_error = .source_action_unavailable;
+            return;
+        }
+        std.mem.sort(YankCandidate, candidates.items, {}, yankCandidateLessThan);
+
         var bytes: std.ArrayList(u8) = .empty;
         defer bytes.deinit(self.allocator);
-        var copied: usize = 0;
-        var row_index = first;
-        var previous_buffer_index: ?usize = null;
-        while (row_index <= last and row_index < published.visual_rows.len and copied < wanted) : (row_index += 1) {
-            const visual_row = published.visual_rows[row_index];
-            if (published.buffer.fileIndexForRow(visual_row.buffer_index) != start_file) break;
-            if (previous_buffer_index == visual_row.buffer_index) continue;
-            previous_buffer_index = visual_row.buffer_index;
-            const source = if (lineAtVisualRow(published.buffer, visual_row)) |line| line.text else null;
-            if (source) |text_value| {
-                if (copied > 0) bytes.append(self.allocator, '\n') catch {
-                    self.action_error = .out_of_memory;
-                    return;
-                };
-                bytes.appendSlice(self.allocator, text_value) catch {
-                    self.action_error = .out_of_memory;
-                    return;
-                };
-                copied += 1;
-            }
-        }
-        if (copied == 0) {
-            self.action_error = .invalid_selection;
-            return;
+        for (candidates.items, 0..) |candidate, index| {
+            if (index > 0) bytes.append(self.allocator, '\n') catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
+            bytes.appendSlice(self.allocator, candidate.line.text) catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
         }
         const command = self.allocator.create(ClipboardCopy) catch {
             self.action_error = .out_of_memory;
@@ -6755,6 +6773,62 @@ fn lineAtVisualRow(buffer: buffer_mod.Buffer, row: frame_mod.VisualRow) ?*const 
         if (halves.left) |half| return half.line;
     }
     return lineAtRow(buffer.rows[row.buffer_index]);
+}
+
+const YankCandidate = struct {
+    line: *const bbr.diff.Line,
+    number: u32,
+};
+
+fn selectedYankCandidate(row: frame_mod.VisualRow, selected: SelectedVersion) ?YankCandidate {
+    const line = switch (selected) {
+        .old => row.yank_candidates.old,
+        .new => row.yank_candidates.new,
+    } orelse return null;
+    return .{ .line = line, .number = lineNumber(line, selected).? };
+}
+
+fn yankCandidateLessThan(_: void, a: YankCandidate, b: YankCandidate) bool {
+    return a.number < b.number;
+}
+
+fn yankRefusal(published: *const Published) ?YankRefusal {
+    const cursor = published.cursorVisualRow() orelse return .no_source;
+    const file_index = published.buffer.fileIndexForRow(cursor.buffer_index) orelse return .no_source;
+    const selection = published.navigation.selection();
+    const first = if (selection) |range| range[0] else published.navigation.cursor;
+    const last = if (selection) |range| range[1] else published.visual_rows.len - 1;
+    var unavailable = false;
+    var index = first;
+    while (index <= last and index < published.visual_rows.len) : (index += 1) {
+        const row = published.visual_rows[index];
+        if (published.buffer.fileIndexForRow(row.buffer_index) != file_index) {
+            if (selection == null) break;
+            continue;
+        }
+        if (selectedYankCandidate(row, published.selected_version) != null) return null;
+        unavailable = unavailable or statusPlaceholderHasUnavailableVersion(published.buffer, row, published.selected_version);
+    }
+    return if (unavailable) .selected_content_unavailable else .no_source;
+}
+
+fn statusPlaceholderHasUnavailableVersion(buffer: buffer_mod.Buffer, row: frame_mod.VisualRow, selected: SelectedVersion) bool {
+    const status = switch (buffer.rows[row.buffer_index]) {
+        .status_placeholder => |value| value,
+        else => return false,
+    };
+    const state = if (selected == .old) status.old else status.new;
+    return switch (state orelse return false) {
+        .empty => false,
+        else => true,
+    };
+}
+
+fn yankRefusalError(refusal: ?YankRefusal, selected: SelectedVersion) ActionError {
+    return switch (refusal orelse return .source_action_unavailable) {
+        .no_source => .yank_no_source,
+        .selected_content_unavailable => if (selected == .old) .old_content_unavailable else .new_content_unavailable,
+    };
 }
 
 fn wholeFileInlineRefusal(published: *const Published) ?InlineCommentRefusal {
@@ -8051,6 +8125,7 @@ test "SideBySide wrapping Anchors an active old-only continuation" {
     try testing.expect(continuation != null);
     presentation.published.?.navigation.jumpTo(continuation.?);
 
+    try presentation.dispatch(.{ .action = .select_old_version });
     try presentation.dispatch(.{ .action = .yank });
     var command = presentation.takeCommand().?;
     defer command.deinit();
@@ -8366,17 +8441,18 @@ test "Comment Action ladder carries inline File and Review scopes" {
     try testing.expect(published.composer.?.request.scope == null);
 }
 
-test "source-only Action reports availability instead of silently doing nothing" {
+test "yank skips a generated cursor row without Count" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
     });
     defer presentation.deinit();
-    presentation.published.?.navigation.jumpTo(0);
-    try testing.expect(!presentation.projection().action_availability.available(.yank));
+    try testing.expect(presentation.projection().action_availability.available(.yank));
     try presentation.dispatch(.{ .action = .yank });
-    try testing.expectEqual(ActionError.source_action_unavailable, presentation.projection().action_error.?);
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqualStrings("new a", command.copy_clipboard.text);
 }
 
 test "Selected Version defaults to new and survives preference and Session replacement changes" {
@@ -8582,6 +8658,10 @@ test "WholeFile Selected Version restoration chooses a blob Line before the next
 
     const frame = presentation.projection().review.?.frame;
     try testing.expectEqualStrings("gap two", frame.visual_rows[frame.navigation.cursor].yank_candidates.old.?.text);
+    try presentation.dispatch(.{ .action = .yank });
+    var copy = presentation.takeCommand().?;
+    defer copy.deinit();
+    try testing.expectEqualStrings("gap two", copy.copy_clipboard.text);
 }
 
 test "a focused loading WholeFile version change queues the existing File Enrichment command" {
@@ -8622,7 +8702,7 @@ test "source Action availability publishes separate typed refusals" {
     try testing.expect(available.available(.suggest));
 }
 
-test "yank Count skips Presentation rows and stops at the File boundary" {
+test "yank Count uses the Selected Version and stops at the File boundary" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -8636,11 +8716,11 @@ test "yank Count skips Presentation rows and stops at the File boundary" {
     var command = presentation.takeCommand().?;
     defer command.deinit();
     try testing.expect(command == .copy_clipboard);
-    try testing.expectEqualStrings("old a\nnew a", command.copy_clipboard.text);
+    try testing.expectEqualStrings("new a", command.copy_clipboard.text);
     try testing.expectEqual(@as(usize, 0), published.navigation.count);
 }
 
-test "side-by-side yank applies provisional new-side-first source selection" {
+test "SideBySide yank uses only the Selected Version column" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -8648,17 +8728,30 @@ test "side-by-side yank applies provisional new-side-first source selection" {
     });
     defer presentation.deinit();
     try presentation.dispatch(.{ .action = .toggle_layout });
-    const published = presentation.published.?;
-    for (published.buffer.rows, 0..) |row, index| if (row == .line_pair and row.line_pair.right != null) {
-        published.navigation.jumpTo(index);
+    var source_row: ?usize = null;
+    for (presentation.projection().review.?.frame.visual_rows, 0..) |row, index| if (row.yank_candidates.new != null) {
+        source_row = index;
         break;
     };
+    try moveToRow(&presentation, source_row.?);
     try presentation.dispatch(.{ .action = .yank });
     var command = presentation.takeCommand().?;
     defer command.deinit();
     try testing.expectEqualStrings("new a", command.copy_clipboard.text);
     try presentation.dispatch(.{ .clipboard_completed = .{ .command_id = command.copy_clipboard.command_id, .success = true } });
     try testing.expectEqual(ClipboardStatus.copied, presentation.projection().clipboard_status.?);
+
+    try presentation.dispatch(.{ .action = .select_old_version });
+    source_row = null;
+    for (presentation.projection().review.?.frame.visual_rows, 0..) |row, index| if (row.yank_candidates.old != null) {
+        source_row = index;
+        break;
+    };
+    try moveToRow(&presentation, source_row.?);
+    try presentation.dispatch(.{ .action = .yank });
+    var old_command = presentation.takeCommand().?;
+    defer old_command.deinit();
+    try testing.expectEqualStrings("old a", old_command.copy_clipboard.text);
 }
 
 test "Selection overrides Count for yank and clipboard failure is visible" {
@@ -8692,6 +8785,149 @@ test "Selection overrides Count for yank and clipboard failure is visible" {
     try testing.expect(presentation.projection().review.?.navigation.mark == null);
     try presentation.dispatch(.{ .clipboard_completed = .{ .command_id = command.copy_clipboard.command_id, .success = false } });
     try testing.expectEqual(ClipboardStatus.failed, presentation.projection().clipboard_status.?);
+}
+
+test "yank Selection uses only inclusive rows from the cursor File" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try presentation.dispatch(.{ .action = .to_bottom });
+    try presentation.dispatch(.{ .push_count_digit = 9 });
+
+    try presentation.dispatch(.{ .action = .yank });
+
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqualStrings("new b", command.copy_clipboard.text);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.count);
+    try testing.expect(presentation.projection().review.?.navigation.mark == null);
+}
+
+test "yank refusal consumes Count and preserves Selection" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try presentation.dispatch(.{ .push_count_digit = 9 });
+
+    try presentation.dispatch(.{ .action = .yank });
+
+    try testing.expectEqual(ActionError.yank_no_source, presentation.projection().action_error.?);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.count);
+    try testing.expectEqual(@as(?usize, 0), presentation.projection().review.?.navigation.mark);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "yank allocation failure consumes Count and preserves Selection" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    var source_row: ?usize = null;
+    for (presentation.projection().review.?.frame.visual_rows, 0..) |row, index| if (row.yank_candidates.new != null) {
+        source_row = index;
+        break;
+    };
+    try moveToRow(&presentation, source_row.?);
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try presentation.dispatch(.{ .push_count_digit = 3 });
+    failing.fail_index = failing.alloc_index;
+
+    try presentation.dispatch(.{ .action = .yank });
+
+    try testing.expect(failing.has_induced_failure);
+    try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.count);
+    try testing.expect(presentation.projection().review.?.navigation.mark != null);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "yank reports unavailable Selected Version content" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testVersionNavigationSession(testing.allocator) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try moveToRow(&presentation, 1);
+    try presentation.dispatch(.{ .push_count_digit = 2 });
+
+    try testing.expectEqual(YankRefusal.selected_content_unavailable, presentation.projection().action_availability.yank_refusal.?);
+    try presentation.dispatch(.{ .action = .yank });
+
+    try testing.expectEqual(ActionError.new_content_unavailable, presentation.projection().action_error.?);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.count);
+}
+
+test "yank reports no candidate for empty Selected Version content" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testVersionNavigationSession(testing.allocator) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const command = presentation.takeCommand().?.enrich_file;
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 200, .body = "" },
+        .{ .status = 200, .body = "" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+    var highlighter = TestNoopHighlighter{};
+    const result = try file_enrichment.enrich(testing.allocator, client, highlighter.highlighter(), command.request());
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = command.command_id,
+        .work_id = command.work_id,
+        .session_epoch = command.session_epoch,
+        .file_index = command.file_index,
+        .outcome = .{ .completed = result },
+    } });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+
+    try testing.expectEqual(YankRefusal.no_source, presentation.projection().action_availability.yank_refusal.?);
+    try presentation.dispatch(.{ .action = .yank });
+    try testing.expectEqual(ActionError.yank_no_source, presentation.projection().action_error.?);
+}
+
+test "empty source Lines count and yank has no trailing newline" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const session = try testSession(testing.allocator, 1, 'e');
+    session.diff = try bbr.diff.parse(session.arena.allocator(),
+        \\diff --git a/empty.zig b/empty.zig
+        \\--- a/empty.zig
+        \\+++ b/empty.zig
+        \\@@ -1,2 +1,2 @@
+        \\-
+        \\-old second
+        \\+
+        \\+new second
+    );
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .push_count_digit = 2 });
+
+    try presentation.dispatch(.{ .action = .yank });
+
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqualStrings("\nnew second", command.copy_clipboard.text);
 }
 
 test "successful Session replacement resets Pane and Sidebar defaults" {

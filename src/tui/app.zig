@@ -425,6 +425,7 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .local_review_no_submission => "Submit is unavailable for a local review; drafts remain local",
         .local_review_remote_action_unavailable => "This action is unavailable for a local review",
         .source_action_unavailable => "This action requires a source line or Selection",
+        .yank_no_source => "No Selected Version source Line exists at the cursor or in Selection",
         .old_content_unavailable => "Old content is unavailable",
         .new_content_unavailable => "New content is unavailable",
         .source_not_hunk_line => "This action requires a Hunk Line",
