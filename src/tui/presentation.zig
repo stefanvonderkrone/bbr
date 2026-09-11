@@ -2002,6 +2002,19 @@ const IssuedEnrichment = struct {
     speculative: bool,
 };
 
+const VersionRestoration = struct {
+    session_epoch: SessionEpoch,
+    file_index: usize,
+    selected_version: SelectedVersion,
+    exact_hunk_line: ?*const bbr.diff.Line,
+    next_hunk_line: ?*const bbr.diff.Line,
+    prior_hunk_line: ?*const bbr.diff.Line,
+    from_hunk: bool,
+    source_line: u32,
+    source_offset: usize,
+    viewport_offset: usize,
+};
+
 const PrefetchArm = struct {
     session_epoch: SessionEpoch,
     file_index: usize,
@@ -2860,6 +2873,7 @@ pub const Presentation = struct {
     composer_footer: std.ArrayList(u8) = .empty,
     interaction_revision: frame_mod.Revision = 1,
     mouse_press: ?MousePress = null,
+    version_restoration: ?VersionRestoration = null,
 
     const MousePress = struct {
         revision: frame_mod.Revision,
@@ -2928,7 +2942,8 @@ pub const Presentation = struct {
         // A candidate completion is not itself an interaction or a Frame
         // change. Keep a press across rollback; a committed replacement
         // invalidates it below when the new Session becomes published.
-        if (input != .mouse and input != .session_loaded and input != .ensure_focused_enrichment) {
+        const version_action = input == .action and (input.action == .select_old_version or input.action == .select_new_version);
+        if (input != .mouse and input != .session_loaded and input != .ensure_focused_enrichment and !version_action) {
             self.mouse_press = null;
             self.interaction_revision +%= 1;
         }
@@ -3196,10 +3211,13 @@ pub const Presentation = struct {
     }
 
     fn activateMouseTarget(self: *Presentation, target: frame_mod.HitTarget) void {
-        self.prefetch_arm = null;
+        if (target != .select_old_version and target != .select_new_version) {
+            self.prefetch_arm = null;
+            self.version_restoration = null;
+        }
         switch (target) {
-            .select_old_version => self.applyAction(.select_old_version),
-            .select_new_version => self.applyAction(.select_new_version),
+            .select_old_version => return self.applyAction(.select_old_version),
+            .select_new_version => return self.applyAction(.select_new_version),
             .picker_entry => |index| {
                 if (self.file_finder) |*finder| finder.select(index) else if (self.picker) |*picker| picker.select(index) else return;
             },
@@ -3239,6 +3257,7 @@ pub const Presentation = struct {
         const target = frame_mod.hitTest(self.frameProjection(), mouse.col, mouse.row) orelse return;
         const rows = self.dependencies.mouse_vertical_scroll_rows;
         if (rows == 0) return;
+        if (target != .select_old_version and target != .select_new_version) self.version_restoration = null;
         switch (target) {
             .select_old_version, .select_new_version => return,
             .picker_entry => {
@@ -4179,7 +4198,16 @@ pub const Presentation = struct {
     }
 
     fn applyAction(self: *Presentation, action: Action) void {
+        if (self.replacement == null) if (self.published) |_| switch (action) {
+            .select_old_version => if (self.preferences.selected_version == .old) return,
+            .select_new_version => if (self.preferences.selected_version == .new) return,
+            else => {},
+        };
         self.clipboard_status = null;
+        if (keymap_mod.isMotion(action) or action == .next_file or action == .prev_file or action == .focus_file or
+            action == .focus_next_pane or action == .isolate or action == .cycle_scope or action == .open_file_finder or
+            action == .scroll_row_up or action == .scroll_row_down)
+            self.version_restoration = null;
         if (keymap_mod.isMotion(action) or action == .next_file or action == .prev_file or
             action == .open_file_finder or action == .focus_next_pane)
         {
@@ -4306,9 +4334,7 @@ pub const Presentation = struct {
                 self.action_error = null;
             },
             .select_old_version, .select_new_version => {
-                var candidate = self.preferences;
-                candidate.selected_version = if (action == .select_old_version) .old else .new;
-                if (candidate.selected_version != self.preferences.selected_version) self.publishPreferences(published, candidate);
+                self.selectVersion(published, if (action == .select_old_version) .old else .new);
             },
             .isolate => self.toggleIsolation(published),
             .next_file => if (published.focus == .diff) self.moveFile(published, 1),
@@ -5798,7 +5824,8 @@ pub const Presentation = struct {
         }
         const published = self.published;
         const applies = if (published) |current|
-            current.epoch == completed.session_epoch and completed.file_index < current.session.enrichment.len()
+            issued.session_epoch == completed.session_epoch and issued.file_index == completed.file_index and
+                current.epoch == completed.session_epoch and completed.file_index < current.session.enrichment.len()
         else
             false;
 
@@ -5831,6 +5858,11 @@ pub const Presentation = struct {
                     return;
                 };
                 current.session.enrichment.commitCacheUpdate();
+                if (self.version_restoration) |target| {
+                    if (self.preferences.scope == .whole and target.selected_version == self.preferences.selected_version and
+                        target.session_epoch == completed.session_epoch and target.file_index == completed.file_index and
+                        restoreVersionNavigation(current, target, self.preferences.selected_version)) self.version_restoration = null;
+                }
                 self.action_error = if (issued.speculative) previous_action_error else null;
                 const focused = current.activeFile();
                 if (focused != null and focused.? == completed.file_index) {
@@ -5943,6 +5975,39 @@ pub const Presentation = struct {
             return;
         };
         self.preferences = candidate;
+        self.action_error = null;
+    }
+
+    fn selectVersion(self: *Presentation, published: *Published, selected: SelectedVersion) void {
+        if (selected == self.preferences.selected_version) return;
+        var candidate = self.preferences;
+        candidate.selected_version = selected;
+        const restoration = if (candidate.scope == .whole) captureVersionRestoration(published, selected) else null;
+        var staged = published.prepareBuffer(candidate, published.expanded_disclosures.items, published.isolated_file, published.geometry) catch |err| {
+            self.action_error = normalizeActionError(err);
+            return;
+        };
+        defer staged.deinit();
+
+        const file_index = published.activeFile();
+        if (candidate.scope == .whole and file_index != null and versionNeedsEnrichment(published, candidate.layout, selected, file_index.?)) {
+            self.queueFileEnrichment(published, file_index.?, false) catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
+        }
+
+        staged.publish();
+        self.preferences = candidate;
+        published.navigation.count = 0;
+        published.navigation.mark = null;
+        self.version_restoration = null;
+        if (restoration) |target| {
+            if (!restoreVersionNavigation(published, target, selected) and versionContentPending(published, target.file_index, selected))
+                self.version_restoration = target;
+        }
+        self.mouse_press = null;
+        self.interaction_revision +%= 1;
         self.action_error = null;
     }
 
@@ -6325,6 +6390,7 @@ pub const Presentation = struct {
                 // the confirmed cascade described the replaced graph.
                 self.reanchor = null;
                 self.delete_confirmation = null;
+                self.version_restoration = null;
                 self.resolver = .{};
                 self.mouse_press = null;
                 self.interaction_revision +%= 1;
@@ -6916,6 +6982,143 @@ fn fileHeaderRow(buffer: buffer_mod.Buffer, file_index: usize) ?usize {
     return buffer.fileHeaderRow(file_index);
 }
 
+fn captureVersionRestoration(published: *const Published, selected: SelectedVersion) ?VersionRestoration {
+    const visual = published.cursorVisualRow() orelse return null;
+    const current = switch (published.selected_version) {
+        .old => visual.yank_candidates.old,
+        .new => visual.yank_candidates.new,
+    } orelse return null;
+    const source_line = lineNumber(current, published.selected_version) orelse return null;
+    const file_index = published.activeFile() orelse return null;
+    const hunk_neighbors: VersionHunkNeighbors = if (current.in_hunk)
+        versionHunkNeighbors(published.session.diff.files[file_index], current, selected)
+    else
+        .{};
+    return .{
+        .session_epoch = published.epoch,
+        .file_index = file_index,
+        .selected_version = selected,
+        .exact_hunk_line = hunk_neighbors.exact,
+        .next_hunk_line = hunk_neighbors.next,
+        .prior_hunk_line = hunk_neighbors.prior,
+        .from_hunk = current.in_hunk,
+        .source_line = source_line,
+        .source_offset = visual.source_start,
+        .viewport_offset = published.navigation.cursor -| published.navigation.scroll,
+    };
+}
+
+fn restoreVersionNavigation(published: *Published, target: VersionRestoration, selected: SelectedVersion) bool {
+    if (published.epoch != target.session_epoch or target.file_index >= published.session.diff.files.len) return false;
+    var chosen: ?*const bbr.diff.Line = null;
+    var next_number: u32 = std.math.maxInt(u32);
+    var prior_number: u32 = 0;
+    const next_hunk_number = if (target.next_hunk_line) |line| lineNumber(line, selected).? else std.math.maxInt(u32);
+    const prior_hunk_number = if (target.prior_hunk_line) |line| lineNumber(line, selected).? else 0;
+    for (published.visual_rows) |visual| {
+        if (published.buffer.fileIndexForRow(visual.buffer_index) != target.file_index) continue;
+        const line = switch (selected) {
+            .old => visual.yank_candidates.old,
+            .new => visual.yank_candidates.new,
+        } orelse continue;
+        if (target.exact_hunk_line == line) {
+            chosen = line;
+            break;
+        }
+        if (target.exact_hunk_line != null) continue;
+        const number = lineNumber(line, selected) orelse continue;
+        const is_next_hunk = target.next_hunk_line == line;
+        const is_next_blob = !line.in_hunk and number > target.source_line and number < next_hunk_number;
+        const is_numeric_next = !target.from_hunk and number >= target.source_line;
+        if ((is_next_hunk or is_next_blob or is_numeric_next) and number < next_number) {
+            chosen = line;
+            next_number = number;
+        } else if (next_number == std.math.maxInt(u32) and
+            (target.prior_hunk_line == line or (!line.in_hunk and number < target.source_line and number > prior_hunk_number) or
+                (!target.from_hunk and number < target.source_line)) and number >= prior_number)
+        {
+            chosen = line;
+            prior_number = number;
+        }
+    }
+
+    if (chosen) |line| {
+        var best: ?usize = null;
+        var best_distance: usize = std.math.maxInt(usize);
+        for (published.visual_rows, 0..) |visual, index| {
+            const candidate = switch (selected) {
+                .old => visual.yank_candidates.old,
+                .new => visual.yank_candidates.new,
+            } orelse continue;
+            if (candidate != line) continue;
+            const distance = if (target.source_offset < visual.source_start)
+                visual.source_start - target.source_offset
+            else if (target.source_offset > visual.source_end)
+                target.source_offset - visual.source_end
+            else
+                0;
+            if (distance < best_distance or (distance == best_distance and visual.source_start <= target.source_offset)) {
+                best = index;
+                best_distance = distance;
+            }
+        }
+        if (best) |index| {
+            published.navigation.jumpTo(index);
+            published.navigation.scroll = index -| target.viewport_offset;
+            published.navigation.setViewport(published.navigation.viewport);
+            return true;
+        }
+    }
+
+    if (fileHeaderRow(published.buffer, target.file_index)) |row| if (published.visualIndexForBufferIndex(row)) |index|
+        published.navigation.jumpTo(index);
+    return false;
+}
+
+const VersionHunkNeighbors = struct {
+    exact: ?*const bbr.diff.Line = null,
+    next: ?*const bbr.diff.Line = null,
+    prior: ?*const bbr.diff.Line = null,
+};
+
+fn versionHunkNeighbors(file: bbr.diff.File, current: *const bbr.diff.Line, selected: SelectedVersion) VersionHunkNeighbors {
+    var result: VersionHunkNeighbors = .{};
+    var found = false;
+    for (file.hunks) |hunk| for (hunk.lines) |*line| {
+        if (line == current) {
+            found = true;
+            if (lineNumber(line, selected) != null) result.exact = line;
+            continue;
+        }
+        if (lineNumber(line, selected) == null) continue;
+        if (found) {
+            if (result.next == null) result.next = line;
+        } else {
+            result.prior = line;
+        }
+    };
+    return result;
+}
+
+fn lineNumber(line: *const bbr.diff.Line, selected: SelectedVersion) ?u32 {
+    const number = if (selected == .old) line.old_no else line.new_no;
+    return if (number == 0) null else number;
+}
+
+fn versionContentPending(published: *const Published, file_index: usize, selected: SelectedVersion) bool {
+    if (file_index >= published.session.enrichment.len()) return false;
+    const status = published.session.enrichment.status(file_index);
+    const side = if (selected == .old) status.old else status.new;
+    return side == .pending or side == .loading;
+}
+
+fn versionNeedsEnrichment(published: *const Published, layout: Layout, selected: SelectedVersion, file_index: usize) bool {
+    if (file_index >= published.session.enrichment.len()) return false;
+    if (layout == .side_by_side) return published.session.enrichment.needsEnrichment(file_index);
+    const status = published.session.enrichment.status(file_index);
+    return (if (selected == .old) status.old else status.new) == .pending;
+}
+
 const testing = std.testing;
 
 fn testSession(backing: std.mem.Allocator, id: u64, marker: u8) !*session_mod.Session {
@@ -6950,6 +7153,41 @@ fn testSession(backing: std.mem.Allocator, id: u64, marker: u8) !*session_mod.Se
         .pull_request_id = pr.id,
     };
     s.diff = try bbr.diff.parse(a, raw);
+    try s.initializeEnrichment();
+    return s;
+}
+
+fn testVersionNavigationSession(backing: std.mem.Allocator) !*session_mod.Session {
+    const s = try testSession(backing, 1, 'a');
+    const a = s.arena.allocator();
+    s.diff = try bbr.diff.parse(a,
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1,3 +1,3 @@
+        \\ before
+        \\-old source that wraps
+        \\+new source that wraps
+        \\ after source that also wraps
+    );
+    try s.initializeEnrichment();
+    return s;
+}
+
+fn testVersionGapSession(backing: std.mem.Allocator) !*session_mod.Session {
+    const s = try testSession(backing, 1, 'a');
+    const a = s.arena.allocator();
+    s.diff = try bbr.diff.parse(a,
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-old one
+        \\+new one
+        \\@@ -4 +4 @@
+        \\-old four
+        \\+new four
+    );
     try s.initializeEnrichment();
     return s;
 }
@@ -8168,6 +8406,203 @@ test "Selected Version defaults to new and survives preference and Session repla
     try testing.expectEqual(SelectedVersion.old, projected.preferences.selected_version);
     try testing.expectEqual(SelectedVersion.old, projected.selected_version);
     try testing.expectEqual(SelectedVersion.old, projected.frame.selected_version);
+}
+
+test "selecting the current Selected Version is an exact no-op" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 10 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try presentation.dispatch(.{ .push_count_digit = 7 });
+    const before = presentation.projection();
+    const target = before.review.?.frame.panes.sidebar_content;
+    try presentation.dispatch(.{ .mouse = .{ .col = target.x, .row = target.y, .button = .left, .type = .press } });
+
+    try presentation.dispatch(.{ .action = .select_new_version });
+
+    const after = presentation.projection();
+    try testing.expect(std.meta.eql(before.revision, after.revision));
+    try testing.expectEqual(before.review.?.buffer.rows.ptr, after.review.?.buffer.rows.ptr);
+    try testing.expect(std.meta.eql(before.review.?.navigation, after.review.?.navigation));
+    try testing.expect(presentation.takeCommand() == null);
+    try presentation.dispatch(.{ .mouse = .{ .col = target.x, .row = target.y, .button = .left, .type = .release } });
+    try testing.expectEqual(frame_mod.PaneFocus.sidebar, presentation.projection().review.?.frame.focus);
+}
+
+test "a Selected Version change publishes one Frame and then clears Count and Selection" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try presentation.dispatch(.{ .push_count_digit = 7 });
+    const before = presentation.projection();
+
+    try presentation.dispatch(.{ .action = .select_old_version });
+
+    const after = presentation.projection();
+    try testing.expectEqual(before.revision.frame + 1, after.revision.frame);
+    try testing.expectEqual(before.revision.interaction + 1, after.revision.interaction);
+    try testing.expectEqual(SelectedVersion.old, after.review.?.preferences.selected_version);
+    try testing.expectEqual(SelectedVersion.old, after.review.?.selected_version);
+    try testing.expectEqual(SelectedVersion.old, after.review.?.frame.selected_version);
+    try testing.expectEqual(@as(usize, 0), after.review.?.navigation.count);
+    try testing.expect(after.review.?.navigation.mark == null);
+    try testing.expectEqual(before.review.?.buffer.rows.len, after.review.?.buffer.rows.len);
+    try testing.expect(after.review.?.frame.visual_rows[after.review.?.navigation.cursor].owner.eql(
+        before.review.?.frame.visual_rows[before.review.?.navigation.cursor].owner,
+    ));
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "a failed Selected Version change preserves the complete published interaction" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 10 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try presentation.dispatch(.{ .push_count_digit = 7 });
+    const before = presentation.projection();
+    const target = before.review.?.frame.panes.sidebar_content;
+    try presentation.dispatch(.{ .mouse = .{ .col = target.x, .row = target.y, .button = .left, .type = .press } });
+
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .action = .select_old_version });
+
+    const after = presentation.projection();
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(std.meta.eql(before.revision, after.revision));
+    try testing.expectEqual(before.review.?.buffer.rows.ptr, after.review.?.buffer.rows.ptr);
+    try testing.expect(std.meta.eql(before.review.?.navigation, after.review.?.navigation));
+    try testing.expectEqual(SelectedVersion.new, after.review.?.selected_version);
+    failing.fail_index = std.math.maxInt(usize);
+    try presentation.dispatch(.{ .mouse = .{ .col = target.x, .row = target.y, .button = .left, .type = .release } });
+    try testing.expectEqual(frame_mod.PaneFocus.sidebar, presentation.projection().review.?.frame.focus);
+}
+
+test "WholeFile Selected Version restoration chooses the next source Line" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testVersionNavigationSession(testing.allocator) },
+        .geometry = .{ .cols = 50, .rows = 8 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const command = presentation.takeCommand().?.enrich_file;
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 200, .body = "before\nold source that wraps\nafter source that also wraps\n" },
+        .{ .status = 200, .body = "before\nnew source that wraps\nafter source that also wraps\n" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+    var highlighter = TestNoopHighlighter{};
+    const result = try file_enrichment.enrich(testing.allocator, client, highlighter.highlighter(), command.request());
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = command.command_id,
+        .work_id = command.work_id,
+        .session_epoch = command.session_epoch,
+        .file_index = command.file_index,
+        .outcome = .{ .completed = result },
+    } });
+    try presentation.dispatch(.{ .action = .toggle_diff_wrap });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    while (true) {
+        const frame = presentation.projection().review.?.frame;
+        const visual = frame.visual_rows[frame.navigation.cursor];
+        if (visual.yank_candidates.new) |line| if (line.kind == .added) break;
+        try presentation.dispatch(.{ .action = .down });
+    }
+
+    try presentation.dispatch(.{ .action = .select_old_version });
+
+    const restored = presentation.projection().review.?.frame;
+    const visual = restored.visual_rows[restored.navigation.cursor];
+    try testing.expectEqualStrings("after source that also wraps", visual.yank_candidates.old.?.text);
+    try testing.expectEqual(@as(usize, 0), visual.source_start);
+    const line = visual.yank_candidates.old.?;
+    try presentation.dispatch(.{ .action = .down });
+    const offset = presentation.projection().review.?.frame.visual_rows[presentation.projection().review.?.navigation.cursor].source_start;
+    try testing.expect(offset > 0);
+    try presentation.dispatch(.{ .action = .select_new_version });
+    const same = presentation.projection().review.?.frame;
+    try testing.expectEqual(line, same.visual_rows[same.navigation.cursor].yank_candidates.new.?);
+    try testing.expectEqual(offset, same.visual_rows[same.navigation.cursor].source_start);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "WholeFile Selected Version restoration chooses a blob Line before the next Hunk" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testVersionGapSession(testing.allocator) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const command = presentation.takeCommand().?.enrich_file;
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 200, .body = "old one\ngap two\ngap three\nold four\n" },
+        .{ .status = 200, .body = "new one\ngap two\ngap three\nnew four\n" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+    var highlighter = TestNoopHighlighter{};
+    const result = try file_enrichment.enrich(testing.allocator, client, highlighter.highlighter(), command.request());
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = command.command_id,
+        .work_id = command.work_id,
+        .session_epoch = command.session_epoch,
+        .file_index = command.file_index,
+        .outcome = .{ .completed = result },
+    } });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    while (true) {
+        const frame = presentation.projection().review.?.frame;
+        const visual = frame.visual_rows[frame.navigation.cursor];
+        if (visual.yank_candidates.new) |line| if (line.kind == .added) break;
+        try presentation.dispatch(.{ .action = .down });
+    }
+
+    try presentation.dispatch(.{ .action = .select_old_version });
+
+    const frame = presentation.projection().review.?.frame;
+    try testing.expectEqualStrings("gap two", frame.visual_rows[frame.navigation.cursor].yank_candidates.old.?.text);
+}
+
+test "a focused loading WholeFile version change queues the existing File Enrichment command" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testVersionNavigationSession(testing.allocator) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+
+    try presentation.dispatch(.{ .action = .select_old_version });
+
+    const frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(SelectedVersion.old, frame.selected_version);
+    try testing.expect(frame.buffer.rows[1] == .status_placeholder);
+    const command = presentation.takeCommand().?.enrich_file;
+    try testing.expectEqual(frame_mod.SelectedVersion.old, presentation.projection().review.?.selected_version);
+    try testing.expectEqual(presentation.projection().review.?.session_epoch, command.session_epoch);
+    try testing.expectEqual(@as(usize, 0), command.file_index);
 }
 
 test "source Action availability publishes separate typed refusals" {
@@ -10819,6 +11254,7 @@ test "non-navigation Action keeps a pending successor prefetch" {
     const second = presentation.takeCommand().?.enrich_file;
 
     try presentation.dispatch(.{ .action = .clear_selection });
+    try presentation.dispatch(.{ .action = .select_new_version });
     try completeTestEnrichment(&presentation, second);
     try testing.expect(presentation.takeCommand().?.enrich_file.speculative);
 }
@@ -11079,6 +11515,7 @@ test "stale-Epoch File Enrichment completion is consumed without changing Sessio
     defer presentation.deinit();
     try presentation.dispatch(.ensure_focused_enrichment);
     const enrich = presentation.takeCommand().?.enrich_file;
+    const before = presentation.projection().review.?;
 
     try presentation.dispatch(.{ .file_enrichment_completed = .{
         .command_id = enrich.command_id,
@@ -11089,6 +11526,11 @@ test "stale-Epoch File Enrichment completion is consumed without changing Sessio
     } });
 
     try testing.expect(presentation.projection().action_error == null);
+    const after = presentation.projection().review.?;
+    try testing.expectEqual(before.buffer.rows.ptr, after.buffer.rows.ptr);
+    try testing.expectEqual(before.session_epoch, after.session_epoch);
+    try testing.expectEqual(before.selected_version, after.selected_version);
+    try testing.expect(std.meta.eql(before.preferences, after.preferences));
     try presentation.dispatch(.request_shutdown);
     try testing.expect(presentation.readyToExit());
 }
