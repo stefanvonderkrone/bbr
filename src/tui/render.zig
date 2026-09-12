@@ -98,7 +98,7 @@ pub fn drawReview(
     const diff_pane = childRect(win, review.frame.panes.diff_content);
     drawFileTree(sidebar, review.frame.file_tree, theme);
     drawVisualPane(scratch, diff_pane, review.frame.buffer, review.frame.visual_rows, theme, review.frame.navigation);
-    joinSectionRules(win, review.frame.panes.diff, review.frame.panes.diff_content, review.frame.visual_rows, review.frame.navigation, theme);
+    joinSectionRules(win, review.frame.panes.diff, review.frame.panes.diff_content, review.frame.buffer, review.frame.visual_rows, review.frame.navigation, theme);
 }
 
 fn drawDiffPaneFrame(scratch: std.mem.Allocator, win: vaxis.Window, frame: @import("frame.zig").Projection, path: []const u8, scope: presentation.Scope, theme: Theme) void {
@@ -134,12 +134,12 @@ fn drawVersionTitleSegment(win: vaxis.Window, target: ?@import("frame.zig").Rect
     _ = childRect(win, rect).printSegment(.{ .text = text, .style = style }, .{ .wrap = .none });
 }
 
-fn joinSectionRules(win: vaxis.Window, outer: @import("frame.zig").Rect, content: @import("frame.zig").Rect, visual_rows: []const @import("frame.zig").VisualRow, nav: Nav, theme: Theme) void {
+fn joinSectionRules(win: vaxis.Window, outer: @import("frame.zig").Rect, content: @import("frame.zig").Rect, buf: Buffer, visual_rows: []const @import("frame.zig").VisualRow, nav: Nav, theme: Theme) void {
     if (outer.width == 0) return;
+    const viewport = @import("frame.zig").diffViewport(buf, visual_rows, nav.scroll, content.height);
     var screen_row: u16 = 0;
     while (screen_row < content.height) : (screen_row += 1) {
-        const index = nav.scroll + screen_row;
-        if (index >= visual_rows.len) break;
+        const index = viewport.visualIndexAt(nav.scroll, screen_row, visual_rows.len) orelse continue;
         const joined = switch (visual_rows[index].kind) {
             .file_header, .section => true,
             else => false,
@@ -278,10 +278,10 @@ fn drawVisualPane(
     nav: Nav,
 ) void {
     const sel = nav.selection();
+    const viewport = @import("frame.zig").diffViewport(buf, visual_rows, nav.scroll, win.height);
     var screen_row: u16 = 0;
     while (screen_row < win.height) : (screen_row += 1) {
-        const index = nav.scroll + screen_row;
-        if (index >= visual_rows.len) break;
+        const index = viewport.visualIndexAt(nav.scroll, screen_row, visual_rows.len) orelse continue;
         const visual_row = visual_rows[index];
         const row = buf.rows[visual_row.buffer_index];
         const selected = if (sel) |selection|
@@ -1378,6 +1378,97 @@ test "disabled Diff visual-row projection clips exactly like Buffer rendering" {
         try testing.expectEqualStrings(expected.char.grapheme, actual.char.grapheme);
         try testing.expectEqual(expected.style, actual.style);
     }
+}
+
+test "scrolled Diff pins Unified File header above visible content" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file: bbr.diff.File = .{ .old_path = "src/a.zig", .new_path = "src/a.zig", .status = .modified, .hunks = &.{} };
+    const first: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "first" };
+    const second: bbr.diff.Line = .{ .old_no = 2, .new_no = 2, .kind = .context, .text = "second" };
+    const rows = [_]Row{
+        .{ .file_header = .{ .file = &file, .path = file.new_path } },
+        .{ .line = .{ .line = &first, .decoration = .{ .runs = &.{.{ .text = first.text }} } } },
+        .{ .line = .{ .line = &second, .decoration = .{ .runs = &.{.{ .text = second.text }} } } },
+    };
+    const file_rows = [_]buffer_mod.FileRow{.{ .file_index = 0, .first_row = 0 }};
+    const buf: Buffer = .{ .rows = &rows, .layout = .unified, .file_rows = &file_rows };
+    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{ .layout = .unified, .width = 40, .wrap = false });
+    var screen = try vaxis.Screen.init(a, .{ .rows = 3, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    var nav = Nav.init(visual_rows.len, 2);
+    nav.scroll = 1;
+    nav.cursor = 1;
+
+    drawVisualPane(a, win, buf, visual_rows, theme_dark, nav);
+
+    try testing.expectEqualStrings("─", win.readCell(0, 0).?.char.grapheme);
+    try testing.expectEqualStrings("M", win.readCell(2, 0).?.char.grapheme);
+    try testing.expectEqualStrings("s", win.readCell(4, 0).?.char.grapheme);
+    try testing.expectEqualStrings("f", win.readCell(gutter_cols, 1).?.char.grapheme);
+    try testing.expectEqualStrings("s", win.readCell(gutter_cols, 2).?.char.grapheme);
+}
+
+test "one-row DiffPane shows content instead of a pinned File header" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file: bbr.diff.File = .{ .old_path = "a.zig", .new_path = "a.zig", .status = .modified, .hunks = &.{} };
+    const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "content" };
+    const rows = [_]Row{
+        .{ .file_header = .{ .file = &file, .path = file.new_path } },
+        .{ .line = .{ .line = &line, .decoration = .{ .runs = &.{.{ .text = line.text }} } } },
+    };
+    const file_rows = [_]buffer_mod.FileRow{.{ .file_index = 0, .first_row = 0 }};
+    const buf: Buffer = .{ .rows = &rows, .layout = .unified, .file_rows = &file_rows };
+    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{ .layout = .unified, .width = 20, .wrap = false });
+    var screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    var nav = Nav.init(visual_rows.len, 1);
+    nav.scroll = 1;
+    nav.cursor = 1;
+
+    drawVisualPane(a, win, buf, visual_rows, theme_dark, nav);
+
+    try testing.expectEqualStrings("c", win.readCell(gutter_cols, 0).?.char.grapheme);
+}
+
+test "scrolled SideBySide Diff pins both File paths" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file: bbr.diff.File = .{ .old_path = "old/a.zig", .new_path = "new/a.zig", .status = .renamed, .hunks = &.{} };
+    const old_line: bbr.diff.Line = .{ .old_no = 1, .new_no = 0, .kind = .removed, .text = "old" };
+    const new_line: bbr.diff.Line = .{ .old_no = 0, .new_no = 1, .kind = .added, .text = "new" };
+    const rows = [_]Row{
+        .{ .file_header = .{ .file = &file, .path = file.new_path } },
+        .{ .line_pair = .{
+            .left = .{ .line = &old_line, .decoration = .{ .runs = &.{.{ .text = old_line.text }} } },
+            .right = .{ .line = &new_line, .decoration = .{ .runs = &.{.{ .text = new_line.text }} } },
+        } },
+    };
+    const file_rows = [_]buffer_mod.FileRow{.{ .file_index = 0, .first_row = 0 }};
+    const buf: Buffer = .{
+        .rows = &rows,
+        .layout = .side_by_side,
+        .selected_column = .{ .version = .new, .inner_gutter_edge = .left },
+        .file_rows = &file_rows,
+    };
+    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{ .layout = .side_by_side, .width = 41, .wrap = false });
+    var screen = try vaxis.Screen.init(a, .{ .rows = 2, .cols = 41, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    var nav = Nav.init(visual_rows.len, 1);
+    nav.scroll = 1;
+    nav.cursor = 1;
+
+    drawVisualPane(a, win, buf, visual_rows, theme_dark, nav);
+
+    try expectScreenText(win, 0, "OLD old/a.zig");
+    try expectScreenText(win.child(.{ .x_off = 21, .width = 20, .height = 2 }), 0, "NEW new/a.zig");
 }
 
 test "disabled SideBySide visual rows clip exactly like Buffer rendering" {

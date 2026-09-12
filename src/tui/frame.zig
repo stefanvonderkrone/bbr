@@ -158,6 +158,52 @@ pub const Projection = struct {
     version_title_targets: VersionTitleTargets = .{},
 };
 
+pub const DiffViewport = struct {
+    pinned_header: ?usize = null,
+    body_row_offset: u16 = 0,
+    viewport_rows: usize,
+
+    pub fn visualIndexAt(self: DiffViewport, scroll: usize, screen_row: u16, visual_row_count: usize) ?usize {
+        if (self.pinned_header) |header| if (screen_row == 0) return header;
+        if (screen_row < self.body_row_offset) return null;
+        const index = scroll + @as(usize, screen_row - self.body_row_offset);
+        return if (index < visual_row_count) index else null;
+    }
+};
+
+/// Project scrolled visual rows onto DiffPane screen rows. A File header gets a
+/// separate pinned row only after its normal row scrolls away.
+pub fn diffViewport(buffer: buffer_mod.Buffer, visual_rows: []const VisualRow, scroll: usize, height: u16) DiffViewport {
+    var result: DiffViewport = .{ .viewport_rows = @max(height, 1) };
+    if (height < 2 or scroll >= visual_rows.len) return result;
+    const top_buffer_index = visual_rows[scroll].buffer_index;
+    const file_index = buffer.fileIndexForRow(top_buffer_index) orelse return result;
+    var header_buffer_index = buffer.fileHeaderRow(file_index) orelse return result;
+    var header_visual_index = visualIndexForBufferIndex(visual_rows, header_buffer_index) orelse return result;
+    if (header_visual_index == scroll and scroll > 0) {
+        const previous_file = buffer.fileIndexForRow(visual_rows[scroll - 1].buffer_index) orelse return result;
+        if (previous_file == file_index) return result;
+        header_buffer_index = buffer.fileHeaderRow(previous_file) orelse return result;
+        header_visual_index = visualIndexForBufferIndex(visual_rows, header_buffer_index) orelse return result;
+    }
+    if (header_visual_index >= scroll) return result;
+    result.pinned_header = header_visual_index;
+    result.body_row_offset = 1;
+    result.viewport_rows = height - 1;
+    return result;
+}
+
+fn visualIndexForBufferIndex(visual_rows: []const VisualRow, buffer_index: usize) ?usize {
+    var low: usize = 0;
+    var high = visual_rows.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (visual_rows[middle].buffer_index < buffer_index) low = middle + 1 else high = middle;
+    }
+    if (low >= visual_rows.len or visual_rows[low].buffer_index != buffer_index) return null;
+    return low;
+}
+
 /// Resolve a cell solely against the immutable, already-published Frame. An
 /// Overlay captures the complete input surface, even outside its rectangle.
 pub fn hitTest(frame: Projection, col: u16, row: u16) ?HitTarget {
@@ -179,8 +225,9 @@ pub fn hitTest(frame: Projection, col: u16, row: u16) ?HitTarget {
         return .sidebar;
     }
     if (frame.panes.diff_content.contains(col, row)) {
-        const index = frame.navigation.scroll + row - frame.panes.diff_content.y;
-        if (index < frame.visual_rows.len) return .{ .diff_row = index };
+        const viewport = diffViewport(frame.buffer, frame.visual_rows, frame.navigation.scroll, frame.panes.diff_content.height);
+        const screen_row = row - frame.panes.diff_content.y;
+        if (viewport.visualIndexAt(frame.navigation.scroll, screen_row, frame.visual_rows.len)) |index| return .{ .diff_row = index };
         return .diff;
     }
     return null;
@@ -552,6 +599,98 @@ fn sourceOffset(source: []const u8, part: []const u8) usize {
 }
 
 const testing = std.testing;
+
+test "Diff viewport pins only a File header above top File content" {
+    const first: bbr.diff.File = .{ .old_path = "a.zig", .new_path = "a.zig", .status = .modified, .hunks = &.{} };
+    const second: bbr.diff.File = .{ .old_path = "b.zig", .new_path = "b.zig", .status = .modified, .hunks = &.{} };
+    const first_line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "first" };
+    const second_line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "second" };
+    const rows = [_]buffer_mod.Row{
+        .{ .section = .{ .kind = .pr_comments, .count = 1 } },
+        .{ .file_header = .{ .file = &first, .path = first.new_path } },
+        .{ .line = .{ .line = &first_line, .decoration = .{ .runs = &.{} } } },
+        .{ .file_header = .{ .file = &second, .path = second.new_path } },
+        .{ .line = .{ .line = &second_line, .decoration = .{ .runs = &.{} } } },
+    };
+    const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, .bytes, .{ .layout = .unified, .width = 40, .wrap = false });
+    defer testing.allocator.free(visual_rows);
+    const file_rows = [_]buffer_mod.FileRow{
+        .{ .file_index = 0, .first_row = 1 },
+        .{ .file_index = 1, .first_row = 3 },
+    };
+    const buffer: buffer_mod.Buffer = .{ .rows = &rows, .layout = .unified, .file_rows = &file_rows };
+
+    try testing.expect(diffViewport(buffer, visual_rows, 0, 3).pinned_header == null);
+    try testing.expectEqual(@as(usize, 3), diffViewport(buffer, visual_rows, 0, 3).viewport_rows);
+    try testing.expect(diffViewport(buffer, visual_rows, 1, 3).pinned_header == null);
+    try testing.expectEqual(@as(usize, 3), diffViewport(buffer, visual_rows, 1, 3).viewport_rows);
+    const first_pinned = diffViewport(buffer, visual_rows, 2, 3);
+    try testing.expectEqual(@as(?usize, 1), first_pinned.pinned_header);
+    try testing.expectEqual(@as(usize, 2), first_pinned.viewport_rows);
+    try testing.expectEqual(@as(?usize, 1), first_pinned.visualIndexAt(2, 0, visual_rows.len));
+    try testing.expectEqual(@as(?usize, 2), first_pinned.visualIndexAt(2, 1, visual_rows.len));
+    const handoff = diffViewport(buffer, visual_rows, 3, 3);
+    try testing.expectEqual(@as(?usize, 1), handoff.pinned_header);
+    try testing.expectEqual(@as(?usize, 1), handoff.visualIndexAt(3, 0, visual_rows.len));
+    try testing.expectEqual(@as(?usize, 3), handoff.visualIndexAt(3, 1, visual_rows.len));
+    try testing.expectEqual(@as(?usize, 3), diffViewport(buffer, visual_rows, 4, 3).pinned_header);
+    try testing.expect(diffViewport(buffer, visual_rows, 2, 1).pinned_header == null);
+}
+
+test "Diff viewport finds a File header across wrapped visual rows" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const file: bbr.diff.File = .{ .old_path = "a.zig", .new_path = "a.zig", .status = .modified, .hunks = &.{} };
+    const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "abcdef" };
+    const rows = [_]buffer_mod.Row{
+        .{ .file_header = .{ .file = &file, .path = file.new_path } },
+        .{ .line = .{ .line = &line, .decoration = .{ .runs = &.{.{ .text = line.text }} } } },
+    };
+    const visual_rows = try buildVisualRowsWithOptions(arena.allocator(), &rows, .bytes, .{ .layout = .unified, .width = 12, .wrap = true });
+    const file_rows = [_]buffer_mod.FileRow{.{ .file_index = 0, .first_row = 0 }};
+    const buffer: buffer_mod.Buffer = .{ .rows = &rows, .layout = .unified, .file_rows = &file_rows };
+
+    try testing.expect(visual_rows.len > rows.len);
+    try testing.expectEqual(@as(?usize, 0), diffViewport(buffer, visual_rows, 2, 3).pinned_header);
+}
+
+test "Diff hit testing maps both File headers during handoff" {
+    const first_file: bbr.diff.File = .{ .old_path = "a.zig", .new_path = "a.zig", .status = .modified, .hunks = &.{} };
+    const second_file: bbr.diff.File = .{ .old_path = "b.zig", .new_path = "b.zig", .status = .modified, .hunks = &.{} };
+    const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "line" };
+    const rows = [_]buffer_mod.Row{
+        .{ .file_header = .{ .file = &first_file, .path = first_file.new_path } },
+        .{ .line = .{ .line = &line, .decoration = .{ .runs = &.{} } } },
+        .{ .file_header = .{ .file = &second_file, .path = second_file.new_path } },
+        .{ .line = .{ .line = &line, .decoration = .{ .runs = &.{} } } },
+    };
+    const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, .bytes, .{ .layout = .unified, .width = 20, .wrap = false });
+    defer testing.allocator.free(visual_rows);
+    const file_rows = [_]buffer_mod.FileRow{
+        .{ .file_index = 0, .first_row = 0 },
+        .{ .file_index = 1, .first_row = 2 },
+    };
+    var navigation = Nav.init(visual_rows.len, 2);
+    navigation.scroll = 2;
+    navigation.cursor = 2;
+    const projection: Projection = .{
+        .revision = 1,
+        .visual_rows_revision = 1,
+        .geometry = .{ .cols = 20, .rows = 2 },
+        .panes = .{
+            .sidebar = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+            .diff = .{ .x = 0, .y = 0, .width = 20, .height = 2 },
+            .sidebar_content = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+            .diff_content = .{ .x = 0, .y = 0, .width = 20, .height = 2 },
+        },
+        .visual_rows = visual_rows,
+        .buffer = .{ .rows = &rows, .layout = .unified, .file_rows = &file_rows },
+        .navigation = navigation,
+    };
+
+    try testing.expectEqual(HitTarget{ .diff_row = 0 }, hitTest(projection, 1, 0).?);
+    try testing.expectEqual(HitTarget{ .diff_row = 2 }, hitTest(projection, 1, 1).?);
+}
 
 test "unwrapped visual rows skip CellMetrics" {
     const Metrics = struct {

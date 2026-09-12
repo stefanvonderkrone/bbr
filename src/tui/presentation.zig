@@ -1387,6 +1387,7 @@ const Published = struct {
         );
         published.buffers.commit();
         published.navigation = Nav.init(published.visual_rows.len, panes.diff_content.height);
+        published.syncDiffViewport();
         return published;
     }
 
@@ -1773,6 +1774,16 @@ const Published = struct {
         self.geometry = geometry;
         frame_mod.resizeViewports(&self.navigation, &self.tree, geometry);
         self.frame_revision += 1;
+    }
+
+    fn syncDiffViewport(self: *Published) void {
+        const height = frame_mod.paneRects(self.geometry).diff_content.height;
+        var remaining: usize = 2;
+        while (remaining > 0) : (remaining -= 1) {
+            const viewport = frame_mod.diffViewport(self.buffer, self.visual_rows, self.navigation.scroll, height);
+            if (self.navigation.viewport == viewport.viewport_rows) return;
+            self.navigation.setViewport(viewport.viewport_rows);
+        }
     }
 
     fn cursorVisualRow(self: *const Published) ?frame_mod.VisualRow {
@@ -2943,6 +2954,7 @@ pub const Presentation = struct {
     /// The sole mutation entry point. Candidate construction consumes a loaded
     /// Session whether it commits, fails, or proves stale.
     pub fn dispatch(self: *Presentation, input: OwnedInput) !void {
+        defer if (self.published) |published| published.syncDiffViewport();
         // A candidate completion is not itself an interaction or a Frame
         // change. Keep a press across rollback; a committed replacement
         // invalidates it below when the new Session becomes published.
@@ -13915,6 +13927,75 @@ test "mouse click uses the published Frame target and a Motion cancels a pending
     try testing.expectEqual(@as(usize, 1), presentation.projection().review.?.navigation.cursor);
 }
 
+test "pinned File header keeps one viewport row available" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 8 },
+    });
+    defer presentation.deinit();
+    const full_height = presentation.projection().review.?.frame.panes.diff_content.height;
+    presentation.published.?.navigation.scroll = 1;
+    presentation.published.?.navigation.cursor = 1;
+
+    try presentation.dispatch(.{ .push_count_digit = 1 });
+    var frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(usize, full_height - 1), frame.navigation.viewport);
+    try testing.expect(frame_mod.diffViewport(frame.buffer, frame.visual_rows, frame.navigation.scroll, frame.panes.diff_content.height).pinned_header != null);
+
+    try presentation.dispatch(.{ .action = .to_top });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(usize, full_height), frame.navigation.viewport);
+    try testing.expect(frame_mod.diffViewport(frame.buffer, frame.visual_rows, frame.navigation.scroll, frame.panes.diff_content.height).pinned_header == null);
+}
+
+test "one-row wheel scrolling hands a pinned File header forward and backward" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .mouse_vertical_scroll_rows = 1,
+    }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 5 },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    const first_header = published.visualIndexForBufferIndex(published.buffer.fileHeaderRow(0).?).?;
+    const second_header = published.visualIndexForBufferIndex(published.buffer.fileHeaderRow(1).?).?;
+    published.navigation.scroll = second_header - 1;
+    published.navigation.cursor = second_header - 1;
+    published.syncDiffViewport();
+    const content = presentation.projection().review.?.frame.panes.diff_content;
+
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y, .button = .wheel_down, .type = .press } });
+    var frame = presentation.projection().review.?.frame;
+    var viewport = frame_mod.diffViewport(frame.buffer, frame.visual_rows, frame.navigation.scroll, content.height);
+    try testing.expectEqual(second_header, frame.navigation.scroll);
+    try testing.expectEqual(@as(?usize, first_header), viewport.pinned_header);
+    try testing.expectEqual(@as(?usize, second_header), viewport.visualIndexAt(frame.navigation.scroll, 1, frame.visual_rows.len));
+
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y, .button = .wheel_down, .type = .press } });
+    frame = presentation.projection().review.?.frame;
+    viewport = frame_mod.diffViewport(frame.buffer, frame.visual_rows, frame.navigation.scroll, content.height);
+    try testing.expectEqual(second_header + 1, frame.navigation.scroll);
+    try testing.expectEqual(@as(?usize, second_header), viewport.pinned_header);
+
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y, .button = .wheel_up, .type = .press } });
+    frame = presentation.projection().review.?.frame;
+    viewport = frame_mod.diffViewport(frame.buffer, frame.visual_rows, frame.navigation.scroll, content.height);
+    try testing.expectEqual(second_header, frame.navigation.scroll);
+    try testing.expectEqual(@as(?usize, first_header), viewport.pinned_header);
+    try testing.expectEqual(@as(?usize, second_header), viewport.visualIndexAt(frame.navigation.scroll, 1, frame.visual_rows.len));
+
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y, .button = .wheel_up, .type = .press } });
+    frame = presentation.projection().review.?.frame;
+    viewport = frame_mod.diffViewport(frame.buffer, frame.visual_rows, frame.navigation.scroll, content.height);
+    try testing.expectEqual(second_header - 1, frame.navigation.scroll);
+    try testing.expectEqual(@as(?usize, first_header), viewport.pinned_header);
+}
+
 test "Selected Version title targets dispatch Actions but source clicks do not change selection" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -14054,9 +14135,12 @@ test "mouse activates Sidebar Files and disclosures and replacement cancels a pr
     defer presentation.deinit();
     const disclosure_key: buffer_mod.DisclosureKey = .{ .resolved_thread = 1 };
     const row = findDisclosureRow(presentation.projection().review.?.buffer.rows, disclosure_key).?;
-    presentation.published.?.navigation.jumpTo(row);
+    const visual_row = presentation.published.?.visualIndexForBufferIndex(row).?;
+    presentation.published.?.navigation.jumpTo(visual_row);
+    presentation.published.?.syncDiffViewport();
     const frame = presentation.projection().review.?.frame;
-    const screen_row: u16 = frame.panes.diff_content.y + @as(u16, @intCast(row - frame.navigation.scroll));
+    const viewport = frame_mod.diffViewport(frame.buffer, frame.visual_rows, frame.navigation.scroll, frame.panes.diff_content.height);
+    const screen_row: u16 = frame.panes.diff_content.y + viewport.body_row_offset + @as(u16, @intCast(visual_row - frame.navigation.scroll));
     try presentation.dispatch(.{ .mouse = .{ .col = frame.panes.diff_content.x, .row = screen_row, .button = .left, .type = .press } });
     try presentation.dispatch(.{ .mouse = .{ .col = frame.panes.diff_content.x, .row = screen_row, .button = .left, .type = .release } });
     const opened = presentation.projection().review.?;
