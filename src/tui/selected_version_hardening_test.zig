@@ -364,7 +364,8 @@ test "M20 hardening accepts only an unmodified same-target title click" {
 
     try presentation.dispatch(.{ .resize = .{ .cols = 34, .rows = 10 } });
     const clipped = presentation.projection().review.?.frame.version_title_targets;
-    try testing.expect(clipped.new == null);
+    try testing.expect(clipped.old == null);
+    try testing.expect(clipped.new != null);
     try presentation.dispatch(.{ .mouse = .{ .col = 33, .row = 0, .button = .left, .type = .press } });
     try presentation.dispatch(.{ .mouse = .{ .col = 33, .row = 0, .button = .left, .type = .release } });
     try testing.expectEqual(SelectedVersion.new, presentation.projection().review.?.selected_version);

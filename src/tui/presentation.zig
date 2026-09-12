@@ -1387,7 +1387,6 @@ const Published = struct {
         );
         published.buffers.commit();
         published.navigation = Nav.init(published.visual_rows.len, panes.diff_content.height);
-        published.syncDiffViewport();
         return published;
     }
 
@@ -1436,7 +1435,7 @@ const Published = struct {
             .file_tree = self.tree,
             .focus = self.focus,
             .selected_version = self.selected_version,
-            .version_title_targets = frame_mod.versionTitleTargets(frame_mod.paneRects(self.geometry).diff),
+            .version_title_targets = frame_mod.versionTitleTargets(frame_mod.paneRects(self.geometry).diff, self.selected_version),
         };
     }
 
@@ -1774,16 +1773,6 @@ const Published = struct {
         self.geometry = geometry;
         frame_mod.resizeViewports(&self.navigation, &self.tree, geometry);
         self.frame_revision += 1;
-    }
-
-    fn syncDiffViewport(self: *Published) void {
-        const height = frame_mod.paneRects(self.geometry).diff_content.height;
-        var remaining: usize = 2;
-        while (remaining > 0) : (remaining -= 1) {
-            const viewport = frame_mod.diffViewport(self.buffer, self.visual_rows, self.navigation.scroll, height);
-            if (self.navigation.viewport == viewport.viewport_rows) return;
-            self.navigation.setViewport(viewport.viewport_rows);
-        }
     }
 
     fn cursorVisualRow(self: *const Published) ?frame_mod.VisualRow {
@@ -2954,7 +2943,6 @@ pub const Presentation = struct {
     /// The sole mutation entry point. Candidate construction consumes a loaded
     /// Session whether it commits, fails, or proves stale.
     pub fn dispatch(self: *Presentation, input: OwnedInput) !void {
-        defer if (self.published) |published| published.syncDiffViewport();
         // A candidate completion is not itself an interaction or a Frame
         // change. Keep a press across rollback; a committed replacement
         // invalidates it below when the new Session becomes published.
@@ -6817,7 +6805,7 @@ fn yankRefusal(published: *const Published) ?YankRefusal {
     const selection = published.navigation.selection();
     const first = if (selection) |range| range[0] else published.navigation.cursor;
     const last = if (selection) |range| range[1] else published.visual_rows.len - 1;
-    var unavailable = false;
+    const unavailable = selectedVersionUnavailableForFile(published.buffer, file_index, published.selected_version);
     var index = first;
     while (index <= last and index < published.visual_rows.len) : (index += 1) {
         const row = published.visual_rows[index];
@@ -6826,21 +6814,20 @@ fn yankRefusal(published: *const Published) ?YankRefusal {
             continue;
         }
         if (selectedYankCandidate(row, published.selected_version) != null) return null;
-        unavailable = unavailable or statusPlaceholderHasUnavailableVersion(published.buffer, row, published.selected_version);
     }
     return if (unavailable) .selected_content_unavailable else .no_source;
 }
 
-fn statusPlaceholderHasUnavailableVersion(buffer: buffer_mod.Buffer, row: frame_mod.VisualRow, selected: SelectedVersion) bool {
-    const status = switch (buffer.rows[row.buffer_index]) {
-        .status_placeholder => |value| value,
-        else => return false,
-    };
-    const state = if (selected == .old) status.old else status.new;
-    return switch (state orelse return false) {
-        .empty => false,
-        else => true,
-    };
+fn selectedVersionUnavailableForFile(buffer: buffer_mod.Buffer, file_index: usize, selected: SelectedVersion) bool {
+    for (buffer.rows, 0..) |row, index| {
+        if (buffer.fileIndexForRow(index) != file_index or row != .status_placeholder) continue;
+        const state = if (selected == .old) row.status_placeholder.old else row.status_placeholder.new;
+        switch (state orelse continue) {
+            .empty => {},
+            else => return true,
+        }
+    }
+    return false;
 }
 
 fn yankRefusalError(refusal: ?YankRefusal, selected: SelectedVersion) ActionError {
@@ -8721,6 +8708,53 @@ test "partial File Enrichment keeps usable content and only refresh replaces its
         try testing.expectEqual(SelectedVersion.old, review.frame.selected_version);
         try testing.expect(review.buffer.rows[1] == .status_placeholder);
     }
+}
+
+test "M20 hardening reports unavailable selected content from an opposite-version row" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
+            .session = try testCrossSourceVersionSession(testing.allocator, false),
+        },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .select_old_version });
+    try presentation.dispatch(.{ .action = .toggle_layout });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const enrichment = presentation.takeCommand().?.enrich_file;
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 404, .body = "" },
+        .{ .status = 200, .body = "new one\ngap two\ngap three\nnew four\ntail\n" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+    var highlighter = TestNoopHighlighter{};
+    const result = try file_enrichment.enrich(testing.allocator, client, highlighter.highlighter(), enrichment.request());
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = enrichment.command_id,
+        .work_id = enrichment.work_id,
+        .session_epoch = enrichment.session_epoch,
+        .file_index = enrichment.file_index,
+        .outcome = .{ .completed = result },
+    } });
+
+    var opposite_row: ?usize = null;
+    for (presentation.projection().review.?.frame.visual_rows, 0..) |row, index| {
+        if (row.yank_candidates.new) |line| if (std.mem.eql(u8, line.text, "tail")) {
+            opposite_row = index;
+            break;
+        };
+    }
+    try moveToRow(&presentation, opposite_row.?);
+
+    try testing.expectEqual(
+        YankRefusal.selected_content_unavailable,
+        presentation.projection().action_availability.yank_refusal.?,
+    );
 }
 
 test "a new Presentation resets Selected Version to new" {
@@ -13927,75 +13961,6 @@ test "mouse click uses the published Frame target and a Motion cancels a pending
     try testing.expectEqual(@as(usize, 1), presentation.projection().review.?.navigation.cursor);
 }
 
-test "pinned File header keeps one viewport row available" {
-    var store = bbr.review.InMemoryStore.init(testing.allocator);
-    defer store.deinit();
-    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
-        .geometry = .{ .cols = 80, .rows = 8 },
-    });
-    defer presentation.deinit();
-    const full_height = presentation.projection().review.?.frame.panes.diff_content.height;
-    presentation.published.?.navigation.scroll = 1;
-    presentation.published.?.navigation.cursor = 1;
-
-    try presentation.dispatch(.{ .push_count_digit = 1 });
-    var frame = presentation.projection().review.?.frame;
-    try testing.expectEqual(@as(usize, full_height - 1), frame.navigation.viewport);
-    try testing.expect(frame_mod.diffViewport(frame.buffer, frame.visual_rows, frame.navigation.scroll, frame.panes.diff_content.height).pinned_header != null);
-
-    try presentation.dispatch(.{ .action = .to_top });
-    frame = presentation.projection().review.?.frame;
-    try testing.expectEqual(@as(usize, full_height), frame.navigation.viewport);
-    try testing.expect(frame_mod.diffViewport(frame.buffer, frame.visual_rows, frame.navigation.scroll, frame.panes.diff_content.height).pinned_header == null);
-}
-
-test "one-row wheel scrolling hands a pinned File header forward and backward" {
-    var store = bbr.review.InMemoryStore.init(testing.allocator);
-    defer store.deinit();
-    var presentation = try Presentation.init(testing.allocator, .{
-        .reviews = store.store(),
-        .mouse_vertical_scroll_rows = 1,
-    }, .{
-        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
-        .geometry = .{ .cols = 80, .rows = 5 },
-    });
-    defer presentation.deinit();
-    const published = presentation.published.?;
-    const first_header = published.visualIndexForBufferIndex(published.buffer.fileHeaderRow(0).?).?;
-    const second_header = published.visualIndexForBufferIndex(published.buffer.fileHeaderRow(1).?).?;
-    published.navigation.scroll = second_header - 1;
-    published.navigation.cursor = second_header - 1;
-    published.syncDiffViewport();
-    const content = presentation.projection().review.?.frame.panes.diff_content;
-
-    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y, .button = .wheel_down, .type = .press } });
-    var frame = presentation.projection().review.?.frame;
-    var viewport = frame_mod.diffViewport(frame.buffer, frame.visual_rows, frame.navigation.scroll, content.height);
-    try testing.expectEqual(second_header, frame.navigation.scroll);
-    try testing.expectEqual(@as(?usize, first_header), viewport.pinned_header);
-    try testing.expectEqual(@as(?usize, second_header), viewport.visualIndexAt(frame.navigation.scroll, 1, frame.visual_rows.len));
-
-    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y, .button = .wheel_down, .type = .press } });
-    frame = presentation.projection().review.?.frame;
-    viewport = frame_mod.diffViewport(frame.buffer, frame.visual_rows, frame.navigation.scroll, content.height);
-    try testing.expectEqual(second_header + 1, frame.navigation.scroll);
-    try testing.expectEqual(@as(?usize, second_header), viewport.pinned_header);
-
-    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y, .button = .wheel_up, .type = .press } });
-    frame = presentation.projection().review.?.frame;
-    viewport = frame_mod.diffViewport(frame.buffer, frame.visual_rows, frame.navigation.scroll, content.height);
-    try testing.expectEqual(second_header, frame.navigation.scroll);
-    try testing.expectEqual(@as(?usize, first_header), viewport.pinned_header);
-    try testing.expectEqual(@as(?usize, second_header), viewport.visualIndexAt(frame.navigation.scroll, 1, frame.visual_rows.len));
-
-    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y, .button = .wheel_up, .type = .press } });
-    frame = presentation.projection().review.?.frame;
-    viewport = frame_mod.diffViewport(frame.buffer, frame.visual_rows, frame.navigation.scroll, content.height);
-    try testing.expectEqual(second_header - 1, frame.navigation.scroll);
-    try testing.expectEqual(@as(?usize, first_header), viewport.pinned_header);
-}
-
 test "Selected Version title targets dispatch Actions but source clicks do not change selection" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -14137,10 +14102,8 @@ test "mouse activates Sidebar Files and disclosures and replacement cancels a pr
     const row = findDisclosureRow(presentation.projection().review.?.buffer.rows, disclosure_key).?;
     const visual_row = presentation.published.?.visualIndexForBufferIndex(row).?;
     presentation.published.?.navigation.jumpTo(visual_row);
-    presentation.published.?.syncDiffViewport();
     const frame = presentation.projection().review.?.frame;
-    const viewport = frame_mod.diffViewport(frame.buffer, frame.visual_rows, frame.navigation.scroll, frame.panes.diff_content.height);
-    const screen_row: u16 = frame.panes.diff_content.y + viewport.body_row_offset + @as(u16, @intCast(visual_row - frame.navigation.scroll));
+    const screen_row: u16 = frame.panes.diff_content.y + @as(u16, @intCast(visual_row - frame.navigation.scroll));
     try presentation.dispatch(.{ .mouse = .{ .col = frame.panes.diff_content.x, .row = screen_row, .button = .left, .type = .press } });
     try presentation.dispatch(.{ .mouse = .{ .col = frame.panes.diff_content.x, .row = screen_row, .button = .left, .type = .release } });
     const opened = presentation.projection().review.?;

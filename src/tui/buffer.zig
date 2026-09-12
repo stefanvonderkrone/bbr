@@ -343,16 +343,11 @@ pub const Buffer = struct {
     }
 
     pub fn fileIndexForRow(self: Buffer, row: usize) ?usize {
-        if (self.file_rows.len == 0) return null;
-        if (row < self.file_rows[0].first_row) return null;
-        var low: usize = 0;
-        var high = self.file_rows.len;
-        while (low < high) {
-            const middle = low + (high - low) / 2;
-            if (self.file_rows[middle].first_row <= row) low = middle + 1 else high = middle;
+        for (self.file_rows, 0..) |file_row, index| {
+            const next_first = if (index + 1 < self.file_rows.len) self.file_rows[index + 1].first_row else self.rows.len;
+            if (row >= file_row.first_row and row < next_first) return file_row.file_index;
         }
-        const file_row = self.file_rows[low -| 1];
-        return if (row < file_row.end_row) file_row.file_index else null;
+        return null;
     }
 
     pub fn fileHeaderRow(self: Buffer, file_index: usize) ?usize {
@@ -377,7 +372,6 @@ pub const FileTally = struct { comments: usize = 0, drafts: usize = 0 };
 pub const FileRow = struct {
     file_index: usize,
     first_row: usize,
-    end_row: usize = std.math.maxInt(usize),
 };
 
 pub const BuildError = error{
@@ -555,7 +549,6 @@ pub fn buildWithComments(
                 }
             }
         }
-        file_rows.items[file_rows.items.len - 1].end_row = rows.items.len;
     }
 
     var unavailable_count: usize = 0;
@@ -2641,25 +2634,6 @@ test "only_file projects a single file's rows, nothing else" {
         if (r == .file_header) try testing.expectEqualStrings("a.txt", r.file_header.path);
     }
     try testing.expectEqual(@as(usize, 5), only_a.rows.len);
-}
-
-test "file row lookup excludes review-level preamble rows" {
-    const rows = [_]Row{
-        .{ .section = .{ .kind = .pr_comments, .count = 1 } },
-        .{ .section = .{ .kind = .pending, .count = 1 } },
-    };
-    const file_rows = [_]FileRow{
-        .{ .file_index = 0, .first_row = 2, .end_row = 7 },
-        .{ .file_index = 1, .first_row = 7, .end_row = 10 },
-    };
-    const buf: Buffer = .{ .rows = &rows, .layout = .unified, .file_rows = &file_rows };
-
-    try testing.expect(buf.fileIndexForRow(0) == null);
-    try testing.expect(buf.fileIndexForRow(1) == null);
-    try testing.expectEqual(@as(?usize, 0), buf.fileIndexForRow(2));
-    try testing.expectEqual(@as(?usize, 0), buf.fileIndexForRow(6));
-    try testing.expectEqual(@as(?usize, 1), buf.fileIndexForRow(7));
-    try testing.expect(buf.fileIndexForRow(10) == null);
 }
 
 test "the isolate view suppresses PR-level and other-file rows" {
