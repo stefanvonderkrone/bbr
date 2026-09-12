@@ -632,7 +632,7 @@ pub fn buildWithComments(
         .rows = owned_rows,
         .row_kinds = row_kinds,
         .layout = layout,
-        .selected_column = if (opts.whole_file and layout == .side_by_side) .{
+        .selected_column = if (layout == .side_by_side) .{
             .version = opts.selected_version,
             .inner_gutter_edge = if (opts.selected_version == .old) .right else .left,
         } else null,
@@ -2899,6 +2899,20 @@ test "SideBySide WholeFile pairs complete versions and preserves Hunk Line ident
     try testing.expectEqualStrings("e", trailing.left.?.line.text);
     try testing.expectEqualStrings("e", trailing.right.?.line.text);
     try testing.expect(!trailing.left.?.line.in_hunk and !trailing.right.?.line.in_hunk);
+}
+
+test "SideBySide Changes publishes Selected Version column accent metadata" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try parse(a, whole_file_diff);
+
+    const projected = try buildWithComments(a, diff, .side_by_side, &.{}, .{
+        .selected_version = .old,
+    });
+
+    try testing.expectEqual(SelectedVersion.old, projected.selected_column.?.version);
+    try testing.expectEqual(InnerGutterEdge.right, projected.selected_column.?.inner_gutter_edge);
 }
 
 test "SideBySide WholeFile pairs gaps before between and after Hunks" {
