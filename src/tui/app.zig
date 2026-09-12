@@ -131,6 +131,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
     try loop.start();
     defer loop.stop();
     try loop.installResizeHandler();
+    vx.screen.width_method = .unicode;
     try vx.enterAltScreen(writer);
     if (ctx.mouse_enabled) try vx.setMouseMode(writer, true);
     try state.dispatch(.{ .resize = contentGeometry(vx.window()) });
@@ -155,6 +156,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             .mouse => |mouse| if (portableMouse(mouse)) |input| try state.dispatch(.{ .mouse = input }),
             .winsize => |winsize| {
                 try vx.resize(ctx.gpa, writer, winsize);
+                vx.screen.width_method = .unicode;
                 try state.dispatch(.{ .resize = contentGeometry(vx.window()) });
             },
             .presentation_done => |done| {

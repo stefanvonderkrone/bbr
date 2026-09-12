@@ -2123,6 +2123,93 @@ test "focused Pane frames and File Tree tallies use Frame-owned geometry" {
     try testing.expectEqualStrings("●", content.readCell(content.width - 5, 0).?.char.grapheme);
 }
 
+test "ReviewCard wide grapheme keeps the DiffPane right border" {
+    const Metrics = struct {
+        fn next(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
+            var iterator = vaxis.unicode.graphemeIterator(text);
+            const grapheme = iterator.next() orelse return .{ .byte_len = 1, .cell_width = 1 };
+            return .{
+                .byte_len = grapheme.len,
+                .cell_width = vaxis.gwidth.gwidth(grapheme.bytes(text), .unicode),
+            };
+        }
+
+        const context: u8 = 0;
+        const value: @import("cell_metrics.zig").CellMetrics = .{ .ptr = &context, .vtable = &.{ .next = next } };
+    };
+
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const session = try @import("session.zig").create(testing.allocator);
+    const a = session.arena.allocator();
+    session.source = .{ .remote = .{
+        .id = 1,
+        .title = "Border test",
+        .state = "OPEN",
+        .author_display_name = "Reviewer",
+        .source_branch = "feature",
+        .destination_branch = "main",
+        .source_commit = "source",
+        .destination_commit = "destination",
+    } };
+    session.header = .{
+        .title = "Border test",
+        .source_ref = "feature",
+        .base_ref = "main",
+        .source_commit = "source",
+        .base_commit = "destination",
+        .author = "Reviewer",
+        .locator = "repo",
+        .source_label = "Bitbucket",
+        .pull_request_id = 1,
+    };
+    session.diff = try bbr.diff.parse(a,
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    );
+    const comments = try a.alloc(bbr.review.Comment, 1);
+    comments[0] = .{ .id = 1, .author = "Ada", .body = "aaaaaaaaaaaaaaaaaaaaaaaa⚠️" };
+    session.threads = try bbr.review.buildThreads(a, comments);
+    try session.initializeEnrichment();
+
+    var state = try presentation.Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .cell_metrics = Metrics.value,
+    }, .{
+        .initial = .{ .key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+        .geometry = .{ .cols = 60, .rows = 10 },
+    });
+    defer state.deinit();
+    const review = state.projection().review.?;
+
+    var projected_body_rows: usize = 0;
+    for (review.buffer.rows) |row| if (row == .comment and row.comment.part == .body) {
+        projected_body_rows += 1;
+    };
+    try testing.expectEqual(@as(usize, 2), projected_body_rows);
+
+    var screen = try vaxis.Screen.init(a, .{ .rows = 10, .cols = 60, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    drawReview(a, win, review, theme_dark, 0);
+
+    var body_row: ?usize = null;
+    for (review.frame.visual_rows, 0..) |visual, index| {
+        const row = review.buffer.rows[visual.buffer_index];
+        if (row == .comment and row.comment.part == .body) {
+            body_row = index;
+            break;
+        }
+    }
+    const screen_row: u16 = review.frame.panes.diff_content.y + @as(u16, @intCast(body_row.? - review.navigation.scroll));
+    const right = review.frame.panes.diff.x + review.frame.panes.diff.width - 1;
+    try testing.expectEqualStrings("│", win.readCell(right, screen_row).?.char.grapheme);
+}
+
 test "DiffPane title reserves and renders published Selected Version targets" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
