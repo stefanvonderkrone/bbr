@@ -96,9 +96,11 @@ pub fn drawReview(
     drawDiffPaneFrame(scratch, win, frame, path, review.preferences.scope, theme);
     const sidebar = childRect(win, review.frame.panes.sidebar_content);
     const diff_pane = childRect(win, review.frame.panes.diff_content);
+    var diff_theme = theme;
+    diff_theme.section_rule = if (frame.focus == .diff) theme.pane_border_focused else theme.pane_border;
     drawFileTree(sidebar, review.frame.file_tree, theme);
-    drawVisualPane(scratch, diff_pane, review.frame.buffer, review.frame.visual_rows, theme, review.frame.navigation);
-    joinSectionRules(win, review.frame.panes.diff, review.frame.panes.diff_content, review.frame.buffer, review.frame.visual_rows, review.frame.navigation, theme);
+    drawVisualPane(scratch, diff_pane, review.frame.buffer, review.frame.visual_rows, diff_theme, review.frame.navigation);
+    joinSectionRules(win, review.frame.panes.diff, review.frame.panes.diff_content, review.frame.buffer, review.frame.visual_rows, review.frame.navigation);
 }
 
 fn drawDiffPaneFrame(scratch: std.mem.Allocator, win: vaxis.Window, frame: @import("frame.zig").Projection, path: []const u8, scope: presentation.Scope, theme: Theme) void {
@@ -134,7 +136,7 @@ fn drawVersionTitleSegment(win: vaxis.Window, target: ?@import("frame.zig").Rect
     _ = childRect(win, rect).printSegment(.{ .text = text, .style = style }, .{ .wrap = .none });
 }
 
-fn joinSectionRules(win: vaxis.Window, outer: @import("frame.zig").Rect, content: @import("frame.zig").Rect, buf: Buffer, visual_rows: []const @import("frame.zig").VisualRow, nav: Nav, theme: Theme) void {
+fn joinSectionRules(win: vaxis.Window, outer: @import("frame.zig").Rect, content: @import("frame.zig").Rect, buf: Buffer, visual_rows: []const @import("frame.zig").VisualRow, nav: Nav) void {
     if (outer.width == 0) return;
     const viewport = @import("frame.zig").diffViewport(buf, visual_rows, nav.scroll, content.height);
     var screen_row: u16 = 0;
@@ -146,8 +148,11 @@ fn joinSectionRules(win: vaxis.Window, outer: @import("frame.zig").Rect, content
         };
         if (!joined) continue;
         const row = content.y + screen_row;
-        win.writeCell(outer.x, row, .{ .char = .{ .grapheme = "├", .width = 1 }, .style = theme.section_rule });
-        if (outer.width > 1) win.writeCell(outer.x + outer.width - 1, row, .{ .char = .{ .grapheme = "┤", .width = 1 }, .style = theme.section_rule });
+        if (win.readCell(outer.x, row)) |cell| win.writeCell(outer.x, row, .{ .char = .{ .grapheme = "├", .width = 1 }, .style = cell.style });
+        if (outer.width > 1) {
+            const right = outer.x + outer.width - 1;
+            if (win.readCell(right, row)) |cell| win.writeCell(right, row, .{ .char = .{ .grapheme = "┤", .width = 1 }, .style = cell.style });
+        }
     }
 }
 
@@ -685,19 +690,20 @@ fn drawDisclosure(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, value: 
     _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = gutter_cols, .wrap = .none });
 }
 
-/// A section divider: "── PR comments (N) ──" or "── Outdated · path (N) ──".
+/// A section divider: "── PR comments (N)" or "── Outdated · path (N)".
 fn drawSection(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, sec: Section, theme: Theme) void {
-    fillRow(win, r, theme.context);
+    fillRuleRow(win, r, theme.section_rule);
     const text = switch (sec.kind) {
-        .pr_comments => std.fmt.allocPrint(scratch, "── PR comments ({d}) ──", .{sec.count}) catch "── PR comments ──",
-        .pending => std.fmt.allocPrint(scratch, "── Pending ({d}) ──", .{sec.count}) catch "── Pending ──",
+        .pr_comments => std.fmt.allocPrint(scratch, "── PR comments ({d}) ", .{sec.count}) catch "── PR comments ",
+        .pending => std.fmt.allocPrint(scratch, "── Pending ({d}) ", .{sec.count}) catch "── Pending ",
         .outdated => if (sec.path.len > 0)
-            std.fmt.allocPrint(scratch, "── Outdated · {s} ({d}) ──", .{ sec.path, sec.count }) catch "── Outdated ──"
+            std.fmt.allocPrint(scratch, "── Outdated · {s} ({d}) ", .{ sec.path, sec.count }) catch "── Outdated "
         else
-            std.fmt.allocPrint(scratch, "── Outdated ({d}) ──", .{sec.count}) catch "── Outdated ──",
-        .unavailable => std.fmt.allocPrint(scratch, "── Anchor unavailable ({d}) ──", .{sec.count}) catch "── Anchor unavailable ──",
+            std.fmt.allocPrint(scratch, "── Outdated ({d}) ", .{sec.count}) catch "── Outdated ",
+        .unavailable => std.fmt.allocPrint(scratch, "── Anchor unavailable ({d}) ", .{sec.count}) catch "── Anchor unavailable ",
     };
-    _ = win.printSegment(.{ .text = text, .style = theme.section }, .{ .row_offset = r, .wrap = .none });
+    const style = if (sec.kind == .pr_comments) theme.file_header else theme.section;
+    _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .wrap = .none });
 }
 
 /// Draw the PR Picker as a centered modal over the current frame. Shows a
@@ -2121,6 +2127,53 @@ test "focused Pane frames and File Tree tallies use Frame-owned geometry" {
     drawFileTree(content, .{ .entries = &entries, .cursor = 0, .scroll = 0, .viewport = content.height }, theme_dark);
     try testing.expectEqualStrings("1", content.readCell(content.width - 1, 0).?.char.grapheme);
     try testing.expectEqualStrings("●", content.readCell(content.width - 5, 0).?.char.grapheme);
+}
+
+test "File header junctions keep the DiffPane border style" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file: bbr.diff.File = .{ .old_path = "a.zig", .new_path = "a.zig", .status = .modified, .hunks = &.{} };
+    const rows = [_]Row{.{ .file_header = .{ .file = &file, .path = file.new_path } }};
+    const buf: Buffer = .{ .rows = &rows, .layout = .unified };
+    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{ .layout = .unified, .width = 10, .wrap = false });
+    var screen = try vaxis.Screen.init(a, .{ .rows = 6, .cols = 16, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const outer: @import("frame.zig").Rect = .{ .x = 2, .y = 0, .width = 12, .height = 6 };
+    const content: @import("frame.zig").Rect = .{ .x = 3, .y = 2, .width = 10, .height = 3 };
+
+    for ([_]bool{ false, true }) |focused| {
+        drawPaneFrame(win, outer, "", theme_dark, focused);
+        joinSectionRules(win, outer, content, buf, visual_rows, Nav.init(visual_rows.len, content.height));
+
+        try testing.expectEqualStrings("├", win.readCell(outer.x, content.y).?.char.grapheme);
+        try testing.expectEqualStrings("┤", win.readCell(outer.x + outer.width - 1, content.y).?.char.grapheme);
+        try testing.expectEqual(win.readCell(outer.x, content.y + 1).?.style, win.readCell(outer.x, content.y).?.style);
+        try testing.expectEqual(win.readCell(outer.x + outer.width - 1, content.y + 1).?.style, win.readCell(outer.x + outer.width - 1, content.y).?.style);
+    }
+}
+
+test "File and PR Comment headers end in DiffPane border rules" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file: bbr.diff.File = .{ .old_path = "a.zig", .new_path = "a.zig", .status = .modified, .hunks = &.{} };
+    var theme = theme_dark;
+    theme.section_rule = theme.pane_border_focused;
+    var screen = try vaxis.Screen.init(a, .{ .rows = 2, .cols = 30, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    drawRow(a, win, 0, .unified, null, .{ .file_header = .{ .file = &file, .path = file.new_path } }, theme);
+    drawRow(a, win, 1, .unified, null, .{ .section = .{ .kind = .pr_comments, .count = 2 } }, theme);
+
+    try testing.expectEqualStrings("─", win.readCell(win.width - 1, 0).?.char.grapheme);
+    try testing.expectEqual(theme.pane_border_focused.fg, win.readCell(win.width - 1, 0).?.style.fg);
+    try testing.expectEqualStrings("P", win.readCell(3, 1).?.char.grapheme);
+    try testing.expectEqual(theme.file_header.fg, win.readCell(3, 1).?.style.fg);
+    try testing.expectEqualStrings("─", win.readCell(win.width - 1, 1).?.char.grapheme);
+    try testing.expectEqual(theme.pane_border_focused.fg, win.readCell(win.width - 1, 1).?.style.fg);
 }
 
 test "ReviewCard wide grapheme keeps the DiffPane right border" {
