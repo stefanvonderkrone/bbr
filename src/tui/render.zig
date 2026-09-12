@@ -92,7 +92,10 @@ pub fn drawReview(
     const frame = review.frame;
     const cursor = frame.navigation.cursor;
     const buffer_index = if (cursor < frame.visual_rows.len) frame.visual_rows[cursor].buffer_index else 0;
-    const path = if (frame.buffer.fileIndexForRow(buffer_index)) |index| review.diff.files[index].displayPath() else "Diff";
+    const path = if (frame.buffer.fileIndexForRow(buffer_index)) |index|
+        frame.buffer.rows[frame.buffer.fileHeaderRow(index).?].file_header.path
+    else
+        "Diff";
     drawDiffPaneFrame(scratch, win, frame, path, review.preferences.scope, theme);
     const sidebar = childRect(win, review.frame.panes.sidebar_content);
     const diff_pane = childRect(win, review.frame.panes.diff_content);

@@ -326,6 +326,41 @@ test "M20 hardening renders zero narrow ordinary and wide DiffPane geometry" {
     try testing.expect(highlighted_source);
 }
 
+test "M20 hardening renders the selected renamed path in the DiffPane title" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const session = try testSession(testing.allocator);
+    errdefer session.destroy();
+    const files = try session.arena.allocator().dupe(bbr.diff.File, session.diff.files);
+    files[0].old_path = "old.txt";
+    files[0].new_path = "new.txt";
+    files[0].status = .renamed;
+    session.diff.files = files;
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try presentation_mod.OwnedReviewIdentity.init("workspace", "repo", 1),
+            .session = session,
+        },
+        .geometry = .{ .cols = 80, .rows = 8 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .select_old_version });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    const review = presentation.projection().review.?;
+    try testing.expectEqual(presentation_mod.Scope.whole, review.preferences.scope);
+
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 8, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const window = headlessWindow(&screen);
+    render.drawReview(scratch.allocator(), window, review, theme, 0);
+
+    const title_x = review.frame.panes.diff.x + 2;
+    try testing.expectEqualStrings("o", window.readCell(title_x, review.frame.panes.diff.y).?.char.grapheme);
+}
+
 test "M20 hardening accepts only an unmodified same-target title click" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
