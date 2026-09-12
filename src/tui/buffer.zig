@@ -337,6 +337,7 @@ pub const Buffer = struct {
     selected_column: ?SelectedColumn = null,
     file_tallies: []const FileTally = &.{},
     file_rows: []const FileRow = &.{},
+    file_rows_end: usize = 0,
 
     pub fn kindAt(self: Buffer, index: usize) RowKind {
         return if (self.row_kinds.len == self.rows.len) self.row_kinds[index] else std.meta.activeTag(self.rows[index]);
@@ -344,7 +345,7 @@ pub const Buffer = struct {
 
     pub fn fileIndexForRow(self: Buffer, row: usize) ?usize {
         for (self.file_rows, 0..) |file_row, index| {
-            const next_first = if (index + 1 < self.file_rows.len) self.file_rows[index + 1].first_row else self.rows.len;
+            const next_first = if (index + 1 < self.file_rows.len) self.file_rows[index + 1].first_row else self.file_rows_end;
             if (row >= file_row.first_row and row < next_first) return file_row.file_index;
         }
         return null;
@@ -550,6 +551,7 @@ pub fn buildWithComments(
             }
         }
     }
+    const file_rows_end = rows.items.len;
 
     var unavailable_count: usize = 0;
     var fallback_outdated_count: usize = 0;
@@ -631,6 +633,7 @@ pub fn buildWithComments(
         } else null,
         .file_tallies = try fileTallies(allocator, diff, threads, opts.drafts, opts),
         .file_rows = try file_rows.toOwnedSlice(allocator),
+        .file_rows_end = file_rows_end,
     };
 }
 
@@ -3104,6 +3107,7 @@ test "whole_file splices removed Files from old content without changing Hunk Li
     try testing.expectEqual(@as(usize, 0), countKind(buf, .comment));
     try testing.expectEqual(SectionKind.pending, buf.rows[5].section.kind);
     try testing.expect(buf.rows[6] == .draft);
+    for (5..buf.rows.len) |row| try testing.expectEqual(@as(?usize, null), buf.fileIndexForRow(row));
 
     const split = try buildWithComments(a, diff, .side_by_side, &.{}, .{ .whole_file = true, .blobs = &blobs });
     try testing.expectEqual(std.meta.Tag(VersionContentState).absent, std.meta.activeTag(split.rows[1].status_placeholder.new.?));

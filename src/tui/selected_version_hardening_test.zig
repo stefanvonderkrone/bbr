@@ -358,7 +358,9 @@ test "M20 hardening renders the selected renamed path in the DiffPane title" {
     render.drawReview(scratch.allocator(), window, review, theme, 0);
 
     const title_x = review.frame.panes.diff.x + 2;
-    try testing.expectEqualStrings("o", window.readCell(title_x, review.frame.panes.diff.y).?.char.grapheme);
+    for ("old.txt", 0..) |char, offset| {
+        try testing.expectEqualStrings(&.{char}, window.readCell(title_x + @as(u16, @intCast(offset)), review.frame.panes.diff.y).?.char.grapheme);
+    }
 }
 
 test "M20 hardening accepts only an unmodified same-target title click" {
