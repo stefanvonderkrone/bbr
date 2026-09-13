@@ -203,10 +203,13 @@ M19 verification: the fan-out gate passed with 36% and 38% median reductions, tw
 connections, no failures, and no 429 responses. Required CI remains Credential-free, and release
 validation publishes no artifact. See `docs/m19-operations.md`.
 
-## M20 — Side-aware version inspection  ·  M  ·  needs M15/M17
+## M20 — Side-aware version inspection  ·  M  ·  ✅ done
 Make old-versus-new File version choice explicit after M15 establishes the Presentation contract
 and M17 closes the remaining old-side and side-by-side fidelity gaps.
-- [ ] Resolve `.scratch/side-version-navigation/issues/01-choose-old-new-side-inspection-and-yank.md`: decide how a reviewer switches between old and new versions for isolated viewing and clipboard operations, including Action grammar, visible side indication, Selection/Count behavior, unavailable sides, state lifetime, and keyboard/mouse parity.
+- [x] Resolve `.scratch/side-version-navigation/issues/01-choose-old-new-side-inspection-and-yank.md`: decide how a reviewer switches between old and new versions for isolated viewing and clipboard operations, including Action grammar, visible side indication, Selection/Count behavior, unavailable sides, state lifetime, and keyboard/mouse parity.
+
+M20 verification: PR #3 merged. `zig build test --summary all` passed 759/759 tests. Native
+macOS and Linux jobs passed on `x86_64` and `aarch64`.
 
 ## M21 — Buffer & Review search  ·  M/L  ·  needs M20
 Find source text without leaving the review, first within the current DiffPane Buffer and then
@@ -230,9 +233,12 @@ File to inherit an obsolete read decision.
 - [ ] Preserve matching read state across quit/reopen, PullRequest switching, Session replacement, and LocalReview Ref refresh. Keep receipts isolated by full ReviewIdentity so equal paths or PullRequestIds in different Reviews never share progress.
 - [ ] Add fingerprint fixtures and fake/SQLite round-trip tests, plus Presentation coverage for initial bold styling, successful and failed toggles, unchanged reload retention, selective invalidation when only one File changes, rename/removal/binary cases, storage failure fallback, and ReviewIdentity isolation.
 
-## M23 — Comment thread presentation fixes  ·  S  ·  needs M15
+## M23 — Comment thread and Markdown presentation fixes  ·  S  ·  needs M15
 - [ ] Indent each Reply one level deeper than its parent, including when the parent is a Reply. Add Presentation coverage for nested Replies.
-- [ ] Preserve Markdown emoji shortcodes in ReviewBody text. Presentation must render text such as `:white_check_mark:` without removing characters between the colons. Add parser and Presentation coverage.
+- [ ] Improve ReviewBody Markdown projection. Hide formatting characters, render italic text in turquoise, bold text in orange, and inline code in green. Add parser and Presentation coverage.
+- [ ] Convert Bitbucket-supported emoji shortcodes such as `:white_check_mark:` to their corresponding emoji characters. Preserve unknown shortcodes as authored text. Add parser and Presentation coverage.
+- [ ] Investigate Bitbucket's list formatting and match its supported ordered, unordered, and nested list behavior in ReviewBody. Add fixtures for the observed wire and presentation behavior.
+- [ ] Yank the raw authored Markdown from a Comment or Draft. Do not copy the projected ReviewBody text. Add clipboard integration coverage.
 
 ## M24 - Remote-first Repository and PullRequest Browser  ·  L  ·  needs M4/M15
 Make `bbr` without arguments open a remote-first Browser for the configured Workspace. Keep direct
