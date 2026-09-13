@@ -212,14 +212,14 @@ M20 verification: PR #3 merged. `zig build test --summary all` passed 759/759 te
 macOS and Linux jobs passed on `x86_64` and `aarch64`.
 
 ## M21 — Buffer & Review search  ·  M/L  ·  needs M20
-Find source text without leaving the review, first within the current DiffPane Buffer and then
-across the complete contents of every changed File in the current Review.
+Find source and authored body text without leaving the review. Search the current DiffPane Buffer
+first, then search complete changed Files and authored bodies across the current Review.
 - [ ] Add `/` search for the current Buffer. Open an inline query prompt, update matches as the reviewer types, highlight every occurrence, show the active/total match count, and use `n`/`N` to move forward/backward with wraparound. `esc` cancels without moving; accepting an empty query retains the previous query. Match semantic source and authored body text, not gutters, borders, or other generated presentation chrome.
 - [ ] Define and test predictable query semantics: Buffer Search uses literal smart-case matching; Review Search uses fuzzy ranking while preserving exact occurrence locations. Matching operates on Unicode text without allowing invalid/non-text File content to break the search.
-- [ ] Add a Review Search Overlay that searches the full selected version of every changed File, not only loaded blobs or visible diff hunks. Show one selectable result per occurrence with path, line/column, and a contextual snippet; keep a larger preview of the selected occurrence with all query hits highlighted, comparable to a live-grep picker.
+- [ ] Add a Review Search Overlay that searches both complete versions of every changed File and every authored Comment, Reply, and Draft body. Show one selectable result per Search Occurrence with its source or ReviewBody context; keep a larger preview of the selected occurrence with all query hits highlighted, comparable to a live-grep picker.
 - [ ] Stream Review Search results as File content becomes available without blocking input. Scope acquisition and result publication to the Session Epoch, cancel stale work on review replacement, bound concurrent File Enrichment, honor the File cache budget, and expose per-File loading/failure state without discarding usable results.
 - [ ] Selecting an occurrence closes the Overlay, focuses its File and selected side, switches to WholeFile scope when the line is outside a visible hunk, and positions the cursor on the exact occurrence. Returning to the Overlay preserves the query and selection while the Session remains current.
-- [ ] Support remote PullRequests and LocalReviews through their existing File Enrichment seams. Search the chosen old/new side from M20; when a side is unavailable (including binary Files), show that explicitly instead of silently searching a different version.
+- [ ] Support remote PullRequests and LocalReviews through their existing File Enrichment seams. Search both old and new File versions; when a version is absent, binary, invalid UTF-8, or unavailable, show that explicitly without discarding usable results.
 - [ ] Add pure matcher/ranker tests plus Presentation integration coverage for incremental input, match highlighting, `n`/`N`, streamed result ordering, preview selection, navigation into out-of-hunk content, partial failures, and stale-Epoch rejection.
 
 ## M22 — Durable File read state  ·  M  ·  needs M15/M17

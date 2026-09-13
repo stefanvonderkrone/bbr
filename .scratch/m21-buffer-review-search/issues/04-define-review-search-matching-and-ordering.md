@@ -6,6 +6,6 @@ Blocked by: 01
 
 ## Question
 
-How should Review Search use fuzzy matching while returning one exact, selectable source occurrence per result?
+How should Review Search use fuzzy matching while returning one exact, selectable source or authored occurrence per result?
 
-Define the fuzzy candidate unit, occurrence extraction, score, tie order, smart-case behavior, multiword behavior, and stable ordering while results stream. Prevent one fuzzy subsequence from creating ambiguous or excessive occurrences. Preserve exact path, version, line, column, and matched ranges. Define how equivalent unchanged old and new occurrences become one version-neutral result.
+Define the fuzzy candidate unit, occurrence extraction, score, tie order, smart-case behavior, multiword behavior, and stable ordering while results stream. Prevent one fuzzy subsequence from creating ambiguous or excessive occurrences. Preserve exact source or ReviewBody ownership, line, column, and matched ranges. Define how equivalent unchanged old and new occurrences become one version-neutral result.

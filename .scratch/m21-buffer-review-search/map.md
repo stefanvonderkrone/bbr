@@ -12,13 +12,15 @@ An implementation-ready M21 specification and dependency map for Buffer Search a
 - Use `prototype`, `grilling`, `domain-modeling`, `technical-writing`, and `zig` as each ticket requires.
 - Treat the M21 entries in `TODO.md` as requirements that tickets can refine when a conflict appears.
 - Buffer Search examines old and new source Lines in the current Buffer. A shared context Line counts once in Unified and SideBySide Layouts.
-- Buffer Search includes every authored Comment, Reply, and Draft body. It includes text behind ReviewCard, Thread, and Fold disclosures. Activating a hidden match reveals its owner.
-- Review Search examines both old and new versions of every changed File. Selected Version does not limit its corpus.
+- Buffer Search includes every authored Comment, Reply, and Draft body owned by the current Buffer. It includes text behind ReviewCard, Thread, and Fold disclosures. Activating a hidden match reveals its owner.
+- Review Search examines both old and new versions of every changed File and every authored body in the Review. Selected Version does not limit its corpus.
 - Review Search keeps version-specific changed occurrences separate. It coalesces equivalent unchanged old and new occurrences into one version-neutral result.
 - Both searches must reject generated Presentation text such as gutters, borders, headers, and disclosure labels.
 - This map plans M21 only. It does not implement M21.
 
 ## Decisions so far
+
+- [Define Search Corpus and Occurrence Identity](issues/01-define-search-corpus-and-occurrence-identity.md) — Buffer Search covers current Buffer semantics; Review Search covers complete File versions and all authored bodies through Session-scoped occurrences.
 
 ## Not yet specified
 
