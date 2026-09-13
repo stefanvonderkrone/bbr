@@ -434,6 +434,8 @@ test "unbinding a default can free its Leader for a shorter Action" {
         \\set_verdict_approved = []
         \\set_verdict_changes_requested = []
         \\set_verdict_none = []
+        \\select_old_version = []
+        \\select_new_version = []
         \\to_top = ["g"]
     ;
     var result = try parse(testing.allocator, source);

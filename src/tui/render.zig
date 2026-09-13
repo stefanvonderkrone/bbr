@@ -89,15 +89,57 @@ pub fn drawReview(
     _ = selected_file;
     win.clear();
     drawPaneFrame(win, review.frame.panes.sidebar, "Files", theme, review.frame.focus == .sidebar);
-    drawPaneFrame(win, review.frame.panes.diff, "Diff", theme, review.frame.focus == .diff);
+    const frame = review.frame;
+    const cursor = frame.navigation.cursor;
+    const buffer_index = if (cursor < frame.visual_rows.len) frame.visual_rows[cursor].buffer_index else 0;
+    const path = if (frame.buffer.fileIndexForRow(buffer_index)) |index|
+        frame.buffer.rows[frame.buffer.fileHeaderRow(index).?].file_header.path
+    else
+        "Diff";
+    drawDiffPaneFrame(scratch, win, frame, path, review.preferences.scope, theme);
     const sidebar = childRect(win, review.frame.panes.sidebar_content);
     const diff_pane = childRect(win, review.frame.panes.diff_content);
+    var diff_theme = theme;
+    diff_theme.section_rule = if (frame.focus == .diff) theme.pane_border_focused else theme.pane_border;
     drawFileTree(sidebar, review.frame.file_tree, theme);
-    drawVisualPane(scratch, diff_pane, review.frame.buffer, review.frame.visual_rows, theme, review.frame.navigation);
-    joinSectionRules(win, review.frame.panes.diff, review.frame.panes.diff_content, review.frame.visual_rows, review.frame.navigation, theme);
+    drawVisualPane(scratch, diff_pane, review.frame.buffer, review.frame.visual_rows, diff_theme, review.frame.navigation);
+    joinSectionRules(win, review.frame.panes.diff, review.frame.panes.diff_content, review.frame.visual_rows, review.frame.navigation);
 }
 
-fn joinSectionRules(win: vaxis.Window, outer: @import("frame.zig").Rect, content: @import("frame.zig").Rect, visual_rows: []const @import("frame.zig").VisualRow, nav: Nav, theme: Theme) void {
+fn drawDiffPaneFrame(scratch: std.mem.Allocator, win: vaxis.Window, frame: @import("frame.zig").Projection, path: []const u8, scope: presentation.Scope, theme: Theme) void {
+    const focused = frame.focus == .diff;
+    drawPaneFrame(win, frame.panes.diff, "", theme, focused);
+    const title_x = frame.panes.diff.x +| @min(frame.panes.diff.width, 2);
+    const control_x = if (frame.version_title_targets.old) |old| old.x else if (frame.version_title_targets.new) |new| new.x else frame.panes.diff.x +| frame.panes.diff.width -| 2;
+    const title_width = control_x -| title_x -| 1;
+    if (title_width > 0) {
+        const title = std.fmt.allocPrint(scratch, "{s} · {s}", .{ path, scopeLabel(scope) }) catch path;
+        const style = if (focused) theme.pane_border_focused else theme.pane_border;
+        _ = childRect(win, .{ .x = title_x, .y = frame.panes.diff.y, .width = title_width, .height = 1 }).printSegment(.{ .text = title, .style = style }, .{ .wrap = .none });
+    }
+    drawVersionTitleSegment(win, frame.version_title_targets.old, "g< OLD", frame.selected_version == .old, theme, focused);
+    drawVersionTitleSegment(win, frame.version_title_targets.new, "NEW g>", frame.selected_version == .new, theme, focused);
+}
+
+fn scopeLabel(scope: presentation.Scope) []const u8 {
+    return switch (scope) {
+        .changes => "Changes",
+        .fetched => "Fetched",
+        .whole => "WholeFile",
+    };
+}
+
+fn drawVersionTitleSegment(win: vaxis.Window, target: ?@import("frame.zig").Rect, text: []const u8, selected: bool, theme: Theme, focused: bool) void {
+    const rect = target orelse return;
+    var style = if (focused) theme.pane_border_focused else theme.pane_border;
+    if (selected) {
+        style.fg = theme.accent;
+        style.bold = true;
+    }
+    _ = childRect(win, rect).printSegment(.{ .text = text, .style = style }, .{ .wrap = .none });
+}
+
+fn joinSectionRules(win: vaxis.Window, outer: @import("frame.zig").Rect, content: @import("frame.zig").Rect, visual_rows: []const @import("frame.zig").VisualRow, nav: Nav) void {
     if (outer.width == 0) return;
     var screen_row: u16 = 0;
     while (screen_row < content.height) : (screen_row += 1) {
@@ -109,8 +151,11 @@ fn joinSectionRules(win: vaxis.Window, outer: @import("frame.zig").Rect, content
         };
         if (!joined) continue;
         const row = content.y + screen_row;
-        win.writeCell(outer.x, row, .{ .char = .{ .grapheme = "├", .width = 1 }, .style = theme.section_rule });
-        if (outer.width > 1) win.writeCell(outer.x + outer.width - 1, row, .{ .char = .{ .grapheme = "┤", .width = 1 }, .style = theme.section_rule });
+        if (win.readCell(outer.x, row)) |cell| win.writeCell(outer.x, row, .{ .char = .{ .grapheme = "├", .width = 1 }, .style = cell.style });
+        if (outer.width > 1) {
+            const right = outer.x + outer.width - 1;
+            if (win.readCell(right, row)) |cell| win.writeCell(right, row, .{ .char = .{ .grapheme = "┤", .width = 1 }, .style = cell.style });
+        }
     }
 }
 
@@ -229,7 +274,7 @@ fn fileAnchoredCount(comptime T: type, items: []const T, file: bbr.diff.File) us
 }
 
 fn drawPane(scratch: std.mem.Allocator, win: vaxis.Window, buf: Buffer, theme: Theme, nav: Nav) void {
-    drawProjectedRows(scratch, win, buf.rows, buf.layout, theme, nav);
+    drawProjectedRows(scratch, win, buf.rows, buf.layout, buf.selected_column, theme, nav);
 }
 
 fn drawVisualPane(
@@ -252,11 +297,11 @@ fn drawVisualPane(
         else
             false;
         const row_theme = if (selected or index == nav.cursor) cursorRowTheme(theme) else theme;
-        drawVisualRow(scratch, win, screen_row, buf.layout, row, visual_row, row_theme);
+        drawVisualRow(scratch, win, screen_row, buf.layout, buf.selected_column, row, visual_row, row_theme);
     }
 }
 
-fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, rows: []const Row, layout: buffer_mod.Layout, theme: Theme, nav: Nav) void {
+fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, rows: []const Row, layout: buffer_mod.Layout, selected_column: ?buffer_mod.SelectedColumn, theme: Theme, nav: Nav) void {
     const sel = nav.selection();
     var screen_row: u16 = 0;
     while (screen_row < win.height) : (screen_row += 1) {
@@ -268,7 +313,7 @@ fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, rows: []cons
         else
             false;
         const row_theme = if (selected or index == nav.cursor) cursorRowTheme(theme) else theme;
-        drawRow(scratch, win, screen_row, layout, row, row_theme);
+        drawRow(scratch, win, screen_row, layout, selected_column, row, row_theme);
     }
 }
 
@@ -284,20 +329,21 @@ fn visualRowSelected(rows: []const @import("frame.zig").VisualRow, selection: [2
     return false;
 }
 
-fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, row: Row, visual_row: @import("frame.zig").VisualRow, theme: Theme) void {
+fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, selected_column: ?buffer_mod.SelectedColumn, row: Row, visual_row: @import("frame.zig").VisualRow, theme: Theme) void {
     if (layout == .side_by_side and visual_row.halves != null) {
         drawVisualLinePair(scratch, win, r, visual_row.halves.?, row.line_pair, theme);
+        drawSelectedColumnEdge(win, r, selected_column, theme);
         return;
     }
     if (row != .line or layout != .unified) {
-        drawRow(scratch, win, r, layout, row, theme);
+        drawRow(scratch, win, r, layout, selected_column, row, theme);
         return;
     }
     const line_row = row.line;
     const style = theme.lineStyle(line_row.line.kind);
     fillRow(win, r, style);
     if (!visual_row.continuation) {
-        drawUnifiedGutter(win, r, line_row.line.oldNo(), line_row.line.newNo(), theme.gutter);
+        drawUnifiedGutter(win, r, line_row.oldNo(), line_row.newNo(), theme.gutter);
     }
     drawLineBodyText(
         scratch,
@@ -338,12 +384,16 @@ fn cursorRowTheme(theme: Theme) Theme {
 /// Gutter is two 4-wide line-number columns; body text starts after it.
 const gutter_cols: u16 = @intCast(@import("frame.zig").unified_gutter_cols);
 
-fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, row: Row, theme: Theme) void {
+fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, selected_column: ?buffer_mod.SelectedColumn, row: Row, theme: Theme) void {
     switch (row) {
-        .file_header => |file| {
-            fillRuleRow(win, r, theme.section_rule);
-            const text = std.fmt.allocPrint(scratch, "─ {s} {s} ", .{ statusChar(file.status), file.displayPath() }) catch file.displayPath();
-            _ = win.printSegment(.{ .text = text, .style = theme.file_header }, .{ .row_offset = r, .wrap = .none });
+        .file_header => |header| {
+            if (selected_column) |selected| {
+                drawSideFileHeader(scratch, win, r, header, selected, theme);
+            } else {
+                fillRuleRow(win, r, theme.section_rule);
+                const text = std.fmt.allocPrint(scratch, "─ {s} {s} ", .{ statusChar(header.file.status), header.path }) catch header.path;
+                _ = win.printSegment(.{ .text = text, .style = theme.file_header }, .{ .row_offset = r, .wrap = .none });
+            }
         },
         .hunk_header => |hunk| {
             fillRow(win, r, theme.hunk_header);
@@ -355,7 +405,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer
             const style = theme.lineStyle(ln.kind);
             fillRow(win, r, style);
 
-            drawUnifiedGutter(win, r, ln.oldNo(), ln.newNo(), theme.gutter);
+            drawUnifiedGutter(win, r, lr.oldNo(), lr.newNo(), theme.gutter);
             drawLineBody(scratch, win, r, gutter_cols, lr, theme, style);
         },
         .line_pair => |pair| drawLinePair(scratch, win, r, pair, theme),
@@ -365,6 +415,37 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer
         .snapshot => |snapshot| drawSnapshot(win, r, snapshot, theme),
         .section => |sec| drawSection(scratch, win, r, sec, theme),
     }
+    if (layout == .side_by_side) drawSelectedColumnEdge(win, r, selected_column, theme);
+}
+
+fn drawSideFileHeader(scratch: std.mem.Allocator, win: vaxis.Window, row: u16, header: buffer_mod.FileHeader, selected: buffer_mod.SelectedColumn, theme: Theme) void {
+    fillRuleRow(win, row, theme.section_rule);
+    const half = win.width / 2;
+    const right_x = half + 1;
+    var old_style = theme.file_header;
+    var new_style = theme.file_header;
+    if (selected.version == .old) {
+        old_style.fg = theme.accent;
+        old_style.bold = true;
+    } else {
+        new_style.fg = theme.accent;
+        new_style.bold = true;
+    }
+    const old = std.fmt.allocPrint(scratch, "OLD {s}", .{header.file.old_path}) catch "OLD";
+    const new = std.fmt.allocPrint(scratch, "NEW {s}", .{header.file.new_path}) catch "NEW";
+    if (half > 0) _ = win.child(.{ .x_off = 0, .y_off = row, .width = half, .height = 1 }).printSegment(.{ .text = old, .style = old_style }, .{ .wrap = .none });
+    if (right_x < win.width) _ = win.child(.{ .x_off = right_x, .y_off = row, .width = win.width - right_x, .height = 1 }).printSegment(.{ .text = new, .style = new_style }, .{ .wrap = .none });
+}
+
+fn drawSelectedColumnEdge(win: vaxis.Window, row: u16, selected: ?buffer_mod.SelectedColumn, theme: Theme) void {
+    const column = selected orelse return;
+    const divider = win.width / 2;
+    if (divider >= win.width) return;
+    const current = win.readCell(divider, row) orelse return;
+    win.writeCell(divider, row, .{
+        .char = .{ .grapheme = if (column.inner_gutter_edge == .right) "▐" else "▌", .width = 1 },
+        .style = .{ .fg = theme.accent, .bg = current.style.bg, .bold = true },
+    });
 }
 
 fn drawStatusPlaceholder(
@@ -408,21 +489,27 @@ fn drawStatusPlaceholder(
     }
 }
 
-fn statusPlaceholderText(scratch: std.mem.Allocator, side: Side, status: bbr.diff.FileContentStatus) []const u8 {
+fn statusPlaceholderText(scratch: std.mem.Allocator, side: Side, state: buffer_mod.VersionContentState) []const u8 {
     const side_name = if (side == .old) "Old" else "New";
-    const size = if (status.byteSize()) |bytes|
-        std.fmt.allocPrint(scratch, "{d} bytes", .{bytes}) catch "size unavailable"
-    else
-        "size unavailable";
-    return switch (status) {
-        .text => unreachable,
-        .binary => std.fmt.allocPrint(scratch, "{s} content binary, {s}", .{ side_name, size }) catch "Binary content",
-        .unavailable => |value| switch (value.reason) {
-            .invalid_utf8 => std.fmt.allocPrint(scratch, "{s} content unavailable: invalid UTF-8, {s}", .{ side_name, size }) catch "Content unavailable",
-            .invalid_path => std.fmt.allocPrint(scratch, "{s} content unavailable: invalid path, {s}", .{ side_name, size }) catch "Content unavailable",
-            .acquisition_failed => |err| std.fmt.allocPrint(scratch, "{s} content unavailable: acquisition failed ({s}), {s}", .{ side_name, @errorName(err), size }) catch "Content unavailable",
+    return switch (state) {
+        .loading => |bytes| statusPlaceholderDetail(scratch, side_name, "loading", bytes),
+        .absent => std.fmt.allocPrint(scratch, "{s} content absent", .{side_name}) catch "Content absent",
+        .empty => std.fmt.allocPrint(scratch, "{s} Empty file", .{side_name}) catch "Empty file",
+        .binary => |bytes| statusPlaceholderDetail(scratch, side_name, "binary", bytes),
+        .unavailable => |status| switch (status.unavailable.reason) {
+            .invalid_utf8 => statusPlaceholderDetail(scratch, side_name, "unavailable: invalid UTF-8", status.byteSize()),
+            .invalid_path => statusPlaceholderDetail(scratch, side_name, "unavailable: invalid path", status.byteSize()),
+            .acquisition_failed => |err| blk: {
+                const reason = std.fmt.allocPrint(scratch, "unavailable: acquisition failed ({s})", .{@errorName(err)}) catch "unavailable: acquisition failed";
+                break :blk statusPlaceholderDetail(scratch, side_name, reason, status.byteSize());
+            },
         },
     };
+}
+
+fn statusPlaceholderDetail(scratch: std.mem.Allocator, side: []const u8, state: []const u8, bytes: ?usize) []const u8 {
+    if (bytes) |size| return std.fmt.allocPrint(scratch, "{s} content {s}, {d} bytes", .{ side, state, size }) catch "Content unavailable";
+    return std.fmt.allocPrint(scratch, "{s} content {s}, size unavailable", .{ side, state }) catch "Content unavailable";
 }
 
 fn fillRuleRow(win: vaxis.Window, row: u16, style: vaxis.Style) void {
@@ -600,24 +687,26 @@ fn drawDisclosure(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, value: 
             std.fmt.allocPrint(scratch, "{s} Outdated · {s} · {d} threads", .{ glyph, value.path, value.count }) catch glyph
         else
             std.fmt.allocPrint(scratch, "{s} Outdated · {d} threads", .{ glyph, value.count }) catch glyph,
+        .opposite_version => std.fmt.allocPrint(scratch, "{s} {s} · {d} threads", .{ glyph, value.path, value.count }) catch glyph,
         .review_card => unreachable,
     };
     _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = gutter_cols, .wrap = .none });
 }
 
-/// A section divider: "── PR comments (N) ──" or "── Outdated · path (N) ──".
+/// A section divider: "── PR comments (N)" or "── Outdated · path (N)".
 fn drawSection(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, sec: Section, theme: Theme) void {
-    fillRow(win, r, theme.context);
+    fillRuleRow(win, r, theme.section_rule);
     const text = switch (sec.kind) {
-        .pr_comments => std.fmt.allocPrint(scratch, "── PR comments ({d}) ──", .{sec.count}) catch "── PR comments ──",
-        .pending => std.fmt.allocPrint(scratch, "── Pending ({d}) ──", .{sec.count}) catch "── Pending ──",
+        .pr_comments => std.fmt.allocPrint(scratch, "── PR comments ({d}) ", .{sec.count}) catch "── PR comments ",
+        .pending => std.fmt.allocPrint(scratch, "── Pending ({d}) ", .{sec.count}) catch "── Pending ",
         .outdated => if (sec.path.len > 0)
-            std.fmt.allocPrint(scratch, "── Outdated · {s} ({d}) ──", .{ sec.path, sec.count }) catch "── Outdated ──"
+            std.fmt.allocPrint(scratch, "── Outdated · {s} ({d}) ", .{ sec.path, sec.count }) catch "── Outdated "
         else
-            std.fmt.allocPrint(scratch, "── Outdated ({d}) ──", .{sec.count}) catch "── Outdated ──",
-        .unavailable => std.fmt.allocPrint(scratch, "── Anchor unavailable ({d}) ──", .{sec.count}) catch "── Anchor unavailable ──",
+            std.fmt.allocPrint(scratch, "── Outdated ({d}) ", .{sec.count}) catch "── Outdated ",
+        .unavailable => std.fmt.allocPrint(scratch, "── Anchor unavailable ({d}) ", .{sec.count}) catch "── Anchor unavailable ",
     };
-    _ = win.printSegment(.{ .text = text, .style = theme.section }, .{ .row_offset = r, .wrap = .none });
+    const style = if (sec.kind == .pr_comments) theme.file_header else theme.section;
+    _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .wrap = .none });
 }
 
 /// Draw the PR Picker as a centered modal over the current frame. Shows a
@@ -1029,13 +1118,40 @@ fn buildHelpRows(scratch: std.mem.Allocator, km: keymap.Keymap, availability: pr
             if (keys.items.len > 0) keys.append(scratch, ' ') catch {};
             keys.appendSlice(scratch, chordLabel(scratch, km.bindings[i].chord)) catch {};
         }
-        const line = std.fmt.allocPrint(scratch, "{s:<8}{s}", .{ keys.items, help }) catch help;
+        const reason = sourceRefusalLabel(availability, act);
+        const line = if (reason) |label|
+            std.fmt.allocPrint(scratch, "{s:<8}{s} ({s})", .{ keys.items, help, label }) catch help
+        else
+            std.fmt.allocPrint(scratch, "{s:<8}{s}", .{ keys.items, help }) catch help;
         (if (keymap.isMotion(act)) &motions else &commands).append(scratch, .{
             .text = line,
             .available = availability.available(act),
         }) catch {};
     }
     return .{ .motions = motions.items, .commands = commands.items };
+}
+
+fn sourceRefusalLabel(availability: presentation.ActionAvailability, action: keymap.Action) ?[]const u8 {
+    return switch (action) {
+        .yank => if (availability.yank_refusal) |refusal| switch (refusal) {
+            .no_source => "no source",
+            .selected_content_unavailable => if (availability.selected_version == .old) "old content unavailable" else "new content unavailable",
+        } else null,
+        .inline_comment => if (availability.inline_comment_refusal) |refusal| switch (refusal) {
+            .no_source => "no source",
+            .selected_content_unavailable => if (availability.selected_version == .old) "old content unavailable" else "new content unavailable",
+            .not_hunk_line => "not a Hunk Line",
+            .opposite_version => "opposite File version",
+        } else null,
+        .suggest => if (availability.suggestion_refusal) |refusal| switch (refusal) {
+            .no_source => "no source",
+            .selected_content_unavailable => if (availability.selected_version == .old) "old content unavailable" else "new content unavailable",
+            .not_hunk_line => "not a Hunk Line",
+            .opposite_version => "opposite File version",
+            .old_version => "requires new File version",
+        } else null,
+        else => null,
+    };
 }
 
 /// Draw the keybinding-help Overlay: a centered modal with Motions in the left
@@ -1372,11 +1488,11 @@ test "Status Placeholder renders side, reason, and known or unavailable size" {
     const rows = [_]buffer_mod.Row{
         .{ .status_placeholder = .{
             .file = &file,
-            .old = .{ .unavailable = .{ .byte_size = 27, .reason = .{ .acquisition_failed = error.NotFound } } },
+            .old = .{ .unavailable = .{ .unavailable = .{ .byte_size = 27, .reason = .{ .acquisition_failed = error.NotFound } } } },
         } },
         .{ .status_placeholder = .{
             .file = &file,
-            .new = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NetworkError } } },
+            .new = .{ .unavailable = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NetworkError } } } },
         } },
     };
     const buf: Buffer = .{ .rows = &rows, .layout = .unified };
@@ -1398,7 +1514,7 @@ test "SideBySide Status Placeholders render each side independently" {
     const rows = [_]buffer_mod.Row{.{ .status_placeholder = .{
         .file = &file,
         .old = .{ .binary = 3 },
-        .new = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NotFound } } },
+        .new = .{ .unavailable = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NotFound } } } },
     } }};
     const buf: Buffer = .{ .rows = &rows, .layout = .side_by_side };
     var screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 100, .x_pixel = 0, .y_pixel = 0 });
@@ -1925,6 +2041,203 @@ test "focused Pane frames and File Tree tallies use Frame-owned geometry" {
     try testing.expectEqualStrings("●", content.readCell(content.width - 5, 0).?.char.grapheme);
 }
 
+test "File header junctions keep the DiffPane border style" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file: bbr.diff.File = .{ .old_path = "a.zig", .new_path = "a.zig", .status = .modified, .hunks = &.{} };
+    const rows = [_]Row{.{ .file_header = .{ .file = &file, .path = file.new_path } }};
+    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{ .layout = .unified, .width = 10, .wrap = false });
+    var screen = try vaxis.Screen.init(a, .{ .rows = 6, .cols = 16, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const outer: @import("frame.zig").Rect = .{ .x = 2, .y = 0, .width = 12, .height = 6 };
+    const content: @import("frame.zig").Rect = .{ .x = 3, .y = 2, .width = 10, .height = 3 };
+
+    for ([_]bool{ false, true }) |focused| {
+        drawPaneFrame(win, outer, "", theme_dark, focused);
+        joinSectionRules(win, outer, content, visual_rows, Nav.init(visual_rows.len, content.height));
+
+        try testing.expectEqualStrings("├", win.readCell(outer.x, content.y).?.char.grapheme);
+        try testing.expectEqualStrings("┤", win.readCell(outer.x + outer.width - 1, content.y).?.char.grapheme);
+        try testing.expectEqual(win.readCell(outer.x, content.y + 1).?.style, win.readCell(outer.x, content.y).?.style);
+        try testing.expectEqual(win.readCell(outer.x + outer.width - 1, content.y + 1).?.style, win.readCell(outer.x + outer.width - 1, content.y).?.style);
+    }
+}
+
+test "File and PR Comment headers end in DiffPane border rules" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file: bbr.diff.File = .{ .old_path = "a.zig", .new_path = "a.zig", .status = .modified, .hunks = &.{} };
+    var theme = theme_dark;
+    theme.section_rule = theme.pane_border_focused;
+    var screen = try vaxis.Screen.init(a, .{ .rows = 2, .cols = 30, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    drawRow(a, win, 0, .unified, null, .{ .file_header = .{ .file = &file, .path = file.new_path } }, theme);
+    drawRow(a, win, 1, .unified, null, .{ .section = .{ .kind = .pr_comments, .count = 2 } }, theme);
+
+    try testing.expectEqualStrings("─", win.readCell(win.width - 1, 0).?.char.grapheme);
+    try testing.expectEqual(theme.pane_border_focused.fg, win.readCell(win.width - 1, 0).?.style.fg);
+    try testing.expectEqualStrings("P", win.readCell(3, 1).?.char.grapheme);
+    try testing.expectEqual(theme.file_header.fg, win.readCell(3, 1).?.style.fg);
+    try testing.expectEqualStrings("─", win.readCell(win.width - 1, 1).?.char.grapheme);
+    try testing.expectEqual(theme.pane_border_focused.fg, win.readCell(win.width - 1, 1).?.style.fg);
+}
+
+test "ReviewCard wide grapheme keeps the DiffPane right border" {
+    const Metrics = struct {
+        fn next(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
+            var iterator = vaxis.unicode.graphemeIterator(text);
+            const grapheme = iterator.next() orelse return .{ .byte_len = 1, .cell_width = 1 };
+            return .{
+                .byte_len = grapheme.len,
+                .cell_width = vaxis.gwidth.gwidth(grapheme.bytes(text), .unicode),
+            };
+        }
+
+        const context: u8 = 0;
+        const value: @import("cell_metrics.zig").CellMetrics = .{ .ptr = &context, .vtable = &.{ .next = next } };
+    };
+
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const session = try @import("session.zig").create(testing.allocator);
+    const a = session.arena.allocator();
+    session.source = .{ .remote = .{
+        .id = 1,
+        .title = "Border test",
+        .state = "OPEN",
+        .author_display_name = "Reviewer",
+        .source_branch = "feature",
+        .destination_branch = "main",
+        .source_commit = "source",
+        .destination_commit = "destination",
+    } };
+    session.header = .{
+        .title = "Border test",
+        .source_ref = "feature",
+        .base_ref = "main",
+        .source_commit = "source",
+        .base_commit = "destination",
+        .author = "Reviewer",
+        .locator = "repo",
+        .source_label = "Bitbucket",
+        .pull_request_id = 1,
+    };
+    session.diff = try bbr.diff.parse(a,
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+    );
+    const comments = try a.alloc(bbr.review.Comment, 1);
+    comments[0] = .{ .id = 1, .author = "Ada", .body = "aaaaaaaaaaaaaaaaaaaaaaaa⚠️" };
+    session.threads = try bbr.review.buildThreads(a, comments);
+    try session.initializeEnrichment();
+
+    var state = try presentation.Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .cell_metrics = Metrics.value,
+    }, .{
+        .initial = .{ .key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+        .geometry = .{ .cols = 60, .rows = 10 },
+    });
+    defer state.deinit();
+    const review = state.projection().review.?;
+
+    var projected_body_rows: usize = 0;
+    for (review.buffer.rows) |row| if (row == .comment and row.comment.part == .body) {
+        projected_body_rows += 1;
+    };
+    try testing.expectEqual(@as(usize, 2), projected_body_rows);
+
+    var screen = try vaxis.Screen.init(a, .{ .rows = 10, .cols = 60, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    drawReview(a, win, review, theme_dark, 0);
+
+    var body_row: ?usize = null;
+    for (review.frame.visual_rows, 0..) |visual, index| {
+        const row = review.buffer.rows[visual.buffer_index];
+        if (row == .comment and row.comment.part == .body) {
+            body_row = index;
+            break;
+        }
+    }
+    const screen_row: u16 = review.frame.panes.diff_content.y + @as(u16, @intCast(body_row.? - review.navigation.scroll));
+    const right = review.frame.panes.diff.x + review.frame.panes.diff.width - 1;
+    try testing.expectEqualStrings("│", win.readCell(right, screen_row).?.char.grapheme);
+}
+
+test "DiffPane title reserves and renders published Selected Version targets" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var screen = try vaxis.Screen.init(arena.allocator(), .{ .rows = 8, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(arena.allocator());
+    const win = headlessWindow(&screen);
+    const panes = @import("frame.zig").paneRects(.{ .cols = 80, .rows = 8 });
+    const targets = @import("frame.zig").versionTitleTargets(panes.diff, .old);
+    const frame: @import("frame.zig").Projection = .{
+        .revision = 1,
+        .visual_rows_revision = 1,
+        .geometry = .{ .cols = 80, .rows = 8 },
+        .panes = panes,
+        .visual_rows = &.{},
+        .buffer = .{ .rows = &.{}, .layout = .unified },
+        .navigation = Nav.init(0, panes.diff_content.height),
+        .focus = .sidebar,
+        .selected_version = .old,
+        .version_title_targets = targets,
+    };
+
+    drawDiffPaneFrame(arena.allocator(), win, frame, "src/a-very-long-file-name.zig", .whole, theme_dark);
+
+    try testing.expectEqualStrings("g", win.readCell(targets.old.?.x, 0).?.char.grapheme);
+    try testing.expectEqualStrings("D", win.readCell(targets.old.?.x + 5, 0).?.char.grapheme);
+    try testing.expectEqualStrings("N", win.readCell(targets.new.?.x, 0).?.char.grapheme);
+    try testing.expectEqual(theme_dark.accent, win.readCell(targets.old.?.x, 0).?.style.fg);
+    try testing.expect(win.readCell(targets.old.?.x, 0).?.style.bold);
+    try testing.expect(!std.meta.eql(win.readCell(targets.new.?.x, 0).?.style.fg, theme_dark.accent));
+    try testing.expectEqualStrings("─", win.readCell(targets.old.?.x - 1, 0).?.char.grapheme);
+}
+
+test "SideBySide WholeFile accents only the selected header and inner gutter edge" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try bbr.diff.parse(a,
+        \\diff --git a/old.txt b/new.txt
+        \\similarity index 80%
+        \\rename from old.txt
+        \\rename to new.txt
+        \\--- a/old.txt
+        \\+++ b/new.txt
+        \\@@ -1 +1 @@
+        \\-let value = 1
+        \\+let value = 2
+    );
+    const blobs = [_]bbr.diff.FileBlob{.{ .old = "let value = 1\n", .new = "let value = 2\n" }};
+    const buf = try buffer_mod.buildWithComments(a, diff, .side_by_side, &.{}, .{ .whole_file = true, .selected_version = .old, .blobs = &blobs });
+    var screen = try vaxis.Screen.init(a, .{ .rows = 6, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    drawPane(a, win, buf, theme_dark, Nav.init(buf.rows.len, 6));
+
+    const half = win.width / 2;
+    try testing.expectEqual(theme_dark.accent, win.readCell(0, 0).?.style.fg);
+    try testing.expect(!std.meta.eql(win.readCell(half + 1, 0).?.style.fg, theme_dark.accent));
+    try testing.expectEqualStrings("▐", win.readCell(half, 1).?.char.grapheme);
+    try testing.expectEqual(theme_dark.accent, win.readCell(half, 1).?.style.fg);
+    try testing.expectEqual(theme_dark.removed.bg, win.readCell(side_gutter, 1).?.style.bg);
+    try testing.expectEqual(theme_dark.added.bg, win.readCell(half + 1 + side_gutter, 1).?.style.bg);
+}
+
 test "a woven comment renders with its marker and style; a suggestion is distinct" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2002,6 +2315,21 @@ test "local help projection marks remote-only commands unavailable" {
     // Remote-only commands, plus edit, re-anchor, and delete, stay visible.
     try testing.expectEqual(@as(usize, 11), unavailable);
     for (rows.motions) |row| try testing.expect(row.available);
+}
+
+test "help keeps refused source Actions visible with typed reasons" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const rows = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{
+        .remote = true,
+        .selected_version = .old,
+        .yank_refusal = .selected_content_unavailable,
+        .inline_comment_refusal = .not_hunk_line,
+        .suggestion_refusal = .old_version,
+    });
+    try testing.expect(!helpRowAvailable(rows.commands, "yank source text (old content unavailable)").?);
+    try testing.expect(!helpRowAvailable(rows.commands, "inline comment (not a Hunk Line)").?);
+    try testing.expect(!helpRowAvailable(rows.commands, "suggestion (requires new File version)").?);
 }
 
 test "delete stays discoverable in the help Overlay when it is refused" {

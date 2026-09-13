@@ -23,7 +23,7 @@ pub fn checksum(buffer: buffer_mod.Buffer) u64 {
     for (buffer.rows) |row| {
         hash.update(&.{@intFromEnum(row)});
         switch (row) {
-            .file_header => |file| hash.update(file.new_path),
+            .file_header => |header| hash.update(header.path),
             .hunk_header => |hunk| hash.update(hunk.header),
             .line => |line| hash.update(line.line.text),
             .comment, .draft => |card| {

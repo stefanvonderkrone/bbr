@@ -131,6 +131,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
     try loop.start();
     defer loop.stop();
     try loop.installResizeHandler();
+    vx.screen.width_method = .unicode;
     try vx.enterAltScreen(writer);
     if (ctx.mouse_enabled) try vx.setMouseMode(writer, true);
     try state.dispatch(.{ .resize = contentGeometry(vx.window()) });
@@ -155,6 +156,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             .mouse => |mouse| if (portableMouse(mouse)) |input| try state.dispatch(.{ .mouse = input }),
             .winsize => |winsize| {
                 try vx.resize(ctx.gpa, writer, winsize);
+                vx.screen.width_method = .unicode;
                 try state.dispatch(.{ .resize = contentGeometry(vx.window()) });
             },
             .presentation_done => |done| {
@@ -425,6 +427,12 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .local_review_no_submission => "Submit is unavailable for a local review; drafts remain local",
         .local_review_remote_action_unavailable => "This action is unavailable for a local review",
         .source_action_unavailable => "This action requires a source line or Selection",
+        .yank_no_source => "No Selected Version source Line exists at the cursor or in Selection",
+        .old_content_unavailable => "Old content is unavailable",
+        .new_content_unavailable => "New content is unavailable",
+        .source_not_hunk_line => "This action requires a Hunk Line",
+        .source_opposite_version => "This source belongs to the other File version",
+        .suggestion_requires_new_version => "Suggestions require the new File version",
         .target_action_unavailable => "This action is unavailable for the current target",
         .no_review_item => "This action requires a Comment or Draft under the cursor",
         .draft_owned_by_submission => "an active Submission owns this local Draft",

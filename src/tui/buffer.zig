@@ -41,15 +41,30 @@ pub const Layout = enum { unified, side_by_side };
 
 pub const RowKind = enum { file_header, hunk_header, status_placeholder, line, line_pair, disclosure, comment, draft, snapshot, section };
 
+pub const SelectedVersion = enum { old, new };
+
+pub const InnerGutterEdge = enum { left, right };
+
+pub const SelectedColumn = struct {
+    version: SelectedVersion,
+    inner_gutter_edge: InnerGutterEdge,
+};
+
+pub const FileHeader = struct {
+    file: *const model.File,
+    path: []const u8,
+};
+
 pub const DisclosureKey = union(enum) {
     resolved_thread: review.CommentId,
     fold: *const model.Line,
     outdated_file: *const model.File,
     outdated_review,
+    opposite_version: *const model.File,
     review_card: review_card.Owner,
 };
 
-pub const DisclosureKind = enum { resolved_thread, fold, outdated, review_card };
+pub const DisclosureKind = enum { resolved_thread, fold, outdated, opposite_version, review_card };
 
 pub const Disclosure = struct {
     key: DisclosureKey,
@@ -67,6 +82,15 @@ pub const Disclosure = struct {
 pub const LineRow = struct {
     line: *const model.Line,
     decoration: decoration.LineDecoration,
+    display_version: ?SelectedVersion = null,
+
+    pub fn oldNo(self: LineRow) ?u32 {
+        return if (self.display_version == .new) null else self.line.oldNo();
+    }
+
+    pub fn newNo(self: LineRow) ?u32 {
+        return if (self.display_version == .old) null else self.line.newNo();
+    }
 };
 
 /// One row of the side-by-side layout: the old line on the left, the new line
@@ -108,8 +132,16 @@ fn chooseMatch(best: *?MatchCell, candidate: MatchCell) void {
 
 pub const StatusPlaceholder = struct {
     file: *const model.File,
-    old: ?model.FileContentStatus = null,
-    new: ?model.FileContentStatus = null,
+    old: ?VersionContentState = null,
+    new: ?VersionContentState = null,
+};
+
+pub const VersionContentState = union(enum) {
+    loading: ?usize,
+    absent,
+    empty,
+    binary: ?usize,
+    unavailable: model.FileContentStatus,
 };
 
 /// A comment woven into the diff: the comment itself plus whether it's a reply
@@ -148,7 +180,7 @@ pub const Section = struct {
 
 /// One drawable row. Borrows the diff node (or comment) it projects.
 pub const Row = union(RowKind) {
-    file_header: *const model.File,
+    file_header: FileHeader,
     hunk_header: *const model.Hunk,
     status_placeholder: StatusPlaceholder,
     line: LineRow,
@@ -203,6 +235,7 @@ pub const BuildOptions = struct {
     /// rendering. Implies no folding. `false` keeps the Changes/fetched behaviour
     /// driven by `fold_context`.
     whole_file: bool = false,
+    selected_version: SelectedVersion = .new,
     /// Per-file blobs for the whole-file splice, index-aligned with `diff.files`
     /// (a shorter/empty slice just means "not loaded" for the missing files).
     blobs: []const model.FileBlob = &.{},
@@ -233,6 +266,7 @@ fn disclosureId(key: DisclosureKey) DisclosureId {
         .fold => |line| .{ .kind = 1, .value = @intFromPtr(line) },
         .outdated_file => |file| .{ .kind = 2, .value = @intFromPtr(file) },
         .outdated_review => .{ .kind = 3, .value = 0 },
+        .opposite_version => |file| .{ .kind = 6, .value = @intFromPtr(file) },
         .review_card => |owner| switch (owner) {
             .comment => |id| .{ .kind = 4, .value = @intCast(id) },
             .draft => |id| .{ .kind = 5, .value = @intCast(id) },
@@ -300,22 +334,21 @@ pub const Buffer = struct {
     rows: []const Row,
     row_kinds: []const RowKind = &.{},
     layout: Layout,
+    selected_column: ?SelectedColumn = null,
     file_tallies: []const FileTally = &.{},
     file_rows: []const FileRow = &.{},
+    file_rows_end: usize = 0,
 
     pub fn kindAt(self: Buffer, index: usize) RowKind {
         return if (self.row_kinds.len == self.rows.len) self.row_kinds[index] else std.meta.activeTag(self.rows[index]);
     }
 
     pub fn fileIndexForRow(self: Buffer, row: usize) ?usize {
-        if (self.file_rows.len == 0) return null;
-        var low: usize = 0;
-        var high = self.file_rows.len;
-        while (low < high) {
-            const middle = low + (high - low) / 2;
-            if (self.file_rows[middle].first_row <= row) low = middle + 1 else high = middle;
+        for (self.file_rows, 0..) |file_row, index| {
+            const next_first = if (index + 1 < self.file_rows.len) self.file_rows[index + 1].first_row else self.file_rows_end;
+            if (row >= file_row.first_row and row < next_first) return file_row.file_index;
         }
-        return self.file_rows[low -| 1].file_index;
+        return null;
     }
 
     pub fn fileHeaderRow(self: Buffer, file_index: usize) ?usize {
@@ -337,7 +370,10 @@ pub const Buffer = struct {
 };
 
 pub const FileTally = struct { comments: usize = 0, drafts: usize = 0 };
-pub const FileRow = struct { file_index: usize, first_row: usize };
+pub const FileRow = struct {
+    file_index: usize,
+    first_row: usize,
+};
 
 pub const BuildError = error{
     /// The requested `Layout` is not implemented yet.
@@ -436,7 +472,15 @@ pub fn buildWithComments(
         }
         w.span_cursors = .init(opts.highlights, fi);
         try file_rows.append(allocator, .{ .file_index = fi, .first_row = rows.items.len });
-        try rows.append(allocator, .{ .file_header = file });
+        const whole_unified = opts.whole_file and layout == .unified;
+        const whole_side_by_side = opts.whole_file and layout == .side_by_side;
+        const header_path = if (!opts.whole_file)
+            file.displayPath()
+        else if (opts.selected_version == .old)
+            file.old_path
+        else
+            file.new_path;
+        try rows.append(allocator, .{ .file_header = .{ .file = file, .path = header_path } });
 
         // File-level roots live at the File header, before hunks/folds/lines.
         for (threads) |*t| {
@@ -446,28 +490,41 @@ pub fn buildWithComments(
             if (draft.parent == null and draftCurrentInFile(draft, opts, file.*)) try w.emitDraft(draft_index);
         }
 
-        try emitStatusPlaceholders(allocator, &rows, layout, file, contentStatus(opts.content_statuses, fi));
+        if (whole_unified) {
+            if (wholeFileState(opts, fi, file.*)) |state| try rows.append(allocator, .{ .status_placeholder = switch (opts.selected_version) {
+                .old => .{ .file = file, .old = state },
+                .new => .{ .file = file, .new = state },
+            } });
+        } else if (whole_side_by_side) {
+            const old = wholeFileStateFor(opts, fi, file.*, .old);
+            const new = wholeFileStateFor(opts, fi, file.*, .new);
+            if (old != null or new != null) try rows.append(allocator, .{ .status_placeholder = .{ .file = file, .old = old, .new = new } });
+        } else try emitStatusPlaceholders(allocator, &rows, layout, file, contentStatus(opts.content_statuses, fi));
 
         // True-whole-file: splice the fetched Hunk lines into the selected side's
         // unchanged lines and emit one continuous sequence without headers or
-        // folds. Falls back to the per-hunk path when that side is unavailable.
-        if (opts.whole_file and wholeFileContent(opts.blobs, fi, file.*) != null) {
-            const content = wholeFileContent(opts.blobs, fi, file.*).?;
-            const lines = switch (content.side) {
-                .old => try spliceOldSide(allocator, file.*, content.blob),
-                .new => try spliceNewSide(allocator, file.*, content.blob),
-            };
-            switch (layout) {
-                .unified => try w.emitUnifiedHunk(file, lines, try computeEmphasis(allocator, lines), &.{}),
-                .side_by_side => try w.emitSideBySideHunk(file, lines, &.{}),
+        // folds. Unavailable content stays explicit and never falls back.
+        if (whole_unified and wholeFileUsableContent(opts.blobs, fi, opts.selected_version) != null) {
+            const content = wholeFileUsableContent(opts.blobs, fi, opts.selected_version).?;
+            const lines = try spliceSide(allocator, file.*, content.blob, content.side);
+            try w.emitUnifiedWholeFile(file, lines, content.side);
+            try w.emitVersionDisclosure(file, content.side);
+        } else if (whole_side_by_side) {
+            const old = if (wholeFileUsableContent(opts.blobs, fi, .old)) |content| try spliceSide(allocator, file.*, content.blob, .old) else null;
+            const new = if (wholeFileUsableContent(opts.blobs, fi, .new)) |content| try spliceSide(allocator, file.*, content.blob, .new) else null;
+            try w.emitSideBySideWholeFile(file, old, new);
+        } else if (!whole_unified) {
+            for (file.hunks) |*hunk| {
+                try rows.append(allocator, .{ .hunk_header = hunk });
+                const folds = try computeFolds(allocator, hunk.lines, opts);
+                switch (layout) {
+                    .unified => try w.emitUnifiedHunk(file, hunk.lines, try computeEmphasis(allocator, hunk.lines), folds),
+                    .side_by_side => try w.emitSideBySideHunk(file, hunk.lines, folds),
+                }
             }
-        } else for (file.hunks) |*hunk| {
-            try rows.append(allocator, .{ .hunk_header = hunk });
-            const folds = try computeFolds(allocator, hunk.lines, opts);
-            switch (layout) {
-                .unified => try w.emitUnifiedHunk(file, hunk.lines, try computeEmphasis(allocator, hunk.lines), folds),
-                .side_by_side => try w.emitSideBySideHunk(file, hunk.lines, folds),
-            }
+        } else {
+            try w.emitInlineSide(file, opts.selected_version);
+            try w.emitVersionDisclosure(file, opts.selected_version);
         }
 
         // Per-file Outdated disclosure remains at the File even while closed.
@@ -494,6 +551,7 @@ pub fn buildWithComments(
             }
         }
     }
+    const file_rows_end = rows.items.len;
 
     var unavailable_count: usize = 0;
     var fallback_outdated_count: usize = 0;
@@ -569,8 +627,13 @@ pub fn buildWithComments(
         .rows = owned_rows,
         .row_kinds = row_kinds,
         .layout = layout,
+        .selected_column = if (layout == .side_by_side) .{
+            .version = opts.selected_version,
+            .inner_gutter_edge = if (opts.selected_version == .old) .right else .left,
+        } else null,
         .file_tallies = try fileTallies(allocator, diff, threads, opts.drafts, opts),
         .file_rows = try file_rows.toOwnedSlice(allocator),
+        .file_rows_end = file_rows_end,
     };
 }
 
@@ -587,6 +650,14 @@ fn unavailableOrBinary(status: ?model.FileContentStatus) ?model.FileContentStatu
     };
 }
 
+fn placeholderState(status: model.FileContentStatus) ?VersionContentState {
+    return switch (status) {
+        .text => null,
+        .binary => |size| .{ .binary = size },
+        .unavailable => .{ .unavailable = status },
+    };
+}
+
 fn emitStatusPlaceholders(
     allocator: std.mem.Allocator,
     rows: *std.ArrayList(Row),
@@ -594,8 +665,8 @@ fn emitStatusPlaceholders(
     file: *const model.File,
     content: model.FileContent,
 ) !void {
-    const old = unavailableOrBinary(content.old);
-    const new = unavailableOrBinary(content.new);
+    const old = if (unavailableOrBinary(content.old)) |status| placeholderState(status) else null;
+    const new = if (unavailableOrBinary(content.new)) |status| placeholderState(status) else null;
     switch (layout) {
         .unified => {
             if (old) |status| try rows.append(allocator, .{ .status_placeholder = .{ .file = file, .old = status } });
@@ -766,6 +837,122 @@ const Weave = struct {
             try w.rows.append(w.a, .{ .line = try decoratedLine(w.a, &lines[i], w.span_cursors.lineSpans(lines[i]), emphasis[i]) });
             try w.weaveInline(file, &lines[i]);
             i += 1;
+        }
+    }
+
+    fn emitUnifiedWholeFile(w: *Weave, file: *const model.File, lines: []const *const model.Line, side: SelectedVersion) !void {
+        for (lines) |line| {
+            var projected = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
+            projected.display_version = side;
+            try w.rows.append(w.a, .{ .line = projected });
+            try w.weaveInlineSide(file, line, side);
+        }
+    }
+
+    fn emitInlineSide(w: *Weave, file: *const model.File, selected: SelectedVersion) !void {
+        const side: AnchorSide = if (selected == .old) .old else .new;
+        for (w.threads, 0..) |*thread, index| {
+            if (!w.emitted_threads[index] and threadCurrentOnSide(thread.*, file.*, side)) try w.emitThread(thread);
+        }
+        for (w.drafts, 0..) |*draft, index| {
+            if (!w.emitted[index] and draft.parent == null and draftCurrentOnSide(draft, w.opts, file.*, side)) try w.emitDraft(index);
+        }
+    }
+
+    fn emitVersionDisclosure(w: *Weave, file: *const model.File, selected: SelectedVersion) !void {
+        const opposite: AnchorSide = if (selected == .old) .new else .old;
+        var count: usize = 0;
+        for (w.threads, 0..) |thread, index| {
+            if (!w.emitted_threads[index] and threadCurrentOnSide(thread, file.*, opposite)) count += 1;
+        }
+        for (w.drafts, 0..) |*draft, index| {
+            if (!w.emitted[index] and draft.parent == null and draftCurrentOnSide(draft, w.opts, file.*, opposite)) count += 1;
+        }
+        if (count == 0) return;
+        const key: DisclosureKey = .{ .opposite_version = file };
+        const expanded = w.expanded_disclosures.contains(disclosureId(key));
+        try w.rows.append(w.a, .{ .disclosure = .{
+            .key = key,
+            .kind = .opposite_version,
+            .expanded = expanded,
+            .count = count,
+            .path = if (opposite == .old) file.old_path else file.new_path,
+        } });
+        for (w.threads, 0..) |*thread, index| {
+            if (w.emitted_threads[index] or !threadCurrentOnSide(thread.*, file.*, opposite)) continue;
+            if (expanded) try w.emitThread(thread) else w.emitted_threads[index] = true;
+        }
+        for (w.drafts, 0..) |*draft, index| {
+            if (w.emitted[index] or draft.parent != null or !draftCurrentOnSide(draft, w.opts, file.*, opposite)) continue;
+            if (expanded) try w.emitDraft(index) else w.emitted[index] = true;
+        }
+    }
+
+    fn emitSideBySideWholeFile(
+        w: *Weave,
+        file: *const model.File,
+        old_lines: ?[]const *const model.Line,
+        new_lines: ?[]const *const model.Line,
+    ) !void {
+        var old_cursor: usize = 0;
+        var new_cursor: usize = 0;
+        for (file.hunks) |hunk| {
+            const old_gap_end = gapEnd(old_lines, old_cursor);
+            const new_gap_end = gapEnd(new_lines, new_cursor);
+            try w.emitWholeFileGap(
+                if (old_lines) |lines| lines[old_cursor..old_gap_end] else &.{},
+                if (new_lines) |lines| lines[new_cursor..new_gap_end] else &.{},
+            );
+            old_cursor = old_gap_end;
+            new_cursor = new_gap_end;
+
+            const old_present = file.status != .added;
+            const new_present = file.status != .removed;
+            if (old_present and new_present) {
+                try w.emitSideBySideHunk(file, hunk.lines, &.{});
+            } else if (old_present) {
+                try w.emitWholeFileSideHunk(file, hunk.lines, .old);
+            } else if (new_present) {
+                try w.emitWholeFileSideHunk(file, hunk.lines, .new);
+            }
+            if (old_lines) |lines| {
+                while (old_cursor < lines.len and lines[old_cursor].in_hunk) old_cursor += 1;
+            }
+            if (new_lines) |lines| {
+                while (new_cursor < lines.len and lines[new_cursor].in_hunk) new_cursor += 1;
+            }
+        }
+        try w.emitWholeFileGap(
+            if (old_lines) |lines| lines[old_cursor..] else &.{},
+            if (new_lines) |lines| lines[new_cursor..] else &.{},
+        );
+    }
+
+    fn emitWholeFileGap(w: *Weave, old: []const *const model.Line, new: []const *const model.Line) !void {
+        const pair_count = @min(old.len, new.len);
+        for (0..pair_count) |index| try w.emitWholeFilePair(old[index], new[index]);
+        for (old[pair_count..]) |line| try w.emitWholeFilePair(line, null);
+        for (new[pair_count..]) |line| try w.emitWholeFilePair(null, line);
+    }
+
+    fn emitWholeFilePair(w: *Weave, old: ?*const model.Line, new: ?*const model.Line) !void {
+        var pair: LinePair = .{};
+        if (old) |line| {
+            pair.left = try decoratedLine(w.a, line, w.span_cursors.lineSpansForSide(line.*, .old), &.{});
+            pair.left.?.display_version = .old;
+        }
+        if (new) |line| {
+            pair.right = try decoratedLine(w.a, line, w.span_cursors.lineSpansForSide(line.*, .new), &.{});
+            pair.right.?.display_version = .new;
+        }
+        try w.rows.append(w.a, .{ .line_pair = pair });
+    }
+
+    fn emitWholeFileSideHunk(w: *Weave, file: *const model.File, lines: []const model.Line, side: SelectedVersion) !void {
+        for (lines) |*line| {
+            if ((side == .old and line.old_no == 0) or (side == .new and line.new_no == 0)) continue;
+            try w.emitWholeFilePair(if (side == .old) line else null, if (side == .new) line else null);
+            try w.weaveInlineSide(file, line, side);
         }
     }
 
@@ -999,6 +1186,16 @@ const Weave = struct {
             try w.emitDraft(index);
         }
     }
+
+    fn weaveInlineSide(w: *Weave, file: *const model.File, line: *const model.Line, side: SelectedVersion) !void {
+        if (!line.in_hunk or w.anchors.count() == 0) return;
+        const bucket = switch (side) {
+            .old => if (line.oldNo()) |number| w.anchors.get(.{ .path = file.old_path, .line = number, .side = .old }) else null,
+            .new => if (line.newNo()) |number| w.anchors.get(.{ .path = file.new_path, .line = number, .side = .new }) else null,
+        } orelse return;
+        for (bucket.threads.items) |index| try w.emitThread(&w.threads[index]);
+        for (bucket.drafts.items) |index| try w.emitDraft(index);
+    }
 };
 
 fn cardContentWidth(width: usize, is_reply: bool) usize {
@@ -1057,105 +1254,95 @@ const SpanCursors = struct {
                 &.{},
         };
     }
+
+    fn lineSpansForSide(cursors: *SpanCursors, line: model.Line, side: SelectedVersion) []const decoration.Span {
+        return switch (side) {
+            .old => if (cursors.old) |*cursor| cursor.lineSpans(line.oldNo()) else &.{},
+            .new => if (cursors.new) |*cursor| cursor.lineSpans(line.newNo()) else &.{},
+        };
+    }
 };
 
 const WholeFileContent = struct {
-    side: enum { old, new },
+    side: SelectedVersion,
     blob: []const u8,
 };
 
-/// Select old content for a removed File and new content for every other File.
-fn wholeFileContent(blobs: []const model.FileBlob, fi: usize, file: model.File) ?WholeFileContent {
+fn wholeFileContent(blobs: []const model.FileBlob, fi: usize, selected: SelectedVersion) ?WholeFileContent {
     if (fi >= blobs.len) return null;
-    if (file.status == .removed) return .{ .side = .old, .blob = blobs[fi].old orelse return null };
-    return .{ .side = .new, .blob = blobs[fi].new orelse return null };
+    return switch (selected) {
+        .old => .{ .side = .old, .blob = blobs[fi].old orelse return null },
+        .new => .{ .side = .new, .blob = blobs[fi].new orelse return null },
+    };
 }
 
-/// Splice a removed File from its old content. RawDiff old line numbers decide
-/// every gap boundary, and Hunk Lines enter the result without modification.
-fn spliceOldSide(allocator: std.mem.Allocator, file: model.File, blob: []const u8) ![]const model.Line {
-    var lines = try splitBlobLines(allocator, blob);
-    defer lines.deinit(allocator);
+fn wholeFileUsableContent(blobs: []const model.FileBlob, fi: usize, selected: SelectedVersion) ?WholeFileContent {
+    const content = wholeFileContent(blobs, fi, selected) orelse return null;
+    return if (content.blob.len == 0) null else content;
+}
 
-    var out: std.ArrayList(model.Line) = .empty;
-    var old_cursor: u32 = 1;
+fn wholeFileState(opts: BuildOptions, fi: usize, file: model.File) ?VersionContentState {
+    return wholeFileStateFor(opts, fi, file, opts.selected_version);
+}
 
+fn wholeFileStateFor(opts: BuildOptions, fi: usize, file: model.File, selected: SelectedVersion) ?VersionContentState {
+    if ((selected == .old and file.status == .added) or (selected == .new and file.status == .removed)) return .absent;
+    if (wholeFileContent(opts.blobs, fi, selected)) |content| {
+        return if (content.blob.len == 0) .empty else null;
+    }
+    const content = contentStatus(opts.content_statuses, fi);
+    const status = switch (selected) {
+        .old => content.old,
+        .new => content.new,
+    } orelse return .{ .loading = null };
+    return placeholderState(status) orelse switch (status) {
+        .text => |size| .{ .loading = size },
+        else => unreachable,
+    };
+}
+
+fn gapEnd(lines: ?[]const *const model.Line, start: usize) usize {
+    const values = lines orelse return start;
+    var end = start;
+    while (end < values.len and !values[end].in_hunk) end += 1;
+    return end;
+}
+
+fn spliceSide(allocator: std.mem.Allocator, file: model.File, blob: []const u8, side: SelectedVersion) ![]const *const model.Line {
+    var blob_lines = try splitBlobLines(allocator, blob);
+    defer blob_lines.deinit(allocator);
+    var out: std.ArrayList(*const model.Line) = .empty;
+    var cursor: u32 = 1;
     for (file.hunks) |hunk| {
-        while (old_cursor < hunk.old_start) : (old_cursor += 1) {
-            const text = blobLine(lines.items, old_cursor) orelse break;
-            try out.append(allocator, .{
-                .old_no = old_cursor,
-                .new_no = 0,
+        const start = if (side == .old) hunk.old_start else hunk.new_start;
+        while (cursor < start) : (cursor += 1) {
+            const text = blobLine(blob_lines.items, cursor) orelse break;
+            const line = try allocator.create(model.Line);
+            line.* = .{
+                .old_no = if (side == .old) cursor else 0,
+                .new_no = if (side == .new) cursor else 0,
                 .kind = .context,
                 .text = text,
                 .in_hunk = false,
-            });
+            };
+            try out.append(allocator, line);
         }
-        try out.appendSlice(allocator, hunk.lines);
-        old_cursor = hunk.old_start + hunk.old_count;
+        for (hunk.lines) |*line| {
+            if ((side == .old and line.old_no != 0) or (side == .new and line.new_no != 0)) try out.append(allocator, line);
+        }
+        cursor = start + if (side == .old) hunk.old_count else hunk.new_count;
     }
-
-    while (blobLine(lines.items, old_cursor)) |text| : (old_cursor += 1) {
-        try out.append(allocator, .{
-            .old_no = old_cursor,
-            .new_no = 0,
+    while (blobLine(blob_lines.items, cursor)) |text| : (cursor += 1) {
+        const line = try allocator.create(model.Line);
+        line.* = .{
+            .old_no = if (side == .old) cursor else 0,
+            .new_no = if (side == .new) cursor else 0,
             .kind = .context,
             .text = text,
             .in_hunk = false,
-        });
+        };
+        try out.append(allocator, line);
     }
-
-    return out.toOwnedSlice(allocator);
-}
-
-/// Splice a file's fetched Hunk lines into the unchanged lines of its new-side
-/// `blob`, producing the whole file as one `Line` sequence. Gaps before, between,
-/// and after the hunks are filled with `.context` lines drawn from the blob and
-/// flagged `in_hunk = false` (so they never anchor). Hunk lines are copied
-/// verbatim (keeping their kind, numbers, and `in_hunk = true`), and Bitbucket's
-/// hunk line numbers stay authoritative (ADR-0001): the gaps are computed from
-/// them, never the other way round. A blob shorter than the hunks expect just
-/// yields fewer gap lines — it degrades, it never misplaces a Hunk line.
-fn spliceNewSide(allocator: std.mem.Allocator, file: model.File, blob: []const u8) ![]const model.Line {
-    var lines = try splitBlobLines(allocator, blob);
-    defer lines.deinit(allocator);
-
-    var out: std.ArrayList(model.Line) = .empty;
-    // `new_cursor` is the next new-file line number (1-based) not yet emitted;
-    // `old_off` maps an unchanged new line to its old number: old = new + old_off.
-    var new_cursor: u32 = 1;
-    var old_off: i64 = 0;
-
-    for (file.hunks) |hunk| {
-        // Gap: blob lines from the cursor up to (but not including) the hunk.
-        while (new_cursor < hunk.new_start) : (new_cursor += 1) {
-            const text = blobLine(lines.items, new_cursor) orelse break;
-            try out.append(allocator, .{
-                .old_no = offsetOldNo(new_cursor, old_off),
-                .new_no = new_cursor,
-                .kind = .context,
-                .text = text,
-                .in_hunk = false,
-            });
-        }
-        // The hunk's own lines, verbatim (removed lines included).
-        try out.appendSlice(allocator, hunk.lines);
-        // Advance past the hunk's new-side span and fold its net line delta in.
-        new_cursor = hunk.new_start + hunk.new_count;
-        old_off -= @as(i64, hunk.new_count) - @as(i64, hunk.old_count);
-    }
-
-    // Trailing gap after the last hunk.
-    while (blobLine(lines.items, new_cursor)) |text| : (new_cursor += 1) {
-        try out.append(allocator, .{
-            .old_no = offsetOldNo(new_cursor, old_off),
-            .new_no = new_cursor,
-            .kind = .context,
-            .text = text,
-            .in_hunk = false,
-        });
-    }
-
     return out.toOwnedSlice(allocator);
 }
 
@@ -1163,13 +1350,6 @@ fn spliceNewSide(allocator: std.mem.Allocator, file: model.File, blob: []const u
 /// spurious blank last row; interior blank lines are preserved.
 fn trimTrailingNewline(s: []const u8) []const u8 {
     return if (s.len > 0 and s[s.len - 1] == '\n') s[0 .. s.len - 1] else s;
-}
-
-/// old_no for an unchanged new line, clamped to a non-negative u32 (a mismatched
-/// blob could in theory drive it negative; a wrong gutter number beats a crash).
-fn offsetOldNo(new_no: u32, old_off: i64) u32 {
-    const v = @as(i64, new_no) + old_off;
-    return if (v < 1) 0 else @intCast(v);
 }
 
 /// The 1-based `n`th line of a blob already split into lines, or null if out of
@@ -1282,6 +1462,15 @@ fn threadCurrentInFile(t: Thread, file: model.File) bool {
     return t.root.state != .outdated and t.scope() == .file and scopeMatchesFile(t.scope(), file);
 }
 
+fn threadCurrentOnSide(thread: Thread, file: model.File, side: AnchorSide) bool {
+    if (thread.root.state == .outdated or thread.scope() != .@"inline") return false;
+    const anchor = thread.scope().@"inline";
+    return switch (side) {
+        .old => anchor.from != null and std.mem.eql(u8, anchor.path, file.old_path),
+        .new => anchor.to != null and std.mem.eql(u8, anchor.path, file.new_path),
+    };
+}
+
 fn fileOutdatedCount(threads: []const Thread, file: model.File) usize {
     var n: usize = 0;
     for (threads) |*t| {
@@ -1367,6 +1556,14 @@ fn draftCurrentInFile(draft: *const Draft, opts: BuildOptions, file: model.File)
     };
 }
 
+fn draftCurrentOnSide(draft: *const Draft, opts: BuildOptions, file: model.File, side: AnchorSide) bool {
+    const anchor = projectedDraftAnchor(draft, opts) orelse return false;
+    return switch (side) {
+        .old => anchor.from != null and std.mem.eql(u8, anchor.path, file.old_path),
+        .new => anchor.to != null and std.mem.eql(u8, anchor.path, file.new_path),
+    };
+}
+
 fn scopeMatchesFile(scope: review.CommentScope, file: model.File) bool {
     return switch (scope) {
         .review => false,
@@ -1447,7 +1644,7 @@ test "build flattens files → hunks → lines in order" {
     try testing.expectEqual(RowKind.line, buf.kindAt(2));
 
     try testing.expect(buf.rows[0] == .file_header);
-    try testing.expectEqualStrings("a.txt", buf.rows[0].file_header.new_path);
+    try testing.expectEqualStrings("a.txt", buf.rows[0].file_header.path);
     try testing.expect(buf.rows[1] == .hunk_header);
     try testing.expect(buf.rows[2] == .line);
     try testing.expectEqual(model.LineKind.context, buf.rows[2].line.line.kind);
@@ -1455,7 +1652,7 @@ test "build flattens files → hunks → lines in order" {
     try testing.expectEqual(model.LineKind.added, buf.rows[4].line.line.kind);
 
     try testing.expect(buf.rows[5] == .file_header);
-    try testing.expectEqualStrings("b.txt", buf.rows[5].file_header.new_path);
+    try testing.expectEqualStrings("b.txt", buf.rows[5].file_header.path);
     try testing.expect(buf.rows[6] == .hunk_header);
     try testing.expectEqual(model.LineKind.context, buf.rows[7].line.line.kind);
     try testing.expectEqual(model.LineKind.added, buf.rows[8].line.line.kind);
@@ -1533,7 +1730,7 @@ test "rows borrow the diff (pointer identity, not copies)" {
     const diff = try parse(a, two_file_diff);
     const buf = try build(a, diff, .unified);
 
-    try testing.expectEqual(&diff.files[0], buf.rows[0].file_header);
+    try testing.expectEqual(&diff.files[0], buf.rows[0].file_header.file);
     try testing.expectEqual(&diff.files[0].hunks[0].lines[0], buf.rows[2].line.line);
 }
 
@@ -1851,10 +2048,18 @@ test "unavailable File sides project non-source Status Placeholders in every Lay
             });
             try testing.expectEqual(@as(usize, 1), countKind(projected, .status_placeholder));
             for (projected.rows) |row| if (row == .status_placeholder) {
-                try testing.expect(row.status_placeholder.old != null);
-                try testing.expect(row.status_placeholder.new == null);
+                if (layout == .unified and whole_file) {
+                    try testing.expect(row.status_placeholder.old == null);
+                    try testing.expectEqual(std.meta.Tag(VersionContentState).loading, std.meta.activeTag(row.status_placeholder.new.?));
+                } else if (layout == .side_by_side and whole_file) {
+                    try testing.expectEqual(std.meta.Tag(VersionContentState).unavailable, std.meta.activeTag(row.status_placeholder.old.?));
+                    try testing.expectEqual(std.meta.Tag(VersionContentState).loading, std.meta.activeTag(row.status_placeholder.new.?));
+                } else {
+                    try testing.expect(row.status_placeholder.old != null);
+                    try testing.expect(row.status_placeholder.new == null);
+                }
             };
-            try testing.expect(countKind(projected, if (layout == .unified) .line else .line_pair) > 0);
+            if (!whole_file) try testing.expect(countKind(projected, if (layout == .unified) .line else .line_pair) > 0);
         }
     }
 }
@@ -1922,24 +2127,34 @@ test "binary Files project independent sides in every Layout and Scope" {
                 .fold_context = !whole_file,
                 .content_statuses = &content_statuses,
             });
-            try testing.expectEqual(@as(usize, if (layout == .unified) 6 else 4), countKind(projected, .status_placeholder));
+            const expected: usize = if (layout == .unified and whole_file) 4 else if (layout == .unified) 6 else 4;
+            try testing.expectEqual(expected, countKind(projected, .status_placeholder));
             try testing.expectEqual(@as(usize, 2), countKind(projected, .comment));
             try testing.expectEqual(@as(usize, 0), countKind(projected, .line));
             try testing.expectEqual(@as(usize, 0), countKind(projected, .line_pair));
             for (projected.rows) |row| if (row == .status_placeholder) {
                 const placeholder = row.status_placeholder;
+                if (layout == .unified and whole_file) {
+                    try testing.expect(placeholder.old == null);
+                    if (placeholder.file.status == .removed) {
+                        try testing.expectEqual(std.meta.Tag(VersionContentState).absent, std.meta.activeTag(placeholder.new.?));
+                    } else {
+                        try testing.expectEqual(std.meta.Tag(VersionContentState).binary, std.meta.activeTag(placeholder.new.?));
+                    }
+                    continue;
+                }
                 switch (placeholder.file.status) {
                     .modified => {
                         if (placeholder.old) |old| try testing.expectEqual(@as(?usize, 3), old.binary);
                         if (placeholder.new) |new| try testing.expectEqual(@as(?usize, 4), new.binary);
                     },
                     .added => {
-                        try testing.expect(placeholder.old == null);
+                        if (whole_file) try testing.expectEqual(std.meta.Tag(VersionContentState).absent, std.meta.activeTag(placeholder.old.?)) else try testing.expect(placeholder.old == null);
                         try testing.expectEqual(@as(?usize, null), placeholder.new.?.binary);
                     },
                     .removed => {
                         try testing.expectEqual(@as(?usize, null), placeholder.old.?.binary);
-                        try testing.expect(placeholder.new == null);
+                        if (whole_file) try testing.expectEqual(std.meta.Tag(VersionContentState).absent, std.meta.activeTag(placeholder.new.?)) else try testing.expect(placeholder.new == null);
                     },
                     .renamed => {
                         if (placeholder.old) |old| try testing.expectEqual(@as(?usize, null), old.binary);
@@ -2409,7 +2624,7 @@ test "only_file projects a single file's rows, nothing else" {
     const only_b = try buildWithComments(a, diff, .unified, &.{}, .{ .only_file = 1 });
     try testing.expectEqual(@as(usize, 1), countKind(only_b, .file_header));
     for (only_b.rows) |r| {
-        if (r == .file_header) try testing.expectEqualStrings("b.txt", r.file_header.new_path);
+        if (r == .file_header) try testing.expectEqualStrings("b.txt", r.file_header.path);
     }
     try testing.expectEqual(@as(usize, 1), only_b.fileIndexForRow(0));
     try testing.expectEqual(@as(usize, 0), only_b.fileHeaderRow(1));
@@ -2419,7 +2634,7 @@ test "only_file projects a single file's rows, nothing else" {
     // Isolating the first file yields a's rows and none of b's.
     const only_a = try buildWithComments(a, diff, .unified, &.{}, .{ .only_file = 0 });
     for (only_a.rows) |r| {
-        if (r == .file_header) try testing.expectEqualStrings("a.txt", r.file_header.new_path);
+        if (r == .file_header) try testing.expectEqualStrings("a.txt", r.file_header.path);
     }
     try testing.expectEqual(@as(usize, 5), only_a.rows.len);
 }
@@ -2497,8 +2712,8 @@ test "whole_file splices blob gaps around the hunk, hunk lines preserved" {
     try testing.expectEqual(@as(usize, 1), countKind(buf, .file_header));
     try testing.expectEqual(@as(usize, 0), countKind(buf, .hunk_header));
 
-    // Rows: file_header, then 6 lines — a(gap) b c CHANGED d e(gap).
-    try testing.expectEqual(@as(usize, 7), buf.rows.len);
+    // Rows: file_header, then the five Lines present in the new version.
+    try testing.expectEqual(@as(usize, 6), buf.rows.len);
     const first = buf.rows[1].line;
     try testing.expectEqualStrings("a", first.line.text);
     try testing.expectEqual(@as(?u32, 1), first.line.newNo());
@@ -2508,15 +2723,363 @@ test "whole_file splices blob gaps around the hunk, hunk lines preserved" {
     try testing.expectEqualStrings("b", buf.rows[2].line.line.text);
     try testing.expect(buf.rows[2].line.line.in_hunk);
 
-    // The change is present with its kinds.
-    try testing.expectEqual(model.LineKind.removed, buf.rows[3].line.line.kind);
-    try testing.expectEqual(model.LineKind.added, buf.rows[4].line.line.kind);
+    try testing.expectEqual(model.LineKind.added, buf.rows[3].line.line.kind);
+    try testing.expectEqual(&diff.files[0].hunks[0].lines[2], buf.rows[3].line.line);
 
     // The trailing gap line "e" comes from the blob.
-    const last = buf.rows[6].line;
+    const last = buf.rows[5].line;
     try testing.expectEqualStrings("e", last.line.text);
     try testing.expectEqual(@as(?u32, 5), last.line.newNo());
     try testing.expect(!last.line.in_hunk);
+}
+
+test "Unified WholeFile projects only the selected old version with its path and Hunk identity" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const parsed = try parse(a, whole_file_diff);
+    var renamed = parsed.files[0];
+    renamed.old_path = "old.txt";
+    renamed.new_path = "new.txt";
+    renamed.status = .renamed;
+    const diff: model.Diff = .{ .files = &.{renamed} };
+    const blobs = [_]model.FileBlob{.{ .old = "a\nb\nc\nd\ne\n", .new = whole_file_blob }};
+    const buf = try buildWithComments(a, diff, .unified, &.{}, .{
+        .whole_file = true,
+        .selected_version = .old,
+        .blobs = &blobs,
+    });
+
+    try testing.expectEqualStrings("old.txt", buf.rows[0].file_header.path);
+    try testing.expectEqual(@as(usize, 5), countKind(buf, .line));
+    try testing.expectEqual(@as(usize, 0), countKind(buf, .hunk_header));
+    try testing.expectEqualStrings("a", buf.rows[1].line.line.text);
+    try testing.expectEqual(@as(?u32, 1), buf.rows[1].line.line.oldNo());
+    try testing.expectEqual(@as(?u32, null), buf.rows[1].line.line.newNo());
+    try testing.expectEqual(&renamed.hunks[0].lines[1], buf.rows[3].line.line);
+    try testing.expectEqual(model.LineKind.removed, buf.rows[3].line.line.kind);
+    try testing.expectEqual(@as(?u32, 2), buf.rows[2].line.oldNo());
+    try testing.expectEqual(@as(?u32, null), buf.rows[2].line.newNo());
+    try testing.expectEqualStrings("e", buf.rows[5].line.line.text);
+    try testing.expectEqual(@as(?u32, 5), buf.rows[5].line.line.oldNo());
+
+    const new = try buildWithComments(a, diff, .unified, &.{}, .{
+        .whole_file = true,
+        .selected_version = .new,
+        .blobs = &blobs,
+    });
+    try testing.expectEqualStrings("new.txt", new.rows[0].file_header.path);
+    try testing.expectEqual(@as(?u32, 1), new.rows[1].line.line.newNo());
+    try testing.expectEqual(@as(?u32, null), new.rows[1].line.line.oldNo());
+    try testing.expectEqual(&renamed.hunks[0].lines[2], new.rows[3].line.line);
+    try testing.expectEqual(@as(?u32, 5), new.rows[5].line.line.newNo());
+}
+
+test "Unified WholeFile fills gaps before between and after Hunks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try parse(a,
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -2 +2 @@
+        \\-old b
+        \\+new b
+        \\@@ -4 +4 @@
+        \\-old d
+        \\+new d
+    );
+    const blobs = [_]model.FileBlob{.{ .new = "a\nnew b\nc\nnew d\ne\n" }};
+    const buf = try buildWithComments(a, diff, .unified, &.{}, .{ .whole_file = true, .blobs = &blobs });
+
+    try testing.expectEqual(@as(usize, 5), countKind(buf, .line));
+    try testing.expectEqualStrings("a", buf.rows[1].line.line.text);
+    try testing.expectEqual(&diff.files[0].hunks[0].lines[1], buf.rows[2].line.line);
+    try testing.expectEqualStrings("c", buf.rows[3].line.line.text);
+    try testing.expectEqual(&diff.files[0].hunks[1].lines[1], buf.rows[4].line.line);
+    try testing.expectEqualStrings("e", buf.rows[5].line.line.text);
+}
+
+test "Unified WholeFile keeps selected inline ReviewCards and collapses opposite-version ReviewCards once" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try parse(a, whole_file_diff);
+    const blobs = [_]model.FileBlob{.{ .old = "a\nb\nc\nd\ne\n", .new = whole_file_blob }};
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "old", .anchor = .{ .path = "a.txt", .from = 3 } },
+        .{ .id = 2, .author = "Bo", .body = "new", .anchor = .{ .path = "a.txt", .to = 3 } },
+        .{ .id = 3, .author = "Cy", .body = "file", .scope = .{ .file = .{ .path = "a.txt", .source_commit = "c" } } },
+        .{ .id = 4, .author = "Di", .body = "outdated", .anchor = .{ .path = "a.txt", .to = 9 }, .state = .outdated },
+    };
+    const threads = try bbr.review.thread.build(a, &comments);
+    const collapsed = try buildWithComments(a, diff, .unified, threads, .{ .whole_file = true, .blobs = &blobs });
+
+    try testing.expectEqual(@as(usize, 2), countKind(collapsed, .comment));
+    var opposite_key: ?DisclosureKey = null;
+    var opposite_count: usize = 0;
+    for (collapsed.rows) |row| if (row == .disclosure and row.disclosure.kind == .opposite_version) {
+        opposite_key = row.disclosure.key;
+        opposite_count += 1;
+        try testing.expectEqual(@as(usize, 1), row.disclosure.count);
+    };
+    try testing.expectEqual(@as(usize, 1), opposite_count);
+    try testing.expectEqual(@as(usize, 1), countKind(collapsed, .disclosure) - opposite_count);
+
+    const expanded = try buildWithComments(a, diff, .unified, threads, .{
+        .whole_file = true,
+        .blobs = &blobs,
+        .expanded_disclosures = &.{opposite_key.?},
+    });
+    try testing.expectEqual(@as(usize, 3), countKind(expanded, .comment));
+}
+
+test "SideBySide WholeFile pairs complete versions and preserves Hunk Line identity" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const parsed = try parse(a, whole_file_diff);
+    var renamed = parsed.files[0];
+    renamed.old_path = "old.txt";
+    renamed.new_path = "new.txt";
+    renamed.status = .renamed;
+    const diff: model.Diff = .{ .files = &.{renamed} };
+    const blobs = [_]model.FileBlob{.{ .old = "a\nb\nc\nd\ne\n", .new = whole_file_blob }};
+    const projected = try buildWithComments(a, diff, .side_by_side, &.{}, .{
+        .whole_file = true,
+        .selected_version = .old,
+        .blobs = &blobs,
+    });
+
+    try testing.expectEqualStrings("old.txt", projected.rows[0].file_header.path);
+    try testing.expectEqual(SelectedVersion.old, projected.selected_column.?.version);
+    try testing.expectEqual(InnerGutterEdge.right, projected.selected_column.?.inner_gutter_edge);
+    try testing.expectEqual(@as(usize, 0), countKind(projected, .hunk_header));
+    try testing.expectEqual(@as(usize, 6), countKind(projected, .line_pair));
+
+    const leading = projected.rows[1].line_pair;
+    try testing.expectEqualStrings("a", leading.left.?.line.text);
+    try testing.expectEqualStrings("a", leading.right.?.line.text);
+    try testing.expect(!leading.left.?.line.in_hunk and !leading.right.?.line.in_hunk);
+    try testing.expectEqual(@as(?u32, 1), leading.left.?.line.oldNo());
+    try testing.expectEqual(@as(?u32, 1), leading.right.?.line.newNo());
+
+    try testing.expectEqual(&renamed.hunks[0].lines[1], projected.rows[3].line_pair.left.?.line);
+    try testing.expect(projected.rows[3].line_pair.right == null);
+    try testing.expect(projected.rows[4].line_pair.left == null);
+    try testing.expectEqual(&renamed.hunks[0].lines[2], projected.rows[4].line_pair.right.?.line);
+
+    const trailing = projected.rows[6].line_pair;
+    try testing.expectEqualStrings("e", trailing.left.?.line.text);
+    try testing.expectEqualStrings("e", trailing.right.?.line.text);
+    try testing.expect(!trailing.left.?.line.in_hunk and !trailing.right.?.line.in_hunk);
+}
+
+test "SideBySide Changes publishes Selected Version column accent metadata" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try parse(a, whole_file_diff);
+
+    const projected = try buildWithComments(a, diff, .side_by_side, &.{}, .{
+        .selected_version = .old,
+    });
+
+    try testing.expectEqual(SelectedVersion.old, projected.selected_column.?.version);
+    try testing.expectEqual(InnerGutterEdge.right, projected.selected_column.?.inner_gutter_edge);
+}
+
+test "SideBySide WholeFile pairs gaps before between and after Hunks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try parse(a,
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -2 +2 @@
+        \\-old b
+        \\+new b
+        \\@@ -4 +4 @@
+        \\-old d
+        \\+new d
+    );
+    const blobs = [_]model.FileBlob{.{
+        .old = "a\nold b\nc\nold d\ne\n",
+        .new = "a\nnew b\nc\nnew d\ne\n",
+    }};
+    const projected = try buildWithComments(a, diff, .side_by_side, &.{}, .{ .whole_file = true, .blobs = &blobs });
+
+    var paired_gaps: usize = 0;
+    for (projected.rows) |row| if (row == .line_pair and row.line_pair.left != null and row.line_pair.right != null) {
+        const left = row.line_pair.left.?.line;
+        const right = row.line_pair.right.?.line;
+        if (!left.in_hunk and !right.in_hunk) {
+            paired_gaps += 1;
+            try testing.expectEqualStrings(left.text, right.text);
+            try testing.expectEqual(left.oldNo(), right.newNo());
+        }
+    };
+    try testing.expectEqual(@as(usize, 3), paired_gaps);
+}
+
+test "SideBySide WholeFile keeps usable content beside each independent version state" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const modified = try parse(a, whole_file_diff);
+    const new_blob = [_]model.FileBlob{.{ .new = whole_file_blob }};
+    const unavailable_cases = [_]struct {
+        status: ?model.FileContentStatus,
+        tag: std.meta.Tag(VersionContentState),
+    }{
+        .{ .status = null, .tag = .loading },
+        .{ .status = .{ .binary = 7 }, .tag = .binary },
+        .{ .status = .{ .unavailable = .{ .reason = .invalid_utf8 } }, .tag = .unavailable },
+        .{ .status = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NotFound } } }, .tag = .unavailable },
+    };
+    for (unavailable_cases) |case| {
+        const statuses = [_]model.FileContent{.{ .old = case.status, .new = .{ .text = whole_file_blob.len } }};
+        const projected = try buildWithComments(a, modified, .side_by_side, &.{}, .{
+            .whole_file = true,
+            .blobs = &new_blob,
+            .content_statuses = &statuses,
+        });
+        try testing.expectEqual(case.tag, std.meta.activeTag(projected.rows[1].status_placeholder.old.?));
+        try testing.expectEqual(@as(usize, 6), countKind(projected, .line_pair));
+        for (projected.rows) |row| if (row == .line_pair and row.line_pair.left != null) try testing.expect(row.line_pair.left.?.line.in_hunk);
+    }
+
+    const old_blob = [_]model.FileBlob{.{ .old = "a\nb\nc\nd\ne\n" }};
+    const new_unavailable = [_]model.FileContent{.{
+        .old = .{ .text = 10 },
+        .new = .{ .unavailable = .{ .byte_size = 9, .reason = .invalid_utf8 } },
+    }};
+    const old_only = try buildWithComments(a, modified, .side_by_side, &.{}, .{
+        .whole_file = true,
+        .blobs = &old_blob,
+        .content_statuses = &new_unavailable,
+    });
+    try testing.expectEqual(std.meta.Tag(VersionContentState).unavailable, std.meta.activeTag(old_only.rows[1].status_placeholder.new.?));
+    try testing.expectEqual(@as(usize, 6), countKind(old_only, .line_pair));
+    for (old_only.rows) |row| if (row == .line_pair and row.line_pair.right != null) try testing.expect(row.line_pair.right.?.line.in_hunk);
+
+    const empty_blobs = [_]model.FileBlob{.{ .old = "", .new = whole_file_blob }};
+    const empty = try buildWithComments(a, modified, .side_by_side, &.{}, .{ .whole_file = true, .blobs = &empty_blobs });
+    try testing.expectEqual(std.meta.Tag(VersionContentState).empty, std.meta.activeTag(empty.rows[1].status_placeholder.old.?));
+    try testing.expectEqual(@as(usize, 6), countKind(empty, .line_pair));
+    for (empty.rows) |row| if (row == .line_pair and row.line_pair.left != null) try testing.expect(row.line_pair.left.?.line.in_hunk);
+
+    const added = try parse(a,
+        \\diff --git a/new.txt b/new.txt
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/new.txt
+        \\@@ -0,0 +1,2 @@
+        \\+one
+        \\+two
+    );
+    const added_blobs = [_]model.FileBlob{.{ .new = "one\ntwo\n" }};
+    const added_projection = try buildWithComments(a, added, .side_by_side, &.{}, .{ .whole_file = true, .blobs = &added_blobs });
+    try testing.expectEqual(std.meta.Tag(VersionContentState).absent, std.meta.activeTag(added_projection.rows[1].status_placeholder.old.?));
+    try testing.expectEqual(@as(usize, 2), countKind(added_projection, .line_pair));
+    for (added_projection.rows) |row| if (row == .line_pair) {
+        try testing.expect(row.line_pair.left == null);
+        try testing.expect(row.line_pair.right != null);
+    };
+}
+
+test "SideBySide WholeFile places native inline File and Outdated ReviewCards once" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try parse(a, whole_file_diff);
+    const blobs = [_]model.FileBlob{.{ .old = "a\nb\nc\nd\ne\n", .new = whole_file_blob }};
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "old", .anchor = .{ .path = "a.txt", .from = 3 } },
+        .{ .id = 2, .author = "Bo", .body = "new", .anchor = .{ .path = "a.txt", .to = 3 } },
+        .{ .id = 3, .author = "Cy", .body = "file", .scope = .{ .file = .{ .path = "a.txt", .source_commit = "c" } } },
+        .{ .id = 4, .author = "Di", .body = "outdated", .anchor = .{ .path = "a.txt", .to = 9 }, .state = .outdated },
+    };
+    const threads = try bbr.review.thread.build(a, &comments);
+    const projected = try buildWithComments(a, diff, .side_by_side, threads, .{
+        .whole_file = true,
+        .blobs = &blobs,
+        .expanded_disclosures = &.{.{ .outdated_file = &diff.files[0] }},
+    });
+
+    var counts = [_]usize{0} ** 4;
+    var latest_pair: ?LinePair = null;
+    for (projected.rows) |row| switch (row) {
+        .line_pair => |pair| latest_pair = pair,
+        .comment => |card| if (card.part == .header) {
+            const id = card.commentItem().id;
+            counts[id - 1] += 1;
+            if (id == 1) try testing.expectEqual(&diff.files[0].hunks[0].lines[1], latest_pair.?.left.?.line);
+            if (id == 2) try testing.expectEqual(&diff.files[0].hunks[0].lines[2], latest_pair.?.right.?.line);
+        },
+        else => {},
+    };
+    try testing.expectEqual([_]usize{ 1, 1, 1, 1 }, counts);
+
+    const new_only = [_]model.FileBlob{.{ .new = whole_file_blob }};
+    const statuses = [_]model.FileContent{.{
+        .old = .{ .unavailable = .{ .reason = .invalid_utf8 } },
+        .new = .{ .text = whole_file_blob.len },
+    }};
+    const partial = try buildWithComments(a, diff, .side_by_side, threads, .{
+        .whole_file = true,
+        .blobs = &new_only,
+        .content_statuses = &statuses,
+        .expanded_disclosures = &.{.{ .outdated_file = &diff.files[0] }},
+    });
+    counts = [_]usize{0} ** 4;
+    latest_pair = null;
+    for (partial.rows) |row| switch (row) {
+        .line_pair => |pair| latest_pair = pair,
+        .comment => |card| if (card.part == .header) {
+            const id = card.commentItem().id;
+            counts[id - 1] += 1;
+            if (id == 1) try testing.expectEqual(&diff.files[0].hunks[0].lines[1], latest_pair.?.left.?.line);
+        },
+        else => {},
+    };
+    try testing.expectEqual([_]usize{ 1, 1, 1, 1 }, counts);
+}
+
+test "Unified WholeFile names every selected-version content state without fallback" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed = try parse(a, whole_file_diff);
+    const file = parsed.files[0];
+    const cases = [_]struct { status: model.FileContentStatus, tag: std.meta.Tag(VersionContentState) }{
+        .{ .status = .{ .binary = 12 }, .tag = .binary },
+        .{ .status = .{ .binary = null }, .tag = .binary },
+        .{ .status = .{ .unavailable = .{ .byte_size = 8, .reason = .invalid_utf8 } }, .tag = .unavailable },
+        .{ .status = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NotFound } } }, .tag = .unavailable },
+    };
+    for (cases) |case| {
+        const statuses = [_]model.FileContent{.{ .old = .{ .text = 5 }, .new = case.status }};
+        const projected = try buildWithComments(a, .{ .files = &.{file} }, .unified, &.{}, .{
+            .whole_file = true,
+            .content_statuses = &statuses,
+            .blobs = &.{.{ .old = "other" }},
+        });
+        try testing.expectEqual(case.tag, std.meta.activeTag(projected.rows[1].status_placeholder.new.?));
+        try testing.expectEqual(@as(usize, 0), countKind(projected, .line));
+    }
+
+    const old_statuses = [_]model.FileContent{.{ .old = .{ .text = 5 }, .new = .{ .text = 9 } }};
+    const old = try buildWithComments(a, .{ .files = &.{file} }, .unified, &.{}, .{
+        .whole_file = true,
+        .selected_version = .old,
+        .content_statuses = &old_statuses,
+    });
+    try testing.expectEqual(@as(?usize, 5), old.rows[1].status_placeholder.old.?.loading);
 }
 
 test "whole_file splices removed Files from old content without changing Hunk Lines" {
@@ -2529,7 +3092,7 @@ test "whole_file splices removed Files from old content without changing Hunk Li
     const comments = [_]Comment{.{ .id = 1, .author = "Ada", .body = "gap?", .anchor = .{ .path = "gone.txt", .from = 1 } }};
     const threads = try bbr.review.thread.build(a, &comments);
     const drafts = [_]Draft{.{ .local_id = 1, .kind = .comment, .body = "gap draft", .anchor = .{ .path = "gone.txt", .from = 4, .commit = "base" } }};
-    const buf = try buildWithComments(a, diff, .unified, threads, .{ .whole_file = true, .blobs = &blobs, .drafts = &drafts });
+    const buf = try buildWithComments(a, diff, .unified, threads, .{ .whole_file = true, .selected_version = .old, .blobs = &blobs, .drafts = &drafts });
 
     try testing.expectEqual(@as(usize, 0), countKind(buf, .hunk_header));
     try testing.expectEqual(@as(usize, 4), countKind(buf, .line));
@@ -2544,25 +3107,35 @@ test "whole_file splices removed Files from old content without changing Hunk Li
     try testing.expectEqual(@as(usize, 0), countKind(buf, .comment));
     try testing.expectEqual(SectionKind.pending, buf.rows[5].section.kind);
     try testing.expect(buf.rows[6] == .draft);
+    for (5..buf.rows.len) |row| try testing.expectEqual(@as(?usize, null), buf.fileIndexForRow(row));
 
     const split = try buildWithComments(a, diff, .side_by_side, &.{}, .{ .whole_file = true, .blobs = &blobs });
-    try testing.expect(split.rows[1].line_pair.left != null);
-    try testing.expect(split.rows[1].line_pair.right == null);
-    try testing.expect(split.rows[4].line_pair.left != null);
-    try testing.expect(split.rows[4].line_pair.right == null);
+    try testing.expectEqual(std.meta.Tag(VersionContentState).absent, std.meta.activeTag(split.rows[1].status_placeholder.new.?));
+    try testing.expect(split.rows[2].line_pair.left != null);
+    try testing.expect(split.rows[2].line_pair.right == null);
+    try testing.expect(split.rows[5].line_pair.left != null);
+    try testing.expect(split.rows[5].line_pair.right == null);
 }
 
-test "whole_file with no blob falls back to the fetched per-hunk rendering" {
+test "Unified WholeFile does not fall back when selected content is loading" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     const diff = try parse(a, whole_file_diff);
-    // whole_file on, but no blobs loaded → per-hunk path (hunk header present).
-    const buf = try buildWithComments(a, diff, .unified, &.{}, .{ .whole_file = true });
-    try testing.expectEqual(@as(usize, 1), countKind(buf, .hunk_header));
-    // Only the fetched lines (b, c, CHANGED, d) — no blob gap lines.
-    try testing.expectEqual(@as(usize, 4), countKind(buf, .line));
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "old", .anchor = .{ .path = "a.txt", .from = 3 } },
+        .{ .id = 2, .author = "Bo", .body = "new", .anchor = .{ .path = "a.txt", .to = 3 } },
+    };
+    const threads = try bbr.review.thread.build(a, &comments);
+    const buf = try buildWithComments(a, diff, .unified, threads, .{ .whole_file = true });
+    try testing.expectEqual(@as(usize, 0), countKind(buf, .hunk_header));
+    try testing.expectEqual(@as(usize, 0), countKind(buf, .line));
+    try testing.expectEqual(std.meta.Tag(VersionContentState).loading, std.meta.activeTag(buf.rows[1].status_placeholder.new.?));
+    try testing.expectEqual(@as(usize, 1), countKind(buf, .comment));
+    for (buf.rows) |row| if (row == .disclosure and row.disclosure.kind == .opposite_version) {
+        try testing.expectEqual(@as(usize, 1), row.disclosure.count);
+    };
 }
 
 test "whole_file treats empty text content as a complete zero-Line File" {
@@ -2584,6 +3157,7 @@ test "whole_file treats empty text content as a complete zero-Line File" {
     try testing.expectEqual(@as(usize, 1), countKind(buf, .file_header));
     try testing.expectEqual(@as(usize, 0), countKind(buf, .hunk_header));
     try testing.expectEqual(@as(usize, 0), countKind(buf, .line));
+    try testing.expectEqual(std.meta.Tag(VersionContentState).empty, std.meta.activeTag(buf.rows[1].status_placeholder.new.?));
 }
 
 test "whole_file anchors bind only to hunk lines, never blob gaps" {

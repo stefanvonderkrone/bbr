@@ -17,6 +17,10 @@ _Avoid_: PullRequest header, comparison string, byline.
 The lazily acquired old/new full-file content and Highlighting attached to a File during a Session. Each side becomes available independently; failure on one side does not suppress usable content from the other.
 _Avoid_: blob load, highlight job, hydration.
 
+**Selected Version**:
+The review-wide choice of old or new File content for version-specific inspection and source Actions. It defaults to new and survives Session replacement within one process. It resets when the application restarts. It does not change a Line's old or new identity. It also does not select a SideBySide column as an Anchor target.
+_Avoid_: selected side, active side, Anchor side.
+
 **Pane**:
 A tiled region of the screen with a defined role (Sidebar, DiffPane, ThreadPane). Panes tile; they do not overlap.
 _Avoid_: window (reserved for vaxis's surface), view, panel.
