@@ -1,0 +1,32 @@
+# M21 Buffer and Review Search
+
+Label: wayfinder:map
+
+## Destination
+
+An implementation-ready M21 specification and dependency map for Buffer Search and Review Search, without implementing the milestone.
+
+## Notes
+
+- Primary domains: Presentation and Diff. Review owns authored bodies. Bitbucket and Git supply remote and local File Enrichment. Consult `CONTEXT-MAP.md`, each domain's `CONTEXT.md`, `TODO.md`, and the M20 Selected Version contract.
+- Use `prototype`, `grilling`, `domain-modeling`, `technical-writing`, and `zig` as each ticket requires.
+- Treat the M21 entries in `TODO.md` as requirements that tickets can refine when a conflict appears.
+- Buffer Search examines old and new source Lines in the current Buffer. A shared context Line counts once in Unified and SideBySide Layouts.
+- Buffer Search includes every authored Comment, Reply, and Draft body. It includes text behind ReviewCard, Thread, and Fold disclosures. Activating a hidden match reveals its owner.
+- Review Search examines both old and new versions of every changed File. Selected Version does not limit its corpus.
+- Review Search keeps version-specific changed occurrences separate. It coalesces equivalent unchanged old and new occurrences into one version-neutral result.
+- Both searches must reject generated Presentation text such as gutters, borders, headers, and disclosure labels.
+- This map plans M21 only. It does not implement M21.
+
+## Decisions so far
+
+## Not yet specified
+
+- The implementation slices and full acceptance matrix depend on the interaction prototypes, occurrence model, and streaming policy.
+
+## Out of scope
+
+- Implementing M21. This map ends at an implementation-ready specification.
+- Regular-expression search, text replacement, and repository-wide search.
+- Searching unchanged Files outside the current Review.
+- A persistent search index or search history across application restarts.

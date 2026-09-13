@@ -50,7 +50,7 @@ The `/`-initiated search over semantic text in the current DiffPane Buffer. It h
 _Avoid_: Review Search (crosses File boundaries), find (the Action has defined search semantics).
 
 **Review Search**:
-The Overlay for fuzzy-searching occurrences across the selected version of every changed File in the current remote PullRequest or LocalReview. Results stream as File Enrichment arrives and retain exact source locations for preview and navigation.
+The Overlay for fuzzy-searching occurrences across both old and new versions of every changed File in the current remote PullRequest or LocalReview. Results stream as File Enrichment arrives and retain exact source locations for preview and navigation. Selected Version does not limit Review Search.
 _Avoid_: Pull Request search (also applies to LocalReview), repository search (only changed Files participate), Picker (switches PullRequests).
 
 **Composer**:
