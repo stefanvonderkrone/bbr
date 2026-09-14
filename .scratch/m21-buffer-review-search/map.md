@@ -21,6 +21,7 @@ An implementation-ready M21 specification and dependency map for Buffer Search a
 ## Decisions so far
 
 - [Define Search Corpus and Occurrence Identity](issues/01-define-search-corpus-and-occurrence-identity.md) — Buffer Search covers current Buffer semantics; Review Search covers complete File versions and all authored bodies through Session-scoped occurrences.
+- [Define Buffer Search Interaction](issues/02-define-buffer-search-interaction.md) — Buffer Search uses Neovim-style incremental input, semantic occurrence traversal, temporary disclosure reveal, and configurable `/`, `n`, and `N` Actions.
 
 ## Not yet specified
 
