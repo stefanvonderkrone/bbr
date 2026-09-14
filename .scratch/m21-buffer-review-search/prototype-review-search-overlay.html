@@ -1,0 +1,827 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prototype: Review Search Overlay</title>
+  <!-- Three Review Search Overlay variants, switchable with ?variant=A|B|C. -->
+  <style>
+    :root {
+      color-scheme: dark;
+      --page: #0d0e12;
+      --terminal: #17171d;
+      --surface: #20202a;
+      --surface-2: #292936;
+      --surface-3: #111218;
+      --border: #626474;
+      --soft-border: #393b48;
+      --text: #d7d7dc;
+      --muted: #8d8f9d;
+      --blue: #6c9cd0;
+      --cyan: #75d7d0;
+      --green: #98c379;
+      --yellow: #e5c07b;
+      --orange: #ff9f43;
+      --red: #e06c75;
+      --purple: #c586c0;
+      --old-bg: #32191c;
+      --new-bg: #18301f;
+      --comment-bg: #222032;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 10% 0%, #20243a 0, transparent 34rem),
+        var(--page);
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    .prototype-shell { width: min(1500px, calc(100vw - 36px)); margin: 24px auto 105px; }
+    .prototype-header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 24px;
+      align-items: end;
+      margin-bottom: 14px;
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      color: #f7f7f9;
+      font: 700 clamp(22px, 3vw, 34px)/1.1 Inter, ui-sans-serif, system-ui, sans-serif;
+      letter-spacing: -0.035em;
+    }
+
+    .purpose, .case-note {
+      margin: 0;
+      color: #999ba8;
+      font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif;
+    }
+
+    .case-note { min-height: 22px; margin-top: 10px; }
+    .cases { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+    .cases button, .stream-button {
+      border: 1px solid #3a3b48;
+      border-radius: 6px;
+      background: #181920;
+      color: #bfc0cb;
+      padding: 8px 10px;
+      font-size: 12px;
+    }
+
+    button:hover { border-color: #737688; color: white; }
+    button[aria-pressed="true"] { border-color: var(--blue); background: #242b38; color: white; }
+    .terminal-wrap { overflow-x: auto; padding: 2px; }
+    .terminal {
+      position: relative;
+      container: terminal / size;
+      width: 100%;
+      min-width: 640px;
+      height: min(760px, calc(100vh - 210px));
+      min-height: 570px;
+      overflow: hidden;
+      border: 1px solid #343641;
+      border-radius: 10px;
+      background: var(--terminal);
+      box-shadow: 0 24px 70px #0008, inset 0 1px #ffffff08;
+      transition: width 180ms ease;
+    }
+
+    .terminal.narrow { width: 620px; min-width: 620px; height: 720px; }
+    .app { height: calc(100% - 28px); opacity: .48; filter: saturate(.75); }
+    .review-title {
+      height: 30px;
+      border-bottom: 1px solid var(--border);
+      padding: 0 11px;
+      line-height: 29px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .review-title .version { float: right; color: var(--blue); }
+    .app-grid { display: grid; grid-template-columns: 225px minmax(0, 1fr); height: calc(100% - 30px); }
+    .sidebar { border-right: 1px solid var(--border); padding: 7px 0; font-size: 12px; line-height: 23px; }
+    .tree-row { height: 23px; padding: 0 10px; white-space: nowrap; overflow: hidden; }
+    .tree-row.active { background: #303040; color: white; font-weight: 700; }
+    .modified { color: var(--yellow); }
+    .added { color: var(--green); }
+    .diff { padding: 8px 0; font-size: 12px; line-height: 21px; overflow: hidden; }
+    .diff-line { display: grid; grid-template-columns: 44px 44px minmax(0, 1fr); padding-right: 12px; white-space: pre; }
+    .diff-line .no { color: var(--muted); text-align: right; padding-right: 8px; }
+    .diff-line.add { background: var(--new-bg); }
+    .diff-line.remove { background: var(--old-bg); }
+    .diff-line.hunk { display: block; color: var(--blue); padding-left: 10px; }
+    .status-line { height: 28px; border-top: 1px solid #3d3e49; color: #9b9cab; font-size: 12px; line-height: 27px; padding: 0 10px; }
+    .status-line .right { float: right; }
+
+    .scrim { position: absolute; inset: 0 0 28px; background: #07080ca0; }
+    .overlay {
+      position: absolute;
+      z-index: 3;
+      inset: 7% 4% calc(7% + 28px);
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      border: 1px solid #8b8d9c;
+      background: var(--surface);
+      box-shadow: 0 24px 70px #000d;
+      overflow: hidden;
+    }
+
+    .overlay-head {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 10px;
+      min-height: 43px;
+      padding: 7px 10px;
+      border-bottom: 1px solid var(--border);
+      background: #1b1c24;
+    }
+
+    .search-title { color: white; font-weight: 800; }
+    .search-prompt { color: var(--cyan); font-weight: 900; }
+    .query-wrap { display: flex; align-items: center; min-width: 0; }
+    .query {
+      width: 100%;
+      min-width: 0;
+      border: 0;
+      outline: 0;
+      background: transparent;
+      color: white;
+      padding: 3px 6px;
+    }
+
+    .summary { color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .overlay-body { display: grid; min-height: 0; }
+    .results, .preview { min-width: 0; min-height: 0; overflow: auto; }
+    .results { border-right: 1px solid var(--border); }
+    .results-head, .preview-head {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      min-height: 27px;
+      border-bottom: 1px solid var(--soft-border);
+      background: #1b1c24;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 26px;
+      padding: 0 9px;
+    }
+
+    .preview-head .right { float: right; }
+    .result {
+      position: relative;
+      border: 0;
+      border-bottom: 1px solid #30313d;
+      background: transparent;
+      color: var(--text);
+      text-align: left;
+      width: 100%;
+      min-width: 0;
+    }
+
+    .result:hover { background: #292a36; }
+    .result.selected { background: #343747; box-shadow: inset 3px 0 var(--blue); color: white; }
+    .result mark, .preview mark { background: #916f22; color: #fff; font-weight: 800; }
+    .result.selected mark, .preview .active-hit { background: var(--orange); color: #19120b; }
+    .badge {
+      display: inline-block;
+      min-width: 34px;
+      border: 1px solid #4c4e5b;
+      border-radius: 3px;
+      padding: 1px 4px;
+      color: #c6c7cf;
+      font-size: 10px;
+      text-align: center;
+    }
+
+    .badge.old { color: #ef8b91; border-color: #824149; }
+    .badge.new { color: #9bd494; border-color: #496c4c; }
+    .badge.both { color: #8fc7ea; border-color: #466a81; }
+    .badge.body { color: #d5a6e6; border-color: #745681; }
+    .path, .owner { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .snippet { overflow: hidden; color: #bfc0c8; }
+    .position { color: var(--muted); white-space: nowrap; }
+    .preview-card { padding: 13px 15px 18px; }
+    .preview-meta { display: flex; flex-wrap: wrap; gap: 7px 12px; margin-bottom: 11px; color: var(--muted); font-size: 11px; }
+    .preview-path { color: white; font-weight: 700; overflow-wrap: anywhere; }
+    .code-frame, .body-frame {
+      border: 1px solid #3d3f4d;
+      background: var(--surface-3);
+      overflow: auto;
+      font-size: 12px;
+      line-height: 21px;
+    }
+
+    .code-row { display: grid; grid-template-columns: 42px minmax(max-content, 1fr); min-width: max-content; }
+    .code-row .line-no { color: var(--muted); text-align: right; padding-right: 9px; user-select: none; }
+    .code-row .code { padding-right: 16px; white-space: pre; }
+    .code-row.active { background: #292b38; box-shadow: inset 3px 0 var(--blue); }
+    .body-frame { padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .context-label { margin: 12px 0 5px; color: var(--yellow); font-size: 11px; font-weight: 800; }
+    .state-list { padding: 9px; }
+    .state-row { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 7px; padding: 7px 6px; color: var(--muted); font-size: 11px; }
+    .state-row.error { color: #ef9aa0; }
+    .state-row .spinner { color: var(--cyan); }
+    .empty { display: grid; place-items: center; height: calc(100% - 27px); color: var(--muted); text-align: center; padding: 24px; }
+    .empty strong { display: block; color: white; margin-bottom: 7px; }
+    .overlay-foot {
+      min-height: 31px;
+      border-top: 1px solid var(--border);
+      background: #171820;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 30px;
+      padding: 0 10px;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+
+    .overlay-foot kbd { color: var(--text); font-family: inherit; }
+    .overlay-foot .right { float: right; }
+    .stream-button { margin-left: 7px; padding: 4px 7px; color: var(--cyan); }
+
+    /* A favors quick scanning. Compact result cards leave a balanced preview. */
+    .variant-A .overlay-body { grid-template-columns: minmax(330px, 43%) minmax(0, 57%); }
+    .variant-A .result { display: grid; grid-template-columns: 58px minmax(0, 1fr) auto; gap: 8px; padding: 8px 9px; }
+    .variant-A .result .result-main { min-width: 0; }
+    .variant-A .result .snippet { margin-top: 3px; white-space: nowrap; text-overflow: ellipsis; }
+    .variant-A .result .position { align-self: center; font-size: 10px; }
+
+    /* B treats result metadata as a table. It gives comparison more width. */
+    .variant-B .overlay-body { grid-template-columns: minmax(430px, 57%) minmax(0, 43%); }
+    .variant-B .results-head { display: grid; grid-template-columns: 56px minmax(140px, 1fr) 84px; gap: 7px; }
+    .variant-B .result { display: grid; grid-template-columns: 56px minmax(140px, 1fr) 84px; gap: 7px; align-items: center; padding: 6px 8px; }
+    .variant-B .result-main { display: contents; }
+    .variant-B .result .path, .variant-B .result .owner { grid-column: 2; grid-row: 1; }
+    .variant-B .result .snippet { display: none; }
+    .variant-B .result .position { grid-column: 3; grid-row: 1; font-size: 10px; }
+    .variant-B .preview-card { padding: 9px; }
+
+    /* C gives context most of the Overlay. Results become a grouped locator rail. */
+    .variant-C .overlay-body { grid-template-columns: minmax(245px, 30%) minmax(0, 70%); }
+    .variant-C .results-head { color: var(--cyan); text-transform: uppercase; letter-spacing: .08em; }
+    .variant-C .result { display: grid; grid-template-columns: 8px minmax(0, 1fr); gap: 6px; padding: 8px 9px; }
+    .variant-C .result .badge { min-width: 0; width: 6px; height: 22px; padding: 0; border: 0; border-radius: 2px; font-size: 0; background: #747784; }
+    .variant-C .result .badge.old { background: var(--red); }
+    .variant-C .result .badge.new { background: var(--green); }
+    .variant-C .result .badge.both { background: var(--blue); }
+    .variant-C .result .badge.body { background: var(--purple); }
+    .variant-C .result-main { min-width: 0; }
+    .variant-C .result .snippet { display: none; }
+    .variant-C .result .position { grid-column: 2; font-size: 10px; margin-top: 3px; }
+    .variant-C .preview-card { padding: 17px 19px; }
+
+    .switcher {
+      position: fixed;
+      z-index: 20;
+      left: 50%;
+      bottom: 20px;
+      transform: translateX(-50%);
+      display: grid;
+      grid-template-columns: 38px minmax(230px, auto) 38px;
+      align-items: center;
+      border: 1px solid #646777;
+      border-radius: 999px;
+      background: #f4f4f6;
+      color: #171820;
+      box-shadow: 0 12px 42px #000b;
+      overflow: hidden;
+      font: 13px/1 Inter, ui-sans-serif, system-ui, sans-serif;
+    }
+
+    .switcher button { height: 38px; border: 0; background: transparent; color: #171820; font-size: 17px; }
+    .switcher button:hover { background: #dadbe1; }
+    .switcher-label { padding: 0 12px; text-align: center; font-weight: 700; }
+
+    .terminal.narrow .overlay { inset-inline: 2%; }
+    .terminal.narrow .search-title { display: none; }
+    .terminal.narrow .summary { max-width: 115px; overflow: hidden; text-overflow: ellipsis; }
+    .terminal.narrow .overlay-foot .optional { display: none; }
+
+    @container terminal (orientation: portrait) {
+      .overlay-body {
+        grid-template-columns: minmax(0, 1fr) !important;
+        grid-template-rows: minmax(150px, 42%) minmax(0, 58%);
+      }
+
+      .results {
+        border-right: 0;
+        border-bottom: 1px solid var(--border);
+      }
+    }
+
+    @media (max-width: 760px) {
+      .prototype-shell { width: calc(100vw - 18px); margin-top: 14px; }
+      .prototype-header { grid-template-columns: 1fr; gap: 10px; }
+      .cases { justify-content: flex-start; }
+      .terminal { height: 620px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="prototype-shell">
+    <header class="prototype-header">
+      <div>
+        <h1>Review Search Overlay</h1>
+        <p class="purpose">Compare result scanning, context preview, streamed state, and exact occurrence selection. Type a fuzzy query.</p>
+      </div>
+      <nav class="cases" aria-label="Prototype cases"></nav>
+    </header>
+
+    <div class="terminal-wrap">
+      <section class="terminal" aria-label="bbr terminal prototype">
+        <div class="app">
+          <div class="review-title">PR #2041 · Keep streamed search results stable <span class="version">g&lt; OLD · NEW g&gt;</span></div>
+          <div class="app-grid">
+            <aside class="sidebar">
+              <div class="tree-row"> ▾ src</div>
+              <div class="tree-row active"> › <span class="modified">M</span> tui/search.zig</div>
+              <div class="tree-row">   <span class="modified">M</span> tui/app.zig</div>
+              <div class="tree-row">   <span class="added">A</span> diff/fuzzy.zig</div>
+              <div class="tree-row"> ▾ docs</div>
+              <div class="tree-row">   <span class="modified">M</span> search.md</div>
+            </aside>
+            <div class="diff">
+              <div class="diff-line hunk">@@ -142,7 +142,12 @@ fn publishResults</div>
+              <div class="diff-line"><span class="no">142</span><span class="no">142</span><span>const previous = state.selected;</span></div>
+              <div class="diff-line remove"><span class="no">143</span><span class="no"></span><span>- state.results = batch;</span></div>
+              <div class="diff-line add"><span class="no"></span><span class="no">143</span><span>+ state.results = sort(all_results);</span></div>
+              <div class="diff-line add"><span class="no"></span><span class="no">144</span><span>+ state.selected = retain(previous);</span></div>
+              <div class="diff-line"><span class="no">145</span><span class="no">146</span><span>render(frame);</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="scrim"></div>
+        <section class="overlay" aria-label="Review Search">
+          <header class="overlay-head">
+            <span class="search-title">Review Search</span>
+            <label class="query-wrap"><span class="search-prompt">&gt;</span><input class="query" aria-label="Review Search query" autocomplete="off" spellcheck="false"></label>
+            <span class="summary"></span>
+          </header>
+          <div class="overlay-body">
+            <section class="results" aria-label="Search results">
+              <div class="results-head"></div>
+              <div class="result-list"></div>
+            </section>
+            <section class="preview" aria-label="Selected occurrence preview">
+              <div class="preview-head">Preview <span class="right"></span></div>
+              <div class="preview-content"></div>
+            </section>
+          </div>
+          <footer class="overlay-foot">
+            <kbd>↑↓</kbd>/<kbd>ctrl-p n</kbd> select · <kbd>enter</kbd> open · <kbd>esc</kbd> close
+            <span class="optional"> · click select · double-click open</span>
+            <span class="right"><kbd>g f</kbd> Review Search</span>
+          </footer>
+        </section>
+        <footer class="status-line">NORMAL · Unified · Changes <span class="right">? help</span></footer>
+      </section>
+    </div>
+    <p class="case-note"></p>
+  </main>
+
+  <div class="switcher" aria-label="Prototype variant switcher">
+    <button type="button" data-cycle="-1" aria-label="Previous variant">←</button>
+    <div class="switcher-label"></div>
+    <button type="button" data-cycle="1" aria-label="Next variant">→</button>
+  </div>
+
+  <script>
+    const variants = {
+      A: "Balanced navigator",
+      B: "Dense result table",
+      C: "Context-first preview"
+    };
+
+    const allResults = [
+      {
+        id: "new-search-143",
+        kind: "new",
+        label: "NEW",
+        path: "src/tui/search.zig",
+        position: "L143:C18",
+        line: 143,
+        text: "state.results = publishSorted(all_results);",
+        context: [
+          "const previous = state.selected;",
+          "state.results = publishSorted(all_results);",
+          "state.selected = retainOccurrence(previous, state.results);"
+        ]
+      },
+      {
+        id: "body-comment-311",
+        kind: "body",
+        label: "COMMENT",
+        owner: "mina · Comment 311",
+        scope: "inline · src/tui/app.zig:884",
+        position: "body L2:C5",
+        line: 2,
+        text: "Do not publish a partial result list before the Session Epoch check.",
+        body: "The loading state looks good.\nDo not publish a partial result list before the Session Epoch check.\nA stale worker must leave the current selection alone."
+      },
+      {
+        id: "both-order-88",
+        kind: "both",
+        label: "OLD+NEW",
+        path: "src/diff/fuzzy.zig",
+        position: "L88:C12",
+        line: 88,
+        text: "pub fn canonicalOrder(left: Occurrence, right: Occurrence) bool {",
+        context: [
+          "/// Stable tie order for streamed publication.",
+          "pub fn canonicalOrder(left: Occurrence, right: Occurrence) bool {",
+          "    return left.corpus_key.lessThan(right.corpus_key);"
+        ]
+      },
+      {
+        id: "old-worker-201",
+        kind: "old",
+        label: "OLD",
+        path: "src/tui/app.zig",
+        position: "L201:C9",
+        line: 201,
+        text: "worker.publish(batch) catch return error.SearchFailed;",
+        context: [
+          "const batch = try worker.collect();",
+          "worker.publish(batch) catch return error.SearchFailed;",
+          "state.loading_files -= 1;"
+        ]
+      },
+      {
+        id: "body-draft-18",
+        kind: "body",
+        label: "DRAFT",
+        owner: "you · Draft 18",
+        scope: "File · src/tui/search.zig",
+        position: "body L1:C1",
+        line: 1,
+        text: "Publish each complete sorted snapshot. Keep the selected occurrence by identity.",
+        body: "Publish each complete sorted snapshot. Keep the selected occurrence by identity.\n\nThe arrival order must not move the reviewer's target."
+      },
+      {
+        id: "long-path-57",
+        kind: "new",
+        label: "NEW",
+        path: "src/presentation/review_search/streaming/file_enrichment/publication_coordinator.zig",
+        position: "L57:C28",
+        line: 57,
+        text: "const publication = buildGloballySortedPublication(allocator, completed_files, authored_bodies, selected_occurrence);",
+        context: [
+          "const completed_files = state.completed.items;",
+          "const publication = buildGloballySortedPublication(allocator, completed_files, authored_bodies, selected_occurrence);",
+          "try events.post(.{ .search_results = publication });"
+        ]
+      },
+      {
+        id: "body-long-91",
+        kind: "body",
+        label: "REPLY",
+        owner: "ari · Reply 91",
+        scope: "Review",
+        position: "body L3:C19",
+        line: 3,
+        text: "When the next file publishes a better match, preserve this selected occurrence even when its row moves.",
+        body: "I tested this with a slow remote File Enrichment request.\nThe first result arrived while I was reading the preview.\nWhen the next file publishes a better match, preserve this selected occurrence even when its row moves. The preview must not jump to the first row."
+      }
+    ];
+
+    const cases = {
+      ready: {
+        label: "Ready",
+        query: "pub",
+        note: "Complete and partial File content contributes exact source and ReviewBody occurrences."
+      },
+      loading: {
+        label: "Loading",
+        query: "pub",
+        note: "Authored bodies and loaded Files stay usable while three File versions load."
+      },
+      partial: {
+        label: "Partial failure",
+        query: "pub",
+        note: "One failed version reports its state without removing usable results."
+      },
+      unavailable: {
+        label: "Unavailable",
+        query: "pub",
+        note: "Absent, binary, invalid UTF-8, and unavailable versions remain visible as corpus state."
+      },
+      none: {
+        label: "No match",
+        query: "socket",
+        note: "A valid query with no matching Search Occurrence keeps acquisition state visible."
+      },
+      streamed: {
+        label: "Reordered stream",
+        query: "pub",
+        note: "Publish another batch. Better matches reorder the list while identity keeps the selected occurrence."
+      },
+      long: {
+        label: "Long content",
+        query: "pub",
+        note: "Long paths, source Lines, and ReviewBodies test clipping and preview scrolling."
+      },
+      narrow: {
+        label: "Portrait",
+        query: "pub",
+        note: "A portrait terminal stacks the result list above the Preview. Both regions keep independent scrolling."
+      }
+    };
+
+    let variant = new URLSearchParams(location.search).get("variant") || "A";
+    if (!variants[variant]) variant = "A";
+    let caseKey = new URLSearchParams(location.search).get("case") || "ready";
+    if (!cases[caseKey]) caseKey = "ready";
+    let selectedId = "new-search-143";
+    let streamStage = 0;
+    let visibleResults = [];
+    let chord = "";
+
+    const terminal = document.querySelector(".terminal");
+    const queryInput = document.querySelector(".query");
+    const resultList = document.querySelector(".result-list");
+    const resultsHead = document.querySelector(".results-head");
+    const previewContent = document.querySelector(".preview-content");
+    const previewPosition = document.querySelector(".preview-head .right");
+    const summary = document.querySelector(".summary");
+    const note = document.querySelector(".case-note");
+    const caseNav = document.querySelector(".cases");
+    const switcherLabel = document.querySelector(".switcher-label");
+
+    for (const [key, value] of Object.entries(cases)) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = value.label;
+      button.dataset.case = key;
+      button.addEventListener("click", () => selectCase(key));
+      caseNav.append(button);
+    }
+
+    function escapeHtml(text) {
+      return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+    }
+
+    function fuzzyRanges(text, query) {
+      if (!query) return [];
+      const sensitive = /\p{Lu}/u.test(query);
+      const source = [...text];
+      const needle = [...query];
+      let cursor = 0;
+      const hits = [];
+      for (const scalar of needle) {
+        const expected = sensitive ? scalar : scalar.toLocaleLowerCase();
+        let found = -1;
+        for (let index = cursor; index < source.length; index += 1) {
+          const candidate = sensitive ? source[index] : source[index].toLocaleLowerCase();
+          if (candidate === expected) {
+            found = index;
+            break;
+          }
+        }
+        if (found === -1) return [];
+        hits.push(found);
+        cursor = found + 1;
+      }
+      return hits;
+    }
+
+    function highlight(text, query, active = false) {
+      const ranges = fuzzyRanges(text, query);
+      if (!ranges.length) return escapeHtml(text);
+      const chars = [...text];
+      let html = "";
+      for (let index = 0; index < chars.length; index += 1) {
+        const escaped = escapeHtml(chars[index]);
+        html += ranges.includes(index) ? `<mark class="${active ? "active-hit" : ""}">${escaped}</mark>` : escaped;
+      }
+      return html;
+    }
+
+    function availableCorpus() {
+      if (caseKey === "loading") return allResults.slice(0, 3);
+      if (caseKey === "streamed") {
+        if (streamStage === 0) return [allResults[3], allResults[4]];
+        if (streamStage === 1) return [allResults[3], allResults[4], allResults[0], allResults[1]];
+      }
+      if (caseKey === "long") return [allResults[5], allResults[6], allResults[1]];
+      return allResults;
+    }
+
+    function score(result, query) {
+      const ranges = fuzzyRanges(result.text, query);
+      if (!ranges.length) return -1;
+      const spread = ranges[ranges.length - 1] - ranges[0];
+      return 1000 - spread * 10 - result.text.length;
+    }
+
+    function statesHtml() {
+      const rows = [];
+      if (["loading", "none", "streamed"].includes(caseKey)) {
+        rows.push(["spinner", "◐", "src/tui/render.zig · OLD and NEW loading"]);
+        rows.push(["spinner", "◒", "docs/search.md · NEW loading"]);
+      }
+      if (caseKey === "partial") {
+        rows.push(["error", "!", "src/tui/render.zig · OLD failed · network"]);
+        rows.push(["spinner", "◐", "docs/search.md · NEW loading"]);
+      }
+      if (caseKey === "unavailable") {
+        rows.push(["", "−", "src/added.zig · OLD absent"]);
+        rows.push(["", "◆", "fixtures/logo.png · OLD and NEW binary · 84 KiB"]);
+        rows.push(["error", "!", "fixtures/legacy.txt · OLD invalid UTF-8"]);
+        rows.push(["error", "!", "src/missing.zig · NEW unavailable"]);
+      }
+      if (!rows.length) return "";
+      return `<div class="state-list">${rows.map(([kind, icon, text]) => `<div class="state-row ${kind}"><span>${icon}</span><span>${escapeHtml(text)}</span></div>`).join("")}</div>`;
+    }
+
+    function resultLabel(result) {
+      return result.path || result.owner;
+    }
+
+    function renderResults() {
+      const query = queryInput.value;
+      visibleResults = availableCorpus()
+        .map((result, corpusIndex) => ({ result, corpusIndex, score: score(result, query) }))
+        .filter(item => item.score >= 0)
+        .sort((left, right) => right.score - left.score || left.result.text.length - right.result.text.length || left.corpusIndex - right.corpusIndex)
+        .map(item => item.result);
+
+      if (visibleResults.length && !visibleResults.some(result => result.id === selectedId)) selectedId = visibleResults[0].id;
+      if (!visibleResults.length) selectedId = null;
+
+      resultsHead.innerHTML = variant === "B"
+        ? "<span>Kind</span><span>Source</span><span>Position</span>"
+        : `${visibleResults.length} Search Occurrence${visibleResults.length === 1 ? "" : "s"}`;
+
+      const rows = visibleResults.map(result => `
+        <button class="result ${result.id === selectedId ? "selected" : ""}" type="button" data-id="${result.id}">
+          <span class="badge ${result.kind}">${result.label}</span>
+          <span class="result-main">
+            <span class="${result.path ? "path" : "owner"}">${escapeHtml(resultLabel(result))}</span>
+            <span class="snippet">${highlight(result.text, query)}</span>
+          </span>
+          <span class="position">${escapeHtml(result.position)}</span>
+        </button>
+      `).join("");
+
+      const noMatches = visibleResults.length === 0
+        ? `<div class="empty"><div><strong>No matching occurrence</strong>File acquisition continues. Edit the query or press Esc.</div></div>`
+        : "";
+      resultList.innerHTML = rows + statesHtml() + noMatches;
+      resultList.querySelectorAll(".result").forEach(row => {
+        row.addEventListener("click", () => selectResult(row.dataset.id));
+        row.addEventListener("dblclick", () => openResult(row.dataset.id));
+      });
+
+      const corpusCount = availableCorpus().length;
+      const state = caseKey === "loading" ? " · 3 versions loading" : caseKey === "partial" ? " · 1 failed" : "";
+      summary.textContent = `${visibleResults.length} matches · ${corpusCount} candidates${state}`;
+      renderPreview();
+    }
+
+    function renderPreview() {
+      const result = visibleResults.find(item => item.id === selectedId);
+      previewPosition.textContent = result ? result.position : "";
+      if (!result) {
+        previewContent.innerHTML = `<div class="empty"><div><strong>No preview</strong>Select a Search Occurrence.</div></div>`;
+        return;
+      }
+
+      const query = queryInput.value;
+      const heading = result.path ? result.path : result.owner;
+      const scope = result.path ? `${result.label} source` : result.scope;
+      const content = result.body
+        ? `<div class="context-label">ReviewBody</div><div class="body-frame">${highlight(result.body, query, true)}</div>`
+        : `<div class="context-label">Source context</div><div class="code-frame">${result.context.map((line, index) => {
+            const lineNo = result.line + index - 1;
+            return `<div class="code-row ${index === 1 ? "active" : ""}"><span class="line-no">${lineNo}</span><span class="code">${highlight(line, query, index === 1)}</span></div>`;
+          }).join("")}</div>`;
+
+      previewContent.innerHTML = `<div class="preview-card">
+        <div class="preview-path">${escapeHtml(heading)}</div>
+        <div class="preview-meta"><span>${escapeHtml(scope)}</span><span>${escapeHtml(result.position)}</span><span>one Search Occurrence</span></div>
+        ${content}
+      </div>`;
+    }
+
+    function selectResult(id) {
+      selectedId = id;
+      renderResults();
+      document.querySelector(`[data-id="${id}"]`)?.scrollIntoView({ block: "nearest" });
+      queryInput.focus({ preventScroll: true });
+    }
+
+    function moveSelection(delta) {
+      if (!visibleResults.length) return;
+      const current = visibleResults.findIndex(result => result.id === selectedId);
+      const next = (current + delta + visibleResults.length) % visibleResults.length;
+      selectResult(visibleResults[next].id);
+    }
+
+    function openResult(id) {
+      const result = visibleResults.find(item => item.id === id);
+      if (!result) return;
+      note.textContent = `Open ${resultLabel(result)} at ${result.position}. The Overlay closes and Presentation focuses this Search Occurrence.`;
+    }
+
+    function selectCase(next) {
+      caseKey = next;
+      streamStage = 0;
+      selectedId = next === "long" ? "long-path-57" : next === "streamed" ? "old-worker-201" : "new-search-143";
+      queryInput.value = cases[next].query;
+      terminal.classList.toggle("narrow", next === "narrow");
+      document.querySelectorAll("[data-case]").forEach(button => button.setAttribute("aria-pressed", String(button.dataset.case === next)));
+      note.textContent = cases[next].note;
+      renderResults();
+      renderFooter();
+      setUrl();
+      queryInput.focus({ preventScroll: true });
+    }
+
+    function renderFooter() {
+      document.querySelectorAll(".stream-button").forEach(button => button.remove());
+      if (caseKey !== "streamed") return;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "stream-button";
+      button.textContent = streamStage < 2 ? "Publish next batch" : "Restart stream";
+      button.addEventListener("click", () => {
+        streamStage = streamStage < 2 ? streamStage + 1 : 0;
+        renderResults();
+        renderFooter();
+      });
+      document.querySelector(".overlay-foot").append(button);
+    }
+
+    function renderVariant() {
+      terminal.classList.remove("variant-A", "variant-B", "variant-C");
+      terminal.classList.add(`variant-${variant}`);
+      switcherLabel.textContent = `${variant} · ${variants[variant]}`;
+      renderResults();
+      setUrl();
+      queryInput.focus({ preventScroll: true });
+    }
+
+    function cycleVariant(delta) {
+      const keys = Object.keys(variants);
+      variant = keys[(keys.indexOf(variant) + delta + keys.length) % keys.length];
+      renderVariant();
+    }
+
+    function setUrl() {
+      const url = new URL(location.href);
+      url.searchParams.set("variant", variant);
+      url.searchParams.set("case", caseKey);
+      history.replaceState(null, "", url);
+    }
+
+    document.querySelectorAll("[data-cycle]").forEach(button => {
+      button.addEventListener("click", () => cycleVariant(Number(button.dataset.cycle)));
+    });
+
+    queryInput.addEventListener("input", renderResults);
+    queryInput.addEventListener("keydown", event => {
+      if (event.key === "ArrowDown" || (event.ctrlKey && event.key === "n")) {
+        event.preventDefault();
+        moveSelection(1);
+      }
+      if (event.key === "ArrowUp" || (event.ctrlKey && event.key === "p")) {
+        event.preventDefault();
+        moveSelection(-1);
+      }
+      if (event.key === "Enter") {
+        event.preventDefault();
+        openResult(selectedId);
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        note.textContent = "Esc closes Review Search and returns to the unchanged DiffPane context.";
+      }
+    });
+
+    document.addEventListener("keydown", event => {
+      if ((event.key === "ArrowLeft" || event.key === "ArrowRight") && !event.target.matches("input, textarea, [contenteditable]")) {
+        cycleVariant(event.key === "ArrowLeft" ? -1 : 1);
+      }
+      if (!event.target.matches("input, textarea, [contenteditable]")) {
+        chord = `${chord}${event.key}`.slice(-2);
+        if (chord === "gf") {
+          queryInput.focus();
+          chord = "";
+        }
+      }
+    });
+
+    queryInput.value = cases[caseKey].query;
+    renderVariant();
+    selectCase(caseKey);
+  </script>
+</body>
+</html>

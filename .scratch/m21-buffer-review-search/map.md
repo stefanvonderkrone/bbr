@@ -24,6 +24,7 @@ An implementation-ready M21 specification and dependency map for Buffer Search a
 - [Define Buffer Search Interaction](issues/02-define-buffer-search-interaction.md) — Buffer Search uses Neovim-style incremental input, semantic occurrence traversal, temporary disclosure reveal, and configurable `/`, `n`, and `N` Actions.
 - [Prototype Buffer Search Feedback](issues/03-prototype-buffer-search-feedback.md) — Buffer Search uses the bottom command line, Theme-owned ochre and orange match styles, and a persistent right-aligned active and total count.
 - [Define Review Search Matching and Ordering](issues/04-define-review-search-matching-and-ordering.md) — Review Search returns one Unicode smart-case `fzy`-ranked occurrence per logical line, with deterministic streamed ordering and Diff-proven version-neutral coalescing.
+- [Prototype Review Search Overlay](issues/05-prototype-review-search-overlay.md) — Review Search uses a dense Kind, Source, and Position table with a responsive context Preview that retains selection through streamed reordering.
 
 ## Not yet specified
 
