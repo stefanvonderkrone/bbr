@@ -46,12 +46,16 @@ The Overlay for fuzzy-finding a PullRequest by id or title (backed by `zf`) to s
 _Avoid_: search, finder, switcher, palette.
 
 **Buffer Search**:
-The `/`-initiated search over semantic text in the current DiffPane Buffer. It highlights every occurrence and gives `n`/`N` a current match to traverse without including rendered gutters or framing.
+The `/`-initiated search over semantic text owned by the current DiffPane Buffer. Layout, Scope, and File isolation define its corpus, but a Fold or authored-content disclosure does not remove hidden text. Buffer Search never starts File Enrichment. It highlights every Search Occurrence and gives `n` and `N` a current occurrence to traverse.
 _Avoid_: Review Search (crosses File boundaries), find (the Action has defined search semantics).
 
 **Review Search**:
-The Overlay for fuzzy-searching occurrences across the selected version of every changed File in the current remote PullRequest or LocalReview. Results stream as File Enrichment arrives and retain exact source locations for preview and navigation.
-_Avoid_: Pull Request search (also applies to LocalReview), repository search (only changed Files participate), Picker (switches PullRequests).
+The Overlay for fuzzy-searching both complete versions of every changed File and every authored Comment, Reply, and Draft body in the current PullRequest or LocalReview. Results stream as File Enrichment arrives and retain exact source or ReviewBody locations for preview and navigation. Selected Version does not limit Review Search.
+_Avoid_: Pull Request search (also applies to LocalReview), repository search (only the current Review participates), Picker (switches PullRequests).
+
+**Search Occurrence**:
+One line-local source or ReviewBody match within a Session Epoch. A source occurrence identifies its File, version relation, line coordinates, and exact UTF-8 ranges. A ReviewBody occurrence identifies its CommentId or TempId owner, logical body line, and exact authored UTF-8 ranges. Buffer reprojection does not change the identity, but Session replacement expires it.
+_Avoid_: visual match (wrapping can project one occurrence more than once), search row (the Overlay projection), result (the presentation of an occurrence).
 
 **Composer**:
 The Overlay for authoring or editing a Comment, Reply, or Suggestion body. Mutation uses the same interaction and validation as creation with the previous editable content prefilled; a Suggestion exposes its replacement code while bbr preserves the fenced Markdown representation.
