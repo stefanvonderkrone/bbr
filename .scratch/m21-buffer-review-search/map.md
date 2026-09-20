@@ -28,10 +28,11 @@ An implementation-ready M21 specification and dependency map for Buffer Search a
 - [Define Streaming File Acquisition](issues/06-define-streaming-file-acquisition.md) — Review Search reuses Session File Enrichment with eight concurrent Files, File-atomic publication, cache pins, and Session Epoch plus query-generation rejection.
 - [Benchmark Review Search File Concurrency](issues/09-benchmark-review-search-file-concurrency.md) — Use a File concurrency limit of 8 for remote PullRequests and LocalReviews; modified remote Files can use up to 16 side requests.
 - [Define Search Navigation and State Lifetime](issues/07-define-search-navigation-and-state-lifetime.md) — Search navigation lands exact wrapped source or ReviewBody occurrences and keeps one Session-scoped search's highlights active at a time.
+- [Define the Integrated M21 Contract](issues/08-define-integrated-m21-contract.md) — M21 uses one pure search module, Presentation-owned search state, leased serial scans over eight-File enrichment, five vertical slices, and deterministic acceptance tiers.
 
 ## Not yet specified
 
-- The implementation slices and full acceptance matrix depend on the interaction prototypes, occurrence model, and streaming policy.
+- None.
 
 ## Out of scope
 
