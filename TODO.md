@@ -315,6 +315,19 @@ replacement. It does not implement one before the evidence supports a design.
 - [ ] Test hostile fixtures for filesystem and network access, infinite work, excessive memory, crashes, malformed Spans, and protocol corruption. Do not call an unconfined helper process a sandbox.
 - [ ] Record the decision in an ADR. Specify the bundle and trust migration, target support, fallback behavior, and removal policy for native UserGrammars. If neither option gives useful confinement at acceptable cost, retain M17's explicit native-code warning.
 
+## M28 - Full-Review File cache evaluation  ·  M/L  ·  needs M17/M21
+Decide whether large Reviews need a full-Review File cache in memory or on disk. M17 keeps a
+Session-only, byte-budgeted LRU for inactive File Enrichment. M21 can reacquire evicted content
+while Review Search scans the complete Review. Keep that policy unless measured workflows justify
+the memory, storage, and invalidation cost of a replacement.
+
+- [ ] Select several large real PullRequests with different File counts, total old/new content sizes, change shapes, and text/binary mixes. Record only metadata and measurements. Do not store source content in benchmark output.
+- [ ] Add an opt-in benchmark that measures the existing LRU during sequential review, non-sequential File navigation, first Review Search, query edits, Overlay reopen, Session replacement, and process restart. Record first-result and complete-result latency, refetch count, request count, failures, `429` responses, peak memory, retained memory, and cache hit rate.
+- [ ] Compare the existing LRU with a full-Review in-memory cache. Measure representative and worst observed memory use. Define a hard bound and the behavior when one Review exceeds it.
+- [ ] Compare both memory policies with a disk cache. Define source-code retention, file permissions, cleanup, size limits, ReviewIdentity and commit invalidation, atomic writes, corruption recovery, format migration, and behavior when the cache is unavailable.
+- [ ] Choose the smallest policy that removes measured user delay without unsafe or unbounded retention. The valid decision is a full-Review memory cache, an opt-in disk cache, a revised LRU, or no change.
+- [ ] Record the decision and evidence in an ADR. If the decision changes the cache, implement the policy behind `[files.cache]` and add deterministic eviction, invalidation, corruption, failure, and Session Epoch tests.
+
 ### Closed historical deferrals
 
 The following notes remain in M0–M14 as implementation history but require no post-M14 work:
@@ -345,11 +358,12 @@ M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M10    (authoring → submission)
               ├─ M15 ─ M23       (comment thread presentation fixes)
               ├─ M4 ─ M15 ─ M24 ─ M25 (remote-first Browser and navigation)
               ├─ M19 ─ M26       (Credential login and logout)
-              └─ M13 ─ M17 ─ M27 (UserGrammar sandbox research)
+              ├─ M13 ─ M17 ─ M27 (UserGrammar sandbox research)
+              └─ M17 ─ M21 ─ M28 (full-Review File cache evaluation)
 ```
 
 **MVP line:** M0–M3 gives a usable read-only reviewer; M4 makes it ergonomic; M6+M10 make it
 write-capable (the headline). M5/M7/M8/M9/M11/M12/M13 are parallelizable polish once M2 lands; M14 is the
-largest standalone feature and depends only on read + authoring, not submission. M15–M27 gather
+largest standalone feature and depends only on read + authoring, not submission. M15–M28 gather
 all still-actionable follow-ups recorded by the completed milestones, design open questions,
 ADRs, domain docs, and the local issue tracker.
