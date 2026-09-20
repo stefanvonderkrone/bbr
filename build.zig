@@ -87,6 +87,27 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&install_bench.step);
     bench_step.dependOn(&run_bench.step);
 
+    const file_enrichment_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/tui/file_enrichment.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = &.{.{ .name = "bbr", .module = bench_core_mod }},
+    });
+    const file_acquisition_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/benchmark/file_acquisition.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = &.{
+            .{ .name = "bbr", .module = bench_core_mod },
+            .{ .name = "file_enrichment", .module = file_enrichment_bench_mod },
+        },
+    });
+    const file_acquisition_bench = b.addExecutable(.{ .name = "bbr-file-acquisition-bench", .root_module = file_acquisition_bench_mod });
+    const run_file_acquisition_bench = b.addRunArtifact(file_acquisition_bench);
+    if (b.args) |args| run_file_acquisition_bench.addArgs(args);
+    const file_acquisition_bench_step = b.step("bench-file-acquisition", "Run the opt-in File Enrichment concurrency benchmark");
+    file_acquisition_bench_step.dependOn(&run_file_acquisition_bench.step);
+
     // Live smoke check against real Bitbucket (opt-in; needs BITBUCKET_* env):
     //   zig build check -- <repo-slug> <pr-id>
     const check_cmd = b.addRunArtifact(exe);

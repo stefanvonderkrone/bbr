@@ -139,7 +139,7 @@ pub fn enrichConcurrent(io: std.Io, backing: Allocator, bb: bbr.bitbucket.Client
     return enrichFromConcurrent(io, backing, remote.source(), highlighter, req);
 }
 
-fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
+pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
     if (req.status == .added or req.status == .removed)
         return enrichFrom(backing, source, highlighter, req);
 
@@ -416,6 +416,12 @@ pub const Storage = struct {
 
     pub fn len(self: *const Storage) usize {
         return self.files.len;
+    }
+
+    pub fn retainedBytes(self: *const Storage) usize {
+        var total: usize = 0;
+        for (self.files) |*stored_file| total +|= stored_file.retainedBytes();
+        return total;
     }
 
     pub fn status(self: *const Storage, file_idx: usize) bbr.highlight.FileHighlightStatus {
