@@ -181,6 +181,11 @@ the main thread; the Epoch token still guards against stale results.
   reached through the `PendingReviewStore` seam and faked in domain tests (ADR-0003, ADR-0006).
   `@cImport({ @cInclude("sqlite3.h"); })` then works from a file in that module. The C flags reach
   the compiler as `-cflags … --` (visible in the failing-command dump).
+- **Zig 0.16 cannot build its bundled libc++ with a macOS 26 deployment minimum.** The libc++
+  `<random>` source fails because the SDK does not expose `INFINITY`. For a native macOS 26 or
+  newer host, `build.zig` sets the deployment minimum to macOS 15. It gets the active SDK path from
+  `xcrun` for CoreFoundation linking. The SDK headers also require
+  `-Wno-elaborated-enum-base` with Zig 0.16's C++ compiler.
 
 ## 6. Testing
 
@@ -311,3 +316,4 @@ the main thread; the Epoch token still guards against stale results.
 - [ ] `Io.Clock.awake` / `Timestamp.untilNow` / `Duration.toNanoseconds` unchanged?
 - [ ] `std.simd.suggestVectorLength` still returns a target-dependent optional comptime length?
 - [ ] `std.http.Client` request concurrency and thread-safe allocator requirements unchanged?
+- [ ] Remove the macOS 26 libc++ and CoreFoundation workarounds when the Zig compiler supports the current SDK?
