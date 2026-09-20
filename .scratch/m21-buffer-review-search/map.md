@@ -27,6 +27,7 @@ An implementation-ready M21 specification and dependency map for Buffer Search a
 - [Prototype Review Search Overlay](issues/05-prototype-review-search-overlay.md) — Review Search uses a dense Kind, Source, and Position table with a responsive context Preview that retains selection through streamed reordering.
 - [Define Streaming File Acquisition](issues/06-define-streaming-file-acquisition.md) — Review Search reuses Session File Enrichment with eight concurrent Files, File-atomic publication, cache pins, and Session Epoch plus query-generation rejection.
 - [Benchmark Review Search File Concurrency](issues/09-benchmark-review-search-file-concurrency.md) — Use a File concurrency limit of 8 for remote PullRequests and LocalReviews; modified remote Files can use up to 16 side requests.
+- [Define Search Navigation and State Lifetime](issues/07-define-search-navigation-and-state-lifetime.md) — Search navigation lands exact wrapped source or ReviewBody occurrences and keeps one Session-scoped search's highlights active at a time.
 
 ## Not yet specified
 
@@ -38,3 +39,4 @@ An implementation-ready M21 specification and dependency map for Buffer Search a
 - Regular-expression search, text replacement, and repository-wide search.
 - Searching unchanged Files outside the current Review.
 - A persistent search index or search history across application restarts.
+- A Comment Overview. M21 navigates to existing ReviewCards; [M29](../../TODO.md) owns the new cross-item view.

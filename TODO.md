@@ -328,6 +328,17 @@ the memory, storage, and invalidation cost of a replacement.
 - [ ] Choose the smallest policy that removes measured user delay without unsafe or unbounded retention. The valid decision is a full-Review memory cache, an opt-in disk cache, a revised LRU, or no change.
 - [ ] Record the decision and evidence in an ADR. If the decision changes the cache, implement the policy behind `[files.cache]` and add deterministic eviction, invalidation, corruption, failure, and Session Epoch tests.
 
+## M29 - Comment Overview  ·  M  ·  needs M15/M21
+Add one place to inspect and navigate every authored item in the current Review with its scope
+context. Keep M21 navigation to the existing DiffPane ReviewCard until this milestone ships.
+
+- [ ] Define the Comment Overview projection and interaction before implementation. Add the accepted term to the Presentation glossary.
+- [ ] List every Comment, Reply, and Draft. Include resolved, outdated, unavailable, and collapsed items without changing their saved disclosure state.
+- [ ] Show nearby source Lines for an inline item, File context for a File-level item, and ReviewHeader context for a Review-level item. Do not invent source context for a Review-level item.
+- [ ] Navigate from an overview item to its ReviewCard in the DiffPane. Preserve the overview query, selection, and scroll position when the reviewer returns.
+- [ ] After the overview ships, route a Review Search result for a Review-level item through the overview when that route gives clearer context than the all-Files Buffer.
+- [ ] Add Presentation coverage for each CommentScope, nested Replies, Drafts, disclosures, stale Session work, navigation, and return-state restoration.
+
 ### Closed historical deferrals
 
 The following notes remain in M0–M14 as implementation history but require no post-M14 work:
@@ -359,11 +370,12 @@ M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M10    (authoring → submission)
               ├─ M4 ─ M15 ─ M24 ─ M25 (remote-first Browser and navigation)
               ├─ M19 ─ M26       (Credential login and logout)
               ├─ M13 ─ M17 ─ M27 (UserGrammar sandbox research)
-              └─ M17 ─ M21 ─ M28 (full-Review File cache evaluation)
+              ├─ M17 ─ M21 ─ M28 (full-Review File cache evaluation)
+              └─ M15 ─ M21 ─ M29 (Comment Overview)
 ```
 
 **MVP line:** M0–M3 gives a usable read-only reviewer; M4 makes it ergonomic; M6+M10 make it
 write-capable (the headline). M5/M7/M8/M9/M11/M12/M13 are parallelizable polish once M2 lands; M14 is the
-largest standalone feature and depends only on read + authoring, not submission. M15–M28 gather
+largest standalone feature and depends only on read + authoring, not submission. M15–M29 gather
 all still-actionable follow-ups recorded by the completed milestones, design open questions,
 ADRs, domain docs, and the local issue tracker.
