@@ -207,6 +207,15 @@ pub fn build(b: *std.Build) void {
     const selected_version_hardening_test_step = b.step("test-selected-version-hardening", "Run Selected Version hardening tests");
     selected_version_hardening_test_step.dependOn(&run_selected_version_hardening_tests.step);
 
+    const search_kernel_tests = b.addTest(.{
+        .name = "search-kernel-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M21 kernel"},
+    });
+    const run_search_kernel_tests = b.addRunArtifact(search_kernel_tests);
+    const search_kernel_test_step = b.step("test-search-kernel", "Run M21 search kernel and reachable-source tests");
+    search_kernel_test_step.dependOn(&run_search_kernel_tests.step);
+
     const fixture_mod = b.createModule(.{
         .root_source_file = b.path("tests/user_grammar_fixture.zig"),
         .target = target,

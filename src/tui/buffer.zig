@@ -21,6 +21,7 @@ const Draft = bbr.review.Draft;
 const Parent = bbr.review.draft.Parent;
 const anchor_projection = bbr.review.anchor;
 const review_card = @import("review_card.zig");
+const search = @import("search.zig");
 pub const CellMetrics = @import("cell_metrics.zig").CellMetrics;
 pub const CellMeasurement = @import("cell_metrics.zig").Measurement;
 
@@ -634,6 +635,149 @@ pub fn buildWithComments(
         .file_tallies = try fileTallies(allocator, diff, threads, opts.drafts, opts),
         .file_rows = try file_rows.toOwnedSlice(allocator),
         .file_rows_end = file_rows_end,
+    };
+}
+
+/// Build the semantic Buffer Search corpus before Fold and ReviewCard
+/// disclosure projection. Returned Candidates borrow Diff and Review storage;
+/// generated ReviewBody text and mappings use `allocator`.
+pub fn buildSearchCandidates(
+    allocator: std.mem.Allocator,
+    diff: model.Diff,
+    layout: Layout,
+    threads: []const Thread,
+    opts: BuildOptions,
+    session_epoch: u64,
+) ![]search.Candidate {
+    var disclosures: std.ArrayList(DisclosureKey) = .empty;
+    defer disclosures.deinit(allocator);
+    try disclosures.appendSlice(allocator, opts.expanded_disclosures);
+    try disclosures.append(allocator, .outdated_review);
+    for (diff.files) |*file| {
+        try disclosures.append(allocator, .{ .outdated_file = file });
+        try disclosures.append(allocator, .{ .opposite_version = file });
+    }
+    for (threads) |thread| {
+        if (thread.resolved) try disclosures.append(allocator, .{ .resolved_thread = thread.root.id });
+        try disclosures.append(allocator, .{ .review_card = .{ .comment = thread.root.id } });
+        for (thread.replies) |reply| try disclosures.append(allocator, .{ .review_card = .{ .comment = reply.id } });
+    }
+    for (opts.drafts) |draft| try disclosures.append(allocator, .{ .review_card = .{ .draft = draft.local_id } });
+
+    var semantic_options = opts;
+    semantic_options.fold_context = false;
+    semantic_options.expanded_disclosures = disclosures.items;
+    semantic_options.collapsed_rows = 0;
+    const semantic = try buildWithComments(allocator, diff, layout, threads, semantic_options);
+
+    var candidates: std.ArrayList(search.Candidate) = .empty;
+    var corpus_order: usize = 0;
+    var file_index: usize = 0;
+    for (semantic.rows) |row| switch (row) {
+        .file_header => |header| file_index = fileIndex(diff, header.file) orelse continue,
+        .line => |line| try appendSourceCandidate(allocator, &candidates, &corpus_order, session_epoch, diff.files[file_index], file_index, line.line, line.display_version),
+        .line_pair => |pair| {
+            if (pair.left != null and pair.right != null and
+                (pair.left.?.line == pair.right.?.line or
+                    (pair.left.?.line.kind == .context and pair.right.?.line.kind == .context and
+                        std.mem.eql(u8, pair.left.?.line.text, pair.right.?.line.text))))
+            {
+                try appendNeutralSourceCandidate(allocator, &candidates, &corpus_order, session_epoch, diff.files[file_index], file_index, pair.left.?.line, pair.right.?.line);
+            } else {
+                if (pair.left) |left| try appendSourceCandidate(allocator, &candidates, &corpus_order, session_epoch, diff.files[file_index], file_index, left.line, .old);
+                if (pair.right) |right| try appendSourceCandidate(allocator, &candidates, &corpus_order, session_epoch, diff.files[file_index], file_index, right.line, .new);
+            }
+        },
+        .comment => |card| {
+            const comment = card.commentItem();
+            if (!comment.deleted and !hasBodyOwner(candidates.items, .{ .comment = comment.id })) {
+                const body = try review_card.ReviewBody.parse(allocator, comment.body);
+                try search.appendReviewBodyCandidates(allocator, body, .{ .comment = comment.id }, session_epoch, &corpus_order, &candidates);
+            }
+        },
+        .draft => |card| {
+            const draft = card.draftItem();
+            if (!hasBodyOwner(candidates.items, .{ .draft = draft.local_id })) {
+                const body = try review_card.ReviewBody.parse(allocator, draft.body);
+                try search.appendReviewBodyCandidates(allocator, body, .{ .draft = draft.local_id }, session_epoch, &corpus_order, &candidates);
+            }
+        },
+        else => {},
+    };
+    return candidates.toOwnedSlice(allocator);
+}
+
+fn fileIndex(diff: model.Diff, file: *const model.File) ?usize {
+    for (diff.files, 0..) |*candidate, index| if (candidate == file) return index;
+    return null;
+}
+
+fn hasBodyOwner(candidates: []const search.Candidate, owner: search.ReviewBodyOwner) bool {
+    for (candidates) |candidate| switch (candidate.location) {
+        .review_body => |body| if (std.meta.eql(body.owner, owner)) return true,
+        .source => {},
+    };
+    return false;
+}
+
+fn appendSourceCandidate(
+    allocator: std.mem.Allocator,
+    candidates: *std.ArrayList(search.Candidate),
+    corpus_order: *usize,
+    session_epoch: u64,
+    file: model.File,
+    file_index: usize,
+    line: *const model.Line,
+    display_version: ?SelectedVersion,
+) !void {
+    const relation: search.VersionRelation = if (display_version) |version|
+        (if (version == .old) .old else .new)
+    else if (line.old_no != 0 and line.new_no != 0)
+        .neutral
+    else if (line.old_no != 0)
+        .old
+    else
+        .new;
+    try candidates.append(allocator, sourceCandidate(file, file_index, line.text, line.oldNo(), line.newNo(), relation, corpus_order.*, session_epoch));
+    corpus_order.* += 1;
+}
+
+fn appendNeutralSourceCandidate(
+    allocator: std.mem.Allocator,
+    candidates: *std.ArrayList(search.Candidate),
+    corpus_order: *usize,
+    session_epoch: u64,
+    file: model.File,
+    file_index: usize,
+    old: *const model.Line,
+    new: *const model.Line,
+) !void {
+    try candidates.append(allocator, sourceCandidate(file, file_index, old.text, old.oldNo(), new.newNo(), .neutral, corpus_order.*, session_epoch));
+    corpus_order.* += 1;
+}
+
+fn sourceCandidate(
+    file: model.File,
+    file_index: usize,
+    text: []const u8,
+    old_line: ?u32,
+    new_line: ?u32,
+    relation: search.VersionRelation,
+    corpus_order: usize,
+    session_epoch: u64,
+) search.Candidate {
+    return .{
+        .text = text,
+        .location = .{ .source = .{
+            .file_index = file_index,
+            .relation = relation,
+            .old_path = file.old_path,
+            .new_path = file.new_path,
+            .old_line = old_line,
+            .new_line = new_line,
+        } },
+        .corpus_order = corpus_order,
+        .session_epoch = session_epoch,
     };
 }
 
@@ -3501,4 +3645,76 @@ test "scope fallbacks distinguish unmatched outdated from unavailable and do not
     const isolated = try buildWithComments(a, diff, .unified, threads, .{ .drafts = &drafts, .scope_projections = &projections, .only_file = 0 });
     try testing.expectEqual(@as(usize, 0), countKind(isolated, .comment));
     try testing.expectEqual(@as(usize, 0), countKind(isolated, .draft));
+}
+
+test "M21 kernel Buffer Candidates include hidden semantic content and one shared context identity" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const diff = try parse(allocator,
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1,3 +1,3 @@
+        \\ same
+        \\-old
+        \\+new
+        \\ tail
+    );
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Ada", .body = "hidden **review** body", .resolved = true },
+        .{ .id = 2, .author = "Ada", .body = "generated ghost", .deleted = true },
+    };
+    const threads = try bbr.review.thread.build(allocator, &comments);
+    const candidates = try buildSearchCandidates(allocator, diff, .side_by_side, threads, .{ .fold_context = true }, 9);
+
+    var same_count: usize = 0;
+    var saw_body = false;
+    var saw_deleted = false;
+    for (candidates) |candidate| {
+        if (std.mem.eql(u8, candidate.text, "same")) same_count += 1;
+        if (std.mem.eql(u8, candidate.text, "hidden review body")) saw_body = true;
+        if (std.mem.indexOf(u8, candidate.text, "ghost") != null) saw_deleted = true;
+        try testing.expectEqual(@as(u64, 9), candidate.session_epoch);
+    }
+    try testing.expectEqual(@as(usize, 1), same_count);
+    try testing.expect(saw_body);
+    try testing.expect(!saw_deleted);
+}
+
+test "M21 kernel Buffer Candidate corpus follows Layout Scope and File isolation" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const diff = try parse(allocator, two_file_diff);
+    const blobs = [_]model.FileBlob{
+        .{ .old = "before\nkeep\nold\nafter\n", .new = "before\nkeep\nnew\nafter\n" },
+        .{ .old = "one\ntwo\nthree\nfour\nctx\n", .new = "one\ntwo\nthree\nfour\nctx\nextra\n" },
+    };
+    const scopes = [_]BuildOptions{
+        .{ .fold_context = true },
+        .{},
+        .{ .whole_file = true, .blobs = &blobs },
+    };
+    for ([_]Layout{ .unified, .side_by_side }) |layout| for (scopes) |scope| for ([_]?usize{ null, 0 }) |only_file| {
+        var options = scope;
+        options.only_file = only_file;
+        const candidates = try buildSearchCandidates(allocator, diff, layout, &.{}, options, 1);
+        try testing.expect(candidates.len > 0);
+        var saw_second_file = false;
+        var shared_keep_count: usize = 0;
+        var saw_whole_file_gap = false;
+        for (candidates) |candidate| switch (candidate.location) {
+            .source => |source| {
+                saw_second_file = saw_second_file or source.file_index == 1;
+                if (source.file_index == 0 and std.mem.eql(u8, candidate.text, "keep")) shared_keep_count += 1;
+                if (source.file_index == 0 and std.mem.eql(u8, candidate.text, "after")) saw_whole_file_gap = true;
+                if (only_file) |index| try testing.expectEqual(index, source.file_index);
+            },
+            .review_body => return error.UnexpectedReviewBody,
+        };
+        try testing.expectEqual(@as(usize, 1), shared_keep_count);
+        try testing.expectEqual(only_file == null, saw_second_file);
+        try testing.expectEqual(scope.whole_file, saw_whole_file_gap);
+    };
 }

@@ -170,7 +170,6 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one('p'), .action = .open_pull_request_picker, .help = "open PullRequest Picker" },
     .{ .chord = Chord.one('R'), .action = .refresh, .help = "refresh review" },
     .{ .chord = Chord.one('s'), .action = .toggle_layout, .help = "toggle unified / side-by-side" },
-    .{ .chord = Chord.one('w'), .action = .toggle_diff_wrap, .help = "toggle diff wrapping" },
     .{ .chord = Chord.one('f'), .action = .cycle_scope, .help = "cycle diff scope" },
     .{ .chord = Chord.two('g', '<'), .action = .select_old_version, .help = "select old File version" },
     .{ .chord = Chord.two('g', '>'), .action = .select_new_version, .help = "select new File version" },
@@ -396,7 +395,6 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .link_existing_comment,
             .help,
             .toggle_layout,
-            .toggle_diff_wrap,
             .cycle_scope,
             .toggle_directory,
             .focus_next_pane,
@@ -427,7 +425,6 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .link_existing_comment,
             .help,
             .toggle_layout,
-            .toggle_diff_wrap,
             .cycle_scope,
             .focus_file,
             .focus_next_pane,
@@ -503,7 +500,6 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .toggle_select,
             .clear_selection,
             .toggle_layout,
-            .toggle_diff_wrap,
             .cycle_scope,
             .select_old_version,
             .select_new_version,
@@ -606,7 +602,7 @@ test "single-key actions and motions resolve" {
     try testing.expectEqual(Action.cursor_view_middle, res.feed(km, .diff, plain('M')).action);
     try testing.expectEqual(Action.reply, res.feed(km, .diff_review_card, plain('r')).action);
     try testing.expectEqual(Action.help, res.feed(km, .diff, .{ .codepoint = '?', .text = "?" }).action);
-    try testing.expectEqual(Action.toggle_diff_wrap, res.feed(km, .diff, plain('w')).action);
+    try testing.expect(res.feed(km, .diff, plain('w')) == .none);
 }
 
 test "isMotion separates movement from commands" {

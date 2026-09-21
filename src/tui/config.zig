@@ -443,6 +443,16 @@ test "unbinding a default can free its Leader for a shorter Action" {
     try testing.expect(result == .ok);
 }
 
+test "M21 kernel strict configuration rejects removed wrapping Action" {
+    var result = try parse(testing.allocator,
+        \\[keymap]
+        \\toggle_diff_wrap = ["w"]
+    );
+    defer result.deinit(testing.allocator);
+    try testing.expect(result == .invalid);
+    try testing.expectEqualStrings("unknown Action name", result.invalid[0].message);
+}
+
 fn isThemeName(name: []const u8) bool {
     return theme.byName(name) != null;
 }

@@ -1358,7 +1358,7 @@ test "syntax foreground composes over an added Line background" {
     try testing.expectEqual(theme_dark.added.bg, cell.style.bg);
 }
 
-test "disabled Diff visual-row projection clips exactly like Buffer rendering" {
+test "zero-width Diff visual-row projection clips exactly like Buffer rendering" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1369,7 +1369,7 @@ test "disabled Diff visual-row projection clips exactly like Buffer rendering" {
     };
     const rows = [_]Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &runs } } }};
     const buf: Buffer = .{ .rows = &rows, .layout = .unified };
-    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{ .layout = .unified, .width = 0, .wrap = false });
+    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{ .layout = .unified, .width = 0 });
     var buffer_screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 14, .x_pixel = 0, .y_pixel = 0 });
     defer buffer_screen.deinit(a);
     var frame_screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 14, .x_pixel = 0, .y_pixel = 0 });
@@ -1389,7 +1389,7 @@ test "disabled Diff visual-row projection clips exactly like Buffer rendering" {
     }
 }
 
-test "disabled SideBySide visual rows clip exactly like Buffer rendering" {
+test "zero-width SideBySide visual rows clip exactly like Buffer rendering" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1400,7 +1400,7 @@ test "disabled SideBySide visual rows clip exactly like Buffer rendering" {
         .right = .{ .line = &right, .decoration = .{ .runs = &.{.{ .text = right.text }} } },
     } }};
     const buf: Buffer = .{ .rows = &rows, .layout = .side_by_side };
-    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{ .layout = .side_by_side, .width = 19, .wrap = false });
+    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{ .layout = .side_by_side, .width = 0 });
     var buffer_screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 19, .x_pixel = 0, .y_pixel = 0 });
     defer buffer_screen.deinit(a);
     var frame_screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 19, .x_pixel = 0, .y_pixel = 0 });
@@ -1433,7 +1433,6 @@ test "Unified continuation rows keep decoration and use a blank gutter" {
     const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{
         .layout = .unified,
         .width = 16,
-        .wrap = true,
     });
     var screen = try vaxis.Screen.init(a, .{ .rows = 2, .cols = 16, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
@@ -1463,7 +1462,6 @@ test "SideBySide continuation rows keep halves inside the fixed divider" {
     const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{
         .layout = .side_by_side,
         .width = 27,
-        .wrap = true,
     });
     var screen = try vaxis.Screen.init(a, .{ .rows = 2, .cols = 27, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
@@ -2047,7 +2045,7 @@ test "File header junctions keep the DiffPane border style" {
     const a = arena.allocator();
     const file: bbr.diff.File = .{ .old_path = "a.zig", .new_path = "a.zig", .status = .modified, .hunks = &.{} };
     const rows = [_]Row{.{ .file_header = .{ .file = &file, .path = file.new_path } }};
-    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{ .layout = .unified, .width = 10, .wrap = false });
+    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{ .layout = .unified, .width = 10 });
     var screen = try vaxis.Screen.init(a, .{ .rows = 6, .cols = 16, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
     const win = headlessWindow(&screen);

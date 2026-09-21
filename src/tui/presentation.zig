@@ -476,7 +476,6 @@ pub const SelectedVersion = frame_mod.SelectedVersion;
 pub const Preferences = struct {
     layout: Layout = .unified,
     scope: Scope = .changes,
-    diff_wrap: bool = false,
     selected_version: SelectedVersion = .new,
 };
 
@@ -1370,7 +1369,6 @@ const Published = struct {
         published.visual_rows = try frame_mod.buildVisualRowsWithOptions(buffer_allocator, published.buffer.rows, cell_metrics, .{
             .layout = preferences.layout,
             .width = frame_mod.paneRects(geometry).diff_content.width,
-            .wrap = preferences.diff_wrap,
         });
         const panes = frame_mod.paneRects(geometry);
         published.tree = try file_tree.build(
@@ -1738,7 +1736,6 @@ const Published = struct {
         const visual_rows = try frame_mod.buildVisualRowsWithOptions(allocator, candidate.rows, self.cell_metrics, .{
             .layout = preferences.layout,
             .width = frame_mod.paneRects(geometry).diff_content.width,
-            .wrap = preferences.diff_wrap,
         });
         const panes = frame_mod.paneRects(geometry);
         const wanted_cursor = if (self.tree.entries.len == 0) null else self.tree.entries[self.tree.cursor].identity;
@@ -4329,11 +4326,6 @@ pub const Presentation = struct {
             .toggle_layout => {
                 var candidate = self.preferences;
                 candidate.layout = if (candidate.layout == .unified) .side_by_side else .unified;
-                self.publishPreferences(published, candidate);
-            },
-            .toggle_diff_wrap => {
-                var candidate = self.preferences;
-                candidate.diff_wrap = !candidate.diff_wrap;
                 self.publishPreferences(published, candidate);
             },
             .cycle_scope => {
@@ -7998,7 +7990,6 @@ test "height resize keeps cached Buffer and visual rows" {
     });
     defer presentation.deinit();
 
-    try presentation.dispatch(.{ .action = .toggle_diff_wrap });
     const before = presentation.projection().review.?.frame;
     try presentation.dispatch(.{ .resize = .{ .cols = 80, .rows = 4 } });
     const after = presentation.projection().review.?.frame;
@@ -8231,7 +8222,6 @@ test "SideBySide wrapping Anchors an active old-only continuation" {
     defer presentation.deinit();
 
     try presentation.dispatch(.{ .action = .toggle_layout });
-    try presentation.dispatch(.{ .action = .toggle_diff_wrap });
     const wrapped = presentation.projection().review.?;
     var continuation: ?usize = null;
     for (wrapped.frame.visual_rows, 0..) |visual_row, index| {
@@ -8253,7 +8243,7 @@ test "SideBySide wrapping Anchors an active old-only continuation" {
     try testing.expect(draft.anchor.?.to == null);
 }
 
-test "Unified wrapping uses visual-row navigation and semantic Anchors" {
+test "Unconditional Unified wrapping uses visual-row navigation and semantic Anchors" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -8262,12 +8252,7 @@ test "Unified wrapping uses visual-row navigation and semantic Anchors" {
     });
     defer presentation.deinit();
 
-    const disabled = presentation.projection().review.?;
-    try testing.expect(!disabled.preferences.diff_wrap);
-    try testing.expectEqual(disabled.buffer.rows.len, disabled.frame.visual_rows.len);
-    try presentation.dispatch(.{ .action = .toggle_diff_wrap });
     const wrapped = presentation.projection().review.?;
-    try testing.expect(wrapped.preferences.diff_wrap);
     try testing.expect(wrapped.frame.visual_rows.len > wrapped.buffer.rows.len);
 
     var first: ?usize = null;
@@ -8290,14 +8275,6 @@ test "Unified wrapping uses visual-row navigation and semantic Anchors" {
     try testing.expectEqual(@as(?u32, 1), draft.anchor.?.to);
     try testing.expect(draft.anchor.?.start_to == null);
     try presentation.dispatch(.{ .composer = .cancel });
-
-    const toggle_offset = current.frame.visual_rows[current.navigation.cursor].source_start;
-    try presentation.dispatch(.{ .action = .toggle_diff_wrap });
-    current = presentation.projection().review.?;
-    try testing.expect(!current.preferences.diff_wrap);
-    try testing.expect(current.frame.visual_rows[current.navigation.cursor].owner.eql(line_owner));
-    try testing.expect(current.frame.visual_rows[current.navigation.cursor].source_start <= toggle_offset and toggle_offset < current.frame.visual_rows[current.navigation.cursor].source_end);
-    try presentation.dispatch(.{ .action = .toggle_diff_wrap });
 
     presentation.published.?.navigation.jumpTo(first.?);
     try presentation.dispatch(.{ .push_count_digit = 2 });
@@ -8915,7 +8892,6 @@ test "WholeFile Selected Version restoration chooses the next source Line" {
         .file_index = command.file_index,
         .outcome = .{ .completed = result },
     } });
-    try presentation.dispatch(.{ .action = .toggle_diff_wrap });
     try presentation.dispatch(.{ .action = .cycle_scope });
     try presentation.dispatch(.{ .action = .cycle_scope });
     while (true) {
@@ -9636,7 +9612,7 @@ test "Session-relative Navigation is suspended during replacement" {
     try testing.expect(std.meta.eql(before, presentation.projection().review.?.navigation));
 }
 
-test "failed SideBySide wrapping transaction preserves Frame preferences and Navigation" {
+test "failed SideBySide Scope transaction preserves Frame preferences and Navigation" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
@@ -9653,7 +9629,7 @@ test "failed SideBySide wrapping transaction preserves Frame preferences and Nav
     const before = presentation.projection().review.?;
 
     failing.fail_index = failing.alloc_index;
-    try presentation.dispatch(.{ .action = .toggle_diff_wrap });
+    try presentation.dispatch(.{ .action = .cycle_scope });
 
     const after = presentation.projection();
     try testing.expect(failing.has_induced_failure);
@@ -9680,13 +9656,11 @@ test "preferences survive replacement while file isolation resets" {
 
     try presentation.dispatch(.{ .action = .toggle_layout });
     try presentation.dispatch(.{ .action = .cycle_scope });
-    try presentation.dispatch(.{ .action = .toggle_diff_wrap });
     try presentation.dispatch(.{ .action = .isolate });
     const isolated = presentation.projection().review.?;
     try testing.expectEqual(@as(?usize, 0), isolated.isolated_file);
     try testing.expectEqual(Layout.side_by_side, isolated.preferences.layout);
     try testing.expectEqual(Scope.fetched, isolated.preferences.scope);
-    try testing.expect(isolated.preferences.diff_wrap);
 
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const command = presentation.takeCommand().?.load_session;
@@ -9698,7 +9672,6 @@ test "preferences survive replacement while file isolation resets" {
     const replaced = presentation.projection().review.?;
     try testing.expectEqual(Layout.side_by_side, replaced.preferences.layout);
     try testing.expectEqual(Scope.fetched, replaced.preferences.scope);
-    try testing.expect(replaced.preferences.diff_wrap);
     try testing.expectEqual(@as(?usize, null), replaced.isolated_file);
     try testing.expectEqual(@as(usize, 0), replaced.navigation.cursor);
 }
