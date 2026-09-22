@@ -4,7 +4,7 @@
 
 **Blocked by:** 10 — Add the Search Kernel and Reachable Source.
 
-**Status:** ready-for-human
+**Status:** resolved
 
 - [x] Configurable Buffer Search Actions default to `/`, `n`, and `N` in every DiffPane Interaction Context.
 - [x] Presentation refuses Buffer Search while Selection is active and tells the reviewer to clear Selection first.
