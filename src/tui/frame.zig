@@ -188,6 +188,7 @@ pub const Projection = struct {
     focus: PaneFocus = .diff,
     selected_version: SelectedVersion = .new,
     version_title_targets: VersionTitleTargets = .{},
+    search_ranges: []const ProjectedSourceRange = &.{},
 };
 
 /// Resolve a cell solely against the immutable, already-published Frame. An

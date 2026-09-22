@@ -16,6 +16,7 @@ const FileFinder = @import("picker.zig").FileFinder;
 const frame_mod = @import("frame.zig");
 const file_tree = frame_mod.file_tree;
 const buffer_mod = @import("buffer.zig");
+const search = @import("search.zig");
 pub const FrameGeometry = frame_mod.Geometry;
 pub const Layout = buffer_mod.Layout;
 
@@ -879,9 +880,17 @@ pub const Projection = struct {
     replacing: bool,
     replacement_error: ?ReplacementError,
     action_error: ?ActionError,
+    buffer_search: ?BufferSearchProjection,
     clipboard_status: ?ClipboardStatus,
     fatal_error: ?FatalError,
     shutting_down: bool,
+};
+
+pub const BufferSearchProjection = struct {
+    query: []const u8,
+    input: bool,
+    active: ?usize,
+    total: usize,
 };
 
 pub const CommentEditResultProjection = struct {
@@ -968,6 +977,7 @@ pub const ActionAvailability = struct {
     inline_comment_refusal: ?InlineCommentRefusal = null,
     suggestion_refusal: ?SuggestionRefusal = null,
     selection: bool = true,
+    buffer_search: bool = true,
     /// null means the ReviewCard under the cursor is editable.
     edit_refusal: ?MutationRefusal = .no_review_item,
     /// null means the ReviewCard under the cursor — or, while re-anchor is
@@ -1002,6 +1012,7 @@ pub const ActionAvailability = struct {
             .suggest => self.suggestion_refusal == null,
             .yank => self.yank_refusal == null,
             .toggle_select => self.selection,
+            .open_buffer_search => self.buffer_search,
             .edit_review_item => self.edit_refusal == null,
             .reanchor_review_item => self.reanchor_refusal == null,
             .delete_review_item => self.delete_refusal == null,
@@ -1139,6 +1150,13 @@ pub const ActionError = enum {
     buffer_build_failed,
     file_enrichment_launch_failed,
     invalid_selection,
+    buffer_search_selection_active,
+    buffer_search_query_too_long,
+    buffer_search_invalid_query,
+    buffer_search_scan_failed,
+    buffer_search_no_matches,
+    buffer_search_hit_bottom,
+    buffer_search_hit_top,
     out_of_memory,
     persistence_failed,
     submission_already_active,
@@ -1196,7 +1214,80 @@ pub const ActionError = enum {
     suggestion_anchor_not_new_side,
 };
 
-const BufferTransactionError = error{ BufferBuildFailed, OutOfMemory };
+const BufferSearchInput = struct {
+    query: ?search.Query = null,
+    batch: ?search.Batch = null,
+    active: ?usize = null,
+    ranges: ?[]frame_mod.ProjectedSourceRange = null,
+    saved_navigation: Nav,
+    origin: usize,
+    count: usize,
+    saved_expanded_disclosures: []buffer_mod.DisclosureKey,
+    saved_search_disclosures: ?[]buffer_mod.DisclosureKey = null,
+
+    fn deinit(self: *BufferSearchInput, allocator: Allocator) void {
+        if (self.query) |*query| query.deinit(allocator);
+        if (self.batch) |*batch| batch.deinit(allocator);
+        if (self.ranges) |ranges| allocator.free(ranges);
+        allocator.free(self.saved_expanded_disclosures);
+        if (self.saved_search_disclosures) |disclosures| allocator.free(disclosures);
+        self.* = undefined;
+    }
+};
+
+const BufferSearchState = struct {
+    accepted_query: ?search.Query = null,
+    accepted_batch: ?search.Batch = null,
+    active: ?usize = null,
+    accepted_ranges: ?[]frame_mod.ProjectedSourceRange = null,
+    saved_disclosures: ?[]buffer_mod.DisclosureKey = null,
+    input: ?BufferSearchInput = null,
+
+    fn deinit(self: *BufferSearchState, allocator: Allocator) void {
+        if (self.input) |*input| input.deinit(allocator);
+        if (self.accepted_query) |*query| query.deinit(allocator);
+        if (self.accepted_batch) |*batch| batch.deinit(allocator);
+        if (self.accepted_ranges) |ranges| allocator.free(ranges);
+        if (self.saved_disclosures) |disclosures| allocator.free(disclosures);
+        self.* = undefined;
+    }
+
+    fn projection(self: *const BufferSearchState) ?BufferSearchProjection {
+        if (self.input) |*input| {
+            const batch = input.batch orelse self.accepted_batch orelse return .{ .query = "", .input = true, .active = null, .total = 0 };
+            return .{
+                .query = if (input.query) |query| query.text else "",
+                .input = true,
+                .active = if (input.batch != null) activeNumber(input.active) else activeNumber(self.active),
+                .total = batch.occurrences.len,
+            };
+        }
+        const query = self.accepted_query orelse return null;
+        const batch = self.accepted_batch orelse return null;
+        return .{ .query = query.text, .input = false, .active = activeNumber(self.active), .total = batch.occurrences.len };
+    }
+
+    fn currentBatch(self: *const BufferSearchState) ?*const search.Batch {
+        if (self.input) |*input| if (input.batch) |*batch| return batch;
+        return if (self.accepted_batch) |*batch| batch else null;
+    }
+
+    fn currentActive(self: *const BufferSearchState) ?usize {
+        if (self.input) |input| if (input.batch != null) return input.active;
+        return self.active;
+    }
+
+    fn currentRanges(self: *const BufferSearchState) []const frame_mod.ProjectedSourceRange {
+        if (self.input) |input| if (input.ranges) |ranges| return ranges;
+        return self.accepted_ranges orelse &.{};
+    }
+};
+
+fn activeNumber(index: ?usize) ?usize {
+    return if (index) |value| value + 1 else null;
+}
+
+const BufferTransactionError = error{ BufferBuildFailed, SearchFailed, OutOfMemory };
 const SaveDraftError = BufferTransactionError || error{ PersistenceFailed, AnchorRangeTooLong, InvalidDraftScope };
 const EditDraftError = SaveDraftError || error{ DraftEditConflict, DraftLocked };
 const ReanchorDraftError = EditDraftError || error{ DraftNotAnchorable, InvalidAnchor };
@@ -1217,10 +1308,22 @@ const Published = struct {
         tree: file_tree.Projection,
         geometry: frame_mod.Geometry,
         selected_version: SelectedVersion,
+        accepted_batch: ?search.Batch = null,
+        accepted_ranges: ?[]frame_mod.ProjectedSourceRange = null,
+        accepted_active: ?usize = null,
+        input_batch: ?search.Batch = null,
+        input_ranges: ?[]frame_mod.ProjectedSourceRange = null,
+        input_active: ?usize = null,
         active: bool = true,
 
         fn deinit(self: *StagedBuffer) void {
-            if (self.active) self.published.buffers.abort();
+            if (self.active) {
+                if (self.accepted_batch) |*batch| batch.deinit(self.published.allocator);
+                if (self.accepted_ranges) |ranges| self.published.allocator.free(ranges);
+                if (self.input_batch) |*batch| batch.deinit(self.published.allocator);
+                if (self.input_ranges) |ranges| self.published.allocator.free(ranges);
+                self.published.buffers.abort();
+            }
             self.* = undefined;
         }
 
@@ -1234,6 +1337,24 @@ const Published = struct {
             self.published.geometry = self.geometry;
             self.published.selected_version = self.selected_version;
             self.published.navigation = frame_mod.restoreNavigation(previous, self.visual_rows, self.geometry);
+            if (self.published.buffer_search.accepted_query != null) {
+                if (self.published.buffer_search.accepted_batch) |*batch| batch.deinit(self.published.allocator);
+                if (self.published.buffer_search.accepted_ranges) |ranges| self.published.allocator.free(ranges);
+                self.published.buffer_search.accepted_batch = self.accepted_batch;
+                self.published.buffer_search.accepted_ranges = self.accepted_ranges;
+                self.published.buffer_search.active = self.accepted_active;
+                self.accepted_batch = null;
+                self.accepted_ranges = null;
+            }
+            if (self.published.buffer_search.input) |*input| if (input.query != null) {
+                if (input.batch) |*batch| batch.deinit(self.published.allocator);
+                if (input.ranges) |ranges| self.published.allocator.free(ranges);
+                input.batch = self.input_batch;
+                input.ranges = self.input_ranges;
+                input.active = self.input_active;
+                self.input_batch = null;
+                self.input_ranges = null;
+            };
             self.published.frame_revision += 1;
             self.published.visual_rows_revision = self.published.frame_revision;
             self.active = false;
@@ -1264,6 +1385,7 @@ const Published = struct {
     isolated_file: ?usize,
     composer_arena: std.heap.ArenaAllocator,
     composer: ?Composer,
+    buffer_search: BufferSearchState,
 
     fn create(
         allocator: Allocator,
@@ -1332,6 +1454,7 @@ const Published = struct {
         published.composer_arena = std.heap.ArenaAllocator.init(allocator);
         errdefer published.composer_arena.deinit();
         published.composer = null;
+        published.buffer_search = .{};
         published.geometry = geometry;
         published.selected_version = preferences.selected_version;
         published.frame_revision = 1;
@@ -1390,6 +1513,7 @@ const Published = struct {
 
     fn destroy(self: *Published) void {
         const allocator = self.allocator;
+        self.buffer_search.deinit(allocator);
         if (self.composer) |*composer| composer.deinit();
         self.composer_arena.deinit();
         self.expanded_disclosures.deinit(allocator);
@@ -1434,6 +1558,7 @@ const Published = struct {
             .focus = self.focus,
             .selected_version = self.selected_version,
             .version_title_targets = frame_mod.versionTitleTargets(frame_mod.paneRects(self.geometry).diff, self.selected_version),
+            .search_ranges = self.buffer_search.currentRanges(),
         };
     }
 
@@ -1752,13 +1877,175 @@ const Published = struct {
             self.tree.scroll,
             self.cell_metrics,
         );
-        return .{ .published = self, .buffer = candidate, .visual_rows = visual_rows, .tree = tree, .geometry = geometry, .selected_version = preferences.selected_version };
+        var accepted_batch: ?search.Batch = null;
+        var accepted_ranges: ?[]frame_mod.ProjectedSourceRange = null;
+        var accepted_active: ?usize = null;
+        errdefer {
+            if (accepted_batch) |*batch| batch.deinit(self.allocator);
+            if (accepted_ranges) |ranges| self.allocator.free(ranges);
+        }
+        if (self.buffer_search.accepted_query) |query| {
+            var batch = self.scanBufferSearchFor(preferences, expanded_disclosures, isolated_file, geometry, query) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.SearchFailed,
+            };
+            accepted_active = retainedSearchIndex(self.buffer_search.accepted_batch, self.buffer_search.active, batch);
+            accepted_ranges = projectBufferSearchRangesFor(self.allocator, candidate, visual_rows, batch, accepted_active) catch |err| {
+                batch.deinit(self.allocator);
+                return err;
+            };
+            accepted_batch = batch;
+        }
+
+        var input_batch: ?search.Batch = null;
+        var input_ranges: ?[]frame_mod.ProjectedSourceRange = null;
+        var input_active: ?usize = null;
+        errdefer {
+            if (input_batch) |*batch| batch.deinit(self.allocator);
+            if (input_ranges) |ranges| self.allocator.free(ranges);
+        }
+        if (self.buffer_search.input) |input| if (input.query) |query| {
+            var batch = self.scanBufferSearchFor(preferences, expanded_disclosures, isolated_file, geometry, query) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.SearchFailed,
+            };
+            input_active = retainedSearchIndex(input.batch, input.active, batch);
+            input_ranges = projectBufferSearchRangesFor(self.allocator, candidate, visual_rows, batch, input_active) catch |err| {
+                batch.deinit(self.allocator);
+                return err;
+            };
+            input_batch = batch;
+        };
+        return .{
+            .published = self,
+            .buffer = candidate,
+            .visual_rows = visual_rows,
+            .tree = tree,
+            .geometry = geometry,
+            .selected_version = preferences.selected_version,
+            .accepted_batch = accepted_batch,
+            .accepted_ranges = accepted_ranges,
+            .accepted_active = accepted_active,
+            .input_batch = input_batch,
+            .input_ranges = input_ranges,
+            .input_active = input_active,
+        };
     }
 
     fn commentsCollapsedRows(self: *const Published) usize {
         // Published projection policy is supplied by its owning Presentation;
         // keep the value alongside the other process preferences in a field.
         return self.comments_collapsed_rows;
+    }
+
+    fn scanBufferSearch(self: *Published, preferences: Preferences, query: search.Query) !search.Batch {
+        return self.scanBufferSearchFor(preferences, self.expanded_disclosures.items, self.isolated_file, self.geometry, query);
+    }
+
+    fn scanBufferSearchFor(
+        self: *Published,
+        preferences: Preferences,
+        expanded_disclosures: []const buffer_mod.DisclosureKey,
+        isolated_file: ?usize,
+        geometry: frame_mod.Geometry,
+        query: search.Query,
+    ) !search.Batch {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const enrichment = self.session.enrichment.projection();
+        const candidates = try buffer_mod.buildSearchCandidates(
+            arena.allocator(),
+            self.session.diff,
+            preferences.layout,
+            self.session.threads,
+            .{
+                .fold_context = preferences.scope == .changes,
+                .whole_file = preferences.scope == .whole,
+                .selected_version = preferences.selected_version,
+                .expanded_disclosures = expanded_disclosures,
+                .drafts = self.review.drafts.items,
+                .scope_projections = self.scope_projection.items,
+                .only_file = isolated_file,
+                .blobs = enrichment.blobs,
+                .highlights = enrichment.highlights,
+                .content_statuses = enrichment.content_statuses,
+                .card_width = frame_mod.paneRects(geometry).diff_content.width,
+                .cell_metrics = self.cell_metrics,
+                .collapsed_rows = self.commentsCollapsedRows(),
+            },
+            self.epoch,
+        );
+        return search.scan(self.allocator, query, candidates, .literal);
+    }
+
+    fn occurrenceVisualRow(self: *const Published, occurrence: search.Occurrence) ?usize {
+        const first = occurrence.ranges[0];
+        for (self.visual_rows, 0..) |visual, index| switch (occurrence.location) {
+            .source => |source| {
+                if (self.buffer.fileIndexForRow(visual.buffer_index) != source.file_index) continue;
+                _ = sourceLineForVisual(visual, source) orelse continue;
+                const start = if (visual.halves) |halves| blk: {
+                    const half = if (source.relation == .old) halves.left else halves.right;
+                    break :blk if (half) |value| value.source_start else continue;
+                } else visual.source_start;
+                const end = if (visual.halves) |halves| blk: {
+                    const half = if (source.relation == .old) halves.left else halves.right;
+                    break :blk if (half) |value| value.source_end else continue;
+                } else visual.source_end;
+                if (first.start < end and first.end > start) return index;
+            },
+            .review_body => |body| switch (visual.owner) {
+                .comment => |owner| if (body.owner == .comment and owner.id == body.owner.comment and owner.part != .header and first.start < visual.source_end and first.end > visual.source_start) return index,
+                .draft => |owner| if (body.owner == .draft and owner.id == body.owner.draft and owner.part != .header and first.start < visual.source_end and first.end > visual.source_start) return index,
+                else => {},
+            },
+        };
+        return null;
+    }
+
+    fn jumpToSearchOccurrence(self: *Published, occurrence: search.Occurrence) bool {
+        const row = self.occurrenceVisualRow(occurrence) orelse return false;
+        self.navigation.jumpTo(row);
+        return true;
+    }
+
+    fn projectBufferSearchRanges(self: *const Published, batch: search.Batch, active: ?usize) ![]frame_mod.ProjectedSourceRange {
+        return projectBufferSearchRangesFor(self.allocator, self.buffer, self.visual_rows, batch, active);
+    }
+
+    fn projectBufferSearchRangesFor(
+        allocator: Allocator,
+        buffer: buffer_mod.Buffer,
+        visual_rows: []const frame_mod.VisualRow,
+        batch: search.Batch,
+        active: ?usize,
+    ) ![]frame_mod.ProjectedSourceRange {
+        var projected: std.ArrayList(frame_mod.ProjectedSourceRange) = .empty;
+        errdefer projected.deinit(allocator);
+        for (batch.occurrences, 0..) |occurrence, occurrence_index| {
+            for (visual_rows, 0..) |visual, visual_index| switch (occurrence.location) {
+                .source => |source| {
+                    if (buffer.fileIndexForRow(visual.buffer_index) != source.file_index) continue;
+                    if (visual.halves) |halves| {
+                        if (halves.left) |half| if ((source.relation == .old or source.relation == .neutral) and sourceLineMatches(half.line, source, .old))
+                            try appendSearchIntersections(allocator, &projected, occurrence, occurrence_index == active, visual_index, .old, half.source_start, half.source_end);
+                        if (halves.right) |half| if ((source.relation == .new or source.relation == .neutral) and sourceLineMatches(half.line, source, .new))
+                            try appendSearchIntersections(allocator, &projected, occurrence, occurrence_index == active, visual_index, .new, half.source_start, half.source_end);
+                    } else if (sourceLineForVisual(visual, source) != null) {
+                        try appendSearchIntersections(allocator, &projected, occurrence, occurrence_index == active, visual_index, source.relation, visual.source_start, visual.source_end);
+                    }
+                },
+                .review_body => |body| {
+                    const matches = switch (visual.owner) {
+                        .comment => |owner| body.owner == .comment and owner.id == body.owner.comment and owner.part != .header,
+                        .draft => |owner| body.owner == .draft and owner.id == body.owner.draft and owner.part != .header,
+                        else => false,
+                    };
+                    if (matches) try appendSearchIntersections(allocator, &projected, occurrence, occurrence_index == active, visual_index, .neutral, visual.source_start, visual.source_end);
+                },
+            };
+        }
+        return projected.toOwnedSlice(allocator);
     }
 
     fn activeFile(self: *const Published) ?usize {
@@ -3107,6 +3394,7 @@ pub const Presentation = struct {
             .replacing = self.replacement != null,
             .replacement_error = self.replacement_error,
             .action_error = self.action_error,
+            .buffer_search = if (self.published) |published| published.buffer_search.projection() else null,
             .clipboard_status = self.clipboard_status,
             .fatal_error = self.fatal_error,
             .shutting_down = self.shutdown_requested,
@@ -3175,6 +3463,10 @@ pub const Presentation = struct {
     }
 
     fn applyMouse(self: *Presentation, mouse: MouseInput) void {
+        if (self.published) |published| if (published.buffer_search.input != null) {
+            self.mouse_press = null;
+            return;
+        };
         if (!self.dependencies.mouse_enabled) {
             self.mouse_press = null;
             return;
@@ -3248,6 +3540,11 @@ pub const Presentation = struct {
                 const previous_cursor = published.navigation.cursor;
                 published.navigation.jumpTo(index);
                 clampSelectionAtUnavailableRow(published, previous_cursor, self.preferences.scope);
+                if (published.navigation.cursor != previous_cursor) self.clearBufferSearchActive(published) catch |err| {
+                    published.navigation.jumpTo(previous_cursor);
+                    self.action_error = normalizeActionError(err);
+                    return;
+                };
                 if (buffer_mod.disclosureKey(published.buffer.rows[published.visual_rows[index].buffer_index]) != null)
                     self.applyAction(.toggle_disclosure);
             },
@@ -3507,6 +3804,7 @@ pub const Presentation = struct {
         if (self.delete_confirmation != null) return .delete_confirmation;
         if (self.file_finder != null) return .file_finder;
         if (self.picker != null) return .pull_request_picker;
+        if (self.published) |published| if (published.buffer_search.input != null) return .buffer_search_input;
         return self.paneContext();
     }
 
@@ -3547,6 +3845,7 @@ pub const Presentation = struct {
             .inline_comment_refusal = if (self.preferences.scope == .whole) wholeFileInlineRefusal(published) else if (source) null else .no_source,
             .suggestion_refusal = if (self.preferences.scope == .whole) wholeFileSuggestionRefusal(published) else if (source) null else .no_source,
             .selection = published.navigation.hasSelection() or canStartSelection(self.preferences.scope, published.cursorRow()),
+            .buffer_search = !published.navigation.hasSelection(),
             .edit_refusal = self.editRefusal(published),
             .reanchor_refusal = self.reanchorRefusal(published),
             .delete_refusal = self.deleteRefusal(published),
@@ -3772,6 +4071,7 @@ pub const Presentation = struct {
                 error.DraftEditConflict => .draft_edit_conflict,
                 error.PersistenceFailed => .persistence_failed,
                 error.BufferBuildFailed => .buffer_build_failed,
+                error.SearchFailed => .buffer_search_scan_failed,
                 error.OutOfMemory => .out_of_memory,
             };
             return;
@@ -3913,6 +4213,7 @@ pub const Presentation = struct {
                 error.InvalidAnchor => .anchor_candidate_ambiguous,
                 error.PersistenceFailed => .persistence_failed,
                 error.BufferBuildFailed => .buffer_build_failed,
+                error.SearchFailed => .buffer_search_scan_failed,
                 error.OutOfMemory => .out_of_memory,
             };
             return;
@@ -4017,6 +4318,15 @@ pub const Presentation = struct {
             } else if (key.text) |text| picker.insert(text);
             return;
         }
+        if (self.published) |published| if (published.buffer_search.input != null) {
+            if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.cancelBufferSearch();
+            if (key.matches(keymap_mod.special.enter, .{})) return self.acceptBufferSearch();
+            if (key.matches(keymap_mod.special.backspace, .{})) return try self.editBufferSearch(.backspace);
+            if (key.matches('w', .{ .ctrl = true })) return try self.editBufferSearch(.delete_word);
+            if (key.matches('u', .{ .ctrl = true })) return try self.editBufferSearch(.delete_all);
+            if (key.text) |text| return try self.insertBufferSearch(text);
+            return;
+        };
         // Stage two of re-anchor keeps the DiffPane's whole motion and Selection
         // vocabulary; only accept and cancel are claimed from it.
         if (self.reanchor != null) {
@@ -4242,6 +4552,7 @@ pub const Presentation = struct {
                 .suggest => suggestionRefusalError(availability.suggestion_refusal, selected_version),
                 .yank => yankRefusalError(availability.yank_refusal, selected_version),
                 .toggle_select => .source_action_unavailable,
+                .open_buffer_search => .buffer_search_selection_active,
                 .edit_review_item => mutationRefusalError(availability.edit_refusal),
                 .reanchor_review_item => mutationRefusalError(availability.reanchor_refusal),
                 .delete_review_item => mutationRefusalError(availability.delete_refusal),
@@ -4276,6 +4587,7 @@ pub const Presentation = struct {
         const published = self.published orelse return;
         self.action_error = null;
         const active_before = published.activeFile();
+        const navigation_before = published.navigation;
         const selection_cursor_before = published.navigation.cursor;
         switch (action) {
             .down => if (published.focus == .sidebar) published.sidebarVertical(1) else published.navigation.down(),
@@ -4321,6 +4633,9 @@ pub const Presentation = struct {
                     self.action_error = .source_action_unavailable;
                 }
             },
+            .open_buffer_search => self.openBufferSearch(),
+            .next_search_occurrence => self.traverseBufferSearch(.forward),
+            .previous_search_occurrence => self.traverseBufferSearch(.backward),
             .clear_selection => published.navigation.clearMark(),
             .refresh => self.queueRefresh(published.key),
             .toggle_layout => {
@@ -4369,6 +4684,13 @@ pub const Presentation = struct {
             .quit => unreachable,
         }
         clampSelectionAtUnavailableRow(published, selection_cursor_before, self.preferences.scope);
+        if (published.focus == .diff and keymap_mod.isMotion(action) and published.navigation.cursor != navigation_before.cursor and published.buffer_search.active != null) {
+            self.clearBufferSearchActive(published) catch |err| {
+                published.navigation = navigation_before;
+                self.action_error = normalizeActionError(err);
+                return;
+            };
+        }
         if (published.focus == .diff and active_before != published.activeFile()) self.revealActiveFile(published);
         const active_after = published.activeFile();
         if (active_before != active_after and action == .next_file and active_before != null and
@@ -4376,6 +4698,356 @@ pub const Presentation = struct {
         {
             self.prefetch_arm = .{ .session_epoch = published.epoch, .file_index = active_after.? };
         }
+    }
+
+    fn openBufferSearch(self: *Presentation) void {
+        const published = self.published orelse return;
+        if (published.buffer_search.input != null) return;
+        const count = if (published.navigation.count == 0) 1 else published.navigation.count;
+        const saved_expanded = self.allocator.dupe(buffer_mod.DisclosureKey, published.expanded_disclosures.items) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        const saved_search = if (published.buffer_search.saved_disclosures) |disclosures|
+            self.allocator.dupe(buffer_mod.DisclosureKey, disclosures) catch {
+                self.allocator.free(saved_expanded);
+                self.action_error = .out_of_memory;
+                return;
+            }
+        else
+            null;
+        published.navigation.count = 0;
+        published.buffer_search.input = .{
+            .saved_navigation = published.navigation,
+            .origin = published.navigation.cursor,
+            .count = count,
+            .saved_expanded_disclosures = saved_expanded,
+            .saved_search_disclosures = saved_search,
+        };
+        published.frame_revision += 1;
+    }
+
+    fn cancelBufferSearch(self: *Presentation) void {
+        const published = self.published orelse return;
+        const saved_navigation = if (published.buffer_search.input) |input| input.saved_navigation else return;
+        self.restoreInputDisclosures(published) catch |err| {
+            self.action_error = normalizeActionError(err);
+            return;
+        };
+        var input = published.buffer_search.input orelse return;
+        published.buffer_search.input = null;
+        published.navigation = saved_navigation;
+        input.deinit(self.allocator);
+        self.action_error = null;
+        published.frame_revision += 1;
+    }
+
+    fn restoreInputDisclosures(self: *Presentation, published: *Published) BufferTransactionError!void {
+        const input = published.buffer_search.input orelse return;
+        var target: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
+        errdefer target.deinit(self.allocator);
+        try target.appendSlice(self.allocator, input.saved_expanded_disclosures);
+        var staged = try published.prepareBuffer(self.preferences, target.items, published.isolated_file, published.geometry);
+        defer staged.deinit();
+        staged.publish();
+        published.expanded_disclosures.deinit(self.allocator);
+        published.expanded_disclosures = target;
+        if (published.buffer_search.saved_disclosures) |disclosures| self.allocator.free(disclosures);
+        const refreshed = &(published.buffer_search.input orelse unreachable);
+        published.buffer_search.saved_disclosures = refreshed.saved_search_disclosures;
+        refreshed.saved_search_disclosures = null;
+    }
+
+    fn acceptBufferSearch(self: *Presentation) void {
+        const published = self.published orelse return;
+        var input = published.buffer_search.input orelse return;
+        published.buffer_search.input = null;
+        if (input.query == null) {
+            const count = input.count;
+            input.deinit(self.allocator);
+            self.traverseBufferSearchBy(count, .forward);
+            return;
+        }
+        if (published.buffer_search.accepted_query) |*query| query.deinit(self.allocator);
+        if (published.buffer_search.accepted_batch) |*batch| batch.deinit(self.allocator);
+        published.buffer_search.accepted_query = input.query;
+        published.buffer_search.accepted_batch = input.batch;
+        if (published.buffer_search.accepted_ranges) |ranges| self.allocator.free(ranges);
+        published.buffer_search.accepted_ranges = input.ranges;
+        published.buffer_search.active = input.active;
+        input.query = null;
+        input.batch = null;
+        input.ranges = null;
+        if (input.active) |active| if (published.buffer_search.accepted_batch) |batch| {
+            _ = published.jumpToSearchOccurrence(batch.occurrences[active]);
+        };
+        input.deinit(self.allocator);
+        self.action_error = null;
+        published.frame_revision += 1;
+    }
+
+    const SearchEdit = enum { backspace, delete_word, delete_all };
+    const SearchDirection = enum { forward, backward };
+
+    fn insertBufferSearch(self: *Presentation, text: []const u8) !void {
+        if (!std.unicode.utf8ValidateSlice(text)) {
+            self.action_error = .buffer_search_invalid_query;
+            return;
+        }
+        const published = self.published orelse return;
+        const input = &(published.buffer_search.input orelse return);
+        const current = if (input.query) |query| query.text else "";
+        const joined = self.allocator.alloc(u8, current.len + text.len) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        defer self.allocator.free(joined);
+        @memcpy(joined[0..current.len], current);
+        @memcpy(joined[current.len..], text);
+        try self.replaceBufferSearchQuery(joined);
+    }
+
+    fn editBufferSearch(self: *Presentation, edit: SearchEdit) !void {
+        const published = self.published orelse return;
+        const input = &(published.buffer_search.input orelse return);
+        const text = if (input.query) |query| query.text else return;
+        const end = switch (edit) {
+            .backspace => lastScalarStart(text),
+            .delete_word => searchWordStart(text),
+            .delete_all => 0,
+        };
+        try self.replaceBufferSearchQuery(text[0..end]);
+    }
+
+    fn replaceBufferSearchQuery(self: *Presentation, text: []const u8) !void {
+        const published = self.published orelse return;
+        const input = &(published.buffer_search.input orelse return);
+        if (text.len == 0) {
+            const old_query = input.query;
+            const old_batch = input.batch;
+            const old_ranges = input.ranges;
+            const old_active = input.active;
+            input.query = null;
+            input.batch = null;
+            input.ranges = null;
+            input.active = null;
+            const accepted_occurrence: ?search.Occurrence = if (published.buffer_search.accepted_batch) |accepted|
+                if (published.buffer_search.active) |active| accepted.occurrences[active] else null
+            else
+                null;
+            self.updateSearchOwnedDisclosure(published, accepted_occurrence) catch |err| {
+                input.query = old_query;
+                input.batch = old_batch;
+                input.ranges = old_ranges;
+                input.active = old_active;
+                self.action_error = normalizeActionError(err);
+                return;
+            };
+            if (old_query) |query| {
+                var owned = query;
+                owned.deinit(self.allocator);
+            }
+            if (old_batch) |batch| {
+                var owned = batch;
+                owned.deinit(self.allocator);
+            }
+            if (old_ranges) |ranges| self.allocator.free(ranges);
+            published.navigation = input.saved_navigation;
+            self.action_error = null;
+            published.frame_revision += 1;
+            return;
+        }
+        var query = search.Query.init(self.allocator, text) catch |err| {
+            self.action_error = switch (err) {
+                error.TooLong => .buffer_search_query_too_long,
+                error.OutOfMemory => .out_of_memory,
+                else => .buffer_search_invalid_query,
+            };
+            return;
+        };
+        var batch = published.scanBufferSearch(self.preferences, query) catch |err| {
+            query.deinit(self.allocator);
+            self.action_error = if (err == error.OutOfMemory) .out_of_memory else .buffer_search_scan_failed;
+            return;
+        };
+        const base = firstSearchOccurrenceAtOrAfter(published, batch, input.origin);
+        const retained = retainedEditedSearchIndex(input.batch, input.active, batch);
+        const active = if (batch.occurrences.len == 0) null else retained orelse (base + input.count - 1) % batch.occurrences.len;
+        const ranges = published.projectBufferSearchRanges(batch, active) catch {
+            batch.deinit(self.allocator);
+            query.deinit(self.allocator);
+            self.action_error = .out_of_memory;
+            return;
+        };
+        const old_query = input.query;
+        const old_batch = input.batch;
+        const old_ranges = input.ranges;
+        const old_active = input.active;
+        input.query = query;
+        input.batch = batch;
+        input.active = active;
+        input.ranges = ranges;
+        if (active) |index| {
+            self.updateSearchOwnedDisclosure(published, batch.occurrences[index]) catch |err| {
+                input.query = old_query;
+                input.batch = old_batch;
+                input.ranges = old_ranges;
+                input.active = old_active;
+                batch.deinit(self.allocator);
+                query.deinit(self.allocator);
+                self.allocator.free(ranges);
+                self.action_error = normalizeActionError(err);
+                return;
+            };
+            const refreshed_input = &(published.buffer_search.input orelse return);
+            if (refreshed_input.batch) |refreshed| {
+                if (refreshed_input.active) |refreshed_active| _ = published.jumpToSearchOccurrence(refreshed.occurrences[refreshed_active]);
+            }
+        } else self.updateSearchOwnedDisclosure(published, null) catch |err| {
+            input.query = old_query;
+            input.batch = old_batch;
+            input.ranges = old_ranges;
+            input.active = old_active;
+            batch.deinit(self.allocator);
+            query.deinit(self.allocator);
+            self.allocator.free(ranges);
+            self.action_error = normalizeActionError(err);
+            return;
+        };
+        if (old_query) |old| {
+            var owned = old;
+            owned.deinit(self.allocator);
+        }
+        if (old_batch) |old| {
+            var owned = old;
+            owned.deinit(self.allocator);
+        }
+        if (old_ranges) |old| self.allocator.free(old);
+        self.action_error = if (active == null) .buffer_search_no_matches else null;
+        published.frame_revision += 1;
+    }
+
+    fn traverseBufferSearch(self: *Presentation, direction: SearchDirection) void {
+        const published = self.published orelse return;
+        const count = if (published.navigation.count == 0) 1 else published.navigation.count;
+        published.navigation.count = 0;
+        self.traverseBufferSearchBy(count, direction);
+    }
+
+    fn traverseBufferSearchBy(self: *Presentation, count: usize, direction: SearchDirection) void {
+        const published = self.published orelse return;
+        const batch = if (published.buffer_search.accepted_batch) |*value| value else return;
+        if (batch.occurrences.len == 0) {
+            self.action_error = .buffer_search_no_matches;
+            return;
+        }
+        const current = published.buffer_search.active;
+        const next_and_wrap = if (current) |active| blk: {
+            const steps = count % batch.occurrences.len;
+            break :blk .{
+                switch (direction) {
+                    .forward => (active + steps) % batch.occurrences.len,
+                    .backward => (active + batch.occurrences.len - steps) % batch.occurrences.len,
+                },
+                switch (direction) {
+                    .forward => count > batch.occurrences.len - 1 - active,
+                    .backward => count > active,
+                },
+            };
+        } else searchFromInactiveRow(published, batch.*, published.navigation.cursor, count, direction);
+        const next = next_and_wrap[0];
+        const wrapped = next_and_wrap[1];
+        const ranges = published.projectBufferSearchRanges(batch.*, next) catch |err| {
+            self.action_error = normalizeActionError(err);
+            return;
+        };
+        const old_ranges = published.buffer_search.accepted_ranges;
+        const old_active = published.buffer_search.active;
+        published.buffer_search.accepted_ranges = ranges;
+        published.buffer_search.active = next;
+        self.updateSearchOwnedDisclosure(published, batch.occurrences[next]) catch |err| {
+            published.buffer_search.accepted_ranges = old_ranges;
+            published.buffer_search.active = old_active;
+            self.allocator.free(ranges);
+            self.action_error = normalizeActionError(err);
+            return;
+        };
+        if (old_ranges) |old| self.allocator.free(old);
+        if (published.buffer_search.accepted_batch) |refreshed| {
+            if (published.buffer_search.active) |refreshed_active| _ = published.jumpToSearchOccurrence(refreshed.occurrences[refreshed_active]);
+        }
+        self.action_error = if (wrapped) switch (direction) {
+            .forward => .buffer_search_hit_bottom,
+            .backward => .buffer_search_hit_top,
+        } else null;
+        published.frame_revision += 1;
+    }
+
+    fn updateSearchOwnedDisclosure(self: *Presentation, published: *Published, occurrence: ?search.Occurrence) BufferTransactionError!void {
+        var required: SearchDisclosureSet = .{};
+        if (occurrence) |active| {
+            const visible = published.occurrenceVisualRow(active) != null;
+            if (!visible) {
+                required = requiredSearchDisclosure(published, active);
+            } else if (published.buffer_search.saved_disclosures != null) {
+                const possible = requiredSearchDisclosure(published, active);
+                for (possible.items[0..possible.len]) |key| {
+                    for (published.expanded_disclosures.items) |expanded| if (std.meta.eql(expanded, key)) {
+                        required.append(key);
+                        break;
+                    };
+                }
+            }
+        }
+
+        if (required.len == 0 and published.buffer_search.saved_disclosures == null) return;
+        const base = published.buffer_search.saved_disclosures orelse published.expanded_disclosures.items;
+
+        var target: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
+        errdefer target.deinit(self.allocator);
+        try target.appendSlice(self.allocator, base);
+        for (required.items[0..required.len]) |key| {
+            var exists = false;
+            for (target.items) |existing| if (std.meta.eql(existing, key)) {
+                exists = true;
+                break;
+            };
+            if (!exists) try target.append(self.allocator, key);
+        }
+        if (required.len > 0 and target.items.len == base.len and published.buffer_search.saved_disclosures == null) return;
+        const saved = if (published.buffer_search.saved_disclosures == null and required.len > 0)
+            try self.allocator.dupe(buffer_mod.DisclosureKey, published.expanded_disclosures.items)
+        else
+            null;
+        errdefer if (saved) |items| self.allocator.free(items);
+
+        var staged = try published.prepareBuffer(self.preferences, target.items, published.isolated_file, published.geometry);
+        defer staged.deinit();
+        staged.publish();
+        published.expanded_disclosures.deinit(self.allocator);
+        published.expanded_disclosures = target;
+        if (saved) |items| published.buffer_search.saved_disclosures = items;
+        if (required.len == 0) {
+            self.allocator.free(published.buffer_search.saved_disclosures.?);
+            published.buffer_search.saved_disclosures = null;
+        }
+    }
+
+    fn clearBufferSearchActive(self: *Presentation, published: *Published) BufferTransactionError!void {
+        const active = published.buffer_search.active orelse return;
+        if (published.buffer_search.saved_disclosures != null) {
+            published.buffer_search.active = null;
+            self.updateSearchOwnedDisclosure(published, null) catch |err| {
+                published.buffer_search.active = active;
+                return err;
+            };
+            return;
+        }
+        const batch = published.buffer_search.accepted_batch orelse return;
+        const ranges = try published.projectBufferSearchRanges(batch, null);
+        if (published.buffer_search.accepted_ranges) |old| self.allocator.free(old);
+        published.buffer_search.accepted_ranges = ranges;
+        published.buffer_search.active = null;
     }
 
     fn togglePaneFocus(self: *Presentation, published: *Published) void {
@@ -5891,6 +6563,7 @@ pub const Presentation = struct {
                 error.InvalidDraftScope => .invalid_selection,
                 error.PersistenceFailed => .persistence_failed,
                 error.BufferBuildFailed => .buffer_build_failed,
+                error.SearchFailed => .buffer_search_scan_failed,
                 error.OutOfMemory => .out_of_memory,
             };
             return;
@@ -5917,6 +6590,7 @@ pub const Presentation = struct {
                 error.DraftEditConflict => .draft_edit_conflict,
                 error.PersistenceFailed => .persistence_failed,
                 error.BufferBuildFailed => .buffer_build_failed,
+                error.SearchFailed => .buffer_search_scan_failed,
                 error.OutOfMemory => .out_of_memory,
             };
             return;
@@ -6517,6 +7191,7 @@ fn captureAnchorSnapshot(allocator: Allocator, file: bbr.diff.File, selected: []
 fn normalizeActionError(err: BufferTransactionError) ActionError {
     return switch (err) {
         error.BufferBuildFailed => .buffer_build_failed,
+        error.SearchFailed => .buffer_search_scan_failed,
         error.OutOfMemory => .out_of_memory,
     };
 }
@@ -6772,6 +7447,309 @@ fn lineAtVisualRow(buffer: buffer_mod.Buffer, row: frame_mod.VisualRow) ?*const 
         if (halves.left) |half| return half.line;
     }
     return lineAtRow(buffer.rows[row.buffer_index]);
+}
+
+fn sourceLineForVisual(row: frame_mod.VisualRow, source: search.SourceLocation) ?*const bbr.diff.Line {
+    if (row.halves) |halves| return switch (source.relation) {
+        .old => if (halves.left) |half| if (sourceLineMatches(half.line, source, .old)) half.line else null else null,
+        .new => if (halves.right) |half| if (sourceLineMatches(half.line, source, .new)) half.line else null else null,
+        .neutral => if (halves.right) |half|
+            if (sourceLineMatches(half.line, source, .new)) half.line else null
+        else if (halves.left) |half|
+            if (sourceLineMatches(half.line, source, .old)) half.line else null
+        else
+            null,
+    };
+    const line = switch (row.owner) {
+        .line => |value| value,
+        else => return null,
+    };
+    return switch (source.relation) {
+        .old => if (line.oldNo() == source.old_line) line else null,
+        .new => if (line.newNo() == source.new_line) line else null,
+        .neutral => if (line.oldNo() == source.old_line and line.newNo() == source.new_line) line else null,
+    };
+}
+
+fn sourceLineMatches(line: *const bbr.diff.Line, source: search.SourceLocation, relation: search.VersionRelation) bool {
+    return switch (relation) {
+        .old => line.oldNo() == source.old_line,
+        .new => line.newNo() == source.new_line,
+        .neutral => line.oldNo() == source.old_line and line.newNo() == source.new_line,
+    };
+}
+
+const SearchDisclosureSet = struct {
+    items: [3]buffer_mod.DisclosureKey = undefined,
+    len: usize = 0,
+
+    fn append(self: *SearchDisclosureSet, key: buffer_mod.DisclosureKey) void {
+        if (self.len == self.items.len) return;
+        self.items[self.len] = key;
+        self.len += 1;
+    }
+};
+
+fn requiredSearchDisclosure(published: *const Published, occurrence: search.Occurrence) SearchDisclosureSet {
+    var result: SearchDisclosureSet = .{};
+    switch (occurrence.location) {
+        .review_body => |body| switch (body.owner) {
+            .comment => |id| {
+                for (published.session.threads) |thread| {
+                    var owns = thread.root.id == id;
+                    for (thread.replies) |reply| if (reply.id == id) {
+                        owns = true;
+                        break;
+                    };
+                    if (!owns) continue;
+                    appendCommentDisclosureChain(published, thread, &result);
+                    if (thread.resolved) result.append(.{ .resolved_thread = thread.root.id });
+                    break;
+                }
+                result.append(.{ .review_card = .{ .comment = id } });
+            },
+            .draft => |id| {
+                appendDraftDisclosureChain(published, id, &result);
+                result.append(.{ .review_card = .{ .draft = id } });
+            },
+        },
+        .source => |source| {
+            if (source.file_index >= published.session.diff.files.len) return result;
+            const file = published.session.diff.files[source.file_index];
+            var target: ?*const bbr.diff.Line = null;
+            for (file.hunks) |hunk| for (hunk.lines) |*line| if (sourceLineMatches(line, source, source.relation)) {
+                target = line;
+                break;
+            };
+            const wanted = target orelse return result;
+            for (published.buffer.rows) |row| {
+                if (row != .disclosure or row.disclosure.kind != .fold) continue;
+                const first = row.disclosure.key.fold;
+                for (file.hunks) |hunk| {
+                    var start: ?usize = null;
+                    for (hunk.lines, 0..) |*line, index| if (line == first) {
+                        start = index;
+                        break;
+                    };
+                    const index = start orelse continue;
+                    const end = @min(index + row.disclosure.count, hunk.lines.len);
+                    for (hunk.lines[index..end]) |*line| if (line == wanted) {
+                        result.append(row.disclosure.key);
+                        return result;
+                    };
+                }
+            }
+        },
+    }
+    return result;
+}
+
+fn appendCommentDisclosureChain(published: *const Published, thread: bbr.review.Thread, result: *SearchDisclosureSet) void {
+    const root = thread.root;
+    for (published.buffer.rows) |row| {
+        const key = buffer_mod.disclosureKey(row) orelse continue;
+        switch (key) {
+            .outdated_file => |file| if (root.state == .outdated and root.anchor != null and pathMatchesFile(root.anchor.?.path, file.*)) result.append(key),
+            .outdated_review => if (root.state == .outdated) result.append(key),
+            .opposite_version => |file| if (root.state != .outdated and root.anchor != null and pathMatchesFile(root.anchor.?.path, file.*) and anchorOpposesSelected(root.anchor.?, published.selected_version)) result.append(key),
+            else => {},
+        }
+    }
+}
+
+fn appendDraftDisclosureChain(published: *const Published, temp_id: bbr.review.TempId, result: *SearchDisclosureSet) void {
+    var draft = published.review.getConst(temp_id) orelse return;
+    while (draft.parent) |parent| switch (parent) {
+        .comment => |comment_id| {
+            for (published.session.threads) |thread| {
+                var owns = thread.root.id == comment_id;
+                for (thread.replies) |reply| if (reply.id == comment_id) {
+                    owns = true;
+                    break;
+                };
+                if (owns) appendCommentDisclosureChain(published, thread, result);
+            }
+            return;
+        },
+        .draft => |parent_id| draft = published.review.getConst(parent_id) orelse return,
+    };
+    var resolution: ?bbr.review.ScopeResolution = null;
+    for (published.scope_projection.items) |entry| if (entry.temp_id == draft.local_id) {
+        resolution = entry.resolution;
+        break;
+    };
+    const resolved = switch (resolution orelse return) {
+        .resolved => |value| value,
+        .unavailable => return,
+    };
+    for (published.buffer.rows) |row| {
+        const key = buffer_mod.disclosureKey(row) orelse continue;
+        switch (key) {
+            .outdated_file => |file| if (resolved.state == .outdated and scopePathMatchesFile(resolved.scope, file.*)) result.append(key),
+            .outdated_review => if (resolved.state == .outdated) result.append(key),
+            .opposite_version => |file| if (resolved.state != .outdated and resolved.scope == .@"inline" and pathMatchesFile(resolved.scope.@"inline".path, file.*) and anchorOpposesSelected(resolved.scope.@"inline", published.selected_version)) result.append(key),
+            else => {},
+        }
+    }
+}
+
+fn scopePathMatchesFile(scope: bbr.review.CommentScope, file: bbr.diff.File) bool {
+    return switch (scope) {
+        .review => false,
+        .file => |value| pathMatchesFile(value.path, file),
+        .@"inline" => |anchor| pathMatchesFile(anchor.path, file),
+    };
+}
+
+fn pathMatchesFile(path: []const u8, file: bbr.diff.File) bool {
+    return std.mem.eql(u8, path, file.old_path) or std.mem.eql(u8, path, file.new_path);
+}
+
+fn anchorOpposesSelected(anchor: bbr.review.Anchor, selected: SelectedVersion) bool {
+    return (anchor.to != null) != (selected == .new);
+}
+
+fn appendSearchIntersections(
+    allocator: Allocator,
+    projected: *std.ArrayList(frame_mod.ProjectedSourceRange),
+    occurrence: search.Occurrence,
+    active: bool,
+    visual_row: usize,
+    relation: search.VersionRelation,
+    row_start: usize,
+    row_end: usize,
+) !void {
+    for (occurrence.ranges) |range| {
+        const start = @max(range.start, row_start);
+        const end = @min(range.end, row_end);
+        if (start >= end) continue;
+        try projected.append(allocator, .{
+            .visual_row = visual_row,
+            .relation = relation,
+            .source = .{ .start = start, .end = end },
+            .row = .{ .start = start - row_start, .end = end - row_start },
+            .active = active,
+        });
+    }
+}
+
+fn firstSearchOccurrenceAtOrAfter(published: *const Published, batch: search.Batch, origin: usize) usize {
+    for (batch.occurrences, 0..) |occurrence, index| {
+        if (searchOccurrenceNavigationRow(published, occurrence)) |row| if (row >= origin) return index;
+    }
+    return 0;
+}
+
+fn searchFromInactiveRow(published: *const Published, batch: search.Batch, cursor: usize, count: usize, direction: Presentation.SearchDirection) struct { usize, bool } {
+    const len = batch.occurrences.len;
+    return switch (direction) {
+        .forward => blk: {
+            var first: ?usize = null;
+            for (batch.occurrences, 0..) |occurrence, index| {
+                if (searchOccurrenceNavigationRow(published, occurrence)) |row| if (row > cursor) {
+                    first = index;
+                    break;
+                };
+            }
+            const start = first orelse 0;
+            const offset = count - 1;
+            break :blk .{ (start + offset % len) % len, first == null or offset >= len - start };
+        },
+        .backward => blk: {
+            var last: ?usize = null;
+            var index = len;
+            while (index > 0) {
+                index -= 1;
+                if (searchOccurrenceNavigationRow(published, batch.occurrences[index])) |row| if (row < cursor) {
+                    last = index;
+                    break;
+                };
+            }
+            const start = last orelse len - 1;
+            const offset = (count - 1) % len;
+            break :blk .{ (start + len - offset) % len, last == null or count - 1 > start };
+        },
+    };
+}
+
+fn searchOccurrenceNavigationRow(published: *const Published, occurrence: search.Occurrence) ?usize {
+    if (published.occurrenceVisualRow(occurrence)) |row| return row;
+    const disclosures = requiredSearchDisclosure(published, occurrence);
+    for (published.visual_rows, 0..) |visual, index| {
+        const key = buffer_mod.disclosureKey(published.buffer.rows[visual.buffer_index]) orelse continue;
+        for (disclosures.items[0..disclosures.len]) |required| if (std.meta.eql(key, required)) return index;
+    }
+    return null;
+}
+
+fn retainedSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next: search.Batch) ?usize {
+    if (next.occurrences.len == 0) return null;
+    if (previous_batch) |previous| if (previous_active) |active| if (active < previous.occurrences.len) {
+        const wanted = previous.occurrences[active];
+        for (next.occurrences, 0..) |candidate, index| if (searchOccurrenceEql(wanted, candidate)) return index;
+        return @min(active, next.occurrences.len - 1);
+    };
+    return 0;
+}
+
+fn retainedEditedSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next: search.Batch) ?usize {
+    const previous = previous_batch orelse return null;
+    const active = previous_active orelse return null;
+    if (active >= previous.occurrences.len) return null;
+    const wanted = previous.occurrences[active];
+    for (next.occurrences, 0..) |candidate, index| {
+        if (wanted.ranges.len > 0 and candidate.ranges.len > 0 and
+            wanted.ranges[0].start == candidate.ranges[0].start and
+            searchLocationEql(wanted.location, candidate.location)) return index;
+    }
+    return null;
+}
+
+fn searchOccurrenceEql(a: search.Occurrence, b: search.Occurrence) bool {
+    if (a.session_epoch != b.session_epoch or a.ranges.len != b.ranges.len or std.meta.activeTag(a.location) != std.meta.activeTag(b.location)) return false;
+    if (!searchLocationEql(a.location, b.location)) return false;
+    for (a.ranges, b.ranges) |left, right| if (left.start != right.start or left.end != right.end) return false;
+    return true;
+}
+
+fn searchLocationEql(a: search.Location, b: search.Location) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .source => |source| blk: {
+            const other = b.source;
+            break :blk source.file_index == other.file_index and source.relation == other.relation and
+                source.old_line == other.old_line and source.new_line == other.new_line and
+                std.mem.eql(u8, source.old_path, other.old_path) and std.mem.eql(u8, source.new_path, other.new_path);
+        },
+        .review_body => |body| std.meta.eql(body, b.review_body),
+    };
+}
+
+fn lastScalarStart(text: []const u8) usize {
+    var result: usize = 0;
+    var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
+    while (iterator.nextCodepointSlice()) |scalar| result = @intFromPtr(scalar.ptr) - @intFromPtr(text.ptr);
+    return result;
+}
+
+fn searchWordStart(text: []const u8) usize {
+    var word_start: usize = 0;
+    var previous_whitespace = true;
+    var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
+    while (iterator.nextCodepointSlice()) |bytes| {
+        const scalar = std.unicode.utf8Decode(bytes) catch unreachable;
+        const whitespace = isSearchWhitespace(scalar);
+        if (!whitespace and previous_whitespace) word_start = @intFromPtr(bytes.ptr) - @intFromPtr(text.ptr);
+        previous_whitespace = whitespace;
+    }
+    return word_start;
+}
+
+fn isSearchWhitespace(scalar: u21) bool {
+    return switch (scalar) {
+        0x0009...0x000D, 0x0020, 0x0085, 0x00A0, 0x1680, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000 => true,
+        else => false,
+    };
 }
 
 const YankCandidate = struct {
@@ -7227,6 +8205,133 @@ fn testSession(backing: std.mem.Allocator, id: u64, marker: u8) !*session_mod.Se
     s.diff = try bbr.diff.parse(a, raw);
     try s.initializeEnrichment();
     return s;
+}
+
+test "M21 kernel Buffer Search refuses an active Selection without changing it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        .geometry = .{ .cols = 80, .rows = 12 },
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+
+    const projection = presentation.projection();
+    try testing.expectEqual(ActionError.buffer_search_selection_active, projection.action_error.?);
+    try testing.expect(projection.review.?.navigation.hasSelection());
+    try testing.expect(projection.buffer_search == null);
+}
+
+test "M21 kernel Buffer Search previews accepts traverses and cancels atomically" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        .geometry = .{ .cols = 80, .rows = 12 },
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try testing.expectEqualStrings("", presentation.projection().buffer_search.?.query);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    const preview = presentation.projection().buffer_search.?;
+    try testing.expect(preview.input);
+    try testing.expectEqualStrings("new", preview.query);
+    try testing.expectEqual(@as(usize, 1), preview.total);
+    try testing.expectEqual(@as(?usize, 1), preview.active);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(!presentation.projection().buffer_search.?.input);
+    try testing.expect(presentation.projection().review.?.frame.search_ranges.len > 0);
+    var accepted_cursor = presentation.projection().review.?.navigation.cursor;
+    try presentation.dispatch(.{ .action = .toggle_layout });
+    try testing.expectEqualStrings("new", presentation.projection().buffer_search.?.query);
+    try testing.expect(presentation.projection().review.?.frame.search_ranges.len > 0);
+    try presentation.dispatch(.{ .action = .up });
+    try testing.expectEqual(@as(?usize, null), presentation.projection().buffer_search.?.active);
+    try presentation.dispatch(.{ .action = .next_search_occurrence });
+    try testing.expect(presentation.projection().review.?.navigation.cursor >= accepted_cursor);
+    accepted_cursor = presentation.projection().review.?.navigation.cursor;
+    try testing.expect(presentation.projection().action_error == null);
+
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 0x00E9, .text = "é" } });
+    try testing.expectEqualStrings("é", presentation.projection().buffer_search.?.query);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.backspace } });
+    try testing.expectEqualStrings("", presentation.projection().buffer_search.?.query);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expectEqualStrings("new", presentation.projection().buffer_search.?.query);
+    try testing.expectEqual(accepted_cursor, presentation.projection().review.?.navigation.cursor);
+}
+
+test "M21 kernel Buffer Search keeps the previous preview after a refused edit" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    const too_long = try testing.allocator.alloc(u8, search.max_query_scalars);
+    defer testing.allocator.free(too_long);
+    @memset(too_long, 'x');
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'x', .text = too_long } });
+
+    try testing.expectEqualStrings("new", presentation.projection().buffer_search.?.query);
+    try testing.expectEqual(ActionError.buffer_search_query_too_long, presentation.projection().action_error.?);
+}
+
+test "M21 kernel Buffer Search applies Count and Unicode-safe query editing" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testVersionNavigationSession(testing.allocator) },
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .push_count_digit = 2 });
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 's', .text = "source extra" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'w', .mods = .{ .ctrl = true } } });
+    try testing.expectEqualStrings("source ", presentation.projection().buffer_search.?.query);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+    try testing.expectEqualStrings("", presentation.projection().buffer_search.?.query);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 's', .text = "sou" } });
+    try testing.expectEqual(@as(?usize, 2), presentation.projection().buffer_search.?.active);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'r', .text = "rce" } });
+    try testing.expectEqual(@as(?usize, 2), presentation.projection().buffer_search.?.active);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try presentation.dispatch(.{ .action = .previous_search_occurrence });
+    try testing.expectEqual(@as(?usize, 1), presentation.projection().buffer_search.?.active);
+    try presentation.dispatch(.{ .push_count_digit = 2 });
+    try presentation.dispatch(.{ .action = .next_search_occurrence });
+    try testing.expectEqual(@as(?usize, 3), presentation.projection().buffer_search.?.active);
+    try presentation.dispatch(.{ .action = .next_search_occurrence });
+    try testing.expectEqual(@as(?usize, 1), presentation.projection().buffer_search.?.active);
+    try testing.expectEqual(ActionError.buffer_search_hit_bottom, presentation.projection().action_error.?);
+}
+
+test "M21 kernel SideBySide Buffer Search navigates to the exact source Line" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testVersionNavigationSession(testing.allocator) },
+        .geometry = .{ .cols = 100, .rows = 12 },
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .toggle_layout });
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 's', .text = "source" } });
+
+    const published = presentation.published.?;
+    const visual = published.visual_rows[published.navigation.cursor];
+    try testing.expectEqualStrings("old source that wraps", visual.halves.?.left.?.line.text);
 }
 
 fn testVersionNavigationSession(backing: std.mem.Allocator) !*session_mod.Session {
@@ -9315,6 +10420,44 @@ fn moveToRow(presentation: *Presentation, row: usize) !void {
     try presentation.dispatch(.{ .action = .to_top });
     var index: usize = 0;
     while (index < row) : (index += 1) try presentation.dispatch(.{ .action = .down });
+}
+
+test "M21 kernel Buffer Search opens only required disclosures and Escape restores them" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 12 },
+    });
+    defer presentation.deinit();
+    const saved_navigation = presentation.projection().review.?.navigation;
+    const initial_rows = presentation.projection().review.?.buffer.rows.len;
+
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "eight" } });
+    try testing.expect(presentation.projection().review.?.buffer.rows.len > initial_rows);
+    try testing.expectEqual(@as(?usize, 1), presentation.projection().buffer_search.?.active);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.backspace } });
+    try testing.expect(presentation.projection().review.?.buffer.rows.len > initial_rows);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 't', .text = "t" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expectEqual(initial_rows, presentation.projection().review.?.buffer.rows.len);
+    try testing.expectEqual(saved_navigation.cursor, presentation.projection().review.?.navigation.cursor);
+    try testing.expectEqual(saved_navigation.scroll, presentation.projection().review.?.navigation.scroll);
+
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c5" } });
+    try testing.expect(presentation.projection().review.?.buffer.rows.len > initial_rows);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expectEqual(initial_rows, presentation.projection().review.?.buffer.rows.len);
+
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'h', .text = "history" } });
+    const outdated_key: buffer_mod.DisclosureKey = .{ .outdated_file = &presentation.projection().review.?.diff.files[0] };
+    const outdated_row = findDisclosureRow(presentation.projection().review.?.buffer.rows, outdated_key).?;
+    try testing.expect(presentation.projection().review.?.buffer.rows[outdated_row].disclosure.expanded);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expectEqual(initial_rows, presentation.projection().review.?.buffer.rows.len);
 }
 
 test "Session disclosures toggle independently persist through rebuilds and reset atomically" {

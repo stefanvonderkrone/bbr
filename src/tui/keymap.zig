@@ -167,6 +167,9 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one('q'), .action = .quit, .help = "quit" },
     .{ .chord = Chord.modified('c', .{ .ctrl = true }), .action = .quit, .help = "quit" },
     .{ .chord = Chord.one('F'), .action = .open_file_finder, .help = "open File finder" },
+    .{ .chord = Chord.one('/'), .action = .open_buffer_search, .help = "search Buffer" },
+    .{ .chord = Chord.one('n'), .action = .next_search_occurrence, .help = "next Search Occurrence" },
+    .{ .chord = Chord.one('N'), .action = .previous_search_occurrence, .help = "previous Search Occurrence" },
     .{ .chord = Chord.one('p'), .action = .open_pull_request_picker, .help = "open PullRequest Picker" },
     .{ .chord = Chord.one('R'), .action = .refresh, .help = "refresh review" },
     .{ .chord = Chord.one('s'), .action = .toggle_layout, .help = "toggle unified / side-by-side" },
@@ -367,7 +370,7 @@ fn validateBindings(bindings: []const Binding) !void {
 pub fn supportsContext(action: Action, context: InteractionContext) bool {
     return switch (context) {
         .composer => action == .external_edit,
-        .help, .unknown_resolution, .delete_confirmation => false,
+        .help, .unknown_resolution, .delete_confirmation, .buffer_search_input => false,
         .file_finder, .pull_request_picker => switch (action) {
             .up, .down, .confirm_picker, .quit => true,
             else => false,
@@ -482,6 +485,9 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .select_up,
             .quit,
             .open_file_finder,
+            .open_buffer_search,
+            .next_search_occurrence,
+            .previous_search_occurrence,
             .open_pull_request_picker,
             .refresh,
             .inline_comment,
@@ -773,4 +779,21 @@ test "same chord is rejected when Actions overlap in an Interaction Context" {
         .{ .action = "up", .sequences = &.{"x"} },
     };
     try testing.expectError(error.AmbiguousContext, Keymap.fromOverrides(testing.allocator, &overrides));
+}
+
+test "M21 Buffer Search Actions resolve in every DiffPane context and remain configurable" {
+    inline for (.{ InteractionContext.diff, .diff_source, .diff_disclosure, .diff_review_card }) |context| {
+        var resolver: Resolver = .{};
+        try testing.expectEqual(Action.open_buffer_search, resolver.feed(.default, context, plain('/')).action);
+        try testing.expectEqual(Action.next_search_occurrence, resolver.feed(.default, context, plain('n')).action);
+        try testing.expectEqual(Action.previous_search_occurrence, resolver.feed(.default, context, plain('N')).action);
+    }
+
+    const overrides = [_]Override{.{ .action = "open_buffer_search", .sequences = &.{"space s"} }};
+    var configured = try Keymap.fromOverrides(testing.allocator, &overrides);
+    defer configured.deinit(testing.allocator);
+    var resolver: Resolver = .{};
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain('/')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain(' ')) == .none);
+    try testing.expectEqual(Action.open_buffer_search, resolver.feed(configured.keymap(), .diff, plain('s')).action);
 }
