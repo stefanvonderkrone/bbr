@@ -30,6 +30,10 @@ An implementation-ready M21 specification and dependency map for Buffer Search a
 - [Define Search Navigation and State Lifetime](issues/07-define-search-navigation-and-state-lifetime.md) — Search navigation lands exact wrapped source or ReviewBody occurrences and keeps one Session-scoped search's highlights active at a time.
 - [Define the Integrated M21 Contract](issues/08-define-integrated-m21-contract.md) — M21 uses one pure search module, Presentation-owned search state, leased serial scans over eight-File enrichment, five vertical slices, and deterministic acceptance tiers.
 
+## Implementation follow-ups
+
+- [Eliminate Remaining Buffer Search Input Stalls](issues/15-eliminate-remaining-buffer-search-input-stalls.md) — Measure opening, editing, completion, disclosure, projection, and painting latency; keep expensive work off the terminal path and coalesce scans to the newest Query generation.
+
 ## Not yet specified
 
 - None.

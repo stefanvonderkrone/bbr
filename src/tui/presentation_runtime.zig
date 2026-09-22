@@ -7,6 +7,7 @@
 const bbr = @import("bbr");
 const presentation = @import("presentation.zig");
 const adapter = @import("presentation_adapter.zig");
+const search = @import("search.zig");
 
 pub const CompletionSink = struct {
     ptr: *anyopaque,
@@ -95,7 +96,7 @@ const CapturingSink = struct {
 };
 
 const ScriptedSink = struct {
-    inputs: [12]?presentation.OwnedInput = .{null} ** 12,
+    inputs: [13]?presentation.OwnedInput = .{null} ** 13,
     count: usize = 0,
 
     fn sink(self: *ScriptedSink) CompletionSink {
@@ -119,7 +120,7 @@ const ScriptedSink = struct {
 };
 
 const ScriptedExecutor = struct {
-    tags: [12]std.meta.Tag(presentation.OwnedCommand) = undefined,
+    tags: [13]std.meta.Tag(presentation.OwnedCommand) = undefined,
     count: usize = 0,
 
     fn executor(self: *ScriptedExecutor) CommandExecutor {
@@ -172,6 +173,17 @@ const ScriptedExecutor = struct {
                 completed.outcome = .unchanged;
                 value.destroy();
                 break :blk .{ .external_edit_completed = completed };
+            },
+            .scan_buffer_search => |*value| blk: {
+                const completed: presentation.BufferSearchScanned = .{
+                    .allocator = std.heap.page_allocator,
+                    .command_id = value.command_id,
+                    .request_id = value.request_id,
+                    .session_epoch = value.session_epoch,
+                    .outcome = .failed,
+                };
+                value.deinit();
+                break :blk .{ .buffer_search_scanned = completed };
             },
         };
         deliver(sink, input);
@@ -268,6 +280,25 @@ fn scriptedExternalEdit(command_id: presentation.CommandId) !*presentation.Exter
     return command;
 }
 
+fn scriptedBufferSearch(command_id: presentation.CommandId) !presentation.ScanBufferSearch {
+    const corpus = try std.heap.page_allocator.create(presentation.BufferSearchCorpus);
+    corpus.* = .{
+        .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        .candidates = &.{},
+    };
+    errdefer {
+        corpus.arena.deinit();
+        std.heap.page_allocator.destroy(corpus);
+    }
+    return .{
+        .command_id = command_id,
+        .request_id = 1,
+        .session_epoch = 7,
+        .corpus = corpus,
+        .query = try search.Query.init(std.heap.page_allocator, "query"),
+    };
+}
+
 test "scripted terminal adapter drains every command family through the production sink" {
     const identity = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1);
     const remote_identity: presentation.OwnedRemoteReviewIdentity = .{ .value = identity };
@@ -284,6 +315,7 @@ test "scripted terminal adapter drains every command family through the producti
         .{ .list_pull_requests = .{ .command_id = 10, .work_id = 19, .repository = undefined } },
         .{ .copy_clipboard = try scriptedClipboard(11) },
         .{ .external_edit = try scriptedExternalEdit(12) },
+        .{ .scan_buffer_search = try scriptedBufferSearch(13) },
     };
     var drained = false;
     defer if (!drained) for (&commands) |*command| command.deinit();
@@ -308,4 +340,5 @@ test "scripted terminal adapter drains every command family through the producti
     try testing.expectEqual(@as(presentation.CommandId, 10), sink.inputs[9].?.pull_requests_loaded.command_id);
     try testing.expectEqual(@as(presentation.CommandId, 11), sink.inputs[10].?.clipboard_completed.command_id);
     try testing.expectEqual(@as(presentation.CommandId, 12), sink.inputs[11].?.external_edit_completed.command_id);
+    try testing.expectEqual(@as(presentation.CommandId, 13), sink.inputs[12].?.buffer_search_scanned.command_id);
 }

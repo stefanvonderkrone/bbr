@@ -417,7 +417,9 @@ fn bufferSearchStatus(frame: std.mem.Allocator, projection: presentation.Project
 }
 
 fn formatBufferSearchStatus(frame: std.mem.Allocator, width: u16, action_error: ?presentation.ActionError, search_projection: presentation.BufferSearchProjection) []const u8 {
-    const message: []const u8 = if (search_projection.query.len > 0 and search_projection.total == 0)
+    const message: []const u8 = if (search_projection.pending)
+        " · Searching"
+    else if (search_projection.query.len > 0 and search_projection.total == 0)
         " · No matches"
     else switch (action_error orelse .action_refused) {
         .buffer_search_no_matches => " · No matches",
@@ -835,6 +837,20 @@ fn presentationEnrichmentWorker(
     } });
 }
 
+fn presentationBufferSearchWorker(
+    loop: *Loop,
+    work_id: u64,
+    command_value: presentation.ScanBufferSearch,
+) void {
+    var command = command_value;
+    defer command.deinit();
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    presentation_runtime.deliver(
+        presentationSink(&sink_context),
+        .{ .buffer_search_scanned = presentation.executeBufferSearchScan(std.heap.page_allocator, &command) },
+    );
+}
+
 fn presentationWaitWorker(loop: *Loop, work_id: u64, io: std.Io, wait: presentation.WaitSubmission) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     io.sleep(std.Io.Duration.fromMilliseconds(@intCast(wait.ms)), .awake) catch {
@@ -1005,6 +1021,7 @@ fn drainPresentationCommands(
             .list_pull_requests => |list| ctx.io.concurrent(presentationListPullRequestsWorker, .{ loop, work_id, ctx.bitbucket.?, list }),
             .copy_clipboard => unreachable,
             .external_edit => unreachable,
+            .scan_buffer_search => |scan| ctx.io.concurrent(presentationBufferSearchWorker, .{ loop, work_id, scan }),
         } catch {
             try admitPresentationLaunchFailure(state, &command);
             continue;
@@ -1063,6 +1080,17 @@ fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *p
             completed.outcome = .failed;
             edit.destroy();
             break :blk .{ .external_edit_completed = completed };
+        },
+        .scan_buffer_search => |*scan| blk: {
+            const completed: presentation.BufferSearchScanned = .{
+                .allocator = std.heap.page_allocator,
+                .command_id = scan.command_id,
+                .request_id = scan.request_id,
+                .session_epoch = scan.session_epoch,
+                .outcome = .failed,
+            };
+            scan.deinit();
+            break :blk .{ .buffer_search_scanned = completed };
         },
     };
     command.* = undefined;
@@ -1320,6 +1348,15 @@ test "M21 narrow Buffer Search status keeps the Query end before the count" {
         .total = 3,
     });
     try std.testing.expect(std.mem.endsWith(u8, inactive, " -/3"));
+
+    const pending = formatBufferSearchStatus(arena.allocator(), 30, null, .{
+        .query = "new",
+        .input = true,
+        .active = null,
+        .total = 0,
+        .pending = true,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, pending, "Searching") != null);
 }
 
 test "LocalReview worker dispatch does not require Bitbucket" {

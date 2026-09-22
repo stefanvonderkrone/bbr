@@ -102,6 +102,31 @@ pub const Occurrence = struct {
 pub const Batch = struct {
     occurrences: []Occurrence,
 
+    pub fn clone(self: Batch, allocator: std.mem.Allocator) !Batch {
+        const occurrences = try allocator.alloc(Occurrence, self.occurrences.len);
+        errdefer allocator.free(occurrences);
+        var initialized: usize = 0;
+        errdefer for (occurrences[0..initialized]) |*occurrence| occurrence.deinit(allocator);
+        for (self.occurrences, occurrences) |source, *target| {
+            target.* = .{
+                .location = try source.location.clone(allocator),
+                .ranges = &.{},
+                .column = source.column,
+                .score = source.score,
+                .calculation = source.calculation,
+                .candidate_scalars = source.candidate_scalars,
+                .corpus_order = source.corpus_order,
+                .session_epoch = source.session_epoch,
+            };
+            target.ranges = allocator.dupe(Range, source.ranges) catch |err| {
+                target.location.deinit(allocator);
+                return err;
+            };
+            initialized += 1;
+        }
+        return .{ .occurrences = occurrences };
+    }
+
     pub fn deinit(self: *Batch, allocator: std.mem.Allocator) void {
         for (self.occurrences) |*occurrence| occurrence.deinit(allocator);
         allocator.free(self.occurrences);
