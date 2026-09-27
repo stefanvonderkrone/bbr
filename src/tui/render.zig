@@ -868,6 +868,117 @@ pub fn drawFileFinder(scratch: std.mem.Allocator, win: vaxis.Window, finder: *co
     }
 }
 
+/// Draw only the immutable Review Search projection. The same rectangles give
+/// Presentation its list and Preview pointer targets.
+pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projection: presentation.ReviewSearchProjection, theme: Theme) void {
+    const geometry = projection.geometry;
+    const modal = childRect(win, geometry.rect);
+    modal.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = theme.picker });
+    if (modal.height == 0) return;
+    fillRow(modal, 0, theme.picker_query);
+    const title = if (modal.width >= 52) "Review Search > " else "> ";
+    const heading = std.fmt.allocPrint(scratch, "{s}{s}  {d} matches · {d} candidates", .{
+        title, projection.query, projection.results.len, projection.candidate_count,
+    }) catch title;
+    _ = modal.printSegment(.{ .text = heading, .style = theme.picker_query }, .{ .wrap = .none });
+    if (modal.height > 1) {
+        const list_header = if (geometry.landscape) "Kind       Source                      Position" else "Kind  Source  Position";
+        _ = modal.printSegment(.{ .text = list_header, .style = theme.picker_query }, .{ .row_offset = 1, .wrap = .none });
+    }
+    const list = childRect(win, geometry.list);
+    const preview = childRect(win, geometry.preview);
+    if (projection.results.len == 0 and list.height > 0) {
+        _ = list.printSegment(.{ .text = if (projection.pending) "Searching ReviewBodies…" else "No matching occurrence", .style = theme.picker }, .{ .wrap = .none });
+    }
+    for (0..list.height) |row_index| {
+        const index = projection.list_scroll + row_index;
+        if (index >= projection.results.len) break;
+        const result = projection.results[index];
+        const selected = projection.selected == index;
+        const style = if (selected) theme.picker_selected else theme.picker;
+        fillRow(list, @intCast(row_index), style);
+        const owner = result.occurrence.location.review_body;
+        const id = switch (owner.owner) {
+            .comment => |value| value,
+            .draft => |value| value,
+        };
+        const row_text = std.fmt.allocPrint(scratch, "{s}{s} {s} #{d}  body L{d}:C{d}", .{
+            if (selected) "▸ " else "  ",
+            result.kind,
+            result.source,
+            id,
+            owner.logical_line,
+            result.occurrence.column,
+        }) catch result.source;
+        _ = list.printSegment(.{ .text = row_text, .style = style }, .{ .row_offset = @intCast(row_index), .wrap = .none });
+    }
+    const selected = projection.selected orelse {
+        if (preview.height > 0) _ = preview.printSegment(.{ .text = "No preview", .style = theme.picker }, .{ .wrap = .none });
+        return;
+    };
+    if (selected >= projection.results.len or preview.height == 0) return;
+    drawReviewSearchPreview(scratch, preview, projection.results[selected], projection.preview_scroll, theme);
+}
+
+fn drawReviewSearchPreview(scratch: std.mem.Allocator, win: vaxis.Window, result: presentation.ReviewSearchResult, scroll: usize, theme: Theme) void {
+    const owner = result.occurrence.location.review_body;
+    const id = switch (owner.owner) {
+        .comment => |value| value,
+        .draft => |value| value,
+    };
+    const scope = switch (result.scope) {
+        .review => "Review",
+        .file => |file| std.fmt.allocPrint(scratch, "File {s}", .{file.path}) catch "File",
+        .@"inline" => |anchor| std.fmt.allocPrint(scratch, "Inline {s} L{d}", .{ anchor.path, anchor.line() orelse 0 }) catch "Inline",
+    };
+    fillRow(win, 0, theme.picker_query);
+    const label = std.fmt.allocPrint(scratch, "{s} #{d} · {s} · body L{d}:C{d}", .{
+        result.source, id, scope, owner.logical_line, result.occurrence.column,
+    }) catch scope;
+    _ = win.printSegment(.{ .text = label, .style = theme.picker_query }, .{ .wrap = .none });
+    var start: usize = 0;
+    var logical_line: usize = 0;
+    var row: u16 = 1;
+    while (start <= result.body.len and row < win.height) {
+        const newline = std.mem.indexOfScalarPos(u8, result.body, start, '\n') orelse result.body.len;
+        logical_line += 1;
+        if (logical_line > scroll) {
+            const line = result.body[start..newline];
+            const line_style = if (logical_line == owner.logical_line) theme.picker_selected else theme.picker;
+            const segments = scratch.alloc(vaxis.Segment, result.occurrence.ranges.len * 2 + 1) catch return;
+            var count: usize = 0;
+            var cursor = start;
+            for (result.occurrence.ranges) |range| {
+                const first = @max(range.start, start);
+                const last = @min(range.end, newline);
+                if (first >= last) continue;
+                if (cursor < first) {
+                    segments[count] = .{ .text = result.body[cursor..first], .style = line_style };
+                    count += 1;
+                }
+                var match_style = line_style;
+                match_style.bg = theme.search_active;
+                match_style.bold = true;
+                segments[count] = .{ .text = result.body[first..last], .style = match_style };
+                count += 1;
+                cursor = last;
+            }
+            if (cursor < newline) {
+                segments[count] = .{ .text = result.body[cursor..newline], .style = line_style };
+                count += 1;
+            }
+            if (count == 0) {
+                segments[0] = .{ .text = line, .style = line_style };
+                count = 1;
+            }
+            const position = win.print(segments[0..count], .{ .row_offset = row, .wrap = .grapheme });
+            row = @max(row +| 1, position.row +| @intFromBool(position.col > 0));
+        }
+        if (newline == result.body.len) break;
+        start = newline + 1;
+    }
+}
+
 /// Draw the Composer as a centered modal: a header naming what's being authored,
 /// the body typed so far (scrolled to the tail with a cursor block), and a hint
 /// line. Borrowed text (the label, the body) outlives render via the composer's
@@ -1360,6 +1471,86 @@ fn expectScreenText(win: vaxis.Window, row: u16, expected: []const u8) !void {
         const cell = win.readCell(@intCast(col), row) orelse return error.MissingCell;
         try testing.expectEqualStrings(&.{char}, cell.char.grapheme);
     }
+}
+
+test "M21 authored Overlay renders ranked rows and matched Preview in landscape and portrait" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const search = @import("search.zig");
+    const ranges = [_]search.Range{.{ .start = 7, .end = 13 }};
+    const occurrence: search.Occurrence = .{
+        .location = .{ .review_body = .{ .owner = .{ .comment = 42 }, .logical_line = 2 } },
+        .ranges = @constCast(&ranges),
+        .column = 1,
+        .candidate_scalars = 6,
+        .corpus_order = 0,
+        .session_epoch = 1,
+    };
+    const result: presentation.ReviewSearchResult = .{
+        .kind = "COMMENT",
+        .source = "Ada",
+        .body = "before\nneedle after\nlater",
+        .scope = .review,
+        .occurrence = occurrence,
+    };
+    inline for (.{ @as(u16, 100), @as(u16, 45) }) |cols| {
+        var screen = try vaxis.Screen.init(a, .{ .rows = 26, .cols = cols, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(a);
+        const win = headlessWindow(&screen);
+        const geometry = @import("frame.zig").reviewSearchGeometry(.{ .cols = cols, .rows = 26 }).?;
+        drawReviewSearch(a, win, .{
+            .query = "need",
+            .occurrences = &.{occurrence},
+            .results = &.{result},
+            .candidate_count = 3,
+            .selected = 0,
+            .list_scroll = 0,
+            .preview_scroll = 0,
+            .pending = false,
+            .geometry = geometry,
+        }, theme_dark);
+        const list = childRect(win, geometry.list);
+        const preview = childRect(win, geometry.preview);
+        try testing.expectEqualStrings("▸", list.readCell(0, 0).?.char.grapheme);
+        try testing.expectEqualStrings("A", preview.readCell(0, 0).?.char.grapheme);
+        try testing.expect(geometry.landscape == (cols == 100));
+        try testing.expectEqual(theme_dark.search_active, preview.readCell(0, 2).?.style.bg);
+    }
+}
+
+test "M21 authored Preview paints every disjoint Markdown match range" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 12, .cols = 45, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const search = @import("search.zig");
+    const ranges = [_]search.Range{ .{ .start = 2, .end = 6 }, .{ .start = 8, .end = 13 } };
+    const occurrence: search.Occurrence = .{
+        .location = .{ .review_body = .{ .owner = .{ .draft = 9 }, .logical_line = 1 } },
+        .ranges = @constCast(&ranges),
+        .column = 1,
+        .candidate_scalars = 9,
+        .corpus_order = 0,
+        .session_epoch = 1,
+    };
+    const geometry = @import("frame.zig").reviewSearchGeometry(.{ .cols = 45, .rows = 12 }).?;
+    drawReviewSearch(a, headlessWindow(&screen), .{
+        .query = "bold text",
+        .occurrences = &.{occurrence},
+        .results = &.{.{ .kind = "DRAFT", .source = "local", .body = "**bold** text", .scope = .review, .occurrence = occurrence }},
+        .candidate_count = 1,
+        .selected = 0,
+        .list_scroll = 0,
+        .preview_scroll = 0,
+        .pending = false,
+        .geometry = geometry,
+    }, theme_dark);
+    const preview = childRect(headlessWindow(&screen), geometry.preview);
+    try testing.expectEqual(theme_dark.search_active, preview.readCell(2, 1).?.style.bg);
+    try testing.expectEqual(theme_dark.search_active, preview.readCell(8, 1).?.style.bg);
+    try testing.expect(!std.meta.eql(preview.readCell(6, 1).?.style.bg, theme_dark.search_active));
 }
 
 test "diff lines render with their band background at the text cells" {

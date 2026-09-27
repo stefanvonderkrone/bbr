@@ -78,13 +78,44 @@ pub fn versionTitleTargets(diff: Rect, selected: SelectedVersion) VersionTitleTa
     };
 }
 
-pub const OverlayKind = enum { picker, other };
+pub const OverlayKind = enum { picker, review_search, other };
+
+pub const ReviewSearchGeometry = struct {
+    rect: Rect,
+    list: Rect,
+    preview: Rect,
+    landscape: bool,
+};
+
+pub fn reviewSearchGeometry(geometry: Geometry) ?ReviewSearchGeometry {
+    const rect = overlayRect(geometry, if (geometry.cols > 4) geometry.cols - 4 else geometry.cols, if (geometry.rows > 2) geometry.rows - 2 else geometry.rows) orelse return null;
+    const body_y = rect.y +| @min(rect.height, 2);
+    const body_height = rect.height -| 2;
+    const landscape = rect.width >= 64 and @as(usize, rect.width) > @as(usize, rect.height) * 2;
+    if (landscape) {
+        const list_width = rect.width * 3 / 5;
+        return .{
+            .rect = rect,
+            .list = .{ .x = rect.x, .y = body_y, .width = list_width, .height = body_height },
+            .preview = .{ .x = rect.x + list_width, .y = body_y, .width = rect.width - list_width, .height = body_height },
+            .landscape = true,
+        };
+    }
+    const list_height = body_height / 2;
+    return .{
+        .rect = rect,
+        .list = .{ .x = rect.x, .y = body_y, .width = rect.width, .height = list_height },
+        .preview = .{ .x = rect.x, .y = body_y + list_height, .width = rect.width, .height = body_height - list_height },
+        .landscape = false,
+    };
+}
 
 pub const OverlayTarget = struct {
     kind: OverlayKind,
     rect: Rect,
     row_count: usize = 0,
     scroll: usize = 0,
+    review_search: ?ReviewSearchGeometry = null,
 };
 
 pub const HitTarget = union(enum) {
@@ -95,6 +126,9 @@ pub const HitTarget = union(enum) {
     sidebar_entry: usize,
     diff_row: usize,
     picker_entry: usize,
+    review_search_entry: usize,
+    review_search_list,
+    review_search_preview,
 };
 
 pub const RowOwner = union(enum) {
@@ -195,6 +229,16 @@ pub const Projection = struct {
 /// Overlay captures the complete input surface, even outside its rectangle.
 pub fn hitTest(frame: Projection, col: u16, row: u16) ?HitTarget {
     if (frame.overlay) |overlay| {
+        if (overlay.kind == .review_search) {
+            const geometry = overlay.review_search orelse return null;
+            if (geometry.list.contains(col, row)) {
+                const index = overlay.scroll + row - geometry.list.y;
+                if (index < overlay.row_count) return .{ .review_search_entry = index };
+                return .review_search_list;
+            }
+            if (geometry.preview.contains(col, row)) return .review_search_preview;
+            return null;
+        }
         if (overlay.kind != .picker or !overlay.rect.contains(col, row)) return null;
         const relative_row = row - overlay.rect.y;
         if (relative_row == 0) return null; // query/title row

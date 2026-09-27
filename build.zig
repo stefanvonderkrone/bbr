@@ -216,6 +216,14 @@ pub fn build(b: *std.Build) void {
     const search_kernel_test_step = b.step("test-search-kernel", "Run M21 search kernel and reachable-source tests");
     search_kernel_test_step.dependOn(&run_search_kernel_tests.step);
 
+    const authored_search_tests = b.addTest(.{
+        .name = "authored-search-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M21 authored"},
+    });
+    const authored_search_step = b.step("test-authored-search", "Run authored Review Search tests");
+    authored_search_step.dependOn(&b.addRunArtifact(authored_search_tests).step);
+
     const fixture_mod = b.createModule(.{
         .root_source_file = b.path("tests/user_grammar_fixture.zig"),
         .target = target,

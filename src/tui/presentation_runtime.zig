@@ -180,6 +180,7 @@ const ScriptedExecutor = struct {
                     .command_id = value.command_id,
                     .request_id = value.request_id,
                     .session_epoch = value.session_epoch,
+                    .mode = value.mode,
                     .outcome = .failed,
                 };
                 value.deinit();

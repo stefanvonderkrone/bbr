@@ -153,7 +153,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         const event = try loop.nextEvent();
         switch (event) {
             .key_press => |key| try state.dispatch(.{ .key = portableKey(key) }),
-            .mouse => |mouse| if (portableMouse(mouse)) |input| try state.dispatch(.{ .mouse = input }),
+            .mouse => |mouse| if (portableMouse(mouse, ctx.io)) |input| try state.dispatch(.{ .mouse = input }),
             .winsize => |winsize| {
                 try vx.resize(ctx.gpa, writer, winsize);
                 vx.screen.width_method = .unicode;
@@ -226,6 +226,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         }
         if (projection.picker) |active_picker| render.drawPicker(frame, content_win, active_picker, ctx.active_theme);
         if (projection.file_finder) |finder| render.drawFileFinder(frame, content_win, finder, ctx.active_theme);
+        if (projection.review_search) |review_search| render.drawReviewSearch(frame, content_win, review_search, ctx.active_theme);
         if (projection.composer) |composer| render.drawComposerProjection(frame, content_win, composer, ctx.active_theme);
         if (projection.unknown_resolution) |resolution| render.drawComposerProjection(frame, content_win, .{
             .label = "Link existing Bitbucket Comment ID",
@@ -319,6 +320,12 @@ fn presentationStatus(
     // The armed re-anchor banner outlives one refusal: it keeps naming the
     // Draft and whatever the source cursor currently proposes.
     if (projection.reanchor) |reanchor| return reanchorStatus(frame, projection, reanchor);
+    if (projection.review_search != null and projection.action_error != null) return switch (projection.action_error.?) {
+        .buffer_search_query_too_long => "Review Search Query limit is 256 characters",
+        .buffer_search_invalid_query => "Review Search Query is invalid",
+        .buffer_search_scan_failed => "Review Search failed",
+        else => actionErrorText(projection.action_error.?),
+    };
     if (projection.buffer_search) |search_projection| return bufferSearchStatus(frame, projection, search_projection);
     if (projection.action_error) |err| return actionErrorText(err);
     if (projection.clipboard_status) |status| return switch (status) {
@@ -576,11 +583,12 @@ fn portableKey(key: vaxis.Key) keymap.KeyStroke {
     };
 }
 
-fn portableMouse(mouse: vaxis.Mouse) ?presentation.MouseInput {
+fn portableMouse(mouse: vaxis.Mouse, io: std.Io) ?presentation.MouseInput {
     if (mouse.col < 0 or mouse.row < 0) return null;
     return .{
         .col = @intCast(mouse.col),
         .row = @intCast(mouse.row),
+        .time_ns = std.Io.Clock.awake.now(io).nanoseconds,
         .button = switch (mouse.button) {
             .left => .left,
             .middle => .middle,

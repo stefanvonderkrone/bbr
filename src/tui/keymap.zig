@@ -168,6 +168,12 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.modified('c', .{ .ctrl = true }), .action = .quit, .help = "quit" },
     .{ .chord = Chord.one('F'), .action = .open_file_finder, .help = "open File finder" },
     .{ .chord = Chord.one('/'), .action = .open_buffer_search, .help = "search Buffer" },
+    .{ .chord = Chord.two('g', 'f'), .action = .open_review_search, .help = "search Review" },
+    .{ .chord = Chord.one(vaxis.Key.down), .action = .next_review_search_occurrence, .help = "next Review Search Occurrence" },
+    .{ .chord = Chord.modified('n', .{ .ctrl = true }), .action = .next_review_search_occurrence, .help = "next Review Search Occurrence" },
+    .{ .chord = Chord.one(vaxis.Key.up), .action = .previous_review_search_occurrence, .help = "previous Review Search Occurrence" },
+    .{ .chord = Chord.modified('p', .{ .ctrl = true }), .action = .previous_review_search_occurrence, .help = "previous Review Search Occurrence" },
+    .{ .chord = Chord.one(vaxis.Key.enter), .action = .open_search_occurrence, .help = "open Search Occurrence" },
     .{ .chord = Chord.one('n'), .action = .next_search_occurrence, .help = "next Search Occurrence" },
     .{ .chord = Chord.one('N'), .action = .previous_search_occurrence, .help = "previous Search Occurrence" },
     .{ .chord = Chord.one('p'), .action = .open_pull_request_picker, .help = "open PullRequest Picker" },
@@ -371,6 +377,10 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
     return switch (context) {
         .composer => action == .external_edit,
         .help, .unknown_resolution, .delete_confirmation, .buffer_search_input => false,
+        .review_search => switch (action) {
+            .next_review_search_occurrence, .previous_review_search_occurrence, .open_search_occurrence => true,
+            else => false,
+        },
         .file_finder, .pull_request_picker => switch (action) {
             .up, .down, .confirm_picker, .quit => true,
             else => false,
@@ -486,6 +496,7 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .quit,
             .open_file_finder,
             .open_buffer_search,
+            .open_review_search,
             .next_search_occurrence,
             .previous_search_occurrence,
             .open_pull_request_picker,
