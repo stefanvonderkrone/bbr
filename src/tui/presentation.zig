@@ -1417,6 +1417,7 @@ const BufferSearchState = struct {
 const ReviewSearchState = struct {
     open: bool = false,
     query: ?search.Query = null,
+    rollback_query: ?search.Query = null,
     batch: ?search.Batch = null,
     results: ?[]ReviewSearchResult = null,
     ranges: ?[]frame_mod.ProjectedSourceRange = null,
@@ -1432,6 +1433,7 @@ const ReviewSearchState = struct {
 
     fn deinit(self: *ReviewSearchState, allocator: Allocator) void {
         if (self.query) |*query| query.deinit(allocator);
+        if (self.rollback_query) |*query| query.deinit(allocator);
         if (self.batch) |*batch| batch.deinit(allocator);
         if (self.results) |results| allocator.free(results);
         if (self.ranges) |ranges| allocator.free(ranges);
@@ -1440,6 +1442,8 @@ const ReviewSearchState = struct {
     }
 
     fn invalidate(self: *ReviewSearchState, allocator: Allocator) void {
+        if (self.rollback_query) |*query| query.deinit(allocator);
+        self.rollback_query = null;
         if (self.corpus) |corpus| corpus.release();
         self.corpus = null;
         self.previous_selection = self.selected;
@@ -5080,6 +5084,8 @@ pub const Presentation = struct {
             query.deinit(self.allocator);
             if (state.query) |*old| old.deinit(self.allocator);
             state.query = null;
+            if (state.rollback_query) |*old| old.deinit(self.allocator);
+            state.rollback_query = null;
             if (state.batch) |*batch| batch.deinit(self.allocator);
             state.batch = null;
             if (state.results) |results| self.allocator.free(results);
@@ -5122,7 +5128,9 @@ pub const Presentation = struct {
         };
         self.discardQueuedReviewSearchScans();
         self.commands.appendAssumeCapacity(command);
-        if (state.query) |*old| old.deinit(self.allocator);
+        if (state.rollback_query == null and state.batch != null) {
+            state.rollback_query = state.query;
+        } else if (state.query) |*old| old.deinit(self.allocator);
         state.query = query;
         state.request_id +%= 1;
         state.pending = true;
@@ -5183,8 +5191,7 @@ pub const Presentation = struct {
         if (!state.open or completed.session_epoch != published.epoch or !state.pending or completed.request_id != state.request_id) return;
         const worker_batch = switch (completed.outcome) {
             .failed => {
-                state.pending = false;
-                state.needs_scan = true;
+                self.rollbackReviewSearchQuery(state);
                 self.action_error = .buffer_search_scan_failed;
                 published.frame_revision += 1;
                 return;
@@ -5192,8 +5199,7 @@ pub const Presentation = struct {
             .scanned => |batch| batch,
         };
         var batch = worker_batch.clone(self.allocator) catch {
-            state.pending = false;
-            state.needs_scan = true;
+            self.rollbackReviewSearchQuery(state);
             self.action_error = .out_of_memory;
             published.frame_revision += 1;
             return;
@@ -5208,8 +5214,7 @@ pub const Presentation = struct {
             false else false else false;
         const ranges = published.projectBufferSearchRanges(batch, selected) catch {
             batch.deinit(self.allocator);
-            state.pending = false;
-            state.needs_scan = true;
+            self.rollbackReviewSearchQuery(state);
             self.action_error = .out_of_memory;
             published.frame_revision += 1;
             return;
@@ -5217,8 +5222,7 @@ pub const Presentation = struct {
         const results = self.allocator.alloc(ReviewSearchResult, batch.occurrences.len) catch {
             batch.deinit(self.allocator);
             self.allocator.free(ranges);
-            state.pending = false;
-            state.needs_scan = true;
+            self.rollbackReviewSearchQuery(state);
             self.action_error = .out_of_memory;
             published.frame_revision += 1;
             return;
@@ -5233,6 +5237,8 @@ pub const Presentation = struct {
         state.selected = selected;
         state.previous_selection = null;
         state.pending = false;
+        if (state.rollback_query) |*old| old.deinit(self.allocator);
+        state.rollback_query = null;
         if (selected) |index| {
             if (!keep_preview) state.preview_scroll = batch.occurrences[index].location.review_body.logical_line -| 3;
             const geometry = frame_mod.reviewSearchGeometry(self.geometry);
@@ -5243,6 +5249,16 @@ pub const Presentation = struct {
         }
         published.frame_revision += 1;
         self.action_error = null;
+    }
+
+    fn rollbackReviewSearchQuery(self: *Presentation, state: *ReviewSearchState) void {
+        state.pending = false;
+        state.needs_scan = state.rollback_query == null;
+        if (state.rollback_query) |previous| {
+            if (state.query) |*query| query.deinit(self.allocator);
+            state.query = previous;
+            state.rollback_query = null;
+        }
     }
 
     fn openReviewSearchOccurrence(self: *Presentation) void {
@@ -9256,6 +9272,7 @@ test "M21 authored failed scan publication keeps the prior complete results and 
     failing.fail_index = failing.alloc_index;
     try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search) });
     try testing.expect(failing.has_induced_failure);
+    try testing.expectEqualStrings("pub", presentation.projection().review_search.?.query);
     try testing.expectEqual(@as(usize, 1), presentation.projection().review_search.?.results.len);
     try testing.expectEqual(old_ranges, presentation.projection().review.?.frame.search_ranges.len);
     failing.fail_index = std.math.maxInt(usize);
