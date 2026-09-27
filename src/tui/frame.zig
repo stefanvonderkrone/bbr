@@ -82,30 +82,38 @@ pub const OverlayKind = enum { picker, review_search, other };
 
 pub const ReviewSearchGeometry = struct {
     rect: Rect,
+    body: Rect,
     list: Rect,
     preview: Rect,
+    header: Rect,
+    divider: u16,
     landscape: bool,
 };
 
 pub fn reviewSearchGeometry(geometry: Geometry) ?ReviewSearchGeometry {
-    const rect = overlayRect(geometry, if (geometry.cols > 4) geometry.cols - 4 else geometry.cols, if (geometry.rows > 2) geometry.rows - 2 else geometry.rows) orelse return null;
-    const body_y = rect.y +| @min(rect.height, 2);
-    const body_height = rect.height -| 2;
-    const landscape = rect.width >= 64 and @as(usize, rect.width) > @as(usize, rect.height) * 2;
+    const rect = overlayRect(geometry, @min(geometry.cols, @max(64, @as(u16, @intCast(@as(u32, geometry.cols) * 4 / 5)))), @min(geometry.rows, @max(14, @as(u16, @intCast(@as(u32, geometry.rows) * 4 / 5))))) orelse return null;
+    const body = Rect{ .x = rect.x, .y = rect.y +| @min(rect.height, 3), .width = rect.width, .height = rect.height -| 3 };
+    const landscape = geometry.cols >= geometry.rows;
     if (landscape) {
-        const list_width = rect.width * 3 / 5;
+        const divider = @min(body.width -| 1, @as(u16, @intCast(@as(u32, body.width) * 3 / 10)));
         return .{
             .rect = rect,
-            .list = .{ .x = rect.x, .y = body_y, .width = list_width, .height = body_height },
-            .preview = .{ .x = rect.x + list_width, .y = body_y, .width = rect.width - list_width, .height = body_height },
+            .body = body,
+            .list = .{ .x = body.x +| 1, .y = body.y +| @min(body.height, 1), .width = divider -| 1, .height = body.height -| 2 },
+            .header = .{ .x = body.x +| divider +| 1, .y = body.y +| @min(body.height, 1), .width = body.width -| divider -| 2, .height = @min(body.height -| 2, 1) },
+            .preview = .{ .x = body.x +| divider +| 1, .y = body.y +| @min(body.height, 3), .width = body.width -| divider -| 2, .height = body.height -| 4 },
+            .divider = body.x +| divider,
             .landscape = true,
         };
     }
-    const list_height = body_height / 2;
+    const divider = @min(body.height -| 1, @max(3, @as(u16, @intCast(@as(u32, body.height) * 3 / 10))));
     return .{
         .rect = rect,
-        .list = .{ .x = rect.x, .y = body_y, .width = rect.width, .height = list_height },
-        .preview = .{ .x = rect.x, .y = body_y + list_height, .width = rect.width, .height = body_height - list_height },
+        .body = body,
+        .list = .{ .x = body.x +| 1, .y = body.y +| @min(body.height, 1), .width = body.width -| 2, .height = divider -| 1 },
+        .header = .{ .x = body.x +| 1, .y = body.y +| @min(body.height, divider +| 1), .width = body.width -| 2, .height = @min(body.height -| divider -| 2, 1) },
+        .preview = .{ .x = body.x +| 1, .y = body.y +| @min(body.height, divider +| 3), .width = body.width -| 2, .height = body.height -| divider -| 4 },
+        .divider = body.y +| divider,
         .landscape = false,
     };
 }
@@ -980,6 +988,41 @@ test "Overlay geometry is centered and clipped to the published Frame" {
     try testing.expectEqual(Rect{ .x = 10, .y = 4, .width = 60, .height = 16 }, overlayRect(.{ .cols = 80, .rows = 24 }, 60, 16).?);
     try testing.expectEqual(Rect{ .x = 0, .y = 0, .width = 20, .height = 8 }, overlayRect(.{ .cols = 20, .rows = 8 }, 60, 16).?);
     try testing.expect(overlayRect(.{ .cols = 0, .rows = 8 }, 60, 16) == null);
+}
+
+test "Review Search geometry keeps bordered content and pointer targets aligned" {
+    const wide = reviewSearchGeometry(.{ .cols = 100, .rows = 40 }).?;
+    try testing.expectEqual(Rect{ .x = 10, .y = 4, .width = 80, .height = 32 }, wide.rect);
+    try testing.expect(wide.landscape);
+    try testing.expectEqual(wide.body.x + wide.body.width - 1, wide.preview.x + wide.preview.width);
+    try testing.expectEqual(wide.divider + 1, wide.preview.x);
+    try testing.expectEqual(wide.body.y + 3, wide.preview.y);
+
+    const portrait = reviewSearchGeometry(.{ .cols = 40, .rows = 100 }).?;
+    try testing.expectEqual(Rect{ .x = 0, .y = 10, .width = 40, .height = 80 }, portrait.rect);
+    try testing.expect(!portrait.landscape);
+    try testing.expectEqual(portrait.divider + 3, portrait.preview.y);
+    try testing.expectEqual(portrait.divider - 1, portrait.list.y + portrait.list.height - 1);
+
+    const small = reviewSearchGeometry(.{ .cols = 40, .rows = 10 }).?;
+    try testing.expectEqual(Rect{ .x = 0, .y = 0, .width = 40, .height = 10 }, small.rect);
+    try testing.expectEqual(Rect{ .x = 8, .y = 2, .width = 64, .height = 19 }, reviewSearchGeometry(.{ .cols = 80, .rows = 24 }).?.rect);
+    try testing.expect(reviewSearchGeometry(.{ .cols = 0, .rows = 10 }) == null);
+
+    const frame: Projection = .{
+        .revision = 1,
+        .visual_rows_revision = 1,
+        .geometry = .{ .cols = 100, .rows = 40 },
+        .panes = paneRects(.{ .cols = 100, .rows = 40 }),
+        .visual_rows = &.{},
+        .buffer = .{ .rows = &.{}, .layout = .unified },
+        .navigation = Nav.init(0, 40),
+        .overlay = .{ .kind = .review_search, .rect = wide.rect, .review_search = wide, .row_count = 2 },
+    };
+    try testing.expectEqual(HitTarget{ .review_search_entry = 0 }, hitTest(frame, wide.list.x, wide.list.y).?);
+    try testing.expectEqual(HitTarget.review_search_preview, hitTest(frame, wide.preview.x, wide.preview.y).?);
+    try testing.expect(hitTest(frame, wide.divider, wide.list.y) == null);
+    try testing.expect(hitTest(frame, wide.rect.x + 1, wide.rect.y + 1) == null);
 }
 
 test "published Frame hit testing gives Overlay rows precedence and clips blank rows" {

@@ -3840,7 +3840,7 @@ pub const Presentation = struct {
                 const results = state.results orelse return;
                 if (selected >= results.len) return;
                 const lines = std.mem.count(u8, results[selected].body, "\n") + 1;
-                const height = (frame_mod.reviewSearchGeometry(self.geometry) orelse return).preview.height -| 1;
+                const height = (frame_mod.reviewSearchGeometry(self.geometry) orelse return).preview.height;
                 state.preview_scroll = if (down) @min(state.preview_scroll +| rows, lines -| height) else state.preview_scroll -| rows;
             },
             .picker_entry => {
@@ -9283,7 +9283,7 @@ test "M21 authored keyboard and wheel keep list and Preview scroll independent" 
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .mouse_vertical_scroll_rows = 1 }, .{
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
-        .geometry = .{ .cols = 45, .rows = 12 },
+        .geometry = .{ .cols = 45, .rows = 9 },
     });
     defer presentation.deinit();
     try presentation.dispatch(.{ .push_count_digit = 9 });
