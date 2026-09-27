@@ -378,7 +378,9 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
         .composer => action == .external_edit,
         .help, .unknown_resolution, .delete_confirmation, .buffer_search_input => false,
         .review_search => switch (action) {
-            .next_review_search_occurrence, .previous_review_search_occurrence, .open_search_occurrence => true,
+            .next_review_search_occurrence, .previous_review_search_occurrence, .open_search_occurrence,
+            .half_page_down, .half_page_up,
+            => true,
             else => false,
         },
         .file_finder, .pull_request_picker => switch (action) {

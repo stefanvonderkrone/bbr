@@ -915,6 +915,9 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
         }
     }
     const list = childRect(win, geometry.list);
+    const list_total = if (projection.results.len > 0) projection.results.len else projection.files.len;
+    const has_scrollbar = list.width > 1 and list.height > 0 and list_total > list.height;
+    const list_text = if (has_scrollbar) list.child(.{ .width = list.width - 1 }) else list;
     const preview = childRect(win, geometry.preview);
     const header = childRect(win, geometry.header);
     if (geometry.header.height > 0) {
@@ -932,14 +935,14 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
             const content = projection.content_statuses[index];
             const status = projection.highlight_statuses[index];
             const label = std.fmt.allocPrint(scratch, "{s}  old {s} · new {s}", .{
-                shortSearchPath(scratch, file.displayPath(), @max(list.width / 2, 1)),
+                shortSearchPath(scratch, file.displayPath(), @max(list_text.width / 2, 1)),
                 sourceContentLabel(scratch, content.old, status.old),
                 sourceContentLabel(scratch, content.new, status.new),
             }) catch file.displayPath();
-            _ = list.printSegment(.{ .text = label, .style = theme.picker }, .{ .row_offset = @intCast(row), .wrap = .none });
+            _ = list_text.printSegment(.{ .text = label, .style = theme.picker }, .{ .row_offset = @intCast(row), .wrap = .none });
         }
         if (projection.files.len == 0)
-            _ = list.printSegment(.{ .text = if (projection.pending) "Searching ReviewBodies…" else "No matching occurrence", .style = theme.picker }, .{ .wrap = .none });
+            _ = list_text.printSegment(.{ .text = if (projection.pending) "Searching ReviewBodies…" else "No matching occurrence", .style = theme.picker }, .{ .wrap = .none });
     }
     for (0..list.height) |row_index| {
         const index = projection.list_scroll + row_index;
@@ -947,7 +950,7 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
         const result = projection.results[index];
         const selected = projection.selected == index;
         const style = if (selected) theme.picker_selected else theme.picker;
-        fillRow(list, @intCast(row_index), style);
+        fillRow(list_text, @intCast(row_index), style);
         const position = switch (result.occurrence.location) {
             .review_body => |owner| std.fmt.allocPrint(scratch, " L{d}:C{d}", .{ owner.logical_line, result.occurrence.column }) catch "",
             .source => |source| std.fmt.allocPrint(scratch, " {s} L{d}:C{d}", .{ @tagName(source.relation), source.new_line orelse source.old_line orelse 0, result.occurrence.column }) catch "",
@@ -960,14 +963,15 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
                 .@"inline" => |anchor| std.fmt.allocPrint(scratch, "{s}:{d}", .{ anchor.path, anchor.line() orelse 0 }) catch anchor.path,
             },
         };
-        const available = list.width -| 2;
+        const available = list_text.width -| 2;
         const filename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| path[slash + 1 ..] else path;
         const show_position = available > position.len + 2 and searchCellWidth(filename) <= available - position.len;
         const location = shortSearchPath(scratch, path, available -| (if (show_position) position.len else @as(usize, 0)));
         const suffix = if (show_position) position else "";
         const row_text = std.fmt.allocPrint(scratch, "{s}{s}{s}", .{ if (selected) "▸ " else "  ", location, suffix }) catch location;
-        _ = list.printSegment(.{ .text = row_text, .style = style }, .{ .row_offset = @intCast(row_index), .wrap = .none });
+        _ = list_text.printSegment(.{ .text = row_text, .style = style }, .{ .row_offset = @intCast(row_index), .wrap = .none });
     }
+    if (has_scrollbar) drawReviewSearchScrollbar(list, list_total, projection.list_scroll, theme);
     const selected = projection.selected orelse {
         if (projection.status_preview) |view| {
             if (projection.list_scroll < projection.files.len) {
@@ -988,6 +992,17 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
         drawReviewSearchHeader(scratch, header, projection.results[selected], theme);
         if (preview.height > 0) drawReviewSearchPreview(scratch, preview, projection.results[selected], projection.preview_scroll, theme);
     }
+}
+
+fn drawReviewSearchScrollbar(list: vaxis.Window, total: usize, scroll: usize, theme: Theme) void {
+    const height: usize = list.height;
+    const thumb = @max(1, (height * height + total - 1) / total);
+    const max_scroll = total - height;
+    const first = @min(scroll, max_scroll) * (height - thumb) / max_scroll;
+    for (0..height) |row| list.writeCell(list.width - 1, @intCast(row), .{
+        .char = .{ .grapheme = if (row >= first and row < first + thumb) "█" else "│", .width = 1 },
+        .style = if (row >= first and row < first + thumb) theme.picker_selected else theme.overlay_border,
+    });
 }
 
 fn sourceContentLabel(scratch: std.mem.Allocator, content: ?@import("bbr").diff.FileContentStatus, state: @import("bbr").highlight.SideState) []const u8 {
@@ -1026,6 +1041,8 @@ fn drawReviewSourcePreview(scratch: std.mem.Allocator, header: vaxis.Window, pre
     }
     const text = side.content.blob;
     const matched_line = source.new_line orelse source.old_line orelse 0;
+    const spans = if (side.content.highlighting == .ready) side.content.highlighting.ready.spans else &.{};
+    var span_cursor: usize = 0;
     var start: usize = 0;
     var line_number: usize = 1;
     var row: u16 = 0;
@@ -1041,25 +1058,45 @@ fn drawReviewSourcePreview(scratch: std.mem.Allocator, header: vaxis.Window, pre
                 skipped += 1;
             }
             const style = if (line_number == matched_line) theme.picker_selected else theme.picker;
-            const segments = scratch.alloc(vaxis.Segment, result.occurrence.ranges.len * 2 + 1) catch return;
-            var count: usize = 0;
-            var cursor: usize = offset;
-            if (line_number == matched_line) for (result.occurrence.ranges) |range| {
-                if (range.end <= offset or range.start >= line.len or range.end > line.len) continue;
-                const first = @max(range.start, offset);
-                if (cursor < first) {
-                    segments[count] = .{ .text = line[cursor..first], .style = style };
-                    count += 1;
+            while (span_cursor < spans.len and spans[span_cursor].line < line_number) span_cursor += 1;
+            const first_span = span_cursor;
+            while (span_cursor < spans.len and spans[span_cursor].line == line_number) span_cursor += 1;
+            const decorated = bbr.highlight.decoration.decorate(scratch, line, spans[first_span..span_cursor], &.{}) catch
+                bbr.highlight.LineDecoration{ .runs = &.{.{ .text = line }} };
+            var segments: std.ArrayList(vaxis.Segment) = .empty;
+            var run_start: usize = 0;
+            for (decorated.runs) |run| {
+                const run_end = run_start + run.text.len;
+                var cursor = @max(run_start, offset);
+                if (cursor >= run_end) {
+                    run_start = run_end;
+                    continue;
                 }
-                var match_style = style;
-                match_style.bg = theme.search_active;
-                match_style.bold = true;
-                segments[count] = .{ .text = line[first..range.end], .style = match_style };
-                count += 1;
-                cursor = range.end;
-            };
-            segments[count] = .{ .text = line[cursor..], .style = style };
-            _ = preview.print(segments[0 .. count + 1], .{ .row_offset = row, .wrap = .none });
+                var syntax_style = style;
+                if (run.capture) |capture| if (theme.captureColor(capture)) |fg| { syntax_style.fg = fg; };
+                while (cursor < run_end) {
+                    var segment_end = run_end;
+                    var matched = false;
+                    if (line_number == matched_line) for (result.occurrence.ranges) |range| {
+                        if (range.end <= cursor) continue;
+                        if (range.start <= cursor) {
+                            matched = true;
+                            segment_end = @min(segment_end, range.end);
+                        } else segment_end = @min(segment_end, range.start);
+                        break;
+                    };
+                    var segment_style = syntax_style;
+                    if (matched) {
+                        segment_style.bg = theme.search_active;
+                        segment_style.bold = true;
+                    }
+                    segments.append(scratch, .{ .text = line[cursor..segment_end], .style = segment_style }) catch return;
+                    cursor = segment_end;
+                }
+                run_start = run_end;
+            }
+            if (segments.items.len == 0) segments.append(scratch, .{ .text = "", .style = style }) catch return;
+            _ = preview.print(segments.items, .{ .row_offset = row, .wrap = .none });
             row += 1;
         }
         start = end + @intFromBool(end < text.len);
@@ -1758,6 +1795,10 @@ test "M21 authored source Preview shows exact ranges, version states, horizontal
         .ranges = @constCast(&ranges), .column = 5, .candidate_scalars = 11, .corpus_order = 0, .session_epoch = 1,
     };
     const result: presentation.ReviewSearchResult = .{ .kind = "SOURCE", .source = "File", .body = "", .scope = .review, .scope_state = null, .occurrence = occurrence };
+    const spans = [_]bbr.highlight.Span{
+        .{ .line = 1, .start = 0, .end = 6, .capture = bbr.highlight.Capture.init(0, "comment") },
+        .{ .line = 2, .start = 4, .end = 7, .capture = bbr.highlight.Capture.init(1, "keyword") },
+    };
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 100, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
@@ -1765,17 +1806,23 @@ test "M21 authored source Preview shows exact ranges, version states, horizontal
     const base: presentation.ReviewSearchProjection = .{
         .query = "needle", .occurrences = &.{occurrence}, .results = &.{result}, .candidate_count = 2,
         .selected = 0, .list_scroll = 0, .preview_scroll = 0, .pending = false, .geometry = geometry,
-        .source_preview = .{ .old = .{ .binary = 12 }, .new = .{ .content = .{ .blob = "before\nxxxxneedle after\n", .highlighting = .skipped_too_large } } },
+        .source_preview = .{ .old = .{ .binary = 12 }, .new = .{ .content = .{ .blob = "before\nxxxxneedle after\n", .highlighting = .{ .ready = .{ .spans = &spans } } } } },
     };
     drawReviewSearch(a, win, base, theme_dark);
     const preview = childRect(win, geometry.preview);
     try testing.expectEqualStrings("x", preview.readCell(0, 1).?.char.grapheme);
+    try testing.expectEqual(theme_dark.syntax_comment, preview.readCell(0, 0).?.style.fg);
     try testing.expectEqual(theme_dark.search_active, preview.readCell(4, 1).?.style.bg);
+    try testing.expectEqual(theme_dark.syntax_keyword, preview.readCell(4, 1).?.style.fg);
+    try testing.expect(!std.meta.eql(preview.readCell(0, 1).?.style.fg, theme_dark.syntax_keyword));
+    try testing.expectEqual(theme_dark.search_active, preview.readCell(8, 1).?.style.bg);
+    try testing.expect(!std.meta.eql(preview.readCell(8, 1).?.style.fg, theme_dark.syntax_keyword));
     var horizontal = base;
     horizontal.preview_horizontal = 4;
     drawReviewSearch(a, win, horizontal, theme_dark);
     try testing.expectEqualStrings("n", preview.readCell(0, 1).?.char.grapheme);
     try testing.expectEqual(theme_dark.search_active, preview.readCell(0, 1).?.style.bg);
+    try testing.expectEqual(theme_dark.syntax_keyword, preview.readCell(0, 1).?.style.fg);
     var evicted = base;
     evicted.source_preview = .{ .old = .{ .binary = 12 }, .new = .pending };
     drawReviewSearch(a, win, evicted, theme_dark);
@@ -1808,6 +1855,35 @@ test "M21 authored Overlay exposes both File version states without a Query" {
     const preview = childRect(win, geometry.preview);
     try testing.expectEqualStrings("o", preview.readCell(0, 0).?.char.grapheme);
     try testing.expectEqualStrings("n", preview.readCell(0, 1).?.char.grapheme);
+}
+
+test "M21 authored Review Search list shows a scroll bar for long results" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 100, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const geometry = @import("frame.zig").reviewSearchGeometry(.{ .cols = 100, .rows = 24 }).?;
+    const occurrence: @import("search.zig").Occurrence = .{
+        .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 1 } },
+        .ranges = @constCast(&[_]@import("search.zig").Range{}), .column = 1,
+        .candidate_scalars = 1, .corpus_order = 0, .session_epoch = 1,
+    };
+    const result: presentation.ReviewSearchResult = .{ .kind = "COMMENT", .source = "Ada", .body = "text", .scope = .review, .scope_state = .current, .occurrence = occurrence };
+    const results = [_]presentation.ReviewSearchResult{result} ** 60;
+    var projection: presentation.ReviewSearchProjection = .{
+        .query = "text", .occurrences = &.{}, .results = &results, .candidate_count = 60,
+        .selected = 0, .list_scroll = 0, .preview_scroll = 0, .pending = false, .geometry = geometry,
+    };
+    drawReviewSearch(a, win, projection, theme_dark);
+    const list = childRect(win, geometry.list);
+    try testing.expectEqualStrings("█", list.readCell(list.width - 1, 0).?.char.grapheme);
+    try testing.expectEqualStrings("│", list.readCell(list.width - 1, list.height - 1).?.char.grapheme);
+    projection.list_scroll = 60 - list.height;
+    drawReviewSearch(a, win, projection, theme_dark);
+    try testing.expectEqualStrings("│", list.readCell(list.width - 1, 0).?.char.grapheme);
+    try testing.expectEqualStrings("█", list.readCell(list.width - 1, list.height - 1).?.char.grapheme);
 }
 
 test "M21 authored Preview paints every disjoint Markdown match range" {

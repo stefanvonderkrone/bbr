@@ -4785,7 +4785,7 @@ pub const Presentation = struct {
             if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) return self.closeReviewSearch();
             if (key.matches(keymap_mod.special.backspace, .{})) return self.editReviewSearch(.backspace);
             if (key.matches('w', .{ .ctrl = true })) return self.editReviewSearch(.delete_word);
-            if (key.matches('u', .{ .ctrl = true })) return self.editReviewSearch(.delete_all);
+            if (key.matches('k', .{ .ctrl = true })) return self.editReviewSearch(.delete_all);
             switch (self.resolver.feed(self.dependencies.keymap, .review_search, key)) {
                 .action => |action| return self.applyAction(action),
                 else => {},
@@ -4982,6 +4982,8 @@ pub const Presentation = struct {
                 .next_review_search_occurrence => self.moveReviewSearch(1),
                 .previous_review_search_occurrence => self.moveReviewSearch(-1),
                 .open_search_occurrence => self.openReviewSearchOccurrence(),
+                .half_page_down => self.scrollReviewSearch(1),
+                .half_page_up => self.scrollReviewSearch(-1),
                 else => {},
             }
             return;
@@ -5593,6 +5595,19 @@ pub const Presentation = struct {
         const current = state.selected orelse 0;
         const next = if (delta > 0) (current + 1) % batch.occurrences.len else (current + batch.occurrences.len - 1) % batch.occurrences.len;
         self.selectReviewSearch(next);
+    }
+
+    fn scrollReviewSearch(self: *Presentation, delta: i2) void {
+        const published = self.published orelse return;
+        const state = &published.review_search;
+        const height = (frame_mod.reviewSearchGeometry(self.geometry) orelse return).list.height;
+        if (height == 0) return;
+        const matches = if (state.pending) 0 else if (state.batch) |batch| batch.occurrences.len else 0;
+        const total = if (matches > 0) matches else published.session.diff.files.len;
+        const max_scroll = total -| height;
+        const step = @max(@as(usize, 1), height / 2);
+        state.list_scroll = if (delta > 0) @min(state.list_scroll +| step, max_scroll) else state.list_scroll -| step;
+        published.frame_revision += 1;
     }
 
     fn selectReviewSearch(self: *Presentation, index: usize) void {
@@ -9698,6 +9713,53 @@ test "M21 authored Review Search waits for an issued Buffer Search scan" {
     try testing.expect(next.scan_buffer_search.mode == .fuzzy);
 }
 
+test "M21 authored ctrl-d and ctrl-u scroll the result list without changing Query or selection" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    for (0..30) |index| try store.store().put(key.storeKey(), .{
+        .local_id = @intCast(index + 1), .kind = .comment, .scope = .review, .body = "needle",
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .geometry = .{ .cols = 100, .rows = 25 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+    try completeBufferSearchScan(&presentation);
+    const before = presentation.projection().review_search.?;
+    try testing.expectEqual(@as(usize, 30), before.results.len);
+    const step = @max(@as(usize, 1), before.geometry.list.height / 2);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'd', .mods = .{ .ctrl = true } } });
+    const down = presentation.projection().review_search.?;
+    try testing.expectEqual(step, down.list_scroll);
+    try testing.expectEqualStrings("needle", down.query);
+    try testing.expectEqual(@as(?usize, 0), down.selected);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+    const up = presentation.projection().review_search.?;
+    try testing.expectEqual(@as(usize, 0), up.list_scroll);
+    try testing.expectEqualStrings("needle", up.query);
+    try testing.expectEqual(@as(?usize, 0), up.selected);
+}
+
+test "M21 authored ctrl-d scrolls File states before the Query has matches" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 30) },
+        .geometry = .{ .cols = 100, .rows = 25 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'd', .mods = .{ .ctrl = true } } });
+    const scrolled = presentation.projection().review_search.?;
+    try testing.expect(scrolled.list_scroll > 0);
+    try testing.expectEqualStrings("", scrolled.query);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review_search.?.list_scroll);
+}
+
 test "M21 authored Review Search opens with every ReviewBody Candidate before File acquisition" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -9819,7 +9881,7 @@ test "M21 authored scope opening resolves Review File Reply and outdated locatio
     try testing.expectEqual(@as(?usize, 0), presentation.projection().review.?.isolated_file);
     inline for (.{ "reviewOnly", "fileOnly", "replyOnly", "outdatedOnly" }, 0..) |needle, index| {
         try presentation.dispatch(.{ .action = .open_review_search });
-        try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'k', .mods = .{ .ctrl = true } } });
         try presentation.dispatch(.{ .key = .{ .codepoint = needle[0], .text = needle } });
         try completeBufferSearchScan(&presentation);
         try testing.expectEqual(@as(usize, 1), presentation.projection().review_search.?.results.len);
@@ -9848,11 +9910,11 @@ test "M21 authored scope opening resolves Review File Reply and outdated locatio
         }
     }
     try presentation.dispatch(.{ .action = .open_review_search });
-    try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'k', .mods = .{ .ctrl = true } } });
     try presentation.dispatch(.{ .key = .{ .codepoint = 'd', .text = "deletedOnly" } });
     try completeBufferSearchScan(&presentation);
     try testing.expectEqual(@as(usize, 0), presentation.projection().review_search.?.results.len);
-    try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'k', .mods = .{ .ctrl = true } } });
     try presentation.dispatch(.{ .key = .{ .codepoint = 's', .text = "surviveOnly" } });
     try completeBufferSearchScan(&presentation);
     try testing.expectEqual(@as(bbr.review.CommentId, 10), presentation.projection().review_search.?.results[0].occurrence.location.review_body.owner.comment);
