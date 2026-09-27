@@ -3644,6 +3644,14 @@ pub const Presentation = struct {
 
     pub fn takeCommand(self: *Presentation) ?OwnedCommand {
         if (self.commands.items.len == 0) return null;
+        const next = self.commands.items[0];
+        if (next == .scan_buffer_search or next == .scan_review_source) {
+            for (self.issued_commands.items) |issued| {
+                if (issued.target == .scan_review_source or
+                    (issued.target == .scan_buffer_search and
+                        (next == .scan_review_source or next.scan_buffer_search.mode == .fuzzy))) return null;
+            }
+        }
         if (self.published) |published| {
             if (self.commands.items[0] == .scan_buffer_search and self.commands.items[0].scan_buffer_search.mode == .fuzzy and
                 (published.review_search.authored_scan_active or published.review_search.source_scan_active)) return null;
@@ -9664,6 +9672,30 @@ test "M21 authored source scan keeps leased content after Session destruction" {
     defer completed.deinit();
     scan_command.deinit();
     try testing.expectEqual(@as(usize, 2), completed.outcome.scanned.occurrences.len);
+}
+
+test "M21 authored Review Search waits for an issued Buffer Search scan" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        .geometry = .{ .cols = 100, .rows = 25 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+    var buffer_command = presentation.takeCommand().?;
+    try testing.expect(buffer_command == .scan_buffer_search);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+    try testing.expect(presentation.takeCommand() == null);
+    try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, &buffer_command.scan_buffer_search) });
+    buffer_command.deinit();
+    var next = presentation.takeCommand().?;
+    defer next.deinit();
+    try testing.expect(next == .scan_buffer_search);
+    try testing.expect(next.scan_buffer_search.mode == .fuzzy);
 }
 
 test "M21 authored Review Search opens with every ReviewBody Candidate before File acquisition" {
