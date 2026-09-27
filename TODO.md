@@ -339,6 +339,14 @@ context. Keep M21 navigation to the existing DiffPane ReviewCard until this mile
 - [ ] After the overview ships, route a Review Search result for a Review-level item through the overview when that route gives clearer context than the all-Files Buffer.
 - [ ] Add Presentation coverage for each CommentScope, nested Replies, Drafts, disclosures, stale Session work, navigation, and return-state restoration.
 
+## M30 - Viewer scrollbars  ·  S/M  ·  needs M15
+Show the visible range in both viewer Panes. Use a thin thumb without a full-height track,
+as in Review Search.
+
+- [ ] Add a scrollbar to the Sidebar File Tree. Size and place the thumb from the visible rows, total rows, and scroll offset. Hide it when every row fits.
+- [ ] Add a scrollbar to the DiffPane. Track its visual rows across layouts, wrapped lines, Folds, and isolated Files. Hide it when every row fits.
+- [ ] Add headless Presentation tests for thumb size and position at the top, middle, and bottom, plus resize and content changes.
+
 ### Closed historical deferrals
 
 The following notes remain in M0–M14 as implementation history but require no post-M14 work:
@@ -371,11 +379,12 @@ M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M10    (authoring → submission)
               ├─ M19 ─ M26       (Credential login and logout)
               ├─ M13 ─ M17 ─ M27 (UserGrammar sandbox research)
               ├─ M17 ─ M21 ─ M28 (full-Review File cache evaluation)
-              └─ M15 ─ M21 ─ M29 (Comment Overview)
+              ├─ M15 ─ M21 ─ M29 (Comment Overview)
+              └─ M15 ─ M30       (viewer scrollbars)
 ```
 
 **MVP line:** M0–M3 gives a usable read-only reviewer; M4 makes it ergonomic; M6+M10 make it
 write-capable (the headline). M5/M7/M8/M9/M11/M12/M13 are parallelizable polish once M2 lands; M14 is the
-largest standalone feature and depends only on read + authoring, not submission. M15–M29 gather
+largest standalone feature and depends only on read + authoring, not submission. M15–M30 gather
 all still-actionable follow-ups recorded by the completed milestones, design open questions,
 ADRs, domain docs, and the local issue tracker.

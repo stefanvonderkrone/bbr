@@ -25,3 +25,13 @@
 - [ ] Source Preview shows complete path details, nearby Lines, exact fuzzy ranges, horizontal scrolling, and a reacquisition state when content was evicted.
 - [ ] Closing the Overlay removes queued acquisition and scans. Started File Enrichment can enter the normal cache but cannot publish closed-search results. Reopening resumes from current cache states.
 - [ ] Presentation, adapter, cache, and headless rendering tests cover limits, ordering, retry, version states, leases, stale work, closure, cache enforcement, and RemoteReview or LocalReview parity.
+
+## Comments
+
+Bitbucket Cloud provides changed Files and Hunks through one [PullRequest diff endpoint](https://developer.atlassian.com/cloud/bitbucket/rest/api-group-pullrequests/).
+`Client.getDiff` fetches that RawDiff once per Session. The RawDiff omits unchanged File content.
+Review Search still needs File Enrichment through the source endpoint for each old and new File version.
+
+Atlassian [limits PullRequest diff viewing](https://support.atlassian.com/bitbucket-cloud/docs/limits-for-viewing-content-and-diffs/) to 200 Files and 8,000 changed lines overall.
+Each File also has a limit of 2,000 changed lines or 100 KB of raw diff.
+Do not assume that a large RawDiff response contains every change. Keep per-File acquisition for complete source search.

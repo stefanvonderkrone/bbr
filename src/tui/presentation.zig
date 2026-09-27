@@ -5607,7 +5607,11 @@ pub const Presentation = struct {
         const max_scroll = total -| height;
         const step = @max(@as(usize, 1), height / 2);
         state.list_scroll = if (delta > 0) @min(state.list_scroll +| step, max_scroll) else state.list_scroll -| step;
-        published.frame_revision += 1;
+        if (matches > 0) {
+            const current = state.selected orelse 0;
+            const next = if (delta > 0) @min(current +| step, matches - 1) else current -| step;
+            self.selectReviewSearch(@max(state.list_scroll, @min(next, state.list_scroll + height - 1)));
+        } else published.frame_revision += 1;
     }
 
     fn selectReviewSearch(self: *Presentation, index: usize) void {
@@ -9713,7 +9717,7 @@ test "M21 authored Review Search waits for an issued Buffer Search scan" {
     try testing.expect(next.scan_buffer_search.mode == .fuzzy);
 }
 
-test "M21 authored ctrl-d and ctrl-u scroll the result list without changing Query or selection" {
+test "M21 authored ctrl-d and ctrl-u move selection with the result list without changing Query" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
@@ -9735,12 +9739,20 @@ test "M21 authored ctrl-d and ctrl-u scroll the result list without changing Que
     const down = presentation.projection().review_search.?;
     try testing.expectEqual(step, down.list_scroll);
     try testing.expectEqualStrings("needle", down.query);
-    try testing.expectEqual(@as(?usize, 0), down.selected);
+    try testing.expectEqual(@as(?usize, step), down.selected);
     try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
     const up = presentation.projection().review_search.?;
     try testing.expectEqual(@as(usize, 0), up.list_scroll);
     try testing.expectEqualStrings("needle", up.query);
     try testing.expectEqual(@as(?usize, 0), up.selected);
+    for (0..10) |_| try presentation.dispatch(.{ .key = .{ .codepoint = 'd', .mods = .{ .ctrl = true } } });
+    const bottom = presentation.projection().review_search.?;
+    try testing.expectEqual(bottom.results.len - bottom.geometry.list.height, bottom.list_scroll);
+    try testing.expectEqual(@as(?usize, bottom.results.len - 1), bottom.selected);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+    const above = presentation.projection().review_search.?;
+    try testing.expect(above.selected.? >= above.list_scroll);
+    try testing.expect(above.selected.? < above.list_scroll + above.geometry.list.height);
 }
 
 test "M21 authored ctrl-d scrolls File states before the Query has matches" {

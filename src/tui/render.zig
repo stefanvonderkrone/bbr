@@ -880,7 +880,7 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
     if (search_box.height > 1 and search_box.width > 2) {
         const input = search_box.child(.{ .x_off = 1, .y_off = 1, .width = search_box.width - 2, .height = 1 });
         const query = std.fmt.allocPrint(scratch, "> {s}", .{projection.query}) catch "> ";
-        _ = input.printSegment(.{ .text = query, .style = theme.picker_query }, .{ .wrap = .none });
+        _ = input.printSegment(.{ .text = query, .style = theme.picker }, .{ .wrap = .none });
     }
     if (search_box.height > 2) {
         const status = std.fmt.allocPrint(scratch, "{d}/{d} matches · {d} candidates{s}", .{
@@ -976,7 +976,7 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
         if (projection.status_preview) |view| {
             if (projection.list_scroll < projection.files.len) {
                 const path = projection.files[projection.list_scroll].displayPath();
-                if (header.height > 0) _ = header.printSegment(.{ .text = path, .style = theme.picker_query }, .{ .wrap = .none });
+                if (header.height > 0) _ = header.printSegment(.{ .text = path, .style = theme.picker }, .{ .wrap = .none });
                 const old = std.fmt.allocPrint(scratch, "old: {s}", .{sourceSideState(scratch, view.old)}) catch "old";
                 const new = std.fmt.allocPrint(scratch, "new: {s}", .{sourceSideState(scratch, view.new)}) catch "new";
                 if (preview.height > 0) _ = preview.printSegment(.{ .text = old, .style = theme.picker }, .{ .wrap = .none });
@@ -999,9 +999,9 @@ fn drawReviewSearchScrollbar(list: vaxis.Window, total: usize, scroll: usize, th
     const thumb = @max(1, (height * height + total - 1) / total);
     const max_scroll = total - height;
     const first = @min(scroll, max_scroll) * (height - thumb) / max_scroll;
-    for (0..height) |row| list.writeCell(list.width - 1, @intCast(row), .{
-        .char = .{ .grapheme = if (row >= first and row < first + thumb) "█" else "│", .width = 1 },
-        .style = if (row >= first and row < first + thumb) theme.picker_selected else theme.overlay_border,
+    for (first..first + thumb) |row| list.writeCell(list.width - 1, @intCast(row), .{
+        .char = .{ .grapheme = "│", .width = 1 },
+        .style = theme.picker,
     });
 }
 
@@ -1023,11 +1023,11 @@ fn drawReviewSourcePreview(scratch: std.mem.Allocator, header: vaxis.Window, pre
     const path = if (source.relation == .old) source.old_path else source.new_path;
     const version = if (source.relation == .old) "old" else if (source.relation == .new) "new" else "old + new";
     if (header.height > 0) {
-        fillRow(header, 0, theme.picker_query);
+        fillRow(header, 0, theme.picker);
         const old_state = if (file_view) |view| sourceSideState(scratch, view.old) else "loading";
         const new_state = if (file_view) |view| sourceSideState(scratch, view.new) else "loading";
         const label = std.fmt.allocPrint(scratch, "{s} · {s} · L{d}:C{d} · old {s} · new {s}", .{ path, version, source.new_line orelse source.old_line orelse 0, result.occurrence.column, old_state, new_state }) catch path;
-        _ = header.printSegment(.{ .text = label, .style = theme.picker_query }, .{ .wrap = .none });
+        _ = header.printSegment(.{ .text = label, .style = theme.picker }, .{ .wrap = .none });
     }
     if (preview.height == 0) return;
     const view = file_view orelse {
@@ -1193,8 +1193,8 @@ fn drawReviewSearchHeader(scratch: std.mem.Allocator, win: vaxis.Window, result:
         .@"inline" => |anchor| std.fmt.allocPrint(scratch, "Inline {s}", .{shortSearchPath(scratch, anchor.path, win.width -| searchCellWidth(prefix) -| 7)}) catch "Inline",
     };
     const label = std.fmt.allocPrint(scratch, "{s}{s} · L{d}:C{d}", .{ prefix, scope, owner.logical_line, result.occurrence.column }) catch prefix;
-    fillRow(win, 0, theme.picker_query);
-    _ = win.printSegment(.{ .text = label, .style = theme.picker_query }, .{ .wrap = .none });
+    fillRow(win, 0, theme.picker);
+    _ = win.printSegment(.{ .text = label, .style = theme.picker }, .{ .wrap = .none });
 }
 
 fn drawReviewSearchPreview(scratch: std.mem.Allocator, win: vaxis.Window, result: presentation.ReviewSearchResult, scroll: usize, theme: Theme) void {
@@ -1776,6 +1776,12 @@ test "M21 authored Overlay renders ranked rows and matched Preview in landscape 
         }, theme_dark);
         const list = childRect(win, geometry.list);
         const preview = childRect(win, geometry.preview);
+        const input = childRect(win, .{ .x = geometry.rect.x + 1, .y = geometry.rect.y + 1, .width = geometry.rect.width - 2, .height = 1 });
+        const header = childRect(win, geometry.header);
+        try testing.expectEqual(theme_dark.picker.bg, input.readCell(0, 0).?.style.bg);
+        try testing.expectEqual(theme_dark.picker.bg, input.readCell(2, 0).?.style.bg);
+        try testing.expectEqual(theme_dark.picker.bg, header.readCell(0, 0).?.style.bg);
+        try testing.expectEqual(theme_dark.picker.bg, header.readCell(header.width - 1, 0).?.style.bg);
         try testing.expectEqualStrings("▸", list.readCell(0, 0).?.char.grapheme);
         try testing.expectEqualStrings("b", preview.readCell(0, 0).?.char.grapheme);
         try testing.expect(geometry.landscape == (cols == 100));
@@ -1810,6 +1816,9 @@ test "M21 authored source Preview shows exact ranges, version states, horizontal
     };
     drawReviewSearch(a, win, base, theme_dark);
     const preview = childRect(win, geometry.preview);
+    const header = childRect(win, geometry.header);
+    try testing.expectEqual(theme_dark.picker.bg, header.readCell(0, 0).?.style.bg);
+    try testing.expectEqual(theme_dark.picker.bg, header.readCell(header.width - 1, 0).?.style.bg);
     try testing.expectEqualStrings("x", preview.readCell(0, 1).?.char.grapheme);
     try testing.expectEqual(theme_dark.syntax_comment, preview.readCell(0, 0).?.style.fg);
     try testing.expectEqual(theme_dark.search_active, preview.readCell(4, 1).?.style.bg);
@@ -1878,12 +1887,23 @@ test "M21 authored Review Search list shows a scroll bar for long results" {
     };
     drawReviewSearch(a, win, projection, theme_dark);
     const list = childRect(win, geometry.list);
-    try testing.expectEqualStrings("█", list.readCell(list.width - 1, 0).?.char.grapheme);
-    try testing.expectEqualStrings("│", list.readCell(list.width - 1, list.height - 1).?.char.grapheme);
+    const bar_col = list.width - 1;
+    const thumb = @max(@as(usize, 1), (@as(usize, list.height) * list.height + results.len - 1) / results.len);
+    try testing.expect(thumb < list.height);
+    try testing.expectEqualStrings("│", list.readCell(bar_col, 0).?.char.grapheme);
+    try testing.expectEqualStrings("│", list.readCell(bar_col, @intCast(thumb - 1)).?.char.grapheme);
+    try testing.expectEqualStrings(" ", list.readCell(bar_col, @intCast(thumb)).?.char.grapheme);
+    try testing.expectEqualStrings(" ", list.readCell(bar_col, list.height - 1).?.char.grapheme);
+    projection.list_scroll = (60 - list.height) / 2;
+    drawReviewSearch(a, win, projection, theme_dark);
+    try testing.expectEqualStrings(" ", list.readCell(bar_col, 0).?.char.grapheme);
+    try testing.expectEqualStrings("│", list.readCell(bar_col, list.height / 2).?.char.grapheme);
+    try testing.expectEqualStrings(" ", list.readCell(bar_col, list.height - 1).?.char.grapheme);
     projection.list_scroll = 60 - list.height;
     drawReviewSearch(a, win, projection, theme_dark);
-    try testing.expectEqualStrings("│", list.readCell(list.width - 1, 0).?.char.grapheme);
-    try testing.expectEqualStrings("█", list.readCell(list.width - 1, list.height - 1).?.char.grapheme);
+    try testing.expectEqualStrings(" ", list.readCell(bar_col, 0).?.char.grapheme);
+    try testing.expectEqualStrings(" ", list.readCell(bar_col, list.height - @as(u16, @intCast(thumb)) - 1).?.char.grapheme);
+    try testing.expectEqualStrings("│", list.readCell(bar_col, list.height - 1).?.char.grapheme);
 }
 
 test "M21 authored Preview paints every disjoint Markdown match range" {
