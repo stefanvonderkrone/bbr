@@ -187,6 +187,15 @@ pub const Client = struct {
         return self.getSource(allocator, repo_slug, commit, path, false);
     }
 
+    pub const FileBlobAttempt = union(enum) {
+        content: []u8,
+        rejected: struct { reason: ApiError, retry_after_ms: ?u64 },
+    };
+
+    pub fn getFileBlobAttempt(self: Client, allocator: Allocator, repo_slug: []const u8, commit: []const u8, path: []const u8) !FileBlobAttempt {
+        return self.getSourceAttempt(allocator, repo_slug, commit, path, false);
+    }
+
     pub fn checkFileBlob(
         self: Client,
         allocator: Allocator,
@@ -220,6 +229,13 @@ pub const Client = struct {
     }
 
     fn getSource(self: Client, allocator: Allocator, repo_slug: []const u8, commit: []const u8, path: []const u8, metadata: bool) ![]u8 {
+        return switch (try self.getSourceAttempt(allocator, repo_slug, commit, path, metadata)) {
+            .content => |bytes| bytes,
+            .rejected => |failure| failure.reason,
+        };
+    }
+
+    fn getSourceAttempt(self: Client, allocator: Allocator, repo_slug: []const u8, commit: []const u8, path: []const u8, metadata: bool) !FileBlobAttempt {
         var url_buf: std.ArrayList(u8) = .empty;
         defer url_buf.deinit(allocator);
         try url_buf.print(allocator, "{s}/repositories/{s}/{s}/src/{s}/", .{ base_url, self.cred.workspace, repo_slug, commit });
@@ -239,9 +255,11 @@ pub const Client = struct {
                 .{ .name = "accept", .value = if (metadata) "application/json" else "text/plain" },
             },
         });
-        errdefer allocator.free(res.body);
-        try classify(res.status);
-        return res.body;
+        classify(res.status) catch |reason| {
+            allocator.free(res.body);
+            return .{ .rejected = .{ .reason = reason, .retry_after_ms = res.retry_after_ms } };
+        };
+        return .{ .content = res.body };
     }
 
     /// POST /repositories/{workspace}/{repo}/pullrequests/{id}/comments: publish

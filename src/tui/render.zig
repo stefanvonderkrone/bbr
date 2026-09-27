@@ -925,7 +925,21 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
         });
     }
     if (projection.results.len == 0 and list.height > 0) {
-        _ = list.printSegment(.{ .text = if (projection.pending) "Searching ReviewBodies…" else "No matching occurrence", .style = theme.picker }, .{ .wrap = .none });
+        for (0..list.height) |row| {
+            const index = projection.list_scroll + row;
+            if (index >= projection.files.len or index >= projection.content_statuses.len or index >= projection.highlight_statuses.len) break;
+            const file = projection.files[index];
+            const content = projection.content_statuses[index];
+            const status = projection.highlight_statuses[index];
+            const label = std.fmt.allocPrint(scratch, "{s}  old {s} · new {s}", .{
+                shortSearchPath(scratch, file.displayPath(), @max(list.width / 2, 1)),
+                sourceContentLabel(scratch, content.old, status.old),
+                sourceContentLabel(scratch, content.new, status.new),
+            }) catch file.displayPath();
+            _ = list.printSegment(.{ .text = label, .style = theme.picker }, .{ .row_offset = @intCast(row), .wrap = .none });
+        }
+        if (projection.files.len == 0)
+            _ = list.printSegment(.{ .text = if (projection.pending) "Searching ReviewBodies…" else "No matching occurrence", .style = theme.picker }, .{ .wrap = .none });
     }
     for (0..list.height) |row_index| {
         const index = projection.list_scroll + row_index;
@@ -934,12 +948,17 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
         const selected = projection.selected == index;
         const style = if (selected) theme.picker_selected else theme.picker;
         fillRow(list, @intCast(row_index), style);
-        const owner = result.occurrence.location.review_body;
-        const position = std.fmt.allocPrint(scratch, " L{d}:C{d}", .{ owner.logical_line, result.occurrence.column }) catch "";
-        const path = switch (result.scope) {
-            .review => "Review",
-            .file => |file| file.path,
-            .@"inline" => |anchor| std.fmt.allocPrint(scratch, "{s}:{d}", .{ anchor.path, anchor.line() orelse 0 }) catch anchor.path,
+        const position = switch (result.occurrence.location) {
+            .review_body => |owner| std.fmt.allocPrint(scratch, " L{d}:C{d}", .{ owner.logical_line, result.occurrence.column }) catch "",
+            .source => |source| std.fmt.allocPrint(scratch, " {s} L{d}:C{d}", .{ @tagName(source.relation), source.new_line orelse source.old_line orelse 0, result.occurrence.column }) catch "",
+        };
+        const path = switch (result.occurrence.location) {
+            .source => |source| if (source.relation == .old) source.old_path else source.new_path,
+            .review_body => switch (result.scope) {
+                .review => "Review",
+                .file => |file| file.path,
+                .@"inline" => |anchor| std.fmt.allocPrint(scratch, "{s}:{d}", .{ anchor.path, anchor.line() orelse 0 }) catch anchor.path,
+            },
         };
         const available = list.width -| 2;
         const filename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| path[slash + 1 ..] else path;
@@ -950,12 +969,119 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
         _ = list.printSegment(.{ .text = row_text, .style = style }, .{ .row_offset = @intCast(row_index), .wrap = .none });
     }
     const selected = projection.selected orelse {
-        if (preview.height > 0) _ = preview.printSegment(.{ .text = "No preview", .style = theme.picker }, .{ .wrap = .none });
+        if (projection.status_preview) |view| {
+            if (projection.list_scroll < projection.files.len) {
+                const path = projection.files[projection.list_scroll].displayPath();
+                if (header.height > 0) _ = header.printSegment(.{ .text = path, .style = theme.picker_query }, .{ .wrap = .none });
+                const old = std.fmt.allocPrint(scratch, "old: {s}", .{sourceSideState(scratch, view.old)}) catch "old";
+                const new = std.fmt.allocPrint(scratch, "new: {s}", .{sourceSideState(scratch, view.new)}) catch "new";
+                if (preview.height > 0) _ = preview.printSegment(.{ .text = old, .style = theme.picker }, .{ .wrap = .none });
+                if (preview.height > 1) _ = preview.printSegment(.{ .text = new, .style = theme.picker }, .{ .row_offset = 1, .wrap = .none });
+            }
+        } else if (preview.height > 0) _ = preview.printSegment(.{ .text = "No preview", .style = theme.picker }, .{ .wrap = .none });
         return;
     };
     if (selected >= projection.results.len) return;
-    drawReviewSearchHeader(scratch, header, projection.results[selected], theme);
-    if (preview.height > 0) drawReviewSearchPreview(scratch, preview, projection.results[selected], projection.preview_scroll, theme);
+    if (projection.results[selected].occurrence.location == .source) {
+        drawReviewSourcePreview(scratch, header, preview, projection.results[selected], projection.source_preview, projection.preview_scroll, projection.preview_horizontal, theme);
+    } else {
+        drawReviewSearchHeader(scratch, header, projection.results[selected], theme);
+        if (preview.height > 0) drawReviewSearchPreview(scratch, preview, projection.results[selected], projection.preview_scroll, theme);
+    }
+}
+
+fn sourceContentLabel(scratch: std.mem.Allocator, content: ?@import("bbr").diff.FileContentStatus, state: @import("bbr").highlight.SideState) []const u8 {
+    const value = content orelse return "absent";
+    return switch (value) {
+        .text => |size| if (size) |bytes| std.fmt.allocPrint(scratch, "text ({d} bytes)", .{bytes}) catch "text" else if (state == .pending or state == .loading) "loading" else "unavailable",
+        .binary => |size| if (size) |bytes| std.fmt.allocPrint(scratch, "binary ({d} bytes)", .{bytes}) catch "binary" else "binary",
+        .unavailable => |unavailable| switch (unavailable.reason) {
+            .invalid_utf8 => if (unavailable.byte_size) |bytes| std.fmt.allocPrint(scratch, "invalid UTF-8 ({d} bytes)", .{bytes}) catch "invalid UTF-8" else "invalid UTF-8",
+            .acquisition_failed => "acquisition failure",
+            .invalid_path => "unavailable",
+        },
+    };
+}
+
+fn drawReviewSourcePreview(scratch: std.mem.Allocator, header: vaxis.Window, preview: vaxis.Window, result: presentation.ReviewSearchResult, file_view: ?@import("file_enrichment.zig").FileView, scroll: usize, horizontal: usize, theme: Theme) void {
+    const source = result.occurrence.location.source;
+    const path = if (source.relation == .old) source.old_path else source.new_path;
+    const version = if (source.relation == .old) "old" else if (source.relation == .new) "new" else "old + new";
+    if (header.height > 0) {
+        fillRow(header, 0, theme.picker_query);
+        const old_state = if (file_view) |view| sourceSideState(scratch, view.old) else "loading";
+        const new_state = if (file_view) |view| sourceSideState(scratch, view.new) else "loading";
+        const label = std.fmt.allocPrint(scratch, "{s} · {s} · L{d}:C{d} · old {s} · new {s}", .{ path, version, source.new_line orelse source.old_line orelse 0, result.occurrence.column, old_state, new_state }) catch path;
+        _ = header.printSegment(.{ .text = label, .style = theme.picker_query }, .{ .wrap = .none });
+    }
+    if (preview.height == 0) return;
+    const view = file_view orelse {
+        _ = preview.printSegment(.{ .text = "Reacquiring File content…", .style = theme.picker }, .{ .wrap = .none });
+        return;
+    };
+    const side = if (source.relation == .old) view.old else view.new;
+    if (side != .content) {
+        _ = preview.printSegment(.{ .text = "Reacquiring File content…", .style = theme.picker }, .{ .wrap = .none });
+        return;
+    }
+    const text = side.content.blob;
+    const matched_line = source.new_line orelse source.old_line orelse 0;
+    var start: usize = 0;
+    var line_number: usize = 1;
+    var row: u16 = 0;
+    while (start < text.len and row < preview.height) : (line_number += 1) {
+        const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+        if (line_number > scroll) {
+            const line = text[start..(if (end > start and text[end - 1] == '\r') end - 1 else end)];
+            var offset: usize = 0;
+            var skipped: usize = 0;
+            while (offset < line.len and skipped < horizontal) {
+                const scalar_length = std.unicode.utf8ByteSequenceLength(line[offset]) catch 1;
+                offset += @min(scalar_length, line.len - offset);
+                skipped += 1;
+            }
+            const style = if (line_number == matched_line) theme.picker_selected else theme.picker;
+            const segments = scratch.alloc(vaxis.Segment, result.occurrence.ranges.len * 2 + 1) catch return;
+            var count: usize = 0;
+            var cursor: usize = offset;
+            if (line_number == matched_line) for (result.occurrence.ranges) |range| {
+                if (range.end <= offset or range.start >= line.len or range.end > line.len) continue;
+                const first = @max(range.start, offset);
+                if (cursor < first) {
+                    segments[count] = .{ .text = line[cursor..first], .style = style };
+                    count += 1;
+                }
+                var match_style = style;
+                match_style.bg = theme.search_active;
+                match_style.bold = true;
+                segments[count] = .{ .text = line[first..range.end], .style = match_style };
+                count += 1;
+                cursor = range.end;
+            };
+            segments[count] = .{ .text = line[cursor..], .style = style };
+            _ = preview.print(segments[0 .. count + 1], .{ .row_offset = row, .wrap = .none });
+            row += 1;
+        }
+        start = end + @intFromBool(end < text.len);
+    }
+}
+
+fn sourceSideState(scratch: std.mem.Allocator, side: @import("file_enrichment.zig").SideView) []const u8 {
+    return switch (side) {
+        .pending => "loading",
+        .absent => "absent",
+        .binary => |size| if (size) |bytes| std.fmt.allocPrint(scratch, "binary ({d} bytes)", .{bytes}) catch "binary" else "binary",
+        .unavailable => |status| switch (status) {
+            .unavailable => |unavailable| switch (unavailable.reason) {
+                .invalid_utf8 => if (unavailable.byte_size) |bytes| std.fmt.allocPrint(scratch, "invalid UTF-8 ({d} bytes)", .{bytes}) catch "invalid UTF-8" else "invalid UTF-8",
+                .acquisition_failed => "acquisition failure",
+                .invalid_path => "unavailable",
+            },
+            else => "unavailable",
+        },
+        .fetch_failed => "acquisition failure",
+        .content => "text",
+    };
 }
 
 fn drawSearchBorder(win: vaxis.Window, theme: Theme) void {
@@ -1619,6 +1745,69 @@ test "M21 authored Overlay renders ranked rows and matched Preview in landscape 
         try testing.expectEqual(theme_dark.search_active, preview.readCell(0, 1).?.style.bg);
         if (cols == 20) try testing.expectEqualStrings("├", win.readCell(geometry.body.x, geometry.divider).?.char.grapheme);
     }
+}
+
+test "M21 authored source Preview shows exact ranges, version states, horizontal scroll, and reacquisition" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const search = @import("search.zig");
+    const ranges = [_]search.Range{.{ .start = 4, .end = 10 }};
+    const occurrence: search.Occurrence = .{
+        .location = .{ .source = .{ .file_index = 0, .relation = .new, .old_path = "src/a.txt", .new_path = "src/a.txt", .new_line = 2 } },
+        .ranges = @constCast(&ranges), .column = 5, .candidate_scalars = 11, .corpus_order = 0, .session_epoch = 1,
+    };
+    const result: presentation.ReviewSearchResult = .{ .kind = "SOURCE", .source = "File", .body = "", .scope = .review, .scope_state = null, .occurrence = occurrence };
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 100, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const geometry = @import("frame.zig").reviewSearchGeometry(.{ .cols = 100, .rows = 24 }).?;
+    const base: presentation.ReviewSearchProjection = .{
+        .query = "needle", .occurrences = &.{occurrence}, .results = &.{result}, .candidate_count = 2,
+        .selected = 0, .list_scroll = 0, .preview_scroll = 0, .pending = false, .geometry = geometry,
+        .source_preview = .{ .old = .{ .binary = 12 }, .new = .{ .content = .{ .blob = "before\nxxxxneedle after\n", .highlighting = .skipped_too_large } } },
+    };
+    drawReviewSearch(a, win, base, theme_dark);
+    const preview = childRect(win, geometry.preview);
+    try testing.expectEqualStrings("x", preview.readCell(0, 1).?.char.grapheme);
+    try testing.expectEqual(theme_dark.search_active, preview.readCell(4, 1).?.style.bg);
+    var horizontal = base;
+    horizontal.preview_horizontal = 4;
+    drawReviewSearch(a, win, horizontal, theme_dark);
+    try testing.expectEqualStrings("n", preview.readCell(0, 1).?.char.grapheme);
+    try testing.expectEqual(theme_dark.search_active, preview.readCell(0, 1).?.style.bg);
+    var evicted = base;
+    evicted.source_preview = .{ .old = .{ .binary = 12 }, .new = .pending };
+    drawReviewSearch(a, win, evicted, theme_dark);
+    try testing.expectEqualStrings("R", preview.readCell(0, 0).?.char.grapheme);
+}
+
+test "M21 authored Overlay exposes both File version states without a Query" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 100, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const geometry = @import("frame.zig").reviewSearchGeometry(.{ .cols = 100, .rows = 24 }).?;
+    const files = [_]@import("bbr").diff.File{.{ .old_path = "a.txt", .new_path = "a.txt", .status = .modified, .hunks = &.{} }};
+    const contents = [_]@import("bbr").diff.FileContent{.{
+        .old = .{ .binary = 12 },
+        .new = .{ .unavailable = .{ .byte_size = 3, .reason = .invalid_utf8 } },
+    }};
+    const statuses = [_]@import("bbr").highlight.FileHighlightStatus{.{ .old = .absent, .new = .absent }};
+    drawReviewSearch(a, win, .{
+        .query = "", .occurrences = &.{}, .results = &.{}, .candidate_count = 0,
+        .selected = null, .list_scroll = 0, .preview_scroll = 0, .pending = false,
+        .geometry = geometry, .files = &files, .content_statuses = &contents, .highlight_statuses = &statuses,
+        .status_preview = .{ .old = .{ .binary = 12 }, .new = .{ .unavailable = contents[0].new.? } },
+    }, theme_dark);
+    const list = childRect(win, geometry.list);
+    try testing.expectEqualStrings("a", list.readCell(0, 0).?.char.grapheme);
+    try testing.expectEqualStrings("b", list.readCell(11, 0).?.char.grapheme);
+    const preview = childRect(win, geometry.preview);
+    try testing.expectEqualStrings("o", preview.readCell(0, 0).?.char.grapheme);
+    try testing.expectEqualStrings("n", preview.readCell(0, 1).?.char.grapheme);
 }
 
 test "M21 authored Preview paints every disjoint Markdown match range" {

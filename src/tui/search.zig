@@ -261,6 +261,102 @@ pub fn scan(
     return .{ .occurrences = try occurrences.toOwnedSlice(allocator) };
 }
 
+/// Scan a complete File without copying its Lines into Search Occurrences.
+/// Only context Lines proven by the Diff can merge old and new identities.
+pub fn scanFile(allocator: std.mem.Allocator, query: Query, file: bbr.diff.File, file_index: usize, epoch: u64, old: ?[]const u8, new: ?[]const u8) !Batch {
+    var candidates: std.ArrayList(Candidate) = .empty;
+    defer candidates.deinit(allocator);
+    for ([_]struct { blob: ?[]const u8, relation: VersionRelation }{
+        .{ .blob = old, .relation = .old },
+        .{ .blob = new, .relation = .new },
+    }) |version| {
+        const blob = version.blob orelse continue;
+        var start: usize = 0;
+        var line_no: u32 = 1;
+        while (start < blob.len) : (line_no += 1) {
+            const end = std.mem.indexOfScalarPos(u8, blob, start, '\n') orelse blob.len;
+            const line_end = if (end > start and blob[end - 1] == '\r') end - 1 else end;
+            try candidates.append(allocator, .{
+                .text = blob[start..line_end],
+                .location = .{ .source = .{
+                    .file_index = file_index,
+                    .relation = version.relation,
+                    .old_path = file.old_path,
+                    .new_path = file.new_path,
+                    .old_line = if (version.relation == .old) line_no else null,
+                    .new_line = if (version.relation == .new) line_no else null,
+                } },
+                .corpus_order = @as(usize, line_no) * 2 + @intFromBool(version.relation == .new),
+                .session_epoch = epoch,
+            });
+            start = end + @intFromBool(end < blob.len);
+        }
+    }
+    var batch = try scan(allocator, query, candidates.items, .fuzzy);
+    if (old == null or new == null) return batch;
+    // ponytail: Context verification walks complete text per Hunk Line. Index offsets if large diffs make scans slow.
+    for (file.hunks) |hunk| for (hunk.lines) |line| {
+        if (line.kind != .context or line.old_no == 0 or line.new_no == 0) continue;
+        const old_text = lineAt(old.?, line.old_no) orelse continue;
+        const new_text = lineAt(new.?, line.new_no) orelse continue;
+        if (!std.mem.eql(u8, old_text, new_text) or !std.mem.eql(u8, old_text, line.text)) continue;
+        var old_index: ?usize = null;
+        var new_index: ?usize = null;
+        for (batch.occurrences, 0..) |occurrence, index| {
+            const source = occurrence.location.source;
+            if (source.relation == .old and source.old_line == line.old_no) old_index = index;
+            if (source.relation == .new and source.new_line == line.new_no) new_index = index;
+        }
+        if (old_index) |oi| if (new_index) |ni| {
+            const before = &batch.occurrences[oi];
+            const after = &batch.occurrences[ni];
+            if (before.ranges.len != after.ranges.len) continue;
+            var same_ranges = true;
+            for (before.ranges, after.ranges) |a, b| if (a.start != b.start or a.end != b.end) {
+                same_ranges = false;
+                break;
+            };
+            if (!same_ranges) continue;
+            before.location.source.relation = .neutral;
+            before.location.source.new_line = line.new_no;
+            after.location.source.relation = .neutral;
+            after.location.source.old_line = line.old_no;
+            // Drop the duplicate after walking all context Lines below.
+            after.corpus_order = std.math.maxInt(usize);
+        };
+    };
+    var kept: usize = 0;
+    for (batch.occurrences) |occurrence| {
+        if (occurrence.corpus_order == std.math.maxInt(usize)) {
+            var duplicate = occurrence;
+            duplicate.deinit(allocator);
+        } else {
+            batch.occurrences[kept] = occurrence;
+            kept += 1;
+        }
+    }
+    // Return a right-sized owned slice; the original remains the allocator's allocation.
+    if (kept == batch.occurrences.len) return batch;
+    const compact = allocator.dupe(Occurrence, batch.occurrences[0..kept]) catch |err| {
+        for (batch.occurrences[0..kept]) |*occurrence| occurrence.deinit(allocator);
+        allocator.free(batch.occurrences);
+        return err;
+    };
+    allocator.free(batch.occurrences);
+    return .{ .occurrences = compact };
+}
+
+fn lineAt(blob: []const u8, target: u32) ?[]const u8 {
+    var start: usize = 0;
+    var number: u32 = 1;
+    while (start < blob.len) : (number += 1) {
+        const end = std.mem.indexOfScalarPos(u8, blob, start, '\n') orelse blob.len;
+        if (number == target) return blob[start..(if (end > start and blob[end - 1] == '\r') end - 1 else end)];
+        start = end + @intFromBool(end < blob.len);
+    }
+    return null;
+}
+
 fn scalarRegions(allocator: std.mem.Allocator, scalars: []const Scalar, boundaries: []const usize) ![]Range {
     var regions: std.ArrayList(Range) = .empty;
     errdefer regions.deinit(allocator);
@@ -519,9 +615,27 @@ fn occurrenceLessThan(mode: Mode, left: Occurrence, right: Occurrence) bool {
         if (left.calculation != right.calculation) return left.calculation == .exact;
         if (left.score != right.score) return left.score > right.score;
         if (left.candidate_scalars != right.candidate_scalars) return left.candidate_scalars < right.candidate_scalars;
+        if (left.location == .source and right.location == .review_body) return true;
+        if (left.location == .review_body and right.location == .source) return false;
+        if (left.location == .source and right.location == .source) {
+            const a = left.location.source;
+            const b = right.location.source;
+            const a_path = if (a.relation == .old) a.old_path else a.new_path;
+            const b_path = if (b.relation == .old) b.old_path else b.new_path;
+            const order = std.mem.order(u8, a_path, b_path);
+            if (order != .eq) return order == .lt;
+            const a_line = a.new_line orelse a.old_line orelse 0;
+            const b_line = b.new_line orelse b.old_line orelse 0;
+            if (a_line != b_line) return a_line < b_line;
+            if (a.relation != b.relation) return @intFromEnum(a.relation) < @intFromEnum(b.relation);
+        }
     }
     if (left.corpus_order != right.corpus_order) return left.corpus_order < right.corpus_order;
     return left.column < right.column;
+}
+
+pub fn rank(batch: *Batch) void {
+    std.mem.sort(Occurrence, batch.occurrences, Mode.fuzzy, occurrenceLessThan);
 }
 
 pub fn appendReviewBodyCandidates(
@@ -583,6 +697,37 @@ pub fn appendReviewBodyCandidates(
 }
 
 const testing = std.testing;
+
+test "complete File scan merges only Diff-proven equal context and keeps opposite-side matches" {
+    var query = try Query.init(testing.allocator, "match");
+    defer query.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const diff = try bbr.diff.parse(arena.allocator(),
+        "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n match context\n-match old\n+match new\n");
+    var batch = try scanFile(testing.allocator, query, diff.files[0], 0, 9,
+        "match context\nmatch old\nmatch outside\n", "match context\nmatch new\nmatch outside\n");
+    defer batch.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 5), batch.occurrences.len);
+    var merged: usize = 0;
+    for (batch.occurrences) |occurrence| if (occurrence.location.source.relation == .neutral) {
+        merged += 1;
+        try testing.expectEqual(@as(?u32, 1), occurrence.location.source.old_line);
+        try testing.expectEqual(@as(?u32, 1), occurrence.location.source.new_line);
+    };
+    try testing.expectEqual(@as(usize, 1), merged);
+}
+
+test "complete File scan keeps the readable version when the other version failed" {
+    var query = try Query.init(testing.allocator, "needle");
+    defer query.deinit(testing.allocator);
+    const file: bbr.diff.File = .{ .old_path = "a.txt", .new_path = "a.txt", .status = .modified, .hunks = &.{} };
+    var batch = try scanFile(testing.allocator, query, file, 3, 8, null, "a needle outside the diff\n");
+    defer batch.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), batch.occurrences.len);
+    try testing.expectEqual(@as(?u32, 1), batch.occurrences[0].location.source.new_line);
+    try testing.expectEqualStrings("a.txt", batch.occurrences[0].location.source.new_path);
+}
 
 fn exerciseScanAllocationFailures(allocator: std.mem.Allocator) !void {
     var query = try Query.init(allocator, "ab");

@@ -186,6 +186,18 @@ const ScriptedExecutor = struct {
                 value.deinit();
                 break :blk .{ .buffer_search_scanned = completed };
             },
+            .scan_review_source => |*value| blk: {
+                const completed: presentation.ReviewSourceScanned = .{
+                    .allocator = std.heap.page_allocator,
+                    .command_id = value.command_id,
+                    .session_epoch = value.session_epoch,
+                    .request_id = value.request_id,
+                    .file_index = value.file_index,
+                    .outcome = .failed,
+                };
+                value.deinit();
+                break :blk .{ .review_source_scanned = completed };
+            },
         };
         deliver(sink, input);
     }

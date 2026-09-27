@@ -859,6 +859,14 @@ fn presentationBufferSearchWorker(
     );
 }
 
+fn presentationReviewSourceWorker(loop: *Loop, work_id: u64, command_value: presentation.ScanReviewSource) void {
+    var command = command_value;
+    defer command.deinit();
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    presentation_runtime.deliver(presentationSink(&sink_context),
+        .{ .review_source_scanned = presentation.executeReviewSourceScan(std.heap.page_allocator, &command) });
+}
+
 fn presentationWaitWorker(loop: *Loop, work_id: u64, io: std.Io, wait: presentation.WaitSubmission) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     io.sleep(std.Io.Duration.fromMilliseconds(@intCast(wait.ms)), .awake) catch {
@@ -1030,6 +1038,7 @@ fn drainPresentationCommands(
             .copy_clipboard => unreachable,
             .external_edit => unreachable,
             .scan_buffer_search => |scan| ctx.io.concurrent(presentationBufferSearchWorker, .{ loop, work_id, scan }),
+            .scan_review_source => |scan| ctx.io.concurrent(presentationReviewSourceWorker, .{ loop, work_id, scan }),
         } catch {
             try admitPresentationLaunchFailure(state, &command);
             continue;
@@ -1099,6 +1108,18 @@ fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *p
             };
             scan.deinit();
             break :blk .{ .buffer_search_scanned = completed };
+        },
+        .scan_review_source => |*scan| blk: {
+            const completed: presentation.ReviewSourceScanned = .{
+                .allocator = std.heap.page_allocator,
+                .command_id = scan.command_id,
+                .session_epoch = scan.session_epoch,
+                .request_id = scan.request_id,
+                .file_index = scan.file_index,
+                .outcome = .failed,
+            };
+            scan.deinit();
+            break :blk .{ .review_source_scanned = completed };
         },
     };
     command.* = undefined;
