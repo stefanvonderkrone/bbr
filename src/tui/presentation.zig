@@ -999,6 +999,7 @@ pub const ReviewSearchResult = struct {
     source: []const u8,
     body: []const u8,
     scope: bbr.review.CommentScope,
+    scope_state: ?bbr.review.ScopeState,
     occurrence: search.Occurrence,
 };
 
@@ -5276,7 +5277,7 @@ pub const Presentation = struct {
             if (file_index) |index| {
                 if (isolated != null) isolated = index;
             } else isolated = null;
-            if (current.scope == .@"inline" and reviewSearchScopeCurrent(published, occurrence.location.review_body.owner))
+            if (current.scope == .@"inline" and current.scope_state != null and current.scope_state.? != .outdated)
                 preferences.selected_version = if (current.scope.@"inline".to != null) .new else .old;
         }
         var disclosures: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
@@ -5284,12 +5285,15 @@ pub const Presentation = struct {
         disclosures.appendSlice(self.allocator, published.expanded_disclosures.items) catch return self.reviewSearchAllocationFailed();
         const required = requiredSearchDisclosure(published, occurrence);
         for (required.items[0..required.len]) |key| addSearchDisclosure(self.allocator, &disclosures, key) catch return self.reviewSearchAllocationFailed();
-        if (current.scope != .review) {
-            addSearchDisclosure(self.allocator, &disclosures, .outdated_review) catch return self.reviewSearchAllocationFailed();
-            for (published.session.diff.files) |*file| if (scopePathMatchesFile(current.scope, file.*)) {
+        if (current.scope_state == .outdated) {
+            var found = false;
+            for (published.session.diff.files, 0..) |*file, index| {
+                if (isolated != null and isolated.? != index) continue;
+                if (!scopePathMatchesFile(current.scope, file.*)) continue;
                 addSearchDisclosure(self.allocator, &disclosures, .{ .outdated_file = file }) catch return self.reviewSearchAllocationFailed();
-                addSearchDisclosure(self.allocator, &disclosures, .{ .opposite_version = file }) catch return self.reviewSearchAllocationFailed();
-            };
+                found = true;
+            }
+            if (!found) addSearchDisclosure(self.allocator, &disclosures, .outdated_review) catch return self.reviewSearchAllocationFailed();
         }
         var staged = published.prepareBuffer(preferences, disclosures.items, isolated, published.geometry) catch |err| {
             self.action_error = normalizeActionError(err);
@@ -5309,6 +5313,7 @@ pub const Presentation = struct {
         self.preferences = preferences;
         published.navigation.jumpTo(row);
         published.focus = .diff;
+        published.cursorToActiveFile();
         state.open = false;
         state.pending = false;
         self.discardQueuedReviewSearchScans();
@@ -8207,32 +8212,6 @@ fn addSearchDisclosure(allocator: Allocator, keys: *std.ArrayList(buffer_mod.Dis
     try keys.append(allocator, key);
 }
 
-fn reviewSearchScopeCurrent(published: *const Published, owner: search.ReviewBodyOwner) bool {
-    switch (owner) {
-        .comment => |id| {
-            for (published.session.threads) |thread| {
-                if (thread.root.id == id) return thread.root.state != .outdated;
-                for (thread.replies) |reply| if (reply.id == id) return thread.root.state != .outdated;
-            }
-        },
-        .draft => |id| {
-            var draft = published.review.getConst(id) orelse return false;
-            var hops: usize = 0;
-            while (draft.parent) |parent| {
-                if (hops >= published.review.drafts.items.len) return false;
-                hops += 1;
-                switch (parent) {
-                    .draft => |parent_id| draft = published.review.getConst(parent_id) orelse return false,
-                    .comment => |parent_id| return reviewSearchScopeCurrent(published, .{ .comment = parent_id }),
-                }
-            }
-            for (published.scope_projection.items) |entry| if (entry.temp_id == draft.local_id)
-                return entry.resolution == .resolved and entry.resolution.resolved.state != .outdated;
-        },
-    }
-    return false;
-}
-
 const SearchDisclosureSet = struct {
     items: [3]buffer_mod.DisclosureKey = undefined,
     len: usize = 0,
@@ -8253,6 +8232,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
                 .source = thread.root.author,
                 .body = thread.root.body,
                 .scope = thread.scope(),
+                .scope_state = thread.root.state,
                 .occurrence = occurrence,
             };
             for (thread.replies) |reply| if (reply.id == id) return .{
@@ -8260,6 +8240,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
                 .source = reply.author,
                 .body = reply.body,
                 .scope = thread.scope(),
+                .scope_state = thread.root.state,
                 .occurrence = occurrence,
             };
         },
@@ -8279,6 +8260,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
                                 .source = "local",
                                 .body = draft.body,
                                 .scope = thread.scope(),
+                                .scope_state = thread.root.state,
                                 .occurrence = occurrence,
                             };
                             for (thread.replies) |reply| if (reply.id == parent_id) return .{
@@ -8286,6 +8268,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
                                 .source = "local",
                                 .body = draft.body,
                                 .scope = thread.scope(),
+                                .scope_state = thread.root.state,
                                 .occurrence = occurrence,
                             };
                         }
@@ -8294,11 +8277,15 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
                 }
             }
             var scope = root.effectiveScope();
+            var scope_state: ?bbr.review.ScopeState = null;
             for (published.scope_projection.items) |entry| if (entry.temp_id == root.local_id) {
-                if (entry.resolution == .resolved) scope = entry.resolution.resolved.scope;
+                if (entry.resolution == .resolved) {
+                    scope = entry.resolution.resolved.scope;
+                    scope_state = entry.resolution.resolved.state;
+                }
                 break;
             };
-            return .{ .kind = "DRAFT", .source = "local", .body = draft.body, .scope = scope, .occurrence = occurrence };
+            return .{ .kind = "DRAFT", .source = "local", .body = draft.body, .scope = scope, .scope_state = scope_state, .occurrence = occurrence };
         },
     }
     unreachable;
@@ -9163,7 +9150,12 @@ test "M21 authored scope opening resolves Review File Reply and outdated locatio
             try presentation.dispatch(.{ .action = .isolate });
             try testing.expectEqual(@as(?usize, 0), presentation.projection().review.?.isolated_file);
         } else try testing.expectEqual(@as(?usize, 1), review.isolated_file);
-        if (index == 1) try testing.expectEqual(@as(?usize, 1), review.buffer.fileIndexForRow(review.frame.visual_rows[review.navigation.cursor].buffer_index));
+        if (index == 1) {
+            try testing.expectEqual(@as(?usize, 1), review.buffer.fileIndexForRow(review.frame.visual_rows[review.navigation.cursor].buffer_index));
+            try testing.expect(review.frame.file_tree.entries[review.frame.file_tree.cursor].identity.eql(.{ .file = 1 }));
+            const outdated = findDisclosureRow(review.buffer.rows, .{ .outdated_file = &review.diff.files[1] }).?;
+            try testing.expect(!review.buffer.rows[outdated].disclosure.expanded);
+        }
         if (index == 2) {
             try testing.expectEqual(SelectedVersion.old, review.selected_version);
             try testing.expectEqual(@as(bbr.review.CommentId, 4), review.frame.visual_rows[review.navigation.cursor].owner.comment.id);

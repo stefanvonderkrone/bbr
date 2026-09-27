@@ -1492,6 +1492,7 @@ test "M21 authored Overlay renders ranked rows and matched Preview in landscape 
         .source = "Ada",
         .body = "before\nneedle after\nlater",
         .scope = .review,
+        .scope_state = .current,
         .occurrence = occurrence,
     };
     inline for (.{ @as(u16, 100), @as(u16, 45) }) |cols| {
@@ -1539,7 +1540,7 @@ test "M21 authored Preview paints every disjoint Markdown match range" {
     drawReviewSearch(a, headlessWindow(&screen), .{
         .query = "bold text",
         .occurrences = &.{occurrence},
-        .results = &.{.{ .kind = "DRAFT", .source = "local", .body = "**bold** text", .scope = .review, .occurrence = occurrence }},
+        .results = &.{.{ .kind = "DRAFT", .source = "local", .body = "**bold** text", .scope = .review, .scope_state = .current, .occurrence = occurrence }},
         .candidate_count = 1,
         .selected = 0,
         .list_scroll = 0,
