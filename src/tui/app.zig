@@ -863,8 +863,7 @@ fn presentationReviewSourceWorker(loop: *Loop, work_id: u64, command_value: pres
     var command = command_value;
     defer command.deinit();
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
-    presentation_runtime.deliver(presentationSink(&sink_context),
-        .{ .review_source_scanned = presentation.executeReviewSourceScan(std.heap.page_allocator, &command) });
+    presentation_runtime.deliver(presentationSink(&sink_context), .{ .review_source_scanned = presentation.executeReviewSourceScan(std.heap.page_allocator, &command) });
 }
 
 fn presentationWaitWorker(loop: *Loop, work_id: u64, io: std.Io, wait: presentation.WaitSubmission) void {

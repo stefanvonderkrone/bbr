@@ -738,8 +738,13 @@ test "remote File Enrichment retries transient source failures once in the File 
         const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
         var plain: bbr.highlight.PlainHighlighter = .{};
         var result = try enrichConcurrent(testing.io, testing.allocator, client, plain.highlighter(), .{
-            .repo = "repo", .status = .added, .source_commit = "source", .destination_commit = "base",
-            .old_path = "/dev/null", .new_path = "a.zig", .max_file_bytes = 0,
+            .repo = "repo",
+            .status = .added,
+            .source_commit = "source",
+            .destination_commit = "base",
+            .old_path = "/dev/null",
+            .new_path = "a.zig",
+            .max_file_bytes = 0,
         });
         defer result.deinit();
         try testing.expectEqualStrings("needle\n", result.new.owned.blob);
@@ -750,8 +755,13 @@ test "remote File Enrichment retries transient source failures once in the File 
     const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
     var plain: bbr.highlight.PlainHighlighter = .{};
     var result = try enrichConcurrent(testing.io, testing.allocator, client, plain.highlighter(), .{
-        .repo = "repo", .status = .added, .source_commit = "source", .destination_commit = "base",
-        .old_path = "/dev/null", .new_path = "a.zig", .max_file_bytes = 0,
+        .repo = "repo",
+        .status = .added,
+        .source_commit = "source",
+        .destination_commit = "base",
+        .old_path = "/dev/null",
+        .new_path = "a.zig",
+        .max_file_bytes = 0,
     });
     defer result.deinit();
     try testing.expectEqual(error.Unauthorized, result.new.fetch_failed);

@@ -703,10 +703,8 @@ test "complete File scan merges only Diff-proven equal context and keeps opposit
     defer query.deinit(testing.allocator);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const diff = try bbr.diff.parse(arena.allocator(),
-        "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n match context\n-match old\n+match new\n");
-    var batch = try scanFile(testing.allocator, query, diff.files[0], 0, 9,
-        "match context\nmatch old\nmatch outside\n", "match context\nmatch new\nmatch outside\n");
+    const diff = try bbr.diff.parse(arena.allocator(), "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n match context\n-match old\n+match new\n");
+    var batch = try scanFile(testing.allocator, query, diff.files[0], 0, 9, "match context\nmatch old\nmatch outside\n", "match context\nmatch new\nmatch outside\n");
     defer batch.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 5), batch.occurrences.len);
     var merged: usize = 0;

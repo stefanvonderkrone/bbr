@@ -922,9 +922,7 @@ pub fn executeReviewSourceScan(allocator: Allocator, command: *const ScanReviewS
         .session_epoch = command.session_epoch,
         .request_id = command.request_id,
         .file_index = command.file_index,
-        .outcome = if (search.scanFile(allocator, command.query, command.file, command.file_index, command.session_epoch,
-            if (view.old == .content) view.old.content.blob else null,
-            if (view.new == .content) view.new.content.blob else null)) |batch| .{ .scanned = batch } else |_| .failed,
+        .outcome = if (search.scanFile(allocator, command.query, command.file, command.file_index, command.session_epoch, if (view.old == .content) view.old.content.blob else null, if (view.new == .content) view.new.content.blob else null)) |batch| .{ .scanned = batch } else |_| .failed,
     };
 }
 
@@ -5266,7 +5264,8 @@ pub const Presentation = struct {
         for (published.session.diff.files, 0..) |_, index| {
             const view = published.session.enrichment.file(index);
             if (published.session.enrichment.isTerminal(index) and !held[index] and
-                (view.old == .content or view.new == .content)) {
+                (view.old == .content or view.new == .content))
+            {
                 published.session.enrichment.hold(index);
                 held[index] = true;
             }
@@ -5436,8 +5435,12 @@ pub const Presentation = struct {
         if (!published.review_search.open) return;
         const acquired = published.review_search.acquired orelse return;
         var active: usize = 0;
-        for (self.issued_enrichments.items) |issued| if (issued.session_epoch == published.epoch) { active += 1; };
-        for (self.commands.items) |command| if (command == .enrich_file and command.enrich_file.session_epoch == published.epoch) { active += 1; };
+        for (self.issued_enrichments.items) |issued| if (issued.session_epoch == published.epoch) {
+            active += 1;
+        };
+        for (self.commands.items) |command| if (command == .enrich_file and command.enrich_file.session_epoch == published.epoch) {
+            active += 1;
+        };
         // Pick the next display path each time a slot opens.
         while (active < 8) {
             var next: ?usize = null;
@@ -5532,7 +5535,8 @@ pub const Presentation = struct {
             const selected = retainedSearchIndex(state.batch, state.selected, combined);
             const same_selection = if (state.selected) |before| if (selected) |after|
                 before < old.occurrences.len and searchOccurrenceEql(old.occurrences[before], combined.occurrences[after])
-            else false else false;
+            else
+                false else false;
             const ranges = published.projectBufferSearchRanges(combined, selected) catch {
                 self.allocator.free(occurrences);
                 self.action_error = .out_of_memory;
@@ -5548,7 +5552,8 @@ pub const Presentation = struct {
             };
             for (occurrences, results) |occurrence, *result| result.* = if (occurrence.location == .source)
                 .{ .kind = "SOURCE", .source = "File", .body = "", .scope = .review, .scope_state = null, .occurrence = occurrence }
-            else reviewSearchResult(published, occurrence);
+            else
+                reviewSearchResult(published, occurrence);
             // The new array takes ownership of both sets of occurrences.
             self.allocator.free(state.batch.?.occurrences);
             self.allocator.free(part.occurrences);
@@ -5767,7 +5772,7 @@ pub const Presentation = struct {
             state.open = false;
             self.discardQueuedReviewSourceScans();
             self.discardQueuedSearchEnrichments(published);
-                published.releaseReviewSearchHolds(self.preferences);
+            published.releaseReviewSearchHolds(self.preferences);
             published.frame_revision += 1;
             return;
         }
@@ -7754,7 +7759,8 @@ pub const Presentation = struct {
                 const current = published.?;
                 const previous_action_error = self.action_error;
                 if (current.review_search.open and current.review_search.query != null and current.review_search.held != null and
-                    !current.review_search.held.?[completed.file_index]) {
+                    !current.review_search.held.?[completed.file_index])
+                {
                     current.session.enrichment.hold(completed.file_index);
                     current.review_search.held.?[completed.file_index] = true;
                 }
@@ -9579,7 +9585,10 @@ test "M21 authored Review Search streams a complete File partition after File En
     const command_id = enrich_command.enrich_file.command_id;
     enrich_command.deinit();
     try presentation.dispatch(.{ .file_enrichment_completed = .{
-        .command_id = command_id, .work_id = work_id, .session_epoch = 1, .file_index = 0,
+        .command_id = command_id,
+        .work_id = work_id,
+        .session_epoch = 1,
+        .file_index = 0,
         .outcome = .{ .completed = enrichment },
     } });
     var scan_command = presentation.takeCommand().?;
@@ -9645,7 +9654,10 @@ test "M21 authored closing Review Search drops queued source work and keeps star
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
     try testing.expect(presentation.takeCommand() == null);
     try presentation.dispatch(.{ .file_enrichment_completed = .{
-        .command_id = command_id, .work_id = work_id, .session_epoch = 1, .file_index = 0,
+        .command_id = command_id,
+        .work_id = work_id,
+        .session_epoch = 1,
+        .file_index = 0,
         .outcome = .{ .completed = result },
     } });
     try testing.expect(presentation.takeCommand() == null);
@@ -9681,7 +9693,10 @@ test "M21 authored source scan keeps leased content after Session destruction" {
     const command_id = enrich_command.enrich_file.command_id;
     enrich_command.deinit();
     try presentation.dispatch(.{ .file_enrichment_completed = .{
-        .command_id = command_id, .work_id = work_id, .session_epoch = 1, .file_index = 0,
+        .command_id = command_id,
+        .work_id = work_id,
+        .session_epoch = 1,
+        .file_index = 0,
         .outcome = .{ .completed = result },
     } });
     var scan_command = presentation.takeCommand().?;
@@ -9722,7 +9737,10 @@ test "M21 authored ctrl-d and ctrl-u move selection with the result list without
     defer store.deinit();
     const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
     for (0..30) |index| try store.store().put(key.storeKey(), .{
-        .local_id = @intCast(index + 1), .kind = .comment, .scope = .review, .body = "needle",
+        .local_id = @intCast(index + 1),
+        .kind = .comment,
+        .scope = .review,
+        .body = "needle",
     });
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },

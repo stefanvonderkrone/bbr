@@ -1073,7 +1073,9 @@ fn drawReviewSourcePreview(scratch: std.mem.Allocator, header: vaxis.Window, pre
                     continue;
                 }
                 var syntax_style = style;
-                if (run.capture) |capture| if (theme.captureColor(capture)) |fg| { syntax_style.fg = fg; };
+                if (run.capture) |capture| if (theme.captureColor(capture)) |fg| {
+                    syntax_style.fg = fg;
+                };
                 while (cursor < run_end) {
                     var segment_end = run_end;
                     var matched = false;
@@ -1798,7 +1800,11 @@ test "M21 authored source Preview shows exact ranges, version states, horizontal
     const ranges = [_]search.Range{.{ .start = 4, .end = 10 }};
     const occurrence: search.Occurrence = .{
         .location = .{ .source = .{ .file_index = 0, .relation = .new, .old_path = "src/a.txt", .new_path = "src/a.txt", .new_line = 2 } },
-        .ranges = @constCast(&ranges), .column = 5, .candidate_scalars = 11, .corpus_order = 0, .session_epoch = 1,
+        .ranges = @constCast(&ranges),
+        .column = 5,
+        .candidate_scalars = 11,
+        .corpus_order = 0,
+        .session_epoch = 1,
     };
     const result: presentation.ReviewSearchResult = .{ .kind = "SOURCE", .source = "File", .body = "", .scope = .review, .scope_state = null, .occurrence = occurrence };
     const spans = [_]bbr.highlight.Span{
@@ -1810,8 +1816,15 @@ test "M21 authored source Preview shows exact ranges, version states, horizontal
     const win = headlessWindow(&screen);
     const geometry = @import("frame.zig").reviewSearchGeometry(.{ .cols = 100, .rows = 24 }).?;
     const base: presentation.ReviewSearchProjection = .{
-        .query = "needle", .occurrences = &.{occurrence}, .results = &.{result}, .candidate_count = 2,
-        .selected = 0, .list_scroll = 0, .preview_scroll = 0, .pending = false, .geometry = geometry,
+        .query = "needle",
+        .occurrences = &.{occurrence},
+        .results = &.{result},
+        .candidate_count = 2,
+        .selected = 0,
+        .list_scroll = 0,
+        .preview_scroll = 0,
+        .pending = false,
+        .geometry = geometry,
         .source_preview = .{ .old = .{ .binary = 12 }, .new = .{ .content = .{ .blob = "before\nxxxxneedle after\n", .highlighting = .{ .ready = .{ .spans = &spans } } } } },
     };
     drawReviewSearch(a, win, base, theme_dark);
@@ -1853,9 +1866,18 @@ test "M21 authored Overlay exposes both File version states without a Query" {
     }};
     const statuses = [_]@import("bbr").highlight.FileHighlightStatus{.{ .old = .absent, .new = .absent }};
     drawReviewSearch(a, win, .{
-        .query = "", .occurrences = &.{}, .results = &.{}, .candidate_count = 0,
-        .selected = null, .list_scroll = 0, .preview_scroll = 0, .pending = false,
-        .geometry = geometry, .files = &files, .content_statuses = &contents, .highlight_statuses = &statuses,
+        .query = "",
+        .occurrences = &.{},
+        .results = &.{},
+        .candidate_count = 0,
+        .selected = null,
+        .list_scroll = 0,
+        .preview_scroll = 0,
+        .pending = false,
+        .geometry = geometry,
+        .files = &files,
+        .content_statuses = &contents,
+        .highlight_statuses = &statuses,
         .status_preview = .{ .old = .{ .binary = 12 }, .new = .{ .unavailable = contents[0].new.? } },
     }, theme_dark);
     const list = childRect(win, geometry.list);
@@ -1876,14 +1898,24 @@ test "M21 authored Review Search list shows a scroll bar for long results" {
     const geometry = @import("frame.zig").reviewSearchGeometry(.{ .cols = 100, .rows = 24 }).?;
     const occurrence: @import("search.zig").Occurrence = .{
         .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 1 } },
-        .ranges = @constCast(&[_]@import("search.zig").Range{}), .column = 1,
-        .candidate_scalars = 1, .corpus_order = 0, .session_epoch = 1,
+        .ranges = @constCast(&[_]@import("search.zig").Range{}),
+        .column = 1,
+        .candidate_scalars = 1,
+        .corpus_order = 0,
+        .session_epoch = 1,
     };
     const result: presentation.ReviewSearchResult = .{ .kind = "COMMENT", .source = "Ada", .body = "text", .scope = .review, .scope_state = .current, .occurrence = occurrence };
     const results = [_]presentation.ReviewSearchResult{result} ** 60;
     var projection: presentation.ReviewSearchProjection = .{
-        .query = "text", .occurrences = &.{}, .results = &results, .candidate_count = 60,
-        .selected = 0, .list_scroll = 0, .preview_scroll = 0, .pending = false, .geometry = geometry,
+        .query = "text",
+        .occurrences = &.{},
+        .results = &results,
+        .candidate_count = 60,
+        .selected = 0,
+        .list_scroll = 0,
+        .preview_scroll = 0,
+        .pending = false,
+        .geometry = geometry,
     };
     drawReviewSearch(a, win, projection, theme_dark);
     const list = childRect(win, geometry.list);
@@ -1964,12 +1996,22 @@ test "Review Search draws titled borders, top query, Position, and separated Pre
     const ranges = [_]search.Range{.{ .start = 0, .end = 4 }};
     const occurrence: search.Occurrence = .{
         .location = .{ .review_body = .{ .owner = .{ .comment = 42 }, .logical_line = 1 } },
-        .ranges = @constCast(&ranges), .column = 1, .candidate_scalars = 4, .corpus_order = 0, .session_epoch = 1,
+        .ranges = @constCast(&ranges),
+        .column = 1,
+        .candidate_scalars = 4,
+        .corpus_order = 0,
+        .session_epoch = 1,
     };
     drawReviewSearch(a, win, .{
-        .query = "text", .occurrences = &.{occurrence},
+        .query = "text",
+        .occurrences = &.{occurrence},
         .results = &.{.{ .kind = "COMMENT", .source = "Ada", .body = "text", .scope = .{ .file = .{ .path = "src/components/review.zig", .source_commit = "abc" } }, .scope_state = .current, .occurrence = occurrence }},
-        .candidate_count = 2, .selected = 0, .list_scroll = 0, .preview_scroll = 0, .pending = false, .geometry = geometry,
+        .candidate_count = 2,
+        .selected = 0,
+        .list_scroll = 0,
+        .preview_scroll = 0,
+        .pending = false,
+        .geometry = geometry,
     }, theme_dark);
     try testing.expectEqualStrings("┌", win.readCell(geometry.rect.x, geometry.rect.y).?.char.grapheme);
     try testing.expectEqualStrings(">", win.readCell(geometry.rect.x + 1, geometry.rect.y + 1).?.char.grapheme);
