@@ -1580,6 +1580,15 @@ const ReviewSearchState = struct {
     }
 };
 
+fn reviewSearchOpeningFile(state: *const ReviewSearchState) ?usize {
+    if (!state.open or !state.opening_source) return null;
+    const selected = state.selected orelse return null;
+    const batch = state.batch orelse return null;
+    if (selected >= batch.occurrences.len) return null;
+    const occurrence = batch.occurrences[selected];
+    return if (occurrence.location == .source) occurrence.location.source.file_index else null;
+}
+
 fn activeNumber(index: ?usize) ?usize {
     return if (index) |value| value + 1 else null;
 }
@@ -2162,6 +2171,17 @@ const Published = struct {
         isolated_file: ?usize,
         geometry: frame_mod.Geometry,
     ) BufferTransactionError!StagedBuffer {
+        return self.prepareBufferForFile(preferences, expanded_disclosures, isolated_file, geometry, null);
+    }
+
+    fn prepareBufferForFile(
+        self: *Published,
+        preferences: Preferences,
+        expanded_disclosures: []const buffer_mod.DisclosureKey,
+        isolated_file: ?usize,
+        geometry: frame_mod.Geometry,
+        focused_file: ?usize,
+    ) BufferTransactionError!StagedBuffer {
         const allocator = self.buffers.begin();
         errdefer self.buffers.abort();
         const enrichment = self.session.enrichment.projection();
@@ -2195,7 +2215,7 @@ const Published = struct {
         });
         const panes = frame_mod.paneRects(geometry);
         const wanted_cursor = if (self.tree.entries.len == 0) null else self.tree.entries[self.tree.cursor].identity;
-        const active_file = if (self.session.diff.files.len == 0) null else isolated_file orelse self.buffer.fileIndexForRow(self.cursorBufferIndex());
+        const active_file = if (self.session.diff.files.len == 0) null else isolated_file orelse focused_file orelse self.buffer.fileIndexForRow(self.cursorBufferIndex());
         const tree = try file_tree.build(
             allocator,
             self.session.diff,
@@ -3937,7 +3957,7 @@ pub const Presentation = struct {
                             time_ns.? - click.time_ns.? <= 500 * 1_000_000) else false;
                 if (double_click) {
                     self.last_review_click = null;
-                    self.openReviewSearchOccurrence();
+                    self.openReviewSearchOccurrence(false);
                 } else {
                     self.selectReviewSearch(index);
                     self.last_review_click = .{ .index = index, .time_ns = time_ns };
@@ -4984,7 +5004,7 @@ pub const Presentation = struct {
             switch (action) {
                 .next_review_search_occurrence => self.moveReviewSearch(1),
                 .previous_review_search_occurrence => self.moveReviewSearch(-1),
-                .open_search_occurrence => self.openReviewSearchOccurrence(),
+                .open_search_occurrence => self.openReviewSearchOccurrence(false),
                 .half_page_down => self.scrollReviewSearch(1),
                 .half_page_up => self.scrollReviewSearch(-1),
                 else => {},
@@ -5117,7 +5137,7 @@ pub const Presentation = struct {
             .open_review_search => self.openReviewSearch(),
             .next_review_search_occurrence => self.moveReviewSearch(1),
             .previous_review_search_occurrence => self.moveReviewSearch(-1),
-            .open_search_occurrence => self.openReviewSearchOccurrence(),
+            .open_search_occurrence => self.openReviewSearchOccurrence(false),
             .next_search_occurrence => self.traverseBufferSearch(.forward),
             .previous_search_occurrence => self.traverseBufferSearch(.backward),
             .clear_selection => {
@@ -5519,7 +5539,6 @@ pub const Presentation = struct {
             return;
         }
         if (completed.outcome == .scanned) {
-            state.opening_source = false;
             var part = completed.outcome.scanned.clone(self.allocator) catch {
                 self.action_error = .out_of_memory;
                 self.maybeQueueReviewSourceScan(published);
@@ -5633,13 +5652,13 @@ pub const Presentation = struct {
         if (state.pending) return;
         const batch = state.batch orelse return;
         if (index >= batch.occurrences.len) return;
-        state.opening_source = false;
         const ranges = published.projectBufferSearchRanges(batch, index) catch {
             self.action_error = .out_of_memory;
             return;
         };
         if (state.ranges) |old| self.allocator.free(old);
         state.ranges = ranges;
+        if (state.selected != index) state.opening_source = false;
         state.selected = index;
         state.preview_scroll = switch (batch.occurrences[index].location) {
             .review_body => |body| body.logical_line -| 3,
@@ -5746,7 +5765,7 @@ pub const Presentation = struct {
         }
     }
 
-    fn openReviewSearchOccurrence(self: *Presentation) void {
+    fn openReviewSearchOccurrence(self: *Presentation, admitting: bool) void {
         const published = self.published orelse return;
         const state = &published.review_search;
         if (state.pending) return;
@@ -5789,10 +5808,14 @@ pub const Presentation = struct {
                 for (required.items[0..required.len]) |key| addSearchDisclosure(self.allocator, &disclosures, key) catch return self.reviewSearchAllocationFailed();
             }
             const isolated = if (published.isolated_file != null) source.file_index else null;
-            _ = published.session.enrichment.stageFocus(source.file_index);
-            var focus_committed = false;
-            defer if (!focus_committed) published.session.enrichment.rollbackCacheUpdate();
-            var staged = published.prepareBuffer(preferences, disclosures.items, isolated, published.geometry) catch |err| {
+            const previous_focus = published.session.enrichment.focused_file;
+            if (!admitting) _ = published.session.enrichment.stageFocus(source.file_index);
+            var committed = false;
+            defer if (!committed and !admitting) {
+                published.session.enrichment.rollbackCacheUpdate();
+                published.session.enrichment.focused_file = previous_focus;
+            };
+            var staged = published.prepareBufferForFile(preferences, disclosures.items, isolated, published.geometry, source.file_index) catch |err| {
                 self.action_error = normalizeActionError(err);
                 return;
             };
@@ -5811,12 +5834,15 @@ pub const Presentation = struct {
             }
             staged.publish();
             published.session.enrichment.commitCacheUpdate();
-            focus_committed = true;
+            committed = true;
             published.isolated_file = isolated;
             self.preferences = preferences;
             published.navigation.jumpTo(row);
             published.focus = .diff;
             published.cursorToActiveFile();
+            if (admitting) published.focusEnrichment(preferences, source.file_index) catch {
+                published.session.enrichment.rollbackCacheUpdate();
+            };
             state.open = false;
             state.pending = false;
             self.discardQueuedReviewSearchScans();
@@ -7828,7 +7854,7 @@ pub const Presentation = struct {
                         self.fatal_error = .file_enrichment_out_of_memory;
                     },
                 }
-                if (current.review_search.opening_source) {
+                if (current.review_search.opening_source and reviewSearchOpeningFile(&current.review_search) == completed.file_index) {
                     current.review_search.opening_source = false;
                     self.action_error = .source_action_unavailable;
                 }
@@ -7849,6 +7875,11 @@ pub const Presentation = struct {
                     if (!issued.speculative) self.action_error = .action_refused;
                     return;
                 };
+                if (reviewSearchOpeningFile(&current.review_search) == completed.file_index) {
+                    self.openReviewSearchOccurrence(true);
+                    if (current.review_search.open) current.session.enrichment.rollbackCacheUpdate();
+                    return;
+                }
                 current.rebuild(self.preferences, current.expanded_disclosures.items, current.isolated_file) catch |err| {
                     current.session.enrichment.rollbackCacheUpdate();
                     if (!issued.speculative) self.action_error = normalizeActionError(err);
@@ -7862,16 +7893,6 @@ pub const Presentation = struct {
                         restoreVersionNavigation(current, target, self.preferences.selected_version)) self.version_restoration = null;
                 }
                 self.action_error = if (issued.speculative) previous_action_error else null;
-                if (current.review_search.opening_source) {
-                    const selected = current.review_search.selected;
-                    if (selected != null and current.review_search.batch != null and
-                        selected.? < current.review_search.batch.?.occurrences.len)
-                    {
-                        const occurrence = current.review_search.batch.?.occurrences[selected.?];
-                        if (occurrence.location == .source and occurrence.location.source.file_index == completed.file_index)
-                            self.openReviewSearchOccurrence();
-                    }
-                }
                 const focused = current.activeFile();
                 if (focused != null and focused.? == completed.file_index) {
                     self.maybeQueuePrefetch(current, completed.file_index) catch {
@@ -9798,7 +9819,8 @@ test "M21 authored source outside Hunks opens WholeFile without changing File is
 test "M21 authored opening evicted source waits for exact File Enrichment" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    var presentation = try Presentation.init(testing.allocator, .{
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{
         .reviews = store.store(), .inactive_file_cache_max_bytes = 1,
     }, .{
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
@@ -9863,14 +9885,23 @@ test "M21 authored opening evicted source waits for exact File Enrichment" {
     const work_id = command.enrich_file.work_id;
     const command_id = command.enrich_file.command_id;
     command.deinit();
+    const before = presentation.projection().revision.frame;
+    try testing.expect(presentation.published.?.review_search.opening_source);
+    failing.fail_index = failing.alloc_index;
     try presentation.dispatch(.{ .file_enrichment_completed = .{
         .command_id = command_id, .work_id = work_id, .session_epoch = 1, .file_index = 1,
         .outcome = .{ .completed = enrichment },
     } });
+    try testing.expectEqualStrings("new b", presentation.projection().review_search.?.query);
+    try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+    try testing.expectEqual(before, presentation.projection().revision.frame);
+    failing.fail_index = std.math.maxInt(usize);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
     const projection = presentation.projection();
     try testing.expect(projection.review_search == null);
     try testing.expect(projection.review.?.isolated_file == null);
     try testing.expectEqual(@as(?usize, 1), projection.review.?.buffer.fileIndexForRow(projection.review.?.frame.visual_rows[projection.review.?.navigation.cursor].buffer_index));
+    try testing.expect(projection.review.?.frame.file_tree.entries[projection.review.?.frame.file_tree.cursor].identity.eql(.{ .file = 1 }));
     try testing.expect(projection.review.?.frame.search_ranges.len > 0);
 }
 
