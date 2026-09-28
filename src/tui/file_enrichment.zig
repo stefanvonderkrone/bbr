@@ -39,7 +39,7 @@ pub const RemoteBlobSource = struct {
                     .content => |bytes| return bytes,
                     .rejected => |failure| {
                         if (attempt == 0 and (failure.reason == error.RateLimited or failure.reason == error.ServerError)) {
-                            io.sleep(std.Io.Duration.fromMilliseconds(@intCast(if (failure.reason == error.RateLimited) failure.retry_after_ms orelse 1000 else 100)), .awake) catch {};
+                            io.sleep(std.Io.Duration.fromMilliseconds(if (failure.reason == error.RateLimited) rateLimitRetryMs(failure.retry_after_ms) else 100), .awake) catch {};
                             continue;
                         }
                         return failure.reason;
@@ -51,6 +51,10 @@ pub const RemoteBlobSource = struct {
         return self.client.getFileBlob(allocator, self.repo, commit, path);
     }
 };
+
+fn rateLimitRetryMs(retry_after_ms: ?u64) i64 {
+    return @intCast(@min(retry_after_ms orelse 1000, 5000));
+}
 
 pub const GitBlobSource = struct {
     client: bbr.git.GitClient,
@@ -697,6 +701,14 @@ fn retainedTerminalSide(side: StoredSide) StoredSide {
 }
 
 const testing = std.testing;
+
+test "remote File Enrichment bounds rate-limit retry delays" {
+    try testing.expectEqual(@as(i64, 1000), rateLimitRetryMs(null));
+    try testing.expectEqual(@as(i64, 1), rateLimitRetryMs(1));
+    try testing.expectEqual(@as(i64, 5000), rateLimitRetryMs(5000));
+    try testing.expectEqual(@as(i64, 5000), rateLimitRetryMs(5001));
+    try testing.expectEqual(@as(i64, 5000), rateLimitRetryMs(std.math.maxInt(u64)));
+}
 
 test "File read lease pins both versions across budget enforcement and Session storage destruction" {
     var files = [_]bbr.diff.File{
