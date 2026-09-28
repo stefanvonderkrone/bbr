@@ -269,6 +269,7 @@ pub fn scan(
 pub fn scanFile(allocator: std.mem.Allocator, query: Query, file: bbr.diff.File, file_index: usize, epoch: u64, old: ?[]const u8, new: ?[]const u8) !Batch {
     var candidates: std.ArrayList(Candidate) = .empty;
     defer candidates.deinit(allocator);
+    var old_count: usize = 0;
     for ([_]struct { blob: ?[]const u8, relation: VersionRelation }{
         .{ .blob = old, .relation = .old },
         .{ .blob = new, .relation = .new },
@@ -294,25 +295,45 @@ pub fn scanFile(allocator: std.mem.Allocator, query: Query, file: bbr.diff.File,
             });
             start = end + @intFromBool(end < blob.len);
         }
+        if (version.relation == .old) old_count = candidates.items.len;
     }
     var batch = try scan(allocator, query, candidates.items, .fuzzy);
     if (old == null or new == null) return batch;
-    // ponytail: Context verification walks complete text per Hunk Line. Index offsets if large diffs make scans slow.
+    errdefer batch.deinit(allocator);
+    const old_lines = candidates.items[0..old_count];
+    const new_lines = candidates.items[old_count..];
+    const old_matches = try allocator.alloc(?usize, old_lines.len);
+    defer allocator.free(old_matches);
+    @memset(old_matches, null);
+    const new_matches = try allocator.alloc(?usize, new_lines.len);
+    defer allocator.free(new_matches);
+    @memset(new_matches, null);
+    for (batch.occurrences, 0..) |occurrence, index| {
+        const source = occurrence.location.source;
+        switch (source.relation) {
+            .old => if (source.old_line) |number| {
+                const offset = @as(usize, number) - 1;
+                if (offset < old_matches.len) old_matches[offset] = index;
+            },
+            .new => if (source.new_line) |number| {
+                const offset = @as(usize, number) - 1;
+                if (offset < new_matches.len) new_matches[offset] = index;
+            },
+            .neutral => {},
+        }
+    }
     for (file.hunks) |hunk| for (hunk.lines) |line| {
         if (line.kind != .context or line.old_no == 0 or line.new_no == 0) continue;
-        const old_text = lineAt(old.?, line.old_no) orelse continue;
-        const new_text = lineAt(new.?, line.new_no) orelse continue;
+        const old_offset = @as(usize, line.old_no) - 1;
+        const new_offset = @as(usize, line.new_no) - 1;
+        if (old_offset >= old_lines.len or new_offset >= new_lines.len) continue;
+        const old_text = old_lines[old_offset].text;
+        const new_text = new_lines[new_offset].text;
         if (!std.mem.eql(u8, old_text, new_text) or !std.mem.eql(u8, old_text, line.text)) continue;
-        var old_index: ?usize = null;
-        var new_index: ?usize = null;
-        for (batch.occurrences, 0..) |occurrence, index| {
-            const source = occurrence.location.source;
-            if (source.relation == .old and source.old_line == line.old_no) old_index = index;
-            if (source.relation == .new and source.new_line == line.new_no) new_index = index;
-        }
-        if (old_index) |oi| if (new_index) |ni| {
+        if (old_matches[old_offset]) |oi| if (new_matches[new_offset]) |ni| {
             const before = &batch.occurrences[oi];
             const after = &batch.occurrences[ni];
+            if (before.location.source.relation != .old or after.location.source.relation != .new) continue;
             if (before.ranges.len != after.ranges.len) continue;
             var same_ranges = true;
             for (before.ranges, after.ranges) |a, b| if (a.start != b.start or a.end != b.end) {
@@ -330,34 +351,23 @@ pub fn scanFile(allocator: std.mem.Allocator, query: Query, file: bbr.diff.File,
     };
     var kept: usize = 0;
     for (batch.occurrences) |occurrence| {
+        if (occurrence.corpus_order != std.math.maxInt(usize)) kept += 1;
+    }
+    if (kept == batch.occurrences.len) return batch;
+    const compact = try allocator.alloc(Occurrence, kept);
+    kept = 0;
+    for (batch.occurrences) |occurrence| {
         if (occurrence.corpus_order == std.math.maxInt(usize)) {
             var duplicate = occurrence;
             duplicate.deinit(allocator);
         } else {
-            batch.occurrences[kept] = occurrence;
+            compact[kept] = occurrence;
             kept += 1;
         }
     }
-    // Return a right-sized owned slice; the original remains the allocator's allocation.
-    if (kept == batch.occurrences.len) return batch;
-    const compact = allocator.dupe(Occurrence, batch.occurrences[0..kept]) catch |err| {
-        for (batch.occurrences[0..kept]) |*occurrence| occurrence.deinit(allocator);
-        allocator.free(batch.occurrences);
-        return err;
-    };
     allocator.free(batch.occurrences);
-    return .{ .occurrences = compact };
-}
-
-fn lineAt(blob: []const u8, target: u32) ?[]const u8 {
-    var start: usize = 0;
-    var number: u32 = 1;
-    while (start < blob.len) : (number += 1) {
-        const end = std.mem.indexOfScalarPos(u8, blob, start, '\n') orelse blob.len;
-        if (number == target) return blob[start..(if (end > start and blob[end - 1] == '\r') end - 1 else end)];
-        start = end + @intFromBool(end < blob.len);
-    }
-    return null;
+    batch.occurrences = compact;
+    return batch;
 }
 
 fn scalarRegions(allocator: std.mem.Allocator, scalars: []const Scalar, boundaries: []const usize) ![]Range {
@@ -728,6 +738,47 @@ test "complete File scan keeps the readable version when the other version faile
     try testing.expectEqual(@as(usize, 1), batch.occurrences.len);
     try testing.expectEqual(@as(?u32, 1), batch.occurrences[0].location.source.new_line);
     try testing.expectEqualStrings("a.txt", batch.occurrences[0].location.source.new_path);
+}
+
+fn exerciseFileScanAllocationFailures(allocator: std.mem.Allocator) !void {
+    var query = try Query.init(allocator, "match");
+    defer query.deinit(allocator);
+    const lines: []const bbr.diff.Line = &.{
+        .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "match" },
+        .{ .old_no = 3, .new_no = 3, .kind = .context, .text = "match" },
+    };
+    const hunks: []const bbr.diff.Hunk = &.{.{ .old_start = 1, .old_count = 3, .new_start = 1, .new_count = 3, .header = "", .lines = lines }};
+    const file: bbr.diff.File = .{ .old_path = "a.txt", .new_path = "a.txt", .status = .modified, .hunks = hunks };
+    var batch = try scanFile(allocator, query, file, 0, 1, "match\r\nmatch\nmatch\n", "match\r\nmatch\nmatch\n");
+    defer batch.deinit(allocator);
+}
+
+test "complete File scan indexes context, ignores duplicate and missing Lines, and releases allocations on failure" {
+    var query = try Query.init(testing.allocator, "match");
+    defer query.deinit(testing.allocator);
+    const lines: []const bbr.diff.Line = &.{
+        .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "match" },
+        .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "match" },
+        .{ .old_no = 9, .new_no = 9, .kind = .context, .text = "match" },
+        .{ .old_no = 2, .new_no = 2, .kind = .context, .text = "wrong" },
+        .{ .old_no = 3, .new_no = 3, .kind = .context, .text = "match" },
+    };
+    const hunks: []const bbr.diff.Hunk = &.{.{ .old_start = 1, .old_count = 3, .new_start = 1, .new_count = 3, .header = "", .lines = lines }};
+    const file: bbr.diff.File = .{ .old_path = "a.txt", .new_path = "a.txt", .status = .modified, .hunks = hunks };
+    var batch = try scanFile(testing.allocator, query, file, 0, 1, "match\r\nmatch\nmatch\n", "match\r\nmatch\nmatch\n");
+    defer batch.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), batch.occurrences.len);
+    var neutral: usize = 0;
+    for (batch.occurrences) |occurrence| {
+        const source = occurrence.location.source;
+        if (source.relation == .neutral) {
+            neutral += 1;
+            try testing.expect(source.old_line == 1 or source.old_line == 3);
+            try testing.expectEqual(source.old_line, source.new_line);
+        } else try testing.expectEqual(@as(?u32, 2), source.old_line orelse source.new_line);
+    }
+    try testing.expectEqual(@as(usize, 2), neutral);
+    try testing.checkAllAllocationFailures(testing.allocator, exerciseFileScanAllocationFailures, .{});
 }
 
 fn exerciseScanAllocationFailures(allocator: std.mem.Allocator) !void {
