@@ -1506,6 +1506,13 @@ const ReviewSearchState = struct {
     ranges: ?[]frame_mod.ProjectedSourceRange = null,
     saved_disclosures: ?[]buffer_mod.DisclosureKey = null,
     opening_source: bool = false,
+    opening_identity: ?struct {
+        file_index: usize,
+        relation: search.VersionRelation,
+        old_line: ?u32,
+        new_line: ?u32,
+        first_range: search.Range,
+    } = null,
     corpus: ?*BufferSearchCorpus = null,
     candidate_count: usize = 0,
     selected: ?usize = null,
@@ -1582,11 +1589,20 @@ const ReviewSearchState = struct {
 
 fn reviewSearchOpeningFile(state: *const ReviewSearchState) ?usize {
     if (!state.open or !state.opening_source) return null;
+    const identity = state.opening_identity orelse return null;
     const selected = state.selected orelse return null;
     const batch = state.batch orelse return null;
     if (selected >= batch.occurrences.len) return null;
     const occurrence = batch.occurrences[selected];
-    return if (occurrence.location == .source) occurrence.location.source.file_index else null;
+    if (occurrence.location != .source or occurrence.ranges.len == 0) return null;
+    const source = occurrence.location.source;
+    const first = occurrence.ranges[0];
+    return if (source.file_index == identity.file_index and source.relation == identity.relation and
+        source.old_line == identity.old_line and source.new_line == identity.new_line and
+        first.start == identity.first_range.start and first.end == identity.first_range.end)
+        source.file_index
+    else
+        null;
 }
 
 fn activeNumber(index: ?usize) ?usize {
@@ -5302,6 +5318,7 @@ pub const Presentation = struct {
         if (published.review_search.pending) published.review_search.needs_scan = true;
         published.review_search.open = false;
         published.review_search.opening_source = false;
+        published.review_search.opening_identity = null;
         published.review_search.pending = false;
         published.review_search.request_id +%= 1;
         self.discardQueuedReviewSearchScans();
@@ -5339,6 +5356,7 @@ pub const Presentation = struct {
         const published = self.published orelse return;
         const state = &published.review_search;
         state.opening_source = false;
+        state.opening_identity = null;
         var query = search.Query.init(self.allocator, text) catch |err| {
             self.action_error = switch (err) {
                 error.TooLong => .buffer_search_query_too_long,
@@ -5470,7 +5488,21 @@ pub const Presentation = struct {
         };
         // Pick the next display path each time a slot opens.
         while (active < 8) {
-            var next: ?usize = null;
+            const opening = reviewSearchOpeningFile(&published.review_search);
+            var next: ?usize = if (opening) |index|
+                if (!acquired[index] and published.session.enrichment.needsEnrichment(index)) index else null
+            else
+                null;
+            if (next != null) {
+                self.queueFileEnrichment(published, next.?, false) catch {
+                    self.action_error = .out_of_memory;
+                    published.review_search.opening_source = false;
+                    break;
+                };
+                if (published.session.enrichment.needsEnrichment(next.?)) break;
+                active += 1;
+                continue;
+            }
             for (published.session.diff.files, 0..) |file, index| {
                 if (acquired[index]) continue;
                 if (published.session.enrichment.isTerminal(index)) {
@@ -5481,7 +5513,10 @@ pub const Presentation = struct {
                 if (next == null or std.mem.order(u8, file.displayPath(), published.session.diff.files[next.?].displayPath()) == .lt) next = index;
             }
             if (next == null) break;
-            self.queueFileEnrichment(published, next.?, false) catch break;
+            self.queueFileEnrichment(published, next.?, false) catch {
+                self.action_error = .out_of_memory;
+                break;
+            };
             // A refused path does not consume a slot; stop instead of looping.
             if (published.session.enrichment.needsEnrichment(next.?)) break;
             active += 1;
@@ -5591,6 +5626,10 @@ pub const Presentation = struct {
             state.results = results;
             state.ranges = ranges;
             state.selected = selected;
+            if (state.opening_source and reviewSearchOpeningFile(state) == null) {
+                state.opening_source = false;
+                state.opening_identity = null;
+            }
             if (!same_selection) if (selected) |index| {
                 state.preview_scroll = switch (combined.occurrences[index].location) {
                     .review_body => |body| body.logical_line -| 3,
@@ -5603,7 +5642,11 @@ pub const Presentation = struct {
                     state.list_scroll = index + 1 - geometry.list.height;
             };
             published.frame_revision += 1;
-        } else self.action_error = .buffer_search_scan_failed;
+        } else {
+            if (state.source_scanned) |scanned| scanned[completed.file_index] = false;
+            self.action_error = .buffer_search_scan_failed;
+            return;
+        }
         self.maybeQueueReviewSourceScan(published);
     }
 
@@ -5658,7 +5701,10 @@ pub const Presentation = struct {
         };
         if (state.ranges) |old| self.allocator.free(old);
         state.ranges = ranges;
-        if (state.selected != index) state.opening_source = false;
+        if (state.selected != index) {
+            state.opening_source = false;
+            state.opening_identity = null;
+        }
         state.selected = index;
         state.preview_scroll = switch (batch.occurrences[index].location) {
             .review_body => |body| body.logical_line -| 3,
@@ -5780,6 +5826,14 @@ pub const Presentation = struct {
             const view = published.session.enrichment.file(source.file_index);
             const side = if (source.relation == .old or (source.relation == .neutral and self.preferences.selected_version == .old)) view.old else view.new;
             if (side != .content) {
+                if (occurrence.ranges.len == 0) return;
+                state.opening_identity = .{
+                    .file_index = source.file_index,
+                    .relation = source.relation,
+                    .old_line = source.old_line,
+                    .new_line = source.new_line,
+                    .first_range = occurrence.ranges[0],
+                };
                 if (side == .pending) {
                     state.opening_source = true;
                     if (state.acquired) |acquired| acquired[source.file_index] = false;
@@ -5791,6 +5845,7 @@ pub const Presentation = struct {
                 return;
             }
             state.opening_source = false;
+            state.opening_identity = null;
             var preferences = self.preferences;
             if (source.relation == .old) preferences.selected_version = .old;
             if (source.relation == .new) preferences.selected_version = .new;
@@ -5840,9 +5895,7 @@ pub const Presentation = struct {
             published.navigation.jumpTo(row);
             published.focus = .diff;
             published.cursorToActiveFile();
-            if (admitting) published.focusEnrichment(preferences, source.file_index) catch {
-                published.session.enrichment.rollbackCacheUpdate();
-            };
+            if (admitting) published.session.enrichment.focused_file = source.file_index;
             state.open = false;
             state.pending = false;
             self.discardQueuedReviewSearchScans();
@@ -7851,8 +7904,9 @@ pub const Presentation = struct {
                 switch (failure) {
                     .launch_failed => self.action_error = .file_enrichment_launch_failed,
                     .out_of_memory => {
-                        if (reviewSearchOpeningFile(&current.review_search) == completed.file_index) {
-                            current.review_search.opening_source = false;
+                        if (current.review_search.open) {
+                            if (reviewSearchOpeningFile(&current.review_search) == completed.file_index)
+                                current.review_search.opening_source = false;
                             self.action_error = .out_of_memory;
                         } else {
                             self.requestShutdown();
@@ -9744,6 +9798,47 @@ test "M21 authored Review Search streams a complete File partition after File En
     try testing.expectEqual(@as(usize, 2), view.results.len);
     try testing.expect(view.results[0].occurrence.location == .source);
     try testing.expectEqualStrings("old needle\n", view.source_preview.?.old.content.blob);
+}
+
+test "M21 authored failed source scan retries after reopening Review Search" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    try completeBufferSearchScan(&presentation);
+    var command = presentation.takeCommand().?;
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 200, .body = "old\n" }, .{ .status = 200, .body = "new\n" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    const enrichment = try file_enrichment.enrich(testing.allocator, bb, plain.highlighter(), command.enrich_file.request());
+    const work_id = command.enrich_file.work_id;
+    const command_id = command.enrich_file.command_id;
+    command.deinit();
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = command_id, .work_id = work_id, .session_epoch = 1, .file_index = 0,
+        .outcome = .{ .completed = enrichment },
+    } });
+    command = presentation.takeCommand().?;
+    const scan_id = command.scan_review_source.command_id;
+    command.deinit();
+    try presentation.dispatch(.{ .review_source_scanned = .{
+        .allocator = testing.allocator, .command_id = scan_id, .session_epoch = 1,
+        .request_id = presentation.published.?.review_search.request_id, .file_index = 0,
+        .outcome = .failed,
+    } });
+    try testing.expect(presentation.takeCommand() == null);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try presentation.dispatch(.{ .action = .open_review_search });
+    command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expect(command == .scan_review_source);
 }
 
 test "M21 authored source opening keeps all-Files and lands on exact wrapped range" {

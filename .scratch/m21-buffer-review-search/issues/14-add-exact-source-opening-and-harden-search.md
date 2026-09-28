@@ -25,4 +25,4 @@
 ## Comments
 
 Exact source opening and search lifetime checks shipped in `43c32fb` and `ccb9207`.
-`zig build test --summary all` passed 827/827 tests.
+`zig build test --summary all` passed 828/828 tests.
