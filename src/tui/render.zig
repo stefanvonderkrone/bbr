@@ -170,7 +170,8 @@ fn drawReviewCardSearchRange(win: vaxis.Window, row: u16, card: buffer_mod.Revie
 }
 
 fn paintSearchCells(win: vaxis.Window, row: u16, start: usize, width: usize, active: bool, theme: Theme) void {
-    const end = @min(start + width, win.width);
+    if (start >= win.width) return;
+    const end = start + @min(width, win.width - start);
     for (start..end) |column| {
         const cell = win.readCell(@intCast(column), row) orelse continue;
         var style = cell.style;
@@ -2159,6 +2160,20 @@ test "M21 Buffer Search overlays active and inactive ranges without erasing synt
     try testing.expectEqual(theme_dark.search_active, win.readCell(gutter_cols, 0).?.style.bg);
     try testing.expectEqual(theme_dark.search_match, win.readCell(gutter_cols + 5, 0).?.style.bg);
     try testing.expectEqual(theme_dark.syntax_keyword, win.readCell(gutter_cols, 0).?.style.fg);
+}
+
+test "Buffer Search clips matches outside a narrow DiffPane" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = 3, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = headlessWindow(&screen);
+
+    paintSearchCells(win, 0, 3, 2, true, theme_dark);
+    paintSearchCells(win, 0, 4, 2, true, theme_dark);
+    try testing.expect(!std.meta.eql(theme_dark.search_active, win.readCell(2, 0).?.style.bg));
+
+    paintSearchCells(win, 0, 2, 4, true, theme_dark);
+    try testing.expectEqual(theme_dark.search_active, win.readCell(2, 0).?.style.bg);
+    try testing.expect(!std.meta.eql(theme_dark.search_active, win.readCell(1, 0).?.style.bg));
 }
 
 test "zero-width SideBySide visual rows clip exactly like Buffer rendering" {
