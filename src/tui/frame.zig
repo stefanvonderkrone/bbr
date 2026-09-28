@@ -365,10 +365,12 @@ pub fn projectSourceRanges(
             continue;
         }
         for (matches) |match| {
+            const old_matches = match.old_line != null and visual_row.yank_candidates.old == match.old_line;
+            const new_matches = match.new_line != null and visual_row.yank_candidates.new == match.new_line;
             const applicable = switch (match.relation) {
-                .neutral => visual_row.yank_candidates.old == match.old_line or visual_row.yank_candidates.new == match.new_line,
-                .old => visual_row.yank_candidates.old == match.old_line,
-                .new => visual_row.yank_candidates.new == match.new_line,
+                .neutral => old_matches or new_matches,
+                .old => old_matches,
+                .new => new_matches,
             };
             if (applicable) try appendRangeIntersections(allocator, &projected, match, visual_index, match.relation, visual_row.source_start, visual_row.source_end);
         }
@@ -970,6 +972,25 @@ test "M21 kernel neutral source ranges project onto distinct SideBySide context 
     try testing.expectEqual(@as(usize, 2), projected.len);
     try testing.expectEqual(search.VersionRelation.old, projected[0].relation);
     try testing.expectEqual(search.VersionRelation.new, projected[1].relation);
+}
+
+test "source ranges do not match absent Line candidates" {
+    const matched: bbr.diff.Line = .{ .old_no = 1, .new_no = 0, .kind = .removed, .text = "first" };
+    const other: bbr.diff.Line = .{ .old_no = 2, .new_no = 0, .kind = .removed, .text = "other" };
+    const visual_rows = [_]VisualRow{
+        .{ .owner = .{ .line = &matched }, .source_end = 5, .yank_candidates = .{ .old = &matched } },
+        .{ .owner = .{ .line = &other }, .source_end = 5, .yank_candidates = .{ .old = &other } },
+        .{ .kind = .comment, .owner = .{ .comment = .{ .id = 1, .source_offset = 0 } }, .source_end = 5 },
+    };
+    const projected = try projectSourceRanges(testing.allocator, &visual_rows, &.{.{
+        .old_line = &matched,
+        .relation = .neutral,
+        .ranges = &.{.{ .start = 1, .end = 3 }},
+    }});
+    defer testing.allocator.free(projected);
+
+    try testing.expectEqual(@as(usize, 1), projected.len);
+    try testing.expectEqual(@as(usize, 0), projected[0].visual_row);
 }
 
 test "framed Pane geometry is bounded at zero narrow ordinary and wide sizes" {
