@@ -153,7 +153,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         const event = try loop.nextEvent();
         switch (event) {
             .key_press => |key| try state.dispatch(.{ .key = portableKey(key) }),
-            .mouse => |mouse| if (portableMouse(mouse)) |input| try state.dispatch(.{ .mouse = input }),
+            .mouse => |mouse| if (portableMouse(mouse, ctx.io)) |input| try state.dispatch(.{ .mouse = input }),
             .winsize => |winsize| {
                 try vx.resize(ctx.gpa, writer, winsize);
                 vx.screen.width_method = .unicode;
@@ -216,6 +216,9 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
                 projection.submission != null,
                 review_projection.drafts.len,
                 status,
+                projection.buffer_search != null,
+                if (projection.buffer_search) |search_projection| search_projection.query.len > 0 and search_projection.total == 0 else false,
+                ctx.active_theme,
             );
         } else {
             const status = presentationStatus(frame, projection, null);
@@ -223,6 +226,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         }
         if (projection.picker) |active_picker| render.drawPicker(frame, content_win, active_picker, ctx.active_theme);
         if (projection.file_finder) |finder| render.drawFileFinder(frame, content_win, finder, ctx.active_theme);
+        if (projection.review_search) |review_search| render.drawReviewSearch(frame, content_win, review_search, ctx.active_theme);
         if (projection.composer) |composer| render.drawComposerProjection(frame, content_win, composer, ctx.active_theme);
         if (projection.unknown_resolution) |resolution| render.drawComposerProjection(frame, content_win, .{
             .label = "Link existing Bitbucket Comment ID",
@@ -316,6 +320,13 @@ fn presentationStatus(
     // The armed re-anchor banner outlives one refusal: it keeps naming the
     // Draft and whatever the source cursor currently proposes.
     if (projection.reanchor) |reanchor| return reanchorStatus(frame, projection, reanchor);
+    if (projection.review_search != null and projection.action_error != null) return switch (projection.action_error.?) {
+        .buffer_search_query_too_long => "Review Search Query limit is 256 characters",
+        .buffer_search_invalid_query => "Review Search Query is invalid",
+        .buffer_search_scan_failed => "Review Search failed",
+        else => actionErrorText(projection.action_error.?),
+    };
+    if (projection.buffer_search) |search_projection| return bufferSearchStatus(frame, projection, search_projection);
     if (projection.action_error) |err| return actionErrorText(err);
     if (projection.clipboard_status) |status| return switch (status) {
         .copied => "copied source text",
@@ -407,6 +418,46 @@ fn presentationStatus(
     return null;
 }
 
+fn bufferSearchStatus(frame: std.mem.Allocator, projection: presentation.Projection, search_projection: presentation.BufferSearchProjection) []const u8 {
+    const width = if (projection.review) |review| review.frame.geometry.cols else 80;
+    return formatBufferSearchStatus(frame, width, projection.action_error, search_projection);
+}
+
+fn formatBufferSearchStatus(frame: std.mem.Allocator, width: u16, action_error: ?presentation.ActionError, search_projection: presentation.BufferSearchProjection) []const u8 {
+    const message: []const u8 = if (search_projection.pending)
+        " · Searching"
+    else if (search_projection.query.len > 0 and search_projection.total == 0)
+        " · No matches"
+    else switch (action_error orelse .action_refused) {
+        .buffer_search_no_matches => " · No matches",
+        .buffer_search_hit_bottom => " · Search hit BOTTOM, continuing at TOP",
+        .buffer_search_hit_top => " · Search hit TOP, continuing at BOTTOM",
+        .buffer_search_query_too_long => " · Query limit is 256 characters",
+        .buffer_search_invalid_query => " · Invalid Query",
+        .buffer_search_scan_failed => " · Search failed",
+        else => "",
+    };
+    const count = if (search_projection.total == 0)
+        (std.fmt.allocPrint(frame, " 0/0", .{}) catch "")
+    else if (search_projection.active) |active|
+        (std.fmt.allocPrint(frame, " {d}/{d}", .{ active, search_projection.total }) catch "")
+    else
+        (std.fmt.allocPrint(frame, " -/{d}", .{search_projection.total}) catch "");
+    const verbose_suffix = std.fmt.allocPrint(frame, "{s}{s}", .{ count, message }) catch count;
+    const suffix = if (vaxis.gwidth.gwidth(verbose_suffix, .unicode) + 2 <= width)
+        verbose_suffix
+    else
+        count;
+    const fixed_width = vaxis.gwidth.gwidth(suffix, .unicode) + 2;
+    const available = @as(usize, width) -| fixed_width;
+    var query_start: usize = 0;
+    while (query_start < search_projection.query.len and vaxis.gwidth.gwidth(search_projection.query[query_start..], .unicode) > available) {
+        const length = std.unicode.utf8ByteSequenceLength(search_projection.query[query_start]) catch 1;
+        query_start += length;
+    }
+    return std.fmt.allocPrint(frame, "/{s}{s}", .{ search_projection.query[query_start..], suffix }) catch "/";
+}
+
 fn reviewerVerdictOutcomeLabel(outcome: presentation.ReviewerVerdictCommandOutcome) []const u8 {
     return switch (outcome) {
         .completed => |result| switch (result) {
@@ -467,6 +518,13 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .anchor_candidate_ambiguous => "that source range is ambiguous; select one side of one File",
         .anchor_range_too_long => "an Anchor covers at most 30 lines",
         .suggestion_anchor_not_new_side => "a Suggestion cannot anchor to removed lines",
+        .buffer_search_selection_active => "Clear Selection before Buffer Search",
+        .buffer_search_query_too_long => "Buffer Search Query limit is 256 characters",
+        .buffer_search_invalid_query => "Buffer Search Query is invalid",
+        .buffer_search_scan_failed => "Buffer Search failed",
+        .buffer_search_no_matches => "No matches",
+        .buffer_search_hit_bottom => "Search hit BOTTOM, continuing at TOP",
+        .buffer_search_hit_top => "Search hit TOP, continuing at BOTTOM",
         else => @tagName(err),
     };
 }
@@ -525,11 +583,12 @@ fn portableKey(key: vaxis.Key) keymap.KeyStroke {
     };
 }
 
-fn portableMouse(mouse: vaxis.Mouse) ?presentation.MouseInput {
+fn portableMouse(mouse: vaxis.Mouse, io: std.Io) ?presentation.MouseInput {
     if (mouse.col < 0 or mouse.row < 0) return null;
     return .{
         .col = @intCast(mouse.col),
         .row = @intCast(mouse.row),
+        .time_ns = std.Io.Clock.awake.now(io).nanoseconds,
         .button = switch (mouse.button) {
             .left => .left,
             .middle => .middle,
@@ -786,6 +845,27 @@ fn presentationEnrichmentWorker(
     } });
 }
 
+fn presentationBufferSearchWorker(
+    loop: *Loop,
+    work_id: u64,
+    command_value: presentation.ScanBufferSearch,
+) void {
+    var command = command_value;
+    defer command.deinit();
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    presentation_runtime.deliver(
+        presentationSink(&sink_context),
+        .{ .buffer_search_scanned = presentation.executeBufferSearchScan(std.heap.page_allocator, &command) },
+    );
+}
+
+fn presentationReviewSourceWorker(loop: *Loop, work_id: u64, command_value: presentation.ScanReviewSource) void {
+    var command = command_value;
+    defer command.deinit();
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    presentation_runtime.deliver(presentationSink(&sink_context), .{ .review_source_scanned = presentation.executeReviewSourceScan(std.heap.page_allocator, &command) });
+}
+
 fn presentationWaitWorker(loop: *Loop, work_id: u64, io: std.Io, wait: presentation.WaitSubmission) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     io.sleep(std.Io.Duration.fromMilliseconds(@intCast(wait.ms)), .awake) catch {
@@ -956,6 +1036,8 @@ fn drainPresentationCommands(
             .list_pull_requests => |list| ctx.io.concurrent(presentationListPullRequestsWorker, .{ loop, work_id, ctx.bitbucket.?, list }),
             .copy_clipboard => unreachable,
             .external_edit => unreachable,
+            .scan_buffer_search => |scan| ctx.io.concurrent(presentationBufferSearchWorker, .{ loop, work_id, scan }),
+            .scan_review_source => |scan| ctx.io.concurrent(presentationReviewSourceWorker, .{ loop, work_id, scan }),
         } catch {
             try admitPresentationLaunchFailure(state, &command);
             continue;
@@ -1014,6 +1096,29 @@ fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *p
             completed.outcome = .failed;
             edit.destroy();
             break :blk .{ .external_edit_completed = completed };
+        },
+        .scan_buffer_search => |*scan| blk: {
+            const completed: presentation.BufferSearchScanned = .{
+                .allocator = std.heap.page_allocator,
+                .command_id = scan.command_id,
+                .request_id = scan.request_id,
+                .session_epoch = scan.session_epoch,
+                .outcome = .failed,
+            };
+            scan.deinit();
+            break :blk .{ .buffer_search_scanned = completed };
+        },
+        .scan_review_source => |*scan| blk: {
+            const completed: presentation.ReviewSourceScanned = .{
+                .allocator = std.heap.page_allocator,
+                .command_id = scan.command_id,
+                .session_epoch = scan.session_epoch,
+                .request_id = scan.request_id,
+                .file_index = scan.file_index,
+                .outcome = .failed,
+            };
+            scan.deinit();
+            break :blk .{ .review_source_scanned = completed };
         },
     };
     command.* = undefined;
@@ -1125,6 +1230,9 @@ fn drawStatus(
     submitting: bool,
     draft_count: usize,
     status_msg: ?[]const u8,
+    searching: bool,
+    search_has_no_matches: bool,
+    active_theme: theme.Theme,
 ) void {
     if (win.height == 0) return;
     const row = win.height - 1;
@@ -1147,18 +1255,24 @@ fn drawStatus(
         (std.fmt.allocPrint(frame, "#{d} {s}  ·  {s}", .{ id, header.title, reviewerVerdictLabel(reviewer_verdict) }) catch header.title)
     else
         header.title;
-    const text = std.fmt.allocPrint(frame, " {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s}  ·  {s}  ·  {s} ", .{
-        identity,
-        header.source_ref,
-        header.base_ref,
-        @min(nav.cursor + 1, buf.rows.len),
-        buf.rows.len,
-        layout_hint,
-        scope_hint,
-        file_hint,
-        tail,
-    }) catch " q quit ";
-    const style: vaxis.Style = .{ .fg = .{ .index = 0 }, .bg = .{ .index = 7 } };
+    const text = if (searching)
+        tail
+    else
+        std.fmt.allocPrint(frame, " {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s}  ·  {s}  ·  {s} ", .{
+            identity,
+            header.source_ref,
+            header.base_ref,
+            @min(nav.cursor + 1, buf.rows.len),
+            buf.rows.len,
+            layout_hint,
+            scope_hint,
+            file_hint,
+            tail,
+        }) catch " q quit ";
+    const style: vaxis.Style = if (search_has_no_matches)
+        .{ .fg = active_theme.search_no_match, .bg = .{ .index = 7 }, .bold = true }
+    else
+        .{ .fg = .{ .index = 0 }, .bg = .{ .index = 7 } };
     var c: u16 = 0;
     while (c < win.width) : (c += 1) win.writeCell(c, row, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
     _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = row, .wrap = .none });
@@ -1239,6 +1353,38 @@ test "content viewport reserves the bottom status row" {
     try std.testing.expectEqual(@as(usize, 9), contentViewportRows(10));
     try std.testing.expectEqual(@as(usize, 1), contentViewportRows(1));
     try std.testing.expectEqual(@as(usize, 1), contentViewportRows(0));
+}
+
+test "M21 narrow Buffer Search status keeps the Query end before the count" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const status = formatBufferSearchStatus(arena.allocator(), 12, null, .{
+        .query = "abcdefghij",
+        .input = true,
+        .active = 2,
+        .total = 3,
+    });
+    try std.testing.expect(std.mem.startsWith(u8, status, "/"));
+    try std.testing.expect(std.mem.indexOf(u8, status, "hij") != null);
+    try std.testing.expect(std.mem.endsWith(u8, status, " 2/3"));
+    try std.testing.expect(vaxis.gwidth.gwidth(status, .unicode) <= 12);
+
+    const inactive = formatBufferSearchStatus(arena.allocator(), 12, null, .{
+        .query = "abc",
+        .input = false,
+        .active = null,
+        .total = 3,
+    });
+    try std.testing.expect(std.mem.endsWith(u8, inactive, " -/3"));
+
+    const pending = formatBufferSearchStatus(arena.allocator(), 30, null, .{
+        .query = "new",
+        .input = true,
+        .active = null,
+        .total = 0,
+        .pending = true,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, pending, "Searching") != null);
 }
 
 test "LocalReview worker dispatch does not require Bitbucket" {

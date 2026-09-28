@@ -104,6 +104,16 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(highlight_yaml_2m);
     const cell_width_content = try asciiFixture(init.gpa, 1024 * 1024);
     defer init.gpa.free(cell_width_content);
+    const search_query = try sourceFixture(init.gpa, 256, "a");
+    defer init.gpa.free(search_query);
+    const search_ascii = try sourceFixture(init.gpa, 1024, "a");
+    defer init.gpa.free(search_ascii);
+    const search_long = try sourceFixture(init.gpa, 4096, "a");
+    defer init.gpa.free(search_long);
+    const search_unicode_query = try sourceFixture(init.gpa, 256 * "界".len, "界");
+    defer init.gpa.free(search_unicode_query);
+    const search_unicode = try sourceFixture(init.gpa, 1024 * "界".len, "界");
+    defer init.gpa.free(search_unicode);
     var frame_paint_context = try frame_paint.Context.init(init.gpa);
     defer frame_paint_context.deinit(init.gpa);
     var tree_sitter_highlighter = try TreeSitterHighlighter.init(init.gpa, null);
@@ -129,8 +139,8 @@ pub fn main(init: std.process.Init) !void {
         .body = "## Review\n\nThis **change** keeps [the contract](https://example.test).\n\n```suggestion\nconst value = 2;\n```\n",
         .count = 4_000,
     };
-    const visual_rows_unwrapped_context: p1_actions.VisualRowsContext = .{ .rows = navigation_context.buffer.rows, .wrap = false };
-    const visual_rows_wrapped_context: p1_actions.VisualRowsContext = .{ .rows = navigation_context.buffer.rows, .wrap = true, .width = 24 };
+    const visual_rows_wide_context: p1_actions.VisualRowsContext = .{ .rows = navigation_context.buffer.rows };
+    const visual_rows_narrow_context: p1_actions.VisualRowsContext = .{ .rows = navigation_context.buffer.rows, .width = 24 };
     const file_tree_tallies = try tui.buffer.fileTallies(comment_arena.allocator(), parsed, comment_contexts[2].threads, comment_contexts[2].drafts, .{ .drafts = comment_contexts[2].drafts });
     const file_tree_context: p1_actions.FileTreeContext = .{ .diff = parsed, .tallies = file_tree_tallies };
     var matched = false;
@@ -218,13 +228,24 @@ pub fn main(init: std.process.Init) !void {
         if (repeat_count) |count| try harness.repeat(writer, init.gpa, "whole_file_line_starts_5000", count, &whole_file_context, p1_actions.wholeFile, p1_actions.bufferChecksum) else try harness.run(writer, init.io, init.gpa, calibrations, "whole_file_line_starts_5000", .memory_bandwidth, whole_file_blob.len, &whole_file_context, p1_actions.wholeFile, p1_actions.bufferChecksum);
     }
     const visual_benchmarks = [_]struct { name: []const u8, context: p1_actions.VisualRowsContext }{
-        .{ .name = "visual_rows_unwrapped_50000", .context = visual_rows_unwrapped_context },
-        .{ .name = "visual_rows_wrapped_50000", .context = visual_rows_wrapped_context },
+        .{ .name = "visual_rows_wide_50000", .context = visual_rows_wide_context },
+        .{ .name = "visual_rows_narrow_50000", .context = visual_rows_narrow_context },
     };
     for (&visual_benchmarks) |*benchmark| {
         if (selected == null or std.mem.eql(u8, selected.?, benchmark.name)) {
             matched = true;
             if (repeat_count) |count| try harness.repeat(writer, init.gpa, benchmark.name, count, &benchmark.context, p1_actions.visualRows, p1_actions.visualRowsChecksum) else try harness.run(writer, init.io, init.gpa, calibrations, benchmark.name, .instruction_throughput, benchmark.context.rows.len, &benchmark.context, p1_actions.visualRows, p1_actions.visualRowsChecksum);
+        }
+    }
+    const search_benchmarks = [_]struct { name: []const u8, context: p1_actions.SearchContext }{
+        .{ .name = "search_fuzzy_ascii_256x1024", .context = .{ .query = search_query, .candidate = search_ascii } },
+        .{ .name = "search_fuzzy_unicode_256x1024", .context = .{ .query = search_unicode_query, .candidate = search_unicode } },
+        .{ .name = "search_fuzzy_fallback_256x4096", .context = .{ .query = search_query, .candidate = search_long } },
+    };
+    for (&search_benchmarks) |*benchmark| {
+        if (selected == null or std.mem.eql(u8, selected.?, benchmark.name)) {
+            matched = true;
+            if (repeat_count) |count| try harness.repeat(writer, init.gpa, benchmark.name, count, &benchmark.context, p1_actions.fuzzySearch, p1_actions.scalarChecksum) else try harness.run(writer, init.io, init.gpa, calibrations, benchmark.name, .instruction_throughput, benchmark.context.candidate.len, &benchmark.context, p1_actions.fuzzySearch, p1_actions.scalarChecksum);
         }
     }
     if (selected == null or std.mem.eql(u8, selected.?, "file_tree_tallies_2000")) {

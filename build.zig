@@ -2,7 +2,21 @@ const std = @import("std");
 const version_identity = @import("build/version.zig");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    var target = b.standardTargetOptions(.{});
+    if (target.query.os_tag == null and
+        target.query.os_version_min == null and
+        target.result.os.tag == .macos and
+        target.result.os.version_range.semver.min.major >= 26)
+    {
+        // Zig 0.16 cannot build its bundled libc++ for a macOS 26 minimum.
+        target.query.os_tag = .macos;
+        target.query.os_version_min = .{ .semver = .{ .major = 15, .minor = 0, .patch = 0 } };
+        target = b.resolveTargetQuery(target.query);
+    }
+    const macos_sdk = if (target.query.os_tag == .macos and b.graph.host.result.os.tag == .macos)
+        std.mem.trimEnd(u8, b.run(&.{ "xcrun", "--show-sdk-path" }), "\r\n")
+    else
+        null;
     const optimize = b.standardOptimizeOption(.{});
     const version = resolveVersion(b);
 
@@ -35,7 +49,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addOptions("build_options", build_options);
     addSqlite(b, exe_mod);
     addTreeSitter(b, exe_mod);
-    addRe2(b, exe_mod, target);
+    addRe2(b, exe_mod, target, macos_sdk);
 
     const exe = b.addExecutable(.{ .name = "bbr", .root_module = exe_mod });
     b.installArtifact(exe);
@@ -76,7 +90,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "bbr", .module = bench_core_mod }},
     });
     addTreeSitter(b, bench_highlight_mod);
-    addRe2(b, bench_highlight_mod, target);
+    addRe2(b, bench_highlight_mod, target, macos_sdk);
     bench_mod.addImport("benchmark_highlight", bench_highlight_mod);
     const bench_exe = b.addExecutable(.{ .name = "bbr-bench", .root_module = bench_mod });
     const install_bench = b.addInstallArtifact(bench_exe, .{});
@@ -86,6 +100,41 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run deterministic ReleaseFast benchmarks");
     bench_step.dependOn(&install_bench.step);
     bench_step.dependOn(&run_bench.step);
+
+    const file_enrichment_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/tui/file_enrichment.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = &.{.{ .name = "bbr", .module = bench_core_mod }},
+    });
+    const file_acquisition_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/benchmark/file_acquisition.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = &.{
+            .{ .name = "bbr", .module = bench_core_mod },
+            .{ .name = "file_enrichment", .module = file_enrichment_bench_mod },
+        },
+    });
+    const file_acquisition_bench = b.addExecutable(.{ .name = "bbr-file-acquisition-bench", .root_module = file_acquisition_bench_mod });
+    const run_file_acquisition_bench = b.addRunArtifact(file_acquisition_bench);
+    if (b.args) |args| run_file_acquisition_bench.addArgs(args);
+    const file_acquisition_bench_step = b.step("bench-file-acquisition", "Run the opt-in File Enrichment concurrency benchmark");
+    file_acquisition_bench_step.dependOn(&run_file_acquisition_bench.step);
+
+    const buffer_search_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/benchmark_buffer_search.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = &.{
+            .{ .name = "bbr", .module = bench_core_mod },
+            .{ .name = "zf", .module = zf.module("zf") },
+            .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+        },
+    });
+    const buffer_search_bench = b.addExecutable(.{ .name = "bbr-buffer-search-bench", .root_module = buffer_search_bench_mod });
+    const buffer_search_bench_step = b.step("bench-buffer-search", "Run the deterministic large Buffer Search benchmark");
+    buffer_search_bench_step.dependOn(&b.addRunArtifact(buffer_search_bench).step);
 
     // Live smoke check against real Bitbucket (opt-in; needs BITBUCKET_* env):
     //   zig build check -- <repo-slug> <pr-id>
@@ -172,6 +221,23 @@ pub fn build(b: *std.Build) void {
     const selected_version_hardening_test_step = b.step("test-selected-version-hardening", "Run Selected Version hardening tests");
     selected_version_hardening_test_step.dependOn(&run_selected_version_hardening_tests.step);
 
+    const search_kernel_tests = b.addTest(.{
+        .name = "search-kernel-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M21 kernel"},
+    });
+    const run_search_kernel_tests = b.addRunArtifact(search_kernel_tests);
+    const search_kernel_test_step = b.step("test-search-kernel", "Run M21 search kernel and reachable-source tests");
+    search_kernel_test_step.dependOn(&run_search_kernel_tests.step);
+
+    const authored_search_tests = b.addTest(.{
+        .name = "authored-search-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M21 authored"},
+    });
+    const authored_search_step = b.step("test-authored-search", "Run authored Review Search tests");
+    authored_search_step.dependOn(&b.addRunArtifact(authored_search_tests).step);
+
     const fixture_mod = b.createModule(.{
         .root_source_file = b.path("tests/user_grammar_fixture.zig"),
         .target = target,
@@ -197,7 +263,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "bbr", .module = mod }},
     });
     addTreeSitter(b, highlight_runtime);
-    addRe2(b, highlight_runtime, target);
+    addRe2(b, highlight_runtime, target, macos_sdk);
     lifecycle_mod.addImport("highlight_runtime", highlight_runtime);
     const lifecycle_test = b.addExecutable(.{ .name = "grammar-cli-integration", .root_module = lifecycle_mod });
     const run_user_grammar_load_test = b.addRunArtifact(lifecycle_test);
@@ -301,7 +367,11 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
     }
 }
 
-fn addRe2(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+fn addRe2(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, macos_sdk: ?[]const u8) void {
+    const cpp_flags: []const []const u8 = if (macos_sdk != null)
+        &.{ "-std=c++17", "-fno-sanitize=undefined", "-Wno-elaborated-enum-base" }
+    else
+        &.{ "-std=c++17", "-fno-sanitize=undefined" };
     const sources = [_][]const u8{
         "bbr_re2.cc",
         "re2/bitmap256.cc",
@@ -332,7 +402,7 @@ fn addRe2(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarge
     mod.addCSourceFiles(.{
         .root = b.path("vendors/re2"),
         .files = &sources,
-        .flags = &.{ "-std=c++17", "-fno-sanitize=undefined" },
+        .flags = cpp_flags,
         .language = .cpp,
     });
     const abseil_sources = [_][]const u8{
@@ -415,11 +485,17 @@ fn addRe2(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarge
     mod.addCSourceFiles(.{
         .root = b.path("vendors/abseil"),
         .files = &abseil_sources,
-        .flags = &.{ "-std=c++17", "-fno-sanitize=undefined" },
+        .flags = cpp_flags,
         .language = .cpp,
     });
     mod.link_libcpp = true;
-    if (target.result.os.tag == .macos) mod.linkFramework("CoreFoundation", .{});
+    if (target.result.os.tag == .macos) {
+        if (macos_sdk) |sdk| {
+            mod.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
+            mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) });
+        }
+        mod.linkFramework("CoreFoundation", .{});
+    }
 }
 
 /// Compile the vendored SQLite amalgamation into `mod`. Flags harden and trim

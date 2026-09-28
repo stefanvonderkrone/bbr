@@ -167,10 +167,18 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one('q'), .action = .quit, .help = "quit" },
     .{ .chord = Chord.modified('c', .{ .ctrl = true }), .action = .quit, .help = "quit" },
     .{ .chord = Chord.one('F'), .action = .open_file_finder, .help = "open File finder" },
+    .{ .chord = Chord.one('/'), .action = .open_buffer_search, .help = "search Buffer" },
+    .{ .chord = Chord.two('g', 'f'), .action = .open_review_search, .help = "search Review" },
+    .{ .chord = Chord.one(vaxis.Key.down), .action = .next_review_search_occurrence, .help = "next Review Search Occurrence" },
+    .{ .chord = Chord.modified('n', .{ .ctrl = true }), .action = .next_review_search_occurrence, .help = "next Review Search Occurrence" },
+    .{ .chord = Chord.one(vaxis.Key.up), .action = .previous_review_search_occurrence, .help = "previous Review Search Occurrence" },
+    .{ .chord = Chord.modified('p', .{ .ctrl = true }), .action = .previous_review_search_occurrence, .help = "previous Review Search Occurrence" },
+    .{ .chord = Chord.one(vaxis.Key.enter), .action = .open_search_occurrence, .help = "open Search Occurrence" },
+    .{ .chord = Chord.one('n'), .action = .next_search_occurrence, .help = "next Search Occurrence" },
+    .{ .chord = Chord.one('N'), .action = .previous_search_occurrence, .help = "previous Search Occurrence" },
     .{ .chord = Chord.one('p'), .action = .open_pull_request_picker, .help = "open PullRequest Picker" },
     .{ .chord = Chord.one('R'), .action = .refresh, .help = "refresh review" },
     .{ .chord = Chord.one('s'), .action = .toggle_layout, .help = "toggle unified / side-by-side" },
-    .{ .chord = Chord.one('w'), .action = .toggle_diff_wrap, .help = "toggle diff wrapping" },
     .{ .chord = Chord.one('f'), .action = .cycle_scope, .help = "cycle diff scope" },
     .{ .chord = Chord.two('g', '<'), .action = .select_old_version, .help = "select old File version" },
     .{ .chord = Chord.two('g', '>'), .action = .select_new_version, .help = "select new File version" },
@@ -368,7 +376,16 @@ fn validateBindings(bindings: []const Binding) !void {
 pub fn supportsContext(action: Action, context: InteractionContext) bool {
     return switch (context) {
         .composer => action == .external_edit,
-        .help, .unknown_resolution, .delete_confirmation => false,
+        .help, .unknown_resolution, .delete_confirmation, .buffer_search_input => false,
+        .review_search => switch (action) {
+            .next_review_search_occurrence,
+            .previous_review_search_occurrence,
+            .open_search_occurrence,
+            .half_page_down,
+            .half_page_up,
+            => true,
+            else => false,
+        },
         .file_finder, .pull_request_picker => switch (action) {
             .up, .down, .confirm_picker, .quit => true,
             else => false,
@@ -396,7 +413,6 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .link_existing_comment,
             .help,
             .toggle_layout,
-            .toggle_diff_wrap,
             .cycle_scope,
             .toggle_directory,
             .focus_next_pane,
@@ -427,7 +443,6 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .link_existing_comment,
             .help,
             .toggle_layout,
-            .toggle_diff_wrap,
             .cycle_scope,
             .focus_file,
             .focus_next_pane,
@@ -485,6 +500,10 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .select_up,
             .quit,
             .open_file_finder,
+            .open_buffer_search,
+            .open_review_search,
+            .next_search_occurrence,
+            .previous_search_occurrence,
             .open_pull_request_picker,
             .refresh,
             .inline_comment,
@@ -503,7 +522,6 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .toggle_select,
             .clear_selection,
             .toggle_layout,
-            .toggle_diff_wrap,
             .cycle_scope,
             .select_old_version,
             .select_new_version,
@@ -606,7 +624,7 @@ test "single-key actions and motions resolve" {
     try testing.expectEqual(Action.cursor_view_middle, res.feed(km, .diff, plain('M')).action);
     try testing.expectEqual(Action.reply, res.feed(km, .diff_review_card, plain('r')).action);
     try testing.expectEqual(Action.help, res.feed(km, .diff, .{ .codepoint = '?', .text = "?" }).action);
-    try testing.expectEqual(Action.toggle_diff_wrap, res.feed(km, .diff, plain('w')).action);
+    try testing.expect(res.feed(km, .diff, plain('w')) == .none);
 }
 
 test "isMotion separates movement from commands" {
@@ -777,4 +795,21 @@ test "same chord is rejected when Actions overlap in an Interaction Context" {
         .{ .action = "up", .sequences = &.{"x"} },
     };
     try testing.expectError(error.AmbiguousContext, Keymap.fromOverrides(testing.allocator, &overrides));
+}
+
+test "M21 Buffer Search Actions resolve in every DiffPane context and remain configurable" {
+    inline for (.{ InteractionContext.diff, .diff_source, .diff_disclosure, .diff_review_card }) |context| {
+        var resolver: Resolver = .{};
+        try testing.expectEqual(Action.open_buffer_search, resolver.feed(.default, context, plain('/')).action);
+        try testing.expectEqual(Action.next_search_occurrence, resolver.feed(.default, context, plain('n')).action);
+        try testing.expectEqual(Action.previous_search_occurrence, resolver.feed(.default, context, plain('N')).action);
+    }
+
+    const overrides = [_]Override{.{ .action = "open_buffer_search", .sequences = &.{"space s"} }};
+    var configured = try Keymap.fromOverrides(testing.allocator, &overrides);
+    defer configured.deinit(testing.allocator);
+    var resolver: Resolver = .{};
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain('/')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain(' ')) == .none);
+    try testing.expectEqual(Action.open_buffer_search, resolver.feed(configured.keymap(), .diff, plain('s')).action);
 }

@@ -131,6 +131,10 @@ from repeating past mistakes. The version-pinned API catalog bbr relies on lives
 - **Bound quadratic work before allocating its table.** Use saturating `*|` and `+|` for the work
   estimate. Preserve exact results below a measured limit and choose a deterministic fallback
   above it. This applies to intra-line LCS and SideBySide Line matching.
+- **Zig 0.16 cannot build bundled libc++ with a macOS 26 deployment minimum.** Keep bbr's native
+  deployment minimum at macOS 15 on newer hosts. Add the active SDK framework and library paths
+  for that explicit target. Zig's C++ compiler also needs `-Wno-elaborated-enum-base` for current
+  CoreFoundation headers. Remove these workarounds after a Zig upgrade passes the full test step.
 
 ## Idioms that are correct here (not hacks)
 

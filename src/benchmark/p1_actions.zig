@@ -26,6 +26,29 @@ pub fn scalarChecksum(value: u64) u64 {
     return value;
 }
 
+pub const SearchContext = struct {
+    query: []const u8,
+    candidate: []const u8,
+};
+
+pub fn fuzzySearch(allocator: std.mem.Allocator, context: *const SearchContext) !u64 {
+    var query = try tui.search.Query.init(allocator, context.query);
+    defer query.deinit(allocator);
+    const candidates = [_]tui.search.Candidate{.{
+        .text = context.candidate,
+        .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 1 } },
+    }};
+    var batch = try tui.search.scan(allocator, query, &candidates, .fuzzy);
+    defer batch.deinit(allocator);
+    var hash = std.hash.Wyhash.init(0);
+    for (batch.occurrences) |occurrence| {
+        hash.update(std.mem.asBytes(&occurrence.score));
+        hash.update(std.mem.asBytes(&occurrence.calculation));
+        hash.update(std.mem.sliceAsBytes(occurrence.ranges));
+    }
+    return hash.final();
+}
+
 pub const WholeFileContext = struct {
     diff: bbr.diff.Diff,
     blobs: []const bbr.diff.FileBlob,
@@ -52,7 +75,6 @@ pub fn bufferChecksum(buffer: tui.buffer.Buffer) u64 {
 
 pub const VisualRowsContext = struct {
     rows: []const tui.buffer.Row,
-    wrap: bool,
     width: usize = 120,
 };
 
@@ -60,7 +82,6 @@ pub fn visualRows(allocator: std.mem.Allocator, context: *const VisualRowsContex
     return tui.frame.buildVisualRowsWithOptions(allocator, context.rows, .bytes, .{
         .layout = .unified,
         .width = context.width,
-        .wrap = context.wrap,
     });
 }
 

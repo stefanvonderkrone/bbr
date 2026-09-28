@@ -18,6 +18,7 @@ pub const BlobSource = struct {
 pub const RemoteBlobSource = struct {
     client: bbr.bitbucket.Client,
     repo: []const u8,
+    retry_io: ?std.Io = null,
 
     pub fn source(self: *RemoteBlobSource) BlobSource {
         return .{ .ptr = self, .read_fn = read };
@@ -25,9 +26,35 @@ pub const RemoteBlobSource = struct {
 
     fn read(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8) anyerror![]u8 {
         const self: *RemoteBlobSource = @ptrCast(@alignCast(ptr));
+        if (self.retry_io) |io| {
+            for (0..2) |attempt| {
+                const response = self.client.getFileBlobAttempt(allocator, self.repo, commit, path) catch |err| {
+                    if (attempt == 0 and err != error.OutOfMemory and err != error.InvalidPath) {
+                        io.sleep(std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+                        continue;
+                    }
+                    return err;
+                };
+                switch (response) {
+                    .content => |bytes| return bytes,
+                    .rejected => |failure| {
+                        if (attempt == 0 and (failure.reason == error.RateLimited or failure.reason == error.ServerError)) {
+                            io.sleep(std.Io.Duration.fromMilliseconds(if (failure.reason == error.RateLimited) rateLimitRetryMs(failure.retry_after_ms) else 100), .awake) catch {};
+                            continue;
+                        }
+                        return failure.reason;
+                    },
+                }
+            }
+            unreachable;
+        }
         return self.client.getFileBlob(allocator, self.repo, commit, path);
     }
 };
+
+fn rateLimitRetryMs(retry_after_ms: ?u64) i64 {
+    return @intCast(@min(retry_after_ms orelse 1000, 5000));
+}
 
 pub const GitBlobSource = struct {
     client: bbr.git.GitClient,
@@ -87,12 +114,14 @@ pub const Projection = struct {
 };
 
 const OwnedSide = struct {
+    references: std.atomic.Value(usize) = .init(1),
     arena: std.heap.ArenaAllocator,
     blob: []const u8,
     highlighting: HighlightingView,
     retained_bytes: usize,
 
     fn destroy(self: *OwnedSide) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
         const backing = self.arena.child_allocator;
         self.arena.deinit();
         backing.destroy(self);
@@ -100,6 +129,20 @@ const OwnedSide = struct {
 
     fn view(self: *const OwnedSide) ContentView {
         return .{ .blob = self.blob, .highlighting = self.highlighting };
+    }
+};
+
+/// The contents of both versions remain immutable even after Session destruction.
+/// Release does not access Storage or Session.
+pub const ReadLease = struct {
+    view: FileView,
+    old: ?*OwnedSide,
+    new: ?*OwnedSide,
+
+    pub fn release(self: *ReadLease) void {
+        if (self.old) |side| side.destroy();
+        if (self.new) |side| side.destroy();
+        self.* = undefined;
     }
 };
 
@@ -135,11 +178,11 @@ pub fn enrich(backing: Allocator, bb: bbr.bitbucket.Client, highlighter: bbr.hig
 /// Fetch both present remote sides at the same time. Each side retains its own
 /// outcome and owned arena, as in the sequential path.
 pub fn enrichConcurrent(io: std.Io, backing: Allocator, bb: bbr.bitbucket.Client, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
-    var remote: RemoteBlobSource = .{ .client = bb, .repo = req.repo };
+    var remote: RemoteBlobSource = .{ .client = bb, .repo = req.repo, .retry_io = io };
     return enrichFromConcurrent(io, backing, remote.source(), highlighter, req);
 }
 
-fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
+pub fn enrichFromConcurrent(io: std.Io, backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
     if (req.status == .added or req.status == .removed)
         return enrichFrom(backing, source, highlighter, req);
 
@@ -193,6 +236,7 @@ fn enrichExpectedSide(backing: Allocator, source: BlobSource, highlighter: bbr.h
 fn enrichSide(backing: Allocator, source: BlobSource, highlighter: bbr.highlight.Highlighter, max_file_bytes: usize, commit: []const u8, path: []const u8) error{OutOfMemory}!SideResult {
     const side = try backing.create(OwnedSide);
     errdefer backing.destroy(side);
+    side.references = .init(1);
     side.arena = std.heap.ArenaAllocator.init(backing);
     errdefer side.arena.deinit();
     const allocator = side.arena.allocator();
@@ -262,6 +306,7 @@ const StoredFile = struct {
     old: StoredSide = .pending,
     new: StoredSide = .pending,
     last_used: u64 = 0,
+    leases: usize = 0,
 
     fn deinit(self: *StoredFile) void {
         self.old.deinit();
@@ -395,6 +440,20 @@ pub const Storage = struct {
         return self.stageCacheEnforcement();
     }
 
+    pub fn rollbackFocus(self: *Storage, previous: ?usize) void {
+        self.rollbackCacheUpdate();
+        self.focused_file = previous;
+    }
+
+    /// The destination Frame already uses this File. Releasing search holds
+    /// enforces the inactive cache budget after focus moves.
+    pub fn focusAdmitted(self: *Storage, file_idx: usize) void {
+        std.debug.assert(self.retired.items.len == 0);
+        self.recency +|= 1;
+        self.files[file_idx].last_used = self.recency;
+        self.focused_file = file_idx;
+    }
+
     pub fn commitCacheUpdate(self: *Storage) void {
         for (self.retired.items) |*retired| retired.file.deinit();
         self.retired.clearRetainingCapacity();
@@ -414,8 +473,37 @@ pub const Storage = struct {
         return .{ .old = self.files[file_idx].old.view(), .new = self.files[file_idx].new.view() };
     }
 
+    pub fn lease(self: *Storage, file_idx: usize) ReadLease {
+        std.debug.assert(file_idx < self.files.len);
+        const stored = &self.files[file_idx];
+        const old = if (stored.old == .content) stored.old.content else null;
+        const new = if (stored.new == .content) stored.new.content else null;
+        if (old) |side| _ = side.references.fetchAdd(1, .acq_rel);
+        if (new) |side| _ = side.references.fetchAdd(1, .acq_rel);
+        stored.leases += 1;
+        return .{ .view = self.file(file_idx), .old = old, .new = new };
+    }
+
+    pub fn hold(self: *Storage, file_idx: usize) void {
+        std.debug.assert(file_idx < self.files.len);
+        self.files[file_idx].leases += 1;
+    }
+
+    /// Call on the Presentation thread before releasing the final borrowed content.
+    pub fn finishLease(self: *Storage, file_idx: usize) bool {
+        std.debug.assert(self.files[file_idx].leases > 0);
+        self.files[file_idx].leases -= 1;
+        return self.stageCacheEnforcement();
+    }
+
     pub fn len(self: *const Storage) usize {
         return self.files.len;
+    }
+
+    pub fn retainedBytes(self: *const Storage) usize {
+        var total: usize = 0;
+        for (self.files) |*stored_file| total +|= stored_file.retainedBytes();
+        return total;
     }
 
     pub fn status(self: *const Storage, file_idx: usize) bbr.highlight.FileHighlightStatus {
@@ -521,6 +609,7 @@ pub const Storage = struct {
                 .old = retainedTerminalSide(self.files[victim].old),
                 .new = retainedTerminalSide(self.files[victim].new),
                 .last_used = self.files[victim].last_used,
+                .leases = self.files[victim].leases,
             };
             self.projectSide(victim, .old);
             self.projectSide(victim, .new);
@@ -533,6 +622,7 @@ pub const Storage = struct {
         var total: usize = 0;
         for (self.files, 0..) |*stored_file, file_idx| {
             if (self.focused_file != null and self.focused_file.? == file_idx) continue;
+            if (stored_file.leases > 0) continue;
             total +|= stored_file.retainedBytes();
         }
         return total;
@@ -542,6 +632,7 @@ pub const Storage = struct {
         var victim: ?usize = null;
         for (self.files, 0..) |*stored_file, file_idx| {
             if (self.focused_file != null and self.focused_file.? == file_idx) continue;
+            if (stored_file.leases > 0) continue;
             if (stored_file.retainedBytes() == 0) continue;
             if (victim == null or stored_file.last_used < self.files[victim.?].last_used) victim = file_idx;
         }
@@ -611,6 +702,98 @@ fn retainedTerminalSide(side: StoredSide) StoredSide {
 
 const testing = std.testing;
 
+test "remote File Enrichment bounds rate-limit retry delays" {
+    try testing.expectEqual(@as(i64, 1000), rateLimitRetryMs(null));
+    try testing.expectEqual(@as(i64, 1), rateLimitRetryMs(1));
+    try testing.expectEqual(@as(i64, 5000), rateLimitRetryMs(5000));
+    try testing.expectEqual(@as(i64, 5000), rateLimitRetryMs(5001));
+    try testing.expectEqual(@as(i64, 5000), rateLimitRetryMs(std.math.maxInt(u64)));
+}
+
+test "File read lease pins both versions across budget enforcement and Session storage destruction" {
+    var files = [_]bbr.diff.File{
+        .{ .old_path = "/dev/null", .new_path = "a.zig", .status = .added, .hunks = &.{} },
+        .{ .old_path = "/dev/null", .new_path = "b.zig", .status = .added, .hunks = &.{} },
+    };
+    var storage = try Storage.init(testing.allocator, &files);
+    var first = try ownedAddedResult(testing.allocator, "first");
+    defer first.deinit();
+    try storage.admit(0, &first);
+    var lease = storage.lease(0);
+    storage.configureCache(.{ .max_retained_bytes = 1 });
+    try testing.expectEqualStrings("first", storage.file(0).new.content.blob);
+    var second = try ownedAddedResult(testing.allocator, "second");
+    defer second.deinit();
+    try storage.admit(1, &second);
+    try testing.expectEqualStrings("first", lease.view.new.content.blob);
+    storage.deinit();
+    try testing.expectEqualStrings("first", lease.view.new.content.blob);
+    lease.release();
+}
+
+test "File read lease release restores inactive cache budget while focused File stays protected" {
+    const files = test_files;
+    var storage = try Storage.init(testing.allocator, &files);
+    defer storage.deinit();
+    storage.focus(1);
+    var first = try ownedAddedResult(testing.allocator, "first");
+    defer first.deinit();
+    try storage.admit(0, &first);
+    var lease = storage.lease(0);
+    var second = try ownedAddedResult(testing.allocator, "second");
+    defer second.deinit();
+    try storage.admit(1, &second);
+    storage.configureCache(.{ .max_retained_bytes = 1 });
+    try testing.expect(storage.file(0).new == .content);
+    try testing.expect(storage.file(1).new == .content);
+    _ = storage.finishLease(0);
+    storage.commitCacheUpdate();
+    try testing.expect(storage.file(0).new == .pending);
+    try testing.expect(storage.file(1).new == .content);
+    try testing.expectEqualStrings("first", lease.view.new.content.blob);
+    lease.release();
+}
+
+test "remote File Enrichment retries transient source failures once in the File slot" {
+    for ([_]u16{ 429, 503, 0 }) |status| {
+        const responses = [_]bbr.http.Canned{
+            .{ .status = status, .retry_after_ms = 1, .body = "try later", .send_error = if (status == 0) error.ConnectionReset else null },
+            .{ .status = 200, .body = "needle\n" },
+        };
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+        const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+        var plain: bbr.highlight.PlainHighlighter = .{};
+        var result = try enrichConcurrent(testing.io, testing.allocator, client, plain.highlighter(), .{
+            .repo = "repo",
+            .status = .added,
+            .source_commit = "source",
+            .destination_commit = "base",
+            .old_path = "/dev/null",
+            .new_path = "a.zig",
+            .max_file_bytes = 0,
+        });
+        defer result.deinit();
+        try testing.expectEqualStrings("needle\n", result.new.owned.blob);
+        try testing.expectEqual(@as(usize, 2), fake.callCount());
+    }
+    const refused = [_]bbr.http.Canned{.{ .status = 401, .body = "unauthorized" }};
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &refused };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    var result = try enrichConcurrent(testing.io, testing.allocator, client, plain.highlighter(), .{
+        .repo = "repo",
+        .status = .added,
+        .source_commit = "source",
+        .destination_commit = "base",
+        .old_path = "/dev/null",
+        .new_path = "a.zig",
+        .max_file_bytes = 0,
+    });
+    defer result.deinit();
+    try testing.expectEqual(error.Unauthorized, result.new.fetch_failed);
+    try testing.expectEqual(@as(usize, 1), fake.callCount());
+}
+
 fn oneTestFile(status: bbr.diff.FileStatus) [1]bbr.diff.File {
     return .{.{ .old_path = "src/main.ts", .new_path = "src/main.ts", .status = status, .hunks = &.{} }};
 }
@@ -624,6 +807,7 @@ const test_files = [_]bbr.diff.File{
 fn ownedAddedResult(backing: Allocator, blob: []const u8) !Result {
     const side = try backing.create(OwnedSide);
     errdefer backing.destroy(side);
+    side.references = .init(1);
     side.arena = std.heap.ArenaAllocator.init(backing);
     errdefer side.arena.deinit();
     side.blob = try side.arena.allocator().dupe(u8, blob);

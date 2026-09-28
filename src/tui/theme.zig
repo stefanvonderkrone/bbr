@@ -83,6 +83,10 @@ pub const Theme = struct {
     picker_selected: Style,
     /// The picker's query/prompt line.
     picker_query: Style,
+    /// Buffer Search overlays replace only the background, so syntax marks remain.
+    search_match: Color,
+    search_active: Color,
+    search_no_match: Color,
     /// Syntax foregrounds. Diff and emphasis continue to own backgrounds.
     syntax_comment: Color,
     syntax_string: Color,
@@ -240,6 +244,9 @@ pub const dark: Theme = .{
     .picker = .{ .bg = rgb(0x20_20_2c), .fg = rgb(0xc8_c8_d8) },
     .picker_selected = .{ .bg = rgb(0x3a_3a_52), .fg = rgb(0xff_ff_ff), .bold = true },
     .picker_query = .{ .bg = rgb(0x28_28_36), .fg = rgb(0xff_ff_ff) },
+    .search_match = rgb(0x5a_4a_18),
+    .search_active = rgb(0x9a_70_18),
+    .search_no_match = rgb(0xd0_6c_6c),
     .syntax_comment = rgb(0x78_78_78),
     .syntax_string = rgb(0x98_c3_79),
     .syntax_keyword = rgb(0xc5_86_c0),
@@ -288,6 +295,9 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
         .picker = .{ .fg = rgb(p.fg), .bg = rgb(p.surface) },
         .picker_selected = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2), .bold = true },
         .picker_query = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2) },
+        .search_match = rgb(if (p.light) 0xff_ef_a8 else 0x5a_4a_18),
+        .search_active = rgb(if (p.light) 0xff_cf_58 else 0x9a_70_18),
+        .search_no_match = rgb(p.red),
         .syntax_comment = rgb(p.muted),
         .syntax_string = rgb(p.green),
         .syntax_keyword = rgb(p.violet),
@@ -336,6 +346,9 @@ pub const system: Theme = .{
     .picker = .{},
     .picker_selected = .{ .reverse = true, .bold = true },
     .picker_query = .{ .reverse = true },
+    .search_match = .{ .index = 12 },
+    .search_active = .{ .index = 11 },
+    .search_no_match = .{ .index = 1 },
     .syntax_comment = .{ .index = 8 },
     .syntax_string = .{ .index = 2 },
     .syntax_keyword = .{ .index = 5 },
@@ -432,6 +445,29 @@ test "every built-in Theme resolves by its exact name and keeps diff bands disti
         try testing.expect(selected.section_rule.dim);
     }
     try testing.expect(byName("catppuccin") == null);
+}
+
+test "search matches stay distinct from ReviewCard and diff backgrounds in every built-in Theme" {
+    for (builtins) |builtin| {
+        const theme = builtin.value;
+        const matches = [_]Color{ theme.search_match, theme.search_active };
+        const diff_backgrounds = [_]Color{
+            theme.context.bg,
+            theme.added.bg,
+            theme.removed.bg,
+            theme.added_emphasis.bg,
+            theme.removed_emphasis.bg,
+        };
+        for (matches) |match| {
+            for (diff_backgrounds) |bg| try testing.expect(!std.meta.eql(match, bg));
+            inline for (std.meta.tags(review_card.CardRole)) |role| {
+                inline for (.{ review_card.Part.body, review_card.Part.suggestion_body }) |part| {
+                    const bg = theme.reviewCardStyle(role, part, .{}).bg;
+                    try testing.expect(!std.meta.eql(match, bg));
+                }
+            }
+        }
+    }
 }
 
 test "every built-in Theme composes every ReviewCard role and Markdown refinement" {

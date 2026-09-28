@@ -203,20 +203,23 @@ M19 verification: the fan-out gate passed with 36% and 38% median reductions, tw
 connections, no failures, and no 429 responses. Required CI remains Credential-free, and release
 validation publishes no artifact. See `docs/m19-operations.md`.
 
-## M20 — Side-aware version inspection  ·  M  ·  needs M15/M17
+## M20 — Side-aware version inspection  ·  M  ·  ✅ done
 Make old-versus-new File version choice explicit after M15 establishes the Presentation contract
 and M17 closes the remaining old-side and side-by-side fidelity gaps.
-- [ ] Resolve `.scratch/side-version-navigation/issues/01-choose-old-new-side-inspection-and-yank.md`: decide how a reviewer switches between old and new versions for isolated viewing and clipboard operations, including Action grammar, visible side indication, Selection/Count behavior, unavailable sides, state lifetime, and keyboard/mouse parity.
+- [x] Resolve `.scratch/side-version-navigation/issues/01-choose-old-new-side-inspection-and-yank.md`: decide how a reviewer switches between old and new versions for isolated viewing and clipboard operations, including Action grammar, visible side indication, Selection/Count behavior, unavailable sides, state lifetime, and keyboard/mouse parity.
+
+M20 verification: PR #3 merged. `zig build test --summary all` passed 759/759 tests. Native
+macOS and Linux jobs passed on `x86_64` and `aarch64`.
 
 ## M21 — Buffer & Review search  ·  M/L  ·  needs M20
-Find source text without leaving the review, first within the current DiffPane Buffer and then
-across the complete contents of every changed File in the current Review.
+Find source and authored body text without leaving the review. Search the current DiffPane Buffer
+first, then search complete changed Files and authored bodies across the current Review.
 - [ ] Add `/` search for the current Buffer. Open an inline query prompt, update matches as the reviewer types, highlight every occurrence, show the active/total match count, and use `n`/`N` to move forward/backward with wraparound. `esc` cancels without moving; accepting an empty query retains the previous query. Match semantic source and authored body text, not gutters, borders, or other generated presentation chrome.
 - [ ] Define and test predictable query semantics: Buffer Search uses literal smart-case matching; Review Search uses fuzzy ranking while preserving exact occurrence locations. Matching operates on Unicode text without allowing invalid/non-text File content to break the search.
-- [ ] Add a Review Search Overlay that searches the full selected version of every changed File, not only loaded blobs or visible diff hunks. Show one selectable result per occurrence with path, line/column, and a contextual snippet; keep a larger preview of the selected occurrence with all query hits highlighted, comparable to a live-grep picker.
+- [ ] Add a Review Search Overlay that searches both complete versions of every changed File and every authored Comment, Reply, and Draft body. Show one selectable result per Search Occurrence with its source or ReviewBody context; keep a larger preview of the selected occurrence with all query hits highlighted, comparable to a live-grep picker.
 - [ ] Stream Review Search results as File content becomes available without blocking input. Scope acquisition and result publication to the Session Epoch, cancel stale work on review replacement, bound concurrent File Enrichment, honor the File cache budget, and expose per-File loading/failure state without discarding usable results.
 - [ ] Selecting an occurrence closes the Overlay, focuses its File and selected side, switches to WholeFile scope when the line is outside a visible hunk, and positions the cursor on the exact occurrence. Returning to the Overlay preserves the query and selection while the Session remains current.
-- [ ] Support remote PullRequests and LocalReviews through their existing File Enrichment seams. Search the chosen old/new side from M20; when a side is unavailable (including binary Files), show that explicitly instead of silently searching a different version.
+- [ ] Support remote PullRequests and LocalReviews through their existing File Enrichment seams. Search both old and new File versions; when a version is absent, binary, invalid UTF-8, or unavailable, show that explicitly without discarding usable results.
 - [ ] Add pure matcher/ranker tests plus Presentation integration coverage for incremental input, match highlighting, `n`/`N`, streamed result ordering, preview selection, navigation into out-of-hunk content, partial failures, and stale-Epoch rejection.
 
 ## M22 — Durable File read state  ·  M  ·  needs M15/M17
@@ -230,9 +233,12 @@ File to inherit an obsolete read decision.
 - [ ] Preserve matching read state across quit/reopen, PullRequest switching, Session replacement, and LocalReview Ref refresh. Keep receipts isolated by full ReviewIdentity so equal paths or PullRequestIds in different Reviews never share progress.
 - [ ] Add fingerprint fixtures and fake/SQLite round-trip tests, plus Presentation coverage for initial bold styling, successful and failed toggles, unchanged reload retention, selective invalidation when only one File changes, rename/removal/binary cases, storage failure fallback, and ReviewIdentity isolation.
 
-## M23 — Comment thread presentation fixes  ·  S  ·  needs M15
+## M23 — Comment thread and Markdown presentation fixes  ·  S  ·  needs M15
 - [ ] Indent each Reply one level deeper than its parent, including when the parent is a Reply. Add Presentation coverage for nested Replies.
-- [ ] Preserve Markdown emoji shortcodes in ReviewBody text. Presentation must render text such as `:white_check_mark:` without removing characters between the colons. Add parser and Presentation coverage.
+- [ ] Improve ReviewBody Markdown projection. Hide formatting characters, render italic text in turquoise, bold text in orange, and inline code in green. Add parser and Presentation coverage.
+- [ ] Convert Bitbucket-supported emoji shortcodes such as `:white_check_mark:` to their corresponding emoji characters. Preserve unknown shortcodes as authored text. Add parser and Presentation coverage.
+- [ ] Investigate Bitbucket's list formatting and match its supported ordered, unordered, and nested list behavior in ReviewBody. Add fixtures for the observed wire and presentation behavior.
+- [ ] Yank the raw authored Markdown from a Comment or Draft. Do not copy the projected ReviewBody text. Add clipboard integration coverage.
 
 ## M24 - Remote-first Repository and PullRequest Browser  ·  L  ·  needs M4/M15
 Make `bbr` without arguments open a remote-first Browser for the configured Workspace. Keep direct
@@ -309,6 +315,38 @@ replacement. It does not implement one before the evidence supports a design.
 - [ ] Test hostile fixtures for filesystem and network access, infinite work, excessive memory, crashes, malformed Spans, and protocol corruption. Do not call an unconfined helper process a sandbox.
 - [ ] Record the decision in an ADR. Specify the bundle and trust migration, target support, fallback behavior, and removal policy for native UserGrammars. If neither option gives useful confinement at acceptable cost, retain M17's explicit native-code warning.
 
+## M28 - Full-Review File cache evaluation  ·  M/L  ·  needs M17/M21
+Decide whether large Reviews need a full-Review File cache in memory or on disk. M17 keeps a
+Session-only, byte-budgeted LRU for inactive File Enrichment. M21 can reacquire evicted content
+while Review Search scans the complete Review. Keep that policy unless measured workflows justify
+the memory, storage, and invalidation cost of a replacement.
+
+- [ ] Select several large real PullRequests with different File counts, total old/new content sizes, change shapes, and text/binary mixes. Record only metadata and measurements. Do not store source content in benchmark output.
+- [ ] Add an opt-in benchmark that measures the existing LRU during sequential review, non-sequential File navigation, first Review Search, query edits, Overlay reopen, Session replacement, and process restart. Record first-result and complete-result latency, refetch count, request count, failures, `429` responses, peak memory, retained memory, and cache hit rate.
+- [ ] Compare the existing LRU with a full-Review in-memory cache. Measure representative and worst observed memory use. Define a hard bound and the behavior when one Review exceeds it.
+- [ ] Compare both memory policies with a disk cache. Define source-code retention, file permissions, cleanup, size limits, ReviewIdentity and commit invalidation, atomic writes, corruption recovery, format migration, and behavior when the cache is unavailable.
+- [ ] Choose the smallest policy that removes measured user delay without unsafe or unbounded retention. The valid decision is a full-Review memory cache, an opt-in disk cache, a revised LRU, or no change.
+- [ ] Record the decision and evidence in an ADR. If the decision changes the cache, implement the policy behind `[files.cache]` and add deterministic eviction, invalidation, corruption, failure, and Session Epoch tests.
+
+## M29 - Comment Overview  ·  M  ·  needs M15/M21
+Add one place to inspect and navigate every authored item in the current Review with its scope
+context. Keep M21 navigation to the existing DiffPane ReviewCard until this milestone ships.
+
+- [ ] Define the Comment Overview projection and interaction before implementation. Add the accepted term to the Presentation glossary.
+- [ ] List every Comment, Reply, and Draft. Include resolved, outdated, unavailable, and collapsed items without changing their saved disclosure state.
+- [ ] Show nearby source Lines for an inline item, File context for a File-level item, and ReviewHeader context for a Review-level item. Do not invent source context for a Review-level item.
+- [ ] Navigate from an overview item to its ReviewCard in the DiffPane. Preserve the overview query, selection, and scroll position when the reviewer returns.
+- [ ] After the overview ships, route a Review Search result for a Review-level item through the overview when that route gives clearer context than the all-Files Buffer.
+- [ ] Add Presentation coverage for each CommentScope, nested Replies, Drafts, disclosures, stale Session work, navigation, and return-state restoration.
+
+## M30 - Viewer scrollbars  ·  S/M  ·  needs M15
+Show the visible range in both viewer Panes. Use a thin thumb without a full-height track,
+as in Review Search.
+
+- [ ] Add a scrollbar to the Sidebar File Tree. Size and place the thumb from the visible rows, total rows, and scroll offset. Hide it when every row fits.
+- [ ] Add a scrollbar to the DiffPane. Track its visual rows across layouts, wrapped lines, Folds, and isolated Files. Hide it when every row fits.
+- [ ] Add headless Presentation tests for thumb size and position at the top, middle, and bottom, plus resize and content changes.
+
 ### Closed historical deferrals
 
 The following notes remain in M0–M14 as implementation history but require no post-M14 work:
@@ -339,11 +377,14 @@ M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M10    (authoring → submission)
               ├─ M15 ─ M23       (comment thread presentation fixes)
               ├─ M4 ─ M15 ─ M24 ─ M25 (remote-first Browser and navigation)
               ├─ M19 ─ M26       (Credential login and logout)
-              └─ M13 ─ M17 ─ M27 (UserGrammar sandbox research)
+              ├─ M13 ─ M17 ─ M27 (UserGrammar sandbox research)
+              ├─ M17 ─ M21 ─ M28 (full-Review File cache evaluation)
+              ├─ M15 ─ M21 ─ M29 (Comment Overview)
+              └─ M15 ─ M30       (viewer scrollbars)
 ```
 
 **MVP line:** M0–M3 gives a usable read-only reviewer; M4 makes it ergonomic; M6+M10 make it
 write-capable (the headline). M5/M7/M8/M9/M11/M12/M13 are parallelizable polish once M2 lands; M14 is the
-largest standalone feature and depends only on read + authoring, not submission. M15–M27 gather
+largest standalone feature and depends only on read + authoring, not submission. M15–M30 gather
 all still-actionable follow-ups recorded by the completed milestones, design open questions,
 ADRs, domain docs, and the local issue tracker.

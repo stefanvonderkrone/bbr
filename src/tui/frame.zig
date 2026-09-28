@@ -4,6 +4,7 @@ const std = @import("std");
 const bbr = @import("bbr");
 const Nav = @import("nav.zig").Nav;
 const buffer_mod = @import("buffer.zig");
+const search = @import("search.zig");
 pub const file_tree = @import("file_tree.zig");
 pub const CellMetrics = @import("cell_metrics.zig").CellMetrics;
 
@@ -77,13 +78,52 @@ pub fn versionTitleTargets(diff: Rect, selected: SelectedVersion) VersionTitleTa
     };
 }
 
-pub const OverlayKind = enum { picker, other };
+pub const OverlayKind = enum { picker, review_search, other };
+
+pub const ReviewSearchGeometry = struct {
+    rect: Rect,
+    body: Rect,
+    list: Rect,
+    preview: Rect,
+    header: Rect,
+    divider: u16,
+    landscape: bool,
+};
+
+pub fn reviewSearchGeometry(geometry: Geometry) ?ReviewSearchGeometry {
+    const rect = overlayRect(geometry, @min(geometry.cols, @max(64, @as(u16, @intCast(@as(u32, geometry.cols) * 4 / 5)))), @min(geometry.rows, @max(14, @as(u16, @intCast(@as(u32, geometry.rows) * 4 / 5))))) orelse return null;
+    const body = Rect{ .x = rect.x, .y = rect.y +| @min(rect.height, 3), .width = rect.width, .height = rect.height -| 3 };
+    const landscape = geometry.cols >= geometry.rows;
+    if (landscape) {
+        const divider = @min(body.width -| 1, @as(u16, @intCast(@as(u32, body.width) * 3 / 10)));
+        return .{
+            .rect = rect,
+            .body = body,
+            .list = .{ .x = body.x +| 1, .y = body.y +| @min(body.height, 1), .width = divider -| 1, .height = body.height -| 2 },
+            .header = .{ .x = body.x +| divider +| 1, .y = body.y +| @min(body.height, 1), .width = body.width -| divider -| 2, .height = @min(body.height -| 2, 1) },
+            .preview = .{ .x = body.x +| divider +| 1, .y = body.y +| @min(body.height, 3), .width = body.width -| divider -| 2, .height = body.height -| 4 },
+            .divider = body.x +| divider,
+            .landscape = true,
+        };
+    }
+    const divider = @min(body.height -| 1, @max(3, @as(u16, @intCast(@as(u32, body.height) * 3 / 10))));
+    return .{
+        .rect = rect,
+        .body = body,
+        .list = .{ .x = body.x +| 1, .y = body.y +| @min(body.height, 1), .width = body.width -| 2, .height = divider -| 1 },
+        .header = .{ .x = body.x +| 1, .y = body.y +| @min(body.height, divider +| 1), .width = body.width -| 2, .height = @min(body.height -| divider -| 2, 1) },
+        .preview = .{ .x = body.x +| 1, .y = body.y +| @min(body.height, divider +| 3), .width = body.width -| 2, .height = body.height -| divider -| 4 },
+        .divider = body.y +| divider,
+        .landscape = false,
+    };
+}
 
 pub const OverlayTarget = struct {
     kind: OverlayKind,
     rect: Rect,
     row_count: usize = 0,
     scroll: usize = 0,
+    review_search: ?ReviewSearchGeometry = null,
 };
 
 pub const HitTarget = union(enum) {
@@ -94,6 +134,9 @@ pub const HitTarget = union(enum) {
     sidebar_entry: usize,
     diff_row: usize,
     picker_entry: usize,
+    review_search_entry: usize,
+    review_search_list,
+    review_search_preview,
 };
 
 pub const RowOwner = union(enum) {
@@ -156,7 +199,22 @@ pub const Halves = struct {
 pub const VisualRowOptions = struct {
     layout: buffer_mod.Layout,
     width: usize,
-    wrap: bool,
+};
+
+pub const SourceMatch = struct {
+    old_line: ?*const bbr.diff.Line = null,
+    new_line: ?*const bbr.diff.Line = null,
+    relation: search.VersionRelation,
+    ranges: []const search.Range,
+    active: bool = false,
+};
+
+pub const ProjectedSourceRange = struct {
+    visual_row: usize,
+    relation: search.VersionRelation,
+    source: search.Range,
+    row: search.Range,
+    active: bool,
 };
 
 pub const Projection = struct {
@@ -172,12 +230,23 @@ pub const Projection = struct {
     focus: PaneFocus = .diff,
     selected_version: SelectedVersion = .new,
     version_title_targets: VersionTitleTargets = .{},
+    search_ranges: []const ProjectedSourceRange = &.{},
 };
 
 /// Resolve a cell solely against the immutable, already-published Frame. An
 /// Overlay captures the complete input surface, even outside its rectangle.
 pub fn hitTest(frame: Projection, col: u16, row: u16) ?HitTarget {
     if (frame.overlay) |overlay| {
+        if (overlay.kind == .review_search) {
+            const geometry = overlay.review_search orelse return null;
+            if (geometry.list.contains(col, row)) {
+                const index = overlay.scroll + row - geometry.list.y;
+                if (index < overlay.row_count) return .{ .review_search_entry = index };
+                return .review_search_list;
+            }
+            if (geometry.preview.contains(col, row)) return .review_search_preview;
+            return null;
+        }
         if (overlay.kind != .picker or !overlay.rect.contains(col, row)) return null;
         const relative_row = row - overlay.rect.y;
         if (relative_row == 0) return null; // query/title row
@@ -246,8 +315,7 @@ pub fn buildVisualRowsWithOptions(
     metrics: CellMetrics,
     options: VisualRowOptions,
 ) ![]const VisualRow {
-    if (!options.wrap or
-        (options.layout == .unified and options.width <= unified_gutter_cols) or
+    if ((options.layout == .unified and options.width <= unified_gutter_cols) or
         (options.layout == .side_by_side and sideBodyWidths(options.width) == null))
     {
         return buildUnwrappedVisualRows(allocator, rows);
@@ -281,6 +349,71 @@ pub fn buildVisualRowsWithOptions(
         else => try visual_rows.append(allocator, makeVisualRow(row, buffer_index)),
     };
     return visual_rows.toOwnedSlice(allocator);
+}
+
+pub fn projectSourceRanges(
+    allocator: std.mem.Allocator,
+    visual_rows: []const VisualRow,
+    matches: []const SourceMatch,
+) ![]ProjectedSourceRange {
+    var projected: std.ArrayList(ProjectedSourceRange) = .empty;
+    errdefer projected.deinit(allocator);
+    for (visual_rows, 0..) |visual_row, visual_index| {
+        if (visual_row.halves) |halves| {
+            if (halves.left) |half| try projectHalf(allocator, &projected, matches, visual_index, .old, half);
+            if (halves.right) |half| try projectHalf(allocator, &projected, matches, visual_index, .new, half);
+            continue;
+        }
+        for (matches) |match| {
+            const old_matches = match.old_line != null and visual_row.yank_candidates.old == match.old_line;
+            const new_matches = match.new_line != null and visual_row.yank_candidates.new == match.new_line;
+            const applicable = switch (match.relation) {
+                .neutral => old_matches or new_matches,
+                .old => old_matches,
+                .new => new_matches,
+            };
+            if (applicable) try appendRangeIntersections(allocator, &projected, match, visual_index, match.relation, visual_row.source_start, visual_row.source_end);
+        }
+    }
+    return projected.toOwnedSlice(allocator);
+}
+
+fn projectHalf(
+    allocator: std.mem.Allocator,
+    projected: *std.ArrayList(ProjectedSourceRange),
+    matches: []const SourceMatch,
+    visual_index: usize,
+    relation: search.VersionRelation,
+    half: VisualHalf,
+) !void {
+    for (matches) |match| {
+        const line = if (relation == .old) match.old_line else match.new_line;
+        if (line != half.line or (match.relation != .neutral and match.relation != relation)) continue;
+        try appendRangeIntersections(allocator, projected, match, visual_index, relation, half.source_start, half.source_end);
+    }
+}
+
+fn appendRangeIntersections(
+    allocator: std.mem.Allocator,
+    projected: *std.ArrayList(ProjectedSourceRange),
+    match: SourceMatch,
+    visual_index: usize,
+    relation: search.VersionRelation,
+    row_start: usize,
+    row_end: usize,
+) !void {
+    for (match.ranges) |range| {
+        const start = @max(range.start, row_start);
+        const end = @min(range.end, row_end);
+        if (start >= end) continue;
+        try projected.append(allocator, .{
+            .visual_row = visual_index,
+            .relation = relation,
+            .source = .{ .start = start, .end = end },
+            .row = .{ .start = start - row_start, .end = end - row_start },
+            .active = match.active,
+        });
+    }
 }
 
 const SideBodyWidths = struct { left: usize, right: usize };
@@ -569,7 +702,7 @@ fn sourceOffset(source: []const u8, part: []const u8) usize {
 
 const testing = std.testing;
 
-test "unwrapped visual rows skip CellMetrics" {
+test "zero-width non-source visual rows skip CellMetrics" {
     const Metrics = struct {
         calls: usize = 0,
 
@@ -584,7 +717,7 @@ test "unwrapped visual rows skip CellMetrics" {
     const metrics: CellMetrics = .{ .ptr = &metrics_context, .vtable = &vtable };
     const rows = [_]buffer_mod.Row{.{ .section = .{ .kind = .outdated, .count = 1, .path = "w\x7fde" } }};
 
-    const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, metrics, .{ .layout = .unified, .width = 0, .wrap = false });
+    const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, metrics, .{ .layout = .unified, .width = 0 });
     defer testing.allocator.free(visual_rows);
 
     try testing.expectEqual(@as(usize, 0), metrics_context.calls);
@@ -606,7 +739,7 @@ test "Presentation Frame projects Diff Lines as complete visual rows" {
         .{ .section = .{ .kind = .pending, .count = 1 } },
     };
 
-    const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, .bytes, .{ .layout = .unified, .width = 0, .wrap = false });
+    const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, .bytes, .{ .layout = .unified, .width = 0 });
     defer testing.allocator.free(visual_rows);
 
     try testing.expectEqual(rows.len, visual_rows.len);
@@ -629,7 +762,7 @@ test "semantic row ownership exposes old and new yank candidates without changin
         .{ .line = .{ .line = &context, .decoration = .{ .runs = &.{} } } },
     };
 
-    const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, .bytes, .{ .layout = .side_by_side, .width = 40, .wrap = false });
+    const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, .bytes, .{ .layout = .side_by_side, .width = 80 });
     defer testing.allocator.free(visual_rows);
 
     try testing.expect(visual_rows[0].owner.eql(.{ .line = &new_line }));
@@ -648,7 +781,7 @@ test "Diff visual-row allocation fails before a partial projection escapes" {
     } }};
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
 
-    try testing.expectError(error.OutOfMemory, buildVisualRowsWithOptions(failing.allocator(), &rows, .bytes, .{ .layout = .unified, .width = 0, .wrap = false }));
+    try testing.expectError(error.OutOfMemory, buildVisualRowsWithOptions(failing.allocator(), &rows, .bytes, .{ .layout = .unified, .width = 0 }));
     try testing.expect(failing.has_induced_failure);
 }
 
@@ -666,7 +799,6 @@ test "Unified visual rows prefer whitespace" {
     const visual_rows = try buildVisualRowsWithOptions(arena.allocator(), &rows, .bytes, .{
         .layout = .unified,
         .width = 16,
-        .wrap = true,
     });
     try testing.expectEqual(@as(usize, 2), visual_rows.len);
     try testing.expectEqual(@as(usize, 0), visual_rows[0].source_start);
@@ -698,7 +830,6 @@ test "Unified hard wrapping keeps wide and combining graphemes complete" {
     const visual_rows = try buildVisualRowsWithOptions(arena.allocator(), &rows, metrics, .{
         .layout = .unified,
         .width = 12,
-        .wrap = true,
     });
     try testing.expectEqual(@as(usize, 2), visual_rows.len);
     try testing.expectEqual(@as(usize, 3), visual_rows[0].source_end);
@@ -720,7 +851,6 @@ test "Unified wrapping keeps non-Line rows atomic when the body has no cells" {
     const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, .bytes, .{
         .layout = .unified,
         .width = unified_gutter_cols,
-        .wrap = true,
     });
     defer testing.allocator.free(visual_rows);
 
@@ -741,7 +871,6 @@ test "SideBySide halves wrap independently and align absent continuations" {
     const visual_rows = try buildVisualRowsWithOptions(arena.allocator(), &rows, .bytes, .{
         .layout = .side_by_side,
         .width = 27,
-        .wrap = true,
     });
 
     try testing.expectEqual(@as(usize, 2), visual_rows.len);
@@ -765,7 +894,6 @@ test "SideBySide wrapping keeps pairs atomic when halves have no body cells" {
     const visual_rows = try buildVisualRowsWithOptions(testing.allocator, &rows, .bytes, .{
         .layout = .side_by_side,
         .width = 11,
-        .wrap = true,
     });
     defer testing.allocator.free(visual_rows);
 
@@ -782,8 +910,8 @@ test "SideBySide resize restores an old-only continuation by source offset" {
         .left = .{ .line = &left, .decoration = .{ .runs = &.{.{ .text = left.text }} } },
         .right = .{ .line = &right, .decoration = .{ .runs = &.{.{ .text = right.text }} } },
     } }};
-    const old_rows = try buildVisualRowsWithOptions(arena.allocator(), &rows, .bytes, .{ .layout = .side_by_side, .width = 27, .wrap = true });
-    const new_rows = try buildVisualRowsWithOptions(arena.allocator(), &rows, .bytes, .{ .layout = .side_by_side, .width = 35, .wrap = true });
+    const old_rows = try buildVisualRowsWithOptions(arena.allocator(), &rows, .bytes, .{ .layout = .side_by_side, .width = 27 });
+    const new_rows = try buildVisualRowsWithOptions(arena.allocator(), &rows, .bytes, .{ .layout = .side_by_side, .width = 35 });
     var navigation = Nav.init(old_rows.len, 2);
     navigation.cursor = 1;
     const previous: Projection = .{
@@ -797,6 +925,72 @@ test "SideBySide resize restores an old-only continuation by source offset" {
     };
 
     try testing.expectEqual(@as(usize, 0), restoreNavigation(previous, new_rows, .{ .cols = 35, .rows = 5 }).cursor);
+}
+
+test "M21 kernel source ranges project across every wrapped visual row without changing wrapping" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "abcdefgh" };
+    const rows = [_]buffer_mod.Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &.{.{ .text = line.text }} } } }};
+    const visual_rows = try buildVisualRowsWithOptions(allocator, &rows, .bytes, .{ .layout = .unified, .width = unified_gutter_cols + 4 });
+    const projected = try projectSourceRanges(allocator, visual_rows, &.{.{
+        .old_line = &line,
+        .new_line = &line,
+        .relation = .neutral,
+        .ranges = &.{.{ .start = 2, .end = 6 }},
+        .active = true,
+    }});
+
+    try testing.expectEqual(@as(usize, 2), visual_rows.len);
+    try testing.expectEqual(@as(usize, 2), projected.len);
+    try testing.expectEqual(search.Range{ .start = 2, .end = 4 }, projected[0].source);
+    try testing.expectEqual(search.Range{ .start = 2, .end = 4 }, projected[0].row);
+    try testing.expectEqual(search.Range{ .start = 4, .end = 6 }, projected[1].source);
+    try testing.expectEqual(search.Range{ .start = 0, .end = 2 }, projected[1].row);
+    try testing.expect(projected[0].active and projected[1].active);
+}
+
+test "M21 kernel neutral source ranges project onto distinct SideBySide context Lines" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const old: bbr.diff.Line = .{ .old_no = 3, .new_no = 3, .kind = .context, .text = "same" };
+    const new: bbr.diff.Line = .{ .old_no = 3, .new_no = 3, .kind = .context, .text = "same" };
+    const rows = [_]buffer_mod.Row{.{ .line_pair = .{
+        .left = .{ .line = &old, .decoration = .{ .runs = &.{.{ .text = old.text }} } },
+        .right = .{ .line = &new, .decoration = .{ .runs = &.{.{ .text = new.text }} } },
+    } }};
+    const visual_rows = try buildVisualRowsWithOptions(allocator, &rows, .bytes, .{ .layout = .side_by_side, .width = 40 });
+    const projected = try projectSourceRanges(allocator, visual_rows, &.{.{
+        .old_line = &old,
+        .new_line = &new,
+        .relation = .neutral,
+        .ranges = &.{.{ .start = 1, .end = 3 }},
+    }});
+
+    try testing.expectEqual(@as(usize, 2), projected.len);
+    try testing.expectEqual(search.VersionRelation.old, projected[0].relation);
+    try testing.expectEqual(search.VersionRelation.new, projected[1].relation);
+}
+
+test "source ranges do not match absent Line candidates" {
+    const matched: bbr.diff.Line = .{ .old_no = 1, .new_no = 0, .kind = .removed, .text = "first" };
+    const other: bbr.diff.Line = .{ .old_no = 2, .new_no = 0, .kind = .removed, .text = "other" };
+    const visual_rows = [_]VisualRow{
+        .{ .owner = .{ .line = &matched }, .source_end = 5, .yank_candidates = .{ .old = &matched } },
+        .{ .owner = .{ .line = &other }, .source_end = 5, .yank_candidates = .{ .old = &other } },
+        .{ .kind = .comment, .owner = .{ .comment = .{ .id = 1, .source_offset = 0 } }, .source_end = 5 },
+    };
+    const projected = try projectSourceRanges(testing.allocator, &visual_rows, &.{.{
+        .old_line = &matched,
+        .relation = .neutral,
+        .ranges = &.{.{ .start = 1, .end = 3 }},
+    }});
+    defer testing.allocator.free(projected);
+
+    try testing.expectEqual(@as(usize, 1), projected.len);
+    try testing.expectEqual(@as(usize, 0), projected[0].visual_row);
 }
 
 test "framed Pane geometry is bounded at zero narrow ordinary and wide sizes" {
@@ -815,6 +1009,41 @@ test "Overlay geometry is centered and clipped to the published Frame" {
     try testing.expectEqual(Rect{ .x = 10, .y = 4, .width = 60, .height = 16 }, overlayRect(.{ .cols = 80, .rows = 24 }, 60, 16).?);
     try testing.expectEqual(Rect{ .x = 0, .y = 0, .width = 20, .height = 8 }, overlayRect(.{ .cols = 20, .rows = 8 }, 60, 16).?);
     try testing.expect(overlayRect(.{ .cols = 0, .rows = 8 }, 60, 16) == null);
+}
+
+test "Review Search geometry keeps bordered content and pointer targets aligned" {
+    const wide = reviewSearchGeometry(.{ .cols = 100, .rows = 40 }).?;
+    try testing.expectEqual(Rect{ .x = 10, .y = 4, .width = 80, .height = 32 }, wide.rect);
+    try testing.expect(wide.landscape);
+    try testing.expectEqual(wide.body.x + wide.body.width - 1, wide.preview.x + wide.preview.width);
+    try testing.expectEqual(wide.divider + 1, wide.preview.x);
+    try testing.expectEqual(wide.body.y + 3, wide.preview.y);
+
+    const portrait = reviewSearchGeometry(.{ .cols = 40, .rows = 100 }).?;
+    try testing.expectEqual(Rect{ .x = 0, .y = 10, .width = 40, .height = 80 }, portrait.rect);
+    try testing.expect(!portrait.landscape);
+    try testing.expectEqual(portrait.divider + 3, portrait.preview.y);
+    try testing.expectEqual(portrait.divider - 1, portrait.list.y + portrait.list.height - 1);
+
+    const small = reviewSearchGeometry(.{ .cols = 40, .rows = 10 }).?;
+    try testing.expectEqual(Rect{ .x = 0, .y = 0, .width = 40, .height = 10 }, small.rect);
+    try testing.expectEqual(Rect{ .x = 8, .y = 2, .width = 64, .height = 19 }, reviewSearchGeometry(.{ .cols = 80, .rows = 24 }).?.rect);
+    try testing.expect(reviewSearchGeometry(.{ .cols = 0, .rows = 10 }) == null);
+
+    const frame: Projection = .{
+        .revision = 1,
+        .visual_rows_revision = 1,
+        .geometry = .{ .cols = 100, .rows = 40 },
+        .panes = paneRects(.{ .cols = 100, .rows = 40 }),
+        .visual_rows = &.{},
+        .buffer = .{ .rows = &.{}, .layout = .unified },
+        .navigation = Nav.init(0, 40),
+        .overlay = .{ .kind = .review_search, .rect = wide.rect, .review_search = wide, .row_count = 2 },
+    };
+    try testing.expectEqual(HitTarget{ .review_search_entry = 0 }, hitTest(frame, wide.list.x, wide.list.y).?);
+    try testing.expectEqual(HitTarget.review_search_preview, hitTest(frame, wide.preview.x, wide.preview.y).?);
+    try testing.expect(hitTest(frame, wide.divider, wide.list.y) == null);
+    try testing.expect(hitTest(frame, wide.rect.x + 1, wide.rect.y + 1) == null);
 }
 
 test "published Frame hit testing gives Overlay rows precedence and clips blank rows" {
