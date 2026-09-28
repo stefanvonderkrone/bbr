@@ -5565,6 +5565,13 @@ pub const Presentation = struct {
         if (!self.consumeCommand(completed.command_id, .scan_review_source)) return;
         const published = self.published orelse return;
         if (published.epoch != completed.session_epoch or completed.file_index >= published.session.enrichment.len()) return;
+        if (self.shutdown_requested) {
+            if (published.session.enrichment.finishLease(completed.file_index))
+                published.session.enrichment.rollbackCacheUpdate();
+            published.session.enrichment.commitCacheUpdate();
+            published.review_search.source_scan_active = false;
+            return;
+        }
         self.finishSearchLease(published, completed.file_index);
         const state = &published.review_search;
         state.source_scan_active = false;
@@ -10296,6 +10303,56 @@ test "M21 authored shutdown rejects queued and late Review Search scans" {
     command.deinit();
     try testing.expect(presentation.projection().review_search == null);
     try testing.expect(presentation.published.?.review_search.batch == null);
+}
+
+test "M21 authored shutdown releases a late source lease without replacing the Frame" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .inactive_file_cache_max_bytes = 1,
+    }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new b" } });
+    try completeBufferSearchScan(&presentation);
+    for (0..2) |index| {
+        var command = presentation.takeCommand().?;
+        const responses = if (index == 0) [_]bbr.http.Canned{
+            .{ .status = 200, .body = "old a\n" }, .{ .status = 200, .body = "new a\n" },
+        } else [_]bbr.http.Canned{
+            .{ .status = 200, .body = "old b\n" }, .{ .status = 200, .body = "new b\n" },
+        };
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+        var plain: bbr.highlight.PlainHighlighter = .{};
+        const enrichment = try file_enrichment.enrich(testing.allocator, bb, plain.highlighter(), command.enrich_file.request());
+        const work_id = command.enrich_file.work_id;
+        const command_id = command.enrich_file.command_id;
+        command.deinit();
+        try presentation.dispatch(.{ .file_enrichment_completed = .{
+            .command_id = command_id,
+            .work_id = work_id,
+            .session_epoch = 1,
+            .file_index = index,
+            .outcome = .{ .completed = enrichment },
+        } });
+    }
+    var command = presentation.takeCommand().?;
+    const first = executeReviewSourceScan(testing.allocator, &command.scan_review_source);
+    command.deinit();
+    try presentation.dispatch(.{ .review_source_scanned = first });
+    command = presentation.takeCommand().?;
+    try testing.expectEqual(@as(usize, 1), command.scan_review_source.file_index);
+    try presentation.dispatch(.request_shutdown);
+    const before = presentation.projection().revision.frame;
+    const late = executeReviewSourceScan(testing.allocator, &command.scan_review_source);
+    command.deinit();
+    try presentation.dispatch(.{ .review_source_scanned = late });
+    try testing.expectEqual(before, presentation.projection().revision.frame);
+    try testing.expect(presentation.published.?.session.enrichment.file(1).new == .content);
 }
 
 test "M21 kernel shutdown rejects a late Buffer Search scan" {
