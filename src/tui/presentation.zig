@@ -1643,6 +1643,7 @@ const Published = struct {
         input_active: ?usize = null,
         review_ranges: ?[]frame_mod.ProjectedSourceRange = null,
         search_corpus: ?*BufferSearchCorpus = null,
+        reuse_search_batch: bool = false,
         active: bool = true,
 
         fn deinit(self: *StagedBuffer) void {
@@ -1674,21 +1675,25 @@ const Published = struct {
             }
             self.published.navigation = frame_mod.restoreNavigation(previous, self.visual_rows, self.geometry);
             if (self.published.buffer_search.accepted_query != null) {
-                if (self.published.buffer_search.accepted_batch) |*batch| batch.deinit(self.published.allocator);
+                if (!self.reuse_search_batch) {
+                    if (self.published.buffer_search.accepted_batch) |*batch| batch.deinit(self.published.allocator);
+                    self.published.buffer_search.accepted_batch = self.accepted_batch;
+                    self.accepted_batch = null;
+                }
                 if (self.published.buffer_search.accepted_ranges) |ranges| self.published.allocator.free(ranges);
-                self.published.buffer_search.accepted_batch = self.accepted_batch;
                 self.published.buffer_search.accepted_ranges = self.accepted_ranges;
                 self.published.buffer_search.active = self.accepted_active;
-                self.accepted_batch = null;
                 self.accepted_ranges = null;
             }
             if (self.published.buffer_search.input) |*input| if (input.query != null) {
-                if (input.batch) |*batch| batch.deinit(self.published.allocator);
+                if (!self.reuse_search_batch) {
+                    if (input.batch) |*batch| batch.deinit(self.published.allocator);
+                    input.batch = self.input_batch;
+                    self.input_batch = null;
+                }
                 if (input.ranges) |ranges| self.published.allocator.free(ranges);
-                input.batch = self.input_batch;
                 input.ranges = self.input_ranges;
                 input.active = self.input_active;
-                self.input_batch = null;
                 self.input_ranges = null;
             };
             if (self.published.review_search.ranges) |ranges| self.published.allocator.free(ranges);
@@ -2206,7 +2211,8 @@ const Published = struct {
     }
 
     fn prepareDisclosureBuffer(self: *Published, preferences: Preferences, disclosures: []const buffer_mod.DisclosureKey) BufferTransactionError!StagedBuffer {
-        // Semantic candidates include hidden text; a disclosure changes only visual rows.
+        // Semantic candidates include hidden text. A disclosure changes visual rows,
+        // so keep the existing Batches and only project their ranges again.
         return self.prepareBufferForFile(preferences, disclosures, self.isolated_file, self.geometry, null, true);
     }
 
@@ -2273,16 +2279,23 @@ const Published = struct {
             if (accepted_ranges) |ranges| self.allocator.free(ranges);
         }
         if (self.buffer_search.accepted_query) |query| {
-            var batch = self.scanBufferSearchFor(preferences, expanded_disclosures, isolated_file, geometry, query) catch |err| return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.SearchFailed,
-            };
-            accepted_active = retainedSearchIndex(self.buffer_search.accepted_batch, self.buffer_search.active, batch);
-            accepted_ranges = projectBufferSearchRangesFor(self.allocator, candidate, visual_rows, batch, accepted_active) catch |err| {
-                batch.deinit(self.allocator);
-                return err;
-            };
-            accepted_batch = batch;
+            if (reuse_search_corpus) {
+                if (self.buffer_search.accepted_batch) |batch| {
+                    accepted_active = self.buffer_search.active;
+                    accepted_ranges = try projectBufferSearchRangesFor(self.allocator, candidate, visual_rows, batch, accepted_active);
+                }
+            } else {
+                var batch = self.scanBufferSearchFor(preferences, expanded_disclosures, isolated_file, geometry, query) catch |err| return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.SearchFailed,
+                };
+                accepted_active = retainedSearchIndex(self.buffer_search.accepted_batch, self.buffer_search.active, batch);
+                accepted_ranges = projectBufferSearchRangesFor(self.allocator, candidate, visual_rows, batch, accepted_active) catch |err| {
+                    batch.deinit(self.allocator);
+                    return err;
+                };
+                accepted_batch = batch;
+            }
         }
 
         var input_batch: ?search.Batch = null;
@@ -2293,16 +2306,23 @@ const Published = struct {
             if (input_ranges) |ranges| self.allocator.free(ranges);
         }
         if (self.buffer_search.input) |input| if (input.query) |query| {
-            var batch = self.scanBufferSearchFor(preferences, expanded_disclosures, isolated_file, geometry, query) catch |err| return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.SearchFailed,
-            };
-            input_active = retainedSearchIndex(input.batch, input.active, batch);
-            input_ranges = projectBufferSearchRangesFor(self.allocator, candidate, visual_rows, batch, input_active) catch |err| {
-                batch.deinit(self.allocator);
-                return err;
-            };
-            input_batch = batch;
+            if (reuse_search_corpus) {
+                if (input.batch) |batch| {
+                    input_active = input.active;
+                    input_ranges = try projectBufferSearchRangesFor(self.allocator, candidate, visual_rows, batch, input_active);
+                }
+            } else {
+                var batch = self.scanBufferSearchFor(preferences, expanded_disclosures, isolated_file, geometry, query) catch |err| return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.SearchFailed,
+                };
+                input_active = retainedSearchIndex(input.batch, input.active, batch);
+                input_ranges = projectBufferSearchRangesFor(self.allocator, candidate, visual_rows, batch, input_active) catch |err| {
+                    batch.deinit(self.allocator);
+                    return err;
+                };
+                input_batch = batch;
+            }
         };
         const review_ranges = if (self.review_search.batch) |batch|
             try projectBufferSearchRangesFor(self.allocator, candidate, visual_rows, batch, self.review_search.selected)
@@ -2328,6 +2348,7 @@ const Published = struct {
             .input_active = input_active,
             .review_ranges = review_ranges,
             .search_corpus = search_corpus,
+            .reuse_search_batch = reuse_search_corpus,
         };
     }
 
@@ -13460,6 +13481,39 @@ test "M21 kernel Buffer Search opens only required disclosures and Escape restor
     try testing.expect(presentation.projection().review.?.buffer.rows[outdated_row].disclosure.expanded);
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
     try testing.expectEqual(initial_rows, presentation.projection().review.?.buffer.rows.len);
+}
+
+test "Buffer Search disclosure rebuild keeps the completed Batch" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 12 },
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "eight" } });
+    try completeBufferSearchScan(&presentation);
+    const input_batch = presentation.published.?.buffer_search.input.?.batch.?.occurrences.ptr;
+    try testing.expect(presentation.published.?.buffer_search.saved_disclosures != null);
+    var staged = try presentation.published.?.prepareDisclosureBuffer(presentation.preferences, presentation.published.?.expanded_disclosures.items);
+    defer staged.deinit();
+    staged.publish();
+    try testing.expectEqual(input_batch, presentation.published.?.buffer_search.input.?.batch.?.occurrences.ptr);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    const accepted_batch = presentation.published.?.buffer_search.accepted_batch.?.occurrences.ptr;
+    staged = try presentation.published.?.prepareDisclosureBuffer(presentation.preferences, presentation.published.?.expanded_disclosures.items);
+    staged.publish();
+    try testing.expectEqual(accepted_batch, presentation.published.?.buffer_search.accepted_batch.?.occurrences.ptr);
+
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c5" } });
+    try testing.expect(presentation.published.?.buffer_search.input.?.pending);
+    staged = try presentation.published.?.prepareDisclosureBuffer(presentation.preferences, presentation.published.?.expanded_disclosures.items);
+    staged.publish();
+    try testing.expect(presentation.published.?.buffer_search.input.?.batch == null);
+    try testing.expect(presentation.published.?.buffer_search.input.?.pending);
 }
 
 test "Session disclosures toggle independently persist through rebuilds and reset atomically" {

@@ -21,7 +21,7 @@
 
 Commits `4b967b3` and `72a7f35` serialize scans, transfer the worker Batch without a full clone, cache the corpus, and index source rows for range projection. The large-Buffer benchmark runs with `zig build bench-buffer-search`. The full suite passed with 833 tests.
 
-The ticket remains open. Corpus construction now runs during Session publication and general Buffer rebuilding. Disclosure rebuilding still runs on the terminal thread. Stage that work, measure a larger fixture, and cover the remaining lifecycle cases before resolving the ticket.
+The ticket remains open. Corpus construction runs during Session publication and general Buffer rebuilding. Disclosure changes reuse completed Batches instead of rescanning Candidates. The Buffer and visual rows still rebuild on the terminal thread. Completion admission still projects ranges there.
 
 ## Baseline
 
@@ -40,7 +40,7 @@ Opening builds the corpus on the terminal thread. Completion admission and discl
 
 The baseline preceded the painting stage in the benchmark. The current benchmark measures headless painting on a 100 × 30 screen.
 
-## Current measurement
+## After corpus caching and indexed projection
 
 Same fixture and nine samples, after caching the corpus with the staged Buffer and indexing source rows during projection:
 
@@ -55,3 +55,13 @@ Same fixture and nine samples, after caching the corpus with the staged Buffer a
 | Headless painting | 55,125 | 81,958 |
 
 The corpus cache moves its build cost to Session publication and Buffer rebuilding. Disclosure rebuilding still runs on the terminal thread. The benchmark uses a 4,096-Line fixture, so it does not set a bound for larger Sessions. The baseline has no painting sample.
+
+## Disclosure rescan removal
+
+On the same 16-File, 4,096-Line fixture, `zig build bench-buffer-search` measured disclosure rebuilding at 8,403,250 ns median and 10,118,125 ns p95 before Batch reuse. After Batch reuse, it measured 4,582,000 ns median and 4,996,583 ns p95. A disclosure changes visual rows but not Search Occurrences. The rebuild now projects existing Batches without scanning them again. A pending Query does not trigger a synchronous scan during a disclosure rebuild. The full suite passed with 839 tests.
+
+Still to do:
+
+- Stage Buffer construction, visual-row projection, and range projection outside the terminal loop. Publish only a complete Presentation Frame.
+- Measure a larger Session and capture p95 input latency during disclosure reveal and rapid query edits.
+- Cover stale completions, cancellation, launch and allocation failure, and Session replacement for staged work.
