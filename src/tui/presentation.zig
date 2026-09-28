@@ -1757,6 +1757,7 @@ const Published = struct {
         published.composer = null;
         published.buffer_search = .{};
         published.review_search = .{};
+        published.active_search = .none;
         published.geometry = geometry;
         published.selected_version = preferences.selected_version;
         published.frame_revision = 1;
