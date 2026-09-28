@@ -346,7 +346,7 @@ pub const system: Theme = .{
     .picker = .{},
     .picker_selected = .{ .reverse = true, .bold = true },
     .picker_query = .{ .reverse = true },
-    .search_match = .{ .index = 3 },
+    .search_match = .{ .index = 12 },
     .search_active = .{ .index = 11 },
     .search_no_match = .{ .index = 1 },
     .syntax_comment = .{ .index = 8 },
@@ -445,6 +445,29 @@ test "every built-in Theme resolves by its exact name and keeps diff bands disti
         try testing.expect(selected.section_rule.dim);
     }
     try testing.expect(byName("catppuccin") == null);
+}
+
+test "search matches stay distinct from ReviewCard and diff backgrounds in every built-in Theme" {
+    for (builtins) |builtin| {
+        const theme = builtin.value;
+        const matches = [_]Color{ theme.search_match, theme.search_active };
+        const diff_backgrounds = [_]Color{
+            theme.context.bg,
+            theme.added.bg,
+            theme.removed.bg,
+            theme.added_emphasis.bg,
+            theme.removed_emphasis.bg,
+        };
+        for (matches) |match| {
+            for (diff_backgrounds) |bg| try testing.expect(!std.meta.eql(match, bg));
+            inline for (std.meta.tags(review_card.CardRole)) |role| {
+                inline for (.{ review_card.Part.body, review_card.Part.suggestion_body }) |part| {
+                    const bg = theme.reviewCardStyle(role, part, .{}).bg;
+                    try testing.expect(!std.meta.eql(match, bg));
+                }
+            }
+        }
+    }
 }
 
 test "every built-in Theme composes every ReviewCard role and Markdown refinement" {
