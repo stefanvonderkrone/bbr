@@ -6187,6 +6187,7 @@ pub const Presentation = struct {
         var completed = completed_value;
         defer completed.deinit();
         if (!self.consumeCommand(completed.command_id, .scan_buffer_search)) return;
+        if (self.shutdown_requested) return;
         const published = self.published orelse return;
         if (completed.session_epoch != published.epoch) return;
         const input = &(published.buffer_search.input orelse return);
@@ -7850,8 +7851,13 @@ pub const Presentation = struct {
                 switch (failure) {
                     .launch_failed => self.action_error = .file_enrichment_launch_failed,
                     .out_of_memory => {
-                        self.requestShutdown();
-                        self.fatal_error = .file_enrichment_out_of_memory;
+                        if (reviewSearchOpeningFile(&current.review_search) == completed.file_index) {
+                            current.review_search.opening_source = false;
+                            self.action_error = .out_of_memory;
+                        } else {
+                            self.requestShutdown();
+                            self.fatal_error = .file_enrichment_out_of_memory;
+                        }
                     },
                 }
                 if (current.review_search.opening_source and reviewSearchOpeningFile(&current.review_search) == completed.file_index) {
@@ -8090,6 +8096,27 @@ pub const Presentation = struct {
 
     fn toggleDisclosure(self: *Presentation, published: *Published) void {
         const key = buffer_mod.disclosureKey(published.cursorRow() orelse return) orelse return;
+        var saved: ?[]buffer_mod.DisclosureKey = null;
+        if (published.review_search.saved_disclosures) |baseline| {
+            var updated: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
+            defer updated.deinit(self.allocator);
+            updated.appendSlice(self.allocator, baseline) catch return self.reviewSearchAllocationFailed();
+            var found: ?usize = null;
+            for (updated.items, 0..) |entry, index| if (std.meta.eql(entry, key)) {
+                found = index;
+                break;
+            };
+            var expanded = false;
+            for (published.expanded_disclosures.items) |entry| if (std.meta.eql(entry, key)) {
+                expanded = true;
+                break;
+            };
+            if (expanded) {
+                if (found) |index| _ = updated.orderedRemove(index);
+            } else if (found == null) updated.append(self.allocator, key) catch return self.reviewSearchAllocationFailed();
+            saved = updated.toOwnedSlice(self.allocator) catch return self.reviewSearchAllocationFailed();
+        }
+        defer if (saved) |keys| self.allocator.free(keys);
         const old_len = published.expanded_disclosures.items.len;
         var removed_index: ?usize = null;
         for (published.expanded_disclosures.items, 0..) |candidate, index| if (std.meta.eql(candidate, key)) {
@@ -8108,6 +8135,11 @@ pub const Presentation = struct {
             self.action_error = normalizeActionError(err);
             return;
         };
+        if (saved) |keys| {
+            self.allocator.free(published.review_search.saved_disclosures.?);
+            published.review_search.saved_disclosures = keys;
+            saved = null;
+        }
         self.action_error = null;
     }
 
@@ -9868,10 +9900,12 @@ test "M21 authored opening evicted source waits for exact File Enrichment" {
     command.deinit();
     try presentation.dispatch(.{ .file_enrichment_completed = .{
         .command_id = failed_command_id, .work_id = failed_work_id, .session_epoch = 1, .file_index = 1,
-        .outcome = .{ .failed = .launch_failed },
+        .outcome = .{ .failed = .out_of_memory },
     } });
     try testing.expectEqualStrings("new b", presentation.projection().review_search.?.query);
     try testing.expectEqual(@as(?usize, 0), presentation.projection().review_search.?.selected);
+    try testing.expect(!presentation.projection().shutting_down);
+    try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
     command = presentation.takeCommand().?;
     try testing.expectEqual(@as(usize, 1), command.enrich_file.file_index);
@@ -9946,6 +9980,15 @@ test "M21 authored source Fold reveal is temporary when Buffer Search starts" {
     try testing.expect(presentation.projection().review.?.frame.search_ranges.len > 0);
     try presentation.dispatch(.{ .action = .open_buffer_search });
     try testing.expect(!presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, original_fold).?].disclosure.expanded);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    const fold_index = findDisclosureRow(presentation.projection().review.?.buffer.rows, original_fold).?;
+    try moveToRow(&presentation, presentation.published.?.visualIndexForBufferIndex(fold_index).?);
+    try presentation.dispatch(.{ .action = .toggle_disclosure });
+    try presentation.dispatch(.{ .action = .toggle_disclosure });
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, original_fold).?].disclosure.expanded);
 }
 
 test "M21 authored Review Search queues eight Files in display-path order without a Query" {
@@ -10071,6 +10114,22 @@ test "M21 authored shutdown rejects queued and late Review Search scans" {
     command.deinit();
     try testing.expect(presentation.projection().review_search == null);
     try testing.expect(presentation.published.?.review_search.batch == null);
+}
+
+test "M21 kernel shutdown rejects a late Buffer Search scan" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    var command = presentation.takeCommand().?;
+    try presentation.dispatch(.request_shutdown);
+    try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search) });
+    command.deinit();
+    try testing.expect(presentation.published.?.buffer_search.input.?.batch == null);
 }
 
 test "M21 authored Review Search waits for an issued Buffer Search scan" {
