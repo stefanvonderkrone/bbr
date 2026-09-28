@@ -11314,8 +11314,7 @@ test "M21 kernel Buffer Search projects matches with identical line numbers in s
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     const session = try testSession(testing.allocator, 1, 'a');
-    session.diff = try bbr.diff.parse(session.arena.allocator(),
-        "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+needle\n" ++
+    session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+needle\n" ++
         "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-old\n+needle\n");
     try session.initializeEnrichment();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
