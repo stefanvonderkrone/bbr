@@ -436,6 +436,20 @@ pub const Storage = struct {
         return self.stageCacheEnforcement();
     }
 
+    pub fn rollbackFocus(self: *Storage, previous: ?usize) void {
+        self.rollbackCacheUpdate();
+        self.focused_file = previous;
+    }
+
+    /// The destination Frame already uses this File. Releasing search holds
+    /// enforces the inactive cache budget after focus moves.
+    pub fn focusAdmitted(self: *Storage, file_idx: usize) void {
+        std.debug.assert(self.retired.items.len == 0);
+        self.recency +|= 1;
+        self.files[file_idx].last_used = self.recency;
+        self.focused_file = file_idx;
+    }
+
     pub fn commitCacheUpdate(self: *Storage) void {
         for (self.retired.items) |*retired| retired.file.deinit();
         self.retired.clearRetainingCapacity();

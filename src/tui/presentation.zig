@@ -5575,19 +5575,17 @@ pub const Presentation = struct {
         }
         if (completed.outcome == .scanned) {
             var part = completed.outcome.scanned.clone(self.allocator) catch {
-                self.action_error = .out_of_memory;
-                self.maybeQueueReviewSourceScan(published);
+                self.reviewSourcePublicationFailed(published, completed.file_index);
                 return;
             };
             var transferred = false;
             defer if (!transferred) part.deinit(self.allocator);
             const old = state.batch orelse {
-                self.maybeQueueReviewSourceScan(published);
+                self.reviewSourcePublicationFailed(published, completed.file_index);
                 return;
             };
             const occurrences = self.allocator.alloc(search.Occurrence, old.occurrences.len + part.occurrences.len) catch {
-                self.action_error = .out_of_memory;
-                self.maybeQueueReviewSourceScan(published);
+                self.reviewSourcePublicationFailed(published, completed.file_index);
                 return;
             };
             @memcpy(occurrences[0..old.occurrences.len], old.occurrences);
@@ -5601,15 +5599,13 @@ pub const Presentation = struct {
                 false else false;
             const ranges = published.projectBufferSearchRanges(combined, selected) catch {
                 self.allocator.free(occurrences);
-                self.action_error = .out_of_memory;
-                self.maybeQueueReviewSourceScan(published);
+                self.reviewSourcePublicationFailed(published, completed.file_index);
                 return;
             };
             const results = self.allocator.alloc(ReviewSearchResult, occurrences.len) catch {
                 self.allocator.free(occurrences);
                 self.allocator.free(ranges);
-                self.action_error = .out_of_memory;
-                self.maybeQueueReviewSourceScan(published);
+                self.reviewSourcePublicationFailed(published, completed.file_index);
                 return;
             };
             for (occurrences, results) |occurrence, *result| result.* = if (occurrence.location == .source)
@@ -5648,6 +5644,11 @@ pub const Presentation = struct {
             return;
         }
         self.maybeQueueReviewSourceScan(published);
+    }
+
+    fn reviewSourcePublicationFailed(self: *Presentation, published: *Published, file_index: usize) void {
+        if (published.review_search.source_scanned) |scanned| scanned[file_index] = false;
+        self.action_error = .out_of_memory;
     }
 
     fn discardQueuedReviewSearchScans(self: *Presentation) void {
@@ -5866,16 +5867,30 @@ pub const Presentation = struct {
             const previous_focus = published.session.enrichment.focused_file;
             if (!admitting) _ = published.session.enrichment.stageFocus(source.file_index);
             var committed = false;
-            defer if (!committed and !admitting) {
-                published.session.enrichment.rollbackCacheUpdate();
-                published.session.enrichment.focused_file = previous_focus;
-            };
+            defer if (!committed and !admitting) published.session.enrichment.rollbackFocus(previous_focus);
             var staged = published.prepareBufferForFile(preferences, disclosures.items, isolated, published.geometry, source.file_index) catch |err| {
                 self.action_error = normalizeActionError(err);
                 return;
             };
-            defer staged.deinit();
-            const row = occurrenceVisualRowFor(staged.buffer, staged.visual_rows, occurrence) orelse {
+            var staged_active = true;
+            defer if (staged_active) staged.deinit();
+            var row = occurrenceVisualRowFor(staged.buffer, staged.visual_rows, occurrence);
+            if (row == null and preferences.scope == .changes and in_hunk) {
+                const hidden = sourceFoldDisclosure(published, staged.buffer, source);
+                if (hidden.len > 0) {
+                    staged.deinit();
+                    staged_active = false;
+                    for (hidden.items[0..hidden.len]) |key|
+                        addSearchDisclosure(self.allocator, &disclosures, key) catch return self.reviewSearchAllocationFailed();
+                    staged = published.prepareBufferForFile(preferences, disclosures.items, isolated, published.geometry, source.file_index) catch |err| {
+                        self.action_error = normalizeActionError(err);
+                        return;
+                    };
+                    staged_active = true;
+                    row = occurrenceVisualRowFor(staged.buffer, staged.visual_rows, occurrence);
+                }
+            }
+            const destination = row orelse {
                 self.action_error = .buffer_search_no_matches;
                 return;
             };
@@ -5892,10 +5907,10 @@ pub const Presentation = struct {
             committed = true;
             published.isolated_file = isolated;
             self.preferences = preferences;
-            published.navigation.jumpTo(row);
+            published.navigation.jumpTo(destination);
             published.focus = .diff;
             published.cursorToActiveFile();
-            if (admitting) published.session.enrichment.focused_file = source.file_index;
+            if (admitting) published.session.enrichment.focusAdmitted(source.file_index);
             state.open = false;
             state.pending = false;
             self.discardQueuedReviewSearchScans();
@@ -9056,33 +9071,37 @@ fn requiredSearchDisclosure(published: *const Published, occurrence: search.Occu
                 result.append(.{ .review_card = .{ .draft = id } });
             },
         },
-        .source => |source| {
-            if (source.file_index >= published.session.diff.files.len) return result;
-            const file = published.session.diff.files[source.file_index];
-            var target: ?*const bbr.diff.Line = null;
-            for (file.hunks) |hunk| for (hunk.lines) |*line| if (sourceLineMatches(line, source, source.relation)) {
-                target = line;
+        .source => |source| return sourceFoldDisclosure(published, published.buffer, source),
+    }
+    return result;
+}
+
+fn sourceFoldDisclosure(published: *const Published, buffer: buffer_mod.Buffer, source: search.SourceLocation) SearchDisclosureSet {
+    var result: SearchDisclosureSet = .{};
+    if (source.file_index >= published.session.diff.files.len) return result;
+    const file = published.session.diff.files[source.file_index];
+    var target: ?*const bbr.diff.Line = null;
+    for (file.hunks) |hunk| for (hunk.lines) |*line| if (sourceLineMatches(line, source, source.relation)) {
+        target = line;
+        break;
+    };
+    const wanted = target orelse return result;
+    for (buffer.rows) |row| {
+        if (row != .disclosure or row.disclosure.kind != .fold) continue;
+        const first = row.disclosure.key.fold;
+        for (file.hunks) |hunk| {
+            var start: ?usize = null;
+            for (hunk.lines, 0..) |*line, index| if (line == first) {
+                start = index;
                 break;
             };
-            const wanted = target orelse return result;
-            for (published.buffer.rows) |row| {
-                if (row != .disclosure or row.disclosure.kind != .fold) continue;
-                const first = row.disclosure.key.fold;
-                for (file.hunks) |hunk| {
-                    var start: ?usize = null;
-                    for (hunk.lines, 0..) |*line, index| if (line == first) {
-                        start = index;
-                        break;
-                    };
-                    const index = start orelse continue;
-                    const end = @min(index + row.disclosure.count, hunk.lines.len);
-                    for (hunk.lines[index..end]) |*line| if (line == wanted) {
-                        result.append(row.disclosure.key);
-                        return result;
-                    };
-                }
-            }
-        },
+            const index = start orelse continue;
+            const end = @min(index + row.disclosure.count, hunk.lines.len);
+            for (hunk.lines[index..end]) |*line| if (line == wanted) {
+                result.append(row.disclosure.key);
+                return result;
+            };
+        }
     }
     return result;
 }
@@ -9803,7 +9822,8 @@ test "M21 authored Review Search streams a complete File partition after File En
 test "M21 authored failed source scan retries after reopening Review Search" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
     });
     defer presentation.deinit();
@@ -9822,31 +9842,50 @@ test "M21 authored failed source scan retries after reopening Review Search" {
     const command_id = command.enrich_file.command_id;
     command.deinit();
     try presentation.dispatch(.{ .file_enrichment_completed = .{
-        .command_id = command_id, .work_id = work_id, .session_epoch = 1, .file_index = 0,
+        .command_id = command_id,
+        .work_id = work_id,
+        .session_epoch = 1,
+        .file_index = 0,
         .outcome = .{ .completed = enrichment },
     } });
     command = presentation.takeCommand().?;
     const scan_id = command.scan_review_source.command_id;
     command.deinit();
     try presentation.dispatch(.{ .review_source_scanned = .{
-        .allocator = testing.allocator, .command_id = scan_id, .session_epoch = 1,
-        .request_id = presentation.published.?.review_search.request_id, .file_index = 0,
+        .allocator = testing.allocator,
+        .command_id = scan_id,
+        .session_epoch = 1,
+        .request_id = presentation.published.?.review_search.request_id,
+        .file_index = 0,
         .outcome = .failed,
     } });
     try testing.expect(presentation.takeCommand() == null);
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
     try presentation.dispatch(.{ .action = .open_review_search });
     command = presentation.takeCommand().?;
-    defer command.deinit();
     try testing.expect(command == .scan_review_source);
+    const failed_publication = executeReviewSourceScan(testing.allocator, &command.scan_review_source);
+    command.deinit();
+    const before = presentation.projection().revision.frame;
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .review_source_scanned = failed_publication });
+    try testing.expectEqual(before, presentation.projection().revision.frame);
+    try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+    failing.fail_index = std.math.maxInt(usize);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try presentation.dispatch(.{ .action = .open_review_search });
+    command = presentation.takeCommand().?;
+    const retried = executeReviewSourceScan(testing.allocator, &command.scan_review_source);
+    command.deinit();
+    try presentation.dispatch(.{ .review_source_scanned = retried });
+    try testing.expectEqual(@as(usize, 1), presentation.projection().review_search.?.results.len);
 }
 
 test "M21 authored source opening keeps all-Files and lands on exact wrapped range" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     const session = try testSession(testing.allocator, 1, 'a');
-    session.diff = try bbr.diff.parse(session.arena.allocator(),
-        "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1 @@\n-old\n+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa new\n");
+    session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1 @@\n-old\n+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa new\n");
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
         .geometry = .{ .cols = 70, .rows = 25 },
@@ -9868,7 +9907,10 @@ test "M21 authored source opening keeps all-Files and lands on exact wrapped ran
     const command_id = command.enrich_file.command_id;
     command.deinit();
     try presentation.dispatch(.{ .file_enrichment_completed = .{
-        .command_id = command_id, .work_id = work_id, .session_epoch = 1, .file_index = 0,
+        .command_id = command_id,
+        .work_id = work_id,
+        .session_epoch = 1,
+        .file_index = 0,
         .outcome = .{ .completed = enrichment },
     } });
     var scan_command = presentation.takeCommand().?;
@@ -9927,7 +9969,10 @@ test "M21 authored source outside Hunks opens WholeFile without changing File is
     const command_id = command.enrich_file.command_id;
     command.deinit();
     try presentation.dispatch(.{ .file_enrichment_completed = .{
-        .command_id = command_id, .work_id = work_id, .session_epoch = 1, .file_index = 0,
+        .command_id = command_id,
+        .work_id = work_id,
+        .session_epoch = 1,
+        .file_index = 0,
         .outcome = .{ .completed = enrichment },
     } });
     var scan_command = presentation.takeCommand().?;
@@ -9948,7 +9993,8 @@ test "M21 authored opening evicted source waits for exact File Enrichment" {
     defer store.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     var presentation = try Presentation.init(failing.allocator(), .{
-        .reviews = store.store(), .inactive_file_cache_max_bytes = 1,
+        .reviews = store.store(),
+        .inactive_file_cache_max_bytes = 1,
     }, .{
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
         .geometry = .{ .cols = 100, .rows = 25 },
@@ -9973,7 +10019,10 @@ test "M21 authored opening evicted source waits for exact File Enrichment" {
         const command_id = command.enrich_file.command_id;
         command.deinit();
         try presentation.dispatch(.{ .file_enrichment_completed = .{
-            .command_id = command_id, .work_id = work_id, .session_epoch = 1, .file_index = file_index,
+            .command_id = command_id,
+            .work_id = work_id,
+            .session_epoch = 1,
+            .file_index = file_index,
             .outcome = .{ .completed = enrichment },
         } });
     }
@@ -9994,7 +10043,10 @@ test "M21 authored opening evicted source waits for exact File Enrichment" {
     const failed_command_id = command.enrich_file.command_id;
     command.deinit();
     try presentation.dispatch(.{ .file_enrichment_completed = .{
-        .command_id = failed_command_id, .work_id = failed_work_id, .session_epoch = 1, .file_index = 1,
+        .command_id = failed_command_id,
+        .work_id = failed_work_id,
+        .session_epoch = 1,
+        .file_index = 1,
         .outcome = .{ .failed = .out_of_memory },
     } });
     try testing.expectEqualStrings("new b", presentation.projection().review_search.?.query);
@@ -10018,7 +10070,10 @@ test "M21 authored opening evicted source waits for exact File Enrichment" {
     try testing.expect(presentation.published.?.review_search.opening_source);
     failing.fail_index = failing.alloc_index;
     try presentation.dispatch(.{ .file_enrichment_completed = .{
-        .command_id = command_id, .work_id = work_id, .session_epoch = 1, .file_index = 1,
+        .command_id = command_id,
+        .work_id = work_id,
+        .session_epoch = 1,
+        .file_index = 1,
         .outcome = .{ .completed = enrichment },
     } });
     try testing.expectEqualStrings("new b", presentation.projection().review_search.?.query);
@@ -10037,8 +10092,12 @@ test "M21 authored opening evicted source waits for exact File Enrichment" {
 test "M21 authored source Fold reveal is temporary when Buffer Search starts" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
+    const session = try testDisclosureSession(testing.allocator, 1);
+    session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,12 +1,12 @@\n-a\n+A\n c1\n c2\n c3\n c4\n c5\n c6\n c7\n c8\n c9\n c10\n-b\n+B\n" ++
+        "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-old b\n+new b\n");
+    try session.initializeEnrichment();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
         .geometry = .{ .cols = 100, .rows = 25 },
     });
     defer presentation.deinit();
@@ -10046,6 +10105,9 @@ test "M21 authored source Fold reveal is temporary when Buffer Search starts" {
     const original_fold = for (original.buffer.rows) |row| {
         if (row == .disclosure and row.disclosure.kind == .fold) break row.disclosure.key;
     } else return error.MissingFold;
+    try presentation.dispatch(.{ .action = .next_file });
+    try presentation.dispatch(.{ .action = .isolate });
+    try testing.expectEqual(@as(?usize, 1), presentation.projection().review.?.isolated_file);
     try presentation.dispatch(.{ .action = .open_review_search });
     try presentation.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c5" } });
     try completeBufferSearchScan(&presentation);
@@ -10062,15 +10124,40 @@ test "M21 authored source Fold reveal is temporary when Buffer Search starts" {
     const command_id = command.enrich_file.command_id;
     command.deinit();
     try presentation.dispatch(.{ .file_enrichment_completed = .{
-        .command_id = command_id, .work_id = work_id, .session_epoch = 1, .file_index = 0,
+        .command_id = command_id,
+        .work_id = work_id,
+        .session_epoch = 1,
+        .file_index = 0,
         .outcome = .{ .completed = enrichment },
+    } });
+    command = presentation.takeCommand().?;
+    const other_responses = [_]bbr.http.Canned{
+        .{ .status = 200, .body = "old b\n" }, .{ .status = 200, .body = "new b\n" },
+    };
+    var other_fake: bbr.http.FakeHttpClient = .{ .responses = &other_responses };
+    const other_bb = bbr.bitbucket.Client.init(other_fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+    const other_enrichment = try file_enrichment.enrich(testing.allocator, other_bb, plain.highlighter(), command.enrich_file.request());
+    const other_work_id = command.enrich_file.work_id;
+    const other_command_id = command.enrich_file.command_id;
+    command.deinit();
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = other_command_id,
+        .work_id = other_work_id,
+        .session_epoch = 1,
+        .file_index = 1,
+        .outcome = .{ .completed = other_enrichment },
     } });
     var scan_command = presentation.takeCommand().?;
     const completed = executeReviewSourceScan(testing.allocator, &scan_command.scan_review_source);
     scan_command.deinit();
     try presentation.dispatch(.{ .review_source_scanned = completed });
+    scan_command = presentation.takeCommand().?;
+    const other_scan = executeReviewSourceScan(testing.allocator, &scan_command.scan_review_source);
+    scan_command.deinit();
+    try presentation.dispatch(.{ .review_source_scanned = other_scan });
     try testing.expectEqual(@as(usize, 1), presentation.projection().review_search.?.results.len);
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expectEqual(@as(?usize, 0), presentation.projection().review.?.isolated_file);
     try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, original_fold).?].disclosure.expanded);
     try testing.expect(presentation.projection().review.?.frame.search_ranges.len > 0);
     try presentation.dispatch(.{ .action = .open_buffer_search });
