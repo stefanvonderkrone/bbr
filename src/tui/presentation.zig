@@ -1642,6 +1642,7 @@ const Published = struct {
         input_ranges: ?[]frame_mod.ProjectedSourceRange = null,
         input_active: ?usize = null,
         review_ranges: ?[]frame_mod.ProjectedSourceRange = null,
+        search_corpus: ?*BufferSearchCorpus = null,
         active: bool = true,
 
         fn deinit(self: *StagedBuffer) void {
@@ -1651,6 +1652,7 @@ const Published = struct {
                 if (self.input_batch) |*batch| batch.deinit(self.published.allocator);
                 if (self.input_ranges) |ranges| self.published.allocator.free(ranges);
                 if (self.review_ranges) |ranges| self.published.allocator.free(ranges);
+                if (self.search_corpus) |corpus| corpus.release();
                 self.published.buffers.abort();
             }
             self.* = undefined;
@@ -1665,6 +1667,11 @@ const Published = struct {
             self.published.tree = self.tree;
             self.published.geometry = self.geometry;
             self.published.selected_version = self.selected_version;
+            if (self.search_corpus) |corpus| {
+                if (self.published.search_corpus) |old| old.release();
+                self.published.search_corpus = corpus;
+                self.search_corpus = null;
+            }
             self.published.navigation = frame_mod.restoreNavigation(previous, self.visual_rows, self.geometry);
             if (self.published.buffer_search.accepted_query != null) {
                 if (self.published.buffer_search.accepted_batch) |*batch| batch.deinit(self.published.allocator);
@@ -1718,6 +1725,7 @@ const Published = struct {
     composer_arena: std.heap.ArenaAllocator,
     composer: ?Composer,
     buffer_search: BufferSearchState,
+    search_corpus: ?*BufferSearchCorpus = null,
     review_search: ReviewSearchState,
     active_search: enum { none, buffer, review } = .none,
 
@@ -1843,6 +1851,7 @@ const Published = struct {
             cell_metrics,
         );
         published.buffers.commit();
+        published.search_corpus = published.bufferSearchCorpus(preferences, published.expanded_disclosures.items, published.isolated_file, geometry) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BufferBuildFailed;
         published.navigation = Nav.init(published.visual_rows.len, panes.diff_content.height);
         return published;
     }
@@ -1851,6 +1860,7 @@ const Published = struct {
         const allocator = self.allocator;
         self.releaseReviewSearchHolds(null);
         self.buffer_search.deinit(allocator);
+        if (self.search_corpus) |corpus| corpus.release();
         self.review_search.deinit(allocator);
         if (self.composer) |*composer| composer.deinit();
         self.composer_arena.deinit();
@@ -2192,7 +2202,12 @@ const Published = struct {
         isolated_file: ?usize,
         geometry: frame_mod.Geometry,
     ) BufferTransactionError!StagedBuffer {
-        return self.prepareBufferForFile(preferences, expanded_disclosures, isolated_file, geometry, null);
+        return self.prepareBufferForFile(preferences, expanded_disclosures, isolated_file, geometry, null, false);
+    }
+
+    fn prepareDisclosureBuffer(self: *Published, preferences: Preferences, disclosures: []const buffer_mod.DisclosureKey) BufferTransactionError!StagedBuffer {
+        // Semantic candidates include hidden text; a disclosure changes only visual rows.
+        return self.prepareBufferForFile(preferences, disclosures, self.isolated_file, self.geometry, null, true);
     }
 
     fn prepareBufferForFile(
@@ -2202,6 +2217,7 @@ const Published = struct {
         isolated_file: ?usize,
         geometry: frame_mod.Geometry,
         focused_file: ?usize,
+        reuse_search_corpus: bool,
     ) BufferTransactionError!StagedBuffer {
         const allocator = self.buffers.begin();
         errdefer self.buffers.abort();
@@ -2292,6 +2308,11 @@ const Published = struct {
             try projectBufferSearchRangesFor(self.allocator, candidate, visual_rows, batch, self.review_search.selected)
         else
             null;
+        errdefer if (review_ranges) |ranges| self.allocator.free(ranges);
+        const search_corpus = if (reuse_search_corpus)
+            null
+        else
+            self.bufferSearchCorpus(preferences, expanded_disclosures, isolated_file, geometry) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.SearchFailed;
         return .{
             .published = self,
             .buffer = candidate,
@@ -2306,6 +2327,7 @@ const Published = struct {
             .input_ranges = input_ranges,
             .input_active = input_active,
             .review_ranges = review_ranges,
+            .search_corpus = search_corpus,
         };
     }
 
@@ -2351,7 +2373,7 @@ const Published = struct {
         return search.scan(self.allocator, query, candidates, .literal);
     }
 
-    fn bufferSearchCorpus(self: *Published, preferences: Preferences, disclosures: []const buffer_mod.DisclosureKey) !*BufferSearchCorpus {
+    fn bufferSearchCorpus(self: *Published, preferences: Preferences, disclosures: []const buffer_mod.DisclosureKey, isolated_file: ?usize, geometry: frame_mod.Geometry) !*BufferSearchCorpus {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const enrichment = self.session.enrichment.projection();
@@ -2367,11 +2389,11 @@ const Published = struct {
                 .expanded_disclosures = disclosures,
                 .drafts = self.review.drafts.items,
                 .scope_projections = self.scope_projection.items,
-                .only_file = self.isolated_file,
+                .only_file = isolated_file,
                 .blobs = enrichment.blobs,
                 .highlights = enrichment.highlights,
                 .content_statuses = enrichment.content_statuses,
-                .card_width = frame_mod.paneRects(self.geometry).diff_content.width,
+                .card_width = frame_mod.paneRects(geometry).diff_content.width,
                 .cell_metrics = self.cell_metrics,
                 .collapsed_rows = self.commentsCollapsedRows(),
             },
@@ -2427,28 +2449,54 @@ const Published = struct {
     ) ![]frame_mod.ProjectedSourceRange {
         var projected: std.ArrayList(frame_mod.ProjectedSourceRange) = .empty;
         errdefer projected.deinit(allocator);
+        var source_rows: std.AutoHashMapUnmanaged(SourceRowKey, std.ArrayList(usize)) = .empty;
+        defer {
+            var values = source_rows.valueIterator();
+            while (values.next()) |rows| rows.deinit(allocator);
+            source_rows.deinit(allocator);
+        }
+        for (visual_rows, 0..) |visual, visual_index| {
+            const file_index = buffer.fileIndexForRow(visual.buffer_index) orelse continue;
+            if (visual.halves) |halves| {
+                if (halves.left) |half| if (half.line.oldNo()) |line| try addSourceRow(allocator, &source_rows, .{ .file_index = file_index, .line = line, .side = .old }, visual_index);
+                if (halves.right) |half| if (half.line.newNo()) |line| try addSourceRow(allocator, &source_rows, .{ .file_index = file_index, .line = line, .side = .new }, visual_index);
+            } else switch (visual.owner) {
+                .line => |line| {
+                    if (line.oldNo()) |number| try addSourceRow(allocator, &source_rows, .{ .file_index = file_index, .line = number, .side = .old }, visual_index);
+                    if (line.newNo()) |number| try addSourceRow(allocator, &source_rows, .{ .file_index = file_index, .line = number, .side = .new }, visual_index);
+                },
+                else => {},
+            }
+        }
         for (batch.occurrences, 0..) |occurrence, occurrence_index| {
-            for (visual_rows, 0..) |visual, visual_index| switch (occurrence.location) {
+            switch (occurrence.location) {
                 .source => |source| {
-                    if (buffer.fileIndexForRow(visual.buffer_index) != source.file_index) continue;
-                    if (visual.halves) |halves| {
-                        if (halves.left) |half| if ((source.relation == .old or source.relation == .neutral) and sourceLineMatches(half.line, source, .old))
-                            try appendSearchIntersections(allocator, &projected, occurrence, occurrence_index == active, visual_index, .old, half.source_start, half.source_end);
-                        if (halves.right) |half| if ((source.relation == .new or source.relation == .neutral) and sourceLineMatches(half.line, source, .new))
-                            try appendSearchIntersections(allocator, &projected, occurrence, occurrence_index == active, visual_index, .new, half.source_start, half.source_end);
-                    } else if (sourceLineForVisual(visual, source) != null) {
-                        try appendSearchIntersections(allocator, &projected, occurrence, occurrence_index == active, visual_index, source.relation, visual.source_start, visual.source_end);
+                    const number = if (source.relation == .new) source.new_line else source.old_line;
+                    const key: SourceRowKey = .{ .file_index = source.file_index, .line = number orelse continue, .side = if (source.relation == .new) .new else .old };
+                    const rows = source_rows.get(key) orelse continue;
+                    for (rows.items) |visual_index| {
+                        const visual = visual_rows[visual_index];
+                        if (visual.halves) |halves| {
+                            if (halves.left) |half| if ((source.relation == .old or source.relation == .neutral) and sourceLineMatches(half.line, source, .old))
+                                try appendSearchIntersections(allocator, &projected, occurrence, occurrence_index == active, visual_index, .old, half.source_start, half.source_end);
+                            if (halves.right) |half| if ((source.relation == .new or source.relation == .neutral) and sourceLineMatches(half.line, source, .new))
+                                try appendSearchIntersections(allocator, &projected, occurrence, occurrence_index == active, visual_index, .new, half.source_start, half.source_end);
+                        } else if (sourceLineForVisual(visual, source) != null) {
+                            try appendSearchIntersections(allocator, &projected, occurrence, occurrence_index == active, visual_index, source.relation, visual.source_start, visual.source_end);
+                        }
                     }
                 },
                 .review_body => |body| {
-                    const matches = switch (visual.owner) {
-                        .comment => |owner| body.owner == .comment and owner.id == body.owner.comment and owner.part != .header,
-                        .draft => |owner| body.owner == .draft and owner.id == body.owner.draft and owner.part != .header,
-                        else => false,
-                    };
-                    if (matches) try appendSearchIntersections(allocator, &projected, occurrence, occurrence_index == active, visual_index, .neutral, visual.source_start, visual.source_end);
+                    for (visual_rows, 0..) |visual, visual_index| {
+                        const matches = switch (visual.owner) {
+                            .comment => |owner| body.owner == .comment and owner.id == body.owner.comment and owner.part != .header,
+                            .draft => |owner| body.owner == .draft and owner.id == body.owner.draft and owner.part != .header,
+                            else => false,
+                        };
+                        if (matches) try appendSearchIntersections(allocator, &projected, occurrence, occurrence_index == active, visual_index, .neutral, visual.source_start, visual.source_end);
+                    }
                 },
-            };
+            }
         }
         return projected.toOwnedSlice(allocator);
     }
@@ -5879,7 +5927,7 @@ pub const Presentation = struct {
             if (!admitting) _ = published.session.enrichment.stageFocus(source.file_index);
             var committed = false;
             defer if (!committed and !admitting) published.session.enrichment.rollbackFocus(previous_focus);
-            var staged = published.prepareBufferForFile(preferences, disclosures.items, isolated, published.geometry, source.file_index) catch |err| {
+            var staged = published.prepareBufferForFile(preferences, disclosures.items, isolated, published.geometry, source.file_index, false) catch |err| {
                 self.action_error = normalizeActionError(err);
                 return;
             };
@@ -5893,7 +5941,7 @@ pub const Presentation = struct {
                     staged_active = false;
                     for (hidden.items[0..hidden.len]) |key|
                         addSearchDisclosure(self.allocator, &disclosures, key) catch return self.reviewSearchAllocationFailed();
-                    staged = published.prepareBufferForFile(preferences, disclosures.items, isolated, published.geometry, source.file_index) catch |err| {
+                    staged = published.prepareBufferForFile(preferences, disclosures.items, isolated, published.geometry, source.file_index, false) catch |err| {
                         self.action_error = normalizeActionError(err);
                         return;
                     };
@@ -6010,10 +6058,8 @@ pub const Presentation = struct {
         const published = self.published orelse return;
         if (published.buffer_search.input != null) return;
         const disclosures = published.review_search.saved_disclosures orelse published.expanded_disclosures.items;
-        const corpus = published.bufferSearchCorpus(self.preferences, disclosures) catch |err| {
-            self.action_error = if (err == error.OutOfMemory) .out_of_memory else .buffer_search_scan_failed;
-            return;
-        };
+        const corpus = published.search_corpus orelse return;
+        corpus.retain();
         const saved_expanded = self.allocator.dupe(buffer_mod.DisclosureKey, disclosures) catch {
             corpus.release();
             self.action_error = .out_of_memory;
@@ -6088,7 +6134,7 @@ pub const Presentation = struct {
         var target: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
         errdefer target.deinit(self.allocator);
         try target.appendSlice(self.allocator, input.saved_expanded_disclosures);
-        var staged = try published.prepareBuffer(self.preferences, target.items, published.isolated_file, published.geometry);
+        var staged = try published.prepareDisclosureBuffer(self.preferences, target.items);
         defer staged.deinit();
         staged.publish();
         published.expanded_disclosures.deinit(self.allocator);
@@ -6426,7 +6472,7 @@ pub const Presentation = struct {
             null;
         errdefer if (saved) |items| self.allocator.free(items);
 
-        var staged = try published.prepareBuffer(self.preferences, target.items, published.isolated_file, published.geometry);
+        var staged = try published.prepareDisclosureBuffer(self.preferences, target.items);
         defer staged.deinit();
         staged.publish();
         published.expanded_disclosures.deinit(self.allocator);
@@ -9177,6 +9223,18 @@ fn anchorOpposesSelected(anchor: bbr.review.Anchor, selected: SelectedVersion) b
     return (anchor.to != null) != (selected == .new);
 }
 
+const SourceRowKey = struct {
+    file_index: usize,
+    line: u32,
+    side: enum { old, new },
+};
+
+fn addSourceRow(allocator: Allocator, index: *std.AutoHashMapUnmanaged(SourceRowKey, std.ArrayList(usize)), key: SourceRowKey, row: usize) !void {
+    const entry = try index.getOrPut(allocator, key);
+    if (!entry.found_existing) entry.value_ptr.* = .empty;
+    try entry.value_ptr.append(allocator, row);
+}
+
 fn appendSearchIntersections(
     allocator: Allocator,
     projected: *std.ArrayList(frame_mod.ProjectedSourceRange),
@@ -9773,6 +9831,101 @@ fn testSession(backing: std.mem.Allocator, id: u64, marker: u8) !*session_mod.Se
     s.diff = try bbr.diff.parse(a, raw);
     try s.initializeEnrichment();
     return s;
+}
+
+/// Repeatable end-to-end stage timings over a generated, network-free Session.
+pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, paint: *const fn (Allocator, ReviewProjection) anyerror!void) !void {
+    const samples = 9;
+    const files = 16;
+    const lines = 128;
+    const Stage = enum { open, edit, scan, admission, disclosure, projection, painting };
+    var times: [@typeInfo(Stage).@"enum".fields.len][samples]u64 = undefined;
+
+    var session = try session_mod.create(allocator);
+    var transferred = false;
+    defer if (!transferred) session.destroy();
+    const a = session.arena.allocator();
+    var raw: std.ArrayList(u8) = .empty;
+    for (0..files) |file| {
+        try raw.print(a, "diff --git a/f{d}.txt b/f{d}.txt\n--- a/f{d}.txt\n+++ b/f{d}.txt\n@@ -1,{d} +1,{d} @@\n", .{ file, file, file, file, lines, lines });
+        for (0..lines) |line| try raw.print(a, "-old {d} needle\n+new {d} needle\n", .{ line, line });
+    }
+    const pr: bbr.bitbucket.PullRequest = .{
+        .id = 1,
+        .title = "Benchmark",
+        .state = "OPEN",
+        .author_display_name = "Reviewer",
+        .source_branch = "feature",
+        .destination_branch = "main",
+        .source_commit = "source",
+        .destination_commit = "destination",
+    };
+    session.source = .{ .remote = pr };
+    session.header = .{
+        .title = pr.title,
+        .source_ref = pr.source_branch,
+        .base_ref = pr.destination_branch,
+        .source_commit = pr.source_commit,
+        .base_commit = pr.destination_commit,
+        .locator = "repo",
+        .source_label = "Bitbucket",
+    };
+    session.threads = &.{};
+    session.diff = try bbr.diff.parse(a, raw.items);
+    try session.initializeEnrichment();
+    var store = bbr.review.InMemoryStore.init(allocator);
+    defer store.deinit();
+    transferred = true;
+    var presentation = try Presentation.init(allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer presentation.deinit();
+
+    for (0..samples) |sample| {
+        var start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        times[@intFromEnum(Stage.open)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+
+        start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+        times[@intFromEnum(Stage.edit)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+
+        var command = presentation.takeCommand() orelse return error.MissingScan;
+        defer command.deinit();
+        if (command != .scan_buffer_search) return error.UnexpectedCommand;
+        start = std.Io.Clock.awake.now(io);
+        const completed = executeBufferSearchScan(std.heap.page_allocator, &command.scan_buffer_search);
+        times[@intFromEnum(Stage.scan)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+
+        start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        times[@intFromEnum(Stage.admission)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        const published = presentation.published orelse return error.MissingSession;
+        const input = published.buffer_search.input orelse return error.MissingInput;
+        const batch = input.batch orelse return error.MissingBatch;
+        if (batch.occurrences.len != files * lines * 2) return error.WrongOccurrenceCount;
+
+        start = std.Io.Clock.awake.now(io);
+        var rebuilt = try published.prepareDisclosureBuffer(presentation.preferences, published.expanded_disclosures.items);
+        times[@intFromEnum(Stage.disclosure)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        rebuilt.deinit();
+
+        start = std.Io.Clock.awake.now(io);
+        const ranges = try published.projectBufferSearchRanges(batch, input.active);
+        times[@intFromEnum(Stage.projection)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (ranges.len == 0) return error.MissingRanges;
+        allocator.free(ranges);
+        start = std.Io.Clock.awake.now(io);
+        try paint(allocator, presentation.projection().review.?);
+        times[@intFromEnum(Stage.painting)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    }
+    std.debug.print("fixture_files={d} fixture_lines={d} fixture_bytes={d}\n", .{ files, files * lines * 2, raw.items.len });
+    inline for (@typeInfo(Stage).@"enum".fields, 0..) |stage, index| {
+        std.mem.sort(u64, &times[index], {}, std.sort.asc(u64));
+        std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ stage.name, times[index][samples / 2], times[index][(samples * 95 + 99) / 100 - 1] });
+    }
 }
 
 fn completeBufferSearchScan(presentation: *Presentation) !void {
@@ -11034,6 +11187,58 @@ test "M21 kernel Buffer Search ignores a completion after input cancellation" {
     try testing.expect(presentation.projection().buffer_search == null);
 }
 
+test "M21 kernel Buffer Search can retry after scan failure" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "n" } });
+    var first = presentation.takeCommand().?;
+    defer first.deinit();
+    try presentation.dispatch(.{ .buffer_search_scanned = .{
+        .allocator = testing.allocator,
+        .command_id = first.scan_buffer_search.command_id,
+        .request_id = first.scan_buffer_search.request_id,
+        .session_epoch = first.scan_buffer_search.session_epoch,
+        .outcome = .failed,
+    } });
+    try testing.expect(!presentation.projection().buffer_search.?.pending);
+    try testing.expectEqual(ActionError.buffer_search_scan_failed, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "ew" } });
+    try completeBufferSearchScan(&presentation);
+    try testing.expectEqual(@as(usize, 1), presentation.projection().buffer_search.?.total);
+}
+
+test "M21 kernel Buffer Search releases stale work after Session replacement" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    var scan = presentation.takeCommand().?;
+    defer scan.deinit();
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    var load = presentation.takeCommand().?;
+    defer load.deinit();
+    try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = load.load_session.command_id,
+        .intent = load.load_session.intent,
+        .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
+    } });
+    try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search) });
+    try testing.expect(presentation.projection().buffer_search == null);
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    try completeBufferSearchScan(&presentation);
+    try testing.expectEqual(@as(usize, 1), presentation.projection().buffer_search.?.total);
+}
+
 test "M21 kernel Buffer Search keeps the previous preview after a refused edit" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -11103,6 +11308,29 @@ test "M21 kernel SideBySide Buffer Search navigates to the exact source Line" {
     const published = presentation.published.?;
     const visual = published.visual_rows[published.navigation.cursor];
     try testing.expectEqualStrings("old source that wraps", visual.halves.?.left.?.line.text);
+}
+
+test "M21 kernel Buffer Search projects matches with identical line numbers in separate Files" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const session = try testSession(testing.allocator, 1, 'a');
+    session.diff = try bbr.diff.parse(session.arena.allocator(),
+        "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+needle\n" ++
+        "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-old\n+needle\n");
+    try session.initializeEnrichment();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+        .geometry = .{ .cols = 100, .rows = 20 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+    try completeBufferSearchScan(&presentation);
+    try testing.expectEqual(@as(usize, 2), presentation.projection().buffer_search.?.total);
+    const frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(usize, 2), frame.search_ranges.len);
+    try testing.expectEqual(@as(?usize, 0), frame.buffer.fileIndexForRow(frame.visual_rows[frame.search_ranges[0].visual_row].buffer_index));
+    try testing.expectEqual(@as(?usize, 1), frame.buffer.fileIndexForRow(frame.visual_rows[frame.search_ranges[1].visual_row].buffer_index));
 }
 
 fn testVersionNavigationSession(backing: std.mem.Allocator) !*session_mod.Session {

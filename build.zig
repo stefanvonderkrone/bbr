@@ -122,6 +122,20 @@ pub fn build(b: *std.Build) void {
     const file_acquisition_bench_step = b.step("bench-file-acquisition", "Run the opt-in File Enrichment concurrency benchmark");
     file_acquisition_bench_step.dependOn(&run_file_acquisition_bench.step);
 
+    const buffer_search_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/benchmark_buffer_search.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = &.{
+            .{ .name = "bbr", .module = bench_core_mod },
+            .{ .name = "zf", .module = zf.module("zf") },
+            .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+        },
+    });
+    const buffer_search_bench = b.addExecutable(.{ .name = "bbr-buffer-search-bench", .root_module = buffer_search_bench_mod });
+    const buffer_search_bench_step = b.step("bench-buffer-search", "Run the deterministic large Buffer Search benchmark");
+    buffer_search_bench_step.dependOn(&b.addRunArtifact(buffer_search_bench).step);
+
     // Live smoke check against real Bitbucket (opt-in; needs BITBUCKET_* env):
     //   zig build check -- <repo-slug> <pr-id>
     const check_cmd = b.addRunArtifact(exe);

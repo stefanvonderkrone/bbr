@@ -345,11 +345,18 @@ pub const Buffer = struct {
     }
 
     pub fn fileIndexForRow(self: Buffer, row: usize) ?usize {
-        for (self.file_rows, 0..) |file_row, index| {
-            const next_first = if (index + 1 < self.file_rows.len) self.file_rows[index + 1].first_row else self.file_rows_end;
-            if (row >= file_row.first_row and row < next_first) return file_row.file_index;
+        if (row >= self.file_rows_end) return null;
+        var low: usize = 0;
+        var high: usize = self.file_rows.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.file_rows[middle].first_row <= row) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
         }
-        return null;
+        return if (low == 0) null else self.file_rows[low - 1].file_index;
     }
 
     pub fn fileHeaderRow(self: Buffer, file_index: usize) ?usize {
