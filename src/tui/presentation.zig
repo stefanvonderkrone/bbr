@@ -845,13 +845,18 @@ pub const BufferSearchScanned = struct {
 };
 
 pub fn executeBufferSearchScan(allocator: Allocator, command: *const ScanBufferSearch) BufferSearchScanned {
+    const result: BufferSearchScanOutcome = if (search.scan(allocator, command.query, command.corpus.candidates, command.mode)) |value| blk: {
+        var batch = value;
+        if (command.mode == .literal) batch.owner = allocator;
+        break :blk .{ .scanned = batch };
+    } else |_| .failed;
     return .{
         .allocator = allocator,
         .command_id = command.command_id,
         .request_id = command.request_id,
         .session_epoch = command.session_epoch,
         .mode = command.mode,
-        .outcome = if (search.scan(allocator, command.query, command.corpus.candidates, command.mode)) |batch| .{ .scanned = batch } else |_| .failed,
+        .outcome = result,
     };
 }
 
@@ -3686,8 +3691,7 @@ pub const Presentation = struct {
         if (next == .scan_buffer_search or next == .scan_review_source) {
             for (self.issued_commands.items) |issued| {
                 if (issued.target == .scan_review_source or
-                    (issued.target == .scan_buffer_search and
-                        (next == .scan_review_source or next.scan_buffer_search.mode == .fuzzy))) return null;
+                    issued.target == .scan_buffer_search) return null;
             }
         }
         if (self.published) |published| {
@@ -6267,7 +6271,7 @@ pub const Presentation = struct {
         if (completed.session_epoch != published.epoch) return;
         const input = &(published.buffer_search.input orelse return);
         if (completed.request_id != input.request_id or !input.pending) return;
-        const worker_batch = switch (completed.outcome) {
+        var batch = switch (completed.outcome) {
             .failed => {
                 input.pending = false;
                 self.action_error = .buffer_search_scan_failed;
@@ -6276,12 +6280,7 @@ pub const Presentation = struct {
             },
             .scanned => |batch| batch,
         };
-        var batch = worker_batch.clone(self.allocator) catch {
-            input.pending = false;
-            self.action_error = .out_of_memory;
-            published.frame_revision += 1;
-            return;
-        };
+        completed.outcome = .failed;
         const base = firstSearchOccurrenceAtOrAfter(published, batch, input.origin);
         const retained = retainedEditedSearchIndex(input.batch, input.active, batch);
         const active = if (batch.occurrences.len == 0) null else retained orelse (base + input.count - 1) % batch.occurrences.len;
@@ -10955,20 +10954,41 @@ test "M21 kernel Buffer Search discards stale scan completions" {
     var first = presentation.takeCommand().?;
     defer first.deinit();
     try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "ew" } });
-    var second = presentation.takeCommand().?;
-    defer second.deinit();
-
     const stale = executeBufferSearchScan(testing.allocator, &first.scan_buffer_search);
     try presentation.dispatch(.{ .buffer_search_scanned = stale });
     var projection = presentation.projection().buffer_search.?;
     try testing.expectEqualStrings("new", projection.query);
     try testing.expect(projection.pending);
 
+    var second = presentation.takeCommand().?;
+    defer second.deinit();
     const current = executeBufferSearchScan(testing.allocator, &second.scan_buffer_search);
     try presentation.dispatch(.{ .buffer_search_scanned = current });
     projection = presentation.projection().buffer_search.?;
     try testing.expect(!projection.pending);
     try testing.expectEqual(@as(usize, 1), projection.total);
+}
+
+test "M21 kernel Buffer Search runs one scan and keeps the newest queued edit" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "n" } });
+    var first = presentation.takeCommand().?;
+    defer first.deinit();
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'w', .text = "w" } });
+    try testing.expect(presentation.takeCommand() == null);
+    try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, &first.scan_buffer_search) });
+    var newest = presentation.takeCommand().?;
+    defer newest.deinit();
+    try testing.expectEqualStrings("new", newest.scan_buffer_search.query.text);
+    try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, &newest.scan_buffer_search) });
+    try testing.expectEqual(@as(usize, 1), presentation.projection().buffer_search.?.total);
 }
 
 test "M21 kernel Buffer Search Enter waits for the current scan" {

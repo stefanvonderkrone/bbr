@@ -101,6 +101,8 @@ pub const Occurrence = struct {
 
 pub const Batch = struct {
     occurrences: []Occurrence,
+    // Worker-owned batches keep their allocator when Presentation takes ownership.
+    owner: ?std.mem.Allocator = null,
 
     pub fn clone(self: Batch, allocator: std.mem.Allocator) !Batch {
         const occurrences = try allocator.alloc(Occurrence, self.occurrences.len);
@@ -128,8 +130,9 @@ pub const Batch = struct {
     }
 
     pub fn deinit(self: *Batch, allocator: std.mem.Allocator) void {
-        for (self.occurrences) |*occurrence| occurrence.deinit(allocator);
-        allocator.free(self.occurrences);
+        const backing = self.owner orelse allocator;
+        for (self.occurrences) |*occurrence| occurrence.deinit(backing);
+        backing.free(self.occurrences);
         self.* = undefined;
     }
 };
