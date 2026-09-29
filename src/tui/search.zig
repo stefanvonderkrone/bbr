@@ -103,6 +103,9 @@ pub const Batch = struct {
     occurrences: []Occurrence,
     // Worker-owned batches keep their allocator when Presentation takes ownership.
     owner: ?std.mem.Allocator = null,
+    // Literal scans allocate many Occurrences. Release the worker arena once
+    // instead of freeing each Occurrence on the terminal thread.
+    owner_arena: ?*std.heap.ArenaAllocator = null,
 
     pub fn clone(self: Batch, allocator: std.mem.Allocator) !Batch {
         const occurrences = try allocator.alloc(Occurrence, self.occurrences.len);
@@ -130,6 +133,13 @@ pub const Batch = struct {
     }
 
     pub fn deinit(self: *Batch, allocator: std.mem.Allocator) void {
+        if (self.owner_arena) |arena| {
+            const backing = arena.child_allocator;
+            arena.deinit();
+            backing.destroy(arena);
+            self.* = undefined;
+            return;
+        }
         const backing = self.owner orelse allocator;
         for (self.occurrences) |*occurrence| occurrence.deinit(backing);
         backing.free(self.occurrences);

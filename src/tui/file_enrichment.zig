@@ -475,12 +475,20 @@ pub const Storage = struct {
 
     pub fn lease(self: *Storage, file_idx: usize) ReadLease {
         std.debug.assert(file_idx < self.files.len);
+        const result = self.snapshot(file_idx);
+        self.files[file_idx].leases += 1;
+        return result;
+    }
+
+    /// Retain immutable File content without changing cache policy. The caller
+    /// can release this lease after the Session itself is replaced.
+    pub fn snapshot(self: *const Storage, file_idx: usize) ReadLease {
+        std.debug.assert(file_idx < self.files.len);
         const stored = &self.files[file_idx];
         const old = if (stored.old == .content) stored.old.content else null;
         const new = if (stored.new == .content) stored.new.content else null;
         if (old) |side| _ = side.references.fetchAdd(1, .acq_rel);
         if (new) |side| _ = side.references.fetchAdd(1, .acq_rel);
-        stored.leases += 1;
         return .{ .view = self.file(file_idx), .old = old, .new = new };
     }
 
@@ -752,6 +760,21 @@ test "File read lease release restores inactive cache budget while focused File 
     try testing.expect(storage.file(1).new == .content);
     try testing.expectEqualStrings("first", lease.view.new.content.blob);
     lease.release();
+}
+
+test "File snapshot survives cache eviction without a Storage lease" {
+    const files = test_files;
+    var storage = try Storage.init(testing.allocator, &files);
+    var first = try ownedAddedResult(testing.allocator, "first");
+    defer first.deinit();
+    try storage.admit(0, &first);
+    var snapshot = storage.snapshot(0);
+    storage.configureCache(.{ .max_retained_bytes = 1 });
+    try testing.expect(storage.file(0).new == .pending);
+    try testing.expectEqualStrings("first", snapshot.view.new.content.blob);
+    storage.deinit();
+    try testing.expectEqualStrings("first", snapshot.view.new.content.blob);
+    snapshot.release();
 }
 
 test "remote File Enrichment retries transient source failures once in the File slot" {

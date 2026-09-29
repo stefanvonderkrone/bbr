@@ -21,7 +21,11 @@ fn paint(allocator: std.mem.Allocator, review: presentation.ReviewProjection) !v
 }
 
 pub fn main(init: std.process.Init) !void {
+    var args = init.minimal.args.iterate();
+    _ = args.next();
+    const lines = if (args.next()) |arg| try std.fmt.parseInt(usize, arg, 10) else 128;
+    if (lines == 0 or lines > 4096 or args.next() != null) return error.InvalidFixtureSize;
     screen = try vaxis.Screen.init(init.gpa, .{ .rows = 30, .cols = 100, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(init.gpa);
-    try presentation.benchmarkBufferSearch(init.gpa, init.io, paint);
+    try presentation.benchmarkBufferSearch(init.gpa, init.io, lines, paint);
 }

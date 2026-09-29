@@ -186,6 +186,10 @@ const ScriptedExecutor = struct {
                 value.deinit();
                 break :blk .{ .buffer_search_scanned = completed };
             },
+            .build_buffer_disclosure => |value| blk: {
+                value.failed = true;
+                break :blk .{ .buffer_disclosure_built = value };
+            },
             .scan_review_source => |*value| blk: {
                 const completed: presentation.ReviewSourceScanned = .{
                     .allocator = std.heap.page_allocator,

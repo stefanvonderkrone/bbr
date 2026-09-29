@@ -134,7 +134,9 @@ pub fn build(b: *std.Build) void {
     });
     const buffer_search_bench = b.addExecutable(.{ .name = "bbr-buffer-search-bench", .root_module = buffer_search_bench_mod });
     const buffer_search_bench_step = b.step("bench-buffer-search", "Run the deterministic large Buffer Search benchmark");
-    buffer_search_bench_step.dependOn(&b.addRunArtifact(buffer_search_bench).step);
+    const run_buffer_search_bench = b.addRunArtifact(buffer_search_bench);
+    if (b.args) |args| run_buffer_search_bench.addArgs(args);
+    buffer_search_bench_step.dependOn(&run_buffer_search_bench.step);
 
     // Live smoke check against real Bitbucket (opt-in; needs BITBUCKET_* env):
     //   zig build check -- <repo-slug> <pr-id>

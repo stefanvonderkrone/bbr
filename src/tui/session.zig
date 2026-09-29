@@ -14,6 +14,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const bbr = @import("bbr");
 const file_enrichment = @import("file_enrichment.zig");
+const buffer = @import("buffer.zig");
 
 const PullRequest = bbr.bitbucket.PullRequest;
 const Client = bbr.bitbucket.Client;
@@ -41,12 +42,14 @@ pub const SourceContext = union(enum) {
 
 pub const Session = struct {
     arena: std.heap.ArenaAllocator,
+    references: std.atomic.Value(usize),
     acquisition_arenas: [4]?std.heap.ArenaAllocator = @splat(null),
     header: ReviewHeader,
     source: SourceContext,
     diff: bbr.diff.Diff,
     threads: []const bbr.review.Thread,
     enrichment: file_enrichment.Storage,
+    emphasis_cache: ?buffer.EmphasisCache = null,
     /// Independently acquired mutation capability. A missing UUID never makes
     /// the read-only Session unusable.
     authenticated_account_uuid: ?[]const u8 = null,
@@ -55,6 +58,7 @@ pub const Session = struct {
     /// Free transferred File Enrichment sides, the Session arena, and finally
     /// the Session struct itself.
     pub fn destroy(self: *Session) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
         const backing = self.arena.child_allocator;
         self.enrichment.deinit();
         self.arena.deinit();
@@ -62,10 +66,18 @@ pub const Session = struct {
         backing.destroy(self);
     }
 
+    pub fn retain(self: *Session) void {
+        _ = self.references.fetchAdd(1, .acq_rel);
+    }
+
     pub fn initializeEnrichment(self: *Session) !void {
         const next = try file_enrichment.Storage.init(self.arena.allocator(), self.diff.files);
         self.enrichment.deinit();
         self.enrichment = next;
+    }
+
+    pub fn prepareEmphasis(self: *Session) !void {
+        self.emphasis_cache = try buffer.EmphasisCache.build(self.arena.allocator(), self.diff);
     }
 
     pub fn remotePullRequest(self: *Session) ?*PullRequest {
@@ -90,7 +102,9 @@ pub fn create(backing: Allocator) !*Session {
     const s = try backing.create(Session);
     errdefer backing.destroy(s);
     s.arena = std.heap.ArenaAllocator.init(backing);
+    s.references = .init(1);
     s.acquisition_arenas = @splat(null);
+    s.emphasis_cache = null;
     errdefer s.arena.deinit();
     s.threads = &.{};
     s.enrichment = try file_enrichment.Storage.init(s.arena.allocator(), &.{});
@@ -172,7 +186,9 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
     const s = try backing.create(Session);
     errdefer backing.destroy(s);
     s.arena = std.heap.ArenaAllocator.init(backing);
+    s.references = .init(1);
     s.acquisition_arenas = @splat(null);
+    s.emphasis_cache = null;
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
 
@@ -199,6 +215,7 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
     errdefer s.enrichment.deinit();
     const comments = comments_branch.value.?;
     s.threads = try bbr.review.buildThreads(a, comments);
+    try s.prepareEmphasis();
     const account_arena: ?std.heap.ArenaAllocator = if (account_branch.err == null)
         account_branch.arena
     else blk: {
@@ -217,7 +234,9 @@ pub fn loadSequentialWith(backing: Allocator, bb: Client, repo: []const u8, id: 
     const s = try backing.create(Session);
     errdefer backing.destroy(s);
     s.arena = std.heap.ArenaAllocator.init(backing);
+    s.references = .init(1);
     s.acquisition_arenas = @splat(null);
+    s.emphasis_cache = null;
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
 
@@ -236,6 +255,7 @@ pub fn loadSequentialWith(backing: Allocator, bb: Client, repo: []const u8, id: 
     errdefer s.enrichment.deinit();
     const comments = try bb.getComments(a, repo, id, .{ .source = pr.source_commit, .destination = pr.destination_commit });
     s.threads = try bbr.review.buildThreads(a, comments);
+    try s.prepareEmphasis();
     return s;
 }
 
@@ -305,7 +325,9 @@ pub fn loadLocalWith(
     const s = try backing.create(Session);
     errdefer backing.destroy(s);
     s.arena = std.heap.ArenaAllocator.init(backing);
+    s.references = .init(1);
     s.acquisition_arenas = @splat(null);
+    s.emphasis_cache = null;
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
 
@@ -334,6 +356,7 @@ pub fn loadLocalWith(
         .locator = common_dir,
         .source_label = "Git",
     };
+    try s.prepareEmphasis();
     return s;
 }
 
@@ -376,6 +399,7 @@ test "loadWith builds a session in order and owns everything" {
     try testing.expectEqualStrings("feature/x", s.header.source_ref);
     try testing.expect(s.remotePullRequestConst() != null);
     try testing.expectEqual(@as(usize, 1), s.diff.files.len);
+    try testing.expect(s.emphasis_cache.?.entries.get(&s.diff.files[0].hunks[0]) != null);
     try testing.expectEqual(@as(usize, 1), s.threads.len);
     try testing.expectEqualStrings("{ada}", s.authenticated_account_uuid.?);
     try testing.expectEqual(@as(usize, 4), fake.call_count);
