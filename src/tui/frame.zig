@@ -232,6 +232,7 @@ pub const Projection = struct {
     selected_version: SelectedVersion = .new,
     version_title_targets: VersionTitleTargets = .{},
     search_ranges: []const ProjectedSourceRange = &.{},
+    search_ranges_sorted: bool = false,
     buffer_search_active: ?usize = null,
     buffer_search_ranges: bool = false,
 };

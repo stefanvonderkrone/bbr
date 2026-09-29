@@ -101,6 +101,7 @@ pub const Occurrence = struct {
 
 pub const Batch = struct {
     occurrences: []Occurrence,
+    references: ?*std.atomic.Value(usize) = null,
     // Worker-owned batches keep their allocator when Presentation takes ownership.
     owner: ?std.mem.Allocator = null,
     // Literal scans allocate many Occurrences. Release the worker arena once
@@ -132,7 +133,27 @@ pub const Batch = struct {
         return .{ .occurrences = occurrences };
     }
 
+    /// Give a worker an immutable view while Presentation can replace its Batch.
+    pub fn retain(self: *Batch, allocator: std.mem.Allocator) !Batch {
+        if (self.references == null) {
+            const references = try std.heap.page_allocator.create(std.atomic.Value(usize));
+            references.* = .init(1);
+            self.references = references;
+            if (self.owner == null and self.owner_arena == null) self.owner = allocator;
+        }
+        _ = self.references.?.fetchAdd(1, .acq_rel);
+        return self.*;
+    }
+
     pub fn deinit(self: *Batch, allocator: std.mem.Allocator) void {
+        if (self.references) |references| {
+            const last = references.fetchSub(1, .acq_rel) == 1;
+            if (!last) {
+                self.* = undefined;
+                return;
+            }
+            std.heap.page_allocator.destroy(references);
+        }
         if (self.owner_arena) |arena| {
             const backing = arena.child_allocator;
             arena.deinit();
@@ -146,6 +167,15 @@ pub const Batch = struct {
         self.* = undefined;
     }
 };
+
+test "a retained Batch survives replacement until its worker releases it" {
+    const allocator = std.testing.allocator;
+    var batch: Batch = .{ .occurrences = try allocator.alloc(Occurrence, 0) };
+    var worker = try batch.retain(allocator);
+    batch.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), worker.occurrences.len);
+    worker.deinit(allocator);
+}
 
 pub const Mode = enum { literal, fuzzy };
 
