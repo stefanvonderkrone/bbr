@@ -109,6 +109,7 @@ pub fn drawReview(
 
 fn drawSearchRanges(win: vaxis.Window, frame: @import("frame.zig").Projection, theme: Theme) void {
     for (frame.search_ranges) |range| {
+        const active = if (frame.buffer_search_ranges and range.occurrence_index != null) frame.buffer_search_active == range.occurrence_index else range.active;
         if (range.visual_row < frame.navigation.scroll) continue;
         const screen_row = range.visual_row - frame.navigation.scroll;
         if (screen_row >= win.height or range.visual_row >= frame.visual_rows.len) continue;
@@ -130,10 +131,10 @@ fn drawSearchRanges(win: vaxis.Window, frame: @import("frame.zig").Projection, t
                 } else gutter_cols;
                 const start = base + vaxis.gwidth.gwidth(text[row_start..range.source.start], .unicode);
                 const width = vaxis.gwidth.gwidth(text[range.source.start..range.source.end], .unicode);
-                paintSearchCells(win, @intCast(screen_row), start, width, range.active, theme);
+                paintSearchCells(win, @intCast(screen_row), start, width, active, theme);
             },
-            .comment => |card| drawReviewCardSearchRange(win, @intCast(screen_row), card, range, theme),
-            .draft => |card| drawReviewCardSearchRange(win, @intCast(screen_row), card, range, theme),
+            .comment => |card| drawReviewCardSearchRange(win, @intCast(screen_row), card, range, active, theme),
+            .draft => |card| drawReviewCardSearchRange(win, @intCast(screen_row), card, range, active, theme),
             else => {},
         }
     }
@@ -151,7 +152,7 @@ fn searchSourceText(row: Row, visual: @import("frame.zig").VisualRow, relation: 
     };
 }
 
-fn drawReviewCardSearchRange(win: vaxis.Window, row: u16, card: buffer_mod.ReviewCardRow, range: @import("frame.zig").ProjectedSourceRange, theme: Theme) void {
+fn drawReviewCardSearchRange(win: vaxis.Window, row: u16, card: buffer_mod.ReviewCardRow, range: @import("frame.zig").ProjectedSourceRange, active: bool, theme: Theme) void {
     var col: usize = (if (card.isReply()) @as(usize, 6) else 2) + (if (card.part == .header) @as(usize, 0) else 2);
     for (card.segments) |segment| {
         const start = @max(range.source.start, segment.source.start);
@@ -162,7 +163,7 @@ fn drawReviewCardSearchRange(win: vaxis.Window, row: u16, card: buffer_mod.Revie
             if (local_end <= segment.text.len) {
                 const cell_start = col + vaxis.gwidth.gwidth(segment.text[0..local_start], .unicode);
                 const width = vaxis.gwidth.gwidth(segment.text[local_start..local_end], .unicode);
-                paintSearchCells(win, row, cell_start, width, range.active, theme);
+                paintSearchCells(win, row, cell_start, width, active, theme);
             }
         }
         col += vaxis.gwidth.gwidth(segment.text, .unicode);

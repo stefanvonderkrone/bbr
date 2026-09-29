@@ -21,7 +21,7 @@
 
 Commits `4b967b3` and `72a7f35` serialize scans, transfer the worker Batch without a full clone, cache the corpus, and index source rows for range projection. The large-Buffer benchmark runs with `zig build bench-buffer-search`. The full suite passed with 833 tests.
 
-The original work caches the corpus, serializes scans, reuses completed Batches, and indexes source rows. Later changes cache Hunk emphasis per Session, project Buffer Search ranges on the scan worker, and stage Query-driven hidden-match Buffer builds on a worker. The ticket remains open because completion admission still does unbounded projection work on the terminal thread, and other Buffer rebuilds remain synchronous.
+The original work caches the corpus, serializes scans, reuses completed Batches, and indexes source rows. Later changes cache Hunk emphasis per Session, project Buffer Search ranges on the scan worker, and stage Query-driven hidden-match Buffer builds on a worker. Completion admission now takes worker ranges directly, but disclosure admission and other Buffer rebuilds remain synchronous.
 
 ## Baseline
 
@@ -102,6 +102,14 @@ A follow-up run measured the handoff from worker scan to queued disclosure build
 
 `zig build bench-buffer-search -- 4096` measures 16 Files, 131,072 changed Lines, and 2,193,960 Diff bytes. The separate hidden-match fixture has 131,074 Lines and 2,772,562 Diff bytes. Nine ReleaseFast samples measured 227 µs p95 for Query edits, 84 µs p95 for the scan-to-disclosure handoff, 41.32 ms p95 for hidden-match Buffer construction, and 10.86 ms p95 for completion admission. Escape measured 1.47 ms p95.
 
-This fixture is larger than the 32,768-Line runs, but it does not close the ticket. Completion admission still copies all projected ranges and rebuilds the File Tree on the terminal thread. Disclosure Buffer publication also reprojects accepted Buffer Search and Review Search ranges there. Stale `n` and `N` traversal and general Buffer rebuilding remain synchronous. The full suite last passed with 854 tests.
+This fixture is larger than the 32,768-Line runs, but it did not close the ticket. At this point, completion admission still copied all projected ranges and rebuilt the File Tree on the terminal thread. Disclosure Buffer publication also reprojected accepted Buffer Search and Review Search ranges there. Stale `n` and `N` traversal and general Buffer rebuilding remained synchronous. The full suite passed with 854 tests.
 
 The full suite passed with 854 tests. Tests cover a pending Frame, Enter before completion, rapid Query edits, cancellation, Session replacement, a changed Frame, launch failure, and allocation failure during completion admission.
+
+## Range transfer and File Tree construction
+
+Scan admission now takes the worker's projected ranges without copying them. If the visual rows changed during the scan, Presentation queues another scan against the current Frame instead of projecting on the terminal thread. The disclosure worker also builds the File Tree. Presentation checks the File Tree cursor, scroll, and active File before it publishes the completed Frame. Visible `n` and `N` traversal changes the active Search Occurrence without projecting the Batch again.
+
+On the 131,072-Line fixture, `zig build bench-buffer-search -- 4096` measured 0.62 ms p95 for top-origin admission and 2.98 ms p95 for bottom-origin admission. The hidden fixture measured 0.53 ms p95 for disclosure admission. Nine ReleaseFast samples produced each measurement. The full suite passed with 854 tests.
+
+The issue remains open. Disclosure admission still projects accepted Buffer Search and Review Search ranges on the terminal thread. Visible `n` and `N` still search visual rows for the target. Hidden traversal, Escape restoration, and general Buffer rebuilds still use synchronous Buffer construction. The 131,072-Line benchmark measured 445 ms p95 for synchronous disclosure rebuilding.

@@ -232,6 +232,8 @@ pub const Projection = struct {
     selected_version: SelectedVersion = .new,
     version_title_targets: VersionTitleTargets = .{},
     search_ranges: []const ProjectedSourceRange = &.{},
+    buffer_search_active: ?usize = null,
+    buffer_search_ranges: bool = false,
 };
 
 /// Resolve a cell solely against the immutable, already-published Frame. An

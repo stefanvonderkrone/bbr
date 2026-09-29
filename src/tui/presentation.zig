@@ -956,6 +956,11 @@ pub const DisclosureBuild = struct {
     drafts: []const bbr.review.Draft = &.{},
     scopes: []const bbr.review.ScopeProjectionEntry = &.{},
     disclosures: []const buffer_mod.DisclosureKey = &.{},
+    collapsed_directories: []const []const u8 = &.{},
+    wanted_cursor: ?file_tree.Identity = null,
+    tree_scroll: usize = 0,
+    active_file: ?usize = null,
+    tree: file_tree.Projection = .{},
     preferences: Preferences,
     geometry: frame_mod.Geometry,
     isolated_file: ?usize,
@@ -1003,6 +1008,17 @@ pub const DisclosureBuild = struct {
             job.leased += 1;
         }
         job.disclosures = try a.dupe(buffer_mod.DisclosureKey, target);
+        const collapsed = try a.alloc([]const u8, published.collapsed_directories.items.len);
+        for (published.collapsed_directories.items, collapsed) |path, *copy| copy.* = try a.dupe(u8, path);
+        job.collapsed_directories = collapsed;
+        job.tree_scroll = published.tree.scroll;
+        job.active_file = if (published.session.diff.files.len == 0) null else published.isolated_file orelse published.buffer.fileIndexForRow(published.cursorBufferIndex());
+        if (published.tree.entries.len > 0) {
+            job.wanted_cursor = switch (published.tree.entries[published.tree.cursor].identity) {
+                .file => |index| .{ .file = index },
+                .directory => |path| .{ .directory = try a.dupe(u8, path) },
+            };
+        }
         const drafts = try a.alloc(bbr.review.Draft, published.review.drafts.items.len);
         for (published.review.drafts.items, drafts) |draft, *copy| {
             copy.* = draft;
@@ -1051,6 +1067,8 @@ pub const DisclosureBuild = struct {
             .layout = self.preferences.layout,
             .width = frame_mod.paneRects(self.geometry).diff_content.width,
         });
+        const panes = frame_mod.paneRects(self.geometry);
+        self.tree = try file_tree.build(a, self.session.diff, self.buffer.file_tallies, self.collapsed_directories, self.active_file, panes.sidebar_content.width, panes.sidebar_content.height, self.wanted_cursor, self.tree_scroll, self.cell_metrics);
         self.projection = try SearchProjection.create(self.buffer, self.visual_rows);
         const result = try self.projection.?.project(std.heap.page_allocator, self.batch.?);
         self.ranges = result.ranges;
@@ -1114,8 +1132,8 @@ pub const BufferSearchScanned = struct {
 
     pub fn deinit(self: *BufferSearchScanned) void {
         if (self.outcome == .scanned) self.outcome.scanned.deinit(self.allocator);
-        if (self.ranges) |ranges| self.allocator.free(ranges);
-        if (self.navigation_rows) |rows| self.allocator.free(rows);
+        if (self.ranges) |ranges| std.heap.page_allocator.free(ranges);
+        if (self.navigation_rows) |rows| std.heap.page_allocator.free(rows);
         self.* = undefined;
     }
 };
@@ -1144,7 +1162,7 @@ pub fn executeBufferSearchScan(allocator: Allocator, command: *const ScanBufferS
         .outcome = result,
     };
     if (command.mode == .literal and command.projection != null and completed.outcome == .scanned) {
-        const projected = command.projection.?.project(allocator, completed.outcome.scanned) catch {
+        const projected = command.projection.?.project(std.heap.page_allocator, completed.outcome.scanned) catch {
             completed.outcome.scanned.deinit(allocator);
             completed.outcome = .failed;
             return completed;
@@ -1738,7 +1756,7 @@ const BufferSearchInput = struct {
     fn deinit(self: *BufferSearchInput, allocator: Allocator) void {
         if (self.query) |*query| query.deinit(allocator);
         if (self.batch) |*batch| batch.deinit(allocator);
-        if (self.ranges) |ranges| allocator.free(ranges);
+        if (self.ranges) |ranges| std.heap.page_allocator.free(ranges);
         allocator.free(self.saved_expanded_disclosures);
         if (self.saved_search_disclosures) |disclosures| allocator.free(disclosures);
         self.corpus.release();
@@ -1759,7 +1777,7 @@ const BufferSearchState = struct {
         if (self.input) |*input| input.deinit(allocator);
         if (self.accepted_query) |*query| query.deinit(allocator);
         if (self.accepted_batch) |*batch| batch.deinit(allocator);
-        if (self.accepted_ranges) |ranges| allocator.free(ranges);
+        if (self.accepted_ranges) |ranges| std.heap.page_allocator.free(ranges);
         if (self.saved_disclosures) |disclosures| allocator.free(disclosures);
         self.* = undefined;
     }
@@ -1946,9 +1964,9 @@ const Published = struct {
         fn deinit(self: *StagedBuffer) void {
             if (self.active) {
                 if (self.accepted_batch) |*batch| batch.deinit(self.published.allocator);
-                if (self.accepted_ranges) |ranges| self.published.allocator.free(ranges);
+                if (self.accepted_ranges) |ranges| std.heap.page_allocator.free(ranges);
                 if (self.input_batch) |*batch| batch.deinit(self.published.allocator);
-                if (self.input_ranges) |ranges| self.published.allocator.free(ranges);
+                if (self.input_ranges) |ranges| std.heap.page_allocator.free(ranges);
                 if (self.review_ranges) |ranges| self.published.allocator.free(ranges);
                 if (self.search_corpus) |corpus| corpus.release();
                 self.search_projection.release();
@@ -1972,6 +1990,11 @@ const Published = struct {
                 if (self.published.search_corpus) |old| old.release();
                 self.published.search_corpus = corpus;
                 self.search_corpus = null;
+                if (self.published.buffer_search.input) |*input| {
+                    corpus.retain();
+                    input.corpus.release();
+                    input.corpus = corpus;
+                }
             }
             self.published.navigation = frame_mod.restoreNavigation(previous, self.visual_rows, self.geometry);
             if (self.published.worker_frame) |worker_frame| worker_frame.destroy();
@@ -1982,7 +2005,7 @@ const Published = struct {
                     self.published.buffer_search.accepted_batch = self.accepted_batch;
                     self.accepted_batch = null;
                 }
-                if (self.published.buffer_search.accepted_ranges) |ranges| self.published.allocator.free(ranges);
+                if (self.published.buffer_search.accepted_ranges) |ranges| std.heap.page_allocator.free(ranges);
                 self.published.buffer_search.accepted_ranges = self.accepted_ranges;
                 self.published.buffer_search.active = self.accepted_active;
                 self.accepted_ranges = null;
@@ -1993,7 +2016,7 @@ const Published = struct {
                     input.batch = self.input_batch;
                     self.input_batch = null;
                 }
-                if (input.ranges) |ranges| self.published.allocator.free(ranges);
+                if (input.ranges) |ranges| std.heap.page_allocator.free(ranges);
                 input.ranges = self.input_ranges;
                 input.active = self.input_active;
                 self.input_ranges = null;
@@ -2246,6 +2269,8 @@ const Published = struct {
                 .buffer => self.buffer_search.currentRanges(),
                 .review => if (self.review_search.pending) &.{} else self.review_search.ranges orelse &.{},
             },
+            .buffer_search_active = if (self.active_search == .buffer) self.buffer_search.currentActive() else null,
+            .buffer_search_ranges = self.active_search == .buffer,
         };
     }
 
@@ -2594,13 +2619,13 @@ const Published = struct {
         var accepted_active: ?usize = null;
         errdefer {
             if (accepted_batch) |*batch| batch.deinit(self.allocator);
-            if (accepted_ranges) |ranges| self.allocator.free(ranges);
+            if (accepted_ranges) |ranges| std.heap.page_allocator.free(ranges);
         }
         if (self.buffer_search.accepted_query) |query| {
             if (reuse_search_corpus) {
                 if (self.buffer_search.accepted_batch) |batch| {
                     accepted_active = self.buffer_search.active;
-                    accepted_ranges = try projectBufferSearchRangesFor(self.allocator, candidate, visual_rows, batch, accepted_active);
+                    accepted_ranges = try projectBufferSearchRangesFor(std.heap.page_allocator, candidate, visual_rows, batch, accepted_active);
                 }
             } else {
                 var batch = self.scanBufferSearchFor(preferences, expanded_disclosures, isolated_file, geometry, query) catch |err| return switch (err) {
@@ -2608,7 +2633,7 @@ const Published = struct {
                     else => error.SearchFailed,
                 };
                 accepted_active = retainedSearchIndex(self.buffer_search.accepted_batch, self.buffer_search.active, batch);
-                accepted_ranges = projectBufferSearchRangesFor(self.allocator, candidate, visual_rows, batch, accepted_active) catch |err| {
+                accepted_ranges = projectBufferSearchRangesFor(std.heap.page_allocator, candidate, visual_rows, batch, accepted_active) catch |err| {
                     batch.deinit(self.allocator);
                     return err;
                 };
@@ -2621,13 +2646,13 @@ const Published = struct {
         var input_active: ?usize = null;
         errdefer {
             if (input_batch) |*batch| batch.deinit(self.allocator);
-            if (input_ranges) |ranges| self.allocator.free(ranges);
+            if (input_ranges) |ranges| std.heap.page_allocator.free(ranges);
         }
         if (self.buffer_search.input) |input| if (input.query) |query| {
             if (reuse_search_corpus) {
                 if (input.batch) |batch| {
                     input_active = input.active;
-                    input_ranges = try projectBufferSearchRangesFor(self.allocator, candidate, visual_rows, batch, input_active);
+                    input_ranges = try projectBufferSearchRangesFor(std.heap.page_allocator, candidate, visual_rows, batch, input_active);
                 }
             } else {
                 var batch = self.scanBufferSearchFor(preferences, expanded_disclosures, isolated_file, geometry, query) catch |err| return switch (err) {
@@ -2635,7 +2660,7 @@ const Published = struct {
                     else => error.SearchFailed,
                 };
                 input_active = retainedSearchIndex(input.batch, input.active, batch);
-                input_ranges = projectBufferSearchRangesFor(self.allocator, candidate, visual_rows, batch, input_active) catch |err| {
+                input_ranges = projectBufferSearchRangesFor(std.heap.page_allocator, candidate, visual_rows, batch, input_active) catch |err| {
                     batch.deinit(self.allocator);
                     return err;
                 };
@@ -2811,6 +2836,7 @@ const Published = struct {
             }
         }
         for (batch.occurrences, 0..) |occurrence, occurrence_index| {
+            const before = projected.items.len;
             switch (occurrence.location) {
                 .source => |source| {
                     const number = if (source.relation == .new) source.new_line else source.old_line;
@@ -2839,6 +2865,7 @@ const Published = struct {
                     }
                 },
             }
+            for (projected.items[before..]) |*range| range.occurrence_index = occurrence_index;
         }
         return projected.toOwnedSlice(allocator);
     }
@@ -6510,7 +6537,7 @@ pub const Presentation = struct {
         if (published.buffer_search.accepted_batch) |*batch| batch.deinit(self.allocator);
         published.buffer_search.accepted_query = input.query;
         published.buffer_search.accepted_batch = input.batch;
-        if (published.buffer_search.accepted_ranges) |ranges| self.allocator.free(ranges);
+        if (published.buffer_search.accepted_ranges) |ranges| std.heap.page_allocator.free(ranges);
         published.buffer_search.accepted_ranges = input.ranges;
         published.buffer_search.active = input.active;
         published.buffer_search.status_visible = true;
@@ -6596,7 +6623,7 @@ pub const Presentation = struct {
                 var owned = batch;
                 owned.deinit(self.allocator);
             }
-            if (old_ranges) |ranges| self.allocator.free(ranges);
+            if (old_ranges) |ranges| std.heap.page_allocator.free(ranges);
             published.navigation = input.saved_navigation;
             self.action_error = null;
             published.frame_revision += 1;
@@ -6682,7 +6709,12 @@ pub const Presentation = struct {
         };
         completed.outcome = .failed;
         const retained = retainedEditedSearchIndex(input.batch, input.active, batch);
-        const base = if (batch.occurrences.len == 0 or retained != null) 0 else firstSearchOccurrenceAtOrAfter(published, batch, input.origin, if (completed.visual_rows_revision == published.visual_rows_revision) completed.navigation_rows else null) catch {
+        if (completed.visual_rows_revision != published.visual_rows_revision) {
+            batch.deinit(self.allocator);
+            self.retryStaleBufferDisclosure(published);
+            return;
+        }
+        const base = if (batch.occurrences.len == 0 or retained != null) 0 else firstSearchOccurrenceAtOrAfter(published, batch, input.origin, completed.navigation_rows) catch {
             batch.deinit(self.allocator);
             input.pending = false;
             self.action_error = .out_of_memory;
@@ -6697,17 +6729,14 @@ pub const Presentation = struct {
             published.frame_revision += 1;
             return;
         }) return;
-        const ranges = (if (completed.ranges != null and completed.visual_rows_revision == published.visual_rows_revision) blk: {
-            const copied = self.allocator.dupe(frame_mod.ProjectedSourceRange, completed.ranges.?) catch break :blk null;
-            for (copied) |*range| range.active = range.occurrence_index == active;
-            break :blk copied;
-        } else null) orelse published.projectBufferSearchRanges(batch, active) catch {
+        const ranges = completed.ranges orelse {
             batch.deinit(self.allocator);
             input.pending = false;
-            self.action_error = .out_of_memory;
+            self.action_error = .buffer_search_scan_failed;
             published.frame_revision += 1;
             return;
         };
+        completed.ranges = null;
         const old_batch = input.batch;
         const old_ranges = input.ranges;
         const old_active = input.active;
@@ -6721,7 +6750,7 @@ pub const Presentation = struct {
                 input.ranges = old_ranges;
                 input.active = old_active;
                 batch.deinit(self.allocator);
-                self.allocator.free(ranges);
+                std.heap.page_allocator.free(ranges);
                 self.action_error = normalizeActionError(err);
                 return;
             };
@@ -6734,7 +6763,7 @@ pub const Presentation = struct {
             input.ranges = old_ranges;
             input.active = old_active;
             batch.deinit(self.allocator);
-            self.allocator.free(ranges);
+            std.heap.page_allocator.free(ranges);
             self.action_error = normalizeActionError(err);
             return;
         };
@@ -6742,7 +6771,7 @@ pub const Presentation = struct {
             var owned = old;
             owned.deinit(self.allocator);
         }
-        if (old_ranges) |old| self.allocator.free(old);
+        if (old_ranges) |old| std.heap.page_allocator.free(old);
         self.action_error = if (active == null) .buffer_search_no_matches else null;
         published.frame_revision += 1;
         if ((published.buffer_search.input orelse return).accept_when_ready) self.acceptBufferSearch();
@@ -6799,23 +6828,18 @@ pub const Presentation = struct {
             return;
         }
 
-        const panes = frame_mod.paneRects(job.geometry);
-        const wanted_cursor = if (published.tree.entries.len == 0) null else published.tree.entries[published.tree.cursor].identity;
         const active_file = if (published.session.diff.files.len == 0) null else published.isolated_file orelse published.buffer.fileIndexForRow(published.cursorBufferIndex());
-        const tree = file_tree.build(job.arena.allocator(), published.session.diff, job.buffer.file_tallies, published.collapsed_directories.items, active_file, panes.sidebar_content.width, panes.sidebar_content.height, wanted_cursor, published.tree.scroll, published.cell_metrics) catch {
-            input.pending = false;
-            self.action_error = .out_of_memory;
+        const wanted_cursor: ?file_tree.Identity = if (published.tree.entries.len == 0) null else published.tree.entries[published.tree.cursor].identity;
+        const same_cursor = if (wanted_cursor) |cursor| if (job.wanted_cursor) |saved| cursor.eql(saved) else false else job.wanted_cursor == null;
+        if (job.active_file != active_file or job.tree_scroll != published.tree.scroll or !same_cursor) {
+            self.retryStaleBufferDisclosure(published);
             return;
-        };
-        const ranges = self.allocator.dupe(frame_mod.ProjectedSourceRange, job.ranges.?) catch {
-            input.pending = false;
-            self.action_error = .out_of_memory;
-            return;
-        };
-        for (ranges) |*range| range.active = range.occurrence_index == job.active;
+        }
+        const ranges = job.ranges.?;
+        job.ranges = null;
         const accepted_ranges = if (published.buffer_search.accepted_batch) |accepted|
-            Published.projectBufferSearchRangesFor(self.allocator, job.buffer, job.visual_rows, accepted, published.buffer_search.active) catch {
-                self.allocator.free(ranges);
+            Published.projectBufferSearchRangesFor(std.heap.page_allocator, job.buffer, job.visual_rows, accepted, published.buffer_search.active) catch {
+                std.heap.page_allocator.free(ranges);
                 input.pending = false;
                 self.action_error = .out_of_memory;
                 return;
@@ -6823,8 +6847,8 @@ pub const Presentation = struct {
         else null;
         const review_ranges = if (published.review_search.batch) |review|
             Published.projectBufferSearchRangesFor(self.allocator, job.buffer, job.visual_rows, review, published.review_search.selected) catch {
-                self.allocator.free(ranges);
-                if (accepted_ranges) |old| self.allocator.free(old);
+                std.heap.page_allocator.free(ranges);
+                if (accepted_ranges) |old| std.heap.page_allocator.free(old);
                 input.pending = false;
                 self.action_error = .out_of_memory;
                 return;
@@ -6833,8 +6857,8 @@ pub const Presentation = struct {
         var disclosures: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
         disclosures.appendSlice(self.allocator, job.disclosures) catch {
             disclosures.deinit(self.allocator);
-            self.allocator.free(ranges);
-            if (accepted_ranges) |old| self.allocator.free(old);
+            std.heap.page_allocator.free(ranges);
+            if (accepted_ranges) |old| std.heap.page_allocator.free(old);
             if (review_ranges) |old| self.allocator.free(old);
             input.pending = false;
             self.action_error = .out_of_memory;
@@ -6843,8 +6867,8 @@ pub const Presentation = struct {
         const saved = if (published.buffer_search.saved_disclosures == null and !job.clear_saved_disclosures)
             self.allocator.dupe(buffer_mod.DisclosureKey, published.expanded_disclosures.items) catch {
                 disclosures.deinit(self.allocator);
-                self.allocator.free(ranges);
-                if (accepted_ranges) |old| self.allocator.free(old);
+                std.heap.page_allocator.free(ranges);
+                if (accepted_ranges) |old| std.heap.page_allocator.free(old);
                 if (review_ranges) |old| self.allocator.free(old);
                 input.pending = false;
                 self.action_error = .out_of_memory;
@@ -6858,18 +6882,18 @@ pub const Presentation = struct {
         published.search_projection = job.projection.?;
         published.buffer = job.buffer;
         published.visual_rows = job.visual_rows;
-        published.tree = tree;
+        published.tree = job.tree;
         published.selected_version = job.preferences.selected_version;
         published.navigation = frame_mod.restoreNavigation(previous, job.visual_rows, job.geometry);
         if (published.worker_frame) |old| old.destroy();
         published.worker_frame = job;
         owned = false;
-        if (published.buffer_search.accepted_ranges) |old| self.allocator.free(old);
+        if (published.buffer_search.accepted_ranges) |old| std.heap.page_allocator.free(old);
         published.buffer_search.accepted_ranges = accepted_ranges;
         if (published.review_search.ranges) |old| self.allocator.free(old);
         published.review_search.ranges = review_ranges;
         if (input.batch) |*old| old.deinit(self.allocator);
-        if (input.ranges) |old| self.allocator.free(old);
+        if (input.ranges) |old| std.heap.page_allocator.free(old);
         input.batch = job.batch;
         job.batch = null;
         input.ranges = ranges;
@@ -6897,12 +6921,13 @@ pub const Presentation = struct {
             self.action_error = .out_of_memory;
             return;
         };
-        input.corpus.retain();
+        const corpus = published.search_corpus orelse input.corpus;
+        corpus.retain();
         published.search_projection.retain();
         var command: OwnedCommand = .{ .scan_buffer_search = .{
             .request_id = input.request_id,
             .session_epoch = published.epoch,
-            .corpus = input.corpus,
+            .corpus = corpus,
             .projection = published.search_projection,
             .visual_rows_revision = published.visual_rows_revision,
             .query = worker_query,
@@ -6911,7 +6936,13 @@ pub const Presentation = struct {
             command.deinit();
             input.pending = false;
             self.action_error = .out_of_memory;
+            return;
         };
+        if (corpus != input.corpus) {
+            corpus.retain();
+            input.corpus.release();
+            input.corpus = corpus;
+        }
     }
 
     fn traverseBufferSearch(self: *Presentation, direction: SearchDirection) void {
@@ -6945,7 +6976,19 @@ pub const Presentation = struct {
         } else searchFromInactiveRow(published, batch.*, published.navigation.cursor, count, direction);
         const next = next_and_wrap[0];
         const wrapped = next_and_wrap[1];
-        const ranges = published.projectBufferSearchRanges(batch.*, next) catch |err| {
+        if (published.buffer_search.saved_disclosures == null) {
+            if (published.occurrenceVisualRow(batch.occurrences[next])) |row| {
+                published.buffer_search.active = next;
+                published.navigation.jumpTo(row);
+                self.action_error = if (wrapped) switch (direction) {
+                    .forward => .buffer_search_hit_bottom,
+                    .backward => .buffer_search_hit_top,
+                } else null;
+                published.frame_revision += 1;
+                return;
+            }
+        }
+        const ranges = Published.projectBufferSearchRangesFor(std.heap.page_allocator, published.buffer, published.visual_rows, batch.*, next) catch |err| {
             self.action_error = normalizeActionError(err);
             return;
         };
@@ -6956,11 +6999,11 @@ pub const Presentation = struct {
         self.updateSearchOwnedDisclosure(published, batch.occurrences[next]) catch |err| {
             published.buffer_search.accepted_ranges = old_ranges;
             published.buffer_search.active = old_active;
-            self.allocator.free(ranges);
+            std.heap.page_allocator.free(ranges);
             self.action_error = normalizeActionError(err);
             return;
         };
-        if (old_ranges) |old| self.allocator.free(old);
+        if (old_ranges) |old| std.heap.page_allocator.free(old);
         if (published.buffer_search.accepted_batch) |refreshed| {
             if (published.buffer_search.active) |refreshed_active| _ = published.jumpToSearchOccurrence(refreshed.occurrences[refreshed_active]);
         }
@@ -7033,10 +7076,6 @@ pub const Presentation = struct {
             };
             return;
         }
-        const batch = published.buffer_search.accepted_batch orelse return;
-        const ranges = try published.projectBufferSearchRanges(batch, null);
-        if (published.buffer_search.accepted_ranges) |old| self.allocator.free(old);
-        published.buffer_search.accepted_ranges = ranges;
         published.buffer_search.active = null;
     }
 
@@ -11689,7 +11728,9 @@ test "M21 kernel Buffer Search previews accepts traverses and cancels atomically
     try testing.expect(presentation.projection().review.?.frame.search_ranges.len > 0);
     try presentation.dispatch(.{ .action = .up });
     try testing.expectEqual(@as(?usize, null), presentation.projection().buffer_search.?.active);
+    const ranges_before = presentation.projection().review.?.frame.search_ranges.ptr;
     try presentation.dispatch(.{ .action = .next_search_occurrence });
+    try testing.expectEqual(ranges_before, presentation.projection().review.?.frame.search_ranges.ptr);
     try testing.expect(presentation.projection().review.?.navigation.cursor >= accepted_cursor);
     accepted_cursor = presentation.projection().review.?.navigation.cursor;
     try testing.expect(presentation.projection().action_error == null);
@@ -11921,6 +11962,7 @@ test "M21 worker range projection matches the current Frame in both Layouts" {
         const expected = try presentation.published.?.projectBufferSearchRanges(completed.outcome.scanned, null);
         defer testing.allocator.free(expected);
         const actual = completed.ranges.?;
+        const worker_ranges = actual.ptr;
         try testing.expectEqual(expected.len, actual.len);
         for (expected, actual) |left, right| {
             try testing.expectEqual(left.visual_row, right.visual_row);
@@ -11929,6 +11971,7 @@ test "M21 worker range projection matches the current Frame in both Layouts" {
             try testing.expectEqualDeep(left.row, right.row);
         }
         try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        try testing.expectEqual(worker_ranges, presentation.projection().review.?.frame.search_ranges.ptr);
         try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
         try presentation.dispatch(.{ .action = .toggle_layout });
     }
@@ -11951,12 +11994,22 @@ test "M21 stale worker ranges do not enter a rebuilt Frame" {
     try presentation.dispatch(.{ .action = .toggle_layout });
     try testing.expect(completed.visual_rows_revision != presentation.published.?.visual_rows_revision);
     try presentation.dispatch(.{ .buffer_search_scanned = completed });
+    try testing.expect(presentation.published.?.buffer_search.input.?.pending);
+    try testing.expectEqual(presentation.published.?.search_corpus.?, presentation.published.?.buffer_search.input.?.corpus);
+    var retry = presentation.takeCommand().?;
+    defer retry.deinit();
+    try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, &retry.scan_buffer_search) });
     const input = presentation.published.?.buffer_search.input.?;
     try testing.expect(!input.pending);
     const expected = try presentation.published.?.projectBufferSearchRanges(input.batch.?, input.active);
     defer testing.allocator.free(expected);
     try testing.expectEqual(expected.len, input.ranges.?.len);
-    for (expected, input.ranges.?) |left, right| try testing.expectEqualDeep(left, right);
+    for (expected, input.ranges.?) |left, right| {
+        try testing.expectEqual(left.visual_row, right.visual_row);
+        try testing.expectEqualDeep(left.source, right.source);
+        try testing.expectEqualDeep(left.row, right.row);
+        try testing.expectEqual(left.active, right.occurrence_index == input.active);
+    }
 }
 
 test "M21 worker projection failure releases its temporary rows" {
