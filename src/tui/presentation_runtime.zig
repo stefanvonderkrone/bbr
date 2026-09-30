@@ -344,21 +344,24 @@ test "closed terminal sink releases a Buffer Search Batch" {
 
 test "closed terminal sink releases a staged Buffer Frame and its Session" {
     const session = try @import("session.zig").create(testing.allocator);
-    const job = try std.heap.page_allocator.create(presentation.DisclosureBuild);
-    job.* = .{
-        .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-        .session = session,
-        .preferences = .{},
-        .geometry = .{ .cols = 80, .rows = 12 },
-        .isolated_file = null,
-        .cell_metrics = .bytes,
-        .collapsed_rows = 2,
-        .epoch = 7,
-        .request_id = 1,
-        .frame_revision = 1,
-        .active = null,
-        .failed = true,
-    };
+    session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Local" };
+    session.source = .{ .local = .{ .common_dir = "." } };
+    session.diff = try bbr.diff.parse(session.arena.allocator(), "");
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try presentation.OwnedReviewIdentity.initLocal(1, "main", "feature");
+    try store.store().put(.{ .workspace = key.workspace(), .repository = key.repository(), .pull_request_id = 1 }, .{ .local_id = 1, .target = .local, .kind = .comment, .scope = .review, .body = "one\n\ntwo\n\nhidden" });
+    var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = key, .session = session },
+    });
+    defer state.deinit();
+    try state.dispatch(.{ .action = .open_buffer_search });
+    try state.dispatch(.{ .key = .{ .codepoint = 'h', .text = "hidden" } });
+    var scan = state.takeCommand().?;
+    defer scan.deinit();
+    try state.dispatch(.{ .buffer_search_scanned = presentation.executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search) });
+    const job = state.takeCommand().?.build_buffer_disclosure;
+    job.failed = true;
     var capture: CapturingSink = .{ .reject = true };
     deliver(capture.sink(), .{ .buffer_disclosure_built = job });
     try testing.expect(capture.input == null);

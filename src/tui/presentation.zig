@@ -957,13 +957,162 @@ fn searchRangeLess(_: void, left: frame_mod.ProjectedSourceRange, right: frame_m
     return left.source.end < right.source.end;
 }
 
+const DisclosureKeys = struct {
+    references: std.atomic.Value(usize) = .init(1),
+    allocator: Allocator,
+    list: std.ArrayList(buffer_mod.DisclosureKey) = .empty,
+
+    fn create(keys: []const buffer_mod.DisclosureKey) !*DisclosureKeys {
+        return createWithAllocator(std.heap.page_allocator, keys);
+    }
+
+    fn createWithAllocator(allocator: Allocator, keys: []const buffer_mod.DisclosureKey) !*DisclosureKeys {
+        const self = try allocator.create(DisclosureKeys);
+        self.* = .{ .allocator = allocator };
+        errdefer self.release();
+        try self.list.appendSlice(allocator, keys);
+        return self;
+    }
+
+    fn retain(self: *DisclosureKeys) *DisclosureKeys {
+        _ = self.references.fetchAdd(1, .acq_rel);
+        return self;
+    }
+
+    fn release(self: *DisclosureKeys) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        const allocator = self.allocator;
+        self.list.deinit(allocator);
+        allocator.destroy(self);
+    }
+
+    fn items(self: *const DisclosureKeys) []const buffer_mod.DisclosureKey {
+        return self.list.items;
+    }
+};
+
+// The worker copies the base keys and applies these bounded changes.
+const DisclosureTarget = struct {
+    base: *DisclosureKeys,
+    add: SearchDisclosureSet = .{},
+    remove: ?buffer_mod.DisclosureKey = null,
+
+    fn matches(self: DisclosureTarget, keys: []const buffer_mod.DisclosureKey) bool {
+        var index: usize = 0;
+        for (self.base.items()) |key| {
+            if (self.remove) |removed| if (std.meta.eql(removed, key)) continue;
+            if (index >= keys.len or !std.meta.eql(key, keys[index])) return false;
+            index += 1;
+        }
+        for (self.add.items[0..self.add.len], 0..) |added, added_index| {
+            var exists = false;
+            for (self.base.items()) |key| {
+                if (self.remove) |removed| if (std.meta.eql(removed, key)) continue;
+                if (std.meta.eql(added, key)) {
+                    exists = true;
+                    break;
+                }
+            }
+            for (self.add.items[0..added_index]) |key| if (std.meta.eql(added, key)) {
+                exists = true;
+                break;
+            };
+            if (exists) continue;
+            if (index >= keys.len or !std.meta.eql(added, keys[index])) return false;
+            index += 1;
+        }
+        return index == keys.len;
+    }
+
+    fn build(self: DisclosureTarget, allocator: Allocator) !*DisclosureKeys {
+        if (self.add.len == 0 and self.remove == null) return self.base.retain();
+        const keys = try DisclosureKeys.createWithAllocator(allocator, self.base.items());
+        errdefer keys.release();
+        if (self.remove) |removed| for (keys.list.items, 0..) |key, index| {
+            if (std.meta.eql(removed, key)) {
+                _ = keys.list.orderedRemove(index);
+                break;
+            }
+        };
+        for (self.add.items[0..self.add.len]) |key| try addSearchDisclosure(allocator, &keys.list, key);
+        return keys;
+    }
+};
+
+// Frame preparation owns the copies and File leases. Handoff retains one input
+// snapshot. Published must replace the snapshot when Drafts or Directories change.
+const DisclosureInputs = struct {
+    references: std.atomic.Value(usize) = .init(1),
+    arena: std.heap.ArenaAllocator,
+    drafts: []const bbr.review.Draft = &.{},
+    scopes: []const bbr.review.ScopeProjectionEntry = &.{},
+    collapsed_directories: []const []const u8 = &.{},
+    blobs: []const bbr.diff.FileBlob = &.{},
+    highlights: []const bbr.highlight.FileHighlights = &.{},
+    content_statuses: []const bbr.diff.FileContent = &.{},
+    leases: []file_enrichment.ReadLease = &.{},
+    leased: usize = 0,
+
+    fn create(published: *Published) !*DisclosureInputs {
+        const self = try clone(std.heap.page_allocator, published.review.drafts.items, published.scope_projection.items, published.collapsed_directories.items, published.session.enrichment.projection());
+        errdefer self.release();
+        self.leases = try self.arena.allocator().alloc(file_enrichment.ReadLease, published.session.enrichment.len());
+        for (self.leases) |*lease| {
+            lease.* = published.session.enrichment.snapshot(self.leased);
+            self.leased += 1;
+        }
+        return self;
+    }
+
+    fn clone(backing: Allocator, drafts: []const bbr.review.Draft, scopes: []const bbr.review.ScopeProjectionEntry, directories: []const []const u8, enrichment: file_enrichment.Projection) !*DisclosureInputs {
+        const self = try backing.create(DisclosureInputs);
+        self.* = .{ .arena = std.heap.ArenaAllocator.init(backing) };
+        errdefer self.release();
+        const a = self.arena.allocator();
+        const copies = try a.dupe(bbr.review.Draft, drafts);
+        for (copies) |*copy| {
+            copy.body = try a.dupe(u8, copy.body);
+            if (copy.scope) |scope| copy.scope = try cloneDisclosureScope(a, scope);
+            if (copy.anchor) |anchor| copy.anchor = (try cloneDisclosureScope(a, .{ .@"inline" = anchor })).@"inline";
+            if (copy.snapshot) |*snapshot| snapshot.text = try a.dupe(u8, snapshot.text);
+        }
+        self.drafts = copies;
+        const scope_copies = try a.dupe(bbr.review.ScopeProjectionEntry, scopes);
+        for (scope_copies) |*entry| if (entry.resolution == .resolved) {
+            entry.resolution.resolved.scope = try cloneDisclosureScope(a, entry.resolution.resolved.scope);
+        };
+        self.scopes = scope_copies;
+        const paths = try a.alloc([]const u8, directories.len);
+        for (directories, paths) |path, *copy| copy.* = try a.dupe(u8, path);
+        self.collapsed_directories = paths;
+        self.blobs = try a.dupe(bbr.diff.FileBlob, enrichment.blobs);
+        self.highlights = try a.dupe(bbr.highlight.FileHighlights, enrichment.highlights);
+        self.content_statuses = try a.dupe(bbr.diff.FileContent, enrichment.content_statuses);
+        return self;
+    }
+
+    fn retain(self: *DisclosureInputs) void {
+        _ = self.references.fetchAdd(1, .acq_rel);
+    }
+
+    fn release(self: *DisclosureInputs) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        for (self.leases[0..self.leased]) |*lease| lease.release();
+        const backing = self.arena.child_allocator;
+        self.arena.deinit();
+        backing.destroy(self);
+    }
+};
+
 pub const DisclosureBuild = struct {
     const Kind = enum { input, accepted, restore, general, clear_input, view, enrichment };
     const NavigationPolicy = enum { restore, reset, file_header, center, version };
     arena: std.heap.ArenaAllocator,
     session: *Session,
-    leases: []file_enrichment.ReadLease = &.{},
-    leased: usize = 0,
+    inputs: *DisclosureInputs,
+    completed_inputs: ?*DisclosureInputs = null,
+    target: DisclosureTarget,
+    disclosure_keys: ?*DisclosureKeys = null,
     blobs: []const bbr.diff.FileBlob = &.{},
     highlights: []const bbr.highlight.FileHighlights = &.{},
     content_statuses: []const bbr.diff.FileContent = &.{},
@@ -982,6 +1131,7 @@ pub const DisclosureBuild = struct {
     cache_entries: []file_enrichment.CacheEntry = &.{},
     cache_policy: file_enrichment.CachePolicy = .{},
     cache_focused: ?usize = null,
+    hold_enrichment: bool = false,
     tree: file_tree.Projection = .{},
     preferences: Preferences,
     geometry: frame_mod.Geometry,
@@ -993,7 +1143,7 @@ pub const DisclosureBuild = struct {
     kind: Kind = .input,
     result_error: ?ActionError = null,
     restore_navigation: ?Nav = null,
-    restore_search_disclosures: ?[]buffer_mod.DisclosureKey = null,
+    restore_search_disclosures: ?*DisclosureKeys = null,
     review_saved_disclosures: ?[]buffer_mod.DisclosureKey = null,
     command_id: CommandId = 0,
     frame_revision: frame_mod.Revision,
@@ -1024,13 +1174,16 @@ pub const DisclosureBuild = struct {
     version_restoration: ?VersionRestoration = null,
     failed: bool = false,
 
-    fn create(published: *Published, preferences: Preferences, target: []const buffer_mod.DisclosureKey, request_id: u64, active: ?usize) !*DisclosureBuild {
+    fn create(published: *Published, preferences: Preferences, target: DisclosureTarget, request_id: u64, active: ?usize) !*DisclosureBuild {
+        if (!published.disclosure_inputs_current) return error.OutOfMemory;
         const backing = std.heap.page_allocator;
         const job = try backing.create(DisclosureBuild);
         published.session.retain();
         job.* = .{
             .arena = std.heap.ArenaAllocator.init(backing),
             .session = published.session,
+            .inputs = published.disclosure_inputs,
+            .target = target,
             .preferences = preferences,
             .geometry = published.geometry,
             .isolated_file = published.isolated_file,
@@ -1044,21 +1197,16 @@ pub const DisclosureBuild = struct {
             .cache_policy = published.session.enrichment.cache,
             .cache_focused = published.session.enrichment.focused_file,
         };
+        job.inputs.retain();
+        _ = job.target.base.retain();
         errdefer job.destroy();
         const a = job.arena.allocator();
-        const enrichment = published.session.enrichment.projection();
-        job.blobs = try a.dupe(bbr.diff.FileBlob, enrichment.blobs);
-        job.highlights = try a.dupe(bbr.highlight.FileHighlights, enrichment.highlights);
-        job.content_statuses = try a.dupe(bbr.diff.FileContent, enrichment.content_statuses);
-        job.leases = try a.alloc(file_enrichment.ReadLease, published.session.enrichment.len());
-        for (job.leases) |*lease| {
-            lease.* = published.session.enrichment.snapshot(job.leased);
-            job.leased += 1;
-        }
-        job.disclosures = try a.dupe(buffer_mod.DisclosureKey, target);
-        const collapsed = try a.alloc([]const u8, published.collapsed_directories.items.len);
-        for (published.collapsed_directories.items, collapsed) |path, *copy| copy.* = try a.dupe(u8, path);
-        job.collapsed_directories = collapsed;
+        job.blobs = job.inputs.blobs;
+        job.highlights = job.inputs.highlights;
+        job.content_statuses = job.inputs.content_statuses;
+        job.drafts = job.inputs.drafts;
+        job.scopes = job.inputs.scopes;
+        job.collapsed_directories = job.inputs.collapsed_directories;
         job.tree_scroll = published.tree.scroll;
         job.active_file = if (published.session.diff.files.len == 0) null else published.isolated_file orelse published.buffer.fileIndexForRow(published.cursorBufferIndex());
         job.source_active_file = job.active_file;
@@ -1068,23 +1216,6 @@ pub const DisclosureBuild = struct {
                 .directory => |path| .{ .directory = try a.dupe(u8, path) },
             };
         }
-        const drafts = try a.alloc(bbr.review.Draft, published.review.drafts.items.len);
-        for (published.review.drafts.items, drafts) |draft, *copy| {
-            copy.* = draft;
-            copy.body = try a.dupe(u8, draft.body);
-            if (draft.scope) |scope| copy.scope = try cloneDisclosureScope(a, scope);
-            if (draft.anchor) |anchor| copy.anchor = (try cloneDisclosureScope(a, .{ .@"inline" = anchor })).@"inline";
-            if (draft.snapshot) |snapshot| {
-                copy.snapshot = snapshot;
-                copy.snapshot.?.text = try a.dupe(u8, snapshot.text);
-            }
-        }
-        job.drafts = drafts;
-        const scopes = try a.dupe(bbr.review.ScopeProjectionEntry, published.scope_projection.items);
-        for (scopes) |*entry| if (entry.resolution == .resolved) {
-            entry.resolution.resolved.scope = try cloneDisclosureScope(a, entry.resolution.resolved.scope);
-        };
-        job.scopes = scopes;
         if (published.buffer_search.accepted_batch) |*batch| {
             job.accepted_snapshot = try batch.retain(published.allocator);
             job.accepted_active = published.buffer_search.active;
@@ -1109,12 +1240,34 @@ pub const DisclosureBuild = struct {
 
     fn buildFallible(self: *DisclosureBuild) !void {
         const a = self.arena.allocator();
+        self.disclosure_keys = try self.target.build(self.arena.child_allocator);
+        self.disclosures = self.disclosure_keys.?.items();
         if (self.kind == .enrichment) {
+            self.blobs = try a.dupe(bbr.diff.FileBlob, self.inputs.blobs);
+            self.highlights = try a.dupe(bbr.highlight.FileHighlights, self.inputs.highlights);
+            self.content_statuses = try a.dupe(bbr.diff.FileContent, self.inputs.content_statuses);
+            self.cache_entries = try self.session.enrichment.cacheEntries(a);
+            if (self.hold_enrichment) self.cache_entries[self.enrichment_file.?].leases += 1;
             file_enrichment.previewAdmission(self.enrichment_file.?, &self.enrichment_result.?, self.cache_policy, self.cache_focused, self.cache_entries, .{
                 .blobs = self.blobs,
                 .highlights = self.highlights,
                 .content_statuses = self.content_statuses,
             });
+            const inputs = try DisclosureInputs.clone(self.arena.child_allocator, self.drafts, self.scopes, self.collapsed_directories, .{
+                .blobs = self.blobs,
+                .highlights = self.highlights,
+                .content_statuses = self.content_statuses,
+            });
+            self.completed_inputs = inputs;
+            inputs.leases = try inputs.arena.allocator().alloc(file_enrichment.ReadLease, self.inputs.leases.len);
+            for (inputs.leases, self.inputs.leases, 0..) |*lease, source, index| {
+                if (index == self.enrichment_file.?) {
+                    var result_lease = self.enrichment_result.?.snapshot();
+                    lease.* = result_lease.retainProjected(inputs.blobs[index]);
+                    result_lease.release();
+                } else lease.* = source.retainProjected(inputs.blobs[index]);
+                inputs.leased += 1;
+            }
         }
         if (self.kind == .view or self.kind == .enrichment) {
             const candidates = try buffer_mod.buildSearchCandidates(a, self.session.diff, self.preferences.layout, self.session.threads, .{
@@ -1214,7 +1367,7 @@ pub const DisclosureBuild = struct {
         if (self.accepted_ranges) |ranges| std.heap.page_allocator.free(ranges);
         if (self.accepted_navigation_rows) |rows| std.heap.page_allocator.free(rows);
         if (self.review_ranges) |ranges| std.heap.page_allocator.free(ranges);
-        if (self.restore_search_disclosures) |keys| std.heap.page_allocator.free(keys);
+        if (self.restore_search_disclosures) |keys| keys.release();
         if (self.review_saved_disclosures) |keys| std.heap.page_allocator.free(keys);
         if (self.rebuilt_batch) |*batch| batch.deinit(std.heap.page_allocator);
         if (self.input_rebuilt_batch) |*batch| batch.deinit(std.heap.page_allocator);
@@ -1222,7 +1375,10 @@ pub const DisclosureBuild = struct {
         if (self.input_navigation_rows) |rows| std.heap.page_allocator.free(rows);
         if (self.search_corpus) |corpus| corpus.release();
         if (self.projection) |projection| projection.release();
-        for (self.leases[0..self.leased]) |*lease| lease.release();
+        if (self.completed_inputs) |inputs| inputs.release();
+        self.inputs.release();
+        if (self.disclosure_keys) |keys| keys.release();
+        self.target.base.release();
         self.arena.deinit();
         self.session.destroy();
         std.heap.page_allocator.destroy(self);
@@ -1903,8 +2059,8 @@ const BufferSearchInput = struct {
     saved_navigation: Nav,
     origin: usize,
     count: usize,
-    saved_expanded_disclosures: []buffer_mod.DisclosureKey,
-    saved_search_disclosures: ?[]buffer_mod.DisclosureKey = null,
+    saved_expanded_disclosures: *DisclosureKeys,
+    saved_search_disclosures: ?*DisclosureKeys = null,
     corpus: *BufferSearchCorpus,
     request_id: u64 = 0,
     pending: bool = false,
@@ -1915,8 +2071,8 @@ const BufferSearchInput = struct {
         if (self.batch) |*batch| batch.deinit(allocator);
         if (self.ranges) |ranges| std.heap.page_allocator.free(ranges);
         if (self.navigation_rows) |rows| std.heap.page_allocator.free(rows);
-        allocator.free(self.saved_expanded_disclosures);
-        if (self.saved_search_disclosures) |disclosures| allocator.free(disclosures);
+        self.saved_expanded_disclosures.release();
+        if (self.saved_search_disclosures) |disclosures| disclosures.release();
         self.corpus.release();
         self.* = undefined;
     }
@@ -1929,7 +2085,7 @@ const BufferSearchState = struct {
     status_visible: bool = true,
     accepted_ranges: ?[]frame_mod.ProjectedSourceRange = null,
     accepted_navigation_rows: ?[]?usize = null,
-    saved_disclosures: ?[]buffer_mod.DisclosureKey = null,
+    saved_disclosures: ?*DisclosureKeys = null,
     input: ?BufferSearchInput = null,
 
     fn deinit(self: *BufferSearchState, allocator: Allocator) void {
@@ -1938,7 +2094,7 @@ const BufferSearchState = struct {
         if (self.accepted_batch) |*batch| batch.deinit(allocator);
         if (self.accepted_ranges) |ranges| std.heap.page_allocator.free(ranges);
         if (self.accepted_navigation_rows) |rows| std.heap.page_allocator.free(rows);
-        if (self.saved_disclosures) |disclosures| allocator.free(disclosures);
+        if (self.saved_disclosures) |disclosures| disclosures.release();
         self.* = undefined;
     }
 
@@ -2107,6 +2263,8 @@ const Published = struct {
         buffer: buffer_mod.Buffer,
         visual_rows: []const frame_mod.VisualRow,
         search_projection: *SearchProjection,
+        disclosure_inputs: *DisclosureInputs,
+        disclosure_keys: *DisclosureKeys,
         tree: file_tree.Projection,
         geometry: frame_mod.Geometry,
         selected_version: SelectedVersion,
@@ -2130,6 +2288,8 @@ const Published = struct {
                 if (self.review_ranges) |ranges| std.heap.page_allocator.free(ranges);
                 if (self.search_corpus) |corpus| corpus.release();
                 self.search_projection.release();
+                self.disclosure_inputs.release();
+                self.disclosure_keys.release();
                 self.published.buffers.abort();
             }
             self.* = undefined;
@@ -2143,6 +2303,11 @@ const Published = struct {
             self.published.visual_rows = self.visual_rows;
             self.published.search_projection.release();
             self.published.search_projection = self.search_projection;
+            self.published.disclosure_inputs.release();
+            self.published.disclosure_inputs = self.disclosure_inputs;
+            self.published.disclosure_inputs_current = true;
+            self.published.disclosure_keys.release();
+            self.published.disclosure_keys = self.disclosure_keys;
             self.published.tree = self.tree;
             self.published.geometry = self.geometry;
             self.published.selected_version = self.selected_version;
@@ -2208,6 +2373,9 @@ const Published = struct {
     buffer: buffer_mod.Buffer,
     visual_rows: []const frame_mod.VisualRow,
     search_projection: *SearchProjection,
+    disclosure_inputs: *DisclosureInputs,
+    disclosure_inputs_current: bool = true,
+    disclosure_keys: *DisclosureKeys,
     tree: file_tree.Projection,
     geometry: frame_mod.Geometry,
     selected_version: SelectedVersion,
@@ -2361,8 +2529,13 @@ const Published = struct {
         );
         published.buffers.commit();
         published.search_corpus = published.bufferSearchCorpus(preferences, published.expanded_disclosures.items, published.isolated_file, geometry) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BufferBuildFailed;
+        errdefer published.search_corpus.?.release();
         published.large_session = published.search_corpus.?.candidates.len > 4096;
         published.navigation = Nav.init(published.visual_rows.len, panes.diff_content.height);
+        published.disclosure_inputs = try DisclosureInputs.create(published);
+        published.disclosure_inputs_current = true;
+        errdefer published.disclosure_inputs.release();
+        published.disclosure_keys = try DisclosureKeys.create(published.expanded_disclosures.items);
         return published;
     }
 
@@ -2380,6 +2553,8 @@ const Published = struct {
         self.buffers.deinit();
         if (self.worker_frame) |worker_frame| worker_frame.destroy();
         self.search_projection.release();
+        self.disclosure_inputs.release();
+        self.disclosure_keys.release();
         self.review_arena.deinit();
         self.session.destroy();
         allocator.destroy(self);
@@ -2453,6 +2628,26 @@ const Published = struct {
         var staged = try self.prepareBuffer(preferences, expanded_disclosures, isolated_file, self.geometry);
         defer staged.deinit();
         staged.publish();
+    }
+
+    fn setDraftState(self: *Published, temp_id: bbr.review.TempId, state: bbr.review.DraftState) void {
+        self.review.setState(temp_id, state);
+        // Workers only release references. A sole Published owner can update
+        // DraftState before the next handoff. Retained snapshots stay immutable.
+        if (self.disclosure_inputs_current and self.disclosure_inputs.references.load(.acquire) == 1) {
+            for (@constCast(self.disclosure_inputs.drafts)) |*draft| if (draft.local_id == temp_id) {
+                draft.state = state;
+                break;
+            };
+            return;
+        }
+        const inputs = DisclosureInputs.create(self) catch {
+            self.disclosure_inputs_current = false;
+            return;
+        };
+        self.disclosure_inputs.release();
+        self.disclosure_inputs = inputs;
+        self.disclosure_inputs_current = true;
     }
 
     fn focusEnrichment(self: *Published, preferences: Preferences, file_index: usize) BufferTransactionError!void {
@@ -2846,11 +3041,20 @@ const Published = struct {
             null
         else
             self.bufferSearchCorpus(preferences, expanded_disclosures, isolated_file, geometry) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.SearchFailed;
+        errdefer if (search_corpus) |corpus| corpus.release();
+        const disclosure_inputs = if (reuse_search_corpus and self.disclosure_inputs_current) blk: {
+            self.disclosure_inputs.retain();
+            break :blk self.disclosure_inputs;
+        } else try DisclosureInputs.create(self);
+        errdefer disclosure_inputs.release();
+        const disclosure_keys = try DisclosureKeys.create(expanded_disclosures);
         return .{
             .published = self,
             .buffer = candidate,
             .visual_rows = visual_rows,
             .search_projection = search_projection,
+            .disclosure_inputs = disclosure_inputs,
+            .disclosure_keys = disclosure_keys,
             .tree = tree,
             .geometry = geometry,
             .selected_version = preferences.selected_version,
@@ -5550,7 +5754,7 @@ pub const Presentation = struct {
         const completion: bbr.review.SubmissionCompletion = .partial;
         const result = durable.persistedResultProjection(completion);
         if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, durable.key))
-            published.review.setState(temp_id, .outcome_unknown);
+            published.setDraftState(temp_id, .outcome_unknown);
         if (self.submission_tree) |tree| {
             tree.finish(durable, completion);
             if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, durable.key)) tree.refresh(&published.review);
@@ -6636,34 +6840,29 @@ pub const Presentation = struct {
         const disclosures = published.review_search.saved_disclosures orelse published.expanded_disclosures.items;
         const corpus = published.search_corpus orelse return;
         corpus.retain();
-        const saved_expanded = self.allocator.dupe(buffer_mod.DisclosureKey, disclosures) catch {
+        const saved_expanded = if (published.review_search.saved_disclosures == null) published.disclosure_keys.retain() else DisclosureKeys.create(disclosures) catch {
             corpus.release();
             self.action_error = .out_of_memory;
             return;
         };
         const saved_search = if (published.buffer_search.saved_disclosures) |keys|
-            self.allocator.dupe(buffer_mod.DisclosureKey, keys) catch {
-                corpus.release();
-                self.allocator.free(saved_expanded);
-                self.action_error = .out_of_memory;
-                return;
-            }
+            keys.retain()
         else
             null;
         if (published.review_search.saved_disclosures) |saved| {
             var restored: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
             restored.appendSlice(self.allocator, saved) catch {
                 corpus.release();
-                self.allocator.free(saved_expanded);
-                if (saved_search) |keys| self.allocator.free(keys);
+                saved_expanded.release();
+                if (saved_search) |keys| keys.release();
                 self.action_error = .out_of_memory;
                 return;
             };
             defer restored.deinit(self.allocator);
             var staged = published.prepareBuffer(self.preferences, restored.items, published.isolated_file, published.geometry) catch |err| {
                 corpus.release();
-                self.allocator.free(saved_expanded);
-                if (saved_search) |keys| self.allocator.free(keys);
+                saved_expanded.release();
+                if (saved_search) |keys| keys.release();
                 self.action_error = normalizeActionError(err);
                 return;
             };
@@ -6693,19 +6892,14 @@ pub const Presentation = struct {
         const published = self.published orelse return;
         const saved_navigation = if (published.buffer_search.input) |input| input.saved_navigation else return;
         const input_disclosures = published.buffer_search.input.?.saved_expanded_disclosures;
-        if (!sameDisclosures(published.expanded_disclosures.items, input_disclosures)) {
-            const job = self.queueAcceptedDisclosure(published, input_disclosures, published.buffer_search.active, .restore, null) catch {
+        if (!sameDisclosures(published.expanded_disclosures.items, input_disclosures.items())) {
+            const job = self.queueAcceptedDisclosure(published, .{ .base = input_disclosures }, published.buffer_search.active, .restore, null) catch {
                 self.action_error = .out_of_memory;
                 return;
             };
             job.restore_navigation = saved_navigation;
             if (published.buffer_search.input.?.saved_search_disclosures) |saved| {
-                job.restore_search_disclosures = std.heap.page_allocator.dupe(buffer_mod.DisclosureKey, saved) catch {
-                    var queued = self.commands.pop().?;
-                    queued.deinit();
-                    self.action_error = .out_of_memory;
-                    return;
-                };
+                job.restore_search_disclosures = saved.retain();
             }
             self.discardQueuedBufferSearchScans(job);
             var input = published.buffer_search.input.?;
@@ -6730,17 +6924,17 @@ pub const Presentation = struct {
 
     fn restoreInputDisclosures(self: *Presentation, published: *Published) BufferTransactionError!void {
         const input = published.buffer_search.input orelse return;
-        if (!sameDisclosures(published.expanded_disclosures.items, input.saved_expanded_disclosures)) {
+        if (!sameDisclosures(published.expanded_disclosures.items, input.saved_expanded_disclosures.items())) {
             var target: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
             errdefer target.deinit(self.allocator);
-            try target.appendSlice(self.allocator, input.saved_expanded_disclosures);
+            try target.appendSlice(self.allocator, input.saved_expanded_disclosures.items());
             var staged = try published.prepareDisclosureBuffer(self.preferences, target.items);
             defer staged.deinit();
             staged.publish();
             published.expanded_disclosures.deinit(self.allocator);
             published.expanded_disclosures = target;
         }
-        if (published.buffer_search.saved_disclosures) |disclosures| self.allocator.free(disclosures);
+        if (published.buffer_search.saved_disclosures) |disclosures| disclosures.release();
         const refreshed = &(published.buffer_search.input orelse unreachable);
         published.buffer_search.saved_disclosures = refreshed.saved_search_disclosures;
         refreshed.saved_search_disclosures = null;
@@ -6942,13 +7136,9 @@ pub const Presentation = struct {
             }
         }
         if (required.len == 0 and published.buffer_search.saved_disclosures == null) return null;
-        const base = published.buffer_search.saved_disclosures orelse published.expanded_disclosures.items;
-        var target: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
-        defer target.deinit(self.allocator);
-        try target.appendSlice(self.allocator, base);
-        for (required.items[0..required.len]) |key| try addSearchDisclosure(self.allocator, &target, key);
-        if (sameDisclosures(target.items, published.expanded_disclosures.items)) return null;
-        const job = try self.queueAcceptedDisclosure(published, target.items, published.buffer_search.active, .clear_input, null);
+        const target: DisclosureTarget = .{ .base = published.buffer_search.saved_disclosures orelse published.disclosure_keys, .add = required };
+        if (target.matches(published.expanded_disclosures.items)) return null;
+        const job = try self.queueAcceptedDisclosure(published, target, published.buffer_search.active, .clear_input, null);
         job.clear_saved_disclosures = required.len == 0;
         job.restore_navigation = published.buffer_search.input.?.saved_navigation;
         return job;
@@ -7087,13 +7277,9 @@ pub const Presentation = struct {
             }
         }
         if (required.len == 0 and published.buffer_search.saved_disclosures == null) return false;
-        const base = published.buffer_search.saved_disclosures orelse published.expanded_disclosures.items;
-        var target: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
-        defer target.deinit(self.allocator);
-        try target.appendSlice(self.allocator, base);
-        for (required.items[0..required.len]) |key| try addSearchDisclosure(self.allocator, &target, key);
-        if (sameDisclosures(target.items, published.expanded_disclosures.items)) return false;
-        const job = try DisclosureBuild.create(published, self.preferences, target.items, request_id, active);
+        const target: DisclosureTarget = .{ .base = published.buffer_search.saved_disclosures orelse published.disclosure_keys, .add = required };
+        if (target.matches(published.expanded_disclosures.items)) return false;
+        const job = try DisclosureBuild.create(published, self.preferences, target, request_id, active);
         errdefer job.destroy();
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
         job.clear_saved_disclosures = required.len == 0;
@@ -7118,7 +7304,7 @@ pub const Presentation = struct {
         }
         const input = &(published.buffer_search.input orelse return);
         if (job.request_id != input.request_id or !input.pending) return;
-        if (job.frame_revision != published.visual_rows_revision or !std.meta.eql(job.geometry, published.geometry)) {
+        if (!published.disclosure_inputs_current or job.inputs != published.disclosure_inputs or job.frame_revision != published.visual_rows_revision or !std.meta.eql(job.geometry, published.geometry)) {
             self.retryStaleBufferDisclosure(published);
             return;
         }
@@ -7165,15 +7351,7 @@ pub const Presentation = struct {
             return;
         };
         const saved = if (published.buffer_search.saved_disclosures == null and !job.clear_saved_disclosures)
-            self.allocator.dupe(buffer_mod.DisclosureKey, published.expanded_disclosures.items) catch {
-                disclosures.deinit(self.allocator);
-                std.heap.page_allocator.free(ranges);
-                if (accepted_ranges) |old| std.heap.page_allocator.free(old);
-                if (review_ranges) |old| std.heap.page_allocator.free(old);
-                input.pending = false;
-                self.action_error = .out_of_memory;
-                return;
-            }
+            published.disclosure_keys.retain()
         else
             null;
 
@@ -7208,9 +7386,11 @@ pub const Presentation = struct {
         input.pending = false;
         published.expanded_disclosures.deinit(self.allocator);
         published.expanded_disclosures = disclosures;
+        published.disclosure_keys.release();
+        published.disclosure_keys = job.disclosure_keys.?.retain();
         if (saved) |baseline| published.buffer_search.saved_disclosures = baseline;
         if (job.clear_saved_disclosures) {
-            if (published.buffer_search.saved_disclosures) |baseline| self.allocator.free(baseline);
+            if (published.buffer_search.saved_disclosures) |baseline| baseline.release();
             published.buffer_search.saved_disclosures = null;
         }
         if (job.active) |index| {
@@ -7242,7 +7422,7 @@ pub const Presentation = struct {
                 return;
             }
         }
-        if (job.frame_revision != published.visual_rows_revision or job.source_active_file != published.activeFile() or job.tree_scroll != published.tree.scroll) {
+        if (!published.disclosure_inputs_current or job.inputs != published.disclosure_inputs or job.frame_revision != published.visual_rows_revision or job.source_active_file != published.activeFile() or job.tree_scroll != published.tree.scroll) {
             if (job.kind == .enrichment) self.retryEnrichmentBuild(published, job) else self.retryViewBuild(published, job);
             return;
         }
@@ -7289,6 +7469,10 @@ pub const Presentation = struct {
                 self.action_error = .action_refused;
                 return;
             };
+            job.completed_inputs.?.retain();
+            published.disclosure_inputs.release();
+            published.disclosure_inputs = job.completed_inputs.?;
+            published.disclosure_inputs_current = true;
         }
         const previous = published.frameProjection();
         published.search_projection.release();
@@ -7389,7 +7573,7 @@ pub const Presentation = struct {
     }
 
     fn retryEnrichmentBuild(self: *Presentation, published: *Published, job: *DisclosureBuild) void {
-        const next = DisclosureBuild.create(published, self.preferences, published.expanded_disclosures.items, published.search_generation, published.buffer_search.active) catch {
+        const next = DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation, published.buffer_search.active) catch {
             if (!job.enrichment_speculative) self.action_error = .out_of_memory;
             published.session.enrichment.resetLoading(job.enrichment_file.?);
             return;
@@ -7400,18 +7584,12 @@ pub const Presentation = struct {
             published.session.enrichment.resetLoading(job.enrichment_file.?);
             return;
         };
-        next.cache_entries = published.session.enrichment.cacheEntries(next.arena.allocator()) catch {
-            next.destroy();
-            if (!job.enrichment_speculative) self.action_error = .out_of_memory;
-            published.session.enrichment.resetLoading(job.enrichment_file.?);
-            return;
-        };
         next.kind = .enrichment;
         next.enrichment_file = job.enrichment_file;
         next.enrichment_result = job.enrichment_result;
         next.enrichment_speculative = job.enrichment_speculative;
         if (published.review_search.open and published.review_search.query != null and published.review_search.held != null and
-            !published.review_search.held.?[next.enrichment_file.?]) next.cache_entries[next.enrichment_file.?].leases += 1;
+            !published.review_search.held.?[next.enrichment_file.?]) next.hold_enrichment = true;
         job.enrichment_result = null;
         self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = next });
     }
@@ -7419,7 +7597,7 @@ pub const Presentation = struct {
     fn queueViewBuild(self: *Presentation, published: *Published, preferences: Preferences, isolated_file: ?usize, geometry: frame_mod.Geometry, policy: DisclosureBuild.NavigationPolicy) !void {
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
         const request_id = if (published.search_generation == std.math.maxInt(u64)) 1 else published.search_generation + 1;
-        const job = try DisclosureBuild.create(published, preferences, published.expanded_disclosures.items, request_id, published.buffer_search.active);
+        const job = try DisclosureBuild.create(published, preferences, .{ .base = published.disclosure_keys }, request_id, published.buffer_search.active);
         job.kind = .view;
         job.geometry = geometry;
         job.isolated_file = isolated_file;
@@ -7443,7 +7621,7 @@ pub const Presentation = struct {
             const input = published.buffer_search.input orelse return;
             if (!input.pending or input.request_id != job.request_id or input.query != null) return;
         } else if (published.buffer_search.input != null) return;
-        if (job.frame_revision != published.visual_rows_revision or !std.meta.eql(job.geometry, published.geometry)) {
+        if (!published.disclosure_inputs_current or job.inputs != published.disclosure_inputs or job.frame_revision != published.visual_rows_revision or !std.meta.eql(job.geometry, published.geometry)) {
             self.retryAcceptedDisclosure(published, job);
             return;
         }
@@ -7488,27 +7666,18 @@ pub const Presentation = struct {
             return;
         };
         const saved = if (published.buffer_search.saved_disclosures == null and (job.kind == .accepted or job.kind == .clear_input and !job.clear_saved_disclosures))
-            self.allocator.dupe(buffer_mod.DisclosureKey, published.expanded_disclosures.items) catch {
-                disclosures.deinit(self.allocator);
-                self.action_error = .out_of_memory;
-                return;
-            }
+            published.disclosure_keys.retain()
         else
             null;
         const restored_search = if (job.kind == .restore and job.restore_search_disclosures != null)
-            self.allocator.dupe(buffer_mod.DisclosureKey, job.restore_search_disclosures.?) catch {
-                disclosures.deinit(self.allocator);
-                if (saved) |baseline| self.allocator.free(baseline);
-                self.action_error = .out_of_memory;
-                return;
-            }
+            job.restore_search_disclosures.?.retain()
         else
             null;
         const review_saved = if (job.review_saved_disclosures) |keys|
             self.allocator.dupe(buffer_mod.DisclosureKey, keys) catch {
                 disclosures.deinit(self.allocator);
-                if (saved) |baseline| self.allocator.free(baseline);
-                if (restored_search) |baseline| self.allocator.free(baseline);
+                if (saved) |baseline| baseline.release();
+                if (restored_search) |baseline| baseline.release();
                 self.action_error = .out_of_memory;
                 return;
             }
@@ -7538,9 +7707,11 @@ pub const Presentation = struct {
         published.buffer_search.active = job.active;
         published.expanded_disclosures.deinit(self.allocator);
         published.expanded_disclosures = disclosures;
+        published.disclosure_keys.release();
+        published.disclosure_keys = job.disclosure_keys.?.retain();
         if (saved) |baseline| published.buffer_search.saved_disclosures = baseline;
         if (job.kind == .restore or job.kind == .clear_input and job.clear_saved_disclosures) {
-            if (published.buffer_search.saved_disclosures) |baseline| self.allocator.free(baseline);
+            if (published.buffer_search.saved_disclosures) |baseline| baseline.release();
             published.buffer_search.saved_disclosures = restored_search;
         }
         if (review_saved) |keys| {
@@ -7563,7 +7734,7 @@ pub const Presentation = struct {
 
     fn retryAcceptedDisclosure(self: *Presentation, published: *Published, job: *const DisclosureBuild) void {
         const active = if (job.kind == .general) published.buffer_search.active else job.active;
-        const replacement = self.queueAcceptedDisclosure(published, job.disclosures, active, job.kind, job.result_error) catch {
+        const replacement = self.queueAcceptedDisclosure(published, job.target, active, job.kind, job.result_error) catch {
             if (job.kind == .clear_input) published.buffer_search.input.?.pending = false;
             self.action_error = .out_of_memory;
             return;
@@ -7572,13 +7743,7 @@ pub const Presentation = struct {
         replacement.clear_saved_disclosures = job.clear_saved_disclosures;
         if (job.kind == .clear_input) published.buffer_search.input.?.request_id = replacement.request_id;
         if (job.restore_search_disclosures) |keys| {
-            replacement.restore_search_disclosures = std.heap.page_allocator.dupe(buffer_mod.DisclosureKey, keys) catch {
-                var queued = self.commands.pop().?;
-                queued.deinit();
-                if (job.kind == .clear_input) published.buffer_search.input.?.pending = false;
-                self.action_error = .out_of_memory;
-                return;
-            };
+            replacement.restore_search_disclosures = keys.retain();
         }
         if (job.review_saved_disclosures) |keys| {
             replacement.review_saved_disclosures = std.heap.page_allocator.dupe(buffer_mod.DisclosureKey, keys) catch {
@@ -7680,30 +7845,20 @@ pub const Presentation = struct {
                 };
             }
         }
-        const base = published.buffer_search.saved_disclosures orelse published.expanded_disclosures.items;
-        var target: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
-        defer target.deinit(self.allocator);
-        target.appendSlice(self.allocator, base) catch {
-            self.action_error = .out_of_memory;
-            return;
-        };
-        for (required.items[0..required.len]) |key| addSearchDisclosure(self.allocator, &target, key) catch {
-            self.action_error = .out_of_memory;
-            return;
-        };
-        if (!sameDisclosures(target.items, published.expanded_disclosures.items)) {
+        const target: DisclosureTarget = .{ .base = published.buffer_search.saved_disclosures orelse published.disclosure_keys, .add = required };
+        if (!target.matches(published.expanded_disclosures.items)) {
             const status: ?ActionError = if (wrapped) switch (direction) {
                 .forward => .buffer_search_hit_bottom,
                 .backward => .buffer_search_hit_top,
             } else null;
-            _ = self.queueAcceptedDisclosure(published, target.items, next, if (required.len == 0) .restore else .accepted, status) catch {
+            _ = self.queueAcceptedDisclosure(published, target, next, if (required.len == 0) .restore else .accepted, status) catch {
                 self.action_error = .out_of_memory;
             };
             return;
         }
         published.buffer_search.active = next;
         if (required.len == 0) if (published.buffer_search.saved_disclosures) |saved| {
-            self.allocator.free(saved);
+            saved.release();
             published.buffer_search.saved_disclosures = null;
         };
         _ = published.jumpToSearchOccurrence(batch.occurrences[next]);
@@ -7714,7 +7869,7 @@ pub const Presentation = struct {
         published.frame_revision += 1;
     }
 
-    fn queueAcceptedDisclosure(self: *Presentation, published: *Published, disclosures: []const buffer_mod.DisclosureKey, active: ?usize, kind: DisclosureBuild.Kind, result_error: ?ActionError) !*DisclosureBuild {
+    fn queueAcceptedDisclosure(self: *Presentation, published: *Published, disclosures: DisclosureTarget, active: ?usize, kind: DisclosureBuild.Kind, result_error: ?ActionError) !*DisclosureBuild {
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
         const request_id = if (published.search_generation == std.math.maxInt(u64)) 1 else published.search_generation + 1;
         const job = try DisclosureBuild.create(published, self.preferences, disclosures, request_id, active);
@@ -7754,7 +7909,7 @@ pub const Presentation = struct {
         }
 
         if (required.len == 0 and published.buffer_search.saved_disclosures == null) return;
-        const base = published.buffer_search.saved_disclosures orelse published.expanded_disclosures.items;
+        const base = if (published.buffer_search.saved_disclosures) |keys| keys.items() else published.expanded_disclosures.items;
 
         var target: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
         errdefer target.deinit(self.allocator);
@@ -7769,10 +7924,10 @@ pub const Presentation = struct {
         }
         if (required.len > 0 and target.items.len == base.len and published.buffer_search.saved_disclosures == null) return;
         const saved = if (published.buffer_search.saved_disclosures == null and required.len > 0)
-            try self.allocator.dupe(buffer_mod.DisclosureKey, published.expanded_disclosures.items)
+            published.disclosure_keys.retain()
         else
             null;
-        errdefer if (saved) |items| self.allocator.free(items);
+        errdefer if (saved) |items| items.release();
 
         if (!sameDisclosures(published.expanded_disclosures.items, target.items)) {
             var staged = try published.prepareDisclosureBuffer(self.preferences, target.items);
@@ -7783,7 +7938,7 @@ pub const Presentation = struct {
         published.expanded_disclosures = target;
         if (saved) |items| published.buffer_search.saved_disclosures = items;
         if (required.len == 0) {
-            self.allocator.free(published.buffer_search.saved_disclosures.?);
+            published.buffer_search.saved_disclosures.?.release();
             published.buffer_search.saved_disclosures = null;
         }
     }
@@ -7792,12 +7947,12 @@ pub const Presentation = struct {
         if (published.buffer_search.active == null) return;
         if (published.buffer_search.saved_disclosures != null) {
             const target = published.buffer_search.saved_disclosures.?;
-            if (!sameDisclosures(published.expanded_disclosures.items, target)) {
-                _ = try self.queueAcceptedDisclosure(published, target, null, .restore, null);
+            if (!sameDisclosures(published.expanded_disclosures.items, target.items())) {
+                _ = try self.queueAcceptedDisclosure(published, .{ .base = target }, null, .restore, null);
                 return;
             }
             published.buffer_search.active = null;
-            self.allocator.free(target);
+            target.release();
             published.buffer_search.saved_disclosures = null;
             return;
         }
@@ -7948,7 +8103,7 @@ pub const Presentation = struct {
             self.action_error = .persistence_failed;
             return;
         };
-        draft.state = .draft;
+        published.setDraftState(temp_id, .draft);
         if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) {
             tree.refresh(&published.review);
             if (tree.find(temp_id)) |item| {
@@ -8153,7 +8308,7 @@ pub const Presentation = struct {
         if (self.submission_tree) |tree| tree.destroy();
         self.durable_submission = started.durable;
         self.submission_tree = started.tree;
-        published.review.setState(started.durable.current_temp_id.?, .submitting);
+        published.setDraftState(started.durable.current_temp_id.?, .submitting);
         self.syncSubmissionTree(started.durable);
         self.action_error = null;
     }
@@ -8458,7 +8613,7 @@ pub const Presentation = struct {
             .next => |next| {
                 self.recordVisibleTransition(durable, next.transition);
                 if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, durable.key))
-                    published.review.setState(durable.current_temp_id.?, .submitting);
+                    published.setDraftState(durable.current_temp_id.?, .submitting);
                 self.commands.appendAssumeCapacity(.{ .post_draft = next.command });
             },
             .check => |command| self.commands.appendAssumeCapacity(.{ .find_duplicate = command }),
@@ -8573,7 +8728,7 @@ pub const Presentation = struct {
         if (durable.current_temp_id) |temp_id| durable.review.setState(temp_id, .draft);
         const result = durable.persistedResultProjection(completion);
         if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, durable.key) and durable.current_temp_id != null)
-            published.review.setState(durable.current_temp_id.?, .draft);
+            published.setDraftState(durable.current_temp_id.?, .draft);
         if (self.submission_tree) |tree| tree.finish(durable, completion);
         self.stale_repair = .{
             .key = durable.key,
@@ -8713,7 +8868,7 @@ pub const Presentation = struct {
         const result = durable.persistedResultProjection(completion);
         if (self.submission_tree) |tree| tree.finish(durable, completion);
         if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, durable.key)) {
-            published.review.setState(temp_id, outcome.draftState());
+            published.setDraftState(temp_id, outcome.draftState());
             if (self.submission_tree) |tree| tree.refresh(&published.review);
         };
         const reconcile = outcome == .posted and !self.shutdown_requested and self.replacement == null and
@@ -8811,7 +8966,7 @@ pub const Presentation = struct {
 
     fn recordVisibleTransition(self: *Presentation, durable: *const DurableSubmission, transition: DurableSubmission.PersistedTransition) void {
         if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, durable.key))
-            published.review.setState(transition.temp_id, transition.state);
+            published.setDraftState(transition.temp_id, transition.state);
     }
 
     fn publishDurableCheckpoint(self: *Presentation, durable: *const DurableSubmission) void {
@@ -9305,13 +9460,7 @@ pub const Presentation = struct {
                     if (!issued.speculative) self.action_error = .out_of_memory;
                     return;
                 };
-                const job = DisclosureBuild.create(current, self.preferences, current.expanded_disclosures.items, current.search_generation, current.buffer_search.active) catch {
-                    current.session.enrichment.resetLoading(completed.file_index);
-                    if (!issued.speculative) self.action_error = .out_of_memory;
-                    return;
-                };
-                job.cache_entries = current.session.enrichment.cacheEntries(job.arena.allocator()) catch {
-                    job.destroy();
+                const job = DisclosureBuild.create(current, self.preferences, .{ .base = current.disclosure_keys }, current.search_generation, current.buffer_search.active) catch {
                     current.session.enrichment.resetLoading(completed.file_index);
                     if (!issued.speculative) self.action_error = .out_of_memory;
                     return;
@@ -9320,7 +9469,7 @@ pub const Presentation = struct {
                 job.enrichment_file = completed.file_index;
                 job.enrichment_speculative = issued.speculative;
                 if (current.review_search.open and current.review_search.query != null and current.review_search.held != null and
-                    !current.review_search.held.?[completed.file_index]) job.cache_entries[completed.file_index].leases += 1;
+                    !current.review_search.held.?[completed.file_index]) job.hold_enrichment = true;
                 job.enrichment_result = result;
                 result = .{ .old = .transferred, .new = .transferred };
                 self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
@@ -9590,23 +9739,13 @@ pub const Presentation = struct {
             saved = updated.toOwnedSlice(self.allocator) catch return self.reviewSearchAllocationFailed();
         }
         defer if (saved) |keys| self.allocator.free(keys);
-        var target: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
-        defer target.deinit(self.allocator);
-        target.appendSlice(self.allocator, published.expanded_disclosures.items) catch {
-            self.action_error = .out_of_memory;
-            return;
-        };
-        var removed_index: ?usize = null;
-        for (target.items, 0..) |candidate, index| if (std.meta.eql(candidate, key)) {
-            removed_index = index;
-            _ = target.orderedRemove(index);
+        var target: DisclosureTarget = .{ .base = published.disclosure_keys };
+        for (published.expanded_disclosures.items) |candidate| if (std.meta.eql(candidate, key)) {
+            target.remove = key;
             break;
         };
-        if (removed_index == null) target.append(self.allocator, key) catch {
-            self.action_error = .out_of_memory;
-            return;
-        };
-        const job = self.queueAcceptedDisclosure(published, target.items, published.buffer_search.active, .general, null) catch {
+        if (target.remove == null) target.add.append(key);
+        const job = self.queueAcceptedDisclosure(published, target, published.buffer_search.active, .general, null) catch {
             self.action_error = .out_of_memory;
             return;
         };
@@ -11340,7 +11479,7 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
         if (ranges.len == 0) return error.MissingRanges;
         allocator.free(ranges);
 
-        const job = try DisclosureBuild.create(published, presentation.preferences, published.expanded_disclosures.items, input.request_id, input.active);
+        const job = try DisclosureBuild.create(published, presentation.preferences, .{ .base = published.disclosure_keys }, input.request_id, input.active);
         job.batch = try batch.clone(std.heap.page_allocator);
         job.batch.?.owner = std.heap.page_allocator;
         published.buffer_search.input.?.pending = true;
@@ -11457,6 +11596,92 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
         std.mem.sort(u64, &times[index], {}, std.sort.asc(u64));
         std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ stage.name, times[index][samples / 2], times[index][(samples * 95 + 99) / 100 - 1] });
     }
+    try benchmarkDisclosureHandoff(allocator, io, false);
+    try benchmarkDisclosureHandoff(allocator, io, true);
+}
+
+fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: bool) !void {
+    const draft_count = 1024;
+    const body_bytes = 4096;
+    const file_count: usize = if (many_inputs) 1024 else 1;
+    var store = bbr.review.InMemoryStore.init(allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 3);
+    var body: [body_bytes]u8 = undefined;
+    @memset(&body, 'x');
+    const session = try testSession(allocator, 3, 'd');
+    var transferred = false;
+    defer if (!transferred) session.destroy();
+    if (many_inputs) {
+        const a = session.arena.allocator();
+        var raw: std.ArrayList(u8) = .empty;
+        for (0..file_count) |index| try raw.print(a, "diff --git a/src/d{d}/f.zig b/src/d{d}/f.zig\n--- a/src/d{d}/f.zig\n+++ b/src/d{d}/f.zig\n@@ -1 +1 @@\n-old\n+new\n", .{ index, index, index, index });
+        session.diff = try bbr.diff.parse(a, raw.items);
+        try session.initializeEnrichment();
+        var fake: bbr.http.FakeHttpClient = .{ .status = 200, .body = &body };
+        const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+        var plain: bbr.highlight.PlainHighlighter = .{};
+        for (session.diff.files, 0..) |file, index| {
+            var result = try file_enrichment.enrich(std.heap.page_allocator, client, plain.highlighter(), .{
+                .repo = "repo",
+                .status = file.status,
+                .source_commit = "source",
+                .destination_commit = "destination",
+                .old_path = file.old_path,
+                .new_path = file.new_path,
+                .max_file_bytes = 0,
+            });
+            defer result.deinit();
+            try session.enrichment.admit(index, &result);
+        }
+    }
+    for (0..draft_count) |index| try store.store().put(key.storeKey(), .{
+        .local_id = index + 1,
+        .kind = .comment,
+        .scope = if (many_inputs) .{ .@"inline" = .{ .path = session.diff.files[index].new_path, .to = 1, .commit = "source" } } else .review,
+        .snapshot = if (many_inputs) .{ .text = &body, .selection_start = 0, .selection_len = 1 } else null,
+        .body = &body,
+    });
+    transferred = true;
+    var presentation = try Presentation.init(allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = session },
+    });
+    defer presentation.deinit();
+    var times: [9]u64 = undefined;
+    var control: [9]u64 = undefined;
+    const published = presentation.published.?;
+    if (many_inputs) {
+        for (0..file_count) |index| {
+            const path = try std.fmt.allocPrint(session.arena.allocator(), "src/d{d}", .{index});
+            try published.collapseDirectory(path);
+            try published.expanded_disclosures.append(allocator, .{ .review_card = .{ .draft = index + 1 } });
+        }
+        try published.rebuild(presentation.preferences, published.expanded_disclosures.items, null);
+    }
+    for (&times, &control) |*elapsed, *copy_elapsed| {
+        var start = std.Io.Clock.awake.now(io);
+        const job = try DisclosureBuild.create(published, presentation.preferences, .{ .base = published.disclosure_keys }, 0, null);
+        elapsed.* = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        std.mem.doNotOptimizeAway(job);
+        job.destroy();
+        start = std.Io.Clock.awake.now(io);
+        const inputs = try DisclosureInputs.create(published);
+        defer inputs.release();
+        const keys = try DisclosureKeys.create(published.expanded_disclosures.items);
+        defer keys.release();
+        copy_elapsed.* = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        std.mem.doNotOptimizeAway(inputs);
+        std.mem.doNotOptimizeAway(keys);
+        if (inputs.drafts.len != draft_count or inputs.scopes.len != draft_count or inputs.blobs.len != file_count or inputs.leased != file_count or
+            inputs.collapsed_directories.len != (if (many_inputs) file_count else @as(usize, 0)) or keys.items().len != (if (many_inputs) draft_count else @as(usize, 0)))
+            return error.WrongHandoffFixtureSize;
+        if (!std.mem.eql(u8, inputs.drafts[0].body, &body) or !std.mem.eql(u8, inputs.drafts[draft_count - 1].body, &body)) return error.WrongHandoffFixtureBody;
+    }
+    std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+    std.mem.sort(u64, &control, {}, std.sort.asc(u64));
+    std.debug.print("handoff_fixture_files={d} handoff_fixture_drafts={d} handoff_fixture_body_bytes={d} handoff_fixture_snapshot_bytes={d} handoff_fixture_directories={d} handoff_fixture_disclosures={d}\n", .{ file_count, draft_count, draft_count * body_bytes, if (many_inputs) draft_count * body_bytes else @as(usize, 0), published.collapsed_directories.items.len, published.expanded_disclosures.items.len });
+    std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ if (many_inputs) "worker_handoff_many_inputs" else "worker_handoff", times[4], times[8] });
+    std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ if (many_inputs) "snapshot_copy_many_inputs_control" else "snapshot_copy_control", control[4], control[8] });
 }
 
 fn completeBufferSearchScan(presentation: *Presentation) !void {
@@ -11477,6 +11702,142 @@ fn completeDisclosureBuild(presentation: *Presentation) !void {
     try testing.expect(command == .build_buffer_disclosure);
     command.build_buffer_disclosure.build();
     try presentation.dispatch(.{ .buffer_disclosure_built = command.build_buffer_disclosure });
+}
+
+test "M21 kernel worker handoff includes a changed DraftState" {
+    for ([_]bool{ false, true }) |issued_before_submission| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+        defer locks.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .scope = .{ .@"inline" = .{ .path = "a.txt", .to = 1, .commit = "source" } }, .body = "pending" });
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .submission_locks = locks.locks() }, .{
+            .initial = .{ .key = key, .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        var issued: ?*DisclosureBuild = null;
+        defer if (issued) |worker| worker.destroy();
+        try moveToRow(&presentation, findDisclosureRow(presentation.projection().review.?.buffer.rows, .{ .resolved_thread = 1 }).?);
+        if (issued_before_submission) {
+            try presentation.dispatch(.{ .action = .toggle_disclosure });
+            issued = presentation.takeCommand().?.build_buffer_disclosure;
+        }
+        try presentation.dispatch(.{ .action = .submit });
+        var post = presentation.takeCommand().?;
+        defer post.deinit();
+        try testing.expect(post == .post_draft);
+        if (issued) |worker| {
+            const before = presentation.projection().review.?.frame;
+            worker.build();
+            try testing.expect(!worker.failed);
+            issued = null;
+            try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+            try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+        } else try presentation.dispatch(.{ .action = .toggle_disclosure });
+        try completeDisclosureBuild(&presentation);
+        try testing.expect(presentation.projection().review.?.drafts[0].state == .submitting);
+        for (presentation.projection().review.?.buffer.rows) |row| switch (row) {
+            .draft => return error.SubmittingDraftVisible,
+            else => {},
+        };
+    }
+}
+
+test "M21 kernel issued Frame retains Draft body and AnchorSnapshot across an edit" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "a.txt", .to = 1, .commit = "source" } },
+        .body = "original",
+        .snapshot = .{ .text = "captured code", .selection_start = 0, .selection_len = 1 },
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testDisclosureSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try moveToRow(&presentation, findDisclosureRow(presentation.projection().review.?.buffer.rows, .{ .resolved_thread = 1 }).?);
+    try presentation.dispatch(.{ .action = .toggle_disclosure });
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    try cursorToDraftCard(&presentation, 1);
+    try presentation.dispatch(.{ .action = .edit_review_item });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init(" changed") } });
+    try presentation.dispatch(.{ .composer = .save });
+    const current = presentation.projection().review.?.frame;
+    worker.build();
+    try testing.expect(!worker.failed);
+    var retained = false;
+    for (worker.buffer.rows) |row| switch (row) {
+        .draft => |draft| {
+            try testing.expectEqualStrings("original", draft.draftItem().body);
+            try testing.expectEqualStrings("captured code", draft.draftItem().snapshot.?.text);
+            retained = true;
+        },
+        else => {},
+    };
+    try testing.expect(retained);
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+    try testing.expectEqual(current.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+    try completeDisclosureBuild(&presentation);
+    for (presentation.projection().review.?.buffer.rows) |row| switch (row) {
+        .draft => |draft| try testing.expectEqualStrings("original changed", draft.draftItem().body),
+        else => {},
+    };
+}
+
+test "M21 kernel disclosure worker allocation failures preserve the complete Frame" {
+    for ([_]bool{ false, true }) |enrichment| try testing.checkAllAllocationFailures(testing.allocator, disclosureWorkerFailureCase, .{enrichment});
+}
+
+fn disclosureWorkerFailureCase(allocator: Allocator, enrichment: bool) !void {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{
+        .local_id = 1,
+        .kind = .comment,
+        .scope = .{ .@"inline" = .{ .path = "a.txt", .to = 1, .commit = "source" } },
+        .body = "pending",
+        .snapshot = .{ .text = "captured code", .selection_start = 0, .selection_len = 1 },
+    });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testDisclosureSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try moveToRow(&presentation, findDisclosureRow(presentation.projection().review.?.buffer.rows, .{ .resolved_thread = 1 }).?);
+    const before = presentation.projection().review.?.frame;
+    if (enrichment) {
+        try presentation.dispatch(.ensure_focused_enrichment);
+        const command = presentation.takeCommand().?.enrich_file;
+        const responses = [_]bbr.http.Canned{ .{ .status = 200, .body = "old\n" }, .{ .status = 200, .body = "new\n" } };
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+        const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+        var highlighter = TestNoopHighlighter{};
+        const result = try file_enrichment.enrich(testing.allocator, client, highlighter.highlighter(), command.request());
+        try presentation.dispatch(.{ .file_enrichment_completed = .{
+            .command_id = command.command_id,
+            .work_id = command.work_id,
+            .session_epoch = command.session_epoch,
+            .file_index = command.file_index,
+            .outcome = .{ .completed = result },
+        } });
+    } else try presentation.dispatch(.{ .action = .toggle_disclosure });
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    worker.arena.deinit();
+    worker.arena = std.heap.ArenaAllocator.init(allocator);
+    worker.build();
+    const failed = worker.failed;
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+    if (failed) {
+        try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+        try testing.expectEqual(ActionError.buffer_build_failed, presentation.projection().action_error.?);
+        if (enrichment) try testing.expect(presentation.published.?.session.enrichment.file(0).new == .pending);
+        return error.OutOfMemory;
+    }
+    try testing.expect(presentation.projection().action_error == null);
 }
 
 test "a queued disclosure keeps the old Frame and ignores a replaced Session" {
@@ -12808,6 +13169,7 @@ test "M21 kernel failed Query clear preserves queued work and Enter intent" {
     try presentation.dispatch(.{ .key = .{ .codepoint = 'x', .text = "x" } });
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
     const before = presentation.projection().review.?.frame;
+    try presentation.commands.shrinkToLen(failing.allocator());
     failing.fail_index = failing.alloc_index;
     try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
     failing.fail_index = std.math.maxInt(usize);
@@ -15651,7 +16013,7 @@ test "M21 disclosure worker projects retained accepted and Review Search Batches
     published.buffer_search.accepted_batch = try search.scan(testing.allocator, query, published.search_corpus.?.candidates, .literal);
     published.review_search.batch = try published.buffer_search.accepted_batch.?.clone(testing.allocator);
 
-    const job = try DisclosureBuild.create(published, presentation.preferences, published.expanded_disclosures.items, 1, null);
+    const job = try DisclosureBuild.create(published, presentation.preferences, .{ .base = published.disclosure_keys }, 1, null);
     defer job.destroy();
     job.batch = try search.scan(std.heap.page_allocator, query, published.search_corpus.?.candidates, .literal);
     if (published.buffer_search.accepted_batch) |*batch| batch.deinit(testing.allocator);

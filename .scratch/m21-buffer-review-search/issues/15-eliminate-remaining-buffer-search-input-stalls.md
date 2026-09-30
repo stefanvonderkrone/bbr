@@ -21,7 +21,7 @@
 
 The original checklist is complete, but the following input-latency work remains. This list reflects the current code, not superseded progress notes.
 
-- [ ] Bound worker handoff cost. `DisclosureBuild.create` still copies every Draft body, AnchorSnapshot, ScopeProjection entry, and per-File enrichment table. It also acquires every File lease and copies disclosure and Directory state on the terminal thread.
+- [x] Bound worker handoff cost. `DisclosureBuild.create` retains cached inputs and disclosure keys. The worker copies private File Enrichment tables and applies bounded disclosure changes. Handoff does not copy the complete PendingReview, ScopeProjection, Directory state, or File lease table.
 - [ ] Stage new Draft Buffer builds on a worker. Keep TempId reservation, persistence, PendingReview, ScopeProjection, Composer closure, and Frame publication consistent. `Published.saveDraft` still calls `prepareBuffer` before persistence.
 - [ ] Stage Draft mutation Buffer builds on a worker. Cover body edits, re-anchor, Draft subtree deletion, and unresolved-outcome repair. Preserve persistence and Frame rollback. The current paths include `editDraftBody`, `reanchorDraft`, `deleteDraftSubtree`, and `resolveUnknownAsUnpublished`.
 - [ ] Stage the remaining view-change Buffer builds. Cover Layout, Scope, resolved visibility, Selected Version, File isolation, isolated File movement, and width changes. Sessions with at most 4,096 Candidates still use synchronous builds. `stageLargeBuffer` also disables worker staging while Buffer Search input is open, so width changes can rebuild large Buffers synchronously.
@@ -170,3 +170,28 @@ The terminal adapter and runtime tests use the same scan-launch failure path. Th
 Tests cover wrong-family and unknown command ids, refresh, Review switching, shutdown, closed completion sinks, Query-clear failures, and File Enrichment during Query edits. Allocation-failure tests check every scan-arena and range-projection allocation. `zig build`, formatting checks, and `zig build test --summary all` passed. The full suite contains 877 tests.
 
 This completes the lifecycle bullet. Draft saves, smaller-Session view changes, and some general Buffer builds remain synchronous. The ticket remains open for those input stalls.
+
+## Bounded worker handoff
+
+`DisclosureBuild.create` now retains one cached input snapshot and one disclosure-key snapshot. The input snapshot owns the Draft bodies, AnchorSnapshots, ScopeProjection, Directory paths, File Enrichment tables, and File leases. Frame preparation updates the snapshot before publication. Disclosure-only builds reuse it. File Enrichment workers prepare replacement snapshots before admission. Each replacement retains only the File content that its projection uses.
+
+Buffer Search retains saved disclosure keys instead of copying complete key arrays during handoff. A disclosure command sends a retained baseline plus at most three additions or one removal. The worker constructs the complete target keys. Query text and the File Tree cursor path remain per-command copies.
+
+DraftState changes update an unshared snapshot or replace a retained snapshot. Admission checks the input snapshot identity as well as the existing command, Session Epoch, Query generation, Frame revision, and geometry. A worker can finish against its retained Draft body and AnchorSnapshot after an edit. Presentation rejects that old Frame and retries against the current inputs.
+
+File Enrichment workers copy cache evidence from atomic per-File records. The existing cache revision check rejects a copy that overlaps a cache change. The terminal thread no longer copies the complete cache-entry table when it queues a worker.
+
+`zig build bench-buffer-search -- 256` uses nine ReleaseFast samples. Before the change, the one-File fixture had 1,024 Drafts and 4,194,304 body bytes. Handoff measured 276,125 ns median and 313,959 ns p95. After the change, the same fixture measured 1,333 ns median and 3,417 ns p95.
+
+The added fixture has 1,024 enriched Files, 1,024 Drafts, 4,194,304 body bytes, and 4,194,304 AnchorSnapshot bytes. It also has 1,024 ScopeProjection entries, 1,024 collapsed Directories, and 1,024 expanded ReviewCards.
+
+| Stage | Median ns | p95 ns |
+| --- | ---: | ---: |
+| One-File worker handoff | 1,333 | 3,417 |
+| One-File snapshot-copy control | 272,042 | 326,750 |
+| Many-input worker handoff | 1,917 | 6,583 |
+| Many-input snapshot-copy control | 572,542 | 690,417 |
+
+The snapshot-copy controls measure complete input copies and File lease acquisition outside production handoff. The benchmark builds each fixture before timing. Snapshot refresh during initial Session publication and synchronous Draft or general Frame builds remains part of the later work in this ticket. Disclosure lookup and navigation restoration also remain separate work.
+
+Tests cover DraftState changes, Draft edits during issued worker work, and allocation failures in disclosure and File Enrichment workers. The existing lifecycle tests cover cancellation, stale work, Session replacement, launch failure, and a closed completion sink. `zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 880 tests. The ticket remains `ready-for-agent` for the next remaining item.

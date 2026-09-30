@@ -139,6 +139,25 @@ pub const ReadLease = struct {
     old: ?*OwnedSide,
     new: ?*OwnedSide,
 
+    pub fn retain(self: ReadLease) ReadLease {
+        if (self.old) |side| _ = side.references.fetchAdd(1, .acq_rel);
+        if (self.new) |side| _ = side.references.fetchAdd(1, .acq_rel);
+        return self;
+    }
+
+    pub fn retainProjected(self: ReadLease, blob: bbr.diff.FileBlob) ReadLease {
+        var lease = self;
+        if (blob.old == null) {
+            lease.old = null;
+            if (lease.view.old == .content) lease.view.old = .pending;
+        }
+        if (blob.new == null) {
+            lease.new = null;
+            if (lease.view.new == .content) lease.view.new = .pending;
+        }
+        return lease.retain();
+    }
+
     pub fn release(self: *ReadLease) void {
         if (self.old) |side| side.destroy();
         if (self.new) |side| side.destroy();
@@ -175,6 +194,14 @@ pub const Result = struct {
 
     pub fn retainedBytes(self: *const Result) usize {
         return resultSideBytes(self.old) +| resultSideBytes(self.new);
+    }
+
+    pub fn snapshot(self: *const Result) ReadLease {
+        return (ReadLease{
+            .view = self.view(),
+            .old = if (self.old == .owned) self.old.owned else null,
+            .new = if (self.new == .owned) self.new.owned else null,
+        }).retain();
     }
 };
 
@@ -357,6 +384,34 @@ pub const CacheEntry = struct {
     failed_new: bool,
 };
 
+// Workers copy cache policy evidence without reading mutable Storage records.
+// Presentation rejects the Frame if the Storage revision changed after handoff.
+const AtomicCacheEntry = struct {
+    retained_bytes: std.atomic.Value(usize) = .init(0),
+    last_used: std.atomic.Value(u64) = .init(0),
+    leases: std.atomic.Value(usize) = .init(0),
+    failed_old: std.atomic.Value(bool) = .init(false),
+    failed_new: std.atomic.Value(bool) = .init(false),
+
+    fn store(self: *AtomicCacheEntry, file: StoredFile) void {
+        self.retained_bytes.store(file.retainedBytes(), .release);
+        self.last_used.store(file.last_used, .release);
+        self.leases.store(file.leases, .release);
+        self.failed_old.store(file.old == .fetch_failed, .release);
+        self.failed_new.store(file.new == .fetch_failed, .release);
+    }
+
+    fn load(self: *const AtomicCacheEntry) CacheEntry {
+        return .{
+            .retained_bytes = self.retained_bytes.load(.acquire),
+            .last_used = self.last_used.load(.acquire),
+            .leases = self.leases.load(.acquire),
+            .failed_old = self.failed_old.load(.acquire),
+            .failed_new = self.failed_new.load(.acquire),
+        };
+    }
+};
+
 /// Project a completed result and the cache victims into private Frame inputs.
 /// The caller keeps the result and all source content alive until publication.
 pub fn previewAdmission(file_idx: usize, result: *const Result, policy: CachePolicy, focused: ?usize, entries: []CacheEntry, projection: Projection) void {
@@ -427,6 +482,7 @@ pub const Storage = struct {
     content_statuses: []bbr.diff.FileContent,
     statuses: []bbr.highlight.FileHighlightStatus,
     errors: []SideErrors,
+    cache_entries: []AtomicCacheEntry,
     cache: CachePolicy = .{},
     focused_file: ?usize = null,
     recency: u64 = 0,
@@ -435,13 +491,7 @@ pub const Storage = struct {
 
     pub fn cacheEntries(self: *const Storage, allocator: Allocator) ![]CacheEntry {
         const entries = try allocator.alloc(CacheEntry, self.files.len);
-        for (self.files, entries) |stored, *entry| entry.* = .{
-            .retained_bytes = stored.retainedBytes(),
-            .last_used = stored.last_used,
-            .leases = stored.leases,
-            .failed_old = stored.old == .fetch_failed,
-            .failed_new = stored.new == .fetch_failed,
-        };
+        for (self.cache_entries, entries) |*stored, *entry| entry.* = stored.load();
         return entries;
     }
 
@@ -479,6 +529,9 @@ pub const Storage = struct {
         const errors = try allocator.alloc(SideErrors, diff_files.len);
         errdefer allocator.free(errors);
         @memset(errors, .{});
+        const cache_entries = try allocator.alloc(AtomicCacheEntry, diff_files.len);
+        errdefer allocator.free(cache_entries);
+        @memset(cache_entries, .{});
         var storage: Storage = .{
             .allocator = allocator,
             .files = files,
@@ -487,6 +540,7 @@ pub const Storage = struct {
             .content_statuses = content_statuses,
             .statuses = statuses,
             .errors = errors,
+            .cache_entries = cache_entries,
         };
         errdefer storage.retired.deinit(allocator);
         try storage.retired.ensureTotalCapacity(allocator, diff_files.len);
@@ -503,6 +557,7 @@ pub const Storage = struct {
         self.allocator.free(self.content_statuses);
         self.allocator.free(self.statuses);
         self.allocator.free(self.errors);
+        self.allocator.free(self.cache_entries);
         self.* = undefined;
     }
 
@@ -544,6 +599,7 @@ pub const Storage = struct {
         std.debug.assert(file_idx < self.files.len);
         self.recency +|= 1;
         self.files[file_idx].last_used = self.recency;
+        self.cache_entries[file_idx].store(self.files[file_idx]);
         self.focused_file = file_idx;
         self.revision +%= 1;
         return self.stageCacheEnforcement();
@@ -560,6 +616,7 @@ pub const Storage = struct {
         std.debug.assert(self.retired.items.len == 0);
         self.recency +|= 1;
         self.files[file_idx].last_used = self.recency;
+        self.cache_entries[file_idx].store(self.files[file_idx]);
         self.focused_file = file_idx;
         self.revision +%= 1;
     }
@@ -587,6 +644,7 @@ pub const Storage = struct {
         std.debug.assert(file_idx < self.files.len);
         const result = self.snapshot(file_idx);
         self.files[file_idx].leases += 1;
+        self.cache_entries[file_idx].store(self.files[file_idx]);
         self.revision +%= 1;
         return result;
     }
@@ -606,6 +664,7 @@ pub const Storage = struct {
     pub fn hold(self: *Storage, file_idx: usize) void {
         std.debug.assert(file_idx < self.files.len);
         self.files[file_idx].leases += 1;
+        self.cache_entries[file_idx].store(self.files[file_idx]);
         self.revision +%= 1;
     }
 
@@ -613,6 +672,7 @@ pub const Storage = struct {
     pub fn finishLease(self: *Storage, file_idx: usize) bool {
         std.debug.assert(self.files[file_idx].leases > 0);
         self.files[file_idx].leases -= 1;
+        self.cache_entries[file_idx].store(self.files[file_idx]);
         self.revision +%= 1;
         return self.stageCacheEnforcement();
     }
@@ -666,6 +726,7 @@ pub const Storage = struct {
     }
 
     fn projectSide(self: *Storage, file_idx: usize, comptime which: enum { old, new }) void {
+        self.cache_entries[file_idx].store(self.files[file_idx]);
         const stored = @field(self.files[file_idx], @tagName(which));
         const blob_slot = &@field(self.blobs[file_idx], @tagName(which));
         const highlight_slot = &@field(self.highlights[file_idx], @tagName(which));
