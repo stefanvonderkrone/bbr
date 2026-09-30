@@ -1070,12 +1070,7 @@ const DisclosureInputs = struct {
         errdefer self.release();
         const a = self.arena.allocator();
         const copies = try a.dupe(bbr.review.Draft, drafts);
-        for (copies) |*copy| {
-            copy.body = try a.dupe(u8, copy.body);
-            if (copy.scope) |scope| copy.scope = try cloneDisclosureScope(a, scope);
-            if (copy.anchor) |anchor| copy.anchor = (try cloneDisclosureScope(a, .{ .@"inline" = anchor })).@"inline";
-            if (copy.snapshot) |*snapshot| snapshot.text = try a.dupe(u8, snapshot.text);
-        }
+        for (copies) |*copy| copy.* = try cloneDisclosureDraft(a, copy.*);
         self.drafts = copies;
         const scope_copies = try a.dupe(bbr.review.ScopeProjectionEntry, scopes);
         for (scope_copies) |*entry| if (entry.resolution == .resolved) {
@@ -1105,7 +1100,7 @@ const DisclosureInputs = struct {
 };
 
 pub const DisclosureBuild = struct {
-    const Kind = enum { input, accepted, restore, general, clear_input, view, enrichment };
+    const Kind = enum { input, accepted, restore, general, clear_input, view, enrichment, draft_save };
     const NavigationPolicy = enum { restore, reset, file_header, center, version };
     arena: std.heap.ArenaAllocator,
     session: *Session,
@@ -1117,6 +1112,7 @@ pub const DisclosureBuild = struct {
     highlights: []const bbr.highlight.FileHighlights = &.{},
     content_statuses: []const bbr.diff.FileContent = &.{},
     drafts: []const bbr.review.Draft = &.{},
+    new_draft: ?bbr.review.Draft = null,
     scopes: []const bbr.review.ScopeProjectionEntry = &.{},
     disclosures: []const buffer_mod.DisclosureKey = &.{},
     collapsed_directories: []const []const u8 = &.{},
@@ -1242,6 +1238,21 @@ pub const DisclosureBuild = struct {
         const a = self.arena.allocator();
         self.disclosure_keys = try self.target.build(self.arena.child_allocator);
         self.disclosures = self.disclosure_keys.?.items();
+        if (self.new_draft) |draft| {
+            const drafts = try a.alloc(bbr.review.Draft, self.inputs.drafts.len + 1);
+            @memcpy(drafts[0..self.inputs.drafts.len], self.inputs.drafts);
+            drafts[self.inputs.drafts.len] = draft;
+            self.drafts = drafts;
+            if (draft.parent == null) {
+                const scopes = try a.alloc(bbr.review.ScopeProjectionEntry, self.inputs.scopes.len + 1);
+                @memcpy(scopes[0..self.inputs.scopes.len], self.inputs.scopes);
+                scopes[self.inputs.scopes.len] = .{
+                    .temp_id = draft.local_id,
+                    .resolution = .{ .resolved = .{ .state = .current, .scope = draft.effectiveScope() } },
+                };
+                self.scopes = scopes;
+            }
+        }
         if (self.kind == .enrichment) {
             self.blobs = try a.dupe(bbr.diff.FileBlob, self.inputs.blobs);
             self.highlights = try a.dupe(bbr.highlight.FileHighlights, self.inputs.highlights);
@@ -1253,6 +1264,8 @@ pub const DisclosureBuild = struct {
                 .highlights = self.highlights,
                 .content_statuses = self.content_statuses,
             });
+        }
+        if (self.kind == .enrichment or self.kind == .draft_save) {
             const inputs = try DisclosureInputs.clone(self.arena.child_allocator, self.drafts, self.scopes, self.collapsed_directories, .{
                 .blobs = self.blobs,
                 .highlights = self.highlights,
@@ -1261,7 +1274,7 @@ pub const DisclosureBuild = struct {
             self.completed_inputs = inputs;
             inputs.leases = try inputs.arena.allocator().alloc(file_enrichment.ReadLease, self.inputs.leases.len);
             for (inputs.leases, self.inputs.leases, 0..) |*lease, source, index| {
-                if (index == self.enrichment_file.?) {
+                if (self.enrichment_file == index) {
                     var result_lease = self.enrichment_result.?.snapshot();
                     lease.* = result_lease.retainProjected(inputs.blobs[index]);
                     result_lease.release();
@@ -1269,7 +1282,7 @@ pub const DisclosureBuild = struct {
                 inputs.leased += 1;
             }
         }
-        if (self.kind == .view or self.kind == .enrichment) {
+        if (self.kind == .view or self.kind == .enrichment or self.kind == .draft_save) {
             const candidates = try buffer_mod.buildSearchCandidates(a, self.session.diff, self.preferences.layout, self.session.threads, .{
                 .fold_context = self.preferences.scope == .changes,
                 .whole_file = self.preferences.scope == .whole,
@@ -1299,7 +1312,7 @@ pub const DisclosureBuild = struct {
                 self.rebuilt_batch.?.owner_arena = arena;
                 self.active = retainedSearchIndex(self.accepted_snapshot, self.accepted_active, self.rebuilt_batch.?);
             }
-            if (self.kind == .enrichment) if (self.input_query_text) |text| {
+            if (self.kind != .view) if (self.input_query_text) |text| {
                 const query = try search.Query.init(a, text);
                 const arena = try std.heap.page_allocator.create(std.heap.ArenaAllocator);
                 arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -1384,6 +1397,15 @@ pub const DisclosureBuild = struct {
         std.heap.page_allocator.destroy(self);
     }
 };
+
+fn cloneDisclosureDraft(a: Allocator, draft: bbr.review.Draft) !bbr.review.Draft {
+    var copy = draft;
+    copy.body = try a.dupe(u8, draft.body);
+    if (draft.scope) |scope| copy.scope = try cloneDisclosureScope(a, scope);
+    if (draft.anchor) |anchor| copy.anchor = (try cloneDisclosureScope(a, .{ .@"inline" = anchor })).@"inline";
+    if (copy.snapshot) |*snapshot| snapshot.text = try a.dupe(u8, snapshot.text);
+    return copy;
+}
 
 fn cloneDisclosureScope(a: Allocator, scope: bbr.review.CommentScope) !bbr.review.CommentScope {
     return switch (scope) {
@@ -2390,6 +2412,7 @@ const Published = struct {
     isolated_file: ?usize,
     composer_arena: std.heap.ArenaAllocator,
     composer: ?Composer,
+    pending_draft_save: ?bbr.review.TempId = null,
     buffer_search: BufferSearchState,
     search_generation: u64 = 0,
     large_session: bool = false,
@@ -2468,6 +2491,7 @@ const Published = struct {
         published.composer_arena = std.heap.ArenaAllocator.init(allocator);
         errdefer published.composer_arena.deinit();
         published.composer = null;
+        published.pending_draft_save = null;
         published.buffer_search = .{};
         published.search_generation = 0;
         published.pending_view = null;
@@ -2659,16 +2683,14 @@ const Published = struct {
         self.session.enrichment.commitCacheUpdate();
     }
 
-    fn saveDraft(
+    fn prepareDraft(
         self: *Published,
         store: bbr.review.PendingReviewStore,
-        preferences: Preferences,
+        review_allocator: Allocator,
         new_draft: bbr.review.NewDraft,
-    ) SaveDraftError!void {
+    ) SaveDraftError!bbr.review.Draft {
         new_draft.validate() catch |err| return err;
-        const review_allocator = self.review_arena.allocator();
         const reserved_id = store.reserveTempId(self.key.storeKey()) catch return error.PersistenceFailed;
-        try self.review.drafts.ensureUnusedCapacity(review_allocator, 1);
 
         var draft: bbr.review.Draft = .{
             .local_id = reserved_id,
@@ -2702,28 +2724,23 @@ const Published = struct {
             if (anchor.commit) |commit| draft.anchor.?.commit = try review_allocator.dupe(u8, commit);
         }
 
-        const previous_len = self.review.drafts.items.len;
-        const previous_projection_len = self.scope_projection.items.len;
-        const previous_next_id = self.review.next_id;
-        self.review.drafts.appendAssumeCapacity(draft);
-        self.review.next_id = @max(self.review.next_id, reserved_id + 1);
-        errdefer {
-            self.review.drafts.shrinkRetainingCapacity(previous_len);
-            self.scope_projection.shrinkRetainingCapacity(previous_projection_len);
-            self.review.next_id = previous_next_id;
-        }
-        if (draft.parent == null) {
-            self.scope_projection.append(review_allocator, .{
-                .temp_id = draft.local_id,
-                .resolution = .{ .resolved = .{ .state = .current, .scope = draft.effectiveScope() } },
-            }) catch return error.OutOfMemory;
-        }
+        return draft;
+    }
 
-        var staged = try self.prepareBuffer(preferences, self.expanded_disclosures.items, self.isolated_file, self.geometry);
-        defer staged.deinit();
+    // All allocations precede persistence. The caller then publishes the worker
+    // Frame and closes the Composer through an infallible final step.
+    fn persistPreparedDraft(self: *Published, store: bbr.review.PendingReviewStore, candidate: bbr.review.Draft) SaveDraftError!void {
+        const a = self.review_arena.allocator();
+        const draft = try cloneDisclosureDraft(a, candidate);
+        try self.review.drafts.ensureUnusedCapacity(a, 1);
+        if (draft.parent == null) try self.scope_projection.ensureUnusedCapacity(a, 1);
         store.put(self.key.storeKey(), draft) catch return error.PersistenceFailed;
-        staged.publish();
-        self.review_search.invalidate(self.allocator);
+        self.review.drafts.appendAssumeCapacity(draft);
+        self.review.next_id = @max(self.review.next_id, draft.local_id + 1);
+        if (draft.parent == null) self.scope_projection.appendAssumeCapacity(.{
+            .temp_id = draft.local_id,
+            .resolution = .{ .resolved = .{ .state = .current, .scope = draft.effectiveScope() } },
+        });
     }
 
     /// Replace one Draft's body: stage the candidate graph and Buffer, persist
@@ -7151,7 +7168,7 @@ pub const Presentation = struct {
             const discard = switch (command) {
                 .scan_buffer_search => true,
                 .build_buffer_disclosure => |job| job != keep and
-                    (job.kind != .enrichment or self.published == null or job.epoch != self.published.?.epoch),
+                    ((job.kind != .enrichment and job.kind != .draft_save) or self.published == null or job.epoch != self.published.?.epoch),
                 else => false,
             };
             if (!discard) {
@@ -7294,7 +7311,7 @@ pub const Presentation = struct {
         if (!self.consumeCommand(job.command_id, .build_buffer_disclosure)) return;
         const published = self.published orelse return;
         if (self.shutdown_requested or published.epoch != job.epoch) return;
-        if (job.kind == .view or job.kind == .enrichment) {
+        if (job.kind == .view or job.kind == .enrichment or job.kind == .draft_save) {
             self.acceptViewBuild(published, job, &owned);
             return;
         }
@@ -7405,59 +7422,70 @@ pub const Presentation = struct {
     }
 
     fn acceptViewBuild(self: *Presentation, published: *Published, job: *DisclosureBuild, owned: *bool) void {
+        if (job.kind == .draft_save and (published.composer == null or published.pending_draft_save != job.new_draft.?.local_id)) return;
+        if (job.kind == .draft_save and !std.meta.eql(job.geometry, published.geometry)) {
+            self.retryContentBuild(published, job);
+            return;
+        }
         if (job.kind == .enrichment and job.cache_revision != published.session.enrichment.revision) {
             self.retryEnrichmentBuild(published, job);
             return;
         }
-        if (job.request_id != published.search_generation or job.kind != .enrichment and published.buffer_search.input != null) {
-            if (job.kind == .enrichment) self.retryEnrichmentBuild(published, job);
+        if (job.request_id != published.search_generation or job.kind == .view and published.buffer_search.input != null) {
+            if (job.kind != .view) self.retryContentBuild(published, job);
             return;
         }
-        if (job.kind == .enrichment) {
+        if (job.kind != .view) {
             const current_input = published.buffer_search.input;
             if (job.input_request_id != (if (current_input) |input| input.request_id else null) or
                 (if (current_input) |input| if (input.query) |query| !std.mem.eql(u8, query.text, job.input_query_text orelse "") else job.input_query_text != null else job.input_query_text != null))
             {
-                self.retryEnrichmentBuild(published, job);
+                self.retryContentBuild(published, job);
                 return;
             }
         }
         if (!published.disclosure_inputs_current or job.inputs != published.disclosure_inputs or job.frame_revision != published.visual_rows_revision or job.source_active_file != published.activeFile() or job.tree_scroll != published.tree.scroll) {
-            if (job.kind == .enrichment) self.retryEnrichmentBuild(published, job) else self.retryViewBuild(published, job);
+            self.retryContentBuild(published, job);
             return;
         }
         const wanted_cursor: ?file_tree.Identity = if (published.tree.entries.len == 0) null else published.tree.entries[published.tree.cursor].identity;
         const same_cursor = if (wanted_cursor) |cursor| if (job.wanted_cursor) |saved| cursor.eql(saved) else false else job.wanted_cursor == null;
         if (!same_cursor) {
-            if (job.kind == .enrichment) self.retryEnrichmentBuild(published, job) else self.retryViewBuild(published, job);
+            self.retryContentBuild(published, job);
             return;
         }
         if (job.accepted_snapshot) |snapshot| {
             const current = published.buffer_search.accepted_batch;
             if (current == null or snapshot.occurrences.ptr != current.?.occurrences.ptr or job.accepted_active != published.buffer_search.active) {
-                if (job.kind == .enrichment) self.retryEnrichmentBuild(published, job) else self.retryViewBuild(published, job);
+                self.retryContentBuild(published, job);
                 return;
             }
         } else if (published.buffer_search.accepted_batch != null) {
-            if (job.kind == .enrichment) self.retryEnrichmentBuild(published, job) else self.retryViewBuild(published, job);
+            self.retryContentBuild(published, job);
             return;
         }
         if (job.review_snapshot) |snapshot| {
             const current = published.review_search.batch;
             if (current == null or snapshot.occurrences.ptr != current.?.occurrences.ptr or job.review_selected != published.review_search.selected) {
-                if (job.kind == .enrichment) self.retryEnrichmentBuild(published, job) else self.retryViewBuild(published, job);
+                self.retryContentBuild(published, job);
                 return;
             }
         } else if (published.review_search.batch != null) {
-            if (job.kind == .enrichment) self.retryEnrichmentBuild(published, job) else self.retryViewBuild(published, job);
+            self.retryContentBuild(published, job);
             return;
         }
         if (job.failed) {
             if (job.kind == .view) published.pending_view = null;
+            if (job.kind == .draft_save) published.pending_draft_save = null;
             if (!job.enrichment_speculative) self.action_error = .buffer_build_failed;
             if (job.enrichment_file) |index| published.session.enrichment.resetLoading(index);
             return;
         }
+        if (job.new_draft) |draft| published.persistPreparedDraft(self.dependencies.reviews, draft) catch |err| {
+            published.pending_draft_save = null;
+            self.action_error = if (err == error.PersistenceFailed) .persistence_failed else .out_of_memory;
+            return;
+        };
         if (job.enrichment_file) |index| {
             if (published.review_search.open and published.review_search.query != null and published.review_search.held != null and
                 !published.review_search.held.?[index])
@@ -7469,9 +7497,11 @@ pub const Presentation = struct {
                 self.action_error = .action_refused;
                 return;
             };
-            job.completed_inputs.?.retain();
+        }
+        if (job.completed_inputs) |inputs| {
+            inputs.retain();
             published.disclosure_inputs.release();
-            published.disclosure_inputs = job.completed_inputs.?;
+            published.disclosure_inputs = inputs;
             published.disclosure_inputs_current = true;
         }
         const previous = published.frameProjection();
@@ -7494,6 +7524,7 @@ pub const Presentation = struct {
         if (published.search_corpus) |old| old.release();
         published.search_corpus = job.search_corpus;
         job.search_corpus = null;
+        published.large_session = published.large_session or published.search_corpus.?.candidates.len > 4096;
         if (published.buffer_search.accepted_batch) |*old| old.deinit(self.allocator);
         published.buffer_search.accepted_batch = job.rebuilt_batch;
         job.rebuilt_batch = null;
@@ -7504,7 +7535,7 @@ pub const Presentation = struct {
         published.buffer_search.accepted_navigation_rows = job.navigation_rows;
         job.navigation_rows = null;
         published.buffer_search.active = job.active;
-        if (job.kind == .enrichment) if (published.buffer_search.input) |*input| {
+        if (job.kind != .view) if (published.buffer_search.input) |*input| {
             const next_active = if (job.input_rebuilt_batch) |batch| retainedSearchIndex(input.batch, input.active, batch) else null;
             if (input.batch) |*old| old.deinit(self.allocator);
             if (input.ranges) |old| std.heap.page_allocator.free(old);
@@ -7542,6 +7573,13 @@ pub const Presentation = struct {
         }
         published.frame_revision += 1;
         published.visual_rows_revision = published.frame_revision;
+        if (job.kind == .draft_save) {
+            published.pending_draft_save = null;
+            published.composer.?.deinit();
+            published.composer = null;
+            published.review_search.invalidate(self.allocator);
+            if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) tree.refresh(&published.review);
+        }
         if (job.kind != .enrichment or !job.enrichment_speculative) self.action_error = null;
         if (job.enrichment_file) |index| {
             published.session.enrichment.commitCacheUpdate();
@@ -7561,6 +7599,28 @@ pub const Presentation = struct {
             };
             if (reviewSearchOpeningFile(&published.review_search) == index) self.openReviewSearchOccurrence(true);
         }
+    }
+
+    fn retryContentBuild(self: *Presentation, published: *Published, job: *DisclosureBuild) void {
+        switch (job.kind) {
+            .enrichment => self.retryEnrichmentBuild(published, job),
+            .draft_save => {
+                self.queueDraftBuild(published, job.new_draft.?) catch {
+                    published.pending_draft_save = null;
+                    self.action_error = .out_of_memory;
+                };
+            },
+            else => self.retryViewBuild(published, job),
+        }
+    }
+
+    fn queueDraftBuild(self: *Presentation, published: *Published, draft: bbr.review.Draft) !void {
+        try self.commands.ensureUnusedCapacity(self.allocator, 1);
+        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation, published.buffer_search.active);
+        errdefer job.destroy();
+        job.kind = .draft_save;
+        job.new_draft = try cloneDisclosureDraft(job.arena.allocator(), draft);
+        self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
     }
 
     fn retryViewBuild(self: *Presentation, published: *Published, job: *const DisclosureBuild) void {
@@ -7877,7 +7937,8 @@ pub const Presentation = struct {
         while (index < self.commands.items.len) {
             if (self.commands.items[index] == .build_buffer_disclosure and
                 self.commands.items[index].build_buffer_disclosure.kind != .input and
-                self.commands.items[index].build_buffer_disclosure.kind != .enrichment)
+                self.commands.items[index].build_buffer_disclosure.kind != .enrichment and
+                self.commands.items[index].build_buffer_disclosure.kind != .draft_save)
             {
                 var previous = self.commands.orderedRemove(index);
                 previous.deinit();
@@ -9176,6 +9237,7 @@ pub const Presentation = struct {
         const published = self.published orelse return;
         const composer = if (published.composer) |*value| value else return;
         if (self.external_edit_pending != null) return;
+        if (composer_input != .save) self.cancelDraftSave(published);
         switch (composer_input) {
             .insert => |chunk| {
                 composer.insert(chunk.slice()) catch {
@@ -9486,7 +9548,18 @@ pub const Presentation = struct {
         const composer = if (published.composer) |*value| value else return;
         if (composer.isBlank()) return;
         if (composer.request.mutation) |target| return self.saveComposerEdit(published, target);
-        published.saveDraft(self.dependencies.reviews, self.preferences, composer.toNewDraft()) catch |err| {
+        if (published.pending_draft_save != null) return;
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        const job = DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation, published.buffer_search.active) catch {
+            self.action_error = .out_of_memory;
+            return;
+        };
+        job.kind = .draft_save;
+        job.new_draft = published.prepareDraft(self.dependencies.reviews, job.arena.allocator(), composer.toNewDraft()) catch |err| {
+            job.destroy();
             self.action_error = switch (err) {
                 error.AnchorRangeTooLong => .anchor_range_too_long,
                 error.InvalidDraftScope => .invalid_selection,
@@ -9497,10 +9570,22 @@ pub const Presentation = struct {
             };
             return;
         };
-        composer.deinit();
-        published.composer = null;
-        if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) tree.refresh(&published.review);
+        published.pending_draft_save = job.new_draft.?.local_id;
+        self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
         self.action_error = null;
+    }
+
+    fn cancelDraftSave(self: *Presentation, published: *Published) void {
+        if (published.pending_draft_save == null) return;
+        published.pending_draft_save = null;
+        var index: usize = 0;
+        while (index < self.commands.items.len) {
+            const command = self.commands.items[index];
+            if (command == .build_buffer_disclosure and command.build_buffer_disclosure.kind == .draft_save) {
+                var discarded = self.commands.orderedRemove(index);
+                discarded.deinit();
+            } else index += 1;
+        }
     }
 
     /// Save an edit rather than a creation. Every failure keeps the Composer
@@ -11682,6 +11767,47 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
     std.debug.print("handoff_fixture_files={d} handoff_fixture_drafts={d} handoff_fixture_body_bytes={d} handoff_fixture_snapshot_bytes={d} handoff_fixture_directories={d} handoff_fixture_disclosures={d}\n", .{ file_count, draft_count, draft_count * body_bytes, if (many_inputs) draft_count * body_bytes else @as(usize, 0), published.collapsed_directories.items.len, published.expanded_disclosures.items.len });
     std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ if (many_inputs) "worker_handoff_many_inputs" else "worker_handoff", times[4], times[8] });
     std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ if (many_inputs) "snapshot_copy_many_inputs_control" else "snapshot_copy_control", control[4], control[8] });
+    var draft_dispatch: [9]u64 = undefined;
+    var draft_worker: [9]u64 = undefined;
+    var draft_admission: [9]u64 = undefined;
+    var draft_control: [9]u64 = undefined;
+    for (0..draft_dispatch.len) |sample| {
+        try presentation.dispatch(.{ .action = .review_comment });
+        try published.composer.?.seed("new Draft");
+        var start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .composer = .save });
+        draft_dispatch[sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (presentation.action_error != null or published.review.drafts.items.len != draft_count + sample or published.composer == null)
+            return error.DraftSavePublishedBeforeWorker;
+        const job = (presentation.takeCommand() orelse return error.MissingDraftBuild).build_buffer_disclosure;
+        start = std.Io.Clock.awake.now(io);
+        job.build();
+        draft_worker[sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (job.failed) return error.DraftBuildFailed;
+        start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .buffer_disclosure_built = job });
+        draft_admission[sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (presentation.action_error != null or published.composer != null or published.review.drafts.items.len != draft_count + sample + 1)
+            return error.DraftSaveAdmissionFailed;
+        // The control builds the same Draft graph through the former synchronous path.
+        start = std.Io.Clock.awake.now(io);
+        var staged = try published.prepareBuffer(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, published.geometry);
+        draft_control[sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        defer staged.deinit();
+        if (staged.buffer.rows.len != published.buffer.rows.len or staged.visual_rows.len != published.visual_rows.len)
+            return error.DraftControlFrameMismatch;
+        std.mem.doNotOptimizeAway(staged.buffer.rows.len);
+    }
+    const labels = [_][]const u8{
+        if (many_inputs) "draft_save_dispatch_many_inputs" else "draft_save_dispatch",
+        if (many_inputs) "draft_save_worker_many_inputs" else "draft_save_worker",
+        if (many_inputs) "draft_save_admission_many_inputs" else "draft_save_admission",
+        if (many_inputs) "draft_buffer_sync_many_inputs_control" else "draft_buffer_sync_control",
+    };
+    for ([_]*[9]u64{ &draft_dispatch, &draft_worker, &draft_admission, &draft_control }, labels) |samples, label| {
+        std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+        std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ label, samples[4], samples[8] });
+    }
 }
 
 fn completeBufferSearchScan(presentation: *Presentation) !void {
@@ -11788,11 +11914,13 @@ test "M21 kernel issued Frame retains Draft body and AnchorSnapshot across an ed
     };
 }
 
-test "M21 kernel disclosure worker allocation failures preserve the complete Frame" {
-    for ([_]bool{ false, true }) |enrichment| try testing.checkAllAllocationFailures(testing.allocator, disclosureWorkerFailureCase, .{enrichment});
+test "M21 kernel Frame worker allocation failures preserve the graph and complete Frame" {
+    for ([_]DisclosureBuild.Kind{ .general, .enrichment, .draft_save }) |kind| try testing.checkAllAllocationFailures(testing.allocator, disclosureWorkerFailureCase, .{kind});
 }
 
-fn disclosureWorkerFailureCase(allocator: Allocator, enrichment: bool) !void {
+fn disclosureWorkerFailureCase(allocator: Allocator, kind: DisclosureBuild.Kind) !void {
+    var saved_arena: ?std.heap.ArenaAllocator = null;
+    defer if (saved_arena) |*arena| arena.deinit();
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
@@ -11809,7 +11937,7 @@ fn disclosureWorkerFailureCase(allocator: Allocator, enrichment: bool) !void {
     defer presentation.deinit();
     try moveToRow(&presentation, findDisclosureRow(presentation.projection().review.?.buffer.rows, .{ .resolved_thread = 1 }).?);
     const before = presentation.projection().review.?.frame;
-    if (enrichment) {
+    if (kind == .enrichment) {
         try presentation.dispatch(.ensure_focused_enrichment);
         const command = presentation.takeCommand().?.enrich_file;
         const responses = [_]bbr.http.Canned{ .{ .status = 200, .body = "old\n" }, .{ .status = 200, .body = "new\n" } };
@@ -11824,9 +11952,13 @@ fn disclosureWorkerFailureCase(allocator: Allocator, enrichment: bool) !void {
             .file_index = command.file_index,
             .outcome = .{ .completed = result },
         } });
+    } else if (kind == .draft_save) {
+        try presentation.dispatch(.{ .action = .review_comment });
+        try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("new Draft") } });
+        try presentation.dispatch(.{ .composer = .save });
     } else try presentation.dispatch(.{ .action = .toggle_disclosure });
     const worker = presentation.takeCommand().?.build_buffer_disclosure;
-    worker.arena.deinit();
+    saved_arena = worker.arena;
     worker.arena = std.heap.ArenaAllocator.init(allocator);
     worker.build();
     const failed = worker.failed;
@@ -11834,7 +11966,16 @@ fn disclosureWorkerFailureCase(allocator: Allocator, enrichment: bool) !void {
     if (failed) {
         try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
         try testing.expectEqual(ActionError.buffer_build_failed, presentation.projection().action_error.?);
-        if (enrichment) try testing.expect(presentation.published.?.session.enrichment.file(0).new == .pending);
+        if (kind == .enrichment) try testing.expect(presentation.published.?.session.enrichment.file(0).new == .pending);
+        if (kind == .draft_save) {
+            try testing.expectEqual(@as(usize, 1), presentation.projection().review.?.drafts.len);
+            try testing.expectEqual(@as(usize, 1), presentation.published.?.scope_projection.items.len);
+            try testing.expectEqualStrings("new Draft", presentation.projection().composer.?.body);
+            var stored_arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer stored_arena.deinit();
+            const stored = try store.store().loadReview(stored_arena.allocator(), key.storeKey());
+            try testing.expectEqual(@as(usize, 1), stored.drafts.items.len);
+        }
         return error.OutOfMemory;
     }
     try testing.expect(presentation.projection().action_error == null);
@@ -14286,6 +14427,7 @@ test "local inline authoring persists a local target and authored context" {
     try presentation.dispatch(.{ .action = .inline_comment });
     try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("remember this") } });
     try presentation.dispatch(.{ .composer = .save });
+    try completeDisclosureBuild(&presentation);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -14318,6 +14460,7 @@ test "initial inline authoring refuses oversized selections at the same boundary
     try testing.expect(presentation.projection().composer != null);
     try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("boundary") } });
     try presentation.dispatch(.{ .composer = .save });
+    try completeDisclosureBuild(&presentation);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -16281,6 +16424,7 @@ test "Session disclosures toggle independently persist through rebuilds and rese
     try presentation.dispatch(.{ .action = .review_comment });
     try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("new review note") } });
     try presentation.dispatch(.{ .composer = .save });
+    try completeDisclosureBuild(&presentation);
     try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
 
     // Width and isolation rebuild the Frame but preserve both explicit choices.
@@ -16591,7 +16735,7 @@ test "preferences survive replacement while file isolation resets" {
     try testing.expectEqual(@as(usize, 0), replaced.navigation.cursor);
 }
 
-test "saving a Composer Draft persists it for a later Session" {
+test "M21 kernel saving a Composer Draft stages persistence and the complete Frame" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
@@ -16606,12 +16750,26 @@ test "saving a Composer Draft persists it for a later Session" {
         try presentation.dispatch(.{ .action = .review_comment });
         try testing.expectEqualStrings("New comment", presentation.projection().composer.?.label);
         try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("ship it") } });
+        const before = presentation.projection().review.?;
         try presentation.dispatch(.{ .composer = .save });
+        try testing.expectEqualStrings("ship it", presentation.projection().composer.?.body);
+        try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.drafts.len);
+        try testing.expectEqual(before.buffer.rows.ptr, presentation.projection().review.?.buffer.rows.ptr);
+        try testing.expectEqual(@as(usize, 0), presentation.published.?.scope_projection.items.len);
+        var stored_arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer stored_arena.deinit();
+        const stored = try store.store().loadReview(stored_arena.allocator(), key.storeKey());
+        try testing.expectEqual(@as(usize, 0), stored.drafts.items.len);
+        // Repeated save must not reserve or persist a second Draft.
+        try presentation.dispatch(.{ .composer = .save });
+        try completeDisclosureBuild(&presentation);
+        try testing.expect(presentation.takeCommand() == null);
 
         const projection = presentation.projection();
         try testing.expect(projection.composer == null);
         try testing.expectEqual(@as(usize, 1), projection.review.?.drafts.len);
         try testing.expectEqualStrings("ship it", projection.review.?.drafts[0].body);
+        try testing.expectEqual(@as(usize, 1), presentation.published.?.scope_projection.items.len);
     }
 
     var resumed = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -16620,6 +16778,221 @@ test "saving a Composer Draft persists it for a later Session" {
     });
     defer resumed.deinit();
     try testing.expectEqualStrings("ship it", resumed.projection().review.?.drafts[0].body);
+}
+
+test "M21 kernel Draft save cancels queued and issued work after Composer changes" {
+    for ([_]bool{ false, true }) |issued| {
+        for ([_]ComposerInput{ .cancel, .{ .insert = try TextChunk.init(" changed") }, .external_edit }) |input| {
+            var store = bbr.review.InMemoryStore.init(testing.allocator);
+            defer store.deinit();
+            const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+            var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+                .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+            });
+            defer presentation.deinit();
+            try presentation.dispatch(.{ .action = .review_comment });
+            try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("original") } });
+            const before = presentation.projection().review.?.frame;
+            try presentation.dispatch(.{ .composer = .save });
+            const job = if (issued) presentation.takeCommand().?.build_buffer_disclosure else null;
+            const reserved = presentation.published.?.pending_draft_save.?;
+            try presentation.dispatch(.{ .composer = input });
+            // A newer save can wait while the cancelled worker still runs.
+            if (issued and input == .insert) try presentation.dispatch(.{ .composer = .save });
+            if (job) |worker| {
+                worker.build();
+                try testing.expect(!worker.failed);
+                try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+            }
+            try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+            try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.drafts.len);
+            var stored_arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer stored_arena.deinit();
+            const stored = try store.store().loadReview(stored_arena.allocator(), key.storeKey());
+            try testing.expectEqual(@as(usize, 0), stored.drafts.items.len);
+            if (input == .external_edit) {
+                var command = presentation.takeCommand().?;
+                try testing.expect(command == .external_edit);
+                command.deinit();
+            } else {
+                if (!issued or input != .insert) try testing.expect(presentation.takeCommand() == null);
+                if (input == .cancel) try presentation.dispatch(.{ .action = .review_comment });
+                if (input == .cancel) try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("replacement") } });
+                try presentation.dispatch(.{ .composer = .save });
+                try completeDisclosureBuild(&presentation);
+                const draft = presentation.projection().review.?.drafts[0];
+                try testing.expect(draft.local_id > reserved);
+                try testing.expectEqualStrings(if (input == .cancel) "replacement" else "original changed", draft.body);
+            }
+        }
+    }
+}
+
+test "M21 kernel Draft save rejects replaced Sessions and drains shutdown" {
+    for ([_]bool{ false, true }) |issued| {
+        for ([_]enum { refresh, switch_review, shutdown }{ .refresh, .switch_review, .shutdown }) |change| {
+            var store = bbr.review.InMemoryStore.init(testing.allocator);
+            defer store.deinit();
+            const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+            var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+                .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+            });
+            defer presentation.deinit();
+            try presentation.dispatch(.{ .action = .review_comment });
+            try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("unsaved") } });
+            try presentation.dispatch(.{ .composer = .save });
+            const job = if (issued) presentation.takeCommand().?.build_buffer_disclosure else null;
+            if (change == .shutdown) {
+                try presentation.dispatch(.request_shutdown);
+            } else {
+                if (change == .refresh) {
+                    try presentation.dispatch(.{ .action = .refresh });
+                } else {
+                    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+                }
+                // The worker lane does not block Candidate Session acquisition.
+                if (!issued) {
+                    const queued = presentation.takeCommand().?.build_buffer_disclosure;
+                    queued.failed = true;
+                    try presentation.dispatch(.{ .buffer_disclosure_built = queued });
+                }
+                const load = presentation.takeCommand().?.load_session;
+                try presentation.dispatch(.{ .session_loaded = .{
+                    .command_id = load.command_id,
+                    .intent = load.intent,
+                    .outcome = .{ .loaded = try testSession(testing.allocator, if (change == .refresh) 1 else 2, 'b') },
+                } });
+            }
+            if (job) |worker| {
+                worker.build();
+                try testing.expect(!worker.failed);
+                try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+            }
+            var stored_arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer stored_arena.deinit();
+            const stored = try store.store().loadReview(stored_arena.allocator(), key.storeKey());
+            try testing.expectEqual(@as(usize, 0), stored.drafts.items.len);
+            try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.drafts.len);
+            if (change == .shutdown) {
+                try testing.expect(presentation.readyToExit());
+            } else {
+                try testing.expect(presentation.projection().composer == null);
+            }
+        }
+    }
+}
+
+test "M21 kernel Draft save retries stale Frames without reserving another TempId" {
+    for ([_]enum { width, height, inputs, sidebar }{ .width, .height, .inputs, .sidebar }) |change| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .scope = .review, .body = "existing" });
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = key, .session = try testTwoFileSession(testing.allocator, 1) },
+            .geometry = .{ .cols = 100, .rows = 30 },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .review_comment });
+        try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("new Draft") } });
+        try presentation.dispatch(.{ .composer = .save });
+        const job = presentation.takeCommand().?.build_buffer_disclosure;
+        const reserved = job.new_draft.?.local_id;
+        switch (change) {
+            .width => try presentation.dispatch(.{ .resize = .{ .cols = 72, .rows = 30 } }),
+            .height => try presentation.dispatch(.{ .resize = .{ .cols = 100, .rows = 40 } }),
+            .inputs => presentation.published.?.setDraftState(1, .submitting),
+            .sidebar => presentation.published.?.tree.cursor = 1,
+        }
+        const before = presentation.projection().review.?.frame;
+        job.build();
+        try testing.expect(!job.failed);
+        try presentation.dispatch(.{ .buffer_disclosure_built = job });
+        try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+        try testing.expectEqual(@as(usize, 1), presentation.projection().review.?.drafts.len);
+        try testing.expectEqual(reserved, presentation.published.?.pending_draft_save.?);
+        try completeDisclosureBuild(&presentation);
+        try testing.expectEqual(reserved, presentation.projection().review.?.drafts[1].local_id);
+        try testing.expect(std.meta.eql(before.geometry, presentation.projection().review.?.frame.geometry));
+        try testing.expectEqual(@as(bbr.review.TempId, reserved + 1), try store.store().reserveTempId(key.storeKey()));
+        if (change == .inputs) try testing.expect(presentation.projection().review.?.drafts[0].state == .submitting);
+    }
+}
+
+test "M21 kernel Draft save updates accepted Buffer Search on the worker" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 's', .text = "ship" } });
+    try completeBufferSearchScan(&presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try presentation.dispatch(.{ .action = .review_comment });
+    try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("ship it") } });
+    try presentation.dispatch(.{ .composer = .save });
+    const job = presentation.takeCommand().?.build_buffer_disclosure;
+    job.build();
+    try testing.expect(!job.failed);
+    try testing.expectEqual(@as(usize, 1), job.rebuilt_batch.?.occurrences.len);
+    const ranges = job.ranges.?.ptr;
+    try presentation.dispatch(.{ .buffer_disclosure_built = job });
+    try testing.expectEqual(ranges, presentation.published.?.buffer_search.accepted_ranges.?.ptr);
+    try testing.expectEqual(@as(usize, 1), presentation.published.?.buffer_search.accepted_batch.?.occurrences.len);
+}
+
+test "M21 kernel Draft save admission failures preserve persistence Composer and Frame" {
+    for ([_]bool{ false, true }) |storage_failure| {
+        var failures: usize = 0;
+        for (0..16) |offset| {
+            var failing = testing.FailingAllocator.init(testing.allocator, .{});
+            var store = bbr.review.InMemoryStore.init(if (storage_failure) failing.allocator() else testing.allocator);
+            defer store.deinit();
+            const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+            var presentation = try Presentation.init(if (storage_failure) testing.allocator else failing.allocator(), .{ .reviews = store.store() }, .{
+                .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+            });
+            defer presentation.deinit();
+            try presentation.dispatch(.{ .action = .review_comment });
+            const body = [_]u8{'x'} ** 8192;
+            try presentation.published.?.composer.?.seed(&body);
+            const before = presentation.projection().review.?;
+            const next_id = presentation.published.?.review.next_id;
+            try presentation.dispatch(.{ .composer = .save });
+            const job = presentation.takeCommand().?.build_buffer_disclosure;
+            const reserved = job.new_draft.?.local_id;
+            job.build();
+            try testing.expect(!job.failed);
+            failing.fail_index = failing.alloc_index + offset;
+            try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            if (!failing.has_induced_failure) {
+                try testing.expect(presentation.projection().composer == null);
+                break;
+            }
+            failures += 1;
+            failing.fail_index = std.math.maxInt(usize);
+            const after = presentation.projection();
+            try testing.expectEqual(if (storage_failure) ActionError.persistence_failed else .out_of_memory, after.action_error.?);
+            try testing.expectEqualStrings(&body, after.composer.?.body);
+            try testing.expectEqual(@as(usize, 0), after.review.?.drafts.len);
+            try testing.expectEqual(@as(usize, 0), presentation.published.?.scope_projection.items.len);
+            try testing.expectEqual(next_id, presentation.published.?.review.next_id);
+            try testing.expectEqual(before.buffer.rows.ptr, after.review.?.buffer.rows.ptr);
+            try testing.expectEqual(before.frame.visual_rows_revision, after.review.?.frame.visual_rows_revision);
+            try testing.expect(std.meta.eql(before.navigation, after.review.?.navigation));
+            var stored_arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer stored_arena.deinit();
+            const stored = try store.store().loadReview(stored_arena.allocator(), key.storeKey());
+            try testing.expectEqual(@as(usize, 0), stored.drafts.items.len);
+            try presentation.dispatch(.{ .composer = .save });
+            try completeDisclosureBuild(&presentation);
+            try testing.expect(presentation.projection().review.?.drafts[0].local_id > reserved);
+        }
+        try testing.expect(failures > 0);
+    }
 }
 
 test "Reply on a Draft row saves a child linked to that Draft" {
@@ -16650,6 +17023,7 @@ test "Reply on a Draft row saves a child linked to that Draft" {
     try testing.expectEqualStrings("Reply", presentation.projection().composer.?.label);
     try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("child") } });
     try presentation.dispatch(.{ .composer = .save });
+    try completeDisclosureBuild(&presentation);
 
     const drafts = presentation.projection().review.?.drafts;
     try testing.expectEqual(@as(usize, 2), drafts.len);
@@ -18380,6 +18754,7 @@ test "Suggest derives an Anchor and persists a fenced seeded Draft" {
     try presentation.dispatch(.{ .action = .suggest });
     try testing.expectEqualStrings("new", presentation.projection().composer.?.body);
     try presentation.dispatch(.{ .composer = .save });
+    try completeDisclosureBuild(&presentation);
 
     const draft = presentation.projection().review.?.drafts[0];
     try testing.expectEqualStrings("```suggestion\nnew\n```", draft.body);
@@ -18417,6 +18792,7 @@ test "persistence failure preserves Composer and the exact published review" {
 
     failing.fail_index = std.math.maxInt(usize);
     try presentation.dispatch(.{ .composer = .save });
+    try completeDisclosureBuild(&presentation);
     try testing.expect(presentation.projection().composer == null);
     try testing.expectEqualStrings("keep me", presentation.projection().review.?.drafts[0].body);
 }

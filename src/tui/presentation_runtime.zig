@@ -367,6 +367,55 @@ test "closed terminal sink releases a staged Buffer Frame and its Session" {
     try testing.expect(capture.input == null);
 }
 
+test "M21 kernel Draft Frame launch failure and closed sink keep the Draft unsaved" {
+    for ([_]bool{ false, true }) |closed| {
+        const session = try @import("session.zig").create(testing.allocator);
+        session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Local" };
+        session.source = .{ .local = .{ .common_dir = "." } };
+        session.diff = try bbr.diff.parse(session.arena.allocator(), "");
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try presentation.OwnedReviewIdentity.initLocal(1, "main", "feature");
+        var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = key, .session = session },
+        });
+        defer state.deinit();
+        try state.dispatch(.{ .action = .review_comment });
+        try state.dispatch(.{ .composer = .{ .insert = try presentation.TextChunk.init("keep me") } });
+        const before = state.projection().review.?.frame;
+        try state.dispatch(.{ .composer = .save });
+        var command = state.takeCommand().?;
+        var capture: CapturingSink = .{ .reject = closed };
+        if (closed) {
+            command.build_buffer_disclosure.build();
+            try testing.expect(!command.build_buffer_disclosure.failed);
+            deliver(capture.sink(), .{ .buffer_disclosure_built = command.build_buffer_disclosure });
+            try testing.expect(capture.input == null);
+        } else {
+            var executor: ScriptedExecutor = .{};
+            try executor.executor().execute(capture.sink(), &command);
+            try state.dispatch(capture.input.?);
+            capture.input = null;
+            try testing.expectEqual(presentation.ActionError.buffer_build_failed, state.projection().action_error.?);
+        }
+        try testing.expectEqualStrings("keep me", state.projection().composer.?.body);
+        try testing.expectEqual(before.visual_rows.ptr, state.projection().review.?.frame.visual_rows.ptr);
+        try testing.expectEqual(@as(usize, 0), state.projection().review.?.drafts.len);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const stored = try store.store().loadReview(arena.allocator(), .{ .workspace = key.workspace(), .repository = key.repository(), .pull_request_id = 1 });
+        try testing.expectEqual(@as(usize, 0), stored.drafts.items.len);
+        if (!closed) {
+            try state.dispatch(.{ .composer = .save });
+            const retry = state.takeCommand().?.build_buffer_disclosure;
+            retry.build();
+            try state.dispatch(.{ .buffer_disclosure_built = retry });
+            try testing.expect(state.projection().composer == null);
+            try testing.expectEqual(@as(usize, 1), state.projection().review.?.drafts.len);
+        }
+    }
+}
+
 test "scripted terminal adapter drains every command family through the production sink" {
     const identity = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1);
     const remote_identity: presentation.OwnedRemoteReviewIdentity = .{ .value = identity };

@@ -22,7 +22,7 @@
 The original checklist is complete, but the following input-latency work remains. This list reflects the current code, not superseded progress notes.
 
 - [x] Bound worker handoff cost. `DisclosureBuild.create` retains cached inputs and disclosure keys. The worker copies private File Enrichment tables and applies bounded disclosure changes. Handoff does not copy the complete PendingReview, ScopeProjection, Directory state, or File lease table.
-- [ ] Stage new Draft Buffer builds on a worker. Keep TempId reservation, persistence, PendingReview, ScopeProjection, Composer closure, and Frame publication consistent. `Published.saveDraft` still calls `prepareBuffer` before persistence.
+- [x] Stage new Draft Buffer builds on a worker. TempId reservation precedes the worker build. Persistence succeeds before PendingReview, ScopeProjection, Composer closure, and the complete Frame publish together.
 - [ ] Stage Draft mutation Buffer builds on a worker. Cover body edits, re-anchor, Draft subtree deletion, and unresolved-outcome repair. Preserve persistence and Frame rollback. The current paths include `editDraftBody`, `reanchorDraft`, `deleteDraftSubtree`, and `resolveUnknownAsUnpublished`.
 - [ ] Stage the remaining view-change Buffer builds. Cover Layout, Scope, resolved visibility, Selected Version, File isolation, isolated File movement, and width changes. Sessions with at most 4,096 Candidates still use synchronous builds. `stageLargeBuffer` also disables worker staging while Buffer Search input is open, so width changes can rebuild large Buffers synchronously.
 - [ ] Remove Sidebar-triggered full Buffer rebuilds. Cover Directory expansion, Directory collapse, and active-File reveal. `revealActiveFile` currently rebuilds even when it removes no collapsed Directories. Update the File Tree without rebuilding unchanged DiffPane content, or stage the complete Frame when content must change.
@@ -195,3 +195,30 @@ The added fixture has 1,024 enriched Files, 1,024 Drafts, 4,194,304 body bytes, 
 The snapshot-copy controls measure complete input copies and File lease acquisition outside production handoff. The benchmark builds each fixture before timing. Snapshot refresh during initial Session publication and synchronous Draft or general Frame builds remains part of the later work in this ticket. Disclosure lookup and navigation restoration also remain separate work.
 
 Tests cover DraftState changes, Draft edits during issued worker work, and allocation failures in disclosure and File Enrichment workers. The existing lifecycle tests cover cancellation, stale work, Session replacement, launch failure, and a closed completion sink. `zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 880 tests. The ticket remains `ready-for-agent` for the next remaining item.
+
+## New Draft Frame staging
+
+New Draft saves now use the existing Frame worker for every Session size. Presentation reserves a TempId and copies only the new Draft into the worker command. The worker retains the current input snapshot. It adds the candidate Draft and its current ScopeProjection. It then builds the Buffer, visual rows, File Tree, search corpus, and search ranges. The worker also prepares the replacement input snapshot.
+
+The old PendingReview, ScopeProjection, Frame, and Composer remain published while the worker runs. Admission checks the command id, Session Epoch, reserved TempId, Query generation, and input snapshot. It also checks the Frame revision, geometry, and File Tree state. A stale Frame retries with the same TempId. Admission completes all allocations before persistence. A successful write publishes the Draft and complete Frame, then closes the Composer. A failure keeps the old projection and Composer body.
+
+Repeated save input keeps one pending save. Composer edits, cancellation, and External Edit cancel the pending save. Issued workers retain their inputs until completion. Refresh, Review switching, and shutdown reject work from a replaced or closed Session.
+
+`zig build bench-buffer-search -- 256` measured nine ReleaseFast samples. Each Draft fixture starts with 1,024 Drafts and 4,194,304 body bytes. Each sample saves a nine-byte Review-level Draft. The measured Frames contain 1,025 through 1,033 Drafts. The many-input fixture also has 1,024 enriched Files and 4,194,304 AnchorSnapshot bytes. It has 1,024 collapsed Directories and 1,024 expanded ReviewCards. The synchronous control builds the same saved Draft graph through `prepareBuffer` without publication.
+
+| Stage | Median ns | p95 ns |
+| --- | ---: | ---: |
+| One-File Draft save dispatch | 7,334 | 40,125 |
+| One-File Draft worker build | 124,270,125 | 133,277,167 |
+| One-File Draft admission | 10,331,167 | 11,465,375 |
+| One-File synchronous Buffer control | 101,277,417 | 130,798,458 |
+| Many-input Draft save dispatch | 12,292 | 43,500 |
+| Many-input Draft worker build | 744,866,666 | 770,106,333 |
+| Many-input Draft admission | 9,985,250 | 12,296,584 |
+| Many-input synchronous Buffer control | 716,660,500 | 745,116,583 |
+
+The save Action no longer builds a Buffer on the terminal thread. Admission still includes persistence, navigation restoration, and release of the previous Frame. These measurements do not close the remaining admission-latency work.
+
+Tests cover delayed persistence and publication, repeated saves, stale Frame retries, and accepted Buffer Search. They also cover Composer changes, refresh, Review switching, and shutdown. Worker allocation-failure tests include the new Draft path. Admission tests cover allocation and persistence failures after reservation. Runtime tests cover launch failure and a closed completion sink. Existing tests cover local AnchorSnapshots, Reply parentage, Suggestion fencing, and restoration from persistence.
+
+`zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 886 tests. The ticket remains `ready-for-agent`. The next remaining item is Draft mutation Buffer staging.
