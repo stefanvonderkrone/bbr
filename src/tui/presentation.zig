@@ -1047,6 +1047,7 @@ const DisclosureInputs = struct {
     drafts: []const bbr.review.Draft = &.{},
     scopes: []const bbr.review.ScopeProjectionEntry = &.{},
     collapsed_directories: []const []const u8 = &.{},
+    content_owner: ?*DisclosureInputs = null,
     blobs: []const bbr.diff.FileBlob = &.{},
     highlights: []const bbr.highlight.FileHighlights = &.{},
     content_statuses: []const bbr.diff.FileContent = &.{},
@@ -1090,9 +1091,35 @@ const DisclosureInputs = struct {
         _ = self.references.fetchAdd(1, .acq_rel);
     }
 
+    fn withDirectories(self: *DisclosureInputs, directories: []const []const u8) !*DisclosureInputs {
+        const backing = self.arena.child_allocator;
+        const copy = try backing.create(DisclosureInputs);
+        // Retain the content owner directly. Repeated Directory changes must not
+        // keep a chain of earlier Directory snapshots alive.
+        const owner = self.content_owner orelse self;
+        owner.retain();
+        copy.* = .{
+            .arena = std.heap.ArenaAllocator.init(backing),
+            .content_owner = owner,
+            .drafts = self.drafts,
+            .scopes = self.scopes,
+            .blobs = self.blobs,
+            .highlights = self.highlights,
+            .content_statuses = self.content_statuses,
+            .leases = self.leases,
+        };
+        errdefer copy.release();
+        const a = copy.arena.allocator();
+        const paths = try a.alloc([]const u8, directories.len);
+        for (directories, paths) |path, *item| item.* = try a.dupe(u8, path);
+        copy.collapsed_directories = paths;
+        return copy;
+    }
+
     fn release(self: *DisclosureInputs) void {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         for (self.leases[0..self.leased]) |*lease| lease.release();
+        if (self.content_owner) |owner| owner.release();
         const backing = self.arena.child_allocator;
         self.arena.deinit();
         backing.destroy(self);
@@ -2467,6 +2494,7 @@ const Published = struct {
     scope_projection: std.ArrayList(bbr.review.ScopeProjectionEntry),
     emphasis_cache: buffer_mod.EmphasisCache,
     buffers: ArenaRing(2),
+    trees: ArenaRing(2),
     worker_frame: ?*DisclosureBuild = null,
     buffer: buffer_mod.Buffer,
     visual_rows: []const frame_mod.VisualRow,
@@ -2558,6 +2586,8 @@ const Published = struct {
         if (session.emphasis_cache == null) try session.prepareEmphasis();
         published.emphasis_cache = session.emphasis_cache.?;
         published.buffers = ArenaRing(2).init(allocator);
+        published.trees = ArenaRing(2).init(allocator);
+        errdefer published.trees.deinit();
         published.worker_frame = null;
         errdefer published.buffers.deinit();
         published.expanded_disclosures = .empty;
@@ -2654,6 +2684,7 @@ const Published = struct {
         for (self.collapsed_directories.items) |path| allocator.free(path);
         self.collapsed_directories.deinit(allocator);
         self.buffers.deinit();
+        self.trees.deinit();
         if (self.worker_frame) |worker_frame| worker_frame.destroy();
         self.search_projection.release();
         self.disclosure_inputs.release();
@@ -2737,7 +2768,7 @@ const Published = struct {
         self.review.setState(temp_id, state);
         // Workers only release references. A sole Published owner can update
         // DraftState before the next handoff. Retained snapshots stay immutable.
-        if (self.disclosure_inputs_current and self.disclosure_inputs.references.load(.acquire) == 1) {
+        if (self.disclosure_inputs_current and self.disclosure_inputs.content_owner == null and self.disclosure_inputs.references.load(.acquire) == 1) {
             for (@constCast(self.disclosure_inputs.drafts)) |*draft| if (draft.local_id == temp_id) {
                 draft.state = state;
                 break;
@@ -3262,6 +3293,19 @@ const Published = struct {
     fn sidebarEntry(self: *const Published) ?file_tree.Entry {
         if (self.tree.cursor >= self.tree.entries.len) return null;
         return self.tree.entries[self.tree.cursor];
+    }
+
+    fn rebuildFileTree(self: *Published) !void {
+        const a = self.trees.begin();
+        errdefer self.trees.abort();
+        const panes = frame_mod.paneRects(self.geometry);
+        const tree = try file_tree.build(a, self.session.diff, self.buffer.file_tallies, self.collapsed_directories.items, self.activeFile(), panes.sidebar_content.width, panes.sidebar_content.height, if (self.sidebarEntry()) |entry| entry.identity else null, self.tree.scroll, self.cell_metrics);
+        const inputs = try self.disclosure_inputs.withDirectories(self.collapsed_directories.items);
+        self.trees.commit();
+        self.tree = tree;
+        self.disclosure_inputs.release();
+        self.disclosure_inputs = inputs;
+        self.frame_revision += 1;
     }
 
     fn sidebarVertical(self: *Published, direction: i2) void {
@@ -8043,7 +8087,7 @@ pub const Presentation = struct {
                 self.action_error = .out_of_memory;
                 return;
             };
-            published.rebuild(self.preferences, published.expanded_disclosures.items, published.isolated_file) catch |err| {
+            published.rebuildFileTree() catch |err| {
                 const path = published.collapsed_directories.pop().?;
                 published.allocator.free(path);
                 self.action_error = normalizeActionError(err);
@@ -8059,7 +8103,7 @@ pub const Presentation = struct {
         if (entry.identity != .directory) return;
         if (!entry.expanded) {
             const removed = published.takeCollapsedDirectory(entry.identity.directory) orelse return;
-            published.rebuild(self.preferences, published.expanded_disclosures.items, published.isolated_file) catch |err| {
+            published.rebuildFileTree() catch |err| {
                 published.collapsed_directories.appendAssumeCapacity(removed);
                 self.action_error = normalizeActionError(err);
                 return;
@@ -8099,6 +8143,25 @@ pub const Presentation = struct {
     fn revealActiveFile(self: *Presentation, published: *Published) void {
         const active = published.activeFile() orelse return;
         const path = published.session.diff.files[active].displayPath();
+        var hidden = false;
+        for (published.collapsed_directories.items) |candidate| {
+            if (path.len > candidate.len and std.mem.startsWith(u8, path, candidate) and path[candidate.len] == '/') {
+                hidden = true;
+                break;
+            }
+        }
+        if (!hidden) {
+            for (@constCast(published.tree.entries)) |*entry| {
+                entry.active = entry.identity == .file and entry.identity.file == active;
+                entry.active_descendant = if (entry.identity == .directory) blk: {
+                    const directory = entry.identity.directory;
+                    break :blk path.len > directory.len and std.mem.startsWith(u8, path, directory) and path[directory.len] == '/';
+                } else false;
+            }
+            published.centerActiveFile();
+            published.frame_revision += 1;
+            return;
+        }
         var removed: std.ArrayList([]const u8) = .empty;
         defer removed.deinit(published.allocator);
         removed.ensureTotalCapacity(published.allocator, published.collapsed_directories.items.len) catch {
@@ -8112,7 +8175,7 @@ pub const Presentation = struct {
             if (path.len > candidate.len and std.mem.startsWith(u8, path, candidate) and path[candidate.len] == '/')
                 removed.appendAssumeCapacity(published.collapsed_directories.orderedRemove(collapsed_index));
         }
-        published.rebuild(self.preferences, published.expanded_disclosures.items, published.isolated_file) catch |err| {
+        published.rebuildFileTree() catch |err| {
             published.collapsed_directories.appendSliceAssumeCapacity(removed.items);
             self.action_error = normalizeActionError(err);
             return;
@@ -11728,6 +11791,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
     std.debug.print("handoff_fixture_files={d} handoff_fixture_drafts={d} handoff_fixture_body_bytes={d} handoff_fixture_snapshot_bytes={d} handoff_fixture_directories={d} handoff_fixture_disclosures={d}\n", .{ file_count, draft_count, draft_count * body_bytes, if (many_inputs) draft_count * body_bytes else @as(usize, 0), published.collapsed_directories.items.len, published.expanded_disclosures.items.len });
     std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ if (many_inputs) "worker_handoff_many_inputs" else "worker_handoff", times[4], times[8] });
     std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ if (many_inputs) "snapshot_copy_many_inputs_control" else "snapshot_copy_control", control[4], control[8] });
+    if (many_inputs) try benchmarkSidebar(&presentation, io);
     var draft_dispatch: [9]u64 = undefined;
     var draft_worker: [9]u64 = undefined;
     var draft_admission: [9]u64 = undefined;
@@ -11849,6 +11913,54 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
             std.mem.sort(u64, samples, {}, std.sort.asc(u64));
             std.debug.print("stage=draft_{s}_{s}{s} median_ns={d} p95_ns={d}\n", .{ mutation, stage, if (many_inputs) "_many_inputs" else "", samples[4], samples[8] });
         }
+    }
+}
+
+fn benchmarkSidebar(presentation: *Presentation, io: std.Io) !void {
+    const published = presentation.published.?;
+    const directory = "src/d0";
+    const stages = [_][]const u8{ "sidebar_collapse", "sidebar_expand", "sidebar_reveal_hidden", "sidebar_reveal_visible", "sidebar_buffer_sync_control" };
+    var times: [stages.len][9]u64 = undefined;
+    for (0..9) |sample| {
+        // Prepare the active File and Directory cursor before timing input.
+        presentation.revealActiveFile(published);
+        try presentation.dispatch(.{ .action = .focus_next_pane });
+        try presentation.dispatch(.{ .action = .left });
+        try presentation.dispatch(.{ .action = .left });
+        try presentation.dispatch(.{ .action = .left });
+        const before = published.frameProjection();
+        var start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .action = .left });
+        times[0][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (published.tree.entries.len != 1 or published.tree.entries[0].expanded) return error.SidebarCollapseFailed;
+        start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .action = .right });
+        times[1][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (!published.tree.entries[0].expanded) return error.SidebarExpandFailed;
+        try presentation.dispatch(.{ .action = .focus_next_pane });
+        // Reveal timings exclude File-header lookup and DiffPane movement.
+        start = std.Io.Clock.awake.now(io);
+        presentation.revealActiveFile(published);
+        times[2][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        const visible_tree = published.tree.entries.ptr;
+        start = std.Io.Clock.awake.now(io);
+        presentation.revealActiveFile(published);
+        times[3][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (presentation.action_error != null or published.tree.entries.ptr != visible_tree or
+            published.buffer.rows.ptr != before.buffer.rows.ptr or published.visual_rows.ptr != before.visual_rows.ptr or
+            published.visual_rows_revision != before.visual_rows_revision) return error.SidebarChangedDiffPane;
+        start = std.Io.Clock.awake.now(io);
+        var control = try published.prepareBuffer(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, published.geometry);
+        defer control.deinit();
+        times[4][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (control.tree.entries.len != published.tree.entries.len or control.buffer.rows.len != published.buffer.rows.len)
+            return error.SidebarControlMismatch;
+        try published.collapseDirectory(directory);
+        try published.rebuildFileTree();
+    }
+    for (stages, &times) |stage, *samples| {
+        std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+        std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ stage, samples[4], samples[8] });
     }
 }
 
@@ -15301,6 +15413,45 @@ fn testDirectorySession(backing: std.mem.Allocator, id: u64) !*session_mod.Sessi
     return s;
 }
 
+test "M21 kernel Sidebar Directory changes preserve DiffPane rows and search ranges" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDirectorySession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 8 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+    try completeBufferSearchScan(&presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try presentation.dispatch(.{ .action = .left });
+    const before = presentation.projection().review.?.frame;
+    try testing.expect(before.file_tree.entries[before.file_tree.cursor].identity.eql(.{ .directory = "src" }));
+
+    try presentation.dispatch(.{ .action = .left });
+    var frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(usize, 1), frame.file_tree.entries.len);
+    try testing.expect(!frame.file_tree.entries[0].expanded);
+    try testing.expect(frame.buffer.rows.ptr == before.buffer.rows.ptr);
+    try testing.expect(frame.visual_rows.ptr == before.visual_rows.ptr);
+    try testing.expectEqual(before.visual_rows_revision, frame.visual_rows_revision);
+    try testing.expect(frame.search_ranges.ptr == before.search_ranges.ptr);
+    try testing.expectEqual(before.navigation, frame.navigation);
+    try testing.expect(presentation.takeCommand() == null);
+
+    try presentation.dispatch(.{ .action = .right });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(usize, 3), frame.file_tree.entries.len);
+    try testing.expect(frame.file_tree.entries[0].expanded);
+    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .directory = "src" }));
+    try testing.expect(frame.buffer.rows.ptr == before.buffer.rows.ptr);
+    try testing.expectEqual(before.visual_rows_revision, frame.visual_rows_revision);
+    try testing.expect(frame.search_ranges.ptr == before.search_ranges.ptr);
+    try testing.expectEqual(before.navigation, frame.navigation);
+}
+
 test "Pane focus gives the Sidebar an independent cursor while DiffPane File motions remain complete" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -15332,6 +15483,150 @@ test "Pane focus gives the Sidebar an independent cursor while DiffPane File mot
     frame = presentation.projection().review.?.frame;
     try testing.expectEqual(@as(usize, 0), frame.buffer.fileIndexForRow(frame.navigation.cursor));
     try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 1 }));
+}
+
+test "M21 kernel active File reveal without collapsed ancestors needs no allocation or Buffer rebuild" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDirectorySession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 8 },
+    });
+    defer presentation.deinit();
+    const before = presentation.projection().review.?.frame;
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .action = .next_file });
+    const frame = presentation.projection().review.?.frame;
+    try testing.expect(presentation.projection().action_error == null);
+    try testing.expect(!failing.has_induced_failure);
+    try testing.expect(frame.buffer.rows.ptr == before.buffer.rows.ptr);
+    try testing.expect(frame.file_tree.entries.ptr == before.file_tree.entries.ptr);
+    try testing.expectEqual(before.visual_rows_revision, frame.visual_rows_revision);
+    try testing.expectEqual(@as(usize, 1), frame.buffer.fileIndexForRow(frame.visual_rows[frame.navigation.cursor].buffer_index));
+    try testing.expect(!frame.file_tree.entries[1].active);
+    try testing.expect(frame.file_tree.entries[2].active);
+    try testing.expect(frame.file_tree.entries[0].active_descendant);
+    try testing.expectEqual(before.file_tree.cursor, frame.file_tree.cursor);
+}
+
+test "M21 kernel active File reveal opens only its collapsed ancestors" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const session = try testDirectorySession(testing.allocator, 1);
+    @constCast(session.diff.files)[0].old_path = "src/nested/a.zig";
+    @constCast(session.diff.files)[0].new_path = "src/nested/a.zig";
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+        .geometry = .{ .cols = 80, .rows = 8 },
+    });
+    defer presentation.deinit();
+    const before = presentation.projection().review.?.frame;
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try presentation.dispatch(.{ .action = .left });
+    try presentation.dispatch(.{ .action = .left });
+    try presentation.dispatch(.{ .action = .left });
+    try presentation.dispatch(.{ .action = .left });
+    try testing.expectEqual(@as(usize, 1), presentation.projection().review.?.frame.file_tree.entries.len);
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try presentation.dispatch(.{ .action = .next_file });
+    var frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(usize, 3), frame.file_tree.entries.len);
+    try testing.expect(frame.file_tree.entries[0].expanded);
+    try testing.expect(frame.file_tree.entries[1].active);
+    try testing.expect(!frame.file_tree.entries[2].expanded);
+    try testing.expect(!frame.file_tree.entries[2].active_descendant);
+    try testing.expect(frame.buffer.rows.ptr == before.buffer.rows.ptr);
+    try testing.expectEqual(before.visual_rows_revision, frame.visual_rows_revision);
+    try presentation.dispatch(.{ .action = .prev_file });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(usize, 4), frame.file_tree.entries.len);
+    try testing.expect(frame.file_tree.entries[2].expanded);
+    try testing.expect(frame.file_tree.entries[2].active_descendant);
+    try testing.expect(frame.file_tree.entries[3].active);
+    try testing.expect(frame.buffer.rows.ptr == before.buffer.rows.ptr);
+    try testing.expectEqual(before.visual_rows_revision, frame.visual_rows_revision);
+}
+
+test "M21 kernel Sidebar changes reject an old worker File Tree and retain Draft content" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .scope = .{ .file = .{ .path = "src/a.zig", .source_commit = "source" } }, .body = "retained Draft body" });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testDirectorySession(testing.allocator, 1) },
+        .geometry = .{ .cols = 80, .rows = 8 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try presentation.dispatch(.{ .action = .left });
+    try presentation.dispatch(.{ .action = .toggle_layout });
+    const old = presentation.takeCommand().?.build_buffer_disclosure;
+    const before = presentation.projection().review.?.frame;
+    try presentation.dispatch(.{ .action = .left });
+    old.build();
+    try presentation.dispatch(.{ .buffer_disclosure_built = old });
+    try testing.expect(presentation.projection().review.?.frame.buffer.rows.ptr == before.buffer.rows.ptr);
+    try testing.expect(!presentation.projection().review.?.frame.file_tree.entries[0].expanded);
+    try completeDisclosureBuild(&presentation);
+    var frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(buffer_mod.Layout.side_by_side, presentation.projection().review.?.preferences.layout);
+    try testing.expectEqual(@as(usize, 1), frame.file_tree.entries.len);
+    try testing.expect(!frame.file_tree.entries[0].expanded);
+    try testing.expectEqualStrings("retained Draft body", presentation.projection().review.?.drafts[0].body);
+    try presentation.dispatch(.{ .action = .right });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    frame = presentation.projection().review.?.frame;
+    try testing.expect(frame.file_tree.entries[0].expanded);
+    try testing.expectEqual(@as(usize, 1), frame.file_tree.entries[1].drafts);
+    try testing.expectEqualStrings("retained Draft body", presentation.projection().review.?.drafts[0].body);
+}
+
+test "M21 kernel failed Sidebar changes preserve the File Tree and can retry" {
+    for ([_]enum { collapse, expand, reveal }{ .collapse, .expand, .reveal }) |change| {
+        var failures: usize = 0;
+        for (0..32) |offset| {
+            var store = bbr.review.InMemoryStore.init(testing.allocator);
+            defer store.deinit();
+            var failing = testing.FailingAllocator.init(testing.allocator, .{});
+            var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+                .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDirectorySession(testing.allocator, 1) },
+                .geometry = .{ .cols = 80, .rows = 8 },
+            });
+            defer presentation.deinit();
+            try presentation.dispatch(.{ .action = .focus_next_pane });
+            try presentation.dispatch(.{ .action = .left });
+            if (change != .collapse) try presentation.dispatch(.{ .action = .left });
+            if (change == .reveal) try presentation.dispatch(.{ .action = .focus_next_pane });
+            const before = presentation.projection().review.?.frame;
+            failing.fail_index = failing.alloc_index + offset;
+            const action: Action = switch (change) {
+                .collapse => .left,
+                .expand => .right,
+                .reveal => .next_file,
+            };
+            try presentation.dispatch(.{ .action = action });
+            const frame = presentation.projection().review.?.frame;
+            try testing.expect(frame.buffer.rows.ptr == before.buffer.rows.ptr);
+            try testing.expectEqual(before.visual_rows_revision, frame.visual_rows_revision);
+            if (!failing.has_induced_failure) {
+                try testing.expect(presentation.projection().action_error == null);
+                try testing.expectEqual(change != .collapse, frame.file_tree.entries[0].expanded);
+                break;
+            }
+            failures += 1;
+            try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+            try testing.expect(frame.file_tree.entries.ptr == before.file_tree.entries.ptr);
+            try testing.expectEqual(before.file_tree.cursor, frame.file_tree.cursor);
+            try testing.expectEqual(before.file_tree.scroll, frame.file_tree.scroll);
+            try testing.expectEqual(before.file_tree.entries[0].expanded, frame.file_tree.entries[0].expanded);
+            failing.fail_index = std.math.maxInt(usize);
+            try presentation.dispatch(.{ .action = if (change == .reveal) .prev_file else action });
+            try testing.expect(presentation.projection().action_error == null);
+            try testing.expectEqual(change != .collapse, presentation.projection().review.?.frame.file_tree.entries[0].expanded);
+        }
+        try testing.expect(failures > 0 and failures < 32);
+    }
 }
 
 test "File finder filters synchronously and confirms within the same Session" {

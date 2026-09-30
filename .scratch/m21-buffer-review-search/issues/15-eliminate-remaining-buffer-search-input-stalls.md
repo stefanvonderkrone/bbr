@@ -25,7 +25,7 @@ The original checklist is complete, but the following input-latency work remains
 - [x] Stage new Draft Buffer builds on a worker. TempId reservation precedes the worker build. Persistence succeeds before PendingReview, ScopeProjection, Composer closure, and the complete Frame publish together.
 - [x] Stage Draft mutation Buffer builds on a worker. Cover body edits, re-anchor, Draft subtree deletion, and unresolved-outcome repair. Preserve persistence and Frame rollback.
 - [x] Stage the remaining view-change Buffer builds. Layout, Scope, Selected Version, File isolation, isolated File movement, and width changes use workers for every Session size. Resolved visibility keeps its worker disclosure path. Width changes also use workers while Buffer Search input is open.
-- [ ] Remove Sidebar-triggered full Buffer rebuilds. Cover Directory expansion, Directory collapse, and active-File reveal. `revealActiveFile` currently rebuilds even when it removes no collapsed Directories. Update the File Tree without rebuilding unchanged DiffPane content, or stage the complete Frame when content must change.
+- [x] Remove Sidebar-triggered full Buffer rebuilds. Directory expansion, Directory collapse, and active-File reveal update the File Tree without rebuilding unchanged DiffPane content. An unchanged reveal updates active flags and Sidebar scroll without an allocation.
 - [ ] Stage Review Search destination Buffer builds. Cover source occurrences, ReviewBody occurrences, and the second build that reveals a hidden Fold. `openReviewSearchOccurrence` still builds on the terminal thread, including after File Enrichment publication.
 - [ ] Stage disclosure restoration when Buffer Search starts after Review Search. `openBufferSearch` still calls `prepareBuffer` when Review Search owns temporary disclosures.
 - [ ] Stage File Enrichment cache-focus and lease-release Frame changes. Completion Frames already use workers, but `focusEnrichment`, `finishSearchLease`, and `releaseReviewSearchHolds` can rebuild synchronously after eviction. Keep cache changes and Frame publication atomic.
@@ -326,3 +326,25 @@ These measurements cover view dispatch and width publication. Admission still re
 Tests cover delayed publication and failed builds for each view change. They also cover queued request composition, reversed Selected Version requests, isolated File focus, isolation exit, and stale completions. Small and large Sessions exercise resize during rapid Query edits and Enter. Repeated width builds preserve Escape navigation across worker Frames. Worker allocation-failure tests include view builds. Runtime tests cover launch failure and a closed completion sink. Session tests cover refresh, Review switching, shutdown, and navigation retries.
 
 `zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 904 tests. The ticket remains `ready-for-agent`. The next remaining item is Sidebar-triggered Buffer rebuilding.
+
+## Sidebar File Tree updates
+
+Directory expansion, Directory collapse, and active-File reveal now update only the File Tree. Presentation builds the candidate File Tree in a separate `ArenaRing`. Publication replaces the File Tree and its Directory snapshot together. It keeps the Buffer, visual rows, search corpus, Batches, projected ranges, and DiffPane navigation. An unchanged active-File reveal updates active flags and Sidebar scroll without an allocation.
+
+Directory snapshots retain the existing Drafts, ScopeProjection, File Enrichment tables, and File leases. Each snapshot retains the content owner directly. Repeated Directory changes do not retain a chain of earlier Directory snapshots. Worker admission rejects an earlier snapshot and retries against the current File Tree. Allocation failure preserves the previous File Tree and collapsed Directories.
+
+`zig build bench-buffer-search -- 32` measured nine ReleaseFast samples without concurrent build or test work. The Sidebar fixture has 1,024 enriched Files and 2,048 changed Lines. It also has 1,024 Drafts, 4,194,304 body bytes, and 4,194,304 AnchorSnapshot bytes. Each File lives under `src/dN`. Samples start with 1,024 collapsed Directories and 1,024 expanded ReviewCards. Collapse and expansion toggle the shared `src` Directory. Active-File reveal opens `src/d0`. Reveal timings exclude File-header lookup and DiffPane movement. The synchronous control builds the same expanded File Tree and Buffer through `prepareBuffer` without publication. Values are nanoseconds.
+
+| Stage | Median ns | p95 ns |
+| --- | ---: | ---: |
+| Directory collapse dispatch | 1,889,125 | 1,914,041 |
+| Directory expansion dispatch | 2,309,875 | 2,418,584 |
+| Hidden active-File reveal | 1,423,667 | 1,438,500 |
+| Visible active-File reveal | 4,375 | 5,208 |
+| Synchronous Buffer control | 723,598,084 | 730,641,875 |
+
+File Tree construction still depends on the File and Directory counts. The Sidebar paths no longer rebuild Draft bodies or DiffPane content. The benchmark checks that Buffer rows, visual rows, and their revision remain unchanged.
+
+Tests cover unchanged DiffPane navigation and accepted search ranges during Directory changes. They also cover allocation-free visible reveal, nested Directory reveal, stale worker retries, retained Draft content, and allocation failures. The existing mouse tests cover the same Sidebar Actions.
+
+`zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 909 tests. The ticket remains `ready-for-agent`. The next remaining item is Review Search destination Buffer staging.
