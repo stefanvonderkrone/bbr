@@ -416,6 +416,101 @@ test "M21 kernel Draft Frame launch failure and closed sink keep the Draft unsav
     }
 }
 
+test "M21 kernel Draft mutation launch failure and closed sink preserve persistence and Frame" {
+    for ([_]enum { body, reanchor, delete, unpublished }{ .body, .reanchor, .delete, .unpublished }) |mutation| for ([_]bool{ false, true }) |closed| {
+        const session = try @import("session.zig").create(testing.allocator);
+        session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Bitbucket", .pull_request_id = 1 };
+        session.source = .{ .remote = .{ .id = 1, .title = "Review", .state = "OPEN", .author_display_name = "Reviewer", .source_branch = "feature", .destination_branch = "main", .source_commit = "source", .destination_commit = "base" } };
+        session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1,2 @@\n-old\n+new\n+later\n");
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1);
+        const store_key: bbr.review.RemoteReviewIdentity = .{ .workspace = key.workspace(), .repository = key.repository(), .pull_request_id = 1 };
+        try store.store().put(store_key, .{
+            .local_id = 1,
+            .kind = .comment,
+            .target = .bitbucket,
+            .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1, .commit = "source" } },
+            .body = "original",
+            .state = if (mutation == .unpublished) .outcome_unknown else .draft,
+        });
+        var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = key, .session = session },
+        });
+        defer state.deinit();
+        var card_row: ?usize = null;
+        var source_row: ?usize = null;
+        const initial = state.projection().review.?;
+        for (initial.frame.visual_rows, 0..) |visual, index| {
+            const row = initial.buffer.rows[visual.buffer_index];
+            if (row == .draft and card_row == null) card_row = index;
+            if (row == .line and row.line.newNo() == 2) source_row = index;
+        }
+        for (0..card_row.?) |_| try state.dispatch(.{ .action = .down });
+        switch (mutation) {
+            .body => {
+                try state.dispatch(.{ .action = .edit_review_item });
+                try state.dispatch(.{ .composer = .{ .insert = try presentation.TextChunk.init(" changed") } });
+                try state.dispatch(.{ .composer = .save });
+            },
+            .reanchor => {
+                try state.dispatch(.{ .action = .reanchor_review_item });
+                try state.dispatch(.{ .action = .to_top });
+                for (0..source_row.?) |_| try state.dispatch(.{ .action = .down });
+                try state.dispatch(.{ .reanchor = .accept });
+            },
+            .delete => {
+                try state.dispatch(.{ .action = .delete_review_item });
+                try state.dispatch(.{ .delete_confirmation = .confirm });
+            },
+            .unpublished => try state.dispatch(.{ .action = .resolve_unpublished }),
+        }
+        const before = state.projection().review.?.frame;
+        try testing.expectEqual(@as(?presentation.ActionError, null), state.projection().action_error);
+        var command = state.takeCommand().?;
+        var capture: CapturingSink = .{ .reject = closed };
+        if (closed) {
+            command.build_buffer_disclosure.build();
+            try testing.expect(!command.build_buffer_disclosure.failed);
+            deliver(capture.sink(), .{ .buffer_disclosure_built = command.build_buffer_disclosure });
+            try testing.expect(capture.input == null);
+        } else {
+            var executor: ScriptedExecutor = .{};
+            try executor.executor().execute(capture.sink(), &command);
+            try state.dispatch(capture.input.?);
+            capture.input = null;
+            try testing.expectEqual(presentation.ActionError.buffer_build_failed, state.projection().action_error.?);
+        }
+        try testing.expectEqual(before.visual_rows.ptr, state.projection().review.?.frame.visual_rows.ptr);
+        try testing.expectEqualStrings("original", state.projection().review.?.drafts[0].body);
+        try testing.expectEqual(@as(?u32, 1), state.projection().review.?.drafts[0].effectiveScope().@"inline".to);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const stored = try store.store().loadReview(arena.allocator(), store_key);
+        try testing.expectEqual(@as(usize, 1), stored.drafts.items.len);
+        try testing.expectEqualStrings("original", stored.getConst(1).?.body);
+        if (mutation == .unpublished) try testing.expect(stored.getConst(1).?.state == .outcome_unknown) else try testing.expect(stored.getConst(1).?.state == .draft);
+        if (!closed) {
+            switch (mutation) {
+                .body => try state.dispatch(.{ .composer = .save }),
+                .reanchor => try state.dispatch(.{ .reanchor = .accept }),
+                .delete => try state.dispatch(.{ .delete_confirmation = .confirm }),
+                .unpublished => try state.dispatch(.{ .action = .resolve_unpublished }),
+            }
+            const retry = state.takeCommand().?.build_buffer_disclosure;
+            retry.build();
+            try state.dispatch(.{ .buffer_disclosure_built = retry });
+            try testing.expect(state.projection().action_error == null);
+            switch (mutation) {
+                .body => try testing.expectEqualStrings("original changed", state.projection().review.?.drafts[0].body),
+                .reanchor => try testing.expectEqual(@as(?u32, 2), state.projection().review.?.drafts[0].effectiveScope().@"inline".to),
+                .delete => try testing.expectEqual(@as(usize, 0), state.projection().review.?.drafts.len),
+                .unpublished => try testing.expect(state.projection().review.?.drafts[0].state == .draft),
+            }
+        }
+    };
+}
+
 test "scripted terminal adapter drains every command family through the production sink" {
     const identity = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1);
     const remote_identity: presentation.OwnedRemoteReviewIdentity = .{ .value = identity };

@@ -23,7 +23,7 @@ The original checklist is complete, but the following input-latency work remains
 
 - [x] Bound worker handoff cost. `DisclosureBuild.create` retains cached inputs and disclosure keys. The worker copies private File Enrichment tables and applies bounded disclosure changes. Handoff does not copy the complete PendingReview, ScopeProjection, Directory state, or File lease table.
 - [x] Stage new Draft Buffer builds on a worker. TempId reservation precedes the worker build. Persistence succeeds before PendingReview, ScopeProjection, Composer closure, and the complete Frame publish together.
-- [ ] Stage Draft mutation Buffer builds on a worker. Cover body edits, re-anchor, Draft subtree deletion, and unresolved-outcome repair. Preserve persistence and Frame rollback. The current paths include `editDraftBody`, `reanchorDraft`, `deleteDraftSubtree`, and `resolveUnknownAsUnpublished`.
+- [x] Stage Draft mutation Buffer builds on a worker. Cover body edits, re-anchor, Draft subtree deletion, and unresolved-outcome repair. Preserve persistence and Frame rollback.
 - [ ] Stage the remaining view-change Buffer builds. Cover Layout, Scope, resolved visibility, Selected Version, File isolation, isolated File movement, and width changes. Sessions with at most 4,096 Candidates still use synchronous builds. `stageLargeBuffer` also disables worker staging while Buffer Search input is open, so width changes can rebuild large Buffers synchronously.
 - [ ] Remove Sidebar-triggered full Buffer rebuilds. Cover Directory expansion, Directory collapse, and active-File reveal. `revealActiveFile` currently rebuilds even when it removes no collapsed Directories. Update the File Tree without rebuilding unchanged DiffPane content, or stage the complete Frame when content must change.
 - [ ] Stage Review Search destination Buffer builds. Cover source occurrences, ReviewBody occurrences, and the second build that reveals a hidden Fold. `openReviewSearchOccurrence` still builds on the terminal thread, including after File Enrichment publication.
@@ -222,3 +222,63 @@ The save Action no longer builds a Buffer on the terminal thread. Admission stil
 Tests cover delayed persistence and publication, repeated saves, stale Frame retries, and accepted Buffer Search. They also cover Composer changes, refresh, Review switching, and shutdown. Worker allocation-failure tests include the new Draft path. Admission tests cover allocation and persistence failures after reservation. Runtime tests cover launch failure and a closed completion sink. Existing tests cover local AnchorSnapshots, Reply parentage, Suggestion fencing, and restoration from persistence.
 
 `zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 886 tests. The ticket remains `ready-for-agent`. The next remaining item is Draft mutation Buffer staging.
+
+## Draft mutation Frame staging
+
+Draft body edits, re-anchor, Draft subtree deletion, and confirmation of an unpublished outcome now use the Frame worker for every Session size. Presentation copies only the changed body or replacement Anchor and AnchorSnapshot into the command. Deletion and outcome repair send only the root TempId. The worker retains the input snapshot and constructs the candidate PendingReview and ScopeProjection privately. It also builds the Buffer, visual rows, File Tree, search corpus, search ranges, and replacement input snapshot.
+
+The published PendingReview, ScopeProjection, Frame, and interaction remain unchanged while the worker runs. Admission checks the command id, Session Epoch, mutation request, Query generation, input snapshot, Frame revision, geometry, and File Tree state. It rechecks mutation eligibility before the store write. A changed Frame or Query retries the same mutation request against the current inputs. The worker computes the complete deletion subtree. The store rechecks that subtree inside its write.
+
+Presentation completes all allocations before persistence. A successful write publishes the changed graph and complete Frame together. Body edits close the Composer after publication. Re-anchor and deletion clear their interactions after publication. A failed build or write keeps the earlier Frame and authored data. Body changes, Composer cancellation, External Edit, re-anchor cancellation, and deletion cancellation reject pending mutation work. Issued workers retain their inputs until completion. Session replacement and shutdown reject their completions.
+
+`zig build bench-buffer-search -- 256` measured nine ReleaseFast samples without concurrent build or test work. Each mutation fixture retains the 1,024 original Drafts and the nine Drafts from the save benchmark. Those 1,033 Drafts contain 4,194,385 body bytes. Each sample adds an inline root and a two-deep Reply chain before timing. The three added Drafts contain 12,288 body bytes. The body edit adds eight bytes to the root. Body edit, re-anchor, and outcome repair build Frames with 1,036 Drafts. Subtree deletion returns the Frame to 1,033 Drafts.
+
+The one-File fixture has no collapsed Directories or expanded ReviewCards. The many-input fixture has 1,024 enriched Files and 4,194,304 AnchorSnapshot bytes. It also has 1,024 collapsed Directories and 1,024 expanded ReviewCards. Fixture preparation, interaction setup, and unknown-outcome setup occur before timing. The synchronous control builds the same graph through `prepareBuffer` after each admitted mutation, without publication. Values are nanoseconds.
+
+### One-File fixture
+
+| Stage | Median ns | p95 ns |
+| --- | ---: | ---: |
+| Body edit dispatch | 10,959 | 12,792 |
+| Body edit worker build | 129,771,125 | 130,898,417 |
+| Body edit admission | 187,500 | 317,833 |
+| Body edit synchronous Buffer control | 104,664,708 | 107,104,916 |
+| Re-anchor dispatch | 12,333 | 14,041 |
+| Re-anchor worker build | 130,585,333 | 136,613,375 |
+| Re-anchor admission | 344,875 | 392,333 |
+| Re-anchor synchronous Buffer control | 105,191,083 | 110,541,917 |
+| Outcome repair dispatch | 297,042 | 334,166 |
+| Outcome repair worker build | 130,115,041 | 131,095,250 |
+| Outcome repair admission | 305,792 | 345,792 |
+| Outcome repair synchronous Buffer control | 102,595,416 | 106,147,875 |
+| Subtree deletion dispatch | 251,875 | 272,125 |
+| Subtree deletion worker build | 129,653,833 | 131,678,500 |
+| Subtree deletion admission | 9,640,167 | 10,691,875 |
+| Subtree deletion synchronous Buffer control | 104,450,084 | 105,263,916 |
+
+### Many-input fixture
+
+| Stage | Median ns | p95 ns |
+| --- | ---: | ---: |
+| Body edit dispatch | 20,042 | 23,250 |
+| Body edit worker build | 764,328,875 | 799,547,750 |
+| Body edit admission | 565,083 | 1,137,500 |
+| Body edit synchronous Buffer control | 729,604,625 | 786,951,542 |
+| Re-anchor dispatch | 14,833 | 18,458 |
+| Re-anchor worker build | 764,108,292 | 879,291,541 |
+| Re-anchor admission | 848,292 | 1,198,541 |
+| Re-anchor synchronous Buffer control | 731,125,708 | 782,729,084 |
+| Outcome repair dispatch | 1,168,666 | 1,247,542 |
+| Outcome repair worker build | 760,504,125 | 785,241,459 |
+| Outcome repair admission | 874,167 | 1,228,792 |
+| Outcome repair synchronous Buffer control | 730,746,709 | 754,262,541 |
+| Subtree deletion dispatch | 251,750 | 267,458 |
+| Subtree deletion worker build | 754,441,292 | 955,372,417 |
+| Subtree deletion admission | 10,891,667 | 18,568,458 |
+| Subtree deletion synchronous Buffer control | 728,679,208 | 871,954,750 |
+
+The mutation Actions no longer build a Buffer on the terminal thread. Dispatch still includes target and eligibility lookup. Admission still includes persistence, navigation restoration, and release of the earlier Frame. Subtree deletion reaches 18.57 ms p95 admission on the many-input fixture. These measurements leave the later admission-latency work open.
+
+Tests cover delayed persistence and publication for all four mutations, repeated input, stale Frame and Query retries, and accepted and open Buffer Search. They also cover queued and issued cancellation, Composer body changes, changed DraftState, refresh, Review switching, and shutdown. Worker allocation-failure tests cover all four candidate graphs and replacement input snapshots. Admission allocation-failure tests cover changed bodies and AnchorSnapshots. Write-failure tests preserve the graph, Frame, and interaction before a successful retry. Runtime tests cover launch failure and a closed completion sink for every mutation. Existing tests retain Reply parentage, Suggestion fencing, LocalReview AnchorSnapshots, deletion navigation, monotonic TempIds, and persistence restoration.
+
+`zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 897 tests. The ticket remains `ready-for-agent`. The next remaining item is view-change Buffer staging.
