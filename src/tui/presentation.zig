@@ -1196,6 +1196,7 @@ pub const DisclosureBuild = struct {
     search_corpus: ?*BufferSearchCorpus = null,
     rebuilt_batch: ?search.Batch = null,
     navigation_policy: NavigationPolicy = .restore,
+    navigation_file: ?usize = null,
     version_restoration: ?VersionRestoration = null,
     failed: bool = false,
 
@@ -1391,7 +1392,7 @@ pub const DisclosureBuild = struct {
                 self.rebuilt_batch.?.owner_arena = arena;
                 self.active = retainedSearchIndex(self.accepted_snapshot, self.accepted_active, self.rebuilt_batch.?);
             }
-            if (self.kind != .view) if (self.input_query_text) |text| {
+            if (self.input_query_text) |text| {
                 const query = try search.Query.init(a, text);
                 const arena = try std.heap.page_allocator.create(std.heap.ArenaAllocator);
                 arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -1401,7 +1402,7 @@ pub const DisclosureBuild = struct {
                     return err;
                 };
                 self.input_rebuilt_batch.?.owner_arena = arena;
-            };
+            }
         }
         self.buffer = try buffer_mod.buildWithComments(a, self.session.diff, self.preferences.layout, self.session.threads, .{
             .fold_context = self.preferences.scope == .changes,
@@ -2410,7 +2411,6 @@ const Published = struct {
             self.published.geometry = self.geometry;
             self.published.selected_version = self.selected_version;
             if (self.search_corpus) |corpus| {
-                self.published.large_session = self.published.large_session or corpus.candidates.len > 4096;
                 if (self.published.search_corpus) |old| old.release();
                 self.published.search_corpus = corpus;
                 self.search_corpus = null;
@@ -2493,8 +2493,8 @@ const Published = struct {
     pending_draft_mutation: ?u64 = null,
     buffer_search: BufferSearchState,
     search_generation: u64 = 0,
-    large_session: bool = false,
-    pending_view: ?struct { preferences: Preferences, isolated_file: ?usize, geometry: frame_mod.Geometry } = null,
+    view_generation: u64 = 0,
+    pending_view: ?struct { request_id: u64, preferences: Preferences, isolated_file: ?usize, geometry: frame_mod.Geometry, navigation_policy: DisclosureBuild.NavigationPolicy, navigation_file: ?usize } = null,
     search_corpus: ?*BufferSearchCorpus = null,
     review_search: ReviewSearchState,
     active_search: enum { none, buffer, review } = .none,
@@ -2634,7 +2634,6 @@ const Published = struct {
         published.buffers.commit();
         published.search_corpus = published.bufferSearchCorpus(preferences, published.expanded_disclosures.items, published.isolated_file, geometry) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BufferBuildFailed;
         errdefer published.search_corpus.?.release();
-        published.large_session = published.search_corpus.?.candidates.len > 4096;
         published.navigation = Nav.init(published.visual_rows.len, panes.diff_content.height);
         published.disclosure_inputs = try DisclosureInputs.create(published);
         published.disclosure_inputs_current = true;
@@ -5750,27 +5749,10 @@ pub const Presentation = struct {
             self.action_error = null;
             return;
         }
-        if (self.stageLargeBuffer(published)) {
-            const desired = published.pending_view;
-            self.queueViewBuild(published, if (desired) |value| value.preferences else self.preferences, if (desired) |value| value.isolated_file else published.isolated_file, geometry, .center) catch {
-                self.action_error = .out_of_memory;
-            };
-            return;
-        }
-        var staged = published.prepareBuffer(
-            self.preferences,
-            published.expanded_disclosures.items,
-            published.isolated_file,
-            geometry,
-        ) catch |err| {
-            self.action_error = normalizeActionError(err);
-            return;
+        const desired = published.pending_view;
+        self.queueViewBuild(published, if (desired) |value| value.preferences else self.preferences, if (desired) |value| value.isolated_file else published.isolated_file, geometry, .center) catch {
+            self.action_error = .out_of_memory;
         };
-        defer staged.deinit();
-        staged.publish();
-        published.centerActiveFile();
-        self.geometry = geometry;
-        self.action_error = null;
     }
 
     fn applyAction(self: *Presentation, action: Action) void {
@@ -5785,9 +5767,9 @@ pub const Presentation = struct {
             }
             return;
         };
-        if (self.replacement == null) if (self.published) |_| switch (action) {
-            .select_old_version => if (self.preferences.selected_version == .old) return,
-            .select_new_version => if (self.preferences.selected_version == .new) return,
+        if (self.replacement == null) if (self.published) |published| switch (action) {
+            .select_old_version => if ((if (published.pending_view) |view| view.preferences else self.preferences).selected_version == .old) return,
+            .select_new_version => if ((if (published.pending_view) |view| view.preferences else self.preferences).selected_version == .new) return,
             else => {},
         };
         self.clipboard_status = null;
@@ -5926,18 +5908,7 @@ pub const Presentation = struct {
             .cycle_scope => {
                 var candidate = if (published.pending_view) |desired| desired.preferences else self.preferences;
                 candidate.scope = candidate.scope.next();
-                if (self.stageLargeBuffer(published)) {
-                    self.queueViewBuild(published, candidate, if (published.pending_view) |desired| desired.isolated_file else published.isolated_file, if (published.pending_view) |desired| desired.geometry else published.geometry, .restore) catch {
-                        self.action_error = .out_of_memory;
-                    };
-                } else {
-                    published.rebuild(candidate, published.expanded_disclosures.items, published.isolated_file) catch |err| {
-                        self.action_error = normalizeActionError(err);
-                        return;
-                    };
-                    self.preferences = candidate;
-                    self.action_error = null;
-                }
+                self.publishPreferences(published, candidate);
             },
             .select_old_version, .select_new_version => {
                 self.selectVersion(published, if (action == .select_old_version) .old else .new);
@@ -7093,7 +7064,7 @@ pub const Presentation = struct {
             const discard = switch (command) {
                 .scan_buffer_search => true,
                 .build_buffer_disclosure => |job| job != keep and
-                    ((job.kind != .enrichment and job.kind != .draft_save and job.kind != .draft_mutation) or self.published == null or job.epoch != self.published.?.epoch),
+                    ((job.kind != .view and job.kind != .enrichment and job.kind != .draft_save and job.kind != .draft_mutation) or self.published == null or job.epoch != self.published.?.epoch),
                 else => false,
             };
             if (!discard) {
@@ -7357,18 +7328,19 @@ pub const Presentation = struct {
             self.retryEnrichmentBuild(published, job);
             return;
         }
-        if (job.request_id != published.search_generation or job.kind == .view and published.buffer_search.input != null) {
-            if (job.kind != .view) self.retryContentBuild(published, job);
+        if (job.kind == .view) {
+            const desired = published.pending_view orelse return;
+            if (job.request_id != desired.request_id) return;
+        } else if (job.request_id != published.search_generation) {
+            self.retryContentBuild(published, job);
             return;
         }
-        if (job.kind != .view) {
-            const current_input = published.buffer_search.input;
-            if (job.input_request_id != (if (current_input) |input| input.request_id else null) or
-                (if (current_input) |input| if (input.query) |query| !std.mem.eql(u8, query.text, job.input_query_text orelse "") else job.input_query_text != null else job.input_query_text != null))
-            {
-                self.retryContentBuild(published, job);
-                return;
-            }
+        const current_input = published.buffer_search.input;
+        if (job.input_request_id != (if (current_input) |input| input.request_id else null) or
+            (if (current_input) |input| if (input.query) |query| !std.mem.eql(u8, query.text, job.input_query_text orelse "") else job.input_query_text != null else job.input_query_text != null))
+        {
+            self.retryContentBuild(published, job);
+            return;
         }
         if (!published.disclosure_inputs_current or job.inputs != published.disclosure_inputs or job.frame_revision != published.visual_rows_revision or job.source_active_file != published.activeFile() or job.tree_scroll != published.tree.scroll) {
             self.retryContentBuild(published, job);
@@ -7450,6 +7422,7 @@ pub const Presentation = struct {
             published.disclosure_inputs = inputs;
             published.disclosure_inputs_current = true;
         }
+        const version_changed = published.selected_version != job.preferences.selected_version;
         const previous = published.frameProjection();
         published.search_projection.release();
         job.projection.?.retain();
@@ -7464,13 +7437,19 @@ pub const Presentation = struct {
         published.geometry = job.geometry;
         published.selected_version = job.preferences.selected_version;
         published.isolated_file = job.isolated_file;
+        if (job.kind == .view) if (published.buffer_search.input) |*input| {
+            var saved = previous;
+            saved.navigation = input.saved_navigation;
+            input.saved_navigation = frame_mod.restoreNavigation(saved, job.visual_rows, job.geometry);
+            saved.navigation.cursor = input.origin;
+            input.origin = frame_mod.restoreNavigation(saved, job.visual_rows, job.geometry).cursor;
+        };
         if (published.worker_frame) |old| old.destroy();
         published.worker_frame = job;
         owned.* = false;
         if (published.search_corpus) |old| old.release();
         published.search_corpus = job.search_corpus;
         job.search_corpus = null;
-        published.large_session = published.large_session or published.search_corpus.?.candidates.len > 4096;
         if (published.buffer_search.accepted_batch) |*old| old.deinit(self.allocator);
         published.buffer_search.accepted_batch = job.rebuilt_batch;
         job.rebuilt_batch = null;
@@ -7481,7 +7460,7 @@ pub const Presentation = struct {
         published.buffer_search.accepted_navigation_rows = job.navigation_rows;
         job.navigation_rows = null;
         published.buffer_search.active = job.active;
-        if (job.kind != .view) if (published.buffer_search.input) |*input| {
+        if (published.buffer_search.input) |*input| {
             const next_active = if (job.input_rebuilt_batch) |batch| retainedSearchIndex(input.batch, input.active, batch) else null;
             if (input.batch) |*old| old.deinit(self.allocator);
             if (input.ranges) |old| std.heap.page_allocator.free(old);
@@ -7496,7 +7475,7 @@ pub const Presentation = struct {
             published.search_corpus.?.retain();
             input.corpus.release();
             input.corpus = published.search_corpus.?;
-        };
+        }
         if (published.review_search.ranges) |ranges| std.heap.page_allocator.free(ranges);
         published.review_search.ranges = job.review_ranges;
         job.review_ranges = null;
@@ -7504,9 +7483,9 @@ pub const Presentation = struct {
         self.geometry = job.geometry;
         if (job.kind == .view) published.pending_view = null;
         if (job.navigation_policy == .file_header) {
-            if (job.source_active_file) |file_index| if (fileHeaderRow(published.buffer, file_index)) |row| if (published.visualIndexForBufferIndex(row)) |visual_index| published.navigation.jumpTo(visual_index);
+            if (job.navigation_file) |file_index| if (fileHeaderRow(published.buffer, file_index)) |row| if (published.visualIndexForBufferIndex(row)) |visual_index| published.navigation.jumpTo(visual_index);
         } else if (job.navigation_policy == .center) published.centerActiveFile();
-        if (job.navigation_policy == .version) {
+        if (job.navigation_policy == .version or version_changed) {
             published.navigation.count = 0;
             published.navigation.mark = null;
             self.version_restoration = null;
@@ -7515,7 +7494,6 @@ pub const Presentation = struct {
                     self.version_restoration = target;
             }
             self.mouse_press = null;
-            self.interaction_revision +%= 1;
         }
         published.frame_revision += 1;
         published.visual_rows_revision = published.frame_revision;
@@ -7634,6 +7612,8 @@ pub const Presentation = struct {
             return;
         };
         self.commands.items[self.commands.items.len - 1].build_buffer_disclosure.version_restoration = job.version_restoration;
+        self.commands.items[self.commands.items.len - 1].build_buffer_disclosure.navigation_file = job.navigation_file;
+        published.pending_view.?.navigation_file = job.navigation_file;
     }
 
     fn retryEnrichmentBuild(self: *Presentation, published: *Published, job: *DisclosureBuild) void {
@@ -7660,12 +7640,22 @@ pub const Presentation = struct {
 
     fn queueViewBuild(self: *Presentation, published: *Published, preferences: Preferences, isolated_file: ?usize, geometry: frame_mod.Geometry, policy: DisclosureBuild.NavigationPolicy) !void {
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
-        const request_id = if (published.search_generation == std.math.maxInt(u64)) 1 else published.search_generation + 1;
+        const request_id = if (published.view_generation == std.math.maxInt(u64)) 1 else published.view_generation + 1;
         const job = try DisclosureBuild.create(published, preferences, .{ .base = published.disclosure_keys }, request_id, published.buffer_search.active);
         job.kind = .view;
         job.geometry = geometry;
         job.isolated_file = isolated_file;
         job.navigation_policy = policy;
+        job.navigation_file = if (published.pending_view) |desired| desired.isolated_file else published.isolated_file;
+        if (policy == .restore or policy == .center) if (published.pending_view) |desired| {
+            if (desired.navigation_policy == .reset or desired.navigation_policy == .file_header or desired.navigation_policy == .version) {
+                job.navigation_policy = desired.navigation_policy;
+                job.navigation_file = desired.navigation_file;
+            }
+        };
+        if (preferences.selected_version != self.preferences.selected_version and preferences.scope == .whole and
+            (policy == .restore or policy == .center or policy == .version))
+            job.version_restoration = captureVersionRestoration(published, preferences.selected_version);
         job.active_file = if (published.session.diff.files.len == 0) null else isolated_file orelse job.source_active_file;
         var index: usize = 0;
         while (index < self.commands.items.len) {
@@ -7674,8 +7664,8 @@ pub const Presentation = struct {
                 previous.deinit();
             } else index += 1;
         }
-        published.search_generation = request_id;
-        published.pending_view = .{ .preferences = preferences, .isolated_file = isolated_file, .geometry = geometry };
+        published.view_generation = request_id;
+        published.pending_view = .{ .request_id = request_id, .preferences = preferences, .isolated_file = isolated_file, .geometry = geometry, .navigation_policy = job.navigation_policy, .navigation_file = job.navigation_file };
         self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
     }
 
@@ -7941,6 +7931,7 @@ pub const Presentation = struct {
         while (index < self.commands.items.len) {
             if (self.commands.items[index] == .build_buffer_disclosure and
                 self.commands.items[index].build_buffer_disclosure.kind != .input and
+                self.commands.items[index].build_buffer_disclosure.kind != .view and
                 self.commands.items[index].build_buffer_disclosure.kind != .enrichment and
                 self.commands.items[index].build_buffer_disclosure.kind != .draft_save and
                 self.commands.items[index].build_buffer_disclosure.kind != .draft_mutation)
@@ -7950,7 +7941,6 @@ pub const Presentation = struct {
             } else index += 1;
         }
         published.search_generation = request_id;
-        published.pending_view = null;
         job.kind = kind;
         job.result_error = result_error;
         self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
@@ -8097,19 +8087,11 @@ pub const Presentation = struct {
     fn focusFile(self: *Presentation, published: *Published, file_index: usize) void {
         self.prefetch_arm = null;
         if (file_index >= published.session.diff.files.len) return;
-        if (published.isolated_file != null) {
-            if (self.stageLargeBuffer(published)) {
-                self.queueViewBuild(published, if (published.pending_view) |desired| desired.preferences else self.preferences, file_index, if (published.pending_view) |desired| desired.geometry else published.geometry, .reset) catch {
-                    self.action_error = .out_of_memory;
-                };
-                return;
-            }
-            published.rebuild(self.preferences, published.expanded_disclosures.items, file_index) catch |err| {
-                self.action_error = normalizeActionError(err);
-                return;
+        if ((if (published.pending_view) |desired| desired.isolated_file else published.isolated_file) != null) {
+            self.queueViewBuild(published, if (published.pending_view) |desired| desired.preferences else self.preferences, file_index, if (published.pending_view) |desired| desired.geometry else published.geometry, .reset) catch {
+                self.action_error = .out_of_memory;
             };
-            published.isolated_file = file_index;
-            published.navigation = Nav.init(published.visual_rows.len, frame_mod.paneRects(published.geometry).diff_content.height);
+            return;
         } else if (fileHeaderRow(published.buffer, file_index)) |row| if (published.visualIndexForBufferIndex(row)) |visual_index| published.navigation.jumpTo(visual_index);
         self.revealActiveFile(published);
     }
@@ -9661,18 +9643,9 @@ pub const Presentation = struct {
     }
 
     fn publishPreferences(self: *Presentation, published: *Published, candidate: Preferences) void {
-        if (self.stageLargeBuffer(published)) {
-            self.queueViewBuild(published, candidate, if (published.pending_view) |desired| desired.isolated_file else published.isolated_file, if (published.pending_view) |desired| desired.geometry else published.geometry, .restore) catch {
-                self.action_error = .out_of_memory;
-            };
-            return;
-        }
-        published.rebuild(candidate, published.expanded_disclosures.items, published.isolated_file) catch |err| {
-            self.action_error = normalizeActionError(err);
-            return;
+        self.queueViewBuild(published, candidate, if (published.pending_view) |desired| desired.isolated_file else published.isolated_file, if (published.pending_view) |desired| desired.geometry else published.geometry, .restore) catch {
+            self.action_error = .out_of_memory;
         };
-        self.preferences = candidate;
-        self.action_error = null;
     }
 
     fn selectVersion(self: *Presentation, published: *Published, selected: SelectedVersion) void {
@@ -9680,83 +9653,31 @@ pub const Presentation = struct {
         if (selected == desired.selected_version) return;
         var candidate = desired;
         candidate.selected_version = selected;
-        const restoration = if (candidate.scope == .whole) captureVersionRestoration(published, selected) else null;
-        if (self.stageLargeBuffer(published)) {
-            self.queueViewBuild(published, candidate, if (published.pending_view) |view| view.isolated_file else published.isolated_file, if (published.pending_view) |view| view.geometry else published.geometry, .version) catch {
-                self.action_error = .out_of_memory;
-                return;
-            };
-            self.commands.items[self.commands.items.len - 1].build_buffer_disclosure.version_restoration = restoration;
-            const file_index = published.activeFile();
-            if (candidate.scope == .whole and file_index != null and versionNeedsEnrichment(published, candidate.layout, selected, file_index.?)) {
-                self.queueFileEnrichment(published, file_index.?, false) catch {
-                    self.cancelQueuedViewBuild(published);
-                    self.action_error = .out_of_memory;
-                };
-            }
-            return;
-        }
-        var staged = published.prepareBuffer(candidate, published.expanded_disclosures.items, published.isolated_file, published.geometry) catch |err| {
-            self.action_error = normalizeActionError(err);
+        self.queueViewBuild(published, candidate, if (published.pending_view) |view| view.isolated_file else published.isolated_file, if (published.pending_view) |view| view.geometry else published.geometry, .version) catch {
+            self.action_error = .out_of_memory;
             return;
         };
-        defer staged.deinit();
-
         const file_index = published.activeFile();
         if (candidate.scope == .whole and file_index != null and versionNeedsEnrichment(published, candidate.layout, selected, file_index.?)) {
             self.queueFileEnrichment(published, file_index.?, false) catch {
+                self.cancelQueuedViewBuild(published);
                 self.action_error = .out_of_memory;
-                return;
             };
         }
-
-        staged.publish();
-        self.preferences = candidate;
-        published.navigation.count = 0;
-        published.navigation.mark = null;
-        self.version_restoration = null;
-        if (restoration) |target| {
-            if (!restoreVersionNavigation(published, target, selected) and versionContentPending(published, target.file_index, selected))
-                self.version_restoration = target;
-        }
-        self.mouse_press = null;
-        self.interaction_revision +%= 1;
-        self.action_error = null;
     }
 
     fn toggleIsolation(self: *Presentation, published: *Published) void {
         if (published.session.diff.files.len == 0) return;
         const previous = if (published.pending_view) |desired| desired.isolated_file else published.isolated_file;
         const candidate = if (previous) |_| null else published.buffer.fileIndexForRow(published.cursorBufferIndex());
-        if (self.stageLargeBuffer(published)) {
-            self.queueViewBuild(published, if (published.pending_view) |desired| desired.preferences else self.preferences, candidate, if (published.pending_view) |desired| desired.geometry else published.geometry, if (previous != null) .file_header else .reset) catch {
-                self.action_error = .out_of_memory;
-            };
-            return;
-        }
-        published.rebuild(self.preferences, published.expanded_disclosures.items, candidate) catch |err| {
-            self.action_error = normalizeActionError(err);
-            return;
+        self.queueViewBuild(published, if (published.pending_view) |desired| desired.preferences else self.preferences, candidate, if (published.pending_view) |desired| desired.geometry else published.geometry, if (previous != null) .file_header else .reset) catch {
+            self.action_error = .out_of_memory;
         };
-        published.isolated_file = candidate;
-        if (previous) |file_index| {
-            if (fileHeaderRow(published.buffer, file_index)) |row| if (published.visualIndexForBufferIndex(row)) |visual_index| published.navigation.jumpTo(visual_index);
-        } else {
-            published.navigation = Nav.init(published.visual_rows.len, frame_mod.paneRects(self.geometry).diff_content.height);
-        }
-        self.action_error = null;
-    }
-
-    fn stageLargeBuffer(self: *const Presentation, published: *const Published) bool {
-        _ = self;
-        return published.buffer_search.input == null and published.large_session;
     }
 
     fn cancelQueuedViewBuild(self: *Presentation, published: *Published) void {
         if (published.pending_view == null) return;
         published.pending_view = null;
-        published.search_generation +%= 1;
-        if (published.search_generation == 0) published.search_generation = 1;
         var index: usize = 0;
         while (index < self.commands.items.len) {
             if (self.commands.items[index] == .build_buffer_disclosure and self.commands.items[index].build_buffer_disclosure.kind == .view) {
@@ -9775,19 +9696,9 @@ pub const Presentation = struct {
                 current - 1
             else
                 return;
-            if (self.stageLargeBuffer(published)) {
-                self.queueViewBuild(published, if (published.pending_view) |desired| desired.preferences else self.preferences, candidate, if (published.pending_view) |desired| desired.geometry else published.geometry, .reset) catch {
-                    self.action_error = .out_of_memory;
-                };
-                return;
-            }
-            published.rebuild(self.preferences, published.expanded_disclosures.items, candidate) catch |err| {
-                self.action_error = normalizeActionError(err);
-                return;
+            self.queueViewBuild(published, if (published.pending_view) |desired| desired.preferences else self.preferences, candidate, if (published.pending_view) |desired| desired.geometry else published.geometry, .reset) catch {
+                self.action_error = .out_of_memory;
             };
-            published.isolated_file = candidate;
-            published.navigation = Nav.init(published.visual_rows.len, frame_mod.paneRects(self.geometry).diff_content.height);
-            self.action_error = null;
             return;
         }
         const row = if (direction > 0)
@@ -11496,7 +11407,7 @@ fn testSession(backing: std.mem.Allocator, id: u64, marker: u8) !*session_mod.Se
 pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, paint: *const fn (Allocator, ReviewProjection) anyerror!void) !void {
     const samples = 9;
     const files = 16;
-    const Stage = enum { open, edit, scan, worker_projection, admission, admission_bottom, disclosure, disclosure_worker, disclosure_admission, projection, painting, view_dispatch, view_worker, view_admission, hidden_edit, hidden_scan_admission, hidden_worker, hidden_admission, hidden_escape, hidden_restore_worker, hidden_restore_admission, clear_dispatch, clear_worker, clear_admission };
+    const Stage = enum { open, edit, scan, worker_projection, admission, admission_bottom, disclosure, disclosure_worker, disclosure_admission, projection, painting, view_dispatch, view_worker, view_admission, resize_input_dispatch, resize_input_worker, resize_input_admission, resize_input_control, hidden_edit, hidden_scan_admission, hidden_worker, hidden_admission, hidden_escape, hidden_restore_worker, hidden_restore_admission, clear_dispatch, clear_worker, clear_admission };
     var times: [@typeInfo(Stage).@"enum".fields.len][samples]u64 = undefined;
 
     var session = try session_mod.create(allocator);
@@ -11623,6 +11534,39 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
         start = std.Io.Clock.awake.now(io);
         try presentation.dispatch(.{ .buffer_disclosure_built = view });
         times[@intFromEnum(Stage.view_admission)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+    }
+    for (0..samples) |sample| {
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+        const published = presentation.published.?;
+        const before = published.visual_rows.ptr;
+        const geometry: frame_mod.Geometry = .{ .cols = if (presentation.geometry.cols == 100) 80 else 100, .rows = 30 };
+        var start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .resize = geometry });
+        times[@intFromEnum(Stage.resize_input_dispatch)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (published.visual_rows.ptr != before or published.pending_view == null or !published.buffer_search.input.?.pending)
+            return error.ResizeNotStaged;
+        var scan = presentation.takeCommand() orelse return error.MissingScan;
+        defer scan.deinit();
+        try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(std.heap.page_allocator, &scan.scan_buffer_search) });
+        const view = (presentation.takeCommand() orelse return error.MissingDisclosureBuild).build_buffer_disclosure;
+        start = std.Io.Clock.awake.now(io);
+        view.build();
+        if (view.failed) return error.DisclosureBuildFailed;
+        times[@intFromEnum(Stage.resize_input_worker)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .buffer_disclosure_built = view });
+        times[@intFromEnum(Stage.resize_input_admission)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (published.worker_frame != view or published.buffer_search.input.?.batch.?.occurrences.len != files * lines * 2)
+            return error.ResizeNotPublished;
+        start = std.Io.Clock.awake.now(io);
+        var control = try published.prepareBuffer(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, geometry);
+        times[@intFromEnum(Stage.resize_input_control)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (control.visual_rows.len != published.visual_rows.len or control.input_batch.?.occurrences.len != files * lines * 2 or
+            control.input_ranges.?.len != published.buffer_search.input.?.ranges.?.len) return error.ResizeControlMismatch;
+        std.mem.doNotOptimizeAway(control.visual_rows.len);
+        control.deinit();
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
     }
     const hidden_session = try testSession(allocator, 2, 'h');
     var hidden_raw: std.ArrayList(u8) = .empty;
@@ -11928,6 +11872,15 @@ fn completeDisclosureBuild(presentation: *Presentation) !void {
     try presentation.dispatch(.{ .buffer_disclosure_built = command.build_buffer_disclosure });
 }
 
+// Existing interaction checks observe completed view changes. Transition checks
+// dispatch directly so they can inspect and reorder the worker commands.
+fn dispatchView(presentation: *Presentation, input: OwnedInput) !void {
+    try presentation.dispatch(input);
+    if (presentation.commands.items.len > 0 and presentation.commands.items[0] == .build_buffer_disclosure and
+        presentation.commands.items[0].build_buffer_disclosure.kind == .view)
+        try completeDisclosureBuild(presentation);
+}
+
 test "M21 kernel worker handoff includes a changed DraftState" {
     for ([_]bool{ false, true }) |issued_before_submission| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
@@ -12018,7 +11971,7 @@ test "M21 kernel issued Frame retains Draft body and AnchorSnapshot while an edi
 }
 
 test "M21 kernel Frame worker allocation failures preserve the graph and complete Frame" {
-    for ([_]DisclosureBuild.Kind{ .general, .enrichment, .draft_save }) |kind| try testing.checkAllAllocationFailures(testing.allocator, disclosureWorkerFailureCase, .{ kind, null });
+    for ([_]DisclosureBuild.Kind{ .general, .view, .enrichment, .draft_save }) |kind| try testing.checkAllAllocationFailures(testing.allocator, disclosureWorkerFailureCase, .{ kind, null });
     for (test_draft_mutations) |mutation| try testing.checkAllAllocationFailures(testing.allocator, disclosureWorkerFailureCase, .{ .draft_mutation, mutation });
 }
 
@@ -12072,7 +12025,7 @@ fn disclosureWorkerFailureCase(allocator: Allocator, kind: DisclosureBuild.Kind,
             .delete => .delete,
             .unpublished => .unpublished,
         } }, null);
-    } else try presentation.dispatch(.{ .action = .toggle_disclosure });
+    } else if (kind == .view) try presentation.dispatch(.{ .action = .toggle_layout }) else try presentation.dispatch(.{ .action = .toggle_disclosure });
     const worker = presentation.takeCommand().?.build_buffer_disclosure;
     saved_arena = worker.arena;
     worker.arena = std.heap.ArenaAllocator.init(allocator);
@@ -12131,14 +12084,20 @@ test "a queued disclosure keeps the old Frame and ignores a replaced Session" {
     try testing.expectEqual(@as(usize, 1), presentation.published.?.session.references.load(.acquire));
 }
 
-test "large Buffer view Actions publish worker Frames together" {
+fn testLargeViewSession() !*Session {
     const session = try testSession(testing.allocator, 1, 'a');
+    errdefer session.destroy();
     const a = session.arena.allocator();
     var raw: std.ArrayList(u8) = .empty;
     try raw.appendSlice(a, "diff --git a/large.txt b/large.txt\n--- a/large.txt\n+++ b/large.txt\n@@ -1,4100 +1,4100 @@\n");
     for (0..4100) |_| try raw.appendSlice(a, "-old needle\n+new needle\n");
     session.diff = try bbr.diff.parse(a, raw.items);
     try session.initializeEnrichment();
+    return session;
+}
+
+test "large Buffer view Actions publish worker Frames together" {
+    const session = try testLargeViewSession();
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -12147,7 +12106,7 @@ test "large Buffer view Actions publish worker Frames together" {
     });
     defer presentation.deinit();
     const published = presentation.published.?;
-    try testing.expect(presentation.stageLargeBuffer(published));
+    try testing.expect(published.search_corpus.?.candidates.len > 4096);
 
     try presentation.dispatch(.{ .action = .open_buffer_search });
     try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
@@ -12168,7 +12127,6 @@ test "large Buffer view Actions publish worker Frames together" {
     try presentation.dispatch(.{ .action = .isolate });
     try completeDisclosureBuild(&presentation);
     try testing.expectEqual(@as(?usize, 0), published.isolated_file);
-    try testing.expect(presentation.stageLargeBuffer(published));
     try presentation.dispatch(.{ .resize = .{ .cols = 80, .rows = 25 } });
     const stale = presentation.takeCommand().?.build_buffer_disclosure;
     try presentation.dispatch(.{ .resize = .{ .cols = 90, .rows = 25 } });
@@ -12207,6 +12165,222 @@ test "large Buffer view Actions publish worker Frames together" {
     try presentation.dispatch(.{ .buffer_disclosure_built = obsolete });
     try testing.expectEqual(@as(SessionEpoch, 2), presentation.published.?.epoch);
     try testing.expect(presentation.published.?.worker_frame == null);
+}
+
+const TestViewChange = enum { layout, scope, resolved, version, isolate, movement, focus, width };
+const test_view_changes = [_]TestViewChange{ .layout, .scope, .resolved, .version, .isolate, .movement, .focus, .width };
+
+fn prepareTestViewChange(presentation: *Presentation, change: TestViewChange) !void {
+    if (change == .resolved) {
+        try moveToRow(presentation, findDisclosureRow(presentation.projection().review.?.buffer.rows, .{ .resolved_thread = 1 }).?);
+    } else if (change == .movement or change == .focus) {
+        try dispatchView(presentation, .{ .action = .isolate });
+    }
+}
+
+fn startTestViewChange(presentation: *Presentation, change: TestViewChange) !void {
+    switch (change) {
+        .layout => try presentation.dispatch(.{ .action = .toggle_layout }),
+        .scope => try presentation.dispatch(.{ .action = .cycle_scope }),
+        .resolved => try presentation.dispatch(.{ .action = .toggle_disclosure }),
+        .version => try presentation.dispatch(.{ .action = .select_old_version }),
+        .isolate => try presentation.dispatch(.{ .action = .isolate }),
+        .movement => try presentation.dispatch(.{ .action = .next_file }),
+        .focus => presentation.focusFile(presentation.published.?, 1),
+        .width => try presentation.dispatch(.{ .resize = .{ .cols = 72, .rows = 12 } }),
+    }
+}
+
+test "M21 kernel every small Session view change waits for a complete worker Frame" {
+    for (test_view_changes) |change| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = if (change == .resolved) try testDisclosureSession(testing.allocator, 1) else try testTwoFileSession(testing.allocator, 1) },
+            .geometry = .{ .cols = 100, .rows = 12 },
+        });
+        defer presentation.deinit();
+        try testing.expect(presentation.published.?.search_corpus.?.candidates.len <= 4096);
+        try prepareTestViewChange(&presentation, change);
+        const before = presentation.projection().review.?;
+        try startTestViewChange(&presentation, change);
+        const pending = presentation.projection().review.?;
+        try testing.expectEqual(before.frame.visual_rows.ptr, pending.frame.visual_rows.ptr);
+        try testing.expectEqual(before.frame.geometry, pending.frame.geometry);
+        try testing.expectEqual(before.preferences, pending.preferences);
+        try testing.expectEqual(before.isolated_file, pending.isolated_file);
+        const worker = presentation.takeCommand().?.build_buffer_disclosure;
+        worker.build();
+        try testing.expect(!worker.failed);
+        const rows = worker.visual_rows.ptr;
+        try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+        const after = presentation.projection().review.?;
+        try testing.expectEqual(rows, after.frame.visual_rows.ptr);
+        switch (change) {
+            .layout => try testing.expectEqual(Layout.side_by_side, after.preferences.layout),
+            .scope => try testing.expectEqual(Scope.fetched, after.preferences.scope),
+            .resolved => try testing.expect(after.buffer.rows[findDisclosureRow(after.buffer.rows, .{ .resolved_thread = 1 }).?].disclosure.expanded),
+            .version => try testing.expectEqual(SelectedVersion.old, after.selected_version),
+            .isolate => try testing.expectEqual(@as(?usize, 0), after.isolated_file),
+            .movement, .focus => try testing.expectEqual(@as(?usize, 1), after.isolated_file),
+            .width => try testing.expectEqual(@as(u16, 72), after.frame.geometry.cols),
+        }
+    }
+}
+
+test "M21 kernel view failures preserve Frame preferences geometry and navigation" {
+    for (test_view_changes) |change| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = if (change == .resolved) try testDisclosureSession(testing.allocator, 1) else try testTwoFileSession(testing.allocator, 1) },
+            .geometry = .{ .cols = 100, .rows = 12 },
+        });
+        defer presentation.deinit();
+        try prepareTestViewChange(&presentation, change);
+        const before = presentation.projection().review.?;
+        try startTestViewChange(&presentation, change);
+        const worker = presentation.takeCommand().?.build_buffer_disclosure;
+        worker.failed = true;
+        try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+        const after = presentation.projection().review.?;
+        try testing.expectEqual(before.frame.visual_rows.ptr, after.frame.visual_rows.ptr);
+        try testing.expectEqual(before.frame.geometry, after.frame.geometry);
+        try testing.expectEqual(before.preferences, after.preferences);
+        try testing.expectEqual(before.isolated_file, after.isolated_file);
+        try testing.expectEqual(before.navigation, after.navigation);
+        try testing.expectEqual(ActionError.buffer_build_failed, presentation.projection().action_error.?);
+        try startTestViewChange(&presentation, change);
+        try completeDisclosureBuild(&presentation);
+        try testing.expect(presentation.projection().action_error == null);
+    }
+}
+
+test "M21 kernel newest queued view retains Layout Scope Version isolation and width" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 12 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .select_old_version });
+    const stale = presentation.takeCommand().?.build_buffer_disclosure;
+    try presentation.dispatch(.{ .action = .select_new_version });
+    try presentation.dispatch(.{ .action = .select_old_version });
+    try presentation.dispatch(.{ .action = .toggle_layout });
+    try presentation.dispatch(.{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .action = .isolate });
+    try presentation.dispatch(.{ .action = .next_file });
+    try presentation.dispatch(.{ .resize = .{ .cols = 72, .rows = 10 } });
+    try testing.expectEqual(@as(usize, 1), presentation.commands.items.len);
+    stale.build();
+    try presentation.dispatch(.{ .buffer_disclosure_built = stale });
+    try testing.expectEqual(SelectedVersion.new, presentation.projection().review.?.selected_version);
+    try completeDisclosureBuild(&presentation);
+    const after = presentation.projection().review.?;
+    try testing.expectEqual(Layout.side_by_side, after.preferences.layout);
+    try testing.expectEqual(Scope.fetched, after.preferences.scope);
+    try testing.expectEqual(SelectedVersion.old, after.selected_version);
+    try testing.expectEqual(@as(?usize, 1), after.isolated_file);
+    try testing.expectEqual(@as(u16, 72), after.frame.geometry.cols);
+    try presentation.dispatch(.{ .action = .prev_file });
+    try presentation.dispatch(.{ .action = .next_file });
+    try presentation.dispatch(.{ .action = .isolate });
+    try presentation.dispatch(.{ .resize = .{ .cols = 80, .rows = 10 } });
+    try completeDisclosureBuild(&presentation);
+    const restored = presentation.projection().review.?;
+    try testing.expect(restored.isolated_file == null);
+    try testing.expectEqual(@as(usize, 1), restored.buffer.fileIndexForRow(restored.frame.visual_rows[restored.navigation.cursor].buffer_index));
+}
+
+test "M21 kernel resize during pending Buffer Search survives rapid Query edits and Enter" {
+    for ([_]bool{ false, true }) |large| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = if (large) try testLargeViewSession() else try testSession(testing.allocator, 1, 'a') },
+            .geometry = .{ .cols = 100, .rows = 12 },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "n" } });
+        try presentation.dispatch(.{ .resize = .{ .cols = 72, .rows = 12 } });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "ew" } });
+        try testing.expectEqual(@as(u16, 100), presentation.projection().review.?.frame.geometry.cols);
+        try testing.expectEqual(@as(usize, 2), presentation.commands.items.len);
+        try completeDisclosureBuild(&presentation);
+        try testing.expectEqual(@as(u16, 100), presentation.projection().review.?.frame.geometry.cols);
+        try testing.expectEqualStrings("new", presentation.projection().buffer_search.?.query);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try completeBufferSearchScan(&presentation);
+        // Enter changed the input ownership. The view retries against accepted search.
+        try completeDisclosureBuild(&presentation);
+        try testing.expectEqual(@as(u16, 72), presentation.projection().review.?.frame.geometry.cols);
+        try testing.expect(!presentation.projection().buffer_search.?.input);
+        try testing.expectEqualStrings("new", presentation.projection().buffer_search.?.query);
+        try testing.expectEqual(@as(usize, if (large) 4100 else 1), presentation.projection().buffer_search.?.total);
+    }
+}
+
+test "M21 kernel view work retries navigation changes and rejects closed Sessions" {
+    for ([_]enum { navigation, refresh, switch_review, shutdown }{ .navigation, .refresh, .switch_review, .shutdown }) |change| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .toggle_layout });
+        const worker = presentation.takeCommand().?.build_buffer_disclosure;
+        if (change == .navigation) {
+            presentation.published.?.tree.cursor = 1;
+        } else if (change == .shutdown) {
+            try presentation.dispatch(.request_shutdown);
+        } else {
+            if (change == .refresh) try presentation.dispatch(.{ .action = .refresh }) else try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+            const load = presentation.takeCommand().?.load_session;
+            try presentation.dispatch(.{ .session_loaded = .{ .intent = load.intent, .outcome = .{ .loaded = try testTwoFileSession(testing.allocator, if (change == .refresh) 1 else 2) } } });
+        }
+        const before = presentation.projection().review.?.frame;
+        worker.build();
+        try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+        try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+        if (change == .navigation) {
+            try completeDisclosureBuild(&presentation);
+            try testing.expectEqual(Layout.side_by_side, presentation.projection().review.?.preferences.layout);
+        } else if (change == .shutdown) {
+            try testing.expect(presentation.readyToExit());
+        } else try testing.expect(presentation.published.?.pending_view == null);
+    }
+}
+
+test "M21 kernel width builds keep Buffer Search Escape navigation across worker Frames" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testWideSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 12 },
+    });
+    defer presentation.deinit();
+    try dispatchView(&presentation, .{ .resize = .{ .cols = 80, .rows = 12 } });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .down });
+    const before = presentation.projection().review.?.frame;
+    const owner = before.visual_rows[before.navigation.cursor].owner;
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'a', .text = "added" } });
+    try completeBufferSearchScan(&presentation);
+    try testing.expectEqual(@as(usize, 40), presentation.projection().buffer_search.?.total);
+    for ([_]u16{ 72, 90 }) |cols| {
+        try presentation.dispatch(.{ .resize = .{ .cols = cols, .rows = 12 } });
+        try completeDisclosureBuild(&presentation);
+        try testing.expect(presentation.projection().review.?.frame.search_ranges.len > 0);
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    const restored = presentation.projection().review.?.frame;
+    try testing.expect(owner.eql(restored.visual_rows[restored.navigation.cursor].owner));
+    try testing.expectEqual(@as(u16, 90), restored.geometry.cols);
 }
 
 test "M21 authored Review Search streams a complete File partition after File Enrichment" {
@@ -12377,7 +12551,7 @@ test "M21 authored source opening keeps all-Files and lands on exact wrapped ran
     try testing.expectEqual(SelectedVersion.old, old_review.selected_version);
     try testing.expectEqual(Scope.changes, old_review.preferences.scope);
     try testing.expect(old_review.frame.search_ranges.len > 0);
-    try presentation.dispatch(.{ .action = .toggle_layout });
+    try dispatchView(&presentation, .{ .action = .toggle_layout });
     try testing.expect(presentation.projection().review.?.frame.search_ranges.len > 0);
     try presentation.dispatch(.{ .action = .down });
     try testing.expect(presentation.projection().review.?.frame.search_ranges.len > 0);
@@ -12549,7 +12723,7 @@ test "M21 authored source Fold reveal is temporary when Buffer Search starts" {
         if (row == .disclosure and row.disclosure.kind == .fold) break row.disclosure.key;
     } else return error.MissingFold;
     try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.{ .action = .isolate });
+    try dispatchView(&presentation, .{ .action = .isolate });
     try testing.expectEqual(@as(?usize, 1), presentation.projection().review.?.isolated_file);
     try presentation.dispatch(.{ .action = .open_review_search });
     try presentation.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c5" } });
@@ -12984,7 +13158,7 @@ test "M21 authored result pointer selects opens and rejects stale Frame targets"
     const geometry = presentation.projection().review_search.?.geometry;
     const point: MouseInput = .{ .col = geometry.list.x, .row = geometry.list.y + 1, .button = .left, .type = .press };
     try presentation.dispatch(.{ .mouse = point });
-    try presentation.dispatch(.{ .resize = .{ .cols = 90, .rows = 24 } });
+    try dispatchView(&presentation, .{ .resize = .{ .cols = 90, .rows = 24 } });
     try presentation.dispatch(.{ .mouse = .{ .col = point.col, .row = point.row, .button = .left, .type = .release } });
     try testing.expectEqual(@as(?usize, 0), presentation.projection().review_search.?.selected);
     try presentation.dispatch(.{ .mouse = point });
@@ -13024,7 +13198,7 @@ test "M21 authored scope opening resolves Review File Reply and outdated locatio
     });
     defer presentation.deinit();
     try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.{ .action = .isolate });
+    try dispatchView(&presentation, .{ .action = .isolate });
     try testing.expectEqual(@as(?usize, 0), presentation.projection().review.?.isolated_file);
     inline for (.{ "reviewOnly", "fileOnly", "replyOnly", "outdatedOnly" }, 0..) |needle, index| {
         try presentation.dispatch(.{ .action = .open_review_search });
@@ -13038,7 +13212,7 @@ test "M21 authored scope opening resolves Review File Reply and outdated locatio
             try testing.expectEqual(@as(?usize, null), review.isolated_file);
             try testing.expectEqual(@as(bbr.review.CommentId, 1), review.frame.visual_rows[review.navigation.cursor].owner.comment.id);
             try presentation.dispatch(.{ .action = .next_file });
-            try presentation.dispatch(.{ .action = .isolate });
+            try dispatchView(&presentation, .{ .action = .isolate });
             try testing.expectEqual(@as(?usize, 0), presentation.projection().review.?.isolated_file);
         } else try testing.expectEqual(@as(?usize, 1), review.isolated_file);
         if (index == 1) {
@@ -13257,7 +13431,7 @@ test "M21 authored unavailable local Draft opens its exact ReviewBody without ch
         .geometry = .{ .cols = 100, .rows = 18 },
     });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .action = .select_old_version });
+    try dispatchView(&presentation, .{ .action = .select_old_version });
     try presentation.dispatch(.{ .action = .open_review_search });
     try presentation.dispatch(.{ .key = .{ .codepoint = 'm', .text = "missingScope" } });
     try completeBufferSearchScan(&presentation);
@@ -13314,7 +13488,7 @@ test "M21 kernel Buffer Search previews accepts traverses and cancels atomically
     try testing.expect(!presentation.projection().buffer_search.?.input);
     try testing.expect(presentation.projection().review.?.frame.search_ranges.len > 0);
     var accepted_cursor = presentation.projection().review.?.navigation.cursor;
-    try presentation.dispatch(.{ .action = .toggle_layout });
+    try dispatchView(&presentation, .{ .action = .toggle_layout });
     try testing.expectEqualStrings("new", presentation.projection().buffer_search.?.query);
     try testing.expect(presentation.projection().review.?.frame.search_ranges.len > 0);
     try presentation.dispatch(.{ .action = .up });
@@ -13649,7 +13823,7 @@ test "M21 worker range projection matches the current Frame in both Layouts" {
         try testing.expectEqual(worker_ranges, presentation.projection().review.?.frame.search_ranges.ptr);
         try testing.expect(presentation.published.?.buffer_search.input.?.navigation_rows != null);
         try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
-        try presentation.dispatch(.{ .action = .toggle_layout });
+        try dispatchView(&presentation, .{ .action = .toggle_layout });
     }
 }
 
@@ -13667,7 +13841,11 @@ test "M21 stale worker ranges do not enter a rebuilt Frame" {
     var command = presentation.takeCommand().?;
     defer command.deinit();
     const completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
-    try presentation.dispatch(.{ .action = .toggle_layout });
+    // The synchronous control changes the Frame while the scan owns the lane.
+    var preferences = presentation.preferences;
+    preferences.layout = .side_by_side;
+    try presentation.published.?.rebuild(preferences, presentation.published.?.expanded_disclosures.items, null);
+    presentation.preferences = preferences;
     try testing.expect(completed.visual_rows_revision != presentation.published.?.visual_rows_revision);
     try presentation.dispatch(.{ .buffer_search_scanned = completed });
     try testing.expect(presentation.published.?.buffer_search.input.?.pending);
@@ -13880,7 +14058,7 @@ test "M21 kernel SideBySide Buffer Search navigates to the exact source Line" {
     });
     defer presentation.deinit();
 
-    try presentation.dispatch(.{ .action = .toggle_layout });
+    try dispatchView(&presentation, .{ .action = .toggle_layout });
     try presentation.dispatch(.{ .action = .open_buffer_search });
     try presentation.dispatch(.{ .key = .{ .codepoint = 's', .text = "source" } });
     try completeBufferSearchScan(&presentation);
@@ -14154,8 +14332,8 @@ test "Unified WholeFile authoring uses only selected-version Hunk Lines" {
     });
     defer presentation.deinit();
 
-    try presentation.dispatch(.{ .action = .cycle_scope });
-    try presentation.dispatch(.{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
     try presentation.dispatch(.{ .action = .down });
     var projected = presentation.projection();
     try testing.expectEqual(InlineCommentRefusal.selected_content_unavailable, projected.action_availability.inline_comment_refusal.?);
@@ -14187,7 +14365,7 @@ test "Unified WholeFile authoring uses only selected-version Hunk Lines" {
     try testing.expect(projected.action_availability.inline_comment_refusal == null);
     try testing.expect(projected.action_availability.suggestion_refusal == null);
 
-    try presentation.dispatch(.{ .action = .select_old_version });
+    try dispatchView(&presentation, .{ .action = .select_old_version });
     try presentation.dispatch(.{ .action = .down });
     projected = presentation.projection();
     try testing.expectEqual(SelectedVersion.old, projected.review.?.selected_version);
@@ -14654,9 +14832,12 @@ test "resize publishes one complete Presentation Frame revision" {
     try testing.expect(navigated.revision > before.revision);
     const owner = navigated.visual_rows[navigated.navigation.cursor].owner;
     try presentation.dispatch(.{ .resize = .{ .cols = 40, .rows = 4 } });
+    const pending = presentation.projection().review.?.frame;
+    try testing.expectEqual(navigated.visual_rows.ptr, pending.visual_rows.ptr);
+    try completeDisclosureBuild(&presentation);
     const after = presentation.projection().review.?.frame;
 
-    try testing.expectEqual(navigated.revision + 1, after.revision);
+    try testing.expectEqual(pending.revision + 1, after.revision);
     try testing.expectEqual(@as(u16, 40), after.geometry.cols);
     try testing.expectEqual(@as(u16, 4), after.geometry.rows);
     try testing.expect(after.visual_rows_revision > navigated.visual_rows_revision);
@@ -14679,7 +14860,7 @@ test "height resize keeps cached Buffer and visual rows" {
     defer presentation.deinit();
 
     const before = presentation.projection().review.?.frame;
-    try presentation.dispatch(.{ .resize = .{ .cols = 80, .rows = 4 } });
+    try dispatchView(&presentation, .{ .resize = .{ .cols = 80, .rows = 4 } });
     const after = presentation.projection().review.?.frame;
 
     try testing.expectEqual(@intFromPtr(before.buffer.rows.ptr), @intFromPtr(after.buffer.rows.ptr));
@@ -14910,7 +15091,7 @@ test "SideBySide wrapping Anchors an active old-only continuation" {
     });
     defer presentation.deinit();
 
-    try presentation.dispatch(.{ .action = .toggle_layout });
+    try dispatchView(&presentation, .{ .action = .toggle_layout });
     const wrapped = presentation.projection().review.?;
     var continuation: ?usize = null;
     for (wrapped.frame.visual_rows, 0..) |visual_row, index| {
@@ -14920,7 +15101,7 @@ test "SideBySide wrapping Anchors an active old-only continuation" {
     try testing.expect(continuation != null);
     presentation.published.?.navigation.jumpTo(continuation.?);
 
-    try presentation.dispatch(.{ .action = .select_old_version });
+    try dispatchView(&presentation, .{ .action = .select_old_version });
     try presentation.dispatch(.{ .action = .yank });
     var command = presentation.takeCommand().?;
     defer command.deinit();
@@ -14990,7 +15171,7 @@ test "Unconditional Unified wrapping uses visual-row navigation and semantic Anc
     current = presentation.projection().review.?;
     const previous_owner = current.frame.visual_rows[current.navigation.cursor].owner;
     const previous_offset = current.frame.visual_rows[current.navigation.cursor].source_start;
-    try presentation.dispatch(.{ .resize = .{ .cols = 80, .rows = 10 } });
+    try dispatchView(&presentation, .{ .resize = .{ .cols = 80, .rows = 10 } });
     current = presentation.projection().review.?;
     const restored = current.frame.visual_rows[current.navigation.cursor];
     try testing.expect(restored.owner.eql(previous_owner));
@@ -15060,11 +15241,11 @@ test "M15 Layout Scope and geometry matrix restores a Unicode source row" {
     try testing.expectEqual(@as(usize, 5), MatrixGraphemeMetrics.value.width("é界👩‍💻"));
 
     for (0..2) |layout_index| {
-        if (layout_index > 0) try presentation.dispatch(.{ .action = .toggle_layout });
+        if (layout_index > 0) try dispatchView(&presentation, .{ .action = .toggle_layout });
         for (0..3) |scope_index| {
-            if (scope_index > 0) try presentation.dispatch(.{ .action = .cycle_scope });
+            if (scope_index > 0) try dispatchView(&presentation, .{ .action = .cycle_scope });
             for (geometries) |geometry| {
-                try presentation.dispatch(.{ .resize = geometry });
+                try dispatchView(&presentation, .{ .resize = geometry });
                 const review = presentation.projection().review.?;
                 try testing.expectEqual(geometry, review.frame.geometry);
                 try testing.expect(review.frame.visual_rows_revision <= review.frame.revision);
@@ -15088,7 +15269,7 @@ test "M15 Layout Scope and geometry matrix restores a Unicode source row" {
                 if (review.preferences.scope != .whole) try testing.expect(saw_projected_body);
             }
         }
-        try presentation.dispatch(.{ .action = .cycle_scope });
+        try dispatchView(&presentation, .{ .action = .cycle_scope });
         if (layout_index == 0) {
             for (presentation.projection().review.?.buffer.rows, 0..) |row, index| {
                 if (row == .line and row.line.line.kind == .added) {
@@ -15262,9 +15443,9 @@ test "RemoteReview and LocalReview share Selected Version behavior in every Layo
         try completeCrossSourceVersionEnrichment(&presentation, enrichment, true);
 
         for (0..2) |layout_index| {
-            if (layout_index > 0) try presentation.dispatch(.{ .action = .toggle_layout });
+            if (layout_index > 0) try dispatchView(&presentation, .{ .action = .toggle_layout });
             for (0..3) |scope_index| {
-                if (scope_index > 0) try presentation.dispatch(.{ .action = .cycle_scope });
+                if (scope_index > 0) try dispatchView(&presentation, .{ .action = .cycle_scope });
                 const whole = presentation.projection().review.?.preferences.scope == .whole;
 
                 var review = presentation.projection().review.?;
@@ -15282,7 +15463,7 @@ test "RemoteReview and LocalReview share Selected Version behavior in every Layo
                     &.{ .file_header, .hunk_header, .line_pair, .hunk_header, .line_pair });
                 try expectVersionYank(&presentation, if (whole) "new one\ngap two\ngap three\nnew four" else "new one\nnew four");
 
-                try presentation.dispatch(.{ .action = .select_old_version });
+                try dispatchView(&presentation, .{ .action = .select_old_version });
                 review = presentation.projection().review.?;
                 try testing.expectEqual(SelectedVersion.old, review.preferences.selected_version);
                 try testing.expectEqual(SelectedVersion.old, review.selected_version);
@@ -15299,10 +15480,10 @@ test "RemoteReview and LocalReview share Selected Version behavior in every Layo
                     &.{ .file_header, .hunk_header, .line_pair, .hunk_header, .line_pair });
                 try expectVersionYank(&presentation, if (whole) "old one\ngap two\ngap three\nold four" else "old one\nold four");
 
-                try presentation.dispatch(.{ .action = .select_new_version });
+                try dispatchView(&presentation, .{ .action = .select_new_version });
                 try testing.expect(presentation.takeCommand() == null);
             }
-            try presentation.dispatch(.{ .action = .cycle_scope });
+            try dispatchView(&presentation, .{ .action = .cycle_scope });
         }
     }
 }
@@ -15320,9 +15501,9 @@ test "partial File Enrichment keeps usable content and only refresh replaces its
             .initial = .{ .key = key, .session = try testCrossSourceVersionSession(testing.allocator, local) },
         });
         defer presentation.deinit();
-        try presentation.dispatch(.{ .action = .select_old_version });
-        try presentation.dispatch(.{ .action = .cycle_scope });
-        try presentation.dispatch(.{ .action = .cycle_scope });
+        try dispatchView(&presentation, .{ .action = .select_old_version });
+        try dispatchView(&presentation, .{ .action = .cycle_scope });
+        try dispatchView(&presentation, .{ .action = .cycle_scope });
         try presentation.dispatch(.ensure_focused_enrichment);
         const enrichment = presentation.takeCommand().?.enrich_file;
         try completeCrossSourceVersionEnrichment(&presentation, enrichment, false);
@@ -15335,10 +15516,10 @@ test "partial File Enrichment keeps usable content and only refresh replaces its
         try presentation.dispatch(.ensure_focused_enrichment);
         try testing.expect(presentation.takeCommand() == null);
 
-        try presentation.dispatch(.{ .action = .select_new_version });
+        try dispatchView(&presentation, .{ .action = .select_new_version });
         try expectVersionLines(presentation.projection().review.?, &.{}, whole_new);
         try expectVersionYank(&presentation, "new one\ngap two\ngap three\nnew four");
-        try presentation.dispatch(.{ .action = .select_old_version });
+        try dispatchView(&presentation, .{ .action = .select_old_version });
         const before = presentation.projection().review.?;
         const before_navigation = before.navigation;
         const before_geometry = before.frame.geometry;
@@ -15386,10 +15567,10 @@ test "M20 hardening reports unavailable selected content from an opposite-versio
         },
     });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .action = .select_old_version });
-    try presentation.dispatch(.{ .action = .toggle_layout });
-    try presentation.dispatch(.{ .action = .cycle_scope });
-    try presentation.dispatch(.{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .select_old_version });
+    try dispatchView(&presentation, .{ .action = .toggle_layout });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
     try presentation.dispatch(.ensure_focused_enrichment);
     const enrichment = presentation.takeCommand().?.enrich_file;
     const responses = [_]bbr.http.Canned{
@@ -15433,7 +15614,7 @@ test "a new Presentation resets Selected Version to new" {
             .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
         });
         defer first.deinit();
-        try first.dispatch(.{ .action = .select_old_version });
+        try dispatchView(&first, .{ .action = .select_old_version });
         try testing.expectEqual(SelectedVersion.old, first.projection().review.?.selected_version);
     }
     var restarted = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -15455,9 +15636,9 @@ test "Selected Version defaults to new and survives preference and Session repla
     try testing.expectEqual(SelectedVersion.new, projected.selected_version);
     try testing.expectEqual(SelectedVersion.new, projected.frame.selected_version);
 
-    try presentation.dispatch(.{ .action = .select_old_version });
-    try presentation.dispatch(.{ .action = .toggle_layout });
-    try presentation.dispatch(.{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .select_old_version });
+    try dispatchView(&presentation, .{ .action = .toggle_layout });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const command = presentation.takeCommand().?.load_session;
     try presentation.dispatch(.{ .session_loaded = .{
@@ -15487,7 +15668,7 @@ test "selecting the current Selected Version is an exact no-op" {
     const target = before.review.?.frame.panes.sidebar_content;
     try presentation.dispatch(.{ .mouse = .{ .col = target.x, .row = target.y, .button = .left, .type = .press } });
 
-    try presentation.dispatch(.{ .action = .select_new_version });
+    try dispatchView(&presentation, .{ .action = .select_new_version });
 
     const after = presentation.projection();
     try testing.expect(std.meta.eql(before.revision, after.revision));
@@ -15510,7 +15691,7 @@ test "a Selected Version change publishes one Frame and then clears Count and Se
     try presentation.dispatch(.{ .push_count_digit = 7 });
     const before = presentation.projection();
 
-    try presentation.dispatch(.{ .action = .select_old_version });
+    try dispatchView(&presentation, .{ .action = .select_old_version });
 
     const after = presentation.projection();
     try testing.expectEqual(before.revision.frame + 1, after.revision.frame);
@@ -15544,7 +15725,7 @@ test "a failed Selected Version change preserves the complete published interact
     try presentation.dispatch(.{ .mouse = .{ .col = target.x, .row = target.y, .button = .left, .type = .press } });
 
     failing.fail_index = failing.alloc_index;
-    try presentation.dispatch(.{ .action = .select_old_version });
+    try dispatchView(&presentation, .{ .action = .select_old_version });
 
     const after = presentation.projection();
     try testing.expect(failing.has_induced_failure);
@@ -15583,8 +15764,8 @@ test "WholeFile Selected Version restoration chooses the next source Line" {
         .outcome = .{ .completed = result },
     } });
     try completeDisclosureBuild(&presentation);
-    try presentation.dispatch(.{ .action = .cycle_scope });
-    try presentation.dispatch(.{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
     while (true) {
         const frame = presentation.projection().review.?.frame;
         const visual = frame.visual_rows[frame.navigation.cursor];
@@ -15592,7 +15773,7 @@ test "WholeFile Selected Version restoration chooses the next source Line" {
         try presentation.dispatch(.{ .action = .down });
     }
 
-    try presentation.dispatch(.{ .action = .select_old_version });
+    try dispatchView(&presentation, .{ .action = .select_old_version });
 
     const restored = presentation.projection().review.?.frame;
     const visual = restored.visual_rows[restored.navigation.cursor];
@@ -15602,7 +15783,7 @@ test "WholeFile Selected Version restoration chooses the next source Line" {
     try presentation.dispatch(.{ .action = .down });
     const offset = presentation.projection().review.?.frame.visual_rows[presentation.projection().review.?.navigation.cursor].source_start;
     try testing.expect(offset > 0);
-    try presentation.dispatch(.{ .action = .select_new_version });
+    try dispatchView(&presentation, .{ .action = .select_new_version });
     const same = presentation.projection().review.?.frame;
     try testing.expectEqual(line, same.visual_rows[same.navigation.cursor].yank_candidates.new.?);
     try testing.expectEqual(offset, same.visual_rows[same.navigation.cursor].source_start);
@@ -15634,8 +15815,8 @@ test "WholeFile Selected Version restoration chooses a blob Line before the next
         .outcome = .{ .completed = result },
     } });
     try completeDisclosureBuild(&presentation);
-    try presentation.dispatch(.{ .action = .cycle_scope });
-    try presentation.dispatch(.{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
     while (true) {
         const frame = presentation.projection().review.?.frame;
         const visual = frame.visual_rows[frame.navigation.cursor];
@@ -15643,7 +15824,7 @@ test "WholeFile Selected Version restoration chooses a blob Line before the next
         try presentation.dispatch(.{ .action = .down });
     }
 
-    try presentation.dispatch(.{ .action = .select_old_version });
+    try dispatchView(&presentation, .{ .action = .select_old_version });
 
     const frame = presentation.projection().review.?.frame;
     try testing.expectEqualStrings("gap two", frame.visual_rows[frame.navigation.cursor].yank_candidates.old.?.text);
@@ -15660,10 +15841,10 @@ test "a focused loading WholeFile version change queues the existing File Enrich
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testVersionNavigationSession(testing.allocator) },
     });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .action = .cycle_scope });
-    try presentation.dispatch(.{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
 
-    try presentation.dispatch(.{ .action = .select_old_version });
+    try dispatchView(&presentation, .{ .action = .select_old_version });
 
     const frame = presentation.projection().review.?.frame;
     try testing.expectEqual(SelectedVersion.old, frame.selected_version);
@@ -15716,7 +15897,7 @@ test "SideBySide yank uses only the Selected Version column" {
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
     });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .action = .toggle_layout });
+    try dispatchView(&presentation, .{ .action = .toggle_layout });
     var source_row: ?usize = null;
     for (presentation.projection().review.?.frame.visual_rows, 0..) |row, index| if (row.yank_candidates.new != null) {
         source_row = index;
@@ -15730,7 +15911,7 @@ test "SideBySide yank uses only the Selected Version column" {
     try presentation.dispatch(.{ .clipboard_completed = .{ .command_id = command.copy_clipboard.command_id, .success = true } });
     try testing.expectEqual(ClipboardStatus.copied, presentation.projection().clipboard_status.?);
 
-    try presentation.dispatch(.{ .action = .select_old_version });
+    try dispatchView(&presentation, .{ .action = .select_old_version });
     source_row = null;
     for (presentation.projection().review.?.frame.visual_rows, 0..) |row, index| if (row.yank_candidates.old != null) {
         source_row = index;
@@ -15848,8 +16029,8 @@ test "yank reports unavailable Selected Version content" {
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testVersionNavigationSession(testing.allocator) },
     });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .action = .cycle_scope });
-    try presentation.dispatch(.{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
     try moveToRow(&presentation, 1);
     try presentation.dispatch(.{ .push_count_digit = 2 });
 
@@ -15885,8 +16066,8 @@ test "yank reports no candidate for empty Selected Version content" {
         .outcome = .{ .completed = result },
     } });
     try completeDisclosureBuild(&presentation);
-    try presentation.dispatch(.{ .action = .cycle_scope });
-    try presentation.dispatch(.{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
 
     try testing.expectEqual(YankRefusal.no_source, presentation.projection().action_availability.yank_refusal.?);
     try presentation.dispatch(.{ .action = .yank });
@@ -16132,7 +16313,7 @@ test "M21 kernel clearing a Query retries changed Frames and restores disclosure
     const job = presentation.takeCommand().?.build_buffer_disclosure;
     try testing.expectEqual(DisclosureBuild.Kind.clear_input, job.kind);
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
-    try presentation.dispatch(.{ .resize = .{ .cols = 90, .rows = 12 } });
+    try presentation.dispatch(.{ .resize = .{ .cols = presentation.geometry.cols, .rows = 12 } });
     job.build();
     try presentation.dispatch(.{ .buffer_disclosure_built = job });
     try testing.expect(presentation.published.?.buffer_search.input.?.pending);
@@ -16218,15 +16399,12 @@ test "M21 hidden Buffer Search drops old Query generations and retries changed F
     try presentation.dispatch(.{ .resize = .{ .cols = 90, .rows = 12 } });
     changed.build();
     try presentation.dispatch(.{ .buffer_disclosure_built = changed });
-    try testing.expect(presentation.projection().buffer_search.?.pending);
-    scan = presentation.takeCommand().?;
-    try testing.expect(scan == .scan_buffer_search);
-    try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search) });
-    scan.deinit();
-    const current = presentation.takeCommand().?.build_buffer_disclosure;
-    current.build();
-    try presentation.dispatch(.{ .buffer_disclosure_built = current });
+    // The disclosure owns the lane. The queued width build retries its Frame.
     try testing.expect(!presentation.projection().buffer_search.?.pending);
+    try completeDisclosureBuild(&presentation);
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(!presentation.projection().buffer_search.?.pending);
+    try testing.expectEqual(@as(u16, 90), presentation.projection().review.?.frame.geometry.cols);
     try testing.expect(presentation.projection().review.?.buffer.rows.len > initial);
 }
 
@@ -16542,10 +16720,10 @@ test "Session disclosures toggle independently persist through rebuilds and rese
     try moveToRow(&presentation, fold_row);
     try presentation.dispatch(.{ .action = .toggle_disclosure });
     try completeDisclosureBuild(&presentation);
-    try presentation.dispatch(.{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
     try testing.expect(findDisclosureRow(presentation.projection().review.?.buffer.rows, fold_key.?) == null);
-    try presentation.dispatch(.{ .action = .cycle_scope });
-    try presentation.dispatch(.{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
     const folds_restored = presentation.projection().review.?;
     try testing.expect(folds_restored.buffer.rows[findDisclosureRow(folds_restored.buffer.rows, fold_key.?).?].disclosure.expanded);
 
@@ -16557,9 +16735,9 @@ test "Session disclosures toggle independently persist through rebuilds and rese
     try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
 
     // Width and isolation rebuild the Frame but preserve both explicit choices.
-    try presentation.dispatch(.{ .resize = .{ .cols = 72, .rows = 8 } });
+    try dispatchView(&presentation, .{ .resize = .{ .cols = 72, .rows = 8 } });
     try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
-    try presentation.dispatch(.{ .action = .isolate });
+    try dispatchView(&presentation, .{ .action = .isolate });
     try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
 
     // Selecting disclosed content and then collapsing its semantic owner drops
@@ -16812,22 +16990,23 @@ test "failed SideBySide Scope transaction preserves Frame preferences and Naviga
         .viewport_rows = 2,
     });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .action = .toggle_layout });
+    try dispatchView(&presentation, .{ .action = .toggle_layout });
     try presentation.dispatch(.{ .action = .down });
     const before = presentation.projection().review.?;
 
-    failing.fail_index = failing.alloc_index;
     try presentation.dispatch(.{ .action = .cycle_scope });
+    const failed = presentation.takeCommand().?.build_buffer_disclosure;
+    failed.failed = true;
+    try presentation.dispatch(.{ .buffer_disclosure_built = failed });
 
     const after = presentation.projection();
-    try testing.expect(failing.has_induced_failure);
     try testing.expectEqual(before.buffer.rows.ptr, after.review.?.buffer.rows.ptr);
     try testing.expectEqual(before.frame.visual_rows.ptr, after.review.?.frame.visual_rows.ptr);
     try testing.expectEqual(before.frame.visual_rows_revision, after.review.?.frame.visual_rows_revision);
     try testing.expectEqual(before.buffer.layout, after.review.?.buffer.layout);
     try testing.expect(std.meta.eql(before.preferences, after.review.?.preferences));
     try testing.expect(std.meta.eql(before.navigation, after.review.?.navigation));
-    try testing.expectEqual(ActionError.out_of_memory, after.action_error.?);
+    try testing.expectEqual(ActionError.buffer_build_failed, after.action_error.?);
 }
 
 test "preferences survive replacement while file isolation resets" {
@@ -16842,9 +17021,9 @@ test "preferences survive replacement while file isolation resets" {
     });
     defer presentation.deinit();
 
-    try presentation.dispatch(.{ .action = .toggle_layout });
-    try presentation.dispatch(.{ .action = .cycle_scope });
-    try presentation.dispatch(.{ .action = .isolate });
+    try dispatchView(&presentation, .{ .action = .toggle_layout });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .isolate });
     const isolated = presentation.projection().review.?;
     try testing.expectEqual(@as(?usize, 0), isolated.isolated_file);
     try testing.expectEqual(Layout.side_by_side, isolated.preferences.layout);
@@ -17025,7 +17204,8 @@ test "M21 kernel Draft save retries stale Frames without reserving another TempI
         try presentation.dispatch(.{ .action = .review_comment });
         try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("new Draft") } });
         try presentation.dispatch(.{ .composer = .save });
-        const job = presentation.takeCommand().?.build_buffer_disclosure;
+        // A view worker must finish before the issued Draft worker can retry.
+        const job = presentation.commands.orderedRemove(0).build_buffer_disclosure;
         const reserved = job.new_draft.?.local_id;
         switch (change) {
             .width => try presentation.dispatch(.{ .resize = .{ .cols = 72, .rows = 30 } }),
@@ -17033,6 +17213,9 @@ test "M21 kernel Draft save retries stale Frames without reserving another TempI
             .inputs => presentation.published.?.setDraftState(1, .submitting),
             .sidebar => presentation.published.?.tree.cursor = 1,
         }
+        if (change == .width) try completeDisclosureBuild(&presentation);
+        try presentation.commands.append(testing.allocator, .{ .build_buffer_disclosure = job });
+        _ = presentation.takeCommand().?;
         const before = presentation.projection().review.?.frame;
         job.build();
         try testing.expect(!job.failed);
@@ -17277,13 +17460,16 @@ test "M21 kernel Draft mutations retry changed Frame Query and input snapshots" 
         var presentation = try testDraftMutationPresentation(testing.allocator, store.store(), key, mutation);
         defer presentation.deinit();
         try startTestDraftMutation(&presentation, mutation);
-        const job = presentation.takeCommand().?.build_buffer_disclosure;
+        const job = presentation.commands.orderedRemove(0).build_buffer_disclosure;
         switch (change) {
             .width => try presentation.dispatch(.{ .resize = .{ .cols = 72, .rows = 60 } }),
             .height => try presentation.dispatch(.{ .resize = .{ .cols = 100, .rows = 70 } }),
             .inputs => presentation.published.?.setDraftState(4, .submitting),
             .query => presentation.published.?.search_generation += 1,
         }
+        if (change == .width) try completeDisclosureBuild(&presentation);
+        try presentation.commands.append(testing.allocator, .{ .build_buffer_disclosure = job });
+        _ = presentation.takeCommand().?;
         const before = presentation.projection().review.?.frame;
         const request = job.mutation_id;
         job.build();
@@ -19688,7 +19874,7 @@ test "non-navigation Action keeps a pending successor prefetch" {
     const second = presentation.takeCommand().?.enrich_file;
 
     try presentation.dispatch(.{ .action = .clear_selection });
-    try presentation.dispatch(.{ .action = .select_new_version });
+    try dispatchView(&presentation, .{ .action = .select_new_version });
     try completeTestEnrichment(&presentation, second);
     try testing.expect(presentation.takeCommand().?.enrich_file.speculative);
 }
@@ -20188,8 +20374,8 @@ test "matching File Enrichment is admitted and reprojects whole-file Buffer" {
         .viewport_rows = 8,
     });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .action = .cycle_scope });
-    try presentation.dispatch(.{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
     const before_rows = presentation.projection().review.?.buffer.rows.len;
     try presentation.dispatch(.ensure_focused_enrichment);
     const command = presentation.takeCommand().?.enrich_file;
@@ -20298,8 +20484,8 @@ test "failed staged File Enrichment preserves the Frame and pending content" {
         .viewport_rows = 8,
     });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .action = .cycle_scope });
-    try presentation.dispatch(.{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
     try presentation.dispatch(.ensure_focused_enrichment);
     const command = presentation.takeCommand().?.enrich_file;
     const before = presentation.projection().review.?;
@@ -20344,7 +20530,7 @@ test "File Enrichment launch failure restores retryable pending state" {
         .viewport_rows = 8,
     });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .action = .select_old_version });
+    try dispatchView(&presentation, .{ .action = .select_old_version });
     try presentation.dispatch(.ensure_focused_enrichment);
     const first = presentation.takeCommand().?.enrich_file;
     const before = presentation.projection().review.?;
@@ -20391,7 +20577,7 @@ test "duplicate File Enrichment completion cannot drain a newer WorkId" {
     try presentation.dispatch(.{ .file_enrichment_completed = first_failure });
     try presentation.dispatch(.ensure_focused_enrichment);
     const retry = presentation.takeCommand().?.enrich_file;
-    try presentation.dispatch(.{ .action = .select_old_version });
+    try dispatchView(&presentation, .{ .action = .select_old_version });
     const before_duplicate = presentation.projection().review.?;
     const before_navigation = before_duplicate.navigation;
     const before_geometry = before_duplicate.frame.geometry;
@@ -22009,7 +22195,7 @@ test "Selected Version title targets dispatch Actions but source clicks do not c
     var frame = presentation.projection().review.?.frame;
     const old = frame.version_title_targets.old.?;
     try presentation.dispatch(.{ .mouse = .{ .col = old.x, .row = old.y, .button = .left, .type = .press } });
-    try presentation.dispatch(.{ .mouse = .{ .col = old.x, .row = old.y, .button = .left, .type = .release } });
+    try dispatchView(&presentation, .{ .mouse = .{ .col = old.x, .row = old.y, .button = .left, .type = .release } });
     try testing.expectEqual(SelectedVersion.old, presentation.projection().review.?.selected_version);
 
     frame = presentation.projection().review.?.frame;

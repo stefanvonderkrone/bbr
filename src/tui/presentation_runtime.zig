@@ -367,6 +367,67 @@ test "closed terminal sink releases a staged Buffer Frame and its Session" {
     try testing.expect(capture.input == null);
 }
 
+test "M21 kernel view Frame launch failure and closed sink preserve the complete Frame" {
+    for ([_]enum { layout, scope, resolved, version, isolate, movement, width }{ .layout, .scope, .resolved, .version, .isolate, .movement, .width }) |change| for ([_]bool{ false, true }) |closed| {
+        const session = try @import("session.zig").create(testing.allocator);
+        session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Local" };
+        session.source = .{ .local = .{ .common_dir = "." } };
+        const a = session.arena.allocator();
+        session.diff = try bbr.diff.parse(a, "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/b.zig b/b.zig\n--- a/b.zig\n+++ b/b.zig\n@@ -1 +1 @@\n-old\n+new\n");
+        session.threads = try bbr.review.buildThreads(a, &.{.{ .id = 1, .author = "Reviewer", .body = "resolved", .resolved = true, .anchor = .{ .path = "a.zig", .to = 1 } }});
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try presentation.OwnedReviewIdentity.initLocal(1, "main", "feature"), .session = session },
+            .geometry = .{ .cols = 100, .rows = 12 },
+        });
+        defer state.deinit();
+        if (change == .movement) {
+            try state.dispatch(.{ .action = .isolate });
+            const initial = state.takeCommand().?.build_buffer_disclosure;
+            initial.build();
+            try state.dispatch(.{ .buffer_disclosure_built = initial });
+        } else if (change == .resolved) {
+            const initial = state.projection().review.?;
+            for (initial.frame.visual_rows, 0..) |visual, index| if (initial.buffer.rows[visual.buffer_index] == .disclosure) {
+                for (0..index) |_| try state.dispatch(.{ .action = .down });
+                break;
+            };
+        }
+        const before = state.projection().review.?;
+        const references = session.references.load(.acquire);
+        switch (change) {
+            .layout => try state.dispatch(.{ .action = .toggle_layout }),
+            .scope => try state.dispatch(.{ .action = .cycle_scope }),
+            .resolved => try state.dispatch(.{ .action = .toggle_disclosure }),
+            .version => try state.dispatch(.{ .action = .select_old_version }),
+            .isolate => try state.dispatch(.{ .action = .isolate }),
+            .movement => try state.dispatch(.{ .action = .next_file }),
+            .width => try state.dispatch(.{ .resize = .{ .cols = 72, .rows = 12 } }),
+        }
+        var command = state.takeCommand().?;
+        var capture: CapturingSink = .{ .reject = closed };
+        if (closed) {
+            command.build_buffer_disclosure.build();
+            try testing.expect(!command.build_buffer_disclosure.failed);
+            deliver(capture.sink(), .{ .buffer_disclosure_built = command.build_buffer_disclosure });
+            try testing.expect(capture.input == null);
+            try testing.expectEqual(references, session.references.load(.acquire));
+        } else {
+            var executor: ScriptedExecutor = .{};
+            try executor.executor().execute(capture.sink(), &command);
+            try state.dispatch(capture.input.?);
+            capture.input = null;
+            try testing.expectEqual(presentation.ActionError.buffer_build_failed, state.projection().action_error.?);
+        }
+        const after = state.projection().review.?;
+        try testing.expectEqual(before.frame.visual_rows.ptr, after.frame.visual_rows.ptr);
+        try testing.expectEqual(before.preferences, after.preferences);
+        try testing.expectEqual(before.frame.geometry, after.frame.geometry);
+        try testing.expectEqual(before.isolated_file, after.isolated_file);
+    };
+}
+
 test "M21 kernel Draft Frame launch failure and closed sink keep the Draft unsaved" {
     for ([_]bool{ false, true }) |closed| {
         const session = try @import("session.zig").create(testing.allocator);

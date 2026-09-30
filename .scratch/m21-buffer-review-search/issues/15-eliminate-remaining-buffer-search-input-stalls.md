@@ -24,7 +24,7 @@ The original checklist is complete, but the following input-latency work remains
 - [x] Bound worker handoff cost. `DisclosureBuild.create` retains cached inputs and disclosure keys. The worker copies private File Enrichment tables and applies bounded disclosure changes. Handoff does not copy the complete PendingReview, ScopeProjection, Directory state, or File lease table.
 - [x] Stage new Draft Buffer builds on a worker. TempId reservation precedes the worker build. Persistence succeeds before PendingReview, ScopeProjection, Composer closure, and the complete Frame publish together.
 - [x] Stage Draft mutation Buffer builds on a worker. Cover body edits, re-anchor, Draft subtree deletion, and unresolved-outcome repair. Preserve persistence and Frame rollback.
-- [ ] Stage the remaining view-change Buffer builds. Cover Layout, Scope, resolved visibility, Selected Version, File isolation, isolated File movement, and width changes. Sessions with at most 4,096 Candidates still use synchronous builds. `stageLargeBuffer` also disables worker staging while Buffer Search input is open, so width changes can rebuild large Buffers synchronously.
+- [x] Stage the remaining view-change Buffer builds. Layout, Scope, Selected Version, File isolation, isolated File movement, and width changes use workers for every Session size. Resolved visibility keeps its worker disclosure path. Width changes also use workers while Buffer Search input is open.
 - [ ] Remove Sidebar-triggered full Buffer rebuilds. Cover Directory expansion, Directory collapse, and active-File reveal. `revealActiveFile` currently rebuilds even when it removes no collapsed Directories. Update the File Tree without rebuilding unchanged DiffPane content, or stage the complete Frame when content must change.
 - [ ] Stage Review Search destination Buffer builds. Cover source occurrences, ReviewBody occurrences, and the second build that reveals a hidden Fold. `openReviewSearchOccurrence` still builds on the terminal thread, including after File Enrichment publication.
 - [ ] Stage disclosure restoration when Buffer Search starts after Review Search. `openBufferSearch` still calls `prepareBuffer` when Review Search owns temporary disclosures.
@@ -282,3 +282,47 @@ The mutation Actions no longer build a Buffer on the terminal thread. Dispatch s
 Tests cover delayed persistence and publication for all four mutations, repeated input, stale Frame and Query retries, and accepted and open Buffer Search. They also cover queued and issued cancellation, Composer body changes, changed DraftState, refresh, Review switching, and shutdown. Worker allocation-failure tests cover all four candidate graphs and replacement input snapshots. Admission allocation-failure tests cover changed bodies and AnchorSnapshots. Write-failure tests preserve the graph, Frame, and interaction before a successful retry. Runtime tests cover launch failure and a closed completion sink for every mutation. Existing tests retain Reply parentage, Suggestion fencing, LocalReview AnchorSnapshots, deletion navigation, monotonic TempIds, and persistence restoration.
 
 `zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 897 tests. The ticket remains `ready-for-agent`. The next remaining item is view-change Buffer staging.
+
+## View-change Frame staging
+
+Layout, Scope, Selected Version, File isolation, isolated File movement, and width changes now use workers for every Session size. The implementation removes `stageLargeBuffer` and its 4,096-Candidate threshold. Resolved Thread visibility keeps the existing worker disclosure path. Height-only changes still reuse the Buffer and visual rows when no view build is pending.
+
+View requests use a separate generation from Buffer Search Queries. A Query edit no longer drops a queued width build. The newest queued view request keeps the requested preferences, File isolation, geometry, and navigation policy. A stale completion cannot replace that request. Admission retries changed Query input, accepted search, File Tree state, input snapshots, or visual rows against the current Session.
+
+The view worker rebuilds the search corpus and both accepted and input Batches. It also projects their ranges and navigation rows. Presentation publishes those results with the Buffer, File Tree, preferences, isolation, and geometry. Width admission restores the saved Buffer Search navigation before it releases the earlier worker Frame. Escape therefore restores the origin in the current geometry. Enter still waits for the newest pending Query. Isolation exit retains the requested File header across queued movement and resize requests.
+
+The benchmark now measures width dispatch during pending Buffer Search input. It measures worker construction and admission separately. The synchronous control calls `prepareBuffer` for the same geometry and Query without publication. Both paths check the visual-row, Search Occurrence, and projected-range counts. Each fixture contains 16 Files and no Drafts or ReviewCards. Each run uses nine ReleaseFast samples, without concurrent build or test work. Width samples alternate between 80 and 100 terminal columns with 30 rows. Values are nanoseconds.
+
+### Small Session
+
+`zig build bench-buffer-search -- 32` uses 1,024 changed Lines and 16,232 Diff bytes. This fixture has fewer than 4,096 Candidates.
+
+| Stage | Median ns | p95 ns |
+| --- | ---: | ---: |
+| Layout dispatch | 4,666 | 25,167 |
+| Layout worker build | 5,738,708 | 6,286,541 |
+| Layout admission | 49,083 | 72,542 |
+| Width dispatch during pending input | 3,167 | 3,875 |
+| Width worker build | 6,294,750 | 7,964,042 |
+| Width admission | 82,167 | 94,541 |
+| Synchronous width Buffer control | 22,144,084 | 23,651,417 |
+
+### Larger Session
+
+`zig build bench-buffer-search -- 256` uses 8,192 changed Lines and 128,776 Diff bytes.
+
+| Stage | Median ns | p95 ns |
+| --- | ---: | ---: |
+| Layout dispatch | 23,875 | 28,792 |
+| Layout worker build | 40,919,125 | 59,882,334 |
+| Layout admission | 239,583 | 325,000 |
+| Width dispatch during pending input | 3,375 | 4,166 |
+| Width worker build | 51,569,000 | 69,165,875 |
+| Width admission | 336,583 | 441,750 |
+| Synchronous width Buffer control | 188,997,583 | 233,112,959 |
+
+These measurements cover view dispatch and width publication. Admission still restores navigation and releases the earlier Frame on the terminal thread. The later admission-latency work remains open.
+
+Tests cover delayed publication and failed builds for each view change. They also cover queued request composition, reversed Selected Version requests, isolated File focus, isolation exit, and stale completions. Small and large Sessions exercise resize during rapid Query edits and Enter. Repeated width builds preserve Escape navigation across worker Frames. Worker allocation-failure tests include view builds. Runtime tests cover launch failure and a closed completion sink. Session tests cover refresh, Review switching, shutdown, and navigation retries.
+
+`zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 904 tests. The ticket remains `ready-for-agent`. The next remaining item is Sidebar-triggered Buffer rebuilding.
