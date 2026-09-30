@@ -174,18 +174,7 @@ const ScriptedExecutor = struct {
                 value.destroy();
                 break :blk .{ .external_edit_completed = completed };
             },
-            .scan_buffer_search => |*value| blk: {
-                const completed: presentation.BufferSearchScanned = .{
-                    .allocator = std.heap.page_allocator,
-                    .command_id = value.command_id,
-                    .request_id = value.request_id,
-                    .session_epoch = value.session_epoch,
-                    .mode = value.mode,
-                    .outcome = .failed,
-                };
-                value.deinit();
-                break :blk .{ .buffer_search_scanned = completed };
-            },
+            .scan_buffer_search => |*value| .{ .buffer_search_scanned = value.launchFailed() },
             .build_buffer_disclosure => |value| blk: {
                 value.failed = true;
                 break :blk .{ .buffer_disclosure_built = value };
@@ -314,6 +303,65 @@ fn scriptedBufferSearch(command_id: presentation.CommandId) !presentation.ScanBu
         .corpus = corpus,
         .query = try search.Query.init(std.heap.page_allocator, "query"),
     };
+}
+
+test "Buffer Search launch failure keeps correlation and releases its command" {
+    for ([_]search.Mode{ .literal, .fuzzy }) |mode| {
+        var command = try scriptedBufferSearch(41);
+        command.mode = mode;
+        command.corpus.references.store(2, .release);
+        const corpus = command.corpus;
+        defer {
+            corpus.arena.deinit();
+            std.heap.page_allocator.destroy(corpus);
+        }
+        var completed = command.launchFailed();
+        defer completed.deinit();
+        try testing.expectEqual(@as(presentation.CommandId, 41), completed.command_id);
+        try testing.expectEqual(@as(u64, 1), completed.request_id);
+        try testing.expectEqual(@as(presentation.SessionEpoch, 7), completed.session_epoch);
+        try testing.expectEqual(mode, completed.mode);
+        try testing.expect(completed.outcome == .failed);
+        try testing.expectEqual(@as(usize, 1), corpus.references.load(.acquire));
+    }
+}
+
+test "closed terminal sink releases a Buffer Search Batch" {
+    var command = try scriptedBufferSearch(41);
+    defer command.deinit();
+    command.corpus.candidates = &.{.{
+        .text = "query",
+        .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 0 } },
+        .session_epoch = 7,
+    }};
+    var capture: CapturingSink = .{ .reject = true };
+    const completed = presentation.executeBufferSearchScan(testing.allocator, &command);
+    try testing.expect(completed.outcome == .scanned);
+    try testing.expectEqual(@as(usize, 1), completed.outcome.scanned.occurrences.len);
+    deliver(capture.sink(), .{ .buffer_search_scanned = completed });
+    try testing.expect(capture.input == null);
+}
+
+test "closed terminal sink releases a staged Buffer Frame and its Session" {
+    const session = try @import("session.zig").create(testing.allocator);
+    const job = try std.heap.page_allocator.create(presentation.DisclosureBuild);
+    job.* = .{
+        .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        .session = session,
+        .preferences = .{},
+        .geometry = .{ .cols = 80, .rows = 12 },
+        .isolated_file = null,
+        .cell_metrics = .bytes,
+        .collapsed_rows = 2,
+        .epoch = 7,
+        .request_id = 1,
+        .frame_revision = 1,
+        .active = null,
+        .failed = true,
+    };
+    var capture: CapturingSink = .{ .reject = true };
+    deliver(capture.sink(), .{ .buffer_disclosure_built = job });
+    try testing.expect(capture.input == null);
 }
 
 test "scripted terminal adapter drains every command family through the production sink" {

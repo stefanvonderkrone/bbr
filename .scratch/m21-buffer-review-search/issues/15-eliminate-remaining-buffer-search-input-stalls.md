@@ -12,10 +12,29 @@
 - [x] Corpus construction is cached, incrementally maintained, or performed as correlated worker work so opening `/` does not stall the terminal loop.
 - [x] Presentation allows at most one Buffer Search scan to consume worker capacity at a time and retains only the newest queued Query generation.
 - [x] Completion admission avoids an unbounded full-Batch clone on the terminal thread. Expensive disclosure and range projection work is staged without publishing a partial Frame.
-- [ ] Command id, Session Epoch, and Query generation reject stale work. Cancellation, refresh, Review switching, shutdown, launch failure, and allocation failure release every Query, corpus reference, Batch, and staged projection.
+- [x] Command id, Session Epoch, and Query generation reject stale work. Cancellation, refresh, Review switching, shutdown, launch failure, and allocation failure release every Query, corpus reference, Batch, and staged projection.
 - [x] `Enter` while work is pending accepts only the newest completed generation. `Esc`, `n`, `N`, Count, active-occurrence retention, hidden-match reveal, and status reset keep their existing behavior.
 - [x] Presentation and runtime tests cover rapid edits before and after worker launch, stale completion ordering, cancellation, failure, and Session replacement.
 - [x] The benchmark demonstrates materially lower p95 input latency on the large fixture, and `zig build test --summary all` passes.
+
+## Remaining work
+
+The original checklist is complete, but the following input-latency work remains. This list reflects the current code, not superseded progress notes.
+
+- [ ] Bound worker handoff cost. `DisclosureBuild.create` still copies every Draft body, AnchorSnapshot, ScopeProjection entry, and per-File enrichment table. It also acquires every File lease and copies disclosure and Directory state on the terminal thread.
+- [ ] Stage new Draft Buffer builds on a worker. Keep TempId reservation, persistence, PendingReview, ScopeProjection, Composer closure, and Frame publication consistent. `Published.saveDraft` still calls `prepareBuffer` before persistence.
+- [ ] Stage Draft mutation Buffer builds on a worker. Cover body edits, re-anchor, Draft subtree deletion, and unresolved-outcome repair. Preserve persistence and Frame rollback. The current paths include `editDraftBody`, `reanchorDraft`, `deleteDraftSubtree`, and `resolveUnknownAsUnpublished`.
+- [ ] Stage the remaining view-change Buffer builds. Cover Layout, Scope, resolved visibility, Selected Version, File isolation, isolated File movement, and width changes. Sessions with at most 4,096 Candidates still use synchronous builds. `stageLargeBuffer` also disables worker staging while Buffer Search input is open, so width changes can rebuild large Buffers synchronously.
+- [ ] Remove Sidebar-triggered full Buffer rebuilds. Cover Directory expansion, Directory collapse, and active-File reveal. `revealActiveFile` currently rebuilds even when it removes no collapsed Directories. Update the File Tree without rebuilding unchanged DiffPane content, or stage the complete Frame when content must change.
+- [ ] Stage Review Search destination Buffer builds. Cover source occurrences, ReviewBody occurrences, and the second build that reveals a hidden Fold. `openReviewSearchOccurrence` still builds on the terminal thread, including after File Enrichment publication.
+- [ ] Stage disclosure restoration when Buffer Search starts after Review Search. `openBufferSearch` still calls `prepareBuffer` when Review Search owns temporary disclosures.
+- [ ] Stage File Enrichment cache-focus and lease-release Frame changes. Completion Frames already use workers, but `focusEnrichment`, `finishSearchLease`, and `releaseReviewSearchHolds` can rebuild synchronously after eviction. Keep cache changes and Frame publication atomic.
+- [ ] Index hidden Search Occurrence navigation and disclosure lookup. `searchOccurrenceNavigationRow`, `requiredSearchDisclosure`, and their helpers still walk visual rows, Buffer rows, Hunks, Threads, or Draft chains. Cover hidden `n`, `N`, Count, Query clearing, and the scan-to-disclosure handoff.
+- [ ] Bound active-occurrence retention and origin selection during completion admission. `retainedEditedSearchIndex` and `firstSearchOccurrenceAtOrAfter` still walk complete Batches on the terminal thread. `searchFromInactiveRow` also walks Batches when traversal starts without an active occurrence.
+- [ ] Bound navigation restoration during worker Frame admission. `frame.restoreNavigation` still searches complete visual-row arrays for the cursor and Selection. Version restoration and File-header navigation also need checks on large Frames.
+- [ ] Measure initial Session publication separately. `Published.create` still builds the initial Buffer, visual rows, File Tree, source-coordinate projection, and search corpus on the terminal thread. Move this work into Candidate Session preparation if the measurement shows an input stall.
+- [ ] Remove reachable synchronous search rebuild fallbacks after the paths above use workers. `prepareBufferForFile` still builds the corpus, scans accepted and input Queries, and projects complete Batches. Keep synchronous benchmark controls distinct from production dispatch. Add transition and failure tests for each newly staged path.
+- [ ] Extend the latency benchmark and record final evidence. Cover many Draft bodies, many ReviewCards, nested Directories, cache eviction, hidden occurrence traversal, and resize during pending input. Measure worker handoff and navigation restoration separately. Record fixture sizes, median latency, and p95 latency. Run `zig build test --summary all` after the implementation changes, then update this checklist and the ticket status.
 
 ## Progress
 
@@ -139,3 +158,15 @@ File Enrichment needs a staged cache update until a worker completes the new Fra
 File Enrichment results now stay private while a disclosure worker builds the Buffer, File Tree, search corpus, and projected ranges. The worker previews the result and cache evictions against a copy of the cache state. Presentation checks the Session Epoch, Frame revision, Query generation, and cache revision before it admits the result and publishes the complete Frame. A second completion can wait in its own worker build. If the first admission changes the cache, Presentation rebuilds the second Frame against the new state. Failed builds release their results and leave the published Frame and cache content unchanged.
 
 Review Search source opening still rebuilds its destination Buffer after File Enrichment publication. Draft saves, smaller-Session view changes, and other general Buffer rebuilds still run on the terminal thread. `zig build test --summary all` passed with 867 tests.
+
+## Buffer Search work ownership
+
+Presentation now checks the completion family before it removes an issued command id. An unrelated completion cannot release the Buffer Search worker lane. Session replacement releases queued scans and disclosure builds, including staged File Enrichment Frames. Issued workers retain their inputs until completion, then Presentation rejects their old Session Epoch.
+
+Query edits and disclosure transitions preserve staged File Enrichment for the current Session. Failed Query clears and Escape restoration keep the earlier queued work. A failed Query edit does not advance the Query generation. Failed Query-clear admission releases the worker Frame and clears the pending flag. A retry preserves the disclosure-restoration flags.
+
+The terminal adapter and runtime tests use the same scan-launch failure path. That path releases the worker Query, corpus reference, and source-coordinate projection while it preserves the completion correlation and scan mode.
+
+Tests cover wrong-family and unknown command ids, refresh, Review switching, shutdown, closed completion sinks, Query-clear failures, and File Enrichment during Query edits. Allocation-failure tests check every scan-arena and range-projection allocation. `zig build`, formatting checks, and `zig build test --summary all` passed. The full suite contains 877 tests.
+
+This completes the lifecycle bullet. Draft saves, smaller-Session view changes, and some general Buffer builds remain synchronous. The ticket remains open for those input stalls.

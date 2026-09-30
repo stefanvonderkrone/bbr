@@ -1104,17 +1104,7 @@ fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *p
             edit.destroy();
             break :blk .{ .external_edit_completed = completed };
         },
-        .scan_buffer_search => |*scan| blk: {
-            const completed: presentation.BufferSearchScanned = .{
-                .allocator = std.heap.page_allocator,
-                .command_id = scan.command_id,
-                .request_id = scan.request_id,
-                .session_epoch = scan.session_epoch,
-                .outcome = .failed,
-            };
-            scan.deinit();
-            break :blk .{ .buffer_search_scanned = completed };
-        },
+        .scan_buffer_search => |*scan| .{ .buffer_search_scanned = scan.launchFailed() },
         .build_buffer_disclosure => |job| blk: {
             job.failed = true;
             break :blk .{ .buffer_disclosure_built = job };
