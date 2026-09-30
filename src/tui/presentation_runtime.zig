@@ -428,6 +428,56 @@ test "M21 kernel view Frame launch failure and closed sink preserve the complete
     };
 }
 
+test "M21 authored destination launch failure and closed sink preserve the Overlay and Frame" {
+    for ([_]bool{ false, true }) |closed| {
+        const session = try @import("session.zig").create(testing.allocator);
+        session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Local" };
+        session.source = .{ .local = .{ .common_dir = "." } };
+        const a = session.arena.allocator();
+        session.diff = try bbr.diff.parse(a, "");
+        session.threads = try bbr.review.buildThreads(a, &.{.{ .id = 1, .author = "Reviewer", .body = "needle" }});
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try presentation.OwnedReviewIdentity.initLocal(1, "main", "feature"), .session = session },
+        });
+        defer state.deinit();
+        try state.dispatch(.{ .action = .open_review_search });
+        try state.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+        var scan = state.takeCommand().?;
+        defer scan.deinit();
+        try state.dispatch(.{ .buffer_search_scanned = presentation.executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search) });
+        const before = state.projection().review.?.frame;
+        const references = session.references.load(.acquire);
+        try state.dispatch(.{ .action = .open_search_occurrence });
+        var command = state.takeCommand().?;
+        var capture: CapturingSink = .{ .reject = closed };
+        if (closed) {
+            command.build_buffer_disclosure.build();
+            try testing.expect(!command.build_buffer_disclosure.failed);
+            deliver(capture.sink(), .{ .buffer_disclosure_built = command.build_buffer_disclosure });
+            try testing.expect(capture.input == null);
+            try testing.expectEqual(references, session.references.load(.acquire));
+        } else {
+            var executor: ScriptedExecutor = .{};
+            try executor.executor().execute(capture.sink(), &command);
+            try state.dispatch(capture.input.?);
+            capture.input = null;
+            try testing.expectEqual(presentation.ActionError.buffer_build_failed, state.projection().action_error.?);
+            try testing.expectEqual(before.visual_rows.ptr, state.projection().review.?.frame.visual_rows.ptr);
+            try testing.expectEqualStrings("needle", state.projection().review_search.?.query);
+            try state.dispatch(.{ .action = .open_search_occurrence });
+            const retry = state.takeCommand().?.build_buffer_disclosure;
+            retry.build();
+            try state.dispatch(.{ .buffer_disclosure_built = retry });
+            try testing.expect(state.projection().review_search == null);
+            continue;
+        }
+        try testing.expectEqual(before.visual_rows.ptr, state.projection().review.?.frame.visual_rows.ptr);
+        try testing.expectEqualStrings("needle", state.projection().review_search.?.query);
+    }
+}
+
 test "M21 kernel Draft Frame launch failure and closed sink keep the Draft unsaved" {
     for ([_]bool{ false, true }) |closed| {
         const session = try @import("session.zig").create(testing.allocator);

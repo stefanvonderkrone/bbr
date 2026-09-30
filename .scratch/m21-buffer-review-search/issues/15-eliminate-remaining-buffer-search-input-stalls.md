@@ -26,7 +26,7 @@ The original checklist is complete, but the following input-latency work remains
 - [x] Stage Draft mutation Buffer builds on a worker. Cover body edits, re-anchor, Draft subtree deletion, and unresolved-outcome repair. Preserve persistence and Frame rollback.
 - [x] Stage the remaining view-change Buffer builds. Layout, Scope, Selected Version, File isolation, isolated File movement, and width changes use workers for every Session size. Resolved visibility keeps its worker disclosure path. Width changes also use workers while Buffer Search input is open.
 - [x] Remove Sidebar-triggered full Buffer rebuilds. Directory expansion, Directory collapse, and active-File reveal update the File Tree without rebuilding unchanged DiffPane content. An unchanged reveal updates active flags and Sidebar scroll without an allocation.
-- [ ] Stage Review Search destination Buffer builds. Cover source occurrences, ReviewBody occurrences, and the second build that reveals a hidden Fold. `openReviewSearchOccurrence` still builds on the terminal thread, including after File Enrichment publication.
+- [x] Stage Review Search destination Buffer builds. Cover source occurrences, ReviewBody occurrences, and the second build that reveals a hidden Fold. `openReviewSearchOccurrence` queues a worker, including after File Enrichment publication.
 - [ ] Stage disclosure restoration when Buffer Search starts after Review Search. `openBufferSearch` still calls `prepareBuffer` when Review Search owns temporary disclosures.
 - [ ] Stage File Enrichment cache-focus and lease-release Frame changes. Completion Frames already use workers, but `focusEnrichment`, `finishSearchLease`, and `releaseReviewSearchHolds` can rebuild synchronously after eviction. Keep cache changes and Frame publication atomic.
 - [ ] Index hidden Search Occurrence navigation and disclosure lookup. `searchOccurrenceNavigationRow`, `requiredSearchDisclosure`, and their helpers still walk visual rows, Buffer rows, Hunks, Threads, or Draft chains. Cover hidden `n`, `N`, Count, Query clearing, and the scan-to-disclosure handoff.
@@ -348,3 +348,36 @@ File Tree construction still depends on the File and Directory counts. The Sideb
 Tests cover unchanged DiffPane navigation and accepted search ranges during Directory changes. They also cover allocation-free visible reveal, nested Directory reveal, stale worker retries, retained Draft content, and allocation failures. The existing mouse tests cover the same Sidebar Actions.
 
 `zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 909 tests. The ticket remains `ready-for-agent`. The next remaining item is Review Search destination Buffer staging.
+
+## Review Search destination Frame staging
+
+Review Search now queues the existing Frame worker for source and ReviewBody destinations on every Session size. The worker builds the Buffer, visual rows, File Tree, search corpus, and search ranges. The worker also finds the exact destination row. If a Fold hides the source occurrence, the worker adds its disclosure key. The worker then builds the revealed Buffer.
+
+Presentation keeps the previous Frame, preferences, isolation, navigation, and Overlay while the worker runs. Repeated Enter input keeps one destination request. Admission checks the command id, Session Epoch, Review Search Query generation, and destination generation. Admission also checks the selected occurrence, Buffer Search generation, retained Batches, and input snapshot. Admission checks the cache revision, geometry, and File Tree state. A changed Frame retries the same selected occurrence against the current inputs. Query edits, selection changes, Escape, Session replacement, and shutdown reject the earlier destination.
+
+Presentation completes disclosure allocations before publication. A failed worker or admission preserves the previous Frame and Overlay for another Enter. A successful admission publishes the complete destination Frame and preferences together. Presentation then moves the cursor and closes the Overlay. Source destinations retain the original disclosure baseline for restoration when Buffer Search starts. File Enrichment publication queues the same destination worker when an occurrence waits for content.
+
+`zig build bench-buffer-search -- 256` measured nine ReleaseFast samples without concurrent build or test work. The source fixture has one File, 8,194 Diff Lines, and 162,814 Diff bytes. Both complete File versions are available before the measurements. The source occurrence starts inside a Fold. Each ReviewBody fixture contains 1,024 Drafts and 4,194,304 body bytes. The many-input fixture also has 1,024 enriched Files and 4,194,304 AnchorSnapshot bytes. The many-input fixture has 1,024 collapsed Directories and 1,024 expanded ReviewCards.
+
+The benchmark measures destination dispatch, worker construction, and admission separately. The synchronous control calls `prepareBuffer` after admission with the same destination preferences and disclosures. The control checks the visual-row and projected-range counts. Fixture preparation, Query scanning, and source disclosure restoration occur before the timed stages. Values are nanoseconds.
+
+| Stage | Median ns | p95 ns |
+| --- | ---: | ---: |
+| Source destination dispatch | 10,500 | 12,041 |
+| Source destination worker | 2,463,792 | 2,658,459 |
+| Source destination admission | 40,083 | 57,917 |
+| Source synchronous Buffer control | 49,089,084 | 52,243,000 |
+| One-File ReviewBody destination dispatch | 26,625 | 97,167 |
+| One-File ReviewBody destination worker | 135,032,875 | 138,491,416 |
+| One-File ReviewBody destination admission | 9,318,084 | 10,319,166 |
+| One-File synchronous Buffer control | 112,262,417 | 129,078,125 |
+| Many-input ReviewBody destination dispatch | 117,375 | 196,750 |
+| Many-input ReviewBody destination worker | 889,107,292 | 934,340,166 |
+| Many-input ReviewBody destination admission | 13,114,041 | 15,291,417 |
+| Many-input synchronous Buffer control | 868,403,875 | 910,313,208 |
+
+Destination dispatch no longer constructs a Buffer. Admission still restores navigation and releases the previous Frame on the terminal thread. `releaseReviewSearchHolds` and queued source-lease release can still rebuild after cache eviction. Those paths remain in the cache-focus and lease-release item. The many-input destination measures 15.29 ms p95 admission. The later admission-latency work remains open.
+
+Tests cover delayed publication, repeated Enter, changed geometry, changed File Tree state, Query edits, selection changes, and Escape. Tests also cover refresh, Review switching, shutdown, and destination opening after File Enrichment publication. Worker allocation-failure tests cover ReviewBody construction and both source Buffer builds. Admission allocation-failure tests preserve disclosures, isolation, cache focus, and the Overlay before a successful retry. Runtime tests cover launch failure and a closed completion sink. Existing tests retain exact wrapped ranges, Selected Version, Scope, isolation, outdated content, and temporary source Fold restoration.
+
+`zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 915 tests. The Standards and Spec review found no remaining findings for this item. The ticket remains `ready-for-agent`. The next remaining item is disclosure restoration when Buffer Search starts after Review Search.
