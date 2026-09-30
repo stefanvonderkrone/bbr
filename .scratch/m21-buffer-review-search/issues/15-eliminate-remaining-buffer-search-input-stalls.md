@@ -133,3 +133,9 @@ Nine samples of `zig build bench-buffer-search -- 4096` measured 0.004 ms p95 fo
 The ticket remains open. Layout, Scope, Selected Version, and File isolation on smaller Sessions still use synchronous builds. File Enrichment, Draft mutations, and some Sidebar actions still rebuild Buffers on the terminal thread. Worker handoff still copies all Draft bodies on the terminal thread. Hidden-occurrence navigation can still scan visual rows for a disclosure marker.
 
 File Enrichment needs a staged cache update until a worker completes the new Frame. `Storage.stageAdmission` allows only one pending cache update, so a second completion cannot replace the first without a new handoff rule. Draft saves must also keep persistence and Frame publication atomic. Both paths need that ownership work before their Buffer builds can move to workers.
+
+## File Enrichment Frame staging
+
+File Enrichment results now stay private while a disclosure worker builds the Buffer, File Tree, search corpus, and projected ranges. The worker previews the result and cache evictions against a copy of the cache state. Presentation checks the Session Epoch, Frame revision, Query generation, and cache revision before it admits the result and publishes the complete Frame. A second completion can wait in its own worker build. If the first admission changes the cache, Presentation rebuilds the second Frame against the new state. Failed builds release their results and leave the published Frame and cache content unchanged.
+
+Review Search source opening still rebuilds its destination Buffer after File Enrichment publication. Draft saves, smaller-Session view changes, and other general Buffer rebuilds still run on the terminal thread. `zig build test --summary all` passed with 867 tests.
