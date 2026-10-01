@@ -226,12 +226,13 @@ M21 verification: PR #4 merged. `zig build test --summary all` passed 829/829 te
 implementation. Native macOS and Linux CI passed on `x86_64` and `aarch64` for the merged PR.
 
 _Follow-up:_ [Buffer Search input stalls](.scratch/m21-buffer-review-search/issues/15-eliminate-remaining-buffer-search-input-stalls.md)
-remains open. The corpus cache, single active scan, Batch transfer, and indexed range projection
-lowered p95 open `/` to 67 µs and completion admission to 1.53 ms on 4,096 changed Lines.
-Reusing completed Batches during disclosure changes cut disclosure p95 from 10.12 ms to 5.00 ms
-on the same fixture. Buffer rebuilding still runs on the terminal thread. Stage that work without
-publishing a partial Presentation Frame, measure a larger Session, and cover cancellation, failure,
-and Session replacement before closing the ticket.
+is resolved. Workers now construct complete Presentation Frames before publication.
+The [final latency evidence](.scratch/m21-buffer-review-search/final-latency-evidence.md)
+records p95 opening `/` at 40.7 µs and completion admission at 12.2 µs on 4,096 changed Lines.
+On 131,072 changed Lines, Query edits measure 28.0 µs p95 and resize dispatch measures 5.1 µs p95.
+Complete admission still releases earlier allocations on the terminal thread.
+The 1,024-File, 1,024-Draft fixture measures complete resize admission at 13.26 ms p95.
+These measurements cover stage costs, not end-to-end input latency.
 
 ## M22 — Durable File read state  ·  M  ·  needs M15/M17
 Make review progress visible in the File Tree and preserve it locally without allowing a changed
