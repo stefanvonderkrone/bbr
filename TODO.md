@@ -221,12 +221,14 @@ first, then search complete changed Files and authored bodies across the current
 - [x] Selecting an occurrence closes the Overlay, focuses its File and selected side, switches to WholeFile scope when the line is outside a visible hunk, and positions the cursor on the exact occurrence. Returning to the Overlay preserves the query and selection while the Session remains current.
 - [x] Support remote PullRequests and LocalReviews through their existing File Enrichment seams. Search both old and new File versions; when a version is absent, binary, invalid UTF-8, or unavailable, show that explicitly without discarding usable results.
 - [x] Add pure matcher/ranker tests plus Presentation integration coverage for incremental input, match highlighting, `n`/`N`, streamed result ordering, preview selection, navigation into out-of-hunk content, partial failures, and stale-Epoch rejection.
+- [x] Resolve [Buffer Search input stalls](.scratch/m21-buffer-review-search/issues/15-eliminate-remaining-buffer-search-input-stalls.md). Move Buffer construction and search projection to workers. Use indexed lookup for occurrence selection and navigation restoration. Record final latency evidence.
 
 M21 verification: PR #4 merged. `zig build test --summary all` passed 829/829 tests during
 implementation. Native macOS and Linux CI passed on `x86_64` and `aarch64` for the merged PR.
 
-_Follow-up:_ [Buffer Search input stalls](.scratch/m21-buffer-review-search/issues/15-eliminate-remaining-buffer-search-input-stalls.md)
-is resolved. Workers now construct complete Presentation Frames before publication.
+M21 input-latency verification: ticket 15 is resolved with every checklist item complete.
+`zig build test --summary all` passed 949/949 tests after the implementation changes.
+Workers now construct complete Presentation Frames before publication.
 The [final latency evidence](.scratch/m21-buffer-review-search/final-latency-evidence.md)
 records p95 opening `/` at 40.7 µs and completion admission at 12.2 µs on 4,096 changed Lines.
 On 131,072 changed Lines, Query edits measure 28.0 µs p95 and resize dispatch measures 5.1 µs p95.
