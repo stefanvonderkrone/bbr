@@ -28,7 +28,7 @@ The original checklist is complete, but the following input-latency work remains
 - [x] Remove Sidebar-triggered full Buffer rebuilds. Directory expansion, Directory collapse, and active-File reveal update the File Tree without rebuilding unchanged DiffPane content. An unchanged reveal updates active flags and Sidebar scroll without an allocation.
 - [x] Stage Review Search destination Buffer builds. Cover source occurrences, ReviewBody occurrences, and the second build that reveals a hidden Fold. `openReviewSearchOccurrence` queues a worker, including after File Enrichment publication.
 - [x] Stage disclosure restoration when Buffer Search starts after Review Search. `openBufferSearch` retains the disclosure baseline and queues a worker. Query input stays open while restoration runs.
-- [ ] Stage File Enrichment cache-focus and lease-release Frame changes. Completion Frames already use workers, but `focusEnrichment`, `finishSearchLease`, and `releaseReviewSearchHolds` can rebuild synchronously after eviction. Keep cache changes and Frame publication atomic.
+- [x] Stage File Enrichment cache-focus and lease-release Frame changes. Completion Frames already use workers, but `focusEnrichment`, `finishSearchLease`, and `releaseReviewSearchHolds` can rebuild synchronously after eviction. Keep cache changes and Frame publication atomic.
 - [ ] Index hidden Search Occurrence navigation and disclosure lookup. `searchOccurrenceNavigationRow`, `requiredSearchDisclosure`, and their helpers still walk visual rows, Buffer rows, Hunks, Threads, or Draft chains. Cover hidden `n`, `N`, Count, Query clearing, and the scan-to-disclosure handoff.
 - [ ] Bound active-occurrence retention and origin selection during completion admission. `retainedEditedSearchIndex` and `firstSearchOccurrenceAtOrAfter` still walk complete Batches on the terminal thread. `searchFromInactiveRow` also walks Batches when traversal starts without an active occurrence.
 - [ ] Bound navigation restoration during worker Frame admission. `frame.restoreNavigation` still searches complete visual-row arrays for the cursor and Selection. Version restoration and File-header navigation also need checks on large Frames.
@@ -407,3 +407,36 @@ Opening no longer constructs a Buffer on the terminal thread. Admission still re
 Tests cover queued and issued restoration, rapid edits, Query clearing, Enter, Count, and accepted search. They also cover Escape, immediate reopening, changed geometry, changed File Tree state, and width publication before restoration. Allocation failures preserve the Frame, baseline, Query, and generation. Worker allocation-failure tests include restoration. Runtime tests cover launch failure and a closed completion sink. Session tests cover refresh, Review switching, and shutdown.
 
 `zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 922 tests. The Standards and Spec review found no remaining findings for this item. The ticket remains `ready-for-agent`. The next remaining item is File Enrichment cache-focus and lease-release Frame staging.
+
+## File Enrichment cache-focus and lease-release Frame staging
+
+File focus changes that need eviction now queue the existing Frame worker. Source-scan lease release also queues that worker. Review Search closure, Query clearing, and destination admission release their holds before they queue one cache Frame. Lease bookkeeping ends immediately, but cache content stays available until the complete Frame can publish. Focus changes without eviction keep their direct metadata update.
+
+The worker copies the private File Enrichment tables and reads the atomic cache records. It chooses the eviction victims and builds the Buffer, visual rows, File Tree, search corpus, and search ranges. It also prepares the replacement input snapshot. Admission checks the command id, Session Epoch, cache request id, cache revision, and Query generation. It also checks the retained Batches, input snapshot, visual-row revision, geometry, active File, and File Tree state. A changed input causes a retry. A newer focus request replaces the queued request and rejects an earlier issued completion.
+
+Admission applies the worker's victim list without another LRU search. It publishes cache content, cache focus, and the complete Frame together. The cache Frame borrows the replacement input snapshot. Admission releases its earlier snapshot so the published worker Frame does not retain evicted File content. Failure preserves the previous Frame and cache content. Buffer Search input keeps its Query, projected ranges, saved navigation, and origin across publication.
+
+`zig build bench-buffer-search -- 32` measured nine ReleaseFast samples without concurrent build or test work. The cache fixture has 1,024 Files and 2,048 changed Lines. Each sample starts with all 1,024 Files enriched. The fixture has 1,033 Drafts and 4,194,385 body bytes. It also has 4,194,304 AnchorSnapshot bytes, 1,023 collapsed Directories, and 1,024 expanded ReviewCards. Cache policy disables inactive caching. The focus case evicts the previous focused File. The source-lease case evicts one inactive File. The hold-release case evicts 1,023 inactive Files.
+
+Fixture restoration, File Enrichment, hold acquisition, and navigation setup occur before timing. The synchronous control calls `prepareBuffer` after admission with the same cache projection. Both paths check the Buffer and visual-row counts. Values are nanoseconds.
+
+| Stage | Median ns | p95 ns |
+| --- | ---: | ---: |
+| Cache focus dispatch | 12,958 | 18,958 |
+| Cache focus worker | 768,893,667 | 919,698,333 |
+| Cache focus admission | 1,175,875 | 2,001,291 |
+| Cache focus synchronous Buffer control | 727,298,417 | 789,723,375 |
+| Source lease release dispatch | 12,959 | 42,292 |
+| Source lease release worker | 788,290,959 | 814,584,250 |
+| Source lease release admission | 1,313,750 | 1,892,375 |
+| Source lease release synchronous Buffer control | 753,277,958 | 779,614,875 |
+| Review Search hold release dispatch | 56,583 | 1,168,917 |
+| Review Search hold release worker | 762,549,459 | 821,989,125 |
+| Review Search hold release admission | 9,102,666 | 11,134,417 |
+| Review Search hold release synchronous Buffer control | 732,209,208 | 778,710,542 |
+
+These paths no longer construct a Buffer on the terminal thread. Hold release still visits the held-File table. Admission still restores navigation and releases the earlier Frame there. The later admission-latency and benchmark items remain open.
+
+Tests cover delayed cache and Frame publication, repeated focus input, queued and issued focus replacement, and retry after failure. Tests also cover changed Query input, geometry, File Tree state, and lease protection. Source lease release, Review Search closure, and Query clearing preserve accepted Buffer Search. A retained read lease verifies that the published cache Frame releases the evicted content. Worker allocation-failure tests include cache Frames. Runtime tests cover launch failure and a closed completion sink. Session tests cover refresh, Review switching, and shutdown. The source-opening test waits for staged eviction before it checks refetch behavior.
+
+`zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 929 tests. The Standards and Spec review found no remaining findings for this item. The ticket remains `ready-for-agent`. The next remaining item is hidden Search Occurrence navigation and disclosure lookup indexing.

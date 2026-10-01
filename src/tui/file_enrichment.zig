@@ -419,6 +419,10 @@ pub fn previewAdmission(file_idx: usize, result: *const Result, policy: CachePol
     entries[file_idx].retained_bytes = result.retainedBytes();
     entries[file_idx].failed_old = result.old == .fetch_failed;
     entries[file_idx].failed_new = result.new == .fetch_failed;
+    previewCacheEnforcement(policy, focused, entries, projection);
+}
+
+pub fn previewCacheEnforcement(policy: CachePolicy, focused: ?usize, entries: []CacheEntry, projection: Projection) void {
     const budget = if (!policy.enabled) 0 else if (policy.max_retained_bytes == 0) std.math.maxInt(usize) else policy.max_retained_bytes;
     while (true) {
         var total: usize = 0;
@@ -670,11 +674,27 @@ pub const Storage = struct {
 
     /// Call on the Presentation thread before releasing the final borrowed content.
     pub fn finishLease(self: *Storage, file_idx: usize) bool {
+        self.finishLeaseDeferred(file_idx);
+        return self.stageCacheEnforcement();
+    }
+
+    /// Release cache protection without changing content borrowed by the Frame.
+    /// Presentation stages enforcement on its Frame worker before eviction.
+    pub fn finishLeaseDeferred(self: *Storage, file_idx: usize) void {
         std.debug.assert(self.files[file_idx].leases > 0);
         self.files[file_idx].leases -= 1;
         self.cache_entries[file_idx].store(self.files[file_idx]);
         self.revision +%= 1;
-        return self.stageCacheEnforcement();
+    }
+
+    pub fn requiresCacheEnforcement(self: *const Storage, focused: ?usize) bool {
+        const budget = if (!self.cache.enabled) 0 else if (self.cache.max_retained_bytes == 0) std.math.maxInt(usize) else self.cache.max_retained_bytes;
+        var total: usize = 0;
+        for (self.files, 0..) |*stored, index| {
+            if (focused == index or stored.leases > 0) continue;
+            total +|= stored.retainedBytes();
+        }
+        return total > budget;
     }
 
     pub fn len(self: *const Storage) usize {
@@ -786,6 +806,16 @@ pub const Storage = struct {
         var changed = false;
         while (self.inactiveRetainedBytes() > budget) {
             const victim = self.leastRecentlyUsedInactive() orelse break;
+            self.stageCacheVictims(&.{victim});
+            changed = true;
+        }
+        return changed;
+    }
+
+    /// The worker chose these victims against the checked cache revision.
+    pub fn stageCacheVictims(self: *Storage, victims: []const usize) void {
+        for (victims) |victim| {
+            std.debug.assert(self.files[victim].leases == 0 and self.focused_file != victim);
             self.retired.appendAssumeCapacity(.{ .index = victim, .file = self.files[victim] });
             self.files[victim] = .{
                 .old = retainedTerminalSide(self.files[victim].old),
@@ -795,9 +825,8 @@ pub const Storage = struct {
             };
             self.projectSide(victim, .old);
             self.projectSide(victim, .new);
-            changed = true;
+            self.revision +%= 1;
         }
-        return changed;
     }
 
     fn inactiveRetainedBytes(self: *const Storage) usize {

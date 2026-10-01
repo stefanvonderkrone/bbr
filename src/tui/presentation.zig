@@ -1152,7 +1152,7 @@ const DraftMutation = struct {
 const DraftMutationError = error{ OutOfMemory, DraftLocked, DraftEditConflict, DraftNotAnchorable, InvalidAnchor, PersistenceFailed };
 
 pub const DisclosureBuild = struct {
-    const Kind = enum { input, accepted, restore, general, clear_input, open_input, view, enrichment, draft_save, draft_mutation, review_destination };
+    const Kind = enum { input, accepted, restore, general, clear_input, open_input, view, enrichment, cache_update, draft_save, draft_mutation, review_destination };
     const NavigationPolicy = enum { restore, reset, file_header, center, version };
     arena: std.heap.ArenaAllocator,
     session: *Session,
@@ -1181,8 +1181,10 @@ pub const DisclosureBuild = struct {
     enrichment_speculative: bool = false,
     cache_revision: u64 = 0,
     cache_entries: []file_enrichment.CacheEntry = &.{},
+    cache_victims: []const usize = &.{},
     cache_policy: file_enrichment.CachePolicy = .{},
     cache_focused: ?usize = null,
+    cache_request_id: u64 = 0,
     hold_enrichment: bool = false,
     tree: file_tree.Projection = .{},
     preferences: Preferences,
@@ -1364,19 +1366,33 @@ pub const DisclosureBuild = struct {
                 self.scopes = scopes;
             }
         }
-        if (self.kind == .enrichment) {
+        if (self.kind == .enrichment or self.kind == .cache_update) {
             self.blobs = try a.dupe(bbr.diff.FileBlob, self.inputs.blobs);
             self.highlights = try a.dupe(bbr.highlight.FileHighlights, self.inputs.highlights);
             self.content_statuses = try a.dupe(bbr.diff.FileContent, self.inputs.content_statuses);
             self.cache_entries = try self.session.enrichment.cacheEntries(a);
-            if (self.hold_enrichment) self.cache_entries[self.enrichment_file.?].leases += 1;
-            file_enrichment.previewAdmission(self.enrichment_file.?, &self.enrichment_result.?, self.cache_policy, self.cache_focused, self.cache_entries, .{
+            const projection: file_enrichment.Projection = .{
                 .blobs = self.blobs,
                 .highlights = self.highlights,
                 .content_statuses = self.content_statuses,
-            });
+            };
+            if (self.kind == .enrichment) {
+                if (self.hold_enrichment) self.cache_entries[self.enrichment_file.?].leases += 1;
+                file_enrichment.previewAdmission(self.enrichment_file.?, &self.enrichment_result.?, self.cache_policy, self.cache_focused, self.cache_entries, projection);
+            } else {
+                file_enrichment.previewCacheEnforcement(self.cache_policy, self.cache_focused, self.cache_entries, projection);
+                const victims = try a.alloc(usize, self.cache_entries.len);
+                var count: usize = 0;
+                for (self.inputs.blobs, self.blobs, 0..) |before, after, index| {
+                    if ((before.old != null or before.new != null) and after.old == null and after.new == null) {
+                        victims[count] = index;
+                        count += 1;
+                    }
+                }
+                self.cache_victims = victims[0..count];
+            }
         }
-        if (self.kind == .enrichment or self.kind == .draft_save or self.kind == .draft_mutation) {
+        if (self.kind == .enrichment or self.kind == .cache_update or self.kind == .draft_save or self.kind == .draft_mutation) {
             const inputs = try DisclosureInputs.clone(self.arena.child_allocator, self.drafts, self.scopes, self.collapsed_directories, .{
                 .blobs = self.blobs,
                 .highlights = self.highlights,
@@ -1391,6 +1407,16 @@ pub const DisclosureBuild = struct {
                     result_lease.release();
                 } else lease.* = source.retainProjected(inputs.blobs[index]);
                 inputs.leased += 1;
+            }
+            if (self.kind == .cache_update) {
+                // The completed Frame must not borrow the input snapshot that
+                // still pins cache victims. Admission releases that snapshot.
+                self.drafts = inputs.drafts;
+                self.scopes = inputs.scopes;
+                self.collapsed_directories = inputs.collapsed_directories;
+                self.blobs = inputs.blobs;
+                self.highlights = inputs.highlights;
+                self.content_statuses = inputs.content_statuses;
             }
         }
         self.buffer = try self.buildBuffer();
@@ -1408,7 +1434,7 @@ pub const DisclosureBuild = struct {
                 }
             }
         }
-        if (self.kind == .view or self.kind == .enrichment or self.kind == .draft_save or self.kind == .draft_mutation or self.kind == .review_destination) {
+        if (self.kind == .view or self.kind == .enrichment or self.kind == .cache_update or self.kind == .draft_save or self.kind == .draft_mutation or self.kind == .review_destination) {
             const candidates = try buffer_mod.buildSearchCandidates(a, self.session.diff, self.preferences.layout, self.session.threads, .{
                 .fold_context = self.preferences.scope == .changes,
                 .whole_file = self.preferences.scope == .whole,
@@ -2553,6 +2579,9 @@ const Published = struct {
     search_generation: u64 = 0,
     view_generation: u64 = 0,
     pending_view: ?struct { request_id: u64, preferences: Preferences, isolated_file: ?usize, geometry: frame_mod.Geometry, navigation_policy: DisclosureBuild.NavigationPolicy, navigation_file: ?usize } = null,
+    cache_update_generation: u64 = 0,
+    pending_cache_update: ?u64 = null,
+    pending_cache_focus: ?usize = null,
     search_corpus: ?*BufferSearchCorpus = null,
     review_search: ReviewSearchState,
     active_search: enum { none, buffer, review } = .none,
@@ -2635,6 +2664,9 @@ const Published = struct {
         published.buffer_search = .{};
         published.search_generation = 0;
         published.pending_view = null;
+        published.cache_update_generation = 0;
+        published.pending_cache_update = null;
+        published.pending_cache_focus = null;
         published.review_search = .{};
         published.active_search = .none;
         published.geometry = geometry;
@@ -2704,7 +2736,7 @@ const Published = struct {
 
     fn destroy(self: *Published) void {
         const allocator = self.allocator;
-        self.releaseReviewSearchHolds(null);
+        self.releaseReviewSearchHolds();
         self.buffer_search.deinit(allocator);
         if (self.search_corpus) |corpus| corpus.release();
         self.review_search.deinit(allocator);
@@ -2724,17 +2756,9 @@ const Published = struct {
         allocator.destroy(self);
     }
 
-    fn releaseReviewSearchHolds(self: *Published, preferences: ?Preferences) void {
+    fn releaseReviewSearchHolds(self: *Published) void {
         if (self.review_search.held) |held| for (held, 0..) |*holding, index| if (holding.*) {
-            const changed = self.session.enrichment.finishLease(index);
-            if (changed and preferences != null) {
-                self.rebuild(preferences.?, self.expanded_disclosures.items, self.isolated_file) catch {
-                    self.session.enrichment.rollbackCacheUpdate();
-                    holding.* = false;
-                    continue;
-                };
-            }
-            self.session.enrichment.commitCacheUpdate();
+            self.session.enrichment.finishLeaseDeferred(index);
             holding.* = false;
         };
     }
@@ -2812,15 +2836,6 @@ const Published = struct {
         self.disclosure_inputs.release();
         self.disclosure_inputs = inputs;
         self.disclosure_inputs_current = true;
-    }
-
-    fn focusEnrichment(self: *Published, preferences: Preferences, file_index: usize) BufferTransactionError!void {
-        if (!self.session.enrichment.stageFocus(file_index)) return;
-        self.rebuild(preferences, self.expanded_disclosures.items, self.isolated_file) catch |err| {
-            self.session.enrichment.rollbackCacheUpdate();
-            return err;
-        };
-        self.session.enrichment.commitCacheUpdate();
     }
 
     fn prepareDraft(
@@ -6134,7 +6149,7 @@ pub const Presentation = struct {
         self.discardQueuedReviewSearchScans();
         self.discardQueuedReviewSourceScans();
         self.discardQueuedSearchEnrichments(published);
-        published.releaseReviewSearchHolds(self.preferences);
+        self.releaseReviewSearchHolds(published);
         published.frame_revision += 1;
     }
 
@@ -6192,7 +6207,7 @@ pub const Presentation = struct {
             state.previous_selection = null;
             state.pending = false;
             state.clearSource(self.allocator);
-            published.releaseReviewSearchHolds(self.preferences);
+            self.releaseReviewSearchHolds(published);
             state.request_id +%= 1;
             self.discardQueuedReviewSearchScans();
             self.discardQueuedReviewSourceScans();
@@ -6359,14 +6374,22 @@ pub const Presentation = struct {
     }
 
     fn finishSearchLease(self: *Presentation, published: *Published, file_index: usize) void {
-        if (published.session.enrichment.finishLease(file_index)) {
-            published.rebuild(self.preferences, published.expanded_disclosures.items, published.isolated_file) catch {
-                published.session.enrichment.rollbackCacheUpdate();
-                self.action_error = .buffer_build_failed;
-                return;
-            };
-        }
-        published.session.enrichment.commitCacheUpdate();
+        published.session.enrichment.finishLeaseDeferred(file_index);
+        self.stageReleasedSearchLeases(published);
+    }
+
+    fn releaseReviewSearchHolds(self: *Presentation, published: *Published) void {
+        published.releaseReviewSearchHolds();
+        self.stageReleasedSearchLeases(published);
+    }
+
+    fn stageReleasedSearchLeases(self: *Presentation, published: *Published) void {
+        if (self.shutdown_requested) return;
+        const focused = if (published.pending_cache_update != null) published.pending_cache_focus else published.session.enrichment.focused_file;
+        if (published.pending_cache_update == null and !published.session.enrichment.requiresCacheEnforcement(focused)) return;
+        self.queueCacheBuild(published, focused) catch {
+            self.action_error = .out_of_memory;
+        };
     }
 
     fn acceptReviewSourceScanned(self: *Presentation, completed_value: ReviewSourceScanned) void {
@@ -6376,9 +6399,7 @@ pub const Presentation = struct {
         const published = self.published orelse return;
         if (published.epoch != completed.session_epoch or completed.file_index >= published.session.enrichment.len()) return;
         if (self.shutdown_requested) {
-            if (published.session.enrichment.finishLease(completed.file_index))
-                published.session.enrichment.rollbackCacheUpdate();
-            published.session.enrichment.commitCacheUpdate();
+            published.session.enrichment.finishLeaseDeferred(completed.file_index);
             published.review_search.source_scan_active = false;
             return;
         }
@@ -7099,7 +7120,7 @@ pub const Presentation = struct {
             const discard = switch (command) {
                 .scan_buffer_search => true,
                 .build_buffer_disclosure => |job| job != keep and
-                    ((job.kind != .view and job.kind != .enrichment and job.kind != .draft_save and job.kind != .draft_mutation) or self.published == null or job.epoch != self.published.?.epoch),
+                    ((job.kind != .view and job.kind != .enrichment and job.kind != .cache_update and job.kind != .draft_save and job.kind != .draft_mutation) or self.published == null or job.epoch != self.published.?.epoch),
                 else => false,
             };
             if (!discard) {
@@ -7242,7 +7263,7 @@ pub const Presentation = struct {
         if (!self.consumeCommand(job.command_id, .build_buffer_disclosure)) return;
         const published = self.published orelse return;
         if (self.shutdown_requested or published.epoch != job.epoch) return;
-        if (job.kind == .view or job.kind == .enrichment or job.kind == .draft_save or job.kind == .draft_mutation or job.kind == .review_destination) {
+        if (job.kind == .view or job.kind == .enrichment or job.kind == .cache_update or job.kind == .draft_save or job.kind == .draft_mutation or job.kind == .review_destination) {
             self.acceptViewBuild(published, job, &owned);
             return;
         }
@@ -7353,6 +7374,7 @@ pub const Presentation = struct {
     }
 
     fn acceptViewBuild(self: *Presentation, published: *Published, job: *DisclosureBuild, owned: *bool) void {
+        if (job.kind == .cache_update and published.pending_cache_update != job.cache_request_id) return;
         if (job.kind == .review_destination) {
             const state = &published.review_search;
             if (!state.open or !state.destination_pending or state.pending or state.request_id != job.review_request_id or state.destination_generation != job.review_destination_id) return;
@@ -7379,8 +7401,10 @@ pub const Presentation = struct {
             self.retryContentBuild(published, job);
             return;
         }
-        if (job.kind == .enrichment and job.cache_revision != published.session.enrichment.revision) {
-            self.retryEnrichmentBuild(published, job);
+        if ((job.kind == .enrichment or job.kind == .cache_update) and
+            (job.cache_revision != published.session.enrichment.revision or !std.meta.eql(job.geometry, published.geometry)))
+        {
+            self.retryContentBuild(published, job);
             return;
         }
         if (job.kind == .view) {
@@ -7428,6 +7452,7 @@ pub const Presentation = struct {
             return;
         }
         if (job.failed) {
+            if (job.kind == .cache_update) published.pending_cache_update = null;
             if (job.kind == .review_destination) published.review_search.destination_pending = false;
             if (job.kind == .view) published.pending_view = null;
             if (job.kind == .draft_save) published.pending_draft_save = null;
@@ -7493,11 +7518,20 @@ pub const Presentation = struct {
                 return;
             };
         }
+        if (job.kind == .cache_update) {
+            if (job.cache_focused) |index| published.session.enrichment.focusAdmitted(index);
+            published.session.enrichment.stageCacheVictims(job.cache_victims);
+        }
         if (job.completed_inputs) |inputs| {
             inputs.retain();
             published.disclosure_inputs.release();
             published.disclosure_inputs = inputs;
             published.disclosure_inputs_current = true;
+            if (job.kind == .cache_update) {
+                inputs.retain();
+                job.inputs.release();
+                job.inputs = inputs;
+            }
         }
         const version_changed = published.selected_version != job.preferences.selected_version;
         const previous = published.frameProjection();
@@ -7514,7 +7548,7 @@ pub const Presentation = struct {
         published.geometry = job.geometry;
         published.selected_version = job.preferences.selected_version;
         published.isolated_file = job.isolated_file;
-        if (job.kind == .view) if (published.buffer_search.input) |*input| {
+        if (job.kind == .view or job.kind == .cache_update) if (published.buffer_search.input) |*input| {
             var saved = previous;
             saved.navigation = input.saved_navigation;
             input.saved_navigation = frame_mod.restoreNavigation(saved, job.visual_rows, job.geometry);
@@ -7559,6 +7593,10 @@ pub const Presentation = struct {
         self.preferences = job.preferences;
         self.geometry = job.geometry;
         if (job.kind == .view) published.pending_view = null;
+        if (job.kind == .cache_update) {
+            published.pending_cache_update = null;
+            published.session.enrichment.commitCacheUpdate();
+        }
         if (job.navigation_policy == .file_header) {
             if (job.navigation_file) |file_index| if (fileHeaderRow(published.buffer, file_index)) |row| if (published.visualIndexForBufferIndex(row)) |visual_index| published.navigation.jumpTo(visual_index);
         } else if (job.navigation_policy == .center) published.centerActiveFile();
@@ -7585,7 +7623,10 @@ pub const Presentation = struct {
                 review_saved = null;
             }
             const occurrence = job.review_snapshot.?.occurrences[job.review_selected.?];
-            if (occurrence.location == .source) published.session.enrichment.focusAdmitted(occurrence.location.source.file_index);
+            if (occurrence.location == .source) {
+                published.session.enrichment.focusAdmitted(occurrence.location.source.file_index);
+                published.pending_cache_focus = occurrence.location.source.file_index;
+            }
             published.navigation.jumpTo(job.destination_row.?);
             published.focus = .diff;
             published.cursorToActiveFile();
@@ -7594,7 +7635,7 @@ pub const Presentation = struct {
             self.discardQueuedReviewSearchScans();
             self.discardQueuedReviewSourceScans();
             self.discardQueuedSearchEnrichments(published);
-            published.releaseReviewSearchHolds(self.preferences);
+            self.releaseReviewSearchHolds(published);
             self.action_error = null;
             return;
         }
@@ -7663,6 +7704,10 @@ pub const Presentation = struct {
                 self.openReviewSearchOccurrence();
             },
             .enrichment => self.retryEnrichmentBuild(published, job),
+            .cache_update => self.queueCacheBuild(published, published.pending_cache_focus) catch {
+                published.pending_cache_update = null;
+                self.action_error = .out_of_memory;
+            },
             .draft_save => {
                 self.queueDraftBuild(published, job.new_draft.?) catch {
                     published.pending_draft_save = null;
@@ -7683,6 +7728,26 @@ pub const Presentation = struct {
         errdefer job.destroy();
         job.kind = .draft_save;
         job.new_draft = try cloneDisclosureDraft(job.arena.allocator(), draft);
+        self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
+    }
+
+    fn queueCacheBuild(self: *Presentation, published: *Published, focused: ?usize) !void {
+        try self.commands.ensureUnusedCapacity(self.allocator, 1);
+        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation, published.buffer_search.active);
+        job.kind = .cache_update;
+        job.cache_focused = focused;
+        job.cache_request_id = published.cache_update_generation +% 1;
+        var index: usize = 0;
+        while (index < self.commands.items.len) {
+            const command = self.commands.items[index];
+            if (command == .build_buffer_disclosure and command.build_buffer_disclosure.kind == .cache_update) {
+                var discarded = self.commands.orderedRemove(index);
+                discarded.deinit();
+            } else index += 1;
+        }
+        published.cache_update_generation = job.cache_request_id;
+        published.pending_cache_update = job.cache_request_id;
+        published.pending_cache_focus = focused;
         self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
     }
 
@@ -9473,10 +9538,15 @@ pub const Presentation = struct {
         const published = self.published orelse return;
         const file_index = published.isolated_file orelse published.buffer.fileIndexForRow(published.cursorBufferIndex()) orelse return;
         if (file_index >= published.session.diff.files.len or file_index >= published.session.enrichment.len()) return;
-        published.focusEnrichment(self.preferences, file_index) catch |err| {
-            self.action_error = normalizeActionError(err);
+        if (published.pending_cache_update != null) {
+            if (published.pending_cache_focus != file_index) try self.queueCacheBuild(published, file_index);
             return;
-        };
+        }
+        if (published.session.enrichment.requiresCacheEnforcement(file_index)) {
+            try self.queueCacheBuild(published, file_index);
+            return;
+        }
+        published.session.enrichment.focusAdmitted(file_index);
         if (published.review_search.open) return;
         self.promoteSpeculativeEnrichment(published.epoch, file_index);
         if (!published.session.enrichment.needsEnrichment(file_index)) {
@@ -12028,6 +12098,87 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
             std.debug.print("stage=draft_{s}_{s}{s} median_ns={d} p95_ns={d}\n", .{ mutation, stage, if (many_inputs) "_many_inputs" else "", samples[4], samples[8] });
         }
     }
+    if (many_inputs) try benchmarkCacheFrames(&presentation, io, &body);
+}
+
+fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u8) !void {
+    const published = presentation.published.?;
+    const storage = &published.session.enrichment;
+    var times: [3][4][9]u64 = undefined;
+    const labels = [_][]const u8{ "cache_focus", "source_lease_release", "review_holds_release" };
+    var fake: bbr.http.FakeHttpClient = .{ .status = 200, .body = body };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+    var plain: bbr.highlight.PlainHighlighter = .{};
+    for (0..3) |change| for (0..9) |sample| {
+        // Restore cache content and the complete Frame outside the timed stages.
+        storage.configureCache(.{ .max_retained_bytes = 0 });
+        storage.focusAdmitted(0);
+        for (published.session.diff.files, 0..) |file, index| {
+            if (storage.needsEnrichment(index)) {
+                var result = try file_enrichment.enrich(std.heap.page_allocator, client, plain.highlighter(), .{
+                    .repo = "repo",
+                    .status = file.status,
+                    .source_commit = "source",
+                    .destination_commit = "destination",
+                    .old_path = file.old_path,
+                    .new_path = file.new_path,
+                    .max_file_bytes = 0,
+                });
+                defer result.deinit();
+                try storage.admit(index, &result);
+            }
+            if (index != 0) storage.hold(index);
+        }
+        storage.configureCache(.{ .enabled = false });
+        try published.rebuild(presentation.preferences, published.expanded_disclosures.items, published.isolated_file);
+        const target: usize = if (change == 0) 1 else 0;
+        published.navigation.jumpTo(published.visualIndexForBufferIndex(fileHeaderRow(published.buffer, target).?).?);
+        if (change == 2) {
+            if (published.review_search.held == null) published.review_search.held = try presentation.allocator.alloc(bool, storage.len());
+            @memset(published.review_search.held.?, true);
+            published.review_search.held.?[0] = false;
+        }
+        const before = published.visual_rows.ptr;
+        var start = std.Io.Clock.awake.now(io);
+        switch (change) {
+            0 => try presentation.dispatch(.ensure_focused_enrichment),
+            1 => presentation.finishSearchLease(published, 1),
+            2 => presentation.releaseReviewSearchHolds(published),
+            else => unreachable,
+        }
+        times[change][0][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (published.visual_rows.ptr != before or !storage.requiresCacheEnforcement(target)) return error.CachePublishedBeforeWorker;
+        const job = (presentation.takeCommand() orelse return error.MissingCacheBuild).build_buffer_disclosure;
+        start = std.Io.Clock.awake.now(io);
+        job.build();
+        times[change][1][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (job.failed) return error.CacheBuildFailed;
+        start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .buffer_disclosure_built = job });
+        times[change][2][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (published.worker_frame != job or storage.requiresCacheEnforcement(target)) return error.CacheNotPublished;
+        const victim: usize = if (change == 0) 0 else 1;
+        if (storage.file(victim).new != .pending or published.disclosure_inputs.blobs[victim].new != null) return error.CacheVictimRetained;
+        start = std.Io.Clock.awake.now(io);
+        var control = try published.prepareBuffer(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, published.geometry);
+        times[change][3][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (control.visual_rows.len != published.visual_rows.len or control.buffer.rows.len != published.buffer.rows.len) return error.CacheControlMismatch;
+        std.mem.doNotOptimizeAway(control.visual_rows.len);
+        control.deinit();
+        // The focus and single-lease cases retain the other inactive holds.
+        if (change != 2) for (1..storage.len()) |index| {
+            if (change == 1 and index == 1) continue;
+            storage.finishLeaseDeferred(index);
+        };
+    };
+    std.debug.print("cache_fixture_files={d} cache_fixture_drafts={d} cache_fixture_body_bytes={d} cache_fixture_snapshot_bytes={d} cache_fixture_directories={d} cache_fixture_disclosures={d}\n", .{
+        storage.len(),                             published.review.drafts.items.len,        1024 * body.len + 9 * "new Draft".len, 1024 * body.len,
+        published.collapsed_directories.items.len, published.expanded_disclosures.items.len,
+    });
+    for (labels, &times) |label, *stages| for ([_][]const u8{ "dispatch", "worker", "admission", "sync_control" }, stages) |stage, *samples| {
+        std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+        std.debug.print("stage={s}_{s} median_ns={d} p95_ns={d}\n", .{ label, stage, samples[4], samples[8] });
+    };
 }
 
 fn benchmarkReviewDestination(presentation: *Presentation, io: std.Io, query: []const u8, label: []const u8) !void {
@@ -12283,7 +12434,7 @@ test "M21 kernel issued Frame retains Draft body and AnchorSnapshot while an edi
 }
 
 test "M21 kernel Frame worker allocation failures preserve the graph and complete Frame" {
-    for ([_]DisclosureBuild.Kind{ .general, .view, .enrichment, .draft_save, .review_destination, .open_input }) |kind| try testing.checkAllAllocationFailures(testing.allocator, disclosureWorkerFailureCase, .{ kind, null, false });
+    for ([_]DisclosureBuild.Kind{ .general, .view, .enrichment, .cache_update, .draft_save, .review_destination, .open_input }) |kind| try testing.checkAllAllocationFailures(testing.allocator, disclosureWorkerFailureCase, .{ kind, null, false });
     try testing.checkAllAllocationFailures(testing.allocator, disclosureWorkerFailureCase, .{ .review_destination, null, true });
     for (test_draft_mutations) |mutation| try testing.checkAllAllocationFailures(testing.allocator, disclosureWorkerFailureCase, .{ .draft_mutation, mutation, false });
 }
@@ -12323,6 +12474,8 @@ fn disclosureWorkerFailureCase(allocator: Allocator, kind: DisclosureBuild.Kind,
             .file_index = command.file_index,
             .outcome = .{ .completed = result },
         } });
+    } else if (kind == .cache_update) {
+        try presentation.queueCacheBuild(presentation.published.?, 0);
     } else if (kind == .draft_save) {
         try presentation.dispatch(.{ .action = .review_comment });
         try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("new Draft") } });
@@ -12990,6 +13143,9 @@ test "M21 authored opening evicted source waits for exact File Enrichment" {
         try presentation.dispatch(.{ .review_source_scanned = completed });
     }
     try testing.expectEqual(@as(usize, 1), presentation.projection().review_search.?.results.len);
+    try testing.expect(presentation.published.?.session.enrichment.file(1).new == .content);
+    while (presentation.commands.items.len > 0 and presentation.commands.items[0] == .build_buffer_disclosure)
+        try completeDisclosureBuild(&presentation);
     try testing.expect(presentation.published.?.session.enrichment.file(1).new == .pending);
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
     try testing.expect(presentation.projection().review_search != null);
@@ -21190,6 +21346,248 @@ const TestNoopHighlighter = struct {
         return .{ .spans = &.{} };
     }
 };
+
+fn testCacheSession(hold_inactive: bool) !*Session {
+    const session = try testTwoFileSession(testing.allocator, 1);
+    errdefer session.destroy();
+    session.enrichment.focus(0);
+    for (0..if (hold_inactive) @as(usize, 2) else 1) |index| {
+        const responses = [_]bbr.http.Canned{
+            .{ .status = 200, .body = "old\ncached old\n" },
+            .{ .status = 200, .body = "new\ncached needle\n" },
+        };
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+        const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+        var highlighter = TestNoopHighlighter{};
+        var result = try file_enrichment.enrich(testing.allocator, client, highlighter.highlighter(), .{
+            .repo = "repo",
+            .status = .modified,
+            .source_commit = "source",
+            .destination_commit = "destination",
+            .old_path = session.diff.files[index].old_path,
+            .new_path = session.diff.files[index].new_path,
+            .max_file_bytes = 0,
+        });
+        defer result.deinit();
+        if (index == 1) session.enrichment.hold(index);
+        try session.enrichment.admit(index, &result);
+    }
+    return session;
+}
+
+test "M21 kernel cache focus keeps eviction and Frame private until admission" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_cache_enabled = false }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(false) },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try presentation.dispatch(.{ .action = .next_file });
+    const before = presentation.projection().review.?.frame;
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    try testing.expect(presentation.takeCommand() == null);
+    try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
+    try testing.expectEqual(@as(?usize, 0), published.session.enrichment.focused_file);
+    worker.build();
+    try testing.expect(!worker.failed);
+    try testing.expect(published.session.enrichment.file(0).new == .content);
+    try testing.expectEqual(before.buffer.rows.ptr, published.buffer.rows.ptr);
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+    try testing.expectEqual(@as(?usize, 1), published.session.enrichment.focused_file);
+    try testing.expect(published.session.enrichment.file(0).new == .pending);
+    try testing.expect(before.visual_rows.ptr != published.visual_rows.ptr);
+    try testing.expect(published.disclosure_inputs.blobs[0].new == null);
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try testing.expectEqual(@as(usize, 1), presentation.takeCommand().?.enrich_file.file_index);
+}
+
+test "M21 kernel cache focus failure preserves content and focus before retry" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store(), .file_cache_enabled = false }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(false) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .next_file });
+    const published = presentation.published.?;
+    const before = published.frameProjection();
+    // Force the handoff to allocate command storage.
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, presentation.dispatch(.ensure_focused_enrichment));
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
+    try testing.expectEqual(@as(?usize, 0), published.session.enrichment.focused_file);
+    try testing.expect(published.session.enrichment.file(0).new == .content);
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const failed = presentation.takeCommand().?.build_buffer_disclosure;
+    failed.failed = true;
+    try presentation.dispatch(.{ .buffer_disclosure_built = failed });
+    try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
+    try testing.expectEqual(@as(?usize, 0), published.session.enrichment.focused_file);
+    try testing.expect(published.session.enrichment.file(0).new == .content);
+    try testing.expect(published.pending_cache_update == null);
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(published.session.enrichment.file(0).new == .pending);
+}
+
+test "M21 kernel cache focus supersedes queued and issued focus changes" {
+    for ([_]bool{ false, true }) |issued| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_cache_enabled = false }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(false) },
+        });
+        defer presentation.deinit();
+        const published = presentation.published.?;
+        try presentation.dispatch(.{ .action = .next_file });
+        try presentation.dispatch(.ensure_focused_enrichment);
+        const old = if (issued) presentation.takeCommand().?.build_buffer_disclosure else null;
+        try presentation.dispatch(.{ .action = .prev_file });
+        try presentation.dispatch(.ensure_focused_enrichment);
+        const before = published.frameProjection();
+        if (old) |worker| {
+            worker.build();
+            try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+            try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
+        }
+        try completeDisclosureBuild(&presentation);
+        try testing.expectEqual(@as(?usize, 0), published.session.enrichment.focused_file);
+        try testing.expect(published.session.enrichment.file(0).new == .content);
+        try testing.expect(presentation.takeCommand() == null);
+    }
+}
+
+test "M21 kernel cache worker retries changed Query geometry File Tree and lease protection" {
+    for ([_]enum { query, geometry, tree, lease }{ .query, .geometry, .tree, .lease }) |change| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_cache_enabled = false }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(false) },
+            .geometry = .{ .cols = 100, .rows = 25 },
+        });
+        defer presentation.deinit();
+        const published = presentation.published.?;
+        try presentation.dispatch(.{ .action = .next_file });
+        try presentation.dispatch(.ensure_focused_enrichment);
+        const old = presentation.takeCommand().?.build_buffer_disclosure;
+        var owned = true;
+        defer if (owned) old.destroy();
+        old.build();
+        switch (change) {
+            .query => {
+                try presentation.dispatch(.{ .action = .open_buffer_search });
+                try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
+            },
+            .geometry => {
+                try presentation.dispatch(.{ .resize = .{ .cols = 100, .rows = 24 } });
+            },
+            .tree => published.tree.scroll += 1,
+            .lease => published.session.enrichment.hold(0),
+        }
+        const before = published.frameProjection();
+        owned = false;
+        try presentation.dispatch(.{ .buffer_disclosure_built = old });
+        try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
+        try testing.expect(published.session.enrichment.file(0).new == .content);
+        if (change == .query) {
+            var scan = presentation.takeCommand().?;
+            defer scan.deinit();
+            try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search) });
+        }
+        try completeDisclosureBuild(&presentation);
+        try testing.expectEqual(@as(?usize, 1), published.session.enrichment.focused_file);
+        if (change == .lease) {
+            try testing.expect(published.session.enrichment.file(0).new == .content);
+            presentation.finishSearchLease(published, 0);
+            try completeDisclosureBuild(&presentation);
+        }
+        try testing.expect(published.session.enrichment.file(0).new == .pending);
+        if (change == .query) {
+            try testing.expectEqualStrings("new", published.buffer_search.input.?.query.?.text);
+            try testing.expect(published.buffer_search.input.?.ranges != null);
+        }
+    }
+}
+
+test "M21 kernel search lease release and Review Search hold release stage eviction once" {
+    for ([_]enum { source, close, clear }{ .source, .close, .clear }) |release| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_cache_enabled = false }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(true) },
+        });
+        defer presentation.deinit();
+        const published = presentation.published.?;
+        try dispatchView(&presentation, .{ .action = .cycle_scope });
+        try dispatchView(&presentation, .{ .action = .cycle_scope });
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+        try completeBufferSearchScan(&presentation);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        const before = published.frameProjection();
+        var lease = published.session.enrichment.snapshot(1);
+        defer lease.release();
+        if (release == .source) presentation.finishSearchLease(published, 1) else {
+            published.review_search.held = try presentation.allocator.alloc(bool, 2);
+            @memset(published.review_search.held.?, false);
+            published.review_search.held.?[1] = true;
+            published.review_search.open = true;
+            if (release == .close) presentation.closeReviewSearch() else presentation.replaceReviewSearchQuery("");
+        }
+        try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
+        try testing.expect(published.session.enrichment.file(1).new == .content);
+        try testing.expectEqual(@as(usize, 1), presentation.commands.items.len);
+        try completeDisclosureBuild(&presentation);
+        try testing.expect(published.session.enrichment.file(1).new == .pending);
+        try testing.expect(published.session.enrichment.file(0).new == .content);
+        try testing.expectEqualStrings("new\ncached needle\n", lease.view.new.content.blob);
+        try testing.expectEqual(@as(usize, 1), lease.new.?.references.load(.acquire));
+        try testing.expectEqualStrings("needle", published.buffer_search.accepted_query.?.text);
+        try testing.expectEqual(@as(usize, 1), published.buffer_search.accepted_batch.?.occurrences.len);
+        try testing.expect(published.buffer_search.accepted_ranges.?.len > 0);
+    }
+}
+
+test "M21 kernel cache worker rejects Session replacement and shutdown" {
+    for ([_]enum { refresh, switch_review, shutdown }{ .refresh, .switch_review, .shutdown }) |replacement| for ([_]bool{ false, true }) |issued| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_cache_enabled = false }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(false) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .next_file });
+        if (issued or replacement == .shutdown) try presentation.dispatch(.ensure_focused_enrichment);
+        const old = if (issued) presentation.takeCommand().?.build_buffer_disclosure else null;
+        switch (replacement) {
+            .refresh => try presentation.dispatch(.{ .action = .refresh }),
+            .switch_review => try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) }),
+            .shutdown => try presentation.dispatch(.request_shutdown),
+        }
+        if (replacement != .shutdown) {
+            if (!issued) try presentation.dispatch(.ensure_focused_enrichment);
+            const load = presentation.takeCommand().?.load_session;
+            try presentation.dispatch(.{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .loaded = try testSession(testing.allocator, if (replacement == .refresh) 1 else 2, 'b') } } });
+        }
+        const before = presentation.projection().review.?.frame;
+        if (old) |worker| {
+            worker.build();
+            try testing.expect(!worker.failed);
+            try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+        }
+        try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+        try testing.expect(presentation.takeCommand() == null);
+    };
+}
 
 test "two File Enrichment completions keep the cache and Frame private until each worker publishes" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
