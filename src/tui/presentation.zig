@@ -3170,13 +3170,13 @@ const Published = struct {
         };
     }
 
-    fn rebuild(
+    fn rebuildBufferControl(
         self: *Published,
         preferences: Preferences,
         expanded_disclosures: []const buffer_mod.DisclosureKey,
         isolated_file: ?usize,
     ) BufferTransactionError!void {
-        var staged = try self.prepareBuffer(preferences, expanded_disclosures, isolated_file, self.geometry);
+        var staged = try self.prepareBufferControl(preferences, expanded_disclosures, isolated_file, self.geometry);
         defer staged.deinit();
         staged.publish();
     }
@@ -3321,31 +3321,34 @@ const Published = struct {
         }
     }
 
-    fn prepareBuffer(
+    // Synchronous benchmark controls and test references. Production dispatch
+    // must use a worker to construct a complete Frame and its search data.
+    fn prepareBufferControl(
         self: *Published,
         preferences: Preferences,
         expanded_disclosures: []const buffer_mod.DisclosureKey,
         isolated_file: ?usize,
         geometry: frame_mod.Geometry,
     ) BufferTransactionError!StagedBuffer {
-        return self.prepareBufferForFile(preferences, expanded_disclosures, isolated_file, geometry, null, false);
+        return self.prepareBufferControlForFile(preferences, expanded_disclosures, isolated_file, geometry, false);
     }
 
-    fn prepareDisclosureBuffer(self: *Published, preferences: Preferences, disclosures: []const buffer_mod.DisclosureKey) BufferTransactionError!StagedBuffer {
+    fn prepareDisclosureBufferControl(self: *Published, preferences: Preferences, disclosures: []const buffer_mod.DisclosureKey) BufferTransactionError!StagedBuffer {
         // Semantic candidates include hidden text. A disclosure changes visual rows,
         // so keep the existing Batches and only project their ranges again.
-        return self.prepareBufferForFile(preferences, disclosures, self.isolated_file, self.geometry, null, true);
+        return self.prepareBufferControlForFile(preferences, disclosures, self.isolated_file, self.geometry, true);
     }
 
-    fn prepareBufferForFile(
+    fn prepareBufferControlForFile(
         self: *Published,
         preferences: Preferences,
         expanded_disclosures: []const buffer_mod.DisclosureKey,
         isolated_file: ?usize,
         geometry: frame_mod.Geometry,
-        focused_file: ?usize,
         reuse_search_corpus: bool,
     ) BufferTransactionError!StagedBuffer {
+        if (!builtin.is_test and !@hasDecl(@import("root"), "buffer_search_benchmark"))
+            @compileError("Synchronous Buffer controls cannot run in production dispatch. Queue a Frame worker.");
         const allocator = self.buffers.begin();
         errdefer self.buffers.abort();
         const enrichment = self.session.enrichment.projection();
@@ -3387,7 +3390,7 @@ const Published = struct {
         errdefer search_projection.release();
         const panes = frame_mod.paneRects(geometry);
         const wanted_cursor = if (self.tree.entries.len == 0) null else self.tree.entries[self.tree.cursor].identity;
-        const active_file = if (self.session.diff.files.len == 0) null else isolated_file orelse focused_file orelse self.buffer.fileIndexForRow(self.cursorBufferIndex());
+        const active_file = if (self.session.diff.files.len == 0) null else isolated_file orelse self.buffer.fileIndexForRow(self.cursorBufferIndex());
         const tree = try file_tree.build(
             allocator,
             self.session.diff,
@@ -3418,7 +3421,7 @@ const Published = struct {
                     accepted_navigation_rows = projected.navigation_rows;
                 }
             } else {
-                var batch = self.scanBufferSearchFor(preferences, expanded_disclosures, isolated_file, geometry, query) catch |err| return switch (err) {
+                var batch = self.scanBufferSearchControl(preferences, expanded_disclosures, isolated_file, geometry, query) catch |err| return switch (err) {
                     error.OutOfMemory => error.OutOfMemory,
                     else => error.SearchFailed,
                 };
@@ -3451,7 +3454,7 @@ const Published = struct {
                     input_navigation_rows = projected.navigation_rows;
                 }
             } else {
-                var batch = self.scanBufferSearchFor(preferences, expanded_disclosures, isolated_file, geometry, query) catch |err| return switch (err) {
+                var batch = self.scanBufferSearchControl(preferences, expanded_disclosures, isolated_file, geometry, query) catch |err| return switch (err) {
                     error.OutOfMemory => error.OutOfMemory,
                     else => error.SearchFailed,
                 };
@@ -3517,7 +3520,7 @@ const Published = struct {
         return self.comments_collapsed_rows;
     }
 
-    fn scanBufferSearchFor(
+    fn scanBufferSearchControl(
         self: *Published,
         preferences: Preferences,
         expanded_disclosures: []const buffer_mod.DisclosureKey,
@@ -3525,6 +3528,8 @@ const Published = struct {
         geometry: frame_mod.Geometry,
         query: search.Query,
     ) !search.Batch {
+        if (!builtin.is_test and !@hasDecl(@import("root"), "buffer_search_benchmark"))
+            @compileError("Synchronous Buffer Search scans cannot run in production dispatch. Queue a scan worker.");
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const enrichment = self.session.enrichment.projection();
@@ -7251,10 +7256,9 @@ pub const Presentation = struct {
             published.frame_revision += 1;
             return;
         }
-        self.restoreInputDisclosures(published) catch |err| {
-            self.action_error = normalizeActionError(err);
-            return;
-        };
+        if (published.buffer_search.saved_disclosures) |disclosures| disclosures.release();
+        published.buffer_search.saved_disclosures = published.buffer_search.input.?.saved_search_disclosures;
+        published.buffer_search.input.?.saved_search_disclosures = null;
         if (published.buffer_search.input.?.restoring_review_disclosures) {
             if (published.review_search.saved_disclosures) |keys| keys.release();
             published.review_search.saved_disclosures = null;
@@ -7266,24 +7270,6 @@ pub const Presentation = struct {
         self.discardQueuedBufferSearchScans(null);
         self.action_error = null;
         published.frame_revision += 1;
-    }
-
-    fn restoreInputDisclosures(self: *Presentation, published: *Published) BufferTransactionError!void {
-        const input = published.buffer_search.input orelse return;
-        if (!sameDisclosures(published.expanded_disclosures.items, input.saved_expanded_disclosures.items())) {
-            var target: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
-            errdefer target.deinit(self.allocator);
-            try target.appendSlice(self.allocator, input.saved_expanded_disclosures.items());
-            var staged = try published.prepareDisclosureBuffer(self.preferences, target.items);
-            defer staged.deinit();
-            staged.publish();
-            published.expanded_disclosures.deinit(self.allocator);
-            published.expanded_disclosures = target;
-        }
-        if (published.buffer_search.saved_disclosures) |disclosures| disclosures.release();
-        const refreshed = &(published.buffer_search.input orelse unreachable);
-        published.buffer_search.saved_disclosures = refreshed.saved_search_disclosures;
-        refreshed.saved_search_disclosures = null;
     }
 
     fn acceptBufferSearch(self: *Presentation) void {
@@ -7420,15 +7406,6 @@ pub const Presentation = struct {
                 input.request_id = job.request_id;
                 input.pending = true;
             } else {
-                self.updateSearchOwnedDisclosure(published, accepted_occurrence) catch |err| {
-                    input.query = old_query;
-                    input.batch = old_batch;
-                    input.ranges = old_ranges;
-                    input.navigation_rows = old_navigation_rows;
-                    input.active = old_active;
-                    self.action_error = normalizeActionError(err);
-                    return;
-                };
                 published.search_generation +%= 1;
                 if (published.search_generation == 0) published.search_generation = 1;
                 input.request_id = published.search_generation;
@@ -7505,7 +7482,13 @@ pub const Presentation = struct {
         }
         if (required.len == 0 and published.buffer_search.saved_disclosures == null) return null;
         const target: DisclosureTarget = .{ .base = published.buffer_search.saved_disclosures orelse published.disclosure_keys, .add = required };
-        if (target.matchesKeys(published.disclosure_keys)) return null;
+        if (target.matchesKeys(published.disclosure_keys)) {
+            if (required.len == 0) if (published.buffer_search.saved_disclosures) |saved| {
+                saved.release();
+                published.buffer_search.saved_disclosures = null;
+            };
+            return null;
+        }
         const job = try self.queueAcceptedDisclosure(published, target, published.buffer_search.active, .clear_input, null);
         job.clear_saved_disclosures = required.len == 0;
         job.restore_navigation = published.buffer_search.input.?.saved_navigation;
@@ -7576,38 +7559,15 @@ pub const Presentation = struct {
         const old_batch = input.batch;
         const old_ranges = input.ranges;
         const old_navigation_rows = input.navigation_rows;
-        const old_active = input.active;
         input.batch = batch;
         input.active = active;
         input.ranges = ranges;
         input.pending = false;
         if (active) |index| {
-            if (published.buffer_search.saved_disclosures != null) self.updateSearchOwnedDisclosure(published, batch.occurrences[index]) catch |err| {
-                input.batch = old_batch;
-                input.ranges = old_ranges;
-                input.active = old_active;
-                batch.deinit(self.allocator);
-                std.heap.page_allocator.free(ranges);
-                self.action_error = normalizeActionError(err);
-                return;
-            };
-            const refreshed = &(published.buffer_search.input orelse return);
-            if (refreshed.batch) |refreshed_batch| {
-                if (refreshed.active) |refreshed_active| {
-                    if (completed.navigation_rows) |rows| {
-                        if (rows[refreshed_active].visible) |row| published.navigation.jumpTo(row) else _ = published.jumpToSearchOccurrence(refreshed_batch.occurrences[refreshed_active]);
-                    } else _ = published.jumpToSearchOccurrence(refreshed_batch.occurrences[refreshed_active]);
-                }
-            }
-        } else if (published.buffer_search.saved_disclosures != null) self.updateSearchOwnedDisclosure(published, null) catch |err| {
-            input.batch = old_batch;
-            input.ranges = old_ranges;
-            input.active = old_active;
-            batch.deinit(self.allocator);
-            std.heap.page_allocator.free(ranges);
-            self.action_error = normalizeActionError(err);
-            return;
-        };
+            if (completed.navigation_rows) |rows| {
+                if (rows[index].visible) |row| published.navigation.jumpTo(row) else _ = published.jumpToSearchOccurrence(batch.occurrences[index]);
+            } else _ = published.jumpToSearchOccurrence(batch.occurrences[index]);
+        }
         if (old_batch) |old| {
             var owned = old;
             owned.deinit(self.allocator);
@@ -7630,7 +7590,13 @@ pub const Presentation = struct {
         }
         if (required.len == 0 and published.buffer_search.saved_disclosures == null) return false;
         const target: DisclosureTarget = .{ .base = published.buffer_search.saved_disclosures orelse published.disclosure_keys, .add = required };
-        if (target.matchesKeys(published.disclosure_keys)) return false;
+        if (target.matchesKeys(published.disclosure_keys)) {
+            if (required.len == 0) if (published.buffer_search.saved_disclosures) |saved| {
+                saved.release();
+                published.buffer_search.saved_disclosures = null;
+            };
+            return false;
+        }
         const job = try DisclosureBuild.create(published, self.preferences, target, request_id, active);
         errdefer job.destroy();
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
@@ -8524,55 +8490,6 @@ pub const Presentation = struct {
         job.result_error = result_error;
         self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
         return job;
-    }
-
-    fn updateSearchOwnedDisclosure(self: *Presentation, published: *Published, occurrence: ?search.Occurrence) BufferTransactionError!void {
-        var required: SearchDisclosureSet = .{};
-        if (occurrence) |active| {
-            required = searchDisclosureForVisibility(published, active, published.occurrenceVisualRow(active) != null);
-        }
-
-        if (required.len == 0 and published.buffer_search.saved_disclosures == null) return;
-        const disclosure_target: DisclosureTarget = .{ .base = published.buffer_search.saved_disclosures orelse published.disclosure_keys, .add = required };
-        if (disclosure_target.matchesKeys(published.disclosure_keys)) {
-            if (required.len == 0) if (published.buffer_search.saved_disclosures) |saved| {
-                saved.release();
-                published.buffer_search.saved_disclosures = null;
-            };
-            return;
-        }
-        const base = if (published.buffer_search.saved_disclosures) |keys| keys.items() else published.expanded_disclosures.items;
-
-        var target: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
-        errdefer target.deinit(self.allocator);
-        try target.appendSlice(self.allocator, base);
-        for (required.items[0..required.len]) |key| {
-            var exists = false;
-            for (target.items) |existing| if (std.meta.eql(existing, key)) {
-                exists = true;
-                break;
-            };
-            if (!exists) try target.append(self.allocator, key);
-        }
-        if (required.len > 0 and target.items.len == base.len and published.buffer_search.saved_disclosures == null) return;
-        const saved = if (published.buffer_search.saved_disclosures == null and required.len > 0)
-            published.disclosure_keys.retain()
-        else
-            null;
-        errdefer if (saved) |items| items.release();
-
-        if (!sameDisclosures(published.expanded_disclosures.items, target.items)) {
-            var staged = try published.prepareDisclosureBuffer(self.preferences, target.items);
-            defer staged.deinit();
-            staged.publish();
-        }
-        published.expanded_disclosures.deinit(self.allocator);
-        published.expanded_disclosures = target;
-        if (saved) |items| published.buffer_search.saved_disclosures = items;
-        if (required.len == 0) {
-            published.buffer_search.saved_disclosures.?.release();
-            published.buffer_search.saved_disclosures = null;
-        }
     }
 
     fn clearBufferSearchActive(self: *Presentation, published: *Published) BufferTransactionError!void {
@@ -12108,7 +12025,7 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
         if (batch.occurrences.len != files * lines * 2) return error.WrongOccurrenceCount;
 
         start = std.Io.Clock.awake.now(io);
-        var rebuilt = try published.prepareDisclosureBuffer(presentation.preferences, published.expanded_disclosures.items);
+        var rebuilt = try published.prepareDisclosureBufferControl(presentation.preferences, published.expanded_disclosures.items);
         times[@intFromEnum(Stage.disclosure)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         rebuilt.deinit();
 
@@ -12186,7 +12103,7 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
         if (published.worker_frame != view or published.buffer_search.input.?.batch.?.occurrences.len != files * lines * 2)
             return error.ResizeNotPublished;
         start = std.Io.Clock.awake.now(io);
-        var control = try published.prepareBuffer(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, geometry);
+        var control = try published.prepareBufferControl(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, geometry);
         times[@intFromEnum(Stage.resize_input_control)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         if (control.visual_rows.len != published.visual_rows.len or control.input_batch.?.occurrences.len != files * lines * 2 or
             control.input_ranges.?.len != published.buffer_search.input.?.ranges.?.len) return error.ResizeControlMismatch;
@@ -12289,7 +12206,7 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
     });
     defer enrichment.deinit();
     try hidden_session.enrichment.admit(0, &enrichment);
-    try hidden.published.?.rebuild(hidden.preferences, hidden.published.?.expanded_disclosures.items, null);
+    try hidden.published.?.rebuildBufferControl(hidden.preferences, hidden.published.?.expanded_disclosures.items, null);
     try benchmarkReviewDestination(&hidden, io, "needle", "review_source_destination");
     try benchmarkDisclosureHandoff(allocator, io, false);
     try benchmarkDisclosureHandoff(allocator, io, true);
@@ -12578,7 +12495,7 @@ fn benchmarkHiddenSearchNavigation(presentation: *Presentation, io: std.Io) !voi
         const baseline = published.buffer_search.saved_disclosures.?.retain();
         defer baseline.release();
         // Collapse the accepted occurrence before timing each traversal Action.
-        try published.rebuild(presentation.preferences, baseline.items(), null);
+        try published.rebuildBufferControl(presentation.preferences, baseline.items(), null);
         const before = published.visual_rows.ptr;
         published.navigation.count = if (stage == 2) 999 else 1;
         const start = std.Io.Clock.awake.now(io);
@@ -12590,7 +12507,7 @@ fn benchmarkHiddenSearchNavigation(presentation: *Presentation, io: std.Io) !voi
         published.buffer_search.deinit(presentation.allocator);
         published.buffer_search = .{};
         published.active_search = .none;
-        try published.rebuild(presentation.preferences, baseline.items(), null);
+        try published.rebuildBufferControl(presentation.preferences, baseline.items(), null);
     };
     const names = [_][]const u8{ "hidden_lookup", "hidden_lookup_linear_control", "hidden_next_dispatch", "hidden_previous_dispatch", "hidden_count_dispatch" };
     for (&times, names) |*samples, name| {
@@ -12655,7 +12572,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
             try published.collapseDirectory(path);
             try published.expanded_disclosures.append(allocator, .{ .review_card = .{ .draft = index + 1 } });
         }
-        try published.rebuild(presentation.preferences, published.expanded_disclosures.items, null);
+        try published.rebuildBufferControl(presentation.preferences, published.expanded_disclosures.items, null);
     }
     for (&times, &control) |*elapsed, *copy_elapsed| {
         var start = std.Io.Clock.awake.now(io);
@@ -12739,7 +12656,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
             return error.DraftSaveAdmissionFailed;
         // The control builds the same Draft graph through the former synchronous path.
         start = std.Io.Clock.awake.now(io);
-        var staged = try published.prepareBuffer(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, published.geometry);
+        var staged = try published.prepareBufferControl(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, published.geometry);
         draft_control[sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         defer staged.deinit();
         if (staged.buffer.rows.len != published.buffer.rows.len or staged.visual_rows.len != published.visual_rows.len)
@@ -12779,7 +12696,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
             try published.persistPreparedDraft(store.store(), reply);
             parent = reply.local_id;
         }
-        try published.rebuild(presentation.preferences, published.expanded_disclosures.items, published.isolated_file);
+        try published.rebuildBufferControl(presentation.preferences, published.expanded_disclosures.items, published.isolated_file);
         for ([_]TestDraftMutation{ .body, .reanchor, .unpublished, .delete }, 0..) |mutation, mutation_index| {
             try cursorToDraftCard(&presentation, root.local_id);
             switch (mutation) {
@@ -12797,7 +12714,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
                     unknown.state = .outcome_unknown;
                     try store.store().put(key.storeKey(), unknown);
                     published.setDraftState(root.local_id, .outcome_unknown);
-                    try published.rebuild(presentation.preferences, published.expanded_disclosures.items, published.isolated_file);
+                    try published.rebuildBufferControl(presentation.preferences, published.expanded_disclosures.items, published.isolated_file);
                 },
             }
             const before = published.frameProjection();
@@ -12822,7 +12739,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
                 .delete => if (published.review.getConst(root.local_id) != null or published.review.getConst(parent) != null) return error.DraftMutationDeletionMismatch,
             }
             start = std.Io.Clock.awake.now(io);
-            var control_frame = try published.prepareBuffer(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, published.geometry);
+            var control_frame = try published.prepareBufferControl(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, published.geometry);
             mutation_times[mutation_index][3][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
             defer control_frame.deinit();
             if (control_frame.buffer.rows.len != published.buffer.rows.len or control_frame.visual_rows.len != published.visual_rows.len)
@@ -12869,7 +12786,7 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
             if (index != 0) storage.hold(index);
         }
         storage.configureCache(.{ .enabled = false });
-        try published.rebuild(presentation.preferences, published.expanded_disclosures.items, published.isolated_file);
+        try published.rebuildBufferControl(presentation.preferences, published.expanded_disclosures.items, published.isolated_file);
         const target: usize = if (change == 0) 1 else 0;
         published.navigation.jumpTo(published.visualIndexForBufferIndex(fileHeaderRow(published.buffer, target).?).?);
         if (change == 2) {
@@ -12899,7 +12816,7 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
         const victim: usize = if (change == 0) 0 else 1;
         if (storage.file(victim).new != .pending or published.disclosure_inputs.blobs[victim].new != null) return error.CacheVictimRetained;
         start = std.Io.Clock.awake.now(io);
-        var control = try published.prepareBuffer(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, published.geometry);
+        var control = try published.prepareBufferControl(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, published.geometry);
         times[change][3][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         if (control.visual_rows.len != published.visual_rows.len or control.buffer.rows.len != published.buffer.rows.len) return error.CacheControlMismatch;
         std.mem.doNotOptimizeAway(control.visual_rows.len);
@@ -12943,7 +12860,7 @@ fn benchmarkReviewDestination(presentation: *Presentation, io: std.Io, query: []
             try published.expanded_disclosures.appendSlice(presentation.allocator, saved.items());
             saved.release();
             published.review_search.saved_disclosures = null;
-            try published.rebuild(presentation.preferences, published.expanded_disclosures.items, published.isolated_file);
+            try published.rebuildBufferControl(presentation.preferences, published.expanded_disclosures.items, published.isolated_file);
         }
         const before = published.visual_rows.ptr;
         var start = std.Io.Clock.awake.now(io);
@@ -12961,7 +12878,7 @@ fn benchmarkReviewDestination(presentation: *Presentation, io: std.Io, query: []
         if (published.review_search.open or published.visual_rows.ptr == before or published.review_search.ranges.?.len == 0) return error.DestinationNotPublished;
         {
             start = std.Io.Clock.awake.now(io);
-            var control = try published.prepareBuffer(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, published.geometry);
+            var control = try published.prepareBufferControl(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, published.geometry);
             times[3][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
             defer control.deinit();
             if (control.visual_rows.len != published.visual_rows.len or control.review_ranges.?.len != published.review_search.ranges.?.len) return error.DestinationControlMismatch;
@@ -12970,7 +12887,7 @@ fn benchmarkReviewDestination(presentation: *Presentation, io: std.Io, query: []
         if (published.review_search.saved_disclosures) |baseline| {
             measured_opening = true;
             start = std.Io.Clock.awake.now(io);
-            var restore_control = try published.prepareBuffer(presentation.preferences, baseline.items(), published.isolated_file, published.geometry);
+            var restore_control = try published.prepareBufferControl(presentation.preferences, baseline.items(), published.isolated_file, published.geometry);
             opening_times[4][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
             const expected_rows = restore_control.visual_rows.len;
             const expected_ranges = restore_control.review_ranges.?.len;
@@ -13040,7 +12957,7 @@ fn benchmarkSidebar(presentation: *Presentation, io: std.Io) !void {
             published.buffer.rows.ptr != before.buffer.rows.ptr or published.visual_rows.ptr != before.visual_rows.ptr or
             published.visual_rows_revision != before.visual_rows_revision) return error.SidebarChangedDiffPane;
         start = std.Io.Clock.awake.now(io);
-        var control = try published.prepareBuffer(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, published.geometry);
+        var control = try published.prepareBufferControl(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, published.geometry);
         defer control.deinit();
         times[4][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         if (control.tree.entries.len != published.tree.entries.len or control.buffer.rows.len != published.buffer.rows.len)
@@ -15586,7 +15503,7 @@ test "M21 stale worker ranges do not enter a rebuilt Frame" {
     // The synchronous control changes the Frame while the scan owns the lane.
     var preferences = presentation.preferences;
     preferences.layout = .side_by_side;
-    try presentation.published.?.rebuild(preferences, presentation.published.?.expanded_disclosures.items, null);
+    try presentation.published.?.rebuildBufferControl(preferences, presentation.published.?.expanded_disclosures.items, null);
     presentation.preferences = preferences;
     try testing.expect(completed.visual_rows_revision != presentation.published.?.visual_rows_revision);
     try presentation.dispatch(.{ .buffer_search_scanned = completed });
@@ -15877,7 +15794,7 @@ test "M21 kernel inactive Batch traversal keeps Count wrap status and synchronou
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
     const published = presentation.published.?;
     for ([_]bool{ false, true }) |synchronous| {
-        if (synchronous) try published.rebuild(presentation.preferences, published.expanded_disclosures.items, null);
+        if (synchronous) try published.rebuildBufferControl(presentation.preferences, published.expanded_disclosures.items, null);
         inline for (.{ Presentation.SearchDirection.forward, Presentation.SearchDirection.backward }) |direction| {
             try presentation.dispatch(.{ .action = if (direction == .forward) .to_bottom else .to_top });
             try testing.expectEqual(@as(?usize, null), published.buffer_search.active);
@@ -18357,6 +18274,109 @@ test "M21 Query edit restores search-owned disclosures on the worker" {
     try testing.expectEqual(ActionError.buffer_search_no_matches, presentation.projection().action_error.?);
 }
 
+test "M21 kernel unchanged search disclosures admit clear and cancel without allocation" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.replaceBufferSearchQuery("eight");
+    try completeBufferSearchScan(&presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    const published = presentation.published.?;
+    const accepted_batch = published.buffer_search.accepted_batch.?.occurrences.ptr;
+    const accepted_ranges = published.buffer_search.accepted_ranges.?.ptr;
+    const baseline = published.buffer_search.saved_disclosures.?;
+    const before = published.frameProjection();
+
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.replaceBufferSearchQuery("eight");
+    var scan = presentation.takeCommand().?;
+    defer scan.deinit();
+    const completed = executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search);
+    const worker_ranges = completed.ranges.?.ptr;
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.{ .buffer_search_scanned = completed });
+    try testing.expect(presentation.projection().action_error == null);
+    try testing.expectEqual(worker_ranges, published.buffer_search.input.?.ranges.?.ptr);
+    try testing.expectEqual(baseline, published.buffer_search.saved_disclosures.?);
+    try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
+    try testing.expectEqual(before.visual_rows_revision, published.visual_rows_revision);
+    try testing.expect(presentation.takeCommand() == null);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+    try testing.expect(presentation.projection().action_error == null);
+    try testing.expect(!published.buffer_search.input.?.pending);
+    try testing.expect(published.buffer_search.input.?.query == null);
+    try testing.expectEqual(baseline, published.buffer_search.saved_disclosures.?);
+    try testing.expect(presentation.takeCommand() == null);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(presentation.projection().action_error == null);
+    try testing.expect(published.buffer_search.input == null);
+    try testing.expectEqual(baseline, published.buffer_search.saved_disclosures.?);
+    try testing.expectEqual(accepted_batch, published.buffer_search.accepted_batch.?.occurrences.ptr);
+    try testing.expectEqual(accepted_ranges, published.buffer_search.accepted_ranges.?.ptr);
+    try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
+    try testing.expectEqual(before.visual_rows_revision, published.visual_rows_revision);
+    try testing.expectEqualDeep(before.navigation, published.navigation);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "M21 kernel search restoration failures never fall back to synchronous Frames" {
+    for ([_]enum { scan, clear, cancel }{ .scan, .clear, .cancel }) |transition| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.replaceBufferSearchQuery("eight");
+        try completeBufferSearchScan(&presentation);
+        const published = presentation.published.?;
+        const before = published.frameProjection();
+        const baseline = published.buffer_search.saved_disclosures.?;
+        switch (transition) {
+            .scan => {
+                try presentation.replaceBufferSearchQuery("no-match");
+                var scan = presentation.takeCommand().?;
+                defer scan.deinit();
+                try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search) });
+            },
+            .clear => try presentation.replaceBufferSearchQuery(""),
+            .cancel => try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } }),
+        }
+        try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
+        try testing.expectEqual(before.visual_rows_revision, published.visual_rows_revision);
+        const job = presentation.takeCommand().?.build_buffer_disclosure;
+        try testing.expectEqual(switch (transition) {
+            .scan => DisclosureBuild.Kind.input,
+            .clear => .clear_input,
+            .cancel => .restore,
+        }, job.kind);
+        job.failed = true;
+        try presentation.dispatch(.{ .buffer_disclosure_built = job });
+        try testing.expectEqual(ActionError.buffer_build_failed, presentation.projection().action_error.?);
+        try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
+        try testing.expectEqual(before.visual_rows_revision, published.visual_rows_revision);
+        try testing.expectEqualDeep(before.navigation, published.navigation);
+        try testing.expectEqual(baseline, published.buffer_search.saved_disclosures.?);
+        try testing.expect(presentation.takeCommand() == null);
+
+        if (transition == .cancel) try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.replaceBufferSearchQuery("no-match");
+        try completeBufferSearchScan(&presentation);
+        try testing.expect(published.buffer_search.saved_disclosures == null);
+        try testing.expect(!published.buffer_search.input.?.pending);
+        try testing.expect(published.visual_rows_revision != before.visual_rows_revision);
+    }
+}
+
 test "M21 kernel clearing a Query retries changed Frames and restores disclosures on the worker" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -18680,7 +18700,7 @@ test "M21 kernel search indexes cover Draft chains and release every failed allo
     try testing.checkAllAllocationFailures(testing.allocator, exerciseSearchIndexAllocationFailure, .{published});
     var preferences = presentation.preferences;
     preferences.scope = .whole;
-    try published.rebuild(preferences, &.{}, null);
+    try published.rebuildBufferControl(preferences, &.{}, null);
     const opposite = published.search_projection.body_disclosures.get(.{ .draft = 13 }).?;
     try testing.expectEqual(@as(usize, 2), opposite.len);
     try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .opposite_version = &published.session.diff.files[0] }, opposite.items[0]);
@@ -18743,7 +18763,7 @@ test "M21 kernel indexed source and ReviewBody navigation matches wrapped visual
     for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]u16{ 48, 49 }) |cols| {
         var preferences = presentation.preferences;
         preferences.layout = layout;
-        var staged = try published.prepareBuffer(preferences, &keys, null, .{ .cols = cols, .rows = 20 });
+        var staged = try published.prepareBufferControl(preferences, &keys, null, .{ .cols = cols, .rows = 20 });
         staged.publish();
         for ([_][]const u8{ "needle", "eight", "c", "A", "a" }) |text| {
             var query = try search.Query.init(testing.allocator, text);
@@ -18904,20 +18924,20 @@ test "Buffer Search disclosure rebuild keeps the completed Batch" {
     try completeBufferSearchScan(&presentation);
     try testing.expectEqual(revealed_revision, presentation.projection().review.?.frame.visual_rows_revision);
     const input_batch = presentation.published.?.buffer_search.input.?.batch.?.occurrences.ptr;
-    var staged = try presentation.published.?.prepareDisclosureBuffer(presentation.preferences, presentation.published.?.expanded_disclosures.items);
+    var staged = try presentation.published.?.prepareDisclosureBufferControl(presentation.preferences, presentation.published.?.expanded_disclosures.items);
     defer staged.deinit();
     staged.publish();
     try testing.expectEqual(input_batch, presentation.published.?.buffer_search.input.?.batch.?.occurrences.ptr);
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
     const accepted_batch = presentation.published.?.buffer_search.accepted_batch.?.occurrences.ptr;
-    staged = try presentation.published.?.prepareDisclosureBuffer(presentation.preferences, presentation.published.?.expanded_disclosures.items);
+    staged = try presentation.published.?.prepareDisclosureBufferControl(presentation.preferences, presentation.published.?.expanded_disclosures.items);
     staged.publish();
     try testing.expectEqual(accepted_batch, presentation.published.?.buffer_search.accepted_batch.?.occurrences.ptr);
 
     try presentation.dispatch(.{ .action = .open_buffer_search });
     try presentation.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c5" } });
     try testing.expect(presentation.published.?.buffer_search.input.?.pending);
-    staged = try presentation.published.?.prepareDisclosureBuffer(presentation.preferences, presentation.published.?.expanded_disclosures.items);
+    staged = try presentation.published.?.prepareDisclosureBufferControl(presentation.preferences, presentation.published.?.expanded_disclosures.items);
     staged.publish();
     try testing.expect(presentation.published.?.buffer_search.input.?.batch == null);
     try testing.expect(presentation.published.?.buffer_search.input.?.pending);

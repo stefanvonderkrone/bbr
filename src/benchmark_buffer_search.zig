@@ -3,6 +3,8 @@ const presentation = @import("tui/presentation.zig");
 const render = @import("tui/render.zig");
 const vaxis = @import("vaxis");
 
+pub const buffer_search_benchmark = true;
+
 var screen: vaxis.Screen = undefined;
 
 fn paint(allocator: std.mem.Allocator, review: presentation.ReviewProjection) !void {
