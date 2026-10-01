@@ -30,7 +30,7 @@ The original checklist is complete, but the following input-latency work remains
 - [x] Stage disclosure restoration when Buffer Search starts after Review Search. `openBufferSearch` retains the disclosure baseline and queues a worker. Query input stays open while restoration runs.
 - [x] Stage File Enrichment cache-focus and lease-release Frame changes. Completion Frames already use workers, but `focusEnrichment`, `finishSearchLease`, and `releaseReviewSearchHolds` can rebuild synchronously after eviction. Keep cache changes and Frame publication atomic.
 - [x] Index hidden Search Occurrence navigation and disclosure lookup. Frame construction indexes source coordinates, ReviewBody owners, Fold membership, disclosure rows, and inherited Draft disclosure chains. Hidden `n`, `N`, Count, Query clearing, and the scan-to-disclosure handoff use the indexes.
-- [ ] Bound active-occurrence retention and origin selection during completion admission. `retainedEditedSearchIndex` and `firstSearchOccurrenceAtOrAfter` still walk complete Batches on the terminal thread. `searchFromInactiveRow` also walks Batches when traversal starts without an active occurrence.
+- [x] Bound active-occurrence retention and origin selection during completion admission. Worker projection builds sorted occurrence-identity indexes and navigation prefix maxima and suffix minima. Completion admission and inactive traversal use binary lookup instead of complete Batch walks.
 - [ ] Bound navigation restoration during worker Frame admission. `frame.restoreNavigation` still searches complete visual-row arrays for the cursor and Selection. Version restoration and File-header navigation also need checks on large Frames.
 - [ ] Measure initial Session publication separately. `Published.create` still builds the initial Buffer, visual rows, File Tree, source-coordinate projection, and search corpus on the terminal thread. Move this work into Candidate Session preparation if the measurement shows an input stall.
 - [ ] Remove reachable synchronous search rebuild fallbacks after the paths above use workers. `prepareBufferForFile` still builds the corpus, scans accepted and input Queries, and projects complete Batches. Keep synchronous benchmark controls distinct from production dispatch. Add transition and failure tests for each newly staged path.
@@ -472,3 +472,36 @@ Index construction remains part of Frame construction. Initial Session publicati
 Tests cover hidden forward and backward traversal, Count, same-Fold traversal, Query clearing, and disclosure restoration. They also cover resolved Replies, nested Draft chains, outdated placement, and opposite-version placement. Wrapped source and ReviewBody lookups match the linear reference in both Layouts at two terminal widths. A retained-index test removes the current row, File, and Thread tables before lookup. Allocation-failure tests check every search-index allocation. Existing transition tests cover stale Frames, cancellation, Session replacement, and worker failures.
 
 `zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 934 tests. The Standards and Spec review found no remaining findings for this item. The ticket remains `ready-for-agent`. The next remaining item is bounded active-occurrence retention and origin selection during completion admission.
+
+## Bounded Batch selection
+
+Worker projection now builds sorted indexes for edited and exact Search Occurrence identities. Edited identity uses the location and first authored range start. Exact identity also uses the Session Epoch and complete ranges. Edited identity keeps the first Batch index when several occurrences share that identity. Query refinement therefore retains the same occurrence when its range end changes. Worker Frame admission also uses the exact index to retain an open input occurrence.
+
+The worker computes navigation prefix maxima and suffix minima in Batch order. Each destination uses its visible row or indexed disclosure row. Binary lookup selects the first occurrence at or after the origin. Inactive `n` selects the first occurrence strictly after the cursor. Inactive `N` selects the last occurrence strictly before the cursor. These lookups preserve occurrence order when visual rows are not monotonic. Count and wrap status keep their earlier rules.
+
+The selection indexes share one allocation with the projected navigation rows. Scan and Frame completions transfer that allocation with their Batch and ranges. Existing command, Session Epoch, Query generation, and Frame checks reject stale work before selection. Synchronous Frame controls also publish navigation indexes so they cannot remove the accepted search's lookup data.
+
+Both benchmark runs use nine ReleaseFast samples without concurrent build or test work. `zig build bench-buffer-search -- 256` has 16 Files, 8,192 changed Lines, and 128,776 Diff bytes. `zig build bench-buffer-search -- 4096` has 16 Files, 131,072 changed Lines, and 2,193,960 Diff bytes. Each Query produces one occurrence per changed Line. The selection measurements use SideBySide Frames with 4,128 and 65,568 visual rows, respectively. Neither fixture contains Drafts or ReviewCards.
+
+The retention sample extends `needl` to `needle` from the bottom origin. Worker scanning completes before admission timing. Inactive traversal starts at the bottom for `n` and at the top for `N`. The Count sample uses 999. Fixture setup and cursor movement occur before timing. Linear controls select the same occurrence and check the indexed result. Values are nanoseconds.
+
+| Stage | 8,192 occurrences median | 8,192 occurrences p95 | 131,072 occurrences median | 131,072 occurrences p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Retention lookup | 292 | 3,000 | 5,625 | 11,708 |
+| Retention linear control | 16,167 | 56,458 | 1,281,166 | 2,385,500 |
+| Bottom-origin lookup | 42 | 167 | 500 | 3,875 |
+| Bottom-origin linear control | 15,208 | 15,834 | 477,458 | 629,417 |
+| Query-refinement admission | 88,292 | 159,292 | 2,156,209 | 2,536,333 |
+| Inactive `n` dispatch | 11,125 | 11,833 | 149,583 | 163,917 |
+| Inactive `N` dispatch | 11,084 | 15,667 | 160,667 | 170,958 |
+| Inactive Count dispatch | 10,917 | 12,458 | 157,250 | 173,666 |
+| Inactive forward linear control | 15,542 | 27,875 | 784,541 | 1,010,834 |
+| Inactive backward linear control | 15,291 | 15,916 | 257,375 | 281,458 |
+
+On the 8,192-Line fixture, bottom-origin scan admission measured 14,291 ns median and 20,625 ns p95 before this change. After this change, the same stage measured 458 ns median and 1,000 ns p95. On the 131,072-Line fixture, it measured 2,541 ns median and 2,834 ns p95. This stage has no previous input Batch to release. Query-refinement admission also releases the previous Batch and ranges, so its total latency remains larger than the indexed retention lookup.
+
+The published navigation allocation uses 64 bytes per occurrence on this target. The two selection fixtures use 524,288 and 8,388,608 bytes. Worker projection includes index construction. The 131,072-Line fixture measured worker projection at 20,874,208 ns median and 26,146,625 ns p95. Terminal selection performs logarithmic lookup without a complete Batch walk or index allocation.
+
+Tests compare indexed selection with linear selection in both Layouts at 45 and 100 columns. They cover wrapped source and ReviewBody ranges, hidden Folds and resolved Threads, typed Comment and Draft owners, and unavailable destinations. They also cover unordered Batches, duplicate identities, changed range ends, disappearing occurrences, empty Batches, Count, wrap status, and synchronous Frame publication. Existing tests cover rapid Query edits, pending Enter, stale Frames, cancellation, Session replacement, and worker failures. Allocation-failure tests exercise the new projection allocations.
+
+`zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 936 tests. The Standards and Spec self-review found no remaining findings for this item. The ticket remains `ready-for-agent`. The next remaining item is bounded navigation restoration during worker Frame admission.

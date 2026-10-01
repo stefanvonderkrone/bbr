@@ -818,12 +818,24 @@ pub const BufferSearchCorpus = struct {
     }
 };
 
+/// One allocation travels with the projected Batch. Prefix maxima and suffix
+/// minima preserve Batch order even when visual rows are not monotonic.
+const SearchNavigationRow = struct {
+    visible: ?usize,
+    prefix_max: ?usize,
+    suffix_min: ?usize,
+    // Across the slice, these fields index sorted occurrence identities.
+    // Edited identities keep the first Batch index when several ranges share a start.
+    edited_index: usize,
+    exact_index: usize,
+};
+
 /// Immutable Frame search indexes. Workers read copied coordinates only.
 /// Disclosure pointers are identities, never dereferenced after construction.
 const SearchProjection = struct {
     const Result = struct {
         ranges: []frame_mod.ProjectedSourceRange,
-        navigation_rows: []?usize,
+        navigation_rows: []SearchNavigationRow,
     };
     const Half = struct {
         old_line: ?u32,
@@ -1091,7 +1103,37 @@ const SearchProjection = struct {
         std.mem.sort(frame_mod.ProjectedSourceRange, projected.items, {}, searchRangeLess);
         const ranges = try allocator.dupe(frame_mod.ProjectedSourceRange, projected.items);
         errdefer allocator.free(ranges);
-        return .{ .ranges = ranges, .navigation_rows = try allocator.dupe(?usize, navigation_rows) };
+        const rows = try allocator.alloc(SearchNavigationRow, batch.occurrences.len);
+        errdefer allocator.free(rows);
+        const identities = try temp.alloc(usize, rows.len);
+        var prefix_max: ?usize = null;
+        for (rows, batch.occurrences, navigation_rows, 0..) |*row, occurrence, visible, index| {
+            const destination = visible orelse self.navigationRow(occurrence);
+            if (destination) |value| prefix_max = if (prefix_max) |previous| @max(previous, value) else value;
+            row.* = .{ .visible = visible, .prefix_max = prefix_max, .suffix_min = destination, .edited_index = undefined, .exact_index = undefined };
+            identities[index] = index;
+        }
+        var suffix_min: ?usize = null;
+        var index = rows.len;
+        while (index > 0) {
+            index -= 1;
+            if (rows[index].suffix_min) |value| suffix_min = if (suffix_min) |previous| @min(previous, value) else value;
+            rows[index].suffix_min = suffix_min;
+        }
+        std.mem.sort(usize, identities, batch, searchIdentityIndexLess);
+        for (rows, identities) |*row, identity| row.exact_index = identity;
+        var group_start: usize = 0;
+        while (group_start < rows.len) {
+            var group_end = group_start + 1;
+            var first = identities[group_start];
+            while (group_end < rows.len and editedSearchOrder(batch.occurrences[identities[group_start]], batch.occurrences[identities[group_end]]) == .eq) : (group_end += 1) {
+                const candidate = identities[group_end];
+                if (batch.occurrences[candidate].ranges.len > 0 and (batch.occurrences[first].ranges.len == 0 or candidate < first)) first = candidate;
+            }
+            for (rows[group_start..group_end]) |*row| row.edited_index = first;
+            group_start = group_end;
+        }
+        return .{ .ranges = ranges, .navigation_rows = rows };
     }
 };
 
@@ -1418,7 +1460,7 @@ pub const DisclosureBuild = struct {
     input_query_text: ?[]const u8 = null,
     input_rebuilt_batch: ?search.Batch = null,
     input_ranges: ?[]frame_mod.ProjectedSourceRange = null,
-    input_navigation_rows: ?[]?usize = null,
+    input_navigation_rows: ?[]SearchNavigationRow = null,
     review_selected: ?usize = null,
     review_request_id: u64 = 0,
     review_destination_id: u64 = 0,
@@ -1427,9 +1469,9 @@ pub const DisclosureBuild = struct {
     visual_rows: []const frame_mod.VisualRow = &.{},
     projection: ?*SearchProjection = null,
     ranges: ?[]frame_mod.ProjectedSourceRange = null,
-    navigation_rows: ?[]?usize = null,
+    navigation_rows: ?[]SearchNavigationRow = null,
     accepted_ranges: ?[]frame_mod.ProjectedSourceRange = null,
-    accepted_navigation_rows: ?[]?usize = null,
+    accepted_navigation_rows: ?[]SearchNavigationRow = null,
     review_ranges: ?[]frame_mod.ProjectedSourceRange = null,
     search_corpus: ?*BufferSearchCorpus = null,
     rebuilt_batch: ?search.Batch = null,
@@ -1828,7 +1870,7 @@ pub const BufferSearchScanned = struct {
     session_epoch: SessionEpoch,
     outcome: BufferSearchScanOutcome,
     ranges: ?[]frame_mod.ProjectedSourceRange = null,
-    navigation_rows: ?[]?usize = null,
+    navigation_rows: ?[]SearchNavigationRow = null,
     visual_rows_revision: frame_mod.Revision = 0,
     mode: search.Mode = .literal,
 
@@ -2445,7 +2487,7 @@ const BufferSearchInput = struct {
     batch: ?search.Batch = null,
     active: ?usize = null,
     ranges: ?[]frame_mod.ProjectedSourceRange = null,
-    navigation_rows: ?[]?usize = null,
+    navigation_rows: ?[]SearchNavigationRow = null,
     saved_navigation: Nav,
     origin: usize,
     count: usize,
@@ -2476,7 +2518,7 @@ const BufferSearchState = struct {
     active: ?usize = null,
     status_visible: bool = true,
     accepted_ranges: ?[]frame_mod.ProjectedSourceRange = null,
-    accepted_navigation_rows: ?[]?usize = null,
+    accepted_navigation_rows: ?[]SearchNavigationRow = null,
     saved_disclosures: ?*DisclosureKeys = null,
     input: ?BufferSearchInput = null,
 
@@ -2662,9 +2704,11 @@ const Published = struct {
         selected_version: SelectedVersion,
         accepted_batch: ?search.Batch = null,
         accepted_ranges: ?[]frame_mod.ProjectedSourceRange = null,
+        accepted_navigation_rows: ?[]SearchNavigationRow = null,
         accepted_active: ?usize = null,
         input_batch: ?search.Batch = null,
         input_ranges: ?[]frame_mod.ProjectedSourceRange = null,
+        input_navigation_rows: ?[]SearchNavigationRow = null,
         input_active: ?usize = null,
         review_ranges: ?[]frame_mod.ProjectedSourceRange = null,
         search_corpus: ?*BufferSearchCorpus = null,
@@ -2675,8 +2719,10 @@ const Published = struct {
             if (self.active) {
                 if (self.accepted_batch) |*batch| batch.deinit(self.published.allocator);
                 if (self.accepted_ranges) |ranges| std.heap.page_allocator.free(ranges);
+                if (self.accepted_navigation_rows) |rows| std.heap.page_allocator.free(rows);
                 if (self.input_batch) |*batch| batch.deinit(self.published.allocator);
                 if (self.input_ranges) |ranges| std.heap.page_allocator.free(ranges);
+                if (self.input_navigation_rows) |rows| std.heap.page_allocator.free(rows);
                 if (self.review_ranges) |ranges| std.heap.page_allocator.free(ranges);
                 if (self.search_corpus) |corpus| corpus.release();
                 self.search_projection.release();
@@ -2725,7 +2771,8 @@ const Published = struct {
                 if (self.published.buffer_search.accepted_ranges) |ranges| std.heap.page_allocator.free(ranges);
                 if (self.published.buffer_search.accepted_navigation_rows) |rows| std.heap.page_allocator.free(rows);
                 self.published.buffer_search.accepted_ranges = self.accepted_ranges;
-                self.published.buffer_search.accepted_navigation_rows = null;
+                self.published.buffer_search.accepted_navigation_rows = self.accepted_navigation_rows;
+                self.accepted_navigation_rows = null;
                 self.published.buffer_search.active = self.accepted_active;
                 self.accepted_ranges = null;
             }
@@ -2738,7 +2785,8 @@ const Published = struct {
                 if (input.ranges) |ranges| std.heap.page_allocator.free(ranges);
                 if (input.navigation_rows) |rows| std.heap.page_allocator.free(rows);
                 input.ranges = self.input_ranges;
-                input.navigation_rows = null;
+                input.navigation_rows = self.input_navigation_rows;
+                self.input_navigation_rows = null;
                 input.active = self.input_active;
                 self.input_ranges = null;
             };
@@ -3254,16 +3302,20 @@ const Published = struct {
         );
         var accepted_batch: ?search.Batch = null;
         var accepted_ranges: ?[]frame_mod.ProjectedSourceRange = null;
+        var accepted_navigation_rows: ?[]SearchNavigationRow = null;
         var accepted_active: ?usize = null;
         errdefer {
             if (accepted_batch) |*batch| batch.deinit(self.allocator);
             if (accepted_ranges) |ranges| std.heap.page_allocator.free(ranges);
+            if (accepted_navigation_rows) |rows| std.heap.page_allocator.free(rows);
         }
         if (self.buffer_search.accepted_query) |query| {
             if (reuse_search_corpus) {
                 if (self.buffer_search.accepted_batch) |batch| {
                     accepted_active = self.buffer_search.active;
-                    accepted_ranges = try projectBufferSearchRangesFor(std.heap.page_allocator, candidate, visual_rows, batch, accepted_active);
+                    const projected = try search_projection.project(std.heap.page_allocator, batch);
+                    accepted_ranges = projected.ranges;
+                    accepted_navigation_rows = projected.navigation_rows;
                 }
             } else {
                 var batch = self.scanBufferSearchFor(preferences, expanded_disclosures, isolated_file, geometry, query) catch |err| return switch (err) {
@@ -3271,26 +3323,32 @@ const Published = struct {
                     else => error.SearchFailed,
                 };
                 accepted_active = retainedSearchIndex(self.buffer_search.accepted_batch, self.buffer_search.active, batch);
-                accepted_ranges = projectBufferSearchRangesFor(std.heap.page_allocator, candidate, visual_rows, batch, accepted_active) catch |err| {
+                const projected = search_projection.project(std.heap.page_allocator, batch) catch |err| {
                     batch.deinit(self.allocator);
                     return err;
                 };
+                accepted_ranges = projected.ranges;
+                accepted_navigation_rows = projected.navigation_rows;
                 accepted_batch = batch;
             }
         }
 
         var input_batch: ?search.Batch = null;
         var input_ranges: ?[]frame_mod.ProjectedSourceRange = null;
+        var input_navigation_rows: ?[]SearchNavigationRow = null;
         var input_active: ?usize = null;
         errdefer {
             if (input_batch) |*batch| batch.deinit(self.allocator);
             if (input_ranges) |ranges| std.heap.page_allocator.free(ranges);
+            if (input_navigation_rows) |rows| std.heap.page_allocator.free(rows);
         }
         if (self.buffer_search.input) |input| if (input.query) |query| {
             if (reuse_search_corpus) {
                 if (input.batch) |batch| {
                     input_active = input.active;
-                    input_ranges = try projectBufferSearchRangesFor(std.heap.page_allocator, candidate, visual_rows, batch, input_active);
+                    const projected = try search_projection.project(std.heap.page_allocator, batch);
+                    input_ranges = projected.ranges;
+                    input_navigation_rows = projected.navigation_rows;
                 }
             } else {
                 var batch = self.scanBufferSearchFor(preferences, expanded_disclosures, isolated_file, geometry, query) catch |err| return switch (err) {
@@ -3298,13 +3356,21 @@ const Published = struct {
                     else => error.SearchFailed,
                 };
                 input_active = retainedSearchIndex(input.batch, input.active, batch);
-                input_ranges = projectBufferSearchRangesFor(std.heap.page_allocator, candidate, visual_rows, batch, input_active) catch |err| {
+                const projected = search_projection.project(std.heap.page_allocator, batch) catch |err| {
                     batch.deinit(self.allocator);
                     return err;
                 };
+                input_ranges = projected.ranges;
+                input_navigation_rows = projected.navigation_rows;
                 input_batch = batch;
             }
         };
+        if (accepted_ranges) |ranges| {
+            for (ranges) |*range| range.active = range.occurrence_index == accepted_active;
+        }
+        if (input_ranges) |ranges| {
+            for (ranges) |*range| range.active = range.occurrence_index == input_active;
+        }
         const review_ranges = if (self.review_search.batch) |batch|
             try projectBufferSearchRangesFor(std.heap.page_allocator, candidate, visual_rows, batch, self.review_search.selected)
         else
@@ -3333,9 +3399,11 @@ const Published = struct {
             .selected_version = preferences.selected_version,
             .accepted_batch = accepted_batch,
             .accepted_ranges = accepted_ranges,
+            .accepted_navigation_rows = accepted_navigation_rows,
             .accepted_active = accepted_active,
             .input_batch = input_batch,
             .input_ranges = input_ranges,
+            .input_navigation_rows = input_navigation_rows,
             .input_active = input_active,
             .review_ranges = review_ranges,
             .search_corpus = search_corpus,
@@ -7134,7 +7202,7 @@ pub const Presentation = struct {
         input.navigation_rows = null;
         if (input.active) |active| if (published.buffer_search.accepted_batch) |batch| {
             if (published.buffer_search.accepted_navigation_rows) |rows| {
-                if (rows[active]) |row| published.navigation.jumpTo(row) else _ = published.jumpToSearchOccurrence(batch.occurrences[active]);
+                if (rows[active].visible) |row| published.navigation.jumpTo(row) else _ = published.jumpToSearchOccurrence(batch.occurrences[active]);
             } else _ = published.jumpToSearchOccurrence(batch.occurrences[active]);
         };
         input.deinit(self.allocator);
@@ -7361,19 +7429,13 @@ pub const Presentation = struct {
             .scanned => |batch| batch,
         };
         completed.outcome = .failed;
-        const retained = retainedEditedSearchIndex(input.batch, input.active, batch);
         if (completed.visual_rows_revision != published.visual_rows_revision) {
             batch.deinit(self.allocator);
             self.retryStaleBufferDisclosure(published);
             return;
         }
-        const base = if (batch.occurrences.len == 0 or retained != null) 0 else firstSearchOccurrenceAtOrAfter(published, batch, input.origin, completed.navigation_rows) catch {
-            batch.deinit(self.allocator);
-            input.pending = false;
-            self.action_error = .out_of_memory;
-            published.frame_revision += 1;
-            return;
-        };
+        const retained = retainedEditedSearchIndex(input.batch, input.active, batch, completed.navigation_rows);
+        const base = if (batch.occurrences.len == 0 or retained != null) 0 else firstSearchOccurrenceAtOrAfter(completed.navigation_rows, input.origin);
         const active = if (batch.occurrences.len == 0) null else retained orelse (base + input.count - 1) % batch.occurrences.len;
         if (self.queueBufferDisclosure(published, batch, active, input.request_id, completed.navigation_rows) catch {
             batch.deinit(self.allocator);
@@ -7412,7 +7474,7 @@ pub const Presentation = struct {
             if (refreshed.batch) |refreshed_batch| {
                 if (refreshed.active) |refreshed_active| {
                     if (completed.navigation_rows) |rows| {
-                        if (rows[refreshed_active]) |row| published.navigation.jumpTo(row) else _ = published.jumpToSearchOccurrence(refreshed_batch.occurrences[refreshed_active]);
+                        if (rows[refreshed_active].visible) |row| published.navigation.jumpTo(row) else _ = published.jumpToSearchOccurrence(refreshed_batch.occurrences[refreshed_active]);
                     } else _ = published.jumpToSearchOccurrence(refreshed_batch.occurrences[refreshed_active]);
                 }
             }
@@ -7438,11 +7500,11 @@ pub const Presentation = struct {
         if ((published.buffer_search.input orelse return).accept_when_ready) self.acceptBufferSearch();
     }
 
-    fn queueBufferDisclosure(self: *Presentation, published: *Published, batch: search.Batch, active: ?usize, request_id: u64, navigation_rows: ?[]?usize) !bool {
+    fn queueBufferDisclosure(self: *Presentation, published: *Published, batch: search.Batch, active: ?usize, request_id: u64, navigation_rows: ?[]SearchNavigationRow) !bool {
         var required: SearchDisclosureSet = .{};
         if (active) |index| {
             const occurrence = batch.occurrences[index];
-            const visible = if (navigation_rows) |rows| rows[index] else published.occurrenceVisualRow(occurrence);
+            const visible = if (navigation_rows) |rows| rows[index].visible else published.occurrenceVisualRow(occurrence);
             required = searchDisclosureForVisibility(published, occurrence, visible != null);
         }
         if (required.len == 0 and published.buffer_search.saved_disclosures == null) return false;
@@ -7564,7 +7626,7 @@ pub const Presentation = struct {
         }
         if (job.active) |index| {
             if (input.navigation_rows) |rows| {
-                if (rows[index]) |row| published.navigation.jumpTo(row) else _ = published.jumpToSearchOccurrence(input.batch.?.occurrences[index]);
+                if (rows[index].visible) |row| published.navigation.jumpTo(row) else _ = published.jumpToSearchOccurrence(input.batch.?.occurrences[index]);
             } else _ = published.jumpToSearchOccurrence(input.batch.?.occurrences[index]);
         }
         published.frame_revision += 1;
@@ -7772,7 +7834,7 @@ pub const Presentation = struct {
         job.navigation_rows = null;
         published.buffer_search.active = job.active;
         if (published.buffer_search.input) |*input| {
-            const next_active = if (job.input_rebuilt_batch) |batch| retainedSearchIndex(input.batch, input.active, batch) else null;
+            const next_active = if (job.input_rebuilt_batch) |batch| retainedProjectedSearchIndex(input.batch, input.active, batch, job.input_navigation_rows) else null;
             if (input.batch) |*old| old.deinit(self.allocator);
             if (input.ranges) |old| std.heap.page_allocator.free(old);
             if (input.navigation_rows) |old| std.heap.page_allocator.free(old);
@@ -8159,7 +8221,7 @@ pub const Presentation = struct {
         if (job.restore_navigation == null and job.kind != .general and job.kind != .open_input) {
             if (job.active) |index| {
                 if (published.buffer_search.accepted_navigation_rows) |rows| {
-                    if (rows[index]) |row| published.navigation.jumpTo(row) else _ = published.jumpToSearchOccurrence(current.?.occurrences[index]);
+                    if (rows[index].visible) |row| published.navigation.jumpTo(row) else _ = published.jumpToSearchOccurrence(current.?.occurrences[index]);
                 } else _ = published.jumpToSearchOccurrence(current.?.occurrences[index]);
             }
         }
@@ -8272,11 +8334,11 @@ pub const Presentation = struct {
                     .backward => count > active,
                 },
             };
-        } else searchFromInactiveRow(published, batch.*, published.buffer_search.accepted_navigation_rows, published.navigation.cursor, count, direction);
+        } else searchFromInactiveRow(batch.*, published.buffer_search.accepted_navigation_rows, published.navigation.cursor, count, direction);
         const next = next_and_wrap[0];
         const wrapped = next_and_wrap[1];
         if (published.buffer_search.saved_disclosures == null) {
-            const row = if (published.buffer_search.accepted_navigation_rows) |rows| rows[next] else published.occurrenceVisualRow(batch.occurrences[next]);
+            const row = if (published.buffer_search.accepted_navigation_rows) |rows| rows[next].visible else published.occurrenceVisualRow(batch.occurrences[next]);
             if (row) |visible| {
                 published.buffer_search.active = next;
                 published.navigation.jumpTo(visible);
@@ -11148,42 +11210,45 @@ fn appendSearchIntersections(
     }
 }
 
-fn firstSearchOccurrenceAtOrAfter(published: *const Published, batch: search.Batch, origin: usize, navigation_rows: ?[]?usize) !usize {
+fn firstSearchOccurrenceAtOrAfter(navigation_rows: ?[]SearchNavigationRow, origin: usize) usize {
     if (origin == 0) return 0;
-    for (batch.occurrences, 0..) |occurrence, index| {
-        const row = (if (navigation_rows) |rows| rows[index] else null) orelse searchOccurrenceNavigationRow(published, occurrence) orelse continue;
-        if (row >= origin) return index;
-    }
-    return 0;
+    const rows = navigation_rows orelse return 0;
+    return firstSearchRow(rows, origin, false) orelse 0;
 }
 
-fn searchFromInactiveRow(published: *const Published, batch: search.Batch, navigation_rows: ?[]?usize, cursor: usize, count: usize, direction: Presentation.SearchDirection) struct { usize, bool } {
+fn firstSearchRow(rows: []const SearchNavigationRow, cursor: usize, strict: bool) ?usize {
+    var low: usize = 0;
+    var high = rows.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const qualifies = if (rows[middle].prefix_max) |row| if (strict) row > cursor else row >= cursor else false;
+        if (qualifies) high = middle else low = middle + 1;
+    }
+    return if (low < rows.len) low else null;
+}
+
+fn lastSearchRowBefore(rows: []const SearchNavigationRow, cursor: usize) ?usize {
+    var low: usize = 0;
+    var high = rows.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const qualifies = if (rows[middle].suffix_min) |row| row < cursor else false;
+        if (qualifies) low = middle + 1 else high = middle;
+    }
+    return if (low > 0) low - 1 else null;
+}
+
+fn searchFromInactiveRow(batch: search.Batch, navigation_rows: ?[]SearchNavigationRow, cursor: usize, count: usize, direction: Presentation.SearchDirection) struct { usize, bool } {
     const len = batch.occurrences.len;
     return switch (direction) {
         .forward => blk: {
-            var first: ?usize = null;
-            for (batch.occurrences, 0..) |occurrence, index| {
-                const row = if (navigation_rows) |rows| rows[index] orelse searchOccurrenceNavigationRow(published, occurrence) else searchOccurrenceNavigationRow(published, occurrence);
-                if (row) |visible| if (visible > cursor) {
-                    first = index;
-                    break;
-                };
-            }
+            const first = if (navigation_rows) |rows| firstSearchRow(rows, cursor, true) else null;
             const start = first orelse 0;
             const offset = count - 1;
             break :blk .{ (start + offset % len) % len, first == null or offset >= len - start };
         },
         .backward => blk: {
-            var last: ?usize = null;
-            var index = len;
-            while (index > 0) {
-                index -= 1;
-                const row = if (navigation_rows) |rows| rows[index] orelse searchOccurrenceNavigationRow(published, batch.occurrences[index]) else searchOccurrenceNavigationRow(published, batch.occurrences[index]);
-                if (row) |visible| if (visible < cursor) {
-                    last = index;
-                    break;
-                };
-            }
+            const last = if (navigation_rows) |rows| lastSearchRowBefore(rows, cursor) else null;
             const start = last orelse len - 1;
             const offset = (count - 1) % len;
             break :blk .{ (start + len - offset) % len, last == null or count - 1 > start };
@@ -11205,17 +11270,96 @@ fn retainedSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, n
     return 0;
 }
 
-fn retainedEditedSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next: search.Batch) ?usize {
+fn editedSearchOrder(a: search.Occurrence, b: search.Occurrence) std.math.Order {
+    const location_order = searchLocationOrder(a.location, b.location);
+    if (location_order != .eq) return location_order;
+    return std.mem.order(usize, &.{if (a.ranges.len > 0) a.ranges[0].start else 0}, &.{if (b.ranges.len > 0) b.ranges[0].start else 0});
+}
+
+fn searchLocationOrder(a: search.Location, b: search.Location) std.math.Order {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return if (a == .source) .lt else .gt;
+    return switch (a) {
+        .source => |source| blk: {
+            const other = b.source;
+            const coordinates = std.mem.order(u64, &.{
+                source.file_index,
+                @intFromEnum(source.relation),
+                if (source.old_line) |line| @as(u64, line) + 1 else 0,
+                if (source.new_line) |line| @as(u64, line) + 1 else 0,
+            }, &.{
+                other.file_index,
+                @intFromEnum(other.relation),
+                if (other.old_line) |line| @as(u64, line) + 1 else 0,
+                if (other.new_line) |line| @as(u64, line) + 1 else 0,
+            });
+            if (coordinates != .eq) break :blk coordinates;
+            const old_path = std.mem.order(u8, source.old_path, other.old_path);
+            if (old_path != .eq) break :blk old_path;
+            break :blk std.mem.order(u8, source.new_path, other.new_path);
+        },
+        .review_body => |body| blk: {
+            const other = b.review_body;
+            if (std.meta.activeTag(body.owner) != std.meta.activeTag(other.owner)) break :blk if (body.owner == .comment) .lt else .gt;
+            const id = switch (body.owner) {
+                .comment => |value| value,
+                .draft => |value| value,
+            };
+            const other_id = switch (other.owner) {
+                .comment => |value| value,
+                .draft => |value| value,
+            };
+            break :blk std.mem.order(u64, &.{ id, body.logical_line }, &.{ other_id, other.logical_line });
+        },
+    };
+}
+
+fn exactSearchOrder(a: search.Occurrence, b: search.Occurrence) std.math.Order {
+    const edited_order = editedSearchOrder(a, b);
+    if (edited_order != .eq) return edited_order;
+    const shape = std.mem.order(u64, &.{ a.session_epoch, a.ranges.len }, &.{ b.session_epoch, b.ranges.len });
+    if (shape != .eq) return shape;
+    for (a.ranges, b.ranges) |left, right| {
+        const order = std.mem.order(usize, &.{ left.start, left.end }, &.{ right.start, right.end });
+        if (order != .eq) return order;
+    }
+    return .eq;
+}
+
+fn searchIdentityIndexLess(batch: search.Batch, left: usize, right: usize) bool {
+    return exactSearchOrder(batch.occurrences[left], batch.occurrences[right]) == .lt;
+}
+
+fn retainedProjectedSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next: search.Batch, navigation_rows: ?[]SearchNavigationRow) ?usize {
+    if (next.occurrences.len == 0) return null;
+    if (previous_batch) |previous| if (previous_active) |active| if (active < previous.occurrences.len) {
+        return indexedSearchIdentity(previous.occurrences[active], next, navigation_rows, true) orelse @min(active, next.occurrences.len - 1);
+    };
+    return 0;
+}
+
+fn retainedEditedSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next: search.Batch, navigation_rows: ?[]SearchNavigationRow) ?usize {
     const previous = previous_batch orelse return null;
     const active = previous_active orelse return null;
     if (active >= previous.occurrences.len) return null;
     const wanted = previous.occurrences[active];
-    for (next.occurrences, 0..) |candidate, index| {
-        if (wanted.ranges.len > 0 and candidate.ranges.len > 0 and
-            wanted.ranges[0].start == candidate.ranges[0].start and
-            searchLocationEql(wanted.location, candidate.location)) return index;
+    if (wanted.ranges.len == 0) return null;
+    return indexedSearchIdentity(wanted, next, navigation_rows, false);
+}
+
+fn indexedSearchIdentity(wanted: search.Occurrence, next: search.Batch, navigation_rows: ?[]SearchNavigationRow, comptime exact: bool) ?usize {
+    const rows = navigation_rows orelse return null;
+    const compare = if (exact) exactSearchOrder else editedSearchOrder;
+    var low: usize = 0;
+    var high = rows.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const index = if (exact) rows[middle].exact_index else rows[middle].edited_index;
+        if (compare(next.occurrences[index], wanted) == .lt) low = middle + 1 else high = middle;
     }
-    return null;
+    if (low == rows.len) return null;
+    const index = if (exact) rows[low].exact_index else rows[low].edited_index;
+    const candidate = next.occurrences[index];
+    return if ((exact or candidate.ranges.len > 0) and compare(candidate, wanted) == .eq) index else null;
 }
 
 fn searchOccurrenceEql(a: search.Occurrence, b: search.Occurrence) bool {
@@ -11953,6 +12097,7 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
         times[@intFromEnum(Stage.clear_admission)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         try hidden.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
     }
+    try benchmarkSearchSelection(&presentation, io);
     try benchmarkHiddenSearchNavigation(&hidden, io);
     std.debug.print("fixture_files={d} fixture_lines={d} fixture_bytes={d}\n", .{ files, files * lines * 2, raw.items.len });
     std.debug.print("hidden_fixture_files=1 hidden_fixture_lines={d} hidden_fixture_bytes={d}\n", .{ hidden_lines + 2, hidden_raw.items.len });
@@ -11982,6 +12127,121 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
     try benchmarkReviewDestination(&hidden, io, "needle", "review_source_destination");
     try benchmarkDisclosureHandoff(allocator, io, false);
     try benchmarkDisclosureHandoff(allocator, io, true);
+}
+
+// Linear controls stay outside production dispatch. They also serve as the
+// reference for selection tests over nonmonotonic and hidden destinations.
+fn linearSearchOrigin(published: *const Published, batch: search.Batch, rows: []const SearchNavigationRow, origin: usize) usize {
+    if (origin == 0) return 0;
+    for (batch.occurrences, rows, 0..) |occurrence, row, index| {
+        const destination = row.visible orelse searchOccurrenceNavigationRow(published, occurrence) orelse continue;
+        if (destination >= origin) return index;
+    }
+    return 0;
+}
+
+fn linearEditedSearchIndex(wanted: search.Occurrence, batch: search.Batch) ?usize {
+    for (batch.occurrences, 0..) |candidate, index| {
+        if (wanted.ranges.len > 0 and candidate.ranges.len > 0 and wanted.ranges[0].start == candidate.ranges[0].start and searchLocationEql(wanted.location, candidate.location)) return index;
+    }
+    return null;
+}
+
+fn linearInactiveSearch(published: *const Published, batch: search.Batch, rows: []const SearchNavigationRow, cursor: usize, count: usize, direction: Presentation.SearchDirection) struct { usize, bool } {
+    const len = batch.occurrences.len;
+    var first: ?usize = null;
+    for (batch.occurrences, rows, 0..) |occurrence, row, index| {
+        const destination = row.visible orelse searchOccurrenceNavigationRow(published, occurrence) orelse continue;
+        if (direction == .forward and destination > cursor) {
+            first = index;
+            break;
+        }
+        if (direction == .backward and destination < cursor) first = index;
+    }
+    const offset = count - 1;
+    const start = first orelse if (direction == .forward) @as(usize, 0) else len - 1;
+    return if (direction == .forward)
+        .{ (start + offset % len) % len, first == null or offset >= len - start }
+    else
+        .{ (start + len - offset % len) % len, first == null or offset > start };
+}
+
+fn benchmarkSearchSelection(presentation: *Presentation, io: std.Io) !void {
+    const samples = 9;
+    const Stage = enum { retention_lookup, retention_linear_control, origin_lookup, origin_linear_control, retention_admission, inactive_next_dispatch, inactive_previous_dispatch, inactive_count_dispatch, inactive_next_linear_control, inactive_previous_linear_control };
+    var times: [@typeInfo(Stage).@"enum".fields.len][samples]u64 = undefined;
+    const published = presentation.published.?;
+    for (0..samples) |sample| {
+        try presentation.dispatch(.{ .action = .to_bottom });
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needl" } });
+        var initial = presentation.takeCommand().?;
+        defer initial.deinit();
+        try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(std.heap.page_allocator, &initial.scan_buffer_search) });
+        const previous = published.buffer_search.input.?.batch.?;
+        const active = published.buffer_search.input.?.active.?;
+        const origin = published.buffer_search.input.?.origin;
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        var completed = executeBufferSearchScan(std.heap.page_allocator, &command.scan_buffer_search);
+        var completion_owned = true;
+        defer if (completion_owned) completed.deinit();
+        if (completed.outcome != .scanned) return error.SearchFailed;
+        const next = completed.outcome.scanned;
+        var start = std.Io.Clock.awake.now(io);
+        const retained = retainedEditedSearchIndex(previous, active, next, completed.navigation_rows);
+        std.mem.doNotOptimizeAway(retained);
+        times[@intFromEnum(Stage.retention_lookup)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        start = std.Io.Clock.awake.now(io);
+        const retained_control = linearEditedSearchIndex(previous.occurrences[active], next);
+        std.mem.doNotOptimizeAway(retained_control);
+        times[@intFromEnum(Stage.retention_linear_control)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        start = std.Io.Clock.awake.now(io);
+        const base = firstSearchOccurrenceAtOrAfter(completed.navigation_rows, origin);
+        std.mem.doNotOptimizeAway(base);
+        times[@intFromEnum(Stage.origin_lookup)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        start = std.Io.Clock.awake.now(io);
+        const base_control = linearSearchOrigin(published, next, completed.navigation_rows.?, origin);
+        std.mem.doNotOptimizeAway(base_control);
+        times[@intFromEnum(Stage.origin_linear_control)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (retained != retained_control or retained == null or base != base_control) return error.SelectionControlMismatch;
+        start = std.Io.Clock.awake.now(io);
+        completion_owned = false;
+        try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        times[@intFromEnum(Stage.retention_admission)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (published.buffer_search.input.?.active != retained) return error.RetentionMismatch;
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        const batch = published.buffer_search.accepted_batch.?;
+        const rows = published.buffer_search.accepted_navigation_rows.?;
+        inline for (.{ Presentation.SearchDirection.forward, Presentation.SearchDirection.backward }) |direction| {
+            try presentation.dispatch(.{ .action = if (direction == .forward) .to_top else .to_bottom });
+            try presentation.dispatch(.{ .action = if (direction == .forward) .to_bottom else .to_top });
+            if (published.buffer_search.active != null) return error.SearchStillActive;
+            const cursor = published.navigation.cursor;
+            start = std.Io.Clock.awake.now(io);
+            const control = linearInactiveSearch(published, batch, rows, cursor, 1, direction);
+            std.mem.doNotOptimizeAway(control);
+            times[@intFromEnum(if (direction == .forward) Stage.inactive_next_linear_control else Stage.inactive_previous_linear_control)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+            start = std.Io.Clock.awake.now(io);
+            try presentation.dispatch(.{ .action = if (direction == .forward) .next_search_occurrence else .previous_search_occurrence });
+            times[@intFromEnum(if (direction == .forward) Stage.inactive_next_dispatch else Stage.inactive_previous_dispatch)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+            if (published.buffer_search.active != control[0]) return error.InactiveSelectionMismatch;
+        }
+        try presentation.dispatch(.{ .action = .to_top });
+        try presentation.dispatch(.{ .action = .to_bottom });
+        const counted = linearInactiveSearch(published, batch, rows, published.navigation.cursor, 999, .forward);
+        for (0..3) |_| try presentation.dispatch(.{ .push_count_digit = 9 });
+        start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .action = .next_search_occurrence });
+        times[@intFromEnum(Stage.inactive_count_dispatch)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (published.buffer_search.active != counted[0]) return error.CountMismatch;
+    }
+    std.debug.print("selection_fixture_occurrences={d} selection_fixture_visual_rows={d} selection_index_bytes={d}\n", .{ published.buffer_search.accepted_batch.?.occurrences.len, published.visual_rows.len, published.buffer_search.accepted_navigation_rows.?.len * @sizeOf(SearchNavigationRow) });
+    inline for (@typeInfo(Stage).@"enum".fields, 0..) |stage, index| {
+        std.mem.sort(u64, &times[index], {}, std.sort.asc(u64));
+        std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ stage.name, times[index][samples / 2], times[index][(samples * 95 + 99) / 100 - 1] });
+    }
 }
 
 fn benchmarkHiddenSearchNavigation(presentation: *Presentation, io: std.Io) !void {
@@ -15144,6 +15404,142 @@ test "M21 kernel Buffer Search keeps the previous preview after a refused edit" 
 
     try testing.expectEqualStrings("new", presentation.projection().buffer_search.?.query);
     try testing.expectEqual(ActionError.buffer_search_query_too_long, presentation.projection().action_error.?);
+}
+
+test "M21 kernel indexed Batch selection matches linear selection across hidden wrapped and unordered occurrences" {
+    for ([_]u16{ 45, 100 }) |width| for ([_]bool{ false, true }) |side_by_side| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .scope = .review, .body = "c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1 c1" });
+        const session = try testDisclosureSession(testing.allocator, 1);
+        session.diff = try bbr.diff.parse(session.arena.allocator(),
+            \\diff --git a/a.txt b/a.txt
+            \\--- a/a.txt
+            \\+++ b/a.txt
+            \\@@ -1,12 +1,12 @@
+            \\-c1 old source that wraps across several terminal rows
+            \\+c1 new source that wraps across several terminal rows
+            \\ c1
+            \\ c2
+            \\ c3
+            \\ c4
+            \\ c5
+            \\ c6
+            \\ c7
+            \\ c8
+            \\ c9
+            \\ c10
+            \\-b
+            \\+B
+        );
+        session.threads = try bbr.review.buildThreads(session.arena.allocator(), &.{
+            .{ .id = 1, .author = "Ada", .body = "c1\n\nc1\n\nc1\n\nc1", .resolved = true, .anchor = .{ .path = "a.txt", .to = 12 } },
+            .{ .id = 2, .parent_id = 1, .author = "Bo", .body = "c1" },
+        });
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+            .initial = .{ .key = key, .session = session },
+            .geometry = .{ .cols = width, .rows = 12 },
+        });
+        defer presentation.deinit();
+        if (side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        const published = presentation.published.?;
+        var candidates: std.ArrayList(search.Candidate) = .empty;
+        defer candidates.deinit(testing.allocator);
+        try candidates.appendSlice(testing.allocator, published.search_corpus.?.candidates);
+        // Duplicate identities and a body with no Frame row exercise stable
+        // first-occurrence selection and unavailable destinations.
+        for (published.search_corpus.?.candidates) |candidate| if (std.mem.indexOf(u8, candidate.text, "c1") != null) {
+            try candidates.append(testing.allocator, candidate);
+            break;
+        };
+        try candidates.append(testing.allocator, .{ .text = "c1 c1", .location = .{ .review_body = .{ .owner = .{ .draft = 999 }, .logical_line = 0 } } });
+        var before_query = try search.Query.init(testing.allocator, "c");
+        defer before_query.deinit(testing.allocator);
+        var after_query = try search.Query.init(testing.allocator, "c1");
+        defer after_query.deinit(testing.allocator);
+        var before = try search.scan(testing.allocator, before_query, candidates.items, .literal);
+        defer before.deinit(testing.allocator);
+        var after = try search.scan(testing.allocator, after_query, candidates.items, .literal);
+        defer after.deinit(testing.allocator);
+        // Retention must not depend on corpus order, score, or column order.
+        var offset: usize = 0;
+        while (offset < after.occurrences.len / 2) : (offset += 2) {
+            const other = after.occurrences.len - offset - 1;
+            const saved = after.occurrences[offset];
+            after.occurrences[offset] = after.occurrences[other];
+            after.occurrences[other] = saved;
+        }
+        const projected = try published.search_projection.project(testing.allocator, after);
+        defer testing.allocator.free(projected.ranges);
+        defer testing.allocator.free(projected.navigation_rows);
+        var hidden = false;
+        var unavailable = false;
+        for (after.occurrences, projected.navigation_rows) |occurrence, row| {
+            if (row.visible == null) {
+                if (searchOccurrenceNavigationRow(published, occurrence) == null) unavailable = true else hidden = true;
+            }
+        }
+        try testing.expect(hidden and unavailable);
+        for (before.occurrences, 0..) |wanted, active| {
+            try testing.expectEqual(linearEditedSearchIndex(wanted, after), retainedEditedSearchIndex(before, active, after, projected.navigation_rows));
+            try testing.expectEqual(retainedSearchIndex(before, active, after), retainedProjectedSearchIndex(before, active, after, projected.navigation_rows));
+        }
+        for (after.occurrences, 0..) |_, active| {
+            try testing.expectEqual(retainedSearchIndex(after, active, after), retainedProjectedSearchIndex(after, active, after, projected.navigation_rows));
+        }
+        for (0..published.visual_rows.len + 2) |cursor| {
+            try testing.expectEqual(linearSearchOrigin(published, after, projected.navigation_rows, cursor), firstSearchOccurrenceAtOrAfter(projected.navigation_rows, cursor));
+            for ([_]usize{ 1, 2, after.occurrences.len, after.occurrences.len + 1, 999 }) |count| {
+                inline for (.{ Presentation.SearchDirection.forward, Presentation.SearchDirection.backward }) |direction| {
+                    try testing.expectEqualDeep(linearInactiveSearch(published, after, projected.navigation_rows, cursor, count, direction), searchFromInactiveRow(after, projected.navigation_rows, cursor, count, direction));
+                }
+            }
+        }
+        try testing.expectEqual(@as(?usize, null), retainedEditedSearchIndex(before, before.occurrences.len, after, projected.navigation_rows));
+        try testing.expectEqual(@as(?usize, null), retainedEditedSearchIndex(null, null, after, projected.navigation_rows));
+        var empty_query = try search.Query.init(testing.allocator, "no occurrence");
+        defer empty_query.deinit(testing.allocator);
+        var empty = try search.scan(testing.allocator, empty_query, candidates.items, .literal);
+        defer empty.deinit(testing.allocator);
+        const empty_projection = try published.search_projection.project(testing.allocator, empty);
+        defer testing.allocator.free(empty_projection.ranges);
+        defer testing.allocator.free(empty_projection.navigation_rows);
+        try testing.expectEqual(@as(usize, 0), firstSearchOccurrenceAtOrAfter(empty_projection.navigation_rows, 999));
+        try testing.expectEqual(@as(?usize, null), retainedEditedSearchIndex(before, 0, empty, empty_projection.navigation_rows));
+    };
+}
+
+test "M21 kernel inactive Batch traversal keeps Count wrap status and synchronous Frame indexes" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testVersionNavigationSession(testing.allocator) },
+        .geometry = .{ .cols = 45, .rows = 12 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 's', .text = "source" } });
+    try completeBufferSearchScan(&presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    const published = presentation.published.?;
+    for ([_]bool{ false, true }) |synchronous| {
+        if (synchronous) try published.rebuild(presentation.preferences, published.expanded_disclosures.items, null);
+        inline for (.{ Presentation.SearchDirection.forward, Presentation.SearchDirection.backward }) |direction| {
+            try presentation.dispatch(.{ .action = if (direction == .forward) .to_bottom else .to_top });
+            try testing.expectEqual(@as(?usize, null), published.buffer_search.active);
+            try testing.expect(published.buffer_search.accepted_navigation_rows != null);
+            const wanted = linearInactiveSearch(published, published.buffer_search.accepted_batch.?, published.buffer_search.accepted_navigation_rows.?, published.navigation.cursor, 9, direction);
+            try presentation.dispatch(.{ .push_count_digit = 9 });
+            try presentation.dispatch(.{ .action = if (direction == .forward) .next_search_occurrence else .previous_search_occurrence });
+            try testing.expectEqual(@as(?usize, wanted[0]), published.buffer_search.active);
+            try testing.expect(wanted[1]);
+            try testing.expectEqual(if (direction == .forward) ActionError.buffer_search_hit_bottom else ActionError.buffer_search_hit_top, presentation.projection().action_error.?);
+            try testing.expectEqual(@as(usize, 0), published.navigation.count);
+            try presentation.dispatch(.{ .action = .down });
+            try testing.expect(presentation.projection().action_error == null);
+        }
+    }
 }
 
 test "M21 kernel Buffer Search applies Count and Unicode-safe query editing" {
