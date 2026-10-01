@@ -478,6 +478,79 @@ test "M21 authored destination launch failure and closed sink preserve the Overl
     }
 }
 
+test "M21 authored Buffer Search restoration launch failure and closed sink preserve the Frame" {
+    for ([_]bool{ false, true }) |closed| {
+        const session = try @import("session.zig").create(testing.allocator);
+        session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Bitbucket" };
+        session.source = .{ .remote = .{ .id = 1, .title = "Review", .state = "OPEN", .author_display_name = "Reviewer", .source_branch = "feature", .destination_branch = "main", .source_commit = "source", .destination_commit = "base" } };
+        session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,12 +1,12 @@\n-a\n+A\n c1\n c2\n c3\n c4\n c5\n c6\n c7\n c8\n c9\n c10\n-b\n+B\n");
+        try session.initializeEnrichment();
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+        });
+        defer state.deinit();
+        try state.dispatch(.ensure_focused_enrichment);
+        var enrichment = state.takeCommand().?;
+        const blob = "a\nc1\nc2\nc3\nc4\nc5\nc6\nc7\nc8\nc9\nc10\nb\n";
+        const responses = [_]bbr.http.Canned{ .{ .status = 200, .body = blob }, .{ .status = 200, .body = blob } };
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+        const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+        var plain: bbr.highlight.PlainHighlighter = .{};
+        const result = try @import("file_enrichment.zig").enrich(testing.allocator, client, plain.highlighter(), enrichment.enrich_file.request());
+        try state.dispatch(.{ .file_enrichment_completed = .{
+            .command_id = enrichment.enrich_file.command_id,
+            .work_id = enrichment.enrich_file.work_id,
+            .session_epoch = enrichment.enrich_file.session_epoch,
+            .file_index = 0,
+            .outcome = .{ .completed = result },
+        } });
+        enrichment.deinit();
+        const enriched = state.takeCommand().?.build_buffer_disclosure;
+        enriched.build();
+        try state.dispatch(.{ .buffer_disclosure_built = enriched });
+        try state.dispatch(.{ .action = .open_review_search });
+        try state.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c5" } });
+        var authored = state.takeCommand().?;
+        try state.dispatch(.{ .buffer_search_scanned = presentation.executeBufferSearchScan(testing.allocator, &authored.scan_buffer_search) });
+        authored.deinit();
+        var source = state.takeCommand().?;
+        try state.dispatch(.{ .review_source_scanned = presentation.executeReviewSourceScan(testing.allocator, &source.scan_review_source) });
+        source.deinit();
+        try state.dispatch(.{ .action = .open_search_occurrence });
+        const destination = state.takeCommand().?.build_buffer_disclosure;
+        destination.build();
+        try state.dispatch(.{ .buffer_disclosure_built = destination });
+        const before = state.projection().review.?.frame;
+        const references = session.references.load(.acquire);
+        try state.dispatch(.{ .action = .open_buffer_search });
+        var command = state.takeCommand().?;
+        var capture: CapturingSink = .{ .reject = closed };
+        if (closed) {
+            command.build_buffer_disclosure.build();
+            try testing.expect(!command.build_buffer_disclosure.failed);
+            deliver(capture.sink(), .{ .buffer_disclosure_built = command.build_buffer_disclosure });
+            try testing.expect(capture.input == null);
+            try testing.expectEqual(references, session.references.load(.acquire));
+        } else {
+            var executor: ScriptedExecutor = .{};
+            try executor.executor().execute(capture.sink(), &command);
+            try state.dispatch(capture.input.?);
+            capture.input = null;
+            try testing.expectEqual(presentation.ActionError.buffer_build_failed, state.projection().action_error.?);
+            try testing.expect(!state.projection().buffer_search.?.pending);
+            try state.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c5" } });
+            const retry = state.takeCommand().?.build_buffer_disclosure;
+            retry.build();
+            try state.dispatch(.{ .buffer_disclosure_built = retry });
+            try testing.expect(before.visual_rows.ptr != state.projection().review.?.frame.visual_rows.ptr);
+            continue;
+        }
+        try testing.expectEqual(before.visual_rows.ptr, state.projection().review.?.frame.visual_rows.ptr);
+    }
+}
+
 test "M21 kernel Draft Frame launch failure and closed sink keep the Draft unsaved" {
     for ([_]bool{ false, true }) |closed| {
         const session = try @import("session.zig").create(testing.allocator);

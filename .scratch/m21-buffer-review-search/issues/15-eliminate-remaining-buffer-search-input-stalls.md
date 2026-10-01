@@ -27,7 +27,7 @@ The original checklist is complete, but the following input-latency work remains
 - [x] Stage the remaining view-change Buffer builds. Layout, Scope, Selected Version, File isolation, isolated File movement, and width changes use workers for every Session size. Resolved visibility keeps its worker disclosure path. Width changes also use workers while Buffer Search input is open.
 - [x] Remove Sidebar-triggered full Buffer rebuilds. Directory expansion, Directory collapse, and active-File reveal update the File Tree without rebuilding unchanged DiffPane content. An unchanged reveal updates active flags and Sidebar scroll without an allocation.
 - [x] Stage Review Search destination Buffer builds. Cover source occurrences, ReviewBody occurrences, and the second build that reveals a hidden Fold. `openReviewSearchOccurrence` queues a worker, including after File Enrichment publication.
-- [ ] Stage disclosure restoration when Buffer Search starts after Review Search. `openBufferSearch` still calls `prepareBuffer` when Review Search owns temporary disclosures.
+- [x] Stage disclosure restoration when Buffer Search starts after Review Search. `openBufferSearch` retains the disclosure baseline and queues a worker. Query input stays open while restoration runs.
 - [ ] Stage File Enrichment cache-focus and lease-release Frame changes. Completion Frames already use workers, but `focusEnrichment`, `finishSearchLease`, and `releaseReviewSearchHolds` can rebuild synchronously after eviction. Keep cache changes and Frame publication atomic.
 - [ ] Index hidden Search Occurrence navigation and disclosure lookup. `searchOccurrenceNavigationRow`, `requiredSearchDisclosure`, and their helpers still walk visual rows, Buffer rows, Hunks, Threads, or Draft chains. Cover hidden `n`, `N`, Count, Query clearing, and the scan-to-disclosure handoff.
 - [ ] Bound active-occurrence retention and origin selection during completion admission. `retainedEditedSearchIndex` and `firstSearchOccurrenceAtOrAfter` still walk complete Batches on the terminal thread. `searchFromInactiveRow` also walks Batches when traversal starts without an active occurrence.
@@ -381,3 +381,29 @@ Destination dispatch no longer constructs a Buffer. Admission still restores nav
 Tests cover delayed publication, repeated Enter, changed geometry, changed File Tree state, Query edits, selection changes, and Escape. Tests also cover refresh, Review switching, shutdown, and destination opening after File Enrichment publication. Worker allocation-failure tests cover ReviewBody construction and both source Buffer builds. Admission allocation-failure tests preserve disclosures, isolation, cache focus, and the Overlay before a successful retry. Runtime tests cover launch failure and a closed completion sink. Existing tests retain exact wrapped ranges, Selected Version, Scope, isolation, outdated content, and temporary source Fold restoration.
 
 `zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 915 tests. The Standards and Spec review found no remaining findings for this item. The ticket remains `ready-for-agent`. The next remaining item is disclosure restoration when Buffer Search starts after Review Search.
+
+## Buffer Search opening restoration
+
+`openBufferSearch` now queues the disclosure worker when Review Search owns temporary disclosures. It retains the saved disclosure keys and cached corpus without copying the full baseline. Review Search and its worker snapshots now share reference-counted `DisclosureKeys`.
+
+Buffer Search captures input immediately. Query edits retain only the newest Query while restoration runs. Enter waits for restoration and the newest scan. Clearing the Query keeps the restoration request. Admission publishes the complete Buffer, visual rows, File Tree, and projected ranges together. It also restores the saved navigation and origin against the new rows before releasing the earlier Frame.
+
+Each opening has its own request id. Escape and immediate reopening reject an earlier opening, even when both retain the same baseline. Frame, geometry, input snapshot, or File Tree changes cause a retry. Successful admission releases Review Search's disclosure baseline. A failed build or admission preserves the previous Frame and baseline for retry. A width build can publish input ranges while restoration waits. Restoration admission discards those old input ranges before it queues the newest scan.
+
+`zig build bench-buffer-search -- 256` measured nine ReleaseFast samples without concurrent build or test work. The source fixture has one File, 8,194 Diff Lines, and 162,814 Diff bytes. Both complete File versions are available. The selected Review Search occurrence starts inside a Fold. Fixture preparation and destination opening occur before the restoration measurements.
+
+The benchmark measures opening dispatch, a Query edit during restoration, worker construction, and admission separately. It clears that Query before admission. The synchronous control calls `prepareBuffer` with the same saved baseline before opening. Both paths check the visual-row and Review Search range counts. Values are nanoseconds.
+
+| Stage | Median ns | p95 ns |
+| --- | ---: | ---: |
+| Opening dispatch after Review Search | 17,959 | 63,583 |
+| Query edit during restoration | 2,625 | 3,292 |
+| Restoration worker | 13,917 | 16,334 |
+| Restoration admission | 222,166 | 246,250 |
+| Synchronous restoration Buffer control | 414,042 | 458,875 |
+
+Opening no longer constructs a Buffer on the terminal thread. Admission still restores navigation and releases the earlier Frame there. This source fixture does not measure restoration with many ReviewCards or cached Files. The later benchmark and admission-latency items remain open.
+
+Tests cover queued and issued restoration, rapid edits, Query clearing, Enter, Count, and accepted search. They also cover Escape, immediate reopening, changed geometry, changed File Tree state, and width publication before restoration. Allocation failures preserve the Frame, baseline, Query, and generation. Worker allocation-failure tests include restoration. Runtime tests cover launch failure and a closed completion sink. Session tests cover refresh, Review switching, and shutdown.
+
+`zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 922 tests. The Standards and Spec review found no remaining findings for this item. The ticket remains `ready-for-agent`. The next remaining item is File Enrichment cache-focus and lease-release Frame staging.

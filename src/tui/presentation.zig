@@ -1152,7 +1152,7 @@ const DraftMutation = struct {
 const DraftMutationError = error{ OutOfMemory, DraftLocked, DraftEditConflict, DraftNotAnchorable, InvalidAnchor, PersistenceFailed };
 
 pub const DisclosureBuild = struct {
-    const Kind = enum { input, accepted, restore, general, clear_input, view, enrichment, draft_save, draft_mutation, review_destination };
+    const Kind = enum { input, accepted, restore, general, clear_input, open_input, view, enrichment, draft_save, draft_mutation, review_destination };
     const NavigationPolicy = enum { restore, reset, file_header, center, version };
     arena: std.heap.ArenaAllocator,
     session: *Session,
@@ -1196,7 +1196,8 @@ pub const DisclosureBuild = struct {
     result_error: ?ActionError = null,
     restore_navigation: ?Nav = null,
     restore_search_disclosures: ?*DisclosureKeys = null,
-    review_saved_disclosures: ?[]buffer_mod.DisclosureKey = null,
+    review_saved_disclosures: ?*DisclosureKeys = null,
+    clear_review_disclosures: bool = false,
     command_id: CommandId = 0,
     frame_revision: frame_mod.Revision,
     active: ?usize,
@@ -1512,7 +1513,7 @@ pub const DisclosureBuild = struct {
         if (self.accepted_navigation_rows) |rows| std.heap.page_allocator.free(rows);
         if (self.review_ranges) |ranges| std.heap.page_allocator.free(ranges);
         if (self.restore_search_disclosures) |keys| keys.release();
-        if (self.review_saved_disclosures) |keys| std.heap.page_allocator.free(keys);
+        if (self.review_saved_disclosures) |keys| keys.release();
         if (self.rebuilt_batch) |*batch| batch.deinit(std.heap.page_allocator);
         if (self.input_rebuilt_batch) |*batch| batch.deinit(std.heap.page_allocator);
         if (self.input_ranges) |ranges| std.heap.page_allocator.free(ranges);
@@ -2218,6 +2219,8 @@ const BufferSearchInput = struct {
     request_id: u64 = 0,
     pending: bool = false,
     accept_when_ready: bool = false,
+    restoring_review_disclosures: bool = false,
+    opening_request_id: u64 = 0,
 
     fn deinit(self: *BufferSearchInput, allocator: Allocator) void {
         if (self.query) |*query| query.deinit(allocator);
@@ -2292,7 +2295,7 @@ const ReviewSearchState = struct {
     batch: ?search.Batch = null,
     results: ?[]ReviewSearchResult = null,
     ranges: ?[]frame_mod.ProjectedSourceRange = null,
-    saved_disclosures: ?[]buffer_mod.DisclosureKey = null,
+    saved_disclosures: ?*DisclosureKeys = null,
     opening_source: bool = false,
     destination_pending: bool = false,
     destination_generation: u64 = 0,
@@ -2331,7 +2334,7 @@ const ReviewSearchState = struct {
         if (self.batch) |*batch| batch.deinit(allocator);
         if (self.results) |results| allocator.free(results);
         if (self.ranges) |ranges| std.heap.page_allocator.free(ranges);
-        if (self.saved_disclosures) |keys| allocator.free(keys);
+        if (self.saved_disclosures) |keys| keys.release();
         if (self.corpus) |corpus| corpus.release();
         self.* = .{};
     }
@@ -6751,42 +6754,22 @@ pub const Presentation = struct {
         const published = self.published orelse return;
         if (published.buffer_search.input != null) return;
         self.cancelQueuedViewBuild(published);
-        const disclosures = published.review_search.saved_disclosures orelse published.expanded_disclosures.items;
         const corpus = published.search_corpus orelse return;
         corpus.retain();
-        const saved_expanded = if (published.review_search.saved_disclosures == null) published.disclosure_keys.retain() else DisclosureKeys.create(disclosures) catch {
-            corpus.release();
-            self.action_error = .out_of_memory;
-            return;
-        };
+        const saved_expanded = (published.review_search.saved_disclosures orelse published.disclosure_keys).retain();
         const saved_search = if (published.buffer_search.saved_disclosures) |keys|
             keys.retain()
         else
             null;
-        if (published.review_search.saved_disclosures) |saved| {
-            var restored: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
-            restored.appendSlice(self.allocator, saved) catch {
+        const restoring = published.review_search.saved_disclosures != null;
+        if (restoring) {
+            self.queueBufferSearchOpening(published, saved_expanded) catch {
                 corpus.release();
                 saved_expanded.release();
                 if (saved_search) |keys| keys.release();
                 self.action_error = .out_of_memory;
                 return;
             };
-            defer restored.deinit(self.allocator);
-            var staged = published.prepareBuffer(self.preferences, restored.items, published.isolated_file, published.geometry) catch |err| {
-                corpus.release();
-                saved_expanded.release();
-                if (saved_search) |keys| keys.release();
-                self.action_error = normalizeActionError(err);
-                return;
-            };
-            defer staged.deinit();
-            staged.publish();
-            published.expanded_disclosures.deinit(self.allocator);
-            published.expanded_disclosures = restored;
-            restored = .empty;
-            self.allocator.free(saved);
-            published.review_search.saved_disclosures = null;
         }
         const count = if (published.navigation.count == 0) 1 else published.navigation.count;
         published.active_search = .buffer;
@@ -6798,8 +6781,22 @@ pub const Presentation = struct {
             .saved_expanded_disclosures = saved_expanded,
             .saved_search_disclosures = saved_search,
             .corpus = corpus,
+            .pending = restoring,
+            .restoring_review_disclosures = restoring,
+            .opening_request_id = published.search_generation,
         };
         published.frame_revision += 1;
+    }
+
+    fn queueBufferSearchOpening(self: *Presentation, published: *Published, baseline: *DisclosureKeys) !void {
+        try self.commands.ensureUnusedCapacity(self.allocator, 1);
+        const request_id = if (published.search_generation == std.math.maxInt(u64)) 1 else published.search_generation + 1;
+        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = baseline }, request_id, published.buffer_search.active);
+        job.kind = .open_input;
+        job.clear_review_disclosures = true;
+        published.search_generation = request_id;
+        if (published.buffer_search.input) |*input| input.opening_request_id = request_id;
+        self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
     }
 
     fn cancelBufferSearch(self: *Presentation) void {
@@ -6812,6 +6809,7 @@ pub const Presentation = struct {
                 return;
             };
             job.restore_navigation = saved_navigation;
+            job.clear_review_disclosures = published.buffer_search.input.?.restoring_review_disclosures;
             if (published.buffer_search.input.?.saved_search_disclosures) |saved| {
                 job.restore_search_disclosures = saved.retain();
             }
@@ -6827,6 +6825,10 @@ pub const Presentation = struct {
             self.action_error = normalizeActionError(err);
             return;
         };
+        if (published.buffer_search.input.?.restoring_review_disclosures) {
+            if (published.review_search.saved_disclosures) |keys| keys.release();
+            published.review_search.saved_disclosures = null;
+        }
         var input = published.buffer_search.input orelse return;
         published.buffer_search.input = null;
         published.navigation = saved_navigation;
@@ -6856,6 +6858,13 @@ pub const Presentation = struct {
 
     fn acceptBufferSearch(self: *Presentation) void {
         const published = self.published orelse return;
+        if (published.buffer_search.input) |*input| if (input.restoring_review_disclosures and !input.pending) {
+            self.queueBufferSearchOpening(published, input.saved_expanded_disclosures) catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
+            input.pending = true;
+        };
         if (published.buffer_search.input) |*input| if (input.pending) {
             input.accept_when_ready = true;
             return;
@@ -6928,6 +6937,31 @@ pub const Presentation = struct {
     fn replaceBufferSearchQuery(self: *Presentation, text: []const u8) !void {
         const published = self.published orelse return;
         const input = &(published.buffer_search.input orelse return);
+        if (input.restoring_review_disclosures) {
+            var query: ?search.Query = if (text.len == 0) null else search.Query.init(self.allocator, text) catch |err| {
+                self.action_error = switch (err) {
+                    error.TooLong => .buffer_search_query_too_long,
+                    error.OutOfMemory => .out_of_memory,
+                    else => .buffer_search_invalid_query,
+                };
+                return;
+            };
+            if (!input.pending) self.queueBufferSearchOpening(published, input.saved_expanded_disclosures) catch {
+                if (query) |*owned| owned.deinit(self.allocator);
+                self.action_error = .out_of_memory;
+                return;
+            };
+            if (input.query) |*old| old.deinit(self.allocator);
+            input.query = query;
+            published.search_generation +%= 1;
+            if (published.search_generation == 0) published.search_generation = 1;
+            input.request_id = published.search_generation;
+            input.pending = true;
+            input.accept_when_ready = false;
+            self.action_error = null;
+            published.frame_revision += 1;
+            return;
+        }
         if (text.len == 0) {
             const old_query = input.query;
             const old_batch = input.batch;
@@ -7404,8 +7438,8 @@ pub const Presentation = struct {
         }
         var disclosures: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
         defer disclosures.deinit(self.allocator);
-        var review_saved: ?[]buffer_mod.DisclosureKey = null;
-        defer if (review_saved) |keys| self.allocator.free(keys);
+        var review_saved: ?*DisclosureKeys = null;
+        defer if (review_saved) |keys| keys.release();
         if (job.kind == .review_destination) {
             if (job.destination_row == null) {
                 published.review_search.destination_pending = false;
@@ -7420,11 +7454,7 @@ pub const Presentation = struct {
             if (job.review_snapshot.?.occurrences[job.review_selected.?].location == .source and
                 published.review_search.saved_disclosures == null and !sameDisclosures(job.disclosures, published.expanded_disclosures.items))
             {
-                review_saved = self.allocator.dupe(buffer_mod.DisclosureKey, published.expanded_disclosures.items) catch {
-                    published.review_search.destination_pending = false;
-                    self.action_error = .out_of_memory;
-                    return;
-                };
+                review_saved = published.disclosure_keys.retain();
             }
         }
         if (job.new_draft) |draft| published.persistPreparedDraft(self.dependencies.reviews, draft) catch |err| {
@@ -7745,24 +7775,27 @@ pub const Presentation = struct {
     }
 
     fn acceptAcceptedDisclosure(self: *Presentation, published: *Published, job: *DisclosureBuild, owned: *bool) void {
-        if (job.request_id != published.search_generation) return;
+        if (job.kind == .open_input) {
+            const input = published.buffer_search.input orelse return;
+            if (!input.restoring_review_disclosures or input.opening_request_id != job.request_id or input.saved_expanded_disclosures != job.target.base) return;
+        } else if (job.request_id != published.search_generation) return;
         if (job.kind == .clear_input) {
             const input = published.buffer_search.input orelse return;
             if (!input.pending or input.request_id != job.request_id or input.query != null) return;
-        } else if (published.buffer_search.input != null) return;
+        } else if (job.kind != .open_input and published.buffer_search.input != null) return;
         if (!published.disclosure_inputs_current or job.inputs != published.disclosure_inputs or job.frame_revision != published.visual_rows_revision or !std.meta.eql(job.geometry, published.geometry)) {
             self.retryAcceptedDisclosure(published, job);
             return;
         }
         if (job.failed) {
-            if (job.kind == .clear_input) published.buffer_search.input.?.pending = false;
+            if (job.kind == .clear_input or job.kind == .open_input) published.buffer_search.input.?.pending = false;
             self.action_error = .buffer_build_failed;
             return;
         }
         const current = published.buffer_search.accepted_batch;
         if (job.accepted_snapshot) |snapshot| {
             if (current == null or snapshot.occurrences.ptr != current.?.occurrences.ptr) return;
-        } else if (current != null or (job.kind != .restore and job.kind != .general and job.kind != .clear_input)) return;
+        } else if (current != null or (job.kind != .restore and job.kind != .general and job.kind != .clear_input and job.kind != .open_input)) return;
         if (job.kind == .general and job.accepted_active != published.buffer_search.active) {
             self.retryAcceptedDisclosure(published, job);
             return;
@@ -7785,7 +7818,7 @@ pub const Presentation = struct {
             return;
         }
         var admitted = false;
-        defer if (!admitted and job.kind == .clear_input) {
+        defer if (!admitted and (job.kind == .clear_input or job.kind == .open_input)) {
             published.buffer_search.input.?.pending = false;
         };
         var disclosures: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
@@ -7802,16 +7835,7 @@ pub const Presentation = struct {
             job.restore_search_disclosures.?.retain()
         else
             null;
-        const review_saved = if (job.review_saved_disclosures) |keys|
-            self.allocator.dupe(buffer_mod.DisclosureKey, keys) catch {
-                disclosures.deinit(self.allocator);
-                if (saved) |baseline| baseline.release();
-                if (restored_search) |baseline| baseline.release();
-                self.action_error = .out_of_memory;
-                return;
-            }
-        else
-            null;
+        const review_saved = if (job.review_saved_disclosures) |keys| keys.retain() else null;
         const previous = published.frameProjection();
         published.search_projection.release();
         job.projection.?.retain();
@@ -7819,7 +7843,22 @@ pub const Presentation = struct {
         published.buffer = job.buffer;
         published.visual_rows = job.visual_rows;
         published.tree = job.tree;
-        published.navigation = job.restore_navigation orelse frame_mod.restoreNavigation(previous, job.visual_rows, job.geometry);
+        var navigation_origin = previous;
+        if (job.clear_review_disclosures) {
+            if (job.restore_navigation) |navigation| navigation_origin.navigation = navigation;
+        }
+        published.navigation = if (job.clear_review_disclosures)
+            frame_mod.restoreNavigation(navigation_origin, job.visual_rows, job.geometry)
+        else
+            job.restore_navigation orelse frame_mod.restoreNavigation(previous, job.visual_rows, job.geometry);
+        if (job.kind == .open_input) {
+            const input = &published.buffer_search.input.?;
+            var origin = previous;
+            origin.navigation = input.saved_navigation;
+            input.saved_navigation = frame_mod.restoreNavigation(origin, job.visual_rows, job.geometry);
+            origin.navigation.cursor = input.origin;
+            input.origin = frame_mod.restoreNavigation(origin, job.visual_rows, job.geometry).cursor;
+        }
         if (published.worker_frame) |old| old.destroy();
         published.worker_frame = job;
         owned.* = false;
@@ -7844,11 +7883,15 @@ pub const Presentation = struct {
             published.buffer_search.saved_disclosures = restored_search;
         }
         if (review_saved) |keys| {
-            if (published.review_search.saved_disclosures) |old| self.allocator.free(old);
+            if (published.review_search.saved_disclosures) |old| old.release();
             published.review_search.saved_disclosures = keys;
         }
+        if (job.clear_review_disclosures) {
+            if (published.review_search.saved_disclosures) |old| old.release();
+            published.review_search.saved_disclosures = null;
+        }
         if (job.kind == .clear_input) published.buffer_search.input.?.pending = false;
-        if (job.restore_navigation == null and job.kind != .general) {
+        if (job.restore_navigation == null and job.kind != .general and job.kind != .open_input) {
             if (job.active) |index| {
                 if (published.buffer_search.accepted_navigation_rows) |rows| {
                     if (rows[index]) |row| published.navigation.jumpTo(row) else _ = published.jumpToSearchOccurrence(current.?.occurrences[index]);
@@ -7858,11 +7901,35 @@ pub const Presentation = struct {
         published.frame_revision += 1;
         published.visual_rows_revision = published.frame_revision;
         self.action_error = job.result_error;
+        if (job.kind == .open_input) {
+            const input = &published.buffer_search.input.?;
+            input.restoring_review_disclosures = false;
+            if (input.batch) |*batch| batch.deinit(self.allocator);
+            if (input.ranges) |ranges| std.heap.page_allocator.free(ranges);
+            if (input.navigation_rows) |rows| std.heap.page_allocator.free(rows);
+            input.batch = null;
+            input.ranges = null;
+            input.navigation_rows = null;
+            input.active = null;
+            if (input.query != null) {
+                self.retryStaleBufferDisclosure(published);
+            } else {
+                input.pending = false;
+                if (input.accept_when_ready) self.acceptBufferSearch();
+            }
+        }
         if (job.kind == .clear_input and published.buffer_search.input.?.accept_when_ready) self.acceptBufferSearch();
     }
 
     fn retryAcceptedDisclosure(self: *Presentation, published: *Published, job: *const DisclosureBuild) void {
         const active = if (job.kind == .general) published.buffer_search.active else job.active;
+        if (job.kind == .open_input) {
+            self.queueBufferSearchOpening(published, job.target.base) catch {
+                published.buffer_search.input.?.pending = false;
+                self.action_error = .out_of_memory;
+            };
+            return;
+        }
         const replacement = self.queueAcceptedDisclosure(published, job.target, active, job.kind, job.result_error) catch {
             if (job.kind == .clear_input) published.buffer_search.input.?.pending = false;
             self.action_error = .out_of_memory;
@@ -7870,18 +7937,13 @@ pub const Presentation = struct {
         };
         replacement.restore_navigation = job.restore_navigation;
         replacement.clear_saved_disclosures = job.clear_saved_disclosures;
+        replacement.clear_review_disclosures = job.clear_review_disclosures;
         if (job.kind == .clear_input) published.buffer_search.input.?.request_id = replacement.request_id;
         if (job.restore_search_disclosures) |keys| {
             replacement.restore_search_disclosures = keys.retain();
         }
         if (job.review_saved_disclosures) |keys| {
-            replacement.review_saved_disclosures = std.heap.page_allocator.dupe(buffer_mod.DisclosureKey, keys) catch {
-                var queued = self.commands.pop().?;
-                queued.deinit();
-                if (job.kind == .clear_input) published.buffer_search.input.?.pending = false;
-                self.action_error = .out_of_memory;
-                return;
-            };
+            replacement.review_saved_disclosures = keys.retain();
         }
     }
 
@@ -9808,7 +9870,7 @@ pub const Presentation = struct {
         if (published.review_search.saved_disclosures) |baseline| {
             var updated: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
             defer updated.deinit(self.allocator);
-            updated.appendSlice(self.allocator, baseline) catch return self.reviewSearchAllocationFailed();
+            updated.appendSlice(self.allocator, baseline.items()) catch return self.reviewSearchAllocationFailed();
             var found: ?usize = null;
             for (updated.items, 0..) |entry, index| if (std.meta.eql(entry, key)) {
                 found = index;
@@ -9836,7 +9898,7 @@ pub const Presentation = struct {
             return;
         };
         if (saved) |keys| {
-            job.review_saved_disclosures = std.heap.page_allocator.dupe(buffer_mod.DisclosureKey, keys) catch {
+            job.review_saved_disclosures = DisclosureKeys.create(keys) catch {
                 var queued = self.commands.pop().?;
                 queued.deinit();
                 self.action_error = .out_of_memory;
@@ -11982,12 +12044,14 @@ fn benchmarkReviewDestination(presentation: *Presentation, io: std.Io, query: []
     }
     if (published.review_search.batch.?.occurrences.len == 0) return error.MissingDestination;
     var times: [4][9]u64 = undefined;
+    var opening_times: [5][9]u64 = undefined;
+    var measured_opening = false;
     for (0..9) |sample| {
         if (!published.review_search.open) try presentation.dispatch(.{ .action = .open_review_search });
         if (published.review_search.saved_disclosures) |saved| {
             published.expanded_disclosures.clearRetainingCapacity();
-            try published.expanded_disclosures.appendSlice(presentation.allocator, saved);
-            presentation.allocator.free(saved);
+            try published.expanded_disclosures.appendSlice(presentation.allocator, saved.items());
+            saved.release();
             published.review_search.saved_disclosures = null;
             try published.rebuild(presentation.preferences, published.expanded_disclosures.items, published.isolated_file);
         }
@@ -12005,17 +12069,51 @@ fn benchmarkReviewDestination(presentation: *Presentation, io: std.Io, query: []
         try presentation.dispatch(.{ .buffer_disclosure_built = job });
         times[2][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         if (published.review_search.open or published.visual_rows.ptr == before or published.review_search.ranges.?.len == 0) return error.DestinationNotPublished;
-        start = std.Io.Clock.awake.now(io);
-        var control = try published.prepareBuffer(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, published.geometry);
-        times[3][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-        defer control.deinit();
-        if (control.visual_rows.len != published.visual_rows.len or control.review_ranges.?.len != published.review_search.ranges.?.len) return error.DestinationControlMismatch;
-        std.mem.doNotOptimizeAway(control.visual_rows.len);
+        {
+            start = std.Io.Clock.awake.now(io);
+            var control = try published.prepareBuffer(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, published.geometry);
+            times[3][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+            defer control.deinit();
+            if (control.visual_rows.len != published.visual_rows.len or control.review_ranges.?.len != published.review_search.ranges.?.len) return error.DestinationControlMismatch;
+            std.mem.doNotOptimizeAway(control.visual_rows.len);
+        }
+        if (published.review_search.saved_disclosures) |baseline| {
+            measured_opening = true;
+            start = std.Io.Clock.awake.now(io);
+            var restore_control = try published.prepareBuffer(presentation.preferences, baseline.items(), published.isolated_file, published.geometry);
+            opening_times[4][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+            const expected_rows = restore_control.visual_rows.len;
+            const expected_ranges = restore_control.review_ranges.?.len;
+            restore_control.deinit();
+            const revealed = published.visual_rows.ptr;
+            start = std.Io.Clock.awake.now(io);
+            try presentation.dispatch(.{ .action = .open_buffer_search });
+            opening_times[0][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+            if (published.visual_rows.ptr != revealed or !published.buffer_search.input.?.pending) return error.RestorationPublishedBeforeWorker;
+            const restore = (presentation.takeCommand() orelse return error.MissingRestorationBuild).build_buffer_disclosure;
+            start = std.Io.Clock.awake.now(io);
+            try presentation.dispatch(.{ .key = .{ .codepoint = query[0], .text = query } });
+            opening_times[1][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+            try presentation.replaceBufferSearchQuery("");
+            start = std.Io.Clock.awake.now(io);
+            restore.build();
+            opening_times[2][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+            if (restore.failed) return error.RestorationBuildFailed;
+            start = std.Io.Clock.awake.now(io);
+            try presentation.dispatch(.{ .buffer_disclosure_built = restore });
+            opening_times[3][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+            if (published.visual_rows.len != expected_rows or published.review_search.ranges.?.len != expected_ranges or published.review_search.saved_disclosures != null) return error.RestorationControlMismatch;
+            try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+        }
     }
     for ([_][]const u8{ "dispatch", "worker", "admission", "sync_control" }, &times) |stage, *samples| {
         std.mem.sort(u64, samples, {}, std.sort.asc(u64));
         std.debug.print("stage={s}_{s} median_ns={d} p95_ns={d}\n", .{ label, stage, samples[4], samples[8] });
     }
+    if (measured_opening) for ([_][]const u8{ "dispatch", "edit", "worker", "admission", "sync_control" }, &opening_times) |stage, *samples| {
+        std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+        std.debug.print("stage=buffer_open_after_review_{s} median_ns={d} p95_ns={d}\n", .{ stage, samples[4], samples[8] });
+    };
 }
 
 fn benchmarkSidebar(presentation: *Presentation, io: std.Io) !void {
@@ -12185,7 +12283,7 @@ test "M21 kernel issued Frame retains Draft body and AnchorSnapshot while an edi
 }
 
 test "M21 kernel Frame worker allocation failures preserve the graph and complete Frame" {
-    for ([_]DisclosureBuild.Kind{ .general, .view, .enrichment, .draft_save, .review_destination }) |kind| try testing.checkAllAllocationFailures(testing.allocator, disclosureWorkerFailureCase, .{ kind, null, false });
+    for ([_]DisclosureBuild.Kind{ .general, .view, .enrichment, .draft_save, .review_destination, .open_input }) |kind| try testing.checkAllAllocationFailures(testing.allocator, disclosureWorkerFailureCase, .{ kind, null, false });
     try testing.checkAllAllocationFailures(testing.allocator, disclosureWorkerFailureCase, .{ .review_destination, null, true });
     for (test_draft_mutations) |mutation| try testing.checkAllAllocationFailures(testing.allocator, disclosureWorkerFailureCase, .{ .draft_mutation, mutation, false });
 }
@@ -12209,7 +12307,7 @@ fn disclosureWorkerFailureCase(allocator: Allocator, kind: DisclosureBuild.Kind,
     });
     defer presentation.deinit();
     try moveToRow(&presentation, findDisclosureRow(presentation.projection().review.?.buffer.rows, .{ .resolved_thread = 1 }).?);
-    const before = presentation.projection().review.?.frame;
+    var before = presentation.projection().review.?.frame;
     if (kind == .enrichment) {
         try presentation.dispatch(.ensure_focused_enrichment);
         const command = presentation.takeCommand().?.enrich_file;
@@ -12258,6 +12356,10 @@ fn disclosureWorkerFailureCase(allocator: Allocator, kind: DisclosureBuild.Kind,
             try completeBufferSearchScan(&presentation);
             try presentation.dispatch(.{ .action = .open_search_occurrence });
         }
+    } else if (kind == .open_input) {
+        try revealTemporaryReviewFold(&presentation);
+        before = presentation.projection().review.?.frame;
+        try presentation.dispatch(.{ .action = .open_buffer_search });
     } else if (kind == .view) try presentation.dispatch(.{ .action = .toggle_layout }) else try presentation.dispatch(.{ .action = .toggle_disclosure });
     const worker = presentation.takeCommand().?.build_buffer_disclosure;
     saved_arena = worker.arena;
@@ -12944,6 +13046,264 @@ test "M21 authored opening evicted source waits for exact File Enrichment" {
     try testing.expect(projection.review.?.frame.search_ranges.len > 0);
 }
 
+fn revealTemporaryReviewFold(presentation: *Presentation) !void {
+    const published = presentation.published.?;
+    const baseline = published.disclosure_keys.retain();
+    errdefer baseline.release();
+    const fold = for (published.buffer.rows, 0..) |row, index| {
+        if (row == .disclosure and row.disclosure.kind == .fold) break index;
+    } else return error.MissingFold;
+    try moveToRow(presentation, published.visualIndexForBufferIndex(fold).?);
+    try presentation.dispatch(.{ .action = .toggle_disclosure });
+    try completeDisclosureBuild(presentation);
+    published.review_search.saved_disclosures = baseline;
+}
+
+test "M21 authored Buffer Search opening restores disclosures before scanning the newest Query" {
+    for ([_]bool{ false, true }) |issued| for ([_]bool{ false, true }) |clear| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try revealTemporaryReviewFold(&presentation);
+        const published = presentation.published.?;
+        published.navigation.count = 2;
+        const before = published.frameProjection();
+        const corpus = published.search_corpus.?;
+        const baseline = published.review_search.saved_disclosures.?;
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        const worker = if (issued) presentation.takeCommand().?.build_buffer_disclosure else null;
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c" } });
+        try presentation.dispatch(.{ .key = .{ .codepoint = '5', .text = "5" } });
+        if (clear) try presentation.replaceBufferSearchQuery("");
+        try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
+        try testing.expectEqual(before.navigation.cursor, published.navigation.cursor);
+        try testing.expectEqual(corpus, published.buffer_search.input.?.corpus);
+        try testing.expectEqual(baseline, published.buffer_search.input.?.saved_expanded_disclosures);
+        try testing.expectEqual(@as(usize, 2), published.buffer_search.input.?.count);
+        try testing.expectEqual(@as(usize, 0), published.navigation.count);
+        try testing.expectEqual(@as(usize, if (issued) 0 else 1), presentation.commands.items.len);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try testing.expect(published.buffer_search.input != null);
+        if (worker) |job| {
+            job.build();
+            try presentation.dispatch(.{ .buffer_disclosure_built = job });
+        } else try completeDisclosureBuild(&presentation);
+        try testing.expect(published.review_search.saved_disclosures == null);
+        try testing.expectEqual(@as(usize, 0), published.expanded_disclosures.items.len);
+        if (clear) {
+            try testing.expect(published.buffer_search.input == null);
+            try testing.expect(presentation.takeCommand() == null);
+        } else {
+            try testing.expect(published.buffer_search.input.?.pending);
+            try testing.expectEqualStrings("c5", presentation.commands.items[0].scan_buffer_search.query.text);
+            try completeBufferSearchScan(&presentation);
+            try testing.expect(published.buffer_search.input == null);
+            try testing.expectEqualStrings("c5", published.buffer_search.accepted_query.?.text);
+            try testing.expect(published.expanded_disclosures.items.len > 0);
+            try testing.expect(published.buffer_search.accepted_ranges.?.len > 0);
+        }
+    };
+}
+
+test "M21 authored Buffer Search opening Escape rejects old work across immediate reopening" {
+    for ([_]bool{ false, true }) |issued| for ([_]bool{ false, true }) |reopen| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try revealTemporaryReviewFold(&presentation);
+        var before = presentation.published.?.frameProjection();
+        const saved_rows = try testing.allocator.dupe(frame_mod.VisualRow, before.visual_rows);
+        defer testing.allocator.free(saved_rows);
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        const worker = if (issued) presentation.takeCommand().?.build_buffer_disclosure else null;
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c5" } });
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+        try testing.expect(presentation.published.?.buffer_search.input == null);
+        try testing.expectEqual(before.visual_rows.ptr, presentation.published.?.visual_rows.ptr);
+        if (reopen) try presentation.dispatch(.{ .action = .open_buffer_search });
+        if (worker) |job| {
+            job.build();
+            try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            try testing.expectEqual(before.visual_rows.ptr, presentation.published.?.visual_rows.ptr);
+        }
+        // A cancelled restoration can precede the new opening in the queue.
+        while (presentation.commands.items.len > 0) try completeDisclosureBuild(&presentation);
+        try testing.expect(presentation.published.?.review_search.saved_disclosures == null);
+        try testing.expectEqual(@as(usize, 0), presentation.published.?.expanded_disclosures.items.len);
+        const after = presentation.published.?.frameProjection();
+        before.visual_rows = saved_rows;
+        const restored = frame_mod.restoreNavigation(before, after.visual_rows, after.geometry);
+        try testing.expectEqual(restored, after.navigation);
+        if (reopen) {
+            try testing.expect(!presentation.projection().buffer_search.?.pending);
+            try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+            try testing.expectEqual(restored, presentation.published.?.navigation);
+        }
+    };
+}
+
+test "M21 authored Buffer Search opening retries changed Frames and keeps accepted search" {
+    for ([_]bool{ false, true }) |width| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'A', .text = "A" } });
+        try completeBufferSearchScan(&presentation);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try revealTemporaryReviewFold(&presentation);
+        var queued = presentation.published.?.frameProjection();
+        const saved_rows = try testing.allocator.dupe(frame_mod.VisualRow, queued.visual_rows);
+        defer testing.allocator.free(saved_rows);
+        queued.visual_rows = saved_rows;
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        const worker = presentation.commands.orderedRemove(0).build_buffer_disclosure;
+        if (width) try dispatchView(&presentation, .{ .resize = .{ .cols = 72, .rows = 20 } }) else presentation.published.?.tree.scroll += 1;
+        try presentation.commands.append(testing.allocator, .{ .build_buffer_disclosure = worker });
+        _ = presentation.takeCommand().?;
+        const before = presentation.published.?.frameProjection();
+        worker.build();
+        try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+        try testing.expectEqual(before.visual_rows.ptr, presentation.published.?.visual_rows.ptr);
+        try testing.expect(presentation.projection().buffer_search.?.pending);
+        try completeDisclosureBuild(&presentation);
+        try testing.expect(!presentation.projection().buffer_search.?.pending);
+        try testing.expectEqualStrings("A", presentation.published.?.buffer_search.accepted_query.?.text);
+        try testing.expect(presentation.published.?.buffer_search.accepted_ranges.?.len > 0);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+        const restored = frame_mod.restoreNavigation(queued, presentation.published.?.visual_rows, presentation.published.?.geometry);
+        try testing.expectEqual(restored.cursor, presentation.published.?.navigation.cursor);
+    }
+}
+
+test "M21 authored Buffer Search opening failures preserve the Frame and allow retry" {
+    for ([_]enum { dispatch, worker, admission }{ .dispatch, .worker, .admission }) |failure| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try moveToRow(&presentation, presentation.published.?.visualIndexForBufferIndex(findDisclosureRow(presentation.published.?.buffer.rows, .{ .resolved_thread = 1 }).?).?);
+        try presentation.dispatch(.{ .action = .toggle_disclosure });
+        try completeDisclosureBuild(&presentation);
+        try revealTemporaryReviewFold(&presentation);
+        const published = presentation.published.?;
+        const before = published.frameProjection();
+        const baseline = published.review_search.saved_disclosures.?;
+        if (failure == .dispatch) {
+            presentation.commands.deinit(presentation.allocator);
+            presentation.commands = .empty;
+            failing.fail_index = failing.alloc_index;
+        }
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        failing.fail_index = std.math.maxInt(usize);
+        if (failure != .dispatch) {
+            const job = presentation.takeCommand().?.build_buffer_disclosure;
+            if (failure == .worker) job.failed = true else job.build();
+            if (failure == .admission) failing.fail_index = failing.alloc_index;
+            try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            failing.fail_index = std.math.maxInt(usize);
+            try testing.expect(!presentation.projection().buffer_search.?.pending);
+        } else try testing.expect(published.buffer_search.input == null);
+        try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
+        try testing.expectEqual(before.navigation, published.navigation);
+        try testing.expectEqual(baseline, published.review_search.saved_disclosures.?);
+        if (failure == .dispatch) try presentation.dispatch(.{ .action = .open_buffer_search });
+        const generation = published.search_generation;
+        failing.fail_index = failing.alloc_index;
+        try presentation.replaceBufferSearchQuery("c5");
+        failing.fail_index = std.math.maxInt(usize);
+        try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+        try testing.expectEqual(generation, published.search_generation);
+        try testing.expect(published.buffer_search.input.?.query == null);
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c5" } });
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try completeDisclosureBuild(&presentation);
+        try completeBufferSearchScan(&presentation);
+        try testing.expectEqualStrings("c5", published.buffer_search.accepted_query.?.text);
+        try testing.expect(published.review_search.saved_disclosures == null);
+    }
+}
+
+test "M21 authored Buffer Search opening drops old input projection after resize and scans the newest Query" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try revealTemporaryReviewFold(&presentation);
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    const opening = presentation.commands.orderedRemove(0).build_buffer_disclosure;
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c5" } });
+    try dispatchView(&presentation, .{ .resize = .{ .cols = 72, .rows = 20 } });
+    try testing.expect(presentation.published.?.buffer_search.input.?.ranges != null);
+    try presentation.commands.append(testing.allocator, .{ .build_buffer_disclosure = opening });
+    _ = presentation.takeCommand().?;
+    opening.build();
+    try presentation.dispatch(.{ .buffer_disclosure_built = opening });
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(presentation.published.?.buffer_search.input.?.ranges == null);
+    try testing.expect(presentation.published.?.buffer_search.input.?.batch == null);
+    try presentation.replaceBufferSearchQuery("c6");
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try completeBufferSearchScan(&presentation);
+    try testing.expectEqualStrings("c6", presentation.published.?.buffer_search.accepted_query.?.text);
+    try testing.expectEqual(@as(u16, 72), presentation.projection().review.?.frame.geometry.cols);
+    try testing.expect(presentation.projection().review.?.frame.search_ranges.len > 0);
+}
+
+test "M21 authored Buffer Search opening rejects replaced Sessions and shutdown" {
+    for ([_]enum { refresh, switch_review, shutdown }{ .refresh, .switch_review, .shutdown }) |change| for ([_]bool{ false, true }) |issued| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try revealTemporaryReviewFold(&presentation);
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        const worker = if (issued) presentation.takeCommand().?.build_buffer_disclosure else null;
+        switch (change) {
+            .refresh => presentation.queueRefresh(presentation.published.?.key),
+            .switch_review => try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) }),
+            .shutdown => try presentation.dispatch(.request_shutdown),
+        }
+        if (change != .shutdown) {
+            const load_index = for (presentation.commands.items, 0..) |command, index| {
+                if (command == .load_session) break index;
+            } else return error.MissingSessionLoad;
+            const queued_load = presentation.commands.orderedRemove(load_index);
+            try presentation.commands.insert(presentation.allocator, 0, queued_load);
+            var load = presentation.takeCommand().?;
+            defer load.deinit();
+            try presentation.dispatch(.{ .session_loaded = .{
+                .command_id = load.load_session.command_id,
+                .intent = load.load_session.intent,
+                .outcome = .{ .loaded = try testSession(testing.allocator, if (change == .refresh) 1 else 2, 'b') },
+            } });
+        }
+        const before = presentation.projection().review.?.frame;
+        if (worker) |job| {
+            job.build();
+            try presentation.dispatch(.{ .buffer_disclosure_built = job });
+        }
+        try testing.expectEqual(before.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+        try testing.expect(presentation.takeCommand() == null);
+    };
+}
+
 test "M21 authored source Fold reveal is temporary when Buffer Search starts" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -13042,7 +13402,11 @@ test "M21 authored source Fold reveal is temporary when Buffer Search starts" {
     try testing.expectEqual(@as(?usize, 0), presentation.projection().review.?.isolated_file);
     try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, original_fold).?].disclosure.expanded);
     try testing.expect(presentation.projection().review.?.frame.search_ranges.len > 0);
+    const revealed_frame = presentation.projection().review.?.frame;
     try presentation.dispatch(.{ .action = .open_buffer_search });
+    try testing.expectEqual(revealed_frame.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
+    try testing.expect(presentation.projection().buffer_search.?.input);
+    try completeDisclosureBuild(&presentation);
     try testing.expect(!presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, original_fold).?].disclosure.expanded);
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
     try presentation.dispatch(.{ .action = .open_review_search });
@@ -13055,6 +13419,7 @@ test "M21 authored source Fold reveal is temporary when Buffer Search starts" {
     try presentation.dispatch(.{ .action = .toggle_disclosure });
     try completeDisclosureBuild(&presentation);
     try presentation.dispatch(.{ .action = .open_buffer_search });
+    try completeDisclosureBuild(&presentation);
     try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, original_fold).?].disclosure.expanded);
 }
 
