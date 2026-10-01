@@ -11941,9 +11941,12 @@ fn testSession(backing: std.mem.Allocator, id: u64, marker: u8) !*session_mod.Se
 }
 
 /// Repeatable end-to-end stage timings over a generated, network-free Session.
-pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, paint: *const fn (Allocator, ReviewProjection) anyerror!void, initial_only: bool) !void {
+pub const BufferSearchBenchmarkMode = enum { all, initial_session, final_evidence };
+
+pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, paint: *const fn (Allocator, ReviewProjection) anyerror!void, mode: BufferSearchBenchmarkMode) !void {
     const samples = 9;
     const files = 16;
+    std.debug.print("samples={d} percentile=nearest_rank clock=awake screen_cols=100 screen_rows=30\n", .{samples});
     const Stage = enum { open, edit, scan, worker_projection, admission, admission_bottom, disclosure, disclosure_worker, disclosure_admission, projection, painting, view_dispatch, view_worker, view_admission, resize_input_dispatch, resize_input_worker, resize_input_admission, resize_input_control, hidden_edit, hidden_scan_admission, hidden_worker, hidden_admission, hidden_escape, hidden_restore_worker, hidden_restore_admission, clear_dispatch, clear_worker, clear_admission };
     var times: [@typeInfo(Stage).@"enum".fields.len][samples]u64 = undefined;
 
@@ -11983,7 +11986,7 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
     var store = bbr.review.InMemoryStore.init(allocator);
     defer store.deinit();
     try benchmarkInitialSession(allocator, io, store.store(), session);
-    if (initial_only) {
+    if (mode == .initial_session) {
         std.debug.print("fixture_files={d} fixture_lines={d} fixture_bytes={d}\n", .{ files, files * lines * 2, raw.items.len });
         return;
     }
@@ -12188,6 +12191,11 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
         std.mem.sort(u64, &times[index], {}, std.sort.asc(u64));
         std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ stage.name, times[index][samples / 2], times[index][(samples * 95 + 99) / 100 - 1] });
     }
+    if (mode == .final_evidence) {
+        try benchmarkDisclosureHandoff(allocator, io, false, paint, true);
+        try benchmarkDisclosureHandoff(allocator, io, true, paint, true);
+        return;
+    }
     // Acquire the complete File before timing Review Search destination builds.
     var source_text: std.ArrayList(u8) = .empty;
     try source_text.appendSlice(hidden_allocator, "new\n");
@@ -12208,8 +12216,8 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
     try hidden_session.enrichment.admit(0, &enrichment);
     try hidden.published.?.rebuildBufferControl(hidden.preferences, hidden.published.?.expanded_disclosures.items, null);
     try benchmarkReviewDestination(&hidden, io, "needle", "review_source_destination");
-    try benchmarkDisclosureHandoff(allocator, io, false);
-    try benchmarkDisclosureHandoff(allocator, io, true);
+    try benchmarkDisclosureHandoff(allocator, io, false, paint, false);
+    try benchmarkDisclosureHandoff(allocator, io, true, paint, false);
 }
 
 fn benchmarkInitialSession(allocator: Allocator, io: std.Io, store: bbr.review.PendingReviewStore, session: *Session) !void {
@@ -12516,7 +12524,7 @@ fn benchmarkHiddenSearchNavigation(presentation: *Presentation, io: std.Io) !voi
     }
 }
 
-fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: bool) !void {
+fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: bool, paint: *const fn (Allocator, ReviewProjection) anyerror!void, final_only: bool) !void {
     const draft_count = 1024;
     const body_bytes = 4096;
     const file_count: usize = if (many_inputs) 1024 else 1;
@@ -12525,6 +12533,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
     const key = try OwnedReviewIdentity.init("workspace", "repo", 3);
     var body: [body_bytes]u8 = undefined;
     @memset(&body, 'x');
+    @memcpy(body[body_bytes - "needle".len ..], "needle");
     const session = try testSession(allocator, 3, 'd');
     var transferred = false;
     defer if (!transferred) session.destroy();
@@ -12630,7 +12639,12 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
     std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ if (many_inputs) "review_body_lookup_many_inputs" else "review_body_lookup", times[4], times[8] });
     std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ if (many_inputs) "review_body_lookup_many_inputs_linear_control" else "review_body_lookup_linear_control", control[4], control[8] });
     try benchmarkNavigationRestoration(&presentation, io, if (many_inputs) "many_input_body" else "body");
+    try benchmarkAuthoredSearchInput(&presentation, io, if (many_inputs) "many_input_body" else "body", draft_count, paint);
     if (many_inputs) try benchmarkSidebar(&presentation, io);
+    if (final_only) {
+        if (many_inputs) try benchmarkCacheFrames(&presentation, io, &body);
+        return;
+    }
     try benchmarkReviewDestination(&presentation, io, "x", if (many_inputs) "review_body_destination_many_inputs" else "review_body_destination");
     var draft_dispatch: [9]u64 = undefined;
     var draft_worker: [9]u64 = undefined;
@@ -12757,10 +12771,120 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
     if (many_inputs) try benchmarkCacheFrames(&presentation, io, &body);
 }
 
+fn benchmarkAuthoredSearchInput(presentation: *Presentation, io: std.Io, label: []const u8, expected_occurrences: usize, paint: *const fn (Allocator, ReviewProjection) anyerror!void) !void {
+    const published = presentation.published.?;
+    const Stage = enum { open, edit_queued, edit_issued, stale_admission, resize_dispatch, resize_worker, resize_admission, resize_control, painting };
+    var times: [@typeInfo(Stage).@"enum".fields.len][9]u64 = undefined;
+    for (0..9) |sample| {
+        const before = published.frameProjection();
+        var start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        times[@intFromEnum(Stage.open)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        try presentation.replaceBufferSearchQuery("need");
+        start = std.Io.Clock.awake.now(io);
+        try presentation.replaceBufferSearchQuery("needl");
+        times[@intFromEnum(Stage.edit_queued)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        var scan = presentation.takeCommand() orelse return error.MissingScan;
+        defer scan.deinit();
+        if (scan != .scan_buffer_search or !std.mem.eql(u8, scan.scan_buffer_search.query.text, "needl")) return error.WrongQueuedQuery;
+        start = std.Io.Clock.awake.now(io);
+        try presentation.replaceBufferSearchQuery("needle");
+        times[@intFromEnum(Stage.edit_issued)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        const generation = published.buffer_search.input.?.request_id;
+        const geometry: frame_mod.Geometry = .{ .cols = if (published.geometry.cols == 100) 80 else 100, .rows = 30 };
+        start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .resize = geometry });
+        times[@intFromEnum(Stage.resize_dispatch)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (published.visual_rows.ptr != before.visual_rows.ptr or published.pending_view == null) return error.ResizeNotStaged;
+        const completed = executeBufferSearchScan(std.heap.page_allocator, &scan.scan_buffer_search);
+        start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .buffer_search_scanned = completed });
+        times[@intFromEnum(Stage.stale_admission)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (!published.buffer_search.input.?.pending or published.buffer_search.input.?.request_id != generation or
+            published.visual_rows.ptr != before.visual_rows.ptr) return error.StaleQueryPublished;
+        var command = presentation.takeCommand() orelse return error.MissingDisclosureBuild;
+        if (command == .scan_buffer_search) {
+            var current_scan = command;
+            defer current_scan.deinit();
+            try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(std.heap.page_allocator, &current_scan.scan_buffer_search) });
+            command = presentation.takeCommand() orelse return error.MissingDisclosureBuild;
+        }
+        if (command != .build_buffer_disclosure) return error.UnexpectedCommand;
+        const job = command.build_buffer_disclosure;
+        start = std.Io.Clock.awake.now(io);
+        job.build();
+        times[@intFromEnum(Stage.resize_worker)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (job.failed) return error.DisclosureBuildFailed;
+        var origin = before;
+        origin.navigation = published.buffer_search.input.?.saved_navigation;
+        const expected_navigation = frame_mod.restoreNavigation(origin, job.visual_rows, geometry);
+        start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .buffer_disclosure_built = job });
+        times[@intFromEnum(Stage.resize_admission)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        const input = published.buffer_search.input orelse return error.MissingInput;
+        if (published.worker_frame != job or input.request_id != generation or
+            !std.mem.eql(u8, input.query.?.text, "needle") or input.batch.?.occurrences.len != expected_occurrences or
+            !std.meta.eql(input.saved_navigation, expected_navigation)) return error.AuthoredResizeMismatch;
+        start = std.Io.Clock.awake.now(io);
+        var control = try published.prepareBufferControl(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, geometry);
+        times[@intFromEnum(Stage.resize_control)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        const same_frame = control.visual_rows.len == published.visual_rows.len and control.buffer.rows.len == published.buffer.rows.len and
+            control.input_batch.?.occurrences.len == expected_occurrences and control.input_ranges.?.len == input.ranges.?.len;
+        control.deinit();
+        if (!same_frame) return error.AuthoredResizeControlMismatch;
+        try finishBenchmarkSearchWork(presentation);
+        if (published.buffer_search.input.?.pending or published.buffer_search.input.?.batch.?.occurrences.len != expected_occurrences)
+            return error.AuthoredSearchStillPending;
+        start = std.Io.Clock.awake.now(io);
+        try paint(presentation.allocator, presentation.projection().review.?);
+        times[@intFromEnum(Stage.painting)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+        try finishBenchmarkSearchWork(presentation);
+        if (presentation.commands.items.len != 0 or !std.meta.eql(published.navigation, expected_navigation)) return error.AuthoredEscapeMismatch;
+    }
+    std.debug.print("input_fixture={s} files={d} drafts={d} body_bytes={d} disclosures={d} directories={d} candidates={d} visual_rows={d} occurrences={d}\n", .{
+        label,                                    published.session.diff.files.len,          published.review.drafts.items.len,        expected_occurrences * 4096,
+        published.expanded_disclosures.items.len, published.collapsed_directories.items.len, published.search_corpus.?.candidates.len, published.visual_rows.len,
+        expected_occurrences,
+    });
+    inline for (@typeInfo(Stage).@"enum".fields, 0..) |stage, index| {
+        std.mem.sort(u64, &times[index], {}, std.sort.asc(u64));
+        std.debug.print("stage=input_{s}_{s} median_ns={d} p95_ns={d}\n", .{ label, stage.name, times[index][4], times[index][8] });
+    }
+}
+
+fn finishBenchmarkSearchWork(presentation: *Presentation) !void {
+    var count: usize = 0;
+    while (presentation.takeCommand()) |next| {
+        count += 1;
+        var command = next;
+        if (count > 4) {
+            command.deinit();
+            return error.BenchmarkSearchDidNotSettle;
+        }
+        switch (command) {
+            .scan_buffer_search => |*scan| {
+                defer command.deinit();
+                try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(std.heap.page_allocator, scan) });
+            },
+            .build_buffer_disclosure => |job| {
+                job.build();
+                try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            },
+            else => {
+                command.deinit();
+                return error.UnexpectedCommand;
+            },
+        }
+    }
+    if (presentation.action_error != null) return error.BenchmarkSearchFailed;
+}
+
 fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u8) !void {
     const published = presentation.published.?;
     const storage = &published.session.enrichment;
     var times: [3][4][9]u64 = undefined;
+    var input_times: [3][9]u64 = undefined;
     const labels = [_][]const u8{ "cache_focus", "source_lease_release", "review_holds_release" };
     var fake: bbr.http.FakeHttpClient = .{ .status = 200, .body = body };
     const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
@@ -12789,6 +12913,11 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
         try published.rebuildBufferControl(presentation.preferences, published.expanded_disclosures.items, published.isolated_file);
         const target: usize = if (change == 0) 1 else 0;
         published.navigation.jumpTo(published.visualIndexForBufferIndex(fileHeaderRow(published.buffer, target).?).?);
+        if (change == 0) {
+            try presentation.dispatch(.{ .action = .open_buffer_search });
+            try presentation.replaceBufferSearchQuery("needle");
+            try finishBenchmarkSearchWork(presentation);
+        }
         if (change == 2) {
             if (published.review_search.held == null) published.review_search.held = try presentation.allocator.alloc(bool, storage.len());
             @memset(published.review_search.held.?, true);
@@ -12804,37 +12933,67 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
         }
         times[change][0][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         if (published.visual_rows.ptr != before or !storage.requiresCacheEnforcement(target)) return error.CachePublishedBeforeWorker;
-        const job = (presentation.takeCommand() orelse return error.MissingCacheBuild).build_buffer_disclosure;
+        var job = (presentation.takeCommand() orelse return error.MissingCacheBuild).build_buffer_disclosure;
         start = std.Io.Clock.awake.now(io);
         job.build();
         times[change][1][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         if (job.failed) return error.CacheBuildFailed;
+        if (change == 0) {
+            start = std.Io.Clock.awake.now(io);
+            try presentation.replaceBufferSearchQuery("needl");
+            input_times[0][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+            start = std.Io.Clock.awake.now(io);
+            try presentation.dispatch(.{ .buffer_disclosure_built = job });
+            input_times[1][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+            if (published.visual_rows.ptr != before or !storage.requiresCacheEnforcement(target)) return error.StaleCachePublished;
+            var scan = presentation.takeCommand() orelse return error.MissingScan;
+            defer scan.deinit();
+            if (scan != .scan_buffer_search) return error.UnexpectedCommand;
+            try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(std.heap.page_allocator, &scan.scan_buffer_search) });
+            job = (presentation.takeCommand() orelse return error.MissingCacheBuild).build_buffer_disclosure;
+            start = std.Io.Clock.awake.now(io);
+            job.build();
+            input_times[2][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+            if (job.failed) return error.CacheBuildFailed;
+        }
         start = std.Io.Clock.awake.now(io);
         try presentation.dispatch(.{ .buffer_disclosure_built = job });
         times[change][2][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         if (published.worker_frame != job or storage.requiresCacheEnforcement(target)) return error.CacheNotPublished;
         const victim: usize = if (change == 0) 0 else 1;
         if (storage.file(victim).new != .pending or published.disclosure_inputs.blobs[victim].new != null) return error.CacheVictimRetained;
+        if (change == 0 and (!std.mem.eql(u8, published.buffer_search.input.?.query.?.text, "needl") or
+            published.buffer_search.input.?.pending or published.buffer_search.input.?.batch.?.occurrences.len != 1024)) return error.CacheInputMismatch;
         start = std.Io.Clock.awake.now(io);
         var control = try published.prepareBufferControl(presentation.preferences, published.expanded_disclosures.items, published.isolated_file, published.geometry);
         times[change][3][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         if (control.visual_rows.len != published.visual_rows.len or control.buffer.rows.len != published.buffer.rows.len) return error.CacheControlMismatch;
         std.mem.doNotOptimizeAway(control.visual_rows.len);
         control.deinit();
+        if (change == 0) {
+            try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+            try finishBenchmarkSearchWork(presentation);
+        }
         // The focus and single-lease cases retain the other inactive holds.
         if (change != 2) for (1..storage.len()) |index| {
             if (change == 1 and index == 1) continue;
             storage.finishLeaseDeferred(index);
         };
     };
+    var draft_body_bytes: usize = 0;
+    for (published.review.drafts.items) |draft| draft_body_bytes += draft.body.len;
     std.debug.print("cache_fixture_files={d} cache_fixture_drafts={d} cache_fixture_body_bytes={d} cache_fixture_snapshot_bytes={d} cache_fixture_directories={d} cache_fixture_disclosures={d}\n", .{
-        storage.len(),                             published.review.drafts.items.len,        1024 * body.len + 9 * "new Draft".len, 1024 * body.len,
+        storage.len(),                             published.review.drafts.items.len,        draft_body_bytes, 1024 * body.len,
         published.collapsed_directories.items.len, published.expanded_disclosures.items.len,
     });
     for (labels, &times) |label, *stages| for ([_][]const u8{ "dispatch", "worker", "admission", "sync_control" }, stages) |stage, *samples| {
         std.mem.sort(u64, samples, {}, std.sort.asc(u64));
         std.debug.print("stage={s}_{s} median_ns={d} p95_ns={d}\n", .{ label, stage, samples[4], samples[8] });
     };
+    for ([_][]const u8{ "edit", "stale_admission", "retry_worker" }, &input_times) |stage, *samples| {
+        std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+        std.debug.print("stage=cache_input_{s} median_ns={d} p95_ns={d}\n", .{ stage, samples[4], samples[8] });
+    }
 }
 
 fn benchmarkReviewDestination(presentation: *Presentation, io: std.Io, query: []const u8, label: []const u8) !void {

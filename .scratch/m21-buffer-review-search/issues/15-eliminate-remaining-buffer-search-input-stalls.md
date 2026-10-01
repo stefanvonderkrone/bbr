@@ -4,7 +4,7 @@
 
 **Blocked by:** 11 — Add Buffer Search.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [x] Add deterministic large-Buffer benchmarks that separately measure opening `/`, query-edit dispatch, worker scanning, completion admission, disclosure rebuilding, range projection, and painting.
 - [x] Record median and p95 latency plus fixture size before changing the implementation, and identify which synchronous stages cause the observed stalls.
@@ -34,7 +34,7 @@ The original checklist is complete, but the following input-latency work remains
 - [x] Bound navigation restoration during worker Frame admission. Worker Frames build owner and source-span navigation indexes. Admission restores the cursor, Selection, saved Buffer Search navigation, and origin through indexed lookup. Workers choose Selected Version and Draft deletion destinations. File-header navigation uses binary lookup.
 - [x] Measure initial Session publication separately. Candidate Session preparation now builds the initial Buffer, visual rows, File Tree, source-coordinate projection, search indexes, and search corpus on a worker. Terminal admission publishes the complete Candidate Session.
 - [x] Remove reachable synchronous search rebuild fallbacks after the paths above use workers. Production dispatch uses worker Frames. Synchronous Buffer builds and scans remain compile-time-guarded benchmark controls and test references. Transition and failure tests cover scan admission, Query clearing, and Escape.
-- [ ] Extend the latency benchmark and record final evidence. Cover many Draft bodies, many ReviewCards, nested Directories, cache eviction, hidden occurrence traversal, and resize during pending input. Measure worker handoff and navigation restoration separately. Record fixture sizes, median latency, and p95 latency. Run `zig build test --summary all` after the implementation changes, then update this checklist and the ticket status.
+- [x] Extend the latency benchmark and record final evidence. Cover many Draft bodies, many ReviewCards, nested Directories, cache eviction, hidden occurrence traversal, and resize during pending input. Measure worker handoff and navigation restoration separately. Record fixture sizes, median latency, and p95 latency. Run `zig build test --summary all` after the implementation changes, then update this checklist and the ticket status.
 
 ## Progress
 
@@ -578,3 +578,13 @@ The synchronous reference functions now use explicit `Control` names. `prepareBu
 New tests disable terminal allocations during unchanged scan admission, Query clearing, and Escape. They check worker-range transfer, accepted Batch retention, disclosure-baseline retention, and unchanged navigation and visual rows. Restoration failure tests cover all three transitions. Each failure preserves the earlier Frame and baseline without synchronous recovery. A later worker request restores the Frame. Existing tests cover stale completions, Query generations, Enter, Count, cancellation, Session replacement, and allocation failures.
 
 `zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 949 tests. `zig build test-search-kernel --summary all` passes with 103 tests. `zig build bench-buffer-search -- 32` passes its worker and synchronous-control checks. The Standards and Spec self-review found no remaining findings for this item. The ticket remains `ready-for-agent`. The next remaining item is the benchmark extension and final latency evidence.
+
+## Final latency evidence
+
+The benchmark now supports `--final-evidence`. This mode measures the final search paths without repeating older Draft mutation and Review Search destination measurements. The default mode retains those measurements.
+
+Both 1,024-Draft fixtures now exercise Query edits before and after scan launch, stale completion admission, and resize during pending input. Each Draft contains one `needle` at its final authored bytes. The benchmark checks the newest Query, occurrence count, complete Frame, projected-range count, saved navigation, and Escape restoration. It also measures headless painting with many ReviewCards. Cache focus now exercises a Query edit after worker construction. Admission rejects the earlier cache Frame before a retry publishes the changed cache and newest Query together.
+
+[Final evidence](../final-latency-evidence.md) records fixture sizes, median latency, p95 latency, commands, and measurement limits. The original 4,096-Line fixture now measures opening at 40,666 ns p95, compared with 8,654,375 ns in the baseline. Completion admission measures 12,209 ns p95, compared with 94,588,583 ns. The 131,072-Line fixture measures Query edits at 28,042 ns p95 and resize dispatch at 5,125 ns p95. The many-input fixture measures worker handoff at 10,125 ns p95 and navigation restoration at 2,000 ns p95. Its complete resize admission measures 13,255,834 ns p95.
+
+`zig build bench-buffer-search -- 128 --final-evidence` and `zig build bench-buffer-search -- 4096 --final-evidence` pass. `zig build`, formatting checks, and `git diff --check` pass. `zig build test --summary all` passes with 949 tests after the implementation changes. The Standards and Spec self-review found no remaining findings. All remaining-work items are complete. The ticket is `resolved`.
