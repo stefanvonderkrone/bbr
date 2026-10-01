@@ -1892,8 +1892,7 @@ test "bounded intraline work keeps whole-line emphasis" {
 test "Session emphasis survives Buffer rebuilds with the same LineDecoration" {
     var session_arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer session_arena.deinit();
-    const diff = try parse(session_arena.allocator(),
-        "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-let value = 1;\n+let value = 2;\n");
+    const diff = try parse(session_arena.allocator(), "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-let value = 1;\n+let value = 2;\n");
     const cache = try EmphasisCache.build(session_arena.allocator(), diff);
     var buffer_arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer buffer_arena.deinit();
