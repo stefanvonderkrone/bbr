@@ -133,6 +133,7 @@ const ScriptedExecutor = struct {
         self.count += 1;
         const input: presentation.OwnedInput = switch (command.*) {
             .load_session => |value| .{ .session_loaded = .{ .command_id = value.command_id, .intent = value.intent, .outcome = .{ .failed = error.Scripted } } },
+            .prepare_session => |value| value.launchFailed(),
             .enrich_file => |value| .{ .file_enrichment_completed = .{
                 .command_id = value.command_id,
                 .work_id = value.work_id,
@@ -365,6 +366,52 @@ test "closed terminal sink releases a staged Buffer Frame and its Session" {
     var capture: CapturingSink = .{ .reject = true };
     deliver(capture.sink(), .{ .buffer_disclosure_built = job });
     try testing.expect(capture.input == null);
+}
+
+fn candidateSessionFixture() !*@import("session.zig").Session {
+    const session = try @import("session.zig").create(testing.allocator);
+    errdefer session.destroy();
+    session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Local" };
+    session.source = .{ .local = .{ .common_dir = "." } };
+    session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1 @@\n-old\n+new\n");
+    try session.initializeEnrichment();
+    return session;
+}
+
+test "M21 kernel Candidate Session launch failure and closed sink release private Frames" {
+    for ([_]enum { launch_failed, closed_before_build, closed_after_build }{ .launch_failed, .closed_before_build, .closed_after_build }) |outcome| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try presentation.OwnedReviewIdentity.initLocal(1, "main", "feature");
+        var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{ .initial = .{ .key = key, .session = try candidateSessionFixture() } });
+        defer state.deinit();
+        const previous = state.projection().review.?;
+        try state.dispatch(.{ .action = .refresh });
+        const load = state.takeCommand().?.load_session;
+        const candidate = try candidateSessionFixture();
+        defer candidate.destroy();
+        candidate.retain();
+        try state.dispatch(.{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .loaded = candidate } } });
+        var command = state.takeCommand().?;
+        var capture: CapturingSink = .{ .reject = outcome != .launch_failed };
+        if (outcome == .closed_after_build) {
+            command.prepare_session.build();
+            try testing.expect(command.prepare_session.ready);
+            deliver(capture.sink(), .{ .session_prepared = command.prepare_session });
+        } else {
+            var executor: ScriptedExecutor = .{};
+            try executor.executor().execute(capture.sink(), &command);
+        }
+        if (outcome == .launch_failed) {
+            try state.dispatch(capture.input.?);
+            capture.input = null;
+            try testing.expectEqual(presentation.ReplacementError.buffer_build_failed, state.projection().replacement_error.?);
+            try testing.expect(!state.projection().replacing);
+        } else try testing.expect(capture.input == null);
+        try testing.expectEqual(@as(usize, 1), candidate.references.load(.acquire));
+        try testing.expectEqual(previous.session_epoch, state.projection().review.?.session_epoch);
+        try testing.expectEqual(previous.frame.visual_rows.ptr, state.projection().review.?.frame.visual_rows.ptr);
+    }
 }
 
 test "M21 kernel view Frame launch failure and closed sink preserve the complete Frame" {

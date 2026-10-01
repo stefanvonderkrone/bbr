@@ -865,6 +865,12 @@ fn presentationDisclosureWorker(loop: *Loop, work_id: u64, job: *presentation.Di
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .buffer_disclosure_built = job });
 }
 
+fn presentationPrepareSessionWorker(loop: *Loop, work_id: u64, job: *presentation.PrepareSession) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    job.build();
+    presentation_runtime.deliver(presentationSink(&sink_context), .{ .session_prepared = job });
+}
+
 fn presentationReviewSourceWorker(loop: *Loop, work_id: u64, command_value: presentation.ScanReviewSource) void {
     var command = command_value;
     defer command.deinit();
@@ -1031,6 +1037,7 @@ fn drainPresentationCommands(
         next_work_id.* +%= 1;
         const future = switch (command) {
             .load_session => |load| ctx.io.concurrent(presentationLoadWorker, .{ loop, work_id, ctx.io, workerBitbucketForReviewKind(ctx.bitbucket, load.key.kind), load }),
+            .prepare_session => |job| ctx.io.concurrent(presentationPrepareSessionWorker, .{ loop, work_id, job }),
             .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, ctx.io, workerBitbucketForEnrichment(ctx.bitbucket, enrich.source), ctx.highlighter, enrich }),
             .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, ctx.bitbucket.?, post }),
             .update_comment => |update| ctx.io.concurrent(presentationCommentEditWorker, .{ loop, work_id, ctx.bitbucket.?, update }),
@@ -1069,6 +1076,7 @@ fn workerBitbucketForEnrichment(client: ?bbr.bitbucket.Client, source: presentat
 fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *presentation.OwnedCommand) !void {
     const input: presentation.OwnedInput = switch (command.*) {
         .load_session => |load| .{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .failed = error.WorkerLaunchFailed } } },
+        .prepare_session => |job| job.launchFailed(),
         .enrich_file => |enrich| .{ .file_enrichment_completed = .{
             .command_id = enrich.command_id,
             .work_id = enrich.work_id,

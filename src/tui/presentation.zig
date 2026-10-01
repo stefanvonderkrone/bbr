@@ -206,6 +206,7 @@ pub const OwnedInput = union(enum) {
     key: keymap_mod.KeyStroke,
     mouse: MouseInput,
     session_loaded: SessionLoaded,
+    session_prepared: *PrepareSession,
     push_count_digit: u8,
     resize_viewport: usize,
     resize: frame_mod.Geometry,
@@ -242,6 +243,7 @@ pub const OwnedInput = union(enum) {
     pub fn deinit(self: *OwnedInput) void {
         switch (self.*) {
             .session_loaded => |loaded| if (loaded.outcome == .loaded) loaded.outcome.loaded.destroy(),
+            .session_prepared => |candidate| candidate.destroy(),
             .file_enrichment_completed => |completed| if (completed.outcome == .completed) {
                 var result = completed.outcome.completed;
                 result.deinit();
@@ -497,6 +499,39 @@ pub const LoadSession = struct {
 
 pub const SessionLoadCause = enum { picker, refresh, reconciliation };
 
+/// Owns a private Candidate Session until its complete initial Frame can publish.
+/// Store reads and ScopeProjection resolution finish before worker handoff.
+pub const PrepareSession = struct {
+    allocator: Allocator,
+    command_id: CommandId = 0,
+    intent: LoadIntent,
+    preferences: Preferences,
+    review_revision: u64,
+    candidate: ?*Published,
+    ready: bool = false,
+    failure: ?ReplacementError = null,
+
+    pub fn build(self: *PrepareSession) void {
+        self.candidate.?.finishCreate(self.preferences) catch |err| {
+            self.failure = if (err == error.OutOfMemory) .out_of_memory else .buffer_build_failed;
+            return;
+        };
+        self.ready = true;
+    }
+
+    pub fn launchFailed(self: *PrepareSession) OwnedInput {
+        self.failure = .buffer_build_failed;
+        return .{ .session_prepared = self };
+    }
+
+    pub fn destroy(self: *PrepareSession) void {
+        if (self.candidate) |candidate| {
+            if (self.ready) candidate.destroy() else candidate.destroyInputs();
+        }
+        self.allocator.destroy(self);
+    }
+};
+
 pub const CommentEditOutcome = union(enum) {
     updated,
     definitive_failure: bbr.bitbucket.ApiError,
@@ -707,6 +742,7 @@ pub const ChangeReviewerVerdict = struct {
 
 pub const OwnedCommand = union(enum) {
     load_session: LoadSession,
+    prepare_session: *PrepareSession,
     enrich_file: EnrichFile,
     post_draft: *PostDraft,
     update_comment: *UpdateComment,
@@ -724,6 +760,7 @@ pub const OwnedCommand = union(enum) {
 
     pub fn deinit(self: *OwnedCommand) void {
         switch (self.*) {
+            .prepare_session => |command| command.destroy(),
             .post_draft, .find_duplicate => |command| command.destroy(),
             .update_comment => |command| command.destroy(),
             .delete_comment => |command| command.destroy(),
@@ -752,6 +789,7 @@ fn commandTarget(command: OwnedCommand) CommandTarget {
 fn setCommandId(command: *OwnedCommand, command_id: CommandId) void {
     switch (command.*) {
         .load_session => |*value| value.command_id = command_id,
+        .prepare_session => |value| value.command_id = command_id,
         .enrich_file => |*value| value.command_id = command_id,
         .post_draft, .find_duplicate => |value| value.command_id = command_id,
         .update_comment => |value| value.command_id = command_id,
@@ -2823,6 +2861,7 @@ const Published = struct {
     key: OwnedReviewIdentity,
     epoch: SessionEpoch,
     session: *Session,
+    backing_allocator: Allocator,
     review_arena: std.heap.ArenaAllocator,
     review: bbr.review.PendingReview,
     scope_projection: std.ArrayList(bbr.review.ScopeProjectionEntry),
@@ -2878,11 +2917,32 @@ const Published = struct {
         cell_metrics: frame_mod.CellMetrics,
         comments_collapsed_rows: usize,
     ) !*Published {
+        const candidate = try createInputs(allocator, store, anchor_resolver, scope_resolver, key, epoch, session, geometry, preferences, cache_policy, cell_metrics, comments_collapsed_rows);
+        errdefer candidate.destroyInputs();
+        try candidate.finishCreate(preferences);
+        return candidate;
+    }
+
+    fn createInputs(
+        allocator: Allocator,
+        store: bbr.review.PendingReviewStore,
+        anchor_resolver: ?bbr.review.AnchorResolver,
+        scope_resolver: ?bbr.review.ScopeResolver,
+        key: OwnedReviewIdentity,
+        epoch: SessionEpoch,
+        session: *Session,
+        geometry: frame_mod.Geometry,
+        preferences: Preferences,
+        cache_policy: file_enrichment.CachePolicy,
+        cell_metrics: frame_mod.CellMetrics,
+        comments_collapsed_rows: usize,
+    ) !*Published {
         errdefer session.destroy();
         const published = try allocator.create(Published);
         errdefer allocator.destroy(published);
 
         published.allocator = allocator;
+        published.backing_allocator = allocator;
         published.key = key;
         published.epoch = epoch;
         published.session = session;
@@ -2920,8 +2980,6 @@ const Published = struct {
                 .unavailable;
             try published.scope_projection.append(published.review_arena.allocator(), .{ .temp_id = draft.local_id, .resolution = resolution });
         }
-        if (session.emphasis_cache == null) try session.prepareEmphasis();
-        published.emphasis_cache = session.emphasis_cache.?;
         published.buffers = ArenaRing(2).init(allocator);
         published.trees = ArenaRing(2).init(allocator);
         errdefer published.trees.deinit();
@@ -2941,10 +2999,12 @@ const Published = struct {
         published.pending_draft_mutation = null;
         published.buffer_search = .{};
         published.search_generation = 0;
+        published.view_generation = 0;
         published.pending_view = null;
         published.cache_update_generation = 0;
         published.pending_cache_update = null;
         published.pending_cache_focus = null;
+        published.search_corpus = null;
         published.review_search = .{};
         published.active_search = .none;
         published.geometry = geometry;
@@ -2955,6 +3015,27 @@ const Published = struct {
         published.comments_collapsed_rows = comments_collapsed_rows;
         session.enrichment.configureCache(cache_policy);
         if (session.enrichment.len() > 0) session.enrichment.focus(0);
+        return published;
+    }
+
+    fn destroyInputs(self: *Published) void {
+        const allocator = self.allocator;
+        self.composer_arena.deinit();
+        self.expanded_disclosures.deinit(allocator);
+        self.collapsed_directories.deinit(allocator);
+        self.buffers.deinit();
+        self.trees.deinit();
+        self.review_arena.deinit();
+        self.session.destroy();
+        self.backing_allocator.destroy(self);
+    }
+
+    fn finishCreate(published: *Published, preferences: Preferences) !void {
+        const session = published.session;
+        const geometry = published.geometry;
+        const cell_metrics = published.cell_metrics;
+        if (session.emphasis_cache == null) try session.prepareEmphasis();
+        published.emphasis_cache = session.emphasis_cache.?;
 
         const buffer_allocator = published.buffers.begin();
         errdefer published.buffers.abort();
@@ -3006,7 +3087,6 @@ const Published = struct {
             0,
             cell_metrics,
         );
-        published.buffers.commit();
         published.search_corpus = published.bufferSearchCorpus(preferences, published.expanded_disclosures.items, published.isolated_file, geometry) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BufferBuildFailed;
         errdefer published.search_corpus.?.release();
         published.navigation = Nav.init(published.visual_rows.len, panes.diff_content.height);
@@ -3014,7 +3094,7 @@ const Published = struct {
         published.disclosure_inputs_current = true;
         errdefer published.disclosure_inputs.release();
         published.disclosure_keys = try DisclosureKeys.create(published.expanded_disclosures.items);
-        return published;
+        published.buffers.commit();
     }
 
     fn destroy(self: *Published) void {
@@ -3036,7 +3116,7 @@ const Published = struct {
         self.disclosure_keys.release();
         self.review_arena.deinit();
         self.session.destroy();
-        allocator.destroy(self);
+        self.backing_allocator.destroy(self);
     }
 
     fn releaseReviewSearchHolds(self: *Published) void {
@@ -4689,6 +4769,7 @@ pub const Presentation = struct {
     replacement: ?Replacement = null,
     next_intent: LoadIntent = 0,
     next_session_epoch: SessionEpoch = 0,
+    candidate_review_revision: u64 = 0,
     next_work_id: WorkId = 0,
     next_command_id: CommandId = 0,
     commands: std.ArrayList(OwnedCommand) = .empty,
@@ -4804,11 +4885,30 @@ pub const Presentation = struct {
     /// The sole mutation entry point. Candidate construction consumes a loaded
     /// Session whether it commits, fails, or proves stale.
     pub fn dispatch(self: *Presentation, input: OwnedInput) !void {
+        // Durable effects can change persisted Drafts while a private initial
+        // Frame is building. Retry that snapshot before it becomes current.
+        switch (input) {
+            .post_draft_completed,
+            .post_draft_launch_failed,
+            .submission_wait_completed,
+            .submission_wait_launch_failed,
+            .duplicate_checked,
+            .recovery_checked,
+            .unknown_resolution,
+            => self.candidate_review_revision +%= 1,
+            .key, .action => if (self.durable_submission != null) {
+                self.candidate_review_revision +%= 1;
+            },
+            .buffer_disclosure_built => |job| if (job.new_draft != null or job.mutation != null) {
+                self.candidate_review_revision +%= 1;
+            },
+            else => {},
+        }
         // A candidate completion is not itself an interaction or a Frame
         // change. Keep a press across rollback; a committed replacement
         // invalidates it below when the new Session becomes published.
         const version_action = input == .action and (input.action == .select_old_version or input.action == .select_new_version);
-        if (input != .mouse and input != .session_loaded and input != .ensure_focused_enrichment and !version_action) {
+        if (input != .mouse and input != .session_loaded and input != .session_prepared and input != .ensure_focused_enrichment and !version_action) {
             self.mouse_press = null;
             self.last_review_click = null;
             self.interaction_revision +%= 1;
@@ -4818,6 +4918,7 @@ pub const Presentation = struct {
             .key => |key| try self.applyKey(key),
             .mouse => |mouse| self.applyMouse(mouse),
             .session_loaded => |completed| self.acceptLoadedSession(completed),
+            .session_prepared => |completed| self.acceptPreparedSession(completed),
             .push_count_digit => |digit| self.pushCountDigit(digit),
             .resize_viewport => |rows| self.resizeViewport(rows),
             .resize => |geometry| self.resize(geometry),
@@ -4885,6 +4986,7 @@ pub const Presentation = struct {
         self.issued_commands.appendAssumeCapacity(.{ .id = command_id, .target = commandTarget(command) });
         switch (command) {
             .load_session => self.outstanding_loads += 1,
+            .prepare_session => {},
             .enrich_file => |enrich| self.issued_enrichments.appendAssumeCapacity(.{
                 .command_id = command_id,
                 .work_id = enrich.work_id,
@@ -5017,7 +5119,7 @@ pub const Presentation = struct {
 
     pub fn readyToExit(self: *const Presentation) bool {
         if (builtin.is_test) for (self.issued_commands.items) |issued| {
-            if (issued.target == .scan_buffer_search or issued.target == .scan_review_source or issued.target == .build_buffer_disclosure) return false;
+            if (issued.target == .scan_buffer_search or issued.target == .scan_review_source or issued.target == .build_buffer_disclosure or issued.target == .prepare_session) return false;
         };
         if (builtin.is_test) return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.durable_reviewer_verdict == null and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.outstanding_picker_loads == 0 and self.issued_enrichments.items.len == 0;
         return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.durable_reviewer_verdict == null and self.commands.items.len == 0 and self.issued_commands.items.len == 0;
@@ -10479,6 +10581,10 @@ pub const Presentation = struct {
         var write: usize = 0;
         for (self.commands.items) |command| {
             if (command == .load_session) continue;
+            if (command == .prepare_session) {
+                command.prepare_session.destroy();
+                continue;
+            }
             self.commands.items[write] = command;
             write += 1;
         }
@@ -10529,81 +10635,124 @@ pub const Presentation = struct {
                 self.replacement_error = if (err == error.OutOfMemory) .out_of_memory else .session_load_failed;
             },
             .loaded => |session| {
-                const epoch = self.next_session_epoch + 1;
-                const candidate = Published.create(
-                    self.allocator,
-                    self.dependencies.reviews,
-                    self.dependencies.anchor_resolver,
-                    self.dependencies.scope_resolver,
-                    replacement.key,
-                    epoch,
-                    session,
-                    self.geometry,
-                    self.preferences,
-                    .{
-                        .enabled = self.dependencies.file_cache_enabled,
-                        .max_retained_bytes = self.dependencies.inactive_file_cache_max_bytes,
-                    },
-                    self.dependencies.cell_metrics,
-                    self.dependencies.comments_collapsed_rows,
-                ) catch |err| {
+                self.queueCandidateSession(session, replacement.intent, replacement.key) catch |err| {
                     self.replacement = null;
                     self.replacement_error = switch (err) {
                         error.OutOfMemory => .out_of_memory,
-                        error.PendingReviewLoadFailed => .pending_review_load_failed,
-                        error.BufferBuildFailed => .buffer_build_failed,
+                        else => .pending_review_load_failed,
                     };
                     if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
-                    return;
                 };
-
-                const previous = self.published;
-                if (previous) |current| {
-                    self.discardQueuedReviewSourceScans();
-                    self.discardQueuedReviewSearchScans();
-                    self.discardQueuedSearchEnrichments(current);
-                    if (OwnedReviewIdentity.eql(current.key, candidate.key))
-                        candidate.navigation = frame_mod.restoreNavigationIndexed(current.frameProjection(), candidate.visual_rows, candidate.geometry, candidate.search_projection.navigation);
-                }
-                self.published = candidate;
-                self.discardQueuedBufferSearchScans(null);
-                if (self.stale_repair) |*gate| if (OwnedReviewIdentity.eql(gate.key, candidate.key)) {
-                    gate.observed_source_commit = BoundedText(64).init(candidate.session.header.source_commit) catch gate.observed_source_commit;
-                    gate.reloaded = true;
-                };
-                if (candidate.session.authenticated_account_uuid) |uuid|
-                    self.authenticated_account_uuid = BoundedText(256).init(uuid) catch self.authenticated_account_uuid;
-                if (candidate.session.authenticated_account_unauthorized) self.authenticated_account_uuid = null;
-                self.next_session_epoch = epoch;
-                self.reload_required_epoch = null;
-                // The armed candidate named rows in the replaced Session, and
-                // the confirmed cascade described the replaced graph.
-                self.reanchor = null;
-                self.delete_confirmation = null;
-                self.version_restoration = null;
-                self.resolver = .{};
-                self.mouse_press = null;
-                self.interaction_revision +%= 1;
-                self.replacement = null;
-                self.replacement_error = null;
-                self.action_error = null;
-                if (replacement.cause == .reconciliation) if (self.durable_comment_edit) |durable| {
-                    if (OwnedReviewIdentity.eql(durable.key, replacement.key)) {
-                        self.durable_comment_edit = null;
-                        durable.destroy();
-                    }
-                };
-                if (replacement.cause == .reconciliation) if (self.durable_comment_delete) |durable| {
-                    if (OwnedReviewIdentity.eql(durable.key, replacement.key)) {
-                        self.durable_comment_delete = null;
-                        durable.destroy();
-                    }
-                };
-                if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
-                if (previous) |published| published.destroy();
-                self.refreshStaleRepairTree();
             },
         }
+    }
+
+    fn queueCandidateSession(self: *Presentation, session: *Session, intent: LoadIntent, key: OwnedReviewIdentity) !void {
+        // Candidate arenas cross the worker boundary. The terminal allocator
+        // remains exclusive to Presentation and the durable store.
+        const allocator = std.heap.page_allocator;
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            session.destroy();
+            return err;
+        };
+        const job = allocator.create(PrepareSession) catch |err| {
+            session.destroy();
+            return err;
+        };
+        errdefer allocator.destroy(job);
+        const candidate = try Published.createInputs(
+            allocator,
+            self.dependencies.reviews,
+            self.dependencies.anchor_resolver,
+            self.dependencies.scope_resolver,
+            key,
+            self.next_session_epoch + 1,
+            session,
+            self.geometry,
+            self.preferences,
+            .{
+                .enabled = self.dependencies.file_cache_enabled,
+                .max_retained_bytes = self.dependencies.inactive_file_cache_max_bytes,
+            },
+            self.dependencies.cell_metrics,
+            self.dependencies.comments_collapsed_rows,
+        );
+        job.* = .{ .allocator = allocator, .intent = intent, .preferences = self.preferences, .review_revision = self.candidate_review_revision, .candidate = candidate };
+        self.commands.appendAssumeCapacity(.{ .prepare_session = job });
+    }
+
+    fn acceptPreparedSession(self: *Presentation, job: *PrepareSession) void {
+        defer job.destroy();
+        if (!self.consumeCommand(job.command_id, .prepare_session)) return;
+        const replacement = self.replacement orelse return;
+        if (self.shutdown_requested or replacement.intent != job.intent) return;
+        if (job.failure) |failure| {
+            self.replacement = null;
+            self.replacement_error = failure;
+            if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
+            return;
+        }
+        const candidate = job.candidate.?;
+        if (!job.ready) return;
+        if (!std.meta.eql(candidate.geometry, self.geometry) or !std.meta.eql(job.preferences, self.preferences) or
+            job.review_revision != self.candidate_review_revision)
+        {
+            candidate.session.retain();
+            self.queueCandidateSession(candidate.session, job.intent, replacement.key) catch |err| {
+                self.replacement = null;
+                self.replacement_error = if (err == error.OutOfMemory) .out_of_memory else .pending_review_load_failed;
+                if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
+            };
+            return;
+        }
+        candidate.epoch = self.next_session_epoch + 1;
+        candidate.allocator = self.allocator;
+        job.candidate = null;
+        const previous = self.published;
+        if (previous) |current| {
+            self.discardQueuedReviewSourceScans();
+            self.discardQueuedReviewSearchScans();
+            self.discardQueuedSearchEnrichments(current);
+            if (OwnedReviewIdentity.eql(current.key, candidate.key))
+                candidate.navigation = frame_mod.restoreNavigationIndexed(current.frameProjection(), candidate.visual_rows, candidate.geometry, candidate.search_projection.navigation);
+        }
+        self.published = candidate;
+        self.discardQueuedBufferSearchScans(null);
+        if (self.stale_repair) |*gate| if (OwnedReviewIdentity.eql(gate.key, candidate.key)) {
+            gate.observed_source_commit = BoundedText(64).init(candidate.session.header.source_commit) catch gate.observed_source_commit;
+            gate.reloaded = true;
+        };
+        if (candidate.session.authenticated_account_uuid) |uuid|
+            self.authenticated_account_uuid = BoundedText(256).init(uuid) catch self.authenticated_account_uuid;
+        if (candidate.session.authenticated_account_unauthorized) self.authenticated_account_uuid = null;
+        self.next_session_epoch = candidate.epoch;
+        self.reload_required_epoch = null;
+        // The armed candidate named rows in the replaced Session, and
+        // the confirmed cascade described the replaced graph.
+        self.reanchor = null;
+        self.delete_confirmation = null;
+        self.version_restoration = null;
+        self.resolver = .{};
+        self.mouse_press = null;
+        self.interaction_revision +%= 1;
+        self.replacement = null;
+        self.replacement_error = null;
+        self.action_error = null;
+        if (replacement.cause == .reconciliation) if (self.durable_comment_edit) |durable| {
+            if (OwnedReviewIdentity.eql(durable.key, replacement.key)) {
+                self.durable_comment_edit = null;
+                durable.destroy();
+            }
+        };
+        if (replacement.cause == .reconciliation) if (self.durable_comment_delete) |durable| {
+            if (OwnedReviewIdentity.eql(durable.key, replacement.key)) {
+                self.durable_comment_delete = null;
+                durable.destroy();
+            }
+        };
+        if (replacement.cause == .reconciliation) self.finishReviewerVerdictReconciliation(replacement.key);
+        if (previous) |published| published.destroy();
+        self.refreshStaleRepairTree();
     }
 
     fn finishReviewerVerdictReconciliation(self: *Presentation, key: OwnedReviewIdentity) void {
@@ -11875,7 +12024,7 @@ fn testSession(backing: std.mem.Allocator, id: u64, marker: u8) !*session_mod.Se
 }
 
 /// Repeatable end-to-end stage timings over a generated, network-free Session.
-pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, paint: *const fn (Allocator, ReviewProjection) anyerror!void) !void {
+pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, paint: *const fn (Allocator, ReviewProjection) anyerror!void, initial_only: bool) !void {
     const samples = 9;
     const files = 16;
     const Stage = enum { open, edit, scan, worker_projection, admission, admission_bottom, disclosure, disclosure_worker, disclosure_admission, projection, painting, view_dispatch, view_worker, view_admission, resize_input_dispatch, resize_input_worker, resize_input_admission, resize_input_control, hidden_edit, hidden_scan_admission, hidden_worker, hidden_admission, hidden_escape, hidden_restore_worker, hidden_restore_admission, clear_dispatch, clear_worker, clear_admission };
@@ -11913,8 +12062,14 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
     session.threads = &.{};
     session.diff = try bbr.diff.parse(a, raw.items);
     try session.initializeEnrichment();
+    try session.prepareEmphasis();
     var store = bbr.review.InMemoryStore.init(allocator);
     defer store.deinit();
+    try benchmarkInitialSession(allocator, io, store.store(), session);
+    if (initial_only) {
+        std.debug.print("fixture_files={d} fixture_lines={d} fixture_bytes={d}\n", .{ files, files * lines * 2, raw.items.len });
+        return;
+    }
     transferred = true;
     var presentation = try Presentation.init(allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
@@ -12138,6 +12293,67 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
     try benchmarkReviewDestination(&hidden, io, "needle", "review_source_destination");
     try benchmarkDisclosureHandoff(allocator, io, false);
     try benchmarkDisclosureHandoff(allocator, io, true);
+}
+
+fn benchmarkInitialSession(allocator: Allocator, io: std.Io, store: bbr.review.PendingReviewStore, session: *Session) !void {
+    var times: [4][9]u64 = undefined;
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    for (0..9) |sample| {
+        session.retain();
+        var start = std.Io.Clock.awake.now(io);
+        const candidate = try Published.create(allocator, store, null, null, key, 1, session, .{ .cols = 100, .rows = 30 }, .{}, .{}, .bytes, 8);
+        times[0][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (candidate.visual_rows.len == 0 or candidate.search_corpus.?.candidates.len == 0) return error.MissingInitialFrame;
+        const expected_rows = candidate.visual_rows.len;
+        const expected_candidates = candidate.search_corpus.?.candidates.len;
+        std.mem.doNotOptimizeAway(candidate.visual_rows.len);
+        candidate.destroy();
+
+        var presentation = try Presentation.init(allocator, .{ .reviews = store }, .{ .geometry = .{ .cols = 100, .rows = 30 } });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .choose_pull_request = key });
+        const load = presentation.takeCommand().?.load_session;
+        session.retain();
+        start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .loaded = session } } });
+        times[1][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (presentation.published != null or !presentation.projection().replacing) return error.InitialFrameNotStaged;
+        const job = (presentation.takeCommand() orelse return error.MissingCandidateSession).prepare_session;
+        start = std.Io.Clock.awake.now(io);
+        job.build();
+        times[2][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (!job.ready) return error.InitialFrameBuildFailed;
+        start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .session_prepared = job });
+        times[3][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        const published = presentation.published orelse return error.MissingInitialFrame;
+        if (published.visual_rows.len != expected_rows or published.search_corpus.?.candidates.len != expected_candidates)
+            return error.InitialFrameControlMismatch;
+    }
+    const names = [_][]const u8{ "initial_session_control", "initial_session_dispatch", "initial_session_worker", "initial_session_admission" };
+    for (&times, names) |*samples, name| {
+        std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+        std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ name, samples[4], samples[8] });
+    }
+}
+
+// Existing transition tests complete Session preparation through the same
+// command and completion seam, without draining unrelated issued work.
+fn dispatchSessionLoadForTest(presentation: *Presentation, input: OwnedInput) !void {
+    try presentation.dispatch(input);
+    while (true) {
+        const index = for (presentation.commands.items, 0..) |command, index| {
+            if (command == .prepare_session) break index;
+        } else return;
+        const candidate_command = presentation.commands.items[index];
+        var destination = index;
+        while (destination > 0) : (destination -= 1)
+            presentation.commands.items[destination] = presentation.commands.items[destination - 1];
+        presentation.commands.items[0] = candidate_command;
+        const job = (presentation.takeCommand() orelse return error.MissingCandidateSession).prepare_session;
+        job.build();
+        try presentation.dispatch(.{ .session_prepared = job });
+    }
 }
 
 // Linear controls stay outside production dispatch. They also serve as the
@@ -13089,7 +13305,7 @@ test "a queued disclosure keeps the old Frame and ignores a replaced Session" {
     const job = presentation.takeCommand().?.build_buffer_disclosure;
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const load = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{ .intent = load.intent, .outcome = .{ .loaded = try testDisclosureSession(testing.allocator, 2) } } });
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{ .intent = load.intent, .outcome = .{ .loaded = try testDisclosureSession(testing.allocator, 2) } } });
     job.build();
     try presentation.dispatch(.{ .buffer_disclosure_built = job });
     try testing.expectEqual(@as(SessionEpoch, 2), presentation.published.?.epoch);
@@ -13169,7 +13385,7 @@ test "large Buffer view Actions publish worker Frames together" {
     const obsolete = presentation.takeCommand().?.build_buffer_disclosure;
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const replacement = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .intent = replacement.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
     } });
@@ -13352,7 +13568,7 @@ test "M21 kernel view work retries navigation changes and rejects closed Session
         } else {
             if (change == .refresh) try presentation.dispatch(.{ .action = .refresh }) else try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
             const load = presentation.takeCommand().?.load_session;
-            try presentation.dispatch(.{ .session_loaded = .{ .intent = load.intent, .outcome = .{ .loaded = try testTwoFileSession(testing.allocator, if (change == .refresh) 1 else 2) } } });
+            try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{ .intent = load.intent, .outcome = .{ .loaded = try testTwoFileSession(testing.allocator, if (change == .refresh) 1 else 2) } } });
         }
         const before = presentation.projection().review.?.frame;
         worker.build();
@@ -14025,7 +14241,7 @@ test "M21 authored Buffer Search opening rejects replaced Sessions and shutdown"
             try presentation.commands.insert(presentation.allocator, 0, queued_load);
             var load = presentation.takeCommand().?;
             defer load.deinit();
-            try presentation.dispatch(.{ .session_loaded = .{
+            try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
                 .command_id = load.load_session.command_id,
                 .intent = load.load_session.intent,
                 .outcome = .{ .loaded = try testSession(testing.allocator, if (change == .refresh) 1 else 2, 'b') },
@@ -14592,7 +14808,7 @@ test "M21 authored destination rejects replaced Sessions" {
             defer owned.deinit();
             if (owned == .enrich_file) continue;
             try testing.expect(owned == .load_session);
-            try presentation.dispatch(.{ .session_loaded = .{
+            try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
                 .command_id = owned.load_session.command_id,
                 .intent = owned.load_session.intent,
                 .outcome = .{ .loaded = try testSession(testing.allocator, id, 'b') },
@@ -15172,7 +15388,7 @@ test "M21 kernel Session replacement releases queued disclosure work for refresh
         defer load.deinit();
         try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search) });
         try testing.expectEqual(@as(usize, 1), presentation.commands.items.len);
-        try presentation.dispatch(.{ .session_loaded = .{
+        try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
             .command_id = load.load_session.command_id,
             .intent = load.load_session.intent,
             .outcome = .{ .loaded = try testSession(testing.allocator, id, 'b') },
@@ -15510,7 +15726,7 @@ test "M21 kernel Buffer Search releases stale work after Session replacement" {
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     var load = presentation.takeCommand().?;
     defer load.deinit();
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .command_id = load.load_session.command_id,
         .intent = load.load_session.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
@@ -16134,7 +16350,7 @@ test "Reviewer Verdict availability gives every refusal and emits one qualified 
     candidate.authenticated_account_uuid = "{me}";
     candidate.source.remote.author_uuid = "{author}";
     candidate.source.remote.reviewer_verdicts = &.{.{ .account_uuid = "{me}", .verdict = .approved }};
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .command_id = reconciliation.command_id,
         .intent = reconciliation.intent,
         .outcome = .{ .loaded = candidate },
@@ -16211,7 +16427,7 @@ test "Reviewer Verdict survives a Session switch without projecting into the new
     const second_key = try OwnedReviewIdentity.init("workspace", "repo", 2);
     try presentation.dispatch(.{ .choose_pull_request = second_key });
     const load = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .command_id = load.command_id,
         .intent = load.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
@@ -16253,7 +16469,7 @@ test "Reviewer Verdict replacement failure preserves the Session and qualified r
         .outcome = .{ .completed = .reconciled_success },
     } });
     const replacement = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .command_id = replacement.command_id,
         .intent = replacement.intent,
         .outcome = .{ .failed = error.TransportFailure },
@@ -16367,8 +16583,10 @@ test "Reviewer Verdict Candidate Session allocation failure releases the global 
         .outcome = .{ .completed = .success },
     } });
     const replacement = presentation.takeCommand().?.load_session;
+    presentation.commands.deinit(failing.allocator());
+    presentation.commands = .empty;
     failing.fail_index = failing.alloc_index;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .command_id = replacement.command_id,
         .intent = replacement.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 1, 'b') },
@@ -17374,7 +17592,7 @@ test "partial File Enrichment keeps usable content and only refresh replaces its
         const failed_refresh = presentation.takeCommand().?.load_session;
         try testing.expectEqual(SessionLoadCause.refresh, failed_refresh.cause);
         try testing.expect(OwnedReviewIdentity.eql(key, failed_refresh.key));
-        try presentation.dispatch(.{ .session_loaded = .{
+        try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
             .command_id = failed_refresh.command_id,
             .intent = failed_refresh.intent,
             .outcome = .{ .failed = error.TransportFailure },
@@ -17389,7 +17607,7 @@ test "partial File Enrichment keeps usable content and only refresh replaces its
 
         try presentation.dispatch(.{ .action = .refresh });
         const successful_refresh = presentation.takeCommand().?.load_session;
-        try presentation.dispatch(.{ .session_loaded = .{
+        try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
             .command_id = successful_refresh.command_id,
             .intent = successful_refresh.intent,
             .outcome = .{ .loaded = try testCrossSourceVersionSession(testing.allocator, local) },
@@ -17486,7 +17704,7 @@ test "Selected Version defaults to new and survives preference and Session repla
     try dispatchView(&presentation, .{ .action = .cycle_scope });
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const command = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .command_id = command.command_id,
         .intent = command.intent,
         .outcome = .{ .loaded = try testTwoFileSession(testing.allocator, 2) },
@@ -17959,7 +18177,7 @@ test "successful Session replacement resets Pane and Sidebar defaults" {
 
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const command = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{ .intent = command.intent, .outcome = .{ .loaded = try testTwoFileSession(testing.allocator, 2) } } });
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{ .intent = command.intent, .outcome = .{ .loaded = try testTwoFileSession(testing.allocator, 2) } } });
     const frame = presentation.projection().review.?.frame;
     try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
     try testing.expectEqual(@as(usize, 0), frame.navigation.cursor);
@@ -18196,7 +18414,7 @@ test "M21 hidden Buffer Search discards cancelled and replaced worker Frames" {
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     var load = presentation.takeCommand().?;
     defer load.deinit();
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .command_id = load.load_session.command_id,
         .intent = load.load_session.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
@@ -18791,7 +19009,7 @@ test "Session disclosures toggle independently persist through rebuilds and rese
 
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const replacement = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{ .intent = replacement.intent, .outcome = .{ .loaded = try testDisclosureSession(testing.allocator, 2) } } });
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{ .intent = replacement.intent, .outcome = .{ .loaded = try testDisclosureSession(testing.allocator, 2) } } });
     const replaced = presentation.projection().review.?;
     try testing.expect(!replaced.buffer.rows[findDisclosureRow(replaced.buffer.rows, thread_key).?].disclosure.expanded);
 }
@@ -18815,11 +19033,17 @@ test "failed replacement Buffer construction preserves the published review" {
     const command = presentation.takeCommand().?.load_session;
 
     const candidate = try testSession(testing.allocator, 2, 'b');
-    failing.fail_index = failing.alloc_index + 1; // Published allocation succeeds; Buffer allocation fails.
     try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = command.command_id,
         .intent = command.intent,
         .outcome = .{ .loaded = candidate },
     } });
+    const job = presentation.takeCommand().?.prepare_session;
+    job.candidate.?.buffers.deinit();
+    job.candidate.?.buffers = ArenaRing(2).init(failing.allocator());
+    failing.fail_index = failing.alloc_index;
+    job.build();
+    try presentation.dispatch(.{ .session_prepared = job });
 
     try testing.expect(failing.has_induced_failure);
     const after = presentation.projection();
@@ -18851,6 +19075,163 @@ test "only the latest queued replacement command is exposed" {
     try testing.expect(presentation.takeCommand() == null);
 }
 
+fn testCandidatePreparation(presentation: *Presentation, id: u64) !*PrepareSession {
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", id) });
+    const load = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testDisclosureSession(testing.allocator, id) },
+    } });
+    return (presentation.takeCommand() orelse return error.MissingCandidateSession).prepare_session;
+}
+
+test "M21 kernel initial Session Frame stays private until worker admission" {
+    for ([_]bool{ false, true }) |has_previous| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 2);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "candidate Draft" });
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = if (has_previous) .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) } else null,
+            .geometry = .{ .cols = 100, .rows = 30 },
+        });
+        defer presentation.deinit();
+        const previous = presentation.published;
+        const epoch = presentation.next_session_epoch;
+        const job = try testCandidatePreparation(&presentation, 2);
+        try testing.expect(!job.ready);
+        try testing.expect(job.candidate.?.session.emphasis_cache == null);
+        try testing.expect(presentation.published == previous);
+        try testing.expectEqual(epoch, presentation.next_session_epoch);
+        try presentation.dispatch(.{ .key = .{ .codepoint = '?', .text = "?" } });
+        try testing.expect(presentation.help_visible);
+        job.build();
+        try testing.expect(job.ready);
+        try testing.expect(presentation.published == previous);
+        try presentation.dispatch(.{ .session_prepared = job });
+        const after = presentation.projection();
+        try testing.expectEqual(epoch + 1, after.review.?.session_epoch);
+        try testing.expectEqualStrings("candidate Draft", after.review.?.drafts[0].body);
+        try testing.expect(after.review.?.frame.visual_rows.len > 0);
+        try testing.expect(presentation.published.?.search_corpus.?.candidates.len > 0);
+        try testing.expect(!after.replacing);
+        // Interaction allocations use the terminal allocator after transfer.
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'x', .text = "candidate" } });
+    }
+}
+
+test "M21 kernel Candidate Session retries geometry changes before publication" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{ .geometry = .{ .cols = 100, .rows = 30 } });
+    defer presentation.deinit();
+    const job = try testCandidatePreparation(&presentation, 2);
+    job.build();
+    try presentation.dispatch(.{ .resize = .{ .cols = 45, .rows = 12 } });
+    try presentation.dispatch(.{ .session_prepared = job });
+    try testing.expect(presentation.published == null);
+    try testing.expectEqual(@as(SessionEpoch, 0), presentation.next_session_epoch);
+    const retry = presentation.takeCommand().?.prepare_session;
+    try testing.expectEqual(@as(u16, 45), retry.candidate.?.geometry.cols);
+    retry.build();
+    try presentation.dispatch(.{ .session_prepared = retry });
+    try testing.expectEqual(@as(u16, 45), presentation.projection().review.?.frame.geometry.cols);
+}
+
+test "M21 kernel Candidate Session rejects queued and issued superseded work" {
+    for ([_]bool{ false, true }) |issued| {
+        for ([_]enum { switch_review, reuse_current, shutdown }{ .switch_review, .reuse_current, .shutdown }) |change| {
+            var store = bbr.review.InMemoryStore.init(testing.allocator);
+            defer store.deinit();
+            const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+            var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{ .initial = .{ .key = key, .session = try testDisclosureSession(testing.allocator, 1) } });
+            defer presentation.deinit();
+            const previous = presentation.published;
+            const epoch = presentation.next_session_epoch;
+            const job = try testCandidatePreparation(&presentation, 2);
+            if (!issued) {
+                try testing.expect(presentation.consumeCommand(job.command_id, .prepare_session));
+                try presentation.commands.append(testing.allocator, .{ .prepare_session = job });
+            }
+            switch (change) {
+                .switch_review => try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 3) }),
+                .reuse_current => try presentation.dispatch(.{ .choose_pull_request = key }),
+                .shutdown => try presentation.dispatch(.request_shutdown),
+            }
+            if (issued) {
+                if (change == .shutdown) try testing.expect(!presentation.readyToExit());
+                job.build();
+                try presentation.dispatch(.{ .session_prepared = job });
+            }
+            try testing.expect(presentation.published == previous);
+            try testing.expectEqual(epoch, presentation.next_session_epoch);
+            if (change == .shutdown) try testing.expect(presentation.readyToExit());
+        }
+    }
+}
+
+test "M21 kernel Candidate Session keeps command correlation after wrong-family completion" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{});
+    defer presentation.deinit();
+    const job = try testCandidatePreparation(&presentation, 2);
+    try presentation.dispatch(.{ .clipboard_completed = .{ .command_id = job.command_id, .success = true } });
+    try testing.expectEqual(@as(usize, 1), presentation.issued_commands.items.len);
+    job.build();
+    try presentation.dispatch(.{ .session_prepared = job });
+    try testing.expectEqual(@as(usize, 0), presentation.issued_commands.items.len);
+    try testing.expect(presentation.published != null);
+}
+
+test "M21 kernel Candidate Session retries Draft state changed by a Durable Operation" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 2);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "posting" });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .submission_locks = locks.locks() }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 2, 'a') } });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .submit });
+    var post = presentation.takeCommand().?;
+    const command_id = post.post_draft.command_id;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    try presentation.dispatch(.{ .action = .refresh });
+    const load = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') } } });
+    const job = presentation.takeCommand().?.prepare_session;
+    job.build();
+    try presentation.dispatch(.{ .post_draft_completed = .{ .command_id = command_id, .operation_id = operation_id, .identity = .init(key), .temp_id = 1, .outcome = .{ .rejected = error.NotFound } } });
+    try presentation.dispatch(.{ .session_prepared = job });
+    const retry = presentation.takeCommand().?.prepare_session;
+    try testing.expect(retry.candidate.?.review.drafts.items[0].state == .failed);
+    retry.build();
+    try presentation.dispatch(.{ .session_prepared = retry });
+    try testing.expect(presentation.projection().review.?.drafts[0].state == .failed);
+}
+
+fn checkCandidatePreparationAllocations(allocator: Allocator) !void {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 2);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "retained body" });
+    const candidate = try Published.createInputs(allocator, store.store(), null, null, key, 1, try testDisclosureSession(allocator, 2), .{ .cols = 45, .rows = 12 }, .{}, .{}, .bytes, 2);
+    var job: PrepareSession = .{ .allocator = allocator, .intent = 1, .preferences = .{}, .review_revision = 0, .candidate = candidate };
+    defer if (job.ready) candidate.destroy() else candidate.destroyInputs();
+    job.build();
+    if (job.failure != null) return error.OutOfMemory;
+    try testing.expect(job.ready);
+}
+
+test "M21 kernel Candidate Session input and Frame allocation failures release private ownership" {
+    try testing.checkAllAllocationFailures(testing.allocator, checkCandidatePreparationAllocations, .{});
+}
+
 test "a complete candidate publishes atomically and advances the Session Epoch" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -18865,7 +19246,7 @@ test "a complete candidate publishes atomically and advances the Session Epoch" 
 
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const command = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .intent = command.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
     } });
@@ -18894,7 +19275,7 @@ test "replacement rollback preserves input grammar and commit resets it" {
     try testing.expectEqual(@as(u4, 1), presentation.resolver.pending_len);
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const failed = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .intent = failed.intent,
         .outcome = .{ .failed = error.NotFound },
     } });
@@ -18902,7 +19283,7 @@ test "replacement rollback preserves input grammar and commit resets it" {
 
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const loaded = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .intent = loaded.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
     } });
@@ -18925,11 +19306,11 @@ test "a stale candidate is disposed and the latest failure restores the exact pu
     const b = presentation.takeCommand().?.load_session;
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 3) });
     const c = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .intent = b.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
     } });
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .intent = c.intent,
         .outcome = .{ .failed = error.NotFound },
     } });
@@ -18955,7 +19336,7 @@ test "shutdown drains issued loads and disposes their late completions" {
 
     try presentation.dispatch(.request_shutdown);
     try testing.expect(!presentation.readyToExit());
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .intent = command.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 1, 'a') },
     } });
@@ -19059,7 +19440,7 @@ test "preferences survive replacement while file isolation resets" {
 
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const command = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .intent = command.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'c') },
     } });
@@ -19193,7 +19574,7 @@ test "M21 kernel Draft save rejects replaced Sessions and drains shutdown" {
                     try presentation.dispatch(.{ .buffer_disclosure_built = queued });
                 }
                 const load = presentation.takeCommand().?.load_session;
-                try presentation.dispatch(.{ .session_loaded = .{
+                try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
                     .command_id = load.command_id,
                     .intent = load.intent,
                     .outcome = .{ .loaded = try testSession(testing.allocator, if (change == .refresh) 1 else 2, 'b') },
@@ -19531,7 +19912,7 @@ test "M21 kernel Draft mutations reject replaced Sessions and drain shutdown" {
                 try presentation.dispatch(.{ .buffer_disclosure_built = queued });
             }
             const load = presentation.takeCommand().?.load_session;
-            try presentation.dispatch(.{ .session_loaded = .{
+            try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
                 .command_id = load.command_id,
                 .intent = load.intent,
                 .outcome = .{ .loaded = try testWideSession(testing.allocator, if (change == .refresh) 1 else 2) },
@@ -20352,7 +20733,7 @@ test "delete not-found and unknown outcomes reconcile and failed reload gates th
         command.delete_comment.destroy();
         command = undefined;
         const reconcile = presentation.takeCommand().?.load_session;
-        try presentation.dispatch(.{ .session_loaded = .{
+        try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
             .command_id = reconcile.command_id,
             .intent = reconcile.intent,
             .outcome = .{ .failed = error.NetworkFailure },
@@ -20386,7 +20767,7 @@ test "published deletion owns the global lane and survives Session replacement" 
     try testing.expectEqual(ActionError.remote_write_busy, presentation.projection().action_error.?);
     try presentation.dispatch(.{ .choose_pull_request = second_key });
     const load = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .command_id = load.command_id,
         .intent = load.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
@@ -20513,7 +20894,7 @@ test "unknown edit delivery reconciles and failed Reconciliation gates the stale
     try testing.expectEqual(.outcome_unknown, presentation.projection().comment_edit_result.?.outcome);
 
     const reconcile = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .command_id = reconcile.command_id,
         .intent = reconcile.intent,
         .outcome = .{ .failed = error.NetworkFailure },
@@ -20563,7 +20944,7 @@ test "published edit completion survives Session replacement as a qualified resu
 
     try presentation.dispatch(.{ .choose_pull_request = second_key });
     const load = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .command_id = load.command_id,
         .intent = load.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
@@ -21115,7 +21496,7 @@ test "a re-anchored Draft survives Session replacement, which disarms an armed c
     try testing.expect(presentation.projection().reanchor != null);
     try presentation.dispatch(.{ .action = .refresh });
     const command = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .intent = command.intent,
         .outcome = .{ .loaded = try testWideSession(testing.allocator, 1) },
     } });
@@ -21523,7 +21904,7 @@ test "a Session replacement disarms a delete confirmation and a deleted subtree 
     try testing.expect(presentation.projection().delete_confirmation != null);
     try presentation.dispatch(.{ .action = .refresh });
     const command = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .intent = command.intent,
         .outcome = .{ .loaded = try testWideSession(testing.allocator, 1) },
     } });
@@ -21678,7 +22059,7 @@ test "failed replacement preserves Composer and successful replacement resets it
     const key_two = try OwnedReviewIdentity.init("workspace", "repo", 2);
     try presentation.dispatch(.{ .choose_pull_request = key_two });
     const failed_command = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .intent = failed_command.intent,
         .outcome = .{ .failed = error.NotFound },
     } });
@@ -21686,7 +22067,7 @@ test "failed replacement preserves Composer and successful replacement resets it
 
     try presentation.dispatch(.{ .choose_pull_request = key_two });
     const successful_command = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .intent = successful_command.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
     } });
@@ -22119,7 +22500,7 @@ test "wrong-target completion preserves CommandId for its matching completion" {
     try testing.expect(presentation.projection().clipboard_status == null);
     try testing.expectEqual(@as(u64, 1), presentation.projection().review.?.pull_request.?.id);
     try testing.expect(presentation.projection().replacing);
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .command_id = load.command_id,
         .intent = load.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
@@ -22127,7 +22508,7 @@ test "wrong-target completion preserves CommandId for its matching completion" {
 
     try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.pull_request.?.id);
     try testing.expect(!presentation.projection().replacing);
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .command_id = load.command_id,
         .intent = load.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 3, 'c') },
@@ -22476,7 +22857,7 @@ test "M21 kernel cache worker rejects Session replacement and shutdown" {
         if (replacement != .shutdown) {
             if (!issued) try presentation.dispatch(.ensure_focused_enrichment);
             const load = presentation.takeCommand().?.load_session;
-            try presentation.dispatch(.{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .loaded = try testSession(testing.allocator, if (replacement == .refresh) 1 else 2, 'b') } } });
+            try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .loaded = try testSession(testing.allocator, if (replacement == .refresh) 1 else 2, 'b') } } });
         }
         const before = presentation.projection().review.?.frame;
         if (old) |worker| {
@@ -22555,7 +22936,7 @@ test "Session replacement rejects a staged File Enrichment Frame" {
     const staged = presentation.takeCommand().?.build_buffer_disclosure;
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const load = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') } } });
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') } } });
     const frame = presentation.projection().review.?.frame;
     staged.build();
     try presentation.dispatch(.{ .buffer_disclosure_built = staged });
@@ -22673,7 +23054,7 @@ test "matching File Enrichment is admitted and reprojects whole-file Buffer" {
 
     try testing.expect(presentation.projection().review.?.buffer.rows.len > before_rows);
     try testing.expect(presentation.projection().replacing);
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .intent = replacement.intent,
         .outcome = .{ .failed = error.NotFound },
     } });
@@ -22716,7 +23097,7 @@ test "stale File Enrichment is disposed without mutating the replacement Session
     const enrich = presentation.takeCommand().?.enrich_file;
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const load = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .intent = load.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
     } });
@@ -23023,7 +23404,7 @@ test "terminal dependency tree names blockers and retries only the selected fail
     try testing.expectEqual(@as(usize, 3), terminal.items.len);
 
     const reconciliation = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .command_id = reconciliation.command_id,
         .intent = reconciliation.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 1, 'a') },
@@ -23423,7 +23804,7 @@ test "stale repair reload evaluates each root scope independently and checks the
     const refreshed = try testSession(testing.allocator, 1, 'a');
     refreshed.header.source_commit = "new-head";
     refreshed.source.remote.source_commit = "new-head";
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .command_id = reload.command_id,
         .intent = reload.intent,
         .outcome = .{ .loaded = refreshed },
@@ -23674,7 +24055,7 @@ test "Submission payload and identity survive originating Session replacement" {
     const post = presentation.takeCommand().?.post_draft;
     defer post.destroy();
     const load = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .intent = load.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
     } });
@@ -23708,7 +24089,7 @@ test "Submission completion does not reconcile over a different visible PR" {
     post.deinit();
     try presentation.dispatch(.{ .choose_pull_request = second_key });
     const load = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .intent = load.intent,
         .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') },
     } });
@@ -24611,7 +24992,7 @@ test "mouse activates Sidebar Files and disclosures and replacement cancels a pr
     try presentation.dispatch(.{ .mouse = .{ .col = current.panes.diff_content.x, .row = current.panes.diff_content.y + 1, .button = .left, .type = .press } });
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const load = presentation.takeCommand().?.load_session;
-    try presentation.dispatch(.{ .session_loaded = .{ .intent = load.intent, .outcome = .{ .loaded = try testDisclosureSession(testing.allocator, 2) } } });
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{ .intent = load.intent, .outcome = .{ .loaded = try testDisclosureSession(testing.allocator, 2) } } });
     const replacement = presentation.projection().review.?.frame;
     try presentation.dispatch(.{ .mouse = .{ .col = replacement.panes.diff_content.x, .row = replacement.panes.diff_content.y + 1, .button = .left, .type = .release } });
     try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.cursor);
@@ -24637,7 +25018,7 @@ test "failed Session replacement preserves a pending mouse press" {
         .type = .press,
     } });
 
-    try presentation.dispatch(.{ .session_loaded = .{
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .intent = load.intent,
         .outcome = .{ .failed = error.NetworkFailure },
     } });

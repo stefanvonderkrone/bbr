@@ -24,8 +24,12 @@ pub fn main(init: std.process.Init) !void {
     var args = init.minimal.args.iterate();
     _ = args.next();
     const lines = if (args.next()) |arg| try std.fmt.parseInt(usize, arg, 10) else 128;
+    const initial_only = if (args.next()) |arg| blk: {
+        if (!std.mem.eql(u8, arg, "--initial-session")) return error.InvalidFixtureSize;
+        break :blk true;
+    } else false;
     if (lines == 0 or lines > 4096 or args.next() != null) return error.InvalidFixtureSize;
     screen = try vaxis.Screen.init(init.gpa, .{ .rows = 30, .cols = 100, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(init.gpa);
-    try presentation.benchmarkBufferSearch(init.gpa, init.io, lines, paint);
+    try presentation.benchmarkBufferSearch(init.gpa, init.io, lines, paint, initial_only);
 }
