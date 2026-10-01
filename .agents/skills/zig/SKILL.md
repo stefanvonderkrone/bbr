@@ -19,8 +19,17 @@ from repeating past mistakes. The version-pinned API catalog bbr relies on lives
   actually opened — not what you remember the API to be.
 - If you're about to write `std.something(...)` without having opened its source this session,
   stop and grep the stdlib. The API has probably changed.
-- `zig build` / `zig build test` is the ground truth. A design that compiles in your head does
-  not compile. Run it.
+
+## Validate a Zig change
+
+1. For a CI failure, read the first failed step and its command in `.github/workflows/ci.yml`.
+   Diagnose that step before attributing the failure to the target architecture.
+2. After the final Zig source edit, run `zig fmt --check build.zig src tests` on any host.
+   Require exit code 0 across the full CI scope, including files outside the current diff.
+   CI runs this target-independent check only in the `linux-x86_64` job.
+   Commit `68eb744` and run `36868408670` both expose missed formatting in test fixture calls.
+3. For behavior or build changes, run `zig build` and `zig build test --summary all`.
+   State which native target you tested. Cross-compilation checks compilation, not native runtime behavior.
 
 ## Known corrections (mistakes already made — do not repeat)
 
@@ -131,6 +140,11 @@ from repeating past mistakes. The version-pinned API catalog bbr relies on lives
 - **Bound quadratic work before allocating its table.** Use saturating `*|` and `+|` for the work
   estimate. Preserve exact results below a measured limit and choose a deterministic fallback
   above it. This applies to intra-line LCS and SideBySide Line matching.
+- For Linux C or C++ dependency failures, check feature macros and platform-specific source files in `build.zig`.
+  Keep `-D_DEFAULT_SOURCE` on the tree-sitter runtime compiled with `-std=c11`.
+  Keep the Linux ELF, vDSO, address-probe, and futex implementations in the Abseil source list.
+  Commit `0164ee0` fixes these Linux build requirements. A macOS build does not verify them.
+  After changes to these dependencies, run the native Linux RE2 and UserGrammar CI steps.
 - **Zig 0.16 cannot build bundled libc++ with a macOS 26 deployment minimum.** Keep bbr's native
   deployment minimum at macOS 15 on newer hosts. Add the active SDK framework and library paths
   for that explicit target. Zig's C++ compiler also needs `-Wno-elaborated-enum-base` for current

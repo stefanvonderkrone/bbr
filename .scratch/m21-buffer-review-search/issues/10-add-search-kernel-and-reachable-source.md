@@ -4,7 +4,7 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-human
+**Status:** resolved
 
 - [x] A validated Query accepts at most 256 Unicode scalars and refuses invalid UTF-8, NUL, and line endings without changing published state.
 - [x] Smart case uses an ASCII fast path and one-scalar Unicode case folding from one pinned Unicode release. It does not use normalization, locale mappings, or multi-scalar mappings.

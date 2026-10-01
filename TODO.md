@@ -211,16 +211,30 @@ and M17 closes the remaining old-side and side-by-side fidelity gaps.
 M20 verification: PR #3 merged. `zig build test --summary all` passed 759/759 tests. Native
 macOS and Linux jobs passed on `x86_64` and `aarch64`.
 
-## M21 — Buffer & Review search  ·  M/L  ·  needs M20
+## M21 — Buffer & Review search  ·  M/L  ·  ✅ done
 Find source and authored body text without leaving the review. Search the current DiffPane Buffer
 first, then search complete changed Files and authored bodies across the current Review.
-- [ ] Add `/` search for the current Buffer. Open an inline query prompt, update matches as the reviewer types, highlight every occurrence, show the active/total match count, and use `n`/`N` to move forward/backward with wraparound. `esc` cancels without moving; accepting an empty query retains the previous query. Match semantic source and authored body text, not gutters, borders, or other generated presentation chrome.
-- [ ] Define and test predictable query semantics: Buffer Search uses literal smart-case matching; Review Search uses fuzzy ranking while preserving exact occurrence locations. Matching operates on Unicode text without allowing invalid/non-text File content to break the search.
-- [ ] Add a Review Search Overlay that searches both complete versions of every changed File and every authored Comment, Reply, and Draft body. Show one selectable result per Search Occurrence with its source or ReviewBody context; keep a larger preview of the selected occurrence with all query hits highlighted, comparable to a live-grep picker.
-- [ ] Stream Review Search results as File content becomes available without blocking input. Scope acquisition and result publication to the Session Epoch, cancel stale work on review replacement, bound concurrent File Enrichment, honor the File cache budget, and expose per-File loading/failure state without discarding usable results.
-- [ ] Selecting an occurrence closes the Overlay, focuses its File and selected side, switches to WholeFile scope when the line is outside a visible hunk, and positions the cursor on the exact occurrence. Returning to the Overlay preserves the query and selection while the Session remains current.
-- [ ] Support remote PullRequests and LocalReviews through their existing File Enrichment seams. Search both old and new File versions; when a version is absent, binary, invalid UTF-8, or unavailable, show that explicitly without discarding usable results.
-- [ ] Add pure matcher/ranker tests plus Presentation integration coverage for incremental input, match highlighting, `n`/`N`, streamed result ordering, preview selection, navigation into out-of-hunk content, partial failures, and stale-Epoch rejection.
+- [x] Add `/` search for the current Buffer. Open an inline query prompt, update matches as the reviewer types, highlight every occurrence, show the active/total match count, and use `n`/`N` to move forward/backward with wraparound. `esc` cancels without moving; accepting an empty query retains the previous query. Match semantic source and authored body text, not gutters, borders, or other generated presentation chrome.
+- [x] Define and test predictable query semantics: Buffer Search uses literal smart-case matching; Review Search uses fuzzy ranking while preserving exact occurrence locations. Matching operates on Unicode text without allowing invalid/non-text File content to break the search.
+- [x] Add a Review Search Overlay that searches both complete versions of every changed File and every authored Comment, Reply, and Draft body. Show one selectable result per Search Occurrence with its source or ReviewBody context; keep a larger preview of the selected occurrence with all query hits highlighted, comparable to a live-grep picker.
+- [x] Stream Review Search results as File content becomes available without blocking input. Scope acquisition and result publication to the Session Epoch, cancel stale work on review replacement, bound concurrent File Enrichment, honor the File cache budget, and expose per-File loading/failure state without discarding usable results.
+- [x] Selecting an occurrence closes the Overlay, focuses its File and selected side, switches to WholeFile scope when the line is outside a visible hunk, and positions the cursor on the exact occurrence. Returning to the Overlay preserves the query and selection while the Session remains current.
+- [x] Support remote PullRequests and LocalReviews through their existing File Enrichment seams. Search both old and new File versions; when a version is absent, binary, invalid UTF-8, or unavailable, show that explicitly without discarding usable results.
+- [x] Add pure matcher/ranker tests plus Presentation integration coverage for incremental input, match highlighting, `n`/`N`, streamed result ordering, preview selection, navigation into out-of-hunk content, partial failures, and stale-Epoch rejection.
+- [x] Resolve [Buffer Search input stalls](.scratch/m21-buffer-review-search/issues/15-eliminate-remaining-buffer-search-input-stalls.md). Move Buffer construction and search projection to workers. Use indexed lookup for occurrence selection and navigation restoration. Record final latency evidence.
+
+M21 verification: PR #4 merged. `zig build test --summary all` passed 829/829 tests during
+implementation. Native macOS and Linux CI passed on `x86_64` and `aarch64` for the merged PR.
+
+M21 input-latency verification: ticket 15 is resolved with every checklist item complete.
+`zig build test --summary all` passed 949/949 tests after the implementation changes.
+Workers now construct complete Presentation Frames before publication.
+The [final latency evidence](.scratch/m21-buffer-review-search/final-latency-evidence.md)
+records p95 opening `/` at 40.7 µs and completion admission at 12.2 µs on 4,096 changed Lines.
+On 131,072 changed Lines, Query edits measure 28.0 µs p95 and resize dispatch measures 5.1 µs p95.
+Complete admission still releases earlier allocations on the terminal thread.
+The 1,024-File, 1,024-Draft fixture measures complete resize admission at 13.26 ms p95.
+These measurements cover stage costs, not end-to-end input latency.
 
 ## M22 — Durable File read state  ·  M  ·  needs M15/M17
 Make review progress visible in the File Tree and preserve it locally without allowing a changed

@@ -215,6 +215,7 @@ pub const ProjectedSourceRange = struct {
     source: search.Range,
     row: search.Range,
     active: bool,
+    occurrence_index: ?usize = null,
 };
 
 pub const Projection = struct {
@@ -231,6 +232,9 @@ pub const Projection = struct {
     selected_version: SelectedVersion = .new,
     version_title_targets: VersionTitleTargets = .{},
     search_ranges: []const ProjectedSourceRange = &.{},
+    search_ranges_sorted: bool = false,
+    buffer_search_active: ?usize = null,
+    buffer_search_ranges: bool = false,
 };
 
 /// Resolve a cell solely against the immutable, already-published Frame. An
@@ -561,11 +565,136 @@ fn isUnicodeWhitespace(grapheme: []const u8) bool {
         cp == 0x202f or cp == 0x205f or cp == 0x3000;
 }
 
+/// Built with the candidate Frame. Lookup does not allocate or walk the Frame.
+pub const NavigationIndex = struct {
+    const OwnerContext = struct {
+        pub fn hash(_: @This(), key: RowOwner) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            std.hash.autoHash(&hasher, std.meta.activeTag(key));
+            switch (key) {
+                .section => |value| {
+                    std.hash.autoHash(&hasher, value.kind);
+                    hasher.update(value.path);
+                },
+                inline else => |value| std.hash.autoHash(&hasher, value),
+            }
+            return hasher.final();
+        }
+
+        pub fn eql(_: @This(), a: RowOwner, b: RowOwner) bool {
+            return a.eql(b);
+        }
+    };
+    const Span = struct { start: usize, end: usize, row: usize, prefix_end: usize = 0 };
+    const Owners = std.HashMapUnmanaged(RowOwner, usize, OwnerContext, 80);
+    const Spans = std.HashMapUnmanaged(RowOwner, std.ArrayList(Span), OwnerContext, 80);
+
+    owners: Owners = .empty,
+    spans: Spans = .empty,
+
+    /// The caller owns all allocations through its Frame arena.
+    pub fn build(a: std.mem.Allocator, rows: []const VisualRow) !NavigationIndex {
+        var result: NavigationIndex = .{};
+        for (rows, 0..) |row, index| {
+            var key = row.owner;
+            if (key == .section) key.section.path = try a.dupe(u8, key.section.path);
+            const exact = try result.owners.getOrPut(a, key);
+            if (!exact.found_existing) exact.value_ptr.* = index;
+            if (row.halves) |halves| {
+                if (halves.right) |half| try result.add(a, .{ .line = half.line }, half.source_start, half.source_end, index);
+                if (halves.left) |half| if (halves.right == null or halves.right.?.line != half.line)
+                    try result.add(a, .{ .line = half.line }, half.source_start, half.source_end, index);
+            } else switch (row.owner) {
+                .line => try result.add(a, row.owner, row.source_start, row.source_end, index),
+                .comment => |value| if (value.part != .header) {
+                    try result.add(a, .{ .comment = .{ .id = value.id, .source_offset = 0 } }, value.source_offset, row.source_end, index);
+                },
+                .draft => |value| if (value.part != .header) {
+                    try result.add(a, .{ .draft = .{ .id = value.id, .source_offset = 0 } }, value.source_offset, row.source_end, index);
+                },
+                else => {},
+            }
+        }
+        var groups = result.spans.valueIterator();
+        while (groups.next()) |group| {
+            std.mem.sort(Span, group.items, {}, spanLess);
+            var end: usize = 0;
+            for (group.items) |*span| {
+                end = @max(end, span.end);
+                span.prefix_end = end;
+            }
+        }
+        return result;
+    }
+
+    fn add(self: *NavigationIndex, a: std.mem.Allocator, key: RowOwner, start: usize, end: usize, row: usize) !void {
+        const group = try self.spans.getOrPut(a, key);
+        if (!group.found_existing) group.value_ptr.* = .empty;
+        try group.value_ptr.append(a, .{ .start = start, .end = end, .row = row });
+    }
+
+    fn spanLess(_: void, a: Span, b: Span) bool {
+        return a.start < b.start or a.start == b.start and a.row < b.row;
+    }
+
+    pub fn find(self: NavigationIndex, wanted: VisualRow) ?usize {
+        if (wanted.owner != .line) if (self.owners.get(wanted.owner)) |row| return row;
+        const key: RowOwner = switch (wanted.owner) {
+            .line => wanted.owner,
+            .comment => |value| .{ .comment = .{ .id = value.id, .source_offset = 0 } },
+            .draft => |value| .{ .draft = .{ .id = value.id, .source_offset = 0 } },
+            else => return null,
+        };
+        const offset = switch (wanted.owner) {
+            .comment => |value| value.source_offset,
+            .draft => |value| value.source_offset,
+            else => wanted.source_start,
+        };
+        const spans = (self.spans.get(key) orelse return null).items;
+        if (wanted.owner == .line) {
+            var containing_low: usize = 0;
+            var containing_high = spans.len;
+            while (containing_low < containing_high) {
+                const middle = containing_low + (containing_high - containing_low) / 2;
+                if (spans[middle].prefix_end <= offset) containing_low = middle + 1 else containing_high = middle;
+            }
+            if (containing_low < spans.len and spans[containing_low].start <= offset) return spans[containing_low].row;
+        }
+        var low: usize = 0;
+        var high = spans.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (spans[middle].prefix_end <= offset and spans[middle].start < offset) low = middle + 1 else high = middle;
+        }
+        if (low < spans.len) return spans[low].row;
+        return if (wanted.owner == .line and spans.len > 0) spans[spans.len - 1].row else null;
+    }
+};
+
+pub fn visualIndexForBufferIndex(rows: []const VisualRow, buffer_index: usize) ?usize {
+    var low: usize = 0;
+    var high = rows.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (rows[middle].buffer_index < buffer_index) low = middle + 1 else high = middle;
+    }
+    return if (low < rows.len and rows[low].buffer_index == buffer_index) low else null;
+}
+
+pub fn restoreNavigationIndexed(previous: Projection, visual_rows: []const VisualRow, geometry: Geometry, index: NavigationIndex) Nav {
+    return restoreNavigationWith(previous, visual_rows, geometry, index);
+}
+
+/// Linear benchmark control and reference for indexed restoration.
 pub fn restoreNavigation(previous: Projection, visual_rows: []const VisualRow, geometry: Geometry) Nav {
+    return restoreNavigationWith(previous, visual_rows, geometry, @as(?NavigationIndex, null));
+}
+
+fn restoreNavigationWith(previous: Projection, visual_rows: []const VisualRow, geometry: Geometry, index: ?NavigationIndex) Nav {
     var restored = Nav.init(visual_rows.len, paneRects(geometry).diff_content.height);
     restored.count = previous.navigation.count;
     const cursor_row = visualRowAt(previous.visual_rows, previous.navigation.cursor) orelse return restored;
-    const cursor = findVisualRow(visual_rows, cursor_row) orelse return restored;
+    const cursor = (if (index) |lookup| lookup.find(cursor_row) else findVisualRow(visual_rows, cursor_row)) orelse return restored;
     restored.jumpTo(cursor);
     restored.count = previous.navigation.count;
 
@@ -575,7 +704,7 @@ pub fn restoreNavigation(previous: Projection, visual_rows: []const VisualRow, g
 
     if (previous.navigation.mark) |mark| {
         const mark_row = visualRowAt(previous.visual_rows, mark) orelse return restored;
-        const restored_mark = findVisualRow(visual_rows, mark_row) orelse return restored;
+        const restored_mark = (if (index) |lookup| lookup.find(mark_row) else findVisualRow(visual_rows, mark_row)) orelse return restored;
         const old_range = [2]usize{ @min(mark, previous.navigation.cursor), @max(mark, previous.navigation.cursor) };
         const new_range = [2]usize{ @min(restored_mark, cursor), @max(restored_mark, cursor) };
         if ((mark_row.owner == .line and cursor_row.owner == .line) or std.meta.eql(old_range, new_range)) restored.mark = restored_mark;
@@ -1173,4 +1302,77 @@ test "ReviewCard restoration follows containing source offset and collapsed foot
         .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 18, .part = .disclosure_footer } }, .source_end = 18 },
     };
     try testing.expectEqual(@as(usize, 1), restoreNavigation(previous, &collapsed, .{ .cols = 30, .rows = 3 }).cursor);
+}
+
+test "M21 kernel navigation index matches linear restoration across wrapping and typed owners" {
+    const old_line: bbr.diff.Line = .{ .old_no = 1, .new_no = 0, .kind = .removed, .text = "old text that wraps across several rows and continues" };
+    const new_line: bbr.diff.Line = .{ .old_no = 0, .new_no = 1, .kind = .added, .text = "new text with a different wrap boundary" };
+    const context: bbr.diff.Line = .{ .old_no = 2, .new_no = 2, .kind = .context, .text = "" };
+    const source = [_]buffer_mod.Row{
+        .{ .line_pair = .{ .left = .{ .line = &old_line, .decoration = .{ .runs = &.{} } }, .right = .{ .line = &new_line, .decoration = .{ .runs = &.{} } } } },
+        .{ .line = .{ .line = &context, .decoration = .{ .runs = &.{} } } },
+    };
+    for ([_]usize{ 24, 45, 100 }) |width| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var rows: std.ArrayList(VisualRow) = .empty;
+        try rows.appendSlice(a, try buildVisualRowsWithOptions(a, &source, .bytes, .{ .layout = .side_by_side, .width = width }));
+        try rows.appendSlice(a, &.{
+            .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 0, .part = .header } } },
+            .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 0 } }, .source_end = 10 },
+            .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 10 } }, .source_end = 30 },
+            .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 15 } }, .source_end = 20 },
+            .{ .owner = .{ .comment = .{ .id = 7, .source_offset = 50, .part = .disclosure_footer } }, .source_end = 50 },
+            .{ .owner = .{ .draft = .{ .id = 7, .source_offset = 0, .part = .header } } },
+            .{ .owner = .{ .draft = .{ .id = 7, .source_offset = 5 } }, .source_end = 12 },
+            .{ .owner = .{ .draft = .{ .id = 7, .source_offset = 40, .part = .disclosure_footer } }, .source_end = 40 },
+            .{ .owner = .{ .snapshot = .{ .id = 7, .source_offset = 0 } } },
+            .{ .owner = .{ .disclosure = .{ .fold = &context } } },
+            .{ .owner = .{ .section = .{ .kind = .pending, .path = "src" } } },
+        });
+        const index = try NavigationIndex.build(a, rows.items);
+        for (rows.items) |row| for (0..65) |offset| {
+            var wanted = row;
+            wanted.source_start = offset;
+            switch (wanted.owner) {
+                .comment => |*value| value.source_offset = offset,
+                .draft => |*value| value.source_offset = offset,
+                else => {},
+            }
+            try testing.expectEqual(findVisualRow(rows.items, wanted), index.find(wanted));
+        };
+        try testing.expectEqual(@as(?usize, null), index.find(.{ .owner = .{ .draft = .{ .id = 8, .source_offset = 0 } } }));
+        const copied_path = try a.dupe(u8, "src");
+        try testing.expectEqual(findVisualRow(rows.items, .{ .owner = .{ .section = .{ .kind = .pending, .path = copied_path } } }), index.find(.{ .owner = .{ .section = .{ .kind = .pending, .path = copied_path } } }));
+    }
+}
+
+test "M21 kernel indexed navigation preserves Selection Count and viewport after width changes" {
+    const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = .context, .text = "alpha beta gamma delta epsilon zeta" };
+    const source = [_]buffer_mod.Row{.{ .line = .{ .line = &line, .decoration = .{ .runs = &.{} } } }};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const old_rows = try buildVisualRowsWithOptions(arena.allocator(), &source, .bytes, .{ .layout = .unified, .width = 18 });
+    const new_rows = try buildVisualRowsWithOptions(arena.allocator(), &source, .bytes, .{ .layout = .unified, .width = 26 });
+    const index = try NavigationIndex.build(arena.allocator(), new_rows);
+    var previous: Projection = .{
+        .revision = 1,
+        .visual_rows_revision = 1,
+        .geometry = .{ .cols = 18, .rows = 8 },
+        .panes = paneRects(.{ .cols = 18, .rows = 8 }),
+        .visual_rows = old_rows,
+        .buffer = .{ .rows = &source, .layout = .unified },
+        .navigation = Nav.init(old_rows.len, 5),
+    };
+    for (old_rows, 0..) |_, cursor| for (old_rows, 0..) |_, mark| {
+        previous.navigation.cursor = cursor;
+        previous.navigation.mark = mark;
+        previous.navigation.scroll = cursor -| 2;
+        previous.navigation.count = 999;
+        try testing.expectEqual(restoreNavigation(previous, new_rows, .{ .cols = 26, .rows = 6 }), restoreNavigationIndexed(previous, new_rows, .{ .cols = 26, .rows = 6 }, index));
+    };
+    try testing.expectEqual(@as(?usize, 0), visualIndexForBufferIndex(new_rows, 0));
+    try testing.expectEqual(@as(?usize, null), visualIndexForBufferIndex(new_rows, 1));
+    try testing.expectEqual(@as(?usize, null), visualIndexForBufferIndex(&.{}, 0));
 }

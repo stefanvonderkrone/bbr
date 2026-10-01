@@ -859,6 +859,18 @@ fn presentationBufferSearchWorker(
     );
 }
 
+fn presentationDisclosureWorker(loop: *Loop, work_id: u64, job: *presentation.DisclosureBuild) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    job.build();
+    presentation_runtime.deliver(presentationSink(&sink_context), .{ .buffer_disclosure_built = job });
+}
+
+fn presentationPrepareSessionWorker(loop: *Loop, work_id: u64, job: *presentation.PrepareSession) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    job.build();
+    presentation_runtime.deliver(presentationSink(&sink_context), .{ .session_prepared = job });
+}
+
 fn presentationReviewSourceWorker(loop: *Loop, work_id: u64, command_value: presentation.ScanReviewSource) void {
     var command = command_value;
     defer command.deinit();
@@ -1025,6 +1037,7 @@ fn drainPresentationCommands(
         next_work_id.* +%= 1;
         const future = switch (command) {
             .load_session => |load| ctx.io.concurrent(presentationLoadWorker, .{ loop, work_id, ctx.io, workerBitbucketForReviewKind(ctx.bitbucket, load.key.kind), load }),
+            .prepare_session => |job| ctx.io.concurrent(presentationPrepareSessionWorker, .{ loop, work_id, job }),
             .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, ctx.io, workerBitbucketForEnrichment(ctx.bitbucket, enrich.source), ctx.highlighter, enrich }),
             .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, ctx.bitbucket.?, post }),
             .update_comment => |update| ctx.io.concurrent(presentationCommentEditWorker, .{ loop, work_id, ctx.bitbucket.?, update }),
@@ -1037,6 +1050,7 @@ fn drainPresentationCommands(
             .copy_clipboard => unreachable,
             .external_edit => unreachable,
             .scan_buffer_search => |scan| ctx.io.concurrent(presentationBufferSearchWorker, .{ loop, work_id, scan }),
+            .build_buffer_disclosure => |job| ctx.io.concurrent(presentationDisclosureWorker, .{ loop, work_id, job }),
             .scan_review_source => |scan| ctx.io.concurrent(presentationReviewSourceWorker, .{ loop, work_id, scan }),
         } catch {
             try admitPresentationLaunchFailure(state, &command);
@@ -1062,6 +1076,7 @@ fn workerBitbucketForEnrichment(client: ?bbr.bitbucket.Client, source: presentat
 fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *presentation.OwnedCommand) !void {
     const input: presentation.OwnedInput = switch (command.*) {
         .load_session => |load| .{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .failed = error.WorkerLaunchFailed } } },
+        .prepare_session => |job| job.launchFailed(),
         .enrich_file => |enrich| .{ .file_enrichment_completed = .{
             .command_id = enrich.command_id,
             .work_id = enrich.work_id,
@@ -1097,16 +1112,10 @@ fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *p
             edit.destroy();
             break :blk .{ .external_edit_completed = completed };
         },
-        .scan_buffer_search => |*scan| blk: {
-            const completed: presentation.BufferSearchScanned = .{
-                .allocator = std.heap.page_allocator,
-                .command_id = scan.command_id,
-                .request_id = scan.request_id,
-                .session_epoch = scan.session_epoch,
-                .outcome = .failed,
-            };
-            scan.deinit();
-            break :blk .{ .buffer_search_scanned = completed };
+        .scan_buffer_search => |*scan| .{ .buffer_search_scanned = scan.launchFailed() },
+        .build_buffer_disclosure => |job| blk: {
+            job.failed = true;
+            break :blk .{ .buffer_disclosure_built = job };
         },
         .scan_review_source => |*scan| blk: {
             const completed: presentation.ReviewSourceScanned = .{

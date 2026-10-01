@@ -108,7 +108,19 @@ pub fn drawReview(
 }
 
 fn drawSearchRanges(win: vaxis.Window, frame: @import("frame.zig").Projection, theme: Theme) void {
-    for (frame.search_ranges) |range| {
+    var ranges = frame.search_ranges;
+    if (frame.search_ranges_sorted) {
+        var low: usize = 0;
+        var high = ranges.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (ranges[middle].visual_row < frame.navigation.scroll) low = middle + 1 else high = middle;
+        }
+        ranges = ranges[low..];
+    }
+    for (ranges) |range| {
+        const active = if (frame.buffer_search_ranges and range.occurrence_index != null) frame.buffer_search_active == range.occurrence_index else range.active;
+        if (frame.search_ranges_sorted and range.visual_row >= frame.navigation.scroll +| win.height) break;
         if (range.visual_row < frame.navigation.scroll) continue;
         const screen_row = range.visual_row - frame.navigation.scroll;
         if (screen_row >= win.height or range.visual_row >= frame.visual_rows.len) continue;
@@ -130,10 +142,10 @@ fn drawSearchRanges(win: vaxis.Window, frame: @import("frame.zig").Projection, t
                 } else gutter_cols;
                 const start = base + vaxis.gwidth.gwidth(text[row_start..range.source.start], .unicode);
                 const width = vaxis.gwidth.gwidth(text[range.source.start..range.source.end], .unicode);
-                paintSearchCells(win, @intCast(screen_row), start, width, range.active, theme);
+                paintSearchCells(win, @intCast(screen_row), start, width, active, theme);
             },
-            .comment => |card| drawReviewCardSearchRange(win, @intCast(screen_row), card, range, theme),
-            .draft => |card| drawReviewCardSearchRange(win, @intCast(screen_row), card, range, theme),
+            .comment => |card| drawReviewCardSearchRange(win, @intCast(screen_row), card, range, active, theme),
+            .draft => |card| drawReviewCardSearchRange(win, @intCast(screen_row), card, range, active, theme),
             else => {},
         }
     }
@@ -151,7 +163,7 @@ fn searchSourceText(row: Row, visual: @import("frame.zig").VisualRow, relation: 
     };
 }
 
-fn drawReviewCardSearchRange(win: vaxis.Window, row: u16, card: buffer_mod.ReviewCardRow, range: @import("frame.zig").ProjectedSourceRange, theme: Theme) void {
+fn drawReviewCardSearchRange(win: vaxis.Window, row: u16, card: buffer_mod.ReviewCardRow, range: @import("frame.zig").ProjectedSourceRange, active: bool, theme: Theme) void {
     var col: usize = (if (card.isReply()) @as(usize, 6) else 2) + (if (card.part == .header) @as(usize, 0) else 2);
     for (card.segments) |segment| {
         const start = @max(range.source.start, segment.source.start);
@@ -162,7 +174,7 @@ fn drawReviewCardSearchRange(win: vaxis.Window, row: u16, card: buffer_mod.Revie
             if (local_end <= segment.text.len) {
                 const cell_start = col + vaxis.gwidth.gwidth(segment.text[0..local_start], .unicode);
                 const width = vaxis.gwidth.gwidth(segment.text[local_start..local_end], .unicode);
-                paintSearchCells(win, row, cell_start, width, range.active, theme);
+                paintSearchCells(win, row, cell_start, width, active, theme);
             }
         }
         col += vaxis.gwidth.gwidth(segment.text, .unicode);
@@ -2160,6 +2172,40 @@ test "M21 Buffer Search overlays active and inactive ranges without erasing synt
     try testing.expectEqual(theme_dark.search_active, win.readCell(gutter_cols, 0).?.style.bg);
     try testing.expectEqual(theme_dark.search_match, win.readCell(gutter_cols + 5, 0).?.style.bg);
     try testing.expectEqual(theme_dark.syntax_keyword, win.readCell(gutter_cols, 0).?.style.fg);
+}
+
+test "sorted Buffer Search ranges paint only the visible row" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const line: bbr.diff.Line = .{ .old_no = 0, .new_no = 1, .kind = .added, .text = "needle" };
+    const runs = [_]bbr.highlight.decoration.Run{.{ .text = line.text }};
+    const rows = [_]Row{ .{ .line = .{ .line = &line, .decoration = .{ .runs = &runs } } }, .{ .line = .{ .line = &line, .decoration = .{ .runs = &runs } } } };
+    const buf: Buffer = .{ .rows = &rows, .layout = .unified };
+    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, &rows, .bytes, .{ .layout = .unified, .width = 30 });
+    const ranges = [_]@import("frame.zig").ProjectedSourceRange{
+        .{ .visual_row = 0, .relation = .new, .source = .{ .start = 0, .end = 6 }, .row = .{ .start = 0, .end = 6 }, .active = true },
+        .{ .visual_row = 1, .relation = .new, .source = .{ .start = 0, .end = 6 }, .row = .{ .start = 0, .end = 6 }, .active = false },
+    };
+    var nav = Nav.init(2, 1);
+    nav.jumpTo(1);
+    const frame: @import("frame.zig").Projection = .{
+        .revision = 1,
+        .visual_rows_revision = 1,
+        .geometry = .{ .cols = 30, .rows = 1 },
+        .panes = @import("frame.zig").paneRects(.{ .cols = 30, .rows = 1 }),
+        .visual_rows = visual_rows,
+        .buffer = buf,
+        .navigation = nav,
+        .search_ranges = &ranges,
+        .search_ranges_sorted = true,
+    };
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = 30, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = headlessWindow(&screen);
+    drawVisualPane(a, win, buf, visual_rows, theme_dark, nav);
+    drawSearchRanges(win, frame, theme_dark);
+    try testing.expectEqual(theme_dark.search_match, win.readCell(gutter_cols, 0).?.style.bg);
 }
 
 test "Buffer Search clips matches outside a narrow DiffPane" {

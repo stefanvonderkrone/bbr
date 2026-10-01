@@ -3,6 +3,8 @@ const presentation = @import("tui/presentation.zig");
 const render = @import("tui/render.zig");
 const vaxis = @import("vaxis");
 
+pub const buffer_search_benchmark = true;
+
 var screen: vaxis.Screen = undefined;
 
 fn paint(allocator: std.mem.Allocator, review: presentation.ReviewProjection) !void {
@@ -21,7 +23,16 @@ fn paint(allocator: std.mem.Allocator, review: presentation.ReviewProjection) !v
 }
 
 pub fn main(init: std.process.Init) !void {
+    var args = init.minimal.args.iterate();
+    _ = args.next();
+    const lines = if (args.next()) |arg| try std.fmt.parseInt(usize, arg, 10) else 128;
+    const mode: presentation.BufferSearchBenchmarkMode = if (args.next()) |arg| blk: {
+        if (std.mem.eql(u8, arg, "--initial-session")) break :blk .initial_session;
+        if (std.mem.eql(u8, arg, "--final-evidence")) break :blk .final_evidence;
+        return error.InvalidFixtureSize;
+    } else .all;
+    if (lines == 0 or lines > 4096 or args.next() != null) return error.InvalidFixtureSize;
     screen = try vaxis.Screen.init(init.gpa, .{ .rows = 30, .cols = 100, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(init.gpa);
-    try presentation.benchmarkBufferSearch(init.gpa, init.io, paint);
+    try presentation.benchmarkBufferSearch(init.gpa, init.io, lines, paint, mode);
 }

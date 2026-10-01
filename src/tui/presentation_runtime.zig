@@ -133,6 +133,7 @@ const ScriptedExecutor = struct {
         self.count += 1;
         const input: presentation.OwnedInput = switch (command.*) {
             .load_session => |value| .{ .session_loaded = .{ .command_id = value.command_id, .intent = value.intent, .outcome = .{ .failed = error.Scripted } } },
+            .prepare_session => |value| value.launchFailed(),
             .enrich_file => |value| .{ .file_enrichment_completed = .{
                 .command_id = value.command_id,
                 .work_id = value.work_id,
@@ -174,17 +175,10 @@ const ScriptedExecutor = struct {
                 value.destroy();
                 break :blk .{ .external_edit_completed = completed };
             },
-            .scan_buffer_search => |*value| blk: {
-                const completed: presentation.BufferSearchScanned = .{
-                    .allocator = std.heap.page_allocator,
-                    .command_id = value.command_id,
-                    .request_id = value.request_id,
-                    .session_epoch = value.session_epoch,
-                    .mode = value.mode,
-                    .outcome = .failed,
-                };
-                value.deinit();
-                break :blk .{ .buffer_search_scanned = completed };
+            .scan_buffer_search => |*value| .{ .buffer_search_scanned = value.launchFailed() },
+            .build_buffer_disclosure => |value| blk: {
+                value.failed = true;
+                break :blk .{ .buffer_disclosure_built = value };
             },
             .scan_review_source => |*value| blk: {
                 const completed: presentation.ReviewSourceScanned = .{
@@ -309,6 +303,513 @@ fn scriptedBufferSearch(command_id: presentation.CommandId) !presentation.ScanBu
         .session_epoch = 7,
         .corpus = corpus,
         .query = try search.Query.init(std.heap.page_allocator, "query"),
+    };
+}
+
+test "Buffer Search launch failure keeps correlation and releases its command" {
+    for ([_]search.Mode{ .literal, .fuzzy }) |mode| {
+        var command = try scriptedBufferSearch(41);
+        command.mode = mode;
+        command.corpus.references.store(2, .release);
+        const corpus = command.corpus;
+        defer {
+            corpus.arena.deinit();
+            std.heap.page_allocator.destroy(corpus);
+        }
+        var completed = command.launchFailed();
+        defer completed.deinit();
+        try testing.expectEqual(@as(presentation.CommandId, 41), completed.command_id);
+        try testing.expectEqual(@as(u64, 1), completed.request_id);
+        try testing.expectEqual(@as(presentation.SessionEpoch, 7), completed.session_epoch);
+        try testing.expectEqual(mode, completed.mode);
+        try testing.expect(completed.outcome == .failed);
+        try testing.expectEqual(@as(usize, 1), corpus.references.load(.acquire));
+    }
+}
+
+test "closed terminal sink releases a Buffer Search Batch" {
+    var command = try scriptedBufferSearch(41);
+    defer command.deinit();
+    command.corpus.candidates = &.{.{
+        .text = "query",
+        .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 0 } },
+        .session_epoch = 7,
+    }};
+    var capture: CapturingSink = .{ .reject = true };
+    const completed = presentation.executeBufferSearchScan(testing.allocator, &command);
+    try testing.expect(completed.outcome == .scanned);
+    try testing.expectEqual(@as(usize, 1), completed.outcome.scanned.occurrences.len);
+    deliver(capture.sink(), .{ .buffer_search_scanned = completed });
+    try testing.expect(capture.input == null);
+}
+
+test "closed terminal sink releases a staged Buffer Frame and its Session" {
+    const session = try @import("session.zig").create(testing.allocator);
+    session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Local" };
+    session.source = .{ .local = .{ .common_dir = "." } };
+    session.diff = try bbr.diff.parse(session.arena.allocator(), "");
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try presentation.OwnedReviewIdentity.initLocal(1, "main", "feature");
+    try store.store().put(.{ .workspace = key.workspace(), .repository = key.repository(), .pull_request_id = 1 }, .{ .local_id = 1, .target = .local, .kind = .comment, .scope = .review, .body = "one\n\ntwo\n\nhidden" });
+    var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = key, .session = session },
+    });
+    defer state.deinit();
+    try state.dispatch(.{ .action = .open_buffer_search });
+    try state.dispatch(.{ .key = .{ .codepoint = 'h', .text = "hidden" } });
+    var scan = state.takeCommand().?;
+    defer scan.deinit();
+    try state.dispatch(.{ .buffer_search_scanned = presentation.executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search) });
+    const job = state.takeCommand().?.build_buffer_disclosure;
+    job.failed = true;
+    var capture: CapturingSink = .{ .reject = true };
+    deliver(capture.sink(), .{ .buffer_disclosure_built = job });
+    try testing.expect(capture.input == null);
+}
+
+fn candidateSessionFixture() !*@import("session.zig").Session {
+    const session = try @import("session.zig").create(testing.allocator);
+    errdefer session.destroy();
+    session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Local" };
+    session.source = .{ .local = .{ .common_dir = "." } };
+    session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1 @@\n-old\n+new\n");
+    try session.initializeEnrichment();
+    return session;
+}
+
+test "M21 kernel Candidate Session launch failure and closed sink release private Frames" {
+    for ([_]enum { launch_failed, closed_before_build, closed_after_build }{ .launch_failed, .closed_before_build, .closed_after_build }) |outcome| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try presentation.OwnedReviewIdentity.initLocal(1, "main", "feature");
+        var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{ .initial = .{ .key = key, .session = try candidateSessionFixture() } });
+        defer state.deinit();
+        const previous = state.projection().review.?;
+        try state.dispatch(.{ .action = .refresh });
+        const load = state.takeCommand().?.load_session;
+        const candidate = try candidateSessionFixture();
+        defer candidate.destroy();
+        candidate.retain();
+        try state.dispatch(.{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .loaded = candidate } } });
+        var command = state.takeCommand().?;
+        var capture: CapturingSink = .{ .reject = outcome != .launch_failed };
+        if (outcome == .closed_after_build) {
+            command.prepare_session.build();
+            try testing.expect(command.prepare_session.ready);
+            deliver(capture.sink(), .{ .session_prepared = command.prepare_session });
+        } else {
+            var executor: ScriptedExecutor = .{};
+            try executor.executor().execute(capture.sink(), &command);
+        }
+        if (outcome == .launch_failed) {
+            try state.dispatch(capture.input.?);
+            capture.input = null;
+            try testing.expectEqual(presentation.ReplacementError.buffer_build_failed, state.projection().replacement_error.?);
+            try testing.expect(!state.projection().replacing);
+        } else try testing.expect(capture.input == null);
+        try testing.expectEqual(@as(usize, 1), candidate.references.load(.acquire));
+        try testing.expectEqual(previous.session_epoch, state.projection().review.?.session_epoch);
+        try testing.expectEqual(previous.frame.visual_rows.ptr, state.projection().review.?.frame.visual_rows.ptr);
+    }
+}
+
+test "M21 kernel view Frame launch failure and closed sink preserve the complete Frame" {
+    for ([_]enum { layout, scope, resolved, version, isolate, movement, width }{ .layout, .scope, .resolved, .version, .isolate, .movement, .width }) |change| for ([_]bool{ false, true }) |closed| {
+        const session = try @import("session.zig").create(testing.allocator);
+        session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Local" };
+        session.source = .{ .local = .{ .common_dir = "." } };
+        const a = session.arena.allocator();
+        session.diff = try bbr.diff.parse(a, "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/b.zig b/b.zig\n--- a/b.zig\n+++ b/b.zig\n@@ -1 +1 @@\n-old\n+new\n");
+        session.threads = try bbr.review.buildThreads(a, &.{.{ .id = 1, .author = "Reviewer", .body = "resolved", .resolved = true, .anchor = .{ .path = "a.zig", .to = 1 } }});
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try presentation.OwnedReviewIdentity.initLocal(1, "main", "feature"), .session = session },
+            .geometry = .{ .cols = 100, .rows = 12 },
+        });
+        defer state.deinit();
+        if (change == .movement) {
+            try state.dispatch(.{ .action = .isolate });
+            const initial = state.takeCommand().?.build_buffer_disclosure;
+            initial.build();
+            try state.dispatch(.{ .buffer_disclosure_built = initial });
+        } else if (change == .resolved) {
+            const initial = state.projection().review.?;
+            for (initial.frame.visual_rows, 0..) |visual, index| if (initial.buffer.rows[visual.buffer_index] == .disclosure) {
+                for (0..index) |_| try state.dispatch(.{ .action = .down });
+                break;
+            };
+        }
+        const before = state.projection().review.?;
+        const references = session.references.load(.acquire);
+        switch (change) {
+            .layout => try state.dispatch(.{ .action = .toggle_layout }),
+            .scope => try state.dispatch(.{ .action = .cycle_scope }),
+            .resolved => try state.dispatch(.{ .action = .toggle_disclosure }),
+            .version => try state.dispatch(.{ .action = .select_old_version }),
+            .isolate => try state.dispatch(.{ .action = .isolate }),
+            .movement => try state.dispatch(.{ .action = .next_file }),
+            .width => try state.dispatch(.{ .resize = .{ .cols = 72, .rows = 12 } }),
+        }
+        var command = state.takeCommand().?;
+        var capture: CapturingSink = .{ .reject = closed };
+        if (closed) {
+            command.build_buffer_disclosure.build();
+            try testing.expect(!command.build_buffer_disclosure.failed);
+            deliver(capture.sink(), .{ .buffer_disclosure_built = command.build_buffer_disclosure });
+            try testing.expect(capture.input == null);
+            try testing.expectEqual(references, session.references.load(.acquire));
+        } else {
+            var executor: ScriptedExecutor = .{};
+            try executor.executor().execute(capture.sink(), &command);
+            try state.dispatch(capture.input.?);
+            capture.input = null;
+            try testing.expectEqual(presentation.ActionError.buffer_build_failed, state.projection().action_error.?);
+        }
+        const after = state.projection().review.?;
+        try testing.expectEqual(before.frame.visual_rows.ptr, after.frame.visual_rows.ptr);
+        try testing.expectEqual(before.preferences, after.preferences);
+        try testing.expectEqual(before.frame.geometry, after.frame.geometry);
+        try testing.expectEqual(before.isolated_file, after.isolated_file);
+    };
+}
+
+test "M21 kernel cache Frame launch failure and closed sink preserve content and focus" {
+    for ([_]bool{ false, true }) |release_holds| for ([_]bool{ false, true }) |closed| {
+        const session = try @import("session.zig").create(testing.allocator);
+        session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Local" };
+        session.source = .{ .local = .{ .common_dir = "." } };
+        session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/b.zig b/b.zig\n--- a/b.zig\n+++ b/b.zig\n@@ -1 +1 @@\n-old\n+new\n");
+        try session.initializeEnrichment();
+        session.enrichment.focus(0);
+        const enrichment = @import("file_enrichment.zig");
+        var fake: bbr.http.FakeHttpClient = .{ .status = 200, .body = "cached needle\n" };
+        const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+        var plain: bbr.highlight.PlainHighlighter = .{};
+        for (0..if (release_holds) @as(usize, 2) else 1) |index| {
+            if (index == 1) session.enrichment.hold(index);
+            var result = try enrichment.enrich(testing.allocator, client, plain.highlighter(), .{
+                .repo = "repo",
+                .status = .modified,
+                .source_commit = "source",
+                .destination_commit = "base",
+                .old_path = session.diff.files[index].old_path,
+                .new_path = session.diff.files[index].new_path,
+                .max_file_bytes = 0,
+            });
+            defer result.deinit();
+            try session.enrichment.admit(index, &result);
+        }
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_cache_enabled = false }, .{
+            .initial = .{ .key = try presentation.OwnedReviewIdentity.initLocal(1, "main", "feature"), .session = session },
+        });
+        defer state.deinit();
+        if (release_holds) {
+            session.enrichment.finishLeaseDeferred(1);
+            try state.dispatch(.{ .action = .open_review_search });
+            try state.dispatch(.{ .key = .{ .codepoint = @import("keymap.zig").special.escape } });
+        } else {
+            try state.dispatch(.{ .action = .next_file });
+            try state.dispatch(.ensure_focused_enrichment);
+        }
+        const before = state.projection().review.?.frame;
+        var command = state.takeCommand().?;
+        const references = session.references.load(.acquire) - 1;
+        var capture: CapturingSink = .{ .reject = closed };
+        if (closed) {
+            command.build_buffer_disclosure.build();
+            try testing.expect(!command.build_buffer_disclosure.failed);
+            deliver(capture.sink(), .{ .buffer_disclosure_built = command.build_buffer_disclosure });
+            try testing.expect(capture.input == null);
+            try testing.expectEqual(references, session.references.load(.acquire));
+        } else {
+            var executor: ScriptedExecutor = .{};
+            try executor.executor().execute(capture.sink(), &command);
+            try state.dispatch(capture.input.?);
+            capture.input = null;
+            try testing.expectEqual(presentation.ActionError.buffer_build_failed, state.projection().action_error.?);
+            try state.dispatch(.ensure_focused_enrichment);
+            const retry = state.takeCommand().?.build_buffer_disclosure;
+            retry.build();
+            try testing.expect(!retry.failed);
+            try testing.expectEqual(before.visual_rows.ptr, state.projection().review.?.frame.visual_rows.ptr);
+            try state.dispatch(.{ .buffer_disclosure_built = retry });
+        }
+        if (closed) {
+            try testing.expectEqual(before.visual_rows.ptr, state.projection().review.?.frame.visual_rows.ptr);
+            try testing.expectEqual(@as(?usize, 0), session.enrichment.focused_file);
+            try testing.expect(session.enrichment.file(if (release_holds) 1 else 0).new == .content);
+        } else try testing.expect(session.enrichment.file(if (release_holds) 1 else 0).new == .pending);
+    };
+}
+
+test "M21 authored destination launch failure and closed sink preserve the Overlay and Frame" {
+    for ([_]bool{ false, true }) |closed| {
+        const session = try @import("session.zig").create(testing.allocator);
+        session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Local" };
+        session.source = .{ .local = .{ .common_dir = "." } };
+        const a = session.arena.allocator();
+        session.diff = try bbr.diff.parse(a, "");
+        session.threads = try bbr.review.buildThreads(a, &.{.{ .id = 1, .author = "Reviewer", .body = "needle" }});
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try presentation.OwnedReviewIdentity.initLocal(1, "main", "feature"), .session = session },
+        });
+        defer state.deinit();
+        try state.dispatch(.{ .action = .open_review_search });
+        try state.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+        var scan = state.takeCommand().?;
+        defer scan.deinit();
+        try state.dispatch(.{ .buffer_search_scanned = presentation.executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search) });
+        const before = state.projection().review.?.frame;
+        const references = session.references.load(.acquire);
+        try state.dispatch(.{ .action = .open_search_occurrence });
+        var command = state.takeCommand().?;
+        var capture: CapturingSink = .{ .reject = closed };
+        if (closed) {
+            command.build_buffer_disclosure.build();
+            try testing.expect(!command.build_buffer_disclosure.failed);
+            deliver(capture.sink(), .{ .buffer_disclosure_built = command.build_buffer_disclosure });
+            try testing.expect(capture.input == null);
+            try testing.expectEqual(references, session.references.load(.acquire));
+        } else {
+            var executor: ScriptedExecutor = .{};
+            try executor.executor().execute(capture.sink(), &command);
+            try state.dispatch(capture.input.?);
+            capture.input = null;
+            try testing.expectEqual(presentation.ActionError.buffer_build_failed, state.projection().action_error.?);
+            try testing.expectEqual(before.visual_rows.ptr, state.projection().review.?.frame.visual_rows.ptr);
+            try testing.expectEqualStrings("needle", state.projection().review_search.?.query);
+            try state.dispatch(.{ .action = .open_search_occurrence });
+            const retry = state.takeCommand().?.build_buffer_disclosure;
+            retry.build();
+            try state.dispatch(.{ .buffer_disclosure_built = retry });
+            try testing.expect(state.projection().review_search == null);
+            continue;
+        }
+        try testing.expectEqual(before.visual_rows.ptr, state.projection().review.?.frame.visual_rows.ptr);
+        try testing.expectEqualStrings("needle", state.projection().review_search.?.query);
+    }
+}
+
+test "M21 authored Buffer Search restoration launch failure and closed sink preserve the Frame" {
+    for ([_]bool{ false, true }) |closed| {
+        const session = try @import("session.zig").create(testing.allocator);
+        session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Bitbucket" };
+        session.source = .{ .remote = .{ .id = 1, .title = "Review", .state = "OPEN", .author_display_name = "Reviewer", .source_branch = "feature", .destination_branch = "main", .source_commit = "source", .destination_commit = "base" } };
+        session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,12 +1,12 @@\n-a\n+A\n c1\n c2\n c3\n c4\n c5\n c6\n c7\n c8\n c9\n c10\n-b\n+B\n");
+        try session.initializeEnrichment();
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+        });
+        defer state.deinit();
+        try state.dispatch(.ensure_focused_enrichment);
+        var enrichment = state.takeCommand().?;
+        const blob = "a\nc1\nc2\nc3\nc4\nc5\nc6\nc7\nc8\nc9\nc10\nb\n";
+        const responses = [_]bbr.http.Canned{ .{ .status = 200, .body = blob }, .{ .status = 200, .body = blob } };
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+        const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+        var plain: bbr.highlight.PlainHighlighter = .{};
+        const result = try @import("file_enrichment.zig").enrich(testing.allocator, client, plain.highlighter(), enrichment.enrich_file.request());
+        try state.dispatch(.{ .file_enrichment_completed = .{
+            .command_id = enrichment.enrich_file.command_id,
+            .work_id = enrichment.enrich_file.work_id,
+            .session_epoch = enrichment.enrich_file.session_epoch,
+            .file_index = 0,
+            .outcome = .{ .completed = result },
+        } });
+        enrichment.deinit();
+        const enriched = state.takeCommand().?.build_buffer_disclosure;
+        enriched.build();
+        try state.dispatch(.{ .buffer_disclosure_built = enriched });
+        try state.dispatch(.{ .action = .open_review_search });
+        try state.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c5" } });
+        var authored = state.takeCommand().?;
+        try state.dispatch(.{ .buffer_search_scanned = presentation.executeBufferSearchScan(testing.allocator, &authored.scan_buffer_search) });
+        authored.deinit();
+        var source = state.takeCommand().?;
+        try state.dispatch(.{ .review_source_scanned = presentation.executeReviewSourceScan(testing.allocator, &source.scan_review_source) });
+        source.deinit();
+        try state.dispatch(.{ .action = .open_search_occurrence });
+        const destination = state.takeCommand().?.build_buffer_disclosure;
+        destination.build();
+        try state.dispatch(.{ .buffer_disclosure_built = destination });
+        const before = state.projection().review.?.frame;
+        const references = session.references.load(.acquire);
+        try state.dispatch(.{ .action = .open_buffer_search });
+        var command = state.takeCommand().?;
+        var capture: CapturingSink = .{ .reject = closed };
+        if (closed) {
+            command.build_buffer_disclosure.build();
+            try testing.expect(!command.build_buffer_disclosure.failed);
+            deliver(capture.sink(), .{ .buffer_disclosure_built = command.build_buffer_disclosure });
+            try testing.expect(capture.input == null);
+            try testing.expectEqual(references, session.references.load(.acquire));
+        } else {
+            var executor: ScriptedExecutor = .{};
+            try executor.executor().execute(capture.sink(), &command);
+            try state.dispatch(capture.input.?);
+            capture.input = null;
+            try testing.expectEqual(presentation.ActionError.buffer_build_failed, state.projection().action_error.?);
+            try testing.expect(!state.projection().buffer_search.?.pending);
+            try state.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c5" } });
+            const retry = state.takeCommand().?.build_buffer_disclosure;
+            retry.build();
+            try state.dispatch(.{ .buffer_disclosure_built = retry });
+            try testing.expect(before.visual_rows.ptr != state.projection().review.?.frame.visual_rows.ptr);
+            continue;
+        }
+        try testing.expectEqual(before.visual_rows.ptr, state.projection().review.?.frame.visual_rows.ptr);
+    }
+}
+
+test "M21 kernel Draft Frame launch failure and closed sink keep the Draft unsaved" {
+    for ([_]bool{ false, true }) |closed| {
+        const session = try @import("session.zig").create(testing.allocator);
+        session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Local" };
+        session.source = .{ .local = .{ .common_dir = "." } };
+        session.diff = try bbr.diff.parse(session.arena.allocator(), "");
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try presentation.OwnedReviewIdentity.initLocal(1, "main", "feature");
+        var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = key, .session = session },
+        });
+        defer state.deinit();
+        try state.dispatch(.{ .action = .review_comment });
+        try state.dispatch(.{ .composer = .{ .insert = try presentation.TextChunk.init("keep me") } });
+        const before = state.projection().review.?.frame;
+        try state.dispatch(.{ .composer = .save });
+        var command = state.takeCommand().?;
+        var capture: CapturingSink = .{ .reject = closed };
+        if (closed) {
+            command.build_buffer_disclosure.build();
+            try testing.expect(!command.build_buffer_disclosure.failed);
+            deliver(capture.sink(), .{ .buffer_disclosure_built = command.build_buffer_disclosure });
+            try testing.expect(capture.input == null);
+        } else {
+            var executor: ScriptedExecutor = .{};
+            try executor.executor().execute(capture.sink(), &command);
+            try state.dispatch(capture.input.?);
+            capture.input = null;
+            try testing.expectEqual(presentation.ActionError.buffer_build_failed, state.projection().action_error.?);
+        }
+        try testing.expectEqualStrings("keep me", state.projection().composer.?.body);
+        try testing.expectEqual(before.visual_rows.ptr, state.projection().review.?.frame.visual_rows.ptr);
+        try testing.expectEqual(@as(usize, 0), state.projection().review.?.drafts.len);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const stored = try store.store().loadReview(arena.allocator(), .{ .workspace = key.workspace(), .repository = key.repository(), .pull_request_id = 1 });
+        try testing.expectEqual(@as(usize, 0), stored.drafts.items.len);
+        if (!closed) {
+            try state.dispatch(.{ .composer = .save });
+            const retry = state.takeCommand().?.build_buffer_disclosure;
+            retry.build();
+            try state.dispatch(.{ .buffer_disclosure_built = retry });
+            try testing.expect(state.projection().composer == null);
+            try testing.expectEqual(@as(usize, 1), state.projection().review.?.drafts.len);
+        }
+    }
+}
+
+test "M21 kernel Draft mutation launch failure and closed sink preserve persistence and Frame" {
+    for ([_]enum { body, reanchor, delete, unpublished }{ .body, .reanchor, .delete, .unpublished }) |mutation| for ([_]bool{ false, true }) |closed| {
+        const session = try @import("session.zig").create(testing.allocator);
+        session.header = .{ .title = "Review", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Bitbucket", .pull_request_id = 1 };
+        session.source = .{ .remote = .{ .id = 1, .title = "Review", .state = "OPEN", .author_display_name = "Reviewer", .source_branch = "feature", .destination_branch = "main", .source_commit = "source", .destination_commit = "base" } };
+        session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1,2 @@\n-old\n+new\n+later\n");
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1);
+        const store_key: bbr.review.RemoteReviewIdentity = .{ .workspace = key.workspace(), .repository = key.repository(), .pull_request_id = 1 };
+        try store.store().put(store_key, .{
+            .local_id = 1,
+            .kind = .comment,
+            .target = .bitbucket,
+            .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1, .commit = "source" } },
+            .body = "original",
+            .state = if (mutation == .unpublished) .outcome_unknown else .draft,
+        });
+        var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = key, .session = session },
+        });
+        defer state.deinit();
+        var card_row: ?usize = null;
+        var source_row: ?usize = null;
+        const initial = state.projection().review.?;
+        for (initial.frame.visual_rows, 0..) |visual, index| {
+            const row = initial.buffer.rows[visual.buffer_index];
+            if (row == .draft and card_row == null) card_row = index;
+            if (row == .line and row.line.newNo() == 2) source_row = index;
+        }
+        for (0..card_row.?) |_| try state.dispatch(.{ .action = .down });
+        switch (mutation) {
+            .body => {
+                try state.dispatch(.{ .action = .edit_review_item });
+                try state.dispatch(.{ .composer = .{ .insert = try presentation.TextChunk.init(" changed") } });
+                try state.dispatch(.{ .composer = .save });
+            },
+            .reanchor => {
+                try state.dispatch(.{ .action = .reanchor_review_item });
+                try state.dispatch(.{ .action = .to_top });
+                for (0..source_row.?) |_| try state.dispatch(.{ .action = .down });
+                try state.dispatch(.{ .reanchor = .accept });
+            },
+            .delete => {
+                try state.dispatch(.{ .action = .delete_review_item });
+                try state.dispatch(.{ .delete_confirmation = .confirm });
+            },
+            .unpublished => try state.dispatch(.{ .action = .resolve_unpublished }),
+        }
+        const before = state.projection().review.?.frame;
+        try testing.expectEqual(@as(?presentation.ActionError, null), state.projection().action_error);
+        var command = state.takeCommand().?;
+        var capture: CapturingSink = .{ .reject = closed };
+        if (closed) {
+            command.build_buffer_disclosure.build();
+            try testing.expect(!command.build_buffer_disclosure.failed);
+            deliver(capture.sink(), .{ .buffer_disclosure_built = command.build_buffer_disclosure });
+            try testing.expect(capture.input == null);
+        } else {
+            var executor: ScriptedExecutor = .{};
+            try executor.executor().execute(capture.sink(), &command);
+            try state.dispatch(capture.input.?);
+            capture.input = null;
+            try testing.expectEqual(presentation.ActionError.buffer_build_failed, state.projection().action_error.?);
+        }
+        try testing.expectEqual(before.visual_rows.ptr, state.projection().review.?.frame.visual_rows.ptr);
+        try testing.expectEqualStrings("original", state.projection().review.?.drafts[0].body);
+        try testing.expectEqual(@as(?u32, 1), state.projection().review.?.drafts[0].effectiveScope().@"inline".to);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const stored = try store.store().loadReview(arena.allocator(), store_key);
+        try testing.expectEqual(@as(usize, 1), stored.drafts.items.len);
+        try testing.expectEqualStrings("original", stored.getConst(1).?.body);
+        if (mutation == .unpublished) try testing.expect(stored.getConst(1).?.state == .outcome_unknown) else try testing.expect(stored.getConst(1).?.state == .draft);
+        if (!closed) {
+            switch (mutation) {
+                .body => try state.dispatch(.{ .composer = .save }),
+                .reanchor => try state.dispatch(.{ .reanchor = .accept }),
+                .delete => try state.dispatch(.{ .delete_confirmation = .confirm }),
+                .unpublished => try state.dispatch(.{ .action = .resolve_unpublished }),
+            }
+            const retry = state.takeCommand().?.build_buffer_disclosure;
+            retry.build();
+            try state.dispatch(.{ .buffer_disclosure_built = retry });
+            try testing.expect(state.projection().action_error == null);
+            switch (mutation) {
+                .body => try testing.expectEqualStrings("original changed", state.projection().review.?.drafts[0].body),
+                .reanchor => try testing.expectEqual(@as(?u32, 2), state.projection().review.?.drafts[0].effectiveScope().@"inline".to),
+                .delete => try testing.expectEqual(@as(usize, 0), state.projection().review.?.drafts.len),
+                .unpublished => try testing.expect(state.projection().review.?.drafts[0].state == .draft),
+            }
+        }
     };
 }
 

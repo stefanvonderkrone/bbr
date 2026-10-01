@@ -139,6 +139,25 @@ pub const ReadLease = struct {
     old: ?*OwnedSide,
     new: ?*OwnedSide,
 
+    pub fn retain(self: ReadLease) ReadLease {
+        if (self.old) |side| _ = side.references.fetchAdd(1, .acq_rel);
+        if (self.new) |side| _ = side.references.fetchAdd(1, .acq_rel);
+        return self;
+    }
+
+    pub fn retainProjected(self: ReadLease, blob: bbr.diff.FileBlob) ReadLease {
+        var lease = self;
+        if (blob.old == null) {
+            lease.old = null;
+            if (lease.view.old == .content) lease.view.old = .pending;
+        }
+        if (blob.new == null) {
+            lease.new = null;
+            if (lease.view.new == .content) lease.view.new = .pending;
+        }
+        return lease.retain();
+    }
+
     pub fn release(self: *ReadLease) void {
         if (self.old) |side| side.destroy();
         if (self.new) |side| side.destroy();
@@ -168,7 +187,38 @@ pub const Result = struct {
         self.old.deinit();
         self.new.deinit();
     }
+
+    pub fn view(self: *const Result) FileView {
+        return .{ .old = resultSideView(self.old), .new = resultSideView(self.new) };
+    }
+
+    pub fn retainedBytes(self: *const Result) usize {
+        return resultSideBytes(self.old) +| resultSideBytes(self.new);
+    }
+
+    pub fn snapshot(self: *const Result) ReadLease {
+        return (ReadLease{
+            .view = self.view(),
+            .old = if (self.old == .owned) self.old.owned else null,
+            .new = if (self.new == .owned) self.new.owned else null,
+        }).retain();
+    }
 };
+
+fn resultSideView(side: SideResult) SideView {
+    return switch (side) {
+        .absent => .absent,
+        .binary => |size| .{ .binary = size },
+        .unavailable => |status| .{ .unavailable = status },
+        .fetch_failed => |err| .{ .fetch_failed = err },
+        .owned => |owned| .{ .content = owned.view() },
+        .transferred => unreachable,
+    };
+}
+
+fn resultSideBytes(side: SideResult) usize {
+    return if (side == .owned) side.owned.retained_bytes else 0;
+}
 
 pub fn enrich(backing: Allocator, bb: bbr.bitbucket.Client, highlighter: bbr.highlight.Highlighter, req: Request) error{OutOfMemory}!Result {
     var remote: RemoteBlobSource = .{ .client = bb, .repo = req.repo };
@@ -326,6 +376,108 @@ pub const CachePolicy = struct {
     max_retained_bytes: usize = std.math.maxInt(usize),
 };
 
+pub const CacheEntry = struct {
+    retained_bytes: usize,
+    last_used: u64,
+    leases: usize,
+    failed_old: bool,
+    failed_new: bool,
+};
+
+// Workers copy cache policy evidence without reading mutable Storage records.
+// Presentation rejects the Frame if the Storage revision changed after handoff.
+const AtomicCacheEntry = struct {
+    retained_bytes: std.atomic.Value(usize) = .init(0),
+    last_used: std.atomic.Value(u64) = .init(0),
+    leases: std.atomic.Value(usize) = .init(0),
+    failed_old: std.atomic.Value(bool) = .init(false),
+    failed_new: std.atomic.Value(bool) = .init(false),
+
+    fn store(self: *AtomicCacheEntry, file: StoredFile) void {
+        self.retained_bytes.store(file.retainedBytes(), .release);
+        self.last_used.store(file.last_used, .release);
+        self.leases.store(file.leases, .release);
+        self.failed_old.store(file.old == .fetch_failed, .release);
+        self.failed_new.store(file.new == .fetch_failed, .release);
+    }
+
+    fn load(self: *const AtomicCacheEntry) CacheEntry {
+        return .{
+            .retained_bytes = self.retained_bytes.load(.acquire),
+            .last_used = self.last_used.load(.acquire),
+            .leases = self.leases.load(.acquire),
+            .failed_old = self.failed_old.load(.acquire),
+            .failed_new = self.failed_new.load(.acquire),
+        };
+    }
+};
+
+/// Project a completed result and the cache victims into private Frame inputs.
+/// The caller keeps the result and all source content alive until publication.
+pub fn previewAdmission(file_idx: usize, result: *const Result, policy: CachePolicy, focused: ?usize, entries: []CacheEntry, projection: Projection) void {
+    projectView(file_idx, result.view(), projection);
+    entries[file_idx].retained_bytes = result.retainedBytes();
+    entries[file_idx].failed_old = result.old == .fetch_failed;
+    entries[file_idx].failed_new = result.new == .fetch_failed;
+    previewCacheEnforcement(policy, focused, entries, projection);
+}
+
+pub fn previewCacheEnforcement(policy: CachePolicy, focused: ?usize, entries: []CacheEntry, projection: Projection) void {
+    const budget = if (!policy.enabled) 0 else if (policy.max_retained_bytes == 0) std.math.maxInt(usize) else policy.max_retained_bytes;
+    while (true) {
+        var total: usize = 0;
+        var victim: ?usize = null;
+        for (entries, 0..) |entry, index| {
+            if (focused != null and focused.? == index or entry.leases > 0) continue;
+            total +|= entry.retained_bytes;
+            if (entry.retained_bytes > 0 and (victim == null or entry.last_used < entries[victim.?].last_used)) victim = index;
+        }
+        if (total <= budget or victim == null) break;
+        entries[victim.?].retained_bytes = 0;
+        // An evicted File returns to its original side statuses on the next
+        // projection. Only acquired text can be evicted here.
+        clearText(victim.?, entries[victim.?], projection);
+    }
+}
+
+fn clearText(index: usize, entry: CacheEntry, projection: Projection) void {
+    const blobs: []bbr.diff.FileBlob = @constCast(projection.blobs);
+    const highlights: []bbr.highlight.FileHighlights = @constCast(projection.highlights);
+    const statuses: []bbr.diff.FileContent = @constCast(projection.content_statuses);
+    if (blobs[index].old != null) {
+        blobs[index].old = null;
+        highlights[index].old = null;
+        statuses[index].old = .{ .text = null };
+    }
+    if (blobs[index].new != null) {
+        blobs[index].new = null;
+        highlights[index].new = null;
+        statuses[index].new = .{ .text = null };
+    }
+    if (entry.failed_old) statuses[index].old = .{ .text = null };
+    if (entry.failed_new) statuses[index].new = .{ .text = null };
+}
+
+pub fn projectView(index: usize, view: FileView, projection: Projection) void {
+    const blobs: []bbr.diff.FileBlob = @constCast(projection.blobs);
+    const highlights: []bbr.highlight.FileHighlights = @constCast(projection.highlights);
+    const statuses: []bbr.diff.FileContent = @constCast(projection.content_statuses);
+    inline for (.{ "old", "new" }) |side| {
+        switch (@field(view, side)) {
+            .pending => @field(statuses[index], side) = .{ .text = null },
+            .absent => @field(statuses[index], side) = null,
+            .binary => |size| @field(statuses[index], side) = .{ .binary = size },
+            .unavailable => |status| @field(statuses[index], side) = status,
+            .fetch_failed => |err| @field(statuses[index], side) = .{ .unavailable = .{ .reason = .{ .acquisition_failed = err } } },
+            .content => |content| {
+                @field(blobs[index], side) = content.blob;
+                @field(statuses[index], side) = .{ .text = content.blob.len };
+                @field(highlights[index], side) = if (content.highlighting == .ready) content.highlighting.ready else null;
+            },
+        }
+    }
+}
+
 pub const Storage = struct {
     allocator: Allocator,
     files: []StoredFile,
@@ -334,10 +486,18 @@ pub const Storage = struct {
     content_statuses: []bbr.diff.FileContent,
     statuses: []bbr.highlight.FileHighlightStatus,
     errors: []SideErrors,
+    cache_entries: []AtomicCacheEntry,
     cache: CachePolicy = .{},
     focused_file: ?usize = null,
     recency: u64 = 0,
     retired: std.ArrayList(RetiredFile) = .empty,
+    revision: u64 = 0,
+
+    pub fn cacheEntries(self: *const Storage, allocator: Allocator) ![]CacheEntry {
+        const entries = try allocator.alloc(CacheEntry, self.files.len);
+        for (self.cache_entries, entries) |*stored, *entry| entry.* = stored.load();
+        return entries;
+    }
 
     pub fn init(allocator: Allocator, diff_files: []const bbr.diff.File) !Storage {
         const files = try allocator.alloc(StoredFile, diff_files.len);
@@ -373,6 +533,9 @@ pub const Storage = struct {
         const errors = try allocator.alloc(SideErrors, diff_files.len);
         errdefer allocator.free(errors);
         @memset(errors, .{});
+        const cache_entries = try allocator.alloc(AtomicCacheEntry, diff_files.len);
+        errdefer allocator.free(cache_entries);
+        @memset(cache_entries, .{});
         var storage: Storage = .{
             .allocator = allocator,
             .files = files,
@@ -381,6 +544,7 @@ pub const Storage = struct {
             .content_statuses = content_statuses,
             .statuses = statuses,
             .errors = errors,
+            .cache_entries = cache_entries,
         };
         errdefer storage.retired.deinit(allocator);
         try storage.retired.ensureTotalCapacity(allocator, diff_files.len);
@@ -397,6 +561,7 @@ pub const Storage = struct {
         self.allocator.free(self.content_statuses);
         self.allocator.free(self.statuses);
         self.allocator.free(self.errors);
+        self.allocator.free(self.cache_entries);
         self.* = undefined;
     }
 
@@ -417,10 +582,12 @@ pub const Storage = struct {
         stored.new = transfer(&result.new);
         self.projectSide(file_idx, .old);
         self.projectSide(file_idx, .new);
+        self.revision +%= 1;
         return self.stageCacheEnforcement();
     }
 
     pub fn configureCache(self: *Storage, policy: CachePolicy) void {
+        self.revision +%= 1;
         self.cache = policy;
         _ = self.stageCacheEnforcement();
         self.commitCacheUpdate();
@@ -436,7 +603,9 @@ pub const Storage = struct {
         std.debug.assert(file_idx < self.files.len);
         self.recency +|= 1;
         self.files[file_idx].last_used = self.recency;
+        self.cache_entries[file_idx].store(self.files[file_idx]);
         self.focused_file = file_idx;
+        self.revision +%= 1;
         return self.stageCacheEnforcement();
     }
 
@@ -451,7 +620,9 @@ pub const Storage = struct {
         std.debug.assert(self.retired.items.len == 0);
         self.recency +|= 1;
         self.files[file_idx].last_used = self.recency;
+        self.cache_entries[file_idx].store(self.files[file_idx]);
         self.focused_file = file_idx;
+        self.revision +%= 1;
     }
 
     pub fn commitCacheUpdate(self: *Storage) void {
@@ -475,25 +646,55 @@ pub const Storage = struct {
 
     pub fn lease(self: *Storage, file_idx: usize) ReadLease {
         std.debug.assert(file_idx < self.files.len);
+        const result = self.snapshot(file_idx);
+        self.files[file_idx].leases += 1;
+        self.cache_entries[file_idx].store(self.files[file_idx]);
+        self.revision +%= 1;
+        return result;
+    }
+
+    /// Retain immutable File content without changing cache policy. The caller
+    /// can release this lease after the Session itself is replaced.
+    pub fn snapshot(self: *const Storage, file_idx: usize) ReadLease {
+        std.debug.assert(file_idx < self.files.len);
         const stored = &self.files[file_idx];
         const old = if (stored.old == .content) stored.old.content else null;
         const new = if (stored.new == .content) stored.new.content else null;
         if (old) |side| _ = side.references.fetchAdd(1, .acq_rel);
         if (new) |side| _ = side.references.fetchAdd(1, .acq_rel);
-        stored.leases += 1;
         return .{ .view = self.file(file_idx), .old = old, .new = new };
     }
 
     pub fn hold(self: *Storage, file_idx: usize) void {
         std.debug.assert(file_idx < self.files.len);
         self.files[file_idx].leases += 1;
+        self.cache_entries[file_idx].store(self.files[file_idx]);
+        self.revision +%= 1;
     }
 
     /// Call on the Presentation thread before releasing the final borrowed content.
     pub fn finishLease(self: *Storage, file_idx: usize) bool {
+        self.finishLeaseDeferred(file_idx);
+        return self.stageCacheEnforcement();
+    }
+
+    /// Release cache protection without changing content borrowed by the Frame.
+    /// Presentation stages enforcement on its Frame worker before eviction.
+    pub fn finishLeaseDeferred(self: *Storage, file_idx: usize) void {
         std.debug.assert(self.files[file_idx].leases > 0);
         self.files[file_idx].leases -= 1;
-        return self.stageCacheEnforcement();
+        self.cache_entries[file_idx].store(self.files[file_idx]);
+        self.revision +%= 1;
+    }
+
+    pub fn requiresCacheEnforcement(self: *const Storage, focused: ?usize) bool {
+        const budget = if (!self.cache.enabled) 0 else if (self.cache.max_retained_bytes == 0) std.math.maxInt(usize) else self.cache.max_retained_bytes;
+        var total: usize = 0;
+        for (self.files, 0..) |*stored, index| {
+            if (focused == index or stored.leases > 0) continue;
+            total +|= stored.retainedBytes();
+        }
+        return total > budget;
     }
 
     pub fn len(self: *const Storage) usize {
@@ -545,6 +746,7 @@ pub const Storage = struct {
     }
 
     fn projectSide(self: *Storage, file_idx: usize, comptime which: enum { old, new }) void {
+        self.cache_entries[file_idx].store(self.files[file_idx]);
         const stored = @field(self.files[file_idx], @tagName(which));
         const blob_slot = &@field(self.blobs[file_idx], @tagName(which));
         const highlight_slot = &@field(self.highlights[file_idx], @tagName(which));
@@ -604,6 +806,16 @@ pub const Storage = struct {
         var changed = false;
         while (self.inactiveRetainedBytes() > budget) {
             const victim = self.leastRecentlyUsedInactive() orelse break;
+            self.stageCacheVictims(&.{victim});
+            changed = true;
+        }
+        return changed;
+    }
+
+    /// The worker chose these victims against the checked cache revision.
+    pub fn stageCacheVictims(self: *Storage, victims: []const usize) void {
+        for (victims) |victim| {
+            std.debug.assert(self.files[victim].leases == 0 and self.focused_file != victim);
             self.retired.appendAssumeCapacity(.{ .index = victim, .file = self.files[victim] });
             self.files[victim] = .{
                 .old = retainedTerminalSide(self.files[victim].old),
@@ -613,9 +825,8 @@ pub const Storage = struct {
             };
             self.projectSide(victim, .old);
             self.projectSide(victim, .new);
-            changed = true;
+            self.revision +%= 1;
         }
-        return changed;
     }
 
     fn inactiveRetainedBytes(self: *const Storage) usize {
@@ -752,6 +963,21 @@ test "File read lease release restores inactive cache budget while focused File 
     try testing.expect(storage.file(1).new == .content);
     try testing.expectEqualStrings("first", lease.view.new.content.blob);
     lease.release();
+}
+
+test "File snapshot survives cache eviction without a Storage lease" {
+    const files = test_files;
+    var storage = try Storage.init(testing.allocator, &files);
+    var first = try ownedAddedResult(testing.allocator, "first");
+    defer first.deinit();
+    try storage.admit(0, &first);
+    var snapshot = storage.snapshot(0);
+    storage.configureCache(.{ .max_retained_bytes = 1 });
+    try testing.expect(storage.file(0).new == .pending);
+    try testing.expectEqualStrings("first", snapshot.view.new.content.blob);
+    storage.deinit();
+    try testing.expectEqualStrings("first", snapshot.view.new.content.blob);
+    snapshot.release();
 }
 
 test "remote File Enrichment retries transient source failures once in the File slot" {
@@ -1483,6 +1709,39 @@ test "File content cache evicts the least-recently-focused whole File and refetc
     defer revisited.deinit();
     try storage.admit(0, &revisited);
     try testing.expectEqualStrings("AAAAAA", storage.file(0).new.content.blob);
+}
+
+test "File Enrichment preview matches an evicted result with a failed side" {
+    const files = [_]bbr.diff.File{
+        oneTestFile(.modified)[0],
+        oneTestFile(.added)[0],
+    };
+    var storage = try Storage.init(testing.allocator, &files);
+    defer storage.deinit();
+    storage.configureCache(.{ .enabled = false });
+    storage.focus(1);
+    var result = try ownedAddedResult(testing.allocator, "content");
+    defer result.deinit();
+    result.old = .{ .fetch_failed = error.NotFound };
+
+    const original = storage.projection();
+    const blobs = try testing.allocator.dupe(bbr.diff.FileBlob, original.blobs);
+    defer testing.allocator.free(blobs);
+    const highlights = try testing.allocator.dupe(bbr.highlight.FileHighlights, original.highlights);
+    defer testing.allocator.free(highlights);
+    const statuses = try testing.allocator.dupe(bbr.diff.FileContent, original.content_statuses);
+    defer testing.allocator.free(statuses);
+    const entries = try storage.cacheEntries(testing.allocator);
+    defer testing.allocator.free(entries);
+    previewAdmission(0, &result, storage.cache, storage.focused_file, entries, .{
+        .blobs = blobs,
+        .highlights = highlights,
+        .content_statuses = statuses,
+    });
+    try storage.admit(0, &result);
+    try testing.expect(std.meta.eql(statuses[0], storage.content_statuses[0]));
+    try testing.expect(std.meta.eql(blobs[0], storage.blobs[0]));
+    try testing.expect(storage.status(0).old == .pending);
 }
 
 test "File content cache budget includes Highlight Spans" {

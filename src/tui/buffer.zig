@@ -248,6 +248,22 @@ pub const BuildOptions = struct {
     card_width: usize = 80,
     cell_metrics: CellMetrics = .bytes,
     collapsed_rows: usize = 6,
+    emphasis_cache: ?*const EmphasisCache = null,
+};
+
+/// Hunk emphasis depends only on the Diff. Keep its segments in the Session
+/// arena so a disclosure rebuild does not repeat word-level diff work.
+pub const EmphasisCache = struct {
+    entries: std.AutoHashMapUnmanaged(*const model.Hunk, []const []const Segment) = .empty,
+
+    pub fn build(allocator: std.mem.Allocator, diff: model.Diff) !EmphasisCache {
+        var cache: EmphasisCache = .{};
+        for (diff.files) |file| for (file.hunks) |*hunk| {
+            const emphasis = try computeEmphasis(allocator, hunk.lines);
+            try cache.entries.put(allocator, hunk, emphasis);
+        };
+        return cache;
+    }
 };
 
 pub fn disclosureKey(row: Row) ?DisclosureKey {
@@ -526,7 +542,7 @@ pub fn buildWithComments(
                 try rows.append(allocator, .{ .hunk_header = hunk });
                 const folds = try computeFolds(allocator, hunk.lines, opts);
                 switch (layout) {
-                    .unified => try w.emitUnifiedHunk(file, hunk.lines, try computeEmphasis(allocator, hunk.lines), folds),
+                    .unified => try w.emitUnifiedHunk(file, hunk.lines, if (opts.emphasis_cache) |cache| cache.entries.get(hunk).? else try computeEmphasis(allocator, hunk.lines), folds),
                     .side_by_side => try w.emitSideBySideHunk(file, hunk.lines, folds),
                 }
             }
@@ -1871,6 +1887,28 @@ test "bounded intraline work keeps whole-line emphasis" {
     try testing.expectEqual(@as(usize, 1), emphasis[1].len);
     try testing.expect(emphasis[0][0].emphasis);
     try testing.expect(emphasis[1][0].emphasis);
+}
+
+test "Session emphasis survives Buffer rebuilds with the same LineDecoration" {
+    var session_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer session_arena.deinit();
+    const diff = try parse(session_arena.allocator(), "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-let value = 1;\n+let value = 2;\n");
+    const cache = try EmphasisCache.build(session_arena.allocator(), diff);
+    var buffer_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer buffer_arena.deinit();
+    const baseline = try buildWithComments(buffer_arena.allocator(), diff, .unified, &.{}, .{});
+    const expected = try session_arena.allocator().dupe(decoration.Run, baseline.rows[2].line.decoration.runs);
+    try testing.expect(expected.len > 1);
+    for (0..3) |_| {
+        _ = buffer_arena.reset(.free_all);
+        const rebuilt = try buildWithComments(buffer_arena.allocator(), diff, .unified, &.{}, .{ .emphasis_cache = &cache });
+        const actual = rebuilt.rows[2].line.decoration.runs;
+        try testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |old, new| {
+            try testing.expectEqualStrings(old.text, new.text);
+            try testing.expectEqual(old.emphasis, new.emphasis);
+        }
+    }
 }
 
 test "rows borrow the diff (pointer identity, not copies)" {

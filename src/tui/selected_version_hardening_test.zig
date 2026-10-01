@@ -97,6 +97,16 @@ fn initPresentation(allocator: std.mem.Allocator, store: bbr.review.PendingRevie
     });
 }
 
+fn dispatchView(presentation: *Presentation, input: presentation_mod.OwnedInput) !void {
+    try presentation.dispatch(input);
+    if (presentation.projection().action_error != null) return;
+    if (presentation.takeCommand()) |command| {
+        const worker = command.build_buffer_disclosure;
+        worker.build();
+        try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+    }
+}
+
 fn headlessWindow(screen: *vaxis.Screen) vaxis.Window {
     return .{
         .x_off = 0,
@@ -199,7 +209,7 @@ test "M20 hardening forces every Selected Version projection allocation failure"
         try presentation.dispatch(.{ .mouse = .{ .col = sidebar.x, .row = sidebar.y, .button = .left, .type = .press } });
         failing.fail_index = failing.alloc_index + offset;
 
-        try presentation.dispatch(.{ .action = .select_old_version });
+        try dispatchView(&presentation, .{ .action = .select_old_version });
 
         const after = presentation.projection().review.?;
         if (!failing.has_induced_failure) {
@@ -257,11 +267,11 @@ test "M20 hardening renders zero narrow ordinary and wide DiffPane geometry" {
     defer store.deinit();
     var presentation = try initPresentation(testing.allocator, store.store(), .{ .cols = 80, .rows = 8 });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .action = .select_old_version });
+    try dispatchView(&presentation, .{ .action = .select_old_version });
     try presentation.dispatch(.{ .action = .focus_next_pane });
 
     for ([_]u16{ 0, 34, 80, 160 }) |cols| {
-        try presentation.dispatch(.{ .resize = .{ .cols = cols, .rows = 8 } });
+        try dispatchView(&presentation, .{ .resize = .{ .cols = cols, .rows = 8 } });
         const review = presentation.projection().review.?;
         var scratch = std.heap.ArenaAllocator.init(testing.allocator);
         defer scratch.deinit();
@@ -298,10 +308,10 @@ test "M20 hardening renders zero narrow ordinary and wide DiffPane geometry" {
         try testing.expectEqual(@import("frame.zig").PaneFocus.sidebar, review.frame.focus);
     }
 
-    try presentation.dispatch(.{ .resize = .{ .cols = 80, .rows = 8 } });
-    try presentation.dispatch(.{ .action = .toggle_layout });
-    try presentation.dispatch(.{ .action = .cycle_scope });
-    try presentation.dispatch(.{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .resize = .{ .cols = 80, .rows = 8 } });
+    try dispatchView(&presentation, .{ .action = .toggle_layout });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
     const review = presentation.projection().review.?;
     var scratch = std.heap.ArenaAllocator.init(testing.allocator);
     defer scratch.deinit();
@@ -344,9 +354,9 @@ test "M20 hardening renders the selected renamed path in the DiffPane title" {
         .geometry = .{ .cols = 80, .rows = 8 },
     });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .action = .select_old_version });
-    try presentation.dispatch(.{ .action = .cycle_scope });
-    try presentation.dispatch(.{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .select_old_version });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
     const review = presentation.projection().review.?;
     try testing.expectEqual(presentation_mod.Scope.whole, review.preferences.scope);
 
@@ -388,7 +398,7 @@ test "M20 hardening accepts only an unmodified same-target title click" {
     try testing.expectEqual(SelectedVersion.new, presentation.projection().review.?.selected_version);
 
     try presentation.dispatch(.{ .mouse = .{ .col = old.x, .row = old.y, .button = .left, .type = .press } });
-    try presentation.dispatch(.{ .resize = .{ .cols = 81, .rows = 10 } });
+    try dispatchView(&presentation, .{ .resize = .{ .cols = 81, .rows = 10 } });
     try presentation.dispatch(.{ .mouse = .{ .col = old.x, .row = old.y, .button = .left, .type = .release } });
     try testing.expectEqual(SelectedVersion.new, presentation.projection().review.?.selected_version);
 
@@ -399,7 +409,7 @@ test "M20 hardening accepts only an unmodified same-target title click" {
     try testing.expectEqual(SelectedVersion.new, presentation.projection().review.?.selected_version);
     try presentation.dispatch(.{ .composer = .cancel });
 
-    try presentation.dispatch(.{ .resize = .{ .cols = 34, .rows = 10 } });
+    try dispatchView(&presentation, .{ .resize = .{ .cols = 34, .rows = 10 } });
     const clipped = presentation.projection().review.?.frame.version_title_targets;
     try testing.expect(clipped.old == null);
     try testing.expect(clipped.new != null);
@@ -407,10 +417,10 @@ test "M20 hardening accepts only an unmodified same-target title click" {
     try presentation.dispatch(.{ .mouse = .{ .col = 33, .row = 0, .button = .left, .type = .release } });
     try testing.expectEqual(SelectedVersion.new, presentation.projection().review.?.selected_version);
 
-    try presentation.dispatch(.{ .resize = .{ .cols = 80, .rows = 10 } });
+    try dispatchView(&presentation, .{ .resize = .{ .cols = 80, .rows = 10 } });
     const visible_old = presentation.projection().review.?.frame.version_title_targets.old.?;
     try presentation.dispatch(.{ .mouse = .{ .col = visible_old.x, .row = visible_old.y, .button = .left, .type = .press } });
-    try presentation.dispatch(.{ .mouse = .{ .col = visible_old.x, .row = visible_old.y, .button = .left, .type = .release } });
+    try dispatchView(&presentation, .{ .mouse = .{ .col = visible_old.x, .row = visible_old.y, .button = .left, .type = .release } });
     try testing.expectEqual(SelectedVersion.old, presentation.projection().review.?.selected_version);
 }
 
