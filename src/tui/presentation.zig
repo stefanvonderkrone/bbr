@@ -833,6 +833,7 @@ const SearchNavigationRow = struct {
 /// Immutable Frame search indexes. Workers read copied coordinates only.
 /// Disclosure pointers are identities, never dereferenced after construction.
 const SearchProjection = struct {
+    const DeletionRow = struct { draft: ?bbr.review.TempId, identity: ?SurvivingRow };
     const Result = struct {
         ranges: []frame_mod.ProjectedSourceRange,
         navigation_rows: []SearchNavigationRow,
@@ -860,6 +861,8 @@ const SearchProjection = struct {
     source_disclosures: std.AutoHashMapUnmanaged(SourceRowKey, buffer_mod.DisclosureKey) = .empty,
     body_disclosures: std.AutoHashMapUnmanaged(search.ReviewBodyOwner, SearchDisclosureSet) = .empty,
     disclosure_rows: std.AutoHashMapUnmanaged(buffer_mod.DisclosureKey, usize) = .empty,
+    navigation: frame_mod.NavigationIndex = .{},
+    deletion_rows: []const DeletionRow = &.{},
     references: std.atomic.Value(usize) = .init(1),
 
     const Context = struct {
@@ -903,6 +906,17 @@ const SearchProjection = struct {
         }
         snapshot.rows = rows;
         const a = snapshot.arena.allocator();
+        snapshot.navigation = try frame_mod.NavigationIndex.build(a, visual_rows);
+        const deletion_rows = try a.alloc(DeletionRow, buffer.rows.len);
+        for (buffer.rows, deletion_rows) |row, *entry| entry.* = .{
+            .draft = switch (row) {
+                .draft => |card| card.owner.draft,
+                .snapshot => |value| value.draft.local_id,
+                else => null,
+            },
+            .identity = survivingRowIdentity(row),
+        };
+        snapshot.deletion_rows = deletion_rows;
         for (rows, visual_rows, 0..) |row, visual, index| {
             if (row.file_index) |file_index| {
                 if (row.left) |half| if (half.old_line) |number| try addSourceRow(a, &snapshot.source_rows, .{ .file_index = file_index, .line = number, .side = .old }, index);
@@ -1478,6 +1492,9 @@ pub const DisclosureBuild = struct {
     navigation_policy: NavigationPolicy = .restore,
     navigation_file: ?usize = null,
     version_restoration: ?VersionRestoration = null,
+    version_destination: VersionDestination = .{},
+    deletion_origin: ?*SearchProjection = null,
+    surviving_row: ?SurvivingRow = null,
     failed: bool = false,
 
     fn create(published: *Published, preferences: Preferences, target: DisclosureTarget, request_id: u64, active: ?usize) !*DisclosureBuild {
@@ -1727,6 +1744,8 @@ pub const DisclosureBuild = struct {
             .layout = self.preferences.layout,
             .width = frame_mod.paneRects(self.geometry).diff_content.width,
         });
+        if (self.version_restoration) |target| self.version_destination = versionNavigationDestination(self.session, self.buffer, self.visual_rows, target, self.preferences.selected_version);
+        if (self.deletion_origin) |origin| self.surviving_row = survivingRowAfterDeletion(origin.deletion_rows, self.deleted_ids);
         const panes = frame_mod.paneRects(self.geometry);
         self.tree = try file_tree.build(a, self.session.diff, self.buffer.file_tallies, self.collapsed_directories, self.active_file, panes.sidebar_content.width, panes.sidebar_content.height, self.wanted_cursor, self.tree_scroll, self.cell_metrics);
         self.projection = try SearchProjection.create(self.buffer, self.visual_rows, .{
@@ -1781,6 +1800,7 @@ pub const DisclosureBuild = struct {
     }
 
     pub fn destroy(self: *DisclosureBuild) void {
+        if (self.deletion_origin) |origin| origin.release();
         if (self.enrichment_result) |*result| result.deinit();
         if (self.batch) |*batch| batch.deinit(std.heap.page_allocator);
         if (self.accepted_snapshot) |*batch| batch.deinit(std.heap.page_allocator);
@@ -2759,7 +2779,7 @@ const Published = struct {
                     input.corpus = corpus;
                 }
             }
-            self.published.navigation = frame_mod.restoreNavigation(previous, self.visual_rows, self.geometry);
+            self.published.navigation = frame_mod.restoreNavigationIndexed(previous, self.visual_rows, self.geometry, self.search_projection.navigation);
             if (self.published.worker_frame) |worker_frame| worker_frame.destroy();
             self.published.worker_frame = null;
             if (self.published.buffer_search.accepted_query != null) {
@@ -3619,8 +3639,7 @@ const Published = struct {
     }
 
     fn visualIndexForBufferIndex(self: *const Published, buffer_index: usize) ?usize {
-        for (self.visual_rows, 0..) |visual_row, index| if (visual_row.buffer_index == buffer_index) return index;
-        return null;
+        return frame_mod.visualIndexForBufferIndex(self.visual_rows, buffer_index);
     }
 
     fn sidebarEntry(self: *const Published) ?file_tree.Entry {
@@ -3851,14 +3870,14 @@ const VersionRestoration = struct {
     session_epoch: SessionEpoch,
     file_index: usize,
     selected_version: SelectedVersion,
-    exact_hunk_line: ?*const bbr.diff.Line,
-    next_hunk_line: ?*const bbr.diff.Line,
-    prior_hunk_line: ?*const bbr.diff.Line,
+    source_hunk_line: ?*const bbr.diff.Line,
     from_hunk: bool,
     source_line: u32,
     source_offset: usize,
     viewport_offset: usize,
 };
+
+const VersionDestination = struct { row: ?usize = null, found: bool = false };
 
 const PrefetchArm = struct {
     session_epoch: SessionEpoch,
@@ -7594,7 +7613,7 @@ pub const Presentation = struct {
         published.visual_rows = job.visual_rows;
         published.tree = job.tree;
         published.selected_version = job.preferences.selected_version;
-        published.navigation = frame_mod.restoreNavigation(previous, job.visual_rows, job.geometry);
+        published.navigation = frame_mod.restoreNavigationIndexed(previous, job.visual_rows, job.geometry, job.projection.?.navigation);
         if (published.worker_frame) |old| old.destroy();
         published.worker_frame = job;
         owned = false;
@@ -7749,7 +7768,6 @@ pub const Presentation = struct {
             self.action_error = if (err == error.PersistenceFailed) .persistence_failed else .out_of_memory;
             return;
         };
-        const surviving = if (job.mutation != null and job.mutation.?.change == .delete) survivingRowAfterDeletion(published, job.deleted_ids) else null;
         if (job.mutation) |mutation| {
             const refusal = switch (mutation.change) {
                 .body => self.draftEditRefusal(published, mutation.temp_id),
@@ -7804,7 +7822,7 @@ pub const Presentation = struct {
         published.visual_rows = job.visual_rows;
         published.tree = job.tree;
         published.navigation = switch (job.navigation_policy) {
-            .restore, .file_header, .center, .version => frame_mod.restoreNavigation(previous, job.visual_rows, job.geometry),
+            .restore, .file_header, .center, .version => frame_mod.restoreNavigationIndexed(previous, job.visual_rows, job.geometry, job.projection.?.navigation),
             .reset => Nav.init(job.visual_rows.len, frame_mod.paneRects(job.geometry).diff_content.height),
         };
         published.geometry = job.geometry;
@@ -7813,9 +7831,9 @@ pub const Presentation = struct {
         if (job.kind == .view or job.kind == .cache_update) if (published.buffer_search.input) |*input| {
             var saved = previous;
             saved.navigation = input.saved_navigation;
-            input.saved_navigation = frame_mod.restoreNavigation(saved, job.visual_rows, job.geometry);
+            input.saved_navigation = frame_mod.restoreNavigationIndexed(saved, job.visual_rows, job.geometry, job.projection.?.navigation);
             saved.navigation.cursor = input.origin;
-            input.origin = frame_mod.restoreNavigation(saved, job.visual_rows, job.geometry).cursor;
+            input.origin = frame_mod.restoreNavigationIndexed(saved, job.visual_rows, job.geometry, job.projection.?.navigation).cursor;
         };
         if (published.worker_frame) |old| old.destroy();
         published.worker_frame = job;
@@ -7867,7 +7885,7 @@ pub const Presentation = struct {
             published.navigation.mark = null;
             self.version_restoration = null;
             if (job.version_restoration) |target| {
-                if (!restoreVersionNavigation(published, target, job.preferences.selected_version) and versionContentPending(published, target.file_index, job.preferences.selected_version))
+                if (!restoreVersionNavigation(published, target, job.version_destination) and versionContentPending(published, target.file_index, job.preferences.selected_version))
                     self.version_restoration = target;
             }
             self.mouse_press = null;
@@ -7923,7 +7941,7 @@ pub const Presentation = struct {
                 .delete => {
                     self.delete_confirmation = null;
                     published.navigation.clearMark();
-                    followSurvivingRow(published, surviving);
+                    followSurvivingRow(published, job.surviving_row);
                 },
                 .unpublished => {},
             }
@@ -7951,7 +7969,8 @@ pub const Presentation = struct {
                 };
             if (self.version_restoration) |target| if (job.preferences.scope == .whole and target.selected_version == job.preferences.selected_version and
                 target.session_epoch == published.epoch and target.file_index == index and
-                restoreVersionNavigation(published, target, job.preferences.selected_version))
+                job.version_restoration != null and std.meta.eql(target, job.version_restoration.?) and
+                restoreVersionNavigation(published, target, job.version_destination))
             {
                 self.version_restoration = null;
             };
@@ -8019,6 +8038,10 @@ pub const Presentation = struct {
         errdefer job.destroy();
         job.kind = .draft_mutation;
         job.mutation = try mutation.clone(job.arena.allocator());
+        if (mutation.change == .delete) {
+            published.search_projection.retain();
+            job.deletion_origin = published.search_projection;
+        }
         job.mutation_id = retry_id orelse (published.draft_mutation_generation +% 1);
         published.draft_mutation_generation = job.mutation_id;
         published.pending_draft_mutation = job.mutation_id;
@@ -8061,6 +8084,7 @@ pub const Presentation = struct {
             return;
         };
         next.kind = .enrichment;
+        next.version_restoration = self.version_restoration;
         next.enrichment_file = job.enrichment_file;
         next.enrichment_result = job.enrichment_result;
         next.enrichment_speculative = job.enrichment_speculative;
@@ -8175,16 +8199,16 @@ pub const Presentation = struct {
             if (job.restore_navigation) |navigation| navigation_origin.navigation = navigation;
         }
         published.navigation = if (job.clear_review_disclosures)
-            frame_mod.restoreNavigation(navigation_origin, job.visual_rows, job.geometry)
+            frame_mod.restoreNavigationIndexed(navigation_origin, job.visual_rows, job.geometry, job.projection.?.navigation)
         else
-            job.restore_navigation orelse frame_mod.restoreNavigation(previous, job.visual_rows, job.geometry);
+            job.restore_navigation orelse frame_mod.restoreNavigationIndexed(previous, job.visual_rows, job.geometry, job.projection.?.navigation);
         if (job.kind == .open_input) {
             const input = &published.buffer_search.input.?;
             var origin = previous;
             origin.navigation = input.saved_navigation;
-            input.saved_navigation = frame_mod.restoreNavigation(origin, job.visual_rows, job.geometry);
+            input.saved_navigation = frame_mod.restoreNavigationIndexed(origin, job.visual_rows, job.geometry, job.projection.?.navigation);
             origin.navigation.cursor = input.origin;
-            input.origin = frame_mod.restoreNavigation(origin, job.visual_rows, job.geometry).cursor;
+            input.origin = frame_mod.restoreNavigationIndexed(origin, job.visual_rows, job.geometry, job.projection.?.navigation).cursor;
         }
         if (published.worker_frame) |old| old.destroy();
         published.worker_frame = job;
@@ -9976,6 +10000,7 @@ pub const Presentation = struct {
                     return;
                 };
                 job.kind = .enrichment;
+                job.version_restoration = self.version_restoration;
                 job.enrichment_file = completed.file_index;
                 job.enrichment_speculative = issued.speculative;
                 if (current.review_search.open and current.review_search.query != null and current.review_search.held != null and
@@ -10538,7 +10563,7 @@ pub const Presentation = struct {
                     self.discardQueuedReviewSearchScans();
                     self.discardQueuedSearchEnrichments(current);
                     if (OwnedReviewIdentity.eql(current.key, candidate.key))
-                        candidate.navigation = frame_mod.restoreNavigation(current.frameProjection(), candidate.visual_rows, candidate.geometry);
+                        candidate.navigation = frame_mod.restoreNavigationIndexed(current.frameProjection(), candidate.visual_rows, candidate.geometry, candidate.search_projection.navigation);
                 }
                 self.published = candidate;
                 self.discardQueuedBufferSearchScans(null);
@@ -10834,35 +10859,26 @@ fn collectCascade(drafts: []const bbr.review.Draft, temp_id: bbr.review.TempId, 
 /// semantic row after the deleted card, falling back to the last surviving one
 /// before it. Source rows qualify, so a Draft that owned the tail of a File
 /// still lands on real content.
-fn survivingRowAfterDeletion(published: *const Published, cascade: []const bbr.review.TempId) ?SurvivingRow {
-    const rows = published.buffer.rows;
+fn survivingRowAfterDeletion(rows: []const SearchProjection.DeletionRow, cascade: []const bbr.review.TempId) ?SurvivingRow {
     var first: ?usize = null;
     for (rows, 0..) |row, index| {
-        if (!rowOwnedByCascade(row, cascade)) continue;
+        if (row.draft == null or !bbr.review.containsTempId(cascade, row.draft.?)) continue;
         first = index;
         break;
     }
     const start = first orelse return null;
     var forward = start;
     while (forward < rows.len) : (forward += 1) {
-        if (rowOwnedByCascade(rows[forward], cascade)) continue;
-        if (survivingRowIdentity(rows[forward])) |identity| return identity;
+        if (rows[forward].draft) |id| if (bbr.review.containsTempId(cascade, id)) continue;
+        if (rows[forward].identity) |identity| return identity;
     }
     var backward = start;
     while (backward > 0) {
         backward -= 1;
-        if (rowOwnedByCascade(rows[backward], cascade)) continue;
-        if (survivingRowIdentity(rows[backward])) |identity| return identity;
+        if (rows[backward].draft) |id| if (bbr.review.containsTempId(cascade, id)) continue;
+        if (rows[backward].identity) |identity| return identity;
     }
     return null;
-}
-
-fn rowOwnedByCascade(row: buffer_mod.Row, cascade: []const bbr.review.TempId) bool {
-    return switch (row) {
-        .draft => |card| bbr.review.containsTempId(cascade, card.owner.draft),
-        .snapshot => |snapshot| bbr.review.containsTempId(cascade, snapshot.draft.local_id),
-        else => false,
-    };
 }
 
 fn survivingRowIdentity(row: buffer_mod.Row) ?SurvivingRow {
@@ -10875,27 +10891,18 @@ fn survivingRowIdentity(row: buffer_mod.Row) ?SurvivingRow {
 
 fn followSurvivingRow(published: *Published, surviving: ?SurvivingRow) void {
     const wanted = surviving orelse return;
-    for (published.buffer.rows, 0..) |row, index| {
-        const identity = survivingRowIdentity(row) orelse continue;
-        const matches = switch (wanted) {
-            .draft => |temp_id| identity == .draft and identity.draft == temp_id,
-            .comment => |id| identity == .comment and identity.comment == id,
-            .line => |line| identity == .line and identity.line == line,
-        };
-        if (!matches) continue;
-        if (published.visualIndexForBufferIndex(index)) |visual_index| published.navigation.jumpTo(visual_index);
-        return;
-    }
+    const owner: frame_mod.RowOwner = switch (wanted) {
+        .draft => |id| .{ .draft = .{ .id = id, .source_offset = 0, .part = .header } },
+        .comment => |id| .{ .comment = .{ .id = id, .source_offset = 0, .part = .header } },
+        .line => |line| .{ .line = line },
+    };
+    if (published.search_projection.navigation.find(.{ .owner = owner })) |row| published.navigation.jumpTo(row);
 }
 
 /// Put the cursor back on `temp_id`'s ReviewCard wherever the reprojection put
 /// it — identity, not a row number, survives a mutation.
 fn followDraftCard(published: *Published, temp_id: bbr.review.TempId) void {
-    for (published.buffer.rows, 0..) |row, index| {
-        if (row != .draft or row.draft.owner.draft != temp_id or row.draft.part != .header) continue;
-        if (published.visualIndexForBufferIndex(index)) |visual_index| published.navigation.jumpTo(visual_index);
-        return;
-    }
+    if (published.search_projection.navigation.owners.get(.{ .draft = .{ .id = temp_id, .source_offset = 0, .part = .header } })) |row| published.navigation.jumpTo(row);
 }
 
 /// The typed owner of the ReviewCard row under the cursor. Every row of a card
@@ -11668,21 +11675,23 @@ fn pickerTop(selected: usize, visible_rows: usize) usize {
 }
 
 fn nextFileHeaderRow(buffer: buffer_mod.Buffer, cursor: usize) ?usize {
-    var row = cursor +| 1;
-    while (row < buffer.rows.len) : (row += 1) {
-        if (buffer.kindAt(row) == .file_header) return row;
+    var low: usize = 0;
+    var high = buffer.file_rows.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (buffer.file_rows[middle].first_row <= cursor) low = middle + 1 else high = middle;
     }
-    return null;
+    return if (low < buffer.file_rows.len) buffer.file_rows[low].first_row else null;
 }
 
 fn previousFileHeaderRow(buffer: buffer_mod.Buffer, cursor: usize) ?usize {
-    if (cursor == 0) return null;
-    var row = cursor;
-    while (row > 0) {
-        row -= 1;
-        if (buffer.kindAt(row) == .file_header) return row;
+    var low: usize = 0;
+    var high = buffer.file_rows.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (buffer.file_rows[middle].first_row < cursor) low = middle + 1 else high = middle;
     }
-    return null;
+    return if (low > 0) buffer.file_rows[low - 1].first_row else null;
 }
 
 fn fileHeaderRow(buffer: buffer_mod.Buffer, file_index: usize) ?usize {
@@ -11697,17 +11706,11 @@ fn captureVersionRestoration(published: *const Published, selected: SelectedVers
     } orelse return null;
     const source_line = lineNumber(current, published.selected_version) orelse return null;
     const file_index = published.activeFile() orelse return null;
-    const hunk_neighbors: VersionHunkNeighbors = if (current.in_hunk)
-        versionHunkNeighbors(published.session.diff.files[file_index], current, selected)
-    else
-        .{};
     return .{
         .session_epoch = published.epoch,
         .file_index = file_index,
         .selected_version = selected,
-        .exact_hunk_line = hunk_neighbors.exact,
-        .next_hunk_line = hunk_neighbors.next,
-        .prior_hunk_line = hunk_neighbors.prior,
+        .source_hunk_line = if (current.in_hunk) current else null,
         .from_hunk = current.in_hunk,
         .source_line = source_line,
         .source_offset = visual.source_start,
@@ -11715,33 +11718,47 @@ fn captureVersionRestoration(published: *const Published, selected: SelectedVers
     };
 }
 
-fn restoreVersionNavigation(published: *Published, target: VersionRestoration, selected: SelectedVersion) bool {
+fn restoreVersionNavigation(published: *Published, target: VersionRestoration, destination: VersionDestination) bool {
     if (published.epoch != target.session_epoch or target.file_index >= published.session.diff.files.len) return false;
+    if (destination.row) |index| {
+        published.navigation.jumpTo(index);
+        if (destination.found) {
+            published.navigation.scroll = index -| target.viewport_offset;
+            published.navigation.setViewport(published.navigation.viewport);
+        }
+    }
+    return destination.found;
+}
+
+/// Runs on the Frame worker, including the Hunk-neighbor and wrapped-row walks.
+fn versionNavigationDestination(session: *const Session, buffer: buffer_mod.Buffer, visual_rows: []const frame_mod.VisualRow, target: VersionRestoration, selected: SelectedVersion) VersionDestination {
+    if (target.file_index >= session.diff.files.len) return .{};
+    const neighbors = if (target.source_hunk_line) |line| versionHunkNeighbors(session.diff.files[target.file_index], line, selected) else VersionHunkNeighbors{};
     var chosen: ?*const bbr.diff.Line = null;
     var next_number: u32 = std.math.maxInt(u32);
     var prior_number: u32 = 0;
-    const next_hunk_number = if (target.next_hunk_line) |line| lineNumber(line, selected).? else std.math.maxInt(u32);
-    const prior_hunk_number = if (target.prior_hunk_line) |line| lineNumber(line, selected).? else 0;
-    for (published.visual_rows) |visual| {
-        if (published.buffer.fileIndexForRow(visual.buffer_index) != target.file_index) continue;
+    const next_hunk_number = if (neighbors.next) |line| lineNumber(line, selected).? else std.math.maxInt(u32);
+    const prior_hunk_number = if (neighbors.prior) |line| lineNumber(line, selected).? else 0;
+    for (visual_rows) |visual| {
+        if (buffer.fileIndexForRow(visual.buffer_index) != target.file_index) continue;
         const line = switch (selected) {
             .old => visual.yank_candidates.old,
             .new => visual.yank_candidates.new,
         } orelse continue;
-        if (target.exact_hunk_line == line) {
+        if (neighbors.exact == line) {
             chosen = line;
             break;
         }
-        if (target.exact_hunk_line != null) continue;
+        if (neighbors.exact != null) continue;
         const number = lineNumber(line, selected) orelse continue;
-        const is_next_hunk = target.next_hunk_line == line;
+        const is_next_hunk = neighbors.next == line;
         const is_next_blob = !line.in_hunk and number > target.source_line and number < next_hunk_number;
         const is_numeric_next = !target.from_hunk and number >= target.source_line;
         if ((is_next_hunk or is_next_blob or is_numeric_next) and number < next_number) {
             chosen = line;
             next_number = number;
         } else if (next_number == std.math.maxInt(u32) and
-            (target.prior_hunk_line == line or (!line.in_hunk and number < target.source_line and number > prior_hunk_number) or
+            (neighbors.prior == line or (!line.in_hunk and number < target.source_line and number > prior_hunk_number) or
                 (!target.from_hunk and number < target.source_line)) and number >= prior_number)
         {
             chosen = line;
@@ -11752,7 +11769,7 @@ fn restoreVersionNavigation(published: *Published, target: VersionRestoration, s
     if (chosen) |line| {
         var best: ?usize = null;
         var best_distance: usize = std.math.maxInt(usize);
-        for (published.visual_rows, 0..) |visual, index| {
+        for (visual_rows, 0..) |visual, index| {
             const candidate = switch (selected) {
                 .old => visual.yank_candidates.old,
                 .new => visual.yank_candidates.new,
@@ -11769,17 +11786,10 @@ fn restoreVersionNavigation(published: *Published, target: VersionRestoration, s
                 best_distance = distance;
             }
         }
-        if (best) |index| {
-            published.navigation.jumpTo(index);
-            published.navigation.scroll = index -| target.viewport_offset;
-            published.navigation.setViewport(published.navigation.viewport);
-            return true;
-        }
+        if (best) |index| return .{ .row = index, .found = true };
     }
 
-    if (fileHeaderRow(published.buffer, target.file_index)) |row| if (published.visualIndexForBufferIndex(row)) |index|
-        published.navigation.jumpTo(index);
-    return false;
+    return .{ .row = if (fileHeaderRow(buffer, target.file_index)) |row| frame_mod.visualIndexForBufferIndex(visual_rows, row) else null };
 }
 
 const VersionHunkNeighbors = struct {
@@ -12097,6 +12107,7 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
         times[@intFromEnum(Stage.clear_admission)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         try hidden.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
     }
+    try benchmarkNavigationRestoration(&presentation, io, "source");
     try benchmarkSearchSelection(&presentation, io);
     try benchmarkHiddenSearchNavigation(&hidden, io);
     std.debug.print("fixture_files={d} fixture_lines={d} fixture_bytes={d}\n", .{ files, files * lines * 2, raw.items.len });
@@ -12164,6 +12175,73 @@ fn linearInactiveSearch(published: *const Published, batch: search.Batch, rows: 
         .{ (start + offset % len) % len, first == null or offset >= len - start }
     else
         .{ (start + len - offset % len) % len, first == null or offset > start };
+}
+
+fn benchmarkNavigationRestoration(presentation: *Presentation, io: std.Io, label: []const u8) !void {
+    const published = presentation.published.?;
+    var previous = published.frameProjection();
+    previous.navigation.jumpTo(previous.visual_rows.len -| 1);
+    previous.navigation.mark = previous.navigation.cursor -| 1;
+    const Stage = enum { restoration, restoration_linear_control, file_header, file_header_linear_control };
+    var times: [@typeInfo(Stage).@"enum".fields.len][9]u64 = undefined;
+    for (0..9) |sample| {
+        var start = std.Io.Clock.awake.now(io);
+        const restored = frame_mod.restoreNavigationIndexed(previous, published.visual_rows, published.geometry, published.search_projection.navigation);
+        times[@intFromEnum(Stage.restoration)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        std.mem.doNotOptimizeAway(restored);
+        start = std.Io.Clock.awake.now(io);
+        const control = frame_mod.restoreNavigation(previous, published.visual_rows, published.geometry);
+        times[@intFromEnum(Stage.restoration_linear_control)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (!std.meta.eql(restored, control) or restored.cursor != previous.navigation.cursor or restored.mark != previous.navigation.mark) return error.NavigationControlMismatch;
+        const header = published.buffer.file_rows[published.buffer.file_rows.len - 1].first_row;
+        start = std.Io.Clock.awake.now(io);
+        const row = published.visualIndexForBufferIndex(header);
+        const next = nextFileHeaderRow(published.buffer, 0);
+        const prior = previousFileHeaderRow(published.buffer, published.buffer.rows.len);
+        times[@intFromEnum(Stage.file_header)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        start = std.Io.Clock.awake.now(io);
+        var linear_row: ?usize = null;
+        for (published.visual_rows, 0..) |visual, index| if (visual.buffer_index == header) {
+            linear_row = index;
+            break;
+        };
+        var linear_next: ?usize = null;
+        var linear_prior: ?usize = null;
+        for (published.buffer.rows, 0..) |buffer_row, index| if (buffer_row == .file_header) {
+            if (index > 0 and linear_next == null) linear_next = index;
+            linear_prior = index;
+        };
+        times[@intFromEnum(Stage.file_header_linear_control)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (row != linear_row or next != linear_next or prior != linear_prior) return error.FileHeaderControlMismatch;
+    }
+    std.debug.print("navigation_fixture={s} files={d} drafts={d} visual_rows={d}\n", .{ label, published.session.diff.files.len, published.review.drafts.items.len, published.visual_rows.len });
+    inline for (@typeInfo(Stage).@"enum".fields, 0..) |stage, index| {
+        std.mem.sort(u64, &times[index], {}, std.sort.asc(u64));
+        std.debug.print("stage=navigation_{s}_{s} median_ns={d} p95_ns={d}\n", .{ label, stage.name, times[index][4], times[index][8] });
+    }
+    if (!std.mem.eql(u8, label, "source")) return;
+    const saved_navigation = published.navigation;
+    defer published.navigation = saved_navigation;
+    published.navigation = previous.navigation;
+    const VersionStage = enum { capture, worker, admission };
+    var version_times: [3][9]u64 = undefined;
+    for (0..9) |sample| {
+        var start = std.Io.Clock.awake.now(io);
+        const target = captureVersionRestoration(published, .old) orelse return error.MissingVersionTarget;
+        version_times[@intFromEnum(VersionStage.capture)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        start = std.Io.Clock.awake.now(io);
+        const destination = versionNavigationDestination(published.session, published.buffer, published.visual_rows, target, .old);
+        version_times[@intFromEnum(VersionStage.worker)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        start = std.Io.Clock.awake.now(io);
+        const found = restoreVersionNavigation(published, target, destination);
+        version_times[@intFromEnum(VersionStage.admission)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (!found or published.navigation.cursor != destination.row.?) return error.VersionDestinationMismatch;
+        published.navigation = previous.navigation;
+    }
+    inline for (@typeInfo(VersionStage).@"enum".fields, 0..) |stage, index| {
+        std.mem.sort(u64, &version_times[index], {}, std.sort.asc(u64));
+        std.debug.print("stage=navigation_version_{s} median_ns={d} p95_ns={d}\n", .{ stage.name, version_times[index][4], version_times[index][8] });
+    }
 }
 
 fn benchmarkSearchSelection(presentation: *Presentation, io: std.Io) !void {
@@ -12418,6 +12496,7 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
     std.mem.sort(u64, &control, {}, std.sort.asc(u64));
     std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ if (many_inputs) "review_body_lookup_many_inputs" else "review_body_lookup", times[4], times[8] });
     std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ if (many_inputs) "review_body_lookup_many_inputs_linear_control" else "review_body_lookup_linear_control", control[4], control[8] });
+    try benchmarkNavigationRestoration(&presentation, io, if (many_inputs) "many_input_body" else "body");
     if (many_inputs) try benchmarkSidebar(&presentation, io);
     try benchmarkReviewDestination(&presentation, io, "x", if (many_inputs) "review_body_destination_many_inputs" else "review_body_destination");
     var draft_dispatch: [9]u64 = undefined;
@@ -13706,6 +13785,64 @@ test "M21 authored Buffer Search opening restores disclosures before scanning th
             try testing.expect(published.buffer_search.accepted_ranges.?.len > 0);
         }
     };
+}
+
+test "M21 kernel worker Frame admission restores the latest cursor Selection and Count" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try presentation.dispatch(.{ .resize = .{ .cols = 72, .rows = 12 } });
+    const job = presentation.takeCommand().?.build_buffer_disclosure;
+    job.build();
+    try testing.expect(!job.failed);
+    var last: ?usize = null;
+    var prior: ?usize = null;
+    for (published.visual_rows, 0..) |row, index| if (row.owner == .line) {
+        prior = last;
+        last = index;
+    };
+    published.navigation.jumpTo(last.?);
+    published.navigation.mark = prior.?;
+    published.navigation.count = 999;
+    const expected = frame_mod.restoreNavigation(published.frameProjection(), job.visual_rows, job.geometry);
+    try presentation.dispatch(.{ .buffer_disclosure_built = job });
+    try testing.expectEqual(expected, published.navigation);
+    try testing.expectEqual(@as(usize, 999), published.navigation.count);
+    try testing.expect(published.navigation.mark != null);
+}
+
+test "M21 kernel File-header navigation matches row order at boundaries and inside wrapped Lines" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 42, .rows = 12 },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try testing.expect(published.visual_rows.len > published.buffer.rows.len);
+    for (0..published.buffer.rows.len + 1) |cursor| {
+        var next: ?usize = null;
+        var prior: ?usize = null;
+        for (published.buffer.rows, 0..) |row, index| if (row == .file_header) {
+            if (index > cursor and next == null) next = index;
+            if (index < cursor) prior = index;
+        };
+        try testing.expectEqual(next, nextFileHeaderRow(published.buffer, cursor));
+        try testing.expectEqual(prior, previousFileHeaderRow(published.buffer, cursor));
+    }
+    for (published.visual_rows) |wanted| {
+        var first: ?usize = null;
+        for (published.visual_rows, 0..) |row, index| if (row.buffer_index == wanted.buffer_index) {
+            first = index;
+            break;
+        };
+        try testing.expectEqual(first, published.visualIndexForBufferIndex(wanted.buffer_index));
+    }
 }
 
 test "M21 authored Buffer Search opening Escape rejects old work across immediate reopening" {

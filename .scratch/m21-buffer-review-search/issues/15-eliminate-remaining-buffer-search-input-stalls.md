@@ -31,7 +31,7 @@ The original checklist is complete, but the following input-latency work remains
 - [x] Stage File Enrichment cache-focus and lease-release Frame changes. Completion Frames already use workers, but `focusEnrichment`, `finishSearchLease`, and `releaseReviewSearchHolds` can rebuild synchronously after eviction. Keep cache changes and Frame publication atomic.
 - [x] Index hidden Search Occurrence navigation and disclosure lookup. Frame construction indexes source coordinates, ReviewBody owners, Fold membership, disclosure rows, and inherited Draft disclosure chains. Hidden `n`, `N`, Count, Query clearing, and the scan-to-disclosure handoff use the indexes.
 - [x] Bound active-occurrence retention and origin selection during completion admission. Worker projection builds sorted occurrence-identity indexes and navigation prefix maxima and suffix minima. Completion admission and inactive traversal use binary lookup instead of complete Batch walks.
-- [ ] Bound navigation restoration during worker Frame admission. `frame.restoreNavigation` still searches complete visual-row arrays for the cursor and Selection. Version restoration and File-header navigation also need checks on large Frames.
+- [x] Bound navigation restoration during worker Frame admission. Worker Frames build owner and source-span navigation indexes. Admission restores the cursor, Selection, saved Buffer Search navigation, and origin through indexed lookup. Workers choose Selected Version and Draft deletion destinations. File-header navigation uses binary lookup.
 - [ ] Measure initial Session publication separately. `Published.create` still builds the initial Buffer, visual rows, File Tree, source-coordinate projection, and search corpus on the terminal thread. Move this work into Candidate Session preparation if the measurement shows an input stall.
 - [ ] Remove reachable synchronous search rebuild fallbacks after the paths above use workers. `prepareBufferForFile` still builds the corpus, scans accepted and input Queries, and projects complete Batches. Keep synchronous benchmark controls distinct from production dispatch. Add transition and failure tests for each newly staged path.
 - [ ] Extend the latency benchmark and record final evidence. Cover many Draft bodies, many ReviewCards, nested Directories, cache eviction, hidden occurrence traversal, and resize during pending input. Measure worker handoff and navigation restoration separately. Record fixture sizes, median latency, and p95 latency. Run `zig build test --summary all` after the implementation changes, then update this checklist and the ticket status.
@@ -505,3 +505,43 @@ The published navigation allocation uses 64 bytes per occurrence on this target.
 Tests compare indexed selection with linear selection in both Layouts at 45 and 100 columns. They cover wrapped source and ReviewBody ranges, hidden Folds and resolved Threads, typed Comment and Draft owners, and unavailable destinations. They also cover unordered Batches, duplicate identities, changed range ends, disappearing occurrences, empty Batches, Count, wrap status, and synchronous Frame publication. Existing tests cover rapid Query edits, pending Enter, stale Frames, cancellation, Session replacement, and worker failures. Allocation-failure tests exercise the new projection allocations.
 
 `zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 936 tests. The Standards and Spec self-review found no remaining findings for this item. The ticket remains `ready-for-agent`. The next remaining item is bounded navigation restoration during worker Frame admission.
+
+## Bounded Frame navigation restoration
+
+Each Frame now builds a `NavigationIndex` inside its retained `SearchProjection`. Exact ownership lookup keeps the first visual row for each owner. Source-span lookup indexes both SideBySide halves and typed Comment and Draft owners. Sorted spans and prefix end maxima support binary lookup for containing rows and following rows. Section keys own their path bytes.
+
+Worker Frame admission uses the index for the cursor and Selection. Width, cache, and disclosure restoration also use the index for saved Buffer Search navigation and origin. Admission reads the latest cursor, Selection, and Count from the published Frame. It preserves the viewport offset and the previous Selection rules. The linear restoration function remains a benchmark control and test reference. Production restoration does not call that control.
+
+Selected Version capture now records only the source Hunk Line identity and navigation coordinates. The worker finds Hunk neighbors and chooses the destination visual row. Admission applies that destination without a row walk. File Enrichment workers carry the pending Selected Version target. Admission checks that target against the current pending restoration before it applies the destination.
+
+Draft deletion workers retain the previous Frame's copied row identities. The worker chooses the surviving destination after it computes the complete deletion subtree. Admission uses indexed owner lookup for the surviving row and re-anchored Draft header. Next and previous File-header navigation use the existing sorted File row table. Buffer-row to visual-row lookup also uses binary search.
+
+`zig build bench-buffer-search -- 4096` measured nine ReleaseFast samples without concurrent build or test work. The source fixture contains 16 Files, 131,072 changed Lines, and 2,193,960 Diff bytes. Its SideBySide Frame contains 65,568 visual rows at 80 terminal columns. Both ReviewBody fixtures contain 1,024 Drafts and 4,194,304 body bytes. The collapsed one-File fixture contains 8,197 visual rows. The many-input fixture contains 100,352 visual rows. It also contains 1,024 enriched Files, 1,024 collapsed Directories, 1,024 expanded ReviewCards, and 4,194,304 AnchorSnapshot bytes.
+
+Restoration samples place the cursor on the last visual row and the Selection mark on the preceding row. Each linear control restores the same navigation and checks the complete result. File-header samples check the last File's visual header, the next header after row zero, and the previous header before Buffer end. Fixture setup and index construction occur outside these lookup measurements. Values are nanoseconds.
+
+| Stage | Median ns | p95 ns |
+| --- | ---: | ---: |
+| Source navigation restoration | 250 | 19,208 |
+| Source navigation linear control | 329,459 | 1,275,167 |
+| Source File-header lookup | 125 | 208 |
+| Source File-header linear control | 113,000 | 175,292 |
+| One-File ReviewBody navigation restoration | 83 | 4,792 |
+| One-File ReviewBody navigation linear control | 44,000 | 58,334 |
+| One-File File-header lookup | 42 | 83 |
+| One-File File-header linear control | 11,333 | 11,917 |
+| Many-input ReviewBody navigation restoration | 375 | 1,209 |
+| Many-input ReviewBody navigation linear control | 345,041 | 383,083 |
+| Many-input File-header lookup | 333 | 958 |
+| Many-input File-header linear control | 360,083 | 452,875 |
+| Selected Version capture | 42 | 542 |
+| Selected Version worker destination | 231,833 | 268,292 |
+| Selected Version navigation admission | 0 | 42 |
+
+The Selected Version sample changes from new to old at the bottom source row. Worker destination work includes the earlier Hunk-neighbor and visual-row walks. The zero admission median falls below the clock's measurement resolution. It does not mean that admission has no cost.
+
+These measurements isolate navigation work. Complete admission still includes persistence and release of the previous Frame, Batch, and ranges. Width admission during pending Buffer Search input measured 4,568,750 ns median and 5,617,791 ns p95 on the source fixture. Many-input Draft deletion admission measured 9,660,584 ns median and 10,612,125 ns p95. The later admission-latency and final benchmark work remain open.
+
+New tests compare indexed lookup with linear lookup across wrapped source rows, overlapping ReviewBody spans, typed owners, and collapsed footers. They also cover empty Lines, missing owners, content-equal Section paths, Selection, Count, viewport offsets, and File-header boundaries. A worker admission test changes the cursor and Selection after the worker finishes. Existing tests cover saved Buffer Search navigation, Selected Version fallback, File Enrichment restoration, Draft deletion navigation, stale Frames, cancellation, Session replacement, and allocation failures.
+
+`zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 940 tests. The Standards and Spec self-review found no remaining findings for this item. The ticket remains `ready-for-agent`. The next remaining item is the separate measurement of initial Session publication.
