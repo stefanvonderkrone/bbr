@@ -818,8 +818,8 @@ pub const BufferSearchCorpus = struct {
     }
 };
 
-/// A pointer-free copy of visual row coordinates. The scan worker can use it
-/// after a Buffer rebuild or Session replacement without reading either owner.
+/// Immutable Frame search indexes. Workers read copied coordinates only.
+/// Disclosure pointers are identities, never dereferenced after construction.
 const SearchProjection = struct {
     const Result = struct {
         ranges: []frame_mod.ProjectedSourceRange,
@@ -843,10 +843,25 @@ const SearchProjection = struct {
 
     arena: std.heap.ArenaAllocator,
     rows: []const Row,
+    source_rows: std.AutoHashMapUnmanaged(SourceRowKey, std.ArrayList(usize)) = .empty,
+    body_rows: std.AutoHashMapUnmanaged(search.ReviewBodyOwner, std.ArrayList(usize)) = .empty,
+    source_disclosures: std.AutoHashMapUnmanaged(SourceRowKey, buffer_mod.DisclosureKey) = .empty,
+    body_disclosures: std.AutoHashMapUnmanaged(search.ReviewBodyOwner, SearchDisclosureSet) = .empty,
+    disclosure_rows: std.AutoHashMapUnmanaged(buffer_mod.DisclosureKey, usize) = .empty,
     references: std.atomic.Value(usize) = .init(1),
 
-    fn create(buffer: buffer_mod.Buffer, visual_rows: []const frame_mod.VisualRow) !*SearchProjection {
-        const backing = std.heap.page_allocator;
+    const Context = struct {
+        session: *const Session,
+        drafts: []const bbr.review.Draft,
+        scopes: []const bbr.review.ScopeProjectionEntry,
+        selected_version: SelectedVersion,
+    };
+
+    fn create(buffer: buffer_mod.Buffer, visual_rows: []const frame_mod.VisualRow, context: Context) !*SearchProjection {
+        return createWithAllocator(std.heap.page_allocator, buffer, visual_rows, context);
+    }
+
+    fn createWithAllocator(backing: Allocator, buffer: buffer_mod.Buffer, visual_rows: []const frame_mod.VisualRow, context: Context) !*SearchProjection {
         const snapshot = try backing.create(SearchProjection);
         snapshot.* = .{ .arena = std.heap.ArenaAllocator.init(backing), .rows = &.{} };
         errdefer {
@@ -875,7 +890,168 @@ const SearchProjection = struct {
             }
         }
         snapshot.rows = rows;
+        const a = snapshot.arena.allocator();
+        for (rows, visual_rows, 0..) |row, visual, index| {
+            if (row.file_index) |file_index| {
+                if (row.left) |half| if (half.old_line) |number| try addSourceRow(a, &snapshot.source_rows, .{ .file_index = file_index, .line = number, .side = .old }, index);
+                if (row.right) |half| if (half.new_line) |number| try addSourceRow(a, &snapshot.source_rows, .{ .file_index = file_index, .line = number, .side = .new }, index);
+                if (row.single) |half| {
+                    if (half.old_line) |number| try addSourceRow(a, &snapshot.source_rows, .{ .file_index = file_index, .line = number, .side = .old }, index);
+                    if (half.new_line) |number| try addSourceRow(a, &snapshot.source_rows, .{ .file_index = file_index, .line = number, .side = .new }, index);
+                }
+            }
+            if (row.owner) |owner| {
+                const entry = try snapshot.body_rows.getOrPut(a, switch (owner) {
+                    .comment => |id| .{ .comment = id },
+                    .draft => |id| .{ .draft = id },
+                });
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(a, index);
+            }
+            if (buffer_mod.disclosureKey(buffer.rows[visual.buffer_index])) |key| {
+                const entry = try snapshot.disclosure_rows.getOrPut(a, key);
+                if (!entry.found_existing) entry.value_ptr.* = index;
+            }
+        }
+        try snapshot.indexDisclosures(buffer, context);
         return snapshot;
+    }
+
+    fn indexDisclosures(self: *SearchProjection, buffer: buffer_mod.Buffer, context: Context) !void {
+        const a = self.arena.allocator();
+        var outdated_files: std.StringHashMapUnmanaged(buffer_mod.DisclosureKey) = .empty;
+        var opposite_files: std.StringHashMapUnmanaged(buffer_mod.DisclosureKey) = .empty;
+        var outdated_review = false;
+        for (buffer.rows, 0..) |row, index| {
+            const key = buffer_mod.disclosureKey(row) orelse continue;
+            switch (key) {
+                .outdated_file, .opposite_version => |file| {
+                    const map = if (key == .outdated_file) &outdated_files else &opposite_files;
+                    try map.put(a, file.old_path, key);
+                    try map.put(a, file.new_path, key);
+                },
+                .outdated_review => outdated_review = true,
+                .fold => |first| {
+                    const file_index = buffer.fileIndexForRow(index) orelse continue;
+                    // Buffer Folds own a contiguous subslice of one Hunk.
+                    const lines = @as([*]const bbr.diff.Line, @ptrCast(first))[0..row.disclosure.count];
+                    for (lines) |line| {
+                        if (line.oldNo()) |number| try self.source_disclosures.put(a, .{ .file_index = file_index, .line = number, .side = .old }, key);
+                        if (line.newNo()) |number| try self.source_disclosures.put(a, .{ .file_index = file_index, .line = number, .side = .new }, key);
+                    }
+                },
+                else => {},
+            }
+        }
+        var comment_chains: std.AutoHashMapUnmanaged(bbr.review.CommentId, SearchDisclosureSet) = .empty;
+        for (context.session.threads) |thread| {
+            const root = thread.root;
+            const chain = disclosureChain(root.effectiveScope(), root.state == .outdated, context.selected_version, outdated_files, opposite_files, outdated_review);
+            var required = chain;
+            if (thread.resolved) required.append(.{ .resolved_thread = root.id });
+            const owners = try a.alloc(bbr.review.CommentId, thread.replies.len + 1);
+            owners[0] = root.id;
+            for (thread.replies, owners[1..]) |reply, *id| id.* = reply.id;
+            for (owners) |id| {
+                try comment_chains.put(a, id, chain);
+                var keys = required;
+                keys.append(.{ .review_card = .{ .comment = id } });
+                try self.body_disclosures.put(a, .{ .comment = id }, keys);
+            }
+        }
+        var drafts: std.AutoHashMapUnmanaged(bbr.review.TempId, usize) = .empty;
+        var scopes: std.AutoHashMapUnmanaged(bbr.review.TempId, bbr.review.ScopeResolution) = .empty;
+        var chains: std.AutoHashMapUnmanaged(bbr.review.TempId, SearchDisclosureSet) = .empty;
+        for (context.drafts, 0..) |draft, index| try drafts.put(a, draft.local_id, index);
+        for (context.scopes) |scope| try scopes.put(a, scope.temp_id, scope.resolution);
+        var path: std.ArrayList(bbr.review.TempId) = .empty;
+        for (context.drafts) |draft| {
+            path.clearRetainingCapacity();
+            var current = draft;
+            var chain: SearchDisclosureSet = .{};
+            while (path.items.len < context.drafts.len) {
+                if (chains.get(current.local_id)) |cached| {
+                    chain = cached;
+                    break;
+                }
+                try path.append(a, current.local_id);
+                if (current.parent) |parent| switch (parent) {
+                    .comment => |id| {
+                        chain = comment_chains.get(id) orelse .{};
+                        break;
+                    },
+                    .draft => |id| current = context.drafts[drafts.get(id) orelse break],
+                } else {
+                    if (scopes.get(current.local_id)) |resolution| if (resolution == .resolved) {
+                        const resolved = resolution.resolved;
+                        chain = disclosureChain(resolved.scope, resolved.state == .outdated, context.selected_version, outdated_files, opposite_files, outdated_review);
+                    };
+                    break;
+                }
+            }
+            for (path.items) |id| try chains.put(a, id, chain);
+            chain.append(.{ .review_card = .{ .draft = draft.local_id } });
+            try self.body_disclosures.put(a, .{ .draft = draft.local_id }, chain);
+        }
+    }
+
+    fn requiredDisclosures(self: *const SearchProjection, occurrence: search.Occurrence) SearchDisclosureSet {
+        var result: SearchDisclosureSet = .{};
+        switch (occurrence.location) {
+            .review_body => |body| return self.body_disclosures.get(body.owner) orelse result,
+            .source => |source| if (sourceRowKey(source)) |key| if (self.source_disclosures.get(key)) |disclosure| result.append(disclosure),
+        }
+        return result;
+    }
+
+    fn occurrenceRows(self: *const SearchProjection, occurrence: search.Occurrence) []const usize {
+        const rows = switch (occurrence.location) {
+            .source => |source| self.source_rows.get(sourceRowKey(source) orelse return &.{}),
+            .review_body => |body| self.body_rows.get(body.owner),
+        };
+        return if (rows) |value| value.items else &.{};
+    }
+
+    fn visibleRow(self: *const SearchProjection, occurrence: search.Occurrence) ?usize {
+        if (occurrence.ranges.len == 0) return null;
+        const first = occurrence.ranges[0];
+        var navigation_occurrence = occurrence;
+        if (navigation_occurrence.location == .source and navigation_occurrence.location.source.relation == .neutral)
+            navigation_occurrence.location.source.relation = .new;
+        const rows = self.occurrenceRows(navigation_occurrence);
+        var low: usize = 0;
+        var high = rows.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const span = self.rowSpan(rows[middle], occurrence) orelse return null;
+            if (span[1] <= first.start) low = middle + 1 else high = middle;
+        }
+        if (low == rows.len) return null;
+        const span = self.rowSpan(rows[low], occurrence) orelse return null;
+        if (first.start < span[1] and first.end > span[0]) return rows[low];
+        return null;
+    }
+
+    fn rowSpan(self: *const SearchProjection, index: usize, occurrence: search.Occurrence) ?[2]usize {
+        const row = self.rows[index];
+        return switch (occurrence.location) {
+            .source => |source| blk: {
+                const half = if (row.single) |half| half else if (source.relation == .old) row.left orelse return null else row.right orelse return null;
+                if (!projectionLineMatches(half, source, if (row.single != null) source.relation else if (source.relation == .old) .old else .new)) return null;
+                break :blk .{ half.start, half.end };
+            },
+            .review_body => .{ row.start, row.end },
+        };
+    }
+
+    fn navigationRow(self: *const SearchProjection, occurrence: search.Occurrence) ?usize {
+        if (self.visibleRow(occurrence)) |row| return row;
+        const required = self.requiredDisclosures(occurrence);
+        var first: ?usize = null;
+        for (required.items[0..required.len]) |key| if (self.disclosure_rows.get(key)) |row| {
+            first = if (first) |previous| @min(previous, row) else row;
+        };
+        return first;
     }
 
     fn retain(self: *SearchProjection) void {
@@ -885,7 +1061,7 @@ const SearchProjection = struct {
     fn release(self: *SearchProjection) void {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         self.arena.deinit();
-        std.heap.page_allocator.destroy(self);
+        self.arena.child_allocator.destroy(self);
     }
 
     fn project(self: *const SearchProjection, allocator: Allocator, batch: search.Batch) !Result {
@@ -895,22 +1071,9 @@ const SearchProjection = struct {
         var projected: std.ArrayList(frame_mod.ProjectedSourceRange) = .empty;
         const navigation_rows = try temp.alloc(?usize, batch.occurrences.len);
         @memset(navigation_rows, null);
-        var source_rows: std.AutoHashMapUnmanaged(SourceRowKey, std.ArrayList(usize)) = .empty;
-        for (self.rows, 0..) |row, index| {
-            const file_index = row.file_index orelse continue;
-            if (row.left) |half| if (half.old_line) |number| try addSourceRow(temp, &source_rows, .{ .file_index = file_index, .line = number, .side = .old }, index);
-            if (row.right) |half| if (half.new_line) |number| try addSourceRow(temp, &source_rows, .{ .file_index = file_index, .line = number, .side = .new }, index);
-            if (row.single) |half| {
-                if (half.old_line) |number| try addSourceRow(temp, &source_rows, .{ .file_index = file_index, .line = number, .side = .old }, index);
-                if (half.new_line) |number| try addSourceRow(temp, &source_rows, .{ .file_index = file_index, .line = number, .side = .new }, index);
-            }
-        }
         for (batch.occurrences, 0..) |occurrence, occurrence_index| switch (occurrence.location) {
             .source => |source| {
-                const number = if (source.relation == .new) source.new_line else source.old_line;
-                const key: SourceRowKey = .{ .file_index = source.file_index, .line = number orelse continue, .side = if (source.relation == .new) .new else .old };
-                const rows = source_rows.get(key) orelse continue;
-                for (rows.items) |index| {
+                for (self.occurrenceRows(occurrence)) |index| {
                     const row = self.rows[index];
                     if (row.left) |half| if ((source.relation == .old or source.relation == .neutral) and projectionLineMatches(half, source, .old))
                         try appendIndexedIntersections(temp, &projected, navigation_rows, occurrence, occurrence_index, index, .old, half.start, half.end);
@@ -920,12 +1083,9 @@ const SearchProjection = struct {
                         try appendIndexedIntersections(temp, &projected, navigation_rows, occurrence, occurrence_index, index, source.relation, half.start, half.end);
                 }
             },
-            .review_body => |body| for (self.rows, 0..) |row, index| {
-                if (row.owner) |owner| if (switch (owner) {
-                    .comment => |id| body.owner == .comment and body.owner.comment == id,
-                    .draft => |id| body.owner == .draft and body.owner.draft == id,
-                })
-                    try appendIndexedIntersections(temp, &projected, navigation_rows, occurrence, occurrence_index, index, .neutral, row.start, row.end);
+            .review_body => for (self.occurrenceRows(occurrence)) |index| {
+                const row = self.rows[index];
+                try appendIndexedIntersections(temp, &projected, navigation_rows, occurrence, occurrence_index, index, .neutral, row.start, row.end);
             },
         };
         std.mem.sort(frame_mod.ProjectedSourceRange, projected.items, {}, searchRangeLess);
@@ -958,9 +1118,16 @@ fn searchRangeLess(_: void, left: frame_mod.ProjectedSourceRange, right: frame_m
 }
 
 const DisclosureKeys = struct {
+    var next_id: std.atomic.Value(u64) = .init(1);
+
     references: std.atomic.Value(usize) = .init(1),
     allocator: Allocator,
     list: std.ArrayList(buffer_mod.DisclosureKey) = .empty,
+    members: std.AutoHashMapUnmanaged(buffer_mod.DisclosureKey, void) = .empty,
+    id: u64,
+    base_id: ?u64 = null,
+    added: SearchDisclosureSet = .{},
+    removed: ?buffer_mod.DisclosureKey = null,
 
     fn create(keys: []const buffer_mod.DisclosureKey) !*DisclosureKeys {
         return createWithAllocator(std.heap.page_allocator, keys);
@@ -968,10 +1135,20 @@ const DisclosureKeys = struct {
 
     fn createWithAllocator(allocator: Allocator, keys: []const buffer_mod.DisclosureKey) !*DisclosureKeys {
         const self = try allocator.create(DisclosureKeys);
-        self.* = .{ .allocator = allocator };
+        self.* = .{ .allocator = allocator, .id = next_id.fetchAdd(1, .monotonic) };
         errdefer self.release();
         try self.list.appendSlice(allocator, keys);
+        try self.index();
         return self;
+    }
+
+    fn index(self: *DisclosureKeys) !void {
+        self.members.clearRetainingCapacity();
+        for (self.list.items) |key| try self.members.put(self.allocator, key, {});
+    }
+
+    fn contains(self: *const DisclosureKeys, key: buffer_mod.DisclosureKey) bool {
+        return self.members.contains(key);
     }
 
     fn retain(self: *DisclosureKeys) *DisclosureKeys {
@@ -983,6 +1160,7 @@ const DisclosureKeys = struct {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         const allocator = self.allocator;
         self.list.deinit(allocator);
+        self.members.deinit(allocator);
         allocator.destroy(self);
     }
 
@@ -996,6 +1174,26 @@ const DisclosureTarget = struct {
     base: *DisclosureKeys,
     add: SearchDisclosureSet = .{},
     remove: ?buffer_mod.DisclosureKey = null,
+
+    // Search-owned keys are a retained baseline plus at most three additions.
+    // Unknown provenance conservatively queues a worker instead of scanning keys.
+    fn matchesKeys(self: DisclosureTarget, keys: *const DisclosureKeys) bool {
+        var added: SearchDisclosureSet = .{};
+        const removed = if (self.remove) |key| if (self.base.contains(key)) key else null else null;
+        for (self.add.items[0..self.add.len]) |key| {
+            if (self.base.contains(key) and (removed == null or !std.meta.eql(removed.?, key))) continue;
+            var exists = false;
+            for (added.items[0..added.len]) |previous| if (std.meta.eql(previous, key)) {
+                exists = true;
+                break;
+            };
+            if (!exists) added.append(key);
+        }
+        if (keys == self.base) return added.len == 0 and removed == null;
+        if (keys.base_id != self.base.id or !std.meta.eql(keys.removed, removed) or keys.added.len != added.len) return false;
+        for (keys.added.items[0..keys.added.len], added.items[0..added.len]) |left, right| if (!std.meta.eql(left, right)) return false;
+        return true;
+    }
 
     fn matches(self: DisclosureTarget, keys: []const buffer_mod.DisclosureKey) bool {
         var index: usize = 0;
@@ -1025,16 +1223,23 @@ const DisclosureTarget = struct {
     }
 
     fn build(self: DisclosureTarget, allocator: Allocator) !*DisclosureKeys {
-        if (self.add.len == 0 and self.remove == null) return self.base.retain();
+        if (self.matchesKeys(self.base)) return self.base.retain();
         const keys = try DisclosureKeys.createWithAllocator(allocator, self.base.items());
         errdefer keys.release();
+        keys.base_id = self.base.id;
         if (self.remove) |removed| for (keys.list.items, 0..) |key, index| {
             if (std.meta.eql(removed, key)) {
                 _ = keys.list.orderedRemove(index);
+                keys.removed = removed;
                 break;
             }
         };
-        for (self.add.items[0..self.add.len]) |key| try addSearchDisclosure(allocator, &keys.list, key);
+        for (self.add.items[0..self.add.len]) |key| {
+            const before = keys.list.items.len;
+            try addSearchDisclosure(allocator, &keys.list, key);
+            if (keys.list.items.len != before) keys.added.append(key);
+        }
+        try keys.index();
         return keys;
     }
 };
@@ -1482,7 +1687,12 @@ pub const DisclosureBuild = struct {
         });
         const panes = frame_mod.paneRects(self.geometry);
         self.tree = try file_tree.build(a, self.session.diff, self.buffer.file_tallies, self.collapsed_directories, self.active_file, panes.sidebar_content.width, panes.sidebar_content.height, self.wanted_cursor, self.tree_scroll, self.cell_metrics);
-        self.projection = try SearchProjection.create(self.buffer, self.visual_rows);
+        self.projection = try SearchProjection.create(self.buffer, self.visual_rows, .{
+            .session = self.session,
+            .drafts = self.drafts,
+            .scopes = self.scopes,
+            .selected_version = self.preferences.selected_version,
+        });
         if (self.kind == .review_destination) {
             self.destination_row = occurrenceVisualRowFor(self.buffer, self.visual_rows, self.review_snapshot.?.occurrences[self.review_selected.?]);
         }
@@ -2708,7 +2918,12 @@ const Published = struct {
             .layout = preferences.layout,
             .width = frame_mod.paneRects(geometry).diff_content.width,
         });
-        published.search_projection = try SearchProjection.create(published.buffer, published.visual_rows);
+        published.search_projection = try SearchProjection.create(published.buffer, published.visual_rows, .{
+            .session = session,
+            .drafts = published.review.drafts.items,
+            .scopes = published.scope_projection.items,
+            .selected_version = preferences.selected_version,
+        });
         errdefer published.search_projection.release();
         const panes = frame_mod.paneRects(geometry);
         published.tree = try file_tree.build(
@@ -3015,7 +3230,12 @@ const Published = struct {
             .layout = preferences.layout,
             .width = frame_mod.paneRects(geometry).diff_content.width,
         });
-        const search_projection = try SearchProjection.create(candidate, visual_rows);
+        const search_projection = try SearchProjection.create(candidate, visual_rows, .{
+            .session = self.session,
+            .drafts = self.review.drafts.items,
+            .scopes = self.scope_projection.items,
+            .selected_version = preferences.selected_version,
+        });
         errdefer search_projection.release();
         const panes = frame_mod.paneRects(geometry);
         const wanted_cursor = if (self.tree.entries.len == 0) null else self.tree.entries[self.tree.cursor].identity;
@@ -3223,7 +3443,7 @@ const Published = struct {
     }
 
     fn occurrenceVisualRow(self: *const Published, occurrence: search.Occurrence) ?usize {
-        return occurrenceVisualRowFor(self.buffer, self.visual_rows, occurrence);
+        return self.search_projection.visibleRow(occurrence);
     }
 
     fn jumpToSearchOccurrence(self: *Published, occurrence: search.Occurrence) bool {
@@ -7092,21 +7312,11 @@ pub const Presentation = struct {
     fn queueQueryClearDisclosure(self: *Presentation, published: *Published, occurrence: ?search.Occurrence) !?*DisclosureBuild {
         var required: SearchDisclosureSet = .{};
         if (occurrence) |active| {
-            if (published.occurrenceVisualRow(active) == null) {
-                required = requiredSearchDisclosure(published, active);
-            } else if (published.buffer_search.saved_disclosures != null) {
-                const possible = requiredSearchDisclosure(published, active);
-                for (possible.items[0..possible.len]) |key| {
-                    for (published.expanded_disclosures.items) |expanded| if (std.meta.eql(expanded, key)) {
-                        required.append(key);
-                        break;
-                    };
-                }
-            }
+            required = searchDisclosureForVisibility(published, active, published.occurrenceVisualRow(active) != null);
         }
         if (required.len == 0 and published.buffer_search.saved_disclosures == null) return null;
         const target: DisclosureTarget = .{ .base = published.buffer_search.saved_disclosures orelse published.disclosure_keys, .add = required };
-        if (target.matches(published.expanded_disclosures.items)) return null;
+        if (target.matchesKeys(published.disclosure_keys)) return null;
         const job = try self.queueAcceptedDisclosure(published, target, published.buffer_search.active, .clear_input, null);
         job.clear_saved_disclosures = required.len == 0;
         job.restore_navigation = published.buffer_search.input.?.saved_navigation;
@@ -7233,21 +7443,11 @@ pub const Presentation = struct {
         if (active) |index| {
             const occurrence = batch.occurrences[index];
             const visible = if (navigation_rows) |rows| rows[index] else published.occurrenceVisualRow(occurrence);
-            if (visible == null) {
-                required = requiredSearchDisclosure(published, occurrence);
-            } else if (published.buffer_search.saved_disclosures != null) {
-                const possible = requiredSearchDisclosure(published, occurrence);
-                for (possible.items[0..possible.len]) |key| {
-                    for (published.expanded_disclosures.items) |expanded| if (std.meta.eql(expanded, key)) {
-                        required.append(key);
-                        break;
-                    };
-                }
-            }
+            required = searchDisclosureForVisibility(published, occurrence, visible != null);
         }
         if (required.len == 0 and published.buffer_search.saved_disclosures == null) return false;
         const target: DisclosureTarget = .{ .base = published.buffer_search.saved_disclosures orelse published.disclosure_keys, .add = required };
-        if (target.matches(published.expanded_disclosures.items)) return false;
+        if (target.matchesKeys(published.disclosure_keys)) return false;
         const job = try DisclosureBuild.create(published, self.preferences, target, request_id, active);
         errdefer job.destroy();
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
@@ -8088,21 +8288,10 @@ pub const Presentation = struct {
                 return;
             }
         }
-        var required: SearchDisclosureSet = .{};
         const occurrence = batch.occurrences[next];
-        if (published.occurrenceVisualRow(occurrence) == null) {
-            required = requiredSearchDisclosure(published, occurrence);
-        } else if (published.buffer_search.saved_disclosures != null) {
-            const possible = requiredSearchDisclosure(published, occurrence);
-            for (possible.items[0..possible.len]) |key| {
-                for (published.expanded_disclosures.items) |expanded| if (std.meta.eql(expanded, key)) {
-                    required.append(key);
-                    break;
-                };
-            }
-        }
+        const required = searchDisclosureForVisibility(published, occurrence, published.occurrenceVisualRow(occurrence) != null);
         const target: DisclosureTarget = .{ .base = published.buffer_search.saved_disclosures orelse published.disclosure_keys, .add = required };
-        if (!target.matches(published.expanded_disclosures.items)) {
+        if (!target.matchesKeys(published.disclosure_keys)) {
             const status: ?ActionError = if (wrapped) switch (direction) {
                 .forward => .buffer_search_hit_bottom,
                 .backward => .buffer_search_hit_top,
@@ -8152,21 +8341,18 @@ pub const Presentation = struct {
     fn updateSearchOwnedDisclosure(self: *Presentation, published: *Published, occurrence: ?search.Occurrence) BufferTransactionError!void {
         var required: SearchDisclosureSet = .{};
         if (occurrence) |active| {
-            const visible = published.occurrenceVisualRow(active) != null;
-            if (!visible) {
-                required = requiredSearchDisclosure(published, active);
-            } else if (published.buffer_search.saved_disclosures != null) {
-                const possible = requiredSearchDisclosure(published, active);
-                for (possible.items[0..possible.len]) |key| {
-                    for (published.expanded_disclosures.items) |expanded| if (std.meta.eql(expanded, key)) {
-                        required.append(key);
-                        break;
-                    };
-                }
-            }
+            required = searchDisclosureForVisibility(published, active, published.occurrenceVisualRow(active) != null);
         }
 
         if (required.len == 0 and published.buffer_search.saved_disclosures == null) return;
+        const disclosure_target: DisclosureTarget = .{ .base = published.buffer_search.saved_disclosures orelse published.disclosure_keys, .add = required };
+        if (disclosure_target.matchesKeys(published.disclosure_keys)) {
+            if (required.len == 0) if (published.buffer_search.saved_disclosures) |saved| {
+                saved.release();
+                published.buffer_search.saved_disclosures = null;
+            };
+            return;
+        }
         const base = if (published.buffer_search.saved_disclosures) |keys| keys.items() else published.expanded_disclosures.items;
 
         var target: std.ArrayList(buffer_mod.DisclosureKey) = .empty;
@@ -10843,29 +11029,15 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
 }
 
 fn requiredSearchDisclosure(published: *const Published, occurrence: search.Occurrence) SearchDisclosureSet {
+    return published.search_projection.requiredDisclosures(occurrence);
+}
+
+fn searchDisclosureForVisibility(published: *const Published, occurrence: search.Occurrence, visible: bool) SearchDisclosureSet {
+    const possible = requiredSearchDisclosure(published, occurrence);
+    if (!visible) return possible;
     var result: SearchDisclosureSet = .{};
-    switch (occurrence.location) {
-        .review_body => |body| switch (body.owner) {
-            .comment => |id| {
-                for (published.session.threads) |thread| {
-                    var owns = thread.root.id == id;
-                    for (thread.replies) |reply| if (reply.id == id) {
-                        owns = true;
-                        break;
-                    };
-                    if (!owns) continue;
-                    appendCommentDisclosureChain(published, thread, &result);
-                    if (thread.resolved) result.append(.{ .resolved_thread = thread.root.id });
-                    break;
-                }
-                result.append(.{ .review_card = .{ .comment = id } });
-            },
-            .draft => |id| {
-                appendDraftDisclosureChain(published, id, &result);
-                result.append(.{ .review_card = .{ .draft = id } });
-            },
-        },
-        .source => |source| return sourceFoldDisclosure(published.session, published.buffer, source),
+    if (published.buffer_search.saved_disclosures != null) {
+        for (possible.items[0..possible.len]) |key| if (published.disclosure_keys.contains(key)) result.append(key);
     }
     return result;
 }
@@ -10900,53 +11072,20 @@ fn sourceFoldDisclosure(session: *const Session, buffer: buffer_mod.Buffer, sour
     return result;
 }
 
-fn appendCommentDisclosureChain(published: *const Published, thread: bbr.review.Thread, result: *SearchDisclosureSet) void {
-    const root = thread.root;
-    for (published.buffer.rows) |row| {
-        const key = buffer_mod.disclosureKey(row) orelse continue;
-        switch (key) {
-            .outdated_file => |file| if (root.state == .outdated and root.anchor != null and pathMatchesFile(root.anchor.?.path, file.*)) result.append(key),
-            .outdated_review => if (root.state == .outdated) result.append(key),
-            .opposite_version => |file| if (root.state != .outdated and root.anchor != null and pathMatchesFile(root.anchor.?.path, file.*) and anchorOpposesSelected(root.anchor.?, published.selected_version)) result.append(key),
-            else => {},
-        }
+fn disclosureChain(scope: bbr.review.CommentScope, outdated: bool, selected: SelectedVersion, outdated_files: std.StringHashMapUnmanaged(buffer_mod.DisclosureKey), opposite_files: std.StringHashMapUnmanaged(buffer_mod.DisclosureKey), outdated_review: bool) SearchDisclosureSet {
+    var result: SearchDisclosureSet = .{};
+    const path: ?[]const u8 = switch (scope) {
+        .review => null,
+        .file => |file| file.path,
+        .@"inline" => |anchor| anchor.path,
+    };
+    if (outdated) {
+        if (path) |value| if (outdated_files.get(value)) |key| result.append(key);
+        if (outdated_review) result.append(.outdated_review);
+    } else if (scope == .@"inline" and anchorOpposesSelected(scope.@"inline", selected)) {
+        if (opposite_files.get(scope.@"inline".path)) |key| result.append(key);
     }
-}
-
-fn appendDraftDisclosureChain(published: *const Published, temp_id: bbr.review.TempId, result: *SearchDisclosureSet) void {
-    var draft = published.review.getConst(temp_id) orelse return;
-    while (draft.parent) |parent| switch (parent) {
-        .comment => |comment_id| {
-            for (published.session.threads) |thread| {
-                var owns = thread.root.id == comment_id;
-                for (thread.replies) |reply| if (reply.id == comment_id) {
-                    owns = true;
-                    break;
-                };
-                if (owns) appendCommentDisclosureChain(published, thread, result);
-            }
-            return;
-        },
-        .draft => |parent_id| draft = published.review.getConst(parent_id) orelse return,
-    };
-    var resolution: ?bbr.review.ScopeResolution = null;
-    for (published.scope_projection.items) |entry| if (entry.temp_id == draft.local_id) {
-        resolution = entry.resolution;
-        break;
-    };
-    const resolved = switch (resolution orelse return) {
-        .resolved => |value| value,
-        .unavailable => return,
-    };
-    for (published.buffer.rows) |row| {
-        const key = buffer_mod.disclosureKey(row) orelse continue;
-        switch (key) {
-            .outdated_file => |file| if (resolved.state == .outdated and scopePathMatchesFile(resolved.scope, file.*)) result.append(key),
-            .outdated_review => if (resolved.state == .outdated) result.append(key),
-            .opposite_version => |file| if (resolved.state != .outdated and resolved.scope == .@"inline" and pathMatchesFile(resolved.scope.@"inline".path, file.*) and anchorOpposesSelected(resolved.scope.@"inline", published.selected_version)) result.append(key),
-            else => {},
-        }
-    }
+    return result;
 }
 
 fn scopePathMatchesFile(scope: bbr.review.CommentScope, file: bbr.diff.File) bool {
@@ -10970,6 +11109,14 @@ const SourceRowKey = struct {
     line: u32,
     side: enum { old, new },
 };
+
+fn sourceRowKey(source: search.SourceLocation) ?SourceRowKey {
+    return .{
+        .file_index = source.file_index,
+        .line = (if (source.relation == .new) source.new_line else source.old_line) orelse return null,
+        .side = if (source.relation == .new) .new else .old,
+    };
+}
 
 fn addSourceRow(allocator: Allocator, index: *std.AutoHashMapUnmanaged(SourceRowKey, std.ArrayList(usize)), key: SourceRowKey, row: usize) !void {
     const entry = try index.getOrPut(allocator, key);
@@ -11003,59 +11150,9 @@ fn appendSearchIntersections(
 
 fn firstSearchOccurrenceAtOrAfter(published: *const Published, batch: search.Batch, origin: usize, navigation_rows: ?[]?usize) !usize {
     if (origin == 0) return 0;
-    if (navigation_rows) |rows| {
-        for (batch.occurrences, rows, 0..) |occurrence, visual, index| {
-            const row = visual orelse searchOccurrenceNavigationRow(published, occurrence) orelse continue;
-            if (row >= origin) return index;
-        }
-        return 0;
-    }
-    var source_rows: std.AutoHashMapUnmanaged(SourceRowKey, std.ArrayList(usize)) = .empty;
-    defer {
-        var values = source_rows.valueIterator();
-        while (values.next()) |rows| rows.deinit(published.allocator);
-        source_rows.deinit(published.allocator);
-    }
-    for (published.visual_rows, 0..) |visual, visual_index| {
-        const file_index = published.buffer.fileIndexForRow(visual.buffer_index) orelse continue;
-        if (visual.halves) |halves| {
-            if (halves.left) |half| if (half.line.oldNo()) |number|
-                try addSourceRow(published.allocator, &source_rows, .{ .file_index = file_index, .line = number, .side = .old }, visual_index);
-            if (halves.right) |half| if (half.line.newNo()) |number|
-                try addSourceRow(published.allocator, &source_rows, .{ .file_index = file_index, .line = number, .side = .new }, visual_index);
-        } else if (visual.owner == .line) {
-            const line = visual.owner.line;
-            if (line.oldNo()) |number| try addSourceRow(published.allocator, &source_rows, .{ .file_index = file_index, .line = number, .side = .old }, visual_index);
-            if (line.newNo()) |number| try addSourceRow(published.allocator, &source_rows, .{ .file_index = file_index, .line = number, .side = .new }, visual_index);
-        }
-    }
     for (batch.occurrences, 0..) |occurrence, index| {
-        if (occurrence.location == .source) {
-            const source = occurrence.location.source;
-            const number = if (source.relation == .new) source.new_line else source.old_line;
-            if (number) |line| {
-                const key: SourceRowKey = .{ .file_index = source.file_index, .line = line, .side = if (source.relation == .new) .new else .old };
-                if (source_rows.get(key)) |rows| {
-                    var visible = false;
-                    for (rows.items) |visual_index| {
-                        const visual = published.visual_rows[visual_index];
-                        if (sourceLineForVisual(visual, source) == null) continue;
-                        if (occurrence.ranges.len == 0) continue;
-                        const span: [2]usize = if (visual.halves) |halves| blk: {
-                            const half = if (source.relation == .old) halves.left else halves.right;
-                            break :blk if (half) |value| .{ value.source_start, value.source_end } else continue;
-                        } else .{ visual.source_start, visual.source_end };
-                        const first = occurrence.ranges[0];
-                        if (first.start >= span[1] or first.end <= span[0]) continue;
-                        visible = true;
-                        if (visual_index >= origin) return index;
-                        break;
-                    }
-                    if (visible) continue;
-                }
-            }
-        }
-        if (searchOccurrenceNavigationRow(published, occurrence)) |row| if (row >= origin) return index;
+        const row = (if (navigation_rows) |rows| rows[index] else null) orelse searchOccurrenceNavigationRow(published, occurrence) orelse continue;
+        if (row >= origin) return index;
     }
     return 0;
 }
@@ -11095,13 +11192,7 @@ fn searchFromInactiveRow(published: *const Published, batch: search.Batch, navig
 }
 
 fn searchOccurrenceNavigationRow(published: *const Published, occurrence: search.Occurrence) ?usize {
-    if (published.occurrenceVisualRow(occurrence)) |row| return row;
-    const disclosures = requiredSearchDisclosure(published, occurrence);
-    for (published.visual_rows, 0..) |visual, index| {
-        const key = buffer_mod.disclosureKey(published.buffer.rows[visual.buffer_index]) orelse continue;
-        for (disclosures.items[0..disclosures.len]) |required| if (std.meta.eql(key, required)) return index;
-    }
-    return null;
+    return published.search_projection.navigationRow(occurrence);
 }
 
 fn retainedSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, next: search.Batch) ?usize {
@@ -11862,6 +11953,7 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
         times[@intFromEnum(Stage.clear_admission)][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         try hidden.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
     }
+    try benchmarkHiddenSearchNavigation(&hidden, io);
     std.debug.print("fixture_files={d} fixture_lines={d} fixture_bytes={d}\n", .{ files, files * lines * 2, raw.items.len });
     std.debug.print("hidden_fixture_files=1 hidden_fixture_lines={d} hidden_fixture_bytes={d}\n", .{ hidden_lines + 2, hidden_raw.items.len });
     inline for (@typeInfo(Stage).@"enum".fields, 0..) |stage, index| {
@@ -11890,6 +11982,67 @@ pub fn benchmarkBufferSearch(allocator: Allocator, io: std.Io, lines: usize, pai
     try benchmarkReviewDestination(&hidden, io, "needle", "review_source_destination");
     try benchmarkDisclosureHandoff(allocator, io, false);
     try benchmarkDisclosureHandoff(allocator, io, true);
+}
+
+fn benchmarkHiddenSearchNavigation(presentation: *Presentation, io: std.Io) !void {
+    const published = presentation.published.?;
+    var query = try search.Query.init(presentation.allocator, "needle");
+    defer query.deinit(presentation.allocator);
+    var batch = try search.scan(presentation.allocator, query, published.search_corpus.?.candidates, .literal);
+    defer batch.deinit(presentation.allocator);
+    if (batch.occurrences.len != 1) return error.WrongHiddenOccurrenceCount;
+    const occurrence = batch.occurrences[0];
+    var times: [5][9]u64 = undefined;
+    for (0..9) |sample| {
+        var start = std.Io.Clock.awake.now(io);
+        const required = requiredSearchDisclosure(published, occurrence);
+        const row = searchOccurrenceNavigationRow(published, occurrence);
+        times[0][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        std.mem.doNotOptimizeAway(required);
+        std.mem.doNotOptimizeAway(row);
+        start = std.Io.Clock.awake.now(io);
+        const control = sourceFoldDisclosure(published.session, published.buffer, occurrence.location.source);
+        const control_row = if (occurrenceVisualRowFor(published.buffer, published.visual_rows, occurrence)) |visible| visible else blk: {
+            for (published.visual_rows, 0..) |visual, index| {
+                const key = buffer_mod.disclosureKey(published.buffer.rows[visual.buffer_index]) orelse continue;
+                for (control.items[0..control.len]) |wanted| if (std.meta.eql(key, wanted)) break :blk @as(?usize, index);
+            }
+            break :blk @as(?usize, null);
+        };
+        times[1][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (required.len != 1 or control.len != 1 or !std.meta.eql(required.items[0], control.items[0]) or row != control_row or row == null)
+            return error.HiddenLookupControlMismatch;
+    }
+    for (0..3) |stage| for (0..9) |sample| {
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.replaceBufferSearchQuery("needle");
+        var scan = presentation.takeCommand() orelse return error.MissingScan;
+        defer scan.deinit();
+        try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(std.heap.page_allocator, &scan.scan_buffer_search) });
+        try completeDisclosureBuild(presentation);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        const baseline = published.buffer_search.saved_disclosures.?.retain();
+        defer baseline.release();
+        // Collapse the accepted occurrence before timing each traversal Action.
+        try published.rebuild(presentation.preferences, baseline.items(), null);
+        const before = published.visual_rows.ptr;
+        published.navigation.count = if (stage == 2) 999 else 1;
+        const start = std.Io.Clock.awake.now(io);
+        try presentation.dispatch(.{ .action = if (stage == 1) .previous_search_occurrence else .next_search_occurrence });
+        times[stage + 2][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (published.visual_rows.ptr != before or published.navigation.count != 0) return error.HiddenTraversalNotStaged;
+        try completeDisclosureBuild(presentation);
+        if (published.buffer_search.active != 0 or published.occurrenceVisualRow(occurrence) == null) return error.HiddenTraversalNotPublished;
+        published.buffer_search.deinit(presentation.allocator);
+        published.buffer_search = .{};
+        published.active_search = .none;
+        try published.rebuild(presentation.preferences, baseline.items(), null);
+    };
+    const names = [_][]const u8{ "hidden_lookup", "hidden_lookup_linear_control", "hidden_next_dispatch", "hidden_previous_dispatch", "hidden_count_dispatch" };
+    for (&times, names) |*samples, name| {
+        std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+        std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ name, samples[4], samples[8] });
+    }
 }
 
 fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: bool) !void {
@@ -11974,6 +12127,37 @@ fn benchmarkDisclosureHandoff(allocator: Allocator, io: std.Io, many_inputs: boo
     std.debug.print("handoff_fixture_files={d} handoff_fixture_drafts={d} handoff_fixture_body_bytes={d} handoff_fixture_snapshot_bytes={d} handoff_fixture_directories={d} handoff_fixture_disclosures={d}\n", .{ file_count, draft_count, draft_count * body_bytes, if (many_inputs) draft_count * body_bytes else @as(usize, 0), published.collapsed_directories.items.len, published.expanded_disclosures.items.len });
     std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ if (many_inputs) "worker_handoff_many_inputs" else "worker_handoff", times[4], times[8] });
     std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ if (many_inputs) "snapshot_copy_many_inputs_control" else "snapshot_copy_control", control[4], control[8] });
+    var last_range = [_]search.Range{.{ .start = body_bytes - 1, .end = body_bytes }};
+    const last_body: search.Occurrence = .{
+        .location = .{ .review_body = .{ .owner = .{ .draft = draft_count }, .logical_line = 0 } },
+        .ranges = &last_range,
+        .column = body_bytes - 1,
+        .candidate_scalars = body_bytes,
+        .corpus_order = draft_count - 1,
+        .session_epoch = published.epoch,
+    };
+    for (&times, &control) |*elapsed, *linear_elapsed| {
+        var start = std.Io.Clock.awake.now(io);
+        const required = requiredSearchDisclosure(published, last_body);
+        const row = searchOccurrenceNavigationRow(published, last_body);
+        elapsed.* = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        std.mem.doNotOptimizeAway(required);
+        std.mem.doNotOptimizeAway(row);
+        start = std.Io.Clock.awake.now(io);
+        const linear_row = occurrenceVisualRowFor(published.buffer, published.visual_rows, last_body) orelse blk: {
+            for (published.visual_rows, 0..) |visual, index| {
+                const key_at_row = buffer_mod.disclosureKey(published.buffer.rows[visual.buffer_index]) orelse continue;
+                if (std.meta.eql(key_at_row, buffer_mod.DisclosureKey{ .review_card = .{ .draft = draft_count } })) break :blk @as(?usize, index);
+            }
+            break :blk @as(?usize, null);
+        };
+        linear_elapsed.* = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (row == null or row != linear_row or required.len != 1) return error.ReviewBodyLookupControlMismatch;
+    }
+    std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+    std.mem.sort(u64, &control, {}, std.sort.asc(u64));
+    std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ if (many_inputs) "review_body_lookup_many_inputs" else "review_body_lookup", times[4], times[8] });
+    std.debug.print("stage={s} median_ns={d} p95_ns={d}\n", .{ if (many_inputs) "review_body_lookup_many_inputs_linear_control" else "review_body_lookup_linear_control", control[4], control[8] });
     if (many_inputs) try benchmarkSidebar(&presentation, io);
     try benchmarkReviewDestination(&presentation, io, "x", if (many_inputs) "review_body_destination_many_inputs" else "review_body_destination");
     var draft_dispatch: [9]u64 = undefined;
@@ -17661,6 +17845,189 @@ test "M21 hidden traversal publishes a complete worker Frame" {
     try testing.expect(published.visual_rows.ptr != old_rows);
     try testing.expectEqual(@as(?usize, 0), published.buffer_search.active);
     try testing.expect(published.buffer_search.saved_disclosures != null);
+}
+
+test "M21 kernel indexed hidden navigation keeps Count direction and disclosure restoration" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'c', .text = "c" } });
+    try completeBufferSearchScan(&presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expectEqual(@as(?usize, 0), published.buffer_search.active);
+    const collapsed = published.visual_rows.ptr;
+    try presentation.dispatch(.{ .key = .{ .codepoint = '4', .text = "4" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "n" } });
+    try testing.expectEqual(@as(usize, 0), published.navigation.count);
+    try testing.expectEqual(collapsed, published.visual_rows.ptr);
+    try completeDisclosureBuild(&presentation);
+    try testing.expectEqual(@as(?usize, 4), published.buffer_search.active);
+    try testing.expect(published.buffer_search.saved_disclosures != null);
+    try presentation.dispatch(.{ .key = .{ .codepoint = '2', .text = "2" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'N', .text = "N" } });
+    try completeDisclosureBuild(&presentation);
+    try testing.expectEqual(@as(?usize, 2), published.buffer_search.active);
+    try testing.expect(published.buffer_search.saved_disclosures == null);
+    try presentation.dispatch(.{ .key = .{ .codepoint = '3', .text = "3" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "n" } });
+    try completeDisclosureBuild(&presentation);
+    try testing.expectEqual(@as(?usize, 5), published.buffer_search.active);
+    const revealed = published.visual_rows.ptr;
+    // Staying in the same Fold must not queue another build.
+    try presentation.dispatch(.{ .action = .previous_search_occurrence });
+    try testing.expectEqual(@as(?usize, 4), published.buffer_search.active);
+    try testing.expectEqual(revealed, published.visual_rows.ptr);
+    try testing.expect(presentation.takeCommand() == null);
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.replaceBufferSearchQuery("no-match");
+    try completeBufferSearchScan(&presentation);
+    try presentation.replaceBufferSearchQuery("");
+    try completeDisclosureBuild(&presentation);
+    try testing.expectEqual(@as(?usize, 4), published.buffer_search.active);
+    try testing.expect(published.buffer_search.saved_disclosures != null);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+}
+
+fn exerciseSearchIndexAllocationFailure(allocator: Allocator, published: *const Published) !void {
+    const projection = try SearchProjection.createWithAllocator(allocator, published.buffer, published.visual_rows, .{
+        .session = published.session,
+        .drafts = published.review.drafts.items,
+        .scopes = published.scope_projection.items,
+        .selected_version = published.selected_version,
+    });
+    defer projection.release();
+    try testing.expect(projection.body_disclosures.count() > 0);
+    try testing.expect(projection.source_disclosures.count() > 0);
+}
+
+test "M21 kernel search indexes cover Draft chains and release every failed allocation" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 11, .kind = .comment, .scope = .{ .@"inline" = .{ .path = "a.txt", .from = 1 } }, .body = "old draft" });
+    try store.store().put(key.storeKey(), .{ .local_id = 12, .kind = .comment, .parent = .{ .draft = 11 }, .body = "nested draft" });
+    try store.store().put(key.storeKey(), .{ .local_id = 13, .kind = .comment, .parent = .{ .draft = 12 }, .body = "deep draft" });
+    try store.store().put(key.storeKey(), .{ .local_id = 14, .kind = .comment, .parent = .{ .comment = 3 }, .body = "outdated reply" });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = key, .session = try testDisclosureSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    const index = published.search_projection;
+    const deep = index.body_disclosures.get(.{ .draft = 13 }).?;
+    try testing.expectEqual(@as(usize, 1), deep.len);
+    try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .review_card = .{ .draft = 13 } }, deep.items[0]);
+    const outdated = index.body_disclosures.get(.{ .draft = 14 }).?;
+    try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .outdated_file = &published.session.diff.files[0] }, outdated.items[0]);
+    const reply = index.body_disclosures.get(.{ .comment = 2 }).?;
+    try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .resolved_thread = 1 }, reply.items[0]);
+    try testing.checkAllAllocationFailures(testing.allocator, exerciseSearchIndexAllocationFailure, .{published});
+    var preferences = presentation.preferences;
+    preferences.scope = .whole;
+    try published.rebuild(preferences, &.{}, null);
+    const opposite = published.search_projection.body_disclosures.get(.{ .draft = 13 }).?;
+    try testing.expectEqual(@as(usize, 2), opposite.len);
+    try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .opposite_version = &published.session.diff.files[0] }, opposite.items[0]);
+    try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .review_card = .{ .draft = 13 } }, opposite.items[1]);
+}
+
+test "M21 kernel search lookup uses its retained Frame after owner tables change" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    const index = published.search_projection;
+    index.retain();
+    defer index.release();
+    var query = try search.Query.init(testing.allocator, "c5");
+    defer query.deinit(testing.allocator);
+    var batch = try search.scan(testing.allocator, query, published.search_corpus.?.candidates, .literal);
+    defer batch.deinit(testing.allocator);
+    const occurrence = batch.occurrences[0];
+    const required = requiredSearchDisclosure(published, occurrence);
+    try testing.expectEqual(@as(usize, 1), required.len);
+    const expected = searchOccurrenceNavigationRow(published, occurrence).?;
+    // Lookup must not depend on mutable row, Hunk, or Thread tables.
+    const buffer = published.buffer;
+    const visual_rows = published.visual_rows;
+    const files = published.session.diff.files;
+    const threads = published.session.threads;
+    published.buffer.rows = &.{};
+    published.visual_rows = &.{};
+    published.session.diff.files = &.{};
+    published.session.threads = &.{};
+    defer {
+        published.buffer = buffer;
+        published.visual_rows = visual_rows;
+        published.session.diff.files = files;
+        published.session.threads = threads;
+    }
+    try testing.expectEqual(expected, searchOccurrenceNavigationRow(published, occurrence).?);
+    try testing.expectEqualDeep(required.items[0], requiredSearchDisclosure(published, occurrence).items[0]);
+    try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .resolved_thread = 1 }, index.body_disclosures.get(.{ .comment = 2 }).?.items[0]);
+}
+
+test "M21 kernel indexed source and ReviewBody navigation matches wrapped visual rows" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 11, .kind = .comment, .scope = .review, .body = "# Heading needle\n\nText [needle link](https://example.com) and `needle code`.\n\n```suggestion\nneedle replacement\n```" });
+    const session = try testDisclosureSession(testing.allocator, 1);
+    @constCast(session.diff.files[0].hunks[0].lines)[2].text = "c1 " ++ "long context " ** 12 ++ "needle";
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = key, .session = session },
+        .geometry = .{ .cols = 48, .rows = 20 },
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    const keys = [_]buffer_mod.DisclosureKey{ .{ .resolved_thread = 1 }, .{ .review_card = .{ .comment = 1 } }, .{ .review_card = .{ .draft = 11 } } };
+    for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]u16{ 48, 49 }) |cols| {
+        var preferences = presentation.preferences;
+        preferences.layout = layout;
+        var staged = try published.prepareBuffer(preferences, &keys, null, .{ .cols = cols, .rows = 20 });
+        staged.publish();
+        for ([_][]const u8{ "needle", "eight", "c", "A", "a" }) |text| {
+            var query = try search.Query.init(testing.allocator, text);
+            defer query.deinit(testing.allocator);
+            var batch = try search.scan(testing.allocator, query, published.search_corpus.?.candidates, .literal);
+            defer batch.deinit(testing.allocator);
+            for (batch.occurrences) |occurrence| {
+                try testing.expectEqual(occurrenceVisualRowFor(published.buffer, published.visual_rows, occurrence), published.occurrenceVisualRow(occurrence));
+            }
+        }
+    };
+}
+
+test "M21 kernel disclosure identity comparison handles additions removals and unknown baselines" {
+    const base = try DisclosureKeys.createWithAllocator(testing.allocator, &.{ .{ .resolved_thread = 1 }, .{ .review_card = .{ .draft = 4 } } });
+    defer base.release();
+    var added: SearchDisclosureSet = .{};
+    added.append(.{ .review_card = .{ .draft = 4 } });
+    added.append(.{ .resolved_thread = 2 });
+    added.append(.{ .resolved_thread = 2 });
+    const target: DisclosureTarget = .{ .base = base, .add = added };
+    const keys = try target.build(testing.allocator);
+    defer keys.release();
+    try testing.expect(target.matchesKeys(keys));
+    try testing.expect(target.matches(keys.items()));
+    try testing.expect(!target.matchesKeys(base));
+    const removed: DisclosureTarget = .{ .base = base, .remove = .{ .resolved_thread = 1 }, .add = added };
+    const removed_keys = try removed.build(testing.allocator);
+    defer removed_keys.release();
+    try testing.expect(removed.matchesKeys(removed_keys));
+    try testing.expect(removed.matches(removed_keys.items()));
+    try testing.expect(!removed_keys.contains(.{ .resolved_thread = 1 }));
+    const unrelated = try DisclosureKeys.createWithAllocator(testing.allocator, keys.items());
+    defer unrelated.release();
+    try testing.expect(!target.matchesKeys(unrelated));
 }
 
 test "M21 Escape restoration keeps the old Frame until the worker finishes" {

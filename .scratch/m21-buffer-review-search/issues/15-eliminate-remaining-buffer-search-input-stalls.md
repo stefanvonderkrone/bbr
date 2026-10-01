@@ -29,7 +29,7 @@ The original checklist is complete, but the following input-latency work remains
 - [x] Stage Review Search destination Buffer builds. Cover source occurrences, ReviewBody occurrences, and the second build that reveals a hidden Fold. `openReviewSearchOccurrence` queues a worker, including after File Enrichment publication.
 - [x] Stage disclosure restoration when Buffer Search starts after Review Search. `openBufferSearch` retains the disclosure baseline and queues a worker. Query input stays open while restoration runs.
 - [x] Stage File Enrichment cache-focus and lease-release Frame changes. Completion Frames already use workers, but `focusEnrichment`, `finishSearchLease`, and `releaseReviewSearchHolds` can rebuild synchronously after eviction. Keep cache changes and Frame publication atomic.
-- [ ] Index hidden Search Occurrence navigation and disclosure lookup. `searchOccurrenceNavigationRow`, `requiredSearchDisclosure`, and their helpers still walk visual rows, Buffer rows, Hunks, Threads, or Draft chains. Cover hidden `n`, `N`, Count, Query clearing, and the scan-to-disclosure handoff.
+- [x] Index hidden Search Occurrence navigation and disclosure lookup. Frame construction indexes source coordinates, ReviewBody owners, Fold membership, disclosure rows, and inherited Draft disclosure chains. Hidden `n`, `N`, Count, Query clearing, and the scan-to-disclosure handoff use the indexes.
 - [ ] Bound active-occurrence retention and origin selection during completion admission. `retainedEditedSearchIndex` and `firstSearchOccurrenceAtOrAfter` still walk complete Batches on the terminal thread. `searchFromInactiveRow` also walks Batches when traversal starts without an active occurrence.
 - [ ] Bound navigation restoration during worker Frame admission. `frame.restoreNavigation` still searches complete visual-row arrays for the cursor and Selection. Version restoration and File-header navigation also need checks on large Frames.
 - [ ] Measure initial Session publication separately. `Published.create` still builds the initial Buffer, visual rows, File Tree, source-coordinate projection, and search corpus on the terminal thread. Move this work into Candidate Session preparation if the measurement shows an input stall.
@@ -440,3 +440,35 @@ These paths no longer construct a Buffer on the terminal thread. Hold release st
 Tests cover delayed cache and Frame publication, repeated focus input, queued and issued focus replacement, and retry after failure. Tests also cover changed Query input, geometry, File Tree state, and lease protection. Source lease release, Review Search closure, and Query clearing preserve accepted Buffer Search. A retained read lease verifies that the published cache Frame releases the evicted content. Worker allocation-failure tests include cache Frames. Runtime tests cover launch failure and a closed completion sink. Session tests cover refresh, Review switching, and shutdown. The source-opening test waits for staged eviction before it checks refetch behavior.
 
 `zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 929 tests. The Standards and Spec review found no remaining findings for this item. The ticket remains `ready-for-agent`. The next remaining item is hidden Search Occurrence navigation and disclosure lookup indexing.
+
+## Indexed Search Occurrence navigation and disclosure lookup
+
+Each complete Frame now owns immutable search indexes in its retained `SearchProjection`. Frame construction indexes visible source coordinates and ReviewBody owners. It also indexes Fold membership, disclosure rows, and inherited Comment and Draft disclosure chains. Disclosure workers build these indexes before Frame publication. Scan workers retain the same indexes with their copied source coordinates.
+
+`requiredSearchDisclosure` uses indexed source coordinates or a typed ReviewBody owner. `searchOccurrenceNavigationRow` first checks the indexed visible rows. Hidden occurrences use at most three indexed disclosure rows. Visible lookup uses binary search within one source Line or ReviewBody owner. The terminal thread no longer searches the complete visual rows, Buffer rows, Hunks, Threads, or Draft parent chains for these lookups.
+
+`DisclosureKeys` now indexes key membership and records each worker's bounded changes against an immutable baseline identity. Search transitions compare those identities and changes instead of complete key arrays. An unknown baseline identity queues a worker. Hidden `n`, `N`, Count, Query clearing, and scan admission use the indexed lookups. Traversal within the same revealed Fold keeps the current Frame. Query clearing retains the accepted occurrence's required disclosures.
+
+`zig build bench-buffer-search -- 4096` measured nine ReleaseFast samples without concurrent build or test work. The main fixture has 16 Files, 131,072 changed Lines, and 2,193,960 Diff bytes. The hidden fixture has one File, 131,074 Lines, and 2,772,562 Diff bytes. Its accepted Query has one hidden occurrence. Each traversal sample collapses that occurrence before timing. Worker construction and fixture restoration occur outside the traversal measurements. The Count sample uses 999.
+
+The ReviewBody fixtures each have 1,024 Drafts and 4,194,304 body bytes. Lookup targets the final authored byte of the last Draft. The one-File fixture keeps its ReviewCards collapsed. The many-input fixture has 1,024 enriched Files, 1,024 collapsed Directories, and 1,024 expanded ReviewCards. It also has 4,194,304 AnchorSnapshot bytes. Linear controls search the same published rows and check the destination row. The hidden source control also uses the earlier Hunk and Fold lookup. Values are nanoseconds.
+
+| Stage | Median ns | p95 ns |
+| --- | ---: | ---: |
+| Hidden source lookup | 83 | 1,250 |
+| Hidden source linear control | 44,292 | 63,625 |
+| Hidden `n` dispatch | 10,833 | 17,625 |
+| Hidden `N` dispatch | 12,083 | 15,375 |
+| Hidden Count dispatch | 11,583 | 15,125 |
+| Scan-to-disclosure handoff | 6,625 | 8,667 |
+| Query clear dispatch | 11,209 | 14,250 |
+| One-File ReviewBody lookup | 125 | 13,041 |
+| One-File ReviewBody linear control | 33,334 | 136,417 |
+| Many-input ReviewBody lookup | 166 | 2,167 |
+| Many-input ReviewBody linear control | 251,375 | 269,583 |
+
+Index construction remains part of Frame construction. Initial Session publication and synchronous benchmark controls therefore also construct the indexes. Completion admission still walks Batches for active-occurrence retention and origin selection. The next remaining item covers those Batch walks.
+
+Tests cover hidden forward and backward traversal, Count, same-Fold traversal, Query clearing, and disclosure restoration. They also cover resolved Replies, nested Draft chains, outdated placement, and opposite-version placement. Wrapped source and ReviewBody lookups match the linear reference in both Layouts at two terminal widths. A retained-index test removes the current row, File, and Thread tables before lookup. Allocation-failure tests check every search-index allocation. Existing transition tests cover stale Frames, cancellation, Session replacement, and worker failures.
+
+`zig build`, formatting checks, and `zig build test --summary all` pass. The full suite contains 934 tests. The Standards and Spec review found no remaining findings for this item. The ticket remains `ready-for-agent`. The next remaining item is bounded active-occurrence retention and origin selection during completion admission.
