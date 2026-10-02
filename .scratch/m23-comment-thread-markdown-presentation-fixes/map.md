@@ -37,6 +37,7 @@ The map ends when behavior, Bitbucket facts, and acceptance criteria leave no op
 - [Research Bitbucket Cloud Markdown compatibility](./issues/01-research-bitbucket-cloud-markdown-compatibility.md): Cloud names Python-Markdown, not CommonMark, and exact list and fence parity remains unobserved.
 - [Research Bitbucket Cloud emoji shortcodes](./issues/02-research-bitbucket-cloud-emoji-shortcodes.md): Cloud publishes no definitive catalog. An Atlassian fixture supplies candidate Unicode mappings, not complete Cloud compatibility.
 - [Choose nested Reply presentation](./issues/03-choose-nested-reply-presentation.md): Group parent subtrees with published-first siblings. Reduce the viewport-dependent unit before capping indentation to preserve body width.
+- [Choose raw ReviewBody yank behavior](./issues/07-choose-raw-reviewbody-yank-behavior.md): Copy complete bodies or mixed selected logical lines. Both modes respect Selected Version and preserve authored bytes.
 
 ## Not yet specified
 

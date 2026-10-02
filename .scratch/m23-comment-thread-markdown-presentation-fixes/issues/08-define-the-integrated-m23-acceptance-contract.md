@@ -20,6 +20,8 @@ Decide what live evidence remains necessary for list compatibility claims.
 Include narrow terminals, mixed Reply ancestry, all applicable Themes, literal code, and unknown shortcode preservation.
 
 Check that authored storage, editing, Suggestions, disclosure, search locations, and source yank retain their contracts.
+Use [Choose raw ReviewBody yank behavior](./07-choose-raw-reviewbody-yank-behavior.md) for the agreed clipboard contract.
+Include mixed Selection, Selected Version filtering, inherited Reply scope, selected labels, hidden logical lines, and available Deleted Comment content.
 Confirm that no unresolved scope or behavior decision remains before the specification handoff.
 Create new decision tickets for gaps rather than silently choosing answers.
 The map can finish only when its remaining in-scope fog is empty.
