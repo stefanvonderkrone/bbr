@@ -41,6 +41,7 @@ The map ends when behavior, Bitbucket facts, and acceptance criteria leave no op
 - [Choose raw ReviewBody yank behavior](./issues/07-choose-raw-reviewbody-yank-behavior.md): Copy complete bodies or mixed selected logical lines. Both modes respect Selected Version and preserve authored bytes.
 - [Choose Cloud compatibility and evidence policy](./issues/09-choose-cloud-compatibility-and-evidence-policy.md): Cloud syntax evidence takes precedence. Best-effort support permits explicit project behavior for unknown cases with acceptance examples.
 - [Choose ReviewBody Markdown presentation](./issues/04-choose-reviewbody-markdown-presentation.md): Theme-based Markdown styles, literal code, text-only images, and fixture emoji mappings require human review of format combinations.
+- [Choose ReviewBody code-block Highlighting](./issues/05-choose-reviewbody-code-block-highlighting.md): Fence aliases reuse GrammarMatch with shebang fallback. One background worker uses existing size limits and an 8 MiB result budget.
 
 ## Not yet specified
 
