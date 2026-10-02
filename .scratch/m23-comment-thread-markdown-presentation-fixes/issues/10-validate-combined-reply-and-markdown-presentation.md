@@ -28,6 +28,8 @@ Use the human review checklist in the Markdown presentation decision to select r
 
 Compare available body widths below 40 columns and at 40, 60, 80, and 100 columns.
 Include a resize and a ReviewCard disclosure change.
+Include a search match across joined prose lines and a complete compound-emoji highlight.
+Show formatted Review Search Preview with code-block Highlighting and search backgrounds that preserve syntax foregrounds.
 Compare a light Theme with a dark Theme to check the agreed code-background direction.
 
 Resolve through the human's reaction to the examples.

@@ -58,7 +58,10 @@ The Overlay for fuzzy-searching both complete versions of every changed File and
 _Avoid_: Pull Request search (also applies to LocalReview), repository search (only the current Review participates), Picker (switches PullRequests).
 
 **Search Occurrence**:
-One line-local source or ReviewBody match within a Session Epoch. A source occurrence identifies its File, version relation, line coordinates, and exact UTF-8 ranges. A ReviewBody occurrence identifies its CommentId or TempId owner, logical body line, and exact authored UTF-8 ranges. Buffer reprojection does not change the identity, but Session replacement expires it.
+One source or ReviewBody match within a Session Epoch, identified by its owner, authored coordinates, and exact UTF-8 ranges.
+A source occurrence belongs to one Line.
+A ReviewBody occurrence can span authored lines that Markdown joins within one paragraph region.
+Buffer reprojection does not change the identity, but Session replacement expires it.
 _Avoid_: visual match (wrapping can project one occurrence more than once), search row (the Overlay projection), result (the presentation of an occurrence).
 
 **Composer**:

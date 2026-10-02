@@ -290,6 +290,8 @@ All Suggestions retain their distinct background and label, including plain fall
 
 ### Scheduling and lifetime
 
+[Choose search through Markdown projection](./06-choose-search-through-markdown-projection.md) extends eligibility and priority to the selected Review Search Preview.
+
 Publish readable plain code first.
 Start background Highlighting when its ReviewCard enters the viewport.
 Analyze the complete eligible block, including rows hidden by ReviewCard body disclosure.
