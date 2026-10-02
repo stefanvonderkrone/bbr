@@ -16,7 +16,8 @@ Link every requirement to its decision ticket and relevant evidence or prototype
 
 Define the required parser, projection, headless rendering, Presentation, search, and clipboard integration checks.
 Separate documented fixtures from observed Cloud wire and browser presentation fixtures.
-Decide what live evidence remains necessary for list compatibility claims.
+Apply [Choose Cloud compatibility and evidence policy](./09-choose-cloud-compatibility-and-evidence-policy.md) to all compatibility claims.
+Check that unverified list, fence, HTML, and emoji cases have explicit project behavior and acceptance examples.
 Include narrow terminals, mixed Reply ancestry, all applicable Themes, literal code, and unknown shortcode preservation.
 
 Check that authored storage, editing, Suggestions, disclosure, search locations, and source yank retain their contracts.

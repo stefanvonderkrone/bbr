@@ -10,6 +10,9 @@ Blocked by: 01, 02, 09
 
 How does ReviewBody present the selected Markdown guide in a terminal, accounting for verified Cloud differences?
 
+Apply [Choose Cloud compatibility and evidence policy](./09-choose-cloud-compatibility-and-evidence-policy.md) to syntax scope and evidence requirements.
+Give explicit project behavior and acceptance examples for cases that Cloud evidence does not settle.
+
 Define the supported syntax and literal fallback for malformed or unsupported input.
 M23 requests turquoise italic text, orange bold text, and green inline code with formatting delimiters hidden.
 Choose Theme handling and precedence for combined styles, links, headings, and cursor or search emphasis.

@@ -38,11 +38,11 @@ The map ends when behavior, Bitbucket facts, and acceptance criteria leave no op
 - [Research Bitbucket Cloud emoji shortcodes](./issues/02-research-bitbucket-cloud-emoji-shortcodes.md): Cloud publishes no definitive catalog. An Atlassian fixture supplies candidate Unicode mappings, not complete Cloud compatibility.
 - [Choose nested Reply presentation](./issues/03-choose-nested-reply-presentation.md): Group parent subtrees with published-first siblings. Reduce the viewport-dependent unit before capping indentation to preserve body width.
 - [Choose raw ReviewBody yank behavior](./issues/07-choose-raw-reviewbody-yank-behavior.md): Copy complete bodies or mixed selected logical lines. Both modes respect Selected Version and preserve authored bytes.
+- [Choose Cloud compatibility and evidence policy](./issues/09-choose-cloud-compatibility-and-evidence-policy.md): Cloud syntax evidence takes precedence. Best-effort support permits explicit project behavior for unknown cases with acceptance examples.
 
 ## Not yet specified
 
 - Terminal examples can expose interactions between deep Reply ancestry and complex Markdown bodies.
-- The live fixture work depends on the compatibility policy and the evidence gaps it selects for verification.
 - The acceptance contract can expose missing decisions when it combines search, disclosure, clipboard, and Highlighting behavior.
 
 ## Out of scope
