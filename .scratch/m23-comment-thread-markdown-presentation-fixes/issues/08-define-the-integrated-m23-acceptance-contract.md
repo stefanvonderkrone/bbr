@@ -4,7 +4,7 @@ Parent: [M23 Comment thread and Markdown presentation fixes](../map.md)
 Label: wayfinder:grilling
 Type: grilling
 Status: needs-info
-Blocked by: 01, 02, 03, 04, 05, 06, 07, 09
+Blocked by: 01, 02, 03, 04, 05, 06, 07, 09, 10
 
 ## Question
 
@@ -19,6 +19,9 @@ Separate documented fixtures from observed Cloud wire and browser presentation f
 Apply [Choose Cloud compatibility and evidence policy](./09-choose-cloud-compatibility-and-evidence-policy.md) to all compatibility claims.
 Check that unverified list, fence, HTML, and emoji cases have explicit project behavior and acceptance examples.
 Include narrow terminals, mixed Reply ancestry, all applicable Themes, literal code, and unknown shortcode preservation.
+Include the human example Comment and human review requirement from [Choose ReviewBody Markdown presentation](./04-choose-reviewbody-markdown-presentation.md).
+Use that ticket's human review checklist to cover format combinations and interaction backgrounds.
+Check the human-confirmed planning examples from [Validate combined Reply and Markdown presentation](./10-validate-combined-reply-and-markdown-presentation.md).
 
 Check that authored storage, editing, Suggestions, disclosure, search locations, and source yank retain their contracts.
 Use [Choose raw ReviewBody yank behavior](./07-choose-raw-reviewbody-yank-behavior.md) for the agreed clipboard contract.

@@ -20,6 +20,7 @@ The map ends when behavior, Bitbucket facts, and acceptance criteria leave no op
 - Explore the existing `y` Action copying a complete raw body from any ReviewCard row.
 - Search must accept both displayed emoji characters and their authored shortcodes.
 - Investigate code-block syntax colors through existing Highlighting. Code-block text remains literal.
+- Use [Choose ReviewBody Markdown presentation](./issues/04-choose-reviewbody-markdown-presentation.md) for the human example Comment and review requirement.
 - Primary contexts are Review, Presentation, Bitbucket, and Highlighting.
 - Read `CONTEXT-MAP.md` and the relevant `CONTEXT.md` files. Consult ADR-0012 for the Presentation seam.
 - Use `grilling` and `domain-modeling` for decision tickets. Use `research` for external facts.
@@ -39,10 +40,10 @@ The map ends when behavior, Bitbucket facts, and acceptance criteria leave no op
 - [Choose nested Reply presentation](./issues/03-choose-nested-reply-presentation.md): Group parent subtrees with published-first siblings. Reduce the viewport-dependent unit before capping indentation to preserve body width.
 - [Choose raw ReviewBody yank behavior](./issues/07-choose-raw-reviewbody-yank-behavior.md): Copy complete bodies or mixed selected logical lines. Both modes respect Selected Version and preserve authored bytes.
 - [Choose Cloud compatibility and evidence policy](./issues/09-choose-cloud-compatibility-and-evidence-policy.md): Cloud syntax evidence takes precedence. Best-effort support permits explicit project behavior for unknown cases with acceptance examples.
+- [Choose ReviewBody Markdown presentation](./issues/04-choose-reviewbody-markdown-presentation.md): Theme-based Markdown styles, literal code, text-only images, and fixture emoji mappings require human review of format combinations.
 
 ## Not yet specified
 
-- Terminal examples can expose interactions between deep Reply ancestry and complex Markdown bodies.
 - The acceptance contract can expose missing decisions when it combines search, disclosure, clipboard, and Highlighting behavior.
 
 ## Out of scope
@@ -50,4 +51,6 @@ The map ends when behavior, Bitbucket facts, and acceptance criteria leave no op
 - Implementing M23 during this planning effort.
 - Adding Bitbucket Server or Data Center transport support. The guide is a presentation reference.
 - Other milestones, including the Repository Browser and durable File read state.
+- Product reference navigation and previews. [M31 in TODO.md](../../TODO.md) investigates that follow-up.
+- Image acquisition and terminal image rendering. [M32 in TODO.md](../../TODO.md) investigates that follow-up.
 - Changing authored Comment or Draft bytes to match their presentation.
