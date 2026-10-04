@@ -47,8 +47,6 @@ The map ends when behavior, Bitbucket facts, and acceptance criteria leave no op
 
 ## Not yet specified
 
-- The acceptance contract can expose missing decisions when it combines search, disclosure, clipboard, and Highlighting behavior.
-
 ## Out of scope
 
 - Implementing M23 during this planning effort.
