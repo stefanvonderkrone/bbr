@@ -43,6 +43,7 @@ The map ends when behavior, Bitbucket facts, and acceptance criteria leave no op
 - [Choose ReviewBody Markdown presentation](./issues/04-choose-reviewbody-markdown-presentation.md): Theme-based Markdown styles, literal code, text-only images, and fixture emoji mappings require human review of format combinations.
 - [Choose ReviewBody code-block Highlighting](./issues/05-choose-reviewbody-code-block-highlighting.md): Fence aliases reuse GrammarMatch with shebang fallback. One background worker uses existing size limits and an 8 MiB result budget.
 - [Choose search through Markdown projection](./issues/06-choose-search-through-markdown-projection.md): Both searches match joined prose and emoji forms with authored locations. Formatted Preview shares code-block Highlighting.
+- [Validate combined Reply and Markdown presentation](./issues/10-validate-combined-reply-and-markdown-presentation.md): The human accepted the combined planning prototype. The existing presentation decisions stand.
 
 ## Not yet specified
 

@@ -3,7 +3,7 @@
 Parent: [M23 Comment thread and Markdown presentation fixes](../map.md)
 Label: wayfinder:grilling
 Type: grilling
-Status: needs-info
+Status: ready-for-agent
 Blocked by: 01, 02, 03, 04, 05, 06, 07, 09, 10
 
 ## Question
