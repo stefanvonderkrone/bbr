@@ -16769,6 +16769,80 @@ test "External Edit snapshots exactly once blocks input and accepts only matchin
     try testing.expectEqualStrings("External Edit accepted", presentation.projection().composer.?.footer.?);
 }
 
+test "M23 ancestry retains typed cursor and search ownership across resize and failed projection" {
+    for ([_]bool{ false, true }) |local| for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = if (local)
+            try OwnedReviewIdentity.initLocal(1, "refs/remotes/origin/main", "refs/heads/feature")
+        else
+            try OwnedReviewIdentity.init("workspace", "repo", 1);
+        for (0..14) |index| try store.store().put(key.storeKey(), .{
+            .local_id = index + 1,
+            .kind = .comment,
+            .body = if (index == 13) "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz needle" else "ancestor body with enough prose to wrap at narrow widths",
+            .parent = if (index == 0) null else .{ .draft = index },
+            .target = if (local) .local else .bitbucket,
+        });
+        const session = if (local) try testLocalSession(testing.allocator) else try testSession(testing.allocator, 1, 'a');
+        if (!local) {
+            const a = session.arena.allocator();
+            const comments = try a.alloc(bbr.review.Comment, 1);
+            comments[0] = .{ .id = 14, .author = "Ada", .body = "distinct CommentId" };
+            session.threads = try bbr.review.buildThreads(a, comments);
+        }
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 1 }, .{
+            .initial = .{ .key = key, .session = session },
+            .geometry = .{ .cols = 131, .rows = 12 },
+        });
+        defer presentation.deinit();
+        if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        try cursorToDraftCard(&presentation, 14);
+        const original = presentation.projection().review.?.frame;
+        const owner = original.visual_rows[original.navigation.cursor].owner;
+        for ([_]u16{ 90, 91, 110, 111, 130, 131, 71, 75 }) |cols| {
+            try dispatchView(&presentation, .{ .resize = .{ .cols = cols, .rows = 12 } });
+            const frame = presentation.projection().review.?.frame;
+            try testing.expect(owner.eql(frame.visual_rows[frame.navigation.cursor].owner));
+            const card = frame.buffer.rows[frame.visual_rows[frame.navigation.cursor].buffer_index].draft;
+            try testing.expectEqual(@as(usize, 13), card.depth);
+        }
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+        try completeBufferSearchScan(&presentation);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        for ([_]u16{ 131, 90, 75 }) |cols| {
+            try dispatchView(&presentation, .{ .resize = .{ .cols = cols, .rows = 12 } });
+            try presentation.dispatch(.{ .action = .next_search_occurrence });
+            const frame = presentation.projection().review.?.frame;
+            const visual = frame.visual_rows[frame.navigation.cursor];
+            try testing.expect(visual.owner == .draft);
+            try testing.expectEqual(@as(u64, 14), visual.owner.draft.id);
+            try testing.expectEqual(@as(usize, 1), presentation.projection().buffer_search.?.total);
+            try testing.expect(frame.search_ranges.len > 0);
+            try testing.expect(frame.search_ranges[0].source.start >= visual.source_start);
+            try testing.expect(frame.search_ranges[0].source.start < visual.source_end);
+        }
+        const before = presentation.projection().review.?.frame;
+        try presentation.dispatch(.{ .resize = .{ .cols = 131, .rows = 12 } });
+        const worker = presentation.takeCommand().?.build_buffer_disclosure;
+        var saved_arena = worker.arena;
+        defer saved_arena.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        worker.arena = std.heap.ArenaAllocator.init(failing.allocator());
+        worker.build();
+        try testing.expect(worker.failed);
+        try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+        const after = presentation.projection().review.?.frame;
+        try testing.expectEqual(before.buffer.rows.ptr, after.buffer.rows.ptr);
+        try testing.expectEqual(before.visual_rows.ptr, after.visual_rows.ptr);
+        try testing.expectEqual(before.search_ranges.ptr, after.search_ranges.ptr);
+        try testing.expectEqualDeep(before.geometry, after.geometry);
+        try testing.expectEqualDeep(before.navigation, after.navigation);
+        try testing.expectEqual(before.visual_rows_revision, after.visual_rows_revision);
+    };
+}
+
 test "resize publishes one complete Presentation Frame revision" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();

@@ -164,7 +164,7 @@ fn searchSourceText(row: Row, visual: @import("frame.zig").VisualRow, relation: 
 }
 
 fn drawReviewCardSearchRange(win: vaxis.Window, row: u16, card: buffer_mod.ReviewCardRow, range: @import("frame.zig").ProjectedSourceRange, active: bool, theme: Theme) void {
-    var col: usize = (if (card.isReply()) @as(usize, 6) else 2) + (if (card.part == .header) @as(usize, 0) else 2);
+    var col: usize = card.contentColumn();
     for (card.segments) |segment| {
         const start = @max(range.source.start, segment.source.start);
         const end = @min(range.source.end, segment.source.end);
@@ -758,7 +758,7 @@ fn drawReviewCard(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, card: b
         .text = segment.text,
         .style = theme.reviewCardStyle(card.role, card.part, segment.marks),
     };
-    const col: u16 = (if (card.isReply()) @as(u16, 6) else 2) + (if (card.part == .header) @as(u16, 0) else 2);
+    const col: u16 = @intCast(card.contentColumn());
     _ = win.print(segments, .{ .row_offset = r, .col_offset = col, .wrap = .none });
 }
 
@@ -2918,6 +2918,61 @@ test "File and PR Comment headers end in DiffPane border rules" {
     try testing.expectEqual(theme.pane_border_focused.fg, win.readCell(win.width - 1, 1).?.style.fg);
 }
 
+test "M23 ancestry renders shared offsets and visible capped depth with search cells" {
+    const cases = [_]struct { width: u16, depth: usize, indent: usize }{
+        .{ .width = 100, .depth = 2, .indent = 8 },
+        .{ .width = 60, .depth = 2, .indent = 4 },
+        .{ .width = 40, .depth = 2, .indent = 0 },
+        .{ .width = 60, .depth = 20, .indent = 16 },
+    };
+    for (cases) |case| for ([_]buffer_mod.Layout{ .unified, .side_by_side }) |layout| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var comments: [21]bbr.review.Comment = undefined;
+        for (comments[0 .. case.depth + 1], 0..) |*comment, index| comment.* = .{
+            .id = index + 1,
+            .parent_id = if (index == 0) null else index,
+            .author = "author with a name longer than the available header width at the indentation cap",
+            .body = "bodyabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+        };
+        const threads = try bbr.review.buildThreads(a, comments[0 .. case.depth + 1]);
+        const diff: bbr.diff.Diff = .{ .files = &.{} };
+        const buf = try buffer_mod.buildWithComments(a, diff, layout, threads, .{ .card_width = case.width, .collapsed_rows = 1 });
+        var screen = try vaxis.Screen.init(a, .{ .rows = 80, .cols = case.width + 29, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(a);
+        const win = headlessWindow(&screen);
+        for (@import("theme.zig").builtins) |builtin| {
+            draw(a, win, diff, buf, builtin.value, Nav.init(buf.rows.len, 80), 0, threads, &.{});
+            for (buf.rows, 0..) |row, index| if (row == .comment and row.comment.owner.comment == case.depth + 1) {
+                const card = row.comment;
+                const start = 29 + case.indent + if (card.part == .header) @as(usize, 2) else 4;
+                if (card.part == .header and (case.indent == 0 or case.depth == 20)) {
+                    var text: std.ArrayList(u8) = .empty;
+                    for (start..win.width) |col| try text.appendSlice(a, win.readCell(@intCast(col), @intCast(index)).?.char.grapheme);
+                    const label = try std.fmt.allocPrint(a, "depth {d}", .{case.depth});
+                    try testing.expect(std.mem.indexOf(u8, text.items, label) != null);
+                } else {
+                    const first = if (card.part == .body) "b" else if (card.part == .header) "↳" else "▸";
+                    try testing.expectEqualStrings(first, win.readCell(@intCast(start), @intCast(index)).?.char.grapheme);
+                }
+                if (card.part == .body) {
+                    const pane = win.child(.{ .x_off = 29, .width = case.width, .height = 80 });
+                    drawReviewCardSearchRange(pane, @intCast(index), card, .{
+                        .visual_row = index,
+                        .relation = .neutral,
+                        .source = .{ .start = 0, .end = 4 },
+                        .row = .{ .start = 0, .end = 4 },
+                        .active = true,
+                    }, true, builtin.value);
+                    try testing.expectEqualDeep(builtin.value.search_active, win.readCell(@intCast(start), @intCast(index)).?.style.bg);
+                    try testing.expect(!std.meta.eql(builtin.value.search_active, win.readCell(@intCast(start - 1), @intCast(index)).?.style.bg));
+                }
+            };
+        }
+    };
+}
+
 test "ReviewCard wide grapheme keeps the DiffPane right border" {
     const Metrics = struct {
         fn next(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
@@ -3069,7 +3124,7 @@ test "SideBySide WholeFile accents only the selected header and inner gutter edg
     try testing.expectEqual(theme_dark.added.bg, win.readCell(half + 1 + side_gutter, 1).?.style.bg);
 }
 
-test "a woven comment renders with its marker and style; a suggestion is distinct" {
+test "M23 ancestry woven Comment and Suggestion retain distinct markers and styles" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -3089,7 +3144,7 @@ test "a woven comment renders with its marker and style; a suggestion is distinc
         .{ .id = 2, .parent_id = 1, .author = "Bo", .body = "```suggestion\nrenamed\n```" },
     };
     const threads = try bbr.review.buildThreads(a, &comments);
-    const buf = try buffer_mod.buildWithComments(a, diff, .unified, threads, .{});
+    const buf = try buffer_mod.buildWithComments(a, diff, .unified, threads, .{ .card_width = 51 });
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
@@ -3104,12 +3159,12 @@ test "a woven comment renders with its marker and style; a suggestion is distinc
     // Root comment marker "▸" at its indent (col 2 within the pane).
     try testing.expectEqualStrings("▸", win.readCell(px + 2, 4).?.char.grapheme);
     try testing.expectEqual(theme_dark.comment.bg, win.readCell(px + 2, 4).?.style.bg);
-    try testing.expectEqualStrings("±", win.readCell(px + 6, 6).?.char.grapheme);
-    try testing.expectEqual(theme_dark.comment_reply.bg, win.readCell(px + 6, 6).?.style.bg);
-    try testing.expectEqualStrings("s", win.readCell(px + 8, 7).?.char.grapheme);
-    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 8, 7).?.style.bg);
-    try testing.expectEqualStrings("r", win.readCell(px + 8, 8).?.char.grapheme);
-    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 8, 8).?.style.bg);
+    try testing.expectEqualStrings("±", win.readCell(px + 3, 6).?.char.grapheme);
+    try testing.expectEqual(theme_dark.comment_reply.bg, win.readCell(px + 3, 6).?.style.bg);
+    try testing.expectEqualStrings("s", win.readCell(px + 5, 7).?.char.grapheme);
+    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 5, 7).?.style.bg);
+    try testing.expectEqualStrings("r", win.readCell(px + 5, 8).?.char.grapheme);
+    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 5, 8).?.style.bg);
 }
 
 test "the help overlay floats a centered Keybindings modal from the Keymap" {

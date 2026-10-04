@@ -47,6 +47,12 @@ pub const ReviewCardRow = struct {
     segments: []const Segment,
     hidden_rows: usize = 0,
     total_rows: usize = 0,
+    depth: usize = 0,
+    indent: usize = 0,
+
+    pub fn contentColumn(self: ReviewCardRow) usize {
+        return self.indent + if (self.part == .header) @as(usize, 2) else 4;
+    }
     pub fn text(self: ReviewCardRow) []const u8 {
         return if (self.segments.len == 1) self.segments[0].text else "";
     }
@@ -82,6 +88,8 @@ pub const Options = struct {
     metrics: CellMetrics,
     collapsed_rows: usize = 6,
     expanded: bool = false,
+    depth: usize = 0,
+    indent: usize = 0,
 };
 
 pub fn project(allocator: std.mem.Allocator, body: ReviewBody, options: Options) ![]const ReviewCardRow {
@@ -147,6 +155,8 @@ fn makeRow(options: Options, part: Part, ordinal: usize, kind: BlockKind, range:
         .block_kind = kind,
         .source_range = range,
         .segments = segments,
+        .depth = options.depth,
+        .indent = options.indent,
     };
 }
 
