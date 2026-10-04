@@ -131,3 +131,11 @@ This confirmation does not approve the complete acceptance matrix or resolve the
 
 Release the claim while [Choose Selection source ownership after Markdown projection](./11-choose-selection-source-ownership-after-markdown-projection.md) blocks this ticket.
 The ticket remains open and cannot return to the frontier until that decision resolves.
+
+### Selection source-ownership dependency resolved
+
+[Choose Selection source ownership after Markdown projection](./11-choose-selection-source-ownership-after-markdown-projection.md) now resolves exact extraction for transformed rows.
+The user's final confirmation was `7a`.
+This ticket is unblocked and remains `ready-for-agent`.
+The acceptance review must use that answer's exact-byte examples and explicit refinements to the earlier yank contract.
+The proposed matrix remains unapproved until this ticket resolves.

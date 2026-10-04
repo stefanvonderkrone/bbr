@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M23 Selection copying questions</title>
+<style>
+	* { box-sizing: border-box; }
+	:root { color-scheme: light; }
+	body { margin: 0 auto; padding: 28px 20px 60px; max-width: 1280px; background: #f3f5f7; color: #202630; font: 15px/1.5 system-ui, sans-serif; }
+	h1 { margin: 0; font-size: 27px; }
+	h2 { margin: 0 0 8px; font-size: 21px; }
+	h3 { font-size: 15px; margin: 0 0 8px; }
+	p { margin: 8px 0 14px; max-width: 95ch; }
+	nav { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 0; background: #f3f5f7; }
+	a { color: #176178; }
+	nav a { padding: 5px 10px; border: 1px solid #cad2db; border-radius: 4px; text-decoration: none; background: white; }
+	section { scroll-margin-top: 90px; background: white; border: 1px solid #cad2db; border-radius: 8px; padding: 22px; margin: 16px 0; }
+	.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 14px 0; }
+	button, select, textarea { font: inherit; }
+	button, select { padding: 6px 10px; border: 1px solid #aab5c2; border-radius: 4px; background: white; color: #202630; }
+	button { cursor: pointer; }
+	button:focus-visible, select:focus-visible, textarea:focus-visible, a:focus-visible { outline: 3px solid #248aa8; outline-offset: 2px; }
+	.panes { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; }
+	pre, code, .terminal { font-family: ui-monospace, Menlo, Consolas, monospace; }
+	pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+	.raw { background: #f3f5f7; border: 1px solid #dce1e7; padding: 12px; border-radius: 4px; }
+	.raw-line { display: grid; grid-template-columns: 5ch minmax(0, 1fr); }
+	.raw-line pre { white-space: pre-wrap; }
+	.line-id { color: #647082; user-select: none; font: 12px/1.8 ui-monospace, Menlo, monospace; }
+	.terminal { padding: 8px; background: #17212d; border-radius: 4px; color: #eef2f6; overflow-x: auto; }
+	.terminal button { display: flex; width: 100%; min-width: max-content; border: 0; border-radius: 0; background: transparent; color: inherit; text-align: left; padding: 2px 6px; font: 14px/22px ui-monospace, Menlo, monospace; white-space: pre; }
+	.terminal button.selected { background: #275f74; box-shadow: inset 3px 0 #86d8ed; }
+	.row-number { color: #a2b4c3; width: 5ch; flex: none; }
+	.generated { color: #9eacbc; }
+	.hit { background: #6d5425; color: #fff1c7; }
+	.notice { padding: 8px 12px; background: #edf5f8; border-left: 3px solid #248aa8; }
+	.selection-state { font-size: 13px; margin: 8px 0; color: #475669; }
+	.options { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin: 16px 0; }
+	.option { border: 1px solid #cad2db; border-radius: 5px; padding: 12px; }
+	.option.chosen { border-color: #176178; box-shadow: inset 0 0 0 1px #176178; }
+	.option label { display: block; cursor: pointer; }
+	.option p { font-size: 13px; margin: 6px 0 10px; }
+	.result { background: #f3f5f7; padding: 10px; border-radius: 3px; min-height: 52px; margin-top: 5px; }
+	.bytes { font-size: 12px; color: #526072; margin: 8px 0; }
+	.badge { font-size: 11px; color: #176178; }
+	.key { display: inline-block; background: #275f74; color: white; padding: 1px 8px; }
+	.note { font-size: 13px; color: #526072; }
+	textarea { width: 100%; min-height: 100px; padding: 10px; border: 1px solid #aab5c2; border-radius: 4px; resize: vertical; }
+	#answer { min-height: 180px; }
+	@media (max-width: 760px) { .panes { grid-template-columns: 1fr; } section { padding: 16px; } nav { position: static; } }
+</style>
+<header>
+	<h1>M23 Selection copying questions</h1>
+	<p>Which authored lines must <code>y</code> copy when selected ReviewBody rows differ from the authored Markdown?</p>
+	<p>All seven answers are recorded from chat. The alternatives remain available for comparison.</p>
+	<p>Questions 2 and 3 now include the confirmed hidden-delimiter and authored-order rules from questions 5 and 7.</p>
+	<p>Each option shows its clipboard result for the highlighted Selection. Use a letter or a longform answer.</p>
+	<p class="note">Throwaway planning prototype. Hand-built rows show proposed copying rules, not the application or a Markdown parser.</p>
+	<p><span class="key">Blue row + ▶</span> means selected. Gray text is generated decoration. Gold text is a search match.</p>
+	<p class="note">All examples use eligible content from Selected Version. Complete-body copying without Selection keeps its agreed behavior.</p>
+</header>
+<nav aria-label="Questions">
+	<a href="#q1">1. Joined prose</a><a href="#q2">2. Table headers</a><a href="#q3">3. Reference links</a>
+	<a href="#q4">4. Blank lines</a><a href="#q5">5. Hidden delimiters</a><a href="#q6">6. Copy order</a>
+	<a href="#q7">7. Implied-line order</a><a href="#answers">Your answer</a>
+</nav>
+<main id="questions"></main>
+<section id="answers">
+	<h2>Your answer</h2>
+	<p>Answer in chat, for example <code>1a, 2a, 3b, 4a, 5a, 6a</code>. Use your own rule for any question.</p>
+	<label for="longform">Longform answer or changes to the examples</label>
+	<textarea id="longform" placeholder="For question 3, I want…"></textarea>
+	<h3>Answer text</h3>
+	<textarea id="answer" readonly aria-label="Answer text to copy"></textarea>
+	<button id="select-answer" type="button">Select answer text</button>
+	<p class="note">Choices stay in this page's memory. Reload clears them. This page does not save or submit decisions.</p>
+</section>
+<script>
+	// Fixed examples illustrate the choices. They do not predict bbr's exact wrapping geometry.
+	const row = (text, refs = [], extra = {}) => ({ text, refs, ...extra });
+	const source = text => text.match(/[^\n]*\n|[^\n]+$/g) || [];
+	const card = text => row(text, [], { generated: true, label: true });
+	const examples = [
+		{
+			title: 'Joined prose',
+			question: 'Does a selected row copy only the authored lines it shows, or the whole joined paragraph?',
+			options: [
+				['a', 'Copy touched authored lines', 'Copy each touched line completely, once. Do not add other paragraph lines.'],
+				['b', 'Copy the whole paragraph', 'Any selected paragraph row adds every authored line in that paragraph.']
+			],
+			cases: [
+				{ name: 'Wide: both authored lines in one row', raw: 'first\nsecond', rows: [row('first second', [0, 1])], selection: [0, 0], paragraph: [0, 1], note: 'One selected displayed row contains text from both authored lines.' },
+				{ name: 'Narrow: only the first line selected', raw: 'first\nsecond', rows: [row('first', [0]), row('second', [1])], selection: [0, 0], paragraph: [0, 1], note: 'Select the second row too to compare the results. The paragraph is still one semantic region.' },
+				{ name: 'Wrapped: select part of one authored line', raw: 'alpha bravo\ncharlie delta', rows: [row('alpha', [0]), row('bravo', [0]), row('charlie', [1]), row('delta', [1])], selection: [0, 0], paragraph: [0, 1], note: 'Selecting alpha touches the complete authored line alpha bravo. Selecting both wraps must not copy it twice.' },
+				{ name: 'Search reveal, then Selection', raw: 'first\nsecond\n\nhidden tail', rows: [row('first', [0], { hit: true }), row('second', [1], { hit: true }), card('Show 1 more body row')], selection: [0, 0], paragraph: [0, 1], note: 'Open the Review Search result for first second. It saves the required disclosure. Close the Overlay, then select first. The hidden tail is not selected.' },
+				{ name: 'Collapsed ReviewCard: only the footer selected', raw: 'first\nsecond', rows: [card('Show 2 body rows')], selection: [0, 0], paragraph: [0, 1], note: 'Both choices keep the agreed selected-label exception. Neither adds hidden body lines from this footer.' }
+			]
+		},
+		{
+			title: 'Repeated table headers',
+			question: 'Does a repeated header beside a narrow table cell also contribute the authored header line?',
+			options: [
+				['a', 'Copy the cell row without the repeated header', 'The repeated header is decoration. The confirmed hidden-delimiter rule also adds the table separator.'],
+				['b', 'Also copy the authored header', 'Each selected repeated header contributes its authored header line, once.']
+			],
+			cases: [
+				{ name: 'Narrow: one header-labelled cell', raw: '| Name | State |\n| --- | --- |\n| Ada | Ready |\n| Bo | Waiting |', rows: [row('Name: Ada', [2], { prefix: 'Name: ', repeated: [0] }), row('State: Ready', [2], { prefix: 'State: ', repeated: [0] }), row('Name: Bo', [3], { prefix: 'Name: ', repeated: [0] }), row('State: Waiting', [3], { prefix: 'State: ', repeated: [0] })], selection: [1, 1], note: 'Select both Ada cells to see deduplication. Your answer 5b adds the hidden separator. Answer 2a still excludes the repeated header.' },
+				{ name: 'Wide: actual header and body row', raw: '| Name | State |\n| --- | --- |\n| Ada | Ready |\n| Bo | Waiting |', rows: [row('Name  │ State', [0]), row('──────┼────────', [], { generated: true }), row('Ada   │ Ready', [2]), row('Bo    │ Waiting', [3])], selection: [2, 2], note: 'Selecting the actual header copies its authored line under either choice. The border itself contributes no text.' }
+			]
+		},
+		{
+			title: 'Reference destinations',
+			question: 'Selecting a visible URL touches a reference use. Must the hidden definition also enter the clipboard?',
+			options: [
+				['a', 'Copy the reference use', 'Copy the authored line containing the visible use. Do not add its hidden definition.'],
+				['b', 'Copy the use and the definition', 'Add the complete hidden definition line after the use. Do not add an unselected blank line.'],
+				['c', 'Copy the definition for a URL-only row', 'Copy the hidden definition when only its resolved URL row is selected. Label rows still copy the use.']
+			],
+			cases: [
+				{ name: 'Narrow: only the resolved URL row selected', raw: '[docs][id]\n\n[id]: https://example.invalid/', rows: [row('docs', [0]), row('‹https://example.invalid/›', [0], { definition: [2], urlOnly: true })], selection: [1, 1], note: 'The definition does not have a visible row. URL brackets are generated decoration.' },
+				{ name: 'Wide: label and URL share a selected row', raw: '[docs][id]\n\n[id]: https://example.invalid/', rows: [row('docs ‹https://example.invalid/›', [0], { definition: [2] })], selection: [0, 0], note: 'Choice c includes both lines here because the selected row contains the label and the resolved destination.' },
+				{ name: 'Two visible uses of one hidden definition', raw: '[docs][id]\n\n[more][id]\n\n[id]: https://example.invalid/', rows: [row('docs ‹https://example.invalid/›', [0], { definition: [4] }), row('', [1]), row('more ‹https://example.invalid/›', [2], { definition: [4] })], selection: [0, 2], note: 'The definition copies once per owner. An unselected authored blank line before the definition does not follow it.' }
+			]
+		},
+		{
+			title: 'Blank lines',
+			question: 'One displayed spacer represents several authored blank lines. Which of those lines must it copy?',
+			options: [
+				['a', 'Copy all represented blank lines', 'Preserve each represented blank line, including its whitespace and line ending.'],
+				['b', 'Copy the first represented blank line', 'The spacer contributes only the first authored blank line.'],
+				['c', 'Copy no blank lines', 'Treat the spacer as decoration.']
+			],
+			cases: [
+				{ name: 'Two authored blank lines, one selected spacer', raw: 'A\n\n\nB', rows: [row('A', [0]), row('', [1, 2], { spacer: true }), row('B', [3])], selection: [1, 1], note: 'The highlighted empty row represents authored lines 2 and 3.' },
+				{ name: 'Blank lines with spaces and a tab', raw: 'A\n  \n\t\nB', rows: [row('A', [0]), row('', [1, 2], { spacer: true }), row('B', [3])], selection: [1, 1], note: 'Visible whitespace marks below expose the bytes. They are not clipboard characters.' },
+				{ name: 'Generated spacer with no authored blank line', raw: '# Title\ntext', rows: [row('§1 Title', [0], { prefix: '§1 ' }), row('', [], { spacer: true }), row('text', [1])], selection: [1, 1], note: 'This schematic spacer has no authored source line. All choices produce no clipboard command.' }
+			]
+		},
+		{
+			title: 'Generated markers and hidden delimiters',
+			question: 'Must marker-only rows or adjacent content imply authored lines that have no visible row?',
+			options: [
+				['a', 'Do not add implied lines', 'Marker-only rows add nothing. Content rows do not add hidden fences, underlines, or table separators.'],
+				['b', 'Include hidden block delimiters', 'Selected block content also adds its existing authored delimiters in authored order. Marker-only rows still add nothing.'],
+				['c', 'Let marker-only rows own source lines', 'Marker-only rows copy the authored line that produced the marker. Content does not add hidden delimiters.']
+			],
+			cases: [
+				{ name: 'Code content selected, fences hidden', raw: '```zig\nconst x = 1;\n```\nafter', rows: [row('const x = 1;', [1], { delimiters: [0, 2] }), row('after', [3])], selection: [0, 0], note: 'Choice b copies existing fence lines. No choice creates a new fence. Choice a keeps the prior partial-code rule.' },
+				{ name: 'Setext heading selected, underline hidden', raw: 'Title\n=====\ntext', rows: [row('§1 Title', [0], { prefix: '§1 ', delimiters: [1] }), row('text', [2])], selection: [0, 0], note: 'The heading content belongs to line 1. Its underline is authored line 2, with no displayed row.' },
+				{ name: 'Very narrow heading: only marker row selected', raw: '# Title', rows: [row('§1', [], { generated: true, markerSource: [0] }), row('Title', [0])], selection: [0, 0], note: 'This schematic split isolates a generated marker. It does not specify exact minimum-width wrapping in bbr.' },
+				{ name: 'Only a generated list marker selected', raw: '- item', rows: [row('•', [], { generated: true, markerSource: [0] }), row('item', [0])], selection: [0, 0], note: 'Selecting the item text copies the complete authored line, including its original dash, under every choice.' },
+				{ name: 'Only a generated quote bar selected', raw: '> quoted', rows: [row('│', [], { generated: true, markerSource: [0] }), row('quoted', [0])], selection: [0, 0], note: 'The bar is generated. The authored quote marker remains in a copied content line.' },
+				{ name: 'Only a generated table border selected', raw: '| Name |\n| --- |\n| Ada |', rows: [row('Name', [0], { delimiters: [1] }), row('──────', [], { generated: true, markerSource: [1] }), row('Ada', [2], { delimiters: [1] })], selection: [1, 1], note: 'Choice c maps this border to the authored separator for comparison. Choice a gives the border no clipboard contribution.' },
+				{ name: 'Selected ReviewCard labels remain permitted', raw: '```suggestion\nnew value\n```', rows: [card('Draft Reply by Ada'), card('Suggestion'), card('Show 1 body row')], selection: [0, 2], note: 'All choices retain the agreed exception for selected ReviewCard labels. Hidden replacement content does not follow the labels.' }
+			]
+		},
+		{
+			title: 'Contribution order',
+			question: 'How must copied contributions follow display order when a Selection crosses source and a ReviewCard?',
+			options: [
+				['a', 'Use first encounter in display order', 'Scan selected rows top to bottom. Within one row, copy new authored lines in authored order. Deduplicate per owner.'],
+				['b', 'Group lines by owner', 'Copy all selected source lines together, then the Comment lines. This changes the agreed mixed-Selection display-order rule.']
+			],
+			cases: [
+				{ name: 'Source, joined Comment, then source', raw: 'before();\nfirst\nsecond\nafter();', owners: ['File L10', 'Comment L1', 'Comment L2', 'File L11'], rows: [row('before();', [0]), row('first second', [1, 2]), row('after();', [3])], selection: [0, 2], groups: [[0, 3], [1, 2]], note: 'The left panel combines two owners for this example. The source File appears before and after the Comment.' },
+				{ name: 'Narrow Comment wraps inside mixed Selection', raw: 'before();\nfirst\nsecond\nafter();', owners: ['File L10', 'Comment L1', 'Comment L2', 'File L11'], rows: [row('before();', [0]), row('first', [1]), row('second', [2]), row('after();', [3])], selection: [0, 3], groups: [[0, 3], [1, 2]], note: 'Narrow projection must retain the same contribution order when the same logical lines participate.' }
+			]
+		},
+		{
+			title: 'Order of implied lines within a ReviewCard',
+			question: 'Your choices add hidden fences and definitions. Where must those lines go when several selected rows share them?',
+			options: [
+				['a', 'Keep authored order within each ReviewCard', 'Collect touched body lines and required hidden lines. Copy them in authored order within the ReviewCard. Keep source and ReviewCards in display order.'],
+				['b', 'Insert implied lines at first encounter', 'Copy implied lines immediately with the first selected row that requires them. Deduplicate later rows without moving earlier contributions.']
+			],
+			cases: [
+				{ name: 'Two selected code lines share hidden fences', raw: '```zig\nconst x = 1;\nconst y = 2;\n```\nafter', rows: [row('const x = 1;', [1], { implied: [0, 3] }), row('const y = 2;', [2], { implied: [0, 3] }), row('after', [4])], selection: [0, 1], note: 'Both code rows are selected. Choice a places the existing closing fence after both lines. Neither choice adds unselected code.' },
+				{ name: 'Two selected references share a hidden definition', raw: '[docs][id]\n[more][id]\n\n[id]: https://example.invalid/', rows: [row('docs ‹https://example.invalid/›', [0], { implied: [3] }), row('more ‹https://example.invalid/›', [1], { implied: [3] })], selection: [0, 1], note: 'Choice a places the definition after both selected uses. The unselected authored blank line does not follow the definition.' }
+			]
+		}
+	];
+	const recordedAnswers = ['a', 'a', 'b', 'b', 'b', 'a', 'a'];
+	const answers = new Map(recordedAnswers.map((answer, index) => [index, answer]));
+	const states = examples.map((example, index) => {
+		const caseIndex = index === 0 ? 1 : 0;
+		const selection = [...example.cases[caseIndex].selection];
+		return { caseIndex, anchor: selection[0], selection };
+	});
+	function contributions(questionIndex, scenario, selection, choice) {
+		const result = [];
+		const selectedRows = selection ? scenario.rows.slice(selection[0], selection[1] + 1) : [];
+		for (const current of selectedRows) {
+			if (current.label) { result.push({ label: current.text }); continue; }
+			let refs = [...current.refs];
+			if (questionIndex === 0 && choice === 'b' && refs.length) refs = [...scenario.paragraph];
+			if (questionIndex === 1 && choice === 'b') refs.push(...current.repeated || []);
+			if (questionIndex === 1 && current.refs.length) refs.push(1);
+			if (questionIndex === 2 && current.definition) {
+				if (choice === 'b') refs.push(...current.definition);
+				if (choice === 'c') refs = current.urlOnly ? [...current.definition] : [...refs, ...current.definition];
+			}
+			if (questionIndex === 3 && current.spacer) refs = choice === 'c' ? [] : choice === 'b' ? refs.slice(0, 1) : refs;
+			if (questionIndex === 4) {
+				if (choice === 'b' && refs.length) refs.push(...current.delimiters || []);
+				if (choice === 'c') refs.push(...current.markerSource || []);
+			}
+			if (questionIndex === 6) refs.push(...current.implied || []);
+			for (const ref of [...new Set(refs)].sort((a, b) => a - b)) result.push({ ref });
+		}
+		const seen = new Set();
+		let unique = result.filter(item => {
+			if ('label' in item) return true;
+			if (seen.has(item.ref)) return false;
+			seen.add(item.ref);
+			return true;
+		});
+		if (questionIndex === 5 && choice === 'b') unique = scenario.groups.flatMap(group => group.filter(ref => seen.has(ref)).map(ref => ({ ref })));
+		if (questionIndex === 1 || questionIndex === 2 || questionIndex === 4 && choice === 'b') unique.sort((a, b) => a.ref - b.ref);
+		if (questionIndex === 6 && choice === 'a') unique.sort((a, b) => a.ref - b.ref);
+		const lines = source(scenario.raw);
+		return unique.map(item => 'label' in item ? item.label : lines[item.ref]);
+	}
+	function clipboard(parts) {
+		return parts.reduce((text, part) => text + (text && !text.endsWith('\n') ? '\n' : '') + part, '');
+	}
+	function visibleBytes(text) {
+		return text.replace(/ /g, '·').replace(/\t/g, '⇥').replace(/\r/g, '␍').replace(/\n/g, '↵\n');
+	}
+	function element(tag, className, text) {
+		const node = document.createElement(tag);
+		if (className) node.className = className;
+		if (text !== undefined) node.textContent = text;
+		return node;
+	}
+	function updateAnswer() {
+		const letters = examples.map((example, index) => `${index + 1}${answers.get(index) || ' unanswered'}`).join(', ');
+		const longform = document.getElementById('longform').value.trim();
+		document.getElementById('answer').value = letters + (longform ? '\n\n' + longform : '');
+	}
+	function render(index) {
+		const example = examples[index], state = states[index], scenario = example.cases[state.caseIndex];
+		const section = document.getElementById(`q${index + 1}`);
+		section.replaceChildren(element('h2', '', `${index + 1}. ${example.title}`), element('p', '', example.question));
+		const controls = element('div', 'controls');
+		const label = element('label', '', 'Example ');
+		const select = element('select');
+		select.setAttribute('aria-label', `Question ${index + 1} example`);
+		example.cases.forEach((item, caseIndex) => {
+			const option = element('option', '', item.name);
+			option.value = caseIndex;
+			option.selected = caseIndex === state.caseIndex;
+			select.append(option);
+		});
+		select.addEventListener('change', () => {
+			state.caseIndex = Number(select.value);
+			state.selection = [...example.cases[state.caseIndex].selection];
+			state.anchor = state.selection[0];
+			render(index);
+		});
+		label.append(select); controls.append(label);
+		for (const [title, action] of [
+			['Reset Selection', () => { state.selection = [...scenario.selection]; state.anchor = state.selection[0]; }],
+			['Select all visible rows', () => { state.selection = [0, scenario.rows.length - 1]; state.anchor = 0; }],
+			['Clear Selection', () => { state.selection = null; }]
+		]) {
+			const button = element('button', '', title);
+			button.type = 'button'; button.addEventListener('click', () => { action(); render(index); }); controls.append(button);
+		}
+		section.append(controls, element('p', 'notice', scenario.note));
+		const panes = element('div', 'panes'), authored = element('div'), projected = element('div');
+		authored.append(element('h3', '', 'Authored bytes. Line labels do not copy.'));
+		const raw = element('div', 'raw');
+		source(scenario.raw).forEach((text, lineIndex) => {
+			const line = element('div', 'raw-line');
+			if (scenario.owners) line.style.gridTemplateColumns = '13ch minmax(0, 1fr)';
+			line.append(element('span', 'line-id', scenario.owners?.[lineIndex] || `L${lineIndex + 1}`), element('pre', '', visibleBytes(text)));
+			raw.append(line);
+		});
+		authored.append(raw, element('p', 'note', '· is a space. ⇥ is a tab. ↵ is a newline. A final ↵ means the authored line ends with a newline.'));
+		projected.append(element('h3', '', 'Displayed rows. Blue rows are the Selection.'));
+		const terminal = element('div', 'terminal');
+		scenario.rows.forEach((current, rowIndex) => {
+			const selected = state.selection && rowIndex >= state.selection[0] && rowIndex <= state.selection[1];
+			const button = element('button', selected ? 'selected' : ''); button.type = 'button';
+			button.setAttribute('aria-pressed', Boolean(selected));
+			button.setAttribute('aria-label', `Row ${rowIndex + 1}: ${current.text || 'blank spacer'}`);
+			button.append(element('span', 'row-number', `${selected ? '▶' : ' '} ${rowIndex + 1} `));
+			if (current.prefix) button.append(element('span', 'generated', current.prefix));
+			button.append(element('span', current.generated ? 'generated' : current.hit ? 'hit' : '', current.text.slice(current.prefix?.length || 0) || ' '));
+			button.addEventListener('click', event => {
+				if (!event.shiftKey || !state.selection) state.anchor = rowIndex;
+				state.selection = [Math.min(state.anchor, rowIndex), Math.max(state.anchor, rowIndex)];
+				render(index);
+				section.querySelectorAll('.terminal button')[rowIndex].focus();
+			});
+			terminal.append(button);
+		});
+		projected.append(terminal, element('p', 'selection-state', state.selection ? `Selected displayed rows ${state.selection[0] + 1} to ${state.selection[1] + 1}.` : 'No Selection. No proposed Selection-copy result.'));
+		projected.append(element('p', 'note', 'Click one row. Shift-click another row to select the inclusive range. You can select upward too.'));
+		panes.append(authored, projected); section.append(panes);
+		const options = element('div', 'options');
+		for (const [letter, title, description] of example.options) {
+			const option = element('div', answers.get(index) === letter ? 'option chosen' : 'option');
+			const choiceLabel = element('label'), radio = element('input');
+			radio.type = 'radio'; radio.name = `answer-${index + 1}`; radio.value = letter; radio.checked = answers.get(index) === letter;
+			radio.addEventListener('change', () => { answers.set(index, letter); render(index); updateAnswer(); });
+			choiceLabel.append(radio, document.createTextNode(` ${letter}. ${title}`));
+			option.append(choiceLabel);
+			if (recordedAnswers[index] === letter) option.append(element('span', 'badge', 'Recorded choice from chat.'));
+			else if (letter === 'a') option.append(element('span', 'badge', 'Recommended.'));
+			option.append(element('p', '', description));
+			const text = clipboard(contributions(index, scenario, state.selection, letter));
+			option.append(element('h3', '', 'Clipboard result'));
+			if (!state.selection || !text) option.append(element('div', 'result', !state.selection ? 'No Selection to compare.' : 'No clipboard command. Existing clipboard stays unchanged.'));
+			else {
+				option.append(element('pre', 'result', visibleBytes(text)));
+				option.append(element('p', 'bytes', `${new TextEncoder().encode(text).length} UTF-8 bytes. Exact string:`));
+				option.append(element('pre', '', JSON.stringify(text)));
+			}
+			options.append(option);
+		}
+		section.append(options);
+	}
+	examples.forEach((example, index) => {
+		const section = element('section'); section.id = `q${index + 1}`;
+		document.getElementById('questions').append(section); render(index);
+	});
+	document.getElementById('longform').addEventListener('input', updateAnswer);
+	document.getElementById('select-answer').addEventListener('click', () => document.getElementById('answer').select());
+	updateAnswer();
+</script>
+</html>

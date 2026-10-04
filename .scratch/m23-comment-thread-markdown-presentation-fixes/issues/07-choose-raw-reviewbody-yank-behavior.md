@@ -98,6 +98,10 @@ This confirmation closes the remaining decision.
 
 ## Answer
 
+[Choose Selection source ownership after Markdown projection](./11-choose-selection-source-ownership-after-markdown-projection.md) refines transformed-row extraction.
+Its required hidden-line exceptions and authored order within each ReviewCard supersede the corresponding clauses below.
+The other clipboard rules remain in effect.
+
 ### Two copy modes
 
 The cursor names one row without creating a Selection.
