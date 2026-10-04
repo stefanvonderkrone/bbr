@@ -3,7 +3,7 @@
 Parent: [M23 Comment thread and Markdown presentation fixes](../map.md)
 Label: wayfinder:grilling
 Type: grilling
-Status: ready-for-agent
+Status: resolved
 Blocked by: 01, 02, 03, 04, 05, 06, 07, 09, 10, 11
 
 ## Question
@@ -60,8 +60,9 @@ The checks combine those decisions without making a second copy of their answers
 | Exact search navigation and disclosure | [Choose search through Markdown projection](./06-choose-search-through-markdown-projection.md) | Check complete authored ranges, first matched position, complete emoji highlights, reference-use navigation, temporary Buffer Search reveals, saved Review Search disclosures, reprojection, and Session expiry. |
 | Formatted Review Search Preview | [Choose search through Markdown projection](./06-choose-search-through-markdown-projection.md) and the [accepted combined prototype](../prototype/combined-presentation.html) | Check shared ReviewBody formatting and code results. Check selected Preview priority, removal of pending eligibility, shared result storage, plain-first presentation, and unchanged geometry after colors arrive. |
 | Raw complete-body yank from the original milestone | [Choose raw ReviewBody yank behavior](./07-choose-raw-reviewbody-yank-behavior.md) | Inspect exact `copy_clipboard` bytes from every eligible ReviewCard part. Include collapsed content, whitespace-only bodies, fences, tabs, trailing newlines, and available Deleted Comment content. |
-| Mixed Selection and source yank | [Choose raw ReviewBody yank behavior](./07-choose-raw-reviewbody-yank-behavior.md) | Check both Selection directions, multiple owners and Files, wrapped-line deduplication, permitted selected labels, excluded structural rows, Selected Version and inherited scope, Count, Selection cleanup, refusals, and clipboard completions. Add transformed-row cases after the source-ownership decision. |
-| Authored storage, editing, and Suggestions | [Choose ReviewBody Markdown presentation](./04-choose-reviewbody-markdown-presentation.md), [Choose raw ReviewBody yank behavior](./07-choose-raw-reviewbody-yank-behavior.md), and [Choose ReviewBody code-block Highlighting](./05-choose-reviewbody-code-block-highlighting.md) | Compare stored, Composer, External Edit, and emitted submission bodies with authored bytes. Check Suggestion recognition, replacement content, inherited inline context, and existing mutation restrictions. |
+| Mixed Selection and source yank | [Choose raw ReviewBody yank behavior](./07-choose-raw-reviewbody-yank-behavior.md) and [Choose Selection source ownership after Markdown projection](./11-choose-selection-source-ownership-after-markdown-projection.md) | Check both Selection directions, multiple owners and Files, wrapped-line deduplication, permitted selected labels, excluded structural rows, Selected Version and inherited scope, Count, Selection cleanup, refusals, and clipboard completions. Apply the later source-ownership answer where it refines the earlier yank answer. |
+| Transformed-row Selection extraction | [Choose Selection source ownership after Markdown projection](./11-choose-selection-source-ownership-after-markdown-projection.md#exact-clipboard-byte-examples) and the [accepted visual Selection examples](../prototype/selection-copy-questions.html) | Inspect exact clipboard bytes for every numbered example. Cover joined and wrapped prose, table cells and repeated headers, reference links and images, compressed blank lines, generated marker-only rows, hidden block delimiters, and authored order within each ReviewCard. Check search reveal, resize, disclosure, per-owner deduplication, and opposite Selected Version exclusion. |
+| Authored storage, editing, and Suggestions | [Choose ReviewBody Markdown presentation](./04-choose-reviewbody-markdown-presentation.md), [Choose raw ReviewBody yank behavior](./07-choose-raw-reviewbody-yank-behavior.md), and [Choose ReviewBody code-block Highlighting](./05-choose-reviewbody-code-block-highlighting.md) | Check that presentation changes do not alter stored or submitted authored bytes. Ordinary Composer and External Edit receive authored Markdown. Suggestion Composer retains its existing replacement-code contract. Check Suggestion recognition, replacement content, inherited inline context, and existing mutation restrictions. |
 | Combined terminal presentation | [Validate combined Reply and Markdown presentation](./10-validate-combined-reply-and-markdown-presentation.md) | Repeat the accepted combinations in actual parser, projection, and rendering checks. Do not treat the prototype's fixed emoji width, colors, or disclosure budget as application requirements. |
 | Human acceptance after implementation | [Choose ReviewBody Markdown presentation](./04-choose-reviewbody-markdown-presentation.md#human-review-checklist) | A human authors the example Comments in an agreed test PullRequest. A human reviews the complete format-combination checklist in bbr, including narrow Replies, code colors, clipboard output, terminal attributes, and light, dark, and system Themes. |
 
@@ -69,13 +70,16 @@ The checks combine those decisions without making a second copy of their answers
 
 - Parser checks inspect width-independent ReviewBody meaning and authored source ranges.
   They include local fallback and byte-preserving literal content.
+  Source ranges distinguish touched content, resolved definitions, and hidden block delimiters.
 - Projection checks inspect ReviewCard order, width, wrapping, disclosure, typed owners, and source mapping.
   They cover Unified and SideBySide layouts and RemoteReview and LocalReview where the behavior applies.
+  Joined prose, narrow tables, and compressed spacers retain the source relationships required for Selection extraction.
 - Headless rendering checks inspect cell text, terminal-column boundaries, foregrounds, backgrounds, and attributes.
   Style checks cover every built-in Theme and applicable ReviewCard role.
   Combined scenarios cover cursor, Selection, and search backgrounds without changing existing Action availability.
 - Presentation integration checks dispatch Actions and owned completions through the existing seam.
   They inspect exact navigation, clipboard text, work scheduling, stale-work cleanup, and preservation of the previous complete Frame on failure.
+  Clipboard checks inspect `copy_clipboard` bytes and correlated completions rather than a system clipboard.
 - The complete hermetic test suite must pass with `zig build test --summary all` during implementation acceptance.
   New test files must participate in the test import chain.
   This planning session does not run application acceptance checks for unimplemented behavior.
@@ -139,3 +143,70 @@ The user's final confirmation was `7a`.
 This ticket is unblocked and remains `ready-for-agent`.
 The acceptance review must use that answer's exact-byte examples and explicit refinements to the earlier yank contract.
 The proposed matrix remains unapproved until this ticket resolves.
+
+### Current integrated acceptance review
+
+This session claimed the ticket after all dependencies reached `resolved`.
+The revised proposed matrix includes [Choose Selection source ownership after Markdown projection](./11-choose-selection-source-ownership-after-markdown-projection.md).
+Its hidden-line exceptions and authored order within each ReviewCard override the corresponding earlier yank clauses.
+The exact-byte examples and accepted visual Selection examples now form part of the proposed acceptance checks.
+
+The matrix also distinguishes authored Markdown editing from Suggestion replacement-code editing.
+Presentation must preserve authored storage and Submission bytes.
+That requirement does not change the existing Suggestion Composer contract.
+
+The review found no further unresolved implementation decision in the resolved answers.
+The existing M21 search exclusions and Action availability remain in force unless an M23 answer explicitly changes them.
+Available Deleted Comment content remains copyable but excluded from both searches and unavailable for mutation.
+M23's ReviewBody search styling preserves Markdown foregrounds and attributes under active search backgrounds.
+Source File search retains its existing style rules.
+
+The earlier human confirmation still requires observed raw Markdown, returned Cloud HTML, and bbr output for the human-authored list examples.
+The acceptance review must apply the Cloud evidence policy to any observed syntax difference.
+Selecting the test PullRequest and agreeing on its authoring scope remain prerequisites for the later live review.
+The human must agree on both before authoring those examples.
+They do not block parser, projection, search, Highlighting, or clipboard implementation decisions.
+
+The user must approve the revised matrix, test boundaries, and evidence requirements before this ticket resolves.
+The final specification handoff follows that approval.
+
+### Final confirmation
+
+The user replied `ok` to the revised acceptance contract and the recommendation to close the map.
+This confirmation approves the complete revised matrix, test boundaries, and evidence requirements.
+
+## Answer
+
+### Approved acceptance contract
+
+The [revised acceptance matrix](#proposed-acceptance-matrix), [test boundaries](#proposed-test-boundaries), and [evidence classes](#evidence-classes) are approved.
+Their proposal headings retain the review history. This answer makes those sections the accepted contract.
+Each matrix row links the decision that owns its detailed behavior and acceptance examples.
+The [current integrated acceptance review](#current-integrated-acceptance-review) records the final contract checks.
+
+[Choose Selection source ownership after Markdown projection](./11-choose-selection-source-ownership-after-markdown-projection.md) supplies the exact-byte extraction examples.
+Its hidden-line exceptions and authored order within each ReviewCard supersede the corresponding earlier yank clauses.
+The other yank rules remain in effect.
+
+Authored content, Suggestion editing, search exclusions, and Action availability retain their existing contracts except for explicit M23 changes.
+Available Deleted Comment content is copyable but remains excluded from both searches and unavailable for mutation.
+The malformed-Suggestion case requires local literal fallback rather than whole-body fallback.
+
+### Implementation and final acceptance
+
+Implementation can start with the agreed project fixtures and best-effort compatibility policy.
+Final acceptance requires the approved automated checks and the post-implementation human review.
+The complete hermetic suite must pass with `zig build test --summary all`.
+
+A human authors the example Comments and reviews the format-combination checklist in bbr.
+The human must agree on the test PullRequest and authoring scope before live authoring.
+Capture raw Markdown, returned Cloud HTML, and observed bbr output for the human-authored list examples during that review.
+Keep documentation, project fixtures, Cloud wire observations, and browser presentation observations distinct.
+Apply the Cloud evidence policy to any observed syntax difference.
+Finite observations establish their tested cases rather than complete Cloud compatibility.
+
+### Handoff
+
+The [M23 specification](../SPEC.md) links the approved decisions and acceptance contract for implementation.
+No implementation decision or in-scope fog remains open.
+All child tickets are resolved, and the planning map is complete.

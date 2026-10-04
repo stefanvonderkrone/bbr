@@ -1,6 +1,7 @@
 # M23 Comment thread and Markdown presentation fixes
 
 Label: wayfinder:map
+Status: resolved
 
 ## Destination
 
@@ -9,12 +10,13 @@ The map ends when behavior, Bitbucket facts, and acceptance criteria leave no op
 
 ## Notes
 
+- The map is complete. The [M23 specification](./SPEC.md) is ready for implementation.
 - This map plans M23. It does not implement the application or produce the final specification during charting.
 - The source milestone is [M23 in TODO.md](../../TODO.md).
 - The Markdown target is the user-selected [Bitbucket Markdown syntax guide](https://confluence.atlassian.com/bitbucketserver/markdown-syntax-guide-776639995.html).
 - That guide describes Data Center. The application uses Bitbucket Cloud REST API 2.0.
 - Research must identify Cloud differences rather than assume the two products have the same Markdown behavior.
-- The guide expands the original milestone beyond inline styles and lists. Terminal presentation decisions remain open.
+- The guide expands the original milestone beyond inline styles and lists. The linked decisions define terminal presentation.
 - M23 retains the original Reply indentation, emoji conversion, and raw authored Markdown yank requirements.
 - Reply presentation covers published Replies, Draft Replies, and mixed published and Draft ancestry.
 - Explore the existing `y` Action copying a complete raw body from any ReviewCard row.
@@ -45,8 +47,11 @@ The map ends when behavior, Bitbucket facts, and acceptance criteria leave no op
 - [Choose search through Markdown projection](./issues/06-choose-search-through-markdown-projection.md): Both searches match joined prose and emoji forms with authored locations. Formatted Preview shares code-block Highlighting.
 - [Validate combined Reply and Markdown presentation](./issues/10-validate-combined-reply-and-markdown-presentation.md): The human accepted the combined planning prototype. The existing presentation decisions stand.
 - [Choose Selection source ownership after Markdown projection](./issues/11-choose-selection-source-ownership-after-markdown-projection.md): Copy touched lines, the first represented blank line, and required hidden definitions or delimiters in authored order within each ReviewCard.
+- [Define the integrated M23 acceptance contract](./issues/08-define-the-integrated-m23-acceptance-contract.md): The human approved the combined acceptance matrix, automated checks, human review, and observed Cloud list fixtures.
 
 ## Not yet specified
+
+None.
 
 ## Out of scope
 
