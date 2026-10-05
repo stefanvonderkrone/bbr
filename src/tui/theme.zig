@@ -75,6 +75,9 @@ pub const Theme = struct {
     /// A Draft whose POST outcome remains unresolved after Duplicate guards.
     outcome_unknown: Style,
     outcome_unknown_reply: Style,
+    markdown_italic: Color = .{ .rgb = .{ 0x40, 0xe0, 0xd0 } },
+    markdown_bold: Color = .{ .rgb = .{ 0xff, 0xa5, 0x00 } },
+    markdown_inline_code: Color = .{ .rgb = .{ 0x90, 0xee, 0x90 } },
     /// A section divider (PR comments / Pending / Outdated).
     section: Style,
     /// The PR picker overlay's background rows.
@@ -141,10 +144,18 @@ pub const Theme = struct {
                 style.dim = true;
             },
             .header => style.bold = true,
-            .body => {},
+            .body => style.bold = false,
         }
         style.italic = style.italic or marks.emphasis;
         style.bold = style.bold or marks.strong;
+        style.strikethrough = style.strikethrough or marks.strikethrough;
+        if (marks.inline_code) {
+            style.fg = self.markdown_inline_code;
+        } else if (marks.strong) {
+            style.fg = self.markdown_bold;
+        } else if (marks.emphasis) {
+            style.fg = self.markdown_italic;
+        }
         if (marks.link_label or marks.link_destination) style.ul_style = .single;
         return style;
     }
@@ -291,6 +302,9 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
         .draft_reply = .{ .fg = rgb(p.yellow), .bg = rgb(p.surface) },
         .outcome_unknown = .{ .fg = rgb(p.fg), .bg = rgb(if (p.light) 0xff_e0_a3 else 0x5a_30_00), .bold = true },
         .outcome_unknown_reply = .{ .fg = rgb(p.fg), .bg = rgb(if (p.light) 0xff_e9_bd else 0x46_25_00) },
+        .markdown_italic = rgb(if (p.light) 0x00_80_80 else 0x40_e0_d0),
+        .markdown_bold = rgb(if (p.light) 0xa6_50_00 else 0xff_a5_00),
+        .markdown_inline_code = rgb(if (p.light) 0x20_7a_36 else 0x90_ee_90),
         .section = .{ .fg = rgb(p.muted), .bg = rgb(p.bg), .bold = true },
         .picker = .{ .fg = rgb(p.fg), .bg = rgb(p.surface) },
         .picker_selected = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2), .bold = true },
@@ -342,6 +356,9 @@ pub const system: Theme = .{
     .draft_reply = .{ .fg = .{ .index = 3 } },
     .outcome_unknown = .{ .fg = .{ .index = 0 }, .bg = .{ .index = 3 }, .bold = true },
     .outcome_unknown_reply = .{ .fg = .{ .index = 0 }, .bg = .{ .index = 3 } },
+    .markdown_italic = .{ .index = 6 },
+    .markdown_bold = .{ .index = 208 },
+    .markdown_inline_code = .{ .index = 2 },
     .section = .{ .fg = .{ .index = 8 }, .bold = true },
     .picker = .{},
     .picker_selected = .{ .reverse = true, .bold = true },
@@ -488,4 +505,21 @@ test "Capture colors resolve hierarchical names and preserve unknown foregrounds
     try testing.expectEqual(dark.syntax_function, dark.captureColor(bbr.highlight.Capture.init(0, "function.call.builtin")).?);
     try testing.expectEqual(dark.syntax_keyword, dark.captureColor(bbr.highlight.Capture.init(1, "operator")).?);
     try testing.expect(dark.captureColor(bbr.highlight.Capture.init(2, "unrecognized.future.capture")) == null);
+}
+
+test "M23 inline Theme colors and attributes combine without Draft body bold" {
+    try testing.expectEqual(rgb(0x40e0d0), dark.markdown_italic);
+    try testing.expectEqual(rgb(0xffa500), dark.markdown_bold);
+    try testing.expectEqual(rgb(0x90ee90), dark.markdown_inline_code);
+    for (builtins) |builtin| {
+        const theme = builtin.value;
+        inline for (std.meta.tags(review_card.CardRole)) |role| {
+            try testing.expect(!theme.reviewCardStyle(role, .body, .{}).bold);
+            const italic = theme.reviewCardStyle(role, .body, .{ .emphasis = true });
+            try testing.expectEqual(theme.markdown_italic, italic.fg);
+            const bold = theme.reviewCardStyle(role, .body, .{ .strong = true, .emphasis = true, .link_label = true });
+            try testing.expectEqual(theme.markdown_bold, bold.fg);
+            try testing.expect(bold.bold and bold.italic and bold.ul_style == .single);
+        }
+    }
 }

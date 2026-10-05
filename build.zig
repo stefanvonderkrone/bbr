@@ -256,6 +256,14 @@ pub fn build(b: *std.Build) void {
     const yank_step = b.step("test-yank", "Run Presentation yank tests");
     yank_step.dependOn(&b.addRunArtifact(yank_tests).step);
 
+    const inline_tests = b.addTest(.{
+        .name = "inline-markdown-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M23 inline"},
+    });
+    const inline_step = b.step("test-inline-markdown", "Run inline Markdown presentation tests");
+    inline_step.dependOn(&b.addRunArtifact(inline_tests).step);
+
     const fixture_mod = b.createModule(.{
         .root_source_file = b.path("tests/user_grammar_fixture.zig"),
         .target = target,

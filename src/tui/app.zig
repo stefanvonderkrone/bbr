@@ -290,22 +290,7 @@ fn syncPickerTick(
     active.* = .{ .id = id, .scope = start_scope.? };
 }
 
-const metrics_context: u8 = 0;
-const metrics_vtable: @import("cell_metrics.zig").CellMetrics.VTable = .{ .next = nextVaxisGrapheme, .width = widthVaxisText };
-const vaxis_cell_metrics: @import("cell_metrics.zig").CellMetrics = .{ .ptr = &metrics_context, .vtable = &metrics_vtable };
-
-fn nextVaxisGrapheme(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
-    var iterator = vaxis.unicode.graphemeIterator(text);
-    const grapheme = iterator.next() orelse return .{ .byte_len = 1, .cell_width = 1 };
-    return .{
-        .byte_len = grapheme.len,
-        .cell_width = vaxis.gwidth.gwidth(grapheme.bytes(text), .unicode),
-    };
-}
-
-fn widthVaxisText(_: *const anyopaque, text: []const u8) usize {
-    return vaxis.gwidth.gwidth(text, .unicode);
-}
+const vaxis_cell_metrics = render.terminal_cell_metrics;
 
 fn contentGeometry(win: vaxis.Window) presentation.FrameGeometry {
     return .{ .cols = win.width, .rows = @intCast(contentViewportRows(win.height)) };

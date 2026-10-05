@@ -191,8 +191,9 @@ const Writer = struct {
             .suggestion => {
                 try self.emitSegments(&.{.{
                     .text = "suggestion",
-                    .source = value.source,
+                    .source = .{ .start = value.source.start, .end = value.source.start },
                     .marks = .{ .strong = true },
+                    .authored = false,
                 }}, .suggestion_label);
                 self.part = .suggestion_body;
                 const content = value.spans[0];
@@ -211,7 +212,7 @@ const Writer = struct {
             },
             .heading => {
                 self.part = .body;
-                try self.addToken("§", value.source, .{ .strong = true }, false);
+                try self.addToken("§", .{ .start = value.source.start, .end = value.source.start }, .{ .strong = true }, false);
                 for (value.spans) |span| try self.addSpan(span, true);
                 try self.flush();
             },
@@ -223,46 +224,82 @@ const Writer = struct {
     }
 
     fn addSpan(self: *Writer, span: body_mod.Span, force_strong: bool) !void {
+        if (span.hidden) {
+            if (span.strike_delimiter and !self.options.metrics.strikethrough_supported) {
+                try self.addToken(self.options.source.body()[span.source.start..span.source.end], span.source, .{}, true);
+            }
+            return;
+        }
         var marks = span.marks;
+        marks.strikethrough = marks.strikethrough and self.options.metrics.strikethrough_supported;
         marks.strong = marks.strong or force_strong;
+        if (marks.inline_code) {
+            try self.addToken(span.text, span.source, marks, true);
+            return;
+        }
         if (marks.link_destination) {
-            try self.addToken("‹", span.source, marks, false);
+            const before = SourceRange{ .start = span.source.start, .end = span.source.start };
+            const after = SourceRange{ .start = span.source.end, .end = span.source.end };
+            if (self.current.items.len > 0) try self.addToken(" ", before, .{}, false);
+            try self.addToken("‹", before, marks, false);
             try self.addWords(span.text, span.source, marks);
-            try self.addToken("›", span.source, marks, false);
+            try self.addToken("›", after, marks, false);
         } else try self.addWords(span.text, span.source, marks);
     }
 
     fn addWords(self: *Writer, text: []const u8, range: SourceRange, marks: Marks) !void {
         var pos: usize = 0;
-        var needs_space = false;
         while (pos < text.len) {
-            while (pos < text.len and std.ascii.isWhitespace(text[pos])) : (pos += 1) needs_space = true;
-            if (pos >= text.len) break;
+            if (std.ascii.isWhitespace(text[pos])) {
+                const start = pos;
+                while (pos < text.len and std.ascii.isWhitespace(text[pos])) : (pos += 1) {}
+                if (self.current.items.len > 0 and self.current_width < self.width) try self.append(.{ .text = " ", .source = .{ .start = range.start + start, .end = range.start + pos }, .marks = marks }, 1);
+                continue;
+            }
             const start = pos;
             while (pos < text.len and !std.ascii.isWhitespace(text[pos])) : (pos += 1) {}
             const token_range = SourceRange{ .start = range.start + start, .end = range.start + pos };
             const token_width = measuredWidth(self.options.metrics, text[start..pos]);
-            if (needs_space and self.current.items.len > 0 and self.current_width + 1 + token_width <= self.width) {
-                try self.append(.{ .text = " ", .source = token_range, .marks = marks, .authored = false }, 1);
-            } else if (self.current.items.len > 0 and self.current_width + token_width > self.width) try self.flush();
+            if (self.current.items.len > 0 and self.current_width + token_width > self.width) try self.flush();
             try self.addToken(text[start..pos], token_range, marks, true);
-            needs_space = true;
         }
     }
 
     fn addToken(self: *Writer, text: []const u8, range: SourceRange, marks: Marks, authored: bool) !void {
         var pos: usize = 0;
+        var code_column: usize = 0;
         while (pos < text.len) {
+            if (marks.inline_code and (text[pos] == '\n' or (text[pos] == '\r' and pos + 1 < text.len and text[pos + 1] == '\n'))) {
+                const newline_length: usize = if (text[pos] == '\r') 2 else 1;
+                if (self.current.items.len == 0) {
+                    try self.emitEmpty(.{ .start = range.start + pos, .end = range.start + pos + newline_length });
+                } else try self.flush();
+                pos += newline_length;
+                code_column = 0;
+                continue;
+            }
+            if (marks.inline_code and text[pos] == '\t') {
+                const spaces = 4 - code_column % 4;
+                for (0..spaces) |_| {
+                    if (self.current_width >= self.width) try self.flush();
+                    try self.append(.{ .text = " ", .source = .{ .start = range.start + pos, .end = range.start + pos + 1 }, .marks = marks, .authored = authored }, 1);
+                    if (self.current_width >= self.width) try self.flush();
+                }
+                code_column += spaces;
+                pos += 1;
+                continue;
+            }
             const measured = validMeasurement(self.options.metrics, text[pos..]);
             const display = if (measured.valid) text[pos .. pos + measured.byte_len] else "�";
             if (self.current.items.len > 0 and self.current_width + measured.cell_width > self.width) try self.flush();
             try self.append(.{
                 .text = display,
-                .source = .{ .start = range.start + pos, .end = @min(range.start + pos + measured.byte_len, range.end) },
+                .source = if (authored) .{ .start = range.start + pos, .end = @min(range.start + pos + measured.byte_len, range.end) } else range,
                 .marks = marks,
                 .authored = authored,
             }, measured.cell_width);
             pos += measured.byte_len;
+            code_column += measured.cell_width;
             if (self.current_width >= self.width) try self.flush();
         }
     }
@@ -431,4 +468,61 @@ test "Comment Reply and Draft share identical body projection" {
             try testing.expectEqual(lseg.marks, rseg.marks);
         }
     }
+}
+
+test "M23 inline code preserves whitespace and source ownership through narrow wraps" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = "**`  *literal* :mask: <tag>  `**" };
+    const body = try ReviewBody.parse(a, comment.body);
+    for ([_]usize{ 80, 5 }) |width| {
+        const rows = try project(a, body, .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "Ada", .content_width = width, .metrics = TestMetrics.value, .collapsed_rows = 0 });
+        var visible: std.ArrayList(u8) = .empty;
+        for (rows[1..]) |row| for (row.segments) |segment| {
+            try visible.appendSlice(a, segment.text);
+            try testing.expect(segment.authored);
+            try testing.expect(segment.marks.strong);
+            try testing.expectEqualStrings(comment.body[segment.source.start..segment.source.end], segment.text);
+        };
+        try testing.expectEqualStrings("  *literal* :mask: <tag>  ", visible.items);
+    }
+}
+
+test "M23 inline terminal fallback keeps strike delimiters and maps expanded code tabs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = "~~**gone**~~ `a\tb`" };
+    const body = try ReviewBody.parse(a, comment.body);
+    for ([_]bool{ true, false }) |supported| {
+        var metrics = TestMetrics.value;
+        metrics.strikethrough_supported = supported;
+        const rows = try project(a, body, .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "Ada", .content_width = 80, .metrics = metrics, .collapsed_rows = 0 });
+        var visible: std.ArrayList(u8) = .empty;
+        var tab_cells: usize = 0;
+        for (rows[1..]) |row| for (row.segments) |segment| {
+            try visible.appendSlice(a, segment.text);
+            if (std.mem.eql(u8, comment.body[segment.source.start..segment.source.end], "\t")) {
+                try testing.expect(segment.authored);
+                tab_cells += segment.text.len;
+            }
+            if (std.mem.eql(u8, segment.text, "g")) try testing.expectEqual(supported, segment.marks.strikethrough);
+        };
+        try testing.expectEqual(@as(usize, 3), tab_cells);
+        try testing.expectEqualStrings(if (supported) "gone a   b" else "~~gone~~ a   b", visible.items);
+    }
+}
+
+test "M23 inline code keeps authored line breaks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const multiline: bbr.review.Comment = .{ .id = 2, .author = "Ada", .body = "`first\r\n  last  `" };
+    const body = try ReviewBody.parse(a, multiline.body);
+    const rows = try project(a, body, .{ .owner = .{ .comment = 2 }, .source = .{ .comment = &multiline }, .role = .comment, .header = "Ada", .content_width = 80, .metrics = TestMetrics.value, .collapsed_rows = 0 });
+    try testing.expectEqual(@as(usize, 3), rows.len);
+    var last: std.ArrayList(u8) = .empty;
+    for (rows[2].segments) |segment| try last.appendSlice(a, segment.text);
+    try testing.expectEqualStrings("  last  ", last.items);
 }

@@ -2202,6 +2202,7 @@ pub const ReviewSearchResult = struct {
 };
 
 pub const ReviewSearchProjection = struct {
+    cell_metrics: ?frame_mod.CellMetrics = null,
     query: []const u8,
     occurrences: []const search.Occurrence,
     results: []const ReviewSearchResult,
@@ -5106,6 +5107,7 @@ pub const Presentation = struct {
             .buffer_search = if (self.published) |published| if (published.active_search == .buffer) published.buffer_search.projection() else null else null,
             .review_search = if (self.published) |published| blk: {
                 var search_view = published.review_search.projection(self.geometry) orelse break :blk null;
+                search_view.cell_metrics = published.cell_metrics;
                 search_view.files = published.session.diff.files;
                 search_view.content_statuses = published.session.enrichment.projection().content_statuses;
                 search_view.highlight_statuses = published.session.enrichment.statuses;
@@ -17920,6 +17922,87 @@ test "M23 yank copies complete authored bytes from every ReviewCard part without
         try testing.expect(seen[@intFromEnum(@import("review_card.zig").Part.suggestion_body)]);
         try testing.expect(seen[@intFromEnum(@import("review_card.zig").Part.disclosure_footer)]);
     }
+}
+
+test "M23 inline Actions retain exact search ranges, Selection bytes, and complete Frames across resize" {
+    const raw = "π **bo*îld*** and `  :mask:  `\r\nsecond *line*  ";
+    for ([_]bool{ false, true }) |local| for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = if (local) try OwnedReviewIdentity.initLocal(1, "refs/remotes/origin/main", "refs/heads/feature") else try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .target = if (local) .local else .bitbucket });
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 0 }, .{
+            .initial = .{ .key = key, .session = if (local) try testLocalSession(testing.allocator) else try testSession(testing.allocator, 1, 'a') },
+            .geometry = .{ .cols = 100, .rows = 20 },
+        });
+        defer presentation.deinit();
+        if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'b', .text = "boîld" } });
+        try completeBufferSearchScan(&presentation);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        for ([_]u16{ 100, 35, 60 }) |cols| {
+            try dispatchView(&presentation, .{ .resize = .{ .cols = cols, .rows = 20 } });
+            try presentation.dispatch(.{ .action = .next_search_occurrence });
+            const review = presentation.projection().review.?;
+            try testing.expectEqual(@as(usize, 1), presentation.projection().buffer_search.?.total);
+            try testing.expectEqual(@as(u64, 1), review.frame.visual_rows[review.navigation.cursor].owner.draft.id);
+            try testing.expect(review.frame.search_ranges.len > 0);
+            for (review.frame.search_ranges) |range| {
+                try testing.expect((range.source.start >= 5 and range.source.end <= 7) or (range.source.start >= 8 and range.source.end <= 12));
+            }
+        }
+        const before = presentation.projection().review.?.frame;
+        try presentation.dispatch(.{ .resize = .{ .cols = 80, .rows = 20 } });
+        const worker = presentation.takeCommand().?.build_buffer_disclosure;
+        var saved_arena = worker.arena;
+        defer saved_arena.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        worker.arena = std.heap.ArenaAllocator.init(failing.allocator());
+        worker.build();
+        try testing.expect(worker.failed);
+        try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+        const after = presentation.projection().review.?.frame;
+        try testing.expectEqual(before.buffer.rows.ptr, after.buffer.rows.ptr);
+        try testing.expectEqual(before.visual_rows.ptr, after.visual_rows.ptr);
+        try testing.expectEqual(before.search_ranges.ptr, after.search_ranges.ptr);
+        try testing.expectEqualDeep(before.geometry, after.geometry);
+        try testing.expectEqualDeep(before.navigation, after.navigation);
+
+        // A styled wrapped row copies its complete touched authored line.
+        const cursor = after.navigation.cursor;
+        try presentation.dispatch(.{ .action = .toggle_select });
+        try presentation.dispatch(.{ .action = .yank });
+        var selected = presentation.takeCommand().?;
+        defer selected.deinit();
+        try testing.expectEqualStrings("π **bo*îld*** and `  :mask:  `\r\n", selected.copy_clipboard.text);
+        try testing.expectEqual(cursor, presentation.projection().review.?.navigation.cursor);
+        try presentation.dispatch(.{ .action = .yank });
+        var complete = presentation.takeCommand().?;
+        defer complete.deinit();
+        try testing.expectEqualStrings(raw, complete.copy_clipboard.text);
+
+        try presentation.dispatch(.{ .action = .edit_review_item });
+        try testing.expectEqualStrings(raw, presentation.projection().composer.?.body);
+        try presentation.dispatch(.{ .composer = .external_edit });
+        const external = presentation.takeCommand().?.external_edit;
+        try testing.expectEqualStrings(raw, external.body);
+        const unchanged = try ExternalEditCompleted.create(testing.allocator, external.command_id, external.session_epoch);
+        unchanged.outcome = .unchanged;
+        external.destroy();
+        try presentation.dispatch(.{ .external_edit_completed = unchanged });
+        try testing.expectEqualStrings(raw, presentation.projection().composer.?.body);
+        try presentation.dispatch(.{ .composer = .cancel });
+
+        try presentation.dispatch(.{ .action = .open_review_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'b', .text = "boîld" } });
+        try completeBufferSearchScan(&presentation);
+        const result = presentation.projection().review_search.?.results[0];
+        try testing.expectEqual(@as(u64, 1), result.occurrence.location.review_body.owner.draft);
+        try testing.expectEqualSlices(search.Range, &.{ .{ .start = 5, .end = 7 }, .{ .start = 8, .end = 12 } }, result.occurrence.ranges);
+        try testing.expectEqual(@as(u32, 5), result.occurrence.column);
+        try testing.expectEqualStrings(raw, result.body);
+    };
 }
 
 test "M23 yank filters root scope for published and Draft Replies in both layouts" {

@@ -10,6 +10,8 @@ pub const SourceRange = struct {
 pub const Marks = packed struct {
     emphasis: bool = false,
     strong: bool = false,
+    inline_code: bool = false,
+    strikethrough: bool = false,
     link_label: bool = false,
     link_destination: bool = false,
 };
@@ -18,6 +20,10 @@ pub const Span = struct {
     text: []const u8,
     source: SourceRange,
     marks: Marks = .{},
+    /// Hidden syntax keeps exact authored ownership but supplies no semantic text.
+    hidden: bool = false,
+    /// Strikethrough syntax can be restored by a terminal without that attribute.
+    strike_delimiter: bool = false,
 };
 
 pub const BlockKind = union(enum) {
@@ -40,16 +46,11 @@ pub const ReviewBody = struct {
     blocks: []const Block,
 
     pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ReviewBody {
-        if (hasUnclosedSuggestion(source)) {
-            const spans = try allocator.alloc(Span, 1);
-            spans[0] = .{ .text = source, .source = .{ .start = 0, .end = source.len } };
-            const blocks = try allocator.alloc(Block, 1);
-            blocks[0] = .{ .kind = .literal, .source = .{ .start = 0, .end = source.len }, .spans = spans };
-            return .{ .source = source, .blocks = blocks };
-        }
-
         var blocks: std.ArrayList(Block) = .empty;
-        errdefer blocks.deinit(allocator);
+        errdefer {
+            for (blocks.items) |block| allocator.free(block.spans);
+            blocks.deinit(allocator);
+        }
         var pos: usize = 0;
         var pending_spacer: ?SourceRange = null;
         while (pos < source.len) {
@@ -72,12 +73,20 @@ pub const ReviewBody = struct {
                     const candidate = nextLine(source, scan);
                     if (isFenceClose(candidate.text)) {
                         const spans = try allocator.alloc(Span, 1);
+                        errdefer allocator.free(spans);
                         spans[0] = .{ .text = source[content_start..scan], .source = .{ .start = content_start, .end = scan } };
                         try blocks.append(allocator, .{ .kind = .suggestion, .source = .{ .start = start, .end = candidate.next }, .spans = spans });
                         pos = candidate.next;
                         break;
                     }
                     scan = candidate.next;
+                }
+                if (scan >= source.len) {
+                    const spans = try allocator.alloc(Span, 1);
+                    errdefer allocator.free(spans);
+                    spans[0] = .{ .text = source[start..], .source = .{ .start = start, .end = source.len } };
+                    try blocks.append(allocator, .{ .kind = .literal, .source = .{ .start = start, .end = source.len }, .spans = spans });
+                    pos = source.len;
                 }
                 continue;
             }
@@ -86,6 +95,7 @@ pub const ReviewBody = struct {
             if (heading) |prefix| {
                 const text_start = pos + prefix.bytes;
                 const spans = try parseInline(allocator, source, text_start, pos + line.text.len);
+                errdefer allocator.free(spans);
                 try blocks.append(allocator, .{ .kind = .{ .heading = prefix.level }, .source = .{ .start = pos, .end = line.next }, .spans = spans });
                 pos = line.next;
                 continue;
@@ -101,6 +111,7 @@ pub const ReviewBody = struct {
                 next = candidate.next;
             }
             const spans = try parseInline(allocator, source, start, end);
+            errdefer allocator.free(spans);
             try blocks.append(allocator, .{ .kind = .paragraph, .source = .{ .start = start, .end = end }, .spans = spans });
             pos = next;
         }
@@ -132,24 +143,6 @@ fn isFenceClose(line: []const u8) bool {
     return std.mem.eql(u8, trimmed(line), "```");
 }
 
-fn hasUnclosedSuggestion(source: []const u8) bool {
-    var pos: usize = 0;
-    while (pos < source.len) {
-        const line = nextLine(source, pos);
-        if (isSuggestionOpen(line.text)) {
-            var scan = line.next;
-            while (scan < source.len) {
-                const candidate = nextLine(source, scan);
-                if (isFenceClose(candidate.text)) break;
-                scan = candidate.next;
-            }
-            if (scan >= source.len) return true;
-            pos = nextLine(source, scan).next;
-        } else pos = line.next;
-    }
-    return false;
-}
-
 const HeadingPrefix = struct { level: u3, bytes: usize };
 fn headingPrefix(line: []const u8) ?HeadingPrefix {
     var count: usize = 0;
@@ -167,67 +160,261 @@ fn appendSpan(list: *std.ArrayList(Span), allocator: std.mem.Allocator, source: 
 
 fn parseInline(allocator: std.mem.Allocator, source: []const u8, start: usize, end: usize) ![]const Span {
     var spans: std.ArrayList(Span) = .empty;
-    errdefer spans.deinit(allocator);
+    defer spans.deinit(allocator);
+    var delimiters: std.ArrayList(Delimiter) = .empty;
+    defer delimiters.deinit(allocator);
     var pos = start;
     var plain = start;
     while (pos < end) {
         if (source[pos] == '\\' and pos + 1 < end and isEscapable(source[pos + 1])) {
             try appendSpan(&spans, allocator, source, plain, pos, .{});
+            try appendHidden(&spans, allocator, pos, pos + 1, false);
             try appendSpan(&spans, allocator, source, pos + 1, pos + 2, .{});
             pos += 2;
             plain = pos;
             continue;
         }
-        if (source[pos] == '[') if (std.mem.indexOfScalarPos(u8, source[0..end], pos + 1, ']')) |close_label| {
+        if (source[pos] == '[') if (labelClose(source, pos + 1, end)) |close_label| {
             if (close_label + 1 < end and source[close_label + 1] == '(') if (std.mem.indexOfScalarPos(u8, source[0..end], close_label + 2, ')')) |close_dest| {
                 try appendSpan(&spans, allocator, source, plain, pos, .{});
-                try appendSpan(&spans, allocator, source, pos + 1, close_label, .{ .link_label = true });
+                try appendHidden(&spans, allocator, pos, pos + 1, false);
+                const label = try parseInline(allocator, source, pos + 1, close_label);
+                defer allocator.free(label);
+                for (label) |span| {
+                    var marked = span;
+                    marked.marks.link_label = true;
+                    try spans.append(allocator, marked);
+                }
+                try appendHidden(&spans, allocator, close_label, close_label + 2, false);
                 try appendSpan(&spans, allocator, source, close_label + 2, close_dest, .{ .link_destination = true });
+                try appendHidden(&spans, allocator, close_dest, close_dest + 1, false);
                 pos = close_dest + 1;
                 plain = pos;
                 continue;
             };
         };
-        const delimiter: ?struct { text: []const u8, marks: Marks } = if (pos + 1 < end and ((source[pos] == '*' and source[pos + 1] == '*') or (source[pos] == '_' and source[pos + 1] == '_')))
-            .{ .text = source[pos .. pos + 2], .marks = .{ .strong = true } }
-        else if (source[pos] == '*' or source[pos] == '_')
-            .{ .text = source[pos .. pos + 1], .marks = .{ .emphasis = true } }
-        else
-            null;
-        if (delimiter) |delim| {
-            const close = std.mem.indexOfPos(u8, source[0..end], pos + delim.text.len, delim.text) orelse {
-                pos += 1;
-                continue;
-            };
-            if (close > pos + delim.text.len) {
+        if (source[pos] == '`') {
+            const length = runLength(source, pos, end);
+            if (codeClose(source, pos + length, end, length)) |close| {
                 try appendSpan(&spans, allocator, source, plain, pos, .{});
-                const inner = try parseInline(allocator, source, pos + delim.text.len, close);
-                defer allocator.free(inner);
-                for (inner) |span| {
-                    var marked = span;
-                    marked.marks.emphasis = marked.marks.emphasis or delim.marks.emphasis;
-                    marked.marks.strong = marked.marks.strong or delim.marks.strong;
-                    try spans.append(allocator, marked);
-                }
-                pos = close + delim.text.len;
+                try appendHidden(&spans, allocator, pos, pos + length, false);
+                try appendSpan(&spans, allocator, source, pos + length, close, .{ .inline_code = true });
+                try appendHidden(&spans, allocator, close, close + length, false);
+                pos = close + length;
                 plain = pos;
                 continue;
             }
+            pos += length;
+            continue;
+        }
+        // HTML stays authored text, including punctuation inside its tags.
+        if (source[pos] == '<') if (std.mem.indexOfScalarPos(u8, source[0..end], pos + 1, '>')) |close| {
+            pos = close + 1;
+            continue;
+        };
+        if (source[pos] == '*' or source[pos] == '_' or source[pos] == '~') {
+            const length = runLength(source, pos, end);
+            const before: u8 = if (pos > start) source[pos - 1] else ' ';
+            const after: u8 = if (pos + length < end) source[pos + length] else ' ';
+            const left = !std.ascii.isWhitespace(after) and (!std.ascii.isPunctuation(after) or std.ascii.isWhitespace(before) or std.ascii.isPunctuation(before));
+            const right = !std.ascii.isWhitespace(before) and (!std.ascii.isPunctuation(before) or std.ascii.isWhitespace(after) or std.ascii.isPunctuation(after));
+            try appendSpan(&spans, allocator, source, plain, pos, .{});
+            try delimiters.append(allocator, .{
+                .index = spans.items.len,
+                .byte = source[pos],
+                .length = length,
+                .open = left and (source[pos] != '_' or !right or std.ascii.isPunctuation(before)),
+                .close = right and (source[pos] != '_' or !left or std.ascii.isPunctuation(after)),
+            });
+            try appendSpan(&spans, allocator, source, pos, pos + length, .{});
+            pos += length;
+            plain = pos;
+            continue;
         }
         pos += 1;
     }
     try appendSpan(&spans, allocator, source, plain, end, .{});
-    return spans.toOwnedSlice(allocator);
+    for (delimiters.items, 0..) |*closer, close_index| {
+        while (closer.close and closer.remaining() >= closer.minimum()) {
+            var open_index = close_index;
+            var matched = false;
+            while (open_index > 0) {
+                open_index -= 1;
+                const opener = &delimiters.items[open_index];
+                if (!opener.open or opener.byte != closer.byte or opener.remaining() < opener.minimum()) continue;
+                if (opener.byte == '~' and (opener.length != 2 or closer.length != 2)) continue;
+                if (opener.byte != '~' and (opener.close or closer.open) and (opener.remaining() + closer.remaining()) % 3 == 0 and (opener.remaining() % 3 != 0 or closer.remaining() % 3 != 0)) continue;
+                const used: usize = if (opener.remaining() >= 2 and closer.remaining() >= 2) 2 else 1;
+                opener.hidden_end += used;
+                closer.hidden_start += used;
+                for (spans.items[opener.index + 1 .. closer.index]) |*span| {
+                    if (opener.byte == '~') span.marks.strikethrough = true else if (used == 2) span.marks.strong = true else span.marks.emphasis = true;
+                }
+                // A paired closer cannot also open a crossing construct.
+                for (delimiters.items[open_index + 1 .. close_index]) |*inner| inner.open = false;
+                matched = true;
+                break;
+            }
+            if (!matched) break;
+        }
+    }
+    var result: std.ArrayList(Span) = .empty;
+    errdefer result.deinit(allocator);
+    var delimiter_index: usize = 0;
+    for (spans.items, 0..) |span, index| {
+        if (delimiter_index < delimiters.items.len and delimiters.items[delimiter_index].index == index) {
+            const delimiter = delimiters.items[delimiter_index];
+            const visible_start = span.source.start + delimiter.hidden_start;
+            const visible_end = span.source.end - delimiter.hidden_end;
+            try appendHidden(&result, allocator, span.source.start, visible_start, delimiter.byte == '~');
+            try appendSpan(&result, allocator, source, visible_start, visible_end, span.marks);
+            try appendHidden(&result, allocator, visible_end, span.source.end, delimiter.byte == '~');
+            delimiter_index += 1;
+        } else try result.append(allocator, span);
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+const Delimiter = struct {
+    index: usize,
+    byte: u8,
+    length: usize,
+    open: bool,
+    close: bool,
+    hidden_start: usize = 0,
+    hidden_end: usize = 0,
+
+    fn remaining(self: Delimiter) usize {
+        return self.length - self.hidden_start - self.hidden_end;
+    }
+    fn minimum(self: Delimiter) usize {
+        return if (self.byte == '~') 2 else 1;
+    }
+};
+
+fn appendHidden(spans: *std.ArrayList(Span), allocator: std.mem.Allocator, start: usize, end: usize, strike: bool) !void {
+    if (start == end) return;
+    try spans.append(allocator, .{ .text = "", .source = .{ .start = start, .end = end }, .hidden = true, .strike_delimiter = strike });
+}
+
+fn runLength(source: []const u8, start: usize, end: usize) usize {
+    var pos = start;
+    while (pos < end and source[pos] == source[start]) : (pos += 1) {}
+    return pos - start;
+}
+
+fn codeClose(source: []const u8, start: usize, end: usize, length: usize) ?usize {
+    var pos = start;
+    while (pos < end) {
+        if (source[pos] == '`') {
+            const run = runLength(source, pos, end);
+            if (run == length) return pos;
+            pos += run;
+        } else pos += 1;
+    }
+    return null;
+}
+
+fn labelClose(source: []const u8, start: usize, end: usize) ?usize {
+    var pos = start;
+    var depth: usize = 0;
+    while (pos < end) {
+        if (source[pos] == '\\' and pos + 1 < end and isEscapable(source[pos + 1])) {
+            pos += 2;
+            continue;
+        }
+        if (source[pos] == '`') {
+            const length = runLength(source, pos, end);
+            if (codeClose(source, pos + length, end, length)) |close| {
+                pos = close + length;
+                continue;
+            }
+        }
+        if (source[pos] == '[') depth += 1;
+        if (source[pos] == ']') {
+            if (depth == 0) return pos;
+            depth -= 1;
+        }
+        pos += 1;
+    }
+    return null;
 }
 
 fn isEscapable(byte: u8) bool {
-    return switch (byte) {
-        '\\', '*', '_', '[', ']', '(', ')', '#', '`' => true,
-        else => false,
-    };
+    return std.ascii.isPunctuation(byte);
 }
 
 const testing = std.testing;
+
+test "M23 inline emphasis respects delimiter runs, escapes, and intraword underscores" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const examples = [_]struct { authored: []const u8, visible: []const u8, combined: []const u8 = "" }{
+        .{ .authored = "snake_case_name __bold__ _italic_", .visible = "snake_case_name bold italic" },
+        .{ .authored = "*outer **both** end*", .visible = "outer both end", .combined = "both" },
+        .{ .authored = "**outer *both* end**", .visible = "outer both end", .combined = "both" },
+        .{ .authored = "***both***", .visible = "both", .combined = "both" },
+        .{ .authored = "\\*literal\\* **valid** *broken", .visible = "*literal* valid *broken" },
+        .{ .authored = "* spaced * and a_b_c", .visible = "* spaced * and a_b_c" },
+        .{ .authored = "\\:mask: <tag> &amp; ABC-123 {color:red}", .visible = ":mask: <tag> &amp; ABC-123 {color:red}" },
+        .{ .authored = "[**a\\]b**](url)", .visible = "a]burl" },
+        .{ .authored = "[`a]b`](url)", .visible = "a]burl" },
+    };
+    for (examples) |example| {
+        const body = try ReviewBody.parse(a, example.authored);
+        var visible: std.ArrayList(u8) = .empty;
+        var combined = example.combined.len == 0;
+        for (body.blocks) |block| for (block.spans) |span| {
+            try visible.appendSlice(a, span.text);
+            if (std.mem.eql(u8, span.text, example.combined) and span.marks.strong and span.marks.emphasis) combined = true;
+        };
+        try testing.expectEqualStrings(example.visible, visible.items);
+        try testing.expect(combined);
+        try testing.expectEqualStrings(example.authored, body.source);
+    }
+}
+
+test "M23 inline code and styled links keep literal text and complete authored ranges" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source = "**_~~[`  *literal* <b> &amp; :mask:  `](https://x)~~_**";
+    const body = try ReviewBody.parse(a, source);
+    var visible: std.ArrayList(u8) = .empty;
+    var offset: usize = 0;
+    var saw_code = false;
+    for (body.blocks[0].spans) |span| {
+        try testing.expectEqual(offset, span.source.start);
+        offset = span.source.end;
+        try visible.appendSlice(a, span.text);
+        if (span.marks.inline_code) {
+            try testing.expect(span.marks.strong and span.marks.emphasis and span.marks.strikethrough and span.marks.link_label);
+            try testing.expectEqualStrings("  *literal* <b> &amp; :mask:  ", span.text);
+            saw_code = true;
+        }
+    }
+    try testing.expectEqual(source.len, offset);
+    try testing.expect(saw_code);
+    try testing.expectEqualStrings("  *literal* <b> &amp; :mask:  https://x", visible.items);
+    const malformed = try ReviewBody.parse(a, "``with `tick` inside`` **valid** `unclosed");
+    var text: std.ArrayList(u8) = .empty;
+    for (malformed.blocks[0].spans) |span| try text.appendSlice(a, span.text);
+    try testing.expectEqualStrings("with `tick` inside valid `unclosed", text.items);
+}
+
+test "M23 inline parsing releases partial bodies after allocation failure" {
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const body = try ReviewBody.parse(allocator, "# *Heading*\n\n**_~~[`literal`](url)~~_**\n\n```suggestion\ncode\n```\n\n```suggestion\nunclosed");
+            defer {
+                for (body.blocks) |block| allocator.free(block.spans);
+                allocator.free(body.blocks);
+            }
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Check.run, .{});
+}
 
 test "ReviewBody parses supported structure while retaining authored ranges" {
     const source = "\n# Heading\n\nA **strong and _nested_** [link](https://x).\n\n```suggestion\n*x*\n\n```\n";
@@ -254,14 +441,16 @@ test "ReviewBody parses supported structure while retaining authored ranges" {
     try testing.expect(saw_destination);
 }
 
-test "unclosed Suggestion degrades the complete body to literal authored text" {
-    const source = "before\n```suggestion\n**still literal**";
+test "M23 inline unclosed Suggestion keeps earlier formatting and local literal content" {
+    const source = "**before**\n```suggestion\n**still literal**";
     const body = try ReviewBody.parse(testing.allocator, source);
     defer {
-        testing.allocator.free(body.blocks[0].spans);
+        for (body.blocks) |block| testing.allocator.free(block.spans);
         testing.allocator.free(body.blocks);
     }
-    try testing.expectEqual(@as(usize, 1), body.blocks.len);
-    try testing.expect(body.blocks[0].kind == .literal);
-    try testing.expectEqualStrings(source, body.blocks[0].spans[0].text);
+    try testing.expectEqual(@as(usize, 2), body.blocks.len);
+    try testing.expect(body.blocks[0].kind == .paragraph);
+    try testing.expect(body.blocks[0].spans[1].marks.strong);
+    try testing.expect(body.blocks[1].kind == .literal);
+    try testing.expectEqualStrings("```suggestion\n**still literal**", body.blocks[1].spans[0].text);
 }

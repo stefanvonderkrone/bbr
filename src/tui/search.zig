@@ -15,6 +15,7 @@ pub const Range = struct {
 pub const Mapping = struct {
     semantic: Range,
     authored: Range,
+    authored_column: ?usize = null,
 };
 
 pub const VersionRelation = enum { neutral, old, new };
@@ -620,10 +621,19 @@ fn makeOccurrence(
     defer allocator.free(semantic_ranges);
     const ranges = try mapRanges(allocator, semantic_ranges, candidate.mapping);
     errdefer allocator.free(ranges);
+    var column = positions[0] + 1;
+    const first = scalars[positions[0]].bytes.start;
+    for (candidate.mapping) |mapping| {
+        if (first < mapping.semantic.start or first >= mapping.semantic.end) continue;
+        if (mapping.authored_column) |authored_column| {
+            column = authored_column + (std.unicode.utf8CountCodepoints(candidate.text[mapping.semantic.start..first]) catch 0);
+        }
+        break;
+    }
     return .{
         .location = try candidate.location.clone(allocator),
         .ranges = ranges,
-        .column = positions[0] + 1,
+        .column = column,
         .score = score,
         .calculation = calculation,
         .candidate_scalars = scalars.len,
@@ -709,11 +719,16 @@ pub fn appendReviewBodyCandidates(
         var boundaries: std.ArrayList(usize) = .empty;
         var previous_destination = false;
         var have_span = false;
+        var column_offset = line_start;
+        var authored_column: usize = 1;
 
         for (body.blocks) |block| for (block.spans) |span| {
+            if (span.hidden) continue;
             const start = @max(line_start, span.source.start);
             const end = @min(line_end, span.source.end);
             if (start >= end) continue;
+            authored_column += std.unicode.utf8CountCodepoints(body.source[column_offset..start]) catch start - column_offset;
+            column_offset = start;
             const destination = span.marks.link_destination;
             if (have_span and destination != previous_destination and (destination or previous_destination)) {
                 try boundaries.append(allocator, text.items.len);
@@ -723,6 +738,7 @@ pub fn appendReviewBodyCandidates(
             try mappings.append(allocator, .{
                 .semantic = .{ .start = semantic_start, .end = text.items.len },
                 .authored = .{ .start = start, .end = end },
+                .authored_column = authored_column,
             });
             previous_destination = destination;
             have_span = true;

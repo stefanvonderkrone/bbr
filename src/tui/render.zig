@@ -168,9 +168,10 @@ fn drawReviewCardSearchRange(win: vaxis.Window, row: u16, card: buffer_mod.Revie
     for (card.segments) |segment| {
         const start = @max(range.source.start, segment.source.start);
         const end = @min(range.source.end, segment.source.end);
-        if (start < end) {
-            const local_start = start - segment.source.start;
-            const local_end = end - segment.source.start;
+        if (segment.authored and start < end) {
+            const equal_length = segment.source.end - segment.source.start == segment.text.len;
+            const local_start = if (equal_length) start - segment.source.start else 0;
+            const local_end = if (equal_length) end - segment.source.start else segment.text.len;
             if (local_end <= segment.text.len) {
                 const cell_start = col + vaxis.gwidth.gwidth(segment.text[0..local_start], .unicode);
                 const width = vaxis.gwidth.gwidth(segment.text[local_start..local_end], .unicode);
@@ -1003,7 +1004,7 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
         drawReviewSourcePreview(scratch, header, preview, projection.results[selected], projection.source_preview, projection.preview_scroll, projection.preview_horizontal, theme);
     } else {
         drawReviewSearchHeader(scratch, header, projection.results[selected], theme);
-        if (preview.height > 0) drawReviewSearchPreview(scratch, preview, projection.results[selected], projection.preview_scroll, theme);
+        if (preview.height > 0) drawReviewSearchPreview(scratch, preview, projection.results[selected], projection.preview_scroll, theme, projection.cell_metrics orelse terminal_cell_metrics);
     }
 }
 
@@ -1212,48 +1213,102 @@ fn drawReviewSearchHeader(scratch: std.mem.Allocator, win: vaxis.Window, result:
     _ = win.printSegment(.{ .text = label, .style = theme.picker }, .{ .wrap = .none });
 }
 
-fn drawReviewSearchPreview(scratch: std.mem.Allocator, win: vaxis.Window, result: presentation.ReviewSearchResult, scroll: usize, theme: Theme) void {
+fn drawReviewSearchPreview(scratch: std.mem.Allocator, win: vaxis.Window, result: presentation.ReviewSearchResult, scroll: usize, theme: Theme, metrics: @import("cell_metrics.zig").CellMetrics) void {
     const owner = result.occurrence.location.review_body;
+    const card_mod = @import("review_card.zig");
+    const body = card_mod.ReviewBody.parse(scratch, result.body) catch return;
+    const comment: bbr.review.Comment = .{ .id = 0, .author = result.source, .body = result.body };
+    const draft: bbr.review.Draft = .{ .local_id = 0, .kind = .comment, .body = result.body };
+    const rows = card_mod.project(scratch, body, .{
+        .owner = if (owner.owner == .draft) .{ .draft = 0 } else .{ .comment = 0 },
+        .source = if (owner.owner == .draft) .{ .draft = &draft } else .{ .comment = &comment },
+        .role = .comment,
+        .header = "",
+        .content_width = win.width,
+        .metrics = metrics,
+        .collapsed_rows = 0,
+    }) catch return;
     var start: usize = 0;
     var logical_line: usize = 0;
-    var row: u16 = 0;
-    while (start <= result.body.len and row < win.height) {
+    while (logical_line < scroll and start < result.body.len) : (logical_line += 1) {
         const newline = std.mem.indexOfScalarPos(u8, result.body, start, '\n') orelse result.body.len;
-        logical_line += 1;
-        if (logical_line > scroll) {
-            const line = result.body[start..newline];
-            const line_style = if (logical_line == owner.logical_line) theme.picker_selected else theme.picker;
-            const segments = scratch.alloc(vaxis.Segment, result.occurrence.ranges.len * 2 + 1) catch return;
-            var count: usize = 0;
-            var cursor = start;
-            for (result.occurrence.ranges) |range| {
-                const first = @max(range.start, start);
-                const last = @min(range.end, newline);
-                if (first >= last) continue;
-                if (cursor < first) {
-                    segments[count] = .{ .text = result.body[cursor..first], .style = line_style };
-                    count += 1;
+        start = newline + @intFromBool(newline < result.body.len);
+    }
+    var row: u16 = 0;
+    for (rows[1..]) |card| {
+        if (card.source_range.end <= start and start > 0) continue;
+        if (row >= win.height) break;
+        fillRow(win, row, theme.picker);
+        const segments = scratch.alloc(vaxis.Segment, card.segments.len) catch return;
+        for (card.segments, 0..) |segment, index| {
+            var style = theme.reviewCardStyle(card.role, card.part, segment.marks);
+            style.bg = theme.picker.bg;
+            if (segment.authored) for (result.occurrence.ranges) |range| {
+                if (range.start < segment.source.end and range.end > segment.source.start) {
+                    style.bg = theme.search_active;
+                    break;
                 }
-                var match_style = line_style;
-                match_style.bg = theme.search_active;
-                match_style.bold = true;
-                segments[count] = .{ .text = result.body[first..last], .style = match_style };
-                count += 1;
-                cursor = last;
-            }
-            if (cursor < newline) {
-                segments[count] = .{ .text = result.body[cursor..newline], .style = line_style };
-                count += 1;
-            }
-            if (count == 0) {
-                segments[0] = .{ .text = line, .style = line_style };
-                count = 1;
-            }
-            const position = win.print(segments[0..count], .{ .row_offset = row, .wrap = .grapheme });
-            row = @max(row +| 1, position.row +| @intFromBool(position.col > 0));
+            };
+            segments[index] = .{ .text = segment.text, .style = style };
         }
-        if (newline == result.body.len) break;
-        start = newline + 1;
+        _ = win.print(segments, .{ .row_offset = row, .wrap = .none });
+        row += 1;
+    }
+}
+
+pub const terminal_cell_metrics: @import("cell_metrics.zig").CellMetrics = .{ .ptr = &metrics_context, .vtable = &metrics_vtable };
+const metrics_context: u8 = 0;
+const metrics_vtable: @import("cell_metrics.zig").CellMetrics.VTable = .{ .next = nextVaxisGrapheme, .width = widthVaxisText };
+fn nextVaxisGrapheme(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
+    var iterator = vaxis.unicode.graphemeIterator(text);
+    const grapheme = iterator.next() orelse return .{ .byte_len = 1, .cell_width = 1 };
+    return .{ .byte_len = grapheme.len, .cell_width = vaxis.gwidth.gwidth(grapheme.bytes(text), .unicode) };
+}
+
+fn widthVaxisText(_: *const anyopaque, text: []const u8) usize {
+    return vaxis.gwidth.gwidth(text, .unicode);
+}
+
+test "M23 inline Review Search Preview shares Markdown styles, literal code, and authored tab matches in every Theme" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 6, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const ranges = [_]@import("search.zig").Range{.{ .start = 16, .end = 17 }};
+    const result: presentation.ReviewSearchResult = .{
+        .kind = "DRAFT",
+        .source = "local",
+        .body = "plain ***x*** `a\tb` ~~gone~~",
+        .scope = .review,
+        .scope_state = .current,
+        .occurrence = .{ .location = .{ .review_body = .{ .owner = .{ .draft = 1 }, .logical_line = 1 } }, .ranges = @constCast(&ranges), .column = 17, .candidate_scalars = 1, .corpus_order = 0, .session_epoch = 1 },
+    };
+    for (@import("theme.zig").builtins) |builtin| {
+        const theme = builtin.value;
+        drawReviewSearchPreview(a, win, result, 0, theme, terminal_cell_metrics);
+        try testing.expectEqualStrings("p", win.readCell(0, 0).?.char.grapheme);
+        try testing.expect(!win.readCell(0, 0).?.style.bold);
+        try testing.expectEqualStrings("x", win.readCell(6, 0).?.char.grapheme);
+        try testing.expectEqual(theme.markdown_bold, win.readCell(6, 0).?.style.fg);
+        try testing.expect(win.readCell(6, 0).?.style.bold and win.readCell(6, 0).?.style.italic);
+        try testing.expectEqualStrings("a", win.readCell(8, 0).?.char.grapheme);
+        for (9..12) |col| {
+            const cell = win.readCell(@intCast(col), 0).?;
+            try testing.expectEqualStrings(" ", cell.char.grapheme);
+            try testing.expectEqual(theme.markdown_inline_code, cell.style.fg);
+            try testing.expectEqual(theme.search_active, cell.style.bg);
+            try testing.expect(!cell.style.bold);
+        }
+        try testing.expectEqualStrings("g", win.readCell(14, 0).?.char.grapheme);
+        try testing.expect(win.readCell(14, 0).?.style.strikethrough);
+        var fallback = terminal_cell_metrics;
+        fallback.strikethrough_supported = false;
+        drawReviewSearchPreview(a, win, result, 0, theme, fallback);
+        try testing.expectEqualStrings("~", win.readCell(14, 0).?.char.grapheme);
+        try testing.expectEqualStrings("g", win.readCell(16, 0).?.char.grapheme);
+        try testing.expect(!win.readCell(16, 0).?.style.strikethrough);
     }
 }
 
@@ -1802,7 +1857,8 @@ test "M21 authored Overlay renders ranked rows and matched Preview in landscape 
         try testing.expectEqualStrings("▸", list.readCell(0, 0).?.char.grapheme);
         try testing.expectEqualStrings("b", preview.readCell(0, 0).?.char.grapheme);
         try testing.expect(geometry.landscape == (cols == 100));
-        try testing.expectEqual(theme_dark.search_active, preview.readCell(0, 1).?.style.bg);
+        try testing.expectEqualStrings("n", preview.readCell(7, 0).?.char.grapheme);
+        try testing.expectEqual(theme_dark.search_active, preview.readCell(7, 0).?.style.bg);
         if (cols == 20) try testing.expectEqualStrings("├", win.readCell(geometry.body.x, geometry.divider).?.char.grapheme);
     }
 }
@@ -1982,9 +2038,11 @@ test "M21 authored Preview paints every disjoint Markdown match range" {
         .geometry = geometry,
     }, theme_dark);
     const preview = childRect(headlessWindow(&screen), geometry.preview);
-    try testing.expectEqual(theme_dark.search_active, preview.readCell(2, 0).?.style.bg);
-    try testing.expectEqual(theme_dark.search_active, preview.readCell(8, 0).?.style.bg);
-    try testing.expect(!std.meta.eql(preview.readCell(6, 0).?.style.bg, theme_dark.search_active));
+    try testing.expectEqualStrings("b", preview.readCell(0, 0).?.char.grapheme);
+    try testing.expectEqual(theme_dark.search_active, preview.readCell(0, 0).?.style.bg);
+    try testing.expectEqual(theme_dark.markdown_bold, preview.readCell(0, 0).?.style.fg);
+    try testing.expectEqual(theme_dark.search_active, preview.readCell(5, 0).?.style.bg);
+    try testing.expectEqual(theme_dark.search_active, preview.readCell(4, 0).?.style.bg);
 }
 
 test "Review Search shortens directories and keeps the filename" {
@@ -3060,6 +3118,43 @@ test "ReviewCard wide grapheme keeps the DiffPane right border" {
     const screen_row: u16 = review.frame.panes.diff_content.y + @as(u16, @intCast(body_row.? - review.navigation.scroll));
     const right = review.frame.panes.diff.x + review.frame.panes.diff.width - 1;
     try testing.expectEqualStrings("│", win.readCell(right, screen_row).?.char.grapheme);
+}
+
+test "M23 inline headless cells retain combined marks under overlapping interaction backgrounds in every Theme and role" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const card_mod = @import("review_card.zig");
+    const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = "plain ***~~[x](url)~~*** **_`a\tb`_**" };
+    const body = try card_mod.ReviewBody.parse(a, comment.body);
+    var screen = try vaxis.Screen.init(a, .{ .rows = 4, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    for (@import("theme.zig").builtins) |builtin| inline for (std.meta.tags(card_mod.CardRole)) |role| {
+        const theme = builtin.value;
+        const rows = try card_mod.project(a, body, .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = role, .header = "Ada", .content_width = 76, .metrics = .bytes, .collapsed_rows = 0 });
+        try testing.expectEqual(@as(usize, 2), rows.len);
+        for ([_]bool{ false, true }) |focused| {
+            drawReviewCard(a, win, 0, rows[1], if (focused) cursorRowTheme(theme) else theme);
+            try testing.expectEqualStrings("p", win.readCell(4, 0).?.char.grapheme);
+            try testing.expect(!win.readCell(4, 0).?.style.bold);
+            try testing.expectEqualStrings("x", win.readCell(10, 0).?.char.grapheme);
+            try testing.expectEqualStrings("a", win.readCell(18, 0).?.char.grapheme);
+            const link = win.readCell(10, 0).?.style;
+            try testing.expectEqual(theme.markdown_bold, link.fg);
+            try testing.expect(link.bold and link.italic and link.strikethrough and link.ul_style == .single);
+            const code = win.readCell(18, 0).?.style;
+            try testing.expectEqual(theme.markdown_inline_code, code.fg);
+            try testing.expect(code.bold and code.italic and !code.strikethrough);
+            for ([_]bool{ false, true }) |active| {
+                drawReviewCardSearchRange(win, 0, rows[1], .{ .visual_row = 0, .relation = .neutral, .source = .{ .start = 12, .end = 13 }, .row = .{ .start = 0, .end = 1 }, .active = active }, active, theme);
+                const matched = win.readCell(10, 0).?.style;
+                try testing.expectEqual(if (active) theme.search_active else theme.search_match, matched.bg);
+                try testing.expectEqual(link.fg, matched.fg);
+                try testing.expect(matched.bold and matched.italic and matched.strikethrough and matched.ul_style == .single);
+            }
+        }
+    };
 }
 
 test "DiffPane title reserves and renders published Selected Version targets" {
