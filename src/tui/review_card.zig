@@ -36,6 +36,8 @@ pub const Segment = struct {
     marks: Marks = .{},
     /// False for terminal markers and generated spacing, even with a source range.
     authored: bool = true,
+    definition_source: ?SourceRange = null,
+    required_definition: ?SourceRange = null,
 };
 
 pub const ReviewCardRow = struct {
@@ -188,6 +190,7 @@ const Writer = struct {
     container: body_mod.Block = .{ .kind = .paragraph, .source = .{ .start = 0, .end = 0 } },
     first_row: bool = true,
     prefix_width: usize = 0,
+    reference: ?body_mod.Span = null,
 
     fn block(self: *Writer, value: body_mod.Block, ordinal: usize) !void {
         self.container = value;
@@ -244,6 +247,12 @@ const Writer = struct {
         var marks = span.marks;
         marks.strikethrough = marks.strikethrough and self.options.metrics.strikethrough_supported;
         marks.strong = marks.strong or force_strong;
+        self.reference = if (span.definition_source != null) span else null;
+        defer self.reference = null;
+        if (span.generated) {
+            try self.addToken(span.text, span.source, marks, false);
+            return;
+        }
         if (span.join) {
             if (self.current.items.len > 0 and self.current_width < self.width) {
                 try self.append(.{ .text = " ", .source = span.source, .marks = marks }, 1);
@@ -257,13 +266,18 @@ const Writer = struct {
             try self.addToken(span.text, span.source, marks, true);
             return;
         }
-        if (marks.link_destination) {
+        if (marks.link_destination and span.destination_brackets) {
             const before = SourceRange{ .start = span.source.start, .end = span.source.start };
             const after = SourceRange{ .start = span.source.end, .end = span.source.end };
-            if (self.current.items.len > 0) try self.addToken(" ", before, .{}, false);
+            try self.addToken(" ", before, .{}, false);
             try self.addToken("‹", before, marks, false);
-            try self.addWords(span.text, span.source, marks);
+            try self.addToken(span.text, span.source, marks, true);
             try self.addToken("›", after, marks, false);
+        } else if (marks.link_title) {
+            try self.addToken(" ", .{ .start = span.source.start, .end = span.source.start }, .{}, false);
+            try self.addToken(span.text, span.source, marks, true);
+        } else if (marks.link_destination) {
+            try self.addToken(span.text, span.source, marks, true);
         } else try self.addWords(span.text, span.source, marks);
     }
 
@@ -321,9 +335,11 @@ const Writer = struct {
             }
             try self.append(.{
                 .text = display,
-                .source = if (authored) .{ .start = range.start + pos, .end = @min(range.start + pos + measured.byte_len, range.end) } else range,
+                .source = if (authored and self.reference == null) .{ .start = range.start + pos, .end = @min(range.start + pos + measured.byte_len, range.end) } else range,
                 .marks = marks,
                 .authored = authored,
+                .definition_source = if (authored and self.reference != null) .{ .start = self.reference.?.definition_source.?.start + pos, .end = self.reference.?.definition_source.?.start + pos + measured.byte_len } else null,
+                .required_definition = if (authored and self.reference != null) self.reference.?.required_definition else null,
             }, measured.cell_width);
             pos += measured.byte_len;
             code_column += measured.cell_width;
@@ -436,6 +452,29 @@ fn measuredWidth(metrics: CellMetrics, text: []const u8) usize {
 }
 
 const testing = std.testing;
+
+test "M23 links wrap complete destinations and literal titles in ReviewCards as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "![**diagram**](<images/a  b_(c)/:mask:> \"Guide *literal*\")";
+    const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
+    for ([_]usize{ 80, 7, 1 }) |width| {
+        const rows = try project(a, try ReviewBody.parse(a, raw), .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment_reply, .header = "Ada", .content_width = width, .metrics = TestMetrics.value, .collapsed_rows = 0 });
+        var destination: std.ArrayList(u8) = .empty;
+        var title: std.ArrayList(u8) = .empty;
+        var visible: std.ArrayList(u8) = .empty;
+        for (rows[1..]) |row| for (row.segments) |segment| {
+            try visible.appendSlice(a, segment.text);
+            if (segment.marks.link_destination and segment.authored) try destination.appendSlice(a, segment.text);
+            if (segment.marks.link_title and segment.authored) try title.appendSlice(a, segment.text);
+            if (segment.marks.link_label) try testing.expect(segment.marks.strong);
+        };
+        try testing.expectEqualStrings("images/a  b_(c)/:mask:", destination.items);
+        try testing.expectEqualStrings("\"Guide *literal*\"", title.items);
+        if (width == 80) try testing.expectEqualStrings("image: diagram ‹images/a  b_(c)/:mask:› \"Guide *literal*\"", visible.items);
+    }
+}
 
 test "M23 containers align wrapped item text and mixed quote nesting as project behavior" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

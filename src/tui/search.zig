@@ -4,6 +4,7 @@ const std = @import("std");
 const bbr = @import("bbr");
 const unicode_data = @import("search_unicode_data.zig");
 const review_body = @import("review_body.zig");
+const fold = @import("unicode_case.zig").fold;
 
 pub const max_query_scalars = 256;
 
@@ -17,6 +18,7 @@ pub const Mapping = struct {
     authored: Range,
     authored_column: ?usize = null,
     authored_line: ?u32 = null,
+    definition_source: ?Range = null,
 };
 
 pub const VersionRelation = enum { neutral, old, new };
@@ -87,6 +89,7 @@ pub const Calculation = enum { exact, fallback };
 pub const Occurrence = struct {
     location: Location,
     ranges: []Range,
+    definition_ranges: []const Range = &.{},
     column: usize,
     score: f64 = 0,
     calculation: Calculation = .exact,
@@ -97,6 +100,7 @@ pub const Occurrence = struct {
     fn deinit(self: *Occurrence, allocator: std.mem.Allocator) void {
         self.location.deinit(allocator);
         allocator.free(self.ranges);
+        allocator.free(self.definition_ranges);
         self.* = undefined;
     }
 };
@@ -128,6 +132,10 @@ pub const Batch = struct {
             };
             target.ranges = allocator.dupe(Range, source.ranges) catch |err| {
                 target.location.deinit(allocator);
+                return err;
+            };
+            target.definition_ranges = allocator.dupe(Range, source.definition_ranges) catch |err| {
+                target.deinit(allocator);
                 return err;
             };
             initialized += 1;
@@ -246,18 +254,6 @@ fn inRanges(scalar: u21, ranges: []const unicode_data.Range) bool {
         if (scalar < range.first) high = middle else if (scalar > range.last) low = middle + 1 else return true;
     }
     return false;
-}
-
-fn fold(scalar: u21) u21 {
-    if (scalar < 0x80) return if (scalar >= 'A' and scalar <= 'Z') scalar + ('a' - 'A') else scalar;
-    var low: usize = 0;
-    var high = unicode_data.folds.len;
-    while (low < high) {
-        const middle = low + (high - low) / 2;
-        const mapping = unicode_data.folds[middle];
-        if (scalar < mapping.source) high = middle else if (scalar > mapping.source) low = middle + 1 else return mapping.target;
-    }
-    return scalar;
 }
 
 pub fn scan(
@@ -620,15 +616,17 @@ fn makeOccurrence(
 ) !Occurrence {
     const semantic_ranges = try mergedScalarRanges(allocator, scalars, positions);
     defer allocator.free(semantic_ranges);
-    const ranges = try mapRanges(allocator, semantic_ranges, candidate.mapping);
+    const ranges = try mapRanges(allocator, semantic_ranges, candidate.mapping, false);
     errdefer allocator.free(ranges);
+    const definition_ranges = try mapRanges(allocator, semantic_ranges, candidate.mapping, true);
+    errdefer allocator.free(definition_ranges);
     var column = positions[0] + 1;
     var location = candidate.location;
     const first = scalars[positions[0]].bytes.start;
     for (candidate.mapping) |mapping| {
         if (first < mapping.semantic.start or first >= mapping.semantic.end) continue;
         if (mapping.authored_column) |authored_column| {
-            column = authored_column + (std.unicode.utf8CountCodepoints(candidate.text[mapping.semantic.start..first]) catch 0);
+            column = authored_column + if (mapping.definition_source == null) (std.unicode.utf8CountCodepoints(candidate.text[mapping.semantic.start..first]) catch 0) else @as(usize, 0);
         }
         if (mapping.authored_line) |line| if (location == .review_body) {
             location.review_body.logical_line = line;
@@ -638,6 +636,7 @@ fn makeOccurrence(
     return .{
         .location = try location.clone(allocator),
         .ranges = ranges,
+        .definition_ranges = definition_ranges,
         .column = column,
         .score = score,
         .calculation = calculation,
@@ -659,19 +658,21 @@ fn mergedScalarRanges(allocator: std.mem.Allocator, scalars: []const Scalar, pos
     return ranges.toOwnedSlice(allocator);
 }
 
-fn mapRanges(allocator: std.mem.Allocator, semantic_ranges: []const Range, mapping: []const Mapping) ![]Range {
-    if (mapping.len == 0) return allocator.dupe(Range, semantic_ranges);
+fn mapRanges(allocator: std.mem.Allocator, semantic_ranges: []const Range, mapping: []const Mapping, definitions: bool) ![]Range {
+    if (mapping.len == 0) return allocator.dupe(Range, if (definitions) &.{} else semantic_ranges);
     var ranges: std.ArrayList(Range) = .empty;
     errdefer ranges.deinit(allocator);
     for (semantic_ranges) |semantic| for (mapping) |entry| {
         const start = @max(semantic.start, entry.semantic.start);
         const end = @min(semantic.end, entry.semantic.end);
         if (start >= end) continue;
-        const equal_length = entry.authored.end - entry.authored.start == entry.semantic.end - entry.semantic.start;
+        const source = if (definitions) entry.definition_source orelse continue else entry.authored;
+        const equal_length = (definitions or entry.definition_source == null) and source.end - source.start == entry.semantic.end - entry.semantic.start;
         const authored = if (equal_length) Range{
-            .start = entry.authored.start + start - entry.semantic.start,
-            .end = entry.authored.start + end - entry.semantic.start,
-        } else entry.authored;
+            .start = source.start + start - entry.semantic.start,
+            .end = source.start + end - entry.semantic.start,
+        } else source;
+        if (ranges.items.len > 0 and std.meta.eql(ranges.items[ranges.items.len - 1], authored)) continue;
         if (ranges.items.len > 0 and ranges.items[ranges.items.len - 1].end == authored.start) {
             ranges.items[ranges.items.len - 1].end = authored.end;
         } else try ranges.append(allocator, authored);
@@ -727,23 +728,18 @@ pub fn appendReviewBodyCandidates(
         defer mappings.deinit(allocator);
         const boundaries = &region.boundaries;
         defer boundaries.deinit(allocator);
-        var previous_destination = false;
         for (block.spans) |span| {
-            if (span.hidden) continue;
+            if (span.boundary and text.items.len > 0) try boundaries.append(allocator, text.items.len);
+            if (span.hidden or span.generated) continue;
             if (span.hard_break) {
                 try appendBodyRegion(allocator, owner, session_epoch, corpus_order, candidates, &region);
-                previous_destination = false;
                 continue;
-            }
-            const destination = span.marks.link_destination;
-            if (text.items.len > 0 and destination != previous_destination and (destination or previous_destination)) {
-                try boundaries.append(allocator, text.items.len);
             }
             var pos: usize = 0;
             while (pos < span.text.len) {
                 const newline = std.mem.indexOfScalarPos(u8, span.text, pos, '\n') orelse span.text.len;
                 const end = if (newline > pos and span.text[newline - 1] == '\r') newline - 1 else newline;
-                const start = span.source.start + pos;
+                const start = span.source.start + if (span.definition_source == null) pos else @as(usize, 0);
                 if (end > pos) {
                     while (authored_offset < start) : (authored_offset += 1) {
                         if (body.source[authored_offset] == '\n') {
@@ -756,14 +752,15 @@ pub fn appendReviewBodyCandidates(
                     try mappings.append(allocator, .{
                         .semantic = .{ .start = semantic_start, .end = text.items.len },
                         .authored = .{ .start = start, .end = if (span.join) span.source.end else start + end - pos },
+                        .definition_source = if (span.definition_source) |definition| .{ .start = definition.start + pos, .end = definition.start + end } else null,
                         .authored_column = 1 + (std.unicode.utf8CountCodepoints(body.source[authored_line_start..start]) catch start - authored_line_start),
                         .authored_line = authored_line,
                     });
+                    if (span.definition_source != null) mappings.items[mappings.items.len - 1].authored = .{ .start = span.source.start, .end = span.source.end };
                 }
                 if (newline < span.text.len) try appendBodyRegion(allocator, owner, session_epoch, corpus_order, candidates, &region);
                 pos = if (newline < span.text.len) newline + 1 else span.text.len;
             }
-            previous_destination = destination;
         }
         try appendBodyRegion(allocator, owner, session_epoch, corpus_order, candidates, &region);
     }
@@ -792,6 +789,34 @@ fn appendBodyRegion(allocator: std.mem.Allocator, owner: ReviewBodyOwner, epoch:
 }
 
 const testing = std.testing;
+
+test "M23 links both searches find each reference use and retain separate definition ranges as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "[Docs][ID]\n![art][id]\n\n[id]: https://host/path \"Guide\"\n[unused]: /other";
+    const body = try review_body.ReviewBody.parse(a, raw);
+    var candidates: std.ArrayList(Candidate) = .empty;
+    var order: usize = 0;
+    try appendReviewBodyCandidates(a, body, .{ .comment = 7 }, 1, &order, &candidates);
+    const batch = try scan(a, try Query.init(a, "host"), candidates.items, .literal);
+    try testing.expectEqual(@as(usize, 2), batch.occurrences.len);
+    for (batch.occurrences, 0..) |occurrence, index| {
+        try testing.expectEqual(@as(u32, @intCast(index + 1)), occurrence.location.review_body.logical_line);
+        try testing.expect(occurrence.ranges[0].start < 20);
+        try testing.expectEqualStrings("host", raw[occurrence.definition_ranges[0].start..occurrence.definition_ranges[0].end]);
+    }
+    for ([_]Mode{ .literal, .fuzzy }) |mode| {
+        for ([_][]const u8{ "Docs", "art", "path", "Guide", "unused" }) |query| {
+            const found = try scan(a, try Query.init(a, query), candidates.items, mode);
+            try testing.expect(found.occurrences.len > 0);
+        }
+        for ([_][]const u8{ "image:", "‹", "Docshttps", "pathGuide" }) |query| {
+            const found = try scan(a, try Query.init(a, query), candidates.items, mode);
+            try testing.expectEqual(@as(usize, 0), found.occurrences.len);
+        }
+    }
+}
 
 test "M23 containers both searches join item and quote prose but exclude markers as project behavior" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1102,7 +1127,7 @@ test "M21 kernel ReviewBody candidates cross Markdown delimiters but stop at gen
 
     try testing.expectEqual(@as(usize, 1), candidates.items.len);
     try testing.expectEqualStrings("bold text docshttps://x tail next", candidates.items[0].text);
-    try testing.expectEqualSlices(usize, &.{ 14, 23 }, candidates.items[0].boundaries);
+    try testing.expectEqualSlices(usize, &.{ 10, 14, 23 }, candidates.items[0].boundaries);
     try testing.expectEqual(@as(u32, 1), candidates.items[0].location.review_body.logical_line);
 
     const across_markdown = try Query.init(allocator, "bold text");

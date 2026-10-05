@@ -890,7 +890,9 @@ const SearchProjection = struct {
         owner: ?review_card.Owner = null,
         start: usize,
         end: usize,
+        reference_ranges: []const ReferenceRange = &.{},
     };
+    const ReferenceRange = struct { use: review_card.SourceRange, definition: review_card.SourceRange };
 
     arena: std.heap.ArenaAllocator,
     rows: []const Row,
@@ -940,6 +942,17 @@ const SearchProjection = struct {
                     row.owner = .{ .draft = owner.id };
                 },
                 else => {},
+            }
+            if (row.owner != null) {
+                const card = switch (buffer.rows[visual.buffer_index]) {
+                    .comment, .draft => |value| value,
+                    else => unreachable,
+                };
+                var references: std.ArrayList(ReferenceRange) = .empty;
+                for (card.segments) |segment| if (segment.definition_source) |definition| {
+                    try references.append(snapshot.arena.allocator(), .{ .use = segment.source, .definition = definition });
+                };
+                row.reference_ranges = try references.toOwnedSlice(snapshot.arena.allocator());
             }
         }
         snapshot.rows = rows;
@@ -1078,6 +1091,10 @@ const SearchProjection = struct {
 
     fn visibleRow(self: *const SearchProjection, occurrence: search.Occurrence) ?usize {
         if (occurrence.ranges.len == 0) return null;
+        if (occurrence.definition_ranges.len > 0) {
+            for (self.occurrenceRows(occurrence)) |index| if (self.referenceRowMatches(index, occurrence)) return index;
+            return null;
+        }
         const first = occurrence.ranges[0];
         var navigation_occurrence = occurrence;
         if (navigation_occurrence.location == .source and navigation_occurrence.location.source.relation == .neutral)
@@ -1094,6 +1111,13 @@ const SearchProjection = struct {
         const span = self.rowSpan(rows[low], occurrence) orelse return null;
         if (first.start < span[1] and first.end > span[0]) return rows[low];
         return null;
+    }
+
+    fn referenceRowMatches(self: *const SearchProjection, index: usize, occurrence: search.Occurrence) bool {
+        for (self.rows[index].reference_ranges) |reference| {
+            if (referenceIntersects(occurrence, reference.use, reference.definition)) return true;
+        }
+        return false;
     }
 
     fn rowSpan(self: *const SearchProjection, index: usize, occurrence: search.Occurrence) ?[2]usize {
@@ -1149,6 +1173,7 @@ const SearchProjection = struct {
             },
             .review_body => for (self.occurrenceRows(occurrence)) |index| {
                 const row = self.rows[index];
+                if (occurrence.definition_ranges.len > 0 and !self.referenceRowMatches(index, occurrence)) continue;
                 try appendIndexedIntersections(temp, &projected, navigation_rows, occurrence, occurrence_index, index, .neutral, row.start, row.end);
             },
         };
@@ -3690,7 +3715,16 @@ const Published = struct {
                             .draft => |owner| body.owner == .draft and owner.id == body.owner.draft and owner.part != .header,
                             else => false,
                         };
-                        if (matches) try appendSearchIntersections(allocator, &projected, occurrence, occurrence_index == active, visual_index, .neutral, visual.source_start, visual.source_end);
+                        if (matches) {
+                            if (occurrence.definition_ranges.len > 0) {
+                                const card = switch (buffer.rows[visual.buffer_index]) {
+                                    .comment, .draft => |value| value,
+                                    else => continue,
+                                };
+                                if (!cardReferenceMatches(card, occurrence)) continue;
+                            }
+                            try appendSearchIntersections(allocator, &projected, occurrence, occurrence_index == active, visual_index, .neutral, visual.source_start, visual.source_end);
+                        }
                     }
                 },
             }
@@ -11121,10 +11155,21 @@ fn occurrenceVisualRowFor(buffer: buffer_mod.Buffer, visual_rows: []const frame_
             } else visual.source_end;
             if (first.start < end and first.end > start) return index;
         },
-        .review_body => |body| switch (visual.owner) {
-            .comment => |owner| if (body.owner == .comment and owner.id == body.owner.comment and owner.part != .header and first.start < visual.source_end and first.end > visual.source_start) return index,
-            .draft => |owner| if (body.owner == .draft and owner.id == body.owner.draft and owner.part != .header and first.start < visual.source_end and first.end > visual.source_start) return index,
-            else => {},
+        .review_body => |body| {
+            const matches = switch (visual.owner) {
+                .comment => |owner| body.owner == .comment and owner.id == body.owner.comment and owner.part != .header,
+                .draft => |owner| body.owner == .draft and owner.id == body.owner.draft and owner.part != .header,
+                else => false,
+            };
+            if (!matches or first.start >= visual.source_end or first.end <= visual.source_start) continue;
+            if (occurrence.definition_ranges.len > 0) {
+                const card = switch (buffer.rows[visual.buffer_index]) {
+                    .comment, .draft => |value| value,
+                    else => continue,
+                };
+                if (!cardReferenceMatches(card, occurrence)) continue;
+            }
+            return index;
         },
     };
     return null;
@@ -11321,6 +11366,21 @@ fn addSourceRow(allocator: Allocator, index: *std.AutoHashMapUnmanaged(SourceRow
     try entry.value_ptr.append(allocator, row);
 }
 
+fn cardReferenceMatches(card: review_card.ReviewCardRow, occurrence: search.Occurrence) bool {
+    for (card.segments) |segment| if (segment.definition_source) |definition| {
+        if (referenceIntersects(occurrence, segment.source, definition)) return true;
+    };
+    return false;
+}
+
+fn referenceIntersects(occurrence: search.Occurrence, use: review_card.SourceRange, definition: review_card.SourceRange) bool {
+    var visible_use = false;
+    for (occurrence.ranges) |range| visible_use = visible_use or (range.start < use.end and range.end > use.start);
+    if (!visible_use) return false;
+    for (occurrence.definition_ranges) |range| if (range.start < definition.end and range.end > definition.start) return true;
+    return false;
+}
+
 fn appendSearchIntersections(
     allocator: Allocator,
     projected: *std.ArrayList(frame_mod.ProjectedSourceRange),
@@ -11341,7 +11401,13 @@ fn appendSearchIntersections(
             .source = .{ .start = start, .end = end },
             .row = .{ .start = start - row_start, .end = end - row_start },
             .active = active,
+            .definition = if (occurrence.definition_ranges.len > 0) occurrence.definition_ranges[0] else null,
         });
+        for (occurrence.definition_ranges[if (occurrence.definition_ranges.len > 0) @as(usize, 1) else 0..]) |definition| {
+            var extra = projected.items[projected.items.len - 1];
+            extra.definition = definition;
+            try projected.append(allocator, extra);
+        }
     }
 }
 
@@ -11408,7 +11474,13 @@ fn retainedSearchIndex(previous_batch: ?search.Batch, previous_active: ?usize, n
 fn editedSearchOrder(a: search.Occurrence, b: search.Occurrence) std.math.Order {
     const location_order = searchLocationOrder(a.location, b.location);
     if (location_order != .eq) return location_order;
-    return std.mem.order(usize, &.{if (a.ranges.len > 0) a.ranges[0].start else 0}, &.{if (b.ranges.len > 0) b.ranges[0].start else 0});
+    return std.mem.order(usize, &.{
+        if (a.ranges.len > 0) a.ranges[0].start else 0,
+        if (a.definition_ranges.len > 0) a.definition_ranges[0].start else 0,
+    }, &.{
+        if (b.ranges.len > 0) b.ranges[0].start else 0,
+        if (b.definition_ranges.len > 0) b.definition_ranges[0].start else 0,
+    });
 }
 
 fn searchLocationOrder(a: search.Location, b: search.Location) std.math.Order {
@@ -11451,9 +11523,13 @@ fn searchLocationOrder(a: search.Location, b: search.Location) std.math.Order {
 fn exactSearchOrder(a: search.Occurrence, b: search.Occurrence) std.math.Order {
     const edited_order = editedSearchOrder(a, b);
     if (edited_order != .eq) return edited_order;
-    const shape = std.mem.order(u64, &.{ a.session_epoch, a.ranges.len }, &.{ b.session_epoch, b.ranges.len });
+    const shape = std.mem.order(u64, &.{ a.session_epoch, a.ranges.len, a.definition_ranges.len }, &.{ b.session_epoch, b.ranges.len, b.definition_ranges.len });
     if (shape != .eq) return shape;
     for (a.ranges, b.ranges) |left, right| {
+        const order = std.mem.order(usize, &.{ left.start, left.end }, &.{ right.start, right.end });
+        if (order != .eq) return order;
+    }
+    for (a.definition_ranges, b.definition_ranges) |left, right| {
         const order = std.mem.order(usize, &.{ left.start, left.end }, &.{ right.start, right.end });
         if (order != .eq) return order;
     }
@@ -11498,9 +11574,10 @@ fn indexedSearchIdentity(wanted: search.Occurrence, next: search.Batch, navigati
 }
 
 fn searchOccurrenceEql(a: search.Occurrence, b: search.Occurrence) bool {
-    if (a.session_epoch != b.session_epoch or a.ranges.len != b.ranges.len or std.meta.activeTag(a.location) != std.meta.activeTag(b.location)) return false;
+    if (a.session_epoch != b.session_epoch or a.ranges.len != b.ranges.len or a.definition_ranges.len != b.definition_ranges.len or std.meta.activeTag(a.location) != std.meta.activeTag(b.location)) return false;
     if (!searchLocationEql(a.location, b.location)) return false;
     for (a.ranges, b.ranges) |left, right| if (left.start != right.start or left.end != right.end) return false;
+    for (a.definition_ranges, b.definition_ranges) |left, right| if (left.start != right.start or left.end != right.end) return false;
     return true;
 }
 
@@ -11644,6 +11721,8 @@ const CardYankLines = struct {
     offset: usize,
     end: usize,
     fence_index: usize = 0,
+    definition_index: usize = 0,
+    last_definition: ?review_card.SourceRange = null,
 
     fn init(card: review_card.ReviewCardRow, cache: *CardYankLineCache) CardYankLines {
         const raw = card.source.body();
@@ -11693,6 +11772,14 @@ const CardYankLines = struct {
         if (self.end > 0 and self.fence_index == 1) {
             self.fence_index = 2;
             if (self.card.fences) |fences| return fences[1];
+        }
+        while (self.end > 0 and self.definition_index < self.card.segments.len) {
+            const segment = self.card.segments[self.definition_index];
+            self.definition_index += 1;
+            const definition = segment.required_definition orelse continue;
+            if (self.last_definition) |last| if (std.meta.eql(last, definition)) continue;
+            self.last_definition = definition;
+            return definition;
         }
         return null;
     }
@@ -18065,6 +18152,117 @@ test "M23 inline joined prose and Setext yank use approved exact authored bytes"
         defer command.deinit();
         try testing.expectEqualStrings(example.expected, command.copy_clipboard.text);
     }
+}
+
+test "M23 links yank selects reference destinations without unrelated definitions in both layouts as project behavior" {
+    for ([_][]const u8{ "[Docs][ID]\r\n[More][id]\n\n[id]: ../first \"Guide\"  \r\n[ID]: /duplicate\n[unused]: /other", "![Docs][ID]\r\n![More][id]\n\n[id]: ../first \"Guide\"  \r\n[ID]: /duplicate\n[unused]: /other" }) |raw| for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const session = try testCommentSession(testing.allocator, 1);
+        @constCast(session.threads[0].root).body = raw;
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 0 }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+            .geometry = .{ .cols = 36, .rows = 40 },
+        });
+        defer presentation.deinit();
+        if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        var label: ?usize = null;
+        var destination: ?usize = null;
+        var last_destination: ?usize = null;
+        for (presentation.projection().review.?.frame.visual_rows, 0..) |visual, index| {
+            const row = presentation.projection().review.?.buffer.rows[visual.buffer_index];
+            if (row != .comment or row.comment.part != .body) continue;
+            var only_label = false;
+            var has_destination = false;
+            for (row.comment.segments) |segment| {
+                only_label = only_label or segment.marks.link_label;
+                has_destination = has_destination or (segment.marks.link_destination and segment.authored);
+            }
+            if (only_label and !has_destination and label == null) label = index;
+            if (has_destination) {
+                if (destination == null) destination = index;
+                last_destination = index;
+            }
+        }
+        try testing.expect(label != null and destination != null);
+        const first_end = std.mem.indexOfScalar(u8, raw, '\n').? + 1;
+        try selectRows(&presentation, label.?, label.?);
+        try presentation.dispatch(.{ .action = .yank });
+        var label_copy = presentation.takeCommand().?;
+        defer label_copy.deinit();
+        try testing.expectEqualStrings(raw[0..first_end], label_copy.copy_clipboard.text);
+        try selectRows(&presentation, destination.?, destination.?);
+        try presentation.dispatch(.{ .action = .yank });
+        var destination_copy = presentation.takeCommand().?;
+        defer destination_copy.deinit();
+        const expected = try std.fmt.allocPrint(testing.allocator, "{s}[id]: ../first \"Guide\"  \r\n", .{raw[0..first_end]});
+        defer testing.allocator.free(expected);
+        try testing.expectEqualStrings(expected, destination_copy.copy_clipboard.text);
+        try selectRows(&presentation, last_destination.?, label.?);
+        try presentation.dispatch(.{ .action = .yank });
+        var both = presentation.takeCommand().?;
+        defer both.deinit();
+        const uses_end = std.mem.indexOf(u8, raw, "\n\n").? + 1;
+        const both_expected = try std.fmt.allocPrint(testing.allocator, "{s}[id]: ../first \"Guide\"  \r\n", .{raw[0..uses_end]});
+        defer testing.allocator.free(both_expected);
+        try testing.expectEqualStrings(both_expected, both.copy_clipboard.text);
+    };
+}
+
+test "M23 links search navigates reference uses across resize and disclosure as project behavior" {
+    const raw = "[Docs][ID]\n![More][id]\n\n[id]: https://host/host \"Guide\"";
+    for ([_]bool{ false, true }) |local| for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = if (local) try OwnedReviewIdentity.initLocal(1, "refs/remotes/origin/main", "refs/heads/feature") else try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .target = if (local) .local else .bitbucket });
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 1 }, .{
+            .initial = .{ .key = key, .session = if (local) try testLocalSession(testing.allocator) else try testSession(testing.allocator, 1, 'a') },
+            .geometry = .{ .cols = 38, .rows = 20 },
+        });
+        defer presentation.deinit();
+        if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'h', .text = "host" } });
+        try completeBufferSearchScan(&presentation);
+        try testing.expectEqual(@as(usize, 4), presentation.projection().buffer_search.?.total);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try presentation.dispatch(.{ .action = .next_search_occurrence });
+        const review = presentation.projection().review.?;
+        const card = review.buffer.rows[review.frame.visual_rows[review.navigation.cursor].buffer_index].draft;
+        try testing.expectEqual(@as(u64, 1), card.owner.draft);
+        var visible_destination = false;
+        const host = std.mem.indexOf(u8, raw, "host").?;
+        for (card.segments) |segment| if (segment.definition_source) |definition| {
+            visible_destination = visible_destination or (definition.start < host + 4 and definition.end > host);
+        };
+        try testing.expect(visible_destination);
+        try testing.expect(review.frame.search_ranges.len > 0);
+        for (review.frame.search_ranges) |range| try testing.expect(range.definition != null);
+        try presentation.dispatch(.{ .action = .next_search_occurrence });
+        const retained_active = presentation.projection().buffer_search.?.active;
+        for ([_]u16{ 160, 38 }) |cols| {
+            try dispatchView(&presentation, .{ .resize = .{ .cols = cols, .rows = 20 } });
+            try testing.expectEqual(@as(usize, 4), presentation.projection().buffer_search.?.total);
+            try testing.expectEqual(retained_active, presentation.projection().buffer_search.?.active);
+        }
+        try presentation.dispatch(.{ .action = .open_review_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'h', .text = "host" } });
+        try completeBufferSearchScan(&presentation);
+        const result = presentation.projection().review_search.?.results[0];
+        try testing.expect(result.occurrence.location.review_body.logical_line < 3);
+        try testing.expectEqualStrings("host", raw[result.occurrence.definition_ranges[0].start..result.occurrence.definition_ranges[0].end]);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try completeDisclosureBuild(&presentation);
+        try testing.expect(presentation.projection().review_search == null);
+        const opened = presentation.projection().review.?;
+        const opened_card = opened.buffer.rows[opened.frame.visual_rows[opened.navigation.cursor].buffer_index].draft;
+        var at_match = false;
+        for (opened_card.segments) |segment| if (segment.definition_source) |definition| {
+            at_match = at_match or (definition.start < host + 4 and definition.end > host);
+        };
+        try testing.expect(at_match);
+    };
 }
 
 test "M23 containers search focuses authored text and keeps identity across resize as project behavior" {

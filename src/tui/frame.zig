@@ -216,6 +216,7 @@ pub const ProjectedSourceRange = struct {
     row: search.Range,
     active: bool,
     occurrence_index: ?usize = null,
+    definition: ?search.Range = null,
 };
 
 pub const Projection = struct {

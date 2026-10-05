@@ -166,12 +166,15 @@ fn searchSourceText(row: Row, visual: @import("frame.zig").VisualRow, relation: 
 fn drawReviewCardSearchRange(win: vaxis.Window, row: u16, card: buffer_mod.ReviewCardRow, range: @import("frame.zig").ProjectedSourceRange, active: bool, theme: Theme) void {
     var col: usize = card.contentColumn();
     for (card.segments) |segment| {
-        const start = @max(range.source.start, segment.source.start);
-        const end = @min(range.source.end, segment.source.end);
+        const source = segment.definition_source orelse segment.source;
+        const use_matches = range.source.start < segment.source.end and range.source.end > segment.source.start;
+        const matched = if (segment.definition_source != null and use_matches) range.definition else if (segment.definition_source == null and range.definition == null) range.source else null;
+        const start = if (matched) |value| @max(value.start, source.start) else 0;
+        const end = if (matched) |value| @min(value.end, source.end) else 0;
         if (segment.authored and start < end) {
-            const equal_length = segment.source.end - segment.source.start == segment.text.len;
-            const local_start = if (equal_length) start - segment.source.start else 0;
-            const local_end = if (equal_length) end - segment.source.start else segment.text.len;
+            const equal_length = source.end - source.start == segment.text.len;
+            const local_start = if (equal_length) start - source.start else 0;
+            const local_end = if (equal_length) end - source.start else segment.text.len;
             if (local_end <= segment.text.len) {
                 const cell_start = col + vaxis.gwidth.gwidth(segment.text[0..local_start], .unicode);
                 const width = vaxis.gwidth.gwidth(segment.text[local_start..local_end], .unicode);
@@ -1245,8 +1248,12 @@ fn drawReviewSearchPreview(scratch: std.mem.Allocator, win: vaxis.Window, result
         for (card.segments, 0..) |segment, index| {
             var style = theme.reviewCardStyle(card.role, card.part, segment.marks);
             if (!code) style.bg = theme.picker.bg;
-            if (segment.authored) for (result.occurrence.ranges) |range| {
-                if (range.start < segment.source.end and range.end > segment.source.start) {
+            const source = segment.definition_source orelse segment.source;
+            var use_matches = false;
+            for (result.occurrence.ranges) |range| use_matches = use_matches or (range.start < segment.source.end and range.end > segment.source.start);
+            const matched = if (segment.definition_source != null and use_matches) result.occurrence.definition_ranges else if (segment.definition_source == null and result.occurrence.definition_ranges.len == 0) result.occurrence.ranges else &.{};
+            if (segment.authored) for (matched) |range| {
+                if (range.start < source.end and range.end > source.start) {
                     style.bg = theme.search_active;
                     break;
                 }
@@ -1269,6 +1276,82 @@ fn nextVaxisGrapheme(_: *const anyopaque, text: []const u8) @import("cell_metric
 
 fn widthVaxisText(_: *const anyopaque, text: []const u8) usize {
     return vaxis.gwidth.gwidth(text, .unicode);
+}
+
+test "M23 links highlight only the matched reference use in ReviewCards and Preview as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "[A][id] [B][id]\n\n[id]: /host";
+    const use = [_]@import("search.zig").Range{.{ .start = 2, .end = 7 }};
+    const definition = [_]@import("search.zig").Range{.{ .start = raw.len - 4, .end = raw.len }};
+    const result: presentation.ReviewSearchResult = .{
+        .kind = "COMMENT",
+        .source = "Ada",
+        .body = raw,
+        .scope = .review,
+        .scope_state = .current,
+        .occurrence = .{ .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 1 } }, .ranges = @constCast(&use), .definition_ranges = &definition, .column = 3, .candidate_scalars = 4, .corpus_order = 0, .session_epoch = 1 },
+    };
+    var screen = try vaxis.Screen.init(a, .{ .rows = 8, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    for (@import("theme.zig").builtins) |builtin| {
+        const theme = builtin.value;
+        drawReviewSearchPreview(a, win, result, 0, theme, terminal_cell_metrics);
+        try testing.expectEqualStrings("h", win.readCell(4, 0).?.char.grapheme);
+        try testing.expectEqual(theme.search_active, win.readCell(4, 0).?.style.bg);
+        try testing.expectEqualStrings("h", win.readCell(14, 0).?.char.grapheme);
+        try testing.expectEqual(theme.picker.bg, win.readCell(14, 0).?.style.bg);
+        const card_mod = @import("review_card.zig");
+        const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
+        const rows = try card_mod.project(a, try card_mod.ReviewBody.parse(a, raw), .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "Ada", .content_width = 76, .metrics = terminal_cell_metrics, .collapsed_rows = 0 });
+        drawReviewCard(a, win, 0, rows[1], theme);
+        const before = win.readCell(18, 0).?.style.bg;
+        drawReviewCardSearchRange(win, 0, rows[1], .{ .visual_row = 0, .relation = .neutral, .source = use[0], .definition = definition[0], .row = use[0], .active = true }, true, theme);
+        try testing.expectEqual(theme.search_active, win.readCell(8, 0).?.style.bg);
+        try testing.expectEqual(before, win.readCell(18, 0).?.style.bg);
+    }
+}
+
+test "M23 links Preview wraps full reference destinations and highlights only matched definition bytes as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "[***Docs***][id]\n\n[id]: ../abcdefgh \"Guide\"";
+    const definition = std.mem.indexOf(u8, raw, "abcdefgh").?;
+    const ranges = [_]@import("search.zig").Range{.{ .start = 11, .end = 15 }};
+    const definition_ranges = [_]@import("search.zig").Range{.{ .start = definition + 2, .end = definition + 6 }};
+    const result: presentation.ReviewSearchResult = .{
+        .kind = "COMMENT",
+        .source = "Ada",
+        .body = raw,
+        .scope = .review,
+        .scope_state = .current,
+        .occurrence = .{ .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 1 } }, .ranges = @constCast(&ranges), .definition_ranges = &definition_ranges, .column = 12, .candidate_scalars = 4, .corpus_order = 0, .session_epoch = 1 },
+    };
+    var screen = try vaxis.Screen.init(a, .{ .rows = 8, .cols = 8, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const expected = [_][]const u8{ "Docs ‹..", "/abcdefg", "h› \"Guid", "e\"" };
+    for (@import("theme.zig").builtins) |builtin| {
+        const theme = builtin.value;
+        drawReviewSearchPreview(a, win, result, 0, theme, terminal_cell_metrics);
+        for (expected, 0..) |text, row| {
+            var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
+            var col: u16 = 0;
+            while (iterator.nextCodepointSlice()) |grapheme| : (col += 1) {
+                try testing.expectEqualStrings(grapheme, win.readCell(col, @intCast(row)).?.char.grapheme);
+            }
+        }
+        const label = win.readCell(0, 0).?.style;
+        try testing.expect(label.bold and label.italic and label.ul_style == .single);
+        try testing.expectEqual(theme.markdown_bold, label.fg);
+        for (0..8) |col| {
+            const style = win.readCell(@intCast(col), 1).?.style;
+            try testing.expectEqual(if (col >= 3 and col < 7) theme.search_active else theme.picker.bg, style.bg);
+        }
+    }
 }
 
 test "M23 literal Preview shares code and Suggestion backgrounds and tab search cells" {
