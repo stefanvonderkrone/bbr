@@ -54,6 +54,7 @@ pub const ReviewCardRow = struct {
     indent: usize = 0,
     /// Only the first authored blank line represented by an empty row.
     blank_source: ?usize = null,
+    hidden_line: ?SourceRange = null,
     plain_label: ?[]const u8 = null,
 
     pub fn contentColumn(self: ReviewCardRow) usize {
@@ -181,11 +182,13 @@ const Writer = struct {
     ordinal: usize = 0,
     kind: BlockKind = .paragraph,
     part: Part = .body,
+    hidden_line: ?SourceRange = null,
 
     fn block(self: *Writer, value: body_mod.Block, ordinal: usize) !void {
         self.ordinal = ordinal;
         self.kind = value.kind;
         self.part = .body;
+        self.hidden_line = value.hidden_line;
         switch (value.kind) {
             .spacer => try self.emitEmpty(value.source),
             .suggestion => {
@@ -210,9 +213,10 @@ const Writer = struct {
                     pos = if (newline < content.text.len) newline + 1 else content.text.len;
                 }
             },
-            .heading => {
+            .heading => |level| {
                 self.part = .body;
-                try self.addToken("§", .{ .start = value.source.start, .end = value.source.start }, .{ .strong = true }, false);
+                const markers = [_][]const u8{ "§1 ", "§2 ", "§3 ", "§4 ", "§5 ", "§6 " };
+                try self.addToken(markers[level - 1], .{ .start = value.source.start, .end = value.source.start }, .{ .strong = true }, false);
                 for (value.spans) |span| try self.addSpan(span, true);
                 try self.flush();
             },
@@ -224,6 +228,10 @@ const Writer = struct {
     }
 
     fn addSpan(self: *Writer, span: body_mod.Span, force_strong: bool) !void {
+        if (span.hard_break) {
+            if (span.marks.inline_code and self.current.items.len == 0) try self.emitEmpty(span.source) else try self.flush();
+            return;
+        }
         if (span.hidden) {
             if (span.strike_delimiter and !self.options.metrics.strikethrough_supported) {
                 try self.addToken(self.options.source.body()[span.source.start..span.source.end], span.source, .{}, true);
@@ -233,6 +241,15 @@ const Writer = struct {
         var marks = span.marks;
         marks.strikethrough = marks.strikethrough and self.options.metrics.strikethrough_supported;
         marks.strong = marks.strong or force_strong;
+        if (span.join) {
+            if (self.current.items.len > 0 and self.current_width < self.width) {
+                try self.append(.{ .text = " ", .source = span.source, .marks = marks }, 1);
+            } else if (self.rows.items.len > 0) {
+                const previous = &self.rows.items[self.rows.items.len - 1];
+                if (previous.block_ordinal == self.ordinal) previous.source_range.end = span.source.end;
+            }
+            return;
+        }
         if (marks.inline_code) {
             try self.addToken(span.text, span.source, marks, true);
             return;
@@ -328,7 +345,9 @@ const Writer = struct {
     fn flush(self: *Writer) !void {
         if (self.current.items.len == 0) return;
         const segments = try self.current.toOwnedSlice(self.allocator);
-        try self.rows.append(self.allocator, makeRow(self.options, self.part, self.ordinal, self.kind, self.current_range.?, segments));
+        var row = makeRow(self.options, self.part, self.ordinal, self.kind, self.current_range.?, segments);
+        row.hidden_line = self.hidden_line;
+        try self.rows.append(self.allocator, row);
         self.current = .empty;
         self.current_width = 0;
         self.current_range = null;
@@ -357,6 +376,50 @@ fn measuredWidth(metrics: CellMetrics, text: []const u8) usize {
 }
 
 const testing = std.testing;
+
+test "M23 inline heading levels and paragraph rows hide syntax with exact source ownership" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = "# One #\n## *Two*\n### `Three`\n#### Four\n##### Five\n###### Six\nSetext\n---\n\nfirst\nsecond\n\nthird  \nfourth" };
+    const body = try ReviewBody.parse(a, comment.body);
+    const rows = try project(a, body, .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "header", .content_width = 80, .metrics = TestMetrics.value, .collapsed_rows = 0 });
+    const expected = [_][]const u8{ "header", "§1 One", "§2 Two", "§3 Three", "§4 Four", "§5 Five", "§6 Six", "§2 Setext", "", "first second", "", "third", "fourth" };
+    try testing.expectEqual(expected.len, rows.len);
+    for (rows, expected) |row, text| {
+        var visible: std.ArrayList(u8) = .empty;
+        for (row.segments) |segment| try visible.appendSlice(a, segment.text);
+        try testing.expectEqualStrings(text, visible.items);
+        if (row.block_kind == .heading) for (row.segments) |segment| {
+            try testing.expect(segment.marks.strong);
+            if (!segment.authored) try testing.expectEqual(segment.source.start, segment.source.end);
+        };
+    }
+    try testing.expect(rows[7].hidden_line != null);
+    const malformed = try ReviewBody.parse(a, "####### literal\n#nospace\n    # indented\n\nnot heading\n= = =\n\nTitle\n\t===");
+    for (malformed.blocks) |block| try testing.expect(block.kind != .heading);
+}
+
+test "M23 inline wrapped paragraph join retains the authored line ending for search navigation" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = "first\nsecond" };
+    const rows = try project(a, try ReviewBody.parse(a, comment.body), .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "header", .content_width = 5, .metrics = TestMetrics.value, .collapsed_rows = 0 });
+    try testing.expectEqual(SourceRange{ .start = 0, .end = 6 }, rows[1].source_range);
+}
+
+test "M23 inline code keeps leading empty authored rows" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = "`\nfirst`" };
+    const rows = try project(a, try ReviewBody.parse(a, comment.body), .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "header", .content_width = 80, .metrics = TestMetrics.value, .collapsed_rows = 0 });
+    try testing.expectEqual(@as(usize, 3), rows.len);
+    try testing.expectEqual(@as(?usize, 1), rows[1].blank_source);
+    try testing.expectEqual(@as(usize, 0), rows[1].segments.len);
+    try testing.expectEqual(SourceRange{ .start = 2, .end = 7 }, rows[2].source_range);
+}
 
 const TestMetrics = struct {
     fn next(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {

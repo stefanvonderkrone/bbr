@@ -16,6 +16,7 @@ pub const Mapping = struct {
     semantic: Range,
     authored: Range,
     authored_column: ?usize = null,
+    authored_line: ?u32 = null,
 };
 
 pub const VersionRelation = enum { neutral, old, new };
@@ -622,16 +623,20 @@ fn makeOccurrence(
     const ranges = try mapRanges(allocator, semantic_ranges, candidate.mapping);
     errdefer allocator.free(ranges);
     var column = positions[0] + 1;
+    var location = candidate.location;
     const first = scalars[positions[0]].bytes.start;
     for (candidate.mapping) |mapping| {
         if (first < mapping.semantic.start or first >= mapping.semantic.end) continue;
         if (mapping.authored_column) |authored_column| {
             column = authored_column + (std.unicode.utf8CountCodepoints(candidate.text[mapping.semantic.start..first]) catch 0);
         }
+        if (mapping.authored_line) |line| if (location == .review_body) {
+            location.review_body.logical_line = line;
+        };
         break;
     }
     return .{
-        .location = try candidate.location.clone(allocator),
+        .location = try location.clone(allocator),
         .ranges = ranges,
         .column = column,
         .score = score,
@@ -662,10 +667,11 @@ fn mapRanges(allocator: std.mem.Allocator, semantic_ranges: []const Range, mappi
         const start = @max(semantic.start, entry.semantic.start);
         const end = @min(semantic.end, entry.semantic.end);
         if (start >= end) continue;
-        const authored = Range{
+        const equal_length = entry.authored.end - entry.authored.start == entry.semantic.end - entry.semantic.start;
+        const authored = if (equal_length) Range{
             .start = entry.authored.start + start - entry.semantic.start,
             .end = entry.authored.start + end - entry.semantic.start,
-        };
+        } else entry.authored;
         if (ranges.items.len > 0 and ranges.items[ranges.items.len - 1].end == authored.start) {
             ranges.items[ranges.items.len - 1].end = authored.end;
         } else try ranges.append(allocator, authored);
@@ -694,6 +700,7 @@ fn occurrenceLessThan(mode: Mode, left: Occurrence, right: Occurrence) bool {
         }
     }
     if (left.corpus_order != right.corpus_order) return left.corpus_order < right.corpus_order;
+    if (mode == .literal and left.ranges.len > 0 and right.ranges.len > 0) return left.ranges[0].start < right.ranges[0].start;
     return left.column < right.column;
 }
 
@@ -709,63 +716,129 @@ pub fn appendReviewBodyCandidates(
     corpus_order: *usize,
     candidates: *std.ArrayList(Candidate),
 ) !void {
-    var line_start: usize = 0;
-    var logical_line: u32 = 1;
-    while (line_start <= body.source.len) : (logical_line += 1) {
-        const newline = std.mem.indexOfScalarPos(u8, body.source, line_start, '\n') orelse body.source.len;
-        const line_end = if (newline > line_start and body.source[newline - 1] == '\r') newline - 1 else newline;
-        var text: std.ArrayList(u8) = .empty;
-        var mappings: std.ArrayList(Mapping) = .empty;
-        var boundaries: std.ArrayList(usize) = .empty;
+    var authored_offset: usize = 0;
+    var authored_line: u32 = 1;
+    var authored_line_start: usize = 0;
+    for (body.blocks) |block| {
+        var region: BodyRegion = .{};
+        const text = &region.text;
+        defer text.deinit(allocator);
+        const mappings = &region.mappings;
+        defer mappings.deinit(allocator);
+        const boundaries = &region.boundaries;
+        defer boundaries.deinit(allocator);
         var previous_destination = false;
-        var have_span = false;
-        var column_offset = line_start;
-        var authored_column: usize = 1;
-
-        for (body.blocks) |block| for (block.spans) |span| {
+        for (block.spans) |span| {
             if (span.hidden) continue;
-            const start = @max(line_start, span.source.start);
-            const end = @min(line_end, span.source.end);
-            if (start >= end) continue;
-            authored_column += std.unicode.utf8CountCodepoints(body.source[column_offset..start]) catch start - column_offset;
-            column_offset = start;
+            if (span.hard_break) {
+                try appendBodyRegion(allocator, owner, session_epoch, corpus_order, candidates, &region);
+                previous_destination = false;
+                continue;
+            }
             const destination = span.marks.link_destination;
-            if (have_span and destination != previous_destination and (destination or previous_destination)) {
+            if (text.items.len > 0 and destination != previous_destination and (destination or previous_destination)) {
                 try boundaries.append(allocator, text.items.len);
             }
-            const semantic_start = text.items.len;
-            try text.appendSlice(allocator, body.source[start..end]);
-            try mappings.append(allocator, .{
-                .semantic = .{ .start = semantic_start, .end = text.items.len },
-                .authored = .{ .start = start, .end = end },
-                .authored_column = authored_column,
-            });
+            var pos: usize = 0;
+            while (pos < span.text.len) {
+                const newline = std.mem.indexOfScalarPos(u8, span.text, pos, '\n') orelse span.text.len;
+                const end = if (newline > pos and span.text[newline - 1] == '\r') newline - 1 else newline;
+                const start = span.source.start + pos;
+                if (end > pos) {
+                    while (authored_offset < start) : (authored_offset += 1) {
+                        if (body.source[authored_offset] == '\n') {
+                            authored_line += 1;
+                            authored_line_start = authored_offset + 1;
+                        }
+                    }
+                    const semantic_start = text.items.len;
+                    try text.appendSlice(allocator, span.text[pos..end]);
+                    try mappings.append(allocator, .{
+                        .semantic = .{ .start = semantic_start, .end = text.items.len },
+                        .authored = .{ .start = start, .end = if (span.join) span.source.end else start + end - pos },
+                        .authored_column = 1 + (std.unicode.utf8CountCodepoints(body.source[authored_line_start..start]) catch start - authored_line_start),
+                        .authored_line = authored_line,
+                    });
+                }
+                if (newline < span.text.len) try appendBodyRegion(allocator, owner, session_epoch, corpus_order, candidates, &region);
+                pos = if (newline < span.text.len) newline + 1 else span.text.len;
+            }
             previous_destination = destination;
-            have_span = true;
-        };
-        if (have_span and previous_destination) try boundaries.append(allocator, text.items.len);
-
-        if (text.items.len > 0) {
-            try candidates.append(allocator, .{
-                .text = try text.toOwnedSlice(allocator),
-                .mapping = try mappings.toOwnedSlice(allocator),
-                .boundaries = try boundaries.toOwnedSlice(allocator),
-                .location = .{ .review_body = .{ .owner = owner, .logical_line = logical_line } },
-                .corpus_order = corpus_order.*,
-                .session_epoch = session_epoch,
-            });
-            corpus_order.* += 1;
-        } else {
-            text.deinit(allocator);
-            mappings.deinit(allocator);
-            boundaries.deinit(allocator);
         }
-        if (newline == body.source.len) break;
-        line_start = newline + 1;
+        try appendBodyRegion(allocator, owner, session_epoch, corpus_order, candidates, &region);
     }
 }
 
+const BodyRegion = struct {
+    text: std.ArrayList(u8) = .empty,
+    mappings: std.ArrayList(Mapping) = .empty,
+    boundaries: std.ArrayList(usize) = .empty,
+};
+
+fn appendBodyRegion(allocator: std.mem.Allocator, owner: ReviewBodyOwner, epoch: u64, order: *usize, candidates: *std.ArrayList(Candidate), region: *BodyRegion) !void {
+    const text = &region.text;
+    const mappings = &region.mappings;
+    const boundaries = &region.boundaries;
+    if (text.items.len == 0) return;
+    const line = mappings.items[0].authored_line.?;
+    const owned_text = try text.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_text);
+    const owned_mapping = try mappings.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_mapping);
+    const owned_boundaries = try boundaries.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_boundaries);
+    try candidates.append(allocator, .{ .text = owned_text, .mapping = owned_mapping, .boundaries = owned_boundaries, .location = .{ .review_body = .{ .owner = owner, .logical_line = line } }, .corpus_order = order.*, .session_epoch = epoch });
+    order.* += 1;
+}
+
 const testing = std.testing;
+
+test "M23 inline joined paragraph search maps CRLF joins and first authored positions" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = try review_body.ReviewBody.parse(a, "π first\r\n**second**\n\nfirst  \nsecond\n\nTitle\n=====\n");
+    var candidates: std.ArrayList(Candidate) = .empty;
+    var order: usize = 0;
+    try appendReviewBodyCandidates(a, body, .{ .comment = 7 }, 9, &order, &candidates);
+    var query = try Query.init(a, "first second");
+    var batch = try scan(a, query, candidates.items, .literal);
+    try testing.expectEqual(@as(usize, 1), batch.occurrences.len);
+    try testing.expectEqualSlices(Range, &.{ .{ .start = 3, .end = 10 }, .{ .start = 12, .end = 18 } }, batch.occurrences[0].ranges);
+    try testing.expectEqual(@as(usize, 3), batch.occurrences[0].column);
+    query = try Query.init(a, "second");
+    batch = try scan(a, query, candidates.items, .literal);
+    try testing.expectEqual(@as(u32, 2), batch.occurrences[0].location.review_body.logical_line);
+    try testing.expectEqual(@as(usize, 3), batch.occurrences[0].column);
+    query = try Query.init(a, "=====");
+    batch = try scan(a, query, candidates.items, .literal);
+    try testing.expectEqual(@as(usize, 0), batch.occurrences.len);
+}
+
+test "M23 inline searches keep paragraph boundaries literal order and one best fuzzy match" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = try review_body.ReviewBody.parse(a, "prefix needle\nneedle\n\nfirst  \nsecond\n\nfirst\n\nsecond\n\n```suggestion\nfirst\nsecond\n```\n\n[docs](url) tail");
+    var candidates: std.ArrayList(Candidate) = .empty;
+    var order: usize = 0;
+    try appendReviewBodyCandidates(a, body, .{ .draft = 1 }, 2, &order, &candidates);
+    var query = try Query.init(a, "needle");
+    var batch = try scan(a, query, candidates.items, .literal);
+    try testing.expectEqual(@as(usize, 2), batch.occurrences.len);
+    try testing.expectEqual(@as(u32, 1), batch.occurrences[0].location.review_body.logical_line);
+    try testing.expectEqual(@as(u32, 2), batch.occurrences[1].location.review_body.logical_line);
+    batch = try scan(a, query, candidates.items, .fuzzy);
+    try testing.expectEqual(@as(usize, 1), batch.occurrences.len);
+    query = try Query.init(a, "first second");
+    for ([_]Mode{ .literal, .fuzzy }) |mode| {
+        batch = try scan(a, query, candidates.items, mode);
+        try testing.expectEqual(@as(usize, 0), batch.occurrences.len);
+    }
+    query = try Query.init(a, "docsurl");
+    batch = try scan(a, query, candidates.items, .fuzzy);
+    try testing.expectEqual(@as(usize, 0), batch.occurrences.len);
+}
 
 test "complete File scan merges only Diff-proven equal context and keeps opposite-side matches" {
     var query = try Query.init(testing.allocator, "match");
@@ -952,8 +1025,8 @@ test "M21 kernel ReviewBody candidates cross Markdown delimiters but stop at gen
     var corpus_order: usize = 0;
     try appendReviewBodyCandidates(allocator, body, .{ .comment = 7 }, 3, &corpus_order, &candidates);
 
-    try testing.expectEqual(@as(usize, 2), candidates.items.len);
-    try testing.expectEqualStrings("bold text docshttps://x tail", candidates.items[0].text);
+    try testing.expectEqual(@as(usize, 1), candidates.items.len);
+    try testing.expectEqualStrings("bold text docshttps://x tail next", candidates.items[0].text);
     try testing.expectEqualSlices(usize, &.{ 14, 23 }, candidates.items[0].boundaries);
     try testing.expectEqual(@as(u32, 1), candidates.items[0].location.review_body.logical_line);
 

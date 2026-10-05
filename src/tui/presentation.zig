@@ -933,10 +933,10 @@ const SearchProjection = struct {
                 if (halves.right) |half| row.right = .{ .old_line = half.line.oldNo(), .new_line = half.line.newNo(), .start = half.source_start, .end = half.source_end };
             } else switch (visual.owner) {
                 .line => |line| row.single = .{ .old_line = line.oldNo(), .new_line = line.newNo(), .start = visual.source_start, .end = visual.source_end },
-                .comment => |owner| if (owner.part != .header) {
+                .comment => |owner| if (owner.part != .header and owner.part != .disclosure_footer) {
                     row.owner = .{ .comment = owner.id };
                 },
-                .draft => |owner| if (owner.part != .header) {
+                .draft => |owner| if (owner.part != .header and owner.part != .disclosure_footer) {
                     row.owner = .{ .draft = owner.id };
                 },
                 else => {},
@@ -11227,6 +11227,11 @@ fn requiredSearchDisclosure(published: *const Published, occurrence: search.Occu
 fn searchDisclosureForVisibility(published: *const Published, occurrence: search.Occurrence, visible: bool) SearchDisclosureSet {
     const possible = requiredSearchDisclosure(published, occurrence);
     if (!visible) return possible;
+    if (occurrence.location == .review_body and occurrence.ranges.len > 0) {
+        const rows = published.search_projection.occurrenceRows(occurrence);
+        const last = occurrence.ranges[occurrence.ranges.len - 1];
+        if (rows.len == 0 or published.search_projection.rows[rows[rows.len - 1]].end < last.end) return possible;
+    }
     var result: SearchDisclosureSet = .{};
     if (published.buffer_search.saved_disclosures != null) {
         for (possible.items[0..possible.len]) |key| if (published.disclosure_keys.contains(key)) result.append(key);
@@ -11653,6 +11658,10 @@ const CardYankLines = struct {
             end = @max(end, blank + 1);
         }
         if (end == 0) return .{ .card = card, .cache = cache, .offset = 0, .end = 0 };
+        if (card.hidden_line) |line| {
+            start = @min(start, line.start);
+            end = @max(end, line.end);
+        }
         if (cache.owner == null or !std.meta.eql(cache.owner.?, card.owner)) cache.* = .{ .owner = card.owner };
         if (cache.line) |line| {
             if (start >= line.start and start < line.end) start = line.start;
@@ -11670,6 +11679,7 @@ const CardYankLines = struct {
             else if (std.mem.indexOfScalarPos(u8, raw, start, '\n')) |pos| pos + 1 else raw.len;
             self.cache.line = .{ .start = start, .end = end };
             self.offset = end;
+            if (self.card.hidden_line) |line| if (line.start == start) return .{ .start = start, .end = end };
             if (self.card.blank_source) |blank| if (blank >= start and blank < end) return .{ .start = start, .end = end };
             for (self.card.segments) |segment| {
                 if (segment.authored and segment.source.start < end and segment.source.end > start) return .{ .start = start, .end = end };
@@ -13368,6 +13378,11 @@ fn benchmarkSidebar(presentation: *Presentation, io: std.Io) !void {
 
 fn completeBufferSearchScan(presentation: *Presentation) !void {
     var command = presentation.takeCommand() orelse return error.MissingBufferSearchScan;
+    while (command == .build_buffer_disclosure) {
+        command.build_buffer_disclosure.build();
+        try presentation.dispatch(.{ .buffer_disclosure_built = command.build_buffer_disclosure });
+        command = presentation.takeCommand() orelse return error.MissingBufferSearchScan;
+    }
     defer command.deinit();
     try testing.expect(command == .scan_buffer_search);
     const completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
@@ -18005,6 +18020,93 @@ test "M23 inline Actions retain exact search ranges, Selection bytes, and comple
     };
 }
 
+test "M23 inline joined prose and Setext yank use approved exact authored bytes" {
+    const examples = [_]struct { body: []const u8, cols: u16, expected: []const u8, spacer: bool = false }{
+        .{ .body = "first\nsecond", .cols = 160, .expected = "first\nsecond" },
+        .{ .body = "first\nsecond", .cols = 38, .expected = "first\n" },
+        .{ .body = "alpha bravo\ncharlie delta", .cols = 38, .expected = "alpha bravo\n" },
+        .{ .body = "Title\n=====\ntext", .cols = 160, .expected = "Title\n=====\n" },
+        .{ .body = "A\n\n\nB", .cols = 160, .expected = "\n", .spacer = true },
+        .{ .body = "A\n  \n\t\nB", .cols = 160, .expected = "  \n", .spacer = true },
+    };
+    for (examples) |example| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const session = try testCommentSession(testing.allocator, 1);
+        @constCast(session.threads[0].root).body = example.body;
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 0 }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+            .geometry = .{ .cols = example.cols, .rows = 20 },
+        });
+        defer presentation.deinit();
+        var selected: ?usize = null;
+        for (presentation.projection().review.?.frame.visual_rows, 0..) |visual, index| {
+            const row = presentation.projection().review.?.buffer.rows[visual.buffer_index];
+            if (row != .comment or row.comment.part != .body) continue;
+            if (example.spacer and row.comment.block_kind != .spacer) continue;
+            selected = index;
+            break;
+        }
+        try testing.expect(selected != null);
+        try selectRows(&presentation, selected.?, selected.?);
+        try presentation.dispatch(.{ .action = .yank });
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        try testing.expectEqualStrings(example.expected, command.copy_clipboard.text);
+    }
+}
+
+test "M23 inline joined search reveals exact rows and retains occurrences across resize" {
+    const raw = "first\nsecond\n\nhidden tail";
+    for ([_]bool{ false, true }) |local| for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = if (local) try OwnedReviewIdentity.initLocal(1, "refs/remotes/origin/main", "refs/heads/feature") else try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .target = if (local) .local else .bitbucket });
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 1 }, .{
+            .initial = .{ .key = key, .session = if (local) try testLocalSession(testing.allocator) else try testSession(testing.allocator, 1, 'a') },
+            .geometry = .{ .cols = 38, .rows = 20 },
+        });
+        defer presentation.deinit();
+        if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'f', .text = "first second" } });
+        try completeBufferSearchScan(&presentation);
+        try testing.expectEqual(@as(usize, 1), presentation.projection().buffer_search.?.total);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try presentation.dispatch(.{ .action = .next_search_occurrence });
+        var review = presentation.projection().review.?;
+        try testing.expectEqual(@as(u64, 1), review.frame.visual_rows[review.navigation.cursor].owner.draft.id);
+        try testing.expect(review.frame.search_ranges.len >= 2);
+        try presentation.dispatch(.{ .action = .toggle_select });
+        try presentation.dispatch(.{ .action = .yank });
+        var copied = presentation.takeCommand().?;
+        defer copied.deinit();
+        try testing.expectEqualStrings("first\n", copied.copy_clipboard.text);
+        for ([_]u16{ 160, 38 }) |cols| {
+            try dispatchView(&presentation, .{ .resize = .{ .cols = cols, .rows = 20 } });
+            try testing.expectEqual(@as(usize, 1), presentation.projection().buffer_search.?.total);
+        }
+        try presentation.dispatch(.{ .action = .open_review_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'f', .text = "first second" } });
+        try completeBufferSearchScan(&presentation);
+        const result = presentation.projection().review_search.?.results[0];
+        try testing.expectEqual(@as(u32, 1), result.occurrence.location.review_body.logical_line);
+        try testing.expectEqual(@as(usize, 1), result.occurrence.column);
+        try testing.expectEqualSlices(search.Range, &.{.{ .start = 0, .end = 12 }}, result.occurrence.ranges);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try completeDisclosureBuild(&presentation);
+        try testing.expect(presentation.projection().review_search == null);
+        review = presentation.projection().review.?;
+        try testing.expectEqual(@as(u64, 1), review.frame.visual_rows[review.navigation.cursor].owner.draft.id);
+        try presentation.dispatch(.{ .action = .toggle_select });
+        try presentation.dispatch(.{ .action = .yank });
+        var revealed = presentation.takeCommand().?;
+        defer revealed.deinit();
+        try testing.expectEqualStrings("first\n", revealed.copy_clipboard.text);
+    };
+}
+
 test "M23 yank filters root scope for published and Draft Replies in both layouts" {
     for ([_]Layout{ .unified, .side_by_side }) |layout| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
@@ -18186,6 +18288,7 @@ test "M23 yank Selection ignores generated heading markers and keeps authored he
     try testing.expect(presentation.takeCommand() == null);
     try testing.expectEqual(marker, presentation.projection().review.?.navigation.mark);
     try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.count);
+    try presentation.dispatch(.{ .push_count_digit = 3 });
     try presentation.dispatch(.{ .action = .down });
     try presentation.dispatch(.{ .action = .yank });
     var command = presentation.takeCommand().?;
@@ -18218,7 +18321,7 @@ test "M23 yank Selection keeps touched authored lines and only the first blank s
         try presentation.dispatch(.{ .action = .yank });
         var partial = presentation.takeCommand().?;
         defer partial.deinit();
-        try testing.expectEqualStrings(if (cols == 160) "  **alpha bravo**  \r\ncharlie delta\r\n" else "  **alpha bravo**  \r\n", partial.copy_clipboard.text);
+        try testing.expectEqualStrings("  **alpha bravo**  \r\n", partial.copy_clipboard.text);
         try selectRows(&presentation, first.?, spacer.?);
         try presentation.dispatch(.{ .action = .yank });
         var command = presentation.takeCommand().?;

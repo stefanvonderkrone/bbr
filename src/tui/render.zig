@@ -1269,6 +1269,34 @@ fn widthVaxisText(_: *const anyopaque, text: []const u8) usize {
     return vaxis.gwidth.gwidth(text, .unicode);
 }
 
+test "M23 inline Preview shows joined prose and Setext headings with every matched part styled" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 8, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const ranges = [_]@import("search.zig").Range{.{ .start = 13, .end = 25 }};
+    const result: presentation.ReviewSearchResult = .{
+        .kind = "COMMENT",
+        .source = "Ada",
+        .body = "Title\n=====\n\nfirst\nsecond",
+        .scope = .review,
+        .scope_state = .current,
+        .occurrence = .{ .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 4 } }, .ranges = @constCast(&ranges), .column = 1, .candidate_scalars = 12, .corpus_order = 0, .session_epoch = 1 },
+    };
+    for (@import("theme.zig").builtins) |builtin| {
+        const theme = builtin.value;
+        drawReviewSearchPreview(a, win, result, 0, theme, terminal_cell_metrics);
+        try testing.expectEqualStrings("§", win.readCell(0, 0).?.char.grapheme);
+        try testing.expectEqualStrings("1", win.readCell(1, 0).?.char.grapheme);
+        try testing.expect(win.readCell(3, 0).?.style.bold);
+        try testing.expectEqualStrings("f", win.readCell(0, 2).?.char.grapheme);
+        try testing.expectEqualStrings("s", win.readCell(6, 2).?.char.grapheme);
+        for (0..12) |col| try testing.expectEqual(theme.search_active, win.readCell(@intCast(col), 2).?.style.bg);
+    }
+}
+
 test "M23 inline Review Search Preview shares Markdown styles, literal code, and authored tab matches in every Theme" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

@@ -24,6 +24,8 @@ pub const Span = struct {
     hidden: bool = false,
     /// Strikethrough syntax can be restored by a terminal without that attribute.
     strike_delimiter: bool = false,
+    hard_break: bool = false,
+    join: bool = false,
 };
 
 pub const BlockKind = union(enum) {
@@ -38,6 +40,7 @@ pub const Block = struct {
     kind: BlockKind,
     source: SourceRange,
     spans: []const Span = &.{},
+    hidden_line: ?SourceRange = null,
 };
 
 pub const ReviewBody = struct {
@@ -94,7 +97,7 @@ pub const ReviewBody = struct {
             const heading = headingPrefix(line.text);
             if (heading) |prefix| {
                 const text_start = pos + prefix.bytes;
-                const spans = try parseInline(allocator, source, text_start, pos + line.text.len);
+                const spans = try parseInline(allocator, source, text_start, pos + headingEnd(line.text, prefix.bytes));
                 errdefer allocator.free(spans);
                 try blocks.append(allocator, .{ .kind = .{ .heading = prefix.level }, .source = .{ .start = pos, .end = line.next }, .spans = spans });
                 pos = line.next;
@@ -104,15 +107,23 @@ pub const ReviewBody = struct {
             const start = pos;
             var end = pos + line.text.len;
             var next = line.next;
+            var underline: ?SourceRange = null;
+            var level: u3 = 0;
             while (next < source.len) {
                 const candidate = nextLine(source, next);
                 if (isBlank(candidate.text) or isSuggestionOpen(candidate.text) or headingPrefix(candidate.text) != null) break;
+                if (setextLevel(candidate.text)) |heading_level| {
+                    level = heading_level;
+                    underline = .{ .start = next, .end = candidate.next };
+                    next = candidate.next;
+                    break;
+                }
                 end = next + candidate.text.len;
                 next = candidate.next;
             }
             const spans = try parseInline(allocator, source, start, end);
             errdefer allocator.free(spans);
-            try blocks.append(allocator, .{ .kind = .paragraph, .source = .{ .start = start, .end = end }, .spans = spans });
+            try blocks.append(allocator, .{ .kind = if (level == 0) .paragraph else .{ .heading = level }, .source = .{ .start = start, .end = end }, .spans = spans, .hidden_line = underline });
             pos = next;
         }
         return .{ .source = source, .blocks = try blocks.toOwnedSlice(allocator) };
@@ -145,17 +156,50 @@ fn isFenceClose(line: []const u8) bool {
 
 const HeadingPrefix = struct { level: u3, bytes: usize };
 fn headingPrefix(line: []const u8) ?HeadingPrefix {
-    var count: usize = 0;
-    while (count < line.len and count < 6 and line[count] == '#') count += 1;
-    if (count == 0 or count >= line.len or (line[count] != ' ' and line[count] != '\t')) return null;
-    var bytes = count;
+    var indent: usize = 0;
+    while (indent < line.len and indent < 3 and line[indent] == ' ') indent += 1;
+    var bytes = indent;
+    while (bytes < line.len and bytes - indent < 6 and line[bytes] == '#') bytes += 1;
+    const count = bytes - indent;
+    if (count == 0 or (bytes < line.len and line[bytes] != ' ' and line[bytes] != '\t')) return null;
     while (bytes < line.len and (line[bytes] == ' ' or line[bytes] == '\t')) bytes += 1;
     return .{ .level = @intCast(count), .bytes = bytes };
 }
 
+fn headingEnd(line: []const u8, start: usize) usize {
+    var end = line.len;
+    while (end > start and (line[end - 1] == ' ' or line[end - 1] == '\t')) end -= 1;
+    var hashes = end;
+    while (hashes > start and line[hashes - 1] == '#') hashes -= 1;
+    if (hashes < end and (hashes == start or line[hashes - 1] == ' ' or line[hashes - 1] == '\t')) {
+        end = hashes;
+        while (end > start and (line[end - 1] == ' ' or line[end - 1] == '\t')) end -= 1;
+    }
+    return end;
+}
+
+fn setextLevel(line: []const u8) ?u3 {
+    var indent: usize = 0;
+    while (indent < line.len and line[indent] == ' ') indent += 1;
+    if (indent > 3 or (indent < line.len and line[indent] == '\t')) return null;
+    const text = trimmed(line[indent..]);
+    if (text.len == 0 or (text[0] != '=' and text[0] != '-')) return null;
+    for (text) |byte| if (byte != text[0]) return null;
+    return if (text[0] == '=') 1 else 2;
+}
+
 fn appendSpan(list: *std.ArrayList(Span), allocator: std.mem.Allocator, source: []const u8, start: usize, end: usize, marks: Marks) !void {
     if (end <= start) return;
-    try list.append(allocator, .{ .text = source[start..end], .source = .{ .start = start, .end = end }, .marks = marks });
+    var pos = start;
+    while (pos < end) {
+        const newline = std.mem.indexOfScalarPos(u8, source[0..end], pos, '\n') orelse end;
+        const content_end = if (newline > pos and source[newline - 1] == '\r') newline - 1 else newline;
+        const hard = !marks.inline_code and newline < end and content_end >= pos + 2 and std.mem.endsWith(u8, source[pos..content_end], "  ");
+        const text_end = if (hard) content_end - 2 else content_end;
+        if (text_end > pos) try list.append(allocator, .{ .text = source[pos..text_end], .source = .{ .start = pos, .end = text_end }, .marks = marks });
+        if (newline < end) try list.append(allocator, .{ .text = if (hard or marks.inline_code) "" else " ", .source = .{ .start = text_end, .end = newline + 1 }, .marks = marks, .hard_break = hard or marks.inline_code, .join = !hard and !marks.inline_code });
+        pos = if (newline < end) newline + 1 else end;
+    }
 }
 
 fn parseInline(allocator: std.mem.Allocator, source: []const u8, start: usize, end: usize) ![]const Span {
@@ -406,7 +450,7 @@ test "M23 inline code and styled links keep literal text and complete authored r
 test "M23 inline parsing releases partial bodies after allocation failure" {
     const Check = struct {
         fn run(allocator: std.mem.Allocator) !void {
-            const body = try ReviewBody.parse(allocator, "# *Heading*\n\n**_~~[`literal`](url)~~_**\n\n```suggestion\ncode\n```\n\n```suggestion\nunclosed");
+            const body = try ReviewBody.parse(allocator, "# *Heading* ##\n\nSetext\n=====\n\nfirst\r\nsecond  \nthird\n\n**_~~[`literal`](url)~~_**\n\n```suggestion\ncode\n```\n\n```suggestion\nunclosed");
             defer {
                 for (body.blocks) |block| allocator.free(block.spans);
                 allocator.free(body.blocks);
