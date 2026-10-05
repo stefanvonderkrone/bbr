@@ -43,7 +43,14 @@ pub const Block = struct {
     spans: []const Span = &.{},
     hidden_line: ?SourceRange = null,
     fences: ?[2]SourceRange = null,
+    quotes: usize = 0,
+    indent: usize = 0,
+    outer_indent: usize = 0,
+    quote_path: []const u8 = "",
+    marker: ?ListMarker = null,
 };
+
+pub const ListMarker = union(enum) { bullet, number: usize };
 
 pub const ReviewBody = struct {
     /// Borrowed, byte-for-byte authored Review storage.
@@ -58,17 +65,44 @@ pub const ReviewBody = struct {
         }
         var pos: usize = 0;
         var pending_spacer: ?SourceRange = null;
+        var spacer_quotes: usize = 0;
+        var spacer_outer_indent: usize = 0;
+        var spacer_quote_path: []const u8 = "";
+        var containers: Containers = .{};
+        defer containers.lists.deinit(allocator);
         while (pos < source.len) {
             const line = nextLine(source, pos);
-            if (isBlank(line.text)) {
+            const context = containers.quoteContext(line.text);
+            const quote = context.prefix;
+            if (isBlank(line.text[quote.bytes..])) {
+                if (quote.levels > 0 and blocks.items.len == 0) {
+                    try blocks.append(allocator, .{ .kind = .paragraph, .source = .{ .start = pos, .end = line.next }, .quotes = quote.levels, .quote_path = line.text[0..quote.bytes] });
+                    pos = line.next;
+                    continue;
+                }
+                if (pending_spacer == null) {
+                    spacer_quotes = quote.levels;
+                    spacer_quote_path = line.text[0..quote.bytes];
+                    const base = context.leading_spaces / 4;
+                    spacer_outer_indent = if (base > 0) (base - 1) * 2 + markerWidth(containers.lists.items[base - 1]) else 0;
+                }
                 if (pending_spacer) |*range| range.end = line.next else pending_spacer = .{ .start = pos, .end = line.next };
                 pos = line.next;
                 continue;
             }
+            const after_blank = pending_spacer != null;
             if (blocks.items.len > 0) if (pending_spacer) |range| {
-                try blocks.append(allocator, .{ .kind = .spacer, .source = range });
+                try blocks.append(allocator, .{ .kind = .spacer, .source = range, .quotes = spacer_quotes, .outer_indent = spacer_outer_indent, .quote_path = spacer_quote_path });
             };
             pending_spacer = null;
+
+            if (try containers.read(allocator, line.text, after_blank or blocks.items.len == 0)) |container| {
+                const block = try containerBlock(allocator, source, pos, container);
+                errdefer allocator.free(block.spans);
+                try blocks.append(allocator, block);
+                pos = block.source.end;
+                continue;
+            }
 
             if (fenceOpen(line.text)) |fence| {
                 const start = pos;
@@ -129,6 +163,7 @@ pub const ReviewBody = struct {
             var level: u3 = 0;
             while (next < source.len) {
                 const candidate = nextLine(source, next);
+                if (quotePrefix(candidate.text).levels > 0) break;
                 if (isBlank(candidate.text) or fenceOpen(candidate.text) != null or headingPrefix(candidate.text) != null) break;
                 if (setextLevel(candidate.text)) |heading_level| {
                     level = heading_level;
@@ -149,6 +184,240 @@ pub const ReviewBody = struct {
 };
 
 const Line = struct { text: []const u8, next: usize };
+
+const QuotePrefix = struct { bytes: usize = 0, levels: usize = 0 };
+
+fn quotePrefix(text: []const u8) QuotePrefix {
+    var result: QuotePrefix = .{};
+    while (result.bytes < text.len and text[result.bytes] == '>') {
+        result.bytes += 1;
+        result.levels += 1;
+        if (result.bytes < text.len and text[result.bytes] == ' ') result.bytes += 1;
+    }
+    return result;
+}
+
+const ItemPrefix = struct { bytes: usize, spaces: usize, marker: ListMarker };
+
+fn itemPrefix(text: []const u8) ?ItemPrefix {
+    var spaces: usize = 0;
+    while (spaces < text.len and text[spaces] == ' ') spaces += 1;
+    if (spaces % 4 != 0 or spaces == text.len) return null;
+    var end = spaces;
+    var marker: ListMarker = .bullet;
+    if (text[end] == '-' or text[end] == '*' or text[end] == '+') {
+        end += 1;
+    } else {
+        while (end < text.len and text[end] >= '0' and text[end] <= '9') end += 1;
+        if (end == spaces or end >= text.len or text[end] != '.') return null;
+        marker = .{ .number = std.fmt.parseInt(usize, text[spaces..end], 10) catch return null };
+        end += 1;
+    }
+    if (end >= text.len or text[end] != ' ') return null;
+    return .{ .bytes = end + 1, .spaces = spaces, .marker = marker };
+}
+
+const Container = struct {
+    quotes: usize,
+    bytes: usize,
+    continuation: usize,
+    indent: usize,
+    outer_indent: usize = 0,
+    quote_path: []const u8 = "",
+    marker: ?ListMarker = null,
+
+    fn strip(self: Container, text: []const u8) ?usize {
+        const prefix_bytes = self.structural(text) orelse return null;
+        var removed: usize = 0;
+        while (removed < self.continuation and prefix_bytes + removed < text.len and text[prefix_bytes + removed] == ' ') removed += 1;
+        if (removed < self.continuation and !isBlank(text[prefix_bytes..])) return null;
+        return prefix_bytes + removed;
+    }
+
+    fn structural(self: Container, text: []const u8) ?usize {
+        var pos: usize = 0;
+        var expected: usize = 0;
+        while (expected < self.quote_path.len) {
+            if (pos >= text.len or text[pos] != self.quote_path[expected]) return null;
+            const quote = self.quote_path[expected] == '>';
+            pos += 1;
+            expected += 1;
+            if (quote) {
+                if (pos < text.len and text[pos] == ' ') pos += 1;
+                if (expected < self.quote_path.len and self.quote_path[expected] == ' ') expected += 1;
+            }
+        }
+        return pos;
+    }
+};
+
+const Containers = struct {
+    lists: std.ArrayList(ListMarker) = .empty,
+    quotes: usize = 0,
+    quote_base: usize = 0,
+
+    fn quoteContext(self: Containers, text: []const u8) struct { prefix: QuotePrefix = .{}, base: usize = 0, leading_spaces: usize = 0 } {
+        var pos: usize = 0;
+        while (pos < text.len and text[pos] == ' ') pos += 1;
+        const leading = pos;
+        if (pos == text.len or text[pos] != '>' or leading % 4 != 0 or leading / 4 > self.lists.items.len) return .{};
+        var base = leading / 4;
+        var levels: usize = 0;
+        while (pos < text.len and text[pos] == '>') {
+            pos += 1;
+            levels += 1;
+            if (pos < text.len and text[pos] == ' ') pos += 1;
+            var next = pos;
+            while (next < text.len and text[next] == ' ') next += 1;
+            const spaces = next - pos;
+            if (next == text.len or text[next] != '>' or spaces % 4 != 0 or base + spaces / 4 > self.lists.items.len) break;
+            base += spaces / 4;
+            pos = next;
+        }
+        return .{ .prefix = .{ .bytes = pos, .levels = levels }, .base = base, .leading_spaces = leading };
+    }
+
+    fn read(self: *Containers, allocator: std.mem.Allocator, text: []const u8, boundary: bool) !?Container {
+        const context = self.quoteContext(text);
+        const quote_indent = context.leading_spaces;
+        const quote = context.prefix;
+        const base = context.base;
+        const changed_quote = quote.levels != self.quotes or base != self.quote_base;
+        if (changed_quote) self.lists.items.len = @min(self.lists.items.len, @max(base, @min(self.quote_base, self.lists.items.len)));
+        self.quotes = quote.levels;
+        self.quote_base = base;
+        const leading_base = quote_indent / 4;
+        const outer_indent = if (leading_base > 0) (leading_base - 1) * 2 + markerWidth(self.lists.items[leading_base - 1]) else 0;
+        const structural = quote.bytes;
+        const rest = text[structural..];
+        if (itemPrefix(rest)) |item| {
+            const level = base + item.spaces / 4;
+            const sibling = level < self.lists.items.len;
+            const same_type = sibling and ((item.marker == .bullet) == (self.lists.items[level] == .bullet));
+            if (level <= self.lists.items.len and (level > base or boundary or sibling or changed_quote) and (!sibling or same_type or boundary)) {
+                var marker = item.marker;
+                if (same_type and marker == .number) marker = .{ .number = self.lists.items[level].number +| 1 };
+                self.lists.items.len = @min(level, self.lists.items.len);
+                try self.lists.append(allocator, marker);
+                return .{ .quotes = quote.levels, .bytes = structural + item.bytes, .continuation = (level - base + 1) * 4, .indent = (level - base) * 2, .marker = marker, .outer_indent = outer_indent, .quote_path = text[0..structural] };
+            }
+        }
+        var spaces: usize = 0;
+        while (spaces < rest.len and rest[spaces] == ' ') spaces += 1;
+        while (self.lists.items.len > base and spaces < (self.lists.items.len - base) * 4) self.lists.items.len -= 1;
+        if (self.lists.items.len > base) {
+            const level = self.lists.items.len - 1;
+            const marker = self.lists.items[level];
+            return .{ .quotes = quote.levels, .bytes = structural + (self.lists.items.len - base) * 4, .continuation = (self.lists.items.len - base) * 4, .indent = (level - base) * 2 + markerWidth(marker), .outer_indent = outer_indent, .quote_path = text[0..structural] };
+        }
+        if (quote.levels > 0) return .{ .quotes = quote.levels, .bytes = structural, .continuation = 0, .indent = 0, .outer_indent = outer_indent, .quote_path = text[0..structural] };
+        return null;
+    }
+};
+
+pub fn markerWidth(marker: ListMarker) usize {
+    if (marker == .bullet) return 2;
+    var number = marker.number;
+    var digits: usize = 1;
+    while (number >= 10) : (number /= 10) digits += 1;
+    return digits + 2;
+}
+
+fn containerBlock(allocator: std.mem.Allocator, source: []const u8, start: usize, container: Container) !Block {
+    const first = nextLine(source, start);
+    const text = first.text[container.bytes..];
+    var result: Block = .{ .kind = .paragraph, .source = .{ .start = start, .end = first.next }, .quotes = container.quotes, .indent = container.indent, .outer_indent = container.outer_indent, .quote_path = container.quote_path, .marker = container.marker };
+    var spans: std.ArrayList(Span) = .empty;
+    errdefer spans.deinit(allocator);
+    const fence = fenceOpen(text);
+    const indented = codeIndent(text) != null;
+    if (fence != null or indented) {
+        var pos = if (fence != null) first.next else start;
+        var found_close = false;
+        while (pos < source.len) {
+            const line = nextLine(source, pos);
+            const removed = if (pos == start) container.bytes else container.strip(line.text) orelse break;
+            const content = line.text[removed..];
+            if (fence) |opening| {
+                if (opening.closes(content)) {
+                    result.fences = .{ .{ .start = start, .end = first.next }, .{ .start = pos, .end = line.next } };
+                    result.source.end = line.next;
+                    found_close = true;
+                    break;
+                }
+            } else if (!isBlank(content) and codeIndent(content) == null) break;
+            var code_removed: usize = 0;
+            if (fence) |opening| {
+                while (code_removed < content.len and code_removed < opening.indent and content[code_removed] == ' ') code_removed += 1;
+            } else code_removed = codeIndent(content) orelse content.len;
+            try spans.append(allocator, .{ .text = source[pos + removed + code_removed .. line.next], .source = .{ .start = pos + removed + code_removed, .end = line.next } });
+            if (fence != null or !isBlank(content)) result.source.end = line.next;
+            pos = line.next;
+        }
+        if (fence == null or found_close) {
+            while (spans.items.len > 0 and spans.items[spans.items.len - 1].source.end > result.source.end) spans.items.len -= 1;
+            result.kind = if (fence != null and fence.?.suggestion) .suggestion else .code;
+            result.spans = try spans.toOwnedSlice(allocator);
+            return result;
+        }
+        // An unclosed container fence stays local and literal.
+        spans.items.len = 0;
+        result.kind = .literal;
+        var literal_pos = start;
+        while (literal_pos < result.source.end) {
+            const line = nextLine(source, literal_pos);
+            const removed = if (literal_pos == start) container.bytes else container.strip(line.text).?;
+            try spans.append(allocator, .{ .text = source[literal_pos + removed .. line.next], .source = .{ .start = literal_pos + removed, .end = line.next } });
+            literal_pos = line.next;
+        }
+        result.spans = try spans.toOwnedSlice(allocator);
+        return result;
+    }
+    var prefixes: std.ArrayList(SourceRange) = .empty;
+    defer prefixes.deinit(allocator);
+    const heading = headingPrefix(text);
+    if (heading) |prefix| result.kind = .{ .heading = prefix.level };
+    const inline_start = start + container.bytes + if (heading) |prefix| prefix.bytes else @as(usize, 0);
+    var inline_end = inline_start;
+    var pos = start;
+    while (pos < source.len) {
+        const line = nextLine(source, pos);
+        const removed = if (pos == start) container.bytes else container.strip(line.text) orelse break;
+        const content = line.text[removed..];
+        if (pos != start) {
+            if (setextLevel(content)) |level| {
+                result.kind = .{ .heading = level };
+                result.hidden_line = .{ .start = pos, .end = line.next };
+                result.source.end = line.next;
+                break;
+            }
+            if (isBlank(content) or itemPrefix(line.text[container.structural(line.text).?..]) != null or quotePrefix(content).levels > 0 or fenceOpen(content) != null or codeIndent(content) != null or headingPrefix(content) != null) break;
+            try prefixes.append(allocator, .{ .start = pos, .end = pos + removed });
+        }
+        inline_end = pos + removed + if (heading) |prefix| headingEnd(content, prefix.bytes) else content.len;
+        result.source.end = line.next;
+        pos = line.next;
+        if (heading != null) break;
+    }
+    const inline_spans = try parseInline(allocator, source, inline_start, inline_end);
+    defer allocator.free(inline_spans);
+    var prefix_index: usize = 0;
+    for (inline_spans) |span| {
+        var visible = span;
+        while (prefix_index < prefixes.items.len and prefixes.items[prefix_index].end <= span.source.start) prefix_index += 1;
+        if (!span.hidden and !span.join and !span.hard_break and prefix_index < prefixes.items.len) {
+            const prefix = prefixes.items[prefix_index];
+            if (span.source.start >= prefix.start and span.source.start < prefix.end) {
+                const removed = @min(prefix.end, span.source.end) - span.source.start;
+                visible.text = visible.text[removed..];
+                visible.source.start += removed;
+            }
+        }
+        if (visible.hidden or visible.join or visible.hard_break or visible.text.len > 0) try spans.append(allocator, visible);
+    }
+    result.spans = try spans.toOwnedSlice(allocator);
+    return result;
+}
 
 fn nextLine(source: []const u8, start: usize) Line {
     const newline = std.mem.indexOfScalarPos(u8, source, start, '\n') orelse source.len;
@@ -456,6 +725,71 @@ fn isEscapable(byte: u8) bool {
 
 const testing = std.testing;
 
+test "M23 containers project mixed list nesting and quote paragraphs as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = try ReviewBody.parse(a, "4. first\n    continuation\n    - child\n        8. grandchild\n1. second\n\n> quoted\n> continuation\n>> deeper\n\n1) literal");
+    const expected = [_][]const u8{ "first continuation", "child", "grandchild", "second", "", "quoted continuation", "deeper", "", "1) literal" };
+    try testing.expectEqual(expected.len, body.blocks.len);
+    for (body.blocks, expected) |block, text| {
+        var visible: std.ArrayList(u8) = .empty;
+        for (block.spans) |span| try visible.appendSlice(a, span.text);
+        try testing.expectEqualStrings(text, visible.items);
+    }
+}
+
+test "M23 containers keep blank line rules malformed markers and code boundaries as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "prose\n- literal\n\n- item\n1. literal switch\n\n7. ordered\n2. next\n\n> - quoted\n>     ~~~zig\n>     a\tb **literal**\n>     ~~~\n>     continuation\n>\n>         indented\n>\n>     ```\n>     unfinished\n\noutside";
+    const body = try ReviewBody.parse(a, raw);
+    var codes: usize = 0;
+    var literal = false;
+    var seven = false;
+    var eight = false;
+    for (body.blocks) |block| {
+        if (block.marker) |marker| if (marker == .number) {
+            seven = seven or marker.number == 7;
+            eight = eight or marker.number == 8;
+        };
+        if (block.kind == .code) {
+            codes += 1;
+            try testing.expectEqual(@as(usize, 1), block.quotes);
+            if (codes == 1) {
+                try testing.expectEqualStrings("a\tb **literal**\n", block.spans[0].text);
+                try testing.expectEqualStrings(">     ~~~zig\n", raw[block.fences.?[0].start..block.fences.?[0].end]);
+            } else try testing.expectEqualStrings("indented\n", block.spans[0].text);
+        }
+        if (block.kind == .literal) {
+            literal = true;
+            try testing.expectEqualStrings("```\n", block.spans[0].text);
+        }
+    }
+    try testing.expect(seven and eight and literal);
+    try testing.expectEqual(@as(usize, 2), codes);
+    var first: std.ArrayList(u8) = .empty;
+    for (body.blocks[0].spans) |span| try first.appendSlice(a, span.text);
+    try testing.expectEqualStrings("prose - literal", first.items);
+    try testing.expectEqualStrings("1. literal switch", body.blocks[3].spans[0].text);
+}
+
+test "M23 containers keep inline styles across joined authored lines as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = try ReviewBody.parse(a, "> - **first\n>     second**\n>\n> Title\n> =====");
+    var visible: std.ArrayList(u8) = .empty;
+    for (body.blocks[0].spans) |span| if (!span.hidden) {
+        try testing.expect(span.marks.strong);
+        try visible.appendSlice(a, span.text);
+    };
+    try testing.expectEqualStrings("first second", visible.items);
+    try testing.expect(body.blocks[2].kind == .heading);
+    try testing.expect(body.blocks[2].hidden_line != null);
+}
+
 test "M23 literal fences hide only valid delimiters and retain code bytes" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -493,7 +827,7 @@ test "M23 inline emphasis respects delimiter runs, escapes, and intraword unders
         .{ .authored = "**outer *both* end**", .visible = "outer both end", .combined = "both" },
         .{ .authored = "***both***", .visible = "both", .combined = "both" },
         .{ .authored = "\\*literal\\* **valid** *broken", .visible = "*literal* valid *broken" },
-        .{ .authored = "* spaced * and a_b_c", .visible = "* spaced * and a_b_c" },
+        .{ .authored = "plain * spaced * and a_b_c", .visible = "plain * spaced * and a_b_c" },
         .{ .authored = "\\:mask: <tag> &amp; ABC-123 {color:red}", .visible = ":mask: <tag> &amp; ABC-123 {color:red}" },
         .{ .authored = "[**a\\]b**](url)", .visible = "a]burl" },
         .{ .authored = "[`a]b`](url)", .visible = "a]burl" },
@@ -543,7 +877,7 @@ test "M23 inline code and styled links keep literal text and complete authored r
 test "M23 inline parsing releases partial bodies after allocation failure" {
     const Check = struct {
         fn run(allocator: std.mem.Allocator) !void {
-            const body = try ReviewBody.parse(allocator, "# *Heading* ##\n\nSetext\n=====\n\nfirst\r\nsecond  \nthird\n\n**_~~[`literal`](url)~~_**\n\n```suggestion\ncode\n```\n\n  ~~~~zig\n  \tcode\n  ~~~~~\n\n    code\n\n    more\n\n```suggestion\nunclosed");
+            const body = try ReviewBody.parse(allocator, "# *Heading* ##\n\nSetext\n=====\n\nfirst\r\nsecond  \nthird\n\n**_~~[`literal`](url)~~_**\n\n```suggestion\ncode\n```\n\n  ~~~~zig\n  \tcode\n  ~~~~~\n\n    code\n\n    more\n\n> 4. item\n>     **continued**\n>     - child\n>         ~~~zig\n>         code\n>         ~~~\n>         ```\n>         unclosed\n\n```suggestion\nunclosed");
             defer {
                 for (body.blocks) |block| allocator.free(block.spans);
                 allocator.free(body.blocks);

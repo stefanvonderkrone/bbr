@@ -1311,6 +1311,47 @@ test "M23 literal Preview shares code and Suggestion backgrounds and tab search 
     }
 }
 
+test "M23 containers Preview keeps quote bars list styles and code tab search cells as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 10, .cols = 12, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const raw = "> - **item**\n>     ```zig\n>     a\tb\n>     ```\n>> _deep_";
+    const tab = std.mem.indexOfScalar(u8, raw, '\t').?;
+    const ranges = [_]@import("search.zig").Range{.{ .start = tab, .end = tab + 1 }};
+    const result: presentation.ReviewSearchResult = .{
+        .kind = "COMMENT",
+        .source = "Ada",
+        .body = raw,
+        .scope = .review,
+        .scope_state = .current,
+        .occurrence = .{ .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 3 } }, .ranges = @constCast(&ranges), .column = 8, .candidate_scalars = 1, .corpus_order = 0, .session_epoch = 1 },
+    };
+    for (@import("theme.zig").builtins) |builtin| {
+        const theme = builtin.value;
+        drawReviewSearchPreview(a, win, result, 0, theme, terminal_cell_metrics);
+        try testing.expectEqualStrings("│", win.readCell(0, 0).?.char.grapheme);
+        try testing.expectEqualStrings("•", win.readCell(2, 0).?.char.grapheme);
+        try testing.expectEqualStrings("i", win.readCell(4, 0).?.char.grapheme);
+        try testing.expectEqual(theme.markdown_bold, win.readCell(4, 0).?.style.fg);
+        try testing.expect(win.readCell(4, 0).?.style.bold);
+        try testing.expectEqualStrings("a", win.readCell(4, 1).?.char.grapheme);
+        for (5..8) |col| {
+            const cell = win.readCell(@intCast(col), 1).?;
+            try testing.expectEqualStrings(" ", cell.char.grapheme);
+            try testing.expectEqual(theme.search_active, cell.style.bg);
+            try testing.expectEqual(theme.context.fg, cell.style.fg);
+        }
+        try testing.expectEqual(theme.code_background, win.readCell(0, 1).?.style.bg);
+        try testing.expectEqualStrings("│", win.readCell(2, 2).?.char.grapheme);
+        try testing.expectEqualStrings("d", win.readCell(4, 2).?.char.grapheme);
+        try testing.expectEqual(theme.markdown_italic, win.readCell(4, 2).?.style.fg);
+        try testing.expect(win.readCell(4, 2).?.style.italic);
+    }
+}
+
 test "M23 inline Preview shows joined prose and Setext headings with every matched part styled" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

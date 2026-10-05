@@ -272,6 +272,14 @@ pub fn build(b: *std.Build) void {
     const literal_step = b.step("test-literal-code", "Run literal code presentation tests");
     literal_step.dependOn(&b.addRunArtifact(literal_tests).step);
 
+    const container_tests = b.addTest(.{
+        .name = "container-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M23 containers"},
+    });
+    const container_step = b.step("test-containers", "Run list and quote presentation tests");
+    container_step.dependOn(&b.addRunArtifact(container_tests).step);
+
     const fixture_mod = b.createModule(.{
         .root_source_file = b.path("tests/user_grammar_fixture.zig"),
         .target = target,

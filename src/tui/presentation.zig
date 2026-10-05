@@ -18031,6 +18031,8 @@ test "M23 inline Actions retain exact search ranges, Selection bytes, and comple
 
 test "M23 inline joined prose and Setext yank use approved exact authored bytes" {
     const examples = [_]struct { body: []const u8, cols: u16, expected: []const u8, spacer: bool = false }{
+        .{ .body = "> 4. first\n>     second\n> 1. other", .cols = 160, .expected = "> 4. first\n>     second\n" },
+        .{ .body = "> 4. first\n>     second\n> 1. other", .cols = 38, .expected = "> 4. first\n" },
         .{ .body = "first\nsecond", .cols = 160, .expected = "first\nsecond" },
         .{ .body = "first\nsecond", .cols = 38, .expected = "first\n" },
         .{ .body = "alpha bravo\ncharlie delta", .cols = 38, .expected = "alpha bravo\n" },
@@ -18062,6 +18064,77 @@ test "M23 inline joined prose and Setext yank use approved exact authored bytes"
         var command = presentation.takeCommand().?;
         defer command.deinit();
         try testing.expectEqualStrings(example.expected, command.copy_clipboard.text);
+    }
+}
+
+test "M23 containers search focuses authored text and keeps identity across resize as project behavior" {
+    const raw = "> 4. first\n>     second\n> 1. other";
+    const expected_ranges = [_]search.Range{ .{ .start = 5, .end = 11 }, .{ .start = 17, .end = 23 } };
+    for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw });
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 1 }, .{
+            .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+            .geometry = .{ .cols = 38, .rows = 20 },
+        });
+        defer presentation.deinit();
+        if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'f', .text = "first second" } });
+        try completeBufferSearchScan(&presentation);
+        try testing.expectEqual(@as(usize, 1), presentation.projection().buffer_search.?.total);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try presentation.dispatch(.{ .action = .next_search_occurrence });
+        const review = presentation.projection().review.?;
+        try testing.expectEqual(@as(u64, 1), review.frame.visual_rows[review.navigation.cursor].owner.draft.id);
+        try testing.expect(review.frame.search_ranges.len >= 2);
+        try presentation.dispatch(.{ .action = .toggle_select });
+        try presentation.dispatch(.{ .action = .yank });
+        var copied = presentation.takeCommand().?;
+        defer copied.deinit();
+        try testing.expectEqualStrings("> 4. first\n", copied.copy_clipboard.text);
+        for ([_]u16{ 160, 38 }) |cols| {
+            try dispatchView(&presentation, .{ .resize = .{ .cols = cols, .rows = 20 } });
+            try testing.expectEqual(@as(usize, 1), presentation.projection().buffer_search.?.total);
+        }
+        try presentation.dispatch(.{ .action = .open_review_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'f', .text = "first second" } });
+        try completeBufferSearchScan(&presentation);
+        for ([_]u16{ 160, 38 }) |cols| {
+            try dispatchView(&presentation, .{ .resize = .{ .cols = cols, .rows = 20 } });
+            const result = presentation.projection().review_search.?.results[0];
+            try testing.expectEqual(@as(u32, 1), result.occurrence.location.review_body.logical_line);
+            try testing.expectEqual(@as(usize, 6), result.occurrence.column);
+            try testing.expectEqualSlices(search.Range, &expected_ranges, result.occurrence.ranges);
+        }
+    }
+}
+
+test "M23 containers yank emits no command for generated marker-only rows as project behavior" {
+    for ([_][]const u8{ "- ", "> ", "> text\n>\n> next" }) |raw| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const session = try testCommentSession(testing.allocator, 1);
+        @constCast(session.threads[0].root).body = raw;
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 0 }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+        });
+        defer presentation.deinit();
+        var selected: ?usize = null;
+        for (presentation.projection().review.?.frame.visual_rows, 0..) |visual, index| {
+            const row = presentation.projection().review.?.buffer.rows[visual.buffer_index];
+            if (row != .comment or row.comment.part != .body) continue;
+            if (raw.len > 2 and row.comment.block_kind != .spacer) continue;
+            selected = index;
+            break;
+        }
+        try testing.expect(selected != null);
+        try selectRows(&presentation, selected.?, selected.?);
+        try testing.expect(!presentation.projection().action_availability.available(.yank));
+        try presentation.dispatch(.{ .action = .yank });
+        try testing.expect(presentation.takeCommand() == null);
     }
 }
 
@@ -18412,6 +18485,9 @@ fn selectRows(presentation: *Presentation, start: usize, end: usize) !void {
 
 test "M23 literal yank selected code adds existing fences without unselected lines in both layouts" {
     const examples = [_]struct { raw: []const u8, expected: []const u8, second: bool = false }{
+        .{ .raw = "> - item\n>     ```zig\r\n>     \tfirst  \r\n>     second\n>     ```\n", .expected = ">     ```zig\r\n>     \tfirst  \r\n>     ```\n" },
+        .{ .raw = "4. item\n    - child\n        ~~~\n        \tfirst  \r\n        second\n        ~~~", .expected = "        ~~~\n        \tfirst  \r\n        ~~~" },
+        .{ .raw = "> - item\n>         \tfirst  \r\n>         second\n", .expected = ">         \tfirst  \r\n" },
         .{ .raw = "  ````zig metadata\r\n  \tfirst  \r\n  second\n  `````\nafter", .expected = "  ````zig metadata\r\n  \tfirst  \r\n  `````\n" },
         .{ .raw = " ~~~suggestion\r\n \tfirst  \r\n second\n ~~~~", .expected = " ~~~suggestion\r\n \tfirst  \r\n ~~~~" },
         .{ .raw = "    \tfirst  \r\n    second\nafter", .expected = "    \tfirst  \r\n" },

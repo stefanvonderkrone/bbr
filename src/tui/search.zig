@@ -793,6 +793,39 @@ fn appendBodyRegion(allocator: std.mem.Allocator, owner: ReviewBodyOwner, epoch:
 
 const testing = std.testing;
 
+test "M23 containers both searches join item and quote prose but exclude markers as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "4. **first**\r\n    second\n1. other\n    - child\n        continuation\n\n> first\n> second\n>\n> separate\n> ~~~zig metadata\n> first\n> second\n> ~~~\n\n1) literal\n\nprose\n- unsupported\n\n- hard  \n    break\n\n> - parent\n>     > quoted\n>     > continuation\n>     > ~~~\n>     > code\n>     > ~~~";
+    const body = try review_body.ReviewBody.parse(a, raw);
+    var candidates: std.ArrayList(Candidate) = .empty;
+    var order: usize = 0;
+    try appendReviewBodyCandidates(a, body, .{ .comment = 7 }, 1, &order, &candidates);
+    for ([_]Mode{ .literal, .fuzzy }) |mode| {
+        const query = try Query.init(a, "first second");
+        const batch = try scan(a, query, candidates.items, mode);
+        try testing.expectEqual(@as(usize, 2), batch.occurrences.len);
+        if (mode == .literal) {
+            try testing.expectEqual(@as(usize, 6), batch.occurrences[0].column);
+            try testing.expectEqual(@as(u32, 1), batch.occurrences[0].location.review_body.logical_line);
+            try testing.expectEqualStrings("first", raw[batch.occurrences[0].ranges[0].start..batch.occurrences[0].ranges[0].end]);
+            try testing.expectEqualStrings("\r\n", raw[batch.occurrences[0].ranges[1].start..batch.occurrences[0].ranges[1].end]);
+            try testing.expectEqualStrings("second", raw[batch.occurrences[0].ranges[2].start..batch.occurrences[0].ranges[2].end]);
+        }
+        for ([_][]const u8{ "4.", "5.", "•", "│", ">", "metadata", "other child", "hard break", "second separate" }) |text| {
+            const excluded = try Query.init(a, text);
+            const matches = try scan(a, excluded, candidates.items, mode);
+            try testing.expectEqual(@as(usize, 0), matches.occurrences.len);
+        }
+        for ([_][]const u8{ "1)", "- unsupported", "child continuation", "quoted continuation" }) |text| {
+            const included = try Query.init(a, text);
+            const matches = try scan(a, included, candidates.items, mode);
+            try testing.expectEqual(@as(usize, 1), matches.occurrences.len);
+        }
+    }
+}
+
 test "M23 literal both searches use authored code lines and exclude fence metadata and tab decoration" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
