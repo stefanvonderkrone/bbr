@@ -1278,6 +1278,58 @@ fn widthVaxisText(_: *const anyopaque, text: []const u8) usize {
     return vaxis.gwidth.gwidth(text, .unicode);
 }
 
+test "M23 tables Preview and ReviewCards share layouts and Theme styles as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "| **Name** | *State* |\n| :--- | ---: |\n| ~~Ada~~ | `Ready` |";
+    const ready = std.mem.indexOf(u8, raw, "Ready").?;
+    const ranges = [_]@import("search.zig").Range{.{ .start = ready, .end = ready + 5 }};
+    const result: presentation.ReviewSearchResult = .{
+        .kind = "COMMENT",
+        .source = "Ada",
+        .body = raw,
+        .scope = .review,
+        .scope_state = .current,
+        .occurrence = .{ .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 3 } }, .ranges = @constCast(&ranges), .column = 14, .candidate_scalars = 5, .corpus_order = 0, .session_epoch = 1 },
+    };
+    for ([_]u16{ 40, 7 }) |width| {
+        var screen = try vaxis.Screen.init(a, .{ .rows = 12, .cols = width + 4, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(a);
+        const win = headlessWindow(&screen);
+        const preview = win.child(.{ .width = width });
+        const card_mod = @import("review_card.zig");
+        const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
+        const rows = try card_mod.project(a, try card_mod.ReviewBody.parse(a, raw), .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "Ada", .content_width = width, .metrics = terminal_cell_metrics, .collapsed_rows = 0 });
+        const expected: []const []const u8 = if (width == 40) &.{ "Name │ State", "Ada  │ Ready" } else &.{ "Name", "State", "Name: ", "Ada", "State: ", "Ready" };
+        for (@import("theme.zig").builtins) |builtin| {
+            const theme = builtin.value;
+            drawReviewSearchPreview(a, preview, result, 0, theme, terminal_cell_metrics);
+            for (expected, 0..) |text, row| {
+                var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
+                var col: u16 = 0;
+                while (iterator.nextCodepointSlice()) |grapheme| : (col += 1) try testing.expectEqualStrings(grapheme, win.readCell(col, @intCast(row)).?.char.grapheme);
+            }
+            const state_row: u16 = if (width == 40) 0 else 1;
+            const ada_row: u16 = if (width == 40) 1 else 3;
+            const ready_row: u16 = if (width == 40) 1 else 5;
+            const value_col: u16 = if (width == 40) 7 else 0;
+            try testing.expect(win.readCell(0, 0).?.style.bold);
+            try testing.expectEqual(theme.markdown_bold, win.readCell(0, 0).?.style.fg);
+            try testing.expect(win.readCell(value_col, state_row).?.style.italic);
+            try testing.expectEqual(theme.markdown_italic, win.readCell(value_col, state_row).?.style.fg);
+            try testing.expect(win.readCell(0, ada_row).?.style.strikethrough);
+            try testing.expectEqual(theme.markdown_inline_code, win.readCell(value_col, ready_row).?.style.fg);
+            try testing.expectEqual(theme.search_active, win.readCell(value_col, ready_row).?.style.bg);
+            if (width == 7) try testing.expectEqual(theme.picker.bg, win.readCell(0, 4).?.style.bg);
+            for (rows[1..], 0..) |card, row| drawReviewCard(a, win, @intCast(row), card, theme);
+            try testing.expectEqual(theme.markdown_inline_code, win.readCell(value_col + 4, ready_row).?.style.fg);
+            drawReviewCardSearchRange(win, ready_row, rows[ready_row + 1], .{ .visual_row = ready_row, .relation = .neutral, .source = ranges[0], .row = ranges[0], .active = true }, true, theme);
+            try testing.expectEqual(theme.search_active, win.readCell(value_col + 4, ready_row).?.style.bg);
+        }
+    }
+}
+
 test "M23 links highlight only the matched reference use in ReviewCards and Preview as project behavior" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

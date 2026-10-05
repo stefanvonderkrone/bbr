@@ -36,12 +36,20 @@ pub const Span = struct {
 };
 
 pub const BlockKind = union(enum) {
+    table: TableRow,
     paragraph,
     heading: u3,
     suggestion,
     code,
     literal,
     spacer,
+};
+
+pub const Alignment = enum { left, center, right };
+pub const TableCell = struct { spans: SourceRange, alignment: Alignment };
+pub const TableRow = struct {
+    header: SourceRange,
+    cells: []const TableCell,
 };
 
 pub const Block = struct {
@@ -94,7 +102,7 @@ pub const ReviewBody = struct {
     fn parseBlocks(allocator: std.mem.Allocator, source: []const u8, references: *const ReferenceDefinitions) !ReviewBody {
         var blocks: std.ArrayList(Block) = .empty;
         errdefer {
-            for (blocks.items) |block| allocator.free(block.spans);
+            for (blocks.items) |block| freeBlock(allocator, block);
             blocks.deinit(allocator);
         }
         var pos: usize = 0;
@@ -102,6 +110,7 @@ pub const ReviewBody = struct {
         var spacer_quotes: usize = 0;
         var spacer_outer_indent: usize = 0;
         var spacer_quote_path: []const u8 = "";
+        var after_table = false;
         var containers: Containers = .{};
         defer containers.lists.deinit(allocator);
         while (pos < source.len) {
@@ -125,12 +134,34 @@ pub const ReviewBody = struct {
                 continue;
             }
             const after_blank = pending_spacer != null;
+            const table_boundary = after_table;
+            after_table = false;
             if (blocks.items.len > 0) if (pending_spacer) |range| {
                 try blocks.append(allocator, .{ .kind = .spacer, .source = range, .quotes = spacer_quotes, .outer_indent = spacer_outer_indent, .quote_path = spacer_quote_path });
             };
             pending_spacer = null;
 
-            if (try containers.read(allocator, line.text, after_blank or blocks.items.len == 0)) |container| {
+            if (try tableStart(allocator, source, pos)) |table| {
+                defer allocator.free(table.alignments);
+                var scan = pos;
+                while (scan < source.len) {
+                    if (scan == table.separator.start) {
+                        scan = table.separator.end;
+                        continue;
+                    }
+                    const candidate = nextLine(source, scan);
+                    if (isBlank(candidate.text) or tableBoundary(source, scan)) break;
+                    const block = try tableBlock(allocator, source, scan, table, references);
+                    errdefer freeBlock(allocator, block);
+                    try blocks.append(allocator, block);
+                    scan = candidate.next;
+                }
+                pos = scan;
+                after_table = true;
+                continue;
+            }
+
+            if (try containers.read(allocator, line.text, after_blank or table_boundary or blocks.items.len == 0)) |container| {
                 const block = try containerBlock(allocator, source, pos, container, references);
                 errdefer allocator.free(block.spans);
                 try blocks.append(allocator, block);
@@ -207,6 +238,10 @@ pub const ReviewBody = struct {
                 const candidate = nextLine(source, next);
                 if (quotePrefix(candidate.text).levels > 0) break;
                 if (isBlank(candidate.text) or fenceOpen(candidate.text) != null or headingPrefix(candidate.text) != null or readDefinition(source, next, next + candidate.text.len) != null) break;
+                if (try tableStart(allocator, source, next)) |table| {
+                    allocator.free(table.alignments);
+                    break;
+                }
                 if (setextLevel(candidate.text)) |heading_level| {
                     level = heading_level;
                     underline = .{ .start = next, .end = candidate.next };
@@ -241,8 +276,143 @@ pub const ReviewBody = struct {
 };
 
 fn freeBlocks(allocator: std.mem.Allocator, blocks: []const Block) void {
-    for (blocks) |block| allocator.free(block.spans);
+    for (blocks) |block| freeBlock(allocator, block);
     allocator.free(blocks);
+}
+
+fn freeBlock(allocator: std.mem.Allocator, block: Block) void {
+    if (block.kind == .table) allocator.free(block.kind.table.cells);
+    allocator.free(block.spans);
+}
+
+const TableStart = struct { header: SourceRange, separator: SourceRange, alignments: []const Alignment };
+
+fn hasTablePipe(text: []const u8) bool {
+    return nextTablePipe(text, 0, text.len) != null;
+}
+
+fn tableCells(allocator: std.mem.Allocator, source: []const u8, start: usize) ![]const SourceRange {
+    const line = nextLine(source, start);
+    var left = start;
+    var right = start + line.text.len;
+    while (left < right and (source[left] == ' ' or source[left] == '\t')) left += 1;
+    while (right > left and (source[right - 1] == ' ' or source[right - 1] == '\t')) right -= 1;
+    if (left < right and source[left] == '|') left += 1;
+    var ranges: std.ArrayList(SourceRange) = .empty;
+    errdefer ranges.deinit(allocator);
+    var cell_start = left;
+    while (nextTablePipe(source, cell_start, right)) |pipe| {
+        try appendTableCell(allocator, source, &ranges, cell_start, pipe);
+        cell_start = pipe + 1;
+    }
+    if (cell_start < right or ranges.items.len == 0) try appendTableCell(allocator, source, &ranges, cell_start, right);
+    return ranges.toOwnedSlice(allocator);
+}
+
+fn nextTablePipe(source: []const u8, left: usize, right: usize) ?usize {
+    var pos = left;
+    while (pos < right) {
+        if (source[pos] == '\\' and pos + 1 < right) {
+            pos += 2;
+            continue;
+        }
+        if (source[pos] == '`') {
+            var run = pos + 1;
+            while (run < right and source[run] == '`') run += 1;
+            var scan = run;
+            while (scan < right) {
+                if (source[scan] != '`') {
+                    scan += 1;
+                    continue;
+                }
+                var end = scan + 1;
+                while (end < right and source[end] == '`') end += 1;
+                if (end - scan == run - pos) {
+                    pos = end;
+                    break;
+                }
+                scan = end;
+            }
+            if (scan < right) continue;
+            pos = run;
+            continue;
+        }
+        if (source[pos] == '|') return pos;
+        pos += 1;
+    }
+    return null;
+}
+
+fn appendTableCell(allocator: std.mem.Allocator, source: []const u8, ranges: *std.ArrayList(SourceRange), start: usize, end: usize) !void {
+    var left = start;
+    var right = end;
+    while (left < right and (source[left] == ' ' or source[left] == '\t')) left += 1;
+    while (right > left and (source[right - 1] == ' ' or source[right - 1] == '\t')) right -= 1;
+    try ranges.append(allocator, .{ .start = left, .end = right });
+}
+
+fn tableStart(allocator: std.mem.Allocator, source: []const u8, start: usize) !?TableStart {
+    const header = nextLine(source, start);
+    if (tableBoundary(source, start)) return null;
+    if (header.next >= source.len) return null;
+    const separator = nextLine(source, header.next);
+    if (!hasTablePipe(header.text) and !hasTablePipe(separator.text)) return null;
+    const cells = try tableCells(allocator, source, header.next);
+    defer allocator.free(cells);
+    const headers = try tableCells(allocator, source, start);
+    defer allocator.free(headers);
+    if (cells.len != headers.len or cells.len == 0) return null;
+    const alignments = try allocator.alloc(Alignment, cells.len);
+    errdefer allocator.free(alignments);
+    for (cells, 0..) |cell, index| {
+        var left = cell.start;
+        var right = cell.end;
+        const leading = left < right and source[left] == ':';
+        const trailing = left < right and source[right - 1] == ':';
+        if (leading) left += 1;
+        if (trailing and right > left) right -= 1;
+        var valid = right - left >= 3;
+        for (source[left..right]) |byte| if (byte != '-') {
+            valid = false;
+        };
+        if (!valid) {
+            allocator.free(alignments);
+            return null;
+        }
+        alignments[index] = if (leading and trailing) .center else if (trailing) .right else .left;
+    }
+    return .{ .header = .{ .start = start, .end = header.next }, .separator = .{ .start = header.next, .end = separator.next }, .alignments = alignments };
+}
+
+fn tableBoundary(source: []const u8, start: usize) bool {
+    const text = nextLine(source, start).text;
+    return fenceOpen(text) != null or headingPrefix(text) != null or quotePrefix(text).levels > 0 or codeIndent(text) != null or itemPrefix(text) != null or readDefinition(source, start, start + text.len) != null;
+}
+
+fn tableBlock(allocator: std.mem.Allocator, source: []const u8, start: usize, table: TableStart, references: *const ReferenceDefinitions) !Block {
+    const line = nextLine(source, start);
+    const ranges = try tableCells(allocator, source, start);
+    defer allocator.free(ranges);
+    if (ranges.len > table.alignments.len) {
+        const spans = try allocator.alloc(Span, 1);
+        spans[0] = .{ .text = line.text, .source = .{ .start = start, .end = start + line.text.len } };
+        return .{ .kind = .literal, .source = .{ .start = start, .end = line.next }, .spans = spans };
+    }
+    const cells = try allocator.alloc(TableCell, table.alignments.len);
+    errdefer allocator.free(cells);
+    var spans: std.ArrayList(Span) = .empty;
+    errdefer spans.deinit(allocator);
+    for (cells, 0..) |*cell, index| {
+        const first = spans.items.len;
+        if (index < ranges.len) {
+            const parsed = try parseInline(allocator, source, ranges[index].start, ranges[index].end, .{ .references = references });
+            defer allocator.free(parsed);
+            try spans.appendSlice(allocator, parsed);
+        }
+        cell.* = .{ .spans = .{ .start = first, .end = spans.items.len }, .alignment = table.alignments[index] };
+        try spans.append(allocator, .{ .text = "", .source = .{ .start = start, .end = start }, .hidden = true, .hard_break = true });
+    }
+    return .{ .kind = .{ .table = .{ .header = table.header, .cells = cells } }, .source = .{ .start = start, .end = line.next }, .spans = try spans.toOwnedSlice(allocator), .hidden_line = table.separator };
 }
 
 const Line = struct { text: []const u8, next: usize };
@@ -1014,6 +1184,61 @@ fn bareUrlEnd(source: []const u8, start: usize, region_start: usize, end: usize,
 }
 
 const testing = std.testing;
+
+test "M23 tables recognize aligned cells without splitting protected pipes as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body = try ReviewBody.parse(arena.allocator(), "| Name | State |\n| :--- | ---: |\n| **Ada** | `a|b` \\| ready |\n| Bo |\n| extra | cells | stay |\n\n*after*");
+    try testing.expect(body.blocks[0].kind == .table);
+    try testing.expectEqual(@as(usize, 2), body.blocks[1].kind.table.cells.len);
+    try testing.expectEqual(Alignment.right, body.blocks[1].kind.table.cells[1].alignment);
+    try testing.expect(body.blocks[1].spans[1].marks.strong);
+    try testing.expect(body.blocks[3].kind == .literal);
+    try testing.expect(body.blocks[5].spans[1].marks.emphasis);
+}
+
+test "M23 tables release table and reference allocations on failure" {
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const body = try ReviewBody.parse(allocator, "before\n\n| Name | State |\n| :---: | ---: |\n| [Ada][id] | `a|b` \\| Ready |\n| Bo |\n| extra | cells | literal |\n\n[id]: /host");
+            defer freeBlocks(allocator, body.blocks);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Check.run, .{});
+}
+
+test "M23 tables stop at lists and reference definitions as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body = try ReviewBody.parse(arena.allocator(), "| A | B |\n| --- | --- |\n| [docs][id] | ready |\n[id]: /path\n\n- **after**");
+    try testing.expect(body.blocks[1].spans[1].marks.link_label);
+    try testing.expectEqualStrings("/path", body.blocks[1].spans[3].text);
+    const list = try ReviewBody.parse(arena.allocator(), "| A | B |\n| --- | --- |\n| x | y |\n- **after**");
+    try testing.expect(list.blocks[2].marker != null);
+}
+
+test "M23 tables do not consume code headings or quotes as headers as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{ "    | A | B |\n    | --- | --- |", "# A | B\n--- | ---", "> A | B\n> --- | ---", "``` A | B\n--- | ---\n```" }) |raw| {
+        const body = try ReviewBody.parse(arena.allocator(), raw);
+        for (body.blocks) |block| try testing.expect(block.kind != .table);
+    }
+    const missing = try ReviewBody.parse(arena.allocator(), "| A | B |\n| --- | --- |\none cell\n\n# after");
+    try testing.expectEqual(@as(usize, 2), missing.blocks[1].kind.table.cells.len);
+    try testing.expectEqual(missing.blocks[1].kind.table.cells[1].spans.start, missing.blocks[1].kind.table.cells[1].spans.end);
+}
+
+test "M23 tables protected pipes do not replace Setext headings as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{ "a\\|b\n---\ntail", "`a|b`\n---\ntail" }) |raw| {
+        const body = try ReviewBody.parse(arena.allocator(), raw);
+        try testing.expect(body.blocks[0].kind == .heading);
+        try testing.expectEqualStrings("tail", body.blocks[1].spans[0].text);
+        try testing.expect(body.blocks[1].hidden_line == null);
+    }
+}
 
 test "M23 links handle large definition sets and unmatched URL brackets as project behavior" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

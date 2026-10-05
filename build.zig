@@ -288,6 +288,14 @@ pub fn build(b: *std.Build) void {
     const link_step = b.step("test-links", "Run link and reference presentation tests");
     link_step.dependOn(&b.addRunArtifact(link_tests).step);
 
+    const table_tests = b.addTest(.{
+        .name = "table-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M23 tables"},
+    });
+    const table_step = b.step("test-tables", "Run table presentation tests");
+    table_step.dependOn(&b.addRunArtifact(table_tests).step);
+
     const fixture_mod = b.createModule(.{
         .root_source_file = b.path("tests/user_grammar_fixture.zig"),
         .target = target,

@@ -730,11 +730,11 @@ pub fn appendReviewBodyCandidates(
         defer boundaries.deinit(allocator);
         for (block.spans) |span| {
             if (span.boundary and text.items.len > 0) try boundaries.append(allocator, text.items.len);
-            if (span.hidden or span.generated) continue;
             if (span.hard_break) {
                 try appendBodyRegion(allocator, owner, session_epoch, corpus_order, candidates, &region);
                 continue;
             }
+            if (span.hidden or span.generated) continue;
             var pos: usize = 0;
             while (pos < span.text.len) {
                 const newline = std.mem.indexOfScalarPos(u8, span.text, pos, '\n') orelse span.text.len;
@@ -789,6 +789,32 @@ fn appendBodyRegion(allocator: std.mem.Allocator, owner: ReviewBodyOwner, epoch:
 }
 
 const testing = std.testing;
+
+test "M23 tables both searches keep authored cells as separate matching regions as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "| Name | State |\r\n| :--- | ---: |\r\n| **Ada** | `a|b` \\| ready |\n| Bo |\n| extra | literal | cells |";
+    const body = try review_body.ReviewBody.parse(a, raw);
+    var candidates: std.ArrayList(Candidate) = .empty;
+    var order: usize = 0;
+    try appendReviewBodyCandidates(a, body, .{ .comment = 7 }, 1, &order, &candidates);
+    for ([_]Mode{ .literal, .fuzzy }) |mode| {
+        for ([_][]const u8{ "Name", "State", "Ada", "a|b", "| ready", "Bo", "extra | literal | cells" }) |text| {
+            const batch = try scan(a, try Query.init(a, text), candidates.items, mode);
+            try testing.expectEqual(@as(usize, 1), batch.occurrences.len);
+            try testing.expectEqual(@as(u64, 7), batch.occurrences[0].location.review_body.owner.comment);
+            if (std.mem.eql(u8, text, "Ada")) {
+                try testing.expectEqual(@as(u32, 3), batch.occurrences[0].location.review_body.logical_line);
+                try testing.expectEqual(@as(usize, 5), batch.occurrences[0].column);
+            }
+        }
+        for ([_][]const u8{ "NameState", "Ada a|b", "ready Bo", "---", "│", "State:" }) |text| {
+            const batch = try scan(a, try Query.init(a, text), candidates.items, mode);
+            try testing.expectEqual(@as(usize, 0), batch.occurrences.len);
+        }
+    }
+}
 
 test "M23 links both searches find each reference use and retain separate definition ranges as project behavior" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

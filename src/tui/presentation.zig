@@ -18209,6 +18209,101 @@ test "M23 links yank selects reference destinations without unrelated definition
     };
 }
 
+test "M23 tables search reveals authored cells and retains occurrence identity across resize as project behavior" {
+    const raw = "| Name | State |\n| --- | --- |\n| Ada | Ready |\n| Bo | Waiting |";
+    const ready = std.mem.indexOf(u8, raw, "Ready").?;
+    for ([_]bool{ false, true }) |local| for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = if (local) try OwnedReviewIdentity.initLocal(1, "refs/remotes/origin/main", "refs/heads/feature") else try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .target = if (local) .local else .bitbucket });
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 1 }, .{
+            .initial = .{ .key = key, .session = if (local) try testLocalSession(testing.allocator) else try testSession(testing.allocator, 1, 'a') },
+            .geometry = .{ .cols = 38, .rows = 20 },
+        });
+        defer presentation.deinit();
+        if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'S', .text = "State" } });
+        try completeBufferSearchScan(&presentation);
+        try testing.expectEqual(@as(usize, 1), presentation.projection().buffer_search.?.total);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'R', .text = "Ready" } });
+        try completeBufferSearchScan(&presentation);
+        try testing.expectEqual(@as(usize, 1), presentation.projection().buffer_search.?.total);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try presentation.dispatch(.{ .action = .next_search_occurrence });
+        const active = presentation.projection().buffer_search.?.active;
+        for ([_]u16{ 160, 38 }) |cols| {
+            try dispatchView(&presentation, .{ .resize = .{ .cols = cols, .rows = 20 } });
+            try testing.expectEqual(@as(usize, 1), presentation.projection().buffer_search.?.total);
+            try testing.expectEqual(active, presentation.projection().buffer_search.?.active);
+            try presentation.dispatch(.{ .action = .next_search_occurrence });
+            const review = presentation.projection().review.?;
+            const card = review.buffer.rows[review.frame.visual_rows[review.navigation.cursor].buffer_index].draft;
+            var visible = false;
+            for (card.segments) |segment| visible = visible or (segment.authored and segment.source.start < ready + 5 and segment.source.end > ready);
+            try testing.expect(visible);
+            try testing.expectEqual(@as(u64, 1), card.owner.draft);
+            try presentation.dispatch(.{ .action = .toggle_select });
+            try presentation.dispatch(.{ .action = .yank });
+            var copy = presentation.takeCommand().?;
+            defer copy.deinit();
+            try testing.expectEqualStrings("| --- | --- |\n| Ada | Ready |\n", copy.copy_clipboard.text);
+        }
+        try presentation.dispatch(.{ .action = .open_review_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'R', .text = "Ready" } });
+        try completeBufferSearchScan(&presentation);
+        const result = presentation.projection().review_search.?.results[0];
+        try testing.expectEqual(@as(u32, 3), result.occurrence.location.review_body.logical_line);
+        try testing.expectEqualSlices(search.Range, &.{.{ .start = ready, .end = ready + 5 }}, result.occurrence.ranges);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try completeDisclosureBuild(&presentation);
+        const review = presentation.projection().review.?;
+        try testing.expectEqual(@as(u64, 1), review.frame.visual_rows[review.navigation.cursor].owner.draft.id);
+        try testing.expect(review.frame.search_ranges.len > 0);
+    };
+}
+
+test "M23 tables yank keeps raw row bytes separator ownership and authored order in both layouts as project behavior" {
+    const raw = "| Name | State |\r\n| :--- | ---: |\r\n| **Ada** | `a|b` \\| Ready |  \r\n| Bo | Waiting |\n| too | many | cells |  \r\n\n*after*";
+    const examples = [_]struct { needle: []const u8, expected: []const u8 }{
+        .{ .needle = "Ready", .expected = "| :--- | ---: |\r\n| **Ada** | `a|b` \\| Ready |  \r\n" },
+        .{ .needle = "Name", .expected = "| Name | State |\r\n| :--- | ---: |\r\n" },
+        .{ .needle = "many", .expected = "| too | many | cells |  \r\n" },
+    };
+    for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]u16{ 160, 38 }) |cols| for (examples) |example| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const session = try testCommentSession(testing.allocator, 1);
+        @constCast(session.threads[0].root).body = raw;
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 0 }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+            .geometry = .{ .cols = cols, .rows = 40 },
+        });
+        defer presentation.deinit();
+        if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        const offset = std.mem.indexOf(u8, raw, example.needle).?;
+        var first: ?usize = null;
+        var last: ?usize = null;
+        for (presentation.projection().review.?.frame.visual_rows, 0..) |visual, index| {
+            const row = presentation.projection().review.?.buffer.rows[visual.buffer_index];
+            if (row != .comment or row.comment.part != .body) continue;
+            for (row.comment.segments) |segment| if (segment.authored and segment.source.start < offset + example.needle.len and segment.source.end > offset) {
+                if (first == null) first = index;
+                last = index;
+            };
+        }
+        try testing.expect(first != null);
+        try selectRows(&presentation, last.?, first.?);
+        try presentation.dispatch(.{ .action = .yank });
+        var copy = presentation.takeCommand().?;
+        defer copy.deinit();
+        try testing.expectEqualStrings(example.expected, copy.copy_clipboard.text);
+    };
+}
+
 test "M23 links search navigates reference uses across resize and disclosure as project behavior" {
     const raw = "[Docs][ID]\n![More][id]\n\n[id]: https://host/host \"Guide\"";
     for ([_]bool{ false, true }) |local| for ([_]Layout{ .unified, .side_by_side }) |layout| {
