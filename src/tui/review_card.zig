@@ -34,6 +34,8 @@ pub const Segment = struct {
     text: []const u8,
     source: SourceRange,
     marks: Marks = .{},
+    /// False for terminal markers and generated spacing, even with a source range.
+    authored: bool = true,
 };
 
 pub const ReviewCardRow = struct {
@@ -50,6 +52,9 @@ pub const ReviewCardRow = struct {
     total_rows: usize = 0,
     depth: usize = 0,
     indent: usize = 0,
+    /// Only the first authored blank line represented by an empty row.
+    blank_source: ?usize = null,
+    plain_label: ?[]const u8 = null,
 
     pub fn contentColumn(self: ReviewCardRow) usize {
         return self.indent + if (self.part == .header) @as(usize, 2) else 4;
@@ -86,6 +91,7 @@ pub const Options = struct {
     scope: bbr.review.CommentScope = .review,
     role: CardRole,
     header: []const u8,
+    plain_header: ?[]const u8 = null,
     content_width: usize,
     metrics: CellMetrics,
     collapsed_rows: usize = 6,
@@ -116,6 +122,7 @@ pub fn project(allocator: std.mem.Allocator, body: ReviewBody, options: Options)
         .text = options.header,
         .source = .{ .start = 0, .end = 0 },
     }));
+    rows[0].plain_label = options.plain_header;
     @memcpy(rows[1 .. 1 + visible_count], body_rows.items[0..visible_count]);
     if (collapsible) {
         const hidden = body_rows.items.len - visible_count;
@@ -196,7 +203,7 @@ const Writer = struct {
                     if (newline == pos) {
                         try self.emitEmpty(line_range);
                     } else {
-                        try self.addToken(content.text[pos..newline], line_range, .{});
+                        try self.addToken(content.text[pos..newline], line_range, .{}, true);
                         try self.flush();
                     }
                     pos = if (newline < content.text.len) newline + 1 else content.text.len;
@@ -204,7 +211,7 @@ const Writer = struct {
             },
             .heading => {
                 self.part = .body;
-                try self.addToken("§", value.source, .{ .strong = true });
+                try self.addToken("§", value.source, .{ .strong = true }, false);
                 for (value.spans) |span| try self.addSpan(span, true);
                 try self.flush();
             },
@@ -219,9 +226,9 @@ const Writer = struct {
         var marks = span.marks;
         marks.strong = marks.strong or force_strong;
         if (marks.link_destination) {
-            try self.addToken("‹", span.source, marks);
+            try self.addToken("‹", span.source, marks, false);
             try self.addWords(span.text, span.source, marks);
-            try self.addToken("›", span.source, marks);
+            try self.addToken("›", span.source, marks, false);
         } else try self.addWords(span.text, span.source, marks);
     }
 
@@ -236,14 +243,14 @@ const Writer = struct {
             const token_range = SourceRange{ .start = range.start + start, .end = range.start + pos };
             const token_width = measuredWidth(self.options.metrics, text[start..pos]);
             if (needs_space and self.current.items.len > 0 and self.current_width + 1 + token_width <= self.width) {
-                try self.append(.{ .text = " ", .source = token_range, .marks = marks }, 1);
+                try self.append(.{ .text = " ", .source = token_range, .marks = marks, .authored = false }, 1);
             } else if (self.current.items.len > 0 and self.current_width + token_width > self.width) try self.flush();
-            try self.addToken(text[start..pos], token_range, marks);
+            try self.addToken(text[start..pos], token_range, marks, true);
             needs_space = true;
         }
     }
 
-    fn addToken(self: *Writer, text: []const u8, range: SourceRange, marks: Marks) !void {
+    fn addToken(self: *Writer, text: []const u8, range: SourceRange, marks: Marks, authored: bool) !void {
         var pos: usize = 0;
         while (pos < text.len) {
             const measured = validMeasurement(self.options.metrics, text[pos..]);
@@ -253,6 +260,7 @@ const Writer = struct {
                 .text = display,
                 .source = .{ .start = range.start + pos, .end = @min(range.start + pos + measured.byte_len, range.end) },
                 .marks = marks,
+                .authored = authored,
             }, measured.cell_width);
             pos += measured.byte_len;
             if (self.current_width >= self.width) try self.flush();
@@ -270,12 +278,14 @@ const Writer = struct {
 
     fn emitSegments(self: *Writer, segments: []const Segment, part: Part) !void {
         self.part = part;
-        for (segments) |segment| try self.addToken(segment.text, segment.source, segment.marks);
+        for (segments) |segment| try self.addToken(segment.text, segment.source, segment.marks, segment.authored);
         try self.flush();
     }
 
     fn emitEmpty(self: *Writer, range: SourceRange) !void {
-        try self.rows.append(self.allocator, makeRow(self.options, self.part, self.ordinal, self.kind, range, &.{}));
+        var row = makeRow(self.options, self.part, self.ordinal, self.kind, range, &.{});
+        row.blank_source = range.start;
+        try self.rows.append(self.allocator, row);
     }
 
     fn flush(self: *Writer) !void {

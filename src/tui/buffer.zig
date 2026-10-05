@@ -979,6 +979,7 @@ const Weave = struct {
             else
                 .comment,
             .header = try indentation.header(w.a, header, depth),
+            .plain_header = try indentation.header(w.a, if (c.deleted) "Deleted Comment" else c.author, depth),
             .content_width = cardContentWidth(w.opts.card_width, indentation.offset(depth)),
             .depth = depth,
             .indent = indentation.offset(depth),
@@ -1027,6 +1028,7 @@ const Weave = struct {
                 .scope = w.card_scope,
                 .role = role,
                 .header = try indentation.header(w.a, header, depth),
+                .plain_header = try indentation.header(w.a, label, depth),
                 .content_width = cardContentWidth(w.opts.card_width, indentation.offset(depth)),
                 .depth = depth,
                 .indent = indentation.offset(depth),

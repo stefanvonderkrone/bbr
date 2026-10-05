@@ -10318,11 +10318,15 @@ pub const Presentation = struct {
     }
 
     fn yank(self: *Presentation, published: *Published, count: usize) void {
-        if (published.navigation.selection() == null) {
-            if (cursorReviewCard(published)) |body| {
-                self.queueClipboard(published, body.source.body());
-                return;
-            }
+        if (published.navigation.selection()) |selection| {
+            self.yankSelection(published, selection) catch {
+                self.action_error = .out_of_memory;
+            };
+            return;
+        }
+        if (cursorReviewCard(published)) |body| {
+            self.queueClipboard(published, body.source.body());
+            return;
         }
         if (published.cursorVisualRow() == null) {
             self.action_error = .invalid_selection;
@@ -10332,18 +10336,14 @@ pub const Presentation = struct {
             self.action_error = .invalid_selection;
             return;
         };
-        const selection = published.navigation.selection();
-        const wanted = if (selection == null) @max(count, 1) else std.math.maxInt(usize);
-        const first = if (selection) |range| range[0] else published.navigation.cursor;
-        const last = if (selection) |range| range[1] else published.visual_rows.len - 1;
+        const wanted = @max(count, 1);
         var candidates: std.ArrayList(YankCandidate) = .empty;
         defer candidates.deinit(self.allocator);
-        var row_index = first;
-        while (row_index <= last and row_index < published.visual_rows.len and candidates.items.len < wanted) : (row_index += 1) {
+        var row_index = published.navigation.cursor;
+        while (row_index < published.visual_rows.len and candidates.items.len < wanted) : (row_index += 1) {
             const visual_row = published.visual_rows[row_index];
             if (published.buffer.fileIndexForRow(visual_row.buffer_index) != start_file) {
-                if (selection == null) break;
-                continue;
+                break;
             }
             const candidate = selectedYankCandidate(visual_row, published.selected_version) orelse continue;
             var duplicate = false;
@@ -10373,6 +10373,49 @@ pub const Presentation = struct {
                 self.action_error = .out_of_memory;
                 return;
             };
+        }
+        self.queueClipboard(published, bytes.items);
+    }
+
+    fn yankSelection(self: *Presentation, published: *Published, selection: [2]usize) Allocator.Error!void {
+        var contributions: std.ArrayList(YankContribution) = .empty;
+        defer contributions.deinit(self.allocator);
+        var seen = std.AutoHashMap(YankContribution.Key, void).init(self.allocator);
+        defer seen.deinit();
+        var line_cache: CardYankLineCache = .{};
+        var index = selection[0];
+        while (index <= selection[1] and index < published.visual_rows.len) : (index += 1) {
+            const row = selectionYankRow(published, published.visual_rows[index]) orelse continue;
+            switch (row) {
+                .source => |source| try appendYankContribution(self.allocator, &contributions, &seen, .{
+                    .key = .{ .source = .{ .file = source.file, .number = source.candidate.number } },
+                    .text = source.candidate.line.text,
+                }),
+                .label => |label| try appendYankContribution(self.allocator, &contributions, &seen, .{
+                    .key = .{ .label = label.key },
+                    .text = label.text,
+                }),
+                .body => |card| {
+                    var lines = CardYankLines.init(card, &line_cache);
+                    while (lines.next()) |range| try appendYankContribution(self.allocator, &contributions, &seen, .{
+                        .key = .{ .body = .{ .owner = card.owner, .start = range.start } },
+                        .text = card.source.body()[range.start..range.end],
+                    });
+                },
+            }
+        }
+        try orderYankBodies(self.allocator, contributions.items);
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(self.allocator);
+        var needs_newline = false;
+        for (contributions.items) |contribution| {
+            if (needs_newline) try bytes.append(self.allocator, '\n');
+            try bytes.appendSlice(self.allocator, contribution.text);
+            needs_newline = contribution.text.len == 0 or contribution.text[contribution.text.len - 1] != '\n';
+        }
+        if (bytes.items.len == 0) {
+            self.action_error = .yank_no_source;
+            return;
         }
         self.queueClipboard(published, bytes.items);
     }
@@ -11512,9 +11555,9 @@ fn yankCandidateLessThan(_: void, a: YankCandidate, b: YankCandidate) bool {
 }
 
 fn yankRefusal(published: *const Published) ?YankRefusal {
-    const cursor = published.cursorVisualRow() orelse return .no_source;
     const selection = published.navigation.selection();
     if (selection == null) {
+        const cursor = published.cursorVisualRow() orelse return .no_source;
         if (cursorReviewCard(published)) |body| {
             if (body.scope == .@"inline" and !scopeOnSelectedVersion(body.scope, published.selected_version)) return .opposite_version;
             return if (body.source.body().len == 0) .no_body else null;
@@ -11523,20 +11566,176 @@ fn yankRefusal(published: *const Published) ?YankRefusal {
         const cursor_file = published.buffer.fileIndexForRow(cursor.buffer_index) orelse return .no_source;
         return if (selectedVersionUnavailableForFile(published.buffer, cursor_file, published.selected_version)) .selected_content_unavailable else .no_source;
     }
-    const file_index = published.buffer.fileIndexForRow(cursor.buffer_index) orelse return .no_source;
-    const first = if (selection) |range| range[0] else published.navigation.cursor;
-    const last = if (selection) |range| range[1] else published.visual_rows.len - 1;
-    const unavailable = selectedVersionUnavailableForFile(published.buffer, file_index, published.selected_version);
-    var index = first;
-    while (index <= last and index < published.visual_rows.len) : (index += 1) {
+    var unavailable = false;
+    var empty_source: ?struct { file: usize, number: u32 } = null;
+    var line_cache: CardYankLineCache = .{};
+    var index = selection.?[0];
+    while (index <= selection.?[1] and index < published.visual_rows.len) : (index += 1) {
         const row = published.visual_rows[index];
-        if (published.buffer.fileIndexForRow(row.buffer_index) != file_index) {
-            if (selection == null) break;
-            continue;
+        if (selectionYankRow(published, row)) |content| switch (content) {
+            .source => |source| {
+                if (source.candidate.line.text.len > 0) return null;
+                if (empty_source) |existing| {
+                    if (existing.file != source.file or existing.number != source.candidate.number) return null;
+                }
+                empty_source = .{ .file = source.file, .number = source.candidate.number };
+            },
+            .label => |label| if (label.text.len > 0) {
+                return null;
+            },
+            .body => |card| {
+                var lines = CardYankLines.init(card, &line_cache);
+                if (lines.next() != null) return null;
+            },
+        };
+        if (published.buffer.rows[row.buffer_index] == .status_placeholder) {
+            const status = published.buffer.rows[row.buffer_index].status_placeholder;
+            const state = if (published.selected_version == .old) status.old else status.new;
+            if (state) |value| if (value != .empty) {
+                unavailable = true;
+            };
         }
-        if (selectedYankCandidate(row, published.selected_version) != null) return null;
     }
     return if (unavailable) .selected_content_unavailable else .no_source;
+}
+
+const SelectionYankRow = union(enum) {
+    source: struct { file: usize, candidate: YankCandidate },
+    label: struct { key: YankLabelKey, text: []const u8 },
+    body: review_card.ReviewCardRow,
+};
+
+fn selectionYankRow(published: *const Published, visual: frame_mod.VisualRow) ?SelectionYankRow {
+    if (selectedYankCandidate(visual, published.selected_version)) |candidate| return .{ .source = .{
+        .file = published.buffer.fileIndexForRow(visual.buffer_index) orelse return null,
+        .candidate = candidate,
+    } };
+    const card = switch (published.buffer.rows[visual.buffer_index]) {
+        .comment, .draft => |value| value,
+        else => return null,
+    };
+    if (!scopeOnSelectedVersion(card.scope, published.selected_version)) return null;
+    if (card.part == .body or card.part == .suggestion_body) return .{ .body = card };
+    const label = if (card.part == .suggestion_label) "suggestion" else card.plain_label orelse plainCardLabel(card.text());
+    if (label.len == 0) return null;
+    return .{ .label = .{
+        .key = .{ .owner = card.owner, .part = card.part, .ordinal = card.block_ordinal },
+        .text = label,
+    } };
+}
+
+fn plainCardLabel(text: []const u8) []const u8 {
+    for ([_][]const u8{ "▸ ", "▾ ", "± ", "↳ ", "✎ " }) |marker| {
+        if (std.mem.startsWith(u8, text, marker)) return text[marker.len..];
+    }
+    return text;
+}
+
+const CardYankLines = struct {
+    card: review_card.ReviewCardRow,
+    cache: *CardYankLineCache,
+    offset: usize,
+    end: usize,
+
+    fn init(card: review_card.ReviewCardRow, cache: *CardYankLineCache) CardYankLines {
+        const raw = card.source.body();
+        var start = raw.len;
+        var end: usize = 0;
+        for (card.segments) |segment| {
+            if (!segment.authored or segment.source.start >= segment.source.end) continue;
+            start = @min(start, segment.source.start);
+            end = @max(end, segment.source.end);
+        }
+        if (card.blank_source) |blank| {
+            start = @min(start, blank);
+            end = @max(end, blank + 1);
+        }
+        if (end == 0) return .{ .card = card, .cache = cache, .offset = 0, .end = 0 };
+        if (cache.owner == null or !std.meta.eql(cache.owner.?, card.owner)) cache.* = .{ .owner = card.owner };
+        if (cache.line) |line| {
+            if (start >= line.start and start < line.end) start = line.start;
+        }
+        while (start > 0 and raw[start - 1] != '\n') start -= 1;
+        return .{ .card = card, .cache = cache, .offset = start, .end = @min(end, raw.len) };
+    }
+
+    fn next(self: *CardYankLines) ?review_card.SourceRange {
+        const raw = self.card.source.body();
+        while (self.offset < self.end) {
+            const start = self.offset;
+            const end = if (self.cache.line != null and self.cache.line.?.start == start)
+                self.cache.line.?.end
+            else if (std.mem.indexOfScalarPos(u8, raw, start, '\n')) |pos| pos + 1 else raw.len;
+            self.cache.line = .{ .start = start, .end = end };
+            self.offset = end;
+            if (self.card.blank_source) |blank| if (blank >= start and blank < end) return .{ .start = start, .end = end };
+            for (self.card.segments) |segment| {
+                if (segment.authored and segment.source.start < end and segment.source.end > start) return .{ .start = start, .end = end };
+            }
+        }
+        return null;
+    }
+};
+
+const CardYankLineCache = struct {
+    owner: ?review_card.Owner = null,
+    line: ?review_card.SourceRange = null,
+};
+
+const YankContribution = struct {
+    const Key = union(enum) {
+        source: struct { file: usize, number: u32 },
+        body: struct { owner: review_card.Owner, start: usize },
+        label: YankLabelKey,
+    };
+    key: Key,
+    text: []const u8,
+};
+
+const YankLabelKey = struct { owner: review_card.Owner, part: review_card.Part, ordinal: usize };
+
+fn appendYankContribution(allocator: Allocator, contributions: *std.ArrayList(YankContribution), seen: *std.AutoHashMap(YankContribution.Key, void), contribution: YankContribution) Allocator.Error!void {
+    if ((try seen.getOrPut(contribution.key)).found_existing) return;
+    try contributions.append(allocator, contribution);
+}
+
+fn orderYankBodies(allocator: Allocator, contributions: []YankContribution) Allocator.Error!void {
+    var bodies: std.ArrayList(YankContribution) = .empty;
+    defer bodies.deinit(allocator);
+    var first: usize = 0;
+    while (first < contributions.len) {
+        const owner = yankContributionCard(contributions[first]) orelse {
+            first += 1;
+            continue;
+        };
+        bodies.clearRetainingCapacity();
+        var last = first;
+        while (last < contributions.len) : (last += 1) {
+            const next_owner = yankContributionCard(contributions[last]) orelse break;
+            if (!std.meta.eql(owner, next_owner)) break;
+            if (contributions[last].key == .body) try bodies.append(allocator, contributions[last]);
+        }
+        std.mem.sort(YankContribution, bodies.items, {}, yankBodyLessThan);
+        var body_index: usize = 0;
+        for (contributions[first..last]) |*contribution| {
+            if (contribution.key != .body) continue;
+            contribution.* = bodies.items[body_index];
+            body_index += 1;
+        }
+        first = last;
+    }
+}
+
+fn yankContributionCard(contribution: YankContribution) ?review_card.Owner {
+    return switch (contribution.key) {
+        .source => null,
+        .body => |body| body.owner,
+        .label => |label| label.owner,
+    };
+}
+
+fn yankBodyLessThan(_: void, a: YankContribution, b: YankContribution) bool {
+    return a.key.body.start < b.key.body.start;
 }
 
 fn cursorReviewCard(published: *const Published) ?@import("review_card.zig").ReviewCardRow {
@@ -17846,7 +18045,7 @@ test "M23 yank source Count skips interleaved ReviewCards and wrapped duplicates
     }
 }
 
-test "M23 yank source Selection takes precedence over a ReviewCard cursor and body-only Selection refuses" {
+test "M23 yank mixed Selection takes precedence over the cursor and copies selected plain labels" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -17864,15 +18063,345 @@ test "M23 yank source Selection takes precedence over a ReviewCard cursor and bo
     try presentation.dispatch(.{ .action = .yank });
     var command = presentation.takeCommand().?;
     defer command.deinit();
-    try testing.expectEqualStrings("new", command.copy_clipboard.text);
+    try testing.expectEqualStrings("new\nAuthor", command.copy_clipboard.text);
     try testing.expect(presentation.projection().review.?.navigation.mark == null);
     try presentation.dispatch(.{ .action = .toggle_select });
-    const mark = presentation.projection().review.?.navigation.mark;
+    try testing.expect(presentation.projection().action_availability.available(.yank));
     try presentation.dispatch(.{ .push_count_digit = 7 });
     try presentation.dispatch(.{ .action = .yank });
-    try testing.expect(presentation.takeCommand() == null);
-    try testing.expectEqual(mark, presentation.projection().review.?.navigation.mark);
+    var label = presentation.takeCommand().?;
+    defer label.deinit();
+    try testing.expectEqualStrings("Author", label.copy_clipboard.text);
+    try testing.expect(presentation.projection().review.?.navigation.mark == null);
     try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.count);
+}
+
+test "M23 yank Selection ignores generated heading markers and keeps authored heading bytes" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const session = try testCommentSession(testing.allocator, 1);
+    @constCast(session.threads[0].root).body = "# title\r\nunselected";
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 0 }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+        .geometry = .{ .cols = 34, .rows = 20 },
+    });
+    defer presentation.deinit();
+    var marker: ?usize = null;
+    for (presentation.projection().review.?.frame.visual_rows, 0..) |visual, index| {
+        const row = presentation.projection().review.?.buffer.rows[visual.buffer_index];
+        if (row == .comment and std.mem.eql(u8, row.comment.text(), "§")) {
+            marker = index;
+            break;
+        }
+    }
+    try testing.expect(marker != null);
+    try moveToRow(&presentation, marker.?);
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try testing.expect(!presentation.projection().action_availability.available(.yank));
+    try presentation.dispatch(.{ .push_count_digit = 8 });
+    try presentation.dispatch(.{ .action = .yank });
+    try testing.expect(presentation.takeCommand() == null);
+    try testing.expectEqual(marker, presentation.projection().review.?.navigation.mark);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.count);
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .yank });
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqualStrings("# title\r\n", command.copy_clipboard.text);
+}
+
+test "M23 yank Selection keeps touched authored lines and only the first blank spacer at each width" {
+    const raw = "  **alpha bravo**  \r\ncharlie delta\r\n  \r\n\t\nhidden tail";
+    for ([_]u16{ 34, 50, 160 }) |cols| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const session = try testCommentSession(testing.allocator, 1);
+        @constCast(session.threads[0].root).body = raw;
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 0 }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+        });
+        defer presentation.deinit();
+        try dispatchView(&presentation, .{ .resize = .{ .cols = cols, .rows = 20 } });
+        var first: ?usize = null;
+        var spacer: ?usize = null;
+        for (presentation.projection().review.?.frame.visual_rows, 0..) |visual, index| {
+            const row = presentation.projection().review.?.buffer.rows[visual.buffer_index];
+            if (row != .comment or row.comment.part != .body) continue;
+            if (first == null) first = index;
+            if (row.comment.block_kind == .spacer) spacer = index;
+        }
+        try testing.expect(first != null and spacer != null);
+        try selectRows(&presentation, first.?, first.?);
+        try presentation.dispatch(.{ .action = .yank });
+        var partial = presentation.takeCommand().?;
+        defer partial.deinit();
+        try testing.expectEqualStrings(if (cols == 160) "  **alpha bravo**  \r\ncharlie delta\r\n" else "  **alpha bravo**  \r\n", partial.copy_clipboard.text);
+        try selectRows(&presentation, first.?, spacer.?);
+        try presentation.dispatch(.{ .action = .yank });
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        try testing.expectEqualStrings("  **alpha bravo**  \r\ncharlie delta\r\n  \r\n", command.copy_clipboard.text);
+        try selectRows(&presentation, spacer.?, spacer.?);
+        try presentation.dispatch(.{ .action = .yank });
+        var blank = presentation.takeCommand().?;
+        defer blank.deinit();
+        try testing.expectEqualStrings("  \r\n", blank.copy_clipboard.text);
+        try selectRows(&presentation, spacer.? + 1, spacer.? + 1);
+        try presentation.dispatch(.{ .action = .yank });
+        var tail = presentation.takeCommand().?;
+        defer tail.deinit();
+        try testing.expectEqualStrings("hidden tail", tail.copy_clipboard.text);
+    }
+}
+
+test "M23 yank mixed Selection keeps Files and typed owners in display order in both directions and layouts" {
+    for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]bool{ false, true }) |upward| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "same\r\n", .parent = .{ .comment = 1 } });
+        const session = try testCommentSession(testing.allocator, 1);
+        session.diff = try bbr.diff.parse(session.arena.allocator(),
+            \\diff --git a/a.zig b/a.zig
+            \\--- a/a.zig
+            \\+++ b/a.zig
+            \\@@ -1,2 +1,2 @@
+            \\-old first
+            \\-old second
+            \\+first long enough to wrap repeatedly in a narrow DiffPane
+            \\+second
+            \\diff --git a/b.zig b/b.zig
+            \\--- a/b.zig
+            \\+++ b/b.zig
+            \\@@ -1,2 +1,2 @@
+            \\-old first
+            \\-old second
+            \\+first long enough to wrap repeatedly in a narrow DiffPane
+            \\+second
+        );
+        const comments = try session.arena.allocator().alloc(bbr.review.Comment, 2);
+        comments[0] = .{ .id = 1, .author = "Author", .body = "same\r\n", .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1 } } };
+        comments[1] = .{ .id = 2, .author = "Author", .body = "same\r\n", .scope = .{ .@"inline" = .{ .path = "b.zig", .to = 1 } } };
+        session.threads = try bbr.review.buildThreads(session.arena.allocator(), comments);
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = key, .session = session },
+            .geometry = .{ .cols = 60, .rows = 20 },
+        });
+        defer presentation.deinit();
+        if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        const last = presentation.projection().review.?.frame.visual_rows.len - 1;
+        try selectRows(&presentation, if (upward) last else 0, if (upward) 0 else last);
+        try testing.expect(presentation.projection().action_availability.available(.yank));
+        try presentation.dispatch(.{ .push_count_digit = 1 });
+        try presentation.dispatch(.{ .action = .yank });
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        try testing.expectEqualStrings("first long enough to wrap repeatedly in a narrow DiffPane\nAuthor\nsame\r\ndepth 1 · draft\nsame\r\nsecond\nfirst long enough to wrap repeatedly in a narrow DiffPane\nAuthor\nsame\r\nsecond", command.copy_clipboard.text);
+        try testing.expect(presentation.projection().review.?.navigation.mark == null);
+        try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.count);
+        try presentation.dispatch(.{ .clipboard_completed = .{ .command_id = command.copy_clipboard.command_id, .success = false } });
+        try testing.expectEqual(ClipboardStatus.failed, presentation.projection().clipboard_status.?);
+        try testing.expect(presentation.projection().review.?.navigation.mark == null);
+    };
+}
+
+fn selectRows(presentation: *Presentation, start: usize, end: usize) !void {
+    try moveToRow(presentation, start);
+    try presentation.dispatch(.{ .action = .toggle_select });
+    var index = start;
+    while (index != end) {
+        try presentation.dispatch(.{ .action = if (index < end) .down else .up });
+        if (index < end) index += 1 else index -= 1;
+    }
+}
+
+test "M23 yank Selection keeps empty source Lines between contributions" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const session = try testSession(testing.allocator, 1, 'a');
+    session.diff = try bbr.diff.parse(session.arena.allocator(),
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -0,0 +1,4 @@
+        \\+one
+        \\+
+        \\+
+        \\+three
+    );
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+    });
+    defer presentation.deinit();
+    try selectRows(&presentation, 0, presentation.projection().review.?.frame.visual_rows.len - 1);
+    try presentation.dispatch(.{ .action = .yank });
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqualStrings("one\n\n\nthree", command.copy_clipboard.text);
+    var blank: ?usize = null;
+    for (presentation.projection().review.?.frame.visual_rows, 0..) |visual, index| {
+        if (visual.yank_candidates.new) |line| if (line.text.len == 0) {
+            blank = index;
+            break;
+        };
+    }
+    try testing.expect(blank != null);
+    try selectRows(&presentation, blank.?, blank.?);
+    try testing.expect(!presentation.projection().action_availability.available(.yank));
+    try presentation.dispatch(.{ .action = .yank });
+    try testing.expect(presentation.takeCommand() == null);
+    try testing.expectEqual(blank, presentation.projection().review.?.navigation.mark);
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try selectRows(&presentation, blank.?, blank.? + 1);
+    try testing.expect(presentation.projection().action_availability.available(.yank));
+    try presentation.dispatch(.{ .action = .yank });
+    var blanks = presentation.takeCommand().?;
+    defer blanks.deinit();
+    try testing.expectEqualStrings("\n", blanks.copy_clipboard.text);
+}
+
+test "M23 yank Selection copies Suggestion and collapsed footer labels without hidden body lines" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const session = try testCommentSession(testing.allocator, 1);
+    @constCast(session.threads[0].root).body = "```suggestion\n\tfirst  \r\nsecond\n```\nafter";
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+        .geometry = .{ .cols = 120, .rows = 20 },
+    });
+    defer presentation.deinit();
+    var label: ?usize = null;
+    var footer: ?usize = null;
+    for (presentation.projection().review.?.frame.visual_rows, 0..) |visual, index| {
+        const row = presentation.projection().review.?.buffer.rows[visual.buffer_index];
+        if (row != .comment) continue;
+        if (row.comment.part == .suggestion_label) label = index;
+        if (row.comment.part == .disclosure_footer) footer = index;
+    }
+    try testing.expect(label != null and footer != null);
+    const row_count = presentation.projection().review.?.frame.visual_rows.len;
+    try selectRows(&presentation, label.?, label.?);
+    try presentation.dispatch(.{ .action = .yank });
+    var suggestion = presentation.takeCommand().?;
+    defer suggestion.deinit();
+    try testing.expectEqualStrings("suggestion", suggestion.copy_clipboard.text);
+    try selectRows(&presentation, footer.?, footer.?);
+    try presentation.dispatch(.{ .action = .yank });
+    var disclosure = presentation.takeCommand().?;
+    defer disclosure.deinit();
+    try testing.expectEqualStrings("2 hidden rows · 4 total · enter to expand", disclosure.copy_clipboard.text);
+    try testing.expectEqual(row_count, presentation.projection().review.?.frame.visual_rows.len);
+    try dispatchView(&presentation, .{ .resize = .{ .cols = 34, .rows = 20 } });
+    var first_label: ?usize = null;
+    var last_label: ?usize = null;
+    for (presentation.projection().review.?.frame.visual_rows, 0..) |visual, index| {
+        const row = presentation.projection().review.?.buffer.rows[visual.buffer_index];
+        if (row != .comment or row.comment.part != .suggestion_label) continue;
+        if (first_label == null) first_label = index;
+        last_label = index;
+    }
+    try testing.expect(first_label != null and last_label.? > first_label.?);
+    try selectRows(&presentation, first_label.?, last_label.?);
+    try presentation.dispatch(.{ .action = .yank });
+    var wrapped = presentation.takeCommand().?;
+    defer wrapped.deinit();
+    try testing.expectEqualStrings("suggestion", wrapped.copy_clipboard.text);
+}
+
+test "M23 yank Selection filters inherited scope in both layouts while keeping Review File and Deleted Comment labels" {
+    for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]SelectedVersion{ .old, .new }) |version| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "draft reply", .parent = .{ .comment = 2 } });
+        const session = try testSession(testing.allocator, 1, 'a');
+        const comments = try session.arena.allocator().alloc(bbr.review.Comment, 6);
+        comments[0] = .{ .id = 1, .author = "Old", .body = "old body", .scope = .{ .@"inline" = .{ .path = "a.zig", .from = 1 } } };
+        comments[1] = .{ .id = 2, .author = "Reply", .body = "old reply", .parent_id = 1 };
+        comments[2] = .{ .id = 3, .author = "New", .body = "new body", .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1 } } };
+        comments[3] = .{ .id = 4, .author = "Review", .body = "review body", .scope = .review };
+        comments[4] = .{ .id = 5, .author = "File", .body = "file body", .scope = .{ .file = .{ .path = "a.zig", .source_commit = "source" } } };
+        comments[5] = .{ .id = 6, .author = "Gone", .body = "", .scope = .review, .deleted = true };
+        session.threads = try bbr.review.buildThreads(session.arena.allocator(), comments);
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{ .initial = .{ .key = key, .session = session } });
+        defer presentation.deinit();
+        if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        if (version == .old) try dispatchView(&presentation, .{ .action = .select_old_version });
+        for (presentation.projection().review.?.frame.visual_rows, 0..) |visual, index| {
+            if (visual.owner != .disclosure or visual.owner.disclosure != .opposite_version) continue;
+            try moveToRow(&presentation, index);
+            try dispatchView(&presentation, .{ .action = .toggle_disclosure });
+            break;
+        }
+        // Check each selected body or label through the same ActionAvailability seam.
+        const row_count = presentation.projection().review.?.frame.visual_rows.len;
+        for (0..row_count) |index| {
+            const review = presentation.projection().review.?;
+            const row = review.buffer.rows[review.frame.visual_rows[index].buffer_index];
+            if (row != .comment and row != .draft) continue;
+            const card = if (row == .comment) row.comment else row.draft;
+            const old_card = card.owner == .draft or (card.owner == .comment and (card.owner.comment == 1 or card.owner.comment == 2));
+            const new_card = card.owner == .comment and card.owner.comment == 3;
+            const eligible = (!old_card and !new_card) or (if (version == .old) old_card else new_card);
+            try selectRows(&presentation, index, index);
+            try testing.expectEqual(eligible, presentation.projection().action_availability.available(.yank));
+            try presentation.dispatch(.{ .push_count_digit = 7 });
+            try presentation.dispatch(.{ .action = .yank });
+            if (eligible) {
+                var command = presentation.takeCommand().?;
+                defer command.deinit();
+                try testing.expect(command.copy_clipboard.text.len > 0);
+                if (card.owner == .comment and card.owner.comment == 6) try testing.expectEqualStrings("Deleted Comment", command.copy_clipboard.text);
+                try testing.expect(presentation.projection().review.?.navigation.mark == null);
+            } else {
+                try testing.expect(presentation.takeCommand() == null);
+                try testing.expectEqual(@as(?usize, index), presentation.projection().review.?.navigation.mark);
+                try presentation.dispatch(.{ .action = .toggle_select });
+            }
+            try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.count);
+        }
+    };
+}
+
+test "M23 yank mixed Selection allocation failures preserve Selection and emit no command" {
+    var saw_failure = false;
+    var offset: usize = 0;
+    while (true) : (offset += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 99, .kind = .comment, .body = "draft bytes\r\n", .scope = .review });
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+            .initial = .{ .key = key, .session = try testCommentSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try selectRows(&presentation, 0, presentation.projection().review.?.frame.visual_rows.len - 1);
+        const before = presentation.projection().review.?;
+        const mark = before.navigation.mark;
+        const cursor = before.navigation.cursor;
+        const row_count = before.frame.visual_rows.len;
+        try presentation.dispatch(.{ .push_count_digit = 3 });
+        failing.fail_index = failing.alloc_index + offset;
+        try presentation.dispatch(.{ .action = .yank });
+        const after = presentation.projection().review.?;
+        try testing.expectEqual(cursor, after.navigation.cursor);
+        try testing.expectEqual(row_count, after.frame.visual_rows.len);
+        try testing.expectEqual(@as(usize, 0), after.navigation.count);
+        if (!failing.has_induced_failure) {
+            failing.fail_index = std.math.maxInt(usize);
+            var command = presentation.takeCommand().?;
+            defer command.deinit();
+            try testing.expectEqualStrings("draft\ndraft bytes\r\nnew\nAuthor\npublished", command.copy_clipboard.text);
+            try testing.expect(after.navigation.mark == null);
+            break;
+        }
+        saw_failure = true;
+        try testing.expectEqual(mark, after.navigation.mark);
+        try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+        try testing.expect(presentation.takeCommand() == null);
+    }
+    try testing.expect(saw_failure);
 }
 
 test "M23 yank complete-body allocation failures preserve cursor and disclosure and emit no command" {
@@ -18524,7 +19053,7 @@ test "Selection overrides Count for yank and clipboard failure is visible" {
     try testing.expectEqual(ClipboardStatus.failed, presentation.projection().clipboard_status.?);
 }
 
-test "yank Selection uses only inclusive rows from the cursor File" {
+test "yank Selection copies inclusive rows across Files" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -18539,7 +19068,7 @@ test "yank Selection uses only inclusive rows from the cursor File" {
 
     var command = presentation.takeCommand().?;
     defer command.deinit();
-    try testing.expectEqualStrings("new b", command.copy_clipboard.text);
+    try testing.expectEqualStrings("new a\nnew b", command.copy_clipboard.text);
     try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.count);
     try testing.expect(presentation.projection().review.?.navigation.mark == null);
 }
