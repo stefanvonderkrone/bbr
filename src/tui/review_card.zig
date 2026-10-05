@@ -39,6 +39,7 @@ pub const Segment = struct {
 pub const ReviewCardRow = struct {
     owner: Owner,
     source: Source,
+    scope: bbr.review.CommentScope = .review,
     role: CardRole,
     part: Part,
     block_ordinal: usize,
@@ -82,6 +83,7 @@ pub const ReviewCardRow = struct {
 pub const Options = struct {
     owner: Owner,
     source: Source,
+    scope: bbr.review.CommentScope = .review,
     role: CardRole,
     header: []const u8,
     content_width: usize,
@@ -149,6 +151,7 @@ fn makeRow(options: Options, part: Part, ordinal: usize, kind: BlockKind, range:
     return .{
         .owner = options.owner,
         .source = options.source,
+        .scope = options.scope,
         .role = options.role,
         .part = part,
         .block_ordinal = ordinal,

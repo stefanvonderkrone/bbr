@@ -2262,7 +2262,7 @@ pub const MutationRefusal = enum {
     comment_author_unknown,
     /// The Authenticated Account did not author this Comment.
     comment_owned_by_other,
-    /// A structural Deleted Comment has no authored body.
+    /// A Deleted Comment cannot be mutated, even when its body is available.
     comment_deleted,
     /// Submission or another published mutation owns the global write lane.
     remote_write_busy,
@@ -2290,7 +2290,7 @@ pub const ReviewerVerdictRefusal = enum {
     remote_write_busy,
 };
 
-pub const YankRefusal = enum { no_source, selected_content_unavailable };
+pub const YankRefusal = enum { no_source, no_body, opposite_version, selected_content_unavailable };
 pub const InlineCommentRefusal = enum { no_source, selected_content_unavailable, not_hunk_line, opposite_version };
 pub const SuggestionRefusal = enum { no_source, selected_content_unavailable, not_hunk_line, opposite_version, old_version };
 
@@ -2499,6 +2499,8 @@ pub const ActionError = enum {
     local_review_remote_action_unavailable,
     source_action_unavailable,
     yank_no_source,
+    yank_no_body,
+    yank_opposite_version,
     old_content_unavailable,
     new_content_unavailable,
     source_not_hunk_line,
@@ -10316,6 +10318,12 @@ pub const Presentation = struct {
     }
 
     fn yank(self: *Presentation, published: *Published, count: usize) void {
+        if (published.navigation.selection() == null) {
+            if (cursorReviewCard(published)) |body| {
+                self.queueClipboard(published, body.source.body());
+                return;
+            }
+        }
         if (published.cursorVisualRow() == null) {
             self.action_error = .invalid_selection;
             return;
@@ -10366,11 +10374,15 @@ pub const Presentation = struct {
                 return;
             };
         }
+        self.queueClipboard(published, bytes.items);
+    }
+
+    fn queueClipboard(self: *Presentation, published: *Published, text: []const u8) void {
         const command = self.allocator.create(ClipboardCopy) catch {
             self.action_error = .out_of_memory;
             return;
         };
-        const owned = bytes.toOwnedSlice(self.allocator) catch {
+        const owned = self.allocator.dupe(u8, text) catch {
             self.allocator.destroy(command);
             self.action_error = .out_of_memory;
             return;
@@ -11501,8 +11513,17 @@ fn yankCandidateLessThan(_: void, a: YankCandidate, b: YankCandidate) bool {
 
 fn yankRefusal(published: *const Published) ?YankRefusal {
     const cursor = published.cursorVisualRow() orelse return .no_source;
-    const file_index = published.buffer.fileIndexForRow(cursor.buffer_index) orelse return .no_source;
     const selection = published.navigation.selection();
+    if (selection == null) {
+        if (cursorReviewCard(published)) |body| {
+            if (body.scope == .@"inline" and !scopeOnSelectedVersion(body.scope, published.selected_version)) return .opposite_version;
+            return if (body.source.body().len == 0) .no_body else null;
+        }
+        if (selectedYankCandidate(cursor, published.selected_version) != null) return null;
+        const cursor_file = published.buffer.fileIndexForRow(cursor.buffer_index) orelse return .no_source;
+        return if (selectedVersionUnavailableForFile(published.buffer, cursor_file, published.selected_version)) .selected_content_unavailable else .no_source;
+    }
+    const file_index = published.buffer.fileIndexForRow(cursor.buffer_index) orelse return .no_source;
     const first = if (selection) |range| range[0] else published.navigation.cursor;
     const last = if (selection) |range| range[1] else published.visual_rows.len - 1;
     const unavailable = selectedVersionUnavailableForFile(published.buffer, file_index, published.selected_version);
@@ -11516,6 +11537,18 @@ fn yankRefusal(published: *const Published) ?YankRefusal {
         if (selectedYankCandidate(row, published.selected_version) != null) return null;
     }
     return if (unavailable) .selected_content_unavailable else .no_source;
+}
+
+fn cursorReviewCard(published: *const Published) ?@import("review_card.zig").ReviewCardRow {
+    const visual = published.cursorVisualRow() orelse return null;
+    return switch (published.buffer.rows[visual.buffer_index]) {
+        .comment, .draft => |card| card,
+        else => return null,
+    };
+}
+
+fn scopeOnSelectedVersion(scope: bbr.review.CommentScope, selected: SelectedVersion) bool {
+    return scope != .@"inline" or (if (selected == .old) scope.@"inline".from != null else scope.@"inline".to != null);
 }
 
 fn selectedVersionUnavailableForFile(buffer: buffer_mod.Buffer, file_index: usize, selected: SelectedVersion) bool {
@@ -11533,6 +11566,8 @@ fn selectedVersionUnavailableForFile(buffer: buffer_mod.Buffer, file_index: usiz
 fn yankRefusalError(refusal: ?YankRefusal, selected: SelectedVersion) ActionError {
     return switch (refusal orelse return .source_action_unavailable) {
         .no_source => .yank_no_source,
+        .no_body => .yank_no_body,
+        .opposite_version => .yank_opposite_version,
         .selected_content_unavailable => if (selected == .old) .old_content_unavailable else .new_content_unavailable,
     };
 }
@@ -16208,6 +16243,13 @@ fn expectRowKinds(review: ReviewProjection, expected: []const buffer_mod.RowKind
 
 fn expectVersionYank(presentation: *Presentation, expected: []const u8) !void {
     try presentation.dispatch(.{ .action = .to_top });
+    const review = presentation.projection().review.?;
+    for (review.frame.visual_rows, 0..) |row, index| {
+        const line = if (review.selected_version == .old) row.yank_candidates.old else row.yank_candidates.new;
+        if (line == null) continue;
+        try moveToRow(presentation, index);
+        break;
+    }
     try presentation.dispatch(.{ .push_count_digit = 9 });
     try presentation.dispatch(.{ .action = .yank });
     var command = presentation.takeCommand().?;
@@ -17617,18 +17659,327 @@ test "Comment Action ladder carries inline File and Review scopes" {
     try testing.expect(published.composer.?.request.scope == null);
 }
 
-test "yank skips a generated cursor row without Count" {
+test "yank refuses a structural cursor row without scanning ahead" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
     });
     defer presentation.deinit();
-    try testing.expect(presentation.projection().action_availability.available(.yank));
+    try testing.expect(!presentation.projection().action_availability.available(.yank));
+    try presentation.dispatch(.{ .push_count_digit = 3 });
+    try presentation.dispatch(.{ .action = .yank });
+    try testing.expect(presentation.takeCommand() == null);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.count);
+}
+
+test "M23 yank copies complete authored bytes from every ReviewCard part without changing disclosure" {
+    const raw = "  **keep** :smile: 😃  \r\n```suggestion\n\t  replacement  \n```\n\nlast without newline";
+    for ([_]buffer_mod.Layout{ .unified, .side_by_side }) |layout| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .scope = .review });
+        const session = try testCommentSession(testing.allocator, 1);
+        @constCast(session.threads[0].root).body = raw;
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 3 }, .{
+            .initial = .{ .key = key, .session = session },
+            .geometry = .{ .cols = 80, .rows = 20 },
+        });
+        defer presentation.deinit();
+        if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        var seen = [_]bool{false} ** 5;
+        var index: usize = 0;
+        while (index < presentation.projection().review.?.frame.visual_rows.len) : (index += 1) {
+            const visual = presentation.projection().review.?.frame.visual_rows[index];
+            const part = switch (presentation.projection().review.?.buffer.rows[visual.buffer_index]) {
+                .comment => |card| card.part,
+                .draft => |card| card.part,
+                else => continue,
+            };
+            seen[@intFromEnum(part)] = true;
+            try moveToRow(&presentation, index);
+            const before = presentation.projection().review.?;
+            const row_count = before.frame.visual_rows.len;
+            try testing.expect(presentation.projection().action_availability.available(.yank));
+            try presentation.dispatch(.{ .push_count_digit = 3 });
+            try presentation.dispatch(.{ .action = .yank });
+            var command = presentation.takeCommand().?;
+            defer command.deinit();
+            try testing.expectEqualStrings(raw, command.copy_clipboard.text);
+            const after = presentation.projection().review.?;
+            try testing.expectEqual(index, after.navigation.cursor);
+            try testing.expectEqual(row_count, after.frame.visual_rows.len);
+            try testing.expectEqual(@as(usize, 0), after.navigation.count);
+            try testing.expect(presentation.takeCommand() == null);
+            try presentation.dispatch(.{ .clipboard_completed = .{ .command_id = command.copy_clipboard.command_id, .success = true } });
+            try testing.expectEqual(ClipboardStatus.copied, presentation.projection().clipboard_status.?);
+        }
+        try testing.expect(seen[@intFromEnum(@import("review_card.zig").Part.header)]);
+        try testing.expect(seen[@intFromEnum(@import("review_card.zig").Part.body)]);
+        try testing.expect(seen[@intFromEnum(@import("review_card.zig").Part.suggestion_label)]);
+        try testing.expect(seen[@intFromEnum(@import("review_card.zig").Part.suggestion_body)]);
+        try testing.expect(seen[@intFromEnum(@import("review_card.zig").Part.disclosure_footer)]);
+    }
+}
+
+test "M23 yank filters root scope for published and Draft Replies in both layouts" {
+    for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "draft reply", .parent = .{ .comment = 100 } });
+        try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .comment, .body = "nested draft reply", .parent = .{ .draft = 1 } });
+        try store.store().put(key.storeKey(), .{ .local_id = 3, .kind = .comment, .body = "posted root", .scope = .{ .@"inline" = .{ .path = "a.zig", .from = 1 } }, .state = .{ .posted = 99 } });
+        try store.store().put(key.storeKey(), .{ .local_id = 4, .kind = .comment, .body = "reply under fetched root", .parent = .{ .draft = 3 } });
+        const session = try testCommentThreadSession(testing.allocator, 1);
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = key, .session = session },
+            .geometry = .{ .cols = 100, .rows = 20 },
+        });
+        defer presentation.deinit();
+        if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        try dispatchView(&presentation, .{ .action = .select_old_version });
+        // Opposite-version Threads become visible only after their section opens.
+        for (presentation.projection().review.?.frame.visual_rows, 0..) |visual, index| {
+            if (visual.owner != .disclosure or visual.owner.disclosure != .opposite_version) continue;
+            try moveToRow(&presentation, index);
+            try dispatchView(&presentation, .{ .action = .toggle_disclosure });
+            break;
+        }
+        var found: usize = 0;
+        var index: usize = 0;
+        while (index < presentation.projection().review.?.frame.visual_rows.len) : (index += 1) {
+            const visual = presentation.projection().review.?.frame.visual_rows[index];
+            if (visual.owner != .comment and visual.owner != .draft) continue;
+            found += 1;
+            try moveToRow(&presentation, index);
+            try testing.expectEqual(YankRefusal.opposite_version, presentation.projection().action_availability.yank_refusal.?);
+            try presentation.dispatch(.{ .push_count_digit = 4 });
+            try presentation.dispatch(.{ .action = .yank });
+            try testing.expect(presentation.takeCommand() == null);
+            try testing.expectEqual(ActionError.yank_opposite_version, presentation.projection().action_error.?);
+            try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.count);
+        }
+        try testing.expect(found >= 8);
+        try dispatchView(&presentation, .{ .action = .select_new_version });
+        try cursorToCommentCard(&presentation, 100);
+        try presentation.dispatch(.{ .action = .yank });
+        var reply = presentation.takeCommand().?;
+        defer reply.deinit();
+        try testing.expectEqualStrings("reply", reply.copy_clipboard.text);
+        try cursorToDraftCard(&presentation, 2);
+        try presentation.dispatch(.{ .action = .yank });
+        var draft = presentation.takeCommand().?;
+        defer draft.deinit();
+        try testing.expectEqualStrings("nested draft reply", draft.copy_clipboard.text);
+        try cursorToDraftCard(&presentation, 4);
+        try presentation.dispatch(.{ .action = .yank });
+        var reconciled = presentation.takeCommand().?;
+        defer reconciled.deinit();
+        try testing.expectEqualStrings("reply under fetched root", reconciled.copy_clipboard.text);
+    }
+}
+
+test "M23 yank uses LocalReview ScopeProjection for a root Draft and its Reply" {
+    const Resolver = struct {
+        fn resolve(_: *anyopaque, _: Allocator, _: bbr.review.CommentScope, _: []const u8) anyerror!bbr.review.ScopeResolution {
+            return .{ .resolved = .{ .state = .moved, .scope = .{ .@"inline" = .{ .path = "a.zig", .from = 1 } } } };
+        }
+    };
+    var resolver: u8 = 0;
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.initLocal(1, "main", "feature");
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .target = .local, .kind = .comment, .body = "local root", .scope = .{ .@"inline" = .{ .path = "before.zig", .to = 1 } } });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .target = .local, .kind = .comment, .body = "local reply", .parent = .{ .draft = 1 } });
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .scope_resolver = .{ .ptr = &resolver, .resolve_fn = Resolver.resolve } }, .{
+        .initial = .{ .key = key, .session = try testLocalSession(testing.allocator) },
+    });
+    defer presentation.deinit();
+    try dispatchView(&presentation, .{ .action = .select_old_version });
+    for ([_]bbr.review.TempId{ 1, 2 }) |id| {
+        try cursorToDraftCard(&presentation, id);
+        try presentation.dispatch(.{ .action = .yank });
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        try testing.expectEqualStrings(if (id == 1) "local root" else "local reply", command.copy_clipboard.text);
+    }
+}
+
+test "M23 yank source Count skips interleaved ReviewCards and wrapped duplicates within one File" {
+    for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const session = try testCommentSession(testing.allocator, 1);
+        session.diff = try bbr.diff.parse(session.arena.allocator(),
+            \\diff --git a/a.zig b/a.zig
+            \\--- a/a.zig
+            \\+++ b/a.zig
+            \\@@ -1,2 +1,2 @@
+            \\-old first
+            \\-old second
+            \\+new first long enough to wrap repeatedly in a narrow DiffPane
+            \\+new second
+            \\diff --git a/b.zig b/b.zig
+            \\--- a/b.zig
+            \\+++ b/b.zig
+            \\@@ -1 +1 @@
+            \\-other old
+            \\+other new
+        );
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+            .geometry = .{ .cols = 60, .rows = 20 },
+        });
+        defer presentation.deinit();
+        if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        for (presentation.projection().review.?.frame.visual_rows, 0..) |visual, index| if (visual.yank_candidates.new != null) {
+            try moveToRow(&presentation, index);
+            break;
+        };
+        try presentation.dispatch(.{ .push_count_digit = 9 });
+        try presentation.dispatch(.{ .action = .yank });
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        try testing.expectEqualStrings("new first long enough to wrap repeatedly in a narrow DiffPane\nnew second", command.copy_clipboard.text);
+    }
+}
+
+test "M23 yank source Selection takes precedence over a ReviewCard cursor and body-only Selection refuses" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCommentSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    for (presentation.projection().review.?.frame.visual_rows, 0..) |visual, index| if (visual.yank_candidates.new != null) {
+        try moveToRow(&presentation, index);
+        break;
+    };
+    try presentation.dispatch(.{ .action = .toggle_select });
+    try presentation.dispatch(.{ .action = .down });
+    try testing.expect(presentation.projection().review.?.frame.visual_rows[presentation.projection().review.?.navigation.cursor].owner == .comment);
+    try presentation.dispatch(.{ .push_count_digit = 7 });
     try presentation.dispatch(.{ .action = .yank });
     var command = presentation.takeCommand().?;
     defer command.deinit();
-    try testing.expectEqualStrings("new a", command.copy_clipboard.text);
+    try testing.expectEqualStrings("new", command.copy_clipboard.text);
+    try testing.expect(presentation.projection().review.?.navigation.mark == null);
+    try presentation.dispatch(.{ .action = .toggle_select });
+    const mark = presentation.projection().review.?.navigation.mark;
+    try presentation.dispatch(.{ .push_count_digit = 7 });
+    try presentation.dispatch(.{ .action = .yank });
+    try testing.expect(presentation.takeCommand() == null);
+    try testing.expectEqual(mark, presentation.projection().review.?.navigation.mark);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.count);
+}
+
+test "M23 yank complete-body allocation failures preserve cursor and disclosure and emit no command" {
+    var saw_failure = false;
+    var offset: usize = 0;
+    while (true) : (offset += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCommentSession(testing.allocator, 1) },
+        });
+        defer presentation.deinit();
+        try cursorToCommentCard(&presentation, 99);
+        const before = presentation.projection().review.?;
+        const cursor = before.navigation.cursor;
+        const row_count = before.frame.visual_rows.len;
+        try presentation.dispatch(.{ .push_count_digit = 3 });
+        failing.fail_index = failing.alloc_index + offset;
+        try presentation.dispatch(.{ .action = .yank });
+        const after = presentation.projection().review.?;
+        try testing.expectEqual(cursor, after.navigation.cursor);
+        try testing.expectEqual(row_count, after.frame.visual_rows.len);
+        try testing.expectEqual(@as(usize, 0), after.navigation.count);
+        if (!failing.has_induced_failure) {
+            failing.fail_index = std.math.maxInt(usize);
+            var command = presentation.takeCommand().?;
+            defer command.deinit();
+            try testing.expectEqualStrings("published", command.copy_clipboard.text);
+            break;
+        }
+        saw_failure = true;
+        try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
+        try testing.expect(presentation.takeCommand() == null);
+    }
+    try testing.expect(saw_failure);
+}
+
+test "M23 yank Deleted Comment content stays excluded from both searches and mutation" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const session = try testCommentThreadSession(testing.allocator, 1);
+    @constCast(session.threads[0].root).deleted = true;
+    @constCast(session.threads[0].root).body = "deleted evidence";
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+    });
+    defer presentation.deinit();
+    try cursorToCommentCard(&presentation, 99);
+    try presentation.dispatch(.{ .action = .yank });
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expectEqualStrings("deleted evidence", command.copy_clipboard.text);
+    for ([_]keymap_mod.Action{ .edit_review_item, .delete_review_item }) |action| {
+        try testing.expect(!presentation.projection().action_availability.available(action));
+        try presentation.dispatch(.{ .action = action });
+        try testing.expectEqual(ActionError.comment_deleted, presentation.projection().action_error.?);
+        try testing.expect(presentation.takeCommand() == null);
+    }
+    for ([_]keymap_mod.Action{ .open_buffer_search, .open_review_search }) |action| {
+        try presentation.dispatch(.{ .action = action });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 'd', .text = "deleted evidence" } });
+        try completeBufferSearchScan(&presentation);
+        if (action == .open_buffer_search) {
+            try testing.expectEqual(@as(usize, 0), presentation.projection().buffer_search.?.total);
+        } else try testing.expectEqual(@as(usize, 0), presentation.projection().review_search.?.results.len);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    }
+}
+
+test "M23 yank accepts Review and File bodies with either version and rejects empty bodies" {
+    for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]SelectedVersion{ .old, .new }) |version| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        const session = try testSession(testing.allocator, 1, 'a');
+        const comments = try session.arena.allocator().alloc(bbr.review.Comment, 3);
+        comments[0] = .{ .id = 1, .author = "Ada", .body = " \t\r\n  ", .scope = .review, .deleted = true };
+        comments[1] = .{ .id = 2, .author = "Ada", .body = "", .scope = .review, .deleted = true };
+        comments[2] = .{ .id = 3, .author = "Ada", .body = "file bytes", .scope = .{ .file = .{ .path = "a.zig", .source_commit = "source" } } };
+        session.threads = try bbr.review.buildThreads(session.arena.allocator(), comments);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "draft file", .scope = .{ .file = .{ .path = "a.zig", .source_commit = "source" } } });
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{ .initial = .{ .key = key, .session = session } });
+        defer presentation.deinit();
+        if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        if (version == .old) try dispatchView(&presentation, .{ .action = .select_old_version });
+        for ([_]bbr.review.CommentId{ 1, 3 }) |id| {
+            try cursorToCommentCard(&presentation, id);
+            try testing.expect(presentation.projection().action_availability.available(.yank));
+            try presentation.dispatch(.{ .action = .yank });
+            var command = presentation.takeCommand().?;
+            defer command.deinit();
+            try testing.expectEqualStrings(if (id == 1) " \t\r\n  " else "file bytes", command.copy_clipboard.text);
+        }
+        try cursorToDraftCard(&presentation, 1);
+        try presentation.dispatch(.{ .action = .yank });
+        var draft = presentation.takeCommand().?;
+        defer draft.deinit();
+        try testing.expectEqualStrings("draft file", draft.copy_clipboard.text);
+        try cursorToCommentCard(&presentation, 2);
+        try testing.expectEqual(YankRefusal.no_body, presentation.projection().action_availability.yank_refusal.?);
+        try presentation.dispatch(.{ .push_count_digit = 3 });
+        try presentation.dispatch(.{ .action = .yank });
+        try testing.expect(presentation.takeCommand() == null);
+        try testing.expectEqual(ActionError.yank_no_body, presentation.projection().action_error.?);
+        try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.count);
+    };
 }
 
 test "RemoteReview and LocalReview share Selected Version behavior in every Layout and Scope" {
@@ -18093,7 +18444,10 @@ test "yank Count uses the Selected Version and stops at the File boundary" {
     });
     defer presentation.deinit();
     const published = presentation.published.?;
-    published.navigation.jumpTo(0); // File header; Count starts here and skips it.
+    for (presentation.projection().review.?.frame.visual_rows, 0..) |row, index| if (row.yank_candidates.new != null) {
+        try moveToRow(&presentation, index);
+        break;
+    };
     published.navigation.pushDigit(9);
     try presentation.dispatch(.{ .action = .yank });
     var command = presentation.takeCommand().?;
@@ -18305,6 +18659,10 @@ test "empty source Lines count and yank has no trailing newline" {
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
     });
     defer presentation.deinit();
+    for (presentation.projection().review.?.frame.visual_rows, 0..) |row, index| if (row.yank_candidates.new != null) {
+        try moveToRow(&presentation, index);
+        break;
+    };
     try presentation.dispatch(.{ .push_count_digit = 2 });
 
     try presentation.dispatch(.{ .action = .yank });

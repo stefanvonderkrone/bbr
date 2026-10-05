@@ -208,7 +208,7 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one('Y'), .action = .recover_submission, .help = "resume interrupted submission" },
     .{ .chord = Chord.one('U'), .action = .resolve_unpublished, .help = "mark unknown draft unpublished" },
     .{ .chord = Chord.two('g', 'C'), .action = .link_existing_comment, .help = "link unknown draft to comment" },
-    .{ .chord = Chord.one('y'), .action = .yank, .help = "yank source text" },
+    .{ .chord = Chord.one('y'), .action = .yank, .help = "yank text" },
     .{ .chord = Chord.one('?'), .action = .help, .help = "toggle this help" },
     .{ .chord = Chord.one(vaxis.Key.tab), .action = .focus_next_pane, .help = "switch Pane" },
 };

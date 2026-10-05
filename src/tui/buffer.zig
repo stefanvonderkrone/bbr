@@ -929,6 +929,7 @@ const Weave = struct {
     ancestry_limit: usize,
     expanded_disclosures: DisclosureSet,
     opts: BuildOptions,
+    card_scope: review.CommentScope = .review,
     span_cursors: SpanCursors = .{},
 
     /// Complete each parent subtree before the next sibling.
@@ -948,6 +949,7 @@ const Weave = struct {
         const index = (@intFromPtr(t) - @intFromPtr(w.threads.ptr)) / @sizeOf(Thread);
         if (w.emitted_threads[index]) return;
         w.emitted_threads[index] = true;
+        w.card_scope = t.scope();
         const parent: Parent = .{ .comment = t.root.id };
         var indentation = CardIndentation.init(w.opts.card_width, w.maxReplyDepth(parent, w.ancestry_limit));
         indentation.relative = w.parentUnavailable(if (t.root.parent_id) |id| .{ .comment = id } else null);
@@ -969,6 +971,7 @@ const Weave = struct {
         const projected = try review_card.project(w.a, parsed, .{
             .owner = owner,
             .source = .{ .comment = c },
+            .scope = w.card_scope,
             .role = if (c.deleted)
                 (if (is_reply) .deleted_reply else .deleted_comment)
             else if (is_reply)
@@ -994,6 +997,7 @@ const Weave = struct {
             return;
         }
         var indentation = CardIndentation.init(w.opts.card_width, w.maxReplyDepth(.{ .draft = w.drafts[i].local_id }, w.ancestry_limit));
+        w.card_scope = draftScope(&w.drafts[i], w.opts);
         indentation.relative = w.parentUnavailable(w.drafts[i].parent);
         try w.emitDraftAt(i, 0, indentation);
     }
@@ -1020,6 +1024,7 @@ const Weave = struct {
             const projected = try review_card.project(w.a, parsed, .{
                 .owner = owner,
                 .source = .{ .draft = d },
+                .scope = w.card_scope,
                 .role = role,
                 .header = try indentation.header(w.a, header, depth),
                 .content_width = cardContentWidth(w.opts.card_width, indentation.offset(depth)),

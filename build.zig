@@ -248,6 +248,14 @@ pub fn build(b: *std.Build) void {
     const reply_ancestry_step = b.step("test-reply-ancestry", "Run Reply ancestry presentation tests");
     reply_ancestry_step.dependOn(&b.addRunArtifact(reply_ancestry_tests).step);
 
+    const yank_tests = b.addTest(.{
+        .name = "yank-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"yank"},
+    });
+    const yank_step = b.step("test-yank", "Run Presentation yank tests");
+    yank_step.dependOn(&b.addRunArtifact(yank_tests).step);
+
     const fixture_mod = b.createModule(.{
         .root_source_file = b.path("tests/user_grammar_fixture.zig"),
         .target = target,

@@ -1596,7 +1596,9 @@ fn buildHelpRows(scratch: std.mem.Allocator, km: keymap.Keymap, availability: pr
 fn sourceRefusalLabel(availability: presentation.ActionAvailability, action: keymap.Action) ?[]const u8 {
     return switch (action) {
         .yank => if (availability.yank_refusal) |refusal| switch (refusal) {
-            .no_source => "no source",
+            .no_source => "no copyable text",
+            .no_body => "no authored body",
+            .opposite_version => "opposite Selected Version",
             .selected_content_unavailable => if (availability.selected_version == .old) "old content unavailable" else "new content unavailable",
         } else null,
         .inline_comment => if (availability.inline_comment_refusal) |refusal| switch (refusal) {
@@ -3213,7 +3215,7 @@ test "help keeps refused source Actions visible with typed reasons" {
         .inline_comment_refusal = .not_hunk_line,
         .suggestion_refusal = .old_version,
     });
-    try testing.expect(!helpRowAvailable(rows.commands, "yank source text (old content unavailable)").?);
+    try testing.expect(!helpRowAvailable(rows.commands, "yank text (old content unavailable)").?);
     try testing.expect(!helpRowAvailable(rows.commands, "inline comment (not a Hunk Line)").?);
     try testing.expect(!helpRowAvailable(rows.commands, "suggestion (requires new File version)").?);
 }

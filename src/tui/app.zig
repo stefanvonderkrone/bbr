@@ -329,8 +329,8 @@ fn presentationStatus(
     if (projection.buffer_search) |search_projection| return bufferSearchStatus(frame, projection, search_projection);
     if (projection.action_error) |err| return actionErrorText(err);
     if (projection.clipboard_status) |status| return switch (status) {
-        .copied => "copied source text",
-        .failed => "could not copy source text",
+        .copied => "copied text",
+        .failed => "could not copy text",
     };
     if (projection.shutting_down) {
         if (projection.submission) |submission|
@@ -478,7 +478,9 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .local_review_no_submission => "Submit is unavailable for a local review; drafts remain local",
         .local_review_remote_action_unavailable => "This action is unavailable for a local review",
         .source_action_unavailable => "This action requires a source line or Selection",
-        .yank_no_source => "No Selected Version source Line exists at the cursor or in Selection",
+        .yank_no_source => "No copyable text exists at the cursor or in Selection",
+        .yank_no_body => "No authored body exists at the cursor",
+        .yank_opposite_version => "ReviewCard belongs to the opposite Selected Version",
         .old_content_unavailable => "Old content is unavailable",
         .new_content_unavailable => "New content is unavailable",
         .source_not_hunk_line => "This action requires a Hunk Line",
