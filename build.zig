@@ -264,6 +264,14 @@ pub fn build(b: *std.Build) void {
     const inline_step = b.step("test-inline-markdown", "Run inline Markdown presentation tests");
     inline_step.dependOn(&b.addRunArtifact(inline_tests).step);
 
+    const literal_tests = b.addTest(.{
+        .name = "literal-code-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M23 literal"},
+    });
+    const literal_step = b.step("test-literal-code", "Run literal code presentation tests");
+    literal_step.dependOn(&b.addRunArtifact(literal_tests).step);
+
     const fixture_mod = b.createModule(.{
         .root_source_file = b.path("tests/user_grammar_fixture.zig"),
         .target = target,

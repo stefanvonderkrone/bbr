@@ -32,6 +32,7 @@ pub const BlockKind = union(enum) {
     paragraph,
     heading: u3,
     suggestion,
+    code,
     literal,
     spacer,
 };
@@ -41,6 +42,7 @@ pub const Block = struct {
     source: SourceRange,
     spans: []const Span = &.{},
     hidden_line: ?SourceRange = null,
+    fences: ?[2]SourceRange = null,
 };
 
 pub const ReviewBody = struct {
@@ -68,17 +70,16 @@ pub const ReviewBody = struct {
             };
             pending_spacer = null;
 
-            if (isSuggestionOpen(line.text)) {
+            if (fenceOpen(line.text)) |fence| {
                 const start = pos;
                 const content_start = line.next;
                 var scan = line.next;
                 while (scan < source.len) {
                     const candidate = nextLine(source, scan);
-                    if (isFenceClose(candidate.text)) {
-                        const spans = try allocator.alloc(Span, 1);
+                    if (fence.closes(candidate.text)) {
+                        const spans = try codeSpans(allocator, source, content_start, scan, fence.indent);
                         errdefer allocator.free(spans);
-                        spans[0] = .{ .text = source[content_start..scan], .source = .{ .start = content_start, .end = scan } };
-                        try blocks.append(allocator, .{ .kind = .suggestion, .source = .{ .start = start, .end = candidate.next }, .spans = spans });
+                        try blocks.append(allocator, .{ .kind = if (fence.suggestion) .suggestion else .code, .source = .{ .start = start, .end = candidate.next }, .spans = spans, .fences = .{ .{ .start = start, .end = content_start }, .{ .start = scan, .end = candidate.next } } });
                         pos = candidate.next;
                         break;
                     }
@@ -91,6 +92,23 @@ pub const ReviewBody = struct {
                     try blocks.append(allocator, .{ .kind = .literal, .source = .{ .start = start, .end = source.len }, .spans = spans });
                     pos = source.len;
                 }
+                continue;
+            }
+
+            if (codeIndent(line.text) != null) {
+                const start = pos;
+                var end = line.next;
+                var scan = line.next;
+                while (scan < source.len) {
+                    const candidate = nextLine(source, scan);
+                    if (!isBlank(candidate.text) and codeIndent(candidate.text) == null) break;
+                    if (!isBlank(candidate.text)) end = candidate.next;
+                    scan = candidate.next;
+                }
+                const spans = try codeSpans(allocator, source, start, end, null);
+                errdefer allocator.free(spans);
+                try blocks.append(allocator, .{ .kind = .code, .source = .{ .start = start, .end = end }, .spans = spans });
+                pos = end;
                 continue;
             }
 
@@ -111,7 +129,7 @@ pub const ReviewBody = struct {
             var level: u3 = 0;
             while (next < source.len) {
                 const candidate = nextLine(source, next);
-                if (isBlank(candidate.text) or isSuggestionOpen(candidate.text) or headingPrefix(candidate.text) != null) break;
+                if (isBlank(candidate.text) or fenceOpen(candidate.text) != null or headingPrefix(candidate.text) != null) break;
                 if (setextLevel(candidate.text)) |heading_level| {
                     level = heading_level;
                     underline = .{ .start = next, .end = candidate.next };
@@ -146,12 +164,60 @@ fn isBlank(line: []const u8) bool {
     return trimmed(line).len == 0;
 }
 
-fn isSuggestionOpen(line: []const u8) bool {
-    return std.mem.eql(u8, trimmed(line), "```suggestion");
+const Fence = struct {
+    character: u8,
+    length: usize,
+    indent: usize,
+    suggestion: bool,
+
+    fn closes(self: Fence, line: []const u8) bool {
+        var indent: usize = 0;
+        while (indent < line.len and line[indent] == ' ') indent += 1;
+        if (indent > 3 or indent == line.len or line[indent] != self.character) return false;
+        const length = runLength(line, indent, line.len);
+        return length >= self.length and isBlank(line[indent + length ..]);
+    }
+};
+
+fn fenceOpen(line: []const u8) ?Fence {
+    var indent: usize = 0;
+    while (indent < line.len and line[indent] == ' ') indent += 1;
+    if (indent > 3 or indent == line.len or (line[indent] != '`' and line[indent] != '~')) return null;
+    const length = runLength(line, indent, line.len);
+    if (length < 3) return null;
+    const info = trimmed(line[indent + length ..]);
+    if (line[indent] == '`' and std.mem.indexOfScalar(u8, info, '`') != null) return null;
+    return .{ .character = line[indent], .length = length, .indent = indent, .suggestion = std.mem.eql(u8, info, "suggestion") };
 }
 
-fn isFenceClose(line: []const u8) bool {
-    return std.mem.eql(u8, trimmed(line), "```");
+fn codeIndent(line: []const u8) ?usize {
+    var pos: usize = 0;
+    while (pos < line.len and pos < 4) : (pos += 1) {
+        if (line[pos] == '\t') return pos + 1;
+        if (line[pos] != ' ') return null;
+    }
+    return if (pos == 4) pos else null;
+}
+
+fn codeSpans(allocator: std.mem.Allocator, source: []const u8, start: usize, end: usize, fence_indent: ?usize) ![]const Span {
+    if (fence_indent == 0) {
+        const spans = try allocator.alloc(Span, 1);
+        spans[0] = .{ .text = source[start..end], .source = .{ .start = start, .end = end } };
+        return spans;
+    }
+    var spans: std.ArrayList(Span) = .empty;
+    errdefer spans.deinit(allocator);
+    var pos = start;
+    while (pos < end) {
+        const line = nextLine(source, pos);
+        var removed: usize = 0;
+        if (fence_indent) |indent| {
+            while (removed < line.text.len and removed < indent and line.text[removed] == ' ') removed += 1;
+        } else removed = codeIndent(line.text) orelse line.text.len;
+        try spans.append(allocator, .{ .text = source[pos + removed .. line.next], .source = .{ .start = pos + removed, .end = line.next } });
+        pos = line.next;
+    }
+    return spans.toOwnedSlice(allocator);
 }
 
 const HeadingPrefix = struct { level: u3, bytes: usize };
@@ -390,6 +456,33 @@ fn isEscapable(byte: u8) bool {
 
 const testing = std.testing;
 
+test "M23 literal fences hide only valid delimiters and retain code bytes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = try ReviewBody.parse(a, "**before**\n\n  ~~~~zig extra\r\n  \t*x* :mask: <b>  \r\n  ~~~\n  ````\n  ~~~~~ \r\n**after**");
+    var visible: std.ArrayList(u8) = .empty;
+    for (body.blocks[2].spans) |span| try visible.appendSlice(a, span.text);
+    try testing.expectEqualStrings("\t*x* :mask: <b>  \r\n~~~\n````\n", visible.items);
+    try testing.expect(body.blocks[3].spans[1].marks.strong);
+}
+
+test "M23 literal indented code removes four columns and preserves remaining whitespace" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = try ReviewBody.parse(a, "\t\tfirst  \r\n  \t  second\n    \tthird\n \t\r\n    fourth\n\n**after**");
+    var visible: std.ArrayList(u8) = .empty;
+    for (body.blocks[0].spans) |span| try visible.appendSlice(a, span.text);
+    try testing.expectEqualStrings("\tfirst  \r\n  second\n\tthird\n\r\nfourth\n", visible.items);
+    try testing.expect(body.blocks[0].fences == null);
+    try testing.expect(body.blocks[2].spans[1].marks.strong);
+    const malformed = try ReviewBody.parse(a, "**before**\n~~~~zig\n**literal**\n```\n~~~");
+    try testing.expect(malformed.blocks[0].spans[1].marks.strong);
+    try testing.expectEqualStrings("~~~~zig\n**literal**\n```\n~~~", malformed.blocks[1].spans[0].text);
+    try testing.expect(malformed.blocks[1].fences == null);
+}
+
 test "M23 inline emphasis respects delimiter runs, escapes, and intraword underscores" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -450,7 +543,7 @@ test "M23 inline code and styled links keep literal text and complete authored r
 test "M23 inline parsing releases partial bodies after allocation failure" {
     const Check = struct {
         fn run(allocator: std.mem.Allocator) !void {
-            const body = try ReviewBody.parse(allocator, "# *Heading* ##\n\nSetext\n=====\n\nfirst\r\nsecond  \nthird\n\n**_~~[`literal`](url)~~_**\n\n```suggestion\ncode\n```\n\n```suggestion\nunclosed");
+            const body = try ReviewBody.parse(allocator, "# *Heading* ##\n\nSetext\n=====\n\nfirst\r\nsecond  \nthird\n\n**_~~[`literal`](url)~~_**\n\n```suggestion\ncode\n```\n\n  ~~~~zig\n  \tcode\n  ~~~~~\n\n    code\n\n    more\n\n```suggestion\nunclosed");
             defer {
                 for (body.blocks) |block| allocator.free(block.spans);
                 allocator.free(body.blocks);

@@ -793,6 +793,48 @@ fn appendBodyRegion(allocator: std.mem.Allocator, owner: ReviewBodyOwner, epoch:
 
 const testing = std.testing;
 
+test "M23 literal both searches use authored code lines and exclude fence metadata and tab decoration" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "**before**\n\n  ~~~~zig metadata\r\n  a\tb **literal** :mask: <b>\r\n  second\n  ~~~~~\n\n    a\tb **literal** :mask: <b>\n    second\n\n```suggestion\na\tb **literal** :mask: <b>\nsecond\n```\n\n**after**\n```suggestion\n**fallback**";
+    const body = try review_body.ReviewBody.parse(a, raw);
+    var candidates: std.ArrayList(Candidate) = .empty;
+    var order: usize = 0;
+    try appendReviewBodyCandidates(a, body, .{ .comment = 7 }, 1, &order, &candidates);
+    for ([_]Mode{ .literal, .fuzzy }) |mode| {
+        var query = try Query.init(a, "**literal** :mask: <b>");
+        var batch = try scan(a, query, candidates.items, mode);
+        try testing.expectEqual(@as(usize, 3), batch.occurrences.len);
+        for (batch.occurrences) |occurrence| {
+            const column: usize = switch (occurrence.location.review_body.logical_line) {
+                4 => 7,
+                8 => 9,
+                12 => 5,
+                else => return error.WrongCodeLine,
+            };
+            try testing.expectEqual(column, occurrence.column);
+            for (occurrence.ranges) |range| try testing.expect(std.mem.indexOfScalar(u8, raw[range.start..range.end], '\n') == null);
+        }
+        query = try Query.init(a, "a\tb");
+        batch = try scan(a, query, candidates.items, mode);
+        try testing.expectEqual(@as(usize, 3), batch.occurrences.len);
+        for ([_][]const u8{ "metadata", "~~~~", "second after" }) |text| {
+            query = try Query.init(a, text);
+            batch = try scan(a, query, candidates.items, mode);
+            try testing.expectEqual(@as(usize, 0), batch.occurrences.len);
+        }
+        if (mode == .literal) {
+            query = try Query.init(a, "a   b");
+            batch = try scan(a, query, candidates.items, mode);
+            try testing.expectEqual(@as(usize, 0), batch.occurrences.len);
+        }
+        query = try Query.init(a, "**fallback**");
+        batch = try scan(a, query, candidates.items, mode);
+        try testing.expectEqual(@as(usize, 1), batch.occurrences.len);
+    }
+}
+
 test "M23 inline joined paragraph search maps CRLF joins and first authored positions" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

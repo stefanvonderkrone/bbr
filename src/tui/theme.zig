@@ -78,6 +78,7 @@ pub const Theme = struct {
     markdown_italic: Color = .{ .rgb = .{ 0x40, 0xe0, 0xd0 } },
     markdown_bold: Color = .{ .rgb = .{ 0xff, 0xa5, 0x00 } },
     markdown_inline_code: Color = .{ .rgb = .{ 0x90, 0xee, 0x90 } },
+    code_background: Color = .{ .rgb = .{ 0x2c, 0x2c, 0x2c } },
     /// A section divider (PR comments / Pending / Outdated).
     section: Style,
     /// The PR picker overlay's background rows.
@@ -145,6 +146,10 @@ pub const Theme = struct {
             },
             .header => style.bold = true,
             .body => style.bold = false,
+            .code_body => {
+                style = self.context;
+                style.bg = self.code_background;
+            },
         }
         style.italic = style.italic or marks.emphasis;
         style.bold = style.bold or marks.strong;
@@ -305,6 +310,7 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
         .markdown_italic = rgb(if (p.light) 0x00_80_80 else 0x40_e0_d0),
         .markdown_bold = rgb(if (p.light) 0xa6_50_00 else 0xff_a5_00),
         .markdown_inline_code = rgb(if (p.light) 0x20_7a_36 else 0x90_ee_90),
+        .code_background = rgb(p.surface2),
         .section = .{ .fg = rgb(p.muted), .bg = rgb(p.bg), .bold = true },
         .picker = .{ .fg = rgb(p.fg), .bg = rgb(p.surface) },
         .picker_selected = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2), .bold = true },
@@ -359,6 +365,7 @@ pub const system: Theme = .{
     .markdown_italic = .{ .index = 6 },
     .markdown_bold = .{ .index = 208 },
     .markdown_inline_code = .{ .index = 2 },
+    .code_background = .{ .index = 8 },
     .section = .{ .fg = .{ .index = 8 }, .bold = true },
     .picker = .{},
     .picker_selected = .{ .reverse = true, .bold = true },

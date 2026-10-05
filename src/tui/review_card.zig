@@ -28,7 +28,7 @@ pub const Source = union(enum) {
 };
 
 pub const CardRole = enum { comment, comment_reply, deleted_comment, deleted_reply, draft, draft_reply, outcome_unknown, outcome_unknown_reply };
-pub const Part = enum { header, body, suggestion_label, suggestion_body, disclosure_footer };
+pub const Part = enum { header, body, code_body, suggestion_label, suggestion_body, disclosure_footer };
 
 pub const Segment = struct {
     text: []const u8,
@@ -55,6 +55,7 @@ pub const ReviewCardRow = struct {
     /// Only the first authored blank line represented by an empty row.
     blank_source: ?usize = null,
     hidden_line: ?SourceRange = null,
+    fences: ?[2]SourceRange = null,
     plain_label: ?[]const u8 = null,
 
     pub fn contentColumn(self: ReviewCardRow) usize {
@@ -183,12 +184,14 @@ const Writer = struct {
     kind: BlockKind = .paragraph,
     part: Part = .body,
     hidden_line: ?SourceRange = null,
+    fences: ?[2]SourceRange = null,
 
     fn block(self: *Writer, value: body_mod.Block, ordinal: usize) !void {
         self.ordinal = ordinal;
         self.kind = value.kind;
         self.part = .body;
         self.hidden_line = value.hidden_line;
+        self.fences = value.fences;
         switch (value.kind) {
             .spacer => try self.emitEmpty(value.source),
             .suggestion => {
@@ -199,19 +202,8 @@ const Writer = struct {
                     .authored = false,
                 }}, .suggestion_label);
                 self.part = .suggestion_body;
-                const content = value.spans[0];
-                var pos: usize = 0;
-                while (pos < content.text.len) {
-                    const newline = std.mem.indexOfScalarPos(u8, content.text, pos, '\n') orelse content.text.len;
-                    const line_range: SourceRange = .{ .start = content.source.start + pos, .end = content.source.start + newline };
-                    if (newline == pos) {
-                        try self.emitEmpty(line_range);
-                    } else {
-                        try self.addToken(content.text[pos..newline], line_range, .{}, true);
-                        try self.flush();
-                    }
-                    pos = if (newline < content.text.len) newline + 1 else content.text.len;
-                }
+                for (value.spans) |span| try self.addToken(span.text, span.source, .{}, true);
+                try self.flush();
             },
             .heading => |level| {
                 self.part = .body;
@@ -220,7 +212,12 @@ const Writer = struct {
                 for (value.spans) |span| try self.addSpan(span, true);
                 try self.flush();
             },
-            .paragraph, .literal => {
+            .code, .literal => {
+                if (value.kind == .code) self.part = .code_body;
+                for (value.spans) |span| try self.addToken(span.text, span.source, .{}, true);
+                try self.flush();
+            },
+            .paragraph => {
                 for (value.spans) |span| try self.addSpan(span, false);
                 try self.flush();
             },
@@ -285,17 +282,18 @@ const Writer = struct {
     fn addToken(self: *Writer, text: []const u8, range: SourceRange, marks: Marks, authored: bool) !void {
         var pos: usize = 0;
         var code_column: usize = 0;
+        const literal = marks.inline_code or self.kind == .code or self.kind == .suggestion or self.kind == .literal;
         while (pos < text.len) {
-            if (marks.inline_code and (text[pos] == '\n' or (text[pos] == '\r' and pos + 1 < text.len and text[pos + 1] == '\n'))) {
+            if (literal and (text[pos] == '\n' or (text[pos] == '\r' and pos + 1 < text.len and text[pos + 1] == '\n'))) {
                 const newline_length: usize = if (text[pos] == '\r') 2 else 1;
-                if (self.current.items.len == 0) {
+                if (self.current.items.len == 0 and code_column == 0) {
                     try self.emitEmpty(.{ .start = range.start + pos, .end = range.start + pos + newline_length });
                 } else try self.flush();
                 pos += newline_length;
                 code_column = 0;
                 continue;
             }
-            if (marks.inline_code and text[pos] == '\t') {
+            if (literal and text[pos] == '\t') {
                 const spaces = 4 - code_column % 4;
                 for (0..spaces) |_| {
                     if (self.current_width >= self.width) try self.flush();
@@ -339,6 +337,8 @@ const Writer = struct {
     fn emitEmpty(self: *Writer, range: SourceRange) !void {
         var row = makeRow(self.options, self.part, self.ordinal, self.kind, range, &.{});
         row.blank_source = range.start;
+        row.hidden_line = self.hidden_line;
+        row.fences = self.fences;
         try self.rows.append(self.allocator, row);
     }
 
@@ -347,6 +347,7 @@ const Writer = struct {
         const segments = try self.current.toOwnedSlice(self.allocator);
         var row = makeRow(self.options, self.part, self.ordinal, self.kind, self.current_range.?, segments);
         row.hidden_line = self.hidden_line;
+        row.fences = self.fences;
         try self.rows.append(self.allocator, row);
         self.current = .empty;
         self.current_width = 0;
@@ -376,6 +377,30 @@ fn measuredWidth(metrics: CellMetrics, text: []const u8) usize {
 }
 
 const testing = std.testing;
+
+test "M23 literal code wraps complete whitespace from its own tab origin" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "```zig\r\na\tb  \r\n\n  *x* :mask: <b>\n```", "~~~suggestion\r\na\tb  \r\n\n  *x* :mask: <b>\n~~~", "    a\tb  \r\n\n      *x* :mask: <b>\n" }) |raw| {
+        const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
+        for ([_]usize{ 80, 3, 1 }) |width| for ([_]usize{ 0, 7 }) |indent| {
+            const rows = try project(a, try ReviewBody.parse(a, raw), .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment_reply, .header = "Ada", .content_width = width, .metrics = TestMetrics.value, .collapsed_rows = 0, .indent = indent });
+            var visible: std.ArrayList(u8) = .empty;
+            var blanks: usize = 0;
+            for (rows[1..]) |row| {
+                if (row.part == .suggestion_label) continue;
+                if (row.segments.len == 0) blanks += 1;
+                for (row.segments) |segment| {
+                    try testing.expect(!segment.marks.inline_code and !segment.marks.strong);
+                    try visible.appendSlice(a, segment.text);
+                }
+            }
+            try testing.expectEqualStrings("a   b    *x* :mask: <b>", visible.items);
+            try testing.expectEqual(@as(usize, 1), blanks);
+        };
+    }
+}
 
 test "M23 inline heading levels and paragraph rows hide syntax with exact source ownership" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

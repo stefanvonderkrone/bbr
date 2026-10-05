@@ -11622,7 +11622,7 @@ fn selectionYankRow(published: *const Published, visual: frame_mod.VisualRow) ?S
         else => return null,
     };
     if (!scopeOnSelectedVersion(card.scope, published.selected_version)) return null;
-    if (card.part == .body or card.part == .suggestion_body) return .{ .body = card };
+    if (card.part == .body or card.part == .code_body or card.part == .suggestion_body) return .{ .body = card };
     const label = if (card.part == .suggestion_label) "suggestion" else card.plain_label orelse plainCardLabel(card.text());
     if (label.len == 0) return null;
     return .{ .label = .{
@@ -11643,6 +11643,7 @@ const CardYankLines = struct {
     cache: *CardYankLineCache,
     offset: usize,
     end: usize,
+    fence_index: usize = 0,
 
     fn init(card: review_card.ReviewCardRow, cache: *CardYankLineCache) CardYankLines {
         const raw = card.source.body();
@@ -11672,6 +11673,10 @@ const CardYankLines = struct {
 
     fn next(self: *CardYankLines) ?review_card.SourceRange {
         const raw = self.card.source.body();
+        if (self.end > 0 and self.fence_index == 0) {
+            self.fence_index = 1;
+            if (self.card.fences) |fences| return fences[0];
+        }
         while (self.offset < self.end) {
             const start = self.offset;
             const end = if (self.cache.line != null and self.cache.line.?.start == start)
@@ -11684,6 +11689,10 @@ const CardYankLines = struct {
             for (self.card.segments) |segment| {
                 if (segment.authored and segment.source.start < end and segment.source.end > start) return .{ .start = start, .end = end };
             }
+        }
+        if (self.end > 0 and self.fence_index == 1) {
+            self.fence_index = 2;
+            if (self.card.fences) |fences| return fences[1];
         }
         return null;
     }
@@ -17904,7 +17913,7 @@ test "M23 yank copies complete authored bytes from every ReviewCard part without
         });
         defer presentation.deinit();
         if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
-        var seen = [_]bool{false} ** 5;
+        var seen = [_]bool{false} ** std.meta.fields(review_card.Part).len;
         var index: usize = 0;
         while (index < presentation.projection().review.?.frame.visual_rows.len) : (index += 1) {
             const visual = presentation.projection().review.?.frame.visual_rows[index];
@@ -18399,6 +18408,44 @@ fn selectRows(presentation: *Presentation, start: usize, end: usize) !void {
         try presentation.dispatch(.{ .action = if (index < end) .down else .up });
         if (index < end) index += 1 else index -= 1;
     }
+}
+
+test "M23 literal yank selected code adds existing fences without unselected lines in both layouts" {
+    const examples = [_]struct { raw: []const u8, expected: []const u8, second: bool = false }{
+        .{ .raw = "  ````zig metadata\r\n  \tfirst  \r\n  second\n  `````\nafter", .expected = "  ````zig metadata\r\n  \tfirst  \r\n  `````\n" },
+        .{ .raw = " ~~~suggestion\r\n \tfirst  \r\n second\n ~~~~", .expected = " ~~~suggestion\r\n \tfirst  \r\n ~~~~" },
+        .{ .raw = "    \tfirst  \r\n    second\nafter", .expected = "    \tfirst  \r\n" },
+        .{ .raw = "**before**\n```suggestion\n\tfirst  \r\nsecond", .expected = "\tfirst  \r\n" },
+        .{ .raw = "```zig metadata\r\n\tfirst  \r\nsecond\nthird\n```\n", .expected = "```zig metadata\r\n\tfirst  \r\nsecond\n```\n", .second = true },
+    };
+    for (examples) |example| for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const session = try testCommentSession(testing.allocator, 1);
+        @constCast(session.threads[0].root).body = example.raw;
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 0 }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+            .geometry = .{ .cols = 48, .rows = 40 },
+        });
+        defer presentation.deinit();
+        if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        var first: ?usize = null;
+        var last: ?usize = null;
+        const content = std.mem.indexOf(u8, example.raw, "\tfirst").?;
+        const content_end = if (example.second) std.mem.indexOf(u8, example.raw, "third").? else content + "\tfirst  ".len;
+        for (presentation.projection().review.?.frame.visual_rows, 0..) |visual, index| {
+            const row = presentation.projection().review.?.buffer.rows[visual.buffer_index];
+            if (row != .comment or row.comment.source_range.start < content or row.comment.source_range.start >= content_end) continue;
+            if (first == null) first = index;
+            last = index;
+        }
+        try testing.expect(first != null);
+        try selectRows(&presentation, last.?, first.?);
+        try presentation.dispatch(.{ .action = .yank });
+        var command = presentation.takeCommand().?;
+        defer command.deinit();
+        try testing.expectEqualStrings(example.expected, command.copy_clipboard.text);
+    };
 }
 
 test "M23 yank Selection keeps empty source Lines between contributions" {
