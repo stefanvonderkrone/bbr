@@ -1,6 +1,56 @@
 //! Pure, width-independent interpretation of authored review Markdown.
 
 const std = @import("std");
+const emoji = @import("emoji.zig");
+
+test "M23 emoji converts exact fixture sequences through shared prose rules" {
+    const raw = "## **:heart: :one: :flag_gb: :woman_technologist::skin-tone-2:**\n\n- :mask:\n\n> [:thumbsup::skin-tone-2:](url/:mask:)\n\n| :white_check_mark: |\n| --- |\n| :mask: |";
+    const body = try ReviewBody.parse(std.testing.allocator, raw);
+    defer freeBlocks(std.testing.allocator, body.blocks);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    for (body.blocks) |block| for (block.spans) |span| {
+        if (!span.hidden and !span.generated) try text.appendSlice(std.testing.allocator, span.text);
+    };
+    try std.testing.expectEqualStrings("❤ 1️⃣ 🇬🇧 👩🏻‍💻😷👍🏻url/:mask:✅😷", text.items);
+    try std.testing.expectEqualStrings(raw, body.source);
+}
+
+test "M23 emoji every pinned fixture entry and variation keeps exact Unicode bytes" {
+    const Entry = struct {
+        shortName: []const u8,
+        fallback: []const u8,
+        skinVariations: []const @This() = &.{},
+
+        fn check(self: @This()) !void {
+            const body = try ReviewBody.parse(std.testing.allocator, self.shortName);
+            defer freeBlocks(std.testing.allocator, body.blocks);
+            try std.testing.expectEqual(@as(usize, 1), body.blocks.len);
+            try std.testing.expectEqual(@as(usize, 1), body.blocks[0].spans.len);
+            const span = body.blocks[0].spans[0];
+            try std.testing.expectEqualStrings(self.fallback, span.text);
+            try std.testing.expectEqualStrings(self.shortName, span.emoji);
+            try std.testing.expectEqual(SourceRange{ .start = 0, .end = self.shortName.len }, span.source);
+            for (self.skinVariations) |variation| try variation.check();
+        }
+    };
+    const fixture = try std.json.parseFromSlice(struct { emojis: []const Entry }, std.testing.allocator, @embedFile("emoji-fixture/service-data-standard.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    for (fixture.value.emojis) |entry| try entry.check();
+}
+
+test "M23 emoji keeps escapes unknown names aliases ASCII and code literal" {
+    const raw = "\\:mask: :MASK: :Mask: :unknown: :+1: :thumbs_up: :gb: (y) :-) :white\\_check_mark: `:mask:` [label](dest/:mask: \"title :mask:\")\n\n```\n:mask:\n```\n\n    :mask:\n\n```suggestion\n:mask:\n```";
+    const body = try ReviewBody.parse(std.testing.allocator, raw);
+    defer freeBlocks(std.testing.allocator, body.blocks);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    for (body.blocks) |block| for (block.spans) |span| {
+        try std.testing.expectEqual(@as(usize, 0), span.emoji.len);
+        if (!span.hidden and !span.generated) try text.appendSlice(std.testing.allocator, span.text);
+    };
+    try std.testing.expectEqualStrings(":mask: :MASK: :Mask: :unknown: :+1: :thumbs_up: :gb: (y) :-) :white_check_mark: :mask: labeldest/:mask:\"title :mask:\":mask:\n:mask:\n:mask:\n", text.items);
+}
 
 pub const SourceRange = struct {
     start: usize,
@@ -29,6 +79,8 @@ pub const Span = struct {
     join: bool = false,
     generated: bool = false,
     boundary: bool = false,
+    /// One indivisible conversion with an exact authored matching alternative.
+    emoji: []const u8 = "",
     destination_brackets: bool = true,
     /// Reference text retains definition bytes apart from visible-use coordinates.
     definition_source: ?SourceRange = null,
@@ -786,6 +838,13 @@ fn parseInline(allocator: std.mem.Allocator, source: []const u8, start: usize, e
     var pos = start;
     var plain = start;
     while (pos < end) {
+        if (source[pos] == ':') if (emoji.at(source[pos..end])) |converted| {
+            try appendSpan(&spans, allocator, source, plain, pos, .{});
+            try spans.append(allocator, .{ .text = converted.text, .source = .{ .start = pos, .end = pos + converted.authored_len }, .emoji = converted.name });
+            pos += converted.authored_len;
+            plain = pos;
+            continue;
+        };
         if (source[pos] == '\\' and pos + 1 < end and isEscapable(source[pos + 1])) {
             try appendSpan(&spans, allocator, source, plain, pos, .{});
             try appendHidden(&spans, allocator, pos, pos + 1, false);

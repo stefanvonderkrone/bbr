@@ -36,6 +36,7 @@ pub const Segment = struct {
     marks: Marks = .{},
     /// False for terminal markers and generated spacing, even with a source range.
     authored: bool = true,
+    atomic: bool = false,
     definition_source: ?SourceRange = null,
     required_definition: ?SourceRange = null,
 };
@@ -340,6 +341,17 @@ const Writer = struct {
         marks.strong = marks.strong or force_strong;
         self.reference = if (span.definition_source != null) span else null;
         defer self.reference = null;
+        if (span.emoji.len > 0) {
+            const cells = self.options.metrics.width(span.text);
+            try self.addPrefix(cells);
+            if (self.current_width > self.prefix_width and self.current_width + cells > self.width) {
+                try self.flush();
+                try self.addPrefix(cells);
+            }
+            try self.append(.{ .text = span.text, .source = span.source, .marks = marks, .atomic = true }, cells);
+            if (self.current_width >= self.width) try self.flush();
+            return;
+        }
         if (span.generated) {
             try self.addToken(span.text, span.source, marks, false);
             return;
@@ -543,6 +555,35 @@ fn measuredWidth(metrics: CellMetrics, text: []const u8) usize {
 }
 
 const testing = std.testing;
+
+test "M23 emoji projection preserves compounds with adapter supplied terminal widths" {
+    const Metrics = struct {
+        fn next(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
+            return .{ .byte_len = std.unicode.utf8ByteSequenceLength(text[0]) catch 1, .cell_width = 1 };
+        }
+        fn width(ptr: *const anyopaque, text: []const u8) usize {
+            const cells: *const usize = @ptrCast(@alignCast(ptr));
+            return if (std.mem.eql(u8, text, "👩🏻‍💻")) cells.* else text.len;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "ab :woman_technologist::skin-tone-2: z";
+    const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
+    const body = try ReviewBody.parse(a, raw);
+    for ([_]usize{ 3, 5 }) |cells| for ([_]usize{ 1, 4, 8 }) |width| {
+        const rows = try project(a, body, .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "Ada", .content_width = width, .metrics = .{ .ptr = &cells, .vtable = &.{ .next = Metrics.next, .width = Metrics.width } }, .collapsed_rows = 0 });
+        var count: usize = 0;
+        for (rows) |row| for (row.segments) |segment| if (segment.atomic) {
+            count += 1;
+            try testing.expectEqualStrings("👩🏻‍💻", segment.text);
+            try testing.expectEqualStrings(":woman_technologist::skin-tone-2:", raw[segment.source.start..segment.source.end]);
+            if (width == 8) try testing.expectEqual(@as(usize, 0), row.source_range.start);
+        };
+        try testing.expectEqual(@as(usize, 1), count);
+    };
+}
 
 test "M23 tables project aligned columns and wrapped generated labels as project behavior" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

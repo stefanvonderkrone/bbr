@@ -164,7 +164,11 @@ fn searchSourceText(row: Row, visual: @import("frame.zig").VisualRow, relation: 
 }
 
 fn drawReviewCardSearchRange(win: vaxis.Window, row: u16, card: buffer_mod.ReviewCardRow, range: @import("frame.zig").ProjectedSourceRange, active: bool, theme: Theme) void {
-    var col: usize = card.contentColumn();
+    drawReviewCardSearchRangeAt(win, row, card, card.contentColumn(), range, active, theme);
+}
+
+fn drawReviewCardSearchRangeAt(win: vaxis.Window, row: u16, card: buffer_mod.ReviewCardRow, column: usize, range: @import("frame.zig").ProjectedSourceRange, active: bool, theme: Theme) void {
+    var col = column;
     for (card.segments) |segment| {
         const source = segment.definition_source orelse segment.source;
         const use_matches = range.source.start < segment.source.end and range.source.end > segment.source.start;
@@ -172,7 +176,7 @@ fn drawReviewCardSearchRange(win: vaxis.Window, row: u16, card: buffer_mod.Revie
         const start = if (matched) |value| @max(value.start, source.start) else 0;
         const end = if (matched) |value| @min(value.end, source.end) else 0;
         if (segment.authored and start < end) {
-            const equal_length = source.end - source.start == segment.text.len;
+            const equal_length = !segment.atomic and source.end - source.start == segment.text.len;
             const local_start = if (equal_length) start - source.start else 0;
             const local_end = if (equal_length) end - source.start else segment.text.len;
             if (local_end <= segment.text.len) {
@@ -1261,6 +1265,17 @@ fn drawReviewSearchPreview(scratch: std.mem.Allocator, win: vaxis.Window, result
             segments[index] = .{ .text = segment.text, .style = style };
         }
         _ = win.print(segments, .{ .row_offset = row, .wrap = .none });
+        // vaxis prints the leading cell of a wide grapheme. Paint the complete
+        // terminal range, including continuation cells, just as ReviewCards do.
+        for (result.occurrence.ranges) |range| {
+            if (result.occurrence.definition_ranges.len == 0) {
+                drawReviewCardSearchRangeAt(win, row, card, 0, .{ .visual_row = row, .relation = .neutral, .source = range, .row = range, .active = true }, true, theme);
+            } else {
+                for (result.occurrence.definition_ranges) |definition| {
+                    drawReviewCardSearchRangeAt(win, row, card, 0, .{ .visual_row = row, .relation = .neutral, .source = range, .definition = definition, .row = range, .active = true }, true, theme);
+                }
+            }
+        }
         row += 1;
     }
 }
@@ -1276,6 +1291,70 @@ fn nextVaxisGrapheme(_: *const anyopaque, text: []const u8) @import("cell_metric
 
 fn widthVaxisText(_: *const anyopaque, text: []const u8) usize {
     return vaxis.gwidth.gwidth(text, .unicode);
+}
+
+test "M23 emoji ReviewCards and Preview paint complete sequences with shared terminal columns" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const examples = [_]struct { name: []const u8, text: []const u8 }{
+        .{ .name = ":v:", .text = "✌" },
+        .{ .name = ":heart:", .text = "❤" },
+        .{ .name = ":one:", .text = "1️⃣" },
+        .{ .name = ":flag_gb:", .text = "🇬🇧" },
+        .{ .name = ":woman_technologist:", .text = "👩‍💻" },
+        .{ .name = ":woman_technologist::skin-tone-2:", .text = "👩🏻‍💻" },
+    };
+    for (examples) |example| {
+        const raw = try std.fmt.allocPrint(a, "**{s}** x", .{example.name});
+        const ranges = [_]@import("search.zig").Range{.{ .start = 3, .end = 4 }};
+        const result: presentation.ReviewSearchResult = .{
+            .kind = "COMMENT",
+            .source = "Ada",
+            .body = raw,
+            .scope = .review,
+            .scope_state = .current,
+            .occurrence = .{ .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 1 } }, .ranges = @constCast(&ranges), .column = 3, .candidate_scalars = 1, .corpus_order = 0, .session_epoch = 1 },
+        };
+        const cells = terminal_cell_metrics.width(example.text);
+        var screen = try vaxis.Screen.init(a, .{ .rows = 8, .cols = @intCast(cells + 12), .x_pixel = 0, .y_pixel = 0 });
+        screen.width_method = .unicode;
+        defer screen.deinit(a);
+        const win = headlessWindow(&screen);
+        const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
+        const draft: bbr.review.Draft = .{ .local_id = 1, .kind = .comment, .body = raw };
+        const card_mod = @import("review_card.zig");
+        const body = try card_mod.ReviewBody.parse(a, raw);
+        for (@import("theme.zig").builtins) |builtin| {
+            const theme = builtin.value;
+            drawReviewSearchPreview(a, win, result, 0, theme, terminal_cell_metrics);
+            try testing.expectEqualStrings(example.text, win.readCell(0, 0).?.char.grapheme);
+            try testing.expectEqualStrings("x", win.readCell(@intCast(cells + 1), 0).?.char.grapheme);
+            for (0..cells) |col| {
+                const style = win.readCell(@intCast(col), 0).?.style;
+                try testing.expectEqual(theme.search_active, style.bg);
+            }
+            try testing.expectEqual(theme.markdown_bold, win.readCell(0, 0).?.style.fg);
+            try testing.expect(win.readCell(0, 0).?.style.bold);
+            inline for (std.meta.tags(card_mod.CardRole)) |role| {
+                const is_draft = switch (role) {
+                    .draft, .draft_reply, .outcome_unknown, .outcome_unknown_reply => true,
+                    else => false,
+                };
+                const rows = try card_mod.project(a, body, .{ .owner = if (is_draft) .{ .draft = 1 } else .{ .comment = 1 }, .source = if (is_draft) .{ .draft = &draft } else .{ .comment = &comment }, .role = role, .header = "Ada", .content_width = cells + 3, .metrics = terminal_cell_metrics, .collapsed_rows = 0 });
+                drawReviewCard(a, win, 1, rows[1], theme);
+                drawReviewCardSearchRange(win, 1, rows[1], .{ .visual_row = 1, .relation = .neutral, .source = ranges[0], .row = ranges[0], .active = true }, true, theme);
+                try testing.expectEqualStrings(example.text, win.readCell(4, 1).?.char.grapheme);
+                try testing.expectEqualStrings("x", win.readCell(@intCast(4 + cells + 1), 1).?.char.grapheme);
+                for (4..4 + cells) |col| {
+                    const style = win.readCell(@intCast(col), 1).?.style;
+                    try testing.expectEqual(theme.search_active, style.bg);
+                }
+                try testing.expectEqual(theme.markdown_bold, win.readCell(4, 1).?.style.fg);
+                try testing.expect(win.readCell(4, 1).?.style.bold);
+            }
+        }
+    }
 }
 
 test "M23 tables Preview and ReviewCards share layouts and Theme styles as project behavior" {

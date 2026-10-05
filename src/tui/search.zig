@@ -19,6 +19,8 @@ pub const Mapping = struct {
     authored_column: ?usize = null,
     authored_line: ?u32 = null,
     definition_source: ?Range = null,
+    /// Static catalog bytes. Either branch consumes this authored location once.
+    alternative: []const u8 = "",
 };
 
 pub const VersionRelation = enum { neutral, old, new };
@@ -274,6 +276,14 @@ pub fn scan(
         defer allocator.free(scalars);
         const regions = try scalarRegions(allocator, scalars, candidate.boundaries);
         defer allocator.free(regions);
+        var has_emoji = false;
+        for (candidate.mapping) |entry| has_emoji = has_emoji or entry.alternative.len > 0;
+        if (has_emoji) {
+            if (mode == .literal) {
+                for (regions) |region| try scanEmojiLiteral(allocator, query, candidate, scalars, region, &occurrences);
+            } else try scanEmojiFuzzy(allocator, query, candidate, scalars, regions, &occurrences);
+            continue;
+        }
         switch (mode) {
             .literal => for (regions) |region| try scanLiteral(allocator, query, candidate, scalars, region, &occurrences),
             .fuzzy => {
@@ -485,6 +495,473 @@ fn alignmentBetter(left: Alignment, right: Alignment) bool {
     return left.positions[0] < right.positions[0];
 }
 
+const no_node: usize = std.math.maxInt(usize);
+const BranchNode = struct { scalar: Scalar, previous: [2]usize, authored_form: bool = false };
+
+fn appendBranch(allocator: std.mem.Allocator, nodes: *std.ArrayList(BranchNode), text: []const u8, semantic: Range, previous: [2]usize, atomic: bool) !usize {
+    var before = previous;
+    const scalars = try decode(allocator, text);
+    defer allocator.free(scalars);
+    for (scalars) |scalar| {
+        try nodes.append(allocator, .{ .scalar = .{ .value = scalar.value, .bytes = if (atomic) semantic else .{ .start = semantic.start + scalar.bytes.start, .end = semantic.start + scalar.bytes.end } }, .previous = before, .authored_form = atomic and scalar.bytes.start == 0 });
+        before = .{ nodes.items.len - 1, no_node };
+    }
+    return before[0];
+}
+
+// The two branches rejoin only after the complete emoji. A match can never
+// walk from its displayed sequence into its own shortcode sequence.
+fn emojiGraph(allocator: std.mem.Allocator, query: Query, candidate: Candidate, start_byte: usize, end_byte: usize, nodes: *std.ArrayList(BranchNode)) ![2]usize {
+    var previous = [_]usize{ no_node, no_node };
+    var offset = start_byte;
+    for (candidate.mapping) |entry| {
+        if (entry.alternative.len == 0 or entry.semantic.start < start_byte or entry.semantic.end > end_byte) continue;
+        if (offset < entry.semantic.start) previous = .{ try appendBranch(allocator, nodes, candidate.text[offset..entry.semantic.start], .{ .start = offset, .end = entry.semantic.start }, previous, false), no_node };
+        const displayed = try appendBranch(allocator, nodes, candidate.text[entry.semantic.start..entry.semantic.end], entry.semantic, previous, false);
+        var supplies_query = false;
+        for (entry.alternative) |byte| for (query.scalars) |needle| {
+            supplies_query = supplies_query or equalScalar(query, needle, byte);
+        };
+        // Unmatched shortcode branches have the same following boundary bonus
+        // as emoji, but add gaps and authored forms. Displayed text dominates.
+        const authored = if (supplies_query) try appendBranch(allocator, nodes, entry.alternative, entry.semantic, previous, true) else no_node;
+        previous = .{ displayed, authored };
+        offset = entry.semantic.end;
+    }
+    if (offset < end_byte) previous = .{ try appendBranch(allocator, nodes, candidate.text[offset..end_byte], .{ .start = offset, .end = end_byte }, previous, false), no_node };
+    return previous;
+}
+
+fn scanEmojiLiteral(allocator: std.mem.Allocator, query: Query, candidate: Candidate, scalars: []const Scalar, region: Range, occurrences: *std.ArrayList(Occurrence)) !void {
+    if (region.start == region.end) return;
+    var nodes: std.ArrayList(BranchNode) = .empty;
+    defer nodes.deinit(allocator);
+    _ = try emojiGraph(allocator, query, candidate, scalars[region.start].bytes.start, scalars[region.end - 1].bytes.end, &nodes);
+    if (query.scalars.len > nodes.items.len) return;
+    var before = try allocator.alloc(usize, nodes.items.len);
+    defer allocator.free(before);
+    var current = try allocator.alloc(usize, nodes.items.len);
+    defer allocator.free(current);
+    @memset(before, no_node);
+    for (query.scalars, 0..) |needle, qi| {
+        @memset(current, no_node);
+        var live = false;
+        for (nodes.items, 0..) |node, ni| {
+            if (!equalScalar(query, needle, node.scalar.value)) continue;
+            if (qi == 0) {
+                current[ni] = node.scalar.bytes.start;
+            } else {
+                for (node.previous) |predecessor| {
+                    if (predecessor != no_node) current[ni] = @min(current[ni], before[predecessor]);
+                }
+            }
+            live = live or current[ni] != no_node;
+        }
+        if (!live) return;
+        const swap = before;
+        before = current;
+        current = swap;
+    }
+    var matches: std.ArrayList(Range) = .empty;
+    defer matches.deinit(allocator);
+    for (nodes.items, before) |node, first| if (first != no_node) {
+        try matches.append(allocator, .{ .start = first, .end = node.scalar.bytes.end });
+    };
+    std.mem.sort(Range, matches.items, {}, struct {
+        fn less(_: void, left: Range, right: Range) bool {
+            return if (left.start != right.start) left.start < right.start else left.end < right.end;
+        }
+    }.less);
+    var authored_end: usize = 0;
+    var scalar_cursor = region.start;
+    for (matches.items) |match| {
+        var positions: std.ArrayList(usize) = .empty;
+        defer positions.deinit(allocator);
+        while (scalar_cursor < region.end and scalars[scalar_cursor].bytes.end <= match.start) scalar_cursor += 1;
+        var index = scalar_cursor;
+        while (index < region.end and scalars[index].bytes.start < match.end) : (index += 1) try positions.append(allocator, index);
+        var occurrence = try makeOccurrence(allocator, candidate, scalars, positions.items, 0, .exact);
+        errdefer occurrence.deinit(allocator);
+        if (occurrence.ranges[0].start < authored_end) {
+            occurrence.deinit(allocator);
+            continue;
+        }
+        authored_end = occurrence.ranges[occurrence.ranges.len - 1].end;
+        try occurrences.append(allocator, occurrence);
+    }
+}
+
+const BranchPath = struct {
+    // All M21 weights are multiples of 1/200. Integer accumulation preserves
+    // mathematical ties before representation and authored-alignment ordering.
+    score: i64 = std.math.minInt(i64),
+    authored_forms: usize = 0,
+    length: usize = 0,
+    first: usize = no_node,
+    last: usize = no_node,
+    previous: usize = no_node,
+    matched: bool = false,
+
+    fn better(left: BranchPath, right: BranchPath) bool {
+        if (left.score != right.score) return left.score > right.score;
+        if (left.authored_forms != right.authored_forms) return left.authored_forms < right.authored_forms;
+        return left.first < right.first;
+    }
+
+    fn step(self: BranchPath, node: BranchNode, score: f64, previous: usize, matched: bool) BranchPath {
+        if (self.score == std.math.minInt(i64)) return .{};
+        return .{
+            .score = self.score + @as(i64, @intFromFloat(@round(score * 200))),
+            .authored_forms = self.authored_forms + @intFromBool(node.authored_form),
+            .length = self.length + 1,
+            .first = if (matched and self.first == no_node) node.scalar.bytes.start else self.first,
+            .last = if (matched) node.scalar.bytes.start else self.last,
+            .previous = previous,
+            .matched = matched,
+        };
+    }
+
+    fn resultScore(self: BranchPath) f64 {
+        return if (self.score == std.math.maxInt(i64)) score_max else @as(f64, @floatFromInt(self.score)) / 200;
+    }
+};
+
+const BranchTrace = struct { path: BranchPath, node: usize, next: usize = no_node };
+const BranchFrontiers = struct { exact: usize = no_node, best: usize = no_node };
+const EmojiAlignment = struct {
+    positions: []usize,
+    path: BranchPath,
+};
+
+fn alignmentOrder(left: BranchPath, right: BranchPath, traces: []const BranchTrace) i8 {
+    var left_positions: [max_query_scalars]usize = undefined;
+    var right_positions: [max_query_scalars]usize = undefined;
+    var starts = [_]usize{ max_query_scalars, max_query_scalars };
+    for ([_]BranchPath{ left, right }, 0..) |initial, side| {
+        var path = initial;
+        while (true) {
+            if (path.matched) {
+                starts[side] -= 1;
+                if (side == 0) left_positions[starts[side]] = path.last else right_positions[starts[side]] = path.last;
+            }
+            if (path.previous == no_node) break;
+            path = traces[path.previous].path;
+        }
+    }
+    for (left_positions[starts[0]..], right_positions[starts[1]..]) |a, b| {
+        if (a != b) return if (a < b) -1 else 1;
+    }
+    return 0;
+}
+
+fn traceBetter(left: BranchPath, right: BranchPath, traces: []const BranchTrace) bool {
+    if (left.score != right.score or left.authored_forms != right.authored_forms or left.first != right.first) return left.better(right);
+    return alignmentOrder(left, right, traces) < 0;
+}
+
+// Keep the score/length frontier. A longer, higher-scoring prefix must not
+// discard a shorter prefix that alone can finish within M21's work limit.
+fn appendFrontier(allocator: std.mem.Allocator, traces: *std.ArrayList(BranchTrace), head: *usize, path: BranchPath, node: usize, remaining: usize, limit: usize) !void {
+    if (path.score == std.math.minInt(i64) or remaining > limit or path.length > limit - remaining) return;
+    var link = head;
+    while (link.* != no_node) {
+        const index = link.*;
+        const current = traces.items[index].path;
+        const tied = current.score == path.score and current.authored_forms == path.authored_forms and current.first == path.first;
+        const order = if (tied) alignmentOrder(current, path, traces.items) else @as(i8, 0);
+        if (current.length <= path.length and (current.better(path) or (tied and order <= 0))) return;
+        if (path.length <= current.length and (path.better(current) or (tied and order > 0))) {
+            link.* = traces.items[index].next;
+        } else link = &traces.items[index].next;
+    }
+    // ArrayList growth can invalidate link, so publish through head only.
+    const next = head.*;
+    try traces.append(allocator, .{ .path = path, .node = node, .next = next });
+    head.* = traces.items.len - 1;
+}
+
+fn exactEmojiAlignment(allocator: std.mem.Allocator, query: Query, nodes: []const BranchNode, ends: [2]usize, whole: bool) !?EmojiAlignment {
+    const limit = exact_fuzzy_cell_limit / query.scalars.len;
+    const remaining = try allocator.alloc(usize, nodes.len);
+    defer allocator.free(remaining);
+    @memset(remaining, no_node);
+    for (ends) |end| if (end != no_node) {
+        remaining[end] = 0;
+    };
+    var cursor = nodes.len;
+    while (cursor > 0) {
+        cursor -= 1;
+        for (nodes[cursor].previous) |previous| if (previous != no_node) {
+            remaining[previous] = @min(remaining[previous], remaining[cursor] + 1);
+        };
+    }
+    const leading = try allocator.alloc(BranchPath, nodes.len);
+    defer allocator.free(leading);
+    for (nodes, 0..) |node, index| {
+        var before: BranchPath = .{};
+        if (node.previous[0] == no_node) before = .{ .score = 0 };
+        for (node.previous) |previous| if (previous != no_node and leading[previous].better(before)) {
+            before = leading[previous];
+        };
+        leading[index] = before.step(node, score_gap_leading, no_node, false);
+    }
+    var shortest = no_node;
+    for (ends) |end| if (end != no_node) {
+        shortest = @min(shortest, leading[end].length);
+    };
+    if (shortest > limit) return null;
+    // Only the current and previous query rows remain live. Traceback records
+    // retain accepted paths, rather than a table for every mutually exclusive branch.
+    const table = try allocator.alloc(BranchFrontiers, 2 * nodes.len);
+    defer allocator.free(table);
+    for (table) |*cell| cell.* = .{};
+    var traces: std.ArrayList(BranchTrace) = .empty;
+    defer traces.deinit(allocator);
+    for (query.scalars, 0..) |needle, query_index| {
+        const current_row = table[(query_index % 2) * nodes.len ..][0..nodes.len];
+        const previous_row = table[((query_index + 1) % 2) * nodes.len ..][0..nodes.len];
+        for (current_row) |*cell| cell.* = .{};
+        const gap = if (query_index + 1 == query.scalars.len) score_gap_trailing else score_gap_inner;
+        for (nodes, 0..) |node, index| {
+            const cell = &current_row[index];
+            if (equalScalar(query, needle, node.scalar.value)) {
+                if (query_index == 0 and node.previous[0] == no_node) try appendFrontier(allocator, &traces, &cell.exact, (BranchPath{ .score = 0 }).step(node, score_match_word, no_node, true), index, remaining[index], limit);
+                for (node.previous) |previous| {
+                    if (previous == no_node) continue;
+                    if (query_index == 0) {
+                        try appendFrontier(allocator, &traces, &cell.exact, leading[previous].step(node, branchBonus(nodes[previous].scalar.value, node.scalar.value), no_node, true), index, remaining[index], limit);
+                    } else {
+                        const before = previous_row[previous];
+                        for ([_]struct { head: usize, bonus: f64 }{ .{ .head = before.exact, .bonus = score_match_consecutive }, .{ .head = before.best, .bonus = branchBonus(nodes[previous].scalar.value, node.scalar.value) } }) |track| {
+                            var trace = track.head;
+                            while (trace != no_node) {
+                                const value = traces.items[trace];
+                                try appendFrontier(allocator, &traces, &cell.exact, value.path.step(node, track.bonus, trace, true), index, remaining[index], limit);
+                                trace = value.next;
+                            }
+                        }
+                    }
+                }
+            }
+            var exact = cell.exact;
+            while (exact != no_node) {
+                const value = traces.items[exact];
+                try appendFrontier(allocator, &traces, &cell.best, value.path, index, remaining[index], limit);
+                exact = value.next;
+            }
+            for (node.previous) |previous| {
+                if (previous == no_node) continue;
+                var trace = current_row[previous].best;
+                while (trace != no_node) {
+                    const value = traces.items[trace];
+                    try appendFrontier(allocator, &traces, &cell.best, value.path.step(node, gap, trace, false), index, remaining[index], limit);
+                    trace = value.next;
+                }
+            }
+        }
+    }
+    var winner: BranchPath = .{};
+    var winner_index = no_node;
+    for (ends) |end| {
+        if (end == no_node) continue;
+        var trace = table[((query.scalars.len - 1) % 2) * nodes.len + end].best;
+        while (trace != no_node) {
+            const value = traces.items[trace];
+            var path = value.path;
+            if (whole and path.length == query.scalars.len) path.score = std.math.maxInt(i64);
+            if (traceBetter(path, winner, traces.items)) {
+                winner = path;
+                winner_index = trace;
+            }
+            trace = value.next;
+        }
+    }
+    if (winner_index == no_node) return null;
+    const positions = try allocator.alloc(usize, query.scalars.len);
+    var left = positions.len;
+    cursor = winner_index;
+    while (cursor != no_node) {
+        const value = traces.items[cursor];
+        if (value.path.matched) {
+            left -= 1;
+            positions[left] = value.node;
+        }
+        cursor = value.path.previous;
+    }
+    std.debug.assert(left == 0);
+    return .{ .positions = positions, .path = winner };
+}
+
+const GreedyState = struct {
+    path: BranchPath = .{},
+    previous_value: ?u21 = null,
+    positions: [max_query_scalars]Range = undefined,
+};
+
+fn greedyBetter(left: GreedyState, right: GreedyState, consumed: usize) bool {
+    if (left.path.score == std.math.minInt(i64)) return false;
+    if (left.path.score != right.path.score or left.path.authored_forms != right.path.authored_forms or left.path.first != right.path.first) return left.path.better(right.path);
+    for (left.positions[0..consumed], right.positions[0..consumed]) |a, b| {
+        if (a.start != b.start) return a.start < b.start;
+    }
+    return false;
+}
+
+fn advanceGreedy(query: Query, text: []const u8, semantic: Range, atomic: bool, current: *[]GreedyState, scratch: *[]GreedyState) void {
+    var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
+    var offset: usize = 0;
+    while (iterator.nextCodepointSlice()) |bytes| {
+        const scalar: Scalar = .{ .value = std.unicode.utf8Decode(bytes) catch unreachable, .bytes = if (atomic) semantic else .{ .start = semantic.start + offset, .end = semantic.start + offset + bytes.len } };
+        const node: BranchNode = .{ .scalar = scalar, .previous = .{ no_node, no_node }, .authored_form = atomic and offset == 0 };
+        for (scratch.*) |*state| state.path = .{};
+        for (current.*, 0..) |*state, index| {
+            if (state.path.score == std.math.minInt(i64)) continue;
+            const consumed = index / 2;
+            const matched = consumed < query.scalars.len and equalScalar(query, query.scalars[consumed], scalar.value);
+            const next = consumed + @intFromBool(matched);
+            const bonus = if (matched) if (consumed > 0 and state.path.matched) score_match_consecutive else branchBonus(state.previous_value, scalar.value) else if (consumed == 0) score_gap_leading else if (consumed == query.scalars.len) score_gap_trailing else score_gap_inner;
+            const path = state.path.step(node, bonus, no_node, matched);
+            const target = &scratch.*[next * 2 + @intFromBool(matched)];
+            var advanced = state.*;
+            advanced.path = path;
+            advanced.previous_value = scalar.value;
+            if (matched) advanced.positions[consumed] = scalar.bytes;
+            if (greedyBetter(advanced, target.*, next)) target.* = advanced;
+        }
+        const swap = current.*;
+        current.* = scratch.*;
+        scratch.* = swap;
+        offset += bytes.len;
+    }
+}
+
+fn greedyEmojiOccurrence(allocator: std.mem.Allocator, query: Query, candidate: Candidate, region: Range) !?struct { occurrence: Occurrence, forms: usize } {
+    const state_count = (query.scalars.len + 1) * 2;
+    var current = try allocator.alloc(GreedyState, state_count);
+    defer allocator.free(current);
+    var scratch = try allocator.alloc(GreedyState, state_count);
+    defer allocator.free(scratch);
+    const before = try allocator.alloc(GreedyState, state_count);
+    defer allocator.free(before);
+    const displayed = try allocator.alloc(GreedyState, state_count);
+    defer allocator.free(displayed);
+    for (current) |*state| state.path = .{};
+    current[0] = .{ .path = .{ .score = 0 } };
+    for (candidate.mapping) |entry| {
+        const start = @max(region.start, entry.semantic.start);
+        const end = @min(region.end, entry.semantic.end);
+        if (start >= end) continue;
+        if (entry.alternative.len == 0) {
+            advanceGreedy(query, candidate.text[start..end], .{ .start = start, .end = end }, false, &current, &scratch);
+        } else {
+            @memcpy(before, current);
+            advanceGreedy(query, candidate.text[start..end], .{ .start = start, .end = end }, false, &current, &scratch);
+            @memcpy(displayed, current);
+            @memcpy(current, before);
+            advanceGreedy(query, entry.alternative, entry.semantic, true, &current, &scratch);
+            for (current, displayed, 0..) |*authored, visible, index| if (greedyBetter(visible, authored.*, index / 2)) {
+                authored.* = visible;
+            };
+        }
+    }
+    const final = current[query.scalars.len * 2 ..];
+    const winner = if (greedyBetter(final[0], final[1], query.scalars.len)) final[0] else final[1];
+    if (winner.path.score == std.math.minInt(i64)) return null;
+    const scalars = try allocator.alloc(Scalar, query.scalars.len);
+    defer allocator.free(scalars);
+    const positions = try allocator.alloc(usize, query.scalars.len);
+    defer allocator.free(positions);
+    for (scalars, positions, 0..) |*scalar, *position, index| {
+        scalar.* = .{ .value = query.scalars[index], .bytes = winner.positions[index] };
+        position.* = index;
+    }
+    var found = try makeOccurrence(allocator, candidate, scalars, positions, winner.path.resultScore(), .fallback);
+    found.candidate_scalars = winner.path.length;
+    return .{ .occurrence = found, .forms = winner.path.authored_forms };
+}
+
+fn branchBonus(previous: ?u21, current: u21) f64 {
+    const before = previous orelse return score_match_word;
+    if (before == '/' or before == '\\') return score_match_slash;
+    if (before == ' ' or before == '_' or before == '-') return score_match_word;
+    if (before == '.') return score_match_dot;
+    if (isLowercase(before) and isUppercase(current)) return score_match_capital;
+    return 0;
+}
+
+fn minimumMatchingLength(query: Query, candidate: Candidate, region: Range) usize {
+    var current = [_]usize{no_node} ** (max_query_scalars + 1);
+    var next = current;
+    current[0] = 0;
+    for (candidate.mapping) |entry| {
+        const start = @max(region.start, entry.semantic.start);
+        const end = @min(region.end, entry.semantic.end);
+        if (start >= end) continue;
+        @memset(&next, no_node);
+        for ([_][]const u8{ candidate.text[start..end], entry.alternative }) |text| {
+            if (text.len == 0) continue;
+            const length = std.unicode.utf8CountCodepoints(text) catch unreachable;
+            for (current[0 .. query.scalars.len + 1], 0..) |prefix, consumed| {
+                if (prefix == no_node) continue;
+                var progress = consumed;
+                var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
+                while (iterator.nextCodepoint()) |scalar| {
+                    if (progress < query.scalars.len and equalScalar(query, query.scalars[progress], scalar)) progress += 1;
+                }
+                next[progress] = @min(next[progress], prefix +| length);
+            }
+        }
+        current = next;
+    }
+    return current[query.scalars.len];
+}
+
+fn scanEmojiFuzzy(allocator: std.mem.Allocator, query: Query, candidate: Candidate, displayed: []const Scalar, regions: []const Range, occurrences: *std.ArrayList(Occurrence)) !void {
+    var best: ?Occurrence = null;
+    errdefer if (best) |*value| value.deinit(allocator);
+    var best_forms: usize = no_node;
+    for (regions) |region| {
+        if (region.start == region.end) continue;
+        var nodes: std.ArrayList(BranchNode) = .empty;
+        defer nodes.deinit(allocator);
+        const bytes = Range{ .start = displayed[region.start].bytes.start, .end = displayed[region.end - 1].bytes.end };
+        // Check legal matching lengths before allocating exact search storage.
+        const minimum = minimumMatchingLength(query, candidate, bytes);
+        if (minimum == no_node) continue;
+        const alignment = if (minimum <= exact_fuzzy_cell_limit / query.scalars.len) blk: {
+            const ends = try emojiGraph(allocator, query, candidate, bytes.start, bytes.end, &nodes);
+            break :blk try exactEmojiAlignment(allocator, query, nodes.items, ends, candidate.boundaries.len == 0);
+        } else null;
+        var found: Occurrence = undefined;
+        var forms: usize = undefined;
+        if (alignment) |matched| {
+            defer allocator.free(matched.positions);
+            const graph_scalars = try allocator.alloc(Scalar, nodes.items.len);
+            defer allocator.free(graph_scalars);
+            for (nodes.items, graph_scalars) |node, *scalar| scalar.* = node.scalar;
+            found = try makeOccurrence(allocator, candidate, graph_scalars, matched.positions, matched.path.resultScore(), .exact);
+            found.candidate_scalars = matched.path.length;
+            forms = matched.path.authored_forms;
+        } else {
+            const fallback = (try greedyEmojiOccurrence(allocator, query, candidate, .{ .start = displayed[region.start].bytes.start, .end = displayed[region.end - 1].bytes.end })) orelse continue;
+            found = fallback.occurrence;
+            forms = fallback.forms;
+        }
+        errdefer found.deinit(allocator);
+        found.candidate_scalars += displayed.len - (region.end - region.start);
+        const better = if (best) |value| if (found.calculation != value.calculation) found.calculation == .exact else if (found.score != value.score) found.score > value.score else if (forms != best_forms) forms < best_forms else found.ranges[0].start < value.ranges[0].start else true;
+        if (better) {
+            if (best) |*value| value.deinit(allocator);
+            best = found;
+            best_forms = forms;
+        } else found.deinit(allocator);
+    }
+    if (best) |value| {
+        try occurrences.append(allocator, value);
+        best = null;
+    }
+}
+
 const score_min = -std.math.inf(f64);
 const score_max = std.math.inf(f64);
 const score_gap_leading: f64 = -0.005;
@@ -586,14 +1063,7 @@ fn greedyAlignment(allocator: std.mem.Allocator, query: Query, scalars: []const 
 }
 
 fn boundaryBonus(scalars: []const Scalar, index: usize) f64 {
-    if (index == 0) return score_match_word;
-    const previous = scalars[index - 1].value;
-    const current = scalars[index].value;
-    if (previous == '/' or previous == '\\') return score_match_slash;
-    if (previous == ' ' or previous == '_' or previous == '-') return score_match_word;
-    if (previous == '.') return score_match_dot;
-    if (isLowercase(previous) and isUppercase(current)) return score_match_capital;
-    return 0;
+    return branchBonus(if (index == 0) null else scalars[index - 1].value, scalars[index].value);
 }
 
 fn alignmentScore(scalars: []const Scalar, positions: []const usize) f64 {
@@ -626,7 +1096,7 @@ fn makeOccurrence(
     for (candidate.mapping) |mapping| {
         if (first < mapping.semantic.start or first >= mapping.semantic.end) continue;
         if (mapping.authored_column) |authored_column| {
-            column = authored_column + if (mapping.definition_source == null) (std.unicode.utf8CountCodepoints(candidate.text[mapping.semantic.start..first]) catch 0) else @as(usize, 0);
+            column = authored_column + if (mapping.definition_source == null and mapping.alternative.len == 0) (std.unicode.utf8CountCodepoints(candidate.text[mapping.semantic.start..first]) catch 0) else @as(usize, 0);
         }
         if (mapping.authored_line) |line| if (location == .review_body) {
             location.review_body.logical_line = line;
@@ -651,8 +1121,8 @@ fn mergedScalarRanges(allocator: std.mem.Allocator, scalars: []const Scalar, pos
     errdefer ranges.deinit(allocator);
     for (positions) |position| {
         const scalar = scalars[position].bytes;
-        if (ranges.items.len > 0 and ranges.items[ranges.items.len - 1].end == scalar.start) {
-            ranges.items[ranges.items.len - 1].end = scalar.end;
+        if (ranges.items.len > 0 and ranges.items[ranges.items.len - 1].end >= scalar.start) {
+            ranges.items[ranges.items.len - 1].end = @max(ranges.items[ranges.items.len - 1].end, scalar.end);
         } else try ranges.append(allocator, scalar);
     }
     return ranges.toOwnedSlice(allocator);
@@ -667,14 +1137,14 @@ fn mapRanges(allocator: std.mem.Allocator, semantic_ranges: []const Range, mappi
         const end = @min(semantic.end, entry.semantic.end);
         if (start >= end) continue;
         const source = if (definitions) entry.definition_source orelse continue else entry.authored;
-        const equal_length = (definitions or entry.definition_source == null) and source.end - source.start == entry.semantic.end - entry.semantic.start;
+        const equal_length = entry.alternative.len == 0 and (definitions or entry.definition_source == null) and source.end - source.start == entry.semantic.end - entry.semantic.start;
         const authored = if (equal_length) Range{
             .start = source.start + start - entry.semantic.start,
             .end = source.start + end - entry.semantic.start,
         } else source;
         if (ranges.items.len > 0 and std.meta.eql(ranges.items[ranges.items.len - 1], authored)) continue;
-        if (ranges.items.len > 0 and ranges.items[ranges.items.len - 1].end == authored.start) {
-            ranges.items[ranges.items.len - 1].end = authored.end;
+        if (ranges.items.len > 0 and ranges.items[ranges.items.len - 1].end >= authored.start) {
+            ranges.items[ranges.items.len - 1].end = @max(ranges.items[ranges.items.len - 1].end, authored.end);
         } else try ranges.append(allocator, authored);
     };
     return ranges.toOwnedSlice(allocator);
@@ -751,7 +1221,8 @@ pub fn appendReviewBodyCandidates(
                     try text.appendSlice(allocator, span.text[pos..end]);
                     try mappings.append(allocator, .{
                         .semantic = .{ .start = semantic_start, .end = text.items.len },
-                        .authored = .{ .start = start, .end = if (span.join) span.source.end else start + end - pos },
+                        .authored = .{ .start = start, .end = if (span.join or span.emoji.len > 0) span.source.end else start + end - pos },
+                        .alternative = span.emoji,
                         .definition_source = if (span.definition_source) |definition| .{ .start = definition.start + pos, .end = definition.start + end } else null,
                         .authored_column = 1 + (std.unicode.utf8CountCodepoints(body.source[authored_line_start..start]) catch start - authored_line_start),
                         .authored_line = authored_line,
@@ -789,6 +1260,204 @@ fn appendBodyRegion(allocator: std.mem.Allocator, owner: ReviewBodyOwner, epoch:
 }
 
 const testing = std.testing;
+
+test "M23 emoji both searches accept mixed forms and map partial matches to complete compounds" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "π :mask: :white_check_mark:\n\n:thumbsup::skin-tone-2:";
+    const body = try review_body.ReviewBody.parse(a, raw);
+    var candidates: std.ArrayList(Candidate) = .empty;
+    var order: usize = 0;
+    try appendReviewBodyCandidates(a, body, .{ .comment = 7 }, 9, &order, &candidates);
+    for ([_]Mode{ .literal, .fuzzy }) |mode| {
+        for ([_][]const u8{ "😷 :white_check_mark:", ":mask: ✅", "mask", "skin-tone-2", "👍", "🏻" }) |text| {
+            const batch = try scan(a, try Query.init(a, text), candidates.items, mode);
+            try testing.expectEqual(@as(usize, 1), batch.occurrences.len);
+            const occurrence = batch.occurrences[0];
+            try testing.expectEqual(@as(u64, 7), occurrence.location.review_body.owner.comment);
+            if (std.mem.eql(u8, text, "mask")) {
+                try testing.expectEqual(@as(usize, 3), occurrence.column);
+                try testing.expectEqualStrings(":mask:", raw[occurrence.ranges[0].start..occurrence.ranges[0].end]);
+            }
+            if (std.mem.eql(u8, text, "skin-tone-2") or std.mem.eql(u8, text, "👍") or std.mem.eql(u8, text, "🏻")) {
+                try testing.expectEqual(@as(u32, 3), occurrence.location.review_body.logical_line);
+                try testing.expectEqual(@as(usize, 1), occurrence.column);
+                try testing.expectEqualStrings(":thumbsup::skin-tone-2:", raw[occurrence.ranges[0].start..occurrence.ranges[0].end]);
+            }
+        }
+        for ([_][]const u8{ "😷:mask:", "👍skin-tone-2", "MASK" }) |text| {
+            const batch = try scan(a, try Query.init(a, text), candidates.items, mode);
+            try testing.expectEqual(@as(usize, 0), batch.occurrences.len);
+        }
+    }
+}
+
+test "M23 emoji fuzzy work counts legal branch nodes rather than representation combinations" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = ":mask:" ** 32;
+    const text = "😷:mask:" ** 16;
+    const body = try review_body.ReviewBody.parse(a, raw);
+    var candidates: std.ArrayList(Candidate) = .empty;
+    var order: usize = 0;
+    try appendReviewBodyCandidates(a, body, .{ .comment = 7 }, 1, &order, &candidates);
+    const batch = try scan(a, try Query.init(a, text), candidates.items, .fuzzy);
+    try testing.expectEqual(@as(usize, 1), batch.occurrences.len);
+    try testing.expectEqual(Calculation.exact, batch.occurrences[0].calculation);
+    try testing.expectEqual(std.math.inf(f64), batch.occurrences[0].score);
+    try testing.expectEqualSlices(Range, &.{.{ .start = 0, .end = raw.len }}, batch.occurrences[0].ranges);
+}
+
+test "M23 emoji counts authored locations and keeps smart case literal exclusions and exact sequences" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const examples = [_]struct { raw: []const u8, query: []const u8, literal: usize, fuzzy: usize }{
+        .{ .raw = ":mask: :mask:", .query = "mask", .literal = 2, .fuzzy = 1 },
+        .{ .raw = ":mask: :mask:", .query = ":", .literal = 2, .fuzzy = 1 },
+        .{ .raw = ":one: :flag_gb: :woman_technologist::skin-tone-2:", .query = "️", .literal = 1, .fuzzy = 1 },
+        .{ .raw = ":flag_gb:", .query = "🇬", .literal = 1, .fuzzy = 1 },
+        .{ .raw = ":woman_technologist::skin-tone-2:", .query = "‍", .literal = 1, .fuzzy = 1 },
+        .{ .raw = ":v:", .query = "v", .literal = 1, .fuzzy = 1 },
+        .{ .raw = "😷", .query = ":mask:", .literal = 0, .fuzzy = 0 },
+        .{ .raw = "`:mask:`\n\n```\n:mask:\n```\n\n\\:mask: [label](url/:mask:) :unknown: :MASK:", .query = "😷", .literal = 0, .fuzzy = 0 },
+        .{ .raw = "`:mask:`\n\n```\n:mask:\n```\n\n\\:mask: [label](url/:mask:) :MASK:", .query = "mask", .literal = 5, .fuzzy = 3 },
+        .{ .raw = ":mask: :MASK:", .query = "MASK", .literal = 1, .fuzzy = 1 },
+        .{ .raw = ":heart:", .query = "❤️", .literal = 0, .fuzzy = 0 },
+        .{ .raw = "[:mask:](url) :white_check_mark:", .query = "😷✅", .literal = 0, .fuzzy = 0 },
+    };
+    for (examples) |example| {
+        var candidates: std.ArrayList(Candidate) = .empty;
+        var order: usize = 0;
+        try appendReviewBodyCandidates(a, try review_body.ReviewBody.parse(a, example.raw), .{ .comment = 7 }, 1, &order, &candidates);
+        for ([_]Mode{ .literal, .fuzzy }) |mode| {
+            const batch = try scan(a, try Query.init(a, example.query), candidates.items, mode);
+            try testing.expectEqual(if (mode == .literal) example.literal else example.fuzzy, batch.occurrences.len);
+            if (std.mem.eql(u8, example.raw, ":v:")) try testing.expectEqualSlices(Range, &.{.{ .start = 0, .end = 3 }}, batch.occurrences[0].ranges);
+            if (std.mem.eql(u8, example.raw, ":mask: :mask:") and mode == .fuzzy) try testing.expectEqual(@as(usize, 0), batch.occurrences[0].ranges[0].start);
+        }
+    }
+}
+
+test "M23 emoji fuzzy scores match the existing scores on each legal representation" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "a :mask: b :white_check_mark: c";
+    var candidates: std.ArrayList(Candidate) = .empty;
+    var order: usize = 0;
+    try appendReviewBodyCandidates(a, try review_body.ReviewBody.parse(a, raw), .{ .comment = 7 }, 1, &order, &candidates);
+    for ([_][]const u8{ "abc", "a😷c", "amaskc", "mask", "a:white_check_mark:", "b✅", "😷:mask:" }) |text| {
+        const query = try Query.init(a, text);
+        const graph_match = try scan(a, query, candidates.items, .fuzzy);
+        var best_score = -std.math.inf(f64);
+        for ([_][]const u8{ "a 😷 b ✅ c", "a :mask: b ✅ c", "a 😷 b :white_check_mark: c", raw }) |legal| {
+            const result = try scan(a, query, &.{.{ .text = legal, .location = .{ .review_body = .{ .owner = .{ .comment = 7 }, .logical_line = 1 } } }}, .fuzzy);
+            if (result.occurrences.len > 0) best_score = @max(best_score, result.occurrences[0].score);
+        }
+        if (best_score == -std.math.inf(f64)) {
+            try testing.expectEqual(@as(usize, 0), graph_match.occurrences.len);
+        } else {
+            try testing.expectEqual(@as(usize, 1), graph_match.occurrences.len);
+            try testing.expectApproxEqAbs(best_score, graph_match.occurrences[0].score, 0.000001);
+        }
+    }
+}
+
+test "M23 emoji both search calculations release every partial allocation" {
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator, query: Query, candidates: []const Candidate, mode: Mode) !void {
+            var batch = try scan(allocator, query, candidates, mode);
+            defer batch.deinit(allocator);
+            try testing.expectEqual(@as(usize, 1), batch.occurrences.len);
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = try review_body.ReviewBody.parse(a, "a :mask: :white_check_mark:\n\n:woman_technologist::skin-tone-2:");
+    var candidates: std.ArrayList(Candidate) = .empty;
+    var order: usize = 0;
+    try appendReviewBodyCandidates(a, body, .{ .comment = 7 }, 1, &order, &candidates);
+    const query = try Query.init(a, "😷 :white_check_mark:");
+    for ([_]Mode{ .literal, .fuzzy }) |mode| try testing.checkAllAllocationFailures(testing.allocator, Check.run, .{ query, candidates.items, mode });
+    var large: std.ArrayList(Candidate) = .empty;
+    try appendReviewBodyCandidates(a, try review_body.ReviewBody.parse(a, "x" ** 3000 ++ " :mask: :white_check_mark:"), .{ .comment = 7 }, 1, &order, &large);
+    try testing.checkAllAllocationFailures(testing.allocator, Check.run, .{ try Query.init(a, "x" ** 100 ++ " 😷 :white_check_mark:"), large.items, Mode.fuzzy });
+}
+
+test "M23 emoji large fuzzy regions use deterministic legal mixed form fallback" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "x" ** 3000 ++ " :mask: :white_check_mark:";
+    var candidates: std.ArrayList(Candidate) = .empty;
+    var order: usize = 0;
+    try appendReviewBodyCandidates(a, try review_body.ReviewBody.parse(a, raw), .{ .comment = 7 }, 1, &order, &candidates);
+    const text = "x" ** 100 ++ " 😷 :white_check_mark:";
+    const batch = try scan(a, try Query.init(a, text), candidates.items, .fuzzy);
+    try testing.expectEqual(@as(usize, 1), batch.occurrences.len);
+    try testing.expectEqual(Calculation.fallback, batch.occurrences[0].calculation);
+    const last = batch.occurrences[0].ranges[batch.occurrences[0].ranges.len - 1];
+    try testing.expectEqualStrings(" :mask: :white_check_mark:", raw[last.start..last.end]);
+    const forbidden = try scan(a, try Query.init(a, "x" ** 100 ++ " 😷:mask:"), candidates.items, .fuzzy);
+    try testing.expectEqual(@as(usize, 0), forbidden.occurrences.len);
+}
+
+test "M23 emoji applies exact work limits to each legal representation" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = ":white_check_mark:" ** 1000;
+    var candidates: std.ArrayList(Candidate) = .empty;
+    var order: usize = 0;
+    try appendReviewBodyCandidates(a, try review_body.ReviewBody.parse(a, raw), .{ .comment = 7 }, 1, &order, &candidates);
+    const exact = try scan(a, try Query.init(a, "✅" ** 100), candidates.items, .fuzzy);
+    try testing.expectEqual(@as(usize, 1), exact.occurrences.len);
+    try testing.expectEqual(Calculation.exact, exact.occurrences[0].calculation);
+    try testing.expectEqual(@as(usize, 1000), exact.occurrences[0].candidate_scalars);
+    const fallback = try scan(a, try Query.init(a, "w" ** 100), candidates.items, .fuzzy);
+    try testing.expectEqual(@as(usize, 1), fallback.occurrences.len);
+    try testing.expectEqual(Calculation.fallback, fallback.occurrences[0].calculation);
+}
+
+test "M23 emoji fallback keeps the best score across legal greedy representations" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "x" ** 3000 ++ ":mask: m";
+    var candidates: std.ArrayList(Candidate) = .empty;
+    var order: usize = 0;
+    try appendReviewBodyCandidates(a, try review_body.ReviewBody.parse(a, raw), .{ .comment = 7 }, 1, &order, &candidates);
+    const found = try scan(a, try Query.init(a, "x" ** 100 ++ "m"), candidates.items, .fuzzy);
+    try testing.expectEqual(@as(usize, 1), found.occurrences.len);
+    try testing.expectEqual(Calculation.fallback, found.occurrences[0].calculation);
+    try testing.expectApproxEqAbs(@as(f64, 71.58), found.occurrences[0].score, 0.000001);
+    const last = found.occurrences[0].ranges[found.occurrences[0].ranges.len - 1];
+    try testing.expectEqualStrings("m", raw[last.start..last.end]);
+    try testing.expectEqual(@as(usize, raw.len - 1), last.start);
+}
+
+test "M23 emoji score ties prefer displayed forms and earliest authored alignment" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const examples = [_]struct { raw: []const u8, query: []const u8, offset: usize }{
+        .{ .raw = "mzzzzzzzzz m:mask:", .query = "m", .offset = 0 },
+        .{ .raw = "x" ** 3000 ++ ":a:zza", .query = "x" ** 100 ++ "a", .offset = 3005 },
+        .{ .raw = "xzm" ++ "z" ** 158 ++ " m:mask:", .query = "xm", .offset = 2 },
+    };
+    for (examples) |example| {
+        var candidates: std.ArrayList(Candidate) = .empty;
+        var order: usize = 0;
+        try appendReviewBodyCandidates(a, try review_body.ReviewBody.parse(a, example.raw), .{ .comment = 7 }, 1, &order, &candidates);
+        const found = try scan(a, try Query.init(a, example.query), candidates.items, .fuzzy);
+        const last = found.occurrences[0].ranges[found.occurrences[0].ranges.len - 1];
+        try testing.expectEqual(example.offset, last.start);
+    }
+}
 
 test "M23 tables both searches keep authored cells as separate matching regions as project behavior" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

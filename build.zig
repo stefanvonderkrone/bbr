@@ -296,6 +296,14 @@ pub fn build(b: *std.Build) void {
     const table_step = b.step("test-tables", "Run table presentation tests");
     table_step.dependOn(&b.addRunArtifact(table_tests).step);
 
+    const emoji_tests = b.addTest(.{
+        .name = "emoji-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M23 emoji"},
+    });
+    const emoji_step = b.step("test-emoji", "Run emoji conversion and search tests");
+    emoji_step.dependOn(&b.addRunArtifact(emoji_tests).step);
+
     const fixture_mod = b.createModule(.{
         .root_source_file = b.path("tests/user_grammar_fixture.zig"),
         .target = target,

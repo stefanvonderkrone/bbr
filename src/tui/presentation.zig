@@ -18209,6 +18209,87 @@ test "M23 links yank selects reference destinations without unrelated definition
     };
 }
 
+test "M23 emoji search navigates exact authored owners and keeps counts and raw yank bytes after resize" {
+    const compound = ":woman_technologist::skin-tone-2:";
+    const raw = "before  \r\n" ++ compound ++ "\r\n\r\n:mask: :white_check_mark:";
+    for ([_]bool{ false, true }) |local| for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = if (local) try OwnedReviewIdentity.initLocal(1, "refs/remotes/origin/main", "refs/heads/feature") else try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .target = if (local) .local else .bitbucket });
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 1, .cell_metrics = MatrixGraphemeMetrics.value }, .{
+            .initial = .{ .key = key, .session = if (local) try testLocalSession(testing.allocator) else try testSession(testing.allocator, 1, 'a') },
+            .geometry = .{ .cols = 38, .rows = 20 },
+        });
+        defer presentation.deinit();
+        if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        try presentation.dispatch(.{ .action = .open_buffer_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 's', .text = "skin-tone-2" } });
+        try completeBufferSearchScan(&presentation);
+        try testing.expectEqual(@as(usize, 1), presentation.projection().buffer_search.?.total);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try presentation.dispatch(.{ .action = .next_search_occurrence });
+        const active = presentation.projection().buffer_search.?.active;
+        for ([_]u16{ 160, 38 }) |cols| {
+            try dispatchView(&presentation, .{ .resize = .{ .cols = cols, .rows = 20 } });
+            try testing.expectEqual(@as(usize, 1), presentation.projection().buffer_search.?.total);
+            try testing.expectEqual(active, presentation.projection().buffer_search.?.active);
+            try presentation.dispatch(.{ .action = .next_search_occurrence });
+            const review = presentation.projection().review.?;
+            const card = review.buffer.rows[review.frame.visual_rows[review.navigation.cursor].buffer_index].draft;
+            try testing.expectEqual(@as(u64, 1), card.owner.draft);
+            var found = false;
+            for (card.segments) |segment| if (segment.atomic) {
+                found = true;
+                try testing.expectEqualStrings("👩🏻‍💻", segment.text);
+                try testing.expectEqualStrings(compound, raw[segment.source.start..segment.source.end]);
+            };
+            try testing.expect(found);
+            try presentation.dispatch(.{ .action = .toggle_select });
+            try presentation.dispatch(.{ .action = .yank });
+            var selection_copy = presentation.takeCommand().?;
+            defer selection_copy.deinit();
+            try testing.expectEqualStrings(compound ++ "\r\n", selection_copy.copy_clipboard.text);
+            try presentation.dispatch(.{ .action = .yank });
+            var body_copy = presentation.takeCommand().?;
+            defer body_copy.deinit();
+            try testing.expectEqualStrings(raw, body_copy.copy_clipboard.text);
+        }
+        try presentation.dispatch(.{ .action = .open_review_search });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 0x1f637, .text = "😷 :white_check_mark:" } });
+        try completeBufferSearchScan(&presentation);
+        try testing.expectEqual(@as(usize, 1), presentation.projection().review_search.?.results.len);
+        const result = presentation.projection().review_search.?.results[0];
+        try testing.expectEqual(@as(u32, 4), result.occurrence.location.review_body.logical_line);
+        try testing.expectEqual(@as(usize, 1), result.occurrence.column);
+        try testing.expectEqualStrings(":mask: :white_check_mark:", raw[result.occurrence.ranges[0].start..result.occurrence.ranges[0].end]);
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try completeDisclosureBuild(&presentation);
+        const review = presentation.projection().review.?;
+        try testing.expectEqual(@as(u64, 1), review.frame.visual_rows[review.navigation.cursor].owner.draft.id);
+        try testing.expect(review.frame.search_ranges.len > 0);
+    };
+}
+
+test "M23 emoji Presentation workers release every failed scan and range projection allocation" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const session = try testCommentSession(testing.allocator, 1);
+    @constCast(session.threads[0].root).body = "**:woman_technologist::skin-tone-2:** :mask: :mask:";
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 0 }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 's', .text = "skin-tone-2" } });
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.checkAllAllocationFailures(testing.allocator, exerciseBufferSearchWorkerAllocationFailure, .{&command.scan_buffer_search});
+    var completed = executeBufferSearchScan(testing.allocator, &command.scan_buffer_search);
+    defer completed.deinit();
+    try testing.checkAllAllocationFailures(testing.allocator, exerciseSearchProjectionAllocationFailure, .{ command.scan_buffer_search.projection.?, completed.outcome.scanned });
+}
+
 test "M23 tables search reveals authored cells and retains occurrence identity across resize as project behavior" {
     const raw = "| Name | State |\n| --- | --- |\n| Ada | Ready |\n| Bo | Waiting |";
     const ready = std.mem.indexOf(u8, raw, "Ready").?;
