@@ -684,7 +684,859 @@ pub const Client = struct {
         out.shrinkRetainingCapacity(write);
         return .{ .comments = try out.toOwnedSlice(allocator) };
     }
+
+    /// GET /user/workspaces: workspaces visible to the authenticated account.
+    /// Follows `next` unless `opts.follow` is false. Owned by `allocator`
+    /// (free with `deinitWorkspaces`).
+    pub fn listWorkspaces(
+        self: Client,
+        allocator: Allocator,
+        opts: PageOptions,
+    ) ![]types.Workspace {
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+
+        var out: std.ArrayList(types.Workspace) = .empty;
+        errdefer {
+            for (out.items) |w| deinitWorkspace(allocator, w);
+            out.deinit(allocator);
+        }
+
+        var url = try pageUrl(allocator, base_url ++ "/user/workspaces", opts);
+        while (true) {
+            const res = try self.http.send(allocator, .{
+                .method = .GET,
+                .url = url,
+                .headers = &.{
+                    .{ .name = "authorization", .value = auth },
+                    .{ .name = "accept", .value = "application/json" },
+                },
+            });
+            allocator.free(url);
+            defer allocator.free(res.body);
+            try classify(res.status);
+
+            const parsed = std.json.parseFromSlice(WorkspacePage, allocator, res.body, .{
+                .ignore_unknown_fields = true,
+            }) catch return error.MalformedResponse;
+            defer parsed.deinit();
+            for (parsed.value.values) |wj| {
+                if (opts.limit) |limit| {
+                    if (out.items.len >= limit) break;
+                }
+                try out.append(allocator, try dupeWorkspace(allocator, wj));
+            }
+            if (!opts.follow) break;
+            if (opts.limit) |limit| {
+                if (out.items.len >= limit) break;
+            }
+            const next = parsed.value.next orelse break;
+            url = try allocator.dupe(u8, next);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// GET /workspaces/{workspace}. Owned by `allocator`.
+    pub fn getWorkspace(
+        self: Client,
+        allocator: Allocator,
+        workspace: []const u8,
+    ) !types.Workspace {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/workspaces/{s}",
+            .{ base_url, workspace },
+        );
+        defer allocator.free(url);
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        const res = try self.http.send(allocator, .{
+            .method = .GET,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "application/json" },
+            },
+        });
+        defer allocator.free(res.body);
+        try classify(res.status);
+        const parsed = std.json.parseFromSlice(WorkspaceJson, allocator, res.body, .{
+            .ignore_unknown_fields = true,
+        }) catch return error.MalformedResponse;
+        defer parsed.deinit();
+        return dupeWorkspaceJson(allocator, parsed.value);
+    }
+
+    /// GET /repositories/{workspace}: repositories in a workspace.
+    /// `workspace_override` selects the workspace (defaults to credential).
+    /// Follows `next` unless `opts.follow` is false.
+    pub fn listRepositories(
+        self: Client,
+        allocator: Allocator,
+        workspace_override: ?[]const u8,
+        opts: PageOptions,
+    ) ![]types.Repository {
+        const ws = workspace_override orelse self.cred.workspace;
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        var out: std.ArrayList(types.Repository) = .empty;
+        errdefer {
+            for (out.items) |r| deinitRepository(allocator, r);
+            out.deinit(allocator);
+        }
+        const first = try std.fmt.allocPrint(allocator, "{s}/repositories/{s}", .{ base_url, ws });
+        defer allocator.free(first);
+        var url = try pageUrlWithBase(allocator, first, opts);
+        while (true) {
+            const res = try self.http.send(allocator, .{
+                .method = .GET,
+                .url = url,
+                .headers = &.{
+                    .{ .name = "authorization", .value = auth },
+                    .{ .name = "accept", .value = "application/json" },
+                },
+            });
+            allocator.free(url);
+            defer allocator.free(res.body);
+            try classify(res.status);
+            const parsed = std.json.parseFromSlice(RepositoryPage, allocator, res.body, .{
+                .ignore_unknown_fields = true,
+            }) catch return error.MalformedResponse;
+            defer parsed.deinit();
+            for (parsed.value.values) |rj| {
+                if (opts.limit) |limit| {
+                    if (out.items.len >= limit) break;
+                }
+                try out.append(allocator, try dupeRepository(allocator, rj));
+            }
+            if (!opts.follow) break;
+            if (opts.limit) |limit| {
+                if (out.items.len >= limit) break;
+            }
+            const next = parsed.value.next orelse break;
+            url = try allocator.dupe(u8, next);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// GET /repositories/{workspace}/{repo}. Owned by `allocator`.
+    pub fn getRepository(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        workspace_override: ?[]const u8,
+    ) !types.Repository {
+        const ws = workspace_override orelse self.cred.workspace;
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}",
+            .{ base_url, ws, repo_slug },
+        );
+        defer allocator.free(url);
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        const res = try self.http.send(allocator, .{
+            .method = .GET,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "application/json" },
+            },
+        });
+        defer allocator.free(res.body);
+        try classify(res.status);
+        const parsed = std.json.parseFromSlice(RepositoryJson, allocator, res.body, .{
+            .ignore_unknown_fields = true,
+        }) catch return error.MalformedResponse;
+        defer parsed.deinit();
+        return dupeRepository(allocator, parsed.value);
+    }
+
+    /// GET .../pullrequests/{id}/commits: commits on a pull request.
+    /// Follows `next` unless `opts.follow` is false.
+    pub fn listPrCommits(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        id: u64,
+        opts: PageOptions,
+    ) ![]types.Commit {
+        const first = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/pullrequests/{d}/commits",
+            .{ base_url, self.cred.workspace, repo_slug, id },
+        );
+        defer allocator.free(first);
+        return self.listCommitsFrom(allocator, first, opts);
+    }
+
+    /// GET .../commits/{revision}: commits reachable from a revision.
+    pub fn listRepoCommits(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        revision: []const u8,
+        opts: PageOptions,
+    ) ![]types.Commit {
+        const first = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/commits/{s}",
+            .{ base_url, self.cred.workspace, repo_slug, revision },
+        );
+        defer allocator.free(first);
+        return self.listCommitsFrom(allocator, first, opts);
+    }
+
+    fn listCommitsFrom(
+        self: Client,
+        allocator: Allocator,
+        first_url: []const u8,
+        opts: PageOptions,
+    ) ![]types.Commit {
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        var out: std.ArrayList(types.Commit) = .empty;
+        errdefer {
+            for (out.items) |c| deinitCommit(allocator, c);
+            out.deinit(allocator);
+        }
+        var url = try pageUrlWithBase(allocator, first_url, opts);
+        while (true) {
+            const res = try self.http.send(allocator, .{
+                .method = .GET,
+                .url = url,
+                .headers = &.{
+                    .{ .name = "authorization", .value = auth },
+                    .{ .name = "accept", .value = "application/json" },
+                },
+            });
+            allocator.free(url);
+            defer allocator.free(res.body);
+            try classify(res.status);
+            const parsed = std.json.parseFromSlice(CommitPage, allocator, res.body, .{
+                .ignore_unknown_fields = true,
+            }) catch return error.MalformedResponse;
+            defer parsed.deinit();
+            for (parsed.value.values) |cj| {
+                if (opts.limit) |limit| {
+                    if (out.items.len >= limit) break;
+                }
+                try out.append(allocator, try dupeCommit(allocator, cj));
+            }
+            if (!opts.follow) break;
+            if (opts.limit) |limit| {
+                if (out.items.len >= limit) break;
+            }
+            const next = parsed.value.next orelse break;
+            url = try allocator.dupe(u8, next);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// GET .../diff/{from}..{to} (or .../patch/... when `patch` is true):
+    /// raw diff between two commits. Owned by `allocator`.
+    pub fn getCompareDiff(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        from: []const u8,
+        to: []const u8,
+        patch: bool,
+    ) ![]u8 {
+        const kind: []const u8 = if (patch) "patch" else "diff";
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/{s}/{s}..{s}",
+            .{ base_url, self.cred.workspace, repo_slug, kind, from, to },
+        );
+        defer allocator.free(url);
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        const res = try self.http.send(allocator, .{
+            .method = .GET,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "text/plain" },
+            },
+        });
+        errdefer allocator.free(res.body);
+        try classify(res.status);
+        return res.body;
+    }
+
+    /// GET a single comment, typed (debug `getCommentRaw` stays raw).
+    /// Owned strings via `allocator`; free with `deinitComment`-equivalent
+    /// caller handling a one-element slice via `deinitComments`.
+    pub fn getComment(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        id: u64,
+        comment_id: u64,
+    ) !Comment {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/pullrequests/{d}/comments/{d}",
+            .{ base_url, self.cred.workspace, repo_slug, id, comment_id },
+        );
+        defer allocator.free(url);
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        const res = try self.http.send(allocator, .{
+            .method = .GET,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "application/json" },
+            },
+        });
+        defer allocator.free(res.body);
+        try classify(res.status);
+        const parsed = std.json.parseFromSlice(CommentJson, allocator, res.body, .{
+            .ignore_unknown_fields = true,
+        }) catch return error.MalformedResponse;
+        defer parsed.deinit();
+        return dupeComment(allocator, parsed.value, .{});
+    }
+
+    /// POST .../comments/{id}/resolve: resolve a comment thread.
+    pub fn resolveComment(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        pull_request_id: u64,
+        comment_id: CommentId,
+    ) !void {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/pullrequests/{d}/comments/{d}/resolve",
+            .{ base_url, self.cred.workspace, repo_slug, pull_request_id, comment_id },
+        );
+        defer allocator.free(url);
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        const res = try self.http.send(allocator, .{
+            .method = .POST,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "application/json" },
+            },
+        });
+        defer allocator.free(res.body);
+        try classify(res.status);
+    }
+
+    /// DELETE .../comments/{id}/resolve: reopen a comment thread.
+    pub fn reopenComment(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        pull_request_id: u64,
+        comment_id: CommentId,
+    ) !void {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/pullrequests/{d}/comments/{d}/resolve",
+            .{ base_url, self.cred.workspace, repo_slug, pull_request_id, comment_id },
+        );
+        defer allocator.free(url);
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        const res = try self.http.send(allocator, .{
+            .method = .DELETE,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "application/json" },
+            },
+        });
+        defer allocator.free(res.body);
+        try classify(res.status);
+    }
+
+    /// GET .../pullrequests/{id}/tasks. Follows `next` unless `opts.follow`
+    /// is false. Owned by `allocator` (free with `deinitTasks`).
+    pub fn listTasks(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        id: u64,
+        opts: PageOptions,
+    ) ![]types.Task {
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        var out: std.ArrayList(types.Task) = .empty;
+        errdefer {
+            for (out.items) |t| deinitTask(allocator, t);
+            out.deinit(allocator);
+        }
+        const first = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/pullrequests/{d}/tasks",
+            .{ base_url, self.cred.workspace, repo_slug, id },
+        );
+        defer allocator.free(first);
+        var url = try pageUrlWithBase(allocator, first, opts);
+        while (true) {
+            const res = try self.http.send(allocator, .{
+                .method = .GET,
+                .url = url,
+                .headers = &.{
+                    .{ .name = "authorization", .value = auth },
+                    .{ .name = "accept", .value = "application/json" },
+                },
+            });
+            allocator.free(url);
+            defer allocator.free(res.body);
+            try classify(res.status);
+            const parsed = std.json.parseFromSlice(TaskPage, allocator, res.body, .{
+                .ignore_unknown_fields = true,
+            }) catch return error.MalformedResponse;
+            defer parsed.deinit();
+            for (parsed.value.values) |tj| {
+                if (opts.limit) |limit| {
+                    if (out.items.len >= limit) break;
+                }
+                try out.append(allocator, try dupeTask(allocator, tj));
+            }
+            if (!opts.follow) break;
+            if (opts.limit) |limit| {
+                if (out.items.len >= limit) break;
+            }
+            const next = parsed.value.next orelse break;
+            url = try allocator.dupe(u8, next);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// GET .../tasks/{task_id}. Owned by `allocator`.
+    pub fn getTask(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        id: u64,
+        task_id: u64,
+    ) !types.Task {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/pullrequests/{d}/tasks/{d}",
+            .{ base_url, self.cred.workspace, repo_slug, id, task_id },
+        );
+        defer allocator.free(url);
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        const res = try self.http.send(allocator, .{
+            .method = .GET,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "application/json" },
+            },
+        });
+        defer allocator.free(res.body);
+        try classify(res.status);
+        const parsed = std.json.parseFromSlice(TaskJson, allocator, res.body, .{
+            .ignore_unknown_fields = true,
+        }) catch return error.MalformedResponse;
+        defer parsed.deinit();
+        return dupeTask(allocator, parsed.value);
+    }
+
+    /// POST .../tasks: create a task. `comment_id` attaches it to a comment.
+    /// Returns the server-assigned task id.
+    pub fn createTask(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        id: u64,
+        content: []const u8,
+        comment_id: ?u64,
+    ) !u64 {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/pullrequests/{d}/tasks",
+            .{ base_url, self.cred.workspace, repo_slug, id },
+        );
+        defer allocator.free(url);
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        const Wire = struct {
+            content: struct { raw: []const u8 },
+            comment: ?struct { id: u64 } = null,
+        };
+        const wire = Wire{
+            .content = .{ .raw = content },
+            .comment = if (comment_id) |cid| .{ .id = cid } else null,
+        };
+        const body = try std.json.Stringify.valueAlloc(allocator, wire, .{ .emit_null_optional_fields = false });
+        defer allocator.free(body);
+        const res = try self.http.send(allocator, .{
+            .method = .POST,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "application/json" },
+                .{ .name = "content-type", .value = "application/json" },
+            },
+            .body = body,
+        });
+        defer allocator.free(res.body);
+        try classify(res.status);
+        const parsed = std.json.parseFromSlice(
+            struct { id: u64 },
+            allocator,
+            res.body,
+            .{ .ignore_unknown_fields = true },
+        ) catch return error.MalformedResponse;
+        defer parsed.deinit();
+        return parsed.value.id;
+    }
+
+    /// PUT .../tasks/{task_id}: update content and/or state.
+    /// Pass null to leave a field unchanged. At least one must be non-null.
+    pub fn updateTask(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        id: u64,
+        task_id: u64,
+        content: ?[]const u8,
+        state: ?[]const u8,
+    ) !types.Task {
+        if (content == null and state == null) return error.BadRequest;
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/pullrequests/{d}/tasks/{d}",
+            .{ base_url, self.cred.workspace, repo_slug, id, task_id },
+        );
+        defer allocator.free(url);
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        const Wire = struct {
+            content: ?struct { raw: []const u8 } = null,
+            state: ?[]const u8 = null,
+        };
+        const wire = Wire{
+            .content = if (content) |c| .{ .raw = c } else null,
+            .state = state,
+        };
+        const body = try std.json.Stringify.valueAlloc(allocator, wire, .{ .emit_null_optional_fields = false });
+        defer allocator.free(body);
+        const res = try self.http.send(allocator, .{
+            .method = .PUT,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "application/json" },
+                .{ .name = "content-type", .value = "application/json" },
+            },
+            .body = body,
+        });
+        defer allocator.free(res.body);
+        try classify(res.status);
+        const parsed = std.json.parseFromSlice(TaskJson, allocator, res.body, .{
+            .ignore_unknown_fields = true,
+        }) catch return error.MalformedResponse;
+        defer parsed.deinit();
+        return dupeTask(allocator, parsed.value);
+    }
+
+    /// DELETE .../tasks/{task_id}.
+    pub fn deleteTask(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        id: u64,
+        task_id: u64,
+    ) !void {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "{s}/repositories/{s}/{s}/pullrequests/{d}/tasks/{d}",
+            .{ base_url, self.cred.workspace, repo_slug, id, task_id },
+        );
+        defer allocator.free(url);
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        const res = try self.http.send(allocator, .{
+            .method = .DELETE,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "application/json" },
+            },
+        });
+        defer allocator.free(res.body);
+        try classify(res.status);
+    }
+
+    /// PUT .../tasks/{task_id} with `state` only: `RESOLVED` or `UNRESOLVED`.
+    pub fn setTaskState(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        id: u64,
+        task_id: u64,
+        resolved: bool,
+    ) !types.Task {
+        return self.updateTask(
+            allocator,
+            repo_slug,
+            id,
+            task_id,
+            null,
+            if (resolved) "RESOLVED" else "UNRESOLVED",
+        );
+    }
+
+    /// Structured file metadata for `?format=meta` (used by `check-blob --json`).
+    pub const FileMeta = struct {
+        path: []const u8,
+        commit: []const u8,
+        size: usize,
+        attributes: [][]const u8,
+    };
+
+    /// GET .../src/{commit}/{path}?format=meta, parsed. Owned by `allocator`
+    /// (free with `deinitFileMeta`).
+    pub fn getFileMeta(
+        self: Client,
+        allocator: Allocator,
+        repo_slug: []const u8,
+        commit: []const u8,
+        path: []const u8,
+    ) !FileMeta {
+        const metadata_body = try self.getSource(allocator, repo_slug, commit, path, true);
+        defer allocator.free(metadata_body);
+        const Wire = struct {
+            type: []const u8,
+            path: []const u8,
+            commit: struct { hash: []const u8 },
+            size: usize,
+            attributes: []const []const u8 = &.{},
+        };
+        const parsed = std.json.parseFromSlice(Wire, allocator, metadata_body, .{ .ignore_unknown_fields = true }) catch return error.MalformedResponse;
+        defer parsed.deinit();
+        const m = parsed.value;
+        if (!std.mem.eql(u8, m.type, "commit_file")) return error.BlobTypeMismatch;
+        const attrs = try allocator.alloc([]const u8, m.attributes.len);
+        errdefer allocator.free(attrs);
+        for (m.attributes, 0..) |a, i| attrs[i] = try allocator.dupe(u8, a);
+        errdefer {
+            for (attrs) |a| allocator.free(a);
+            allocator.free(attrs);
+        }
+        return .{
+            .path = try allocator.dupe(u8, m.path),
+            .commit = try allocator.dupe(u8, m.commit.hash),
+            .size = m.size,
+            .attributes = attrs,
+        };
+    }
 };
+
+/// Paging for list endpoints. `follow` follows `next` links (default true:
+/// return all items). With `follow=false` a single page is returned.
+/// `limit` caps the total when following. `query`/`sort` pass through where
+/// the endpoint supports them.
+pub const PageOptions = struct {
+    pagelen: ?u32 = null,
+    page: ?u32 = null,
+    query: ?[]const u8 = null,
+    sort: ?[]const u8 = null,
+    follow: bool = true,
+    limit: ?usize = null,
+};
+
+fn pageUrl(allocator: Allocator, first: []const u8, opts: PageOptions) ![]u8 {
+    return pageUrlWithBase(allocator, first, opts);
+}
+
+fn pageUrlWithBase(allocator: Allocator, first: []const u8, opts: PageOptions) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, first);
+    var sep: u8 = if (std.mem.indexOfScalar(u8, first, '?') != null) '&' else '?';
+    if (opts.pagelen) |n| {
+        try buf.print(allocator, "{c}pagelen={d}", .{ sep, n });
+        sep = '&';
+    }
+    if (opts.page) |n| {
+        try buf.print(allocator, "{c}page={d}", .{ sep, n });
+        sep = '&';
+    }
+    if (opts.query) |q| {
+        try buf.append(allocator, sep);
+        try buf.appendSlice(allocator, "q=");
+        try percentEncodeInto(allocator, &buf, q);
+        sep = '&';
+    }
+    if (opts.sort) |s| {
+        try buf.append(allocator, sep);
+        try buf.appendSlice(allocator, "sort=");
+        try percentEncodeInto(allocator, &buf, s);
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+const WorkspaceJson = struct {
+    slug: []const u8,
+    name: []const u8 = "",
+    uuid: []const u8 = "",
+};
+
+const WorkspaceEntryJson = struct {
+    workspace: WorkspaceJson,
+};
+
+const WorkspacePage = struct {
+    values: []WorkspaceEntryJson,
+    next: ?[]const u8 = null,
+};
+
+fn dupeWorkspace(allocator: Allocator, wj: WorkspaceEntryJson) !types.Workspace {
+    return dupeWorkspaceJson(allocator, wj.workspace);
+}
+
+fn dupeWorkspaceJson(allocator: Allocator, wj: WorkspaceJson) !types.Workspace {
+    return .{
+        .slug = try allocator.dupe(u8, wj.slug),
+        .name = try allocator.dupe(u8, wj.name),
+        .uuid = try allocator.dupe(u8, wj.uuid),
+    };
+}
+
+fn deinitWorkspace(allocator: Allocator, w: types.Workspace) void {
+    allocator.free(w.slug);
+    allocator.free(w.name);
+    allocator.free(w.uuid);
+}
+
+/// Free a batch returned by `listWorkspaces`.
+pub fn deinitWorkspaces(allocator: Allocator, items: []types.Workspace) void {
+    for (items) |w| deinitWorkspace(allocator, w);
+    allocator.free(items);
+}
+
+const RepositoryJson = struct {
+    slug: []const u8,
+    full_name: []const u8 = "",
+    name: []const u8 = "",
+    uuid: []const u8 = "",
+    is_private: bool = false,
+};
+
+const RepositoryPage = struct {
+    values: []RepositoryJson,
+    next: ?[]const u8 = null,
+};
+
+fn dupeRepository(allocator: Allocator, rj: RepositoryJson) !types.Repository {
+    return .{
+        .slug = try allocator.dupe(u8, rj.slug),
+        .full_name = try allocator.dupe(u8, rj.full_name),
+        .name = try allocator.dupe(u8, rj.name),
+        .uuid = try allocator.dupe(u8, rj.uuid),
+        .is_private = rj.is_private,
+    };
+}
+
+fn deinitRepository(allocator: Allocator, r: types.Repository) void {
+    allocator.free(r.slug);
+    allocator.free(r.full_name);
+    allocator.free(r.name);
+    allocator.free(r.uuid);
+}
+
+/// Free a batch returned by `listRepositories`.
+pub fn deinitRepositories(allocator: Allocator, items: []types.Repository) void {
+    for (items) |r| deinitRepository(allocator, r);
+    allocator.free(items);
+}
+
+const CommitJson = struct {
+    hash: []const u8,
+    message: []const u8 = "",
+    author: ?struct {
+        display_name: ?[]const u8 = null,
+        user: ?struct { display_name: ?[]const u8 = null } = null,
+    } = null,
+    date: []const u8 = "",
+};
+
+const CommitPage = struct {
+    values: []CommitJson,
+    next: ?[]const u8 = null,
+};
+
+fn dupeCommit(allocator: Allocator, cj: CommitJson) !types.Commit {
+    const author: []const u8 = if (cj.author) |a| (a.display_name orelse (if (a.user) |u| (u.display_name orelse "") else "")) else "";
+    return .{
+        .hash = try allocator.dupe(u8, cj.hash),
+        .message = try allocator.dupe(u8, cj.message),
+        .author = try allocator.dupe(u8, author),
+        .date = try allocator.dupe(u8, cj.date),
+    };
+}
+
+fn deinitCommit(allocator: Allocator, c: types.Commit) void {
+    allocator.free(c.hash);
+    allocator.free(c.message);
+    allocator.free(c.author);
+    allocator.free(c.date);
+}
+
+/// Free a batch returned by `listPrCommits` / `listRepoCommits`.
+pub fn deinitCommits(allocator: Allocator, items: []types.Commit) void {
+    for (items) |c| deinitCommit(allocator, c);
+    allocator.free(items);
+}
+
+const TaskJson = struct {
+    id: u64,
+    content: ?struct { raw: ?[]const u8 = null } = null,
+    state: []const u8 = "UNRESOLVED",
+    creator: ?struct { uuid: ?[]const u8 = null } = null,
+    comment: ?struct { id: u64 } = null,
+};
+
+const TaskPage = struct {
+    values: []TaskJson,
+    next: ?[]const u8 = null,
+};
+
+fn dupeTask(allocator: Allocator, tj: TaskJson) !types.Task {
+    const raw = if (tj.content) |c| (c.raw orelse "") else "";
+    const creator = if (tj.creator) |c| (c.uuid orelse "") else "";
+    return .{
+        .id = tj.id,
+        .content = try allocator.dupe(u8, raw),
+        .state = try allocator.dupe(u8, tj.state),
+        .creator_uuid = try allocator.dupe(u8, creator),
+        .comment_id = if (tj.comment) |c| c.id else null,
+    };
+}
+
+fn deinitTask(allocator: Allocator, t: types.Task) void {
+    allocator.free(t.content);
+    allocator.free(t.state);
+    allocator.free(t.creator_uuid);
+}
+
+/// Free a batch returned by `listTasks`.
+pub fn deinitTasks(allocator: Allocator, items: []types.Task) void {
+    for (items) |t| deinitTask(allocator, t);
+    allocator.free(items);
+}
+
+/// Free a `FileMeta` returned by `getFileMeta`.
+pub fn deinitFileMeta(allocator: Allocator, m: Client.FileMeta) void {
+    allocator.free(m.path);
+    allocator.free(m.commit);
+    for (m.attributes) |a| allocator.free(a);
+    allocator.free(m.attributes);
+}
 
 /// Map HTTP status to an `ApiError`; return normally on 2xx.
 fn classify(status: u16) ApiError!void {
@@ -2168,4 +3020,234 @@ test "getDiff output feeds the parser end to end" {
     try testing.expectEqual(@as(usize, 1), parsed.files.len);
     try testing.expectEqualStrings("a.txt", parsed.files[0].new_path);
     try testing.expectEqual(@as(usize, 3), parsed.files[0].hunks[0].lines.len);
+}
+
+// ---------------------------------------------------------------------------
+// Additive `bbr api` surface: workspaces, repositories, commits, compare,
+// single comment, resolve/reopen, tasks. Uses FakeHttpClient; no network.
+// ---------------------------------------------------------------------------
+
+test "getDiff output still feeds the parser end to end" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body = sample_diff };
+    const bb = Client.init(fake.httpClient(), testCredential());
+
+    const raw = try bb.getDiff(a, "myrepo", 42);
+    defer a.free(raw);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const parsed = try @import("../diff/parser.zig").parse(arena.allocator(), raw);
+
+    try testing.expectEqual(@as(usize, 1), parsed.files.len);
+}
+
+test "listWorkspaces parses nested workspace entries" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body =
+        \\{ "values": [
+        \\  { "workspace": { "slug": "acme", "name": "Acme", "uuid": "{w1}" } },
+        \\  { "workspace": { "slug": "other", "name": "Other", "uuid": "{w2}" } }
+        \\] }
+    };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const items = try bb.listWorkspaces(a, .{});
+    defer deinitWorkspaces(a, items);
+    try testing.expectEqual(@as(usize, 2), items.len);
+    try testing.expectEqualStrings("acme", items[0].slug);
+    try testing.expectEqualStrings("{w1}", items[0].uuid);
+    try testing.expectEqualStrings(
+        "https://api.bitbucket.org/2.0/user/workspaces",
+        fake.lastUrl().?,
+    );
+}
+
+test "listWorkspaces honors no-follow and limit" {
+    const a = testing.allocator;
+    const page1 =
+        \\{ "values": [ { "workspace": { "slug": "a" } } ],
+        \\  "next": "https://api.bitbucket.org/2.0/user/workspaces?page=2" }
+    ;
+    const page2 =
+        \\{ "values": [ { "workspace": { "slug": "b" } } ] }
+    ;
+    const responses = [_]@import("../http/fake_client.zig").Canned{
+        .{ .status = 200, .body = page1 },
+        .{ .status = 200, .body = page2 },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const one = try bb.listWorkspaces(a, .{ .follow = false });
+    defer deinitWorkspaces(a, one);
+    try testing.expectEqual(@as(usize, 1), one.len);
+    try testing.expectEqual(@as(usize, 1), fake.call_count);
+}
+
+test "getWorkspace builds the right URL" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body =
+        \\{ "slug": "acme", "name": "Acme", "uuid": "{w1}" }
+    };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const w = try bb.getWorkspace(a, "acme");
+    defer deinitWorkspace(a, w);
+    try testing.expectEqualStrings("acme", w.slug);
+    try testing.expectEqualStrings(
+        "https://api.bitbucket.org/2.0/workspaces/acme",
+        fake.lastUrl().?,
+    );
+}
+
+test "listRepositories parses slugs" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body =
+        \\{ "values": [
+        \\  { "slug": "api", "full_name": "acme/api", "name": "api", "uuid": "{r1}", "is_private": true }
+        \\] }
+    };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const items = try bb.listRepositories(a, "acme", .{});
+    defer deinitRepositories(a, items);
+    try testing.expectEqual(@as(usize, 1), items.len);
+    try testing.expectEqualStrings("acme/api", items[0].full_name);
+    try testing.expect(items[0].is_private);
+}
+
+test "getRepository builds the right URL" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body =
+        \\{ "slug": "api", "full_name": "acme/api" }
+    };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const r = try bb.getRepository(a, "api", "acme");
+    defer deinitRepository(a, r);
+    try testing.expectEqualStrings(
+        "https://api.bitbucket.org/2.0/repositories/acme/api",
+        fake.lastUrl().?,
+    );
+}
+
+test "listPrCommits parses hashes" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body =
+        \\{ "values": [
+        \\  { "hash": "abc123", "message": "first", "date": "2026-01-01" },
+        \\  { "hash": "def456", "message": "second" }
+        \\] }
+    };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const items = try bb.listPrCommits(a, "myrepo", 42, .{});
+    defer deinitCommits(a, items);
+    try testing.expectEqual(@as(usize, 2), items.len);
+    try testing.expectEqualStrings("abc123", items[0].hash);
+    try testing.expectEqualStrings(
+        "https://api.bitbucket.org/2.0/repositories/check24/myrepo/pullrequests/42/commits",
+        fake.lastUrl().?,
+    );
+}
+
+test "getCompareDiff hits the from..to URL" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body = sample_diff };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const raw = try bb.getCompareDiff(a, "myrepo", "aaa", "bbb", false);
+    defer a.free(raw);
+    try testing.expectEqualStrings(
+        "https://api.bitbucket.org/2.0/repositories/check24/myrepo/diff/aaa..bbb",
+        fake.lastUrl().?,
+    );
+    const patch = try bb.getCompareDiff(a, "myrepo", "aaa", "bbb", true);
+    defer a.free(patch);
+    try testing.expectEqualStrings(
+        "https://api.bitbucket.org/2.0/repositories/check24/myrepo/patch/aaa..bbb",
+        fake.lastUrl().?,
+    );
+}
+
+test "getComment returns one typed comment" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body =
+        \\{ "id": 9, "content": { "raw": "hello" }, "user": { "display_name": "Ada" } }
+    };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const c = try bb.getComment(a, "myrepo", 7, 9);
+    defer {
+        var tmp = [_]review.Comment{c};
+        _ = &tmp;
+        deinitComment(a, c);
+    }
+    try testing.expectEqual(@as(u64, 9), c.id);
+    try testing.expectEqualStrings(
+        "https://api.bitbucket.org/2.0/repositories/check24/myrepo/pullrequests/7/comments/9",
+        fake.lastUrl().?,
+    );
+}
+
+test "resolveComment POSTs and reopenComment DELETEs" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body = "{}" };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    try bb.resolveComment(a, "myrepo", 7, 42);
+    try testing.expectEqual(httpc.Method.POST, fake.last_method.?);
+    try testing.expectEqualStrings(
+        "https://api.bitbucket.org/2.0/repositories/check24/myrepo/pullrequests/7/comments/42/resolve",
+        fake.lastUrl().?,
+    );
+    try bb.reopenComment(a, "myrepo", 7, 42);
+    try testing.expectEqual(httpc.Method.DELETE, fake.last_method.?);
+}
+
+test "tasks round-trip: list, get, create, update, state, delete" {
+    const a = testing.allocator;
+    const list_body =
+        \\{ "values": [
+        \\  { "id": 1, "content": { "raw": "fix it" }, "state": "UNRESOLVED",
+        \\    "creator": { "uuid": "{me}" }, "comment": { "id": 9 } }
+        \\] }
+    ;
+    var fake: FakeHttpClient = .{ .status = 200, .body = list_body };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const items = try bb.listTasks(a, "myrepo", 7, .{});
+    defer deinitTasks(a, items);
+    try testing.expectEqual(@as(usize, 1), items.len);
+    try testing.expect(!items[0].resolved());
+    try testing.expectEqual(@as(?u64, 9), items[0].comment_id);
+
+    const single =
+        \\{ "id": 1, "content": { "raw": "fix it" }, "state": "RESOLVED" }
+    ;
+    var fake2: FakeHttpClient = .{ .status = 200, .body = single };
+    const bb2 = Client.init(fake2.httpClient(), testCredential());
+    const t = try bb2.getTask(a, "myrepo", 7, 1);
+    defer deinitTask(a, t);
+    try testing.expect(t.resolved());
+
+    var fake3: FakeHttpClient = .{ .status = 201, .body = "{ \"id\": 5 }" };
+    const bb3 = Client.init(fake3.httpClient(), testCredential());
+    try testing.expectEqual(@as(u64, 5), try bb3.createTask(a, "myrepo", 7, "do it", null));
+    try testing.expectEqual(httpc.Method.POST, fake3.last_method.?);
+
+    var fake4: FakeHttpClient = .{ .status = 200, .body = single };
+    const bb4 = Client.init(fake4.httpClient(), testCredential());
+    const updated = try bb4.updateTask(a, "myrepo", 7, 1, null, "RESOLVED");
+    defer deinitTask(a, updated);
+    try testing.expect(updated.resolved());
+    try testing.expectEqual(httpc.Method.PUT, fake4.last_method.?);
+
+    var fake5: FakeHttpClient = .{ .status = 204, .body = "" };
+    const bb5 = Client.init(fake5.httpClient(), testCredential());
+    try bb5.deleteTask(a, "myrepo", 7, 1);
+    try testing.expectEqual(httpc.Method.DELETE, fake5.last_method.?);
+}
+
+test "getFileMeta parses size and attributes" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body =
+        \\{"type":"commit_file","path":"src/run.sh","commit":{"hash":"abc123"},"size":17,"attributes":["executable"]}
+    };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const m = try bb.getFileMeta(a, "myrepo", "abc123", "src/run.sh");
+    defer deinitFileMeta(a, m);
+    try testing.expectEqual(@as(usize, 17), m.size);
+    try testing.expectEqual(@as(usize, 1), m.attributes.len);
 }

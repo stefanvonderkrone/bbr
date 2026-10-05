@@ -16,6 +16,7 @@ const persist = @import("persist/sqlite_store.zig");
 const config = @import("tui/config.zig");
 const TreeSitterHighlighter = @import("highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter;
 const grammar_cli = @import("highlight/grammar_cli.zig");
+const api_cli = @import("api/cli.zig");
 const presentation = @import("tui/presentation.zig");
 const buffer_mod = @import("tui/buffer.zig");
 
@@ -39,6 +40,7 @@ pub fn main(init: std.process.Init) !void {
     // buffer/renderer so the comment UI can be exercised entirely offline.
     if (first) |f| {
         if (std.mem.eql(u8, f, "grammar")) return grammarRun(init, gpa, &it);
+        if (std.mem.eql(u8, f, "api")) return apiRun(init, gpa, &it);
         if (std.mem.eql(u8, f, "demo")) {
             var loaded = try config.load(gpa, init.io, init.environ_map);
             defer loaded.deinit(gpa);
@@ -106,6 +108,12 @@ pub fn main(init: std.process.Init) !void {
         .ok => |*configuration| try openTui(init, gpa, cred, input, configuration),
         .invalid => |failure| failure.report(),
     }
+}
+
+/// `bbr api [...]`: scriptable Bitbucket Cloud access without the TUI and
+/// without config. Help works with no credentials; verbs need BITBUCKET_*.
+fn apiRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
+    return api_cli.run(init, gpa, it);
 }
 
 fn grammarRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
@@ -758,6 +766,9 @@ fn usage() void {
         \\  bbr external-edit-smoke          interactive PTY External Edit check
         \\  bbr demo                         open the TUI with synthetic data (no network)
         \\  bbr grammar <command> ...        manage trusted local UserGrammars
+        \\  bbr api [--workspace SLUG] [--json] VERB [options]
+        \\  bbr api --help                   list all verbs (no credentials needed)
+        \\  bbr api VERB --help              options for one verb
         \\
         \\Remote review commands need BITBUCKET_USERNAME, BITBUCKET_TOKEN,
         \\BITBUCKET_WORKSPACE in the environment.
@@ -868,6 +879,15 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
 // (app → render → theme → nav → picker → session); the core `bbr` module's
 // tests run via src/root.zig.
 test {
+    _ = @import("api/cli.zig");
+    _ = @import("api/args.zig");
+    _ = @import("api/workspaces.zig");
+    _ = @import("api/repositories.zig");
+    _ = @import("api/pullrequests.zig");
+    _ = @import("api/comments.zig");
+    _ = @import("api/tasks.zig");
+    _ = @import("api/files.zig");
+    _ = @import("api/commits.zig");
     _ = @import("highlight/tree_sitter_highlighter.zig");
     _ = @import("highlight/query_regex.zig");
     _ = @import("highlight/user_grammar.zig");

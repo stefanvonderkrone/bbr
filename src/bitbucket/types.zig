@@ -76,6 +76,49 @@ pub const HeadCommits = struct {
     destination: []const u8 = "",
 };
 
+/// A Bitbucket workspace: owns repositories. All slices owned by the
+/// allocator that produced the value.
+pub const Workspace = struct {
+    slug: []const u8,
+    name: []const u8 = "",
+    uuid: []const u8 = "",
+};
+
+/// A repository within a workspace. All slices owned by the allocator that
+/// produced the value.
+pub const Repository = struct {
+    slug: []const u8,
+    full_name: []const u8 = "",
+    name: []const u8 = "",
+    uuid: []const u8 = "",
+    is_private: bool = false,
+};
+
+/// A task on a pull request: actionable prose distinct from a `Comment`.
+/// `resolved` mirrors Bitbucket's `state` (`RESOLVED` vs `UNRESOLVED`).
+/// `comment_id` links the task to a comment when created against one.
+/// All slices owned by the allocator that produced the value.
+pub const Task = struct {
+    id: u64,
+    content: []const u8,
+    state: []const u8,
+    creator_uuid: []const u8 = "",
+    comment_id: ?u64 = null,
+
+    pub fn resolved(self: Task) bool {
+        return std.mem.eql(u8, self.state, "RESOLVED");
+    }
+};
+
+/// A commit as listed on a pull request or repository. All slices owned by
+/// the allocator that produced the value.
+pub const Commit = struct {
+    hash: []const u8,
+    message: []const u8 = "",
+    author: []const u8 = "",
+    date: []const u8 = "",
+};
+
 /// Classified API failures. The adapter maps HTTP status → one of these so the
 /// UI can react (re-auth, back off, report) without knowing HTTP.
 pub const ApiError = error{
