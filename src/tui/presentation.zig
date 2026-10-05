@@ -22327,6 +22327,48 @@ test "failed replacement preserves Composer and successful replacement resets it
     try testing.expect(presentation.projection().composer == null);
 }
 
+test "M21 kernel WholeFile admits enrichment across event-loop focus checks" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{
+            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
+            .session = try testSession(testing.allocator, 1, 'a'),
+        },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try dispatchView(&presentation, .{ .action = .cycle_scope });
+    try presentation.dispatch(.ensure_focused_enrichment);
+    const command = presentation.takeCommand().?.enrich_file;
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 200, .body = "old\n" },
+        .{ .status = 200, .body = "new\n" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+    var highlighter = TestNoopHighlighter{};
+    const result = try file_enrichment.enrich(testing.allocator, client, highlighter.highlighter(), command.request());
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = command.command_id,
+        .work_id = command.work_id,
+        .session_epoch = command.session_epoch,
+        .file_index = command.file_index,
+        .outcome = .{ .completed = result },
+    } });
+    const worker = presentation.takeCommand().?.build_buffer_disclosure;
+    // The application checks focus after issuing work and before accepting it.
+    try presentation.dispatch(.ensure_focused_enrichment);
+    worker.build();
+    try presentation.dispatch(.{ .buffer_disclosure_built = worker });
+    try testing.expect(presentation.published.?.session.enrichment.file(0).new == .content);
+    try testing.expect(presentation.takeCommand() == null);
+    for (presentation.projection().review.?.frame.buffer.rows) |row| {
+        try testing.expect(row != .status_placeholder);
+    }
+}
+
 test "focused File Enrichment emits one Session Epoch command while in flight" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
