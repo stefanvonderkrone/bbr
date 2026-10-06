@@ -107,6 +107,19 @@ bbr api whoami --profile work --json
 bbr --profile work api list-pull-requests --workspace check24 --repository sample
 ```
 
+### Shell completions
+
+`bbr completion` prints a completion script for `bbr` commands, `bbr api` verbs,
+and per-verb flags. `--profile` values complete from saved Profiles. No
+credentials are needed to print a script.
+
+```sh
+eval "$(bbr completion bash)"                                   # try it once
+bbr completion bash > ~/.local/share/bash-completion/completions/bbr
+bbr completion zsh > "${fpath[1]}/_bbr"                        # then `compinit`
+bbr completion fish > ~/.config/fish/completions/bbr.fish
+```
+
 ## Configuration
 
 The TUI reads `$XDG_CONFIG_HOME/bbr/config.toml`, falling back to

@@ -15,7 +15,7 @@ const tasks = @import("tasks.zig");
 const files = @import("files.zig");
 const commits = @import("commits.zig");
 
-const Verb = struct {
+pub const Verb = struct {
     name: []const u8,
     summary: []const u8,
     help: []const u8,
@@ -23,7 +23,7 @@ const Verb = struct {
     handler: *const fn (std.process.Init, bbr.bitbucket.Client, []const []const u8, bool) anyerror!void,
 };
 
-const verbs = [_]Verb{
+pub const verbs = [_]Verb{
     .{ .name = "list-workspaces", .summary = "list workspaces for the authenticated account", .help = workspaces.list_help, .example = "bbr api list-workspaces --pagelen 10 --no-follow", .handler = workspaces.runList },
     .{ .name = "get-workspace", .summary = "get one workspace", .help = workspaces.get_help, .example = "bbr api get-workspace --workspace demo", .handler = workspaces.runGet },
     .{ .name = "list-repositories", .summary = "list repositories in a workspace", .help = repositories.list_help, .example = "bbr api list-repositories --workspace demo --limit 10", .handler = repositories.runList },
@@ -87,8 +87,66 @@ const value_flags = [_][]const u8{
 };
 
 fn takesValue(name: []const u8) bool {
+    return completionTakesValue(name);
+}
+
+/// Global `bbr api` flags, also completed before and after the verb.
+pub const global_flags = [_][]const u8{ "profile", "workspace", "json", "help" };
+
+/// Whether a flag name takes a value (space or `=` form). Shared with the
+/// `bbr completion` scripts so value flags don't complete as booleans.
+pub fn completionTakesValue(name: []const u8) bool {
     for (value_flags) |v| if (std.mem.eql(u8, v, name)) return true;
     return false;
+}
+
+/// Value-flag names for embedding in completion scripts.
+pub const completion_value_flags = value_flags;
+
+/// Per-verb flags for completion. Keep beside `verbs[]`: a new verb row needs
+/// its flag row or `bbr completion` won't offer the verb's options. Names are
+/// the long `--kebab-case` form without `--`; boolean flags (`--no-follow`,
+/// `--no-head`, `--patch`, `--json`) are included too.
+pub const VerbFlags = struct {
+    verb: []const u8,
+    flags: []const []const u8,
+};
+
+pub const verb_flags = [_]VerbFlags{
+    .{ .verb = "list-workspaces", .flags = &.{ "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
+    .{ .verb = "get-workspace", .flags = &.{ "workspace", "json" } },
+    .{ .verb = "list-repositories", .flags = &.{ "workspace", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
+    .{ .verb = "get-repository", .flags = &.{ "repository", "workspace", "json" } },
+    .{ .verb = "list-pull-requests", .flags = &.{ "repository", "state", "source-branch", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
+    .{ .verb = "get-pull-request", .flags = &.{ "repository", "pull-request-id", "json" } },
+    .{ .verb = "list-commits", .flags = &.{ "repository", "pull-request-id", "revision", "from", "to", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
+    .{ .verb = "get-diff", .flags = &.{ "repository", "pull-request-id", "out", "json" } },
+    .{ .verb = "get-compare-diff", .flags = &.{ "repository", "from", "to", "patch", "out", "json" } },
+    .{ .verb = "get-blob", .flags = &.{ "repository", "commit", "path", "out", "json" } },
+    .{ .verb = "check-blob", .flags = &.{ "repository", "commit", "path", "attributes", "json" } },
+    .{ .verb = "list-comments", .flags = &.{ "repository", "pull-request-id", "source-commit", "destination-commit", "no-head", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
+    .{ .verb = "get-comment", .flags = &.{ "repository", "pull-request-id", "comment-id", "json" } },
+    .{ .verb = "create-comment", .flags = &.{ "repository", "pull-request-id", "body", "body-file", "parent-id", "path", "to", "from", "start-to", "start-from", "file-path", "source-commit", "json" } },
+    .{ .verb = "update-comment", .flags = &.{ "repository", "pull-request-id", "comment-id", "body", "body-file", "json" } },
+    .{ .verb = "delete-comment", .flags = &.{ "repository", "pull-request-id", "comment-id" } },
+    .{ .verb = "resolve-comment", .flags = &.{ "repository", "pull-request-id", "comment-id", "json" } },
+    .{ .verb = "reopen-comment", .flags = &.{ "repository", "pull-request-id", "comment-id", "json" } },
+    .{ .verb = "list-tasks", .flags = &.{ "repository", "pull-request-id", "state-filter", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
+    .{ .verb = "get-task", .flags = &.{ "repository", "pull-request-id", "task-id", "json" } },
+    .{ .verb = "create-task", .flags = &.{ "repository", "pull-request-id", "content", "content-file", "comment-id", "json" } },
+    .{ .verb = "update-task", .flags = &.{ "repository", "pull-request-id", "task-id", "content", "content-file", "state", "json" } },
+    .{ .verb = "delete-task", .flags = &.{ "repository", "pull-request-id", "task-id" } },
+    .{ .verb = "resolve-task", .flags = &.{ "repository", "pull-request-id", "task-id", "json" } },
+    .{ .verb = "reopen-task", .flags = &.{ "repository", "pull-request-id", "task-id", "json" } },
+    .{ .verb = "whoami", .flags = &.{"json"} },
+    .{ .verb = "get-verdict", .flags = &.{ "repository", "pull-request-id", "uuid", "json" } },
+    .{ .verb = "set-verdict", .flags = &.{ "repository", "pull-request-id", "verdict", "expected-source-commit", "json" } },
+};
+
+/// Flag names for one verb, or `null` for an unknown verb.
+pub fn flagsForVerb(name: []const u8) ?[]const []const u8 {
+    for (verb_flags) |entry| if (std.mem.eql(u8, entry.verb, name)) return entry.flags;
+    return null;
 }
 
 /// Split argv (after `api`) into globals + verb + verb args.

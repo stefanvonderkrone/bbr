@@ -17,6 +17,7 @@ const config = @import("tui/config.zig");
 const TreeSitterHighlighter = @import("highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter;
 const grammar_cli = @import("highlight/grammar_cli.zig");
 const api_cli = @import("api/cli.zig");
+const completion_cli = @import("completion.zig");
 const presentation = @import("tui/presentation.zig");
 const buffer_mod = @import("tui/buffer.zig");
 
@@ -115,6 +116,7 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, f, "login")) return loginRun(init, gpa, &rest, flag_profile);
         if (std.mem.eql(u8, f, "logout")) return logoutRun(init, gpa, &rest, flag_profile);
+        if (std.mem.eql(u8, f, "completion")) return completion_cli.run(init, gpa, &rest);
         if (std.mem.eql(u8, f, "check-blobs")) {
             var blob_owned = auth.resolve(gpa, init.io, init.environ_map, flag_profile) catch |err| {
                 if (err == error.InvalidAuthFile) return;
@@ -1017,6 +1019,8 @@ fn usage() void {
         \\  bbr api [--workspace SLUG] [--json] VERB [options]
         \\  bbr api --help                   list all verbs (no credentials needed)
         \\  bbr api VERB --help              options for one verb
+        \\  bbr completion (bash|zsh|fish)   print a shell completion script (no credentials needed)
+        \\  bbr completion --list-profiles   saved Profile names, one per line (for completion scripts)
         \\
         \\Credentials come from `$XDG_DATA_HOME/bbr/auth.toml` (see `bbr login`).
         \\`--profile <name>` (or BBR_PROFILE) selects a saved profile.
