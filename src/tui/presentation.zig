@@ -514,6 +514,142 @@ test "M23 highlighting rejects completions with a changed typed owner block cont
     }
 }
 
+test "M23 acceptance Highlighting admission failures preserve active search Selection and retained results" {
+    var failures: usize = 0;
+    var offset: usize = 0;
+    while (true) : (offset += 1) {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var state = try codeTestPresentation(failing.allocator(), store.store(), &.{ "needle\n\n```js\none\n```", "needle\n\n```js\ntwo\n```", "needle\n\n```js\nthree\n```" }, 0, 40);
+        defer state.deinit();
+        const capacity = 3 * 1024 * 1024 / @sizeOf(code_highlighting.SourceSpan);
+        for (0..2) |_| {
+            const job = state.takeCommand().?.highlight_code;
+            try state.dispatch(.{ .code_highlight_completed = try codeCapacityCompletion(job, capacity) });
+        }
+        const running = state.takeCommand().?.highlight_code;
+        try testing.expectEqualDeep(review_card.Owner{ .draft = 3 }, running.identity.owner);
+        try state.dispatch(.{ .action = .open_buffer_search });
+        try state.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+        try completeBufferSearchScan(&state);
+        try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try state.dispatch(.{ .action = .toggle_select });
+        try state.dispatch(.{ .action = .down });
+        const before = state.projection().review.?.frame;
+        const before_revision = state.projection().revision;
+        try testing.expect(before.navigation.mark != null);
+        try testing.expect(before.search_ranges.len > 0);
+        const first_spans = before.code_highlights[0].spans.ptr;
+        const second_spans = before.code_highlights[1].spans.ptr;
+        const completed = try codeCapacityCompletion(running, capacity);
+        failing.fail_index = failing.alloc_index + offset;
+        try state.dispatch(.{ .code_highlight_completed = completed });
+        failing.fail_index = std.math.maxInt(usize);
+        const after = state.projection().review.?.frame;
+        try testing.expectEqual(before.buffer.rows.ptr, after.buffer.rows.ptr);
+        try testing.expectEqual(before.visual_rows.ptr, after.visual_rows.ptr);
+        try testing.expectEqual(before.search_ranges.ptr, after.search_ranges.ptr);
+        try testing.expectEqual(before.visual_rows_revision, after.visual_rows_revision);
+        try testing.expectEqualDeep(before.geometry, after.geometry);
+        try testing.expectEqualDeep(before.navigation, after.navigation);
+        try testing.expectEqual(@as(usize, 3), state.projection().buffer_search.?.total);
+        try testing.expect(after.code_highlight_retained_bytes <= code_highlighting.budget_bytes);
+        try testing.expectEqual(@as(usize, 2), after.code_highlights.len);
+        if (!failing.has_induced_failure) {
+            try testing.expectEqualDeep(review_card.Owner{ .draft = 2 }, after.code_highlights[0].owner);
+            try testing.expectEqualDeep(review_card.Owner{ .draft = 3 }, after.code_highlights[1].owner);
+            try testing.expect(state.projection().revision.frame > before_revision.frame);
+            try testing.expectEqual(before_revision.interaction, state.projection().revision.interaction);
+            break;
+        }
+        failures += 1;
+        try testing.expectEqualDeep(before_revision, state.projection().revision);
+        try testing.expectEqual(before.revision, after.revision);
+        try testing.expectEqual(first_spans, after.code_highlights[0].spans.ptr);
+        try testing.expectEqual(second_spans, after.code_highlights[1].spans.ptr);
+        try testing.expect(state.takeCommand() == null);
+    }
+    try testing.expect(failures > 0);
+}
+
+test "M23 acceptance Preview priority limits eviction body replacement and Session expiry keep interaction ownership" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const bodies = [_][]const u8{ "```js\none\n```", "```js\ntwo\n```", "```js\ntri\n```", "```js\nfour\n```" } ++ [_][]const u8{"plain card"} ** 30 ++ [_][]const u8{"needle\n\n```js\nfive\n```\n\n```js\noverlimit\n```"};
+    var state = try codeTestPresentation(testing.allocator, store.store(), &bodies, 5, 40);
+    defer state.deinit();
+    const capacity = 3 * 1024 * 1024 / @sizeOf(code_highlighting.SourceSpan);
+    for (0..2) |_| {
+        const job = state.takeCommand().?.highlight_code;
+        try state.dispatch(.{ .code_highlight_completed = try codeCapacityCompletion(job, capacity) });
+    }
+    const third = state.takeCommand().?.highlight_code;
+    try testing.expectEqualDeep(review_card.Owner{ .draft = 3 }, third.identity.owner);
+    try visitCodeCard(&state, 20);
+    try state.dispatch(.{ .action = .toggle_select });
+    try state.dispatch(.{ .action = .down });
+    const selection = state.projection().review.?.navigation;
+    try state.dispatch(.{ .action = .open_review_search });
+    try state.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+    try completeBufferSearchScan(&state);
+    var saved_occurrences = try (search.Batch{ .occurrences = @constCast(state.projection().review_search.?.occurrences) }).clone(testing.allocator);
+    defer saved_occurrences.deinit(testing.allocator);
+    const selected = saved_occurrences.occurrences[0];
+    try testing.expectEqualDeep(search.ReviewBodyOwner{ .draft = 35 }, selected.location.review_body.owner);
+    while (state.takeCommand()) |command| try testing.expect(command == .enrich_file);
+    const before = state.projection().review.?.frame;
+    try state.dispatch(.{ .code_highlight_completed = try codeCapacityCompletion(third, capacity) });
+    const frame = state.projection().review.?.frame;
+    try testing.expectEqual(before.visual_rows.ptr, frame.visual_rows.ptr);
+    try testing.expectEqualDeep(selection, frame.navigation);
+    try testing.expectEqualDeep(selected, state.projection().review_search.?.results[0].occurrence);
+    try testing.expectEqual(@as(usize, 2), frame.code_highlights.len);
+    try testing.expectEqualDeep(review_card.Owner{ .draft = 2 }, frame.code_highlights[0].owner);
+    try testing.expectEqualDeep(review_card.Owner{ .draft = 3 }, frame.code_highlights[1].owner);
+    try testing.expect(frame.code_highlight_retained_bytes <= code_highlighting.budget_bytes);
+    const preview = state.takeCommand().?.highlight_code;
+    try testing.expectEqualDeep(review_card.Owner{ .draft = 35 }, preview.identity.owner);
+    const preview_identity = preview.identity;
+    try testing.expectEqualStrings("five\n", preview.content);
+    try testing.expect(state.takeCommand() == null);
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try state.dispatch(.{ .action = .clear_selection });
+    try visitCodeCard(&state, 35);
+    try state.dispatch(.{ .action = .edit_review_item });
+    try state.dispatch(.{ .composer = .{ .insert = try TextChunk.init("\nchanged") } });
+    try state.dispatch(.{ .composer = .save });
+    try completeDisclosureBuild(&state);
+    const replaced = state.projection().review.?.frame;
+    try state.dispatch(.{ .code_highlight_completed = try codeCapacityCompletion(preview, capacity) });
+    try testing.expectEqual(replaced.visual_rows.ptr, state.projection().review.?.frame.visual_rows.ptr);
+    try testing.expectEqual(@as(usize, 2), state.projection().review.?.frame.code_highlights.len);
+    const fresh = state.takeCommand().?.highlight_code;
+    try testing.expectEqualStrings("five\n", fresh.content);
+    try testing.expect(fresh.identity.body_hash != preview_identity.body_hash);
+    try state.dispatch(.{ .action = .open_buffer_search });
+    try state.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+    try completeBufferSearchScan(&state);
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try state.dispatch(.{ .action = .toggle_select });
+    const epoch = state.projection().review.?.session_epoch;
+    try state.dispatch(.{ .action = .refresh });
+    const load = state.takeCommand().?.load_session;
+    try dispatchSessionLoadForTest(&state, .{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .loaded = try testSession(testing.allocator, 1, 'a') } } });
+    try testing.expect(state.projection().review.?.session_epoch != epoch);
+    try testing.expect(state.projection().buffer_search == null);
+    try testing.expect(state.projection().review.?.navigation.mark == null);
+    try testing.expectEqual(@as(usize, 0), state.projection().review.?.frame.code_highlights.len);
+    const replacement = state.projection().review.?.frame;
+    try state.dispatch(.{ .code_highlight_completed = try codeCapacityCompletion(fresh, capacity) });
+    try testing.expectEqual(replacement.visual_rows.ptr, state.projection().review.?.frame.visual_rows.ptr);
+    try testing.expectEqual(@as(usize, 0), state.projection().review.?.frame.code_highlights.len);
+    const restarted = state.takeCommand().?.highlight_code;
+    try testing.expectEqualDeep(review_card.Owner{ .draft = 1 }, restarted.identity.owner);
+    try testing.expect(restarted.identity.session_epoch != epoch);
+    try state.dispatch(.{ .code_highlight_completed = restarted.launchFailed() });
+}
+
 test "M23 highlighting failed admission preserves the complete Frame and does not retry" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -11460,8 +11596,6 @@ pub const Presentation = struct {
             self.discardQueuedReviewSourceScans();
             self.discardQueuedReviewSearchScans();
             self.discardQueuedSearchEnrichments(current);
-            if (OwnedReviewIdentity.eql(current.key, candidate.key))
-                candidate.navigation = frame_mod.restoreNavigationIndexed(current.frameProjection(), candidate.visual_rows, candidate.geometry, candidate.search_projection.navigation);
         }
         self.published = candidate;
         self.discardQueuedBufferSearchScans(null);
@@ -18862,6 +18996,201 @@ test "M23 inline Actions retain exact search ranges, Selection bytes, and comple
     };
 }
 
+test "M23 acceptance authored Markdown storage editing and Submission stay byte exact" {
+    const raw = "# **Title**\r\n\r\nfirst :mask:\nsecond [docs][id]  \n\n| A | B |\n| --- | --- |\n| x | y |\n\n```js\nconst\tx = 1; // **literal** :mask:\n```\n\n[id]: /path \t\n";
+    const replacement = "const\tx = ':mask: **literal**';\nsecond();";
+    const suggestion = "```suggestion\n" ++ replacement ++ "\n```";
+    for ([_]bool{ false, true }) |local| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+        defer locks.deinit();
+        const key = if (local) try OwnedReviewIdentity.initLocal(1, "main", "feature") else try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .target = if (local) .local else .bitbucket, .body = raw, .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1, .commit = "source" } } });
+        try store.store().put(key.storeKey(), .{ .local_id = 2, .kind = .suggestion, .target = if (local) .local else .bitbucket, .body = suggestion, .parent = .{ .draft = 1 } });
+        var state = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .submission_locks = locks.locks(), .highlight_max_file_bytes = 1 }, .{
+            .initial = .{ .key = key, .session = if (local) try testLocalSession(testing.allocator) else try testSession(testing.allocator, 1, 'a') },
+            .geometry = .{ .cols = 100, .rows = 20 },
+        });
+        defer state.deinit();
+        for ([_]u16{ 38, 160, 100 }) |cols| try dispatchView(&state, .{ .resize = .{ .cols = cols, .rows = 20 } });
+        try dispatchView(&state, .{ .action = .toggle_layout });
+        try state.dispatch(.{ .action = .open_buffer_search });
+        try state.dispatch(.{ .key = .{ .codepoint = 'f', .text = "first :mask: second" } });
+        try completeBufferSearchScan(&state);
+        try testing.expectEqual(@as(usize, 1), state.projection().buffer_search.?.total);
+        try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        for ([_]u64{ 1, 2 }) |id| {
+            try cursorToDraftCard(&state, id);
+            try state.dispatch(.{ .action = .edit_review_item });
+            const editable = if (id == 1) raw else replacement;
+            try testing.expectEqualStrings(editable, state.projection().composer.?.body);
+            try state.dispatch(.{ .composer = .external_edit });
+            const external = state.takeCommand().?.external_edit;
+            try testing.expectEqualStrings(editable, external.body);
+            const unchanged = try ExternalEditCompleted.create(testing.allocator, external.command_id, external.session_epoch);
+            unchanged.outcome = .unchanged;
+            external.destroy();
+            try state.dispatch(.{ .external_edit_completed = unchanged });
+            try state.dispatch(.{ .composer = .save });
+            if (state.takeCommand()) |command| {
+                try testing.expect(command == .build_buffer_disclosure);
+                command.build_buffer_disclosure.build();
+                try state.dispatch(.{ .buffer_disclosure_built = command.build_buffer_disclosure });
+            }
+            try testing.expect(state.projection().composer == null);
+        }
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const stored = try store.store().load(arena.allocator(), key.storeKey());
+        try testing.expectEqual(@as(usize, 2), stored.len);
+        try testing.expectEqualStrings(raw, stored[0].body);
+        try testing.expectEqualStrings(suggestion, stored[1].body);
+        try testing.expectEqualDeep(@as(?bbr.review.draft.Parent, .{ .draft = 1 }), stored[1].parent);
+        if (local) {
+            try testing.expect(!state.projection().action_availability.available(.submit));
+        } else {
+            try state.dispatch(.{ .action = .submit });
+            var root = state.takeCommand().?;
+            const posted: PostDraftCompleted = .{ .command_id = root.post_draft.command_id, .operation_id = root.post_draft.operation_id, .identity = root.post_draft.identity, .temp_id = 1, .outcome = .{ .posted = 99 } };
+            try testing.expectEqualStrings(raw, root.post_draft.draft.body);
+            root.deinit();
+            try state.dispatch(.{ .post_draft_completed = posted });
+            var reply = state.takeCommand().?;
+            defer reply.deinit();
+            try testing.expectEqualStrings(suggestion, reply.post_draft.draft.body);
+            try testing.expectEqual(@as(?u64, 99), reply.post_draft.parent);
+            try state.dispatch(.{ .post_draft_completed = .{ .command_id = reply.post_draft.command_id, .operation_id = reply.post_draft.operation_id, .identity = reply.post_draft.identity, .temp_id = 2, .outcome = .{ .rejected = error.NotFound } } });
+        }
+    }
+}
+
+test "M23 acceptance yank completes the numbered transformed-row byte examples" {
+    const examples = [_]struct { body: []const u8, first: []const u8, last: []const u8, expected: []const u8, wide_expected: ?[]const u8 = null }{
+        .{ .body = "first\nsecond", .first = "first", .last = "second", .expected = "first\nsecond" },
+        .{ .body = "alpha bravo\ncharlie delta", .first = "alpha", .last = "bravo", .expected = "alpha bravo\n", .wide_expected = "alpha bravo\ncharlie delta" },
+        .{ .body = "| Name | State |\n| --- | --- |\n| Ada | Ready |\n| Bo | Waiting |", .first = "Ready", .last = "Ready", .expected = "| --- | --- |\n| Ada | Ready |\n" },
+        .{ .body = "| Name | State |\n| --- | --- |\n| Ada | Ready |\n| Bo | Waiting |", .first = "Ada", .last = "Ready", .expected = "| --- | --- |\n| Ada | Ready |\n" },
+        .{ .body = "[docs][id]\n\n[id]: https://example.invalid/", .first = "https://example.invalid/", .last = "https://example.invalid/", .expected = "[docs][id]\n[id]: https://example.invalid/" },
+        .{ .body = "[docs][id]\n\n[id]: https://example.invalid/", .first = "docs", .last = "docs", .expected = "[docs][id]\n", .wide_expected = "[docs][id]\n[id]: https://example.invalid/" },
+        .{ .body = "[docs][id]\n[more][id]\n\n[id]: https://example.invalid/", .first = "docs", .last = "https://example.invalid/", .expected = "[docs][id]\n[more][id]\n[id]: https://example.invalid/" },
+        .{ .body = "A\n\n\nB", .first = "A", .last = "B", .expected = "A\n\nB" },
+        .{ .body = "```zig\nconst x = 1;\nconst y = 2;\n```\nafter", .first = "const x", .last = "const y", .expected = "```zig\nconst x = 1;\nconst y = 2;\n```\n" },
+        .{ .body = "```zig\nconst x = 1;\nconst y = 2;\n```\nafter", .first = "const x", .last = "const x", .expected = "```zig\nconst x = 1;\n```\n" },
+    };
+    for (examples) |example| for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]bool{ false, true }) |upward| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const session = try testCommentSession(testing.allocator, 1);
+        @constCast(session.threads[0].root).body = example.body;
+        var state = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 0 }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+            .geometry = .{ .cols = 38, .rows = 40 },
+        });
+        defer state.deinit();
+        if (layout == .side_by_side) try dispatchView(&state, .{ .action = .toggle_layout });
+        for ([_]u16{ 38, 160, 38 }) |cols| {
+            try dispatchView(&state, .{ .resize = .{ .cols = cols, .rows = 40 } });
+            const first_range: search.Range = .{ .start = std.mem.indexOf(u8, example.body, example.first).?, .end = std.mem.indexOf(u8, example.body, example.first).? + example.first.len };
+            const last_start = std.mem.lastIndexOf(u8, example.body, example.last).?;
+            const last_range: search.Range = .{ .start = last_start, .end = last_start + example.last.len };
+            var first: ?usize = null;
+            var last: ?usize = null;
+            const review = state.projection().review.?;
+            for (review.frame.visual_rows, 0..) |visual, index| {
+                const row = review.buffer.rows[visual.buffer_index];
+                if (row != .comment or row.comment.part == .header or row.comment.part == .disclosure_footer) continue;
+                for (row.comment.segments) |segment| {
+                    const source = segment.definition_source orelse segment.source;
+                    if (!segment.authored) continue;
+                    if (source.start < first_range.end and source.end > first_range.start and first == null) first = index;
+                    if (source.start < last_range.end and source.end > last_range.start) last = index;
+                }
+            }
+            try testing.expect(first != null and last != null);
+            try selectRows(&state, if (upward) last.? else first.?, if (upward) first.? else last.?);
+            try state.dispatch(.{ .push_count_digit = 9 });
+            try state.dispatch(.{ .action = .yank });
+            var copy = state.takeCommand().?;
+            defer copy.deinit();
+            try testing.expectEqualStrings(if (cols == 160) example.wide_expected orelse example.expected else example.expected, copy.copy_clipboard.text);
+            try testing.expect(state.projection().review.?.navigation.mark == null);
+            try testing.expectEqual(@as(usize, 0), state.projection().review.?.navigation.count);
+            try state.dispatch(.{ .clipboard_completed = .{ .command_id = copy.copy_clipboard.command_id, .success = true } });
+            try testing.expectEqual(ClipboardStatus.copied, state.projection().clipboard_status.?);
+        }
+    };
+}
+
+test "M23 acceptance yank keeps exact source Comment source bytes at both widths and directions" {
+    for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]bool{ false, true }) |upward| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const session = try testCommentSession(testing.allocator, 1);
+        session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -0,0 +1,2 @@\n+before();\n+after();\n");
+        const comment = @constCast(session.threads[0].root);
+        comment.author = "";
+        comment.body = "first\nsecond\n";
+        var state = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 0 }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+            .geometry = .{ .cols = 38, .rows = 20 },
+        });
+        defer state.deinit();
+        if (layout == .side_by_side) try dispatchView(&state, .{ .action = .toggle_layout });
+        for ([_]u16{ 38, 160, 38 }) |cols| {
+            try dispatchView(&state, .{ .resize = .{ .cols = cols, .rows = 20 } });
+            const last = state.projection().review.?.frame.visual_rows.len - 1;
+            try selectRows(&state, if (upward) last else 0, if (upward) 0 else last);
+            try state.dispatch(.{ .action = .yank });
+            var copy = state.takeCommand().?;
+            defer copy.deinit();
+            try testing.expectEqualStrings("before();\nfirst\nsecond\nafter();", copy.copy_clipboard.text);
+        }
+    };
+}
+
+test "M23 acceptance yank orders hidden delimiters and definitions per typed owner across Files" {
+    const raw = "Title\n=====\n[docs][id]\n[more][id]\n\n```js\nconst x = 1;\nconst y = 2;\n```\n\n| Name | State |\n| --- | --- |\n| Ada | Ready |\n\n[id]: /path\n";
+    for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]bool{ false, true }) |upward| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .parent = .{ .comment = 1 } });
+        const session = try testSession(testing.allocator, 1, 'a');
+        const a = session.arena.allocator();
+        session.diff = try bbr.diff.parse(a, "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1,2 +1,2 @@\n-old before\n-old after\n+before();\n+after();\ndiff --git a/b.zig b/b.zig\n--- a/b.zig\n+++ b/b.zig\n@@ -1,2 +1,2 @@\n-old next\n-old end\n+next();\n+end();\n");
+        const comments = try a.dupe(bbr.review.Comment, &.{
+            .{ .id = 1, .author = "Ada", .body = raw, .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1 } } },
+            .{ .id = 2, .author = "Bo", .body = raw, .scope = .{ .@"inline" = .{ .path = "b.zig", .to = 1 } } },
+            .{ .id = 3, .author = "Old", .body = "excluded **body**", .scope = .{ .@"inline" = .{ .path = "a.zig", .from = 1 } } },
+        });
+        session.threads = try bbr.review.buildThreads(a, comments);
+        var state = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 0 }, .{
+            .initial = .{ .key = key, .session = session },
+            .geometry = .{ .cols = 48, .rows = 40 },
+        });
+        defer state.deinit();
+        if (layout == .side_by_side) try dispatchView(&state, .{ .action = .toggle_layout });
+        for (state.projection().review.?.frame.visual_rows, 0..) |visual, index| {
+            if (visual.owner != .disclosure or visual.owner.disclosure != .opposite_version) continue;
+            try moveToRow(&state, index);
+            try dispatchView(&state, .{ .action = .toggle_disclosure });
+            break;
+        }
+        for ([_]u16{ 48, 160, 48 }) |cols| {
+            try dispatchView(&state, .{ .resize = .{ .cols = cols, .rows = 40 } });
+            const last = state.projection().review.?.frame.visual_rows.len - 1;
+            try selectRows(&state, if (upward) last else 0, if (upward) 0 else last);
+            try state.dispatch(.{ .action = .yank });
+            var copy = state.takeCommand().?;
+            defer copy.deinit();
+            const narrow = "before();\nAda\n" ++ raw ++ "depth 1 · draft\n" ++ raw ++ "after();\nnext();\nBo\n" ++ raw ++ "end();";
+            const wide = "before();\nAda\n" ++ raw ++ "draft\n" ++ raw ++ "after();\nnext();\nBo\n" ++ raw ++ "end();";
+            try testing.expectEqualStrings(if (cols == 160) wide else narrow, copy.copy_clipboard.text);
+        }
+    };
+}
+
 test "M23 inline joined prose and Setext yank use approved exact authored bytes" {
     const examples = [_]struct { body: []const u8, cols: u16, expected: []const u8, spacer: bool = false }{
         .{ .body = "> 4. first\n>     second\n> 1. other", .cols = 160, .expected = "> 4. first\n>     second\n" },
@@ -20628,6 +20957,39 @@ test "empty source Lines count and yank has no trailing newline" {
     var command = presentation.takeCommand().?;
     defer command.deinit();
     try testing.expectEqualStrings("\nnew second", command.copy_clipboard.text);
+}
+
+test "M23 acceptance same Review refresh expires search and Selection in both layouts and Review modes" {
+    for ([_]bool{ false, true }) |local| for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = if (local) try OwnedReviewIdentity.initLocal(1, "main", "feature") else try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .target = if (local) .local else .bitbucket, .body = "# heading\n\nfirst\nneedle\n\nhidden tail" });
+        var state = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 1 }, .{
+            .initial = .{ .key = key, .session = if (local) try testLocalSession(testing.allocator) else try testSession(testing.allocator, 1, 'a') },
+            .geometry = .{ .cols = 38, .rows = 20 },
+        });
+        defer state.deinit();
+        if (layout == .side_by_side) try dispatchView(&state, .{ .action = .toggle_layout });
+        try state.dispatch(.{ .action = .open_buffer_search });
+        try state.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+        try completeBufferSearchScan(&state);
+        try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        try state.dispatch(.{ .action = .toggle_select });
+        try testing.expect(state.projection().review.?.navigation.mark != null);
+        const epoch = state.projection().review.?.session_epoch;
+        try state.dispatch(.{ .action = .refresh });
+        const load = state.takeCommand().?.load_session;
+        try dispatchSessionLoadForTest(&state, .{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .loaded = if (local) try testLocalSession(testing.allocator) else try testSession(testing.allocator, 1, 'a') } } });
+        const review = state.projection().review.?;
+        try testing.expect(review.session_epoch != epoch);
+        try testing.expect(state.projection().buffer_search == null);
+        try testing.expect(review.navigation.mark == null);
+        try testing.expectEqual(@as(usize, 0), review.navigation.cursor);
+        try testing.expectEqual(@as(usize, 0), review.navigation.count);
+        try testing.expectEqual(layout, review.buffer.layout);
+        try testing.expectEqual(@as(usize, 0), review.frame.search_ranges.len);
+    };
 }
 
 test "successful Session replacement resets Pane and Sidebar defaults" {

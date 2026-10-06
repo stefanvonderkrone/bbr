@@ -3683,6 +3683,72 @@ test "M23 literal code cells keep foreground under cursor Selection and search i
     };
 }
 
+test "M23 acceptance narrow lists tables links and compound emoji retain styles under Selection and search" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const card_mod = @import("review_card.zig");
+    const raw = "# ***Heading***\n\n> 4. ***[x](url)*** **:woman_technologist::skin-tone-2:**\n>     - ~~gone~~ `a\tb`\n\n| Name | State |\n| --- | --- |\n| ~~Ada~~ | `Ready` |";
+    const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
+    const draft: bbr.review.Draft = .{ .local_id = 1, .kind = .comment, .body = raw };
+    const body = try card_mod.ReviewBody.parse(a, raw);
+    var screen = try vaxis.Screen.init(a, .{ .rows = 128, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    screen.width_method = .unicode;
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    inline for (std.meta.tags(card_mod.CardRole)) |role| {
+        const is_draft = switch (role) {
+            .draft, .draft_reply, .outcome_unknown, .outcome_unknown_reply => true,
+            else => false,
+        };
+        const rows = try card_mod.project(a, body, .{ .owner = if (is_draft) .{ .draft = 1 } else .{ .comment = 1 }, .source = if (is_draft) .{ .draft = &draft } else .{ .comment = &comment }, .role = role, .header = "Ada", .content_width = 14, .indent = 7, .metrics = terminal_cell_metrics, .collapsed_rows = 0 });
+        const buffer_rows = try a.alloc(buffer_mod.Row, rows.len);
+        for (rows, buffer_rows) |row, *target| target.* = if (is_draft) .{ .draft = row } else .{ .comment = row };
+        for (@import("theme.zig").builtins) |builtin| {
+            const theme = builtin.value;
+            var nav = Nav.init(rows.len, 128);
+            nav.mark = rows.len - 1;
+            drawPane(a, win, .{ .rows = buffer_rows, .layout = .unified }, theme, nav);
+            var seen = [_]bool{false} ** 5;
+            for (rows[1..], 1..) |row, index| {
+                const y: u16 = @intCast(index);
+                drawReviewCardSearchRange(win, y, row, .{ .visual_row = index, .relation = .neutral, .source = .{ .start = 0, .end = raw.len }, .row = .{ .start = 0, .end = 1 }, .active = true }, true, theme);
+                var col: u16 = @intCast(row.contentColumn());
+                for (row.segments) |segment| {
+                    const width: u16 = @intCast(terminal_cell_metrics.width(segment.text));
+                    const cell = win.readCell(col, y).?;
+                    if (!segment.authored) {
+                        try testing.expect(!std.meta.eql(theme.search_active, cell.style.bg));
+                    } else if (std.mem.eql(u8, segment.text, "x")) {
+                        seen[0] = true;
+                        try testing.expectEqual(theme.markdown_bold, cell.style.fg);
+                        try testing.expect(cell.style.bold and cell.style.italic and cell.style.ul_style == .single);
+                    } else if (std.mem.eql(u8, segment.text, "👩🏻‍💻")) {
+                        seen[1] = true;
+                        try testing.expectEqualStrings("👩🏻‍💻", cell.char.grapheme);
+                        try testing.expectEqual(theme.markdown_bold, cell.style.fg);
+                        try testing.expect(cell.style.bold);
+                        for (col..col + width) |emoji_col| try testing.expectEqual(theme.search_active, win.readCell(@intCast(emoji_col), y).?.style.bg);
+                    } else if (segment.source.start == std.mem.indexOf(u8, raw, "gone").?) {
+                        seen[2] = true;
+                        try testing.expect(cell.style.strikethrough);
+                    } else if (segment.source.start == std.mem.indexOf(u8, raw, "Ready").?) {
+                        seen[3] = true;
+                        try testing.expectEqual(theme.markdown_inline_code, cell.style.fg);
+                        try testing.expect(!cell.style.bold and !cell.style.italic);
+                    } else if (segment.source.start == std.mem.indexOf(u8, raw, "Heading").?) {
+                        seen[4] = true;
+                        try testing.expect(cell.style.bold and cell.style.italic);
+                    }
+                    if (segment.authored and segment.source.start < segment.source.end) try testing.expectEqual(theme.search_active, cell.style.bg);
+                    col += width;
+                }
+            }
+            for (seen) |found| try testing.expect(found);
+        }
+    }
+}
+
 test "M23 inline headless cells retain combined marks under overlapping interaction backgrounds in every Theme and role" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

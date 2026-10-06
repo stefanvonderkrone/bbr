@@ -2850,6 +2850,92 @@ test "M23 ancestry completes mixed parent subtrees before published siblings" {
     };
 }
 
+test "M23 acceptance mixed Reply subtrees retain combined Markdown at every width breakpoint" {
+    const raw = "# ***Heading***\n\nTitle\n=====\n\n**bold** *italic* ~~strike~~ `code` [docs][id] :mask:\n\n4. outer\n    - inner\n        > quote **text**\n        > ```js\n        > const\tx = 1;\n        > ```\n\n```suggestion\nreplacement\n```\n\n| Name | State |\n| --- | --- |\n| Ada | **Ready** |\n\n[id]: https://example.invalid/\n";
+    const expected = [_]review_card.Owner{ .{ .comment = 1 }, .{ .comment = 2 }, .{ .comment = 4 }, .{ .draft = 1 }, .{ .draft = 2 }, .{ .comment = 3 } };
+    const depths = [_]usize{ 0, 1, 2, 3, 2, 1 };
+    const widths = [_]struct { width: usize, unit: usize }{
+        .{ .width = 43, .unit = 1 }, .{ .width = 44, .unit = 1 },
+        .{ .width = 59, .unit = 1 }, .{ .width = 60, .unit = 2 },
+        .{ .width = 79, .unit = 2 }, .{ .width = 80, .unit = 3 },
+        .{ .width = 99, .unit = 3 }, .{ .width = 100, .unit = 4 },
+    };
+    for (widths) |case| for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]bool{ false, true }) |expanded| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const diff = try parse(a, anchor_diff);
+        const scope: review.CommentScope = .{ .@"inline" = .{ .path = "a.txt", .to = 2 } };
+        const comments = [_]Comment{
+            .{ .id = 1, .author = "Root", .body = raw, .scope = scope },
+            .{ .id = 2, .parent_id = 1, .author = "A", .body = raw },
+            .{ .id = 3, .parent_id = 1, .author = "B", .body = raw },
+            .{ .id = 4, .parent_id = 2, .author = "C", .body = raw },
+        };
+        const threads = try bbr.review.buildThreads(a, &comments);
+        const drafts = [_]Draft{
+            .{ .local_id = 1, .kind = .comment, .body = raw, .parent = .{ .comment = 4 } },
+            .{ .local_id = 2, .kind = .comment, .body = raw, .parent = .{ .comment = 2 } },
+        };
+        const keys = [_]DisclosureKey{
+            .{ .review_card = expected[0] }, .{ .review_card = expected[1] }, .{ .review_card = expected[2] },
+            .{ .review_card = expected[3] }, .{ .review_card = expected[4] }, .{ .review_card = expected[5] },
+        };
+        const buf = try buildWithComments(a, diff, layout, threads, .{ .drafts = &drafts, .card_width = case.width, .collapsed_rows = 1, .expanded_disclosures = if (expanded) &keys else &.{} });
+        var headers: usize = 0;
+        var footers: usize = 0;
+        var kinds = [_][5]bool{.{false} ** 5} ** expected.len;
+        var styles = [_][6]bool{.{false} ** 6} ** expected.len;
+        var containers = [_][2]bool{.{false} ** 2} ** expected.len;
+        for (buf.rows) |row| switch (row) {
+            .comment, .draft => |card| {
+                try testing.expectEqualDeep(scope, card.scope);
+                try testing.expectEqualStrings(raw, card.source.body());
+                if (card.part == .header) {
+                    try testing.expect(headers < expected.len);
+                    try testing.expectEqualDeep(expected[headers], card.owner);
+                    try testing.expectEqual(depths[headers], card.depth);
+                    try testing.expectEqual(@min(depths[headers] * case.unit, case.width -| 44), card.indent);
+                    headers += 1;
+                } else if (card.part == .disclosure_footer) {
+                    footers += 1;
+                    try testing.expectEqual(expanded, card.hidden_rows == 0);
+                } else {
+                    try testing.expectEqualDeep(expected[headers - 1], card.owner);
+                    const card_kinds = &kinds[headers - 1];
+                    const card_styles = &styles[headers - 1];
+                    const card_containers = &containers[headers - 1];
+                    card_kinds[0] = card_kinds[0] or card.block_kind == .heading;
+                    card_kinds[1] = card_kinds[1] or card.block_kind == .paragraph;
+                    card_kinds[2] = card_kinds[2] or card.block_kind == .code;
+                    card_kinds[3] = card_kinds[3] or card.block_kind == .suggestion;
+                    card_kinds[4] = card_kinds[4] or card.block_kind == .table;
+                    for (card.segments) |segment| {
+                        card_styles[0] = card_styles[0] or segment.marks.strong;
+                        card_styles[1] = card_styles[1] or segment.marks.emphasis;
+                        card_styles[2] = card_styles[2] or segment.marks.strikethrough;
+                        card_styles[3] = card_styles[3] or segment.marks.inline_code;
+                        card_styles[4] = card_styles[4] or segment.marks.link_destination;
+                        card_styles[5] = card_styles[5] or std.mem.eql(u8, segment.text, "😷");
+                        if (!segment.authored and card.block_kind != .table) {
+                            card_containers[0] = card_containers[0] or std.mem.eql(u8, segment.text, "│");
+                            card_containers[1] = card_containers[1] or std.mem.eql(u8, segment.text, "•");
+                        }
+                    }
+                }
+            },
+            else => {},
+        };
+        try testing.expectEqual(expected.len, headers);
+        try testing.expectEqual(expected.len, footers);
+        if (expanded) {
+            for (kinds) |card_kinds| for (card_kinds) |found| try testing.expect(found);
+            for (styles) |card_styles| for (card_styles) |found| try testing.expect(found);
+            for (containers) |card_containers| for (card_containers) |found| try testing.expect(found);
+        }
+    };
+}
+
 test "M23 ancestry shares a width unit and caps indentation at readable body width" {
     const cases = [_]struct { width: usize, depth: usize, unit: usize, indent: usize, body_width: usize }{
         .{ .width = 100, .depth = 3, .unit = 4, .indent = 12, .body_width = 84 },
