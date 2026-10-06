@@ -86,8 +86,9 @@ Remote-review credentials are managed with `bbr login` / `bbr logout` and stored
 `bbr login [profile]` prompts for Email, API Token, and Workspace, verifies them live
 against Bitbucket (`GET /user` plus a workspace probe), then saves the profile and selects
 it as active. Named profiles hold one credential set each (`[profiles.<name>]`); selection is
-`--profile <name>` (or `BBR_PROFILE`), then the file's `active_profile`, then `default`.
-`bbr logout [profile]` removes one profile, `bbr logout --all` deletes the file.
+`--profile <name>`, then `BBR_PROFILE`, then the Active Profile in `active_profile`, then `default`.
+`bbr logout [profile]` removes the selected Profile. Bare `bbr logout` uses the same Profile selection order.
+`bbr logout --all` deletes the file.
 `BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, `BITBUCKET_WORKSPACE` override the selected
 profile per field for scripting. `bbr local` does not read or
 require them. Its SourceRef defaults to the current branch; its BaseRef defaults to the tracking

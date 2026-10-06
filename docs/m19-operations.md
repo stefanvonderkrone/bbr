@@ -57,29 +57,42 @@ validation publishes no binary, archive, source copy, GitHub release, or other a
 
 ## Credential handling
 
-Remote operations read one Credential from these environment variables:
+`bbr login [profile]` verifies the Credential and Workspace against Bitbucket before it saves the named Profile.
+A successful login sets that Profile as the Active Profile.
+bbr stores Profiles in `$XDG_DATA_HOME/bbr/auth.toml`, with `$HOME/.local/share/bbr/auth.toml` as the fallback.
+bbr writes the file atomically with mode `0600`.
+
+Remote operations select a Profile in this order:
+
+1. The explicit `--profile <name>` flag.
+2. `BBR_PROFILE`.
+3. The Active Profile in the file's `active_profile` field.
+4. `default`.
+
+These environment variables override the selected Profile per field:
 
 - `BITBUCKET_USERNAME` contains the Atlassian account email.
 - `BITBUCKET_TOKEN` contains the Atlassian API token.
 - `BITBUCKET_WORKSPACE` contains the Bitbucket Workspace.
 
-bbr does not store a Credential and has no login flow. Do not put these values in repository files
-or command arguments. Diagnostics omit Credential data, Authorization values, proxy authentication,
-and token-bearing URLs.
+`bbr logout [profile]` removes the selected Profile. Bare `bbr logout` uses the same Profile selection order.
+`bbr logout --all` deletes `auth.toml`. Logout does not clear environment overrides.
 
-On macOS, a local wrapper can read the token from Keychain and start bbr:
+`auth.toml` is the only allowed Credential store for bbr. bbr never stores Credential data in SQLite or state files.
+Do not put Credential data in repository files or command arguments.
+bbr never prints Credential data, Authorization values, proxy authentication, or token-bearing URLs.
+
+On macOS, an optional local wrapper can override the saved Profile's token with a token from Keychain:
 
 ```sh
 #!/bin/sh
-BITBUCKET_USERNAME='<email>' \
+# The saved Profile supplies the email and Workspace unless environment variables override them.
 BITBUCKET_TOKEN="$(security find-generic-password -w -s '<keychain-service>' -a '<keychain-account>')" \
-BITBUCKET_WORKSPACE='<workspace>' \
 exec zig build run -- "$@"
 ```
 
 Replace each placeholder. Keep the wrapper outside the repository, and do not enable shell tracing.
-This wrapper keeps the token out of repository files and shell history. It remains a macOS-specific
-bridge until M26.
+This wrapper supplies an optional environment override. It does not change the Credential in `auth.toml`.
 
 ## HTTP and proxy policy
 
@@ -139,8 +152,9 @@ M19 adds no merge Action or decline Action.
 
 ## Optional live checks
 
-Set the three Credential variables before a remote check. Use only a disposable PullRequest for a
-destructive check.
+Use a stored Profile or set the Credential environment variables before a remote check.
+Select a stored Profile with `--profile <name>` or `BBR_PROFILE`, or use the Active Profile.
+Use only a disposable PullRequest for a destructive check.
 
 ```sh
 zig build check -- <repository> <pull-request-id>

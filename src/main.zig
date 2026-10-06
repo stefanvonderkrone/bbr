@@ -114,7 +114,8 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, f, "login")) return loginRun(init, gpa, &rest, flag_profile);
         if (std.mem.eql(u8, f, "logout")) return logoutRun(init, gpa, &rest, flag_profile);
         if (std.mem.eql(u8, f, "check-blobs")) {
-            var blob_owned = auth.resolve(gpa, init.io, init.environ_map, flag_profile) catch {
+            var blob_owned = auth.resolve(gpa, init.io, init.environ_map, flag_profile) catch |err| {
+                if (err == error.InvalidAuthFile) return;
                 std.debug.print("skipped: blob checker needs a login (`bbr login`) or BITBUCKET_USERNAME, BITBUCKET_TOKEN, and BITBUCKET_WORKSPACE\n", .{});
                 return;
             };
@@ -124,6 +125,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var owned = auth.resolve(gpa, init.io, init.environ_map, flag_profile) catch |err| {
+        if (err == error.InvalidAuthFile) return;
         std.debug.print("bbr: missing credential: {s}\nRun `bbr login` to save credentials, or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, BITBUCKET_WORKSPACE.\n", .{
             @errorName(err),
         });
@@ -805,12 +807,12 @@ fn detectRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket
 /// `error.EmptyInput` when the line is blank (the caller re-prompts).
 /// `stdin` is one reader held for the whole login so piped input is not lost
 /// between prompts (each reader buffers its fill).
-fn promptInput(gpa: std.mem.Allocator, io: std.Io, stdin: anytype, prompt: []const u8) ![]u8 {
+fn promptInput(gpa: std.mem.Allocator, io: std.Io, stdin: *std.Io.Reader, prompt: []const u8) ![]u8 {
     var output_buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &output_buffer);
     try stdout.interface.writeAll(prompt);
     try stdout.interface.flush();
-    const line = (try stdin.interface.takeDelimiter('\n')) orelse return error.LoginAborted;
+    const line = (try stdin.takeDelimiter('\n')) orelse return error.LoginAborted;
     const trimmed = std.mem.trim(u8, line, " \t\r");
     if (trimmed.len == 0) return error.EmptyInput;
     if (trimmed.len > 1024) return error.InputTooLong;
@@ -818,7 +820,7 @@ fn promptInput(gpa: std.mem.Allocator, io: std.Io, stdin: anytype, prompt: []con
 }
 
 /// Prompt up to three times for a non-empty value.
-fn promptField(gpa: std.mem.Allocator, io: std.Io, stdin: anytype, prompt: []const u8) ![]u8 {
+fn promptField(gpa: std.mem.Allocator, io: std.Io, stdin: *std.Io.Reader, prompt: []const u8) ![]u8 {
     var attempts: usize = 0;
     while (attempts < 3) : (attempts += 1) {
         return promptInput(gpa, io, stdin, prompt) catch |err| switch (err) {
@@ -856,19 +858,25 @@ fn loginRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fla
     }
     const profile_name = positional orelse flag_profile orelse auth.default_profile;
 
+    const auth_path = (try auth.authFilePath(gpa, init.environ_map)) orelse {
+        std.debug.print("bbr: cannot save credentials: set XDG_DATA_HOME or HOME\n", .{});
+        return;
+    };
+    defer gpa.free(auth_path);
+
     var stdin_buffer: [4096]u8 = undefined;
     var stdin = std.Io.File.stdin().reader(init.io, &stdin_buffer);
-    const email = promptField(gpa, init.io, &stdin, "Email: ") catch |err| {
+    const email = promptField(gpa, init.io, &stdin.interface, "Email: ") catch |err| {
         std.debug.print("bbr: login aborted ({s})\n", .{@errorName(err)});
         return;
     };
     defer gpa.free(email);
-    const token = promptField(gpa, init.io, &stdin, "Token (paste; input is visible): ") catch |err| {
+    const token = promptField(gpa, init.io, &stdin.interface, "Token (paste; input is visible): ") catch |err| {
         std.debug.print("bbr: login aborted ({s})\n", .{@errorName(err)});
         return;
     };
     defer gpa.free(token);
-    const workspace = promptField(gpa, init.io, &stdin, "Workspace: ") catch |err| {
+    const workspace = promptField(gpa, init.io, &stdin.interface, "Workspace: ") catch |err| {
         std.debug.print("bbr: login aborted ({s})\n", .{@errorName(err)});
         return;
     };
@@ -887,7 +895,7 @@ fn loginRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fla
     defer gpa.free(uuid);
     bb.checkWorkspace(gpa, workspace) catch |err| {
         if (err == error.NotFound) {
-            std.debug.print("bbr: login failed: workspace '{s}' not found or not visible; nothing saved\n", .{workspace});
+            std.debug.print("bbr: login failed: workspace not found or not visible; nothing saved\n", .{});
         } else {
             std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)});
         }
@@ -896,15 +904,16 @@ fn loginRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fla
 
     const path = auth.upsertProfile(gpa, init.io, init.environ_map, profile_name, candidate) catch |err| {
         std.debug.print("bbr: could not save credentials: {s}\n", .{@errorName(err)});
+        if (err == error.InvalidAuthFile) return;
         return err;
     };
     defer gpa.free(path);
-    std.debug.print("Logged in as '{s}' (workspace '{s}'). Saved to {s}.\n", .{ profile_name, workspace, path });
+    std.debug.print("Logged in as '{s}'. Saved to {s}.\n", .{ profile_name, path });
     warnEnvOverride(init.environ_map);
 }
 
 /// `bbr logout [profile]` removes one profile; `bbr logout --all` deletes the
-/// whole file. Bare `bbr logout` removes the active profile. Missing files or
+/// whole file. Bare `bbr logout` removes the selected Profile. Missing files or
 /// profiles exit quietly with "already logged out".
 fn logoutRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag_profile: ?[]const u8) !void {
     const auth = bbr.bitbucket.auth;
@@ -940,25 +949,25 @@ fn logoutRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
         return;
     }
 
-    const explicit = positional orelse flag_profile;
-    if (explicit) |name| {
-        if (try auth.removeProfile(gpa, init.io, init.environ_map, name)) {
-            std.debug.print("Logged out '{s}'.\n", .{name});
-        } else {
-            std.debug.print("Already logged out (no credentials for '{s}').\n", .{name});
-        }
-        warnEnvOverride(init.environ_map);
-        return;
-    }
-
-    // No profile given: remove the active one (or `default` when no file).
-    var loaded = try auth.load(gpa, init.io, init.environ_map);
+    var loaded = auth.load(gpa, init.io, init.environ_map) catch |err| switch (err) {
+        error.InvalidAuthFile => return,
+        else => return err,
+    };
     defer if (loaded) |*l| l.deinit(gpa);
-    const active: []const u8 = if (loaded) |*l| l.file.active_profile else auth.default_profile;
-    if (try auth.removeProfile(gpa, init.io, init.environ_map, active)) {
-        std.debug.print("Logged out '{s}'.\n", .{active});
+    const file_active: ?[]const u8 = if (loaded) |*l| l.file.active_profile else null;
+    const name = auth.selectedProfileName(gpa, init.environ_map, file_active, positional orelse flag_profile) catch |err| {
+        std.debug.print("bbr: could not select profile: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer gpa.free(name);
+    const removed = auth.removeProfile(gpa, init.io, init.environ_map, name) catch |err| switch (err) {
+        error.InvalidAuthFile => return,
+        else => return err,
+    };
+    if (removed) {
+        std.debug.print("Logged out '{s}'.\n", .{name});
     } else {
-        std.debug.print("Already logged out.\n", .{});
+        std.debug.print("Already logged out (no credentials for '{s}').\n", .{name});
     }
     warnEnvOverride(init.environ_map);
 }
@@ -1110,6 +1119,31 @@ test "File Enrichment OOM has a distinct fatal message" {
         tuiFatalMessage(error.FileEnrichmentOutOfMemory).?,
     );
     try std.testing.expect(tuiFatalMessage(error.NotFound) == null);
+}
+
+test "login reader trims lines and preserves empty input and EOF errors" {
+    const testing = std.testing;
+    var reader = std.Io.Reader.fixed(" \t first \r\n \t\r\nsecond");
+    const first = try promptInput(testing.allocator, testing.io, &reader, "");
+    defer testing.allocator.free(first);
+    try testing.expectEqualStrings("first", first);
+    try testing.expectError(error.EmptyInput, promptInput(testing.allocator, testing.io, &reader, ""));
+    const second = try promptInput(testing.allocator, testing.io, &reader, "");
+    defer testing.allocator.free(second);
+    try testing.expectEqualStrings("second", second);
+    try testing.expectError(error.LoginAborted, promptInput(testing.allocator, testing.io, &reader, ""));
+}
+
+test "login field retries blank lines at most three times" {
+    const testing = std.testing;
+    var reader = std.Io.Reader.fixed("\n \r\n value \n\n\n\nignored\n");
+    const value = try promptField(testing.allocator, testing.io, &reader, "");
+    defer testing.allocator.free(value);
+    try testing.expectEqualStrings("value", value);
+    try testing.expectError(error.LoginAborted, promptField(testing.allocator, testing.io, &reader, ""));
+    const remaining = try promptInput(testing.allocator, testing.io, &reader, "");
+    defer testing.allocator.free(remaining);
+    try testing.expectEqualStrings("ignored", remaining);
 }
 
 // The demo is our offline validation surface, so guard that its synthetic data
