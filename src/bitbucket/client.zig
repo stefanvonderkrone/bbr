@@ -386,6 +386,25 @@ pub const Client = struct {
         return allocator.dupe(u8, parsed.value.uuid);
     }
 
+    /// GET /repositories/{workspace} to prove the workspace exists and the
+    /// credential can see it. Used by `bbr login` before saving.
+    pub fn checkWorkspace(self: Client, allocator: Allocator, workspace: []const u8) !void {
+        const url = try std.fmt.allocPrint(allocator, "{s}/repositories/{s}?pagelen=1", .{ base_url, workspace });
+        defer allocator.free(url);
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        const res = try self.http.send(allocator, .{
+            .method = .GET,
+            .url = url,
+            .headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "application/json" },
+            },
+        });
+        defer allocator.free(res.body);
+        try classify(res.status);
+    }
+
     /// Change the Authenticated Account's Reviewer Verdict only while the
     /// PullRequest still has the expected SourceCommit. The mutation is never
     /// retried. A lost mutation response is reconciled with one fresh read.
@@ -1773,6 +1792,20 @@ test "authenticated account acquisition returns UUID and classifies unauthorized
     fake.status = 401;
     fake.body = "unauthorized";
     try testing.expectError(error.Unauthorized, bb.getAuthenticatedAccountUuid(a));
+}
+
+test "checkWorkspace probes the workspace repository list" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 200, .body = "{\"values\": []}" };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    try bb.checkWorkspace(a, "check24");
+    try testing.expectEqualStrings(
+        "https://api.bitbucket.org/2.0/repositories/check24?pagelen=1",
+        fake.lastUrl().?,
+    );
+
+    fake.status = 404;
+    try testing.expectError(error.NotFound, bb.checkWorkspace(a, "nope"));
 }
 
 test "updateComment PUTs only accepted bytes as content raw" {

@@ -66,7 +66,9 @@ pub fn main(init: std.process.Init) !void {
         const repo = arguments.next() orelse return usage();
         const id = std.fmt.parseInt(u64, arguments.next() orelse return usage(), 10) catch return usage();
         if (arguments.next() != null) return usage();
-        const credential = bbr.bitbucket.Credential.fromEnv(init.environ_map) catch return error.MissingCredential;
+        var owned = bbr.bitbucket.auth.resolve(allocator, init.io, init.environ_map, null) catch return error.MissingCredential;
+        defer owned.deinit(allocator);
+        const credential = owned.credential();
         var transport = bbr.http.StdHttpClient.init(std.heap.page_allocator, init.io);
         defer transport.deinit();
         try transport.initDefaultProxies(allocator, init.environ_map);
