@@ -155,6 +155,7 @@ pub const BlockState = struct {
     context_hash: u64 = 0,
     used: u64 = 0,
     left_viewport: bool = false,
+    preview_visible: bool = false,
 };
 
 pub const Body = struct {
@@ -163,17 +164,28 @@ pub const Body = struct {
     parsed: body_mod.ReviewBody,
     blocks: []BlockState,
     visible: bool = false,
+    suggestion_path: ?[]const u8 = null,
 
     pub const Eligible = struct { ordinal: usize, block: body_mod.Block, path: []const u8 };
 
-    pub fn nextEligible(self: *Body, a: Allocator, max_bytes: usize) !?Eligible {
+    pub fn blockVisible(self: *const Body, ordinal: usize) bool {
+        return self.visible or self.blocks[ordinal].preview_visible;
+    }
+
+    fn grammarPath(self: *const Body, a: Allocator, block: body_mod.Block) !?[]const u8 {
+        if (block.kind == .suggestion) return if (self.suggestion_path) |path| try a.dupe(u8, path) else null;
+        return fencePath(a, block.fence_identifier);
+    }
+
+    pub fn nextEligible(self: *Body, a: Allocator, max_bytes: usize, preview_only: bool) !?Eligible {
         for (self.parsed.blocks, self.blocks, 0..) |block, *state, ordinal| {
+            if (preview_only and !state.preview_visible) continue;
             if (state.state != .pending) continue;
-            if (block.kind != .code or block.fences == null or block.fence_identifier.len == 0) {
+            if ((block.kind != .code and block.kind != .suggestion) or block.fences == null) {
                 state.state = .skipped;
                 continue;
             }
-            const path = fencePath(a, block.fence_identifier) catch |err| {
+            const path = self.grammarPath(a, block) catch |err| {
                 state.state = .failed;
                 return err;
             } orelse {
@@ -226,15 +238,16 @@ pub const Storage = struct {
         body.destroy();
     }
 
-    pub fn get(self: *Storage, a: Allocator, owner: card.Owner, source: []const u8) !*Body {
+    pub fn get(self: *Storage, a: Allocator, owner: card.Owner, source: []const u8, suggestion_path: ?[]const u8) !*Body {
         for (self.bodies.items, 0..) |body, index| if (std.meta.eql(body.owner, owner)) {
-            if (std.mem.eql(u8, body.parsed.source, source)) return body;
+            if (std.mem.eql(u8, body.parsed.source, source) and samePath(body.suggestion_path, suggestion_path)) return body;
             self.remove(index);
             break;
         };
         const body = try a.create(Body);
         body.* = .{ .owner = owner, .arena = std.heap.ArenaAllocator.init(a), .parsed = undefined, .blocks = &.{} };
         errdefer body.destroy();
+        body.suggestion_path = if (suggestion_path) |path| try body.arena.allocator().dupe(u8, path) else null;
         body.parsed = try body_mod.ReviewBody.parse(body.arena.allocator(), source);
         body.blocks = try body.arena.allocator().alloc(BlockState, body.parsed.blocks.len);
         @memset(body.blocks, .{});
@@ -243,9 +256,9 @@ pub const Storage = struct {
     }
 
     pub fn finishVisibility(self: *Storage) void {
-        for (self.bodies.items) |body| for (body.blocks) |*block| {
-            if (!body.visible) block.left_viewport = true;
-            if (body.visible) {
+        for (self.bodies.items) |body| for (body.blocks, 0..) |*block, ordinal| {
+            if (!body.blockVisible(ordinal)) block.left_viewport = true;
+            if (body.blockVisible(ordinal)) {
                 self.clock +%= 1;
                 block.used = self.clock;
                 if (block.state == .evicted and block.left_viewport) block.state = .pending;
@@ -265,7 +278,7 @@ pub const Storage = struct {
         result.destroy();
         block.result = null;
         block.state = .evicted;
-        block.left_viewport = !body.visible;
+        block.left_viewport = !body.blockVisible(ordinal);
     }
 
     /// Allocation precedes eviction and publication. A failed admission changes no colors.
@@ -284,8 +297,10 @@ pub const Storage = struct {
             for (candidate.items[0 .. candidate.items.len - 1], 0..) |view, index| {
                 const selected_body = self.bodyFor(view.owner);
                 const prior = self.bodyFor(candidate.items[victim].owner);
-                if ((!selected_body.visible and prior.visible) or
-                    (selected_body.visible == prior.visible and selected_body.blocks[view.block].used < prior.blocks[candidate.items[victim].block].used)) victim = index;
+                const selected_visible = selected_body.blockVisible(view.block);
+                const prior_visible = prior.blockVisible(candidate.items[victim].block);
+                if ((!selected_visible and prior_visible) or
+                    (selected_visible == prior_visible and selected_body.blocks[view.block].used < prior.blocks[candidate.items[victim].block].used)) victim = index;
             }
             const removed = candidate.orderedRemove(victim);
             result_bytes -= self.bodyFor(removed.owner).blocks[removed.block].result.?.retainedBytes();
@@ -316,6 +331,11 @@ pub const Storage = struct {
         unreachable;
     }
 };
+
+pub fn samePath(first: ?[]const u8, second: ?[]const u8) bool {
+    if (first) |path| return if (second) |other| std.mem.eql(u8, path, other) else false;
+    return second == null;
+}
 
 test "M23 highlighting approved fence aliases and invalid identifiers" {
     const a = std.testing.allocator;

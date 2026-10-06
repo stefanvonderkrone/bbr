@@ -20,6 +20,164 @@ const search = @import("search.zig");
 const review_card = @import("review_card.zig");
 const code_highlighting = @import("code_highlighting.zig");
 
+test "M23 highlighting Suggestions inherit authored inline context after LocalReview rename" {
+    const Resolver = struct {
+        fn resolve(_: *anyopaque, _: Allocator, _: bbr.review.CommentScope, _: []const u8) anyerror!bbr.review.ScopeResolution {
+            return .{ .resolved = .{ .state = .moved, .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 1 } } } };
+        }
+    };
+    var resolver: u8 = 0;
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.initLocal(1, "main", "feature");
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .target = .local, .kind = .comment, .body = "root", .scope = .{ .@"inline" = .{ .path = "before.js", .to = 1 } } });
+    try store.store().put(key.storeKey(), .{ .local_id = 2, .target = .local, .kind = .suggestion, .body = "```suggestion\nconst value = 1;\n```", .parent = .{ .draft = 1 } });
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .scope_resolver = .{ .ptr = &resolver, .resolve_fn = Resolver.resolve } }, .{
+        .initial = .{ .key = key, .session = try testLocalSession(testing.allocator) },
+        .viewport_rows = 40,
+    });
+    defer state.deinit();
+    const command = state.takeCommand() orelse return error.MissingSuggestionHighlight;
+    const job = command.highlight_code;
+    try testing.expectEqualStrings("before.js", job.path);
+    try testing.expectEqualStrings("const value = 1;\n", job.content);
+    try testing.expectEqualDeep(review_card.Owner{ .draft = 2 }, job.identity.owner);
+    try state.dispatch(.{ .code_highlight_completed = job.launchFailed() });
+}
+
+test "M23 highlighting selected Preview precedes cards and closing removes pending Preview blocks" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try codeTestPresentation(testing.allocator, store.store(), &.{ "```ts\nconst first = 1;\n```\n\n```json\n{}\n```", "needle\n\n```js\nconst selected = 2;\n```\n\n```css\na {}\n```" }, 0, 40);
+    defer state.deinit();
+    const started = state.takeCommand().?.highlight_code;
+    try state.dispatch(.{ .action = .open_review_search });
+    try state.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+    try completeBufferSearchScan(&state);
+    try testing.expectEqual(@as(usize, 1), state.projection().review_search.?.results.len);
+    while (state.takeCommand()) |command| try testing.expect(command == .enrich_file);
+    try state.dispatch(.{ .code_highlight_completed = try codeCapacityCompletion(started, 1) });
+    const preview = state.takeCommand().?.highlight_code;
+    try testing.expectEqualStrings("review.js", preview.path);
+    try testing.expectEqualDeep(review_card.Owner{ .draft = 2 }, preview.identity.owner);
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try state.dispatch(.{ .code_highlight_completed = try codeCapacityCompletion(preview, 1) });
+    const card = state.takeCommand().?.highlight_code;
+    try testing.expectEqualStrings("review.json", card.path);
+    try state.dispatch(.{ .code_highlight_completed = card.launchFailed() });
+}
+
+fn nextCodeTestJob(state: *Presentation) !?*code_highlighting.Analyze {
+    while (state.takeCommand()) |value| {
+        var command = value;
+        if (command == .highlight_code) return command.highlight_code;
+        defer command.deinit();
+        try testing.expect(command == .enrich_file);
+    }
+    return null;
+}
+
+test "M23 highlighting RemoteReview outdated Reply Suggestions use authored context and absent inline context stays plain" {
+    const scopes = [_]bbr.review.CommentScope{ .{ .@"inline" = .{ .path = "before.js", .to = 1 } }, .review, .{ .file = .{ .path = "before.js", .source_commit = "source" } } };
+    for (scopes, 0..) |scope, index| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+        try store.store().put(key.storeKey(), .{ .local_id = 3, .kind = .comment, .parent = .{ .comment = 2 }, .body = "draftneedle\n\n```suggestion\nconst draft = 2;\n```" });
+        const session = try testSession(testing.allocator, 1, 'a');
+        const a = session.arena.allocator();
+        const comments = try a.dupe(bbr.review.Comment, &.{
+            .{ .id = 1, .author = "Ada", .body = "root", .scope = scope, .state = .outdated },
+            .{ .id = 2, .author = "Ada", .parent_id = 1, .body = "publishedneedle\n\n```suggestion\nconst reply = 1;\n```" },
+        });
+        session.threads = try bbr.review.buildThreads(a, comments);
+        var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{ .initial = .{ .key = key, .session = session }, .geometry = .{ .cols = 120, .rows = 40 } });
+        defer state.deinit();
+        try state.dispatch(.{ .action = .open_review_search });
+        for ([_][]const u8{ "publishedneedle", "draftneedle" }, 0..) |query, kind| {
+            if (kind > 0) try state.dispatch(.{ .key = .{ .codepoint = 'k', .mods = .{ .ctrl = true } } });
+            try state.dispatch(.{ .key = .{ .codepoint = 'n', .text = query } });
+            try completeBufferSearchScan(&state);
+            const job = try nextCodeTestJob(&state);
+            if (index == 0) {
+                try testing.expect(job != null);
+                try testing.expectEqualStrings("before.js", job.?.path);
+                try testing.expectEqualStrings(if (kind == 0) "const reply = 1;\n" else "const draft = 2;\n", job.?.content);
+                var highlighter = try @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, null);
+                defer highlighter.deinit();
+                try state.dispatch(.{ .code_highlight_completed = job.?.execute(highlighter.highlighter()) });
+                try testing.expect(state.projection().review_search.?.code_highlights[kind].spans.len > 0);
+            } else try testing.expect(job == null);
+        }
+    }
+}
+
+test "M23 highlighting offscreen Preview shares results and changing selected result removes pending eligibility" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const bodies = [_][]const u8{"plain card"} ** 30 ++ [_][]const u8{ "needle\n\n```js\nconst one = 1;\n```\n\n```json\n{}\n```", "needle\n\n```css\na {}\n```" };
+    var state = try codeTestPresentation(testing.allocator, store.store(), &bodies, 0, 40);
+    defer state.deinit();
+    try testing.expect(state.takeCommand() == null);
+    try state.dispatch(.{ .action = .open_review_search });
+    try state.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+    try completeBufferSearchScan(&state);
+    const first = (try nextCodeTestJob(&state)).?;
+    try testing.expectEqualStrings("review.js", first.path);
+    try testing.expect(state.takeCommand() == null);
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.down } });
+    try testing.expectEqual(@as(?usize, 1), state.projection().review_search.?.selected);
+    try state.dispatch(.{ .code_highlight_completed = try codeCapacityCompletion(first, 1) });
+    const second = (try nextCodeTestJob(&state)).?;
+    try testing.expectEqualStrings("review.css", second.path);
+    try state.dispatch(.{ .code_highlight_completed = try codeCapacityCompletion(second, 1) });
+    try testing.expect(try nextCodeTestJob(&state) == null);
+    const spans = state.projection().review_search.?.code_highlights[0].spans.ptr;
+    try state.dispatch(.{ .key = .{ .codepoint = 'k', .mods = .{ .ctrl = true } } });
+    try state.dispatch(.{ .key = .{ .codepoint = 'n', .text = "const one" } });
+    try completeBufferSearchScan(&state);
+    try testing.expectEqual(spans, state.projection().review_search.?.code_highlights[0].spans.ptr);
+    // A different occurrence of the same body uses the accepted block result.
+    const remaining = try nextCodeTestJob(&state);
+    if (remaining) |job| {
+        try testing.expectEqualStrings("review.json", job.path);
+        try state.dispatch(.{ .code_highlight_completed = job.launchFailed() });
+    }
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try visitCodeCard(&state, 31);
+    try testing.expectEqual(spans, state.projection().review.?.frame.code_highlights[0].spans.ptr);
+    try testing.expect(try nextCodeTestJob(&state) == null);
+}
+
+test "M23 highlighting eviction protects only visible Preview blocks within the shared budget" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const body = "needle\n\n```js\nconst visible = 1;\n```\n\n" ++ "paragraph  \n" ** 40 ++ "\n```json\n{}\n```";
+    const bodies = [_][]const u8{ body, "```css\na {}\n```" } ++ [_][]const u8{"plain card"} ** 30;
+    var state = try codeTestPresentation(testing.allocator, store.store(), &bodies, 0, 40);
+    defer state.deinit();
+    const capacity = 3 * 1024 * 1024 / @sizeOf(code_highlighting.SourceSpan);
+    for (0..2) |_| {
+        const job = state.takeCommand().?.highlight_code;
+        try state.dispatch(.{ .code_highlight_completed = try codeCapacityCompletion(job, capacity) });
+    }
+    const started = state.takeCommand().?.highlight_code;
+    try testing.expectEqualStrings("review.css", started.path);
+    try visitCodeCard(&state, 20);
+    try state.dispatch(.{ .action = .open_review_search });
+    try state.dispatch(.{ .key = .{ .codepoint = 'n', .text = "needle" } });
+    try completeBufferSearchScan(&state);
+    while (state.takeCommand()) |command| try testing.expect(command == .enrich_file);
+    try state.dispatch(.{ .code_highlight_completed = try codeCapacityCompletion(started, capacity) });
+    const frame = state.projection().review.?.frame;
+    try testing.expectEqual(@as(usize, 2), frame.code_highlights.len);
+    try testing.expectEqualDeep(review_card.Owner{ .draft = 1 }, frame.code_highlights[0].owner);
+    try testing.expectEqual(@as(usize, 2), frame.code_highlights[0].block);
+    try testing.expectEqualDeep(review_card.Owner{ .draft = 2 }, frame.code_highlights[1].owner);
+    try testing.expect(frame.code_highlight_retained_bytes <= code_highlighting.budget_bytes);
+    try testing.expect(try nextCodeTestJob(&state) == null);
+}
+
 test "M23 highlighting publishes plain code before one complete hidden-block command" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -2602,6 +2760,7 @@ pub const BufferSearchProjection = struct {
 };
 
 pub const ReviewSearchResult = struct {
+    code_highlights: []const code_highlighting.View = &.{},
     kind: []const u8,
     source: []const u8,
     body: []const u8,
@@ -2611,6 +2770,7 @@ pub const ReviewSearchResult = struct {
 };
 
 pub const ReviewSearchProjection = struct {
+    code_highlights: []const code_highlighting.View = &.{},
     cell_metrics: ?frame_mod.CellMetrics = null,
     query: []const u8,
     occurrences: []const search.Occurrence,
@@ -5537,6 +5697,7 @@ pub const Presentation = struct {
             .review_search = if (self.published) |published| blk: {
                 var search_view = published.review_search.projection(self.geometry) orelse break :blk null;
                 search_view.cell_metrics = published.cell_metrics;
+                search_view.code_highlights = published.code_highlighting.views.items;
                 search_view.files = published.session.diff.files;
                 search_view.content_statuses = published.session.enrichment.projection().content_statuses;
                 search_view.highlight_statuses = published.session.enrichment.statuses;
@@ -10270,13 +10431,41 @@ pub const Presentation = struct {
         return published.visual_rows[first..last];
     }
 
+    fn suggestionPath(published: *const Published, owner: review_card.Owner) ?[]const u8 {
+        var current = owner;
+        var hops: usize = 0;
+        while (hops <= published.review.drafts.items.len) : (hops += 1) switch (current) {
+            .comment => |id| {
+                for (published.session.threads) |thread| {
+                    var belongs = thread.root.id == id;
+                    for (thread.replies) |reply| belongs = belongs or reply.id == id;
+                    if (belongs) return if (thread.scope() == .@"inline") thread.scope().@"inline".path else null;
+                }
+                return null;
+            },
+            .draft => |id| {
+                const draft = published.review.getConst(id) orelse return null;
+                if (draft.parent) |parent| {
+                    current = switch (parent) {
+                        .draft => |parent_id| .{ .draft = parent_id },
+                        .comment => |parent_id| .{ .comment = parent_id },
+                    };
+                } else {
+                    const scope = draft.effectiveScope();
+                    return if (scope == .@"inline") scope.@"inline".path else null;
+                }
+            },
+        };
+        return null;
+    }
+
     fn codeRowBody(self: *Presentation, published: *Published, visual: frame_mod.VisualRow) ?*code_highlighting.Body {
         const card: review_card.ReviewCardRow = switch (published.buffer.rows[visual.buffer_index]) {
             .comment, .draft => |value| value,
             else => return null,
         };
         const source = codeBodySource(published, card.owner) orelse return null;
-        return published.code_highlighting.get(self.allocator, card.owner, source) catch null;
+        return published.code_highlighting.get(self.allocator, card.owner, source, suggestionPath(published, card.owner)) catch null;
     }
 
     fn refreshCodeVisibility(self: *Presentation) void {
@@ -10286,55 +10475,95 @@ pub const Presentation = struct {
         while (index < storage.bodies.items.len) {
             const body = storage.bodies.items[index];
             const source = codeBodySource(published, body.owner);
-            if (source == null or !std.mem.eql(u8, source.?, body.parsed.source)) {
+            if (source == null or !std.mem.eql(u8, source.?, body.parsed.source) or !code_highlighting.samePath(body.suggestion_path, suggestionPath(published, body.owner))) {
                 storage.remove(index);
                 continue;
             }
             body.visible = false;
+            for (body.blocks) |*block| block.preview_visible = false;
             index += 1;
         }
         for (codeViewportRows(published)) |visual| {
             const body = self.codeRowBody(published, visual) orelse continue;
             body.visible = true;
         }
+        if (self.codePreviewBody(published)) |body| {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const geometry = frame_mod.reviewSearchGeometry(self.geometry) orelse return;
+            const comment: bbr.review.Comment = .{ .id = if (body.owner == .comment) body.owner.comment else 0, .author = "", .body = body.parsed.source };
+            const draft: bbr.review.Draft = .{ .local_id = if (body.owner == .draft) body.owner.draft else 0, .kind = .comment, .body = body.parsed.source };
+            const rows = review_card.projectPreview(arena.allocator(), body.parsed, .{
+                .owner = body.owner,
+                .source = if (body.owner == .draft) .{ .draft = &draft } else .{ .comment = &comment },
+                .role = .comment,
+                .header = "",
+                .content_width = geometry.preview.width,
+                .metrics = published.cell_metrics,
+                .collapsed_rows = 0,
+            }, published.review_search.preview_scroll, geometry.preview.height) catch &.{};
+            for (rows) |row| if (row.part == .code_body or row.part == .suggestion_body) {
+                body.blocks[row.block_ordinal].preview_visible = true;
+            };
+        }
         storage.finishVisibility();
+    }
+
+    fn codePreviewBody(self: *Presentation, published: *Published) ?*code_highlighting.Body {
+        const view = published.review_search.projection(self.geometry) orelse return null;
+        const selected = view.selected orelse return null;
+        if (selected >= view.results.len) return null;
+        const occurrence = view.results[selected].occurrence;
+        if (occurrence.location != .review_body) return null;
+        const owner: review_card.Owner = switch (occurrence.location.review_body.owner) {
+            .comment => |id| .{ .comment = id },
+            .draft => |id| .{ .draft = id },
+        };
+        const source = codeBodySource(published, owner) orelse return null;
+        return published.code_highlighting.get(self.allocator, owner, source, suggestionPath(published, owner)) catch null;
     }
 
     fn scheduleCodeHighlight(self: *Presentation) void {
         const published = self.published orelse return;
         self.refreshCodeVisibility();
+        if (self.codePreviewBody(published)) |body| if (self.scheduleCodeBody(published, body, true)) return;
         for (codeViewportRows(published)) |visual| {
             const body = self.codeRowBody(published, visual) orelse continue;
-            while (body.nextEligible(self.allocator, self.dependencies.highlight_max_file_bytes) catch {
-                std.log.warn("code Highlighting Grammar selection allocation failed", .{});
-                break;
-            }) |eligible| {
-                defer self.allocator.free(eligible.path);
-                const state = &body.blocks[eligible.ordinal];
-                const identity: code_highlighting.Identity = .{
-                    .session_epoch = published.epoch,
-                    .owner = body.owner,
-                    .block = eligible.ordinal,
-                    .body_hash = std.hash.Wyhash.hash(0, body.parsed.source),
-                    .context_hash = std.hash.Wyhash.hash(0, eligible.path),
-                };
-                const command = code_highlighting.Analyze.create(std.heap.page_allocator, identity, eligible.block, eligible.path) catch {
-                    state.state = .failed;
-                    std.log.warn("code Highlighting command allocation failed", .{});
-                    continue;
-                };
-                self.commands.append(self.allocator, .{ .highlight_code = command }) catch {
-                    command.destroy();
-                    state.state = .failed;
-                    std.log.warn("code Highlighting command admission failed", .{});
-                    continue;
-                };
-                state.state = .running;
-                state.context_hash = identity.context_hash;
-                self.code_work = identity;
-                return;
-            }
+            if (self.scheduleCodeBody(published, body, false)) return;
         }
+    }
+
+    fn scheduleCodeBody(self: *Presentation, published: *Published, body: *code_highlighting.Body, preview_only: bool) bool {
+        while (body.nextEligible(self.allocator, self.dependencies.highlight_max_file_bytes, preview_only) catch {
+            std.log.warn("code Highlighting Grammar selection allocation failed", .{});
+            return false;
+        }) |eligible| {
+            defer self.allocator.free(eligible.path);
+            const state = &body.blocks[eligible.ordinal];
+            const identity: code_highlighting.Identity = .{
+                .session_epoch = published.epoch,
+                .owner = body.owner,
+                .block = eligible.ordinal,
+                .body_hash = std.hash.Wyhash.hash(0, body.parsed.source),
+                .context_hash = std.hash.Wyhash.hash(0, eligible.path),
+            };
+            const command = code_highlighting.Analyze.create(std.heap.page_allocator, identity, eligible.block, eligible.path) catch {
+                state.state = .failed;
+                std.log.warn("code Highlighting command allocation failed", .{});
+                continue;
+            };
+            self.commands.append(self.allocator, .{ .highlight_code = command }) catch {
+                command.destroy();
+                state.state = .failed;
+                std.log.warn("code Highlighting command admission failed", .{});
+                continue;
+            };
+            state.state = .running;
+            state.context_hash = identity.context_hash;
+            self.code_work = identity;
+            return true;
+        }
+        return false;
     }
 
     fn acceptCodeHighlight(self: *Presentation, completed_value: code_highlighting.Completed) void {
@@ -10350,6 +10579,7 @@ pub const Presentation = struct {
         if (std.hash.Wyhash.hash(0, source) != completed.identity.body_hash) return;
         for (published.code_highlighting.bodies.items) |body| {
             if (!std.meta.eql(body.owner, completed.identity.owner) or !std.mem.eql(u8, body.parsed.source, source)) continue;
+            if (!code_highlighting.samePath(body.suggestion_path, suggestionPath(published, body.owner))) return;
             if (completed.identity.block >= body.blocks.len) return;
             const state = &body.blocks[completed.identity.block];
             if (state.state != .running or state.context_hash != completed.identity.context_hash) return;
@@ -18532,6 +18762,13 @@ test "M23 yank copies complete authored bytes from every ReviewCard part without
             try testing.expectEqual(index, after.navigation.cursor);
             try testing.expectEqual(row_count, after.frame.visual_rows.len);
             try testing.expectEqual(@as(usize, 0), after.navigation.count);
+            if (presentation.takeCommand()) |highlight| {
+                try testing.expect(highlight == .highlight_code);
+                var plain: bbr.highlight.PlainHighlighter = .{};
+                try presentation.dispatch(.{ .code_highlight_completed = highlight.highlight_code.execute(plain.highlighter()) });
+                try testing.expectEqual(index, presentation.projection().review.?.navigation.cursor);
+                try testing.expectEqual(row_count, presentation.projection().review.?.frame.visual_rows.len);
+            }
             try testing.expect(presentation.takeCommand() == null);
             try presentation.dispatch(.{ .clipboard_completed = .{ .command_id = command.copy_clipboard.command_id, .success = true } });
             try testing.expectEqual(ClipboardStatus.copied, presentation.projection().clipboard_status.?);

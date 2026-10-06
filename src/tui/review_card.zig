@@ -105,6 +105,25 @@ pub const Options = struct {
     indent: usize = 0,
 };
 
+pub fn projectPreview(allocator: std.mem.Allocator, body: ReviewBody, options: Options, scroll: usize, height: usize) ![]const ReviewCardRow {
+    const rows = try project(allocator, body, options);
+    defer allocator.free(rows);
+    var start: usize = 0;
+    var logical_line: usize = 0;
+    while (logical_line < scroll and start < body.source.len) : (logical_line += 1) {
+        const newline = std.mem.indexOfScalarPos(u8, body.source, start, '\n') orelse body.source.len;
+        start = newline + @intFromBool(newline < body.source.len);
+    }
+    var visible: std.ArrayList(ReviewCardRow) = .empty;
+    errdefer visible.deinit(allocator);
+    for (rows[1..]) |row| {
+        if (start > 0 and row.source_range.end <= start) continue;
+        if (visible.items.len >= height) break;
+        try visible.append(allocator, row);
+    }
+    return visible.toOwnedSlice(allocator);
+}
+
 pub fn project(allocator: std.mem.Allocator, body: ReviewBody, options: Options) ![]const ReviewCardRow {
     std.debug.assert(std.meta.eql(options.owner, ownerForSource(options.source)));
     std.debug.assert(options.source.body().ptr == body.source.ptr and options.source.body().len == body.source.len);
