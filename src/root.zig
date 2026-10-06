@@ -162,6 +162,7 @@ pub const bitbucket = struct {
     pub const Workspace = types.Workspace;
     pub const Repository = types.Repository;
     pub const Task = types.Task;
+    pub const TaskState = types.TaskState;
     pub const Commit = types.Commit;
     pub const ReviewerVerdict = types.ReviewerVerdict;
     pub const ReviewerVerdictChangeResult = types.ReviewerVerdictChangeResult;

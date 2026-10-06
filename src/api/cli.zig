@@ -15,59 +15,73 @@ const tasks = @import("tasks.zig");
 const files = @import("files.zig");
 const commits = @import("commits.zig");
 
-pub const help =
-    \\usage: bbr api [--workspace SLUG] [--json] VERB [options]
-    \\
-    \\Talk to the Bitbucket Cloud REST API (api.bitbucket.org/2.0) without the TUI.
-    \\Global flags go before the verb: --workspace overrides BITBUCKET_WORKSPACE,
-    \\--json prints machine-readable JSON, --help prints this reference.
-    \\`bbr api VERB --help` prints the verb's options. All flags are long
-    \\`--kebab-case`; there are no short aliases.
-    \\
-    \\Verbs:
-    \\  list-workspaces    list workspaces for the authenticated account
-    \\  get-workspace      get one workspace
-    \\  list-repositories  list repositories in a workspace
-    \\  get-repository     get one repository
-    \\  list-prs           list pull requests in a repository
-    \\  get-pr             get one pull request
-    \\  list-commits       list commits (PR, revision, or from..to range)
-    \\  get-diff           raw diff of a pull request
-    \\  get-compare-diff   raw diff between two commits
-    \\  get-blob           file bytes at a commit
-    \\  check-blob         verify file metadata at a commit
-    \\  list-comments      list comments on a pull request
-    \\  get-comment        get one comment
-    \\  create-comment     create a comment or reply
-    \\  update-comment     edit a comment body
-    \\  delete-comment     delete a comment
-    \\  resolve-comment    resolve a comment thread
-    \\  reopen-comment     reopen a comment thread
-    \\  list-tasks         list tasks on a pull request
-    \\  get-task           get one task
-    \\  create-task        create a task
-    \\  update-task        update a task (content and/or state)
-    \\  delete-task        delete a task
-    \\  resolve-task       resolve a task
-    \\  reopen-task        reopen a task
-    \\  whoami             authenticated account UUID
-    \\  get-verdict        reviewer verdict for an account
-    \\  set-verdict        set the reviewer verdict
-    \\
-    \\Auth comes from BITBUCKET_USERNAME, BITBUCKET_TOKEN, BITBUCKET_WORKSPACE.
-    \\
-;
+const Verb = struct {
+    name: []const u8,
+    summary: []const u8,
+    help: []const u8,
+    example: []const u8,
+    handler: *const fn (std.process.Init, bbr.bitbucket.Client, []const []const u8, bool) anyerror!void,
+};
+
+const verbs = [_]Verb{
+    .{ .name = "list-workspaces", .summary = "list workspaces for the authenticated account", .help = workspaces.list_help, .example = "bbr api list-workspaces --pagelen 10 --no-follow", .handler = workspaces.runList },
+    .{ .name = "get-workspace", .summary = "get one workspace", .help = workspaces.get_help, .example = "bbr api get-workspace --workspace demo", .handler = workspaces.runGet },
+    .{ .name = "list-repositories", .summary = "list repositories in a workspace", .help = repositories.list_help, .example = "bbr api list-repositories --workspace demo --limit 10", .handler = repositories.runList },
+    .{ .name = "get-repository", .summary = "get one repository", .help = repositories.get_help, .example = "bbr api get-repository --workspace demo --repository sample", .handler = repositories.runGet },
+    .{ .name = "list-prs", .summary = "list pull requests in a repository", .help = pullrequests.list_help, .example = "bbr api list-prs --repository sample --state OPEN --pagelen 10 --page 2 --no-follow", .handler = pullrequests.runList },
+    .{ .name = "get-pr", .summary = "get one pull request", .help = pullrequests.get_help, .example = "bbr api get-pr --repository sample --pull-request-id 42", .handler = pullrequests.runGet },
+    .{ .name = "list-commits", .summary = "list commits (PR, revision, or from..to range)", .help = commits.help, .example = "bbr api list-commits --repository sample --revision main --limit 10", .handler = commits.run },
+    .{ .name = "get-diff", .summary = "raw diff of a pull request", .help = files.diff_help, .example = "bbr api get-diff --repository sample --pull-request-id 42 --out review.diff", .handler = files.runDiff },
+    .{ .name = "get-compare-diff", .summary = "raw diff between two commits", .help = files.compare_help, .example = "bbr api get-compare-diff --repository sample --from abc123 --to def456 --patch", .handler = files.runCompare },
+    .{ .name = "get-blob", .summary = "file bytes at a commit", .help = files.blob_help, .example = "bbr api get-blob --repository sample --commit abc123 --path src/main.zig --out main.zig", .handler = files.runBlob },
+    .{ .name = "check-blob", .summary = "verify file metadata at a commit", .help = files.check_help, .example = "bbr api check-blob --repository sample --commit abc123 --path src/main.zig --attributes -", .handler = files.runCheck },
+    .{ .name = "list-comments", .summary = "list comments on a pull request", .help = comments.list_help, .example = "bbr api list-comments --repository sample --pull-request-id 42 --no-head --limit 10", .handler = comments.runList },
+    .{ .name = "get-comment", .summary = "get one comment", .help = comments.get_help, .example = "bbr api get-comment --repository sample --pull-request-id 42 --comment-id 7", .handler = comments.runGet },
+    .{ .name = "create-comment", .summary = "create a comment or reply", .help = comments.create_help, .example = "bbr api create-comment --repository sample --pull-request-id 42 --body 'Please add a test.'", .handler = comments.runCreate },
+    .{ .name = "update-comment", .summary = "edit a comment body", .help = comments.update_help, .example = "bbr api update-comment --repository sample --pull-request-id 42 --comment-id 7 --body 'Please test this case.'", .handler = comments.runUpdate },
+    .{ .name = "delete-comment", .summary = "delete a comment", .help = comments.delete_help, .example = "bbr api delete-comment --repository sample --pull-request-id 42 --comment-id 7", .handler = comments.runDelete },
+    .{ .name = "resolve-comment", .summary = "resolve a comment thread", .help = comments.resolve_help, .example = "bbr api resolve-comment --repository sample --pull-request-id 42 --comment-id 7", .handler = comments.runResolve },
+    .{ .name = "reopen-comment", .summary = "reopen a comment thread", .help = comments.reopen_help, .example = "bbr api reopen-comment --repository sample --pull-request-id 42 --comment-id 7", .handler = comments.runReopen },
+    .{ .name = "list-tasks", .summary = "list tasks on a pull request", .help = tasks.list_help, .example = "bbr api list-tasks --repository sample --pull-request-id 42 --state-filter UNRESOLVED --limit 10", .handler = tasks.runList },
+    .{ .name = "get-task", .summary = "get one task", .help = tasks.get_help, .example = "bbr api get-task --repository sample --pull-request-id 42 --task-id 3", .handler = tasks.runGet },
+    .{ .name = "create-task", .summary = "create a task", .help = tasks.create_help, .example = "bbr api create-task --repository sample --pull-request-id 42 --content 'Add a test.'", .handler = tasks.runCreate },
+    .{ .name = "update-task", .summary = "update a task (content and/or state)", .help = tasks.update_help, .example = "bbr api update-task --repository sample --pull-request-id 42 --task-id 3 --state RESOLVED", .handler = tasks.runUpdate },
+    .{ .name = "delete-task", .summary = "delete a task", .help = tasks.delete_help, .example = "bbr api delete-task --repository sample --pull-request-id 42 --task-id 3", .handler = tasks.runDelete },
+    .{ .name = "resolve-task", .summary = "resolve a task", .help = tasks.resolve_help, .example = "bbr api resolve-task --repository sample --pull-request-id 42 --task-id 3", .handler = tasks.runResolve },
+    .{ .name = "reopen-task", .summary = "reopen a task", .help = tasks.reopen_help, .example = "bbr api reopen-task --repository sample --pull-request-id 42 --task-id 3", .handler = tasks.runReopen },
+    .{ .name = "whoami", .summary = "authenticated account UUID", .help = pullrequests.whoami_help, .example = "bbr api whoami --json", .handler = pullrequests.runWhoami },
+    .{ .name = "get-verdict", .summary = "reviewer verdict for an account", .help = pullrequests.get_verdict_help, .example = "bbr api get-verdict --repository sample --pull-request-id 42 --uuid '{reviewer}'", .handler = pullrequests.runGetVerdict },
+    .{ .name = "set-verdict", .summary = "set the reviewer verdict", .help = pullrequests.set_verdict_help, .example = "bbr api set-verdict --repository sample --pull-request-id 42 --verdict approved --expected-source-commit abc123", .handler = pullrequests.runSetVerdict },
+};
+
+pub const help = blk: {
+    var text: []const u8 =
+        \\usage: bbr api [--workspace SLUG] [--json] VERB [options]
+        \\
+        \\Talk to the Bitbucket Cloud REST API (api.bitbucket.org/2.0) without the TUI.
+        \\Global flags can go before or after the verb. --workspace overrides BITBUCKET_WORKSPACE,
+        \\--json prints machine-readable JSON, --help prints this reference.
+        \\`bbr api VERB --help` prints the verb's options. All flags are long
+        \\`--kebab-case`; there are no short aliases.
+        \\
+        \\Verbs:
+        \\
+    ;
+    for (verbs) |verb| text = text ++ "  " ++ verb.name ++ "  " ++ verb.summary ++ "\n";
+    break :blk text ++ "\nAuth comes from BITBUCKET_USERNAME and BITBUCKET_TOKEN.\n" ++
+        "Workspace comes from --workspace or BITBUCKET_WORKSPACE.\n";
+};
 
 const value_flags = [_][]const u8{
-    "workspace",       "repository",     "pull-request-id", "comment-id",
-    "parent-id",       "task-id",        "body",            "body-file",
-    "content",         "content-file",   "path",            "file-path",
-    "to",              "from",           "start-to",        "start-from",
-    "state",           "state-filter",   "source-branch",   "commit",
-    "revision",        "source-commit",  "destination-commit",
-    "expected-source-commit", "uuid",    "out",             "pagelen",
-    "page",            "query",          "sort",            "limit",
-    "attributes",      "verdict",
+    "workspace", "repository",    "pull-request-id",    "comment-id",
+    "parent-id", "task-id",       "body",               "body-file",
+    "content",   "content-file",  "path",               "file-path",
+    "to",        "from",          "start-to",           "start-from",
+    "state",     "state-filter",  "source-branch",      "commit",
+    "revision",  "source-commit", "destination-commit", "expected-source-commit",
+    "uuid",      "out",           "pagelen",            "page",
+    "query",     "sort",          "limit",              "attributes",
+    "verdict",
 };
 
 fn takesValue(name: []const u8) bool {
@@ -144,194 +158,132 @@ fn parseGlobal(
     };
 }
 
-fn printHelp(init: std.process.Init) !void {
+fn printHelp(init: std.process.Init, verb: ?[]const u8) !void {
     var buf: [8192]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(init.io, &buf);
-    try stdout.interface.writeAll(help);
+    try writeHelp(&stdout.interface, verb);
     try stdout.interface.flush();
 }
 
-fn printVerbHelp(init: std.process.Init, verb: []const u8) !void {
-    var buf: [8192]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &buf);
-    const text: ?[]const u8 = if (std.mem.eql(u8, verb, "list-workspaces"))
-        workspaces.list_help
-    else if (std.mem.eql(u8, verb, "get-workspace"))
-        workspaces.get_help
-    else if (std.mem.eql(u8, verb, "list-repositories"))
-        repositories.list_help
-    else if (std.mem.eql(u8, verb, "get-repository"))
-        repositories.get_help
-    else if (std.mem.eql(u8, verb, "list-prs"))
-        pullrequests.list_help
-    else if (std.mem.eql(u8, verb, "get-pr"))
-        pullrequests.get_help
-    else if (std.mem.eql(u8, verb, "whoami"))
-        pullrequests.whoami_help
-    else if (std.mem.eql(u8, verb, "get-verdict"))
-        pullrequests.get_verdict_help
-    else if (std.mem.eql(u8, verb, "set-verdict"))
-        pullrequests.set_verdict_help
-    else if (std.mem.eql(u8, verb, "list-commits"))
-        commits.help
-    else if (std.mem.eql(u8, verb, "get-diff"))
-        files.diff_help
-    else if (std.mem.eql(u8, verb, "get-compare-diff"))
-        files.compare_help
-    else if (std.mem.eql(u8, verb, "get-blob"))
-        files.blob_help
-    else if (std.mem.eql(u8, verb, "check-blob"))
-        files.check_help
-    else if (std.mem.eql(u8, verb, "list-comments"))
-        comments.list_help
-    else if (std.mem.eql(u8, verb, "get-comment"))
-        comments.get_help
-    else if (std.mem.eql(u8, verb, "create-comment"))
-        comments.create_help
-    else if (std.mem.eql(u8, verb, "update-comment"))
-        comments.update_help
-    else if (std.mem.eql(u8, verb, "delete-comment"))
-        comments.delete_help
-    else if (std.mem.eql(u8, verb, "resolve-comment"))
-        comments.resolve_help
-    else if (std.mem.eql(u8, verb, "reopen-comment"))
-        comments.reopen_help
-    else if (std.mem.eql(u8, verb, "list-tasks"))
-        tasks.list_help
-    else if (std.mem.eql(u8, verb, "get-task"))
-        tasks.get_help
-    else if (std.mem.eql(u8, verb, "create-task"))
-        tasks.create_help
-    else if (std.mem.eql(u8, verb, "update-task"))
-        tasks.update_help
-    else if (std.mem.eql(u8, verb, "delete-task"))
-        tasks.delete_help
-    else if (std.mem.eql(u8, verb, "resolve-task"))
-        tasks.resolve_help
-    else if (std.mem.eql(u8, verb, "reopen-task"))
-        tasks.reopen_help
-    else
-        null;
-    if (text) |t| {
-        try stdout.interface.writeAll(t);
-    } else {
-        try stdout.interface.writeAll(help);
+fn writeHelp(writer: *std.Io.Writer, name: ?[]const u8) !void {
+    if (name) |n| {
+        if (findVerb(n)) |verb| {
+            try writer.writeAll(verb.help);
+            try writer.writeAll("\nGlobal options: --workspace SLUG, --json, --help.\n");
+            try writer.print("\nExample:\n  {s}\n", .{verb.example});
+            return;
+        }
     }
-    try stdout.interface.flush();
+    try writer.writeAll(help);
+}
+
+fn isOptionError(err: anyerror) bool {
+    return err == error.UnknownFlag or err == error.MissingRequired or
+        err == error.MissingValue or err == error.InvalidNumber or err == error.BadRequest;
+}
+
+fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror) !void {
+    try writer.writeAll("bbr api");
+    if (verb) |v| try writer.print(" {s}", .{v.name});
+    if (isOptionError(err)) {
+        try writer.print(": bad options ({s})\n", .{@errorName(err)});
+        try writeHelp(writer, if (verb) |v| v.name else null);
+    } else {
+        try writer.print(": {s}\n", .{@errorName(err)});
+        if (err == error.MissingCredential) {
+            try writer.writeAll("Set BITBUCKET_USERNAME, BITBUCKET_TOKEN, and --workspace or BITBUCKET_WORKSPACE.\n");
+        }
+    }
+}
+
+fn printError(init: std.process.Init, verb: ?Verb, err: anyerror) !void {
+    var buf: [8192]u8 = undefined;
+    var stderr = std.Io.File.stderr().writer(init.io, &buf);
+    try writeError(&stderr.interface, verb, err);
+    try stderr.interface.flush();
+}
+
+/// Only report a registered verb in a positional slot. Never report a flag value.
+fn diagnosticVerb(argv: []const []const u8) ?Verb {
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const a = argv[i];
+        if (arg.isHelp(a)) continue;
+        if (arg.splitFlag(a)) |f| {
+            if (f.value != null) continue;
+            if (takesValue(f.name)) {
+                i += 1;
+                if (i >= argv.len) return null;
+            } else if (!std.mem.eql(u8, f.name, "json") and
+                !std.mem.eql(u8, f.name, "no-follow") and
+                !std.mem.eql(u8, f.name, "no-head") and
+                !std.mem.eql(u8, f.name, "patch"))
+            {
+                // An unknown flag can take a value. Do not guess its meaning.
+                return null;
+            }
+            continue;
+        }
+        return findVerb(a);
+    }
+    return null;
+}
+
+fn findVerb(name: []const u8) ?Verb {
+    for (verbs) |verb| if (std.mem.eql(u8, verb.name, name)) return verb;
+    return null;
+}
+
+fn verbHelp(name: []const u8) []const u8 {
+    return if (findVerb(name)) |verb| verb.help else help;
+}
+
+fn cliCredential(
+    env: *const std.process.Environ.Map,
+    workspace: ?[]const u8,
+) bbr.bitbucket.Credential.Error!bbr.bitbucket.Credential {
+    return .{
+        .username = env.get("BITBUCKET_USERNAME") orelse return error.MissingUsername,
+        .token = env.get("BITBUCKET_TOKEN") orelse return error.MissingToken,
+        .workspace = workspace orelse env.get("BITBUCKET_WORKSPACE") orelse return error.MissingWorkspace,
+    };
 }
 
 /// Entry from `main.zig`: `bbr api [...]`. Never touches config or the TUI.
 pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
-    while (it.next()) |a| try argv.append(gpa, a);
+    while (it.next()) |a| argv.append(gpa, a) catch |err| {
+        try printError(init, diagnosticVerb(argv.items), err);
+        return err;
+    };
+    runArgs(init, gpa, argv.items) catch |err| {
+        try printError(init, diagnosticVerb(argv.items), err);
+        return err;
+    };
+}
 
-    const parsed = try parseGlobal(gpa, argv.items);
+fn runArgs(init: std.process.Init, gpa: std.mem.Allocator, argv: []const []const u8) !void {
+    const parsed = try parseGlobal(gpa, argv);
     defer gpa.free(parsed.rest);
 
+    if (parsed.verb == null and !parsed.help_only and parsed.rest.len != 0) return error.UnknownFlag;
     if (parsed.verb == null or parsed.help_only) {
-        if (parsed.verb) |v| {
-            // `bbr api VERB --help`: verb reference, no credentials needed.
-            try printVerbHelp(init, v);
-        } else {
-            try printHelp(init);
-        }
+        try printHelp(init, parsed.verb);
         return;
     }
     const verb = parsed.verb.?;
 
-    // Unknown verb: full reference to stderr, non-zero exit.
-    if (!isVerb(verb)) {
-        std.debug.print("bbr api: unknown verb '{s}'\n{s}", .{ verb, help });
-        return error.UnknownFlag;
-    }
+    const entry = findVerb(verb) orelse return error.UnknownFlag;
 
-    var cred = bbr.bitbucket.Credential.fromEnv(init.environ_map) catch {
-        std.debug.print(
-            "bbr api: missing credential: set BITBUCKET_USERNAME, BITBUCKET_TOKEN, BITBUCKET_WORKSPACE\n",
-            .{},
-        );
-        return error.MissingCredential;
-    };
-    if (parsed.workspace) |w| cred.workspace = w;
+    const cred = cliCredential(init.environ_map, parsed.workspace) catch return error.MissingCredential;
 
     var transport = bbr.http.StdHttpClient.init(gpa, init.io);
     defer transport.deinit();
     try transport.initDefaultProxies(init.arena.allocator(), init.environ_map);
     const bb = bbr.bitbucket.Client.init(transport.httpClient(), cred);
 
-    dispatch(init, bb, verb, parsed.rest, parsed.json) catch |err| {
-        if (err == error.UnknownFlag or err == error.MissingRequired or
-            err == error.MissingValue or err == error.InvalidNumber or
-            err == error.BadRequest)
-        {
-            std.debug.print("bbr api {s}: bad options ({s})\n", .{ verb, @errorName(err) });
-            try printVerbHelp(init, verb);
-        } else {
-            std.debug.print("bbr api {s}: {s}\n", .{ verb, @errorName(err) });
-        }
-        return err;
-    };
-}
-
-fn isVerb(verb: []const u8) bool {
-    for (verbs) |v| if (std.mem.eql(u8, v, verb)) return true;
-    return false;
-}
-
-const verbs = [_][]const u8{
-    "list-workspaces", "get-workspace",
-    "list-repositories", "get-repository",
-    "list-prs",         "get-pr",
-    "list-commits",     "get-diff",
-    "get-compare-diff",  "get-blob",
-    "check-blob",        "list-comments",
-    "get-comment",       "create-comment",
-    "update-comment",    "delete-comment",
-    "resolve-comment",   "reopen-comment",
-    "list-tasks",        "get-task",
-    "create-task",       "update-task",
-    "delete-task",       "resolve-task",
-    "reopen-task",       "whoami",
-    "get-verdict",       "set-verdict",
-};
-
-fn dispatch(
-    init: std.process.Init,
-    bb: bbr.bitbucket.Client,
-    verb: []const u8,
-    args: []const []const u8,
-    json: bool,
-) !void {
-    if (std.mem.eql(u8, verb, "list-workspaces")) return workspaces.runList(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "get-workspace")) return workspaces.runGet(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "list-repositories")) return repositories.runList(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "get-repository")) return repositories.runGet(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "list-prs")) return pullrequests.runList(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "get-pr")) return pullrequests.runGet(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "whoami")) return pullrequests.runWhoami(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "get-verdict")) return pullrequests.runGetVerdict(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "set-verdict")) return pullrequests.runSetVerdict(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "list-commits")) return commits.run(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "get-diff")) return files.runDiff(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "get-compare-diff")) return files.runCompare(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "get-blob")) return files.runBlob(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "check-blob")) return files.runCheck(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "list-comments")) return comments.runList(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "get-comment")) return comments.runGet(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "create-comment")) return comments.runCreate(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "update-comment")) return comments.runUpdate(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "delete-comment")) return comments.runDelete(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "resolve-comment")) return comments.runResolve(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "reopen-comment")) return comments.runReopen(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "list-tasks")) return tasks.runList(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "get-task")) return tasks.runGet(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "create-task")) return tasks.runCreate(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "update-task")) return tasks.runUpdate(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "delete-task")) return tasks.runDelete(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "resolve-task")) return tasks.runResolve(init, bb, args, json);
-    if (std.mem.eql(u8, verb, "reopen-task")) return tasks.runReopen(init, bb, args, json);
-    return error.UnknownFlag;
+    try entry.handler(init, bb, parsed.rest, parsed.json);
 }
 
 test "parseGlobal extracts globals and verb" {
@@ -355,7 +307,233 @@ test "parseGlobal keeps flag values intact" {
     try std.testing.expectEqual(@as(usize, 2), p.rest.len);
 }
 
-test "all verbs are known" {
-    for (verbs) |v| try std.testing.expect(isVerb(v));
-    try std.testing.expect(!isVerb("frobnicate"));
+test "verb registry is unique and every entry has matching help" {
+    try std.testing.expectEqual(@as(usize, 28), verbs.len);
+    inline for (verbs, 0..) |verb, index| {
+        for (verbs[index + 1 ..]) |other| try std.testing.expect(!std.mem.eql(u8, verb.name, other.name));
+        try std.testing.expect(std.mem.startsWith(u8, verbHelp(verb.name), "usage: bbr api " ++ verb.name));
+        try std.testing.expect(std.mem.indexOf(u8, help, "  " ++ verb.name ++ "  " ++ verb.summary ++ "\n") != null);
+        try std.testing.expect(std.mem.startsWith(u8, verb.example, "bbr api " ++ verb.name ++ " "));
+        var buffer: [8192]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try writeHelp(&writer, verb.name);
+        try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), verb.example) != null);
+        try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "Global options: --workspace SLUG, --json, --help.") != null);
+    }
+    try std.testing.expect(findVerb("frobnicate") == null);
+    try std.testing.expectEqualStrings(help, verbHelp("frobnicate"));
+    try std.testing.expectEqualStrings(pullrequests.list_help, verbHelp("list-prs"));
+    try std.testing.expectEqualStrings(pullrequests.set_verdict_help, verbHelp("set-verdict"));
 }
+
+test "CLI workspace override works without an environment workspace" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("BITBUCKET_USERNAME", "test-user");
+    try env.put("BITBUCKET_TOKEN", "test-token");
+    const parsed = try parseGlobal(a, &.{ "list-prs", "--workspace", "flag-workspace" });
+    defer a.free(parsed.rest);
+    const cred = try cliCredential(&env, parsed.workspace);
+    try std.testing.expectEqualStrings("flag-workspace", cred.workspace);
+    try std.testing.expectEqualStrings("test-user", cred.username);
+    try std.testing.expectEqualStrings("test-token", cred.token);
+    try env.put("BITBUCKET_WORKSPACE", "env-workspace");
+    try std.testing.expectEqualStrings("flag-workspace", (try cliCredential(&env, parsed.workspace)).workspace);
+    try std.testing.expectEqualStrings("env-workspace", (try cliCredential(&env, null)).workspace);
+}
+
+test "CLI credentials require username token and a workspace" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expectError(error.MissingUsername, cliCredential(&env, "flag-workspace"));
+    try env.put("BITBUCKET_USERNAME", "test-user");
+    try std.testing.expectError(error.MissingToken, cliCredential(&env, "flag-workspace"));
+    try env.put("BITBUCKET_TOKEN", "test-token");
+    try std.testing.expectError(error.MissingWorkspace, cliCredential(&env, null));
+}
+
+test "global and every verb help write examples to stdout without credentials" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var output: TestOutput = .{};
+    var global: arg.Cursor = .{ .args = &.{"--help"} };
+    try run(output.init(&env, &arena), a, &global);
+    try std.testing.expectEqualStrings(help, output.stdoutBytes());
+    try std.testing.expectEqual(@as(usize, 0), output.stderr_len);
+    for (verbs) |verb| {
+        output = .{};
+        var args: arg.Cursor = .{ .args = &.{ verb.name, "--help" } };
+        try run(output.init(&env, &arena), a, &args);
+        try std.testing.expect(std.mem.startsWith(u8, output.stdoutBytes(), verb.help));
+        try std.testing.expect(std.mem.indexOf(u8, output.stdoutBytes(), verb.example) != null);
+        try std.testing.expectEqual(@as(usize, 0), output.stderr_len);
+    }
+}
+
+test "diagnostic verb lookup skips sensitive values and does not guess unknown flag values" {
+    try std.testing.expectEqualStrings("get-pr", diagnosticVerb(&.{ "--workspace", "private-workspace", "get-pr", "--body" }).?.name);
+    try std.testing.expect(diagnosticVerb(&.{ "--body", "get-pr", "--workspace" }) == null);
+    try std.testing.expect(diagnosticVerb(&.{ "--unknown", "get-pr", "--workspace" }) == null);
+    try std.testing.expect(diagnosticVerb(&.{ "--workspace=whoami", "--body" }) == null);
+    try std.testing.expect(diagnosticVerb(&.{ "private-value", "get-pr" }) == null);
+}
+
+test "global parse errors use stderr and name only a safely supplied verb" {
+    const cases = [_]struct { args: []const []const u8, prefix: []const u8, hidden: []const u8 }{
+        .{ .args = &.{ "--json", "create-comment", "--body", "private-body", "--workspace" }, .prefix = "bbr api create-comment: bad options (MissingValue)\n", .hidden = "private-body" },
+        .{ .args = &.{ "--body", "get-pr", "--workspace" }, .prefix = "bbr api: bad options (MissingValue)\n", .hidden = "bbr api get-pr:" },
+        .{ .args = &.{ "--unknown", "get-pr", "--workspace" }, .prefix = "bbr api: bad options (MissingValue)\n", .hidden = "bbr api get-pr:" },
+        .{ .args = &.{ "--workspace", "private-workspace", "get-pr", "--pull-request-id" }, .prefix = "bbr api get-pr: bad options (MissingValue)\n", .hidden = "private-workspace" },
+        .{ .args = &.{"private-invalid-verb"}, .prefix = "bbr api: bad options (UnknownFlag)\n", .hidden = "private-invalid-verb" },
+        .{ .args = &.{"--unknown=private-value"}, .prefix = "bbr api: bad options (UnknownFlag)\n", .hidden = "private-value" },
+    };
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for (cases) |case| {
+        var output: TestOutput = .{};
+        var args: arg.Cursor = .{ .args = case.args };
+        const expected: anyerror = if (case.args.len == 1) error.UnknownFlag else error.MissingValue;
+        try std.testing.expectError(expected, run(output.init(&env, &arena), a, &args));
+        try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+        try std.testing.expect(std.mem.startsWith(u8, output.stderrBytes(), case.prefix));
+        try std.testing.expect(std.mem.indexOf(u8, output.stderrBytes(), case.hidden) == null);
+    }
+}
+
+test "credential handler and proxy initialization errors stay on stderr with json" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var output: TestOutput = .{};
+    var missing: arg.Cursor = .{ .args = &.{ "whoami", "--json" } };
+    try std.testing.expectError(error.MissingCredential, run(output.init(&env, &arena), a, &missing));
+    try std.testing.expect(std.mem.startsWith(u8, output.stderrBytes(), "bbr api whoami: MissingCredential\n"));
+    try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+
+    try env.put("BITBUCKET_USERNAME", "private-username");
+    try env.put("BITBUCKET_TOKEN", "private-token");
+    try env.put("BITBUCKET_WORKSPACE", "private-workspace");
+    output = .{};
+    var invalid: arg.Cursor = .{ .args = &.{ "whoami", "--json", "--uuid=private-value" } };
+    try std.testing.expectError(error.UnknownFlag, run(output.init(&env, &arena), a, &invalid));
+    try std.testing.expect(std.mem.startsWith(u8, output.stderrBytes(), "bbr api whoami: bad options (UnknownFlag)\n"));
+    try std.testing.expect(std.mem.indexOf(u8, output.stderrBytes(), "Example:\n  bbr api whoami --json\n") != null);
+    try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderrBytes(), "private-") == null);
+
+    try env.put("https_proxy", "socks5://private-proxy.invalid");
+    output = .{};
+    var proxy: arg.Cursor = .{ .args = &.{ "whoami", "--json" } };
+    try std.testing.expectError(error.InvalidProxyConfiguration, run(output.init(&env, &arena), a, &proxy));
+    try std.testing.expectEqualStrings("bbr api whoami: InvalidProxyConfiguration\n", output.stderrBytes());
+    try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+}
+
+test "error writer formats option help and runtime errors without user values" {
+    var buffer: [8192]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeError(&writer, findVerb("get-pr"), error.InvalidNumber);
+    try std.testing.expect(std.mem.startsWith(u8, writer.buffered(), "bbr api get-pr: bad options (InvalidNumber)\nusage: bbr api get-pr"));
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), findVerb("get-pr").?.example) != null);
+    writer = std.Io.Writer.fixed(&buffer);
+    try writeError(&writer, findVerb("set-verdict"), error.Forbidden);
+    try std.testing.expectEqualStrings("bbr api set-verdict: Forbidden\n", writer.buffered());
+}
+
+test "failed verdict changes produce no stdout success result" {
+    const pr =
+        \\{"id":42,"title":"Review","state":"OPEN","author":{"display_name":"Ada","uuid":"{author}"},
+        \\ "source":{"branch":{"name":"feature"},"commit":{"hash":"abc123"}},
+        \\ "destination":{"branch":{"name":"main"},"commit":{"hash":"def456"}},"participants":[]}
+    ;
+    const cases = [_]struct { account: []const u8, expected_commit: []const u8, err: anyerror }{
+        .{ .account = "{\"uuid\":\"{account}\"}", .expected_commit = "old", .err = error.ReviewerVerdictChangeFailed },
+        .{ .account = "{\"uuid\":\"{author}\"}", .expected_commit = "abc123", .err = error.Forbidden },
+    };
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for (cases) |case| {
+        const responses = [_]bbr.http.Canned{ .{ .body = case.account }, .{ .body = pr } };
+        for ([_]bool{ false, true }) |json| {
+            var output: TestOutput = .{};
+            var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+            const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "test-user", .token = "test-token", .workspace = "demo" });
+            const args = &.{ "--repository=sample", "--pull-request-id=42", "--verdict=approved", "--expected-source-commit", case.expected_commit };
+            try std.testing.expectError(case.err, pullrequests.runSetVerdict(output.init(&env, &arena), bb, args, json));
+            try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+            try std.testing.expectEqual(@as(usize, 2), fake.call_count);
+        }
+    }
+}
+
+const TestOutput = struct {
+    stdout_buffer: [8192]u8 = undefined,
+    stderr_buffer: [8192]u8 = undefined,
+    stdout_len: usize = 0,
+    stderr_len: usize = 0,
+
+    const vtable: std.Io.VTable = blk: {
+        var table = std.Io.failing.vtable.*;
+        table.fileWritePositional = writePositional;
+        table.operate = operate;
+        break :blk table;
+    };
+
+    fn init(self: *TestOutput, env: *std.process.Environ.Map, arena: *std.heap.ArenaAllocator) std.process.Init {
+        return .{
+            .minimal = undefined,
+            .arena = arena,
+            .gpa = std.testing.allocator,
+            .io = .{ .userdata = self, .vtable = &vtable },
+            .environ_map = env,
+            .preopens = undefined,
+        };
+    }
+
+    fn stdoutBytes(self: *const TestOutput) []const u8 {
+        return self.stdout_buffer[0..self.stdout_len];
+    }
+
+    fn stderrBytes(self: *const TestOutput) []const u8 {
+        return self.stderr_buffer[0..self.stderr_len];
+    }
+
+    fn writePositional(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, _: u64) std.Io.File.WritePositionalError!usize {
+        return capture(userdata, file, header, data, splat);
+    }
+
+    fn capture(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize) error{NoSpaceLeft}!usize {
+        const self: *TestOutput = @ptrCast(@alignCast(userdata.?));
+        const buffer: []u8 = if (file.handle == std.Io.File.stdout().handle) &self.stdout_buffer else &self.stderr_buffer;
+        const len: *usize = if (file.handle == std.Io.File.stdout().handle) &self.stdout_len else &self.stderr_len;
+        var writer = std.Io.Writer.fixed(buffer[len.*..]);
+        writer.writeAll(header) catch return error.NoSpaceLeft;
+        for (data, 0..) |part, index| {
+            const repetitions = if (index + 1 == data.len) splat else 1;
+            for (0..repetitions) |_| writer.writeAll(part) catch return error.NoSpaceLeft;
+        }
+        const written = writer.buffered().len;
+        len.* += written;
+        return written;
+    }
+
+    fn operate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+        const write = switch (operation) {
+            .file_write_streaming => |write| write,
+            else => unreachable,
+        };
+        return .{ .file_write_streaming = capture(userdata, write.file, write.header, write.data, write.splat) };
+    }
+};

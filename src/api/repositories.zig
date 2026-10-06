@@ -21,31 +21,51 @@ pub const get_help =
     \\
 ;
 
-pub fn runList(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
+const ListArgs = struct {
+    workspace: ?[]const u8,
+    page: bbr.bitbucket.PageOptions,
+};
+
+fn parseList(args: []const []const u8) !ListArgs {
     var cur: arg.Cursor = .{ .args = args };
     var workspace: ?[]const u8 = null;
+    var page: bbr.bitbucket.PageOptions = .{};
     while (cur.peek()) |a| {
         const f = arg.splitFlag(a) orelse break;
+        if (try ws.takePageFlag(&cur, f, &page)) continue;
         if (std.mem.eql(u8, f.name, "workspace")) {
             _ = cur.next();
             workspace = try arg.takeValue(&cur, f);
         } else break;
     }
-    // Remaining page flags follow workspace (order: --workspace first).
-    const rest = args[cur.pos..];
-    var cur2: arg.Cursor = .{ .args = rest };
-    const opts = try ws.pageOpts(rest, &cur2);
-    if (!cur2.done()) return error.UnknownFlag;
+    if (!cur.done()) return error.UnknownFlag;
+    return .{ .workspace = workspace, .page = page };
+}
 
+pub fn runList(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
+    const parsed = try parseList(args);
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
-    const items = try bb.listRepositories(arena.allocator(), workspace, opts);
+    const items = try bb.listRepositories(arena.allocator(), parsed.workspace, parsed.page);
     if (json) {
         try out.printJson(init, items);
     } else {
         for (items) |r| try out.printLine(init, "{s} ({s})", .{ r.slug, r.full_name });
         try out.printLine(init, "ok: {d} repositor(ies)", .{items.len});
     }
+}
+
+test "repository list flags can interleave workspace and page controls" {
+    const parsed = try parseList(&.{ "--page=3", "--workspace", "demo", "--query=slug=\"repo\"", "--pagelen=10", "--sort=-slug", "--limit=12", "--no-follow" });
+    try std.testing.expectEqualStrings("demo", parsed.workspace.?);
+    try std.testing.expectEqual(@as(u32, 3), parsed.page.page.?);
+    try std.testing.expectEqual(@as(u32, 10), parsed.page.pagelen.?);
+    try std.testing.expectEqual(@as(usize, 12), parsed.page.limit.?);
+    try std.testing.expectEqualStrings("slug=\"repo\"", parsed.page.query.?);
+    try std.testing.expectEqualStrings("-slug", parsed.page.sort.?);
+    try std.testing.expect(!parsed.page.follow);
+    try std.testing.expectError(error.UnknownFlag, parseList(&.{ "--workspace=demo", "--no-follow=false" }));
+    try std.testing.expectError(error.InvalidNumber, parseList(&.{ "--page=0", "--workspace=demo" }));
 }
 
 pub fn runGet(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {

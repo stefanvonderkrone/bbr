@@ -94,19 +94,20 @@ pub const Repository = struct {
     is_private: bool = false,
 };
 
+pub const TaskState = enum { resolved, unresolved };
+
 /// A task on a pull request: actionable prose distinct from a `Comment`.
-/// `resolved` mirrors Bitbucket's `state` (`RESOLVED` vs `UNRESOLVED`).
 /// `comment_id` links the task to a comment when created against one.
 /// All slices owned by the allocator that produced the value.
 pub const Task = struct {
     id: u64,
     content: []const u8,
-    state: []const u8,
+    state: TaskState,
     creator_uuid: []const u8 = "",
     comment_id: ?u64 = null,
 
     pub fn resolved(self: Task) bool {
-        return std.mem.eql(u8, self.state, "RESOLVED");
+        return self.state == .resolved;
     }
 };
 
