@@ -613,6 +613,12 @@ pub fn selectedProfileName(
     return allocator.dupe(u8, default_profile);
 }
 
+/// Return a non-empty environment override. The environment owns the value.
+pub fn credentialEnvValue(env: *const EnvMap, key: []const u8) ?[]const u8 {
+    const value = env.get(key) orelse return null;
+    return if (value.len > 0) value else null;
+}
+
 /// Resolve the credential for one profile: per-field `BITBUCKET_*`
 /// environment overrides over the file. Missing fields are
 /// `MissingUsername` / `MissingToken` / `MissingWorkspace`.
@@ -629,9 +635,9 @@ pub fn resolve(
     errdefer allocator.free(selected);
 
     const from_file: ?*const NamedProfile = if (loaded) |*l| l.file.find(selected) else null;
-    const username_src = env.get("BITBUCKET_USERNAME") orelse if (from_file) |f| (if (f.username.len > 0) f.username else null) else null;
-    const token_src = env.get("BITBUCKET_TOKEN") orelse if (from_file) |f| (if (f.token.len > 0) f.token else null) else null;
-    const workspace_src = env.get("BITBUCKET_WORKSPACE") orelse if (from_file) |f| (if (f.workspace.len > 0) f.workspace else null) else null;
+    const username_src = credentialEnvValue(env, "BITBUCKET_USERNAME") orelse if (from_file) |f| (if (f.username.len > 0) f.username else null) else null;
+    const token_src = credentialEnvValue(env, "BITBUCKET_TOKEN") orelse if (from_file) |f| (if (f.token.len > 0) f.token else null) else null;
+    const workspace_src = credentialEnvValue(env, "BITBUCKET_WORKSPACE") orelse if (from_file) |f| (if (f.workspace.len > 0) f.workspace else null) else null;
 
     const username = try allocator.dupe(u8, username_src orelse return error.MissingUsername);
     errdefer allocator.free(username);
@@ -1140,11 +1146,67 @@ test "resolve merges env over file per field" {
     try testing.expectEqualStrings("default", cred.profile);
 }
 
+test "resolve ignores empty environment overrides for every Credential field" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer testing.allocator.free(base);
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", base);
+    const path = try upsertProfile(testing.allocator, testing.io, &env, "work", .{
+        .username = "file-user",
+        .token = "file-token",
+        .workspace = "file-ws",
+    });
+    defer testing.allocator.free(path);
+
+    const keys = [_][]const u8{ "BITBUCKET_USERNAME", "BITBUCKET_TOKEN", "BITBUCKET_WORKSPACE" };
+    const file_values = [_][]const u8{ "file-user", "file-token", "file-ws" };
+    const env_values = [_][]const u8{ "env-user", "env-token", "env-ws" };
+    for (0..8) |mask| {
+        var expected: [3][]const u8 = undefined;
+        for (keys, 0..) |key, i| {
+            const overridden = mask & (@as(usize, 1) << @intCast(i)) != 0;
+            try env.put(key, if (overridden) env_values[i] else "");
+            expected[i] = if (overridden) env_values[i] else file_values[i];
+        }
+        var cred = try resolve(testing.allocator, testing.io, &env, null);
+        defer cred.deinit(testing.allocator);
+        try testing.expectEqualStrings(expected[0], cred.username);
+        try testing.expectEqualStrings(expected[1], cred.token);
+        try testing.expectEqualStrings(expected[2], cred.workspace);
+    }
+}
+
+test "Profile selection honors explicit and environment names with a login default" {
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    const fallback = try selectedProfileName(testing.allocator, &env, null, null);
+    defer testing.allocator.free(fallback);
+    try testing.expectEqualStrings("default", fallback);
+    try env.put("BBR_PROFILE", "work");
+    const selected = try selectedProfileName(testing.allocator, &env, null, null);
+    defer testing.allocator.free(selected);
+    try testing.expectEqualStrings("work", selected);
+    const explicit = try selectedProfileName(testing.allocator, &env, null, "personal");
+    defer testing.allocator.free(explicit);
+    try testing.expectEqualStrings("personal", explicit);
+    try env.put("BBR_PROFILE", "bad name");
+    try testing.expectError(error.InvalidProfileName, selectedProfileName(testing.allocator, &env, null, null));
+}
+
 test "resolve reports the missing field" {
     var env = EnvMap.init(testing.allocator);
     defer env.deinit();
     // No data home, no env: the file cannot exist and every field is missing.
     try testing.expectError(error.MissingUsername, resolve(testing.allocator, testing.io, &env, null));
+    try env.put("BITBUCKET_USERNAME", "");
+    try testing.expectError(error.MissingUsername, resolve(testing.allocator, testing.io, &env, null));
     try env.put("BITBUCKET_USERNAME", "u");
+    try env.put("BITBUCKET_TOKEN", "");
     try testing.expectError(error.MissingToken, resolve(testing.allocator, testing.io, &env, null));
+    try env.put("BITBUCKET_TOKEN", "t");
+    try env.put("BITBUCKET_WORKSPACE", "");
+    try testing.expectError(error.MissingWorkspace, resolve(testing.allocator, testing.io, &env, null));
 }
