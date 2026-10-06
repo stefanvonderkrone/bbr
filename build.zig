@@ -240,6 +240,82 @@ pub fn build(b: *std.Build) void {
     const authored_search_step = b.step("test-authored-search", "Run authored Review Search tests");
     authored_search_step.dependOn(&b.addRunArtifact(authored_search_tests).step);
 
+    const reply_ancestry_tests = b.addTest(.{
+        .name = "reply-ancestry-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M23 ancestry"},
+    });
+    const reply_ancestry_step = b.step("test-reply-ancestry", "Run Reply ancestry presentation tests");
+    reply_ancestry_step.dependOn(&b.addRunArtifact(reply_ancestry_tests).step);
+
+    const yank_tests = b.addTest(.{
+        .name = "yank-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"yank"},
+    });
+    const yank_step = b.step("test-yank", "Run Presentation yank tests");
+    yank_step.dependOn(&b.addRunArtifact(yank_tests).step);
+
+    const inline_tests = b.addTest(.{
+        .name = "inline-markdown-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M23 inline"},
+    });
+    const inline_step = b.step("test-inline-markdown", "Run inline Markdown presentation tests");
+    inline_step.dependOn(&b.addRunArtifact(inline_tests).step);
+
+    const literal_tests = b.addTest(.{
+        .name = "literal-code-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M23 literal"},
+    });
+    const literal_step = b.step("test-literal-code", "Run literal code presentation tests");
+    literal_step.dependOn(&b.addRunArtifact(literal_tests).step);
+
+    const code_tests = b.addTest(.{ .name = "code-highlighting-tests", .root_module = exe.root_module, .filters = &.{"M23 highlighting"} });
+    const code_step = b.step("test-code-highlighting", "Run fenced-code Highlighting tests");
+    code_step.dependOn(&b.addRunArtifact(code_tests).step);
+
+    const container_tests = b.addTest(.{
+        .name = "container-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M23 containers"},
+    });
+    const container_step = b.step("test-containers", "Run list and quote presentation tests");
+    container_step.dependOn(&b.addRunArtifact(container_tests).step);
+
+    const link_tests = b.addTest(.{
+        .name = "link-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M23 links"},
+    });
+    const link_step = b.step("test-links", "Run link and reference presentation tests");
+    link_step.dependOn(&b.addRunArtifact(link_tests).step);
+
+    const table_tests = b.addTest(.{
+        .name = "table-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M23 tables"},
+    });
+    const table_step = b.step("test-tables", "Run table presentation tests");
+    table_step.dependOn(&b.addRunArtifact(table_tests).step);
+
+    const emoji_tests = b.addTest(.{
+        .name = "emoji-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M23 emoji"},
+    });
+    const emoji_step = b.step("test-emoji", "Run emoji conversion and search tests");
+    emoji_step.dependOn(&b.addRunArtifact(emoji_tests).step);
+
+    const acceptance_tests = b.addTest(.{
+        .name = "m23-acceptance-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M23 acceptance"},
+    });
+    const acceptance_step = b.step("test-m23-acceptance", "Run combined M23 acceptance tests");
+    acceptance_step.dependOn(&b.addRunArtifact(acceptance_tests).step);
+
     const fixture_mod = b.createModule(.{
         .root_source_file = b.path("tests/user_grammar_fixture.zig"),
         .target = target,

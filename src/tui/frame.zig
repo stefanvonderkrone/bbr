@@ -216,6 +216,7 @@ pub const ProjectedSourceRange = struct {
     row: search.Range,
     active: bool,
     occurrence_index: ?usize = null,
+    definition: ?search.Range = null,
 };
 
 pub const Projection = struct {
@@ -235,6 +236,8 @@ pub const Projection = struct {
     search_ranges_sorted: bool = false,
     buffer_search_active: ?usize = null,
     buffer_search_ranges: bool = false,
+    code_highlights: []const @import("code_highlighting.zig").View = &.{},
+    code_highlight_retained_bytes: usize = 0,
 };
 
 /// Resolve a cell solely against the immutable, already-published Frame. An

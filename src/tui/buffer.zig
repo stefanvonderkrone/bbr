@@ -338,7 +338,28 @@ fn addAnchorIndex(allocator: std.mem.Allocator, index: *AnchorIndex, key: Anchor
 }
 
 const ParentKey = struct { kind: u8, id: u64 };
-const ReplyIndex = std.AutoHashMapUnmanaged(ParentKey, std.ArrayList(usize));
+const ReplyItem = union(enum) { comment: *const Comment, draft: usize };
+const ReplyIndex = std.AutoHashMapUnmanaged(ParentKey, std.ArrayList(ReplyItem));
+const ParentIndex = std.AutoHashMapUnmanaged(ParentKey, ReplyItem);
+
+fn effectiveParent(parent: Parent, parents: ParentIndex, drafts: []const Draft) Parent {
+    const item = parents.get(parentKey(parent)) orelse return parent;
+    return switch (item) {
+        .comment => |comment| .{ .comment = comment.id },
+        .draft => |index| .{ .draft = drafts[index].local_id },
+    };
+}
+
+fn replyLessThan(drafts: []const Draft, lhs: ReplyItem, rhs: ReplyItem) bool {
+    return switch (lhs) {
+        .comment => rhs == .draft,
+        .draft => |left| rhs == .draft and drafts[left].local_id < drafts[rhs.draft].local_id,
+    };
+}
+
+fn threadRootLessThan(threads: []const Thread, lhs: usize, rhs: usize) bool {
+    return threads[lhs].root_input_order < threads[rhs].root_input_order;
+}
 
 fn parentKey(parent: Parent) ParentKey {
     return switch (parent) {
@@ -438,22 +459,59 @@ pub fn buildWithComments(
     @memset(emitted_threads, false);
     var anchors: AnchorIndex = .empty;
     try anchors.ensureTotalCapacity(allocator, @intCast(threads.len + opts.drafts.len));
-    for (threads, 0..) |thread, thread_index| {
-        if (thread.root.state == .outdated) continue;
+    var replies: ReplyIndex = .empty;
+    var comment_count: usize = 0;
+    for (threads) |thread| comment_count += 1 + thread.replies.len;
+    var parents: ParentIndex = .empty;
+    try parents.ensureTotalCapacity(allocator, @intCast(comment_count + opts.drafts.len * 2));
+    for (threads) |thread| {
+        parents.putAssumeCapacity(parentKey(.{ .comment = thread.root.id }), .{ .comment = thread.root });
+        for (thread.replies) |comment| parents.putAssumeCapacity(parentKey(.{ .comment = comment.id }), .{ .comment = comment });
+    }
+    for (opts.drafts, 0..) |draft, index| {
+        const item: ReplyItem = if (draft.state == .posted)
+            parents.get(parentKey(.{ .comment = draft.state.posted })) orelse .{ .draft = index }
+        else
+            .{ .draft = index };
+        parents.putAssumeCapacity(parentKey(.{ .draft = draft.local_id }), item);
+        if (draft.state == .posted and item == .draft) parents.putAssumeCapacity(parentKey(.{ .comment = draft.state.posted }), item);
+    }
+    try replies.ensureTotalCapacity(allocator, @intCast(comment_count + opts.drafts.len));
+    const thread_order = try allocator.alloc(usize, threads.len);
+    for (thread_order, 0..) |*index, order| index.* = order;
+    std.mem.sort(usize, thread_order, threads, threadRootLessThan);
+    for (thread_order) |thread_index| {
+        const thread = threads[thread_index];
+        if (thread.root.parent_id) |id| if (parents.contains(parentKey(.{ .comment = id }))) {
+            // A fetched Reply can precede its parent's fetched representation.
+            // Its posted Draft parent still supplies known ancestry and placement.
+            emitted_threads[thread_index] = true;
+            const result = replies.getOrPutAssumeCapacity(parentKey(effectiveParent(.{ .comment = id }, parents, opts.drafts)));
+            if (!result.found_existing) result.value_ptr.* = .empty;
+            try result.value_ptr.append(allocator, .{ .comment = thread.root });
+        };
+        for (thread.replies) |comment| {
+            const parent = effectiveParent(.{ .comment = comment.parent_id orelse thread.root.id }, parents, opts.drafts);
+            const result = replies.getOrPutAssumeCapacity(parentKey(parent));
+            if (!result.found_existing) result.value_ptr.* = .empty;
+            try result.value_ptr.append(allocator, .{ .comment = comment });
+        }
+        if (emitted_threads[thread_index] or thread.root.state == .outdated) continue;
         if (thread.anchor()) |anchor| if (anchorKey(anchor)) |key|
             try addAnchorIndex(allocator, &anchors, key, thread_index, .threads);
     }
-    var replies: ReplyIndex = .empty;
-    try replies.ensureTotalCapacity(allocator, @intCast(opts.drafts.len));
     for (opts.drafts, 0..) |*draft, draft_index| {
         if (draft.parent) |parent| {
-            const result = replies.getOrPutAssumeCapacity(parentKey(parent));
+            if (parents.get(parentKey(.{ .draft = draft.local_id })).? == .comment) continue;
+            const result = replies.getOrPutAssumeCapacity(parentKey(effectiveParent(parent, parents, opts.drafts)));
             if (!result.found_existing) result.value_ptr.* = .empty;
-            try result.value_ptr.append(allocator, draft_index);
+            try result.value_ptr.append(allocator, .{ .draft = draft_index });
         } else if (projectedDraftAnchor(draft, opts)) |anchor| if (anchorKey(anchor)) |key| {
             try addAnchorIndex(allocator, &anchors, key, draft_index, .drafts);
         };
     }
+    var reply_iterator = replies.valueIterator();
+    while (reply_iterator.next()) |children| std.mem.sort(ReplyItem, children.items, opts.drafts, replyLessThan);
     var w: Weave = .{
         .a = allocator,
         .rows = &rows,
@@ -463,13 +521,18 @@ pub fn buildWithComments(
         .emitted_threads = emitted_threads,
         .anchors = anchors,
         .replies = replies,
+        .parents = parents,
+        .ancestry_limit = comment_count + opts.drafts.len,
         .expanded_disclosures = try expandedDisclosureSet(allocator, opts.expanded_disclosures),
         .opts = opts,
     };
 
     // 1. PR-level comments (no anchor), respecting the resolved toggle. Skipped
     // in the isolate view — PR-level comments belong to no single File.
-    const pr_count = if (opts.only_file == null) countWhere(threads, isPrLevel) else 0;
+    var pr_count: usize = 0;
+    if (opts.only_file == null) for (threads, 0..) |thread, index| {
+        if (!emitted_threads[index] and isPrLevel(thread)) pr_count += 1;
+    };
     if (pr_count > 0) {
         try rows.append(allocator, .{ .section = .{ .kind = .pr_comments, .count = pr_count } });
         for (threads) |*t| {
@@ -552,7 +615,7 @@ pub fn buildWithComments(
         }
 
         // Per-file Outdated disclosure remains at the File even while closed.
-        const od_count = fileOutdatedCount(threads, file.*) + draftOutdatedCount(opts.drafts, opts, file.*);
+        const od_count = fileOutdatedCount(threads, emitted_threads, file.*) + draftOutdatedCount(opts.drafts, opts, file.*);
         if (od_count > 0) {
             const key: DisclosureKey = .{ .outdated_file = file };
             const expanded = w.expanded_disclosures.contains(disclosureId(key));
@@ -630,17 +693,21 @@ pub fn buildWithComments(
 
     // 3. A reply Draft shares its parent's visibility: when the parent thread is
     // hidden (resolved, toggle off), the reply hides with it — so an un-emitted
-    // reply is deliberately left out here. A *root* Draft has no parent to hide
+    // reply is deliberately left out here. An absent parent is different from
+    // a hidden parent: its highest available Draft retains a labelled subtree.
+    // A *root* Draft has no parent to hide
     // behind, so an anchored one whose line isn't currently visible is surfaced
     // in a trailing pending section (with its own reply subtree) rather than lost.
     var stranded: usize = 0;
     for (opts.drafts, 0..) |*d, i| {
-        if (!emitted[i] and d.parent == null and draftInScope(d, diff, opts)) stranded += 1;
+        if (!emitted[i] and ((d.parent == null and draftInScope(d, diff, opts)) or
+            (opts.only_file == null and w.parentUnavailable(d.parent)))) stranded += 1;
     }
     if (stranded > 0) {
         try rows.append(allocator, .{ .section = .{ .kind = .pending, .count = stranded } });
         for (opts.drafts, 0..) |*d, i| {
-            if (!emitted[i] and d.parent == null and draftInScope(d, diff, opts)) try w.emitDraft(i);
+            if (!emitted[i] and ((d.parent == null and draftInScope(d, diff, opts)) or
+                (opts.only_file == null and w.parentUnavailable(d.parent)))) try w.emitDraft(i);
         }
     }
 
@@ -858,13 +925,17 @@ const Weave = struct {
     emitted_threads: []bool,
     anchors: AnchorIndex,
     replies: ReplyIndex,
+    parents: ParentIndex,
+    ancestry_limit: usize,
     expanded_disclosures: DisclosureSet,
     opts: BuildOptions,
+    card_scope: review.CommentScope = .review,
     span_cursors: SpanCursors = .{},
 
-    /// Append a thread's rows: root, then any pending reply-Drafts to the root,
-    /// then each published reply followed by its own pending reply-Drafts.
+    /// Complete each parent subtree before the next sibling.
     fn emitThread(w: *Weave, t: *const Thread) !void {
+        const index = (@intFromPtr(t) - @intFromPtr(w.threads.ptr)) / @sizeOf(Thread);
+        if (w.emitted_threads[index]) return;
         if (t.resolved) {
             const key: DisclosureKey = .{ .resolved_thread = t.root.id };
             const expanded = w.expanded_disclosures.contains(disclosureId(key));
@@ -878,17 +949,18 @@ const Weave = struct {
         const index = (@intFromPtr(t) - @intFromPtr(w.threads.ptr)) / @sizeOf(Thread);
         if (w.emitted_threads[index]) return;
         w.emitted_threads[index] = true;
-        try w.emitComment(t.root, false);
-        try w.emitRepliesTo(.{ .comment = t.root.id });
-        for (t.replies) |reply| {
-            try w.emitComment(reply, true);
-            try w.emitRepliesTo(.{ .comment = reply.id });
-        }
+        w.card_scope = t.scope();
+        const parent: Parent = .{ .comment = t.root.id };
+        var indentation = CardIndentation.init(w.opts.card_width, w.maxReplyDepth(parent, w.ancestry_limit));
+        indentation.relative = w.parentUnavailable(if (t.root.parent_id) |id| .{ .comment = id } else null);
+        try w.emitComment(t.root, 0, indentation);
+        try w.emitRepliesTo(parent, 1, indentation);
     }
 
     /// Parse authored bytes into a width-independent ReviewBody and project the
     /// shared ReviewCardRow shape used by root Comments, Replies, and Drafts.
-    fn emitComment(w: *Weave, c: *const Comment, is_reply: bool) !void {
+    fn emitComment(w: *Weave, c: *const Comment, depth: usize, indentation: CardIndentation) !void {
+        const is_reply = depth > 0 or c.parent_id != null;
         const owner: review_card.Owner = .{ .comment = c.id };
         const marker = if (c.suggestion() != null) "±" else if (is_reply) "↳" else "▸";
         const header = if (c.deleted)
@@ -899,14 +971,18 @@ const Weave = struct {
         const projected = try review_card.project(w.a, parsed, .{
             .owner = owner,
             .source = .{ .comment = c },
+            .scope = w.card_scope,
             .role = if (c.deleted)
                 (if (is_reply) .deleted_reply else .deleted_comment)
             else if (is_reply)
                 .comment_reply
             else
                 .comment,
-            .header = header,
-            .content_width = cardContentWidth(w.opts.card_width, is_reply),
+            .header = try indentation.header(w.a, header, depth),
+            .plain_header = try indentation.header(w.a, if (c.deleted) "Deleted Comment" else c.author, depth),
+            .content_width = cardContentWidth(w.opts.card_width, indentation.offset(depth)),
+            .depth = depth,
+            .indent = indentation.offset(depth),
             .metrics = w.opts.cell_metrics,
             .collapsed_rows = w.opts.collapsed_rows,
             .expanded = w.expanded_disclosures.contains(disclosureId(.{ .review_card = owner })),
@@ -917,23 +993,27 @@ const Weave = struct {
     /// Append one Draft row (marking it emitted), then cascade its own pending
     /// reply-Drafts right after it, so a reply chain nests under its root.
     fn emitDraft(w: *Weave, i: usize) std.mem.Allocator.Error!void {
+        if (w.parents.get(parentKey(.{ .draft = w.drafts[i].local_id })).? == .comment) {
+            w.emitted[i] = true;
+            return;
+        }
+        var indentation = CardIndentation.init(w.opts.card_width, w.maxReplyDepth(.{ .draft = w.drafts[i].local_id }, w.ancestry_limit));
+        w.card_scope = draftScope(&w.drafts[i], w.opts);
+        indentation.relative = w.parentUnavailable(w.drafts[i].parent);
+        try w.emitDraftAt(i, 0, indentation);
+    }
+
+    fn emitDraftAt(w: *Weave, i: usize, depth: usize, indentation: CardIndentation) std.mem.Allocator.Error!void {
         if (w.emitted[i]) return;
         w.emitted[i] = true;
         const d = &w.drafts[i];
-        // A posted/submitting Draft is represented by the server Comment once the
-        // post-submit re-fetch lands; hide its own row so it doesn't double up
-        // with that Comment (the transient reconciliation window, ADR-0007). Its
-        // pending descendants are still placed, so a failed reply under a posted
-        // parent stays visible for a selective retry.
-        const published = switch (d.state) {
-            .posted, .submitting => true,
-            else => false,
-        };
-        if (!published) {
+        // Fetched Comments replace posted Drafts through the ParentIndex alias.
+        // Until then, the posted Draft retains its place and known ancestry.
+        if (d.state != .submitting) {
             const is_reply = d.parent != null;
             const owner: review_card.Owner = .{ .draft = d.local_id };
             const marker: []const u8 = if (d.kind == .suggestion) "±" else if (is_reply) "↳" else "✎";
-            const label = if (d.state == .outcome_unknown) "outcome unknown" else "draft";
+            const label = if (d.state == .outcome_unknown) "outcome unknown" else if (d.state == .posted) "posted" else "draft";
             const header = try std.fmt.allocPrint(w.a, "{s} {s}", .{ marker, label });
             const parsed = try review_card.ReviewBody.parse(w.a, d.body);
             const role: review_card.CardRole = if (d.state == .outcome_unknown)
@@ -945,16 +1025,20 @@ const Weave = struct {
             const projected = try review_card.project(w.a, parsed, .{
                 .owner = owner,
                 .source = .{ .draft = d },
+                .scope = w.card_scope,
                 .role = role,
-                .header = header,
-                .content_width = cardContentWidth(w.opts.card_width, is_reply),
+                .header = try indentation.header(w.a, header, depth),
+                .plain_header = try indentation.header(w.a, label, depth),
+                .content_width = cardContentWidth(w.opts.card_width, indentation.offset(depth)),
+                .depth = depth,
+                .indent = indentation.offset(depth),
                 .metrics = w.opts.cell_metrics,
                 .collapsed_rows = w.opts.collapsed_rows,
                 .expanded = w.expanded_disclosures.contains(disclosureId(.{ .review_card = owner })),
             });
             for (projected) |row| try w.rows.append(w.a, .{ .draft = row });
         }
-        try w.emitRepliesTo(.{ .draft = d.local_id });
+        try w.emitRepliesTo(.{ .draft = d.local_id }, depth + 1, indentation);
     }
 
     fn emitDraftSnapshot(w: *Weave, i: usize) std.mem.Allocator.Error!void {
@@ -976,9 +1060,33 @@ const Weave = struct {
     /// Emit every not-yet-placed reply Draft whose parent is `parent`, recursively
     /// (so a reply-to-a-reply-Draft nests correctly). The `emitted` guard bounds
     /// the recursion even if the parent graph contains a cycle.
-    fn emitRepliesTo(w: *Weave, parent: Parent) std.mem.Allocator.Error!void {
+    fn emitRepliesTo(w: *Weave, parent: Parent, depth: usize, indentation: CardIndentation) std.mem.Allocator.Error!void {
         const children = w.replies.get(parentKey(parent)) orelse return;
-        for (children.items) |index| try w.emitDraft(index);
+        for (children.items) |item| switch (item) {
+            .comment => |comment| {
+                try w.emitComment(comment, depth, indentation);
+                try w.emitRepliesTo(.{ .comment = comment.id }, depth + 1, indentation);
+            },
+            .draft => |index| try w.emitDraftAt(index, depth, indentation),
+        };
+    }
+
+    fn parentUnavailable(w: *const Weave, parent: ?Parent) bool {
+        return if (parent) |value| !w.parents.contains(parentKey(value)) else false;
+    }
+
+    fn maxReplyDepth(w: *const Weave, parent: Parent, remaining: usize) usize {
+        if (remaining == 0) return 0;
+        const children = w.replies.get(parentKey(parent)) orelse return 0;
+        var deepest: usize = 0;
+        for (children.items) |item| {
+            const child: Parent = switch (item) {
+                .comment => |comment| .{ .comment = comment.id },
+                .draft => |index| .{ .draft = w.drafts[index].local_id },
+            };
+            deepest = @max(deepest, 1 + w.maxReplyDepth(child, remaining - 1));
+        }
+        return deepest;
     }
 
     /// Emit a hunk's lines in unified layout: one row per line, each followed by
@@ -1365,9 +1473,32 @@ const Weave = struct {
     }
 };
 
-fn cardContentWidth(width: usize, is_reply: bool) usize {
-    const indent: usize = if (is_reply) 8 else 4;
-    return @max(width -| indent, 1);
+const CardIndentation = struct {
+    unit: usize,
+    budget: usize,
+    relative: bool = false,
+
+    fn init(width: usize, deepest: usize) CardIndentation {
+        const body_width = cardContentWidth(width, 0);
+        const budget = body_width -| 40;
+        var unit: usize = if (width >= 100) 4 else if (width >= 80) 3 else if (width >= 60) 2 else 1;
+        while (unit > 1 and deepest *| unit > budget) unit -= 1;
+        return .{ .unit = unit, .budget = budget };
+    }
+
+    fn offset(self: CardIndentation, depth: usize) usize {
+        return @min(depth *| self.unit, self.budget);
+    }
+
+    fn header(self: CardIndentation, allocator: std.mem.Allocator, text: []const u8, depth: usize) ![]const u8 {
+        if (self.relative and depth == 0) return std.fmt.allocPrint(allocator, "parent unavailable · {s}", .{text});
+        if (depth *| self.unit > self.budget) return std.fmt.allocPrint(allocator, "{s}depth {d} · {s}", .{ if (self.relative) "known relative " else "", depth, text });
+        return text;
+    }
+};
+
+fn cardContentWidth(width: usize, indent: usize) usize {
+    return @max(width -| 4 -| indent, 1);
 }
 
 fn decoratedLine(allocator: std.mem.Allocator, line: *const model.Line, spans: []const decoration.Span, emphasis: []const Segment) decoration.Error!LineRow {
@@ -1638,10 +1769,10 @@ fn threadCurrentOnSide(thread: Thread, file: model.File, side: AnchorSide) bool 
     };
 }
 
-fn fileOutdatedCount(threads: []const Thread, file: model.File) usize {
+fn fileOutdatedCount(threads: []const Thread, emitted: []const bool, file: model.File) usize {
     var n: usize = 0;
-    for (threads) |*t| {
-        if (isFileOutdated(t.*, file)) n += 1;
+    for (threads, 0..) |*t, index| {
+        if (!emitted[index] and isFileOutdated(t.*, file)) n += 1;
     }
     return n;
 }
@@ -1761,14 +1892,6 @@ pub fn fileTallies(allocator: std.mem.Allocator, diff: model.Diff, threads: []co
         };
     }
     return tallies;
-}
-
-fn countWhere(threads: []const Thread, pred: fn (Thread) bool) usize {
-    var n: usize = 0;
-    for (threads) |*t| {
-        if (pred(t.*)) n += 1;
-    }
-    return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -2661,20 +2784,363 @@ test "an anchored draft is woven under its line; a PR-level draft gets a pending
     }
 }
 
-test "a reply draft whose parent is absent stays hidden (shares parent visibility)" {
+test "a Reply Draft whose Comment parent is absent retains a labelled subtree" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     const diff = try parse(a, anchor_diff);
     const drafts = [_]Draft{
-        // Parent comment 5 isn't present, so the reply has nothing to nest under.
-        // A reply is never surfaced as a root, so it stays hidden — it still
-        // persists and submits, but it doesn't float free in the diff.
+        // The unavailable parent does not supply a CommentScope.
         .{ .local_id = 1, .kind = .comment, .body = "re", .parent = .{ .comment = 5 } },
     };
     const buf = try buildWithComments(a, diff, .unified, &.{}, .{ .drafts = &drafts });
-    try testing.expectEqual(@as(usize, 0), countKind(buf, .draft));
+    try testing.expectEqual(@as(usize, 1), countKind(buf, .draft));
+    for (buf.rows) |row| if (row == .draft and row.draft.part == .header) {
+        try testing.expect(std.mem.indexOf(u8, row.draft.text(), "parent unavailable") != null);
+        try testing.expectEqualDeep(@as(?Parent, .{ .comment = 5 }), row.draft.draftItem().parent);
+    };
+}
+
+test "M23 ancestry completes mixed parent subtrees before published siblings" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try parse(a, anchor_diff);
+    var comments = [_]Comment{
+        .{ .id = 1, .author = "Root", .body = "Root", .anchor = .{ .path = "a.txt", .to = 2 } },
+        .{ .id = 2, .parent_id = 1, .author = "A", .body = "A" },
+        .{ .id = 3, .parent_id = 1, .author = "B", .body = "B" },
+        .{ .id = 4, .parent_id = 2, .author = "C", .body = "C" },
+    };
+    const threads = try bbr.review.thread.build(a, &comments);
+    const drafts = [_]Draft{
+        .{ .local_id = 1, .kind = .comment, .body = "F", .parent = .{ .comment = 4 } },
+        .{ .local_id = 2, .kind = .comment, .body = "D", .parent = .{ .comment = 2 } },
+        .{ .local_id = 3, .kind = .comment, .body = "E", .parent = .{ .comment = 1 } },
+        .{ .local_id = 4, .kind = .comment, .body = "H", .parent = .{ .draft = 3 } },
+    };
+    const expected = [_]review_card.Owner{
+        .{ .comment = 1 }, .{ .comment = 2 }, .{ .comment = 4 }, .{ .draft = 1 },
+        .{ .draft = 2 },   .{ .comment = 3 }, .{ .draft = 3 },   .{ .draft = 4 },
+    };
+    const depths = [_]usize{ 0, 1, 2, 3, 2, 1, 1, 2 };
+    for ([_]Layout{ .unified, .side_by_side }) |layout| for (0..3) |disclosure| {
+        comments[0].resolved = disclosure == 1;
+        threads[0].resolved = disclosure == 1;
+        comments[0].state = if (disclosure == 2) .outdated else .current;
+        const keys = [_]DisclosureKey{ .{ .resolved_thread = 1 }, .{ .outdated_file = &diff.files[0] } };
+        if (disclosure > 0) {
+            const hidden = try buildWithComments(a, diff, layout, threads, .{ .drafts = &drafts });
+            try testing.expectEqual(@as(usize, 0), countKind(hidden, .comment));
+            try testing.expectEqual(@as(usize, 0), countKind(hidden, .draft));
+        }
+        const buf = try buildWithComments(a, diff, layout, threads, .{ .drafts = &drafts, .expanded_disclosures = &keys });
+        var index: usize = 0;
+        for (buf.rows) |row| switch (row) {
+            .comment, .draft => |card| if (card.part == .header) {
+                try testing.expect(index < expected.len);
+                try testing.expectEqualDeep(expected[index], card.owner);
+                try testing.expectEqual(depths[index], card.depth);
+                index += 1;
+            },
+            else => {},
+        };
+        try testing.expectEqual(expected.len, index);
+    };
+}
+
+test "M23 acceptance mixed Reply subtrees retain combined Markdown at every width breakpoint" {
+    const raw = "# ***Heading***\n\nTitle\n=====\n\n**bold** *italic* ~~strike~~ `code` [docs][id] :mask:\n\n4. outer\n    - inner\n        > quote **text**\n        > ```js\n        > const\tx = 1;\n        > ```\n\n```suggestion\nreplacement\n```\n\n| Name | State |\n| --- | --- |\n| Ada | **Ready** |\n\n[id]: https://example.invalid/\n";
+    const expected = [_]review_card.Owner{ .{ .comment = 1 }, .{ .comment = 2 }, .{ .comment = 4 }, .{ .draft = 1 }, .{ .draft = 2 }, .{ .comment = 3 } };
+    const depths = [_]usize{ 0, 1, 2, 3, 2, 1 };
+    const widths = [_]struct { width: usize, unit: usize }{
+        .{ .width = 43, .unit = 1 }, .{ .width = 44, .unit = 1 },
+        .{ .width = 59, .unit = 1 }, .{ .width = 60, .unit = 2 },
+        .{ .width = 79, .unit = 2 }, .{ .width = 80, .unit = 3 },
+        .{ .width = 99, .unit = 3 }, .{ .width = 100, .unit = 4 },
+    };
+    for (widths) |case| for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]bool{ false, true }) |expanded| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const diff = try parse(a, anchor_diff);
+        const scope: review.CommentScope = .{ .@"inline" = .{ .path = "a.txt", .to = 2 } };
+        const comments = [_]Comment{
+            .{ .id = 1, .author = "Root", .body = raw, .scope = scope },
+            .{ .id = 2, .parent_id = 1, .author = "A", .body = raw },
+            .{ .id = 3, .parent_id = 1, .author = "B", .body = raw },
+            .{ .id = 4, .parent_id = 2, .author = "C", .body = raw },
+        };
+        const threads = try bbr.review.buildThreads(a, &comments);
+        const drafts = [_]Draft{
+            .{ .local_id = 1, .kind = .comment, .body = raw, .parent = .{ .comment = 4 } },
+            .{ .local_id = 2, .kind = .comment, .body = raw, .parent = .{ .comment = 2 } },
+        };
+        const keys = [_]DisclosureKey{
+            .{ .review_card = expected[0] }, .{ .review_card = expected[1] }, .{ .review_card = expected[2] },
+            .{ .review_card = expected[3] }, .{ .review_card = expected[4] }, .{ .review_card = expected[5] },
+        };
+        const buf = try buildWithComments(a, diff, layout, threads, .{ .drafts = &drafts, .card_width = case.width, .collapsed_rows = 1, .expanded_disclosures = if (expanded) &keys else &.{} });
+        var headers: usize = 0;
+        var footers: usize = 0;
+        var kinds = [_][5]bool{.{false} ** 5} ** expected.len;
+        var styles = [_][6]bool{.{false} ** 6} ** expected.len;
+        var containers = [_][2]bool{.{false} ** 2} ** expected.len;
+        for (buf.rows) |row| switch (row) {
+            .comment, .draft => |card| {
+                try testing.expectEqualDeep(scope, card.scope);
+                try testing.expectEqualStrings(raw, card.source.body());
+                if (card.part == .header) {
+                    try testing.expect(headers < expected.len);
+                    try testing.expectEqualDeep(expected[headers], card.owner);
+                    try testing.expectEqual(depths[headers], card.depth);
+                    try testing.expectEqual(@min(depths[headers] * case.unit, case.width -| 44), card.indent);
+                    headers += 1;
+                } else if (card.part == .disclosure_footer) {
+                    footers += 1;
+                    try testing.expectEqual(expanded, card.hidden_rows == 0);
+                } else {
+                    try testing.expectEqualDeep(expected[headers - 1], card.owner);
+                    const card_kinds = &kinds[headers - 1];
+                    const card_styles = &styles[headers - 1];
+                    const card_containers = &containers[headers - 1];
+                    card_kinds[0] = card_kinds[0] or card.block_kind == .heading;
+                    card_kinds[1] = card_kinds[1] or card.block_kind == .paragraph;
+                    card_kinds[2] = card_kinds[2] or card.block_kind == .code;
+                    card_kinds[3] = card_kinds[3] or card.block_kind == .suggestion;
+                    card_kinds[4] = card_kinds[4] or card.block_kind == .table;
+                    for (card.segments) |segment| {
+                        card_styles[0] = card_styles[0] or segment.marks.strong;
+                        card_styles[1] = card_styles[1] or segment.marks.emphasis;
+                        card_styles[2] = card_styles[2] or segment.marks.strikethrough;
+                        card_styles[3] = card_styles[3] or segment.marks.inline_code;
+                        card_styles[4] = card_styles[4] or segment.marks.link_destination;
+                        card_styles[5] = card_styles[5] or std.mem.eql(u8, segment.text, "😷");
+                        if (!segment.authored and card.block_kind != .table) {
+                            card_containers[0] = card_containers[0] or std.mem.eql(u8, segment.text, "│");
+                            card_containers[1] = card_containers[1] or std.mem.eql(u8, segment.text, "•");
+                        }
+                    }
+                }
+            },
+            else => {},
+        };
+        try testing.expectEqual(expected.len, headers);
+        try testing.expectEqual(expected.len, footers);
+        if (expanded) {
+            for (kinds) |card_kinds| for (card_kinds) |found| try testing.expect(found);
+            for (styles) |card_styles| for (card_styles) |found| try testing.expect(found);
+            for (containers) |card_containers| for (card_containers) |found| try testing.expect(found);
+        }
+    };
+}
+
+test "M23 ancestry shares a width unit and caps indentation at readable body width" {
+    const cases = [_]struct { width: usize, depth: usize, unit: usize, indent: usize, body_width: usize }{
+        .{ .width = 100, .depth = 3, .unit = 4, .indent = 12, .body_width = 84 },
+        .{ .width = 100, .depth = 20, .unit = 2, .indent = 40, .body_width = 56 },
+        .{ .width = 80, .depth = 12, .unit = 3, .indent = 36, .body_width = 40 },
+        .{ .width = 60, .depth = 12, .unit = 1, .indent = 12, .body_width = 44 },
+        .{ .width = 60, .depth = 20, .unit = 1, .indent = 16, .body_width = 40 },
+        .{ .width = 40, .depth = 3, .unit = 1, .indent = 0, .body_width = 36 },
+        .{ .width = 44, .depth = 3, .unit = 1, .indent = 0, .body_width = 40 },
+        .{ .width = 59, .depth = 3, .unit = 1, .indent = 3, .body_width = 52 },
+        .{ .width = 60, .depth = 3, .unit = 2, .indent = 6, .body_width = 50 },
+        .{ .width = 79, .depth = 3, .unit = 2, .indent = 6, .body_width = 69 },
+        .{ .width = 80, .depth = 3, .unit = 3, .indent = 9, .body_width = 67 },
+        .{ .width = 99, .depth = 3, .unit = 3, .indent = 9, .body_width = 86 },
+    };
+    const body = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnop";
+    for (cases) |case| for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const diff = try parse(a, anchor_diff);
+        var drafts: [21]Draft = undefined;
+        for (drafts[0 .. case.depth + 1], 0..) |*draft, index| draft.* = .{
+            .local_id = index + 1,
+            .kind = .comment,
+            .body = body,
+            .parent = if (index == 0) null else .{ .draft = index },
+        };
+        const buf = try buildWithComments(a, diff, layout, &.{}, .{ .drafts = drafts[0 .. case.depth + 1], .card_width = case.width, .collapsed_rows = 1 });
+        var checked = false;
+        for (buf.rows) |row| if (row == .draft) {
+            const card = row.draft;
+            const depth = card.draftItem().local_id - 1;
+            try testing.expectEqual(depth, card.depth);
+            try testing.expectEqual(@min(depth * case.unit, case.width -| 44), card.indent);
+            if (card.part == .header) {
+                try testing.expectEqual(depth * case.unit > case.width -| 44, std.mem.indexOf(u8, card.text(), "depth") != null);
+            }
+            if (card.draftItem().local_id != case.depth + 1 or card.part != .body) continue;
+            var columns: usize = 0;
+            for (card.segments) |segment| columns += segment.text.len;
+            try testing.expectEqual(case.body_width, columns);
+            checked = true;
+        };
+        try testing.expect(checked);
+    };
+}
+
+test "M23 ancestry reconciles posted Draft aliases at fetched Comment depth" {
+    for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]bool{ false, true }) |fetched_reply| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const diff = try parse(a, anchor_diff);
+        const comments = [_]Comment{
+            .{ .id = 100, .author = "Root", .body = "root", .anchor = .{ .path = "a.txt", .to = 2 } },
+            .{ .id = 101, .parent_id = 100, .author = "A", .body = "posted Reply" },
+            .{ .id = 102, .parent_id = 100, .author = "B", .body = "sibling" },
+        };
+        const partial_comments = [_]Comment{ comments[0], comments[2] };
+        const threads = try bbr.review.thread.build(a, if (fetched_reply) &comments else &partial_comments);
+        const drafts = [_]Draft{
+            .{ .local_id = 1, .kind = .comment, .body = "root", .anchor = .{ .path = "a.txt", .to = 2 }, .state = .{ .posted = 100 } },
+            .{ .local_id = 2, .kind = .comment, .body = "posted Reply", .parent = .{ .draft = 1 }, .state = .{ .posted = 101 } },
+            .{ .local_id = 3, .kind = .comment, .body = "pending", .parent = .{ .draft = 2 }, .state = .{ .failed = error.ServerError } },
+            .{ .local_id = 4, .kind = .comment, .body = "nested pending", .parent = .{ .draft = 3 } },
+            .{ .local_id = 5, .kind = .comment, .body = "CommentId parent", .parent = .{ .comment = 101 } },
+        };
+        const expected = if (fetched_reply)
+            [_]review_card.Owner{ .{ .comment = 100 }, .{ .comment = 101 }, .{ .draft = 3 }, .{ .draft = 4 }, .{ .draft = 5 }, .{ .comment = 102 } }
+        else
+            [_]review_card.Owner{ .{ .comment = 100 }, .{ .comment = 102 }, .{ .draft = 2 }, .{ .draft = 3 }, .{ .draft = 4 }, .{ .draft = 5 } };
+        const depths = if (fetched_reply) [_]usize{ 0, 1, 2, 3, 2, 1 } else [_]usize{ 0, 1, 1, 2, 3, 2 };
+        const buf = try buildWithComments(a, diff, layout, threads, .{ .drafts = &drafts, .card_width = 100 });
+        var index: usize = 0;
+        for (buf.rows) |row| switch (row) {
+            .comment, .draft => |card| if (card.part == .header) {
+                try testing.expect(index < expected.len);
+                try testing.expectEqualDeep(expected[index], card.owner);
+                try testing.expectEqual(depths[index], card.depth);
+                index += 1;
+            },
+            else => {},
+        };
+        try testing.expectEqual(expected.len, index);
+    };
+}
+
+test "M23 ancestry labels absent parents and keeps known relative depth" {
+    for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const diff = try parse(a, anchor_diff);
+        const comments = [_]Comment{
+            .{ .id = 2, .parent_id = 99, .author = "A", .body = "available", .anchor = .{ .path = "a.txt", .to = 2 } },
+            .{ .id = 3, .parent_id = 2, .author = "B", .body = "descendant", .deleted = true },
+            .{ .id = 4, .parent_id = 3, .author = "C", .body = "surviving Reply" },
+        };
+        const threads = try bbr.review.thread.build(a, &comments);
+        const drafts = [_]Draft{
+            .{ .local_id = 4, .kind = .comment, .body = "younger sibling", .parent = .{ .draft = 2 } },
+            .{ .local_id = 3, .kind = .comment, .body = "older sibling", .parent = .{ .draft = 2 } },
+            .{ .local_id = 2, .kind = .comment, .body = "missing Draft parent", .parent = .{ .draft = 99 } },
+            .{ .local_id = 5, .kind = .comment, .body = "nested", .parent = .{ .draft = 3 } },
+        };
+        const expected = [_]review_card.Owner{ .{ .comment = 2 }, .{ .comment = 3 }, .{ .comment = 4 }, .{ .draft = 2 }, .{ .draft = 3 }, .{ .draft = 5 }, .{ .draft = 4 } };
+        const depths = [_]usize{ 0, 1, 2, 0, 1, 2, 1 };
+        const buf = try buildWithComments(a, diff, layout, threads, .{ .drafts = &drafts, .card_width = 40 });
+        var index: usize = 0;
+        for (buf.rows) |row| switch (row) {
+            .comment, .draft => |card| if (card.part == .header) {
+                try testing.expect(index < expected.len);
+                try testing.expectEqualDeep(expected[index], card.owner);
+                try testing.expectEqual(depths[index], card.depth);
+                try testing.expectEqual(@as(usize, 0), card.indent);
+                try testing.expectEqual(depths[index] == 0, std.mem.indexOf(u8, card.text(), "parent unavailable") != null);
+                if (depths[index] > 0) try testing.expect(std.mem.indexOf(u8, card.text(), "known relative depth") != null);
+                index += 1;
+            },
+            else => {},
+        };
+        try testing.expectEqual(expected.len, index);
+        try testing.expectEqual(@as(?u64, 99), comments[0].parent_id);
+        try testing.expectEqualDeep(@as(?Parent, .{ .draft = 99 }), drafts[2].parent);
+        try testing.expectEqual(@as(?review.CommentScope, null), comments[0].scope);
+    }
+}
+
+test "M23 ancestry attaches a fetched Reply to an unfetched posted parent" {
+    for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const diff = try parse(a, anchor_diff);
+        const comments = [_]Comment{.{ .id = 101, .parent_id = 100, .author = "A", .body = "fetched Reply" }};
+        const threads = try bbr.review.thread.build(a, &comments);
+        const drafts = [_]Draft{
+            .{ .local_id = 1, .kind = .comment, .body = "unfetched parent", .anchor = .{ .path = "a.txt", .to = 2 }, .state = .{ .posted = 100 } },
+            .{ .local_id = 2, .kind = .comment, .body = "fetched Reply", .parent = .{ .draft = 1 }, .state = .{ .posted = 101 } },
+            .{ .local_id = 3, .kind = .comment, .body = "pending", .parent = .{ .draft = 2 } },
+        };
+        const expected = [_]review_card.Owner{ .{ .draft = 1 }, .{ .comment = 101 }, .{ .draft = 3 } };
+        for ([_]bool{ false, true }) |outdated| {
+            const scopes = [_]anchor_projection.ScopeProjectionEntry{.{
+                .temp_id = 1,
+                .resolution = .{ .resolved = .{ .state = if (outdated) .outdated else .current, .scope = .{ .@"inline" = drafts[0].anchor.? } } },
+            }};
+            if (outdated) {
+                const hidden = try buildWithComments(a, diff, layout, threads, .{ .drafts = &drafts, .scope_projections = &scopes });
+                try testing.expectEqual(@as(usize, 0), countKind(hidden, .comment));
+                try testing.expectEqual(@as(usize, 0), countKind(hidden, .draft));
+            }
+            const buf = try buildWithComments(a, diff, layout, threads, .{ .drafts = &drafts, .scope_projections = &scopes, .card_width = 100, .expanded_disclosures = &.{.{ .outdated_file = &diff.files[0] }} });
+            var index: usize = 0;
+            for (buf.rows, 0..) |row, row_index| switch (row) {
+                .comment, .draft => |card| if (card.part == .header) {
+                    try testing.expect(index < expected.len);
+                    try testing.expectEqualDeep(expected[index], card.owner);
+                    try testing.expectEqual(index, card.depth);
+                    try testing.expectEqual(index * 4, card.indent);
+                    try testing.expect(std.mem.indexOf(u8, card.text(), "parent unavailable") == null);
+                    try testing.expectEqual(@as(?usize, 0), buf.fileIndexForRow(row_index));
+                    index += 1;
+                },
+                .section => |section| try testing.expect(section.kind != .pr_comments),
+                else => {},
+            };
+            try testing.expectEqual(expected.len, index);
+        }
+    }
+}
+
+test "M23 ancestry keeps reattached published siblings in fetched input order" {
+    for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const diff = try parse(a, anchor_diff);
+        const comments = [_]Comment{
+            .{ .id = 103, .parent_id = 101, .author = "C", .body = "C" },
+            .{ .id = 102, .parent_id = 100, .author = "B", .body = "B" },
+            .{ .id = 101, .parent_id = 100, .author = "A", .body = "A" },
+        };
+        const threads = try bbr.review.thread.build(a, &comments);
+        const drafts = [_]Draft{.{ .local_id = 1, .kind = .comment, .body = "R", .anchor = .{ .path = "a.txt", .to = 2 }, .state = .{ .posted = 100 } }};
+        const expected = [_]review_card.Owner{ .{ .draft = 1 }, .{ .comment = 102 }, .{ .comment = 101 }, .{ .comment = 103 } };
+        for ([_]bool{ false, true }) |outdated| {
+            const scopes = [_]anchor_projection.ScopeProjectionEntry{.{
+                .temp_id = 1,
+                .resolution = .{ .resolved = .{ .state = if (outdated) .outdated else .current, .scope = .{ .@"inline" = drafts[0].anchor.? } } },
+            }};
+            const buf = try buildWithComments(a, diff, layout, threads, .{ .drafts = &drafts, .scope_projections = &scopes, .expanded_disclosures = &.{.{ .outdated_file = &diff.files[0] }} });
+            var index: usize = 0;
+            for (buf.rows) |row| switch (row) {
+                .comment, .draft => |card| if (card.part == .header) {
+                    try testing.expect(index < expected.len);
+                    try testing.expectEqualDeep(expected[index], card.owner);
+                    index += 1;
+                },
+                else => {},
+            };
+            try testing.expectEqual(expected.len, index);
+        }
+    }
 }
 
 test "a reply draft to a resolved thread hides and reveals with its parent" {
@@ -2780,25 +3246,22 @@ test "a reply-to-draft chain nests under its root draft" {
     }
 }
 
-test "a posted draft's row is hidden but its pending reply is still placed" {
+test "a posted Draft retains its representation until its Comment is fetched" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     const diff = try parse(a, anchor_diff);
-    // A partial batch: the root posted (now owned by the server after re-fetch),
-    // its reply failed and stays pending for a selective retry.
+    // The root posted, but Reconciliation did not fetch its Comment yet.
     const drafts = [_]Draft{
         .{ .local_id = 1, .kind = .comment, .body = "root", .anchor = .{ .path = "a.txt", .to = 2, .commit = "c0" }, .state = .{ .posted = 999 } },
         .{ .local_id = 2, .kind = .comment, .body = "still pending", .parent = .{ .draft = 1 }, .state = .{ .failed = error.ServerError } },
     };
     const buf = try buildWithComments(a, diff, .unified, &.{}, .{ .drafts = &drafts });
 
-    // The posted root is hidden (the server Comment represents it); only the
-    // pending reply renders as a draft row.
-    try testing.expectEqual(@as(usize, 1), countKind(buf, .draft));
+    try testing.expectEqual(@as(usize, 2), countKind(buf, .draft));
     for (buf.rows) |r| {
-        if (r == .draft) try testing.expectEqual(@as(u64, 2), r.draft.draftItem().local_id);
+        if (r == .draft) try testing.expectEqual(r.draft.draftItem().local_id - 1, r.draft.depth);
     }
 }
 

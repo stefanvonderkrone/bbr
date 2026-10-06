@@ -925,7 +925,7 @@ const CommentsPage = struct {
 /// is the PR's current revision, used to detect outdated inline comments.
 fn dupeComment(allocator: Allocator, cj: CommentJson, head: HeadCommits) !Comment {
     const author = if (cj.user) |u| (u.display_name orelse "") else "";
-    const raw = if (cj.deleted) "" else if (cj.content) |c| (c.raw orelse "") else "";
+    const raw = if (cj.content) |c| (c.raw orelse "") else "";
 
     const author_owned = try allocator.dupe(u8, author);
     errdefer allocator.free(author_owned);
@@ -1876,7 +1876,7 @@ test "getComments follows next links and retains only structural Deleted Comment
 
     const tombstone = comments[2];
     try testing.expect(tombstone.deleted);
-    try testing.expectEqualStrings("", tombstone.body);
+    try testing.expectEqualStrings("gone", tombstone.body);
     try testing.expectEqualStrings("{sys}", tombstone.author_uuid.?);
     try testing.expectEqual(@as(?u32, 9), tombstone.scope.?.@"inline".to);
     try testing.expectEqual(@as(?review.CommentId, 3), comments[3].parent_id);
@@ -1890,6 +1890,39 @@ test "getComments follows next links and retains only structural Deleted Comment
     // Bitbucket's outdated verdict is honored.
     try testing.expectEqual(review.AnchorState.outdated, comments[5].state);
     try testing.expectEqual(@as(?u32, 10), comments[5].anchor.?.from);
+}
+
+test "getComments retains exact available Deleted Comment bytes and absent-body ancestry" {
+    const pages = [_]@import("../http/fake_client.zig").Canned{
+        .{ .status = 200, .body =
+        \\{"values":[
+        \\ {"id":1,"deleted":true,"content":{"raw":"  **keep** :smile: 😃  \r\n\tcode"}},
+        \\ {"id":2,"deleted":true,"parent":{"id":1}},
+        \\ {"id":4,"deleted":true,"content":{"raw":"unused tombstone"}}
+        \\],"next":"https://api.bitbucket.org/2.0/repositories/check24/myrepo/pullrequests/7/comments?page=2"}
+        },
+        .{ .status = 200, .body =
+        \\{"values":[{"id":3,"parent":{"id":2},"content":{"raw":"surviving Reply"}}]}
+        },
+    };
+    var fake: FakeHttpClient = .{ .responses = &pages };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const comments = try bb.getComments(testing.allocator, "myrepo", 7, .{});
+    defer deinitComments(testing.allocator, comments);
+    try testing.expectEqual(@as(usize, 2), fake.call_count);
+    try testing.expectEqual(@as(usize, 3), comments.len);
+    try testing.expect(comments[0].deleted);
+    try testing.expectEqualStrings("  **keep** :smile: 😃  \r\n\tcode", comments[0].body);
+    try testing.expect(comments[1].deleted);
+    try testing.expectEqualStrings("", comments[1].body);
+    try testing.expectEqual(@as(?review.CommentId, 1), comments[1].parent_id);
+    try testing.expectEqual(@as(?review.CommentId, 2), comments[2].parent_id);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const threads = try @import("../review/thread.zig").build(arena.allocator(), comments);
+    try testing.expectEqual(@as(usize, 1), threads.len);
+    try testing.expectEqual(@as(review.CommentId, 1), threads[0].root.id);
+    try testing.expectEqual(@as(usize, 2), threads[0].replies.len);
 }
 
 test "getComments classifies Review File inline roots and strips Reply scope" {

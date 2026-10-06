@@ -290,22 +290,7 @@ fn syncPickerTick(
     active.* = .{ .id = id, .scope = start_scope.? };
 }
 
-const metrics_context: u8 = 0;
-const metrics_vtable: @import("cell_metrics.zig").CellMetrics.VTable = .{ .next = nextVaxisGrapheme, .width = widthVaxisText };
-const vaxis_cell_metrics: @import("cell_metrics.zig").CellMetrics = .{ .ptr = &metrics_context, .vtable = &metrics_vtable };
-
-fn nextVaxisGrapheme(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
-    var iterator = vaxis.unicode.graphemeIterator(text);
-    const grapheme = iterator.next() orelse return .{ .byte_len = 1, .cell_width = 1 };
-    return .{
-        .byte_len = grapheme.len,
-        .cell_width = vaxis.gwidth.gwidth(grapheme.bytes(text), .unicode),
-    };
-}
-
-fn widthVaxisText(_: *const anyopaque, text: []const u8) usize {
-    return vaxis.gwidth.gwidth(text, .unicode);
-}
+const vaxis_cell_metrics = render.terminal_cell_metrics;
 
 fn contentGeometry(win: vaxis.Window) presentation.FrameGeometry {
     return .{ .cols = win.width, .rows = @intCast(contentViewportRows(win.height)) };
@@ -329,8 +314,8 @@ fn presentationStatus(
     if (projection.buffer_search) |search_projection| return bufferSearchStatus(frame, projection, search_projection);
     if (projection.action_error) |err| return actionErrorText(err);
     if (projection.clipboard_status) |status| return switch (status) {
-        .copied => "copied source text",
-        .failed => "could not copy source text",
+        .copied => "copied text",
+        .failed => "could not copy text",
     };
     if (projection.shutting_down) {
         if (projection.submission) |submission|
@@ -478,7 +463,9 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .local_review_no_submission => "Submit is unavailable for a local review; drafts remain local",
         .local_review_remote_action_unavailable => "This action is unavailable for a local review",
         .source_action_unavailable => "This action requires a source line or Selection",
-        .yank_no_source => "No Selected Version source Line exists at the cursor or in Selection",
+        .yank_no_source => "No copyable text exists at the cursor or in Selection",
+        .yank_no_body => "No authored body exists at the cursor",
+        .yank_opposite_version => "ReviewCard belongs to the opposite Selected Version",
         .old_content_unavailable => "Old content is unavailable",
         .new_content_unavailable => "New content is unavailable",
         .source_not_hunk_line => "This action requires a Hunk Line",
@@ -987,6 +974,11 @@ fn loadPullRequestSummaries(
     summaries.prs = try client.listPullRequests(summaries.arena.allocator(), repository, .{});
 }
 
+fn presentationCodeHighlightWorker(loop: *Loop, work_id: u64, highlighter: bbr.highlight.Highlighter, command: *@import("code_highlighting.zig").Analyze) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    presentation_runtime.deliver(presentationSink(&sink_context), .{ .code_highlight_completed = command.execute(highlighter) });
+}
+
 fn drainPresentationCommands(
     state: *presentation.Presentation,
     ctx: RunCtx,
@@ -1039,6 +1031,7 @@ fn drainPresentationCommands(
             .load_session => |load| ctx.io.concurrent(presentationLoadWorker, .{ loop, work_id, ctx.io, workerBitbucketForReviewKind(ctx.bitbucket, load.key.kind), load }),
             .prepare_session => |job| ctx.io.concurrent(presentationPrepareSessionWorker, .{ loop, work_id, job }),
             .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, ctx.io, workerBitbucketForEnrichment(ctx.bitbucket, enrich.source), ctx.highlighter, enrich }),
+            .highlight_code => |job| ctx.io.concurrent(presentationCodeHighlightWorker, .{ loop, work_id, ctx.highlighter, job }),
             .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, ctx.bitbucket.?, post }),
             .update_comment => |update| ctx.io.concurrent(presentationCommentEditWorker, .{ loop, work_id, ctx.bitbucket.?, update }),
             .delete_comment => |delete| ctx.io.concurrent(presentationCommentDeleteWorker, .{ loop, work_id, ctx.bitbucket.?, delete }),
@@ -1075,6 +1068,7 @@ fn workerBitbucketForEnrichment(client: ?bbr.bitbucket.Client, source: presentat
 
 fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *presentation.OwnedCommand) !void {
     const input: presentation.OwnedInput = switch (command.*) {
+        .highlight_code => |job| .{ .code_highlight_completed = job.launchFailed() },
         .load_session => |load| .{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .failed = error.WorkerLaunchFailed } } },
         .prepare_session => |job| job.launchFailed(),
         .enrich_file => |enrich| .{ .file_enrichment_completed = .{

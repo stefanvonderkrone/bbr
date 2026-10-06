@@ -10,6 +10,9 @@ pub const Measurement = struct {
 pub const CellMetrics = struct {
     ptr: *const anyopaque,
     vtable: *const VTable,
+    /// SGR 9 is available in the vaxis adapter. Other terminal adapters can
+    /// retain authored strikethrough delimiters instead.
+    strikethrough_supported: bool = true,
 
     pub const VTable = struct {
         next: *const fn (ptr: *const anyopaque, text: []const u8) Measurement,

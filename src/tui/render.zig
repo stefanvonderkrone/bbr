@@ -103,8 +103,53 @@ pub fn drawReview(
     diff_theme.section_rule = if (frame.focus == .diff) theme.pane_border_focused else theme.pane_border;
     drawFileTree(sidebar, review.frame.file_tree, theme);
     drawVisualPane(scratch, diff_pane, review.frame.buffer, review.frame.visual_rows, diff_theme, review.frame.navigation);
+    drawCodeHighlights(diff_pane, review.frame, theme);
     drawSearchRanges(diff_pane, review.frame, theme);
     joinSectionRules(win, review.frame.panes.diff, review.frame.panes.diff_content, review.frame.visual_rows, review.frame.navigation);
+}
+
+fn drawCodeHighlights(win: vaxis.Window, frame: @import("frame.zig").Projection, theme: Theme) void {
+    const first = @min(frame.navigation.scroll, frame.visual_rows.len);
+    const last = @min(first +| win.height, frame.visual_rows.len);
+    for (frame.visual_rows[first..last], first..) |visual, index| {
+        const card = switch (frame.buffer.rows[visual.buffer_index]) {
+            .comment, .draft => |value| value,
+            else => continue,
+        };
+        if (card.part != .code_body and card.part != .suggestion_body) continue;
+        for (frame.code_highlights) |view| {
+            if (std.meta.eql(view.owner, card.owner) and view.block == card.block_ordinal and std.mem.eql(u8, view.body, card.source.body())) {
+                drawReviewCardSyntax(win, @intCast(index - first), card, view.spans, theme);
+                break;
+            }
+        }
+    }
+}
+
+fn drawReviewCardSyntax(win: vaxis.Window, row: u16, card: buffer_mod.ReviewCardRow, spans: []const @import("code_highlighting.zig").SourceSpan, theme: Theme) void {
+    drawReviewCardSyntaxAt(win, row, card, card.contentColumn(), spans, theme);
+}
+
+fn drawReviewCardSyntaxAt(win: vaxis.Window, row: u16, card: buffer_mod.ReviewCardRow, start_column: usize, spans: []const @import("code_highlighting.zig").SourceSpan, theme: Theme) void {
+    var col = start_column;
+    for (card.segments) |segment| {
+        if (segment.authored) for (spans) |span| {
+            const start = @max(segment.source.start, span.source.start);
+            const end = @min(segment.source.end, span.source.end);
+            if (start >= end) continue;
+            const fg = theme.captureColor(span.capture) orelse continue;
+            const cells = mappedSegmentCells(segment, segment.source, start, end) orelse continue;
+            const cell_start = col + cells.start;
+            const width = cells.width;
+            if (cell_start >= win.width) continue;
+            for (cell_start..@min(cell_start +| width, win.width)) |column| {
+                var cell = win.readCell(@intCast(column), row) orelse continue;
+                cell.style.fg = fg;
+                win.writeCell(@intCast(column), row, cell);
+            }
+        };
+        col += vaxis.gwidth.gwidth(segment.text, .unicode);
+    }
 }
 
 fn drawSearchRanges(win: vaxis.Window, frame: @import("frame.zig").Projection, theme: Theme) void {
@@ -164,21 +209,30 @@ fn searchSourceText(row: Row, visual: @import("frame.zig").VisualRow, relation: 
 }
 
 fn drawReviewCardSearchRange(win: vaxis.Window, row: u16, card: buffer_mod.ReviewCardRow, range: @import("frame.zig").ProjectedSourceRange, active: bool, theme: Theme) void {
-    var col: usize = (if (card.isReply()) @as(usize, 6) else 2) + (if (card.part == .header) @as(usize, 0) else 2);
+    drawReviewCardSearchRangeAt(win, row, card, card.contentColumn(), range, active, theme);
+}
+
+fn drawReviewCardSearchRangeAt(win: vaxis.Window, row: u16, card: buffer_mod.ReviewCardRow, column: usize, range: @import("frame.zig").ProjectedSourceRange, active: bool, theme: Theme) void {
+    var col = column;
     for (card.segments) |segment| {
-        const start = @max(range.source.start, segment.source.start);
-        const end = @min(range.source.end, segment.source.end);
-        if (start < end) {
-            const local_start = start - segment.source.start;
-            const local_end = end - segment.source.start;
-            if (local_end <= segment.text.len) {
-                const cell_start = col + vaxis.gwidth.gwidth(segment.text[0..local_start], .unicode);
-                const width = vaxis.gwidth.gwidth(segment.text[local_start..local_end], .unicode);
-                paintSearchCells(win, row, cell_start, width, active, theme);
-            }
+        const source = segment.definition_source orelse segment.source;
+        const use_matches = range.source.start < segment.source.end and range.source.end > segment.source.start;
+        const matched = if (segment.definition_source != null and use_matches) range.definition else if (segment.definition_source == null and range.definition == null) range.source else null;
+        const start = if (matched) |value| @max(value.start, source.start) else 0;
+        const end = if (matched) |value| @min(value.end, source.end) else 0;
+        if (segment.authored and start < end) {
+            if (mappedSegmentCells(segment, source, start, end)) |cells| paintSearchCells(win, row, col + cells.start, cells.width, active, theme);
         }
         col += vaxis.gwidth.gwidth(segment.text, .unicode);
     }
+}
+
+fn mappedSegmentCells(segment: @import("review_card.zig").Segment, source: @import("review_card.zig").SourceRange, start: usize, end: usize) ?struct { start: usize, width: usize } {
+    const equal_length = !segment.atomic and source.end - source.start == segment.text.len;
+    const lo = if (equal_length) start - source.start else 0;
+    const hi = if (equal_length) end - source.start else segment.text.len;
+    if (hi > segment.text.len) return null;
+    return .{ .start = vaxis.gwidth.gwidth(segment.text[0..lo], .unicode), .width = vaxis.gwidth.gwidth(segment.text[lo..hi], .unicode) };
 }
 
 fn paintSearchCells(win: vaxis.Window, row: u16, start: usize, width: usize, active: bool, theme: Theme) void {
@@ -458,6 +512,7 @@ fn cursorRowTheme(theme: Theme) Theme {
     result.comment.bg = theme.cursorBg(theme.comment.bg);
     result.comment_reply.bg = theme.cursorBg(theme.comment_reply.bg);
     result.suggestion.bg = theme.cursorBg(theme.suggestion.bg);
+    result.code_background = theme.cursorBg(theme.code_background);
     result.draft.bg = theme.cursorBg(theme.draft.bg);
     result.draft_reply.bg = theme.cursorBg(theme.draft_reply.bg);
     result.outcome_unknown.bg = theme.cursorBg(theme.outcome_unknown.bg);
@@ -758,7 +813,7 @@ fn drawReviewCard(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, card: b
         .text = segment.text,
         .style = theme.reviewCardStyle(card.role, card.part, segment.marks),
     };
-    const col: u16 = (if (card.isReply()) @as(u16, 6) else 2) + (if (card.part == .header) @as(u16, 0) else 2);
+    const col: u16 = @intCast(card.contentColumn());
     _ = win.print(segments, .{ .row_offset = r, .col_offset = col, .wrap = .none });
 }
 
@@ -1003,7 +1058,11 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
         drawReviewSourcePreview(scratch, header, preview, projection.results[selected], projection.source_preview, projection.preview_scroll, projection.preview_horizontal, theme);
     } else {
         drawReviewSearchHeader(scratch, header, projection.results[selected], theme);
-        if (preview.height > 0) drawReviewSearchPreview(scratch, preview, projection.results[selected], projection.preview_scroll, theme);
+        if (preview.height > 0) {
+            var result = projection.results[selected];
+            result.code_highlights = projection.code_highlights;
+            drawReviewSearchPreview(scratch, preview, result, projection.preview_scroll, theme, projection.cell_metrics orelse terminal_cell_metrics);
+        }
     }
 }
 
@@ -1212,48 +1271,417 @@ fn drawReviewSearchHeader(scratch: std.mem.Allocator, win: vaxis.Window, result:
     _ = win.printSegment(.{ .text = label, .style = theme.picker }, .{ .wrap = .none });
 }
 
-fn drawReviewSearchPreview(scratch: std.mem.Allocator, win: vaxis.Window, result: presentation.ReviewSearchResult, scroll: usize, theme: Theme) void {
+fn drawReviewSearchPreview(scratch: std.mem.Allocator, win: vaxis.Window, result: presentation.ReviewSearchResult, scroll: usize, theme: Theme, metrics: @import("cell_metrics.zig").CellMetrics) void {
     const owner = result.occurrence.location.review_body;
-    var start: usize = 0;
-    var logical_line: usize = 0;
+    const card_mod = @import("review_card.zig");
+    const body = card_mod.ReviewBody.parse(scratch, result.body) catch return;
+    const comment: bbr.review.Comment = .{ .id = if (owner.owner == .comment) owner.owner.comment else 0, .author = result.source, .body = result.body };
+    const draft: bbr.review.Draft = .{ .local_id = if (owner.owner == .draft) owner.owner.draft else 0, .kind = .comment, .body = result.body };
+    const rows = card_mod.projectPreview(scratch, body, .{
+        .owner = if (owner.owner == .draft) .{ .draft = owner.owner.draft } else .{ .comment = owner.owner.comment },
+        .source = if (owner.owner == .draft) .{ .draft = &draft } else .{ .comment = &comment },
+        .role = .comment,
+        .header = "",
+        .content_width = win.width,
+        .metrics = metrics,
+        .collapsed_rows = 0,
+    }, scroll, win.height) catch return;
     var row: u16 = 0;
-    while (start <= result.body.len and row < win.height) {
-        const newline = std.mem.indexOfScalarPos(u8, result.body, start, '\n') orelse result.body.len;
-        logical_line += 1;
-        if (logical_line > scroll) {
-            const line = result.body[start..newline];
-            const line_style = if (logical_line == owner.logical_line) theme.picker_selected else theme.picker;
-            const segments = scratch.alloc(vaxis.Segment, result.occurrence.ranges.len * 2 + 1) catch return;
-            var count: usize = 0;
-            var cursor = start;
-            for (result.occurrence.ranges) |range| {
-                const first = @max(range.start, start);
-                const last = @min(range.end, newline);
-                if (first >= last) continue;
-                if (cursor < first) {
-                    segments[count] = .{ .text = result.body[cursor..first], .style = line_style };
-                    count += 1;
+    for (rows) |card| {
+        const code = card.part == .code_body or card.part == .suggestion_body or card.part == .suggestion_label;
+        fillRow(win, row, if (code) theme.reviewCardStyle(card.role, card.part, .{}) else theme.picker);
+        const segments = scratch.alloc(vaxis.Segment, card.segments.len) catch return;
+        for (card.segments, 0..) |segment, index| {
+            var style = theme.reviewCardStyle(card.role, card.part, segment.marks);
+            if (!code) style.bg = theme.picker.bg;
+            const source = segment.definition_source orelse segment.source;
+            var use_matches = false;
+            for (result.occurrence.ranges) |range| use_matches = use_matches or (range.start < segment.source.end and range.end > segment.source.start);
+            const matched = if (segment.definition_source != null and use_matches) result.occurrence.definition_ranges else if (segment.definition_source == null and result.occurrence.definition_ranges.len == 0) result.occurrence.ranges else &.{};
+            if (segment.authored) for (matched) |range| {
+                if (range.start < source.end and range.end > source.start) {
+                    style.bg = theme.search_active;
+                    break;
                 }
-                var match_style = line_style;
-                match_style.bg = theme.search_active;
-                match_style.bold = true;
-                segments[count] = .{ .text = result.body[first..last], .style = match_style };
-                count += 1;
-                cursor = last;
-            }
-            if (cursor < newline) {
-                segments[count] = .{ .text = result.body[cursor..newline], .style = line_style };
-                count += 1;
-            }
-            if (count == 0) {
-                segments[0] = .{ .text = line, .style = line_style };
-                count = 1;
-            }
-            const position = win.print(segments[0..count], .{ .row_offset = row, .wrap = .grapheme });
-            row = @max(row +| 1, position.row +| @intFromBool(position.col > 0));
+            };
+            segments[index] = .{ .text = segment.text, .style = style };
         }
-        if (newline == result.body.len) break;
-        start = newline + 1;
+        _ = win.print(segments, .{ .row_offset = row, .wrap = .none });
+        if (card.part == .code_body or card.part == .suggestion_body) for (result.code_highlights) |view| {
+            if (std.meta.eql(view.owner, card.owner) and view.block == card.block_ordinal and std.mem.eql(u8, view.body, result.body)) {
+                drawReviewCardSyntaxAt(win, row, card, 0, view.spans, theme);
+                break;
+            }
+        };
+        // vaxis prints the leading cell of a wide grapheme. Paint the complete
+        // terminal range, including continuation cells, just as ReviewCards do.
+        for (result.occurrence.ranges) |range| {
+            if (result.occurrence.definition_ranges.len == 0) {
+                drawReviewCardSearchRangeAt(win, row, card, 0, .{ .visual_row = row, .relation = .neutral, .source = range, .row = range, .active = true }, true, theme);
+            } else {
+                for (result.occurrence.definition_ranges) |definition| {
+                    drawReviewCardSearchRangeAt(win, row, card, 0, .{ .visual_row = row, .relation = .neutral, .source = range, .definition = definition, .row = range, .active = true }, true, theme);
+                }
+            }
+        }
+        row += 1;
+    }
+}
+
+pub const terminal_cell_metrics: @import("cell_metrics.zig").CellMetrics = .{ .ptr = &metrics_context, .vtable = &metrics_vtable };
+const metrics_context: u8 = 0;
+const metrics_vtable: @import("cell_metrics.zig").CellMetrics.VTable = .{ .next = nextVaxisGrapheme, .width = widthVaxisText };
+fn nextVaxisGrapheme(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
+    var iterator = vaxis.unicode.graphemeIterator(text);
+    const grapheme = iterator.next() orelse return .{ .byte_len = 1, .cell_width = 1 };
+    return .{ .byte_len = grapheme.len, .cell_width = vaxis.gwidth.gwidth(grapheme.bytes(text), .unicode) };
+}
+
+fn widthVaxisText(_: *const anyopaque, text: []const u8) usize {
+    return vaxis.gwidth.gwidth(text, .unicode);
+}
+
+test "M23 emoji ReviewCards and Preview paint complete sequences with shared terminal columns" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const examples = [_]struct { name: []const u8, text: []const u8 }{
+        .{ .name = ":v:", .text = "✌" },
+        .{ .name = ":heart:", .text = "❤" },
+        .{ .name = ":one:", .text = "1️⃣" },
+        .{ .name = ":flag_gb:", .text = "🇬🇧" },
+        .{ .name = ":woman_technologist:", .text = "👩‍💻" },
+        .{ .name = ":woman_technologist::skin-tone-2:", .text = "👩🏻‍💻" },
+    };
+    for (examples) |example| {
+        const raw = try std.fmt.allocPrint(a, "**{s}** x", .{example.name});
+        const ranges = [_]@import("search.zig").Range{.{ .start = 3, .end = 4 }};
+        const result: presentation.ReviewSearchResult = .{
+            .kind = "COMMENT",
+            .source = "Ada",
+            .body = raw,
+            .scope = .review,
+            .scope_state = .current,
+            .occurrence = .{ .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 1 } }, .ranges = @constCast(&ranges), .column = 3, .candidate_scalars = 1, .corpus_order = 0, .session_epoch = 1 },
+        };
+        const cells = terminal_cell_metrics.width(example.text);
+        var screen = try vaxis.Screen.init(a, .{ .rows = 8, .cols = @intCast(cells + 12), .x_pixel = 0, .y_pixel = 0 });
+        screen.width_method = .unicode;
+        defer screen.deinit(a);
+        const win = headlessWindow(&screen);
+        const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
+        const draft: bbr.review.Draft = .{ .local_id = 1, .kind = .comment, .body = raw };
+        const card_mod = @import("review_card.zig");
+        const body = try card_mod.ReviewBody.parse(a, raw);
+        for (@import("theme.zig").builtins) |builtin| {
+            const theme = builtin.value;
+            drawReviewSearchPreview(a, win, result, 0, theme, terminal_cell_metrics);
+            try testing.expectEqualStrings(example.text, win.readCell(0, 0).?.char.grapheme);
+            try testing.expectEqualStrings("x", win.readCell(@intCast(cells + 1), 0).?.char.grapheme);
+            for (0..cells) |col| {
+                const style = win.readCell(@intCast(col), 0).?.style;
+                try testing.expectEqual(theme.search_active, style.bg);
+            }
+            try testing.expectEqual(theme.markdown_bold, win.readCell(0, 0).?.style.fg);
+            try testing.expect(win.readCell(0, 0).?.style.bold);
+            inline for (std.meta.tags(card_mod.CardRole)) |role| {
+                const is_draft = switch (role) {
+                    .draft, .draft_reply, .outcome_unknown, .outcome_unknown_reply => true,
+                    else => false,
+                };
+                const rows = try card_mod.project(a, body, .{ .owner = if (is_draft) .{ .draft = 1 } else .{ .comment = 1 }, .source = if (is_draft) .{ .draft = &draft } else .{ .comment = &comment }, .role = role, .header = "Ada", .content_width = cells + 3, .metrics = terminal_cell_metrics, .collapsed_rows = 0 });
+                drawReviewCard(a, win, 1, rows[1], theme);
+                drawReviewCardSearchRange(win, 1, rows[1], .{ .visual_row = 1, .relation = .neutral, .source = ranges[0], .row = ranges[0], .active = true }, true, theme);
+                try testing.expectEqualStrings(example.text, win.readCell(4, 1).?.char.grapheme);
+                try testing.expectEqualStrings("x", win.readCell(@intCast(4 + cells + 1), 1).?.char.grapheme);
+                for (4..4 + cells) |col| {
+                    const style = win.readCell(@intCast(col), 1).?.style;
+                    try testing.expectEqual(theme.search_active, style.bg);
+                }
+                try testing.expectEqual(theme.markdown_bold, win.readCell(4, 1).?.style.fg);
+                try testing.expect(win.readCell(4, 1).?.style.bold);
+            }
+        }
+    }
+}
+
+test "M23 tables Preview and ReviewCards share layouts and Theme styles as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "| **Name** | *State* |\n| :--- | ---: |\n| ~~Ada~~ | `Ready` |";
+    const ready = std.mem.indexOf(u8, raw, "Ready").?;
+    const ranges = [_]@import("search.zig").Range{.{ .start = ready, .end = ready + 5 }};
+    const result: presentation.ReviewSearchResult = .{
+        .kind = "COMMENT",
+        .source = "Ada",
+        .body = raw,
+        .scope = .review,
+        .scope_state = .current,
+        .occurrence = .{ .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 3 } }, .ranges = @constCast(&ranges), .column = 14, .candidate_scalars = 5, .corpus_order = 0, .session_epoch = 1 },
+    };
+    for ([_]u16{ 40, 7 }) |width| {
+        var screen = try vaxis.Screen.init(a, .{ .rows = 12, .cols = width + 4, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(a);
+        const win = headlessWindow(&screen);
+        const preview = win.child(.{ .width = width });
+        const card_mod = @import("review_card.zig");
+        const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
+        const rows = try card_mod.project(a, try card_mod.ReviewBody.parse(a, raw), .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "Ada", .content_width = width, .metrics = terminal_cell_metrics, .collapsed_rows = 0 });
+        const expected: []const []const u8 = if (width == 40) &.{ "Name │ State", "Ada  │ Ready" } else &.{ "Name", "State", "Name: ", "Ada", "State: ", "Ready" };
+        for (@import("theme.zig").builtins) |builtin| {
+            const theme = builtin.value;
+            drawReviewSearchPreview(a, preview, result, 0, theme, terminal_cell_metrics);
+            for (expected, 0..) |text, row| {
+                var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
+                var col: u16 = 0;
+                while (iterator.nextCodepointSlice()) |grapheme| : (col += 1) try testing.expectEqualStrings(grapheme, win.readCell(col, @intCast(row)).?.char.grapheme);
+            }
+            const state_row: u16 = if (width == 40) 0 else 1;
+            const ada_row: u16 = if (width == 40) 1 else 3;
+            const ready_row: u16 = if (width == 40) 1 else 5;
+            const value_col: u16 = if (width == 40) 7 else 0;
+            try testing.expect(win.readCell(0, 0).?.style.bold);
+            try testing.expectEqual(theme.markdown_bold, win.readCell(0, 0).?.style.fg);
+            try testing.expect(win.readCell(value_col, state_row).?.style.italic);
+            try testing.expectEqual(theme.markdown_italic, win.readCell(value_col, state_row).?.style.fg);
+            try testing.expect(win.readCell(0, ada_row).?.style.strikethrough);
+            try testing.expectEqual(theme.markdown_inline_code, win.readCell(value_col, ready_row).?.style.fg);
+            try testing.expectEqual(theme.search_active, win.readCell(value_col, ready_row).?.style.bg);
+            if (width == 7) try testing.expectEqual(theme.picker.bg, win.readCell(0, 4).?.style.bg);
+            for (rows[1..], 0..) |card, row| drawReviewCard(a, win, @intCast(row), card, theme);
+            try testing.expectEqual(theme.markdown_inline_code, win.readCell(value_col + 4, ready_row).?.style.fg);
+            drawReviewCardSearchRange(win, ready_row, rows[ready_row + 1], .{ .visual_row = ready_row, .relation = .neutral, .source = ranges[0], .row = ranges[0], .active = true }, true, theme);
+            try testing.expectEqual(theme.search_active, win.readCell(value_col + 4, ready_row).?.style.bg);
+        }
+    }
+}
+
+test "M23 links highlight only the matched reference use in ReviewCards and Preview as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "[A][id] [B][id]\n\n[id]: /host";
+    const use = [_]@import("search.zig").Range{.{ .start = 2, .end = 7 }};
+    const definition = [_]@import("search.zig").Range{.{ .start = raw.len - 4, .end = raw.len }};
+    const result: presentation.ReviewSearchResult = .{
+        .kind = "COMMENT",
+        .source = "Ada",
+        .body = raw,
+        .scope = .review,
+        .scope_state = .current,
+        .occurrence = .{ .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 1 } }, .ranges = @constCast(&use), .definition_ranges = &definition, .column = 3, .candidate_scalars = 4, .corpus_order = 0, .session_epoch = 1 },
+    };
+    var screen = try vaxis.Screen.init(a, .{ .rows = 8, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    for (@import("theme.zig").builtins) |builtin| {
+        const theme = builtin.value;
+        drawReviewSearchPreview(a, win, result, 0, theme, terminal_cell_metrics);
+        try testing.expectEqualStrings("h", win.readCell(4, 0).?.char.grapheme);
+        try testing.expectEqual(theme.search_active, win.readCell(4, 0).?.style.bg);
+        try testing.expectEqualStrings("h", win.readCell(14, 0).?.char.grapheme);
+        try testing.expectEqual(theme.picker.bg, win.readCell(14, 0).?.style.bg);
+        const card_mod = @import("review_card.zig");
+        const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
+        const rows = try card_mod.project(a, try card_mod.ReviewBody.parse(a, raw), .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "Ada", .content_width = 76, .metrics = terminal_cell_metrics, .collapsed_rows = 0 });
+        drawReviewCard(a, win, 0, rows[1], theme);
+        const before = win.readCell(18, 0).?.style.bg;
+        drawReviewCardSearchRange(win, 0, rows[1], .{ .visual_row = 0, .relation = .neutral, .source = use[0], .definition = definition[0], .row = use[0], .active = true }, true, theme);
+        try testing.expectEqual(theme.search_active, win.readCell(8, 0).?.style.bg);
+        try testing.expectEqual(before, win.readCell(18, 0).?.style.bg);
+    }
+}
+
+test "M23 links Preview wraps full reference destinations and highlights only matched definition bytes as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "[***Docs***][id]\n\n[id]: ../abcdefgh \"Guide\"";
+    const definition = std.mem.indexOf(u8, raw, "abcdefgh").?;
+    const ranges = [_]@import("search.zig").Range{.{ .start = 11, .end = 15 }};
+    const definition_ranges = [_]@import("search.zig").Range{.{ .start = definition + 2, .end = definition + 6 }};
+    const result: presentation.ReviewSearchResult = .{
+        .kind = "COMMENT",
+        .source = "Ada",
+        .body = raw,
+        .scope = .review,
+        .scope_state = .current,
+        .occurrence = .{ .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 1 } }, .ranges = @constCast(&ranges), .definition_ranges = &definition_ranges, .column = 12, .candidate_scalars = 4, .corpus_order = 0, .session_epoch = 1 },
+    };
+    var screen = try vaxis.Screen.init(a, .{ .rows = 8, .cols = 8, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const expected = [_][]const u8{ "Docs ‹..", "/abcdefg", "h› \"Guid", "e\"" };
+    for (@import("theme.zig").builtins) |builtin| {
+        const theme = builtin.value;
+        drawReviewSearchPreview(a, win, result, 0, theme, terminal_cell_metrics);
+        for (expected, 0..) |text, row| {
+            var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
+            var col: u16 = 0;
+            while (iterator.nextCodepointSlice()) |grapheme| : (col += 1) {
+                try testing.expectEqualStrings(grapheme, win.readCell(col, @intCast(row)).?.char.grapheme);
+            }
+        }
+        const label = win.readCell(0, 0).?.style;
+        try testing.expect(label.bold and label.italic and label.ul_style == .single);
+        try testing.expectEqual(theme.markdown_bold, label.fg);
+        for (0..8) |col| {
+            const style = win.readCell(@intCast(col), 1).?.style;
+            try testing.expectEqual(if (col >= 3 and col < 7) theme.search_active else theme.picker.bg, style.bg);
+        }
+    }
+}
+
+test "M23 literal Preview shares code and Suggestion backgrounds and tab search cells" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 10, .cols = 8, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    for ([_][]const u8{ "```zig\r\na\tb  \r\n\n*x* :mask:\n```", "```suggestion\r\na\tb  \r\n\n*x* :mask:\n```" }, 0..) |raw, kind| {
+        const tab = std.mem.indexOfScalar(u8, raw, '\t').?;
+        const ranges = [_]@import("search.zig").Range{.{ .start = tab, .end = tab + 1 }};
+        const result: presentation.ReviewSearchResult = .{
+            .kind = "COMMENT",
+            .source = "Ada",
+            .body = raw,
+            .scope = .review,
+            .scope_state = .current,
+            .occurrence = .{ .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 2 } }, .ranges = @constCast(&ranges), .column = 2, .candidate_scalars = 1, .corpus_order = 0, .session_epoch = 1 },
+        };
+        for (@import("theme.zig").builtins) |builtin| {
+            const theme = builtin.value;
+            drawReviewSearchPreview(a, win, result, 0, theme, terminal_cell_metrics);
+            const row: u16 = @intCast(kind * 2);
+            const bg = if (kind == 0) theme.code_background else theme.suggestion.bg;
+            const fg = if (kind == 0) theme.context.fg else theme.suggestion.fg;
+            try testing.expectEqualStrings("a", win.readCell(0, row).?.char.grapheme);
+            try testing.expectEqual(fg, win.readCell(0, row).?.style.fg);
+            try testing.expectEqual(bg, win.readCell(0, row).?.style.bg);
+            for (1..4) |col| {
+                try testing.expectEqualStrings(" ", win.readCell(@intCast(col), row).?.char.grapheme);
+                try testing.expectEqual(theme.search_active, win.readCell(@intCast(col), row).?.style.bg);
+                try testing.expectEqual(fg, win.readCell(@intCast(col), row).?.style.fg);
+            }
+            try testing.expectEqual(bg, win.readCell(7, row).?.style.bg);
+            try testing.expectEqual(bg, win.readCell(0, row + 1).?.style.bg);
+            try testing.expectEqualStrings("*", win.readCell(0, row + 2).?.char.grapheme);
+            try testing.expectEqualStrings(":", win.readCell(4, row + 2).?.char.grapheme);
+        }
+    }
+}
+
+test "M23 containers Preview keeps quote bars list styles and code tab search cells as project behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 10, .cols = 12, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const raw = "> - **item**\n>     ```zig\n>     a\tb\n>     ```\n>> _deep_";
+    const tab = std.mem.indexOfScalar(u8, raw, '\t').?;
+    const ranges = [_]@import("search.zig").Range{.{ .start = tab, .end = tab + 1 }};
+    const result: presentation.ReviewSearchResult = .{
+        .kind = "COMMENT",
+        .source = "Ada",
+        .body = raw,
+        .scope = .review,
+        .scope_state = .current,
+        .occurrence = .{ .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 3 } }, .ranges = @constCast(&ranges), .column = 8, .candidate_scalars = 1, .corpus_order = 0, .session_epoch = 1 },
+    };
+    for (@import("theme.zig").builtins) |builtin| {
+        const theme = builtin.value;
+        drawReviewSearchPreview(a, win, result, 0, theme, terminal_cell_metrics);
+        try testing.expectEqualStrings("│", win.readCell(0, 0).?.char.grapheme);
+        try testing.expectEqualStrings("•", win.readCell(2, 0).?.char.grapheme);
+        try testing.expectEqualStrings("i", win.readCell(4, 0).?.char.grapheme);
+        try testing.expectEqual(theme.markdown_bold, win.readCell(4, 0).?.style.fg);
+        try testing.expect(win.readCell(4, 0).?.style.bold);
+        try testing.expectEqualStrings("a", win.readCell(4, 1).?.char.grapheme);
+        for (5..8) |col| {
+            const cell = win.readCell(@intCast(col), 1).?;
+            try testing.expectEqualStrings(" ", cell.char.grapheme);
+            try testing.expectEqual(theme.search_active, cell.style.bg);
+            try testing.expectEqual(theme.context.fg, cell.style.fg);
+        }
+        try testing.expectEqual(theme.code_background, win.readCell(0, 1).?.style.bg);
+        try testing.expectEqualStrings("│", win.readCell(2, 2).?.char.grapheme);
+        try testing.expectEqualStrings("d", win.readCell(4, 2).?.char.grapheme);
+        try testing.expectEqual(theme.markdown_italic, win.readCell(4, 2).?.style.fg);
+        try testing.expect(win.readCell(4, 2).?.style.italic);
+    }
+}
+
+test "M23 inline Preview shows joined prose and Setext headings with every matched part styled" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 8, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const ranges = [_]@import("search.zig").Range{.{ .start = 13, .end = 25 }};
+    const result: presentation.ReviewSearchResult = .{
+        .kind = "COMMENT",
+        .source = "Ada",
+        .body = "Title\n=====\n\nfirst\nsecond",
+        .scope = .review,
+        .scope_state = .current,
+        .occurrence = .{ .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 4 } }, .ranges = @constCast(&ranges), .column = 1, .candidate_scalars = 12, .corpus_order = 0, .session_epoch = 1 },
+    };
+    for (@import("theme.zig").builtins) |builtin| {
+        const theme = builtin.value;
+        drawReviewSearchPreview(a, win, result, 0, theme, terminal_cell_metrics);
+        try testing.expectEqualStrings("§", win.readCell(0, 0).?.char.grapheme);
+        try testing.expectEqualStrings("1", win.readCell(1, 0).?.char.grapheme);
+        try testing.expect(win.readCell(3, 0).?.style.bold);
+        try testing.expectEqualStrings("f", win.readCell(0, 2).?.char.grapheme);
+        try testing.expectEqualStrings("s", win.readCell(6, 2).?.char.grapheme);
+        for (0..12) |col| try testing.expectEqual(theme.search_active, win.readCell(@intCast(col), 2).?.style.bg);
+    }
+}
+
+test "M23 inline Review Search Preview shares Markdown styles, literal code, and authored tab matches in every Theme" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 6, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const ranges = [_]@import("search.zig").Range{.{ .start = 16, .end = 17 }};
+    const result: presentation.ReviewSearchResult = .{
+        .kind = "DRAFT",
+        .source = "local",
+        .body = "plain ***x*** `a\tb` ~~gone~~",
+        .scope = .review,
+        .scope_state = .current,
+        .occurrence = .{ .location = .{ .review_body = .{ .owner = .{ .draft = 1 }, .logical_line = 1 } }, .ranges = @constCast(&ranges), .column = 17, .candidate_scalars = 1, .corpus_order = 0, .session_epoch = 1 },
+    };
+    for (@import("theme.zig").builtins) |builtin| {
+        const theme = builtin.value;
+        drawReviewSearchPreview(a, win, result, 0, theme, terminal_cell_metrics);
+        try testing.expectEqualStrings("p", win.readCell(0, 0).?.char.grapheme);
+        try testing.expect(!win.readCell(0, 0).?.style.bold);
+        try testing.expectEqualStrings("x", win.readCell(6, 0).?.char.grapheme);
+        try testing.expectEqual(theme.markdown_bold, win.readCell(6, 0).?.style.fg);
+        try testing.expect(win.readCell(6, 0).?.style.bold and win.readCell(6, 0).?.style.italic);
+        try testing.expectEqualStrings("a", win.readCell(8, 0).?.char.grapheme);
+        for (9..12) |col| {
+            const cell = win.readCell(@intCast(col), 0).?;
+            try testing.expectEqualStrings(" ", cell.char.grapheme);
+            try testing.expectEqual(theme.markdown_inline_code, cell.style.fg);
+            try testing.expectEqual(theme.search_active, cell.style.bg);
+            try testing.expect(!cell.style.bold);
+        }
+        try testing.expectEqualStrings("g", win.readCell(14, 0).?.char.grapheme);
+        try testing.expect(win.readCell(14, 0).?.style.strikethrough);
+        var fallback = terminal_cell_metrics;
+        fallback.strikethrough_supported = false;
+        drawReviewSearchPreview(a, win, result, 0, theme, fallback);
+        try testing.expectEqualStrings("~", win.readCell(14, 0).?.char.grapheme);
+        try testing.expectEqualStrings("g", win.readCell(16, 0).?.char.grapheme);
+        try testing.expect(!win.readCell(16, 0).?.style.strikethrough);
     }
 }
 
@@ -1596,7 +2024,9 @@ fn buildHelpRows(scratch: std.mem.Allocator, km: keymap.Keymap, availability: pr
 fn sourceRefusalLabel(availability: presentation.ActionAvailability, action: keymap.Action) ?[]const u8 {
     return switch (action) {
         .yank => if (availability.yank_refusal) |refusal| switch (refusal) {
-            .no_source => "no source",
+            .no_source => "no copyable text",
+            .no_body => "no authored body",
+            .opposite_version => "opposite Selected Version",
             .selected_content_unavailable => if (availability.selected_version == .old) "old content unavailable" else "new content unavailable",
         } else null,
         .inline_comment => if (availability.inline_comment_refusal) |refusal| switch (refusal) {
@@ -1800,7 +2230,8 @@ test "M21 authored Overlay renders ranked rows and matched Preview in landscape 
         try testing.expectEqualStrings("▸", list.readCell(0, 0).?.char.grapheme);
         try testing.expectEqualStrings("b", preview.readCell(0, 0).?.char.grapheme);
         try testing.expect(geometry.landscape == (cols == 100));
-        try testing.expectEqual(theme_dark.search_active, preview.readCell(0, 1).?.style.bg);
+        try testing.expectEqualStrings("n", preview.readCell(7, 0).?.char.grapheme);
+        try testing.expectEqual(theme_dark.search_active, preview.readCell(7, 0).?.style.bg);
         if (cols == 20) try testing.expectEqualStrings("├", win.readCell(geometry.body.x, geometry.divider).?.char.grapheme);
     }
 }
@@ -1980,9 +2411,11 @@ test "M21 authored Preview paints every disjoint Markdown match range" {
         .geometry = geometry,
     }, theme_dark);
     const preview = childRect(headlessWindow(&screen), geometry.preview);
-    try testing.expectEqual(theme_dark.search_active, preview.readCell(2, 0).?.style.bg);
-    try testing.expectEqual(theme_dark.search_active, preview.readCell(8, 0).?.style.bg);
-    try testing.expect(!std.meta.eql(preview.readCell(6, 0).?.style.bg, theme_dark.search_active));
+    try testing.expectEqualStrings("b", preview.readCell(0, 0).?.char.grapheme);
+    try testing.expectEqual(theme_dark.search_active, preview.readCell(0, 0).?.style.bg);
+    try testing.expectEqual(theme_dark.markdown_bold, preview.readCell(0, 0).?.style.fg);
+    try testing.expectEqual(theme_dark.search_active, preview.readCell(5, 0).?.style.bg);
+    try testing.expectEqual(theme_dark.search_active, preview.readCell(4, 0).?.style.bg);
 }
 
 test "Review Search shortens directories and keeps the filename" {
@@ -2918,6 +3351,61 @@ test "File and PR Comment headers end in DiffPane border rules" {
     try testing.expectEqual(theme.pane_border_focused.fg, win.readCell(win.width - 1, 1).?.style.fg);
 }
 
+test "M23 ancestry renders shared offsets and visible capped depth with search cells" {
+    const cases = [_]struct { width: u16, depth: usize, indent: usize }{
+        .{ .width = 100, .depth = 2, .indent = 8 },
+        .{ .width = 60, .depth = 2, .indent = 4 },
+        .{ .width = 40, .depth = 2, .indent = 0 },
+        .{ .width = 60, .depth = 20, .indent = 16 },
+    };
+    for (cases) |case| for ([_]buffer_mod.Layout{ .unified, .side_by_side }) |layout| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var comments: [21]bbr.review.Comment = undefined;
+        for (comments[0 .. case.depth + 1], 0..) |*comment, index| comment.* = .{
+            .id = index + 1,
+            .parent_id = if (index == 0) null else index,
+            .author = "author with a name longer than the available header width at the indentation cap",
+            .body = "bodyabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+        };
+        const threads = try bbr.review.buildThreads(a, comments[0 .. case.depth + 1]);
+        const diff: bbr.diff.Diff = .{ .files = &.{} };
+        const buf = try buffer_mod.buildWithComments(a, diff, layout, threads, .{ .card_width = case.width, .collapsed_rows = 1 });
+        var screen = try vaxis.Screen.init(a, .{ .rows = 80, .cols = case.width + 29, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(a);
+        const win = headlessWindow(&screen);
+        for (@import("theme.zig").builtins) |builtin| {
+            draw(a, win, diff, buf, builtin.value, Nav.init(buf.rows.len, 80), 0, threads, &.{});
+            for (buf.rows, 0..) |row, index| if (row == .comment and row.comment.owner.comment == case.depth + 1) {
+                const card = row.comment;
+                const start = 29 + case.indent + if (card.part == .header) @as(usize, 2) else 4;
+                if (card.part == .header and (case.indent == 0 or case.depth == 20)) {
+                    var text: std.ArrayList(u8) = .empty;
+                    for (start..win.width) |col| try text.appendSlice(a, win.readCell(@intCast(col), @intCast(index)).?.char.grapheme);
+                    const label = try std.fmt.allocPrint(a, "depth {d}", .{case.depth});
+                    try testing.expect(std.mem.indexOf(u8, text.items, label) != null);
+                } else {
+                    const first = if (card.part == .body) "b" else if (card.part == .header) "↳" else "▸";
+                    try testing.expectEqualStrings(first, win.readCell(@intCast(start), @intCast(index)).?.char.grapheme);
+                }
+                if (card.part == .body) {
+                    const pane = win.child(.{ .x_off = 29, .width = case.width, .height = 80 });
+                    drawReviewCardSearchRange(pane, @intCast(index), card, .{
+                        .visual_row = index,
+                        .relation = .neutral,
+                        .source = .{ .start = 0, .end = 4 },
+                        .row = .{ .start = 0, .end = 4 },
+                        .active = true,
+                    }, true, builtin.value);
+                    try testing.expectEqualDeep(builtin.value.search_active, win.readCell(@intCast(start), @intCast(index)).?.style.bg);
+                    try testing.expect(!std.meta.eql(builtin.value.search_active, win.readCell(@intCast(start - 1), @intCast(index)).?.style.bg));
+                }
+            };
+        }
+    };
+}
+
 test "ReviewCard wide grapheme keeps the DiffPane right border" {
     const Metrics = struct {
         fn next(_: *const anyopaque, text: []const u8) @import("cell_metrics.zig").Measurement {
@@ -3005,6 +3493,299 @@ test "ReviewCard wide grapheme keeps the DiffPane right border" {
     try testing.expectEqualStrings("│", win.readCell(right, screen_row).?.char.grapheme);
 }
 
+test "M23 highlighting syntax foreground preserves tab cells and interaction backgrounds in every Theme" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const card_mod = @import("review_card.zig");
+    const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = "```TS\na\tb\n```" };
+    const body = try card_mod.ReviewBody.parse(a, comment.body);
+    const rows = try card_mod.project(a, body, .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "Ada", .content_width = 60, .metrics = terminal_cell_metrics, .collapsed_rows = 0 });
+    var screen = try vaxis.Screen.init(a, .{ .rows = 4, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const spans = [_]@import("code_highlighting.zig").SourceSpan{.{ .source = .{ .start = 6, .end = 9 }, .capture = bbr.highlight.Capture.init(1, "keyword") }};
+    for (@import("theme.zig").builtins) |builtin| {
+        const theme = builtin.value;
+        drawReviewCard(a, win, 1, rows[1], cursorRowTheme(theme));
+        drawReviewCardSyntax(win, 1, rows[1], &spans, theme);
+        drawReviewCardSearchRange(win, 1, rows[1], .{ .visual_row = 1, .relation = .neutral, .source = .{ .start = 7, .end = 8 }, .row = .{ .start = 0, .end = 1 }, .active = true }, true, theme);
+        for (5..8) |col| {
+            try testing.expectEqual(theme.search_active, win.readCell(@intCast(col), 1).?.style.bg);
+            try testing.expectEqual(theme.syntax_keyword, win.readCell(@intCast(col), 1).?.style.fg);
+        }
+        try testing.expectEqual(theme.cursorBg(theme.code_background), win.readCell(4, 1).?.style.bg);
+        try testing.expectEqual(theme.syntax_keyword, win.readCell(4, 1).?.style.fg);
+        try testing.expectEqualStrings("b", win.readCell(8, 1).?.char.grapheme);
+    }
+}
+
+test "M23 highlighting selected Suggestion Preview uses shared syntax and retains its label background and search foreground" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.identity().remote, .{ .local_id = 7, .kind = .comment, .scope = .{ .@"inline" = .{ .path = "before.js", .to = 1 } }, .body = "```suggestion\nconst\tvalue = 1; // :mask: **literal**\n```" });
+    const session = try @import("session.zig").create(testing.allocator);
+    session.source = .{ .remote = .{ .id = 1, .title = "Code", .state = "OPEN", .author_display_name = "Ada", .source_branch = "feature", .destination_branch = "main", .source_commit = "source", .destination_commit = "base" } };
+    session.header = .{ .title = "Code", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Bitbucket" };
+    session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1 @@\n-old\n+new\n");
+    try session.initializeEnrichment();
+    var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store(), .cell_metrics = terminal_cell_metrics }, .{
+        .initial = .{ .key = key, .session = session },
+        .geometry = .{ .cols = 120, .rows = 40 },
+    });
+    defer state.deinit();
+    try state.dispatch(.{ .action = .open_review_search });
+    try state.dispatch(.{ .key = .{ .codepoint = 'c', .text = "const" } });
+    var scan = state.takeCommand().?;
+    while (scan == .build_buffer_disclosure) {
+        scan.build_buffer_disclosure.build();
+        try state.dispatch(.{ .buffer_disclosure_built = scan.build_buffer_disclosure });
+        scan = state.takeCommand().?;
+    }
+    const completed = presentation.executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search);
+    scan.deinit();
+    try state.dispatch(.{ .buffer_search_scanned = completed });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 40, .cols = 120, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const before = state.projection();
+    const preview = childRect(win, before.review_search.?.geometry.preview);
+    drawReviewSearch(a, win, before.review_search.?, theme_dark);
+    try testing.expectEqualStrings("s", preview.readCell(0, 0).?.char.grapheme);
+    try testing.expectEqualStrings("c", preview.readCell(0, 1).?.char.grapheme);
+    try testing.expectEqual(theme_dark.suggestion.fg, preview.readCell(0, 1).?.style.fg);
+    var command = state.takeCommand().?;
+    while (command == .enrich_file) command = state.takeCommand().?;
+    const job = command.highlight_code;
+    try testing.expectEqualStrings("before.js", job.path);
+    var highlighter = try @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    try state.dispatch(.{ .code_highlight_completed = job.execute(highlighter.highlighter()) });
+    const after = state.projection();
+    try testing.expectEqual(before.review.?.frame.visual_rows.ptr, after.review.?.frame.visual_rows.ptr);
+    try testing.expectEqualDeep(before.review.?.navigation, after.review.?.navigation);
+    try testing.expectEqualDeep(before.review_search.?.occurrences[0], after.review_search.?.occurrences[0]);
+    try testing.expectEqual(after.review.?.frame.code_highlights[0].spans.ptr, after.review_search.?.code_highlights[0].spans.ptr);
+    for (@import("theme.zig").builtins) |builtin| {
+        const theme = builtin.value;
+        drawReviewSearch(a, win, after.review_search.?, theme);
+        try testing.expectEqualStrings("s", preview.readCell(0, 0).?.char.grapheme);
+        try testing.expectEqual(theme.suggestion.bg, preview.readCell(0, 0).?.style.bg);
+        try testing.expectEqual(theme.syntax_keyword, preview.readCell(0, 1).?.style.fg);
+        try testing.expectEqual(theme.search_active, preview.readCell(0, 1).?.style.bg);
+        try testing.expectEqual(theme.suggestion.bg, preview.readCell(10, 1).?.style.bg);
+    }
+}
+
+test "M23 highlighting published Frame renders real syntax through wrapping Selection search and Theme changes" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.identity().remote, .{ .local_id = 1, .kind = .comment, .scope = .review, .body = "```TS\nconst\tx = 1; // enough code to wrap across several rows\n```" });
+    const session = try @import("session.zig").create(testing.allocator);
+    session.source = .{ .remote = .{ .id = 1, .title = "Code", .state = "OPEN", .author_display_name = "Ada", .source_branch = "feature", .destination_branch = "main", .source_commit = "source", .destination_commit = "base" } };
+    session.header = .{ .title = "Code", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Bitbucket" };
+    session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1 @@\n-old\n+new\n");
+    try session.initializeEnrichment();
+    var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 0, .cell_metrics = terminal_cell_metrics }, .{
+        .initial = .{ .key = key, .session = session },
+        .geometry = .{ .cols = 48, .rows = 24 },
+    });
+    defer state.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 48, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const plain = state.projection().review.?;
+    var code_row: ?usize = null;
+    var wrapped_rows: usize = 0;
+    for (plain.frame.visual_rows, 0..) |visual, index| {
+        const row = plain.buffer.rows[visual.buffer_index];
+        if (row == .draft and row.draft.part == .code_body) {
+            if (code_row == null) code_row = index;
+            wrapped_rows += 1;
+        }
+    }
+    try testing.expect(wrapped_rows > 1);
+    for (0..code_row.?) |_| try state.dispatch(.{ .action = .down });
+    const x = plain.frame.panes.diff_content.x + 4;
+    const y = plain.frame.panes.diff_content.y + @as(u16, @intCast(code_row.?));
+    drawReview(a, win, state.projection().review.?, theme_dark, 0);
+    try testing.expectEqualStrings("c", win.readCell(x, y).?.char.grapheme);
+    try testing.expectEqual(theme_dark.context.fg, win.readCell(x, y).?.style.fg);
+    var highlighter = try @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const job = state.takeCommand().?.highlight_code;
+    try state.dispatch(.{ .code_highlight_completed = job.execute(highlighter.highlighter()) });
+    const spans = state.projection().review.?.frame.code_highlights[0].spans.ptr;
+    try state.dispatch(.{ .action = .toggle_select });
+    try state.dispatch(.{ .action = .down });
+    for (@import("theme.zig").builtins) |builtin| {
+        drawReview(a, win, state.projection().review.?, builtin.value, 0);
+        try testing.expectEqual(builtin.value.syntax_keyword, win.readCell(x, y).?.style.fg);
+        try testing.expectEqual(builtin.value.cursorBg(builtin.value.code_background), win.readCell(x, y).?.style.bg);
+    }
+    try state.dispatch(.{ .action = .clear_selection });
+    try state.dispatch(.{ .action = .open_buffer_search });
+    try state.dispatch(.{ .key = .{ .codepoint = 'c', .text = "const" } });
+    var scan = state.takeCommand().?;
+    const completed = presentation.executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search);
+    scan.deinit();
+    try state.dispatch(.{ .buffer_search_scanned = completed });
+    for (@import("theme.zig").builtins) |builtin| {
+        drawReview(a, win, state.projection().review.?, builtin.value, 0);
+        try testing.expectEqual(builtin.value.syntax_keyword, win.readCell(x, y).?.style.fg);
+        try testing.expectEqual(builtin.value.search_active, win.readCell(x, y).?.style.bg);
+    }
+    try testing.expectEqual(spans, state.projection().review.?.frame.code_highlights[0].spans.ptr);
+    try testing.expect(state.takeCommand() == null);
+}
+
+test "M23 literal code cells keep foreground under cursor Selection and search in every Theme and role" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const card_mod = @import("review_card.zig");
+    const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = "```zig\na\tb **x** :mask:\n```" };
+    const body = try card_mod.ReviewBody.parse(a, comment.body);
+    var screen = try vaxis.Screen.init(a, .{ .rows = 4, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    for (@import("theme.zig").builtins) |builtin| inline for (std.meta.tags(card_mod.CardRole)) |role| {
+        const theme = builtin.value;
+        const rows = try card_mod.project(a, body, .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = role, .header = "Ada", .content_width = 60, .metrics = terminal_cell_metrics, .collapsed_rows = 0, .indent = 7 });
+        const buffer_rows = [_]buffer_mod.Row{ .{ .comment = rows[0] }, .{ .comment = rows[1] } };
+        const buf: Buffer = .{ .rows = &buffer_rows, .layout = .unified };
+        for ([_]bool{ false, true }) |selected| {
+            var nav = Nav.init(2, 4);
+            nav.cursor = if (selected) 0 else 1;
+            if (selected) nav.mark = 1;
+            drawPane(a, win, buf, theme, nav);
+            try testing.expectEqualStrings("a", win.readCell(11, 1).?.char.grapheme);
+            try testing.expectEqualStrings("b", win.readCell(15, 1).?.char.grapheme);
+            try testing.expectEqualStrings("*", win.readCell(17, 1).?.char.grapheme);
+            const cell = win.readCell(11, 1).?;
+            try testing.expectEqual(theme.context.fg, cell.style.fg);
+            try testing.expectEqual(theme.cursorBg(theme.code_background), cell.style.bg);
+            try testing.expect(!cell.style.bold and !cell.style.italic);
+            drawReviewCardSearchRange(win, 1, rows[1], .{ .visual_row = 1, .relation = .neutral, .source = .{ .start = 8, .end = 9 }, .row = .{ .start = 0, .end = 1 }, .active = true }, true, theme);
+            for (12..15) |col| {
+                try testing.expectEqual(theme.search_active, win.readCell(@intCast(col), 1).?.style.bg);
+                try testing.expectEqual(theme.context.fg, win.readCell(@intCast(col), 1).?.style.fg);
+            }
+        }
+    };
+}
+
+test "M23 acceptance narrow lists tables links and compound emoji retain styles under Selection and search" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const card_mod = @import("review_card.zig");
+    const raw = "# ***Heading***\n\n> 4. ***[x](url)*** **:woman_technologist::skin-tone-2:**\n>     - ~~gone~~ `a\tb`\n\n| Name | State |\n| --- | --- |\n| ~~Ada~~ | `Ready` |";
+    const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
+    const draft: bbr.review.Draft = .{ .local_id = 1, .kind = .comment, .body = raw };
+    const body = try card_mod.ReviewBody.parse(a, raw);
+    var screen = try vaxis.Screen.init(a, .{ .rows = 128, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    screen.width_method = .unicode;
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    inline for (std.meta.tags(card_mod.CardRole)) |role| {
+        const is_draft = switch (role) {
+            .draft, .draft_reply, .outcome_unknown, .outcome_unknown_reply => true,
+            else => false,
+        };
+        const rows = try card_mod.project(a, body, .{ .owner = if (is_draft) .{ .draft = 1 } else .{ .comment = 1 }, .source = if (is_draft) .{ .draft = &draft } else .{ .comment = &comment }, .role = role, .header = "Ada", .content_width = 14, .indent = 7, .metrics = terminal_cell_metrics, .collapsed_rows = 0 });
+        const buffer_rows = try a.alloc(buffer_mod.Row, rows.len);
+        for (rows, buffer_rows) |row, *target| target.* = if (is_draft) .{ .draft = row } else .{ .comment = row };
+        for (@import("theme.zig").builtins) |builtin| {
+            const theme = builtin.value;
+            var nav = Nav.init(rows.len, 128);
+            nav.mark = rows.len - 1;
+            drawPane(a, win, .{ .rows = buffer_rows, .layout = .unified }, theme, nav);
+            var seen = [_]bool{false} ** 5;
+            for (rows[1..], 1..) |row, index| {
+                const y: u16 = @intCast(index);
+                drawReviewCardSearchRange(win, y, row, .{ .visual_row = index, .relation = .neutral, .source = .{ .start = 0, .end = raw.len }, .row = .{ .start = 0, .end = 1 }, .active = true }, true, theme);
+                var col: u16 = @intCast(row.contentColumn());
+                for (row.segments) |segment| {
+                    const width: u16 = @intCast(terminal_cell_metrics.width(segment.text));
+                    const cell = win.readCell(col, y).?;
+                    if (!segment.authored) {
+                        try testing.expect(!std.meta.eql(theme.search_active, cell.style.bg));
+                    } else if (std.mem.eql(u8, segment.text, "x")) {
+                        seen[0] = true;
+                        try testing.expectEqual(theme.markdown_bold, cell.style.fg);
+                        try testing.expect(cell.style.bold and cell.style.italic and cell.style.ul_style == .single);
+                    } else if (std.mem.eql(u8, segment.text, "👩🏻‍💻")) {
+                        seen[1] = true;
+                        try testing.expectEqualStrings("👩🏻‍💻", cell.char.grapheme);
+                        try testing.expectEqual(theme.markdown_bold, cell.style.fg);
+                        try testing.expect(cell.style.bold);
+                        for (col..col + width) |emoji_col| try testing.expectEqual(theme.search_active, win.readCell(@intCast(emoji_col), y).?.style.bg);
+                    } else if (segment.source.start == std.mem.indexOf(u8, raw, "gone").?) {
+                        seen[2] = true;
+                        try testing.expect(cell.style.strikethrough);
+                    } else if (segment.source.start == std.mem.indexOf(u8, raw, "Ready").?) {
+                        seen[3] = true;
+                        try testing.expectEqual(theme.markdown_inline_code, cell.style.fg);
+                        try testing.expect(!cell.style.bold and !cell.style.italic);
+                    } else if (segment.source.start == std.mem.indexOf(u8, raw, "Heading").?) {
+                        seen[4] = true;
+                        try testing.expect(cell.style.bold and cell.style.italic);
+                    }
+                    if (segment.authored and segment.source.start < segment.source.end) try testing.expectEqual(theme.search_active, cell.style.bg);
+                    col += width;
+                }
+            }
+            for (seen) |found| try testing.expect(found);
+        }
+    }
+}
+
+test "M23 inline headless cells retain combined marks under overlapping interaction backgrounds in every Theme and role" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const card_mod = @import("review_card.zig");
+    const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = "plain ***~~[x](url)~~*** **_`a\tb`_**" };
+    const body = try card_mod.ReviewBody.parse(a, comment.body);
+    var screen = try vaxis.Screen.init(a, .{ .rows = 4, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    for (@import("theme.zig").builtins) |builtin| inline for (std.meta.tags(card_mod.CardRole)) |role| {
+        const theme = builtin.value;
+        const rows = try card_mod.project(a, body, .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = role, .header = "Ada", .content_width = 76, .metrics = .bytes, .collapsed_rows = 0 });
+        try testing.expectEqual(@as(usize, 2), rows.len);
+        for ([_]bool{ false, true }) |focused| {
+            drawReviewCard(a, win, 0, rows[1], if (focused) cursorRowTheme(theme) else theme);
+            try testing.expectEqualStrings("p", win.readCell(4, 0).?.char.grapheme);
+            try testing.expect(!win.readCell(4, 0).?.style.bold);
+            try testing.expectEqualStrings("x", win.readCell(10, 0).?.char.grapheme);
+            try testing.expectEqualStrings("a", win.readCell(18, 0).?.char.grapheme);
+            const link = win.readCell(10, 0).?.style;
+            try testing.expectEqual(theme.markdown_bold, link.fg);
+            try testing.expect(link.bold and link.italic and link.strikethrough and link.ul_style == .single);
+            const code = win.readCell(18, 0).?.style;
+            try testing.expectEqual(theme.markdown_inline_code, code.fg);
+            try testing.expect(code.bold and code.italic and !code.strikethrough);
+            for ([_]bool{ false, true }) |active| {
+                drawReviewCardSearchRange(win, 0, rows[1], .{ .visual_row = 0, .relation = .neutral, .source = .{ .start = 12, .end = 13 }, .row = .{ .start = 0, .end = 1 }, .active = active }, active, theme);
+                const matched = win.readCell(10, 0).?.style;
+                try testing.expectEqual(if (active) theme.search_active else theme.search_match, matched.bg);
+                try testing.expectEqual(link.fg, matched.fg);
+                try testing.expect(matched.bold and matched.italic and matched.strikethrough and matched.ul_style == .single);
+            }
+        }
+    };
+}
+
 test "DiffPane title reserves and renders published Selected Version targets" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -3069,7 +3850,7 @@ test "SideBySide WholeFile accents only the selected header and inner gutter edg
     try testing.expectEqual(theme_dark.added.bg, win.readCell(half + 1 + side_gutter, 1).?.style.bg);
 }
 
-test "a woven comment renders with its marker and style; a suggestion is distinct" {
+test "M23 ancestry woven Comment and Suggestion retain distinct markers and styles" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -3089,7 +3870,7 @@ test "a woven comment renders with its marker and style; a suggestion is distinc
         .{ .id = 2, .parent_id = 1, .author = "Bo", .body = "```suggestion\nrenamed\n```" },
     };
     const threads = try bbr.review.buildThreads(a, &comments);
-    const buf = try buffer_mod.buildWithComments(a, diff, .unified, threads, .{});
+    const buf = try buffer_mod.buildWithComments(a, diff, .unified, threads, .{ .card_width = 51 });
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
@@ -3104,12 +3885,12 @@ test "a woven comment renders with its marker and style; a suggestion is distinc
     // Root comment marker "▸" at its indent (col 2 within the pane).
     try testing.expectEqualStrings("▸", win.readCell(px + 2, 4).?.char.grapheme);
     try testing.expectEqual(theme_dark.comment.bg, win.readCell(px + 2, 4).?.style.bg);
-    try testing.expectEqualStrings("±", win.readCell(px + 6, 6).?.char.grapheme);
-    try testing.expectEqual(theme_dark.comment_reply.bg, win.readCell(px + 6, 6).?.style.bg);
-    try testing.expectEqualStrings("s", win.readCell(px + 8, 7).?.char.grapheme);
-    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 8, 7).?.style.bg);
-    try testing.expectEqualStrings("r", win.readCell(px + 8, 8).?.char.grapheme);
-    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 8, 8).?.style.bg);
+    try testing.expectEqualStrings("±", win.readCell(px + 3, 6).?.char.grapheme);
+    try testing.expectEqual(theme_dark.comment_reply.bg, win.readCell(px + 3, 6).?.style.bg);
+    try testing.expectEqualStrings("s", win.readCell(px + 5, 7).?.char.grapheme);
+    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 5, 7).?.style.bg);
+    try testing.expectEqualStrings("r", win.readCell(px + 5, 8).?.char.grapheme);
+    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 5, 8).?.style.bg);
 }
 
 test "the help overlay floats a centered Keybindings modal from the Keymap" {
@@ -3158,7 +3939,7 @@ test "help keeps refused source Actions visible with typed reasons" {
         .inline_comment_refusal = .not_hunk_line,
         .suggestion_refusal = .old_version,
     });
-    try testing.expect(!helpRowAvailable(rows.commands, "yank source text (old content unavailable)").?);
+    try testing.expect(!helpRowAvailable(rows.commands, "yank text (old content unavailable)").?);
     try testing.expect(!helpRowAvailable(rows.commands, "inline comment (not a Hunk Line)").?);
     try testing.expect(!helpRowAvailable(rows.commands, "suggestion (requires new File version)").?);
 }

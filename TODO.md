@@ -361,6 +361,24 @@ as in Review Search.
 - [ ] Add a scrollbar to the DiffPane. Track its visual rows across layouts, wrapped lines, Folds, and isolated Files. Hide it when every row fits.
 - [ ] Add headless Presentation tests for thumb size and position at the top, middle, and bottom, plus resize and content changes.
 
+## M31 - Product reference navigation and preview investigation  ·  S/M  ·  needs M23
+Decide how reviewers can follow or preview product references in a ReviewBody, such as
+`pull request #1541` or a Jira key. M23 keeps these references as authored text.
+
+- [ ] Identify the reference forms Bitbucket Cloud supports in Comments. Record the Repository and integration context each form needs.
+- [ ] Investigate destination resolution and preview data for PullRequest, issue, and Jira references. Identify available APIs and the behavior when context, access, or preview data is unavailable.
+- [ ] Compare navigation to the destination with an in-place preview. Define the Actions, return behavior, loading state, and failure behavior for the selected approach.
+- [ ] Review concrete examples with a human and record the decision before planning implementation.
+
+## M32 - ReviewBody image rendering investigation  ·  S/M  ·  needs M23
+Decide whether bbr can show images from ReviewBody image references in the terminal.
+M23 shows an image label, alternative text, and the authored destination.
+
+- [ ] Investigate terminal image protocols and text fallbacks across the supported terminals. Check compatibility with the existing terminal adapter.
+- [ ] Investigate image acquisition for absolute URLs, relative references, and Bitbucket attachments. Define the context each source needs and the behavior when acquisition fails.
+- [ ] Compare inline images with a separate image preview. Review sizing, aspect ratio, scrolling, Reply indentation, and ReviewCard disclosure with a human.
+- [ ] Evaluate acquisition latency, image decoding, memory limits, and cache lifetime. Record the selected behavior and evidence before planning implementation.
+
 ### Closed historical deferrals
 
 The following notes remain in M0–M14 as implementation history but require no post-M14 work:
@@ -388,7 +406,8 @@ M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M10    (authoring → submission)
               ├─ M14 ─ M19       (operational hardening & product gates)
               ├─ M15 ─ M17 ─ M20 ─ M21 (side-aware inspection → review search)
               ├─ M15 ─ M17 ─ M22 (durable File read state)
-              ├─ M15 ─ M23       (comment thread presentation fixes)
+              ├─ M15 ─ M23 ─ M31 (comment presentation → product reference investigation)
+              ├─ M15 ─ M23 ─ M32 (ReviewBody image rendering investigation)
               ├─ M4 ─ M15 ─ M24 ─ M25 (remote-first Browser and navigation)
               ├─ M19 ─ M26       (Credential login and logout)
               ├─ M13 ─ M17 ─ M27 (UserGrammar sandbox research)
@@ -399,6 +418,6 @@ M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M10    (authoring → submission)
 
 **MVP line:** M0–M3 gives a usable read-only reviewer; M4 makes it ergonomic; M6+M10 make it
 write-capable (the headline). M5/M7/M8/M9/M11/M12/M13 are parallelizable polish once M2 lands; M14 is the
-largest standalone feature and depends only on read + authoring, not submission. M15–M30 gather
+largest standalone feature and depends only on read + authoring, not submission. M15–M32 gather
 all still-actionable follow-ups recorded by the completed milestones, design open questions,
 ADRs, domain docs, and the local issue tracker.
