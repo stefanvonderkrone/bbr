@@ -974,6 +974,11 @@ fn loadPullRequestSummaries(
     summaries.prs = try client.listPullRequests(summaries.arena.allocator(), repository, .{});
 }
 
+fn presentationCodeHighlightWorker(loop: *Loop, work_id: u64, highlighter: bbr.highlight.Highlighter, command: *@import("code_highlighting.zig").Analyze) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    presentation_runtime.deliver(presentationSink(&sink_context), .{ .code_highlight_completed = command.execute(highlighter) });
+}
+
 fn drainPresentationCommands(
     state: *presentation.Presentation,
     ctx: RunCtx,
@@ -1026,6 +1031,7 @@ fn drainPresentationCommands(
             .load_session => |load| ctx.io.concurrent(presentationLoadWorker, .{ loop, work_id, ctx.io, workerBitbucketForReviewKind(ctx.bitbucket, load.key.kind), load }),
             .prepare_session => |job| ctx.io.concurrent(presentationPrepareSessionWorker, .{ loop, work_id, job }),
             .enrich_file => |enrich| ctx.io.concurrent(presentationEnrichmentWorker, .{ loop, work_id, ctx.io, workerBitbucketForEnrichment(ctx.bitbucket, enrich.source), ctx.highlighter, enrich }),
+            .highlight_code => |job| ctx.io.concurrent(presentationCodeHighlightWorker, .{ loop, work_id, ctx.highlighter, job }),
             .post_draft => |post| ctx.io.concurrent(presentationPostWorker, .{ loop, work_id, ctx.bitbucket.?, post }),
             .update_comment => |update| ctx.io.concurrent(presentationCommentEditWorker, .{ loop, work_id, ctx.bitbucket.?, update }),
             .delete_comment => |delete| ctx.io.concurrent(presentationCommentDeleteWorker, .{ loop, work_id, ctx.bitbucket.?, delete }),
@@ -1062,6 +1068,7 @@ fn workerBitbucketForEnrichment(client: ?bbr.bitbucket.Client, source: presentat
 
 fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *presentation.OwnedCommand) !void {
     const input: presentation.OwnedInput = switch (command.*) {
+        .highlight_code => |job| .{ .code_highlight_completed = job.launchFailed() },
         .load_session => |load| .{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .failed = error.WorkerLaunchFailed } } },
         .prepare_session => |job| job.launchFailed(),
         .enrich_file => |enrich| .{ .file_enrichment_completed = .{

@@ -3,6 +3,16 @@
 const std = @import("std");
 const emoji = @import("emoji.zig");
 
+test "M23 highlighting keeps only the first fence information token" {
+    const body = try ReviewBody.parse(std.testing.allocator, "```TS extra\nconst a = 1;\n```\n\n> ~~~javascript extra\n> let b = 2;\n> ~~~");
+    defer freeBlocks(std.testing.allocator, body.blocks);
+    try std.testing.expectEqualStrings("TS", body.blocks[0].fence_identifier);
+    try std.testing.expectEqualStrings("javascript", body.blocks[2].fence_identifier);
+    const whitespace = try ReviewBody.parse(std.testing.allocator, "```\x0bTS\x0cextra\nx\n```");
+    defer freeBlocks(std.testing.allocator, whitespace.blocks);
+    try std.testing.expectEqualStrings("TS", whitespace.blocks[0].fence_identifier);
+}
+
 test "M23 emoji converts exact fixture sequences through shared prose rules" {
     const raw = "## **:heart: :one: :flag_gb: :woman_technologist::skin-tone-2:**\n\n- :mask:\n\n> [:thumbsup::skin-tone-2:](url/:mask:)\n\n| :white_check_mark: |\n| --- |\n| :mask: |";
     const body = try ReviewBody.parse(std.testing.allocator, raw);
@@ -115,6 +125,7 @@ pub const Block = struct {
     outer_indent: usize = 0,
     quote_path: []const u8 = "",
     marker: ?ListMarker = null,
+    fence_identifier: []const u8 = "",
 };
 
 pub const ListMarker = union(enum) { bullet, number: usize };
@@ -230,7 +241,7 @@ pub const ReviewBody = struct {
                     if (fence.closes(candidate.text)) {
                         const spans = try codeSpans(allocator, source, content_start, scan, fence.indent);
                         errdefer allocator.free(spans);
-                        try blocks.append(allocator, .{ .kind = if (fence.suggestion) .suggestion else .code, .source = .{ .start = start, .end = candidate.next }, .spans = spans, .fences = .{ .{ .start = start, .end = content_start }, .{ .start = scan, .end = candidate.next } } });
+                        try blocks.append(allocator, .{ .kind = if (fence.suggestion) .suggestion else .code, .source = .{ .start = start, .end = candidate.next }, .spans = spans, .fence_identifier = fence.identifier, .fences = .{ .{ .start = start, .end = content_start }, .{ .start = scan, .end = candidate.next } } });
                         pos = candidate.next;
                         break;
                     }
@@ -647,6 +658,7 @@ fn containerBlock(allocator: std.mem.Allocator, source: []const u8, start: usize
         if (fence == null or found_close) {
             while (spans.items.len > 0 and spans.items[spans.items.len - 1].source.end > result.source.end) spans.items.len -= 1;
             result.kind = if (fence != null and fence.?.suggestion) .suggestion else .code;
+            result.fence_identifier = if (fence) |opening| opening.identifier else "";
             result.spans = try spans.toOwnedSlice(allocator);
             return result;
         }
@@ -728,6 +740,7 @@ const Fence = struct {
     length: usize,
     indent: usize,
     suggestion: bool,
+    identifier: []const u8,
 
     fn closes(self: Fence, line: []const u8) bool {
         var indent: usize = 0;
@@ -746,7 +759,16 @@ fn fenceOpen(line: []const u8) ?Fence {
     if (length < 3) return null;
     const info = trimmed(line[indent + length ..]);
     if (line[indent] == '`' and std.mem.indexOfScalar(u8, info, '`') != null) return null;
-    return .{ .character = line[indent], .length = length, .indent = indent, .suggestion = std.mem.eql(u8, info, "suggestion") };
+    var start: usize = 0;
+    while (start < info.len and infoWhitespace(info[start])) start += 1;
+    var end = start;
+    while (end < info.len and !infoWhitespace(info[end])) end += 1;
+    const identifier = info[start..end];
+    return .{ .character = line[indent], .length = length, .indent = indent, .suggestion = std.mem.eql(u8, info, "suggestion"), .identifier = identifier };
+}
+
+fn infoWhitespace(byte: u8) bool {
+    return byte == ' ' or (byte >= '\t' and byte <= '\r');
 }
 
 fn codeIndent(line: []const u8) ?usize {

@@ -272,6 +272,10 @@ pub fn build(b: *std.Build) void {
     const literal_step = b.step("test-literal-code", "Run literal code presentation tests");
     literal_step.dependOn(&b.addRunArtifact(literal_tests).step);
 
+    const code_tests = b.addTest(.{ .name = "code-highlighting-tests", .root_module = exe.root_module, .filters = &.{"M23 highlighting"} });
+    const code_step = b.step("test-code-highlighting", "Run fenced-code Highlighting tests");
+    code_step.dependOn(&b.addRunArtifact(code_tests).step);
+
     const container_tests = b.addTest(.{
         .name = "container-tests",
         .root_module = exe.root_module,
