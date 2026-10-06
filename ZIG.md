@@ -299,6 +299,15 @@ the main thread; the Epoch token still guards against stale results.
 
 ---
 
+## 8. Terminal input
+
+- `std.posix.tcgetattr(fd)` returns `TermiosGetError!termios` (`std/posix.zig:1161-1173`).
+  A pipe returns `error.NotATerminal`.
+- `std.posix.tcsetattr(fd, .NOW, term)` takes the `termios` value (`std/posix.zig:1176-1189`).
+  `bbr login` restores the original value with `defer` after each Token prompt.
+- On macOS, `term.lflag.ECHO` and `term.lflag.ECHONL` are boolean fields (`std/c.zig:9332-9339`).
+  The Token prompt clears both fields and writes its own newline.
+
 ## Re-verification checklist (on any Zig upgrade)
 - [ ] `std.process.Init` shape (`gpa`/`arena`/`io`/`environ_map`/`minimal.args`) unchanged?
 - [ ] `Environ.Map.get`/`.put` and `main(init)` entry still the way to read env?
@@ -311,6 +320,7 @@ the main thread; the Epoch token still guards against stale results.
 - [ ] `ArenaAllocator.reset(.{ .retain_with_limit = bytes })` failure semantics unchanged?
 - [ ] `ArenaAllocator.queryCapacity` semantics still exclude internal node storage?
 - [ ] `std.Io.Reader`/`Writer` method surface we use unchanged?
+- [ ] `std.posix.tcgetattr`, `tcsetattr`, and the `ECHO` and `ECHONL` fields unchanged?
 - [ ] libvaxis still builds against the new toolchain; re-pin its commit.
 - [ ] libvaxis `Vaxis.copyToSystemClipboard` signature and OSC 52 behavior unchanged?
 - [ ] `Io.Clock.awake` / `Timestamp.untilNow` / `Duration.toNanoseconds` unchanged?

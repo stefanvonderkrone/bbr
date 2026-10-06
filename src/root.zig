@@ -149,6 +149,7 @@ pub const bitbucket = struct {
     pub const ListOptions = client_mod.ListOptions;
     pub const base_url = client_mod.base_url;
     pub const Credential = @import("bitbucket/credential.zig").Credential;
+    pub const auth = @import("bitbucket/auth.zig");
     pub const types = @import("bitbucket/types.zig");
     pub const PullRequest = types.PullRequest;
     pub const PullRequestSummary = types.PullRequestSummary;
@@ -165,6 +166,7 @@ test {
     _ = @import("http/fake_client.zig");
     _ = @import("http/std_client.zig");
     _ = @import("bitbucket/credential.zig");
+    _ = @import("bitbucket/auth.zig");
     _ = @import("bitbucket/client.zig");
     _ = @import("bitbucket/poster.zig");
     _ = @import("bitbucket/types.zig");
