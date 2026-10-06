@@ -1,5 +1,5 @@
 //! `bbr api` dispatcher: one verb table row per endpoint, global
-//! `--workspace` / `--json` / `--help`, per-verb long flags. Never starts
+//! `--profile` / `--workspace` / `--json` / `--help`, per-verb long flags. Never starts
 //! the TUI: this module only builds `StdHttpClient` + `Client` and runs one
 //! verb. Add a new endpoint as one `Client` method + one table row (+ one
 //! function in the matching `src/api/*.zig` resource file).
@@ -56,11 +56,12 @@ const verbs = [_]Verb{
 
 pub const help = blk: {
     var text: []const u8 =
-        \\usage: bbr api [--workspace SLUG] [--json] VERB [options]
+        \\usage: bbr api [--profile NAME] [--workspace SLUG] [--json] VERB [options]
         \\
         \\Talk to the Bitbucket Cloud REST API (api.bitbucket.org/2.0) without the TUI.
-        \\Global flags can go before or after the verb. --workspace overrides BITBUCKET_WORKSPACE,
-        \\--json prints machine-readable JSON, --help prints this reference.
+        \\Global flags can go before or after the verb.
+        \\--profile selects a saved Profile. --workspace overrides its Workspace and BITBUCKET_WORKSPACE.
+        \\--json prints machine-readable JSON. --help prints this reference.
         \\`bbr api VERB --help` prints the verb's options. All flags are long
         \\`--kebab-case`; there are no short aliases.
         \\
@@ -68,8 +69,9 @@ pub const help = blk: {
         \\
     ;
     for (verbs) |verb| text = text ++ "  " ++ verb.name ++ "  " ++ verb.summary ++ "\n";
-    break :blk text ++ "\nAuth comes from BITBUCKET_USERNAME and BITBUCKET_TOKEN.\n" ++
-        "Workspace comes from --workspace or BITBUCKET_WORKSPACE.\n";
+    break :blk text ++ "\nAuth comes from `bbr login` Profiles with per-field BITBUCKET_* overrides.\n" ++
+        "Profile selection: --profile, BBR_PROFILE, Active Profile, default.\n" ++
+        "Workspace selection: --workspace, BITBUCKET_WORKSPACE, selected Profile.\n";
 };
 
 const value_flags = [_][]const u8{
@@ -81,7 +83,7 @@ const value_flags = [_][]const u8{
     "revision",  "source-commit", "destination-commit", "expected-source-commit",
     "uuid",      "out",           "pagelen",            "page",
     "query",     "sort",          "limit",              "attributes",
-    "verdict",
+    "verdict",   "profile",
 };
 
 fn takesValue(name: []const u8) bool {
@@ -90,7 +92,7 @@ fn takesValue(name: []const u8) bool {
 }
 
 /// Split argv (after `api`) into globals + verb + verb args.
-/// Strips `--json` (sets json) and `--workspace V` (sets override) wherever
+/// Strips `--json`, `--workspace V`, and `--profile V` wherever
 /// they appear as flags (never as a value-flag's value). `--help` anywhere
 /// sets help_only.
 const Parsed = struct {
@@ -98,6 +100,7 @@ const Parsed = struct {
     rest: []const []const u8,
     json: bool,
     workspace: ?[]const u8,
+    profile: ?[]const u8,
     help_only: bool,
 };
 
@@ -110,6 +113,7 @@ fn parseGlobal(
     var verb: ?[]const u8 = null;
     var json = false;
     var workspace: ?[]const u8 = null;
+    var profile: ?[]const u8 = null;
     var help_only = false;
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -123,13 +127,14 @@ fn parseGlobal(
                 json = true;
                 continue;
             }
-            if (std.mem.eql(u8, f.name, "workspace")) {
+            if (std.mem.eql(u8, f.name, "workspace") or std.mem.eql(u8, f.name, "profile")) {
                 const v = if (f.value) |v| v else blk: {
                     i += 1;
                     if (i >= argv.len) return error.MissingValue;
                     break :blk argv[i];
                 };
-                workspace = v;
+                if (v.len == 0) return error.MissingValue;
+                if (std.mem.eql(u8, f.name, "workspace")) workspace = v else profile = v;
                 continue;
             }
             // Any other flag: keep verbatim (plus its value, when it takes
@@ -154,6 +159,7 @@ fn parseGlobal(
         .rest = try rest.toOwnedSlice(gpa),
         .json = json,
         .workspace = workspace,
+        .profile = profile,
         .help_only = help_only,
     };
 }
@@ -169,7 +175,7 @@ fn writeHelp(writer: *std.Io.Writer, name: ?[]const u8) !void {
     if (name) |n| {
         if (findVerb(n)) |verb| {
             try writer.writeAll(verb.help);
-            try writer.writeAll("\nGlobal options: --workspace SLUG, --json, --help.\n");
+            try writer.writeAll("\nGlobal options: --profile NAME, --workspace SLUG, --json, --help.\n");
             try writer.print("\nExample:\n  {s}\n", .{verb.example});
             return;
         }
@@ -179,7 +185,8 @@ fn writeHelp(writer: *std.Io.Writer, name: ?[]const u8) !void {
 
 fn isOptionError(err: anyerror) bool {
     return err == error.UnknownFlag or err == error.MissingRequired or
-        err == error.MissingValue or err == error.InvalidNumber or err == error.BadRequest;
+        err == error.MissingValue or err == error.InvalidNumber or err == error.BadRequest or
+        err == error.InvalidProfileName;
 }
 
 fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror) !void {
@@ -191,7 +198,7 @@ fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror) !void {
     } else {
         try writer.print(": {s}\n", .{@errorName(err)});
         if (err == error.MissingCredential) {
-            try writer.writeAll("Set BITBUCKET_USERNAME, BITBUCKET_TOKEN, and --workspace or BITBUCKET_WORKSPACE.\n");
+            try writer.writeAll("Run `bbr login` or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, and --workspace or BITBUCKET_WORKSPACE.\n");
         }
     }
 }
@@ -239,31 +246,36 @@ fn verbHelp(name: []const u8) []const u8 {
 }
 
 fn cliCredential(
+    gpa: std.mem.Allocator,
+    io: std.Io,
     env: *const std.process.Environ.Map,
     workspace: ?[]const u8,
-) bbr.bitbucket.Credential.Error!bbr.bitbucket.Credential {
-    return .{
-        .username = env.get("BITBUCKET_USERNAME") orelse return error.MissingUsername,
-        .token = env.get("BITBUCKET_TOKEN") orelse return error.MissingToken,
-        .workspace = workspace orelse env.get("BITBUCKET_WORKSPACE") orelse return error.MissingWorkspace,
-    };
+    profile: ?[]const u8,
+) !bbr.bitbucket.auth.OwnedCredential {
+    if (workspace) |value| {
+        var overrides = try env.clone(gpa);
+        defer overrides.deinit();
+        try overrides.put("BITBUCKET_WORKSPACE", value);
+        return bbr.bitbucket.auth.resolve(gpa, io, &overrides, profile);
+    }
+    return bbr.bitbucket.auth.resolve(gpa, io, env, profile);
 }
 
-/// Entry from `main.zig`: `bbr api [...]`. Never touches config or the TUI.
-pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
+/// Entry from `main.zig`: `bbr api [...]`. Reads auth without loading TUI config.
+pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, profile: ?[]const u8) !void {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     while (it.next()) |a| argv.append(gpa, a) catch |err| {
         try printError(init, diagnosticVerb(argv.items), err);
         return err;
     };
-    runArgs(init, gpa, argv.items) catch |err| {
+    runArgs(init, gpa, argv.items, profile) catch |err| {
         try printError(init, diagnosticVerb(argv.items), err);
         return err;
     };
 }
 
-fn runArgs(init: std.process.Init, gpa: std.mem.Allocator, argv: []const []const u8) !void {
+fn runArgs(init: std.process.Init, gpa: std.mem.Allocator, argv: []const []const u8, profile: ?[]const u8) !void {
     const parsed = try parseGlobal(gpa, argv);
     defer gpa.free(parsed.rest);
 
@@ -276,12 +288,16 @@ fn runArgs(init: std.process.Init, gpa: std.mem.Allocator, argv: []const []const
 
     const entry = findVerb(verb) orelse return error.UnknownFlag;
 
-    const cred = cliCredential(init.environ_map, parsed.workspace) catch return error.MissingCredential;
+    var owned = cliCredential(gpa, init.io, init.environ_map, parsed.workspace, parsed.profile orelse profile) catch |err| switch (err) {
+        error.MissingUsername, error.MissingToken, error.MissingWorkspace => return error.MissingCredential,
+        else => return err,
+    };
+    defer owned.deinit(gpa);
 
     var transport = bbr.http.StdHttpClient.init(gpa, init.io);
     defer transport.deinit();
     try transport.initDefaultProxies(init.arena.allocator(), init.environ_map);
-    const bb = bbr.bitbucket.Client.init(transport.httpClient(), cred);
+    const bb = bbr.bitbucket.Client.init(transport.httpClient(), owned.credential());
 
     try entry.handler(init, bb, parsed.rest, parsed.json);
 }
@@ -307,6 +323,24 @@ test "parseGlobal keeps flag values intact" {
     try std.testing.expectEqual(@as(usize, 2), p.rest.len);
 }
 
+test "parseGlobal extracts Profiles without consuming verb flag values" {
+    const a = std.testing.allocator;
+    for ([_][]const []const u8{
+        &.{ "--profile", "work", "create-comment", "--body", "--profile", "--workspace=demo" },
+        &.{ "create-comment", "--body", "--profile", "--profile=work", "--workspace", "demo" },
+    }) |argv| {
+        const parsed = try parseGlobal(a, argv);
+        defer a.free(parsed.rest);
+        try std.testing.expectEqualStrings("work", parsed.profile.?);
+        try std.testing.expectEqualStrings("demo", parsed.workspace.?);
+        try std.testing.expectEqual(@as(usize, 2), parsed.rest.len);
+        try std.testing.expectEqualStrings("--body", parsed.rest[0]);
+        try std.testing.expectEqualStrings("--profile", parsed.rest[1]);
+    }
+    try std.testing.expectError(error.MissingValue, parseGlobal(a, &.{ "whoami", "--profile" }));
+    try std.testing.expectError(error.MissingValue, parseGlobal(a, &.{ "whoami", "--profile=" }));
+}
+
 test "verb registry is unique and every entry has matching help" {
     try std.testing.expectEqual(@as(usize, 28), verbs.len);
     inline for (verbs, 0..) |verb, index| {
@@ -318,7 +352,7 @@ test "verb registry is unique and every entry has matching help" {
         var writer = std.Io.Writer.fixed(&buffer);
         try writeHelp(&writer, verb.name);
         try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), verb.example) != null);
-        try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "Global options: --workspace SLUG, --json, --help.") != null);
+        try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "Global options: --profile NAME, --workspace SLUG, --json, --help.") != null);
     }
     try std.testing.expect(findVerb("frobnicate") == null);
     try std.testing.expectEqualStrings(help, verbHelp("frobnicate"));
@@ -334,23 +368,71 @@ test "CLI workspace override works without an environment workspace" {
     try env.put("BITBUCKET_TOKEN", "test-token");
     const parsed = try parseGlobal(a, &.{ "list-prs", "--workspace", "flag-workspace" });
     defer a.free(parsed.rest);
-    const cred = try cliCredential(&env, parsed.workspace);
+    var cred = try cliCredential(a, std.testing.io, &env, parsed.workspace, null);
+    defer cred.deinit(a);
     try std.testing.expectEqualStrings("flag-workspace", cred.workspace);
     try std.testing.expectEqualStrings("test-user", cred.username);
     try std.testing.expectEqualStrings("test-token", cred.token);
     try env.put("BITBUCKET_WORKSPACE", "env-workspace");
-    try std.testing.expectEqualStrings("flag-workspace", (try cliCredential(&env, parsed.workspace)).workspace);
-    try std.testing.expectEqualStrings("env-workspace", (try cliCredential(&env, null)).workspace);
+    var override = try cliCredential(a, std.testing.io, &env, parsed.workspace, null);
+    defer override.deinit(a);
+    try std.testing.expectEqualStrings("flag-workspace", override.workspace);
+    var from_env = try cliCredential(a, std.testing.io, &env, null, null);
+    defer from_env.deinit(a);
+    try std.testing.expectEqualStrings("env-workspace", from_env.workspace);
+    try std.testing.expectEqualStrings("env-workspace", env.get("BITBUCKET_WORKSPACE").?);
 }
 
 test "CLI credentials require username token and a workspace" {
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
-    try std.testing.expectError(error.MissingUsername, cliCredential(&env, "flag-workspace"));
+    try std.testing.expectError(error.MissingUsername, cliCredential(std.testing.allocator, std.testing.io, &env, "flag-workspace", null));
     try env.put("BITBUCKET_USERNAME", "test-user");
-    try std.testing.expectError(error.MissingToken, cliCredential(&env, "flag-workspace"));
+    try std.testing.expectError(error.MissingToken, cliCredential(std.testing.allocator, std.testing.io, &env, "flag-workspace", null));
     try env.put("BITBUCKET_TOKEN", "test-token");
-    try std.testing.expectError(error.MissingWorkspace, cliCredential(&env, null));
+    try std.testing.expectError(error.MissingWorkspace, cliCredential(std.testing.allocator, std.testing.io, &env, null, null));
+}
+
+test "API credentials use saved Profiles and per-field overrides" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer a.free(base);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", base);
+    const path = try bbr.bitbucket.auth.save(a, std.testing.io, &env, "personal", &.{
+        .{ .name = "personal", .username = "personal-user", .token = "personal-token", .workspace = "personal-workspace" },
+        .{ .name = "work", .username = "work-user", .token = "work-token", .workspace = "" },
+    });
+    defer a.free(path);
+
+    var active = try cliCredential(a, std.testing.io, &env, null, null);
+    defer active.deinit(a);
+    try std.testing.expectEqualStrings("personal-user", active.username);
+    try std.testing.expectEqualStrings("personal-token", active.token);
+    try std.testing.expectEqualStrings("personal-workspace", active.workspace);
+
+    try env.put("BBR_PROFILE", "work");
+    try std.testing.expectError(error.MissingWorkspace, cliCredential(a, std.testing.io, &env, null, null));
+    var work = try cliCredential(a, std.testing.io, &env, "flag-workspace", null);
+    defer work.deinit(a);
+    try std.testing.expectEqualStrings("work-user", work.username);
+    try std.testing.expectEqualStrings("work-token", work.token);
+    try std.testing.expectEqualStrings("flag-workspace", work.workspace);
+    try std.testing.expect(env.get("BITBUCKET_WORKSPACE") == null);
+
+    try env.put("BITBUCKET_USERNAME", "override-user");
+    try env.put("BITBUCKET_TOKEN", "");
+    try env.put("BITBUCKET_WORKSPACE", "env-workspace");
+    var override = try cliCredential(a, std.testing.io, &env, "flag-workspace", "personal");
+    defer override.deinit(a);
+    try std.testing.expectEqualStrings("personal", override.profile);
+    try std.testing.expectEqualStrings("override-user", override.username);
+    try std.testing.expectEqualStrings("personal-token", override.token);
+    try std.testing.expectEqualStrings("flag-workspace", override.workspace);
+    try std.testing.expectEqualStrings("env-workspace", env.get("BITBUCKET_WORKSPACE").?);
 }
 
 test "global and every verb help write examples to stdout without credentials" {
@@ -361,13 +443,13 @@ test "global and every verb help write examples to stdout without credentials" {
     defer arena.deinit();
     var output: TestOutput = .{};
     var global: arg.Cursor = .{ .args = &.{"--help"} };
-    try run(output.init(&env, &arena), a, &global);
+    try run(output.init(&env, &arena), a, &global, null);
     try std.testing.expectEqualStrings(help, output.stdoutBytes());
     try std.testing.expectEqual(@as(usize, 0), output.stderr_len);
     for (verbs) |verb| {
         output = .{};
         var args: arg.Cursor = .{ .args = &.{ verb.name, "--help" } };
-        try run(output.init(&env, &arena), a, &args);
+        try run(output.init(&env, &arena), a, &args, null);
         try std.testing.expect(std.mem.startsWith(u8, output.stdoutBytes(), verb.help));
         try std.testing.expect(std.mem.indexOf(u8, output.stdoutBytes(), verb.example) != null);
         try std.testing.expectEqual(@as(usize, 0), output.stderr_len);
@@ -400,7 +482,7 @@ test "global parse errors use stderr and name only a safely supplied verb" {
         var output: TestOutput = .{};
         var args: arg.Cursor = .{ .args = case.args };
         const expected: anyerror = if (case.args.len == 1) error.UnknownFlag else error.MissingValue;
-        try std.testing.expectError(expected, run(output.init(&env, &arena), a, &args));
+        try std.testing.expectError(expected, run(output.init(&env, &arena), a, &args, null));
         try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
         try std.testing.expect(std.mem.startsWith(u8, output.stderrBytes(), case.prefix));
         try std.testing.expect(std.mem.indexOf(u8, output.stderrBytes(), case.hidden) == null);
@@ -415,7 +497,7 @@ test "credential handler and proxy initialization errors stay on stderr with jso
     defer arena.deinit();
     var output: TestOutput = .{};
     var missing: arg.Cursor = .{ .args = &.{ "whoami", "--json" } };
-    try std.testing.expectError(error.MissingCredential, run(output.init(&env, &arena), a, &missing));
+    try std.testing.expectError(error.MissingCredential, run(output.init(&env, &arena), a, &missing, null));
     try std.testing.expect(std.mem.startsWith(u8, output.stderrBytes(), "bbr api whoami: MissingCredential\n"));
     try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
 
@@ -424,7 +506,7 @@ test "credential handler and proxy initialization errors stay on stderr with jso
     try env.put("BITBUCKET_WORKSPACE", "private-workspace");
     output = .{};
     var invalid: arg.Cursor = .{ .args = &.{ "whoami", "--json", "--uuid=private-value" } };
-    try std.testing.expectError(error.UnknownFlag, run(output.init(&env, &arena), a, &invalid));
+    try std.testing.expectError(error.UnknownFlag, run(output.init(&env, &arena), a, &invalid, null));
     try std.testing.expect(std.mem.startsWith(u8, output.stderrBytes(), "bbr api whoami: bad options (UnknownFlag)\n"));
     try std.testing.expect(std.mem.indexOf(u8, output.stderrBytes(), "Example:\n  bbr api whoami --json\n") != null);
     try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
@@ -433,7 +515,7 @@ test "credential handler and proxy initialization errors stay on stderr with jso
     try env.put("https_proxy", "socks5://private-proxy.invalid");
     output = .{};
     var proxy: arg.Cursor = .{ .args = &.{ "whoami", "--json" } };
-    try std.testing.expectError(error.InvalidProxyConfiguration, run(output.init(&env, &arena), a, &proxy));
+    try std.testing.expectError(error.InvalidProxyConfiguration, run(output.init(&env, &arena), a, &proxy, null));
     try std.testing.expectEqualStrings("bbr api whoami: InvalidProxyConfiguration\n", output.stderrBytes());
     try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
 }

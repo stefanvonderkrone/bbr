@@ -35,8 +35,16 @@ A classified Bitbucket response failure, distinct from a transport error: `rate_
 _Avoid_: HTTP error, status, exception.
 
 **Credential**:
-The Atlassian account email plus API token used for HTTP Basic auth, read from the environment. Never logged, never persisted.
+The Atlassian account email plus API token used for HTTP Basic auth, with the Workspace scoping every API call. Resolved per field from the environment (`BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, `BITBUCKET_WORKSPACE`) over the saved Profile. Never logged; persisted only in `auth.toml` (`0600`).
 _Avoid_: password, app password, secret, key.
+
+**Profile**:
+One named Credential set in `auth.toml` (`[profiles.<name>]`), selected by `--profile`, then `BBR_PROFILE`, then the file's Active Profile, then `default`. `bbr login [profile]` verifies live and saves; `bbr logout [profile|--all]` removes.
+_Avoid_: account, provider, login (the command, not the thing).
+
+**Active Profile**:
+The Profile that runs when no override exists, recorded as `active_profile` in `auth.toml`. A successful `bbr login [profile]` selects it as active.
+_Avoid_: default profile (that is only the fallback name), current user.
 
 **Authenticated Account**:
 The Bitbucket account proven by the current Credential, identified for mutation ownership by its UUID. Acquisition is an independent capability: failure to acquire it does not fail Review loading, but published Comment mutation remains unavailable until ownership can be proven. A `401` invalidates the cached identity.

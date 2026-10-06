@@ -26,7 +26,7 @@ suggestions that stay **pending locally** until you submit them as a batch.
 ## Key decisions at a glance
 
 - **Target:** Bitbucket Cloud (`api.bitbucket.org/2.0`), workspace `check24`; HTTP Basic with an
-  Atlassian API token from the environment.
+  Atlassian API token saved via `bbr login` (environment override available).
 - **Stack:** Zig 0.16.0, libvaxis (TUI), zf (fuzzy find), SQLite/libSQL (pending reviews),
   tree-sitter (highlighting, post-MVP).
 - **Pending review is client-side** — Bitbucket Cloud has no native draft concept
@@ -81,10 +81,31 @@ zig build run -- local [base-ref] [source-ref]  # committed local review (no cre
 Credential. The `check*` commands are explicit local opt-ins and are never part of `test`; see
 [`docs/m19-operations.md`](docs/m19-operations.md) for their gates and scope.
 
-Remote-review credentials come from the environment only (never a config file, never persisted):
-`BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, `BITBUCKET_WORKSPACE`. `bbr local` does not read or
+Remote-review credentials are managed with `bbr login` / `bbr logout` and stored in
+`$XDG_DATA_HOME/bbr/auth.toml` (fallback `$HOME/.local/share/bbr/auth.toml`, mode `0600`).
+`bbr login [profile]` prompts for Email, API Token, and Workspace, verifies them live
+against Bitbucket (`GET /user` plus a workspace probe), then saves the profile and selects
+it as active. Named profiles hold one credential set each (`[profiles.<name>]`); selection is
+`--profile <name>`, then `BBR_PROFILE`, then the Active Profile in `active_profile`, then `default`.
+`bbr logout [profile]` removes the selected Profile. Bare `bbr logout` uses the same Profile selection order.
+`bbr logout --all` deletes the file.
+`BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, `BITBUCKET_WORKSPACE` override the selected
+profile per field for scripting. `bbr local` does not read or
 require them. Its SourceRef defaults to the current branch; its BaseRef defaults to the tracking
 remote's locally recorded default branch and must be supplied when Git has no such default.
+
+### Bitbucket API commands
+
+`bbr api` uses the same saved Profiles and per-field environment overrides as remote review.
+`--workspace` overrides both `BITBUCKET_WORKSPACE` and the selected Profile's Workspace.
+The API commands do not load the TUI configuration.
+Help does not need credentials.
+
+```sh
+bbr api --help
+bbr api whoami --profile work --json
+bbr --profile work api list-prs --workspace check24 --repository sample
+```
 
 ## Configuration
 
