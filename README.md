@@ -104,7 +104,7 @@ Help does not need credentials.
 ```sh
 bbr api --help
 bbr api whoami --profile work --json
-bbr --profile work api list-prs --workspace check24 --repository sample
+bbr --profile work api list-pull-requests --workspace check24 --repository sample
 ```
 
 ## Configuration

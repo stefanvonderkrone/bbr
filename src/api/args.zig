@@ -83,7 +83,7 @@ test "splitFlag handles = and bare forms" {
     const b = splitFlag("--json").?;
     try std.testing.expectEqualStrings("json", b.name);
     try std.testing.expect(b.value == null);
-    try std.testing.expect(splitFlag("get-pr") == null);
+    try std.testing.expect(splitFlag("get-pull-request") == null);
 }
 
 test "takeValue consumes next arg" {

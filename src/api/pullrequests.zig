@@ -1,4 +1,4 @@
-//! `bbr api list-prs | get-pr | whoami | get-verdict | set-verdict`.
+//! `bbr api list-pull-requests | get-pull-request | whoami | get-verdict | set-verdict`.
 
 const std = @import("std");
 const bbr = @import("bbr");
@@ -7,7 +7,7 @@ const out = @import("output.zig");
 const ws = @import("workspaces.zig");
 
 pub const list_help =
-    \\usage: bbr api list-prs --repository SLUG [--state OPEN|MERGED|DECLINED|SUPERSEDED] [--source-branch NAME] [--pagelen N] [--page N] [--query Q] [--sort S] [--no-follow] [--limit N] [--json]
+    \\usage: bbr api list-pull-requests --repository SLUG [--state OPEN|MERGED|DECLINED|SUPERSEDED] [--source-branch NAME] [--pagelen N] [--page N] [--query Q] [--sort S] [--no-follow] [--limit N] [--json]
     \\
     \\List pull requests (GET .../pullrequests).
     \\Follow pages by default. --no-follow returns one page. --limit caps the total.
@@ -15,7 +15,7 @@ pub const list_help =
 ;
 
 pub const get_help =
-    \\usage: bbr api get-pr --repository SLUG --pull-request-id N [--json]
+    \\usage: bbr api get-pull-request --repository SLUG --pull-request-id N [--json]
     \\
 ;
 
@@ -244,7 +244,7 @@ pub fn runSetVerdict(init: std.process.Init, bb: bbr.bitbucket.Client, args: []c
     }
 }
 
-test "list-prs parses interleaved filters and page controls in both value forms" {
+test "list-pull-requests parses interleaved filters and page controls in both value forms" {
     const cases = [_][]const []const u8{
         &.{ "--page", "3", "--repository", "repository", "--query", "title=\"Review\"", "--state", "MERGED", "--pagelen", "10", "--source-branch", "feature", "--limit", "12", "--sort", "-id", "--no-follow" },
         &.{ "--no-follow", "--repository=repository", "--pagelen=10", "--state=MERGED", "--sort=-id", "--source-branch=feature", "--page=3", "--query=title=\"Review\"", "--limit=12" },
@@ -267,7 +267,7 @@ test "list-prs parses interleaved filters and page controls in both value forms"
     try std.testing.expectEqual(bbr.bitbucket.PageOptions{}, defaults.page);
 }
 
-test "list-prs rejects invalid page controls before HTTP" {
+test "list-pull-requests rejects invalid page controls before HTTP" {
     var fake: bbr.http.FakeHttpClient = .{};
     const bb = testClient(&fake);
     const a = std.testing.allocator;
@@ -299,7 +299,7 @@ fn testClient(fake: *bbr.http.FakeHttpClient) bbr.bitbucket.Client {
     });
 }
 
-test "list-prs sends filters and page controls and does not follow with no-follow" {
+test "list-pull-requests sends filters and page controls and does not follow with no-follow" {
     const responses = [_]bbr.http.Canned{
         .{ .body = test_first_page },
         .{ .send_error = error.UnexpectedNextPage },
@@ -321,7 +321,7 @@ test "list-prs sends filters and page controls and does not follow with no-follo
     }) |part| try std.testing.expect(std.mem.indexOf(u8, url, part) != null);
 }
 
-test "list-prs limit stops HTTP paging and defaults still follow next" {
+test "list-pull-requests limit stops HTTP paging and defaults still follow next" {
     const responses = [_]bbr.http.Canned{
         .{ .body = test_first_page },
         .{ .body = test_last_page },

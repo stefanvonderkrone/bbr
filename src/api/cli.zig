@@ -28,8 +28,8 @@ const verbs = [_]Verb{
     .{ .name = "get-workspace", .summary = "get one workspace", .help = workspaces.get_help, .example = "bbr api get-workspace --workspace demo", .handler = workspaces.runGet },
     .{ .name = "list-repositories", .summary = "list repositories in a workspace", .help = repositories.list_help, .example = "bbr api list-repositories --workspace demo --limit 10", .handler = repositories.runList },
     .{ .name = "get-repository", .summary = "get one repository", .help = repositories.get_help, .example = "bbr api get-repository --workspace demo --repository sample", .handler = repositories.runGet },
-    .{ .name = "list-prs", .summary = "list pull requests in a repository", .help = pullrequests.list_help, .example = "bbr api list-prs --repository sample --state OPEN --pagelen 10 --page 2 --no-follow", .handler = pullrequests.runList },
-    .{ .name = "get-pr", .summary = "get one pull request", .help = pullrequests.get_help, .example = "bbr api get-pr --repository sample --pull-request-id 42", .handler = pullrequests.runGet },
+    .{ .name = "list-pull-requests", .summary = "list pull requests in a repository", .help = pullrequests.list_help, .example = "bbr api list-pull-requests --repository sample --state OPEN --pagelen 10 --page 2 --no-follow", .handler = pullrequests.runList },
+    .{ .name = "get-pull-request", .summary = "get one pull request", .help = pullrequests.get_help, .example = "bbr api get-pull-request --repository sample --pull-request-id 42", .handler = pullrequests.runGet },
     .{ .name = "list-commits", .summary = "list commits (PR, revision, or from..to range)", .help = commits.help, .example = "bbr api list-commits --repository sample --revision main --limit 10", .handler = commits.run },
     .{ .name = "get-diff", .summary = "raw diff of a pull request", .help = files.diff_help, .example = "bbr api get-diff --repository sample --pull-request-id 42 --out review.diff", .handler = files.runDiff },
     .{ .name = "get-compare-diff", .summary = "raw diff between two commits", .help = files.compare_help, .example = "bbr api get-compare-diff --repository sample --from abc123 --to def456 --patch", .handler = files.runCompare },
@@ -304,10 +304,10 @@ fn runArgs(init: std.process.Init, gpa: std.mem.Allocator, argv: []const []const
 
 test "parseGlobal extracts globals and verb" {
     const a = std.testing.allocator;
-    const argv = [_][]const u8{ "--json", "--workspace", "myws", "get-pr", "--repository", "r" };
+    const argv = [_][]const u8{ "--json", "--workspace", "myws", "get-pull-request", "--repository", "r" };
     const p = try parseGlobal(a, &argv);
     defer a.free(p.rest);
-    try std.testing.expectEqualStrings("get-pr", p.verb.?);
+    try std.testing.expectEqualStrings("get-pull-request", p.verb.?);
     try std.testing.expect(p.json);
     try std.testing.expectEqualStrings("myws", p.workspace.?);
     try std.testing.expectEqual(@as(usize, 2), p.rest.len);
@@ -356,7 +356,7 @@ test "verb registry is unique and every entry has matching help" {
     }
     try std.testing.expect(findVerb("frobnicate") == null);
     try std.testing.expectEqualStrings(help, verbHelp("frobnicate"));
-    try std.testing.expectEqualStrings(pullrequests.list_help, verbHelp("list-prs"));
+    try std.testing.expectEqualStrings(pullrequests.list_help, verbHelp("list-pull-requests"));
     try std.testing.expectEqualStrings(pullrequests.set_verdict_help, verbHelp("set-verdict"));
 }
 
@@ -366,7 +366,7 @@ test "CLI workspace override works without an environment workspace" {
     defer env.deinit();
     try env.put("BITBUCKET_USERNAME", "test-user");
     try env.put("BITBUCKET_TOKEN", "test-token");
-    const parsed = try parseGlobal(a, &.{ "list-prs", "--workspace", "flag-workspace" });
+    const parsed = try parseGlobal(a, &.{ "list-pull-requests", "--workspace", "flag-workspace" });
     defer a.free(parsed.rest);
     var cred = try cliCredential(a, std.testing.io, &env, parsed.workspace, null);
     defer cred.deinit(a);
@@ -457,19 +457,19 @@ test "global and every verb help write examples to stdout without credentials" {
 }
 
 test "diagnostic verb lookup skips sensitive values and does not guess unknown flag values" {
-    try std.testing.expectEqualStrings("get-pr", diagnosticVerb(&.{ "--workspace", "private-workspace", "get-pr", "--body" }).?.name);
-    try std.testing.expect(diagnosticVerb(&.{ "--body", "get-pr", "--workspace" }) == null);
-    try std.testing.expect(diagnosticVerb(&.{ "--unknown", "get-pr", "--workspace" }) == null);
+    try std.testing.expectEqualStrings("get-pull-request", diagnosticVerb(&.{ "--workspace", "private-workspace", "get-pull-request", "--body" }).?.name);
+    try std.testing.expect(diagnosticVerb(&.{ "--body", "get-pull-request", "--workspace" }) == null);
+    try std.testing.expect(diagnosticVerb(&.{ "--unknown", "get-pull-request", "--workspace" }) == null);
     try std.testing.expect(diagnosticVerb(&.{ "--workspace=whoami", "--body" }) == null);
-    try std.testing.expect(diagnosticVerb(&.{ "private-value", "get-pr" }) == null);
+    try std.testing.expect(diagnosticVerb(&.{ "private-value", "get-pull-request" }) == null);
 }
 
 test "global parse errors use stderr and name only a safely supplied verb" {
     const cases = [_]struct { args: []const []const u8, prefix: []const u8, hidden: []const u8 }{
         .{ .args = &.{ "--json", "create-comment", "--body", "private-body", "--workspace" }, .prefix = "bbr api create-comment: bad options (MissingValue)\n", .hidden = "private-body" },
-        .{ .args = &.{ "--body", "get-pr", "--workspace" }, .prefix = "bbr api: bad options (MissingValue)\n", .hidden = "bbr api get-pr:" },
-        .{ .args = &.{ "--unknown", "get-pr", "--workspace" }, .prefix = "bbr api: bad options (MissingValue)\n", .hidden = "bbr api get-pr:" },
-        .{ .args = &.{ "--workspace", "private-workspace", "get-pr", "--pull-request-id" }, .prefix = "bbr api get-pr: bad options (MissingValue)\n", .hidden = "private-workspace" },
+        .{ .args = &.{ "--body", "get-pull-request", "--workspace" }, .prefix = "bbr api: bad options (MissingValue)\n", .hidden = "bbr api get-pull-request:" },
+        .{ .args = &.{ "--unknown", "get-pull-request", "--workspace" }, .prefix = "bbr api: bad options (MissingValue)\n", .hidden = "bbr api get-pull-request:" },
+        .{ .args = &.{ "--workspace", "private-workspace", "get-pull-request", "--pull-request-id" }, .prefix = "bbr api get-pull-request: bad options (MissingValue)\n", .hidden = "private-workspace" },
         .{ .args = &.{"private-invalid-verb"}, .prefix = "bbr api: bad options (UnknownFlag)\n", .hidden = "private-invalid-verb" },
         .{ .args = &.{"--unknown=private-value"}, .prefix = "bbr api: bad options (UnknownFlag)\n", .hidden = "private-value" },
     };
@@ -523,9 +523,9 @@ test "credential handler and proxy initialization errors stay on stderr with jso
 test "error writer formats option help and runtime errors without user values" {
     var buffer: [8192]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try writeError(&writer, findVerb("get-pr"), error.InvalidNumber);
-    try std.testing.expect(std.mem.startsWith(u8, writer.buffered(), "bbr api get-pr: bad options (InvalidNumber)\nusage: bbr api get-pr"));
-    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), findVerb("get-pr").?.example) != null);
+    try writeError(&writer, findVerb("get-pull-request"), error.InvalidNumber);
+    try std.testing.expect(std.mem.startsWith(u8, writer.buffered(), "bbr api get-pull-request: bad options (InvalidNumber)\nusage: bbr api get-pull-request"));
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), findVerb("get-pull-request").?.example) != null);
     writer = std.Io.Writer.fixed(&buffer);
     try writeError(&writer, findVerb("set-verdict"), error.Forbidden);
     try std.testing.expectEqualStrings("bbr api set-verdict: Forbidden\n", writer.buffered());
