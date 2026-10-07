@@ -184,6 +184,13 @@ pub const YankCandidates = struct {
     new: ?*const bbr.diff.Line = null,
 };
 
+pub fn selectedSource(row: VisualRow, version: SelectedVersion) ?*const bbr.diff.Line {
+    return switch (version) {
+        .old => row.yank_candidates.old,
+        .new => row.yank_candidates.new,
+    };
+}
+
 pub const VisualHalf = struct {
     line: *const bbr.diff.Line,
     source_start: usize,

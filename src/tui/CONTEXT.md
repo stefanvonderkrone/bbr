@@ -19,8 +19,11 @@ _Avoid_: blob load, highlight job, hydration.
 
 **Selected Version**:
 The review-wide choice of old or new File content for version-specific inspection, source Actions, and clipboard eligibility.
-It defaults to new and survives Session replacement within one process.
+It defaults to new when both File versions exist.
+It survives Session replacement within one process, subject to the File's permitted version.
 It resets when the application restarts.
+An added File permits only new.
+A removed File permits only old.
 It does not change a Line's old or new identity.
 It also does not select a SideBySide column as an Anchor target.
 _Avoid_: selected side, active side, Anchor side.

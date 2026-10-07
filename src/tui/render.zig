@@ -257,8 +257,9 @@ fn drawDiffPaneFrame(scratch: std.mem.Allocator, win: vaxis.Window, frame: @impo
         const style = if (focused) theme.pane_border_focused else theme.pane_border;
         _ = childRect(win, .{ .x = title_x, .y = frame.panes.diff.y, .width = title_width, .height = 1 }).printSegment(.{ .text = title, .style = style }, .{ .wrap = .none });
     }
-    drawVersionTitleSegment(win, frame.version_title_targets.old, "g< OLD", frame.selected_version == .old, theme, focused);
-    drawVersionTitleSegment(win, frame.version_title_targets.new, "NEW g>", frame.selected_version == .new, theme, focused);
+    const buffer_index = if (frame.navigation.cursor < frame.visual_rows.len) frame.visual_rows[frame.navigation.cursor].buffer_index else 0;
+    drawVersionTitleSegment(win, frame.version_title_targets.old, "h← OLD", frame.selected_version == .old, frame.buffer.hasFileVersion(buffer_index, .old), theme, focused);
+    drawVersionTitleSegment(win, frame.version_title_targets.new, "NEW l→", frame.selected_version == .new, frame.buffer.hasFileVersion(buffer_index, .new), theme, focused);
 }
 
 fn scopeLabel(scope: presentation.Scope) []const u8 {
@@ -269,9 +270,10 @@ fn scopeLabel(scope: presentation.Scope) []const u8 {
     };
 }
 
-fn drawVersionTitleSegment(win: vaxis.Window, target: ?@import("frame.zig").Rect, text: []const u8, selected: bool, theme: Theme, focused: bool) void {
+fn drawVersionTitleSegment(win: vaxis.Window, target: ?@import("frame.zig").Rect, text: []const u8, selected: bool, available: bool, theme: Theme, focused: bool) void {
     const rect = target orelse return;
     var style = if (focused) theme.pane_border_focused else theme.pane_border;
+    if (!available) style = theme.gutter;
     if (selected) {
         style.fg = theme.accent;
         style.bold = true;
@@ -414,7 +416,7 @@ fn fileAnchoredCount(comptime T: type, items: []const T, file: bbr.diff.File) us
 }
 
 fn drawPane(scratch: std.mem.Allocator, win: vaxis.Window, buf: Buffer, theme: Theme, nav: Nav) void {
-    drawProjectedRows(scratch, win, buf.rows, buf.layout, buf.selected_column, theme, nav);
+    drawProjectedRows(scratch, win, buf, theme, nav);
 }
 
 fn drawVisualPane(
@@ -425,23 +427,20 @@ fn drawVisualPane(
     theme: Theme,
     nav: Nav,
 ) void {
-    const sel = nav.selection();
+    const sel = nav.selection() orelse .{ nav.cursor, nav.cursor };
     var screen_row: u16 = 0;
     while (screen_row < win.height) : (screen_row += 1) {
         const index = nav.scroll + screen_row;
         if (index >= visual_rows.len) break;
         const visual_row = visual_rows[index];
         const row = buf.rows[visual_row.buffer_index];
-        const selected = if (sel) |selection|
-            visual_row.kind != .status_placeholder and visualRowSelected(visual_rows, selection, index)
-        else
-            false;
-        const row_theme = if (selected or index == nav.cursor) cursorRowTheme(theme) else theme;
-        drawVisualRow(scratch, win, screen_row, buf.layout, buf.selected_column, row, visual_row, row_theme);
+        const selected = visual_row.kind != .status_placeholder and buf.hasFileVersion(visual_row.buffer_index, buf.selected_version) and visualRowSelected(visual_rows, sel, index, buf.selected_version);
+        drawVisualRow(scratch, win, screen_row, buf.layout, buf.selected_column, row, visual_row, theme, if (selected) buf.selected_version else null);
     }
 }
 
-fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, rows: []const Row, layout: buffer_mod.Layout, selected_column: ?buffer_mod.SelectedColumn, theme: Theme, nav: Nav) void {
+fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, buf: Buffer, theme: Theme, nav: Nav) void {
+    const rows = buf.rows;
     const sel = nav.selection();
     var screen_row: u16 = 0;
     while (screen_row < win.height) : (screen_row += 1) {
@@ -452,29 +451,42 @@ fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, rows: []cons
             row != .status_placeholder and index >= selection[0] and index <= selection[1]
         else
             false;
-        const row_theme = if (selected or index == nav.cursor) cursorRowTheme(theme) else theme;
-        drawRow(scratch, win, screen_row, layout, selected_column, row, row_theme);
+        const active = buf.hasFileVersion(index, buf.selected_version) and (selected or index == nav.cursor);
+        if (row == .line_pair) {
+            drawLinePair(scratch, win, screen_row, row.line_pair, theme, if (active) buf.selected_version else null);
+            drawSelectedColumnEdge(win, screen_row, buf.selected_column, theme);
+        } else {
+            const eligible = row != .line or (if (buf.selected_version == .old) row.line.oldNo() != null else row.line.newNo() != null);
+            const row_theme = if (active and eligible and row != .status_placeholder) cursorRowTheme(theme) else theme;
+            drawRow(scratch, win, screen_row, buf.layout, buf.selected_column, row, row_theme);
+        }
     }
 }
 
-fn visualRowSelected(rows: []const @import("frame.zig").VisualRow, selection: [2]usize, index: usize) bool {
+fn visualRowSelected(rows: []const @import("frame.zig").VisualRow, selection: [2]usize, index: usize, version: buffer_mod.SelectedVersion) bool {
     if (index >= rows.len) return false;
     const candidate = rows[index];
     if (candidate.owner != .line) return index >= selection[0] and index <= selection[1];
+    const line = @import("frame.zig").selectedSource(candidate, version) orelse return false;
     var selected = selection[0];
     while (selected <= selection[1] and selected < rows.len) : (selected += 1) {
-        if (candidate.kind == .line_pair and rows[selected].buffer_index == candidate.buffer_index) return true;
-        if (rows[selected].owner.eql(candidate.owner)) return true;
+        if (@import("frame.zig").selectedSource(rows[selected], version) == line) return true;
     }
     return false;
 }
 
-fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, selected_column: ?buffer_mod.SelectedColumn, row: Row, visual_row: @import("frame.zig").VisualRow, theme: Theme) void {
+fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, selected_column: ?buffer_mod.SelectedColumn, row: Row, visual_row: @import("frame.zig").VisualRow, base_theme: Theme, highlighted_version: ?buffer_mod.SelectedVersion) void {
     if (layout == .side_by_side and visual_row.halves != null) {
-        drawVisualLinePair(scratch, win, r, visual_row.halves.?, row.line_pair, theme);
-        drawSelectedColumnEdge(win, r, selected_column, theme);
+        drawVisualLinePair(scratch, win, r, visual_row.halves.?, row.line_pair, base_theme, highlighted_version);
+        drawSelectedColumnEdge(win, r, selected_column, base_theme);
         return;
     }
+    if (row == .line_pair) {
+        drawLinePair(scratch, win, r, row.line_pair, base_theme, highlighted_version);
+        drawSelectedColumnEdge(win, r, selected_column, base_theme);
+        return;
+    }
+    const theme = if (highlighted_version != null) cursorRowTheme(base_theme) else base_theme;
     if (row != .line or layout != .unified) {
         drawRow(scratch, win, r, layout, selected_column, row, theme);
         return;
@@ -549,7 +561,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer
             drawUnifiedGutter(win, r, lr.oldNo(), lr.newNo(), theme.gutter);
             drawLineBody(scratch, win, r, gutter_cols, lr, theme, style);
         },
-        .line_pair => |pair| drawLinePair(scratch, win, r, pair, theme),
+        .line_pair => |pair| drawLinePair(scratch, win, r, pair, theme, null),
         .disclosure => |value| drawDisclosure(scratch, win, r, value, theme),
         .comment => |cr| drawComment(scratch, win, r, cr, theme),
         .draft => |dr| drawDraft(scratch, win, r, dr, theme),
@@ -671,7 +683,7 @@ const side_gutter: u16 = @intCast(@import("frame.zig").side_gutter_cols);
 /// right half, split by a one-column divider. Each half is a 1-row child window
 /// so a long line is clipped at the divider instead of bleeding into the other
 /// pane. An absent side is drawn as a neutral empty half.
-fn drawLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, pair: buffer_mod.LinePair, theme: Theme) void {
+fn drawLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, pair: buffer_mod.LinePair, theme: Theme, highlighted_version: ?buffer_mod.SelectedVersion) void {
     const half = win.width / 2;
     if (half == 0) return;
     const right_x = half + 1; // divider column sits at `half`
@@ -679,21 +691,21 @@ fn drawLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, pair: buf
     fillRow(win, r, theme.context);
 
     const left = win.child(.{ .x_off = 0, .y_off = r, .width = half, .height = 1 });
-    drawHalf(scratch, left, pair.left, theme, .old);
+    drawHalf(scratch, left, pair.left, if (highlighted_version == .old and pair.left != null) cursorRowTheme(theme) else theme, .old);
     if (right_w > 0) {
         const right = win.child(.{ .x_off = right_x, .y_off = r, .width = right_w, .height = 1 });
-        drawHalf(scratch, right, pair.right, theme, .new);
+        drawHalf(scratch, right, pair.right, if (highlighted_version == .new and pair.right != null) cursorRowTheme(theme) else theme, .new);
     }
 }
 
-fn drawVisualLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, halves: @import("frame.zig").Halves, pair: LinePair, theme: Theme) void {
+fn drawVisualLinePair(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, halves: @import("frame.zig").Halves, pair: LinePair, theme: Theme, highlighted_version: ?buffer_mod.SelectedVersion) void {
     const half = win.width / 2;
     if (half == 0) return;
     const right_x = half + @as(u16, @intCast(@import("frame.zig").side_divider_cols));
     const right_w = if (win.width > right_x) win.width - right_x else 0;
     fillRow(win, r, theme.context);
-    drawVisualHalf(scratch, win.child(.{ .x_off = 0, .y_off = r, .width = half, .height = 1 }), halves.left, pair.left, theme, .old);
-    if (right_w > 0) drawVisualHalf(scratch, win.child(.{ .x_off = right_x, .y_off = r, .width = right_w, .height = 1 }), halves.right, pair.right, theme, .new);
+    drawVisualHalf(scratch, win.child(.{ .x_off = 0, .y_off = r, .width = half, .height = 1 }), halves.left, pair.left, if (highlighted_version == .old and halves.left != null) cursorRowTheme(theme) else theme, .old);
+    if (right_w > 0) drawVisualHalf(scratch, win.child(.{ .x_off = right_x, .y_off = r, .width = right_w, .height = 1 }), halves.right, pair.right, if (highlighted_version == .new and halves.right != null) cursorRowTheme(theme) else theme, .new);
 }
 
 fn drawVisualHalf(scratch: std.mem.Allocator, win: vaxis.Window, half: ?@import("frame.zig").VisualHalf, line_row: ?LineRow, theme: Theme, side: Side) void {
@@ -1962,6 +1974,8 @@ fn keyName(scratch: std.mem.Allocator, cp: u21) []const u8 {
         vaxis.Key.escape => "esc",
         vaxis.Key.up => "↑",
         vaxis.Key.down => "↓",
+        vaxis.Key.left => "←",
+        vaxis.Key.right => "→",
         vaxis.Key.home => "home",
         vaxis.Key.end => "end",
         vaxis.Key.page_up => "pgup",
@@ -2023,6 +2037,8 @@ fn buildHelpRows(scratch: std.mem.Allocator, km: keymap.Keymap, availability: pr
 
 fn sourceRefusalLabel(availability: presentation.ActionAvailability, action: keymap.Action) ?[]const u8 {
     return switch (action) {
+        .select_old_version => if (!availability.old_version) "old File version absent" else null,
+        .select_new_version => if (!availability.new_version) "new File version absent" else null,
         .yank => if (availability.yank_refusal) |refusal| switch (refusal) {
             .no_source => "no copyable text",
             .no_body => "no authored body",
@@ -2735,13 +2751,104 @@ test "SideBySide continuation rows keep halves inside the fixed divider" {
 
     var nav = Nav.init(visual_rows.len, 2);
     nav.mark = 0;
-    drawVisualPane(a, win, .{ .rows = &rows, .layout = .side_by_side }, visual_rows, theme_dark, nav);
+    drawVisualPane(a, win, .{ .rows = &rows, .layout = .side_by_side, .selected_version = .old }, visual_rows, theme_dark, nav);
 
     try testing.expectEqualStrings("7", win.readCell(3, 0).?.char.grapheme);
     try testing.expectEqualStrings("9", win.readCell(17, 0).?.char.grapheme);
     try testing.expectEqualStrings("t", win.readCell(side_gutter, 1).?.char.grapheme);
     try testing.expectEqualStrings(" ", win.readCell(17, 1).?.char.grapheme);
     try testing.expectEqual(theme_dark.cursorBg(theme_dark.removed_emphasis.bg), win.readCell(side_gutter, 1).?.style.bg);
+}
+
+test "cursor and Selection paint only Selected Version across complete wrapped source Lines" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try bbr.diff.parse(a,
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-const value = old source that wraps through several rows
+        \\+const value = new
+    );
+    for ([_]buffer_mod.Layout{ .unified, .side_by_side }) |layout| for ([_]buffer_mod.SelectedVersion{ .old, .new }) |version| {
+        const buf = try buffer_mod.buildWithComments(a, diff, layout, &.{}, .{ .selected_version = version });
+        const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, buf.rows, .bytes, .{ .layout = layout, .width = 40 });
+        const cursor = for (visual_rows, 0..) |row, index| {
+            if (@import("frame.zig").selectedSource(row, version) != null) break index;
+        } else return error.MissingSourceLine;
+        const line = @import("frame.zig").selectedSource(visual_rows[cursor], version).?;
+        var screen = try vaxis.Screen.init(a, .{ .rows = 20, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(a);
+        const win = headlessWindow(&screen);
+        var backgrounds: [20][2]@TypeOf(theme_dark.context.bg) = undefined;
+        drawVisualPane(a, win, buf, visual_rows, theme_dark, Nav.init(visual_rows.len, 20));
+        for (visual_rows, 0..) |row, index| {
+            if (row.owner != .line) continue;
+            backgrounds[index][0] = win.readCell(if (layout == .unified) gutter_cols else side_gutter, @intCast(index)).?.style.bg;
+            if (layout == .side_by_side) backgrounds[index][1] = win.readCell(21 + side_gutter, @intCast(index)).?.style.bg;
+        }
+        for ([_]bool{ false, true }) |selection| {
+            var nav = Nav.init(visual_rows.len, 20);
+            nav.cursor = cursor;
+            if (selection) nav.mark = cursor;
+            drawVisualPane(a, win, buf, visual_rows, theme_dark, nav);
+            for (visual_rows, 0..) |row, index| {
+                if (row.owner != .line) continue;
+                if (layout == .unified) {
+                    const candidate = row.owner.line;
+                    const band = backgrounds[index][0];
+                    const expected = if (candidate == line) theme_dark.cursorBg(band) else band;
+                    try testing.expectEqual(expected, win.readCell(gutter_cols, @intCast(index)).?.style.bg);
+                } else {
+                    for ([_]buffer_mod.SelectedVersion{ .old, .new }) |side| {
+                        const candidate = @import("frame.zig").selectedSource(row, side);
+                        const band = backgrounds[index][if (side == .old) 0 else 1];
+                        const expected = if (side == version and candidate == line) theme_dark.cursorBg(band) else band;
+                        const column: u16 = if (side == .old) side_gutter else 21 + side_gutter;
+                        try testing.expectEqual(expected, win.readCell(column, @intCast(index)).?.style.bg);
+                    }
+                }
+            }
+        }
+    };
+}
+
+test "Selection leaves skipped File headers unhighlighted in both layouts" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try bbr.diff.parse(a,
+        \\diff --git a/added.zig b/added.zig
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/added.zig
+        \\@@ -0,0 +1 @@
+        \\+new
+        \\diff --git a/deleted.zig b/deleted.zig
+        \\deleted file mode 100644
+        \\--- a/deleted.zig
+        \\+++ /dev/null
+        \\@@ -1 +0,0 @@
+        \\-old
+    );
+    for ([_]buffer_mod.Layout{ .unified, .side_by_side }) |layout| for ([_]buffer_mod.SelectedVersion{ .old, .new }) |version| {
+        const buf = try buffer_mod.buildWithComments(a, diff, layout, &.{}, .{ .selected_version = version });
+        const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, buf.rows, .bytes, .{ .layout = layout, .width = 60 });
+        var screen = try vaxis.Screen.init(a, .{ .rows = 12, .cols = 60, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(a);
+        const win = headlessWindow(&screen);
+        var nav = Nav.init(visual_rows.len, 12);
+        nav.mark = 0;
+        nav.cursor = visual_rows.len - 1;
+        drawVisualPane(a, win, buf, visual_rows, theme_dark, nav);
+        for (visual_rows, 0..) |row, index| {
+            if (row.kind != .file_header) continue;
+            const expected = if (buf.hasFileVersion(row.buffer_index, version)) theme_dark.cursorBg(theme_dark.file_header.bg) else theme_dark.file_header.bg;
+            try testing.expectEqual(expected, win.readCell(0, @intCast(index)).?.style.bg);
+        }
+    };
 }
 
 test "Status Placeholder renders side, reason, and known or unavailable size" {
@@ -2896,7 +3003,7 @@ test "side-by-side draws old on the left, new on the right" {
     try testing.expect(win.readCell(body_r, 2).?.style.bg == .default);
 }
 
-test "the cursor row is highlighted across its whole width, keeping band hue" {
+test "the cursor source row is highlighted only for Selected Version, keeping band hue" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -2912,7 +3019,7 @@ test "the cursor row is highlighted across its whole width, keeping band hue" {
         \\
     ;
     const diff = try bbr.diff.parse(a, raw);
-    const buf = try buffer_mod.build(a, diff, .unified);
+    const buf = try buffer_mod.buildWithComments(a, diff, .unified, &.{}, .{ .selected_version = .old });
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
@@ -2938,6 +3045,10 @@ test "the cursor row is highlighted across its whole width, keeping band hue" {
 
     // An off-cursor line keeps its untinted band.
     try testing.expectEqual(theme_dark.added.bg, win.readCell(body_x, 4).?.style.bg);
+    var opposite = buf;
+    opposite.selected_version = .new;
+    draw(a, win, diff, opposite, theme_dark, nav, 0, &.{}, &.{});
+    try testing.expectEqual(theme_dark.removed.bg, win.readCell(body_x, 3).?.style.bg);
 }
 
 test "a folded context run renders as a fold row" {
@@ -3809,7 +3920,7 @@ test "DiffPane title reserves and renders published Selected Version targets" {
 
     drawDiffPaneFrame(arena.allocator(), win, frame, "src/a-very-long-file-name.zig", .whole, theme_dark);
 
-    try testing.expectEqualStrings("g", win.readCell(targets.old.?.x, 0).?.char.grapheme);
+    try testing.expectEqualStrings("h", win.readCell(targets.old.?.x, 0).?.char.grapheme);
     try testing.expectEqualStrings("D", win.readCell(targets.old.?.x + 5, 0).?.char.grapheme);
     try testing.expectEqualStrings("N", win.readCell(targets.new.?.x, 0).?.char.grapheme);
     try testing.expectEqual(theme_dark.accent, win.readCell(targets.old.?.x, 0).?.style.fg);
@@ -3914,6 +4025,28 @@ test "the help overlay floats a centered Keybindings modal from the Keymap" {
     try testing.expectEqualStrings("j", win.readCell(5, modal_y + 1).?.char.grapheme);
     const mouse_row: u16 = @intCast(@min(@max(rows.motions.len, rows.commands.len), modal_height -| 5) + 1);
     try testing.expectEqualStrings("M", win.readCell(5, modal_y + mouse_row).?.char.grapheme);
+}
+
+test "Selected Version help names horizontal keys and the absent File version" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const rows = buildHelpRows(arena.allocator(), .default, .{ .remote = true, .old_version = false });
+    var old_found = false;
+    var new_found = false;
+    for (rows.commands) |row| {
+        if (std.mem.indexOf(u8, row.text, "select old File version") != null) {
+            old_found = true;
+            try testing.expect(!row.available);
+            try testing.expect(std.mem.indexOf(u8, row.text, "h ←") != null);
+            try testing.expect(std.mem.indexOf(u8, row.text, "old File version absent") != null);
+        }
+        if (std.mem.indexOf(u8, row.text, "select new File version") != null) {
+            new_found = true;
+            try testing.expect(row.available);
+            try testing.expect(std.mem.indexOf(u8, row.text, "l →") != null);
+        }
+    }
+    try testing.expect(old_found and new_found);
 }
 
 test "local help projection marks remote-only commands unavailable" {

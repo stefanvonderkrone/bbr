@@ -455,7 +455,7 @@ test "M21 kernel view Frame launch failure and closed sink preserve the complete
         } else if (change == .resolved) {
             const initial = state.projection().review.?;
             for (initial.frame.visual_rows, 0..) |visual, index| if (initial.buffer.rows[visual.buffer_index] == .disclosure) {
-                for (0..index) |_| try state.dispatch(.{ .action = .down });
+                while (state.projection().review.?.navigation.cursor < index) try state.dispatch(.{ .action = .down });
                 break;
             };
         }

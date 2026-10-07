@@ -55,6 +55,8 @@ pub const special = struct {
     pub const backspace = vaxis.Key.backspace;
     pub const up = vaxis.Key.up;
     pub const down = vaxis.Key.down;
+    pub const left = vaxis.Key.left;
+    pub const right = vaxis.Key.right;
 };
 
 /// Is this Action a Motion (movement within a Pane) rather than a command? The
@@ -180,8 +182,10 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one('R'), .action = .refresh, .help = "refresh review" },
     .{ .chord = Chord.one('s'), .action = .toggle_layout, .help = "toggle unified / side-by-side" },
     .{ .chord = Chord.one('f'), .action = .cycle_scope, .help = "cycle diff scope" },
-    .{ .chord = Chord.two('g', '<'), .action = .select_old_version, .help = "select old File version" },
-    .{ .chord = Chord.two('g', '>'), .action = .select_new_version, .help = "select new File version" },
+    .{ .chord = Chord.one('h'), .action = .select_old_version, .help = "select old File version" },
+    .{ .chord = Chord.one(vaxis.Key.left), .action = .select_old_version, .help = "select old File version" },
+    .{ .chord = Chord.one('l'), .action = .select_new_version, .help = "select new File version" },
+    .{ .chord = Chord.one(vaxis.Key.right), .action = .select_new_version, .help = "select new File version" },
     .{ .chord = Chord.one('v'), .action = .toggle_select, .help = "toggle visual selection" },
     .{ .chord = Chord.one(vaxis.Key.escape), .action = .clear_selection, .help = "clear selection" },
     .{ .chord = Chord.one('i'), .action = .inline_comment, .help = "inline comment" },
@@ -753,10 +757,18 @@ test "the default bindings are themselves unambiguous and prefix-free" {
 
 test "Selected Version Actions resolve by default and remain strictly configurable" {
     var resolver: Resolver = .{};
+    for ([_]InteractionContext{ .diff, .diff_source, .diff_disclosure, .diff_review_card }) |context| {
+        try testing.expectEqual(Action.select_old_version, resolver.feed(.default, context, plain('h')).action);
+        try testing.expectEqual(Action.select_old_version, resolver.feed(.default, context, .{ .codepoint = special.left }).action);
+        try testing.expectEqual(Action.select_new_version, resolver.feed(.default, context, plain('l')).action);
+        try testing.expectEqual(Action.select_new_version, resolver.feed(.default, context, .{ .codepoint = special.right }).action);
+    }
+    try testing.expectEqual(Action.left, resolver.feed(.default, .sidebar, plain('h')).action);
+    try testing.expectEqual(Action.right, resolver.feed(.default, .sidebar, plain('l')).action);
     try testing.expect(resolver.feed(.default, .diff, plain('g')) == .none);
-    try testing.expectEqual(Action.select_old_version, resolver.feed(.default, .diff, plain('<')).action);
+    try testing.expect(resolver.feed(.default, .diff, plain('<')) == .none);
     try testing.expect(resolver.feed(.default, .diff, plain('g')) == .none);
-    try testing.expectEqual(Action.select_new_version, resolver.feed(.default, .diff, plain('>')).action);
+    try testing.expect(resolver.feed(.default, .diff, plain('>')) == .none);
 
     const overrides = [_]Override{
         .{ .action = "select_old_version", .sequences = &.{} },
@@ -765,8 +777,9 @@ test "Selected Version Actions resolve by default and remain strictly configurab
     var configured = try Keymap.fromOverrides(testing.allocator, &overrides);
     defer configured.deinit(testing.allocator);
     resolver = .{};
-    try testing.expect(resolver.feed(configured.keymap(), .diff, plain('g')) == .none);
-    try testing.expect(resolver.feed(configured.keymap(), .diff, plain('<')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain('h')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .diff, .{ .codepoint = special.left }) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain('l')) == .none);
     try testing.expect(resolver.feed(configured.keymap(), .diff, plain(' ')) == .none);
     try testing.expectEqual(Action.select_new_version, resolver.feed(configured.keymap(), .diff, plain('n')).action);
     try testing.expectError(error.UnknownAction, validateOverride(.{ .action = "select_previous_version" }));

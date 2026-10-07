@@ -372,6 +372,7 @@ pub const Buffer = struct {
     rows: []const Row,
     row_kinds: []const RowKind = &.{},
     layout: Layout,
+    selected_version: SelectedVersion = .new,
     selected_column: ?SelectedColumn = null,
     file_tallies: []const FileTally = &.{},
     file_rows: []const FileRow = &.{},
@@ -411,6 +412,16 @@ pub const Buffer = struct {
             }
         }
         return null;
+    }
+
+    pub fn hasFileVersion(self: Buffer, row: usize, version: SelectedVersion) bool {
+        const file_index = self.fileIndexForRow(row) orelse return true;
+        const file = self.rows[self.fileHeaderRow(file_index).?].file_header.file;
+        return switch (file.status) {
+            .added => version == .new,
+            .removed => version == .old,
+            .modified, .renamed => true,
+        };
     }
 };
 
@@ -718,6 +729,7 @@ pub fn buildWithComments(
         .rows = owned_rows,
         .row_kinds = row_kinds,
         .layout = layout,
+        .selected_version = opts.selected_version,
         .selected_column = if (layout == .side_by_side) .{
             .version = opts.selected_version,
             .inner_gutter_edge = if (opts.selected_version == .old) .right else .left,

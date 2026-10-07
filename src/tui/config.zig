@@ -434,12 +434,20 @@ test "unbinding a default can free its Leader for a shorter Action" {
         \\set_verdict_approved = []
         \\set_verdict_changes_requested = []
         \\set_verdict_none = []
-        \\select_old_version = []
-        \\select_new_version = []
         \\open_review_search = []
         \\to_top = ["g"]
     ;
     var result = try parse(testing.allocator, source);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result == .ok);
+}
+
+test "Selected Version configuration can share horizontal keys with Sidebar Actions" {
+    var result = try parse(testing.allocator,
+        \\[keymap]
+        \\select_old_version = ["h", "left"]
+        \\select_new_version = ["l", "right"]
+    );
     defer result.deinit(testing.allocator);
     try testing.expect(result == .ok);
 }

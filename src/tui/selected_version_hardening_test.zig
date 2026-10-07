@@ -284,7 +284,7 @@ test "M20 hardening renders zero narrow ordinary and wide DiffPane geometry" {
         const targets = review.frame.version_title_targets;
         if (targets.old) |old| {
             try testing.expect(old.x + old.width <= cols);
-            try testing.expectEqualStrings("g", window.readCell(old.x, old.y).?.char.grapheme);
+            try testing.expectEqualStrings("h", window.readCell(old.x, old.y).?.char.grapheme);
             try testing.expectEqual(theme.accent, window.readCell(old.x, old.y).?.style.fg);
             try testing.expect(window.readCell(old.x, old.y).?.style.bold);
         }
