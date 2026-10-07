@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DiffPane selection prototype</title>
+<style>
+  :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #11151c; color: #e0e6ef; }
+  * { box-sizing: border-box; }
+  body { max-width: 1320px; margin: auto; padding: 28px; }
+  h1 { font-size: 26px; margin: 6px 0 12px; }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  p { line-height: 1.55; margin: 8px 0; }
+  .muted, .eyebrow { color: #98a6ba; }
+  .eyebrow { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
+  .controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: end; margin: 22px 0 16px; }
+  label { display: grid; gap: 6px; font-size: 13px; }
+  button, select { font: inherit; color: inherit; background: #202937; border: 1px solid #3b485d; border-radius: 5px; padding: 8px 11px; }
+  button { cursor: pointer; }
+  button:hover { background: #303d50; }
+  button:disabled { opacity: .4; cursor: default; }
+  button:focus-visible, select:focus-visible, #terminal:focus-visible { outline: 2px solid #88b9ff; outline-offset: 3px; }
+  button[aria-pressed="true"] { color: #11151c; background: #88b9ff; border-color: #88b9ff; }
+  #option { max-width: 100%; }
+  .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 16px; }
+  .panel { background: #171e29; border: 1px solid #334158; border-radius: 7px; padding: 16px; min-width: 0; }
+  .diff { padding: 0; overflow: hidden; }
+  .title { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid #334158; }
+  .versions { display: flex; gap: 6px; }
+  #terminal { font: 13px/24px ui-monospace, SFMono-Regular, Consolas, monospace; min-height: 340px; overflow: auto; padding: 8px 0; }
+  .row { display: flex; min-height: 24px; }
+  .half { display: flex; flex: 1; min-width: 0; white-space: pre; }
+  .half + .half { border-left: 1px solid #3b485d; }
+  .number { width: 44px; flex: 0 0 44px; color: #94a2b7; text-align: right; padding-right: 9px; user-select: none; }
+  .text { padding-right: 8px; }
+  .old.changed { background: #361f2a; color: #ffc1ca; }
+  .new.changed { background: #17352d; color: #a7e8c8; }
+  .highlight { background: #345274 !important; color: #f3f7ff !important; }
+  .cursor .number { color: #eaf4ff; font-weight: 700; }
+  .extra { box-shadow: inset 0 -2px #f3b26a; }
+  .structural { padding: 0 12px; color: #9fb3d1; background: #202937; }
+  .structural.cursor { background: #345274; }
+  .notice { margin: 12px 14px; padding: 10px; background: #30271e; color: #f3c892; border-radius: 4px; }
+  #parity { padding: 12px 14px; border-top: 1px solid #334158; font-size: 13px; }
+  #parity[data-match="true"] { color: #a7e8c8; }
+  #parity[data-match="false"] { color: #f3b26a; }
+  dl { margin: 0; }
+  dt { color: #98a6ba; font-size: 12px; margin-top: 12px; }
+  dd { margin: 4px 0 0; font-size: 14px; overflow-wrap: anywhere; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; background: #11151c; padding: 12px; border-radius: 4px; min-height: 48px; }
+  .copy { margin-top: 18px; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 14px; border-top: 1px solid #334158; }
+  .scenario { margin-top: 16px; }
+  .steps { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .steps button.done { border-color: #88b9ff; }
+  details { margin-top: 16px; }
+  summary { cursor: pointer; }
+  kbd { font: 12px ui-monospace, monospace; background: #29354a; padding: 2px 5px; border-radius: 3px; }
+  @media (max-width: 960px) { .workspace { grid-template-columns: 1fr; } .inspector { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; } .copy { margin-top: 0; } }
+  @media (max-width: 560px) { body { padding: 14px; } .inspector { display: block; } .copy { margin-top: 18px; } .controls label { width: 100%; } select { width: 100%; } .number { width: 32px; flex-basis: 32px; padding-right: 5px; } #terminal { font-size: 11px; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="eyebrow">Throwaway prototype · source selection only</div>
+  <h1>Does the highlight show what you copy?</h1>
+  <p>Compare three highlight options with the same navigation and copied source text.</p>
+  <p class="muted">A blank Line exists. A missing Line does not. Navigation skips missing Lines and keeps blank Lines.</p>
+  <p class="muted">Click the DiffPane to use its keys. Use the buttons for guided scenarios.</p>
+</header>
+<div class="controls">
+  <label>Highlight option
+    <select id="option">
+      <option value="1">1. Both highlights, both layouts</option>
+      <option value="2">2. Both highlights, SideBySide only</option>
+      <option value="3">3. Cursor highlight only</option>
+    </select>
+  </label>
+  <label>Layout
+    <select id="layout"><option value="side_by_side">SideBySide</option><option value="unified">Unified</option></select>
+  </label>
+  <label>Fixture
+    <select id="fixture"><option value="main">Changed File</option><option value="gap">Missing Lines</option><option value="added">Added File</option></select>
+  </label>
+</div>
+<div class="workspace">
+  <section class="panel diff" aria-label="DiffPane">
+    <div class="title"><span id="path"></span><div class="versions">
+      <button id="old" data-action="old" aria-pressed="false">h / ← OLD</button>
+      <button id="new" data-action="new" aria-pressed="true">NEW l / →</button>
+    </div></div>
+    <div id="terminal" tabindex="0" aria-label="DiffPane. Use h and l to select a version, j and k to move, v to select, and y to copy."></div>
+    <div id="parity" role="status"></div>
+    <div class="toolbar">
+      <button data-action="up">↑ Up / k</button><button data-action="down">↓ Down / j</button>
+      <button id="select" data-action="select">v Select</button>
+      <button data-action="extendUp">Shift ↑</button><button data-action="extendDown">Shift ↓</button>
+      <button data-action="clear">Esc Clear</button><button id="copy" data-action="copy">y Copy</button>
+    </div>
+  </section>
+  <aside class="panel inspector">
+    <div><h2>Current state</h2><dl>
+      <dt>Selected Version</dt><dd id="version-state"></dd>
+      <dt>Cursor</dt><dd id="cursor-state"></dd>
+      <dt>Visual selection</dt><dd id="selection-state"></dd>
+      <dt>Copy Line identities</dt><dd id="identities"></dd>
+      <dt>Last Action</dt><dd id="last-action"></dd>
+    </dl></div>
+    <div class="copy"><h2>What y would copy</h2><pre id="preview"></pre><div id="bytes" class="muted"></div>
+      <h2 style="margin-top:18px">Captured by y</h2><pre id="captured">No copy yet.</pre>
+      <p class="muted">Copy captures text in this page. It does not write to your system clipboard.</p>
+    </div>
+  </aside>
+</div>
+<section class="panel scenario">
+  <label>Guided scenario
+    <select id="scenario">
+      <option value="pair">Replacement pair</option><option value="range">Mixed visual selection</option>
+      <option value="missing">Switch on a missing Line</option><option value="wrap">Wrapped source Line</option>
+      <option value="absent">Version with no source</option><option value="direction">Directional navigation</option>
+      <option value="stops">Blank Line and non-source stops</option>
+    </select>
+  </label>
+  <p id="scenario-description"></p>
+  <div class="steps"><button id="reset">Reset scenario</button><span id="steps" class="steps" style="margin-top:0"></span></div>
+</section>
+<details class="panel"><summary>Help and configuration</summary>
+  <p><kbd>h</kbd> or <kbd>←</kbd> selects old. <kbd>l</kbd> or <kbd>→</kbd> selects new.</p>
+  <p><kbd>j</kbd> or <kbd>↓</kbd> moves down. <kbd>k</kbd> or <kbd>↑</kbd> moves up.</p>
+  <p><kbd>v</kbd> toggles selection. <kbd>Shift ↑</kbd> and <kbd>Shift ↓</kbd> extend selection. <kbd>Esc</kbd> clears selection.</p>
+  <p><kbd>y</kbd> captures exactly the source text in the preview. Wrapped Lines contribute their full text once.</p>
+  <p>Changing Selected Version clears selection. Selecting the current version keeps selection.</p>
+  <p>A version switch keeps a paired row when possible. Otherwise, it chooses the closest source Line in the File.</p>
+  <p>Equal distances choose the following Line. Vertical navigation skips missing Lines in its requested direction.</p>
+  <p>File headers, Hunk headers, Folds, and Comments remain navigation stops. This prototype does not copy those rows.</p>
+  <p>The Sidebar keeps its collapse and expand Actions. These entries apply to the DiffPane.</p>
+  <pre>[keymap]
+select_old_version = ["h", "left"]
+select_new_version = ["l", "right"]</pre>
+</details>
+<script>
+// Throwaway model. All source content and interaction state stay in memory.
+const model = (() => {
+  const source = (version, number, text, changed = false) => ({ id: `${version}:${number}`, version, number, text, changed });
+  const context = (key, oldNumber, newNumber, text) => ({ key, old: source('old', oldNumber, text), new: source('new', newNumber, text) });
+  const fixtures = {
+    main: { path: 'src/example.zig', rows: [
+      { key: 'file', kind: 'File header', label: 'M src/example.zig' },
+      { key: 'hunk', kind: 'Hunk header', label: '@@ -1,7 +1,7 @@' },
+      context('context', 1, 1, 'const enabled = true;'),
+      { key: 'pair', old: source('old', 2, 'const limit = 10;', true), new: source('new', 2, 'const limit = 20;', true) },
+      { key: 'removed', old: source('old', 3, 'const legacy = true;', true), new: null },
+      { key: 'added', old: null, new: source('new', 3, 'const fast = true;', true) },
+      context('blank', 4, 4, ''),
+      context('wrapped', 5, 5, 'const message = "A long source Line wraps into several visual rows. Copy must include this whole source Line exactly once.";'),
+      { key: 'fold', kind: 'Fold', label: '… 12 context Lines folded …' },
+      { key: 'comment', kind: 'Comment', label: 'Comment: Is this limit correct?' },
+      context('tail', 6, 6, 'return enabled;'),
+    ] },
+    gap: { path: 'src/missing.zig', rows: [
+      context('first', 1, 1, 'source Line 1'),
+      { key: 'gap-two', old: source('old', 2, 'old-only Line 2', true), new: null },
+      { key: 'gap-three', old: source('old', 3, 'old-only Line 3', true), new: null },
+      context('fourth', 4, 2, 'source Line 4'),
+    ] },
+    added: { path: 'src/added.zig', rows: [
+      { key: 'file', kind: 'File header', label: 'A src/added.zig' },
+      { key: 'only', old: null, new: source('new', 1, 'const added = true;', true) },
+      { key: 'only-blank', old: null, new: source('new', 2, '', true) },
+    ] },
+  };
+  function chunks(line, width) {
+    if (!line) return [];
+    const chars = Array.from(line.text);
+    if (!chars.length) return [''];
+    const result = [];
+    for (let i = 0; i < chars.length; i += width) result.push(chars.slice(i, i + width).join(''));
+    return result;
+  }
+  function project(state) {
+    const result = [];
+    const emit = (row, old, next) => {
+      const left = chunks(old, state.wrap), right = chunks(next, state.wrap);
+      for (let segment = 0; segment < Math.max(left.length, right.length); segment++) {
+        result.push({ key: row.key, segment, old, new: next,
+          oldPart: left[segment] ?? null, newPart: right[segment] ?? null });
+      }
+    };
+    for (const row of fixtures[state.fixture].rows) {
+      if (row.kind) result.push({ ...row, segment: 0 });
+      else if (state.layout === 'side_by_side' || (row.old && row.new && !row.old.changed && !row.new.changed)) emit(row, row.old, row.new);
+      else {
+        if (row.old) emit(row, row.old, null);
+        if (row.new) emit(row, null, row.new);
+      }
+    }
+    return result;
+  }
+  function initial(patch = {}) {
+    return { option: 1, layout: 'side_by_side', fixture: 'main', version: 'new', cursor: 3,
+      mark: null, wrap: 44, captured: null, lastAction: 'Ready', ...patch };
+  }
+  function copyLines(state, rows = project(state)) {
+    const lo = state.mark === null ? state.cursor : Math.min(state.cursor, state.mark);
+    const hi = state.mark === null ? state.cursor : Math.max(state.cursor, state.mark);
+    const found = new Map();
+    for (let i = lo; i <= hi; i++) {
+      const line = rows[i]?.[state.version];
+      if (line) found.set(line.id, line);
+    }
+    return [...found.values()].sort((a, b) => a.number - b.number);
+  }
+  function copyText(state, rows) { return copyLines(state, rows).map(line => line.text).join('\n'); }
+  function eligible(state, row) {
+    return !!row && (!!row.kind || (row[state.version] && row[`${state.version}Part`] !== null));
+  }
+  function nearest(state, rows, origin) {
+    let best = null;
+    for (let i = 0; i < rows.length; i++) {
+      if (!rows[i][state.version] || rows[i][`${state.version}Part`] === null) continue;
+      if (best === null || Math.abs(i - origin) <= Math.abs(best - origin)) best = i;
+    }
+    return best;
+  }
+  function highlights(state, rows = project(state)) {
+    const copies = new Set(copyLines(state, rows).map(line => line.id));
+    const cursorLine = rows[state.cursor]?.[state.version];
+    const lo = Math.min(state.cursor, state.mark ?? state.cursor);
+    const hi = Math.max(state.cursor, state.mark ?? state.cursor);
+    const selectedKeys = new Set(rows.slice(lo, hi + 1).map(row => row.key));
+    const fullSelection = state.option === 3 || (state.option === 2 && state.layout === 'unified');
+    const fullCursor = state.option === 2 && state.layout === 'unified';
+    return rows.map((row, index) => {
+      if (row.kind) return { structural: index === state.cursor || (state.mark !== null && index >= lo && index <= hi) };
+      const active = line => !!line && (state.mark !== null ? copies.has(line.id) : line.id === cursorLine?.id);
+      const full = state.mark !== null ? fullSelection && selectedKeys.has(row.key) : fullCursor && row.key === rows[state.cursor]?.key;
+      return {
+        old: !!(full || active(row.old)), new: !!(full || active(row.new)),
+        oldExtra: !!row.old && !!(full || active(row.old)) && !copies.has(row.old.id),
+        newExtra: !!row.new && !!(full || active(row.new)) && !copies.has(row.new.id),
+      };
+    });
+  }
+  function reproject(state, patch) {
+    const previous = project(state);
+    const cursor = previous[state.cursor], mark = previous[state.mark];
+    const next = { ...state, ...patch };
+    const rows = project(next);
+    const locate = row => {
+      if (!row) return 0;
+      const matching = rows.map((candidate, index) => ({ candidate, index })).filter(({ candidate }) => candidate.key === row.key);
+      const eligibleMatches = matching.filter(({ candidate }) => eligible(next, candidate));
+      const choices = eligibleMatches.length ? eligibleMatches : matching;
+      return choices[Math.min(row.segment, choices.length - 1)]?.index ?? 0;
+    };
+    next.cursor = locate(cursor);
+    next.mark = state.mark === null ? null : locate(mark);
+    return next;
+  }
+  function action(state, name) {
+    const next = { ...state, lastAction: name };
+    const rows = project(next);
+    if (name === 'old' || name === 'new') {
+      if (name === state.version) return next;
+      next.version = name;
+      next.mark = null;
+      if (!rows[next.cursor]?.kind && !eligible(next, rows[next.cursor])) next.cursor = nearest(next, rows, next.cursor) ?? 0;
+    } else if (['up', 'down', 'extendUp', 'extendDown'].includes(name)) {
+      if (name.startsWith('extend') && next.mark === null) next.mark = next.cursor;
+      const direction = name === 'up' || name === 'extendUp' ? -1 : 1;
+      for (let index = next.cursor + direction; index >= 0 && index < rows.length; index += direction) {
+        if (eligible(next, rows[index])) { next.cursor = index; break; }
+      }
+    } else if (name === 'select') next.mark = next.mark === null ? next.cursor : null;
+    else if (name === 'clear') next.mark = null;
+    else if (name === 'copy' && copyLines(next, rows).length) next.captured = copyText(next, rows);
+    return next;
+  }
+  return { fixtures, project, initial, copyLines, copyText, highlights, action, reproject, nearest };
+})();
+
+let state = model.initial();
+let scenarioStep = 0;
+const scenarios = {
+  pair: { description: 'Switch versions on a replacement pair. The copy preview changes with the highlighted source.', key: 'pair', steps: [['old', 'Select old'], ['copy', 'Copy old'], ['new', 'Select new'], ['copy', 'Copy new']] },
+  range: { description: 'Select through changed and blank Lines. Compare options in both layouts. Orange marks highlighted source that y excludes.', key: 'context', steps: [['select', 'Start selection'], ['down', 'Include replacement'], ['down', 'Skip removed Line'], ['down', 'Include blank Line'], ['copy', 'Capture range']] },
+  missing: { description: 'Start on an old-only Line. Switch to new. The source Line above is closer, so the cursor moves up.', fixture: 'gap', version: 'old', key: 'gap-two', steps: [['new', 'Switch to new'], ['copy', 'Copy destination']] },
+  wrap: { description: 'Start inside a wrapped source Line. A one-row selection highlights the whole logical Line. Copy includes it once.', key: 'wrapped', segment: 1, steps: [['select', 'Select wrapped Line'], ['copy', 'Copy whole Line'], ['old', 'Switch and clear selection']] },
+  absent: { description: 'This added File has no old source. Select old to see the no-source state.', fixture: 'added', key: 'only', steps: [['old', 'Select absent old'], ['new', 'Return to new'], ['copy', 'Copy new source']] },
+  direction: { description: 'For new, rows 2 and 3 have no source. Down moves from row 1 to row 4. Up returns to row 1.', fixture: 'gap', key: 'first', steps: [['down', 'Down to row 4'], ['up', 'Up to row 1']] },
+  stops: { description: 'A real blank Line remains a stop. Wrapped source, Folds, Comments, and headers also remain stops.', key: 'added', steps: [['down', 'Stop on blank Line'], ['up', 'Return to added Line'], ['up', 'Skip removed Line'], ['up', 'Stop on context'], ['up', 'Stop on Hunk header'], ['up', 'Stop on File header']] },
+};
+const $ = id => document.getElementById(id);
+function setText(id, text) { $(id).textContent = text; }
+function render() {
+  const rows = model.project(state), lights = model.highlights(state, rows), lines = model.copyLines(state, rows);
+  $('option').value = state.option;
+  $('layout').value = state.layout;
+  $('fixture').value = state.fixture;
+  setText('path', model.fixtures[state.fixture].path);
+  $('old').setAttribute('aria-pressed', state.version === 'old');
+  $('new').setAttribute('aria-pressed', state.version === 'new');
+  $('select').setAttribute('aria-pressed', state.mark !== null);
+  $('copy').disabled = !lines.length;
+  const terminal = $('terminal');
+  terminal.replaceChildren();
+  const hasSource = rows.some(row => row[state.version]);
+  if (!hasSource) {
+    const notice = document.createElement('div');
+    notice.className = 'notice';
+    notice.textContent = `No ${state.version} source in this File. Source copy is unavailable.`;
+    terminal.append(notice);
+  }
+  const extraIds = new Set();
+  const highlightedIds = new Set();
+  rows.forEach((row, index) => {
+    const element = document.createElement('div');
+    element.className = 'row';
+    element.dataset.index = index;
+    element.dataset.key = row.key;
+    if (row.kind) {
+      element.className += ' structural' + (lights[index].structural ? ' cursor' : '');
+      element.textContent = row.label;
+    } else {
+      const sides = state.layout === 'side_by_side' ? ['old', 'new'] : [row.new ? 'new' : 'old'];
+      for (const side of sides) {
+        const line = row[side], part = row[`${side}Part`];
+        const half = document.createElement('div');
+        half.className = `half ${side}`;
+        if (line?.changed) half.classList.add('changed');
+        const sharedContext = state.layout === 'unified' && row.old && row.new;
+        const highlighted = sharedContext ? lights[index].old || lights[index].new : lights[index][side];
+        if (highlighted) half.classList.add('highlight');
+        if (lights[index][`${side}Extra`]) { half.classList.add('extra'); extraIds.add(line.id); }
+        if (highlighted && line) {
+          highlightedIds.add(line.id);
+          // A Unified context Line represents both versions with the same source text.
+          if (state.layout === 'unified' && row.old && row.new) highlightedIds.add(row[state.version].id);
+        }
+        if (index === state.cursor && side === state.version) half.classList.add('cursor');
+        half.dataset.line = line?.id ?? '';
+        const number = document.createElement('span');
+        number.className = 'number';
+        number.textContent = line && part !== null && row.segment === 0 ? String(line.number) : '';
+        const text = document.createElement('span');
+        text.className = 'text';
+        text.textContent = part ?? '';
+        half.append(number, text);
+        element.append(half);
+      }
+    }
+    terminal.append(element);
+  });
+  // A Unified context row displays one text for both versions. It is not an extra copy Line.
+  if (state.layout === 'unified') for (const row of rows) {
+    if (row.old && row.new && lines.some(line => line.id === row[state.version].id)) extraIds.delete(row[state.version === 'old' ? 'new' : 'old'].id);
+  }
+  const missing = lines.filter(line => !highlightedIds.has(line.id));
+  const parity = extraIds.size === 0 && missing.length === 0;
+  $('parity').dataset.match = parity;
+  setText('parity', !lines.length ? 'No source text at this cursor.' : parity
+    ? 'Highlight matches the source text that y copies.'
+    : `Highlight differs from copy. Extra highlighted Lines: ${[...extraIds].join(', ') || 'none'}. Missing highlights: ${missing.map(line => line.id).join(', ') || 'none'}.`);
+  const current = rows[state.cursor], candidate = current?.[state.version];
+  setText('version-state', state.version.toUpperCase());
+  setText('cursor-state', `Visual row ${state.cursor + 1}. ${current?.kind ?? (candidate ? `${candidate.id}${candidate.text === '' ? ' · blank Line' : ''} · segment ${current.segment + 1}` : 'No source')}`);
+  setText('selection-state', state.mark === null ? 'None' : `Mark ${state.mark + 1}. Cursor ${state.cursor + 1}. Range ${Math.min(state.mark, state.cursor) + 1}–${Math.max(state.mark, state.cursor) + 1}.`);
+  setText('identities', lines.map(line => line.id).join(', ') || 'None');
+  setText('last-action', state.lastAction);
+  const text = model.copyText(state, rows);
+  setText('preview', lines.length ? text : 'No source to copy.');
+  setText('bytes', `${new TextEncoder().encode(text).length} bytes · ${lines.length} source Lines${lines.length && text === '' ? ' · one empty Line' : ''}`);
+  setText('captured', state.captured === null ? 'No copy yet.' : state.captured);
+  $('captured').dataset.captured = state.captured === null ? 'false' : 'true';
+  setText('scenario-description', scenarios[$('scenario').value].description);
+  $('steps').replaceChildren();
+  scenarios[$('scenario').value].steps.forEach(([action, label], index) => {
+    const button = document.createElement('button');
+    button.textContent = `${index + 1}. ${label}`;
+    button.disabled = index !== scenarioStep;
+    if (index < scenarioStep) button.className = 'done';
+    button.addEventListener('click', () => { scenarioStep++; dispatch(action); });
+    $('steps').append(button);
+  });
+  terminal.querySelector(`[data-index="${state.cursor}"]`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+function dispatch(action) { state = model.action(state, action); render(); }
+function resetScenario() {
+  const scenario = scenarios[$('scenario').value];
+  state = model.initial({ option: state.option, layout: state.layout, wrap: state.wrap,
+    fixture: scenario.fixture ?? 'main', version: scenario.version ?? 'new', lastAction: 'Reset scenario' });
+  const rows = model.project(state);
+  state.cursor = rows.findIndex(row => row.key === scenario.key && row.segment === (scenario.segment ?? 0) && row[state.version]);
+  if (state.cursor < 0) state.cursor = 0;
+  scenarioStep = 0;
+  render();
+}
+document.querySelectorAll('[data-action]').forEach(button => button.addEventListener('click', () => dispatch(button.dataset.action)));
+$('option').addEventListener('change', event => { state = { ...state, option: Number(event.target.value), lastAction: 'Changed highlight option' }; render(); });
+$('layout').addEventListener('change', event => { state = model.reproject(state, { layout: event.target.value, lastAction: 'Changed layout' }); resize(); render(); });
+$('fixture').addEventListener('change', event => { state = model.initial({ option: state.option, layout: state.layout, wrap: state.wrap, fixture: event.target.value, cursor: 0 }); render(); });
+$('scenario').addEventListener('change', resetScenario);
+$('reset').addEventListener('click', resetScenario);
+document.addEventListener('keydown', event => {
+  if (event.ctrlKey || event.altKey || event.metaKey || ['SELECT', 'INPUT', 'TEXTAREA'].includes(event.target.tagName)) return;
+  const keys = { h: 'old', ArrowLeft: 'old', l: 'new', ArrowRight: 'new', j: 'down', k: 'up', v: 'select', y: 'copy', Escape: 'clear' };
+  const action = event.key === 'ArrowDown' ? (event.shiftKey ? 'extendDown' : 'down')
+    : event.key === 'ArrowUp' ? (event.shiftKey ? 'extendUp' : 'up') : keys[event.key];
+  if (!action) return;
+  event.preventDefault();
+  dispatch(action);
+});
+function resize() {
+  const width = $('terminal').clientWidth;
+  const narrow = window.innerWidth <= 560;
+  const column = state.layout === 'side_by_side' ? (width - 1) / 2 : width;
+  const wrap = Math.max(8, Math.floor((column - (narrow ? 32 : 44) - 10) / (narrow ? 6.65 : 7.85)));
+  if (wrap !== state.wrap) state = model.reproject(state, { wrap });
+}
+window.addEventListener('resize', () => { resize(); render(); });
+// Expose the in-memory model for browser inspection. This is not a production API.
+window.diffPrototype = { model, getState: () => ({ ...state }), dispatch, resetScenario };
+resize();
+resetScenario();
+</script>
+</body>
+</html>
