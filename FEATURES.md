@@ -82,7 +82,7 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [ ] **Credential login and logout** — `bbr auth` manages one validated Bitbucket Credential in an XDG auth file; complete environment credentials remain available for automation. `M26`
 - [ ] **Markdown comment bodies and long-body folding** `M15`
 - [x] **External editor handoff** `M16`
-- [ ] **Shell completions** — `bbr completion (bash|zsh|fish)` prints verbs, flags, and Profile names
+- [x] **Shell completions**. `bbr completion (bash|zsh|fish)` prints verbs, flags, and Profile names. `PR #7`
 
 ## Explicit non-features (for now)
 - Bitbucket Server / Data Center · applying suggestions · editing files · merge · decline.

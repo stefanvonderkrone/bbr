@@ -153,8 +153,8 @@ pub fn flagsForVerb(name: []const u8) ?[]const []const u8 {
 
 /// Split argv (after `api`) into globals + verb + verb args.
 /// Strips `--json`, `--workspace V`, and `--profile V` wherever
-/// they appear as flags (never as a value-flag's value). `--help` anywhere
-/// sets help_only.
+/// they appear as flags (never as a value-flag's value). Standalone `--help`
+/// or `-h` sets help_only.
 const Parsed = struct {
     verb: ?[]const u8,
     rest: []const []const u8,
@@ -375,12 +375,16 @@ test "parseGlobal extracts globals and verb" {
 
 test "parseGlobal keeps flag values intact" {
     const a = std.testing.allocator;
-    const argv = [_][]const u8{ "create-comment", "--body", "--json" };
-    const p = try parseGlobal(a, &argv);
-    defer a.free(p.rest);
-    // `--json` right after value-flag `--body` is its value, not the global.
-    try std.testing.expect(!p.json);
-    try std.testing.expectEqual(@as(usize, 2), p.rest.len);
+    for ([_][]const u8{ "--json", "--help", "-h" }) |value| {
+        const p = try parseGlobal(a, &.{ "create-comment", "--body", value });
+        defer a.free(p.rest);
+        try std.testing.expect(!p.json);
+        try std.testing.expect(!p.help_only);
+        try std.testing.expectEqualStrings("create-comment", p.verb.?);
+        try std.testing.expectEqual(@as(usize, 2), p.rest.len);
+        try std.testing.expectEqualStrings("--body", p.rest[0]);
+        try std.testing.expectEqualStrings(value, p.rest[1]);
+    }
 }
 
 test "parseGlobal extracts Profiles without consuming verb flag values" {
@@ -525,6 +529,11 @@ test "diagnostic verb lookup skips sensitive values and does not guess unknown f
     try std.testing.expect(diagnosticVerb(&.{ "--unknown", "get-pull-request", "--workspace" }) == null);
     try std.testing.expect(diagnosticVerb(&.{ "--workspace=whoami", "--body" }) == null);
     try std.testing.expect(diagnosticVerb(&.{ "private-value", "get-pull-request" }) == null);
+    for ([_][]const u8{ "--help", "-h" }) |value| {
+        try std.testing.expectEqualStrings("create-comment", diagnosticVerb(&.{ "--body", value, "create-comment", "--workspace" }).?.name);
+        try std.testing.expect(diagnosticVerb(&.{ "--body", value, "--repository", "create-comment" }) == null);
+        try std.testing.expectEqualStrings("create-comment", diagnosticVerb(&.{ value, "create-comment" }).?.name);
+    }
 }
 
 test "global parse errors use stderr and name only a safely supplied verb" {

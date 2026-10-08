@@ -70,12 +70,18 @@ with tempfile.TemporaryDirectory(prefix="bbr-api-auth-test-") as data_home:
         b"bbr api create-comment: bad options (MissingRequired)")
     run(direct, ["api", "create-comment", "--body", "--profile=work", "--repository", "sample"],
         b"bbr api create-comment: bad options (MissingRequired)")
+    for value in ("--help", "-h"):
+        run(direct, ["api", "create-comment", "--body", value, "--repository", "sample"],
+            b"bbr api create-comment: bad options (MissingRequired)")
+        run(env, ["api", "create-comment", "--repository", "r", "--pull-request-id", "1", "--body", value],
+            b"bbr api create-comment: InvalidProxyConfiguration")
 
     auth_file.write_text('[profiles.personal]\ntoken = "private-token"oops"\n')
     run(env, ["api", "whoami", "--json"], b"InvalidAuthFile")
-    result = subprocess.run([binary, "api", "whoami", "--help"], capture_output=True, env=env, timeout=5)
-    assert result.returncode == 0, result.stderr
-    assert b"--profile NAME" in result.stdout
-    assert result.stderr == b"", result.stderr
+    for flag in ("--help", "-h"):
+        result = subprocess.run([binary, "api", "whoami", flag], capture_output=True, env=env, timeout=5)
+        assert result.returncode == 0, result.stderr
+        assert b"--profile NAME" in result.stdout
+        assert result.stderr == b"", result.stderr
 
 print("API auth CLI checks passed. Saved Profiles, overrides, flag values, errors, and help.")
