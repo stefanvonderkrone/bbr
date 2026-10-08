@@ -181,7 +181,10 @@ pub fn runList(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const [
             head = .{ .source = p.source.?, .destination = p.destination.? };
         } else {
             const pr = try bb.getPullRequest(a, p.ids.repository, p.ids.pr_id);
-            head = .{ .source = pr.source_commit, .destination = pr.destination_commit };
+            head = .{
+                .source = p.source orelse pr.source_commit,
+                .destination = p.destination orelse pr.destination_commit,
+            };
         }
     }
     const items = try bb.getCommentsPage(a, p.ids.repository, p.ids.pr_id, head, p.opts);
@@ -587,19 +590,26 @@ test "api comments list head selection preserves automatic explicit and no-head 
     const pull_request =
         \\{"id":7,"title":"Title","state":"OPEN","author":{"display_name":"Ada","uuid":"{account}"},"source":{"branch":{"name":"source"},"commit":{"hash":"other"}},"destination":{"branch":{"name":"destination"},"commit":{"hash":"def"}},"participants":[]}
     ;
+    const destination_pull_request =
+        \\{"id":7,"title":"Title","state":"OPEN","author":{"display_name":"Ada","uuid":"{account}"},"source":{"branch":{"name":"source"},"commit":{"hash":"abc"}},"destination":{"branch":{"name":"destination"},"commit":{"hash":"other"}},"participants":[]}
+    ;
     const cases = [_]struct {
         args: []const []const u8,
         state: bbr.review.ScopeState,
         calls: usize,
+        pr_body: []const u8 = pull_request,
     }{
         .{ .args = &.{ "--repository=repo", "--pull-request-id=7" }, .state = .outdated, .calls = 2 },
         .{ .args = &.{ "--source-commit=abc", "--repository=repo", "--destination-commit=def", "--pull-request-id=7" }, .state = .current, .calls = 1 },
         .{ .args = &.{ "--no-head", "--repository=repo", "--pull-request-id=7" }, .state = .current, .calls = 1 },
-        .{ .args = &.{ "--source-commit=abc", "--repository=repo", "--pull-request-id=7" }, .state = .outdated, .calls = 2 },
+        .{ .args = &.{ "--source-commit=abc", "--repository=repo", "--pull-request-id=7" }, .state = .current, .calls = 2 },
+        .{ .args = &.{ "--source-commit=wrong", "--repository=repo", "--pull-request-id=7" }, .state = .outdated, .calls = 2 },
+        .{ .args = &.{ "--destination-commit=def", "--repository=repo", "--pull-request-id=7" }, .state = .current, .calls = 2, .pr_body = destination_pull_request },
+        .{ .args = &.{ "--destination-commit=wrong", "--repository=repo", "--pull-request-id=7" }, .state = .outdated, .calls = 2, .pr_body = destination_pull_request },
         .{ .args = &.{ "--source-commit=wrong", "--no-head", "--destination-commit=wrong", "--repository=repo", "--pull-request-id=7" }, .state = .current, .calls = 1 },
     };
     for (cases) |case| {
-        const responses = [_]bbr.http.Canned{ .{ .body = pull_request }, .{ .body = page } };
+        const responses = [_]bbr.http.Canned{ .{ .body = case.pr_body }, .{ .body = page } };
         var fake: bbr.http.FakeHttpClient = .{ .responses = if (case.calls == 2) &responses else responses[1..] };
         var output: TestOutput = .{};
         try runList(output.init(), testClient(&fake), case.args, true);

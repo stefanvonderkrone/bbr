@@ -1132,6 +1132,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
 // (app → render → theme → nav → picker → session); the core `bbr` module's
 // tests run via src/root.zig.
 test {
+    _ = @import("completion.zig");
     _ = @import("api/cli.zig");
     _ = @import("api/args.zig");
     _ = @import("api/workspaces.zig");

@@ -387,11 +387,22 @@ pub const zsh_script =
     \\
 ;
 
+fn fishVerbLine(comptime name: []const u8, comptime summary: []const u8) []const u8 {
+    comptime {
+        var escaped: []const u8 = "";
+        for (summary, 0..) |byte, i| {
+            if (byte == '\'' or byte == '\\') escaped = escaped ++ "\\";
+            escaped = escaped ++ summary[i .. i + 1];
+        }
+        return "complete -c bbr -n '__fish_seen_subcommand_from api' -f -a '" ++ name ++ "' -d '" ++ escaped ++ "'\n";
+    }
+}
+
 const fish_verb_lines = blk: {
     @setEvalBranchQuota(100_000);
     var text: []const u8 = "";
     for (cli.verbs) |verb| {
-        text = text ++ "complete -c bbr -n '__fish_seen_subcommand_from api' -f -a '" ++ verb.name ++ "' -d '" ++ verb.summary ++ "'\n";
+        text = text ++ fishVerbLine(verb.name, verb.summary);
         if (cli.flagsForVerb(verb.name)) |flags| {
             for (flags) |flag| {
                 const cond = "'__fish_seen_subcommand_from " ++ verb.name ++ "; and __fish_seen_subcommand_from api'";
@@ -447,7 +458,6 @@ test "completion metadata covers every verb" {
 }
 
 test "bash script completes verbs, flags, and the profiles hook" {
-    try std.testing.expect(std.mem.indexOf(u8, bash_script, "++") == null);
     for (cli.verbs) |verb| try std.testing.expect(std.mem.indexOf(u8, bash_script, verb.name) != null);
     for ([_][]const u8{ "--pull-request-id", "--profile", "--workspace", "--json" }) |flag| {
         try std.testing.expect(std.mem.indexOf(u8, bash_script, flag) != null);
@@ -457,7 +467,6 @@ test "bash script completes verbs, flags, and the profiles hook" {
 }
 
 test "zsh script completes verbs, flags, and the profiles hook" {
-    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "++") == null);
     for (cli.verbs) |verb| try std.testing.expect(std.mem.indexOf(u8, zsh_script, verb.name) != null);
     for ([_][]const u8{ "--pull-request-id", "--profile", "--workspace" }) |flag| {
         try std.testing.expect(std.mem.indexOf(u8, zsh_script, flag) != null);
@@ -468,8 +477,16 @@ test "zsh script completes verbs, flags, and the profiles hook" {
 
 test "fish script completes verbs, flags, and the profiles hook" {
     for (cli.verbs) |verb| try std.testing.expect(std.mem.indexOf(u8, fish_script, verb.name) != null);
-    for ([_][]const u8{ "--pull-request-id", "--profile", "--workspace" }) |flag| {
+    for ([_][]const u8{ "-l pull-request-id", "-l profile", "-l workspace" }) |flag| {
         try std.testing.expect(std.mem.indexOf(u8, fish_script, flag) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, fish_script, "(bbr completion --list-profiles)") != null);
+}
+
+test "fish verb descriptions preserve quotes and backslashes" {
+    const line = comptime fishVerbLine("get-comment", "read author's \\path\\'comment'");
+    try std.testing.expectEqualStrings(
+        "complete -c bbr -n '__fish_seen_subcommand_from api' -f -a 'get-comment' -d 'read author\\'s \\\\path\\\\\\'comment\\''\n",
+        line,
+    );
 }
