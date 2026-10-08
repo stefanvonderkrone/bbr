@@ -191,7 +191,7 @@ pub fn runList(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const [
         for (items) |c| {
             const where: []const u8 = if (c.anchor) |anc| anc.path else "(review)";
             const state: []const u8 = @tagName(c.state);
-            try out.printLine(init, "#{d} {s} [{s}{s}] {s}", .{
+            try out.printLine(init, "#{d} {s} [{s} {s}] {s}", .{
                 c.id,                                c.author, where, state,
                 if (c.resolved) " resolved" else "",
             });
