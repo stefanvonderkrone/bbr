@@ -11,6 +11,7 @@ binary = str(Path(sys.argv[1]).resolve())
 
 
 def clean_env(data_home):
+    """Return an environment without Credential or proxy overrides, using the test data directory."""
     env = dict(os.environ)
     for key in list(env):
         if key.startswith("BITBUCKET_") or key == "BBR_PROFILE" or key.lower().endswith("_proxy"):

@@ -11,6 +11,7 @@ binary = str(Path(sys.argv[1]).resolve())
 
 
 def run(env, args, expected):
+    """Check that the command fails with the expected error and hides Credential values."""
     result = subprocess.run([binary, *args], capture_output=True, env=env, timeout=5)
     assert result.returncode != 0, result
     assert result.stdout == b"", result.stdout

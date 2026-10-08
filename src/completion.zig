@@ -453,7 +453,7 @@ test "bash script completes verbs, flags, and the profiles hook" {
         try std.testing.expect(std.mem.indexOf(u8, bash_script, flag) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, bash_script, "bbr completion --list-profiles") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bash_script, "complete -F _bbr bbr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash_script, "complete -F _bbr -o default bbr") != null);
 }
 
 test "zsh script completes verbs, flags, and the profiles hook" {
