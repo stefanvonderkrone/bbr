@@ -68,7 +68,9 @@ pub const help = blk: {
         \\Verbs:
         \\
     ;
-    for (verbs) |verb| text = text ++ "  " ++ verb.name ++ "  " ++ verb.summary ++ "\n";
+    var name_width: usize = 0;
+    for (verbs) |verb| name_width = @max(name_width, verb.name.len);
+    for (verbs) |verb| text = text ++ "  " ++ verb.name ++ (" " ** (name_width - verb.name.len + 2)) ++ verb.summary ++ "\n";
     break :blk text ++ "\nAuth comes from `bbr login` Profiles with per-field BITBUCKET_* overrides.\n" ++
         "Profile selection: --profile, BBR_PROFILE, Active Profile, default.\n" ++
         "Workspace selection: --workspace, BITBUCKET_WORKSPACE, selected Profile.\n";
@@ -401,10 +403,13 @@ test "parseGlobal extracts Profiles without consuming verb flag values" {
 
 test "verb registry is unique and every entry has matching help" {
     try std.testing.expectEqual(@as(usize, 28), verbs.len);
+    var summary_column: ?usize = null;
     inline for (verbs, 0..) |verb, index| {
         for (verbs[index + 1 ..]) |other| try std.testing.expect(!std.mem.eql(u8, verb.name, other.name));
         try std.testing.expect(std.mem.startsWith(u8, verbHelp(verb.name), "usage: bbr api " ++ verb.name));
-        try std.testing.expect(std.mem.indexOf(u8, help, "  " ++ verb.name ++ "  " ++ verb.summary ++ "\n") != null);
+        const row_start = std.mem.indexOf(u8, help, "  " ++ verb.name ++ "  ") orelse return error.TestUnexpectedResult;
+        const column = std.mem.indexOf(u8, help[row_start..], verb.summary ++ "\n") orelse return error.TestUnexpectedResult;
+        if (summary_column) |expected| try std.testing.expectEqual(expected, column) else summary_column = column;
         try std.testing.expect(std.mem.startsWith(u8, verb.example, "bbr api " ++ verb.name ++ " "));
         var buffer: [8192]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);
