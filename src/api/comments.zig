@@ -210,7 +210,32 @@ pub fn runGet(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []
     if (json) {
         try out.printJson(init, single);
     } else {
-        try out.printLine(init, "#{d} {s}: {s}", .{ single.id, single.author, single.body });
+        try out.printLine(init, "#{d} {s}", .{ single.id, single.author });
+        if (single.author_uuid) |uuid| try out.printLine(init, "author uuid: {s}", .{uuid});
+        if (single.parent_id) |id| {
+            try out.printLine(init, "parent: #{d}", .{id});
+            try out.printLine(init, "scope: inherited", .{});
+        } else switch (single.effectiveScope()) {
+            .review => try out.printLine(init, "scope: review", .{}),
+            .file => |file| {
+                try out.printLine(init, "scope: file", .{});
+                try out.printLine(init, "path: {s}", .{file.path});
+                try out.printLine(init, "source commit: {s}", .{file.source_commit});
+            },
+            .@"inline" => |anchor| {
+                try out.printLine(init, "scope: inline", .{});
+                try out.printLine(init, "path: {s}", .{anchor.path});
+                if (anchor.from) |line| try out.printLine(init, "from: {d}", .{line});
+                if (anchor.to) |line| try out.printLine(init, "to: {d}", .{line});
+                if (anchor.start_from) |line| try out.printLine(init, "start from: {d}", .{line});
+                if (anchor.start_to) |line| try out.printLine(init, "start to: {d}", .{line});
+                if (anchor.commit) |commit| try out.printLine(init, "commit: {s}", .{commit});
+            },
+        }
+        try out.printLine(init, "state: {s}", .{@tagName(single.state)});
+        try out.printLine(init, "resolved: {}", .{single.resolved});
+        try out.printLine(init, "deleted: {}", .{single.deleted});
+        try out.printLine(init, "body:\n{s}", .{single.body});
     }
 }
 
@@ -394,6 +419,52 @@ const test_account = "{\"uuid\":\"{account}\"}";
 const test_owned_comment =
     \\{"id":9,"content":{"raw":"original"},"user":{"display_name":"Ada","uuid":"{account}"}}
 ;
+
+test "human comment details distinguish scopes replies and deleted comments" {
+    const cases = [_]struct { body: []const u8, expected: []const u8 }{
+        .{
+            .body = test_owned_comment,
+            .expected = "#9 Ada\nauthor uuid: {account}\nscope: review\nstate: current\nresolved: false\ndeleted: false\nbody:\noriginal\n",
+        },
+        .{
+            .body =
+            \\{"id":9,"content":{"raw":"first\nsecond"},"user":{"display_name":"Ada"},"inline":{"path":"f.zig","to":4,"start_to":2,"outdated":true},"resolution":{}}
+            ,
+            .expected = "#9 Ada\nscope: inline\npath: f.zig\nto: 4\nstart to: 2\nstate: outdated\nresolved: true\ndeleted: false\nbody:\nfirst\nsecond\n",
+        },
+        .{
+            .body =
+            \\{"id":9,"content":{"raw":"original"},"user":{"display_name":"Ada"},"inline":{"path":"f.zig","from":8,"start_from":6}}
+            ,
+            .expected = "#9 Ada\nscope: inline\npath: f.zig\nfrom: 8\nstart from: 6\nstate: current\nresolved: false\ndeleted: false\nbody:\noriginal\n",
+        },
+        .{
+            .body =
+            \\{"id":9,"content":{"raw":"original"},"user":{"display_name":"Ada"},"inline":{"path":"f.zig"}}
+            ,
+            .expected = "#9 Ada\nscope: file\npath: f.zig\nsource commit: \nstate: current\nresolved: false\ndeleted: false\nbody:\noriginal\n",
+        },
+        .{
+            .body =
+            \\{"id":9,"parent":{"id":7},"content":{"raw":"reply"},"user":{"display_name":"Ada"}}
+            ,
+            .expected = "#9 Ada\nparent: #7\nscope: inherited\nstate: current\nresolved: false\ndeleted: false\nbody:\nreply\n",
+        },
+        .{
+            .body =
+            \\{"id":9,"deleted":true,"content":{"raw":"hidden"},"user":{"display_name":"Ada"},"inline":{"path":"f.zig","to":4}}
+            ,
+            .expected = "#9 Ada\nscope: inline\npath: f.zig\nto: 4\nstate: current\nresolved: false\ndeleted: true\nbody:\n\n",
+        },
+    };
+    for (cases) |case| {
+        var fake: bbr.http.FakeHttpClient = .{ .body = case.body };
+        var output: TestOutput = .{};
+        try runGet(output.init(), testClient(&fake), &test_ids, false);
+        try std.testing.expectEqualStrings(case.expected, output.bytes());
+        try std.testing.expectEqual(@as(usize, 1), fake.call_count);
+    }
+}
 
 test "api comments list parses interleaved identifiers head and all page options" {
     const p = try parseList(&.{

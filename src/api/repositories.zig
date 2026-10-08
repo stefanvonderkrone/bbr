@@ -92,5 +92,7 @@ pub fn runGet(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []
         try out.printJson(init, r);
     } else {
         try out.printLine(init, "{s} ({s}) private={}", .{ r.slug, r.full_name, r.is_private });
+        try out.printLine(init, "name: {s}", .{r.name});
+        try out.printLine(init, "uuid: {s}", .{r.uuid});
     }
 }

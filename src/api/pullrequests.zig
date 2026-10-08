@@ -118,8 +118,15 @@ pub fn runGet(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []
     } else {
         try out.printLine(init, "#{d} [{s}] {s}", .{ pr.id, pr.state, pr.title });
         try out.printLine(init, "author: {s}", .{pr.author_display_name});
+        try out.printLine(init, "author uuid: {s}", .{pr.author_uuid});
         try out.printLine(init, "{s} -> {s}", .{ pr.source_branch, pr.destination_branch });
         try out.printLine(init, "source: {s} destination: {s}", .{ pr.source_commit, pr.destination_commit });
+        if (pr.reviewer_verdicts) |verdicts| {
+            try out.printLine(init, "reviewer verdicts: {d}", .{verdicts.len});
+            for (verdicts) |entry| {
+                try out.printLine(init, "  {s}: {s}", .{ entry.account_uuid, @tagName(entry.verdict) });
+            }
+        }
     }
 }
 

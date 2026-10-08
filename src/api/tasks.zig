@@ -131,7 +131,10 @@ pub fn runGet(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []
     if (json) {
         try out.printJson(init, t);
     } else {
-        try out.printLine(init, "#{d} [{s}] {s}", .{ t.id, @tagName(t.state), t.content });
+        try out.printLine(init, "#{d} [{s}]", .{ t.id, @tagName(t.state) });
+        try out.printLine(init, "creator uuid: {s}", .{t.creator_uuid});
+        if (t.comment_id) |id| try out.printLine(init, "comment: #{d}", .{id});
+        try out.printLine(init, "content:\n{s}", .{t.content});
     }
 }
 
