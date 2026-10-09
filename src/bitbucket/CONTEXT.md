@@ -54,6 +54,14 @@ _Avoid_: reviewer identity (a reviewer may read without proven mutation ownershi
 The Authenticated Account's current review decision for a PullRequest: Approved, Changes Requested, or No Verdict. Setting No Verdict removes the account's current Approved or Changes Requested state. A PullRequest Author cannot set a Reviewer Verdict on that PullRequest.
 _Avoid_: approval state (omits Changes Requested), participant state (Bitbucket wire vocabulary), review status (too broad).
 
+**Task**:
+Actionable prose on a PullRequest, distinct from a Comment: it carries content plus a state of Resolved or Unresolved, and may link to the Comment it was raised against. Resolving a Task never edits its content.
+_Avoid_: comment, thread, issue.
+
+**Resolve**:
+Closing a Thread or completing a Task without editing its prose: a resolved Comment Thread shows its resolution flag, a resolved Task shows its Resolved state. Reopening reverses it. Never means editing a body.
+_Avoid_: update, edit, fix.
+
 ## API quirks (verified against live PRs)
 
 **Outdated comments.** The comments *list* endpoint

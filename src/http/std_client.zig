@@ -86,6 +86,14 @@ pub const StdHttpClient = struct {
             try request_body.writer.writeAll(payload);
             try request_body.end();
             try request.connection.?.flush();
+        } else if (toStdMethod(req.method).requestHasBody()) {
+            // POST/PUT with no payload (resolve, approve): std.http refuses a
+            // bodiless request for these methods, so send an empty body with
+            // an explicit zero length instead.
+            request.transfer_encoding = .{ .content_length = 0 };
+            var request_body = try request.sendBodyUnflushed(&.{});
+            try request_body.end();
+            try request.connection.?.flush();
         } else {
             try request.sendBodiless();
         }
@@ -100,12 +108,21 @@ pub const StdHttpClient = struct {
 
         var body: Io.Writer.Allocating = .init(allocator);
         errdefer body.deinit();
-        var transfer_buffer: [64]u8 = undefined;
-        const reader = response.reader(&transfer_buffer);
-        _ = reader.streamRemaining(&body.writer) catch |err| switch (err) {
-            error.ReadFailed => return response.bodyErr().?,
-            else => |e| return e,
-        };
+        // 1xx/204/304 never carry a body (RFC 9110 §15): std's reader keys
+        // off the request method, so it would wait on a keep-alive
+        // connection for bytes that never come. Skip the read entirely, and
+        // retire the connection: Request.deinit would otherwise drain the
+        // (absent) body the same way before pooling it.
+        const has_body = !(status == 204 or status == 304 or (status >= 100 and status < 200));
+        if (!has_body) request.connection.?.closing = true;
+        if (has_body) {
+            var transfer_buffer: [64]u8 = undefined;
+            const reader = response.reader(&transfer_buffer);
+            _ = reader.streamRemaining(&body.writer) catch |err| switch (err) {
+                error.ReadFailed => return response.bodyErr().?,
+                else => |e| return e,
+            };
+        }
 
         const response_body = try body.toOwnedSlice();
         if (isSubmissionRequest(req))

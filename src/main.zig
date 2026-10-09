@@ -16,6 +16,8 @@ const persist = @import("persist/sqlite_store.zig");
 const config = @import("tui/config.zig");
 const TreeSitterHighlighter = @import("highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter;
 const grammar_cli = @import("highlight/grammar_cli.zig");
+const api_cli = @import("api/cli.zig");
+const completion_cli = @import("completion.zig");
 const presentation = @import("tui/presentation.zig");
 const buffer_mod = @import("tui/buffer.zig");
 
@@ -26,7 +28,7 @@ const ArgSlice = struct {
     args: []const []const u8,
     idx: usize = 0,
 
-    fn next(self: *@This()) ?[]const u8 {
+    pub fn next(self: *@This()) ?[]const u8 {
         if (self.idx >= self.args.len) return null;
         defer self.idx += 1;
         return self.args[self.idx];
@@ -37,9 +39,7 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const auth = bbr.bitbucket.auth;
 
-    // Collect argv (minus the executable) so the global `--profile` flag
-    // works in any position and for every subcommand — including future
-    // non-TUI ones like `api` and `mcp` — through one shared resolver.
+    // Collect argv so each subcommand can parse its flags and their values.
     var it = init.minimal.args.iterate();
     _ = it.next(); // executable name
     var argv: std.ArrayList([]const u8) = .empty;
@@ -52,7 +52,10 @@ pub fn main(init: std.process.Init) !void {
     var arg_idx: usize = 0;
     while (arg_idx < argv.items.len) : (arg_idx += 1) {
         const a = argv.items[arg_idx];
-        if (std.mem.eql(u8, a, "--profile")) {
+        if (filtered.items.len == 0 and std.mem.eql(u8, a, "api")) {
+            var api_args = ArgSlice{ .args = argv.items[arg_idx + 1 ..] };
+            return api_cli.run(init, gpa, &api_args, flag_profile);
+        } else if (std.mem.eql(u8, a, "--profile")) {
             arg_idx += 1;
             if (arg_idx >= argv.items.len) {
                 std.debug.print("bbr: --profile needs a value\n", .{});
@@ -113,6 +116,7 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, f, "login")) return loginRun(init, gpa, &rest, flag_profile);
         if (std.mem.eql(u8, f, "logout")) return logoutRun(init, gpa, &rest, flag_profile);
+        if (std.mem.eql(u8, f, "completion")) return completion_cli.run(init, gpa, &rest);
         if (std.mem.eql(u8, f, "check-blobs")) {
             var blob_owned = auth.resolve(gpa, init.io, init.environ_map, flag_profile) catch |err| {
                 if (err == error.InvalidAuthFile) return;
@@ -1012,6 +1016,11 @@ fn usage() void {
         \\  bbr external-edit-smoke          interactive PTY External Edit check
         \\  bbr demo                         open the TUI with synthetic data (no network)
         \\  bbr grammar <command> ...        manage trusted local UserGrammars
+        \\  bbr api [--workspace SLUG] [--json] VERB [options]
+        \\  bbr api --help                   list all verbs (no credentials needed)
+        \\  bbr api VERB --help              options for one verb
+        \\  bbr completion (bash|zsh|fish)   print a shell completion script (no credentials needed)
+        \\  bbr completion --list-profiles   saved Profile names, one per line (for completion scripts)
         \\
         \\Credentials come from `$XDG_DATA_HOME/bbr/auth.toml` (see `bbr login`).
         \\`--profile <name>` (or BBR_PROFILE) selects a saved profile.
@@ -1123,6 +1132,16 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
 // (app → render → theme → nav → picker → session); the core `bbr` module's
 // tests run via src/root.zig.
 test {
+    _ = @import("completion.zig");
+    _ = @import("api/cli.zig");
+    _ = @import("api/args.zig");
+    _ = @import("api/workspaces.zig");
+    _ = @import("api/repositories.zig");
+    _ = @import("api/pullrequests.zig");
+    _ = @import("api/comments.zig");
+    _ = @import("api/tasks.zig");
+    _ = @import("api/files.zig");
+    _ = @import("api/commits.zig");
     _ = @import("highlight/tree_sitter_highlighter.zig");
     _ = @import("highlight/query_regex.zig");
     _ = @import("highlight/user_grammar.zig");

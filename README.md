@@ -94,6 +94,32 @@ profile per field for scripting. `bbr local` does not read or
 require them. Its SourceRef defaults to the current branch; its BaseRef defaults to the tracking
 remote's locally recorded default branch and must be supplied when Git has no such default.
 
+### Bitbucket API commands
+
+`bbr api` uses the same saved Profiles and per-field environment overrides as remote review.
+`--workspace` overrides both `BITBUCKET_WORKSPACE` and the selected Profile's Workspace.
+The API commands do not load the TUI configuration.
+Help does not need credentials.
+
+```sh
+bbr api --help
+bbr api whoami --profile work --json
+bbr --profile work api list-pull-requests --workspace check24 --repository sample
+```
+
+### Shell completions
+
+`bbr completion` prints a completion script for `bbr` commands, `bbr api` verbs,
+and per-verb flags. `--profile` values complete from saved Profiles. No
+credentials are needed to print a script.
+
+```sh
+eval "$(bbr completion bash)"                                   # try it once
+bbr completion bash > ~/.local/share/bash-completion/completions/bbr
+bbr completion zsh > "${fpath[1]}/_bbr"                        # then `compinit`
+bbr completion fish > ~/.config/fish/completions/bbr.fish
+```
+
 ## Configuration
 
 The TUI reads `$XDG_CONFIG_HOME/bbr/config.toml`, falling back to
