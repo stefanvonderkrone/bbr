@@ -2,8 +2,9 @@
 //! `std.process.getEnvVarOwned`; env access now goes through the
 //! `std.process.Environ.Map` the runtime hands `main` via `Init.environ_map`.
 //!
-//! The token is a secret: it is never logged and never persisted. It lives only
-//! in the environ map (process lifetime) and in the Authorization header we build.
+//! The token is a secret: it is never logged. It lives in the environ map
+//! (process lifetime), in `auth.toml` profiles (`0600`, see `auth.zig`), and
+//! in the Authorization header we build.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
