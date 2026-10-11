@@ -1142,6 +1142,7 @@ test {
     _ = @import("api/tasks.zig");
     _ = @import("api/files.zig");
     _ = @import("api/commits.zig");
+    _ = @import("api/branches.zig");
     _ = @import("highlight/tree_sitter_highlighter.zig");
     _ = @import("highlight/query_regex.zig");
     _ = @import("highlight/user_grammar.zig");

@@ -35,7 +35,12 @@ with tempfile.TemporaryDirectory(prefix="bbr-completion-test-") as data_home:
         assert marker in result.stdout, result
         for flag in flags:
             assert flag in result.stdout, (shell, flag)
-        for expected in (b"list-pull-requests", b"set-verdict", b"completion --list-profiles"):
+        for expected in (
+            b"list-pull-requests", b"set-verdict", b"completion --list-profiles",
+            b"create-branch", b"list-branches", b"get-branch",
+            b"create-pull-request", b"update-pull-request", b"decline-pull-request",
+            b"list-commit-pull-requests",
+        ):
             assert expected in result.stdout, (shell, expected)
 
     result = subprocess.run([binary, "completion", "--help"], capture_output=True, env=env, timeout=5)

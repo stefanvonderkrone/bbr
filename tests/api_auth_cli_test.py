@@ -75,6 +75,10 @@ with tempfile.TemporaryDirectory(prefix="bbr-api-auth-test-") as data_home:
             b"bbr api create-comment: bad options (MissingRequired)")
         run(env, ["api", "create-comment", "--repository", "r", "--pull-request-id", "1", "--body", value],
             b"bbr api create-comment: InvalidProxyConfiguration")
+        run(env, ["api", "create-pull-request", "--repository=sample", "--source-branch=feature", "--title", value],
+            b"bbr api create-pull-request: InvalidProxyConfiguration")
+        run(env, ["api", "create-branch", "--repository=sample", "--name", value, "--target=main"],
+            b"bbr api create-branch: InvalidProxyConfiguration")
 
     auth_file.write_text('[profiles.personal]\ntoken = "private-token"oops"\n')
     run(env, ["api", "whoami", "--json"], b"InvalidAuthFile")
@@ -82,6 +86,20 @@ with tempfile.TemporaryDirectory(prefix="bbr-api-auth-test-") as data_home:
         result = subprocess.run([binary, "api", "whoami", flag], capture_output=True, env=env, timeout=5)
         assert result.returncode == 0, result.stderr
         assert b"--profile NAME" in result.stdout
+        assert result.stderr == b"", result.stderr
+    for verb, option in (
+        ("create-branch", b"--target REV"),
+        ("list-branches", b"--sort S"),
+        ("get-branch", b"--name NAME"),
+        ("create-pull-request", b"--source-repository WORKSPACE/SLUG"),
+        ("update-pull-request", b"--draft true|false"),
+        ("decline-pull-request", b"--pull-request-id N"),
+        ("list-commit-pull-requests", b"--commit HASH"),
+    ):
+        result = subprocess.run([binary, "api", verb, "--help"], capture_output=True, env=env, timeout=5)
+        assert result.returncode == 0, result.stderr
+        assert option in result.stdout, result.stdout
+        assert b"--profile NAME" in result.stdout, result.stdout
         assert result.stderr == b"", result.stderr
 
 print("API auth CLI checks passed. Saved Profiles, overrides, flag values, errors, and help.")

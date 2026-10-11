@@ -187,6 +187,13 @@ the main thread; the Epoch token still guards against stale results.
   `xcrun` for CoreFoundation linking. The SDK headers also require
   `-Wno-elaborated-enum-base` with Zig 0.16's C++ compiler.
 
+## 5.5 Bounded file reads
+
+`std.Io.Dir.readFileAlloc` returns `StreamTooLong` when the reader reaches the limit, even at EOF.
+For an inclusive byte limit, pass `.limited(max_bytes + 1)`.
+The API text-file helper uses this rule to accept exactly 1 MiB and reject larger files.
+Verified in `std/Io/Dir.zig:1326-1338` and `std/Io/Reader.zig:367-386`.
+
 ## 6. Testing
 
 - `test "name" { ... }` blocks compiled and run by `zig build test`; `std.testing`

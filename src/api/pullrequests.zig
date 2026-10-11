@@ -1,4 +1,4 @@
-//! `bbr api list-pull-requests | get-pull-request | whoami | get-verdict | set-verdict`.
+//! PullRequest reads, creation, updates, decline, and Reviewer Verdict commands.
 
 const std = @import("std");
 const bbr = @import("bbr");
@@ -16,6 +16,56 @@ pub const list_help =
 
 pub const get_help =
     \\usage: bbr api get-pull-request --repository SLUG --pull-request-id N [--json]
+    \\
+;
+
+const mutation_options =
+    \\      [--source-repository WORKSPACE/SLUG] [--destination-branch NAME]
+    \\      [--description TEXT | --description-file PATH] [--reviewer UUID ... | --clear-reviewers]
+    \\      [--draft true|false] [--close-source-branch true|false] [--json]
+    \\
+    \\--reviewer replaces the reviewer list. --clear-reviewers sends an empty list.
+    \\Omitted reviewers use Bitbucket defaults on create and stay unchanged on update.
+    \\--source-repository selects a fork source. The request Repository is the destination.
+    \\Description files must not exceed 1 MiB. Flags can appear in any order.
+    \\
+;
+
+pub const create_help =
+    \\usage: bbr api create-pull-request --repository SLUG --title TEXT --source-branch NAME
+    \\
+++ mutation_options ++
+    \\Create a ready PullRequest by default. Use --draft true to create a Draft PullRequest.
+    \\An omitted destination branch uses the Repository's main branch.
+    \\
+;
+
+pub const update_help =
+    \\usage: bbr api update-pull-request --repository SLUG --pull-request-id N
+    \\      [--title TEXT] [--source-branch NAME]
+    \\
+++ mutation_options ++
+    \\Update an open PullRequest. Supply at least one change.
+    \\--draft false makes a Draft PullRequest ready. --draft true makes it a draft.
+    \\Omitted fields stay unchanged. An empty description clears the description.
+    \\
+;
+
+pub const decline_help =
+    \\usage: bbr api decline-pull-request --repository SLUG --pull-request-id N [--json]
+    \\
+    \\Close a PullRequest without merging. This does not set a Reviewer Verdict.
+    \\
+;
+
+pub const commit_list_help =
+    \\usage: bbr api list-commit-pull-requests --repository SLUG --commit HASH [--pagelen N] [--page N] [--no-follow] [--limit N] [--json]
+    \\
+    \\List PullRequests where Bitbucket reviewed this commit, including closed PullRequests.
+    \\Follow pages by default. --no-follow returns one page. --limit caps the total.
+    \\Pending link indexing fails with a hint. This command does not poll.
+    \\The Pull Request Commit Links app must exist. Bitbucket installs it when someone
+    \\selects 'Go to pull request' on a commit's details page.
     \\
 ;
 
@@ -82,11 +132,15 @@ pub fn runList(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const [
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
     const items = try listPullRequests(arena.allocator(), bb, args);
+    try printSummaries(init, items, json);
+}
+
+fn printSummaries(init: std.process.Init, items: []const bbr.bitbucket.PullRequestSummary, json: bool) !void {
     if (json) {
         try out.printJson(init, items);
     } else {
-        for (items) |pr| try out.printLine(init, "#{d} [{s}] {s} ({s} -> {s})", .{
-            pr.id, pr.state, pr.title, pr.source_branch, pr.destination_branch,
+        for (items) |pr| try out.printLine(init, "#{d} [{s}{s}] {s} ({s} -> {s})", .{
+            pr.id, pr.state, if (pr.draft) " draft" else "", pr.title, pr.source_branch, pr.destination_branch,
         });
         try out.printLine(init, "ok: {d} pull request(s)", .{items.len});
     }
@@ -113,14 +167,28 @@ pub fn runGet(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
     const pr = try bb.getPullRequest(arena.allocator(), repo, id);
+    try printPullRequest(init, pr, json);
+}
+
+fn printPullRequest(init: std.process.Init, pr: bbr.bitbucket.PullRequest, json: bool) !void {
     if (json) {
         try out.printJson(init, pr);
     } else {
         try out.printLine(init, "#{d} [{s}] {s}", .{ pr.id, pr.state, pr.title });
+        try out.printLine(init, "draft: {}", .{pr.draft});
+        if (pr.url.len != 0) try out.printLine(init, "url: {s}", .{pr.url});
         try out.printLine(init, "author: {s}", .{pr.author_display_name});
         try out.printLine(init, "author uuid: {s}", .{pr.author_uuid});
         try out.printLine(init, "{s} -> {s}", .{ pr.source_branch, pr.destination_branch });
         try out.printLine(init, "source: {s} destination: {s}", .{ pr.source_commit, pr.destination_commit });
+        if (pr.source_repository.len != 0) try out.printLine(init, "source repository: {s}", .{pr.source_repository});
+        if (pr.destination_repository.len != 0) try out.printLine(init, "destination repository: {s}", .{pr.destination_repository});
+        try out.printLine(init, "close source branch: {}", .{pr.close_source_branch});
+        try out.printLine(init, "description: {s}", .{pr.description});
+        if (pr.reviewers) |reviewers| {
+            try out.printLine(init, "reviewers: {d}", .{reviewers.len});
+            for (reviewers) |reviewer| try out.printLine(init, "  {s}: {s}", .{ reviewer.uuid, reviewer.display_name });
+        }
         if (pr.reviewer_verdicts) |verdicts| {
             try out.printLine(init, "reviewer verdicts: {d}", .{verdicts.len});
             for (verdicts) |entry| {
@@ -128,6 +196,146 @@ pub fn runGet(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []
             }
         }
     }
+}
+
+const MutationArgs = struct {
+    repository: ?[]const u8 = null,
+    pr_id: ?u64 = null,
+    opts: bbr.bitbucket.PullRequestOptions = .{},
+    description_file: ?[]const u8 = null,
+    reviewers: std.ArrayList([]const u8) = .empty,
+    clear_reviewers: bool = false,
+
+    fn deinit(self: *MutationArgs, a: std.mem.Allocator) void {
+        self.reviewers.deinit(a);
+    }
+};
+
+fn parseMutation(a: std.mem.Allocator, args: []const []const u8, create: bool) !MutationArgs {
+    var cur: arg.Cursor = .{ .args = args };
+    var p: MutationArgs = .{};
+    errdefer p.deinit(a);
+    while (cur.next()) |text| {
+        const f = arg.splitFlag(text) orelse return error.UnknownFlag;
+        if (std.mem.eql(u8, f.name, "repository")) {
+            try arg.setOption([]const u8, &p.repository, try arg.takeValue(&cur, f));
+        } else if (!create and std.mem.eql(u8, f.name, "pull-request-id")) {
+            try arg.setOption(u64, &p.pr_id, try arg.parseU64(try arg.takeValue(&cur, f)));
+        } else if (std.mem.eql(u8, f.name, "title")) {
+            try arg.setOption([]const u8, &p.opts.title, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "source-branch")) {
+            try arg.setOption([]const u8, &p.opts.source_branch, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "source-repository")) {
+            try arg.setOption([]const u8, &p.opts.source_repository, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "destination-branch")) {
+            try arg.setOption([]const u8, &p.opts.destination_branch, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "description")) {
+            try arg.setOption([]const u8, &p.opts.description, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "description-file")) {
+            try arg.setOption([]const u8, &p.description_file, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "reviewer")) {
+            try p.reviewers.append(a, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "clear-reviewers")) {
+            if (f.value != null) return error.UnknownFlag;
+            p.clear_reviewers = true;
+        } else if (std.mem.eql(u8, f.name, "draft")) {
+            try arg.setOption(bool, &p.opts.draft, try arg.parseBool(try arg.takeValue(&cur, f)));
+        } else if (std.mem.eql(u8, f.name, "close-source-branch")) {
+            try arg.setOption(bool, &p.opts.close_source_branch, try arg.parseBool(try arg.takeValue(&cur, f)));
+        } else return error.UnknownFlag;
+    }
+    const repository = p.repository orelse return error.MissingRequired;
+    if (repository.len == 0) return error.BadRequest;
+    if (!create) {
+        const id = p.pr_id orelse return error.MissingRequired;
+        if (id == 0) return error.InvalidNumber;
+    }
+    if (p.clear_reviewers and p.reviewers.items.len != 0) return error.BadRequest;
+    p.opts.reviewers = if (p.clear_reviewers) &.{} else if (p.reviewers.items.len != 0) p.reviewers.items else null;
+    if (p.description_file) |path| {
+        if (path.len == 0 or p.opts.description != null) return error.BadRequest;
+        // A file is an explicit description change, even before it is read.
+        p.opts.description = "";
+    }
+    try p.opts.validate(create);
+    return p;
+}
+
+fn mutatePullRequest(a: std.mem.Allocator, io: std.Io, bb: bbr.bitbucket.Client, args: []const []const u8, create: bool) !bbr.bitbucket.PullRequest {
+    var p = try parseMutation(a, args, create);
+    defer p.deinit(a);
+    const description = if (p.description_file) |path| try out.readFile(io, a, path) else null;
+    defer if (description) |text| a.free(text);
+    if (description) |text| p.opts.description = text;
+    return if (create)
+        bb.createPullRequest(a, p.repository.?, p.opts)
+    else
+        bb.updatePullRequest(a, p.repository.?, p.pr_id.?, p.opts);
+}
+
+pub fn runCreate(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    try printPullRequest(init, try mutatePullRequest(arena.allocator(), init.io, bb, args, true), json);
+}
+
+pub fn runUpdate(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    try printPullRequest(init, try mutatePullRequest(arena.allocator(), init.io, bb, args, false), json);
+}
+
+fn declinePullRequest(a: std.mem.Allocator, bb: bbr.bitbucket.Client, args: []const []const u8) !bbr.bitbucket.PullRequest {
+    var cur: arg.Cursor = .{ .args = args };
+    var repository: ?[]const u8 = null;
+    var id: ?u64 = null;
+    while (cur.next()) |text| {
+        const f = arg.splitFlag(text) orelse return error.UnknownFlag;
+        if (std.mem.eql(u8, f.name, "repository")) {
+            try arg.setOption([]const u8, &repository, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "pull-request-id")) {
+            try arg.setOption(u64, &id, try arg.parseU64(try arg.takeValue(&cur, f)));
+        } else return error.UnknownFlag;
+    }
+    const repo = repository orelse return error.MissingRequired;
+    const pr_id = id orelse return error.MissingRequired;
+    if (repo.len == 0) return error.BadRequest;
+    if (pr_id == 0) return error.InvalidNumber;
+    return bb.declinePullRequest(a, repo, pr_id);
+}
+
+pub fn runDecline(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    try printPullRequest(init, try declinePullRequest(arena.allocator(), bb, args), json);
+}
+
+fn listCommitPullRequests(a: std.mem.Allocator, bb: bbr.bitbucket.Client, args: []const []const u8) ![]bbr.bitbucket.PullRequestSummary {
+    var cur: arg.Cursor = .{ .args = args };
+    var repository: ?[]const u8 = null;
+    var commit: ?[]const u8 = null;
+    var page: bbr.bitbucket.PageOptions = .{};
+    while (cur.peek()) |text| {
+        const f = arg.splitFlag(text) orelse return error.UnknownFlag;
+        if (std.mem.eql(u8, f.name, "query") or std.mem.eql(u8, f.name, "sort")) return error.UnknownFlag;
+        if (try ws.takePageFlag(&cur, f, &page)) continue;
+        _ = cur.next();
+        if (std.mem.eql(u8, f.name, "repository")) {
+            try arg.setOption([]const u8, &repository, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "commit")) {
+            try arg.setOption([]const u8, &commit, try arg.takeValue(&cur, f));
+        } else return error.UnknownFlag;
+    }
+    const repo = repository orelse return error.MissingRequired;
+    const hash = commit orelse return error.MissingRequired;
+    if (repo.len == 0 or hash.len == 0) return error.BadRequest;
+    return bb.listCommitPullRequests(a, repo, hash, page);
+}
+
+pub fn runListCommit(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    try printSummaries(init, try listCommitPullRequests(arena.allocator(), bb, args), json);
 }
 
 pub fn runWhoami(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
@@ -399,4 +607,101 @@ test "set-verdict does not mutate when account authentication fails" {
     try std.testing.expectEqual(@as(usize, 1), fake.call_count);
     try std.testing.expectEqualStrings(bbr.bitbucket.base_url ++ "/user", fake.lastUrl().?);
     try std.testing.expectEqual(bbr.http.client.Method.GET, fake.last_method.?);
+}
+
+test "API lifecycle mutation parser preserves optional values and reviewer replacement" {
+    const a = std.testing.allocator;
+    var created = try parseMutation(a, &.{
+        "--draft=true",                "--reviewer",     "{ada}",                   "--source-repository=fork/sample", "--repository=sample",
+        "--title",                     "Change",         "--source-branch=feature", "--destination-branch=release",    "--reviewer={bob}",
+        "--close-source-branch=false", "--description=",
+    }, true);
+    defer created.deinit(a);
+    try std.testing.expectEqual(@as(?bool, true), created.opts.draft);
+    try std.testing.expectEqual(@as(?bool, false), created.opts.close_source_branch);
+    try std.testing.expectEqualStrings("", created.opts.description.?);
+    try std.testing.expectEqual(@as(usize, 2), created.opts.reviewers.?.len);
+    var minimal = try parseMutation(a, &.{ "--repository=sample", "--title=Change", "--source-branch=feature" }, true);
+    defer minimal.deinit(a);
+    try std.testing.expect(minimal.opts.draft == null);
+    try std.testing.expect(minimal.opts.reviewers == null);
+    var cleared = try parseMutation(a, &.{ "--clear-reviewers", "--repository=sample", "--pull-request-id=42", "--draft", "false" }, false);
+    defer cleared.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), cleared.opts.reviewers.?.len);
+    try std.testing.expectEqual(@as(?bool, false), cleared.opts.draft);
+}
+
+test "API lifecycle invalid mutation options fail before HTTP" {
+    const a = std.testing.allocator;
+    var fake: bbr.http.FakeHttpClient = .{};
+    const bb = testClient(&fake);
+    for ([_][]const []const u8{
+        &.{ "--repository=sample", "--pull-request-id=42" },
+        &.{ "--repository=sample", "--pull-request-id=42", "--draft=yes" },
+        &.{ "--repository=sample", "--pull-request-id=42", "--draft=true", "--draft=false" },
+        &.{ "--repository=sample", "--pull-request-id=42", "--title=" },
+        &.{ "--repository=sample", "--pull-request-id=42", "--reviewer=" },
+        &.{ "--repository=sample", "--pull-request-id=42", "--reviewer={ada}", "--clear-reviewers" },
+        &.{ "--repository=sample", "--pull-request-id=42", "--description=", "--description-file=unused" },
+        &.{ "--repository=sample", "--pull-request-id=42", "--source-repository=invalid" },
+        &.{ "--repository=sample", "--pull-request-id=42", "--description-file=" },
+    }) |args| try std.testing.expectError(error.BadRequest, mutatePullRequest(a, std.testing.io, bb, args, false));
+    try std.testing.expectError(error.MissingRequired, mutatePullRequest(a, std.testing.io, bb, &.{"--repository=sample"}, true));
+    try std.testing.expectError(error.UnknownFlag, mutatePullRequest(a, std.testing.io, bb, &.{ "--repository=sample", "--pull-request-id=42", "--clear-reviewers=true" }, false));
+    try std.testing.expectError(error.InvalidNumber, declinePullRequest(a, bb, &.{ "--repository=sample", "--pull-request-id=0" }));
+    try std.testing.expectError(error.UnknownFlag, listCommitPullRequests(a, bb, &.{ "--repository=sample", "--commit=abc123", "--query=state=OPEN" }));
+    try std.testing.expectError(error.InvalidNumber, listCommitPullRequests(a, bb, &.{ "--repository=sample", "--commit=abc123", "--page=0" }));
+    try std.testing.expectEqual(@as(usize, 0), fake.call_count);
+}
+
+test "API lifecycle description files preserve text and fail before HTTP when too large" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/description", .{tmp.sub_path});
+    defer a.free(path);
+    const args = &.{ "--repository=sample", "--pull-request-id=42", "--description-file", path };
+    var fake: bbr.http.FakeHttpClient = .{ .body = test_pull_request ++ "}" };
+    const bb = testClient(&fake);
+    for ([_][]const u8{ "Line one\nQuote \" and slash \\.", "" }) |text| {
+        try out.writeFile(io, text, path);
+        const pr = try mutatePullRequest(a, io, bb, args, false);
+        defer bbr.bitbucket.deinitPullRequest(a, pr);
+        const sent = try std.json.parseFromSlice(struct { description: []const u8 }, a, fake.lastBody().?, .{});
+        defer sent.deinit();
+        try std.testing.expectEqualStrings(text, sent.value.description);
+    }
+    const large = try a.alloc(u8, 1024 * 1024 + 1);
+    defer a.free(large);
+    @memset(large, 'x');
+    try out.writeFile(io, large[0 .. 1024 * 1024], path);
+    const exact_limit = try mutatePullRequest(a, io, bb, args, false);
+    defer bbr.bitbucket.deinitPullRequest(a, exact_limit);
+    try out.writeFile(io, large, path);
+    try std.testing.expectError(error.StreamTooLong, mutatePullRequest(a, io, bb, args, false));
+    try std.testing.expectEqual(@as(usize, 3), fake.call_count);
+}
+
+test "API lifecycle commit CLI follows pages and retains closed states" {
+    const a = std.testing.allocator;
+    const merged = "{\"id\":42,\"title\":\"Change\",\"state\":\"MERGED\",\"source\":{\"branch\":{\"name\":\"feature\"}},\"destination\":{\"branch\":{\"name\":\"main\"}}}";
+    const declined = "{\"id\":43,\"title\":\"Other\",\"state\":\"DECLINED\",\"source\":{\"branch\":{\"name\":\"other\"}},\"destination\":{\"branch\":{\"name\":\"main\"}}}";
+    const responses = [_]bbr.http.Canned{
+        .{ .body = "{\"values\":[" ++ merged ++ "],\"next\":\"https://api.bitbucket.org/2.0/next\"}" },
+        .{ .body = "{\"values\":[" ++ declined ++ "]}" },
+    };
+    for ([_][]const []const u8{
+        &.{ "--page=2", "--repository=sample", "--commit=abc123", "--pagelen=5" },
+        &.{ "--no-follow", "--repository=sample", "--commit=abc123" },
+        &.{ "--limit=1", "--commit=abc123", "--repository=sample" },
+    }, [_]usize{ 2, 1, 1 }) |args, count| {
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+        const items = try listCommitPullRequests(a, testClient(&fake), args);
+        defer bbr.bitbucket.deinitSummaries(a, items);
+        try std.testing.expectEqual(count, items.len);
+        try std.testing.expectEqual(count, fake.call_count);
+        try std.testing.expectEqualStrings("MERGED", items[0].state);
+        if (count == 2) try std.testing.expectEqualStrings("DECLINED", items[1].state);
+    }
 }

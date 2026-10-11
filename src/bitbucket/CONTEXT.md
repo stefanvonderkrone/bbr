@@ -18,6 +18,22 @@ _Avoid_: repo slug (that's just the identifier), project.
 A proposed set of changes from a source branch to a destination branch, identified by a `PullRequestId` (integer, unique per Repository). The aggregate root a review is about.
 _Avoid_: PR (fine in prose, not as a type name), merge request, changeset.
 
+**Branch**:
+A named reference to a Commit in a Repository.
+_Avoid_: ref, file path, Draft subtree.
+
+**Draft PullRequest**:
+An open PullRequest that the PullRequest Author has not marked ready for review. It is distinct from an unpublished Comment Draft in the Review context.
+_Avoid_: Draft, PendingReview, unpublished PullRequest.
+
+**Ready PullRequest**:
+An open PullRequest that is not a Draft PullRequest. Ready does not mean approved or merged.
+_Avoid_: approved PullRequest, submitted review.
+
+**Decline**:
+Close a PullRequest without merging its changes. Decline changes the PullRequest lifecycle state, not a Reviewer Verdict.
+_Avoid_: Changes Requested, No Verdict, delete PullRequest.
+
 **PullRequest Author**:
 The Bitbucket account that opened the PullRequest. This account cannot set a Reviewer Verdict on its own PullRequest.
 _Avoid_: reviewer, owner (the Workspace owns the Repository).

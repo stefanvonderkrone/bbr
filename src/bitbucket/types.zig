@@ -18,6 +18,13 @@ pub const PullRequest = struct {
     /// Head commit of the destination branch as we loaded it.
     destination_commit: []const u8,
     reviewer_verdicts: ?[]const ReviewerVerdictEntry = null,
+    draft: bool = false,
+    description: []const u8 = "",
+    close_source_branch: bool = false,
+    source_repository: []const u8 = "",
+    destination_repository: []const u8 = "",
+    url: []const u8 = "",
+    reviewers: ?[]const Reviewer = null,
 
     pub fn reviewerVerdict(self: PullRequest, authenticated_account_uuid: []const u8) ReviewerVerdict {
         for (self.reviewer_verdicts orelse &.{}) |entry| {
@@ -38,6 +45,41 @@ pub const ReviewerVerdict = enum {
 pub const ReviewerVerdictEntry = struct {
     account_uuid: []const u8,
     verdict: ReviewerVerdict,
+};
+
+pub const Reviewer = struct {
+    uuid: []const u8,
+    display_name: []const u8 = "",
+};
+
+/// Optional values distinguish unchanged fields from explicit false or empty values.
+pub const PullRequestOptions = struct {
+    title: ?[]const u8 = null,
+    source_branch: ?[]const u8 = null,
+    source_repository: ?[]const u8 = null,
+    destination_branch: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    reviewers: ?[]const []const u8 = null,
+    draft: ?bool = null,
+    close_source_branch: ?bool = null,
+
+    pub fn validate(self: PullRequestOptions, create: bool) !void {
+        if (create and (self.title == null or self.source_branch == null)) return error.MissingRequired;
+        if (!create and self.title == null and self.source_branch == null and self.source_repository == null and
+            self.destination_branch == null and self.description == null and self.reviewers == null and
+            self.draft == null and self.close_source_branch == null) return error.BadRequest;
+        for ([_]?[]const u8{ self.title, self.source_branch, self.destination_branch }) |value| {
+            if (value) |text| if (text.len == 0) return error.BadRequest;
+        }
+        if (self.source_repository) |full_name| {
+            const slash = std.mem.indexOfScalar(u8, full_name, '/') orelse return error.BadRequest;
+            if (slash == 0 or slash + 1 == full_name.len or
+                std.mem.indexOfScalar(u8, full_name[slash + 1 ..], '/') != null) return error.BadRequest;
+        }
+        if (self.reviewers) |reviewers| {
+            for (reviewers) |uuid| if (uuid.len == 0) return error.BadRequest;
+        }
+    }
 };
 
 pub const ReviewerVerdictChangeResult = union(enum) {
@@ -67,6 +109,7 @@ pub const PullRequestSummary = struct {
     author_display_name: []const u8,
     source_branch: []const u8,
     destination_branch: []const u8,
+    draft: bool = false,
 };
 
 /// The commit pair identifying a PR's current diff revision. A comment whose
@@ -118,6 +161,15 @@ pub const Commit = struct {
     message: []const u8 = "",
     author: []const u8 = "",
     date: []const u8 = "",
+};
+
+/// A named reference to a Commit. All slices belong to the adapter's allocator.
+pub const Branch = struct {
+    name: []const u8,
+    target: Commit,
+    url: []const u8 = "",
+    merge_strategies: []const []const u8 = &.{},
+    default_merge_strategy: []const u8 = "",
 };
 
 /// Classified API failures. The adapter maps HTTP status → one of these so the

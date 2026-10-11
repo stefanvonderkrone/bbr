@@ -107,6 +107,32 @@ bbr api whoami --profile work --json
 bbr --profile work api list-pull-requests --workspace check24 --repository sample
 ```
 
+Create a Branch and a Draft PullRequest, then mark the PullRequest ready:
+
+```sh
+bbr api create-branch --repository sample --name feature/example --target main
+bbr api list-branches --repository sample --sort name --limit 10
+bbr api get-branch --repository sample --name feature/example
+bbr api create-pull-request --repository sample --title 'Example change' --source-branch feature/example --draft true
+bbr api update-pull-request --repository sample --pull-request-id 42 --draft false
+```
+
+PullRequest creation requires a title and a source branch. It defaults to ready and uses the Repository's main branch as the destination. Use `--destination-branch` to select another destination. For a fork source, add `--source-repository WORKSPACE/SLUG`.
+
+Create and update support descriptions, reviewers, draft state, and source-branch closure. `--description-file PATH` reads up to 1 MiB. Repeated `--reviewer UUID` options replace the reviewer list. `--clear-reviewers` sends an empty list. Omitted fields stay unchanged on update, including reviewers. An empty description clears the description.
+
+Approve or decline a PullRequest, or find PullRequests for a commit:
+
+```sh
+bbr api set-verdict --repository sample --pull-request-id 42 --verdict approved --expected-source-commit abc123
+bbr api decline-pull-request --repository sample --pull-request-id 42
+bbr api list-commit-pull-requests --repository sample --commit abc123 --json
+```
+
+Approval sets the Authenticated Account's Reviewer Verdict. Decline closes the PullRequest without merging. Commit lookup includes closed PullRequests and follows pages by default. Use `--page`, `--pagelen`, `--no-follow`, and `--limit` to control the results.
+
+Commit lookup needs Bitbucket's Pull Request Commit Links app. Bitbucket installs it when someone selects `Go to pull request` on a commit's details page. Pending indexing produces an error and a hint instead of an empty result.
+
 ### Shell completions
 
 `bbr completion` prints a completion script for `bbr` commands, `bbr api` verbs,

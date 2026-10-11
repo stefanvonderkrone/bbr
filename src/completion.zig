@@ -459,7 +459,7 @@ test "completion metadata covers every verb" {
 
 test "bash script completes verbs, flags, and the profiles hook" {
     for (cli.verbs) |verb| try std.testing.expect(std.mem.indexOf(u8, bash_script, verb.name) != null);
-    for ([_][]const u8{ "--pull-request-id", "--profile", "--workspace", "--json" }) |flag| {
+    for ([_][]const u8{ "--pull-request-id", "--profile", "--workspace", "--json", "--target", "--draft", "--reviewer", "--clear-reviewers" }) |flag| {
         try std.testing.expect(std.mem.indexOf(u8, bash_script, flag) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, bash_script, "bbr completion --list-profiles") != null);
@@ -468,7 +468,7 @@ test "bash script completes verbs, flags, and the profiles hook" {
 
 test "zsh script completes verbs, flags, and the profiles hook" {
     for (cli.verbs) |verb| try std.testing.expect(std.mem.indexOf(u8, zsh_script, verb.name) != null);
-    for ([_][]const u8{ "--pull-request-id", "--profile", "--workspace" }) |flag| {
+    for ([_][]const u8{ "--pull-request-id", "--profile", "--workspace", "--target", "--draft", "--reviewer", "--clear-reviewers" }) |flag| {
         try std.testing.expect(std.mem.indexOf(u8, zsh_script, flag) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "bbr completion --list-profiles") != null);
@@ -477,7 +477,7 @@ test "zsh script completes verbs, flags, and the profiles hook" {
 
 test "fish script completes verbs, flags, and the profiles hook" {
     for (cli.verbs) |verb| try std.testing.expect(std.mem.indexOf(u8, fish_script, verb.name) != null);
-    for ([_][]const u8{ "-l pull-request-id", "-l profile", "-l workspace" }) |flag| {
+    for ([_][]const u8{ "-l pull-request-id", "-l profile", "-l workspace", "-l target", "-l draft", "-l reviewer", "-l clear-reviewers" }) |flag| {
         try std.testing.expect(std.mem.indexOf(u8, fish_script, flag) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, fish_script, "(bbr completion --list-profiles)") != null);

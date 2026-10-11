@@ -57,7 +57,117 @@ pub const Client = struct {
         defer allocator.free(res.body);
 
         try classify(res.status);
-        return parsePullRequest(allocator, res.body);
+        return parsePullRequest(allocator, res.body, true);
+    }
+
+    pub fn createPullRequest(self: Client, allocator: Allocator, repo_slug: []const u8, opts: types.PullRequestOptions) !PullRequest {
+        try opts.validate(true);
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests");
+        defer allocator.free(url);
+        const body = try pullRequestBody(allocator, opts);
+        defer allocator.free(body);
+        const response = try self.requestJson(allocator, .POST, url, body);
+        defer allocator.free(response);
+        return parsePullRequest(allocator, response, false);
+    }
+
+    pub fn updatePullRequest(self: Client, allocator: Allocator, repo_slug: []const u8, id: u64, opts: types.PullRequestOptions) !PullRequest {
+        try opts.validate(false);
+        const suffix = try std.fmt.allocPrint(allocator, "/pullrequests/{d}", .{id});
+        defer allocator.free(suffix);
+        const url = try self.repositoryEndpoint(allocator, repo_slug, suffix);
+        defer allocator.free(url);
+        const body = try pullRequestBody(allocator, opts);
+        defer allocator.free(body);
+        const response = try self.requestJson(allocator, .PUT, url, body);
+        defer allocator.free(response);
+        return parsePullRequest(allocator, response, false);
+    }
+
+    pub fn declinePullRequest(self: Client, allocator: Allocator, repo_slug: []const u8, id: u64) !PullRequest {
+        const suffix = try std.fmt.allocPrint(allocator, "/pullrequests/{d}/decline", .{id});
+        defer allocator.free(suffix);
+        const url = try self.repositoryEndpoint(allocator, repo_slug, suffix);
+        defer allocator.free(url);
+        const response = try self.requestJson(allocator, .POST, url, null);
+        defer allocator.free(response);
+        return parsePullRequest(allocator, response, false);
+    }
+
+    /// Includes every returned lifecycle state. A pending index is not an empty result.
+    pub fn listCommitPullRequests(self: Client, allocator: Allocator, repo_slug: []const u8, commit: []const u8, opts: PageOptions) ![]PullRequestSummary {
+        if (commit.len == 0 or opts.query != null or opts.sort != null) return error.BadRequest;
+        var suffix: std.ArrayList(u8) = .empty;
+        defer suffix.deinit(allocator);
+        try suffix.appendSlice(allocator, "/commit/");
+        try percentEncodeInto(allocator, &suffix, commit);
+        try suffix.appendSlice(allocator, "/pullrequests");
+        const url = try self.repositoryEndpoint(allocator, repo_slug, suffix.items);
+        defer allocator.free(url);
+        return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, url, opts, null, true);
+    }
+
+    pub fn listBranches(self: Client, allocator: Allocator, repo_slug: []const u8, opts: PageOptions) ![]types.Branch {
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/refs/branches");
+        defer allocator.free(url);
+        return self.listPages(allocator, types.Branch, BranchPage, dupeBranch, deinitBranch, .{}, url, opts, null, false);
+    }
+
+    pub fn getBranch(self: Client, allocator: Allocator, repo_slug: []const u8, name: []const u8) !types.Branch {
+        try validateBranchName(name);
+        var suffix: std.ArrayList(u8) = .empty;
+        defer suffix.deinit(allocator);
+        try suffix.appendSlice(allocator, "/refs/branches/");
+        try percentEncodeInto(allocator, &suffix, name);
+        const url = try self.repositoryEndpoint(allocator, repo_slug, suffix.items);
+        defer allocator.free(url);
+        const response = try self.requestJson(allocator, .GET, url, null);
+        defer allocator.free(response);
+        return parseBranch(allocator, response);
+    }
+
+    pub fn createBranch(self: Client, allocator: Allocator, repo_slug: []const u8, name: []const u8, target: []const u8) !types.Branch {
+        try validateBranchName(name);
+        if (target.len == 0) return error.BadRequest;
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/refs/branches");
+        defer allocator.free(url);
+        const body = try std.json.Stringify.valueAlloc(allocator, .{ .name = name, .target = .{ .hash = target } }, .{});
+        defer allocator.free(body);
+        const response = try self.requestJson(allocator, .POST, url, body);
+        defer allocator.free(response);
+        return parseBranch(allocator, response);
+    }
+
+    fn repositoryEndpoint(self: Client, allocator: Allocator, repo_slug: []const u8, suffix: []const u8) ![]u8 {
+        if (repo_slug.len == 0) return error.BadRequest;
+        var url: std.ArrayList(u8) = .empty;
+        defer url.deinit(allocator);
+        try url.appendSlice(allocator, base_url ++ "/repositories/");
+        try percentEncodeInto(allocator, &url, self.cred.workspace);
+        try url.append(allocator, '/');
+        try percentEncodeInto(allocator, &url, repo_slug);
+        try url.appendSlice(allocator, suffix);
+        return url.toOwnedSlice(allocator);
+    }
+
+    /// Return owned JSON bytes. Mutations make one send and never retry.
+    fn requestJson(self: Client, allocator: Allocator, method: httpc.Method, url: []const u8, body: ?[]const u8) ![]u8 {
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        const headers = [_]httpc.Header{
+            .{ .name = "authorization", .value = auth },
+            .{ .name = "accept", .value = "application/json" },
+            .{ .name = "content-type", .value = "application/json" },
+        };
+        const response = try self.http.send(allocator, .{
+            .method = method,
+            .url = url,
+            .headers = headers[0..if (body != null) 3 else 2],
+            .body = body,
+        });
+        errdefer allocator.free(response.body);
+        try classify(response.status);
+        return response.body;
     }
 
     /// GET /repositories/{workspace}/{repo}/pullrequests, following `next`
@@ -106,7 +216,7 @@ pub const Client = struct {
             }
             page_opts.query = null;
         }
-        return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, buf.items, page_opts, null);
+        return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, buf.items, page_opts, null, false);
     }
 
     /// GET /repositories/{workspace}/{repo}/pullrequests/{id}/diff.
@@ -641,7 +751,7 @@ pub const Client = struct {
             .{ base_url, self.cred.workspace, repo_slug, pr_id },
         );
         defer allocator.free(first);
-        return self.listPages(allocator, Comment, CommentsPage, dupeComment, deinitComment, .{head}, first, opts, rejection);
+        return self.listPages(allocator, Comment, CommentsPage, dupeComment, deinitComment, .{head}, first, opts, rejection, false);
     }
 
     /// GET /user/workspaces: workspaces visible to the authenticated account.
@@ -652,7 +762,7 @@ pub const Client = struct {
         allocator: Allocator,
         opts: PageOptions,
     ) ![]types.Workspace {
-        return self.listPages(allocator, types.Workspace, WorkspacePage, dupeWorkspace, deinitWorkspace, .{}, base_url ++ "/user/workspaces", opts, null);
+        return self.listPages(allocator, types.Workspace, WorkspacePage, dupeWorkspace, deinitWorkspace, .{}, base_url ++ "/user/workspaces", opts, null, false);
     }
 
     /// GET /workspaces/{workspace}. Owned by `allocator`.
@@ -698,7 +808,7 @@ pub const Client = struct {
         const ws = workspace_override orelse self.cred.workspace;
         const first = try std.fmt.allocPrint(allocator, "{s}/repositories/{s}", .{ base_url, ws });
         defer allocator.free(first);
-        return self.listPages(allocator, types.Repository, RepositoryPage, dupeRepository, deinitRepository, .{}, first, opts, null);
+        return self.listPages(allocator, types.Repository, RepositoryPage, dupeRepository, deinitRepository, .{}, first, opts, null, false);
     }
 
     /// GET /repositories/{workspace}/{repo}. Owned by `allocator`.
@@ -775,7 +885,7 @@ pub const Client = struct {
         first_url: []const u8,
         opts: PageOptions,
     ) ![]types.Commit {
-        return self.listPages(allocator, types.Commit, CommitPage, dupeCommit, deinitCommit, .{}, first_url, opts, null);
+        return self.listPages(allocator, types.Commit, CommitPage, dupeCommit, deinitCommit, .{}, first_url, opts, null, false);
     }
 
     /// Return commits reachable from `to`, excluding all commits reachable from `from`.
@@ -802,6 +912,7 @@ pub const Client = struct {
         first_url: []const u8,
         opts: PageOptions,
         rejection: ?*?PageRejection,
+        comptime commit_links: bool,
     ) ![]Item {
         var out: std.ArrayList(Item) = .empty;
         defer {
@@ -823,6 +934,7 @@ pub const Client = struct {
                 },
             });
             defer allocator.free(res.body);
+            if (commit_links and res.status == 202) return error.PullRequestLinksIndexing;
             classify(res.status) catch |reason| {
                 if (rejection) |failure| failure.* = .{ .reason = reason, .retry_after_ms = res.retry_after_ms };
                 return reason;
@@ -1009,7 +1121,7 @@ pub const Client = struct {
             .{ base_url, self.cred.workspace, repo_slug, id },
         );
         defer allocator.free(first);
-        return self.listPages(allocator, types.Task, TaskPage, dupeTask, deinitTask, .{}, first, opts, null);
+        return self.listPages(allocator, types.Task, TaskPage, dupeTask, deinitTask, .{}, first, opts, null, false);
     }
 
     /// GET .../tasks/{task_id}. Owned by `allocator`.
@@ -1410,6 +1522,98 @@ fn deinitCommit(allocator: Allocator, c: types.Commit) void {
     allocator.free(c.date);
 }
 
+const BranchJson = struct {
+    name: []const u8,
+    target: CommitJson,
+    links: ?struct { html: ?struct { href: []const u8 } = null } = null,
+    merge_strategies: []const []const u8 = &.{},
+    default_merge_strategy: []const u8 = "",
+};
+
+const BranchPage = struct {
+    values: []BranchJson,
+    next: ?[]const u8 = null,
+};
+
+fn validateBranchName(name: []const u8) !void {
+    if (name.len == 0 or std.mem.startsWith(u8, name, "refs/heads/")) return error.BadRequest;
+}
+
+fn parseBranch(allocator: Allocator, body: []const u8) !types.Branch {
+    const parsed = std.json.parseFromSlice(BranchJson, allocator, body, .{ .ignore_unknown_fields = true }) catch |err|
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
+    defer parsed.deinit();
+    return dupeBranch(allocator, parsed.value);
+}
+
+fn dupeBranch(allocator: Allocator, wire: BranchJson) !types.Branch {
+    var branch: types.Branch = .{ .name = "", .target = .{ .hash = "" } };
+    errdefer deinitBranch(allocator, branch);
+    branch.name = try allocator.dupe(u8, wire.name);
+    branch.target = try dupeCommit(allocator, wire.target);
+    branch.url = try allocator.dupe(u8, if (wire.links) |links| if (links.html) |html| html.href else "" else "");
+    branch.default_merge_strategy = try allocator.dupe(u8, wire.default_merge_strategy);
+    var strategies: std.ArrayList([]const u8) = .empty;
+    defer strategies.deinit(allocator);
+    errdefer for (strategies.items) |strategy| allocator.free(strategy);
+    for (wire.merge_strategies) |strategy| {
+        const owned = try allocator.dupe(u8, strategy);
+        errdefer allocator.free(owned);
+        try strategies.append(allocator, owned);
+    }
+    branch.merge_strategies = try strategies.toOwnedSlice(allocator);
+    return branch;
+}
+
+pub fn deinitBranch(allocator: Allocator, branch: types.Branch) void {
+    allocator.free(branch.name);
+    deinitCommit(allocator, branch.target);
+    allocator.free(branch.url);
+    allocator.free(branch.default_merge_strategy);
+    for (branch.merge_strategies) |strategy| allocator.free(strategy);
+    allocator.free(branch.merge_strategies);
+}
+
+pub fn deinitBranches(allocator: Allocator, branches: []types.Branch) void {
+    for (branches) |branch| deinitBranch(allocator, branch);
+    allocator.free(branches);
+}
+
+fn pullRequestBody(allocator: Allocator, opts: types.PullRequestOptions) ![]u8 {
+    const Endpoint = struct {
+        branch: ?struct { name: []const u8 } = null,
+        repository: ?struct { full_name: []const u8 } = null,
+    };
+    const ReviewerWire = struct { uuid: []const u8 };
+    const reviewers = if (opts.reviewers) |values| try allocator.alloc(ReviewerWire, values.len) else null;
+    defer if (reviewers) |values| allocator.free(values);
+    if (reviewers) |values| for (values, opts.reviewers.?) |*value, uuid| {
+        value.* = .{ .uuid = uuid };
+    };
+    const Wire = struct {
+        title: ?[]const u8,
+        source: ?Endpoint,
+        destination: ?Endpoint,
+        description: ?[]const u8,
+        reviewers: ?[]const ReviewerWire,
+        draft: ?bool,
+        close_source_branch: ?bool,
+    };
+    const wire: Wire = .{
+        .title = opts.title,
+        .source = if (opts.source_branch != null or opts.source_repository != null) .{
+            .branch = if (opts.source_branch) |name| .{ .name = name } else null,
+            .repository = if (opts.source_repository) |full_name| .{ .full_name = full_name } else null,
+        } else null,
+        .destination = if (opts.destination_branch) |name| .{ .branch = .{ .name = name } } else null,
+        .description = opts.description,
+        .reviewers = reviewers,
+        .draft = opts.draft,
+        .close_source_branch = opts.close_source_branch,
+    };
+    return std.json.Stringify.valueAlloc(allocator, wire, .{ .emit_null_optional_fields = false });
+}
+
 /// Free a batch returned by `listPrCommits` / `listRepoCommits`.
 pub fn deinitCommits(allocator: Allocator, items: []types.Commit) void {
     for (items) |c| deinitCommit(allocator, c);
@@ -1574,6 +1778,7 @@ const PrSummaryJson = struct {
     author: ?struct { display_name: ?[]const u8 = null } = null,
     source: struct { branch: struct { name: []const u8 } },
     destination: struct { branch: struct { name: []const u8 } },
+    draft: bool = false,
 };
 
 const PrListPage = struct {
@@ -1598,6 +1803,7 @@ fn dupeSummary(allocator: Allocator, pj: PrSummaryJson) !PullRequestSummary {
         .author_display_name = author_owned,
         .source_branch = source_branch,
         .destination_branch = try allocator.dupe(u8, pj.destination.branch.name),
+        .draft = pj.draft,
     };
 }
 
@@ -1620,29 +1826,47 @@ const PrJson = struct {
     id: u64,
     title: []const u8,
     state: []const u8,
-    author: struct { display_name: []const u8, uuid: []const u8 },
-    source: struct { branch: struct { name: []const u8 }, commit: struct { hash: []const u8 } },
-    destination: struct { branch: struct { name: []const u8 }, commit: struct { hash: []const u8 } },
-    participants: []const struct {
+    author: ?struct { display_name: ?[]const u8 = null, uuid: ?[]const u8 = null } = null,
+    source: PrEndpointJson,
+    destination: PrEndpointJson,
+    participants: ?[]const struct {
         user: struct { uuid: []const u8 },
         approved: bool = false,
         state: ?[]const u8 = null,
-    },
+    } = null,
+    draft: bool = false,
+    description: []const u8 = "",
+    close_source_branch: bool = false,
+    reviewers: ?[]const types.Reviewer = null,
+    links: ?struct { html: ?struct { href: []const u8 } = null } = null,
 };
 
-fn parsePullRequest(allocator: Allocator, body: []const u8) !PullRequest {
+const PrEndpointJson = struct {
+    branch: struct { name: []const u8 },
+    commit: ?struct { hash: []const u8 } = null,
+    repository: ?struct { full_name: []const u8 = "" } = null,
+};
+
+fn parsePullRequest(allocator: Allocator, body: []const u8, comptime full_read: bool) !PullRequest {
     const parsed = std.json.parseFromSlice(PrJson, allocator, body, .{
         .ignore_unknown_fields = true,
-    }) catch return error.MalformedResponse;
+    }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
     defer parsed.deinit();
     const v = parsed.value;
+    // Preserve the full-read contract used by SourceCommit and Reviewer Verdict
+    // guards. An explicit empty author UUID remains valid evidence.
+    if (full_read) {
+        const author = v.author orelse return error.MalformedResponse;
+        if (author.display_name == null or author.uuid == null or v.source.commit == null or
+            v.destination.commit == null or v.participants == null) return error.MalformedResponse;
+    }
 
     var verdicts: std.ArrayList(types.ReviewerVerdictEntry) = .empty;
     errdefer {
         for (verdicts.items) |entry| allocator.free(entry.account_uuid);
         verdicts.deinit(allocator);
     }
-    for (v.participants) |participant| {
+    for (v.participants orelse &.{}) |participant| {
         const verdict: types.ReviewerVerdict = if (participant.approved) blk: {
             if (participant.state) |state| {
                 if (!std.mem.eql(u8, state, "approved")) return error.MalformedResponse;
@@ -1660,19 +1884,49 @@ fn parsePullRequest(allocator: Allocator, body: []const u8) !PullRequest {
         });
     }
 
-    // Duplicate the strings out of the parse arena into the caller's allocator.
-    return .{
+    var pr: PullRequest = .{
         .id = v.id,
-        .title = try allocator.dupe(u8, v.title),
-        .state = try allocator.dupe(u8, v.state),
-        .author_display_name = try allocator.dupe(u8, v.author.display_name),
-        .author_uuid = try allocator.dupe(u8, v.author.uuid),
-        .source_branch = try allocator.dupe(u8, v.source.branch.name),
-        .destination_branch = try allocator.dupe(u8, v.destination.branch.name),
-        .source_commit = try allocator.dupe(u8, v.source.commit.hash),
-        .destination_commit = try allocator.dupe(u8, v.destination.commit.hash),
-        .reviewer_verdicts = try verdicts.toOwnedSlice(allocator),
+        .title = "",
+        .state = "",
+        .author_display_name = "",
+        .source_branch = "",
+        .destination_branch = "",
+        .source_commit = "",
+        .destination_commit = "",
+        .draft = v.draft,
+        .close_source_branch = v.close_source_branch,
     };
+    errdefer deinitPullRequest(allocator, pr);
+    pr.title = try allocator.dupe(u8, v.title);
+    pr.state = try allocator.dupe(u8, v.state);
+    pr.author_display_name = try allocator.dupe(u8, if (v.author) |author| author.display_name orelse "" else "");
+    pr.author_uuid = try allocator.dupe(u8, if (v.author) |author| author.uuid orelse "" else "");
+    pr.source_branch = try allocator.dupe(u8, v.source.branch.name);
+    pr.destination_branch = try allocator.dupe(u8, v.destination.branch.name);
+    pr.source_commit = try allocator.dupe(u8, if (v.source.commit) |commit| commit.hash else "");
+    pr.destination_commit = try allocator.dupe(u8, if (v.destination.commit) |commit| commit.hash else "");
+    pr.description = try allocator.dupe(u8, v.description);
+    pr.source_repository = try allocator.dupe(u8, if (v.source.repository) |repo| repo.full_name else "");
+    pr.destination_repository = try allocator.dupe(u8, if (v.destination.repository) |repo| repo.full_name else "");
+    pr.url = try allocator.dupe(u8, if (v.links) |links| if (links.html) |html| html.href else "" else "");
+    if (v.reviewers) |reviewers| {
+        var owned: std.ArrayList(types.Reviewer) = .empty;
+        defer owned.deinit(allocator);
+        errdefer for (owned.items) |reviewer| {
+            allocator.free(reviewer.uuid);
+            allocator.free(reviewer.display_name);
+        };
+        for (reviewers) |reviewer| {
+            const uuid = try allocator.dupe(u8, reviewer.uuid);
+            errdefer allocator.free(uuid);
+            const display_name = try allocator.dupe(u8, reviewer.display_name);
+            errdefer allocator.free(display_name);
+            try owned.append(allocator, .{ .uuid = uuid, .display_name = display_name });
+        }
+        pr.reviewers = try owned.toOwnedSlice(allocator);
+    }
+    if (v.participants != null) pr.reviewer_verdicts = try verdicts.toOwnedSlice(allocator);
+    return pr;
 }
 
 /// The comment JSON we read from a page of the comments endpoint. Fields we
@@ -1865,6 +2119,17 @@ pub fn deinitPullRequest(allocator: Allocator, pr: PullRequest) void {
     allocator.free(pr.destination_branch);
     allocator.free(pr.source_commit);
     allocator.free(pr.destination_commit);
+    allocator.free(pr.description);
+    allocator.free(pr.source_repository);
+    allocator.free(pr.destination_repository);
+    allocator.free(pr.url);
+    if (pr.reviewers) |reviewers| {
+        for (reviewers) |reviewer| {
+            allocator.free(reviewer.uuid);
+            allocator.free(reviewer.display_name);
+        }
+        allocator.free(reviewers);
+    }
     if (pr.reviewer_verdicts) |verdicts| {
         for (verdicts) |entry| allocator.free(entry.account_uuid);
         allocator.free(verdicts);
@@ -1883,6 +2148,277 @@ const fixture_pr = @embedFile("testdata/pullrequest.json");
 
 fn testCredential() Credential {
     return .{ .username = "u", .token = "t", .workspace = "check24" };
+}
+
+const lifecycle_branch =
+    \\{"name":"feature/test","target":{"hash":"abc123","message":"Change","date":"2026-10-11"},
+    \\ "links":{"html":{"href":"https://bitbucket.org/check24/myrepo/branch/feature/test"}},
+    \\ "merge_strategies":["merge_commit","squash"],"default_merge_strategy":"squash"}
+;
+
+const lifecycle_pr =
+    \\{"id":42,"title":"Change","state":"OPEN","draft":true,"description":"Details","close_source_branch":true,
+    \\ "source":{"branch":{"name":"feature/test"},"repository":{"full_name":"fork/sample"}},
+    \\ "destination":{"branch":{"name":"main"},"repository":{"full_name":"check24/myrepo"}},
+    \\ "reviewers":[{"uuid":"{reviewer}","display_name":"Ada"}],
+    \\ "links":{"html":{"href":"https://bitbucket.org/check24/myrepo/pull-requests/42"}}}
+;
+
+test "API lifecycle branches create and read encoded names with target metadata" {
+    const a = testing.allocator;
+    for ([_][]const u8{ "abc123", "main" }) |target| {
+        var fake: FakeHttpClient = .{ .status = 201, .body = lifecycle_branch };
+        const bb = Client.init(fake.httpClient(), testCredential());
+        const branch = try bb.createBranch(a, "myrepo", "feature/test", target);
+        defer deinitBranch(a, branch);
+        try testing.expectEqual(httpc.Method.POST, fake.last_method.?);
+        try testing.expectEqualStrings(base_url ++ "/repositories/check24/myrepo/refs/branches", fake.lastUrl().?);
+        const body = try std.json.parseFromSlice(struct { name: []const u8, target: struct { hash: []const u8 } }, a, fake.lastBody().?, .{});
+        defer body.deinit();
+        try testing.expectEqualStrings(target, body.value.target.hash);
+        try testing.expectEqualStrings("feature/test", body.value.name);
+        try testing.expectEqualStrings("abc123", branch.target.hash);
+        try testing.expectEqualStrings("Change", branch.target.message);
+        try testing.expectEqualStrings("squash", branch.default_merge_strategy);
+        try testing.expectEqual(@as(usize, 2), branch.merge_strategies.len);
+        try testing.expect(branch.url.len > 0);
+    }
+    var fake: FakeHttpClient = .{ .body = lifecycle_branch };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const branch = try bb.getBranch(a, "myrepo", "feature/a %?#");
+    defer deinitBranch(a, branch);
+    try testing.expectEqual(httpc.Method.GET, fake.last_method.?);
+    try testing.expectEqualStrings(base_url ++ "/repositories/check24/myrepo/refs/branches/feature%2Fa%20%25%3F%23", fake.lastUrl().?);
+    try testing.expectError(error.BadRequest, bb.createBranch(a, "myrepo", "refs/heads/new", "main"));
+    try testing.expectError(error.BadRequest, bb.createBranch(a, "myrepo", "new", ""));
+    try testing.expectError(error.BadRequest, bb.getBranch(a, "myrepo", ""));
+    try testing.expectEqual(@as(usize, 1), fake.call_count);
+}
+
+test "API lifecycle branch pagination keeps filters and stops at a limit" {
+    const a = testing.allocator;
+    const first = "{\"values\":[" ++ lifecycle_branch ++ "," ++ lifecycle_branch ++ "],\"next\":\"" ++ base_url ++ "/next\"}";
+    const last = "{\"values\":[" ++ lifecycle_branch ++ "]}";
+    const responses = [_]httpc_fixture.Canned{ .{ .body = first }, .{ .body = last } };
+    for ([_]PageOptions{ .{}, .{ .follow = false }, .{ .limit = 1 }, .{ .limit = 0 } }, [_]usize{ 3, 2, 1, 0 }, [_]usize{ 2, 1, 1, 0 }) |base_opts, count, calls| {
+        var opts = base_opts;
+        opts.query = "name ~ \"test\"";
+        opts.sort = "-name";
+        opts.page = 2;
+        opts.pagelen = 10;
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        const branches = try Client.init(fake.httpClient(), testCredential()).listBranches(a, "myrepo", opts);
+        defer deinitBranches(a, branches);
+        try testing.expectEqual(count, branches.len);
+        try testing.expectEqual(calls, fake.call_count);
+        if (calls != 0) {
+            const url = fake.urlAt(0).?;
+            for ([_][]const u8{ "page=2", "pagelen=10", "q=name%20~%20%22test%22", "sort=-name" }) |part|
+                try testing.expect(std.mem.indexOf(u8, url, part) != null);
+        }
+    }
+}
+
+test "API lifecycle PullRequest bodies preserve omitted false and empty values" {
+    const a = testing.allocator;
+    const minimal = try pullRequestBody(a, .{ .title = "Change", .source_branch = "feature" });
+    defer a.free(minimal);
+    try testing.expectEqualStrings("{\"title\":\"Change\",\"source\":{\"branch\":{\"name\":\"feature\"}}}", minimal);
+    for ([_]bool{ true, false }) |draft| {
+        const ready = try pullRequestBody(a, .{ .draft = draft });
+        defer a.free(ready);
+        try testing.expectEqualStrings(if (draft) "{\"draft\":true}" else "{\"draft\":false}", ready);
+    }
+    const cleared = try pullRequestBody(a, .{ .description = "", .reviewers = &.{}, .close_source_branch = false });
+    defer a.free(cleared);
+    try testing.expectEqualStrings("{\"description\":\"\",\"reviewers\":[],\"close_source_branch\":false}", cleared);
+    const full = try pullRequestBody(a, .{
+        .title = "Quote \" and newline\n",
+        .source_branch = "feature",
+        .source_repository = "fork/sample",
+        .destination_branch = "release",
+        .description = "Details",
+        .reviewers = &.{ "{ada}", "{bob}" },
+        .draft = true,
+        .close_source_branch = true,
+    });
+    defer a.free(full);
+    const decoded = try std.json.parseFromSlice(struct {
+        title: []const u8,
+        source: struct { branch: struct { name: []const u8 }, repository: struct { full_name: []const u8 } },
+        destination: struct { branch: struct { name: []const u8 } },
+        reviewers: []types.Reviewer,
+    }, a, full, .{ .ignore_unknown_fields = true });
+    defer decoded.deinit();
+    try testing.expectEqualStrings("Quote \" and newline\n", decoded.value.title);
+    try testing.expectEqualStrings("fork/sample", decoded.value.source.repository.full_name);
+    try testing.expectEqualStrings("release", decoded.value.destination.branch.name);
+    try testing.expectEqual(@as(usize, 2), decoded.value.reviewers.len);
+}
+
+test "API lifecycle PullRequest mutations return optional detail fields without participants" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 201, .body = lifecycle_pr };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const created = try bb.createPullRequest(a, "myrepo", .{ .title = "Change", .source_branch = "feature/test" });
+    defer deinitPullRequest(a, created);
+    try testing.expectEqual(httpc.Method.POST, fake.last_method.?);
+    try testing.expectEqualStrings(base_url ++ "/repositories/check24/myrepo/pullrequests", fake.lastUrl().?);
+    try testing.expect(created.draft);
+    try testing.expect(created.close_source_branch);
+    try testing.expectEqualStrings("Details", created.description);
+    try testing.expectEqualStrings("fork/sample", created.source_repository);
+    try testing.expectEqualStrings("check24/myrepo", created.destination_repository);
+    try testing.expectEqualStrings("Ada", created.reviewers.?[0].display_name);
+    try testing.expect(created.reviewer_verdicts == null);
+    fake.status = 200;
+    const updated = try bb.updatePullRequest(a, "myrepo", 42, .{ .draft = false });
+    defer deinitPullRequest(a, updated);
+    try testing.expectEqual(httpc.Method.PUT, fake.last_method.?);
+    try testing.expectEqualStrings(base_url ++ "/repositories/check24/myrepo/pullrequests/42", fake.lastUrl().?);
+    try testing.expectEqualStrings("{\"draft\":false}", fake.lastBody().?);
+    fake.body = "{\"id\":42,\"title\":\"Change\",\"state\":\"DECLINED\",\"source\":{\"branch\":{\"name\":\"feature\"}},\"destination\":{\"branch\":{\"name\":\"main\"}},\"participants\":[]}";
+    const declined = try bb.declinePullRequest(a, "myrepo", 42);
+    defer deinitPullRequest(a, declined);
+    try testing.expectEqualStrings("DECLINED", declined.state);
+    try testing.expect(declined.reviewer_verdicts != null);
+    try testing.expectEqual(@as(usize, 0), declined.reviewer_verdicts.?.len);
+    try testing.expectEqual(httpc.Method.POST, fake.last_method.?);
+    try testing.expectEqualStrings(base_url ++ "/repositories/check24/myrepo/pullrequests/42/decline", fake.lastUrl().?);
+    try testing.expectEqualStrings("", fake.lastBody().?);
+    try testing.expectError(error.MissingRequired, bb.createPullRequest(a, "myrepo", .{}));
+    try testing.expectError(error.BadRequest, bb.updatePullRequest(a, "myrepo", 42, .{}));
+    try testing.expectError(error.BadRequest, bb.updatePullRequest(a, "myrepo", 42, .{ .title = "" }));
+    try testing.expectEqual(@as(usize, 3), fake.call_count);
+}
+
+test "API lifecycle commit lookup has no state filter and reports pending pages" {
+    const a = testing.allocator;
+    const page = "{\"values\":[{\"id\":42,\"title\":\"Change\",\"state\":\"MERGED\",\"draft\":false,\"source\":{\"branch\":{\"name\":\"feature\"}},\"destination\":{\"branch\":{\"name\":\"main\"}}}],\"next\":\"" ++ base_url ++ "/next\"}";
+    const responses = [_]httpc_fixture.Canned{ .{ .body = page }, .{ .status = 202, .body = "{\"values\":[]}" } };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const first = try bb.listCommitPullRequests(a, "myrepo", "abc123", .{ .follow = false, .page = 2, .pagelen = 5 });
+    defer deinitSummaries(a, first);
+    try testing.expectEqualStrings("MERGED", first[0].state);
+    const url = fake.lastUrl().?;
+    try testing.expect(std.mem.startsWith(u8, url, base_url ++ "/repositories/check24/myrepo/commit/abc123/pullrequests?"));
+    try testing.expect(std.mem.indexOf(u8, url, "state=") == null);
+    fake.call_count = 0;
+    try testing.expectError(error.PullRequestLinksIndexing, bb.listCommitPullRequests(a, "myrepo", "abc123", .{}));
+    try testing.expectEqual(@as(usize, 2), fake.call_count);
+    fake.responses = null;
+    fake.status = 202;
+    try testing.expectError(error.PullRequestLinksIndexing, bb.listCommitPullRequests(a, "myrepo", "abc123", .{}));
+    fake.status = 200;
+    fake.body = "{\"values\":[]}";
+    const empty = try bb.listCommitPullRequests(a, "myrepo", "abc123", .{});
+    defer deinitSummaries(a, empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
+    const calls = fake.call_count;
+    const limited = try bb.listCommitPullRequests(a, "myrepo", "abc123", .{ .limit = 0 });
+    defer deinitSummaries(a, limited);
+    try testing.expectEqual(calls, fake.call_count);
+    try testing.expectError(error.BadRequest, bb.listCommitPullRequests(a, "myrepo", "abc123", .{ .query = "state=OPEN" }));
+}
+
+const httpc_fixture = @import("../http/fake_client.zig");
+
+test "API lifecycle errors classify failures without retrying writes" {
+    const a = testing.allocator;
+    for ([_]u16{ 400, 401, 403, 404, 409, 429, 555, 200 }, [_]anyerror{
+        error.BadRequest, error.Unauthorized, error.Forbidden,   error.NotFound,
+        error.Conflict,   error.RateLimited,  error.ServerError, error.MalformedResponse,
+    }) |status, expected| {
+        var fake: FakeHttpClient = .{ .status = status, .body = "not JSON" };
+        const bb = Client.init(fake.httpClient(), testCredential());
+        try testing.expectError(expected, bb.createBranch(a, "myrepo", "new", "main"));
+        try testing.expectError(expected, bb.getBranch(a, "myrepo", "main"));
+        try testing.expectError(expected, bb.createPullRequest(a, "myrepo", .{ .title = "New", .source_branch = "feature" }));
+        try testing.expectError(expected, bb.updatePullRequest(a, "myrepo", 42, .{ .draft = false }));
+        try testing.expectError(expected, bb.declinePullRequest(a, "myrepo", 42));
+        try testing.expectError(expected, bb.listBranches(a, "myrepo", .{}));
+        try testing.expectError(expected, bb.listCommitPullRequests(a, "myrepo", "abc123", .{}));
+        try testing.expectEqual(@as(usize, 7), fake.call_count);
+    }
+}
+
+fn lifecycleAllocations(a: Allocator) !void {
+    var fake: FakeHttpClient = .{ .body = lifecycle_branch };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const branch = try bb.createBranch(a, "myrepo", "new", "main");
+    defer deinitBranch(a, branch);
+    fake.body = "{\"values\":[" ++ lifecycle_branch ++ "]}";
+    const branches = try bb.listBranches(a, "myrepo", .{});
+    defer deinitBranches(a, branches);
+    fake.body = lifecycle_pr;
+    const pr = try bb.createPullRequest(a, "myrepo", .{
+        .title = "Change",
+        .source_branch = "feature",
+        .reviewers = &.{"{reviewer}"},
+    });
+    defer deinitPullRequest(a, pr);
+    fake.body = fixture_pr;
+    const with_participants = try bb.getPullRequest(a, "myrepo", 42);
+    defer deinitPullRequest(a, with_participants);
+    fake.body = "{\"values\":[" ++ lifecycle_pr ++ "]}";
+    const linked = try bb.listCommitPullRequests(a, "myrepo", "abc123", .{});
+    defer deinitSummaries(a, linked);
+}
+
+test "API lifecycle allocation failures release owned results" {
+    try testing.checkAllAllocationFailures(testing.allocator, lifecycleAllocations, .{});
+}
+
+test "API lifecycle mutation response omissions do not weaken full read guards" {
+    var fake: FakeHttpClient = .{ .body = lifecycle_pr };
+    try testing.expectError(error.MalformedResponse, Client.init(fake.httpClient(), testCredential()).getPullRequest(testing.allocator, "myrepo", 42));
+}
+
+const LifecycleHeaderClient = struct {
+    fake: FakeHttpClient = .{},
+
+    fn client(self: *LifecycleHeaderClient) HttpClient {
+        return .{ .ptr = self, .vtable = &.{ .send = send } };
+    }
+
+    fn send(ptr: *anyopaque, a: Allocator, request: httpc.Request) !httpc.Response {
+        const self: *LifecycleHeaderClient = @ptrCast(@alignCast(ptr));
+        var authorization = false;
+        var accept = false;
+        var content_type = false;
+        for (request.headers) |header| {
+            if (std.mem.eql(u8, header.name, "authorization")) authorization = std.mem.eql(u8, header.value, "Basic dTp0");
+            if (std.mem.eql(u8, header.name, "accept")) accept = std.mem.eql(u8, header.value, "application/json");
+            if (std.mem.eql(u8, header.name, "content-type")) content_type = std.mem.eql(u8, header.value, "application/json");
+        }
+        try testing.expect(authorization and accept);
+        try testing.expectEqual(request.body != null, content_type);
+        return self.fake.httpClient().send(a, request);
+    }
+};
+
+test "API lifecycle HTTP headers and transport errors follow the existing credential contract" {
+    const a = testing.allocator;
+    var checked: LifecycleHeaderClient = .{ .fake = .{ .body = lifecycle_branch } };
+    const bb = Client.init(checked.client(), testCredential());
+    const branch = try bb.createBranch(a, "myrepo", "feature", "main");
+    defer deinitBranch(a, branch);
+    const read = try bb.getBranch(a, "myrepo", "feature");
+    defer deinitBranch(a, read);
+    checked.fake.body = lifecycle_pr;
+    const pr = try bb.createPullRequest(a, "myrepo", .{ .title = "Change", .source_branch = "feature" });
+    defer deinitPullRequest(a, pr);
+    const updated = try bb.updatePullRequest(a, "myrepo", 42, .{ .draft = false });
+    defer deinitPullRequest(a, updated);
+    const declined = try bb.declinePullRequest(a, "myrepo", 42);
+    defer deinitPullRequest(a, declined);
+    checked.fake.send_error = error.ConnectionReset;
+    try testing.expectError(error.ConnectionReset, bb.createBranch(a, "myrepo", "new", "main"));
+    try testing.expectError(error.ConnectionReset, bb.createPullRequest(a, "myrepo", .{ .title = "Change", .source_branch = "feature" }));
+    try testing.expectError(error.ConnectionReset, bb.updatePullRequest(a, "myrepo", 42, .{ .draft = false }));
+    try testing.expectError(error.ConnectionReset, bb.declinePullRequest(a, "myrepo", 42));
+    try testing.expectEqual(@as(usize, 9), checked.fake.call_count);
 }
 
 test "getPullRequest parses a well-formed fixture" {

@@ -33,6 +33,8 @@ from repeating past mistakes. The version-pinned API catalog bbr relies on lives
 
 ## Known corrections (mistakes already made — do not repeat)
 
+- **Bounded file reads use an exclusive limit.** `std.Io.Dir.readFileAlloc` fails when it reaches `.limited(n)`, even at EOF. Pass `.limited(max_bytes + 1)` for an inclusive maximum. The API text-file tests cover exactly 1 MiB and one byte more.
+
 - **`main` takes `std.process.Init`; env vars come from it, not `getEnvVarOwned`.** 0.16 removed
   `std.process.getEnvVarOwned`. Write `pub fn main(init: std.process.Init) !void` and the runtime
   hands you `init.gpa`, `init.arena`, `init.io`, `init.environ_map` (`*Environ.Map`, use
