@@ -4,6 +4,7 @@ const std = @import("std");
 const bbr = @import("bbr");
 const arg = @import("args.zig");
 const out = @import("output.zig");
+const member_search = @import("member_search.zig");
 
 pub const list_help =
     \\usage: bbr api list-workspaces [--pagelen N] [--page N] [--query Q] [--sort S] [--no-follow] [--limit N] [--json]
@@ -20,6 +21,117 @@ pub const get_help =
     \\workspace from BITBUCKET_WORKSPACE.
     \\
 ;
+
+pub const members_help =
+    \\usage: bbr api list-workspace-members [--pagelen N] [--page N] [--no-follow] [--limit N] [--json]
+    \\
+    \\List members in the selected Workspace, with UUIDs, display names, and nicknames.
+    \\Follow pages by default. --no-follow returns one page. --limit caps fetched members.
+    \\Requires the read:workspace:bitbucket API token scope.
+    \\
+;
+
+pub const search_members_help =
+    \\usage: bbr api search-workspace-members --name TEXT [--pagelen N] [--limit N] [--json]
+    \\
+    \\Search all members in the selected Workspace by display name or nickname.
+    \\Rank exact, German spelling, partial, and typo matches in that order.
+    \\Name parts can appear in any order. Middle names can be omitted.
+    \\Small typos and common German spelling changes can be combined.
+    \\Search always follows all pages. --limit caps results after ranking, not requests.
+    \\Counts include all matches before the result limit. No matches is a successful empty result.
+    \\A name must be nonblank, with at most 256 Unicode code points and no control characters.
+    \\Requires the read:workspace:bitbucket API token scope.
+    \\
+;
+
+const SearchOptions = struct { name: []const u8, page: bbr.bitbucket.PageOptions };
+
+fn searchOptions(args: []const []const u8) !SearchOptions {
+    var cur: arg.Cursor = .{ .args = args };
+    var name: ?[]const u8 = null;
+    var page: bbr.bitbucket.PageOptions = .{};
+    while (cur.peek()) |a| {
+        const f = arg.splitFlag(a) orelse return error.UnknownFlag;
+        if (std.mem.eql(u8, f.name, "name")) {
+            _ = cur.next();
+            try arg.setOption([]const u8, &name, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "pagelen") or std.mem.eql(u8, f.name, "limit")) {
+            _ = try takePageFlag(&cur, f, &page);
+        } else return error.UnknownFlag;
+    }
+    const query = name orelse return error.MissingRequired;
+    try member_search.validateName(query);
+    return .{ .name = query, .page = page };
+}
+
+pub fn runSearchMembers(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
+    const opts = try searchOptions(args);
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const members = try bb.listWorkspaceMembers(a, .{ .pagelen = opts.page.pagelen });
+    const result = try member_search.search(a, members, opts.name, opts.page.limit);
+    if (json) return out.printJson(init, result);
+    for (result.matches) |match| {
+        try out.printLine(init, "{s} {s} nickname: {s} match: {s} field: {s} edits: {d}", .{
+            match.member.uuid,          match.member.display_name,     match.member.nickname,
+            @tagName(match.match_kind), @tagName(match.matched_field), match.edit_distance,
+        });
+    }
+    try out.printLine(init, "ok: {d} match(es), {d} exact, {d} shown", .{ result.total_matches, result.exact_matches, result.matches.len });
+}
+
+test "Workspace Member search parser requires valid names and a complete Workspace search" {
+    const parsed = try searchOptions(&.{ "--limit=1", "--name", "Ada Lovelace", "--pagelen=100" });
+    try std.testing.expectEqualStrings("Ada Lovelace", parsed.name);
+    try std.testing.expectEqual(@as(?usize, 1), parsed.page.limit);
+    try std.testing.expectEqual(@as(?u32, 100), parsed.page.pagelen);
+    try std.testing.expect(parsed.page.follow);
+    try std.testing.expectEqual(@as(?u32, null), parsed.page.page);
+    for ([_][]const []const u8{
+        &.{ "--name=Ada", "--page=2" },    &.{ "--name=Ada", "--no-follow" },
+        &.{ "--name=Ada", "--query=Bob" }, &.{ "--name=Ada", "--sort=name" },
+    }) |args| try std.testing.expectError(error.UnknownFlag, searchOptions(args));
+    for ([_][]const []const u8{ &.{"--name="}, &.{"--name=   "}, &.{"--name=Ada\n"}, &.{ "--name=Ada", "--name=Bob" } }) |args|
+        try std.testing.expectError(error.BadRequest, searchOptions(args));
+    try std.testing.expectError(error.MissingRequired, searchOptions(&.{}));
+    try std.testing.expectError(error.MissingValue, searchOptions(&.{"--name"}));
+    try std.testing.expectError(error.InvalidNumber, searchOptions(&.{ "--name=Ada", "--pagelen=101" }));
+    try std.testing.expectEqualStrings("--help", (try searchOptions(&.{ "--name", "--help" })).name);
+}
+
+fn memberPageOptions(args: []const []const u8) !bbr.bitbucket.PageOptions {
+    var cur: arg.Cursor = .{ .args = args };
+    var opts: bbr.bitbucket.PageOptions = .{};
+    while (cur.peek()) |a| {
+        const f = arg.splitFlag(a) orelse return error.UnknownFlag;
+        if (std.mem.eql(u8, f.name, "query") or std.mem.eql(u8, f.name, "sort")) return error.UnknownFlag;
+        if (!try takePageFlag(&cur, f, &opts)) return error.UnknownFlag;
+    }
+    return opts;
+}
+
+pub fn runListMembers(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
+    const opts = try memberPageOptions(args);
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    const members = try bb.listWorkspaceMembers(arena.allocator(), opts);
+    if (json) return out.printJson(init, members);
+    for (members) |member| try out.printLine(init, "{s} {s} nickname: {s}", .{ member.uuid, member.display_name, member.nickname });
+    try out.printLine(init, "ok: {d} Workspace Member(s)", .{members.len});
+}
+
+test "Workspace Member list parser accepts only documented pagination options" {
+    const opts = try memberPageOptions(&.{ "--limit=2", "--pagelen", "100", "--page=3", "--no-follow" });
+    try std.testing.expectEqual(@as(?usize, 2), opts.limit);
+    try std.testing.expectEqual(@as(?u32, 3), opts.page);
+    try std.testing.expect(!opts.follow);
+    for ([_][]const []const u8{ &.{"--query=Bob"}, &.{"--sort=display_name"}, &.{"--repository=sample"}, &.{"--name=Bob"} }) |args|
+        try std.testing.expectError(error.UnknownFlag, memberPageOptions(args));
+    try std.testing.expectError(error.InvalidNumber, memberPageOptions(&.{"--page=0"}));
+    try std.testing.expectError(error.MissingValue, memberPageOptions(&.{"--limit"}));
+}
 
 /// The cursor points at the flag. Unknown flags leave the cursor and options unchanged.
 pub fn takePageFlag(cur: *arg.Cursor, f: arg.Flag, opts: *bbr.bitbucket.PageOptions) !bool {

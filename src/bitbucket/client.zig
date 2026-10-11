@@ -765,6 +765,17 @@ pub const Client = struct {
         return self.listPages(allocator, types.Workspace, WorkspacePage, dupeWorkspace, deinitWorkspace, .{}, base_url ++ "/user/workspaces", opts, null, false);
     }
 
+    /// GET /workspaces/{workspace}/members. Free with `deinitWorkspaceMembers`.
+    pub fn listWorkspaceMembers(self: Client, allocator: Allocator, opts: PageOptions) ![]types.WorkspaceMember {
+        if (self.cred.workspace.len == 0 or opts.query != null or opts.sort != null) return error.BadRequest;
+        var url: std.ArrayList(u8) = .empty;
+        defer url.deinit(allocator);
+        try url.appendSlice(allocator, base_url ++ "/workspaces/");
+        try percentEncodeInto(allocator, &url, self.cred.workspace);
+        try url.appendSlice(allocator, "/members");
+        return self.listPages(allocator, types.WorkspaceMember, WorkspaceMembersPage, dupeWorkspaceMember, deinitWorkspaceMember, .{}, url.items, opts, null, false);
+    }
+
     /// GET /workspaces/{workspace}. Owned by `allocator`.
     pub fn getWorkspace(
         self: Client,
@@ -1403,6 +1414,40 @@ const WorkspaceJson = struct {
     name: []const u8 = "",
     uuid: []const u8 = "",
 };
+
+const WorkspaceMemberEntry = struct {
+    user: struct {
+        uuid: []const u8,
+        display_name: []const u8,
+        nickname: ?[]const u8 = null,
+    },
+};
+
+const WorkspaceMembersPage = struct {
+    values: []WorkspaceMemberEntry,
+    next: ?[]const u8 = null,
+};
+
+fn dupeWorkspaceMember(allocator: Allocator, entry: WorkspaceMemberEntry) !types.WorkspaceMember {
+    const user = entry.user;
+    if (user.uuid.len == 0) return error.MalformedResponse;
+    const uuid = try allocator.dupe(u8, user.uuid);
+    errdefer allocator.free(uuid);
+    const name = try allocator.dupe(u8, user.display_name);
+    errdefer allocator.free(name);
+    return .{ .uuid = uuid, .display_name = name, .nickname = try allocator.dupe(u8, user.nickname orelse "") };
+}
+
+fn deinitWorkspaceMember(allocator: Allocator, member: types.WorkspaceMember) void {
+    allocator.free(member.uuid);
+    allocator.free(member.display_name);
+    allocator.free(member.nickname);
+}
+
+pub fn deinitWorkspaceMembers(allocator: Allocator, members: []types.WorkspaceMember) void {
+    for (members) |member| deinitWorkspaceMember(allocator, member);
+    allocator.free(members);
+}
 
 const WorkspaceEntryJson = struct {
     workspace: WorkspaceJson,
@@ -3555,6 +3600,85 @@ test "getDiff output feeds the parser end to end" {
 // Additive `bbr api` surface: workspaces, repositories, commits, compare,
 // single comment, resolve/reopen, tasks. Uses FakeHttpClient; no network.
 // ---------------------------------------------------------------------------
+
+const members_fixture =
+    \\{"values":[{"user":{"uuid":"{ada}","display_name":"Ada Lovelace","nickname":"ada","extra":true}},
+    \\{"user":{"uuid":"{bob}","display_name":"Bob","nickname":null}},
+    \\{"user":{"uuid":"{carol}","display_name":"Carol"}}]}
+;
+
+test "Workspace Member reads decode nested identities and send encoded scoped GET requests" {
+    const a = testing.allocator;
+    var checked: LifecycleHeaderClient = .{ .fake = .{ .body = members_fixture } };
+    const bb = Client.init(checked.client(), .{ .username = "u", .token = "t", .workspace = "{a b}/?" });
+    const members = try bb.listWorkspaceMembers(a, .{ .pagelen = 100, .page = 2 });
+    defer deinitWorkspaceMembers(a, members);
+    try testing.expectEqual(@as(usize, 3), members.len);
+    try testing.expectEqualStrings("{ada}", members[0].uuid);
+    try testing.expectEqualStrings("Ada Lovelace", members[0].display_name);
+    try testing.expectEqualStrings("ada", members[0].nickname);
+    try testing.expectEqualStrings("", members[1].nickname);
+    try testing.expectEqualStrings("", members[2].nickname);
+    try testing.expectEqual(httpc.Method.GET, checked.fake.last_method.?);
+    try testing.expectEqualStrings(base_url ++ "/workspaces/%7Ba%20b%7D%2F%3F/members?pagelen=100&page=2", checked.fake.lastUrl().?);
+}
+
+test "Workspace Member pagination honors fetch limits and rejects unsupported filters" {
+    const a = testing.allocator;
+    const responses = [_]httpc_fixture.Canned{
+        .{ .body = "{\"values\":[{\"user\":{\"uuid\":\"{first}\",\"display_name\":\"First\"}}],\"next\":\"https://api.bitbucket.org/2.0/workspaces/check24/members?page=2\"}" },
+        .{ .body = members_fixture },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    for ([_]PageOptions{ .{}, .{ .follow = false }, .{ .limit = 1 }, .{ .limit = 2 }, .{ .limit = 0 } }, [_]usize{ 4, 1, 1, 2, 0 }, [_]usize{ 2, 1, 1, 2, 0 }) |opts, count, calls| {
+        fake.call_count = 0;
+        const members = try bb.listWorkspaceMembers(a, opts);
+        defer deinitWorkspaceMembers(a, members);
+        try testing.expectEqual(count, members.len);
+        try testing.expectEqual(calls, fake.call_count);
+    }
+    try testing.expectError(error.BadRequest, bb.listWorkspaceMembers(a, .{ .query = "name=Bob" }));
+    try testing.expectError(error.BadRequest, bb.listWorkspaceMembers(a, .{ .sort = "name" }));
+    try testing.expectEqual(@as(usize, 0), fake.call_count);
+    fake.responses = null;
+    fake.body = "{\"values\":[]}";
+    const empty = try bb.listWorkspaceMembers(a, .{});
+    defer deinitWorkspaceMembers(a, empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "Workspace Member errors discard accumulated results and reject missing identities" {
+    const a = testing.allocator;
+    for ([_][]const u8{
+        "not JSON",                                             "{}",                                                                 "{\"values\":[{}]}",
+        "{\"values\":[{\"user\":{\"display_name\":\"Ada\"}}]}", "{\"values\":[{\"user\":{\"uuid\":\"\",\"display_name\":\"Ada\"}}]}", "{\"values\":[{\"user\":{\"uuid\":\"{ada}\"}}]}",
+    }) |body| {
+        var fake: FakeHttpClient = .{ .body = body };
+        try testing.expectError(error.MalformedResponse, Client.init(fake.httpClient(), testCredential()).listWorkspaceMembers(a, .{}));
+    }
+    for ([_]u16{ 400, 401, 403, 404, 429, 500, 200 }, [_]anyerror{ error.BadRequest, error.Unauthorized, error.Forbidden, error.NotFound, error.RateLimited, error.ServerError, error.MalformedResponse }) |status, expected| {
+        const responses = [_]httpc_fixture.Canned{
+            .{ .body = "{\"values\":[{\"user\":{\"uuid\":\"{first}\",\"display_name\":\"First\"}}],\"next\":\"https://api.bitbucket.org/2.0/workspaces/check24/members?page=2\"}" },
+            .{ .status = status, .body = "invalid" },
+        };
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        try testing.expectError(expected, Client.init(fake.httpClient(), testCredential()).listWorkspaceMembers(a, .{}));
+        try testing.expectEqual(@as(usize, 2), fake.call_count);
+    }
+    var fake: FakeHttpClient = .{ .send_error = error.ConnectionReset };
+    try testing.expectError(error.ConnectionReset, Client.init(fake.httpClient(), testCredential()).listWorkspaceMembers(a, .{}));
+}
+
+fn memberReadAllocations(a: Allocator) !void {
+    var fake: FakeHttpClient = .{ .body = members_fixture };
+    const members = try Client.init(fake.httpClient(), testCredential()).listWorkspaceMembers(a, .{});
+    defer deinitWorkspaceMembers(a, members);
+}
+
+test "Workspace Member read allocation failures release owned identities" {
+    try testing.checkAllAllocationFailures(testing.allocator, memberReadAllocations, .{});
+}
 
 test "listWorkspaces parses nested workspace entries" {
     const a = testing.allocator;

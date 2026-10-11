@@ -27,6 +27,8 @@ pub const Verb = struct {
 pub const verbs = [_]Verb{
     .{ .name = "list-workspaces", .summary = "list workspaces for the authenticated account", .help = workspaces.list_help, .example = "bbr api list-workspaces --pagelen 10 --no-follow", .handler = workspaces.runList },
     .{ .name = "get-workspace", .summary = "get one workspace", .help = workspaces.get_help, .example = "bbr api get-workspace --workspace demo", .handler = workspaces.runGet },
+    .{ .name = "list-workspace-members", .summary = "list Workspace Member names and UUIDs", .help = workspaces.members_help, .example = "bbr api list-workspace-members --json", .handler = workspaces.runListMembers },
+    .{ .name = "search-workspace-members", .summary = "find Workspace Member UUIDs by name", .help = workspaces.search_members_help, .example = "bbr api search-workspace-members --name 'Ada Lovelace' --json", .handler = workspaces.runSearchMembers },
     .{ .name = "list-repositories", .summary = "list repositories in a workspace", .help = repositories.list_help, .example = "bbr api list-repositories --workspace demo --limit 10", .handler = repositories.runList },
     .{ .name = "get-repository", .summary = "get one repository", .help = repositories.get_help, .example = "bbr api get-repository --workspace demo --repository sample", .handler = repositories.runGet },
     .{ .name = "create-branch", .summary = "create a branch from a commit or branch", .help = branches.create_help, .example = "bbr api create-branch --repository sample --name feature/example --target main", .handler = branches.runCreate },
@@ -127,6 +129,8 @@ pub const VerbFlags = struct {
 pub const verb_flags = [_]VerbFlags{
     .{ .verb = "list-workspaces", .flags = &.{ "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
     .{ .verb = "get-workspace", .flags = &.{ "workspace", "json" } },
+    .{ .verb = "list-workspace-members", .flags = &.{ "pagelen", "page", "no-follow", "limit", "json" } },
+    .{ .verb = "search-workspace-members", .flags = &.{ "name", "pagelen", "limit", "json" } },
     .{ .verb = "list-repositories", .flags = &.{ "workspace", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
     .{ .verb = "get-repository", .flags = &.{ "repository", "workspace", "json" } },
     .{ .verb = "create-branch", .flags = &.{ "repository", "name", "target", "json" } },
@@ -433,7 +437,7 @@ test "parseGlobal extracts Profiles without consuming verb flag values" {
 }
 
 test "verb registry is unique and every entry has matching help" {
-    try std.testing.expectEqual(@as(usize, 35), verbs.len);
+    try std.testing.expectEqual(@as(usize, 37), verbs.len);
     var summary_column: ?usize = null;
     inline for (verbs, 0..) |verb, index| {
         for (verbs[index + 1 ..]) |other| try std.testing.expect(!std.mem.eql(u8, verb.name, other.name));
@@ -733,6 +737,119 @@ test "API lifecycle pending commit lookup has no success output and has an actio
         try writeError(&writer, findVerb("list-commit-pull-requests"), expected);
         try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), if (status == 202) "still indexes" else "Go to pull request") != null);
         try std.testing.expectEqual(@as(usize, 1), fake.call_count);
+    }
+}
+
+const member_page_one =
+    \\{"values":[{"user":{"uuid":"{partial}","display_name":"Adaline Lovelace"}}],
+    \\"next":"https://api.bitbucket.org/2.0/workspaces/demo/members?page=2"}
+;
+const member_page_two =
+    \\{"values":[{"user":{"uuid":"{exact}","display_name":"Ada","nickname":"a"}},
+    \\{"user":{"uuid":"{nickname}","display_name":"Nadia","nickname":"Ada"}}]}
+;
+
+test "Workspace Member search scans later pages and reports all exact matches before limiting output" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const responses = [_]bbr.http.Canned{ .{ .body = member_page_one }, .{ .body = member_page_two } };
+    for ([_][]const u8{ "1", "0" }, [_]i64{ 1, 0 }) |limit, count| {
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+        var output: TestOutput = .{};
+        try workspaces.runSearchMembers(output.init(&env, &arena), bb, &.{ "--name=Ada", "--pagelen=2", "--limit", limit }, true);
+        try std.testing.expectEqual(@as(usize, 2), fake.call_count);
+        try std.testing.expectEqualStrings("https://api.bitbucket.org/2.0/workspaces/demo/members?pagelen=2", fake.urlAt(0).?);
+        try std.testing.expectEqual(bbr.http.client.Method.GET, fake.methodAt(1).?);
+        try std.testing.expectEqual(@as(usize, 0), output.stderr_len);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, output.stdoutBytes(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("total_matches").?.integer);
+        try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("exact_matches").?.integer);
+        const matches = parsed.value.object.get("matches").?.array.items;
+        try std.testing.expectEqual(@as(usize, @intCast(count)), matches.len);
+        if (count != 0) {
+            try std.testing.expectEqualStrings("{exact}", matches[0].object.get("member").?.object.get("uuid").?.string);
+            try std.testing.expectEqualStrings("exact", matches[0].object.get("match_kind").?.string);
+            try std.testing.expectEqualStrings("display_name", matches[0].object.get("matched_field").?.string);
+        }
+    }
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+    var human: TestOutput = .{};
+    try workspaces.runSearchMembers(human.init(&env, &arena), bb, &.{ "--name=Ada", "--limit=1" }, false);
+    try std.testing.expect(std.mem.indexOf(u8, human.stdoutBytes(), "{exact} Ada nickname: a match: exact field: display_name edits: 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, human.stdoutBytes(), "3 match(es), 2 exact, 1 shown") != null);
+    var listed: TestOutput = .{};
+    fake.responses = null;
+    fake.body = member_page_two;
+    try workspaces.runListMembers(listed.init(&env, &arena), bb, &.{}, true);
+    const list = try std.json.parseFromSlice(std.json.Value, a, listed.stdoutBytes(), .{});
+    defer list.deinit();
+    try std.testing.expectEqual(@as(usize, 2), list.value.array.items.len);
+    var human_list: TestOutput = .{};
+    try workspaces.runListMembers(human_list.init(&env, &arena), bb, &.{}, false);
+    try std.testing.expect(std.mem.indexOf(u8, human_list.stdoutBytes(), "{nickname} Nadia nickname: Ada") != null);
+    try std.testing.expect(std.mem.indexOf(u8, human_list.stdoutBytes(), "ok: 2 Workspace Member(s)") != null);
+}
+
+test "Workspace Member commands reject invalid options before HTTP and preserve name flag values" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var fake: bbr.http.FakeHttpClient = .{ .body = "{\"values\":[]}" };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+    var output: TestOutput = .{};
+    const init = output.init(&env, &arena);
+    for ([_]struct { args: []const []const u8, err: anyerror }{
+        .{ .args = &.{}, .err = error.MissingRequired },
+        .{ .args = &.{"--name= "}, .err = error.BadRequest },
+        .{ .args = &.{"--name=\xff"}, .err = error.BadRequest },
+        .{ .args = &.{ "--name=Ada", "--page=2" }, .err = error.UnknownFlag },
+        .{ .args = &.{ "--name=Ada", "--no-follow" }, .err = error.UnknownFlag },
+        .{ .args = &.{ "--name=Ada", "--pagelen=0" }, .err = error.InvalidNumber },
+    }) |case| try std.testing.expectError(case.err, workspaces.runSearchMembers(init, bb, case.args, true));
+    try std.testing.expectError(error.UnknownFlag, workspaces.runListMembers(init, bb, &.{"--query=Ada"}, true));
+    try std.testing.expectEqual(@as(usize, 0), fake.call_count);
+    try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+    for ([_][]const u8{ "--help", "--profile", "--json", "--workspace=other" }) |value| {
+        const parsed = try parseGlobal(a, &.{ "--profile=work", "search-workspace-members", "--name", value, "--json", "--workspace=demo" });
+        defer a.free(parsed.rest);
+        try std.testing.expect(!parsed.help_only);
+        try std.testing.expectEqualStrings(value, parsed.rest[1]);
+        try std.testing.expectEqualStrings("demo", parsed.workspace.?);
+        try std.testing.expectEqualStrings("work", parsed.profile.?);
+        var empty: TestOutput = .{};
+        try workspaces.runSearchMembers(empty.init(&env, &arena), bb, parsed.rest, parsed.json);
+        try std.testing.expectEqualStrings("{\"matches\":[],\"total_matches\":0,\"exact_matches\":0}\n", empty.stdoutBytes());
+    }
+}
+
+test "Workspace Member search failure on any page produces no partial success output" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for ([_]bbr.http.Canned{
+        .{ .status = 401 }, .{ .status = 403 }, .{ .status = 429 }, .{ .body = "invalid" }, .{ .send_error = error.ConnectionReset },
+    }, [_]anyerror{ error.Unauthorized, error.Forbidden, error.RateLimited, error.MalformedResponse, error.ConnectionReset }) |failure, expected| {
+        for ([_]bool{ false, true }) |json| {
+            for ([_]bool{ false, true }) |later| {
+                const responses = [_]bbr.http.Canned{ .{ .body = member_page_one }, failure };
+                var fake: bbr.http.FakeHttpClient = .{ .responses = if (later) &responses else responses[1..] };
+                const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+                var output: TestOutput = .{};
+                try std.testing.expectError(expected, workspaces.runSearchMembers(output.init(&env, &arena), bb, &.{"--name=Ada"}, json));
+                try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+                try std.testing.expectEqual(@as(usize, if (later) 2 else 1), fake.call_count);
+            }
+        }
     }
 }
 

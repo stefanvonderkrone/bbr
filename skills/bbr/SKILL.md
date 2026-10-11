@@ -1,6 +1,6 @@
 ---
 name: bbr
-description: Bitbucket Cloud work through bbr api. Use for Branches, PullRequest creation, draft-to-ready updates, decline, commit lookup, and Reviewer Verdicts. Also use for Workspaces, Repositories, diffs, file bytes, Comments, Tasks, and the Authenticated Account.
+description: Bitbucket Cloud work through bbr api. Use for member UUID lookup by name, reviewer assignment, Branches, PullRequest creation, draft-to-ready updates, decline, commit lookup, and Reviewer Verdicts. Also use for Workspaces, Repositories, diffs, file bytes, Comments, Tasks, and the Authenticated Account.
 ---
 
 # bbr api — Bitbucket Cloud CLI
@@ -43,7 +43,31 @@ Add `--json` for scripts. Default prints human lines. `get-diff`, `get-compare-d
 
 Reads run free. Writes need approval unless the user ordered the write. The write commands are `create-branch`, `create-pull-request`, `update-pull-request`, `decline-pull-request`, `create-comment`, `update-comment`, `delete-comment`, `resolve-comment`, `reopen-comment`, `create-task`, `update-task`, `delete-task`, `resolve-task`, `reopen-task`, and `set-verdict`. Done when approval exists or the user ordered it.
 
-`Resolve` closes without editing prose. `reopen` reverses it. A PullRequest Author cannot set a Reviewer Verdict on that PullRequest. `set-verdict` needs `--expected-source-commit`. Use `--body-file`, `--content-file`, or `--description-file` for long text. Get the UUID through `whoami` where needed.
+`Resolve` closes without editing prose. `reopen` reverses it. A PullRequest Author cannot set a Reviewer Verdict on that PullRequest. `set-verdict` needs `--expected-source-commit`. Use `--body-file`, `--content-file`, or `--description-file` for long text. Use `whoami` for the Authenticated Account's UUID. For another account, follow the member lookup steps below.
+
+## Resolve a member name to a UUID
+
+When the user names a reviewer or another account, resolve that name in the selected Workspace:
+
+1. Run `bbr api search-workspace-members --help`.
+2. Run `bbr api search-workspace-members --name 'Ada Lovelace' --json` with the user's name as the value.
+   If the request fails, report the error and stop this lookup.
+3. Read `exact_matches`, which counts distinct members before any result limit.
+   - If `exact_matches` equals one, select the returned member whose `match_kind` is `exact`.
+   - For multiple exact matches, ask the user to choose among those members.
+   - If there is no exact match and candidates exist, ask the user to choose among them.
+   - Show each candidate's display name, nickname, and UUID in the question.
+   - Ask even when a single candidate has a `spelling`, `partial`, or `fuzzy` match.
+4. If the result contains no matches, ask for a more complete name, nickname, or another Workspace.
+   Search another Workspace only after the user selects it.
+5. Pass the selected UUID to the command's existing `--reviewer` or `--uuid` option.
+   Reviewer Verdict writes still use the Authenticated Account.
+
+Done when one exact match or the user's selection supplies the UUID used by the next command.
+
+Search reads every member page before it ranks matches. It handles reversed name parts, omitted middle names, and small typos. German spelling forms are approximate matches, including `Jorg` for `Jörg` and `Mueller` for `Müller`. A complete spelling match ranks above a partial name match. Exact matches compare the complete display name or nickname, ignoring case differences and repeated spaces. A nickname match has no priority over another member's exact display-name match.
+
+Use `list-workspace-members --json` to read the member directory without a name filter. Both commands need the `read:workspace:bitbucket` API token scope. Workspace membership does not prove Repository access.
 
 ## Branch and PullRequest workflow
 
@@ -67,4 +91,4 @@ The Pull Request Commit Links app must exist. Bitbucket installs it when someone
 
 ## Keep current
 
-`bbr api --help` lists verbs. `bbr api VERB --help` defines flags. Follow help on conflict. Use the canonical terms Workspace, Repository, Branch, PullRequest, Draft PullRequest, Ready PullRequest, Comment, Task, Reviewer Verdict, and Authenticated Account.
+`bbr api --help` lists verbs. `bbr api VERB --help` defines flags. Follow help on conflict. Use the canonical terms Workspace, Workspace Member, Repository, Branch, PullRequest, Draft PullRequest, Ready PullRequest, Comment, Task, Reviewer Verdict, and Authenticated Account.

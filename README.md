@@ -107,6 +107,28 @@ bbr api whoami --profile work --json
 bbr --profile work api list-pull-requests --workspace check24 --repository sample
 ```
 
+Find a Workspace Member's UUID before assigning a reviewer:
+
+```sh
+bbr api list-workspace-members --json
+bbr api search-workspace-members --name 'Ada Lovelace' --json
+bbr api search-workspace-members --name 'Kronechek Stefan' --limit 5 --json
+```
+
+Member search reads every page in the selected Workspace before it ranks the results.
+It supports reversed name parts, omitted middle names, common German spelling forms, and small typos.
+Results rank as `exact`, `spelling`, `partial`, and `fuzzy`.
+Each match contains the member's UUID, display name, nickname, matched field, and edit distance.
+The JSON result also contains `total_matches` and `exact_matches`, counted before the result limit.
+Search's `--limit` caps returned matches, while list's `--limit` caps fetched members.
+No matches returns an empty result with exit status zero.
+Both commands require the `read:workspace:bitbucket` API token scope.
+Workspace membership does not prove Repository access.
+
+The `bbr` skill uses a unique exact name or nickname match directly.
+It asks you to select a member for multiple exact matches or any approximate match.
+Use the selected UUID in `--reviewer UUID` or `--uuid UUID`.
+
 Create a Branch and a Draft PullRequest, then mark the PullRequest ready:
 
 ```sh

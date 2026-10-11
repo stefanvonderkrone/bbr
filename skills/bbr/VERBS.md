@@ -1,11 +1,13 @@
 # bbr api verbs
 
-35 verbs. Run `bbr api VERB --help` for flags. No flag tables here.
+37 verbs. Run `bbr api VERB --help` for flags. No flag tables here.
 
 ## Workspaces
 
 - `list-workspaces` — list Workspaces for the account. Example: `bbr api list-workspaces --pagelen 10 --no-follow`
 - `get-workspace` — get one Workspace. Example: `bbr api get-workspace --workspace demo`
+- `list-workspace-members`. List Workspace Member UUIDs, display names, and nicknames. Example: `bbr api list-workspace-members --json`
+- `search-workspace-members`. Find member UUIDs by name with local ranked matches. Example: `bbr api search-workspace-members --name 'Ada Lovelace' --json`
 
 ## Repositories
 

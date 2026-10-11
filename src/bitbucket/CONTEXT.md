@@ -10,6 +10,11 @@ that vocabulary into our domain terms so nothing else depends on Atlassian's sha
 The account that owns repositories (ours is `check24`). The `{workspace}` path segment in every API call.
 _Avoid_: org, team, project.
 
+**Workspace Member**:
+A Bitbucket account that belongs to a Workspace, identified by its UUID.
+Membership alone does not establish Repository access.
+_Avoid_: Reviewer, Authenticated Account (these identify different roles).
+
 **Repository**:
 A git repository within a Workspace, addressed by its slug.
 _Avoid_: repo slug (that's just the identifier), project.

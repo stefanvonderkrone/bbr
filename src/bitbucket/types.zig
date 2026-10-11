@@ -127,6 +127,13 @@ pub const Workspace = struct {
     uuid: []const u8 = "",
 };
 
+/// A Bitbucket account in a Workspace. The producing allocator owns all strings.
+pub const WorkspaceMember = struct {
+    uuid: []const u8,
+    display_name: []const u8,
+    nickname: []const u8 = "",
+};
+
 /// A repository within a workspace. All slices owned by the allocator that
 /// produced the value.
 pub const Repository = struct {
