@@ -46,7 +46,8 @@ pub const search_members_help =
     \\Concurrency defaults to 8. --concurrency accepts a positive integer, capped by logical CPUs.
     \\Fetch the next page as a request finishes. Unknown page counts can cause extra empty-page requests.
     \\A failed page fails the complete search. HTTP 429 is not retried.
-    \\Counts include all matches before the result limit. No matches is a successful empty result.
+    \\Each JSON group contains name and matches with UUID, display name, and nickname.
+    \\No matches is a successful empty result.
     \\A name must be nonblank, with at most 256 Unicode code points and no control characters.
     \\Requires the read:workspace:bitbucket API token scope.
     \\
@@ -104,9 +105,7 @@ test "member search concurrency accepts positive values and caps them by logical
 
 const SearchGroup = struct {
     name: []const u8,
-    matches: []member_search.Match,
-    total_matches: usize,
-    exact_matches: usize,
+    matches: []bbr.bitbucket.WorkspaceMember,
 };
 
 pub fn runSearchMembers(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
@@ -119,7 +118,9 @@ pub fn runSearchMembers(init: std.process.Init, bb: bbr.bitbucket.Client, args: 
     const groups = try a.alloc(SearchGroup, opts.names.items.len);
     for (opts.names.items, groups) |name, *group| {
         const result = try member_search.search(a, members, name, opts.page.limit);
-        group.* = .{ .name = name, .matches = result.matches, .total_matches = result.total_matches, .exact_matches = result.exact_matches };
+        const matches = try a.alloc(bbr.bitbucket.WorkspaceMember, result.matches.len);
+        for (result.matches, matches) |match, *member| member.* = match.member;
+        group.* = .{ .name = name, .matches = matches };
     }
     if (json) return out.printJson(init, groups);
     for (groups) |group| try printSearchGroup(init, group);
@@ -128,12 +129,9 @@ pub fn runSearchMembers(init: std.process.Init, bb: bbr.bitbucket.Client, args: 
 fn printSearchGroup(init: std.process.Init, result: SearchGroup) !void {
     try out.printLine(init, "name: {s}", .{result.name});
     for (result.matches) |match| {
-        try out.printLine(init, "{s} {s} nickname: {s} match: {s} field: {s} edits: {d}", .{
-            match.member.uuid,          match.member.display_name,     match.member.nickname,
-            @tagName(match.match_kind), @tagName(match.matched_field), match.edit_distance,
-        });
+        try out.printLine(init, "{s} {s} nickname: {s}", .{ match.uuid, match.display_name, match.nickname });
     }
-    try out.printLine(init, "ok: {d} match(es), {d} exact, {d} shown", .{ result.total_matches, result.exact_matches, result.matches.len });
+    try out.printLine(init, "ok: {d} shown", .{result.matches.len});
 }
 
 test "Workspace Member search parser requires valid names and a complete Workspace search" {

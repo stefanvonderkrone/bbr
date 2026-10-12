@@ -128,12 +128,13 @@ An empty successful page without a next link marks the end. A failed request fai
 HTTP 429 fails with `RateLimited` without automatic retries.
 It supports reversed name parts, omitted middle names, common German spelling forms, and small typos.
 Results rank as `exact`, `spelling`, `partial`, and `fuzzy`.
-Each match contains the member's UUID, display name, nickname, matched field, and edit distance.
+Each match contains only the member's `uuid`, `display_name`, and `nickname`.
 JSON returns an array of groups, even for one name.
-Each group contains `name`, `matches`, `total_matches`, and `exact_matches`.
-Groups preserve input order and duplicate name values. Each group counts matches before the result limit.
+Each group contains `name` and `matches`.
+Groups preserve input order and duplicate name values.
 Search's `--limit` caps returned matches per name, while list's `--limit` caps fetched members.
 Human output starts each group with `name: TEXT`.
+Each member line contains the UUID, display name, and nickname. The group ends with the number shown.
 A name with no matches returns an empty group with exit status zero.
 All names must pass validation before any member request. A failed search produces no partial groups.
 Both commands require the `read:workspace:bitbucket` API token scope.

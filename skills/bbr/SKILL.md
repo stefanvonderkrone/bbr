@@ -54,13 +54,14 @@ When the user names a reviewer or another account, resolve that name in the sele
    For several names in the same Workspace, repeat `--name` in one command to fetch the member list once.
    If the request fails, report the error and stop this lookup.
 3. Read the JSON array, which contains one group per supplied name in input order, including duplicate names.
-   For each group, read `name`, `matches`, and `exact_matches`.
-   `exact_matches` counts distinct members before the per-name result limit.
-   - If `exact_matches` equals one, select the returned member whose `match_kind` is `exact`.
+   Each group contains `name` and `matches`. Each match contains `uuid`, `display_name`, and `nickname` directly.
+   Use the complete matches without `--limit` to check for ambiguity.
+   Compare the supplied name with each member's complete display name and nickname using the exact-match rules below.
+   - If exactly one member has an exact match, select that member.
    - For multiple exact matches, ask the user to choose among those members.
    - If there is no exact match and candidates exist, ask the user to choose among them.
    - Show each candidate's display name, nickname, and UUID in the question.
-   - Ask even when a single candidate has a `spelling`, `partial`, or `fuzzy` match.
+   - Ask even when only one candidate exists but its display name and nickname do not match exactly.
 4. If a group contains no matches, ask for a more complete name, nickname, or another Workspace.
    Search another Workspace only after the user selects it.
 5. Pass the selected UUID to the command's existing `--reviewer` or `--uuid` option.
