@@ -7,7 +7,7 @@
 - `list-workspaces` — list Workspaces for the account. Example: `bbr api list-workspaces --pagelen 10 --no-follow`
 - `get-workspace` — get one Workspace. Example: `bbr api get-workspace --workspace demo`
 - `list-workspace-members`. List Workspace Member UUIDs, display names, and nicknames. Example: `bbr api list-workspace-members --json`
-- `search-workspace-members`. Find member UUIDs by name with local ranked matches. Example: `bbr api search-workspace-members --name 'Ada Lovelace' --json`
+- `search-workspace-members`. Find member UUIDs by name with local ranked matches. Repeat `--name` to share one member list acquisition. Example: `bbr api search-workspace-members --name 'Ada Lovelace' --name 'Grace Hopper' --json`
 
 ## Repositories
 

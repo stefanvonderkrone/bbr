@@ -114,9 +114,11 @@ bbr api list-workspace-members --json
 bbr api search-workspace-members --name 'Ada Lovelace' --json
 bbr api search-workspace-members --name 'Kronechek Stefan' --limit 5 --json
 bbr api search-workspace-members --name 'Ada Lovelace' --concurrency 4 --json
+bbr api search-workspace-members --name 'Ada Lovelace' --name='Grace Hopper' --limit 5 --json
 ```
 
 Member search reads every page in the selected Workspace before it ranks the results.
+Repeat `--name` to search several names from one member list acquisition.
 It defaults to 100 members per page and eight concurrent page requests.
 `--concurrency N` accepts a positive integer and caps active requests at the logical CPU count.
 The search starts the next page when a request finishes.
@@ -127,9 +129,13 @@ HTTP 429 fails with `RateLimited` without automatic retries.
 It supports reversed name parts, omitted middle names, common German spelling forms, and small typos.
 Results rank as `exact`, `spelling`, `partial`, and `fuzzy`.
 Each match contains the member's UUID, display name, nickname, matched field, and edit distance.
-The JSON result also contains `total_matches` and `exact_matches`, counted before the result limit.
-Search's `--limit` caps returned matches, while list's `--limit` caps fetched members.
-No matches returns an empty result with exit status zero.
+JSON returns an array of groups, even for one name.
+Each group contains `name`, `matches`, `total_matches`, and `exact_matches`.
+Groups preserve input order and duplicate name values. Each group counts matches before the result limit.
+Search's `--limit` caps returned matches per name, while list's `--limit` caps fetched members.
+Human output starts each group with `name: TEXT`.
+A name with no matches returns an empty group with exit status zero.
+All names must pass validation before any member request. A failed search produces no partial groups.
 Both commands require the `read:workspace:bitbucket` API token scope.
 Workspace membership does not prove Repository access.
 

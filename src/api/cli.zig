@@ -768,9 +768,12 @@ test "Workspace Member search scans later pages and reports all exact matches be
         try std.testing.expectEqual(@as(usize, 0), output.stderr_len);
         const parsed = try std.json.parseFromSlice(std.json.Value, a, output.stdoutBytes(), .{});
         defer parsed.deinit();
-        try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("total_matches").?.integer);
-        try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("exact_matches").?.integer);
-        const matches = parsed.value.object.get("matches").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+        const group = parsed.value.array.items[0].object;
+        try std.testing.expectEqualStrings("Ada", group.get("name").?.string);
+        try std.testing.expectEqual(@as(i64, 3), group.get("total_matches").?.integer);
+        try std.testing.expectEqual(@as(i64, 2), group.get("exact_matches").?.integer);
+        const matches = group.get("matches").?.array.items;
         try std.testing.expectEqual(@as(usize, @intCast(count)), matches.len);
         if (count != 0) {
             try std.testing.expectEqualStrings("{exact}", matches[0].object.get("member").?.object.get("uuid").?.string);
@@ -798,6 +801,51 @@ test "Workspace Member search scans later pages and reports all exact matches be
     try std.testing.expect(std.mem.indexOf(u8, human_list.stdoutBytes(), "ok: 2 Workspace Member(s)") != null);
 }
 
+test "Workspace Member searches group repeated names and acquire each page once" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const responses = [_]bbr.http.Canned{ .{ .body = member_page_one }, .{ .body = member_page_two } };
+    const names = [_][]const u8{ "Nadia", "Ada", "UnmatchedXYZ", "Ada" };
+    for ([_][]const u8{ "1", "0" }) |limit| {
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+        var output: TestOutput = .{};
+        try workspaces.runSearchMembers(output.init(&env, &arena), bb, &.{ "--name", names[0], "--name=Ada", "--name", names[2], "--name=Ada", "--limit", limit, "--concurrency=1", "--pagelen=2" }, true);
+        try std.testing.expectEqual(@as(usize, 2), fake.call_count);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, output.stdoutBytes(), .{});
+        defer parsed.deinit();
+        const groups = parsed.value.array.items;
+        try std.testing.expectEqual(@as(usize, 4), groups.len);
+        for (groups, names, [_]i64{ 1, 3, 0, 3 }, [_]i64{ 1, 2, 0, 2 }) |group, name, total, exact| {
+            try std.testing.expectEqualStrings(name, group.object.get("name").?.string);
+            try std.testing.expectEqual(total, group.object.get("total_matches").?.integer);
+            try std.testing.expectEqual(exact, group.object.get("exact_matches").?.integer);
+            try std.testing.expectEqual(@as(usize, if (total != 0 and limit[0] == '1') 1 else 0), group.object.get("matches").?.array.items.len);
+        }
+    }
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+    var output: TestOutput = .{};
+    try workspaces.runSearchMembers(output.init(&env, &arena), bb, &.{ "--name=Nadia", "--name=Ada", "--concurrency=1" }, true);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, output.stdoutBytes(), .{});
+    defer parsed.deinit();
+    const groups = parsed.value.array.items;
+    try std.testing.expectEqualStrings("{nickname}", groups[0].object.get("matches").?.array.items[0].object.get("member").?.object.get("uuid").?.string);
+    try std.testing.expectEqualStrings("{nickname}", groups[1].object.get("matches").?.array.items[1].object.get("member").?.object.get("uuid").?.string);
+    fake.call_count = 0;
+    var human: TestOutput = .{};
+    try workspaces.runSearchMembers(human.init(&env, &arena), bb, &.{ "--name=Nadia", "--name=Ada", "--limit=1", "--concurrency=1" }, false);
+    try std.testing.expectEqual(@as(usize, 2), fake.call_count);
+    try std.testing.expectEqualStrings(
+        "name: Nadia\n{nickname} Nadia nickname: Ada match: exact field: display_name edits: 0\nok: 1 match(es), 1 exact, 1 shown\n" ++
+            "name: Ada\n{exact} Ada nickname: a match: exact field: display_name edits: 0\nok: 3 match(es), 2 exact, 1 shown\n",
+        human.stdoutBytes(),
+    );
+}
+
 test "Workspace Member commands reject invalid options before HTTP and preserve name flag values" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
@@ -812,6 +860,10 @@ test "Workspace Member commands reject invalid options before HTTP and preserve 
         .{ .args = &.{}, .err = error.MissingRequired },
         .{ .args = &.{"--name= "}, .err = error.BadRequest },
         .{ .args = &.{"--name=\xff"}, .err = error.BadRequest },
+        .{ .args = &.{ "--name=Ada", "--name= " }, .err = error.BadRequest },
+        .{ .args = &.{ "--name=Ada", "--name=\xff" }, .err = error.BadRequest },
+        .{ .args = &.{ "--name=Ada", "--name=Bob\n" }, .err = error.BadRequest },
+        .{ .args = &.{ "--name=Ada", "--name" }, .err = error.MissingValue },
         .{ .args = &.{ "--name=Ada", "--page=2" }, .err = error.UnknownFlag },
         .{ .args = &.{ "--name=Ada", "--no-follow" }, .err = error.UnknownFlag },
         .{ .args = &.{ "--name=Ada", "--pagelen=0" }, .err = error.InvalidNumber },
@@ -823,7 +875,7 @@ test "Workspace Member commands reject invalid options before HTTP and preserve 
     try std.testing.expectEqual(@as(usize, 0), fake.call_count);
     try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
     for ([_][]const u8{ "--help", "--profile", "--json", "--workspace=other" }) |value| {
-        const parsed = try parseGlobal(a, &.{ "--profile=work", "search-workspace-members", "--name", value, "--json", "--workspace=demo" });
+        const parsed = try parseGlobal(a, &.{ "--profile=work", "search-workspace-members", "--name", value, "--name=Ada", "--json", "--workspace=demo" });
         defer a.free(parsed.rest);
         try std.testing.expect(!parsed.help_only);
         try std.testing.expectEqualStrings(value, parsed.rest[1]);
@@ -831,7 +883,15 @@ test "Workspace Member commands reject invalid options before HTTP and preserve 
         try std.testing.expectEqualStrings("work", parsed.profile.?);
         var empty: TestOutput = .{};
         try workspaces.runSearchMembers(empty.init(&env, &arena), bb, parsed.rest, parsed.json);
-        try std.testing.expectEqualStrings("{\"matches\":[],\"total_matches\":0,\"exact_matches\":0}\n", empty.stdoutBytes());
+        const groups = try std.json.parseFromSlice(std.json.Value, a, empty.stdoutBytes(), .{});
+        defer groups.deinit();
+        try std.testing.expectEqual(@as(usize, 2), groups.value.array.items.len);
+        for (groups.value.array.items, [_][]const u8{ value, "Ada" }) |group, name| {
+            try std.testing.expectEqualStrings(name, group.object.get("name").?.string);
+            try std.testing.expectEqual(@as(usize, 0), group.object.get("matches").?.array.items.len);
+            try std.testing.expectEqual(@as(i64, 0), group.object.get("total_matches").?.integer);
+            try std.testing.expectEqual(@as(i64, 0), group.object.get("exact_matches").?.integer);
+        }
         const concurrency = try parseGlobal(a, &.{ "search-workspace-members", "--name=Ada", "--concurrency", value, "--profile=work", "--workspace=demo", "--json" });
         defer a.free(concurrency.rest);
         try std.testing.expect(!concurrency.help_only);
@@ -856,7 +916,7 @@ test "Workspace Member search failure on any page produces no partial success ou
                 var fake: bbr.http.FakeHttpClient = .{ .responses = if (later) &responses else responses[1..] };
                 const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
                 var output: TestOutput = .{};
-                try std.testing.expectError(expected, workspaces.runSearchMembers(output.init(&env, &arena), bb, &.{"--name=Ada"}, json));
+                try std.testing.expectError(expected, workspaces.runSearchMembers(output.init(&env, &arena), bb, &.{ "--name=Ada", "--name=Nadia", "--concurrency=1" }, json));
                 try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
                 try std.testing.expectEqual(@as(usize, if (later) 2 else 1), fake.call_count);
             }

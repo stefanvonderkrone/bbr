@@ -51,14 +51,17 @@ When the user names a reviewer or another account, resolve that name in the sele
 
 1. Run `bbr api search-workspace-members --help`.
 2. Run `bbr api search-workspace-members --name 'Ada Lovelace' --json` with the user's name as the value.
+   For several names in the same Workspace, repeat `--name` in one command to fetch the member list once.
    If the request fails, report the error and stop this lookup.
-3. Read `exact_matches`, which counts distinct members before any result limit.
+3. Read the JSON array, which contains one group per supplied name in input order, including duplicate names.
+   For each group, read `name`, `matches`, and `exact_matches`.
+   `exact_matches` counts distinct members before the per-name result limit.
    - If `exact_matches` equals one, select the returned member whose `match_kind` is `exact`.
    - For multiple exact matches, ask the user to choose among those members.
    - If there is no exact match and candidates exist, ask the user to choose among them.
    - Show each candidate's display name, nickname, and UUID in the question.
    - Ask even when a single candidate has a `spelling`, `partial`, or `fuzzy` match.
-4. If the result contains no matches, ask for a more complete name, nickname, or another Workspace.
+4. If a group contains no matches, ask for a more complete name, nickname, or another Workspace.
    Search another Workspace only after the user selects it.
 5. Pass the selected UUID to the command's existing `--reviewer` or `--uuid` option.
    Reviewer Verdict writes still use the Authenticated Account.
