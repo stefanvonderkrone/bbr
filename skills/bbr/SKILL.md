@@ -45,6 +45,8 @@ Reads run free. Writes need approval unless the user ordered the write. The writ
 
 `Resolve` closes without editing prose. `reopen` reverses it. A PullRequest Author cannot set a Reviewer Verdict on that PullRequest. `set-verdict` needs `--expected-source-commit`. Use `--body-file`, `--content-file`, or `--description-file` for long text. Use `whoami` for the Authenticated Account's UUID. For another account, follow the member lookup steps below.
 
+Files supplied through `--description-file` must not exceed 1 MiB.
+
 ## Resolve a member name to a UUID
 
 When the user names a reviewer or another account, resolve that name in the selected Workspace:
