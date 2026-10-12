@@ -14,6 +14,7 @@ const comments = @import("comments.zig");
 const tasks = @import("tasks.zig");
 const files = @import("files.zig");
 const commits = @import("commits.zig");
+const branches = @import("branches.zig");
 
 pub const Verb = struct {
     name: []const u8,
@@ -26,10 +27,19 @@ pub const Verb = struct {
 pub const verbs = [_]Verb{
     .{ .name = "list-workspaces", .summary = "list workspaces for the authenticated account", .help = workspaces.list_help, .example = "bbr api list-workspaces --pagelen 10 --no-follow", .handler = workspaces.runList },
     .{ .name = "get-workspace", .summary = "get one workspace", .help = workspaces.get_help, .example = "bbr api get-workspace --workspace demo", .handler = workspaces.runGet },
+    .{ .name = "list-workspace-members", .summary = "list Workspace Member names and UUIDs", .help = workspaces.members_help, .example = "bbr api list-workspace-members --json", .handler = workspaces.runListMembers },
+    .{ .name = "search-workspace-members", .summary = "find Workspace Member UUIDs by name", .help = workspaces.search_members_help, .example = "bbr api search-workspace-members --name 'Ada Lovelace' --json", .handler = workspaces.runSearchMembers },
     .{ .name = "list-repositories", .summary = "list repositories in a workspace", .help = repositories.list_help, .example = "bbr api list-repositories --workspace demo --limit 10", .handler = repositories.runList },
     .{ .name = "get-repository", .summary = "get one repository", .help = repositories.get_help, .example = "bbr api get-repository --workspace demo --repository sample", .handler = repositories.runGet },
+    .{ .name = "create-branch", .summary = "create a branch from a commit or branch", .help = branches.create_help, .example = "bbr api create-branch --repository sample --name feature/example --target main", .handler = branches.runCreate },
+    .{ .name = "list-branches", .summary = "list branches in a repository", .help = branches.list_help, .example = "bbr api list-branches --repository sample --sort name --limit 10", .handler = branches.runList },
+    .{ .name = "get-branch", .summary = "get a branch and its target commit", .help = branches.get_help, .example = "bbr api get-branch --repository sample --name feature/example", .handler = branches.runGet },
     .{ .name = "list-pull-requests", .summary = "list pull requests in a repository", .help = pullrequests.list_help, .example = "bbr api list-pull-requests --repository sample --state OPEN --pagelen 10 --page 2 --no-follow", .handler = pullrequests.runList },
     .{ .name = "get-pull-request", .summary = "get one pull request", .help = pullrequests.get_help, .example = "bbr api get-pull-request --repository sample --pull-request-id 42", .handler = pullrequests.runGet },
+    .{ .name = "create-pull-request", .summary = "create a ready or draft pull request", .help = pullrequests.create_help, .example = "bbr api create-pull-request --repository sample --title 'Example change' --source-branch feature/example --draft true", .handler = pullrequests.runCreate },
+    .{ .name = "update-pull-request", .summary = "update an open pull request", .help = pullrequests.update_help, .example = "bbr api update-pull-request --repository sample --pull-request-id 42 --draft false", .handler = pullrequests.runUpdate },
+    .{ .name = "decline-pull-request", .summary = "close a pull request without merging", .help = pullrequests.decline_help, .example = "bbr api decline-pull-request --repository sample --pull-request-id 42", .handler = pullrequests.runDecline },
+    .{ .name = "list-commit-pull-requests", .summary = "list pull requests for a commit", .help = pullrequests.commit_list_help, .example = "bbr api list-commit-pull-requests --repository sample --commit abc123 --limit 10", .handler = pullrequests.runListCommit },
     .{ .name = "list-commits", .summary = "list commits (PR, revision, or from..to range)", .help = commits.help, .example = "bbr api list-commits --repository sample --revision main --limit 10", .handler = commits.run },
     .{ .name = "get-diff", .summary = "raw diff of a pull request", .help = files.diff_help, .example = "bbr api get-diff --repository sample --pull-request-id 42 --out review.diff", .handler = files.runDiff },
     .{ .name = "get-compare-diff", .summary = "raw diff between two commits", .help = files.compare_help, .example = "bbr api get-compare-diff --repository sample --from abc123 --to def456 --patch", .handler = files.runCompare },
@@ -77,15 +87,18 @@ pub const help = blk: {
 };
 
 const value_flags = [_][]const u8{
-    "workspace", "repository",    "pull-request-id",    "comment-id",
-    "parent-id", "task-id",       "body",               "body-file",
-    "content",   "content-file",  "path",               "file-path",
-    "to",        "from",          "start-to",           "start-from",
-    "state",     "state-filter",  "source-branch",      "commit",
-    "revision",  "source-commit", "destination-commit", "expected-source-commit",
-    "uuid",      "out",           "pagelen",            "page",
-    "query",     "sort",          "limit",              "attributes",
-    "verdict",   "profile",
+    "workspace",        "repository",        "pull-request-id",    "comment-id",
+    "parent-id",        "task-id",           "body",               "body-file",
+    "content",          "content-file",      "path",               "file-path",
+    "to",               "from",              "start-to",           "start-from",
+    "state",            "state-filter",      "source-branch",      "commit",
+    "revision",         "source-commit",     "destination-commit", "expected-source-commit",
+    "uuid",             "out",               "pagelen",            "page",
+    "query",            "sort",              "limit",              "attributes",
+    "verdict",          "profile",           "name",               "target",
+    "title",            "source-repository", "destination-branch", "description",
+    "description-file", "reviewer",          "draft",              "close-source-branch",
+    "concurrency",
 };
 
 fn takesValue(name: []const u8) bool {
@@ -117,10 +130,19 @@ pub const VerbFlags = struct {
 pub const verb_flags = [_]VerbFlags{
     .{ .verb = "list-workspaces", .flags = &.{ "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
     .{ .verb = "get-workspace", .flags = &.{ "workspace", "json" } },
+    .{ .verb = "list-workspace-members", .flags = &.{ "pagelen", "page", "no-follow", "limit", "json" } },
+    .{ .verb = "search-workspace-members", .flags = &.{ "name", "pagelen", "concurrency", "limit", "json" } },
     .{ .verb = "list-repositories", .flags = &.{ "workspace", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
     .{ .verb = "get-repository", .flags = &.{ "repository", "workspace", "json" } },
+    .{ .verb = "create-branch", .flags = &.{ "repository", "name", "target", "json" } },
+    .{ .verb = "list-branches", .flags = &.{ "repository", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
+    .{ .verb = "get-branch", .flags = &.{ "repository", "name", "json" } },
     .{ .verb = "list-pull-requests", .flags = &.{ "repository", "state", "source-branch", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
     .{ .verb = "get-pull-request", .flags = &.{ "repository", "pull-request-id", "json" } },
+    .{ .verb = "create-pull-request", .flags = &.{ "repository", "title", "source-branch", "source-repository", "destination-branch", "description", "description-file", "reviewer", "clear-reviewers", "draft", "close-source-branch", "json" } },
+    .{ .verb = "update-pull-request", .flags = &.{ "repository", "pull-request-id", "title", "source-branch", "destination-branch", "description", "description-file", "reviewer", "clear-reviewers", "draft", "close-source-branch", "json" } },
+    .{ .verb = "decline-pull-request", .flags = &.{ "repository", "pull-request-id", "json" } },
+    .{ .verb = "list-commit-pull-requests", .flags = &.{ "repository", "commit", "pagelen", "page", "no-follow", "limit", "json" } },
     .{ .verb = "list-commits", .flags = &.{ "repository", "pull-request-id", "revision", "from", "to", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
     .{ .verb = "get-diff", .flags = &.{ "repository", "pull-request-id", "out", "json" } },
     .{ .verb = "get-compare-diff", .flags = &.{ "repository", "from", "to", "patch", "out", "json" } },
@@ -260,6 +282,15 @@ fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror) !void {
         if (err == error.MissingCredential) {
             try writer.writeAll("Run `bbr login` or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, and --workspace or BITBUCKET_WORKSPACE.\n");
         }
+        if (verb) |v| {
+            if (std.mem.eql(u8, v.name, "list-commit-pull-requests")) {
+                if (err == error.PullRequestLinksIndexing) {
+                    try writer.writeAll("Bitbucket still indexes PullRequest links. Run the command again after indexing completes.\n");
+                } else if (err == error.NotFound) {
+                    try writer.writeAll("The Repository or commit links were not found. Links can lack an index. Select 'Go to pull request' on the commit's details page to install the Pull Request Commit Links app.\n");
+                }
+            }
+        }
     }
 }
 
@@ -284,6 +315,7 @@ fn diagnosticVerb(argv: []const []const u8) ?Verb {
             } else if (!std.mem.eql(u8, f.name, "json") and
                 !std.mem.eql(u8, f.name, "no-follow") and
                 !std.mem.eql(u8, f.name, "no-head") and
+                !std.mem.eql(u8, f.name, "clear-reviewers") and
                 !std.mem.eql(u8, f.name, "patch"))
             {
                 // An unknown flag can take a value. Do not guess its meaning.
@@ -406,7 +438,7 @@ test "parseGlobal extracts Profiles without consuming verb flag values" {
 }
 
 test "verb registry is unique and every entry has matching help" {
-    try std.testing.expectEqual(@as(usize, 28), verbs.len);
+    try std.testing.expectEqual(@as(usize, 37), verbs.len);
     var summary_column: ?usize = null;
     inline for (verbs, 0..) |verb, index| {
         for (verbs[index + 1 ..]) |other| try std.testing.expect(!std.mem.eql(u8, verb.name, other.name));
@@ -628,6 +660,263 @@ test "failed verdict changes produce no stdout success result" {
             try std.testing.expectError(case.err, pullrequests.runSetVerdict(output.init(&env, &arena), bb, args, json));
             try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
             try std.testing.expectEqual(@as(usize, 2), fake.call_count);
+        }
+    }
+}
+
+test "API lifecycle globals preserve every new value option and clear-reviewers is boolean" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "name", "target", "title", "source-repository", "destination-branch", "description", "description-file", "reviewer", "draft", "close-source-branch" }) |name| {
+        const flag = try std.fmt.allocPrint(a, "--{s}", .{name});
+        defer a.free(flag);
+        for ([_][]const u8{ "--help", "--profile", "--json", "--workspace=other" }) |value| {
+            const parsed = try parseGlobal(a, &.{ "--profile=work", "update-pull-request", flag, value, "--json", "--workspace=demo" });
+            defer a.free(parsed.rest);
+            try std.testing.expectEqualStrings(value, parsed.rest[1]);
+            try std.testing.expectEqualStrings("work", parsed.profile.?);
+            try std.testing.expectEqualStrings("demo", parsed.workspace.?);
+            try std.testing.expect(parsed.json);
+            try std.testing.expect(!parsed.help_only);
+        }
+    }
+    try std.testing.expect(!completionTakesValue("clear-reviewers"));
+    try std.testing.expectEqualStrings("update-pull-request", diagnosticVerb(&.{ "--clear-reviewers", "update-pull-request" }).?.name);
+}
+
+test "API lifecycle command handlers emit domain JSON and human draft state" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const branch = "{\"name\":\"feature\",\"target\":{\"hash\":\"abc123\"}}";
+    const pr = "{\"id\":42,\"title\":\"Review\",\"state\":\"OPEN\",\"draft\":true,\"source\":{\"branch\":{\"name\":\"feature\"}},\"destination\":{\"branch\":{\"name\":\"main\"}}}";
+    const cases = [_]struct { verb: []const u8, args: []const []const u8, response: []const u8, method: bbr.http.client.Method, list: bool = false }{
+        .{ .verb = "create-branch", .args = &.{ "--repository=sample", "--name=feature", "--target=main" }, .response = branch, .method = .POST },
+        .{ .verb = "get-branch", .args = &.{ "--repository=sample", "--name=feature" }, .response = branch, .method = .GET },
+        .{ .verb = "list-branches", .args = &.{"--repository=sample"}, .response = "{\"values\":[" ++ branch ++ "]}", .method = .GET, .list = true },
+        .{ .verb = "create-pull-request", .args = &.{ "--repository=sample", "--title=Review", "--source-branch=feature" }, .response = pr, .method = .POST },
+        .{ .verb = "update-pull-request", .args = &.{ "--repository=sample", "--pull-request-id=42", "--draft=false" }, .response = pr, .method = .PUT },
+        .{ .verb = "decline-pull-request", .args = &.{ "--repository=sample", "--pull-request-id=42" }, .response = pr, .method = .POST },
+        .{ .verb = "list-commit-pull-requests", .args = &.{ "--repository=sample", "--commit=abc123" }, .response = "{\"values\":[" ++ pr ++ "]}", .method = .GET, .list = true },
+    };
+    for (cases) |case| {
+        var fake: bbr.http.FakeHttpClient = .{ .body = case.response };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+        var output: TestOutput = .{};
+        try findVerb(case.verb).?.handler(output.init(&env, &arena), bb, case.args, true);
+        try std.testing.expectEqual(case.method, fake.last_method.?);
+        try std.testing.expectEqual(@as(usize, 1), fake.call_count);
+        try std.testing.expectEqual(@as(usize, 0), output.stderr_len);
+        const decoded = try std.json.parseFromSlice(std.json.Value, a, output.stdoutBytes(), .{});
+        defer decoded.deinit();
+        try std.testing.expect(if (case.list) decoded.value == .array else decoded.value == .object);
+        if (std.mem.indexOf(u8, case.verb, "pull-request") != null) {
+            const item = if (case.list) decoded.value.array.items[0] else decoded.value;
+            try std.testing.expect(item.object.get("draft").?.bool);
+            var human: TestOutput = .{};
+            try findVerb(case.verb).?.handler(human.init(&env, &arena), bb, case.args, false);
+            try std.testing.expect(std.mem.indexOf(u8, human.stdoutBytes(), if (case.list) "OPEN draft" else "draft: true") != null);
+        }
+    }
+}
+
+test "API lifecycle pending commit lookup has no success output and has an actionable hint" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for ([_]u16{ 202, 404 }, [_]anyerror{ error.PullRequestLinksIndexing, error.NotFound }) |status, expected| {
+        var output: TestOutput = .{};
+        var fake: bbr.http.FakeHttpClient = .{ .status = status, .body = "{\"values\":[]}" };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+        try std.testing.expectError(expected, pullrequests.runListCommit(output.init(&env, &arena), bb, &.{ "--repository=sample", "--commit=abc123" }, true));
+        try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+        var buf: [2048]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buf);
+        try writeError(&writer, findVerb("list-commit-pull-requests"), expected);
+        try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), if (status == 202) "still indexes" else "Go to pull request") != null);
+        try std.testing.expectEqual(@as(usize, 1), fake.call_count);
+    }
+}
+
+const member_page_one =
+    \\{"page":1,"pagelen":2,"size":3,"values":[{"user":{"uuid":"{partial}","display_name":"Adaline Lovelace"}}],
+    \\"next":"https://api.bitbucket.org/2.0/workspaces/demo/members?page=2"}
+;
+const member_page_two =
+    \\{"values":[{"user":{"uuid":"{exact}","display_name":"Ada","nickname":"a"}},
+    \\{"user":{"uuid":"{nickname}","display_name":"Nadia","nickname":"Ada"}}]}
+;
+
+test "Workspace Member search scans later pages and reports all exact matches before limiting output" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const responses = [_]bbr.http.Canned{ .{ .body = member_page_one }, .{ .body = member_page_two } };
+    for ([_][]const u8{ "1", "0" }, [_]i64{ 1, 0 }) |limit, count| {
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+        var output: TestOutput = .{};
+        try workspaces.runSearchMembers(output.init(&env, &arena), bb, &.{ "--name=Ada", "--pagelen=2", "--limit", limit }, true);
+        try std.testing.expectEqual(@as(usize, 2), fake.call_count);
+        try std.testing.expectEqualStrings("https://api.bitbucket.org/2.0/workspaces/demo/members?pagelen=2", fake.urlAt(0).?);
+        try std.testing.expectEqual(bbr.http.client.Method.GET, fake.methodAt(1).?);
+        try std.testing.expectEqual(@as(usize, 0), output.stderr_len);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, output.stdoutBytes(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+        const group = parsed.value.array.items[0].object;
+        try std.testing.expectEqualStrings("Ada", group.get("name").?.string);
+        try std.testing.expectEqual(@as(usize, 2), group.count());
+        const matches = group.get("matches").?.array.items;
+        try std.testing.expectEqual(@as(usize, @intCast(count)), matches.len);
+        if (count != 0) {
+            try std.testing.expectEqual(@as(usize, 3), matches[0].object.count());
+            try std.testing.expectEqualStrings("{exact}", matches[0].object.get("uuid").?.string);
+            try std.testing.expectEqualStrings("Ada", matches[0].object.get("display_name").?.string);
+            try std.testing.expectEqualStrings("a", matches[0].object.get("nickname").?.string);
+        }
+    }
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+    var human: TestOutput = .{};
+    try workspaces.runSearchMembers(human.init(&env, &arena), bb, &.{ "--name=Ada", "--limit=1" }, false);
+    try std.testing.expectEqualStrings("https://api.bitbucket.org/2.0/workspaces/demo/members?pagelen=100", fake.urlAt(0).?);
+    try std.testing.expectEqualStrings("name: Ada\n{exact} Ada nickname: a\nok: 1 shown\n", human.stdoutBytes());
+    var listed: TestOutput = .{};
+    fake.responses = null;
+    fake.body = member_page_two;
+    try workspaces.runListMembers(listed.init(&env, &arena), bb, &.{}, true);
+    const list = try std.json.parseFromSlice(std.json.Value, a, listed.stdoutBytes(), .{});
+    defer list.deinit();
+    try std.testing.expectEqual(@as(usize, 2), list.value.array.items.len);
+    var human_list: TestOutput = .{};
+    try workspaces.runListMembers(human_list.init(&env, &arena), bb, &.{}, false);
+    try std.testing.expect(std.mem.indexOf(u8, human_list.stdoutBytes(), "{nickname} Nadia nickname: Ada") != null);
+    try std.testing.expect(std.mem.indexOf(u8, human_list.stdoutBytes(), "ok: 2 Workspace Member(s)") != null);
+}
+
+test "Workspace Member searches group repeated names and acquire each page once" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const responses = [_]bbr.http.Canned{ .{ .body = member_page_one }, .{ .body = member_page_two } };
+    const names = [_][]const u8{ "Nadia", "Ada", "UnmatchedXYZ", "Ada" };
+    for ([_][]const u8{ "1", "0" }) |limit| {
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+        var output: TestOutput = .{};
+        try workspaces.runSearchMembers(output.init(&env, &arena), bb, &.{ "--name", names[0], "--name=Ada", "--name", names[2], "--name=Ada", "--limit", limit, "--concurrency=1", "--pagelen=2" }, true);
+        try std.testing.expectEqual(@as(usize, 2), fake.call_count);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, output.stdoutBytes(), .{});
+        defer parsed.deinit();
+        const groups = parsed.value.array.items;
+        try std.testing.expectEqual(@as(usize, 4), groups.len);
+        for (groups, names, [_]bool{ true, true, false, true }) |group, name, has_matches| {
+            try std.testing.expectEqualStrings(name, group.object.get("name").?.string);
+            try std.testing.expectEqual(@as(usize, 2), group.object.count());
+            try std.testing.expectEqual(@as(usize, if (has_matches and limit[0] == '1') 1 else 0), group.object.get("matches").?.array.items.len);
+        }
+    }
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+    var output: TestOutput = .{};
+    try workspaces.runSearchMembers(output.init(&env, &arena), bb, &.{ "--name=Nadia", "--name=Ada", "--concurrency=1" }, true);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, output.stdoutBytes(), .{});
+    defer parsed.deinit();
+    const groups = parsed.value.array.items;
+    try std.testing.expectEqualStrings("{nickname}", groups[0].object.get("matches").?.array.items[0].object.get("uuid").?.string);
+    try std.testing.expectEqualStrings("{nickname}", groups[1].object.get("matches").?.array.items[1].object.get("uuid").?.string);
+    fake.call_count = 0;
+    var human: TestOutput = .{};
+    try workspaces.runSearchMembers(human.init(&env, &arena), bb, &.{ "--name=Nadia", "--name=Ada", "--limit=1", "--concurrency=1" }, false);
+    try std.testing.expectEqual(@as(usize, 2), fake.call_count);
+    try std.testing.expectEqualStrings(
+        "name: Nadia\n{nickname} Nadia nickname: Ada\nok: 1 shown\n" ++
+            "name: Ada\n{exact} Ada nickname: a\nok: 1 shown\n",
+        human.stdoutBytes(),
+    );
+}
+
+test "Workspace Member commands reject invalid options before HTTP and preserve name flag values" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var fake: bbr.http.FakeHttpClient = .{ .body = "{\"values\":[]}" };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+    var output: TestOutput = .{};
+    const init = output.init(&env, &arena);
+    for ([_]struct { args: []const []const u8, err: anyerror }{
+        .{ .args = &.{}, .err = error.MissingRequired },
+        .{ .args = &.{"--name= "}, .err = error.BadRequest },
+        .{ .args = &.{"--name=\xff"}, .err = error.BadRequest },
+        .{ .args = &.{ "--name=Ada", "--name= " }, .err = error.BadRequest },
+        .{ .args = &.{ "--name=Ada", "--name=\xff" }, .err = error.BadRequest },
+        .{ .args = &.{ "--name=Ada", "--name=Bob\n" }, .err = error.BadRequest },
+        .{ .args = &.{ "--name=Ada", "--name" }, .err = error.MissingValue },
+        .{ .args = &.{ "--name=Ada", "--page=2" }, .err = error.UnknownFlag },
+        .{ .args = &.{ "--name=Ada", "--no-follow" }, .err = error.UnknownFlag },
+        .{ .args = &.{ "--name=Ada", "--pagelen=0" }, .err = error.InvalidNumber },
+        .{ .args = &.{ "--name=Ada", "--concurrency=0" }, .err = error.InvalidNumber },
+        .{ .args = &.{ "--name=Ada", "--concurrency=-1" }, .err = error.InvalidNumber },
+        .{ .args = &.{ "--name=Ada", "--concurrency" }, .err = error.MissingValue },
+    }) |case| try std.testing.expectError(case.err, workspaces.runSearchMembers(init, bb, case.args, true));
+    try std.testing.expectError(error.UnknownFlag, workspaces.runListMembers(init, bb, &.{"--query=Ada"}, true));
+    try std.testing.expectEqual(@as(usize, 0), fake.call_count);
+    try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+    for ([_][]const u8{ "--help", "--profile", "--json", "--workspace=other" }) |value| {
+        const parsed = try parseGlobal(a, &.{ "--profile=work", "search-workspace-members", "--name", value, "--name=Ada", "--json", "--workspace=demo" });
+        defer a.free(parsed.rest);
+        try std.testing.expect(!parsed.help_only);
+        try std.testing.expectEqualStrings(value, parsed.rest[1]);
+        try std.testing.expectEqualStrings("demo", parsed.workspace.?);
+        try std.testing.expectEqualStrings("work", parsed.profile.?);
+        var empty: TestOutput = .{};
+        try workspaces.runSearchMembers(empty.init(&env, &arena), bb, parsed.rest, parsed.json);
+        const groups = try std.json.parseFromSlice(std.json.Value, a, empty.stdoutBytes(), .{});
+        defer groups.deinit();
+        try std.testing.expectEqual(@as(usize, 2), groups.value.array.items.len);
+        for (groups.value.array.items, [_][]const u8{ value, "Ada" }) |group, name| {
+            try std.testing.expectEqualStrings(name, group.object.get("name").?.string);
+            try std.testing.expectEqual(@as(usize, 0), group.object.get("matches").?.array.items.len);
+            try std.testing.expectEqual(@as(usize, 2), group.object.count());
+        }
+        const concurrency = try parseGlobal(a, &.{ "search-workspace-members", "--name=Ada", "--concurrency", value, "--profile=work", "--workspace=demo", "--json" });
+        defer a.free(concurrency.rest);
+        try std.testing.expect(!concurrency.help_only);
+        try std.testing.expectEqualStrings(value, concurrency.rest[2]);
+        try std.testing.expectEqualStrings("demo", concurrency.workspace.?);
+        try std.testing.expectError(error.InvalidNumber, workspaces.runSearchMembers(init, bb, concurrency.rest, concurrency.json));
+    }
+}
+
+test "Workspace Member search failure on any page produces no partial success output" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for ([_]bbr.http.Canned{
+        .{ .status = 401 }, .{ .status = 403 }, .{ .status = 429 }, .{ .body = "invalid" }, .{ .send_error = error.ConnectionReset },
+    }, [_]anyerror{ error.Unauthorized, error.Forbidden, error.RateLimited, error.MalformedResponse, error.ConnectionReset }) |failure, expected| {
+        for ([_]bool{ false, true }) |json| {
+            for ([_]bool{ false, true }) |later| {
+                const responses = [_]bbr.http.Canned{ .{ .body = member_page_one }, failure };
+                var fake: bbr.http.FakeHttpClient = .{ .responses = if (later) &responses else responses[1..] };
+                const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+                var output: TestOutput = .{};
+                try std.testing.expectError(expected, workspaces.runSearchMembers(output.init(&env, &arena), bb, &.{ "--name=Ada", "--name=Nadia", "--concurrency=1" }, json));
+                try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+                try std.testing.expectEqual(@as(usize, if (later) 2 else 1), fake.call_count);
+            }
         }
     }
 }

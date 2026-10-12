@@ -64,6 +64,9 @@ the main thread; the Epoch token still guards against stale results.
 - **No `std.heap.ThreadSafeAllocator` in this 0.16 build.** Don't share one allocator across
   threads: give worker threads the stateless `std.heap.page_allocator` and keep the main
   allocator (gpa) main-thread-only. Hand ownership across the thread boundary via the event.
+- `std.Io.failing` rejects concurrent starts but panics on `swapCancelProtection`
+  (`std/Io.zig:2745`). Enter cancel protection only after a worker starts successfully.
+  This lets the sequential fallback work with a runtime that does not support concurrency.
 - Shelling out: `std.process.run(gpa, io, .{ .argv, .cwd })` → `RunResult{ term, stdout, stderr }`
   (caller owns stdout/stderr). `Term` is `union(enum){ exited: u8, signal, stopped, unknown }`;
   `Cwd` is `union(enum){ inherit, dir: Io.Dir, path: []const u8 }`.
@@ -186,6 +189,13 @@ the main thread; the Epoch token still guards against stale results.
   newer host, `build.zig` sets the deployment minimum to macOS 15. It gets the active SDK path from
   `xcrun` for CoreFoundation linking. The SDK headers also require
   `-Wno-elaborated-enum-base` with Zig 0.16's C++ compiler.
+
+## 5.5 Bounded file reads
+
+`std.Io.Dir.readFileAlloc` returns `StreamTooLong` when the reader reaches the limit, even at EOF.
+For an inclusive byte limit, pass `.limited(max_bytes + 1)`.
+The API text-file helper uses this rule to accept exactly 1 MiB and reject larger files.
+Verified in `std/Io/Dir.zig:1326-1338` and `std/Io/Reader.zig:367-386`.
 
 ## 6. Testing
 

@@ -24,9 +24,9 @@ with tempfile.TemporaryDirectory(prefix="bbr-completion-test-") as data_home:
     env = clean_env(data_home)
 
     for shell, marker, flags in (
-        ("bash", b"complete -F _bbr", (b"--pull-request-id", b"--profile")),
-        ("zsh", b"#compdef bbr", (b"--pull-request-id", b"--profile")),
-        ("fish", b"complete -c bbr", (b"-l pull-request-id", b"-l profile")),
+        ("bash", b"complete -F _bbr", (b"--pull-request-id", b"--profile", b"--concurrency")),
+        ("zsh", b"#compdef bbr", (b"--pull-request-id", b"--profile", b"--concurrency")),
+        ("fish", b"complete -c bbr", (b"-l pull-request-id", b"-l profile", b"-l concurrency")),
     ):
         result = subprocess.run([binary, "completion", shell], capture_output=True, env=env, timeout=5)
         assert result.returncode == 0, result
@@ -35,7 +35,13 @@ with tempfile.TemporaryDirectory(prefix="bbr-completion-test-") as data_home:
         assert marker in result.stdout, result
         for flag in flags:
             assert flag in result.stdout, (shell, flag)
-        for expected in (b"list-pull-requests", b"set-verdict", b"completion --list-profiles"):
+        for expected in (
+            b"list-pull-requests", b"set-verdict", b"completion --list-profiles",
+            b"create-branch", b"list-branches", b"get-branch",
+            b"create-pull-request", b"update-pull-request", b"decline-pull-request",
+            b"list-commit-pull-requests",
+            b"list-workspace-members", b"search-workspace-members",
+        ):
             assert expected in result.stdout, (shell, expected)
 
     result = subprocess.run([binary, "completion", "--help"], capture_output=True, env=env, timeout=5)
