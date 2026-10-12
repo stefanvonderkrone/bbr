@@ -457,6 +457,12 @@ test "human comment details distinguish scopes replies and deleted comments" {
             .body =
             \\{"id":9,"deleted":true,"content":{"raw":"hidden"},"user":{"display_name":"Ada"},"inline":{"path":"f.zig","to":4}}
             ,
+            .expected = "#9 Ada\nscope: inline\npath: f.zig\nto: 4\nstate: current\nresolved: false\ndeleted: true\nbody:\nhidden\n",
+        },
+        .{
+            .body =
+            \\{"id":9,"deleted":true,"user":{"display_name":"Ada"},"inline":{"path":"f.zig","to":4}}
+            ,
             .expected = "#9 Ada\nscope: inline\npath: f.zig\nto: 4\nstate: current\nresolved: false\ndeleted: true\nbody:\n\n",
         },
     };

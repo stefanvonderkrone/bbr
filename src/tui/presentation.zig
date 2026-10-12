@@ -515,6 +515,10 @@ test "M23 highlighting rejects completions with a changed typed owner block cont
 }
 
 test "M23 acceptance Highlighting admission failures preserve active search Selection and retained results" {
+    const log_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = log_level;
+
     var failures: usize = 0;
     var offset: usize = 0;
     while (true) : (offset += 1) {
@@ -574,6 +578,10 @@ test "M23 acceptance Highlighting admission failures preserve active search Sele
 }
 
 test "M23 acceptance Preview priority limits eviction body replacement and Session expiry keep interaction ownership" {
+    const log_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = log_level;
+
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     const bodies = [_][]const u8{ "```js\none\n```", "```js\ntwo\n```", "```js\ntri\n```", "```js\nfour\n```" } ++ [_][]const u8{"plain card"} ** 30 ++ [_][]const u8{"needle\n\n```js\nfive\n```\n\n```js\noverlimit\n```"};
