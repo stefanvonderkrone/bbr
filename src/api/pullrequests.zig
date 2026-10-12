@@ -20,21 +20,22 @@ pub const get_help =
 ;
 
 const mutation_options =
-    \\      [--source-repository WORKSPACE/SLUG] [--destination-branch NAME]
+    \\      [--destination-branch NAME]
     \\      [--description TEXT | --description-file PATH] [--reviewer UUID ... | --clear-reviewers]
     \\      [--draft true|false] [--close-source-branch true|false] [--json]
     \\
     \\--reviewer replaces the reviewer list. --clear-reviewers sends an empty list.
     \\Omitted reviewers use Bitbucket defaults on create and stay unchanged on update.
-    \\--source-repository selects a fork source. The request Repository is the destination.
     \\Description files must not exceed 1 MiB. Flags can appear in any order.
     \\
 ;
 
 pub const create_help =
     \\usage: bbr api create-pull-request --repository SLUG --title TEXT --source-branch NAME
+    \\      [--source-repository WORKSPACE/SLUG]
     \\
 ++ mutation_options ++
+    \\--source-repository selects a fork source. The request Repository is the destination.
     \\Create a ready PullRequest by default. Use --draft true to create a Draft PullRequest.
     \\An omitted destination branch uses the Repository's main branch.
     \\
@@ -225,7 +226,7 @@ fn parseMutation(a: std.mem.Allocator, args: []const []const u8, create: bool) !
             try arg.setOption([]const u8, &p.opts.title, try arg.takeValue(&cur, f));
         } else if (std.mem.eql(u8, f.name, "source-branch")) {
             try arg.setOption([]const u8, &p.opts.source_branch, try arg.takeValue(&cur, f));
-        } else if (std.mem.eql(u8, f.name, "source-repository")) {
+        } else if (create and std.mem.eql(u8, f.name, "source-repository")) {
             try arg.setOption([]const u8, &p.opts.source_repository, try arg.takeValue(&cur, f));
         } else if (std.mem.eql(u8, f.name, "destination-branch")) {
             try arg.setOption([]const u8, &p.opts.destination_branch, try arg.takeValue(&cur, f));
@@ -643,11 +644,16 @@ test "API lifecycle invalid mutation options fail before HTTP" {
         &.{ "--repository=sample", "--pull-request-id=42", "--reviewer=" },
         &.{ "--repository=sample", "--pull-request-id=42", "--reviewer={ada}", "--clear-reviewers" },
         &.{ "--repository=sample", "--pull-request-id=42", "--description=", "--description-file=unused" },
-        &.{ "--repository=sample", "--pull-request-id=42", "--source-repository=invalid" },
         &.{ "--repository=sample", "--pull-request-id=42", "--description-file=" },
     }) |args| try std.testing.expectError(error.BadRequest, mutatePullRequest(a, std.testing.io, bb, args, false));
     try std.testing.expectError(error.MissingRequired, mutatePullRequest(a, std.testing.io, bb, &.{"--repository=sample"}, true));
     try std.testing.expectError(error.UnknownFlag, mutatePullRequest(a, std.testing.io, bb, &.{ "--repository=sample", "--pull-request-id=42", "--clear-reviewers=true" }, false));
+    for ([_][]const []const u8{
+        &.{ "--repository=sample", "--pull-request-id=42", "--source-repository=fork/sample" },
+        &.{ "--repository=sample", "--pull-request-id=42", "--title=Change", "--source-repository", "fork/sample" },
+    }) |args| try std.testing.expectError(error.UnknownFlag, mutatePullRequest(a, std.testing.io, bb, args, false));
+    try std.testing.expect(std.mem.indexOf(u8, update_help, "--source-repository") == null);
+    try std.testing.expect(std.mem.indexOf(u8, create_help, "--source-repository WORKSPACE/SLUG") != null);
     try std.testing.expectError(error.InvalidNumber, declinePullRequest(a, bb, &.{ "--repository=sample", "--pull-request-id=0" }));
     try std.testing.expectError(error.UnknownFlag, listCommitPullRequests(a, bb, &.{ "--repository=sample", "--commit=abc123", "--query=state=OPEN" }));
     try std.testing.expectError(error.InvalidNumber, listCommitPullRequests(a, bb, &.{ "--repository=sample", "--commit=abc123", "--page=0" }));

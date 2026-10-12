@@ -2552,7 +2552,7 @@ test "API lifecycle PullRequest mutations return optional detail fields without 
     const a = testing.allocator;
     var fake: FakeHttpClient = .{ .status = 201, .body = lifecycle_pr };
     const bb = Client.init(fake.httpClient(), testCredential());
-    const created = try bb.createPullRequest(a, "myrepo", .{ .title = "Change", .source_branch = "feature/test" });
+    const created = try bb.createPullRequest(a, "myrepo", .{ .title = "Change", .source_branch = "feature/test", .source_repository = "fork/sample" });
     defer deinitPullRequest(a, created);
     try testing.expectEqual(httpc.Method.POST, fake.last_method.?);
     try testing.expectEqualStrings(base_url ++ "/repositories/check24/myrepo/pullrequests", fake.lastUrl().?);
@@ -2581,6 +2581,8 @@ test "API lifecycle PullRequest mutations return optional detail fields without 
     try testing.expectError(error.MissingRequired, bb.createPullRequest(a, "myrepo", .{}));
     try testing.expectError(error.BadRequest, bb.updatePullRequest(a, "myrepo", 42, .{}));
     try testing.expectError(error.BadRequest, bb.updatePullRequest(a, "myrepo", 42, .{ .title = "" }));
+    try testing.expectError(error.BadRequest, bb.updatePullRequest(a, "myrepo", 42, .{ .source_repository = "fork/sample" }));
+    try testing.expectError(error.BadRequest, bb.updatePullRequest(a, "myrepo", 42, .{ .title = "Change", .source_repository = "fork/sample" }));
     try testing.expectEqual(@as(usize, 3), fake.call_count);
 }
 

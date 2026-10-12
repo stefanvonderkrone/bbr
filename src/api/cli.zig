@@ -140,7 +140,7 @@ pub const verb_flags = [_]VerbFlags{
     .{ .verb = "list-pull-requests", .flags = &.{ "repository", "state", "source-branch", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
     .{ .verb = "get-pull-request", .flags = &.{ "repository", "pull-request-id", "json" } },
     .{ .verb = "create-pull-request", .flags = &.{ "repository", "title", "source-branch", "source-repository", "destination-branch", "description", "description-file", "reviewer", "clear-reviewers", "draft", "close-source-branch", "json" } },
-    .{ .verb = "update-pull-request", .flags = &.{ "repository", "pull-request-id", "title", "source-branch", "source-repository", "destination-branch", "description", "description-file", "reviewer", "clear-reviewers", "draft", "close-source-branch", "json" } },
+    .{ .verb = "update-pull-request", .flags = &.{ "repository", "pull-request-id", "title", "source-branch", "destination-branch", "description", "description-file", "reviewer", "clear-reviewers", "draft", "close-source-branch", "json" } },
     .{ .verb = "decline-pull-request", .flags = &.{ "repository", "pull-request-id", "json" } },
     .{ .verb = "list-commit-pull-requests", .flags = &.{ "repository", "commit", "pagelen", "page", "no-follow", "limit", "json" } },
     .{ .verb = "list-commits", .flags = &.{ "repository", "pull-request-id", "revision", "from", "to", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },

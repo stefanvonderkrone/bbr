@@ -65,7 +65,8 @@ pub const PullRequestOptions = struct {
 
     pub fn validate(self: PullRequestOptions, create: bool) !void {
         if (create and (self.title == null or self.source_branch == null)) return error.MissingRequired;
-        if (!create and self.title == null and self.source_branch == null and self.source_repository == null and
+        if (!create and self.source_repository != null) return error.BadRequest;
+        if (!create and self.title == null and self.source_branch == null and
             self.destination_branch == null and self.description == null and self.reviewers == null and
             self.draft == null and self.close_source_branch == null) return error.BadRequest;
         for ([_]?[]const u8{ self.title, self.source_branch, self.destination_branch }) |value| {

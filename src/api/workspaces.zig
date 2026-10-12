@@ -82,7 +82,7 @@ fn searchOptions(allocator: std.mem.Allocator, args: []const []const u8) !Search
 }
 
 fn effectiveConcurrency(requested: usize, cpu_count: std.Thread.CpuCountError!usize) usize {
-    return @min(requested, cpu_count catch 1);
+    return @max(1, @min(requested, cpu_count catch 1));
 }
 
 test "member search concurrency accepts positive values and caps them by logical CPUs" {
@@ -96,6 +96,7 @@ test "member search concurrency accepts positive values and caps them by logical
     try std.testing.expectEqual(@as(usize, 18), effectiveConcurrency(100, 18));
     try std.testing.expectEqual(@as(usize, 2), effectiveConcurrency(8, 2));
     try std.testing.expectEqual(@as(usize, 1), effectiveConcurrency(8, error.Unsupported));
+    try std.testing.expectEqual(@as(usize, 1), effectiveConcurrency(8, 0));
     try std.testing.expectEqual(@as(usize, 1), effectiveConcurrency(1, 18));
     for ([_][]const u8{ "0", "-1", "1.5", "text", "184467440737095516160" }) |value|
         try std.testing.expectError(error.InvalidNumber, searchOptions(std.testing.allocator, &.{ "--name=Ada", "--concurrency", value }));
