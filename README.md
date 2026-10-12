@@ -107,6 +107,69 @@ bbr api whoami --profile work --json
 bbr --profile work api list-pull-requests --workspace check24 --repository sample
 ```
 
+Find a Workspace Member's UUID before assigning a reviewer:
+
+```sh
+bbr api list-workspace-members --json
+bbr api search-workspace-members --name 'Ada Lovelace' --json
+bbr api search-workspace-members --name 'Kronechek Stefan' --limit 5 --json
+bbr api search-workspace-members --name 'Ada Lovelace' --concurrency 4 --json
+bbr api search-workspace-members --name 'Ada Lovelace' --name='Grace Hopper' --limit 5 --json
+```
+
+Member search reads every page in the selected Workspace before it ranks the results.
+Repeat `--name` to search several names from one member list acquisition.
+It defaults to 100 members per page and eight concurrent page requests.
+`--concurrency N` accepts a positive integer and caps active requests at the logical CPU count.
+The search starts the next page when a request finishes.
+Without a total page count, the search can send extra requests beyond the last page.
+The extra request count is at most the effective concurrency minus one.
+An empty successful page without a next link marks the end. A failed request fails the complete search.
+HTTP 429 fails with `RateLimited` without automatic retries.
+It supports reversed name parts, omitted middle names, common German spelling forms, and small typos.
+Results rank as `exact`, `spelling`, `partial`, and `fuzzy`.
+Each match contains only the member's `uuid`, `display_name`, and `nickname`.
+JSON returns an array of groups, even for one name.
+Each group contains `name` and `matches`.
+Groups preserve input order and duplicate name values.
+Search's `--limit` caps returned matches per name, while list's `--limit` caps fetched members.
+Human output starts each group with `name: TEXT`.
+Each member line contains the UUID, display name, and nickname. The group ends with the number shown.
+A name with no matches returns an empty group with exit status zero.
+All names must pass validation before any member request. A failed search produces no partial groups.
+Both commands require the `read:workspace:bitbucket` API token scope.
+Workspace membership does not prove Repository access.
+
+The `bbr` skill uses a single result directly when the name or nickname has only minor differences.
+It asks you to select a member for multiple results or to confirm a single result with larger differences.
+Use the selected UUID in `--reviewer UUID` or `--uuid UUID`.
+
+Create a Branch and a Draft PullRequest, then mark the PullRequest ready:
+
+```sh
+bbr api create-branch --repository sample --name feature/example --target main
+bbr api list-branches --repository sample --sort name --limit 10
+bbr api get-branch --repository sample --name feature/example
+bbr api create-pull-request --repository sample --title 'Example change' --source-branch feature/example --draft true
+bbr api update-pull-request --repository sample --pull-request-id 42 --draft false
+```
+
+PullRequest creation requires a title and a source branch. It defaults to ready and uses the Repository's main branch as the destination. Use `--destination-branch` to select another destination. For a fork source, add `--source-repository WORKSPACE/SLUG`.
+
+Create and update support descriptions, reviewers, draft state, and source-branch closure. `--description-file PATH` reads up to 1 MiB. Repeated `--reviewer UUID` options replace the reviewer list. `--clear-reviewers` sends an empty list. Omitted fields stay unchanged on update, including reviewers. An empty description clears the description.
+
+Approve or decline a PullRequest, or find PullRequests for a commit:
+
+```sh
+bbr api set-verdict --repository sample --pull-request-id 42 --verdict approved --expected-source-commit abc123
+bbr api decline-pull-request --repository sample --pull-request-id 42
+bbr api list-commit-pull-requests --repository sample --commit abc123 --json
+```
+
+Approval sets the Authenticated Account's Reviewer Verdict. Decline closes the PullRequest without merging. Commit lookup includes closed PullRequests and follows pages by default. Use `--page`, `--pagelen`, `--no-follow`, and `--limit` to control the results.
+
+Commit lookup needs Bitbucket's Pull Request Commit Links app. Bitbucket installs it when someone selects `Go to pull request` on a commit's details page. Pending indexing produces an error and a hint instead of an empty result.
+
 ### Shell completions
 
 `bbr completion` prints a completion script for `bbr` commands, `bbr api` verbs,

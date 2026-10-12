@@ -62,13 +62,15 @@ pub fn writeFile(io: std.Io, raw: []const u8, path: []const u8) !void {
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = raw });
 }
 
-/// Read a whole file (for `--body-file` / `--content-file`). Caller frees.
+/// Read up to 1 MiB for text-file options. Caller frees.
 pub fn readFile(
     io: std.Io,
     gpa: std.mem.Allocator,
     path: []const u8,
 ) ![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1024 * 1024));
+    // The reader fails when it reaches the limit. One extra byte permits an
+    // exact 1 MiB file and still rejects every larger file.
+    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1024 * 1024 + 1));
 }
 
 test "JSON file output keeps binary bytes out of stdout and truncates empty files" {

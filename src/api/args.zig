@@ -76,6 +76,21 @@ pub fn parseUsize(s: []const u8) ParseError!usize {
     return std.fmt.parseInt(usize, s, 10) catch return error.InvalidNumber;
 }
 
+pub fn parseBool(text: []const u8) !bool {
+    if (std.mem.eql(u8, text, "true")) return true;
+    if (std.mem.eql(u8, text, "false")) return false;
+    return error.BadRequest;
+}
+
+/// Identical repeated values are allowed. Conflicting scalar values are not.
+pub fn setOption(comptime T: type, slot: *?T, value: T) !void {
+    if (slot.*) |old| {
+        const same = if (T == []const u8) std.mem.eql(u8, old, value) else old == value;
+        if (!same) return error.BadRequest;
+    }
+    slot.* = value;
+}
+
 test "splitFlag handles = and bare forms" {
     const a = splitFlag("--repository=foo").?;
     try std.testing.expectEqualStrings("repository", a.name);

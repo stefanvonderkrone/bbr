@@ -1136,12 +1136,14 @@ test {
     _ = @import("api/cli.zig");
     _ = @import("api/args.zig");
     _ = @import("api/workspaces.zig");
+    _ = @import("api/member_search.zig");
     _ = @import("api/repositories.zig");
     _ = @import("api/pullrequests.zig");
     _ = @import("api/comments.zig");
     _ = @import("api/tasks.zig");
     _ = @import("api/files.zig");
     _ = @import("api/commits.zig");
+    _ = @import("api/branches.zig");
     _ = @import("highlight/tree_sitter_highlighter.zig");
     _ = @import("highlight/query_regex.zig");
     _ = @import("highlight/user_grammar.zig");

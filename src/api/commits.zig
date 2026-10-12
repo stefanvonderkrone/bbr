@@ -24,13 +24,7 @@ const Parsed = struct {
     mode: CommitMode = .pr,
 };
 
-fn setOption(comptime T: type, slot: *?T, value: T) !void {
-    if (slot.*) |old| {
-        const same = if (T == []const u8) std.mem.eql(u8, old, value) else old == value;
-        if (!same) return error.BadRequest;
-    }
-    slot.* = value;
-}
+const setOption = arg.setOption;
 
 fn parse(args: []const []const u8) !Parsed {
     var cur: arg.Cursor = .{ .args = args };

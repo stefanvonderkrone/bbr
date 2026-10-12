@@ -57,7 +57,117 @@ pub const Client = struct {
         defer allocator.free(res.body);
 
         try classify(res.status);
-        return parsePullRequest(allocator, res.body);
+        return parsePullRequest(allocator, res.body, true);
+    }
+
+    pub fn createPullRequest(self: Client, allocator: Allocator, repo_slug: []const u8, opts: types.PullRequestOptions) !PullRequest {
+        try opts.validate(true);
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests");
+        defer allocator.free(url);
+        const body = try pullRequestBody(allocator, opts);
+        defer allocator.free(body);
+        const response = try self.requestJson(allocator, .POST, url, body);
+        defer allocator.free(response);
+        return parsePullRequest(allocator, response, false);
+    }
+
+    pub fn updatePullRequest(self: Client, allocator: Allocator, repo_slug: []const u8, id: u64, opts: types.PullRequestOptions) !PullRequest {
+        try opts.validate(false);
+        const suffix = try std.fmt.allocPrint(allocator, "/pullrequests/{d}", .{id});
+        defer allocator.free(suffix);
+        const url = try self.repositoryEndpoint(allocator, repo_slug, suffix);
+        defer allocator.free(url);
+        const body = try pullRequestBody(allocator, opts);
+        defer allocator.free(body);
+        const response = try self.requestJson(allocator, .PUT, url, body);
+        defer allocator.free(response);
+        return parsePullRequest(allocator, response, false);
+    }
+
+    pub fn declinePullRequest(self: Client, allocator: Allocator, repo_slug: []const u8, id: u64) !PullRequest {
+        const suffix = try std.fmt.allocPrint(allocator, "/pullrequests/{d}/decline", .{id});
+        defer allocator.free(suffix);
+        const url = try self.repositoryEndpoint(allocator, repo_slug, suffix);
+        defer allocator.free(url);
+        const response = try self.requestJson(allocator, .POST, url, null);
+        defer allocator.free(response);
+        return parsePullRequest(allocator, response, false);
+    }
+
+    /// Includes every returned lifecycle state. A pending index is not an empty result.
+    pub fn listCommitPullRequests(self: Client, allocator: Allocator, repo_slug: []const u8, commit: []const u8, opts: PageOptions) ![]PullRequestSummary {
+        if (commit.len == 0 or opts.query != null or opts.sort != null) return error.BadRequest;
+        var suffix: std.ArrayList(u8) = .empty;
+        defer suffix.deinit(allocator);
+        try suffix.appendSlice(allocator, "/commit/");
+        try percentEncodeInto(allocator, &suffix, commit);
+        try suffix.appendSlice(allocator, "/pullrequests");
+        const url = try self.repositoryEndpoint(allocator, repo_slug, suffix.items);
+        defer allocator.free(url);
+        return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, url, opts, null, true);
+    }
+
+    pub fn listBranches(self: Client, allocator: Allocator, repo_slug: []const u8, opts: PageOptions) ![]types.Branch {
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/refs/branches");
+        defer allocator.free(url);
+        return self.listPages(allocator, types.Branch, BranchPage, dupeBranch, deinitBranch, .{}, url, opts, null, false);
+    }
+
+    pub fn getBranch(self: Client, allocator: Allocator, repo_slug: []const u8, name: []const u8) !types.Branch {
+        try validateBranchName(name);
+        var suffix: std.ArrayList(u8) = .empty;
+        defer suffix.deinit(allocator);
+        try suffix.appendSlice(allocator, "/refs/branches/");
+        try percentEncodeInto(allocator, &suffix, name);
+        const url = try self.repositoryEndpoint(allocator, repo_slug, suffix.items);
+        defer allocator.free(url);
+        const response = try self.requestJson(allocator, .GET, url, null);
+        defer allocator.free(response);
+        return parseBranch(allocator, response);
+    }
+
+    pub fn createBranch(self: Client, allocator: Allocator, repo_slug: []const u8, name: []const u8, target: []const u8) !types.Branch {
+        try validateBranchName(name);
+        if (target.len == 0) return error.BadRequest;
+        const url = try self.repositoryEndpoint(allocator, repo_slug, "/refs/branches");
+        defer allocator.free(url);
+        const body = try std.json.Stringify.valueAlloc(allocator, .{ .name = name, .target = .{ .hash = target } }, .{});
+        defer allocator.free(body);
+        const response = try self.requestJson(allocator, .POST, url, body);
+        defer allocator.free(response);
+        return parseBranch(allocator, response);
+    }
+
+    fn repositoryEndpoint(self: Client, allocator: Allocator, repo_slug: []const u8, suffix: []const u8) ![]u8 {
+        if (repo_slug.len == 0) return error.BadRequest;
+        var url: std.ArrayList(u8) = .empty;
+        defer url.deinit(allocator);
+        try url.appendSlice(allocator, base_url ++ "/repositories/");
+        try percentEncodeInto(allocator, &url, self.cred.workspace);
+        try url.append(allocator, '/');
+        try percentEncodeInto(allocator, &url, repo_slug);
+        try url.appendSlice(allocator, suffix);
+        return url.toOwnedSlice(allocator);
+    }
+
+    /// Return owned JSON bytes. Mutations make one send and never retry.
+    fn requestJson(self: Client, allocator: Allocator, method: httpc.Method, url: []const u8, body: ?[]const u8) ![]u8 {
+        const auth = try self.cred.basicAuthHeader(allocator);
+        defer allocator.free(auth);
+        const headers = [_]httpc.Header{
+            .{ .name = "authorization", .value = auth },
+            .{ .name = "accept", .value = "application/json" },
+            .{ .name = "content-type", .value = "application/json" },
+        };
+        const response = try self.http.send(allocator, .{
+            .method = method,
+            .url = url,
+            .headers = headers[0..if (body != null) 3 else 2],
+            .body = body,
+        });
+        errdefer allocator.free(response.body);
+        try classify(response.status);
+        return response.body;
     }
 
     /// GET /repositories/{workspace}/{repo}/pullrequests, following `next`
@@ -106,7 +216,7 @@ pub const Client = struct {
             }
             page_opts.query = null;
         }
-        return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, buf.items, page_opts, null);
+        return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, buf.items, page_opts, null, false);
     }
 
     /// GET /repositories/{workspace}/{repo}/pullrequests/{id}/diff.
@@ -641,7 +751,7 @@ pub const Client = struct {
             .{ base_url, self.cred.workspace, repo_slug, pr_id },
         );
         defer allocator.free(first);
-        return self.listPages(allocator, Comment, CommentsPage, dupeComment, deinitComment, .{head}, first, opts, rejection);
+        return self.listPages(allocator, Comment, CommentsPage, dupeComment, deinitComment, .{head}, first, opts, rejection, false);
     }
 
     /// GET /user/workspaces: workspaces visible to the authenticated account.
@@ -652,7 +762,148 @@ pub const Client = struct {
         allocator: Allocator,
         opts: PageOptions,
     ) ![]types.Workspace {
-        return self.listPages(allocator, types.Workspace, WorkspacePage, dupeWorkspace, deinitWorkspace, .{}, base_url ++ "/user/workspaces", opts, null);
+        return self.listPages(allocator, types.Workspace, WorkspacePage, dupeWorkspace, deinitWorkspace, .{}, base_url ++ "/user/workspaces", opts, null, false);
+    }
+
+    /// GET /workspaces/{workspace}/members. Free with `deinitWorkspaceMembers`.
+    pub fn listWorkspaceMembers(self: Client, allocator: Allocator, opts: PageOptions) ![]types.WorkspaceMember {
+        if (self.cred.workspace.len == 0 or opts.query != null or opts.sort != null) return error.BadRequest;
+        const endpoint = try self.workspaceMembersEndpoint(allocator);
+        defer allocator.free(endpoint);
+        return self.listPages(allocator, types.WorkspaceMember, WorkspaceMembersPage, dupeWorkspaceMember, deinitWorkspaceMember, .{}, endpoint, opts, null, false);
+    }
+
+    fn workspaceMembersEndpoint(self: Client, allocator: Allocator) ![]u8 {
+        if (self.cred.workspace.len == 0) return error.BadRequest;
+        var url: std.ArrayList(u8) = .empty;
+        errdefer url.deinit(allocator);
+        try url.appendSlice(allocator, base_url ++ "/workspaces/");
+        try percentEncodeInto(allocator, &url, self.cred.workspace);
+        try url.appendSlice(allocator, "/members");
+        return url.toOwnedSlice(allocator);
+    }
+
+    /// Complete member acquisition with a caller-selected active-request bound.
+    /// Workers own separate arenas. Only the coordinator uses `allocator`.
+    /// Free the result with `deinitWorkspaceMembers`.
+    pub fn listWorkspaceMembersConcurrent(self: Client, io: std.Io, allocator: Allocator, pagelen: u32, concurrency: usize) ![]types.WorkspaceMember {
+        if (pagelen == 0 or pagelen > 100 or concurrency == 0) return error.BadRequest;
+        const endpoint = try self.workspaceMembersEndpoint(allocator);
+        defer allocator.free(endpoint);
+        const first_url = try pageUrlWithBase(allocator, endpoint, .{ .pagelen = pagelen });
+        defer allocator.free(first_url);
+        var first = try fetchMemberPage(self, first_url, allocator);
+        defer first.arena.deinit();
+        if (first.value.page) |number| if (number != 1) return error.MalformedResponse;
+        const actual_pagelen = first.value.pagelen orelse pagelen;
+        if (actual_pagelen == 0 or actual_pagelen > 100) return error.MalformedResponse;
+
+        var pages: std.ArrayList(MemberPageRecord) = .empty;
+        defer {
+            for (pages.items) |page| deinitWorkspaceMembers(allocator, page.members);
+            pages.deinit(allocator);
+        }
+        try retainMemberPage(allocator, &pages, 1, first.value);
+        const first_next = first.value.next orelse return finishMemberPages(allocator, &pages, 1);
+        if (!numberedMemberNext(first_next, endpoint, 2, actual_pagelen)) {
+            var url = try allocator.dupe(u8, first_next);
+            defer allocator.free(url);
+            var number: u32 = 2;
+            while (true) {
+                var page = try fetchMemberPage(self, url, allocator);
+                defer page.arena.deinit();
+                try retainMemberPage(allocator, &pages, number, page.value);
+                const next = page.value.next orelse break;
+                const next_url = try allocator.dupe(u8, next);
+                allocator.free(url);
+                url = next_url;
+                number = std.math.add(u32, number, 1) catch return error.MalformedResponse;
+            }
+            return finishMemberPages(allocator, &pages, number);
+        }
+
+        var horizon: u64 = std.math.maxInt(u32);
+        if (first.value.size) |size| {
+            const count = size / actual_pagelen + @intFromBool(size % actual_pagelen != 0);
+            if (count >= 2 and count <= std.math.maxInt(u32)) horizon = count;
+        }
+        const slots = try allocator.alloc(MemberPageSlot, concurrency);
+        for (slots) |*slot| slot.* = .{};
+        defer {
+            for (slots) |*slot| slot.deinit(allocator);
+            allocator.free(slots);
+        }
+        const completions = try allocator.alloc(MemberCompletion, slots.len);
+        defer allocator.free(completions);
+        var select = std.Io.Select(MemberCompletion).init(io, completions);
+        // Each outstanding worker can enqueue one completion without a reader.
+        // Join before freeing slots, including when a coordinator allocation fails.
+        var protection: ?std.Io.CancelProtection = null;
+        defer if (protection) |previous| {
+            _ = io.swapCancelProtection(previous);
+        };
+        defer select.group.await(io) catch {};
+        var active: usize = 0;
+        var next_page: u64 = 2;
+        var terminal: ?u32 = null;
+        var failure: ?MemberPageFailure = null;
+        var concurrent = concurrency > 1;
+        while (true) {
+            var ready: ?usize = null;
+            if (failure == null and terminal == null and (concurrent or active == 0)) {
+                for (slots, 0..) |*slot, index| {
+                    if (slot.busy or next_page > horizon) continue;
+                    slot.number = @intCast(next_page);
+                    slot.url = try pageUrlWithBase(allocator, endpoint, .{ .pagelen = actual_pagelen, .page = slot.number });
+                    if (concurrent) {
+                        select.concurrent(.page, fetchMemberSlot, .{ self, slot, index }) catch {
+                            slot.deinit(allocator);
+                            concurrent = false;
+                            break;
+                        };
+                        if (protection == null) protection = io.swapCancelProtection(.blocked);
+                        slot.busy = true;
+                        active += 1;
+                    } else {
+                        ready = fetchMemberSlot(self, slot, index);
+                    }
+                    next_page += 1;
+                    if (!concurrent) break;
+                }
+            }
+            const index = ready orelse blk: {
+                if (active == 0) {
+                    if (failure != null or terminal != null) break;
+                    if (!concurrent and next_page <= horizon) continue;
+                    return error.MalformedResponse;
+                }
+                const completion = try select.await();
+                active -= 1;
+                break :blk completion.page;
+            };
+            const slot = &slots[index];
+            defer slot.deinit(allocator);
+            if (slot.err) |err| {
+                recordMemberFailure(&failure, slot.number, err);
+                continue;
+            }
+            const page = slot.result.?.value;
+            if (page.page != null and page.page.? != slot.number or page.pagelen != null and page.pagelen.? != actual_pagelen) {
+                recordMemberFailure(&failure, slot.number, error.MalformedResponse);
+                continue;
+            }
+            if (page.next) |next| {
+                if (slot.number == std.math.maxInt(u32) or !numberedMemberNext(next, endpoint, slot.number + 1, actual_pagelen)) {
+                    recordMemberFailure(&failure, slot.number, error.MalformedResponse);
+                    continue;
+                }
+                if (slot.number == horizon) horizon = std.math.maxInt(u32);
+            } else terminal = @min(terminal orelse slot.number, slot.number);
+            if (failure == null and slot.number <= (terminal orelse std.math.maxInt(u32)))
+                try retainMemberPage(allocator, &pages, slot.number, page);
+        }
+        if (failure) |err| return err.reason;
+        return finishMemberPages(allocator, &pages, terminal.?);
     }
 
     /// GET /workspaces/{workspace}. Owned by `allocator`.
@@ -698,7 +949,7 @@ pub const Client = struct {
         const ws = workspace_override orelse self.cred.workspace;
         const first = try std.fmt.allocPrint(allocator, "{s}/repositories/{s}", .{ base_url, ws });
         defer allocator.free(first);
-        return self.listPages(allocator, types.Repository, RepositoryPage, dupeRepository, deinitRepository, .{}, first, opts, null);
+        return self.listPages(allocator, types.Repository, RepositoryPage, dupeRepository, deinitRepository, .{}, first, opts, null, false);
     }
 
     /// GET /repositories/{workspace}/{repo}. Owned by `allocator`.
@@ -775,7 +1026,7 @@ pub const Client = struct {
         first_url: []const u8,
         opts: PageOptions,
     ) ![]types.Commit {
-        return self.listPages(allocator, types.Commit, CommitPage, dupeCommit, deinitCommit, .{}, first_url, opts, null);
+        return self.listPages(allocator, types.Commit, CommitPage, dupeCommit, deinitCommit, .{}, first_url, opts, null, false);
     }
 
     /// Return commits reachable from `to`, excluding all commits reachable from `from`.
@@ -802,6 +1053,7 @@ pub const Client = struct {
         first_url: []const u8,
         opts: PageOptions,
         rejection: ?*?PageRejection,
+        comptime commit_links: bool,
     ) ![]Item {
         var out: std.ArrayList(Item) = .empty;
         defer {
@@ -823,6 +1075,7 @@ pub const Client = struct {
                 },
             });
             defer allocator.free(res.body);
+            if (commit_links and res.status == 202) return error.PullRequestLinksIndexing;
             classify(res.status) catch |reason| {
                 if (rejection) |failure| failure.* = .{ .reason = reason, .retry_after_ms = res.retry_after_ms };
                 return reason;
@@ -1009,7 +1262,7 @@ pub const Client = struct {
             .{ base_url, self.cred.workspace, repo_slug, id },
         );
         defer allocator.free(first);
-        return self.listPages(allocator, types.Task, TaskPage, dupeTask, deinitTask, .{}, first, opts, null);
+        return self.listPages(allocator, types.Task, TaskPage, dupeTask, deinitTask, .{}, first, opts, null, false);
     }
 
     /// GET .../tasks/{task_id}. Owned by `allocator`.
@@ -1292,6 +1545,157 @@ const WorkspaceJson = struct {
     uuid: []const u8 = "",
 };
 
+const WorkspaceMemberEntry = struct {
+    user: struct {
+        uuid: []const u8,
+        display_name: []const u8,
+        nickname: ?[]const u8 = null,
+    },
+};
+
+const WorkspaceMembersPage = struct {
+    values: []WorkspaceMemberEntry,
+    next: ?[]const u8 = null,
+};
+
+const MemberPageWire = struct {
+    values: []WorkspaceMemberEntry,
+    next: ?[]const u8 = null,
+    page: ?u32 = null,
+    pagelen: ?u32 = null,
+    size: ?usize = null,
+};
+
+const OwnedMemberPage = struct {
+    arena: std.heap.ArenaAllocator,
+    value: MemberPageWire,
+};
+
+fn fetchMemberPage(bb: Client, url: []const u8, backing: Allocator) !OwnedMemberPage {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const auth = try bb.cred.basicAuthHeader(a);
+    const response = try bb.http.send(a, .{
+        .method = .GET,
+        .url = url,
+        .headers = &.{
+            .{ .name = "authorization", .value = auth },
+            .{ .name = "accept", .value = "application/json" },
+        },
+    });
+    try classify(response.status);
+    const page = std.json.parseFromSliceLeaky(MemberPageWire, a, response.body, .{ .ignore_unknown_fields = true }) catch |err|
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
+    for (page.values) |entry| if (entry.user.uuid.len == 0) return error.MalformedResponse;
+    return .{ .arena = arena, .value = page };
+}
+
+const MemberPageSlot = struct {
+    number: u32 = 0,
+    url: []const u8 = &.{},
+    busy: bool = false,
+    result: ?OwnedMemberPage = null,
+    err: ?anyerror = null,
+
+    fn deinit(self: *MemberPageSlot, a: Allocator) void {
+        if (self.result) |*result| result.arena.deinit();
+        a.free(self.url);
+        self.* = .{};
+    }
+};
+
+const MemberCompletion = union(enum) { page: usize };
+
+fn fetchMemberSlot(bb: Client, slot: *MemberPageSlot, index: usize) usize {
+    slot.result = fetchMemberPage(bb, slot.url, std.heap.page_allocator) catch |err| {
+        slot.err = err;
+        return index;
+    };
+    return index;
+}
+
+const MemberPageFailure = struct { number: u32, reason: anyerror };
+
+fn recordMemberFailure(failure: *?MemberPageFailure, number: u32, reason: anyerror) void {
+    if (failure.* == null or number < failure.*.?.number)
+        failure.* = .{ .number = number, .reason = reason };
+}
+
+// A numbered link is an endpoint-specific optimization, not a cursor contract.
+fn numberedMemberNext(url: []const u8, endpoint: []const u8, expected: u32, pagelen: u32) bool {
+    if (!std.mem.startsWith(u8, url, endpoint) or url.len <= endpoint.len or url[endpoint.len] != '?') return false;
+    var page: ?u32 = null;
+    var length: ?u32 = null;
+    var query = std.mem.splitScalar(u8, url[endpoint.len + 1 ..], '&');
+    while (query.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse return false;
+        const value = std.fmt.parseInt(u32, pair[eq + 1 ..], 10) catch return false;
+        if (std.mem.eql(u8, pair[0..eq], "page") and page == null) page = value else if (std.mem.eql(u8, pair[0..eq], "pagelen") and length == null) length = value else return false;
+    }
+    return page == expected and (length == null or length == pagelen);
+}
+
+const MemberPageRecord = struct { number: u32, members: []types.WorkspaceMember };
+
+fn retainMemberPage(a: Allocator, pages: *std.ArrayList(MemberPageRecord), number: u32, wire: MemberPageWire) !void {
+    const members = try a.alloc(types.WorkspaceMember, wire.values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (members[0..initialized]) |member| deinitWorkspaceMember(a, member);
+        a.free(members);
+    }
+    for (wire.values, members) |entry, *member| {
+        member.* = try dupeWorkspaceMember(a, entry);
+        initialized += 1;
+    }
+    try pages.append(a, .{ .number = number, .members = members });
+}
+
+fn finishMemberPages(a: Allocator, pages: *std.ArrayList(MemberPageRecord), terminal: u32) ![]types.WorkspaceMember {
+    const Order = struct {
+        fn less(_: void, lhs: MemberPageRecord, rhs: MemberPageRecord) bool {
+            return lhs.number < rhs.number;
+        }
+    };
+    std.mem.sort(MemberPageRecord, pages.items, {}, Order.less);
+    var count: usize = 0;
+    for (pages.items) |page| if (page.number <= terminal) {
+        count = try std.math.add(usize, count, page.members.len);
+    };
+    const members = try a.alloc(types.WorkspaceMember, count);
+    var offset: usize = 0;
+    for (pages.items) |*page| {
+        if (page.number > terminal) continue;
+        @memcpy(members[offset..][0..page.members.len], page.members);
+        offset += page.members.len;
+        a.free(page.members);
+        page.members = &.{};
+    }
+    return members;
+}
+
+fn dupeWorkspaceMember(allocator: Allocator, entry: WorkspaceMemberEntry) !types.WorkspaceMember {
+    const user = entry.user;
+    if (user.uuid.len == 0) return error.MalformedResponse;
+    const uuid = try allocator.dupe(u8, user.uuid);
+    errdefer allocator.free(uuid);
+    const name = try allocator.dupe(u8, user.display_name);
+    errdefer allocator.free(name);
+    return .{ .uuid = uuid, .display_name = name, .nickname = try allocator.dupe(u8, user.nickname orelse "") };
+}
+
+fn deinitWorkspaceMember(allocator: Allocator, member: types.WorkspaceMember) void {
+    allocator.free(member.uuid);
+    allocator.free(member.display_name);
+    allocator.free(member.nickname);
+}
+
+pub fn deinitWorkspaceMembers(allocator: Allocator, members: []types.WorkspaceMember) void {
+    for (members) |member| deinitWorkspaceMember(allocator, member);
+    allocator.free(members);
+}
+
 const WorkspaceEntryJson = struct {
     workspace: WorkspaceJson,
 };
@@ -1408,6 +1812,98 @@ fn deinitCommit(allocator: Allocator, c: types.Commit) void {
     allocator.free(c.message);
     allocator.free(c.author);
     allocator.free(c.date);
+}
+
+const BranchJson = struct {
+    name: []const u8,
+    target: CommitJson,
+    links: ?struct { html: ?struct { href: []const u8 } = null } = null,
+    merge_strategies: []const []const u8 = &.{},
+    default_merge_strategy: []const u8 = "",
+};
+
+const BranchPage = struct {
+    values: []BranchJson,
+    next: ?[]const u8 = null,
+};
+
+fn validateBranchName(name: []const u8) !void {
+    if (name.len == 0 or std.mem.startsWith(u8, name, "refs/heads/")) return error.BadRequest;
+}
+
+fn parseBranch(allocator: Allocator, body: []const u8) !types.Branch {
+    const parsed = std.json.parseFromSlice(BranchJson, allocator, body, .{ .ignore_unknown_fields = true }) catch |err|
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
+    defer parsed.deinit();
+    return dupeBranch(allocator, parsed.value);
+}
+
+fn dupeBranch(allocator: Allocator, wire: BranchJson) !types.Branch {
+    var branch: types.Branch = .{ .name = "", .target = .{ .hash = "" } };
+    errdefer deinitBranch(allocator, branch);
+    branch.name = try allocator.dupe(u8, wire.name);
+    branch.target = try dupeCommit(allocator, wire.target);
+    branch.url = try allocator.dupe(u8, if (wire.links) |links| if (links.html) |html| html.href else "" else "");
+    branch.default_merge_strategy = try allocator.dupe(u8, wire.default_merge_strategy);
+    var strategies: std.ArrayList([]const u8) = .empty;
+    defer strategies.deinit(allocator);
+    errdefer for (strategies.items) |strategy| allocator.free(strategy);
+    for (wire.merge_strategies) |strategy| {
+        const owned = try allocator.dupe(u8, strategy);
+        errdefer allocator.free(owned);
+        try strategies.append(allocator, owned);
+    }
+    branch.merge_strategies = try strategies.toOwnedSlice(allocator);
+    return branch;
+}
+
+pub fn deinitBranch(allocator: Allocator, branch: types.Branch) void {
+    allocator.free(branch.name);
+    deinitCommit(allocator, branch.target);
+    allocator.free(branch.url);
+    allocator.free(branch.default_merge_strategy);
+    for (branch.merge_strategies) |strategy| allocator.free(strategy);
+    allocator.free(branch.merge_strategies);
+}
+
+pub fn deinitBranches(allocator: Allocator, branches: []types.Branch) void {
+    for (branches) |branch| deinitBranch(allocator, branch);
+    allocator.free(branches);
+}
+
+fn pullRequestBody(allocator: Allocator, opts: types.PullRequestOptions) ![]u8 {
+    const Endpoint = struct {
+        branch: ?struct { name: []const u8 } = null,
+        repository: ?struct { full_name: []const u8 } = null,
+    };
+    const ReviewerWire = struct { uuid: []const u8 };
+    const reviewers = if (opts.reviewers) |values| try allocator.alloc(ReviewerWire, values.len) else null;
+    defer if (reviewers) |values| allocator.free(values);
+    if (reviewers) |values| for (values, opts.reviewers.?) |*value, uuid| {
+        value.* = .{ .uuid = uuid };
+    };
+    const Wire = struct {
+        title: ?[]const u8,
+        source: ?Endpoint,
+        destination: ?Endpoint,
+        description: ?[]const u8,
+        reviewers: ?[]const ReviewerWire,
+        draft: ?bool,
+        close_source_branch: ?bool,
+    };
+    const wire: Wire = .{
+        .title = opts.title,
+        .source = if (opts.source_branch != null or opts.source_repository != null) .{
+            .branch = if (opts.source_branch) |name| .{ .name = name } else null,
+            .repository = if (opts.source_repository) |full_name| .{ .full_name = full_name } else null,
+        } else null,
+        .destination = if (opts.destination_branch) |name| .{ .branch = .{ .name = name } } else null,
+        .description = opts.description,
+        .reviewers = reviewers,
+        .draft = opts.draft,
+        .close_source_branch = opts.close_source_branch,
+    };
+    return std.json.Stringify.valueAlloc(allocator, wire, .{ .emit_null_optional_fields = false });
 }
 
 /// Free a batch returned by `listPrCommits` / `listRepoCommits`.
@@ -1574,6 +2070,7 @@ const PrSummaryJson = struct {
     author: ?struct { display_name: ?[]const u8 = null } = null,
     source: struct { branch: struct { name: []const u8 } },
     destination: struct { branch: struct { name: []const u8 } },
+    draft: bool = false,
 };
 
 const PrListPage = struct {
@@ -1598,6 +2095,7 @@ fn dupeSummary(allocator: Allocator, pj: PrSummaryJson) !PullRequestSummary {
         .author_display_name = author_owned,
         .source_branch = source_branch,
         .destination_branch = try allocator.dupe(u8, pj.destination.branch.name),
+        .draft = pj.draft,
     };
 }
 
@@ -1620,29 +2118,47 @@ const PrJson = struct {
     id: u64,
     title: []const u8,
     state: []const u8,
-    author: struct { display_name: []const u8, uuid: []const u8 },
-    source: struct { branch: struct { name: []const u8 }, commit: struct { hash: []const u8 } },
-    destination: struct { branch: struct { name: []const u8 }, commit: struct { hash: []const u8 } },
-    participants: []const struct {
+    author: ?struct { display_name: ?[]const u8 = null, uuid: ?[]const u8 = null } = null,
+    source: PrEndpointJson,
+    destination: PrEndpointJson,
+    participants: ?[]const struct {
         user: struct { uuid: []const u8 },
         approved: bool = false,
         state: ?[]const u8 = null,
-    },
+    } = null,
+    draft: bool = false,
+    description: []const u8 = "",
+    close_source_branch: bool = false,
+    reviewers: ?[]const types.Reviewer = null,
+    links: ?struct { html: ?struct { href: []const u8 } = null } = null,
 };
 
-fn parsePullRequest(allocator: Allocator, body: []const u8) !PullRequest {
+const PrEndpointJson = struct {
+    branch: struct { name: []const u8 },
+    commit: ?struct { hash: []const u8 } = null,
+    repository: ?struct { full_name: []const u8 = "" } = null,
+};
+
+fn parsePullRequest(allocator: Allocator, body: []const u8, comptime full_read: bool) !PullRequest {
     const parsed = std.json.parseFromSlice(PrJson, allocator, body, .{
         .ignore_unknown_fields = true,
-    }) catch return error.MalformedResponse;
+    }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
     defer parsed.deinit();
     const v = parsed.value;
+    // Preserve the full-read contract used by SourceCommit and Reviewer Verdict
+    // guards. An explicit empty author UUID remains valid evidence.
+    if (full_read) {
+        const author = v.author orelse return error.MalformedResponse;
+        if (author.display_name == null or author.uuid == null or v.source.commit == null or
+            v.destination.commit == null or v.participants == null) return error.MalformedResponse;
+    }
 
     var verdicts: std.ArrayList(types.ReviewerVerdictEntry) = .empty;
     errdefer {
         for (verdicts.items) |entry| allocator.free(entry.account_uuid);
         verdicts.deinit(allocator);
     }
-    for (v.participants) |participant| {
+    for (v.participants orelse &.{}) |participant| {
         const verdict: types.ReviewerVerdict = if (participant.approved) blk: {
             if (participant.state) |state| {
                 if (!std.mem.eql(u8, state, "approved")) return error.MalformedResponse;
@@ -1660,19 +2176,49 @@ fn parsePullRequest(allocator: Allocator, body: []const u8) !PullRequest {
         });
     }
 
-    // Duplicate the strings out of the parse arena into the caller's allocator.
-    return .{
+    var pr: PullRequest = .{
         .id = v.id,
-        .title = try allocator.dupe(u8, v.title),
-        .state = try allocator.dupe(u8, v.state),
-        .author_display_name = try allocator.dupe(u8, v.author.display_name),
-        .author_uuid = try allocator.dupe(u8, v.author.uuid),
-        .source_branch = try allocator.dupe(u8, v.source.branch.name),
-        .destination_branch = try allocator.dupe(u8, v.destination.branch.name),
-        .source_commit = try allocator.dupe(u8, v.source.commit.hash),
-        .destination_commit = try allocator.dupe(u8, v.destination.commit.hash),
-        .reviewer_verdicts = try verdicts.toOwnedSlice(allocator),
+        .title = "",
+        .state = "",
+        .author_display_name = "",
+        .source_branch = "",
+        .destination_branch = "",
+        .source_commit = "",
+        .destination_commit = "",
+        .draft = v.draft,
+        .close_source_branch = v.close_source_branch,
     };
+    errdefer deinitPullRequest(allocator, pr);
+    pr.title = try allocator.dupe(u8, v.title);
+    pr.state = try allocator.dupe(u8, v.state);
+    pr.author_display_name = try allocator.dupe(u8, if (v.author) |author| author.display_name orelse "" else "");
+    pr.author_uuid = try allocator.dupe(u8, if (v.author) |author| author.uuid orelse "" else "");
+    pr.source_branch = try allocator.dupe(u8, v.source.branch.name);
+    pr.destination_branch = try allocator.dupe(u8, v.destination.branch.name);
+    pr.source_commit = try allocator.dupe(u8, if (v.source.commit) |commit| commit.hash else "");
+    pr.destination_commit = try allocator.dupe(u8, if (v.destination.commit) |commit| commit.hash else "");
+    pr.description = try allocator.dupe(u8, v.description);
+    pr.source_repository = try allocator.dupe(u8, if (v.source.repository) |repo| repo.full_name else "");
+    pr.destination_repository = try allocator.dupe(u8, if (v.destination.repository) |repo| repo.full_name else "");
+    pr.url = try allocator.dupe(u8, if (v.links) |links| if (links.html) |html| html.href else "" else "");
+    if (v.reviewers) |reviewers| {
+        var owned: std.ArrayList(types.Reviewer) = .empty;
+        defer owned.deinit(allocator);
+        errdefer for (owned.items) |reviewer| {
+            allocator.free(reviewer.uuid);
+            allocator.free(reviewer.display_name);
+        };
+        for (reviewers) |reviewer| {
+            const uuid = try allocator.dupe(u8, reviewer.uuid);
+            errdefer allocator.free(uuid);
+            const display_name = try allocator.dupe(u8, reviewer.display_name);
+            errdefer allocator.free(display_name);
+            try owned.append(allocator, .{ .uuid = uuid, .display_name = display_name });
+        }
+        pr.reviewers = try owned.toOwnedSlice(allocator);
+    }
+    if (v.participants != null) pr.reviewer_verdicts = try verdicts.toOwnedSlice(allocator);
+    return pr;
 }
 
 /// The comment JSON we read from a page of the comments endpoint. Fields we
@@ -1865,6 +2411,17 @@ pub fn deinitPullRequest(allocator: Allocator, pr: PullRequest) void {
     allocator.free(pr.destination_branch);
     allocator.free(pr.source_commit);
     allocator.free(pr.destination_commit);
+    allocator.free(pr.description);
+    allocator.free(pr.source_repository);
+    allocator.free(pr.destination_repository);
+    allocator.free(pr.url);
+    if (pr.reviewers) |reviewers| {
+        for (reviewers) |reviewer| {
+            allocator.free(reviewer.uuid);
+            allocator.free(reviewer.display_name);
+        }
+        allocator.free(reviewers);
+    }
     if (pr.reviewer_verdicts) |verdicts| {
         for (verdicts) |entry| allocator.free(entry.account_uuid);
         allocator.free(verdicts);
@@ -1883,6 +2440,279 @@ const fixture_pr = @embedFile("testdata/pullrequest.json");
 
 fn testCredential() Credential {
     return .{ .username = "u", .token = "t", .workspace = "check24" };
+}
+
+const lifecycle_branch =
+    \\{"name":"feature/test","target":{"hash":"abc123","message":"Change","date":"2026-10-11"},
+    \\ "links":{"html":{"href":"https://bitbucket.org/check24/myrepo/branch/feature/test"}},
+    \\ "merge_strategies":["merge_commit","squash"],"default_merge_strategy":"squash"}
+;
+
+const lifecycle_pr =
+    \\{"id":42,"title":"Change","state":"OPEN","draft":true,"description":"Details","close_source_branch":true,
+    \\ "source":{"branch":{"name":"feature/test"},"repository":{"full_name":"fork/sample"}},
+    \\ "destination":{"branch":{"name":"main"},"repository":{"full_name":"check24/myrepo"}},
+    \\ "reviewers":[{"uuid":"{reviewer}","display_name":"Ada"}],
+    \\ "links":{"html":{"href":"https://bitbucket.org/check24/myrepo/pull-requests/42"}}}
+;
+
+test "API lifecycle branches create and read encoded names with target metadata" {
+    const a = testing.allocator;
+    for ([_][]const u8{ "abc123", "main" }) |target| {
+        var fake: FakeHttpClient = .{ .status = 201, .body = lifecycle_branch };
+        const bb = Client.init(fake.httpClient(), testCredential());
+        const branch = try bb.createBranch(a, "myrepo", "feature/test", target);
+        defer deinitBranch(a, branch);
+        try testing.expectEqual(httpc.Method.POST, fake.last_method.?);
+        try testing.expectEqualStrings(base_url ++ "/repositories/check24/myrepo/refs/branches", fake.lastUrl().?);
+        const body = try std.json.parseFromSlice(struct { name: []const u8, target: struct { hash: []const u8 } }, a, fake.lastBody().?, .{});
+        defer body.deinit();
+        try testing.expectEqualStrings(target, body.value.target.hash);
+        try testing.expectEqualStrings("feature/test", body.value.name);
+        try testing.expectEqualStrings("abc123", branch.target.hash);
+        try testing.expectEqualStrings("Change", branch.target.message);
+        try testing.expectEqualStrings("squash", branch.default_merge_strategy);
+        try testing.expectEqual(@as(usize, 2), branch.merge_strategies.len);
+        try testing.expect(branch.url.len > 0);
+    }
+    var fake: FakeHttpClient = .{ .body = lifecycle_branch };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const branch = try bb.getBranch(a, "myrepo", "feature/a %?#");
+    defer deinitBranch(a, branch);
+    try testing.expectEqual(httpc.Method.GET, fake.last_method.?);
+    try testing.expectEqualStrings(base_url ++ "/repositories/check24/myrepo/refs/branches/feature%2Fa%20%25%3F%23", fake.lastUrl().?);
+    try testing.expectError(error.BadRequest, bb.createBranch(a, "myrepo", "refs/heads/new", "main"));
+    try testing.expectError(error.BadRequest, bb.createBranch(a, "myrepo", "new", ""));
+    try testing.expectError(error.BadRequest, bb.getBranch(a, "myrepo", ""));
+    try testing.expectEqual(@as(usize, 1), fake.call_count);
+}
+
+test "API lifecycle branch pagination keeps filters and stops at a limit" {
+    const a = testing.allocator;
+    const first = "{\"values\":[" ++ lifecycle_branch ++ "," ++ lifecycle_branch ++ "],\"next\":\"" ++ base_url ++ "/next\"}";
+    const last = "{\"values\":[" ++ lifecycle_branch ++ "]}";
+    const responses = [_]httpc_fixture.Canned{ .{ .body = first }, .{ .body = last } };
+    for ([_]PageOptions{ .{}, .{ .follow = false }, .{ .limit = 1 }, .{ .limit = 0 } }, [_]usize{ 3, 2, 1, 0 }, [_]usize{ 2, 1, 1, 0 }) |base_opts, count, calls| {
+        var opts = base_opts;
+        opts.query = "name ~ \"test\"";
+        opts.sort = "-name";
+        opts.page = 2;
+        opts.pagelen = 10;
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        const branches = try Client.init(fake.httpClient(), testCredential()).listBranches(a, "myrepo", opts);
+        defer deinitBranches(a, branches);
+        try testing.expectEqual(count, branches.len);
+        try testing.expectEqual(calls, fake.call_count);
+        if (calls != 0) {
+            const url = fake.urlAt(0).?;
+            for ([_][]const u8{ "page=2", "pagelen=10", "q=name%20~%20%22test%22", "sort=-name" }) |part|
+                try testing.expect(std.mem.indexOf(u8, url, part) != null);
+        }
+    }
+}
+
+test "API lifecycle PullRequest bodies preserve omitted false and empty values" {
+    const a = testing.allocator;
+    const minimal = try pullRequestBody(a, .{ .title = "Change", .source_branch = "feature" });
+    defer a.free(minimal);
+    try testing.expectEqualStrings("{\"title\":\"Change\",\"source\":{\"branch\":{\"name\":\"feature\"}}}", minimal);
+    for ([_]bool{ true, false }) |draft| {
+        const ready = try pullRequestBody(a, .{ .draft = draft });
+        defer a.free(ready);
+        try testing.expectEqualStrings(if (draft) "{\"draft\":true}" else "{\"draft\":false}", ready);
+    }
+    const cleared = try pullRequestBody(a, .{ .description = "", .reviewers = &.{}, .close_source_branch = false });
+    defer a.free(cleared);
+    try testing.expectEqualStrings("{\"description\":\"\",\"reviewers\":[],\"close_source_branch\":false}", cleared);
+    const full = try pullRequestBody(a, .{
+        .title = "Quote \" and newline\n",
+        .source_branch = "feature",
+        .source_repository = "fork/sample",
+        .destination_branch = "release",
+        .description = "Details",
+        .reviewers = &.{ "{ada}", "{bob}" },
+        .draft = true,
+        .close_source_branch = true,
+    });
+    defer a.free(full);
+    const decoded = try std.json.parseFromSlice(struct {
+        title: []const u8,
+        source: struct { branch: struct { name: []const u8 }, repository: struct { full_name: []const u8 } },
+        destination: struct { branch: struct { name: []const u8 } },
+        reviewers: []types.Reviewer,
+    }, a, full, .{ .ignore_unknown_fields = true });
+    defer decoded.deinit();
+    try testing.expectEqualStrings("Quote \" and newline\n", decoded.value.title);
+    try testing.expectEqualStrings("fork/sample", decoded.value.source.repository.full_name);
+    try testing.expectEqualStrings("release", decoded.value.destination.branch.name);
+    try testing.expectEqual(@as(usize, 2), decoded.value.reviewers.len);
+}
+
+test "API lifecycle PullRequest mutations return optional detail fields without participants" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .status = 201, .body = lifecycle_pr };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const created = try bb.createPullRequest(a, "myrepo", .{ .title = "Change", .source_branch = "feature/test", .source_repository = "fork/sample" });
+    defer deinitPullRequest(a, created);
+    try testing.expectEqual(httpc.Method.POST, fake.last_method.?);
+    try testing.expectEqualStrings(base_url ++ "/repositories/check24/myrepo/pullrequests", fake.lastUrl().?);
+    try testing.expect(created.draft);
+    try testing.expect(created.close_source_branch);
+    try testing.expectEqualStrings("Details", created.description);
+    try testing.expectEqualStrings("fork/sample", created.source_repository);
+    try testing.expectEqualStrings("check24/myrepo", created.destination_repository);
+    try testing.expectEqualStrings("Ada", created.reviewers.?[0].display_name);
+    try testing.expect(created.reviewer_verdicts == null);
+    fake.status = 200;
+    const updated = try bb.updatePullRequest(a, "myrepo", 42, .{ .draft = false });
+    defer deinitPullRequest(a, updated);
+    try testing.expectEqual(httpc.Method.PUT, fake.last_method.?);
+    try testing.expectEqualStrings(base_url ++ "/repositories/check24/myrepo/pullrequests/42", fake.lastUrl().?);
+    try testing.expectEqualStrings("{\"draft\":false}", fake.lastBody().?);
+    fake.body = "{\"id\":42,\"title\":\"Change\",\"state\":\"DECLINED\",\"source\":{\"branch\":{\"name\":\"feature\"}},\"destination\":{\"branch\":{\"name\":\"main\"}},\"participants\":[]}";
+    const declined = try bb.declinePullRequest(a, "myrepo", 42);
+    defer deinitPullRequest(a, declined);
+    try testing.expectEqualStrings("DECLINED", declined.state);
+    try testing.expect(declined.reviewer_verdicts != null);
+    try testing.expectEqual(@as(usize, 0), declined.reviewer_verdicts.?.len);
+    try testing.expectEqual(httpc.Method.POST, fake.last_method.?);
+    try testing.expectEqualStrings(base_url ++ "/repositories/check24/myrepo/pullrequests/42/decline", fake.lastUrl().?);
+    try testing.expectEqualStrings("", fake.lastBody().?);
+    try testing.expectError(error.MissingRequired, bb.createPullRequest(a, "myrepo", .{}));
+    try testing.expectError(error.BadRequest, bb.updatePullRequest(a, "myrepo", 42, .{}));
+    try testing.expectError(error.BadRequest, bb.updatePullRequest(a, "myrepo", 42, .{ .title = "" }));
+    try testing.expectError(error.BadRequest, bb.updatePullRequest(a, "myrepo", 42, .{ .source_repository = "fork/sample" }));
+    try testing.expectError(error.BadRequest, bb.updatePullRequest(a, "myrepo", 42, .{ .title = "Change", .source_repository = "fork/sample" }));
+    try testing.expectEqual(@as(usize, 3), fake.call_count);
+}
+
+test "API lifecycle commit lookup has no state filter and reports pending pages" {
+    const a = testing.allocator;
+    const page = "{\"values\":[{\"id\":42,\"title\":\"Change\",\"state\":\"MERGED\",\"draft\":false,\"source\":{\"branch\":{\"name\":\"feature\"}},\"destination\":{\"branch\":{\"name\":\"main\"}}}],\"next\":\"" ++ base_url ++ "/next\"}";
+    const responses = [_]httpc_fixture.Canned{ .{ .body = page }, .{ .status = 202, .body = "{\"values\":[]}" } };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const first = try bb.listCommitPullRequests(a, "myrepo", "abc123", .{ .follow = false, .page = 2, .pagelen = 5 });
+    defer deinitSummaries(a, first);
+    try testing.expectEqualStrings("MERGED", first[0].state);
+    const url = fake.lastUrl().?;
+    try testing.expect(std.mem.startsWith(u8, url, base_url ++ "/repositories/check24/myrepo/commit/abc123/pullrequests?"));
+    try testing.expect(std.mem.indexOf(u8, url, "state=") == null);
+    fake.call_count = 0;
+    try testing.expectError(error.PullRequestLinksIndexing, bb.listCommitPullRequests(a, "myrepo", "abc123", .{}));
+    try testing.expectEqual(@as(usize, 2), fake.call_count);
+    fake.responses = null;
+    fake.status = 202;
+    try testing.expectError(error.PullRequestLinksIndexing, bb.listCommitPullRequests(a, "myrepo", "abc123", .{}));
+    fake.status = 200;
+    fake.body = "{\"values\":[]}";
+    const empty = try bb.listCommitPullRequests(a, "myrepo", "abc123", .{});
+    defer deinitSummaries(a, empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
+    const calls = fake.call_count;
+    const limited = try bb.listCommitPullRequests(a, "myrepo", "abc123", .{ .limit = 0 });
+    defer deinitSummaries(a, limited);
+    try testing.expectEqual(calls, fake.call_count);
+    try testing.expectError(error.BadRequest, bb.listCommitPullRequests(a, "myrepo", "abc123", .{ .query = "state=OPEN" }));
+}
+
+const httpc_fixture = @import("../http/fake_client.zig");
+
+test "API lifecycle errors classify failures without retrying writes" {
+    const a = testing.allocator;
+    for ([_]u16{ 400, 401, 403, 404, 409, 429, 555, 200 }, [_]anyerror{
+        error.BadRequest, error.Unauthorized, error.Forbidden,   error.NotFound,
+        error.Conflict,   error.RateLimited,  error.ServerError, error.MalformedResponse,
+    }) |status, expected| {
+        var fake: FakeHttpClient = .{ .status = status, .body = "not JSON" };
+        const bb = Client.init(fake.httpClient(), testCredential());
+        try testing.expectError(expected, bb.createBranch(a, "myrepo", "new", "main"));
+        try testing.expectError(expected, bb.getBranch(a, "myrepo", "main"));
+        try testing.expectError(expected, bb.createPullRequest(a, "myrepo", .{ .title = "New", .source_branch = "feature" }));
+        try testing.expectError(expected, bb.updatePullRequest(a, "myrepo", 42, .{ .draft = false }));
+        try testing.expectError(expected, bb.declinePullRequest(a, "myrepo", 42));
+        try testing.expectError(expected, bb.listBranches(a, "myrepo", .{}));
+        try testing.expectError(expected, bb.listCommitPullRequests(a, "myrepo", "abc123", .{}));
+        try testing.expectEqual(@as(usize, 7), fake.call_count);
+    }
+}
+
+fn lifecycleAllocations(a: Allocator) !void {
+    var fake: FakeHttpClient = .{ .body = lifecycle_branch };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const branch = try bb.createBranch(a, "myrepo", "new", "main");
+    defer deinitBranch(a, branch);
+    fake.body = "{\"values\":[" ++ lifecycle_branch ++ "]}";
+    const branches = try bb.listBranches(a, "myrepo", .{});
+    defer deinitBranches(a, branches);
+    fake.body = lifecycle_pr;
+    const pr = try bb.createPullRequest(a, "myrepo", .{
+        .title = "Change",
+        .source_branch = "feature",
+        .reviewers = &.{"{reviewer}"},
+    });
+    defer deinitPullRequest(a, pr);
+    fake.body = fixture_pr;
+    const with_participants = try bb.getPullRequest(a, "myrepo", 42);
+    defer deinitPullRequest(a, with_participants);
+    fake.body = "{\"values\":[" ++ lifecycle_pr ++ "]}";
+    const linked = try bb.listCommitPullRequests(a, "myrepo", "abc123", .{});
+    defer deinitSummaries(a, linked);
+}
+
+test "API lifecycle allocation failures release owned results" {
+    try testing.checkAllAllocationFailures(testing.allocator, lifecycleAllocations, .{});
+}
+
+test "API lifecycle mutation response omissions do not weaken full read guards" {
+    var fake: FakeHttpClient = .{ .body = lifecycle_pr };
+    try testing.expectError(error.MalformedResponse, Client.init(fake.httpClient(), testCredential()).getPullRequest(testing.allocator, "myrepo", 42));
+}
+
+const LifecycleHeaderClient = struct {
+    fake: FakeHttpClient = .{},
+
+    fn client(self: *LifecycleHeaderClient) HttpClient {
+        return .{ .ptr = self, .vtable = &.{ .send = send } };
+    }
+
+    fn send(ptr: *anyopaque, a: Allocator, request: httpc.Request) !httpc.Response {
+        const self: *LifecycleHeaderClient = @ptrCast(@alignCast(ptr));
+        var authorization = false;
+        var accept = false;
+        var content_type = false;
+        for (request.headers) |header| {
+            if (std.mem.eql(u8, header.name, "authorization")) authorization = std.mem.eql(u8, header.value, "Basic dTp0");
+            if (std.mem.eql(u8, header.name, "accept")) accept = std.mem.eql(u8, header.value, "application/json");
+            if (std.mem.eql(u8, header.name, "content-type")) content_type = std.mem.eql(u8, header.value, "application/json");
+        }
+        try testing.expect(authorization and accept);
+        try testing.expectEqual(request.body != null, content_type);
+        return self.fake.httpClient().send(a, request);
+    }
+};
+
+test "API lifecycle HTTP headers and transport errors follow the existing credential contract" {
+    const a = testing.allocator;
+    var checked: LifecycleHeaderClient = .{ .fake = .{ .body = lifecycle_branch } };
+    const bb = Client.init(checked.client(), testCredential());
+    const branch = try bb.createBranch(a, "myrepo", "feature", "main");
+    defer deinitBranch(a, branch);
+    const read = try bb.getBranch(a, "myrepo", "feature");
+    defer deinitBranch(a, read);
+    checked.fake.body = lifecycle_pr;
+    const pr = try bb.createPullRequest(a, "myrepo", .{ .title = "Change", .source_branch = "feature" });
+    defer deinitPullRequest(a, pr);
+    const updated = try bb.updatePullRequest(a, "myrepo", 42, .{ .draft = false });
+    defer deinitPullRequest(a, updated);
+    const declined = try bb.declinePullRequest(a, "myrepo", 42);
+    defer deinitPullRequest(a, declined);
+    checked.fake.send_error = error.ConnectionReset;
+    try testing.expectError(error.ConnectionReset, bb.createBranch(a, "myrepo", "new", "main"));
+    try testing.expectError(error.ConnectionReset, bb.createPullRequest(a, "myrepo", .{ .title = "Change", .source_branch = "feature" }));
+    try testing.expectError(error.ConnectionReset, bb.updatePullRequest(a, "myrepo", 42, .{ .draft = false }));
+    try testing.expectError(error.ConnectionReset, bb.declinePullRequest(a, "myrepo", 42));
+    try testing.expectEqual(@as(usize, 9), checked.fake.call_count);
 }
 
 test "getPullRequest parses a well-formed fixture" {
@@ -3019,6 +3849,369 @@ test "getDiff output feeds the parser end to end" {
 // Additive `bbr api` surface: workspaces, repositories, commits, compare,
 // single comment, resolve/reopen, tasks. Uses FakeHttpClient; no network.
 // ---------------------------------------------------------------------------
+
+const members_fixture =
+    \\{"values":[{"user":{"uuid":"{ada}","display_name":"Ada Lovelace","nickname":"ada","extra":true}},
+    \\{"user":{"uuid":"{bob}","display_name":"Bob","nickname":null}},
+    \\{"user":{"uuid":"{carol}","display_name":"Carol"}}]}
+;
+
+test "Workspace Member reads decode nested identities and send encoded scoped GET requests" {
+    const a = testing.allocator;
+    var checked: LifecycleHeaderClient = .{ .fake = .{ .body = members_fixture } };
+    const bb = Client.init(checked.client(), .{ .username = "u", .token = "t", .workspace = "{a b}/?" });
+    const members = try bb.listWorkspaceMembers(a, .{ .pagelen = 100, .page = 2 });
+    defer deinitWorkspaceMembers(a, members);
+    try testing.expectEqual(@as(usize, 3), members.len);
+    try testing.expectEqualStrings("{ada}", members[0].uuid);
+    try testing.expectEqualStrings("Ada Lovelace", members[0].display_name);
+    try testing.expectEqualStrings("ada", members[0].nickname);
+    try testing.expectEqualStrings("", members[1].nickname);
+    try testing.expectEqualStrings("", members[2].nickname);
+    try testing.expectEqual(httpc.Method.GET, checked.fake.last_method.?);
+    try testing.expectEqualStrings(base_url ++ "/workspaces/%7Ba%20b%7D%2F%3F/members?pagelen=100&page=2", checked.fake.lastUrl().?);
+}
+
+test "Workspace Member pagination honors fetch limits and rejects unsupported filters" {
+    const a = testing.allocator;
+    const responses = [_]httpc_fixture.Canned{
+        .{ .body = "{\"values\":[{\"user\":{\"uuid\":\"{first}\",\"display_name\":\"First\"}}],\"next\":\"https://api.bitbucket.org/2.0/workspaces/check24/members?page=2\"}" },
+        .{ .body = members_fixture },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    for ([_]PageOptions{ .{}, .{ .follow = false }, .{ .limit = 1 }, .{ .limit = 2 }, .{ .limit = 0 } }, [_]usize{ 4, 1, 1, 2, 0 }, [_]usize{ 2, 1, 1, 2, 0 }) |opts, count, calls| {
+        fake.call_count = 0;
+        const members = try bb.listWorkspaceMembers(a, opts);
+        defer deinitWorkspaceMembers(a, members);
+        try testing.expectEqual(count, members.len);
+        try testing.expectEqual(calls, fake.call_count);
+    }
+    try testing.expectError(error.BadRequest, bb.listWorkspaceMembers(a, .{ .query = "name=Bob" }));
+    try testing.expectError(error.BadRequest, bb.listWorkspaceMembers(a, .{ .sort = "name" }));
+    try testing.expectEqual(@as(usize, 0), fake.call_count);
+    fake.responses = null;
+    fake.body = "{\"values\":[]}";
+    const empty = try bb.listWorkspaceMembers(a, .{});
+    defer deinitWorkspaceMembers(a, empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "Workspace Member errors discard accumulated results and reject missing identities" {
+    const a = testing.allocator;
+    for ([_][]const u8{
+        "not JSON",                                             "{}",                                                                 "{\"values\":[{}]}",
+        "{\"values\":[{\"user\":{\"display_name\":\"Ada\"}}]}", "{\"values\":[{\"user\":{\"uuid\":\"\",\"display_name\":\"Ada\"}}]}", "{\"values\":[{\"user\":{\"uuid\":\"{ada}\"}}]}",
+    }) |body| {
+        var fake: FakeHttpClient = .{ .body = body };
+        try testing.expectError(error.MalformedResponse, Client.init(fake.httpClient(), testCredential()).listWorkspaceMembers(a, .{}));
+    }
+    for ([_]u16{ 400, 401, 403, 404, 429, 500, 200 }, [_]anyerror{ error.BadRequest, error.Unauthorized, error.Forbidden, error.NotFound, error.RateLimited, error.ServerError, error.MalformedResponse }) |status, expected| {
+        const responses = [_]httpc_fixture.Canned{
+            .{ .body = "{\"values\":[{\"user\":{\"uuid\":\"{first}\",\"display_name\":\"First\"}}],\"next\":\"https://api.bitbucket.org/2.0/workspaces/check24/members?page=2\"}" },
+            .{ .status = status, .body = "invalid" },
+        };
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        try testing.expectError(expected, Client.init(fake.httpClient(), testCredential()).listWorkspaceMembers(a, .{}));
+        try testing.expectEqual(@as(usize, 2), fake.call_count);
+    }
+    var fake: FakeHttpClient = .{ .send_error = error.ConnectionReset };
+    try testing.expectError(error.ConnectionReset, Client.init(fake.httpClient(), testCredential()).listWorkspaceMembers(a, .{}));
+}
+
+fn memberReadAllocations(a: Allocator) !void {
+    var fake: FakeHttpClient = .{ .body = members_fixture };
+    const members = try Client.init(fake.httpClient(), testCredential()).listWorkspaceMembers(a, .{});
+    defer deinitWorkspaceMembers(a, members);
+}
+
+test "Workspace Member read allocation failures release owned identities" {
+    try testing.checkAllAllocationFailures(testing.allocator, memberReadAllocations, .{});
+}
+
+const MemberPagesFixture = struct {
+    arena: std.heap.ArenaAllocator,
+    responses: []httpc_fixture.Canned,
+
+    fn init(count: u32, include_size: bool) !MemberPagesFixture {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const responses = try a.alloc(httpc_fixture.Canned, count);
+        for (1..count + 1) |number| {
+            const next: ?[]const u8 = if (number < count)
+                try std.fmt.allocPrint(a, base_url ++ "/workspaces/check24/members?pagelen=1&page={d}", .{number + 1})
+            else
+                null;
+            const user: WorkspaceMemberEntry = .{ .user = .{
+                .uuid = try std.fmt.allocPrint(a, "{{{d}}}", .{number}),
+                .display_name = try std.fmt.allocPrint(a, "Member {d}", .{number}),
+            } };
+            const body = try std.json.Stringify.valueAlloc(a, .{
+                .values = &.{user},
+                .next = next,
+                .page = number,
+                .pagelen = 1,
+                .size = if (include_size) @as(?usize, count) else null,
+            }, .{ .emit_null_optional_fields = false });
+            // Longer numbered keys come first, so page=2 cannot match page=20.
+            const index = if (number == 1) 0 else count - number + 1;
+            responses[index] = .{
+                .body = body,
+                .request_key = if (number == 1) null else try std.fmt.allocPrint(a, "page={d}", .{number}),
+            };
+        }
+        return .{ .arena = arena, .responses = responses };
+    }
+
+    fn page(self: *MemberPagesFixture, number: usize) *httpc_fixture.Canned {
+        return &self.responses[if (number == 1) 0 else self.responses.len - number + 1];
+    }
+
+    fn setSize(self: *MemberPagesFixture, number: usize, size: usize) !void {
+        const a = self.arena.allocator();
+        var wire = try std.json.parseFromSliceLeaky(MemberPageWire, a, self.page(number).body, .{});
+        wire.size = size;
+        self.page(number).body = try std.json.Stringify.valueAlloc(a, wire, .{ .emit_null_optional_fields = false });
+    }
+};
+
+fn waitMemberCalls(fake: *FakeHttpClient, count: usize) !void {
+    for (0..100_000_000) |_| {
+        if (fake.callCount() >= count) return;
+        std.atomic.spinLoopHint();
+    }
+    return error.TestTimeout;
+}
+
+fn runMemberAcquisition(bb: Client, concurrency: usize, done: *std.atomic.Value(bool)) ![]types.WorkspaceMember {
+    defer done.store(true, .release);
+    return bb.listWorkspaceMembersConcurrent(testing.io, testing.allocator, 1, concurrency);
+}
+
+test "member acquisition refills eight slots while an earlier page remains blocked" {
+    var fixture = try MemberPagesFixture.init(19, true);
+    defer fixture.arena.deinit();
+    var first: std.atomic.Value(bool) = .init(false);
+    var slow: std.atomic.Value(bool) = .init(false);
+    var fast: std.atomic.Value(bool) = .init(false);
+    var rest: std.atomic.Value(bool) = .init(false);
+    var done: std.atomic.Value(bool) = .init(false);
+    for (fixture.responses) |*response| response.released = &rest;
+    fixture.page(1).released = &first;
+    fixture.page(2).released = &slow;
+    fixture.page(3).released = &fast;
+    var fake: FakeHttpClient = .{ .responses = fixture.responses };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    var claimed = false;
+    var future = try testing.io.concurrent(runMemberAcquisition, .{ bb, 8, &done });
+    defer {
+        first.store(true, .release);
+        slow.store(true, .release);
+        fast.store(true, .release);
+        rest.store(true, .release);
+        if (future.await(testing.io)) |members| {
+            if (!claimed) deinitWorkspaceMembers(testing.allocator, members);
+        } else |_| {}
+    }
+    try waitMemberCalls(&fake, 1);
+    try testing.expectEqual(@as(usize, 1), fake.callCount());
+    first.store(true, .release);
+    try waitMemberCalls(&fake, 9);
+    try testing.expectEqual(@as(usize, 8), fake.maxActiveRequests());
+    fast.store(true, .release);
+    try waitMemberCalls(&fake, 10);
+    try testing.expect(!slow.load(.acquire));
+    rest.store(true, .release);
+    try waitMemberCalls(&fake, 19);
+    try testing.expect(!done.load(.acquire));
+    slow.store(true, .release);
+    const members = try future.await(testing.io);
+    claimed = true;
+    defer deinitWorkspaceMembers(testing.allocator, members);
+    try testing.expectEqual(@as(usize, 19), members.len);
+    try testing.expectEqual(@as(usize, 19), fake.callCount());
+    try testing.expectEqual(@as(usize, 8), fake.maxActiveRequests());
+    try testing.expectEqual(@as(usize, 0), fake.activeRequestCount());
+    for (members, 1..) |member, number| {
+        const expected = try std.fmt.allocPrint(testing.allocator, "Member {d}", .{number});
+        defer testing.allocator.free(expected);
+        try testing.expectEqualStrings(expected, member.display_name);
+        const url = try std.fmt.allocPrint(testing.allocator, base_url ++ "/workspaces/check24/members?pagelen=1&page={d}", .{number});
+        defer testing.allocator.free(url);
+        var calls: usize = 0;
+        if (number == 1) {
+            try testing.expectEqualStrings(base_url ++ "/workspaces/check24/members?pagelen=1", fake.urlAt(0).?);
+        } else {
+            for (0..fake.callCount()) |index| if (std.mem.eql(u8, url, fake.urlAt(index).?)) {
+                calls += 1;
+            };
+            try testing.expectEqual(@as(usize, 1), calls);
+        }
+    }
+}
+
+test "unknown member page counts fetch ahead and retain slower pages before the end" {
+    var fixture = try MemberPagesFixture.init(3, false);
+    defer fixture.arena.deinit();
+    var slow: std.atomic.Value(bool) = .init(false);
+    var done: std.atomic.Value(bool) = .init(false);
+    fixture.page(3).released = &slow;
+    var fake: FakeHttpClient = .{ .responses = fixture.responses, .body = "{\"values\":[]}" };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    var claimed = false;
+    var future = try testing.io.concurrent(runMemberAcquisition, .{ bb, 2, &done });
+    defer {
+        slow.store(true, .release);
+        if (future.await(testing.io)) |members| {
+            if (!claimed) deinitWorkspaceMembers(testing.allocator, members);
+        } else |_| {}
+    }
+    try waitMemberCalls(&fake, 4);
+    try testing.expect(!done.load(.acquire));
+    slow.store(true, .release);
+    const members = try future.await(testing.io);
+    claimed = true;
+    defer deinitWorkspaceMembers(testing.allocator, members);
+    try testing.expectEqual(@as(usize, 3), members.len);
+    try testing.expectEqual(@as(usize, 4), fake.callCount());
+    try testing.expect(fake.maxActiveRequests() <= 2);
+    try testing.expectEqualStrings("Member 3", members[2].display_name);
+}
+
+test "member page failures drain active requests and report the lowest failed page" {
+    var fixture = try MemberPagesFixture.init(19, true);
+    defer fixture.arena.deinit();
+    var failure: std.atomic.Value(bool) = .init(false);
+    var rest: std.atomic.Value(bool) = .init(false);
+    var done: std.atomic.Value(bool) = .init(false);
+    for (2..10) |number| {
+        fixture.page(number).status = 404;
+        fixture.page(number).released = &rest;
+    }
+    fixture.page(2).status = 403;
+    fixture.page(2).released = &failure;
+    var fake: FakeHttpClient = .{ .responses = fixture.responses };
+    var future = try testing.io.concurrent(runMemberAcquisition, .{ Client.init(fake.httpClient(), testCredential()), 8, &done });
+    defer {
+        failure.store(true, .release);
+        rest.store(true, .release);
+        if (future.await(testing.io)) |members| deinitWorkspaceMembers(testing.allocator, members) else |_| {}
+    }
+    try waitMemberCalls(&fake, 9);
+    failure.store(true, .release);
+    try testing.expect(!done.load(.acquire));
+    rest.store(true, .release);
+    try testing.expectError(error.Forbidden, future.await(testing.io));
+    try testing.expectEqual(@as(usize, 9), fake.callCount());
+    try testing.expectEqual(@as(usize, 0), fake.activeRequestCount());
+}
+
+test "member acquisition preserves serial bounds cursor links and runtime fallback" {
+    for ([_]std.Io{ testing.io, std.Io.failing }) |io| {
+        var fixture = try MemberPagesFixture.init(3, true);
+        defer fixture.arena.deinit();
+        var fake: FakeHttpClient = .{ .responses = fixture.responses };
+        const members = try Client.init(fake.httpClient(), testCredential()).listWorkspaceMembersConcurrent(io, testing.allocator, 1, if (io.vtable == std.Io.failing.vtable) 8 else 1);
+        defer deinitWorkspaceMembers(testing.allocator, members);
+        try testing.expectEqual(@as(usize, 3), members.len);
+        try testing.expectEqual(@as(usize, 3), fake.callCount());
+        try testing.expectEqual(@as(usize, 1), fake.maxActiveRequests());
+    }
+    const responses = [_]httpc_fixture.Canned{
+        .{ .body = "{\"values\":[],\"next\":\"https://api.bitbucket.org/2.0/workspaces/check24/members?cursor=opaque\"}" },
+        .{ .body = members_fixture },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const members = try Client.init(fake.httpClient(), testCredential()).listWorkspaceMembersConcurrent(testing.io, testing.allocator, 100, 8);
+    defer deinitWorkspaceMembers(testing.allocator, members);
+    try testing.expectEqual(@as(usize, 3), members.len);
+    try testing.expectEqual(@as(usize, 2), fake.callCount());
+    try testing.expectEqual(@as(usize, 1), fake.maxActiveRequests());
+    try testing.expectEqualStrings("https://api.bitbucket.org/2.0/workspaces/check24/members?cursor=opaque", fake.urlAt(1).?);
+}
+
+test "member acquisition extends an outdated size hint and accepts later size changes" {
+    var fixture = try MemberPagesFixture.init(3, true);
+    defer fixture.arena.deinit();
+    try fixture.setSize(1, 2);
+    try fixture.setSize(2, 90);
+    var fake: FakeHttpClient = .{ .responses = fixture.responses, .body = "{\"values\":[]}" };
+    const members = try Client.init(fake.httpClient(), testCredential()).listWorkspaceMembersConcurrent(testing.io, testing.allocator, 1, 2);
+    defer deinitWorkspaceMembers(testing.allocator, members);
+    try testing.expectEqual(@as(usize, 3), members.len);
+    try testing.expectEqualStrings("Member 3", members[2].display_name);
+    try testing.expect(fake.callCount() >= 3 and fake.callCount() <= 4);
+}
+
+test "member acquisition treats speculative rate limiting as failure instead of an end marker" {
+    var fixture = try MemberPagesFixture.init(3, false);
+    defer fixture.arena.deinit();
+    var slow: std.atomic.Value(bool) = .init(false);
+    var done: std.atomic.Value(bool) = .init(false);
+    fixture.page(3).released = &slow;
+    var fake: FakeHttpClient = .{ .responses = fixture.responses, .status = 429 };
+    var future = try testing.io.concurrent(runMemberAcquisition, .{ Client.init(fake.httpClient(), testCredential()), 2, &done });
+    defer {
+        slow.store(true, .release);
+        if (future.await(testing.io)) |members| deinitWorkspaceMembers(testing.allocator, members) else |_| {}
+    }
+    try waitMemberCalls(&fake, 4);
+    try testing.expect(!done.load(.acquire));
+    slow.store(true, .release);
+    try testing.expectError(error.RateLimited, future.await(testing.io));
+    try testing.expectEqual(@as(usize, 4), fake.callCount());
+    try testing.expectEqual(@as(usize, 0), fake.activeRequestCount());
+}
+
+test "member acquisition rejects invalid pages and retains classified HTTP failures" {
+    for ([_]httpc_fixture.Canned{
+        .{ .status = 400 },                                                                .{ .status = 401 },                        .{ .status = 403 },                           .{ .status = 404 },
+        .{ .status = 429 },                                                                .{ .status = 500 },                        .{ .send_error = error.ConnectionReset },     .{ .body = "invalid" },
+        .{ .body = "{\"values\":[{\"user\":{\"uuid\":\"\",\"display_name\":\"Ada\"}}]}" }, .{ .body = "{\"values\":[],\"page\":9}" }, .{ .body = "{\"values\":[],\"pagelen\":0}" }, .{ .body = "{\"values\":[],\"next\":\"https://api.bitbucket.org/2.0/workspaces/check24/members?page=9\"}" },
+    }, [_]anyerror{
+        error.BadRequest,        error.Unauthorized,      error.Forbidden,         error.NotFound,
+        error.RateLimited,       error.ServerError,       error.ConnectionReset,   error.MalformedResponse,
+        error.MalformedResponse, error.MalformedResponse, error.MalformedResponse, error.MalformedResponse,
+    }) |failure, expected| {
+        var fixture = try MemberPagesFixture.init(3, true);
+        defer fixture.arena.deinit();
+        var controlled = failure;
+        controlled.request_key = fixture.page(2).request_key;
+        fixture.page(2).* = controlled;
+        var fake: FakeHttpClient = .{ .responses = fixture.responses };
+        try testing.expectError(expected, Client.init(fake.httpClient(), testCredential()).listWorkspaceMembersConcurrent(testing.io, testing.allocator, 1, 2));
+        try testing.expectEqual(@as(usize, 3), fake.callCount());
+        try testing.expectEqual(@as(usize, 0), fake.activeRequestCount());
+    }
+    for ([_][]const u8{ "{\"values\":[]}", members_fixture }) |body| {
+        var fake: FakeHttpClient = .{ .body = body };
+        const members = try Client.init(fake.httpClient(), testCredential()).listWorkspaceMembersConcurrent(testing.io, testing.allocator, 100, 8);
+        defer deinitWorkspaceMembers(testing.allocator, members);
+        try testing.expectEqual(@as(usize, 1), fake.callCount());
+    }
+    const responses = [_]httpc_fixture.Canned{
+        .{ .body = "{\"values\":[],\"next\":\"https://api.bitbucket.org/2.0/workspaces/check24/members?page=2\"}" },
+        .{ .body = members_fixture },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const members = try Client.init(fake.httpClient(), testCredential()).listWorkspaceMembersConcurrent(testing.io, testing.allocator, 100, 1);
+    defer deinitWorkspaceMembers(testing.allocator, members);
+    try testing.expectEqual(@as(usize, 3), members.len);
+    try testing.expectEqual(@as(usize, 2), fake.callCount());
+}
+
+fn concurrentMemberAllocations(a: Allocator) !void {
+    var fixture = try MemberPagesFixture.init(3, true);
+    defer fixture.arena.deinit();
+    var fake: FakeHttpClient = .{ .responses = fixture.responses };
+    const members = try Client.init(fake.httpClient(), testCredential()).listWorkspaceMembersConcurrent(testing.io, a, 1, 2);
+    defer deinitWorkspaceMembers(a, members);
+}
+
+test "member acquisition allocation failures release pages and join all workers" {
+    try testing.checkAllAllocationFailures(testing.allocator, concurrentMemberAllocations, .{});
+}
 
 test "listWorkspaces parses nested workspace entries" {
     const a = testing.allocator;

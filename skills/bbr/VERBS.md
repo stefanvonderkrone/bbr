@@ -1,21 +1,33 @@
 # bbr api verbs
 
-28 verbs. Run `bbr api VERB --help` for flags. No flag tables here.
+37 verbs. Run `bbr api VERB --help` for flags. No flag tables here.
 
 ## Workspaces
 
 - `list-workspaces` — list Workspaces for the account. Example: `bbr api list-workspaces --pagelen 10 --no-follow`
 - `get-workspace` — get one Workspace. Example: `bbr api get-workspace --workspace demo`
+- `list-workspace-members`. List Workspace Member UUIDs, display names, and nicknames. Example: `bbr api list-workspace-members --json`
+- `search-workspace-members`. Find member UUIDs by name with local ranked matches. Repeat `--name` to share one member list acquisition. Example: `bbr api search-workspace-members --name 'Ada Lovelace' --name 'Grace Hopper' --json`
 
 ## Repositories
 
 - `list-repositories` — list Repositories in a Workspace. Example: `bbr api list-repositories --workspace demo --limit 10`
 - `get-repository` — get one Repository. Example: `bbr api get-repository --workspace demo --repository sample`
 
+## Branches
+
+- `create-branch`. Create a Branch from a commit hash or an existing branch name. Example: `bbr api create-branch --repository sample --name feature/example --target main`
+- `list-branches`. List Branches with filters and page controls. Example: `bbr api list-branches --repository sample --sort name --limit 10`
+- `get-branch`. Read a Branch, its target Commit, and its merge strategies. Example: `bbr api get-branch --repository sample --name feature/example`
+
 ## PullRequests
 
 - `list-pull-requests` — list PullRequests in a Repository. Example: `bbr api list-pull-requests --repository sample --state OPEN --pagelen 10 --page 2 --no-follow`
 - `get-pull-request` — get one PullRequest. Example: `bbr api get-pull-request --repository sample --pull-request-id 42`
+- `create-pull-request`. Create a Ready PullRequest or a Draft PullRequest. Example: `bbr api create-pull-request --repository sample --title 'Example change' --source-branch feature/example --draft true`
+- `update-pull-request`. Update supplied fields on an open PullRequest. Example: `bbr api update-pull-request --repository sample --pull-request-id 42 --draft false`
+- `decline-pull-request`. Close a PullRequest without merging. Example: `bbr api decline-pull-request --repository sample --pull-request-id 42`
+- `list-commit-pull-requests`. List PullRequests where Bitbucket reviewed a commit. Example: `bbr api list-commit-pull-requests --repository sample --commit abc123 --limit 10`
 - `list-commits` — list commits by PullRequest, revision, or from..to range. Example: `bbr api list-commits --repository sample --revision main --limit 10`
 
 ## Files (raw bytes)
