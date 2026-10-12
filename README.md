@@ -140,8 +140,8 @@ All names must pass validation before any member request. A failed search produc
 Both commands require the `read:workspace:bitbucket` API token scope.
 Workspace membership does not prove Repository access.
 
-The `bbr` skill uses a unique exact name or nickname match directly.
-It asks you to select a member for multiple exact matches or any approximate match.
+The `bbr` skill uses a single result directly when the name or nickname has only minor differences.
+It asks you to select a member for multiple results or to confirm a single result with larger differences.
 Use the selected UUID in `--reviewer UUID` or `--uuid UUID`.
 
 Create a Branch and a Draft PullRequest, then mark the PullRequest ready:

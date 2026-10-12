@@ -51,23 +51,28 @@ When the user names a reviewer or another account, resolve that name in the sele
 
 1. Run `bbr api search-workspace-members --help`.
 2. Run `bbr api search-workspace-members --name 'Ada Lovelace' --json` with the user's name as the value.
-   For several names in the same Workspace, repeat `--name` in one command to fetch the member list once.
+   For several names in the same Workspace, use one command with repeated `--name` flags:
+   `bbr api search-workspace-members --name 'Ada Lovelace' --name 'Grace Hopper' --json`.
+   The command fetches the member list once for all names.
    If the request fails, report the error and stop this lookup.
 3. Read the JSON array, which contains one group per supplied name in input order, including duplicate names.
    Each group contains `name` and `matches`. Each match contains `uuid`, `display_name`, and `nickname` directly.
    Use the complete matches without `--limit` to check for ambiguity.
-   Compare the supplied name with each member's complete display name and nickname using the exact-match rules below.
-   - If exactly one member has an exact match, select that member.
-   - For multiple exact matches, ask the user to choose among those members.
-   - If there is no exact match and candidates exist, ask the user to choose among them.
-   - Show each candidate's display name, nickname, and UUID in the question.
-   - Ask even when only one candidate exists but its display name and nickname do not match exactly.
+   Apply these selection rules independently to each group:
+   - For one result, use its UUID directly when the complete display name or nickname matches with only minor differences.
+     Minor differences include casing, repeated spaces, umlaut spelling, or one character added, removed, or replaced.
+     Treat `max mustermann` and `Max Mustermann` as the same name.
+     Accept `jon doe` for `John Doe` when that query returns only this member.
+     Accept `Jorg Muller` for `Jörg Müller` under the same condition.
+   - For multiple results, ask the user to choose, even when one result matches exactly.
+     Show each candidate's display name, nickname, and UUID.
+   - For one result with larger differences or only a partial name match, ask the user to confirm that member.
 4. If a group contains no matches, ask for a more complete name, nickname, or another Workspace.
    Search another Workspace only after the user selects it.
 5. Pass the selected UUID to the command's existing `--reviewer` or `--uuid` option.
    Reviewer Verdict writes still use the Authenticated Account.
 
-Done when one exact match or the user's selection supplies the UUID used by the next command.
+Done when a single result with only minor name differences or the user's selection supplies the UUID for the next command.
 
 Search reads every member page before it ranks matches. It handles reversed name parts, omitted middle names, and small typos. German spelling forms are approximate matches, including `Jorg` for `Jörg` and `Mueller` for `Müller`. A complete spelling match ranks above a partial name match. Exact matches compare the complete display name or nickname, ignoring case differences and repeated spaces. A nickname match has no priority over another member's exact display-name match.
 
