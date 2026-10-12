@@ -24,9 +24,9 @@ with tempfile.TemporaryDirectory(prefix="bbr-completion-test-") as data_home:
     env = clean_env(data_home)
 
     for shell, marker, flags in (
-        ("bash", b"complete -F _bbr", (b"--pull-request-id", b"--profile")),
-        ("zsh", b"#compdef bbr", (b"--pull-request-id", b"--profile")),
-        ("fish", b"complete -c bbr", (b"-l pull-request-id", b"-l profile")),
+        ("bash", b"complete -F _bbr", (b"--pull-request-id", b"--profile", b"--concurrency")),
+        ("zsh", b"#compdef bbr", (b"--pull-request-id", b"--profile", b"--concurrency")),
+        ("fish", b"complete -c bbr", (b"-l pull-request-id", b"-l profile", b"-l concurrency")),
     ):
         result = subprocess.run([binary, "completion", shell], capture_output=True, env=env, timeout=5)
         assert result.returncode == 0, result

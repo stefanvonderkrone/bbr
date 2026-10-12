@@ -768,12 +768,142 @@ pub const Client = struct {
     /// GET /workspaces/{workspace}/members. Free with `deinitWorkspaceMembers`.
     pub fn listWorkspaceMembers(self: Client, allocator: Allocator, opts: PageOptions) ![]types.WorkspaceMember {
         if (self.cred.workspace.len == 0 or opts.query != null or opts.sort != null) return error.BadRequest;
+        const endpoint = try self.workspaceMembersEndpoint(allocator);
+        defer allocator.free(endpoint);
+        return self.listPages(allocator, types.WorkspaceMember, WorkspaceMembersPage, dupeWorkspaceMember, deinitWorkspaceMember, .{}, endpoint, opts, null, false);
+    }
+
+    fn workspaceMembersEndpoint(self: Client, allocator: Allocator) ![]u8 {
+        if (self.cred.workspace.len == 0) return error.BadRequest;
         var url: std.ArrayList(u8) = .empty;
-        defer url.deinit(allocator);
+        errdefer url.deinit(allocator);
         try url.appendSlice(allocator, base_url ++ "/workspaces/");
         try percentEncodeInto(allocator, &url, self.cred.workspace);
         try url.appendSlice(allocator, "/members");
-        return self.listPages(allocator, types.WorkspaceMember, WorkspaceMembersPage, dupeWorkspaceMember, deinitWorkspaceMember, .{}, url.items, opts, null, false);
+        return url.toOwnedSlice(allocator);
+    }
+
+    /// Complete member acquisition with a caller-selected active-request bound.
+    /// Workers own separate arenas. Only the coordinator uses `allocator`.
+    /// Free the result with `deinitWorkspaceMembers`.
+    pub fn listWorkspaceMembersConcurrent(self: Client, io: std.Io, allocator: Allocator, pagelen: u32, concurrency: usize) ![]types.WorkspaceMember {
+        if (pagelen == 0 or pagelen > 100 or concurrency == 0) return error.BadRequest;
+        const endpoint = try self.workspaceMembersEndpoint(allocator);
+        defer allocator.free(endpoint);
+        const first_url = try pageUrlWithBase(allocator, endpoint, .{ .pagelen = pagelen });
+        defer allocator.free(first_url);
+        var first = try fetchMemberPage(self, first_url, allocator);
+        defer first.arena.deinit();
+        if (first.value.page) |number| if (number != 1) return error.MalformedResponse;
+        const actual_pagelen = first.value.pagelen orelse pagelen;
+        if (actual_pagelen == 0 or actual_pagelen > 100) return error.MalformedResponse;
+
+        var pages: std.ArrayList(MemberPageRecord) = .empty;
+        defer {
+            for (pages.items) |page| deinitWorkspaceMembers(allocator, page.members);
+            pages.deinit(allocator);
+        }
+        try retainMemberPage(allocator, &pages, 1, first.value);
+        const first_next = first.value.next orelse return finishMemberPages(allocator, &pages, 1);
+        if (!numberedMemberNext(first_next, endpoint, 2, actual_pagelen)) {
+            var url = try allocator.dupe(u8, first_next);
+            defer allocator.free(url);
+            var number: u32 = 2;
+            while (true) {
+                var page = try fetchMemberPage(self, url, allocator);
+                defer page.arena.deinit();
+                try retainMemberPage(allocator, &pages, number, page.value);
+                const next = page.value.next orelse break;
+                const next_url = try allocator.dupe(u8, next);
+                allocator.free(url);
+                url = next_url;
+                number = std.math.add(u32, number, 1) catch return error.MalformedResponse;
+            }
+            return finishMemberPages(allocator, &pages, number);
+        }
+
+        var horizon: u64 = std.math.maxInt(u32);
+        if (first.value.size) |size| {
+            const count = size / actual_pagelen + @intFromBool(size % actual_pagelen != 0);
+            if (count >= 2 and count <= std.math.maxInt(u32)) horizon = count;
+        }
+        const slots = try allocator.alloc(MemberPageSlot, concurrency);
+        for (slots) |*slot| slot.* = .{};
+        defer {
+            for (slots) |*slot| slot.deinit(allocator);
+            allocator.free(slots);
+        }
+        const completions = try allocator.alloc(MemberCompletion, slots.len);
+        defer allocator.free(completions);
+        var select = std.Io.Select(MemberCompletion).init(io, completions);
+        // Each outstanding worker can enqueue one completion without a reader.
+        // Join before freeing slots, including when a coordinator allocation fails.
+        var protection: ?std.Io.CancelProtection = null;
+        defer if (protection) |previous| {
+            _ = io.swapCancelProtection(previous);
+        };
+        defer select.group.await(io) catch {};
+        var active: usize = 0;
+        var next_page: u64 = 2;
+        var terminal: ?u32 = null;
+        var failure: ?MemberPageFailure = null;
+        var concurrent = concurrency > 1;
+        while (true) {
+            var ready: ?usize = null;
+            if (failure == null and terminal == null and (concurrent or active == 0)) {
+                for (slots, 0..) |*slot, index| {
+                    if (slot.busy or next_page > horizon) continue;
+                    slot.number = @intCast(next_page);
+                    slot.url = try pageUrlWithBase(allocator, endpoint, .{ .pagelen = actual_pagelen, .page = slot.number });
+                    if (concurrent) {
+                        select.concurrent(.page, fetchMemberSlot, .{ self, slot, index }) catch {
+                            slot.deinit(allocator);
+                            concurrent = false;
+                            break;
+                        };
+                        if (protection == null) protection = io.swapCancelProtection(.blocked);
+                        slot.busy = true;
+                        active += 1;
+                    } else {
+                        ready = fetchMemberSlot(self, slot, index);
+                    }
+                    next_page += 1;
+                    if (!concurrent) break;
+                }
+            }
+            const index = ready orelse blk: {
+                if (active == 0) {
+                    if (failure != null or terminal != null) break;
+                    if (!concurrent and next_page <= horizon) continue;
+                    return error.MalformedResponse;
+                }
+                const completion = try select.await();
+                active -= 1;
+                break :blk completion.page;
+            };
+            const slot = &slots[index];
+            defer slot.deinit(allocator);
+            if (slot.err) |err| {
+                recordMemberFailure(&failure, slot.number, err);
+                continue;
+            }
+            const page = slot.result.?.value;
+            if (page.page != null and page.page.? != slot.number or page.pagelen != null and page.pagelen.? != actual_pagelen) {
+                recordMemberFailure(&failure, slot.number, error.MalformedResponse);
+                continue;
+            }
+            if (page.next) |next| {
+                if (slot.number == std.math.maxInt(u32) or !numberedMemberNext(next, endpoint, slot.number + 1, actual_pagelen)) {
+                    recordMemberFailure(&failure, slot.number, error.MalformedResponse);
+                    continue;
+                }
+                if (slot.number == horizon) horizon = std.math.maxInt(u32);
+            } else terminal = @min(terminal orelse slot.number, slot.number);
+            if (failure == null and slot.number <= (terminal orelse std.math.maxInt(u32)))
+                try retainMemberPage(allocator, &pages, slot.number, page);
+        }
+        if (failure) |err| return err.reason;
+        return finishMemberPages(allocator, &pages, terminal.?);
     }
 
     /// GET /workspaces/{workspace}. Owned by `allocator`.
@@ -1427,6 +1557,123 @@ const WorkspaceMembersPage = struct {
     values: []WorkspaceMemberEntry,
     next: ?[]const u8 = null,
 };
+
+const MemberPageWire = struct {
+    values: []WorkspaceMemberEntry,
+    next: ?[]const u8 = null,
+    page: ?u32 = null,
+    pagelen: ?u32 = null,
+    size: ?usize = null,
+};
+
+const OwnedMemberPage = struct {
+    arena: std.heap.ArenaAllocator,
+    value: MemberPageWire,
+};
+
+fn fetchMemberPage(bb: Client, url: []const u8, backing: Allocator) !OwnedMemberPage {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const auth = try bb.cred.basicAuthHeader(a);
+    const response = try bb.http.send(a, .{
+        .method = .GET,
+        .url = url,
+        .headers = &.{
+            .{ .name = "authorization", .value = auth },
+            .{ .name = "accept", .value = "application/json" },
+        },
+    });
+    try classify(response.status);
+    const page = std.json.parseFromSliceLeaky(MemberPageWire, a, response.body, .{ .ignore_unknown_fields = true }) catch |err|
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
+    for (page.values) |entry| if (entry.user.uuid.len == 0) return error.MalformedResponse;
+    return .{ .arena = arena, .value = page };
+}
+
+const MemberPageSlot = struct {
+    number: u32 = 0,
+    url: []const u8 = &.{},
+    busy: bool = false,
+    result: ?OwnedMemberPage = null,
+    err: ?anyerror = null,
+
+    fn deinit(self: *MemberPageSlot, a: Allocator) void {
+        if (self.result) |*result| result.arena.deinit();
+        a.free(self.url);
+        self.* = .{};
+    }
+};
+
+const MemberCompletion = union(enum) { page: usize };
+
+fn fetchMemberSlot(bb: Client, slot: *MemberPageSlot, index: usize) usize {
+    slot.result = fetchMemberPage(bb, slot.url, std.heap.page_allocator) catch |err| {
+        slot.err = err;
+        return index;
+    };
+    return index;
+}
+
+const MemberPageFailure = struct { number: u32, reason: anyerror };
+
+fn recordMemberFailure(failure: *?MemberPageFailure, number: u32, reason: anyerror) void {
+    if (failure.* == null or number < failure.*.?.number)
+        failure.* = .{ .number = number, .reason = reason };
+}
+
+// A numbered link is an endpoint-specific optimization, not a cursor contract.
+fn numberedMemberNext(url: []const u8, endpoint: []const u8, expected: u32, pagelen: u32) bool {
+    if (!std.mem.startsWith(u8, url, endpoint) or url.len <= endpoint.len or url[endpoint.len] != '?') return false;
+    var page: ?u32 = null;
+    var length: ?u32 = null;
+    var query = std.mem.splitScalar(u8, url[endpoint.len + 1 ..], '&');
+    while (query.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse return false;
+        const value = std.fmt.parseInt(u32, pair[eq + 1 ..], 10) catch return false;
+        if (std.mem.eql(u8, pair[0..eq], "page") and page == null) page = value else if (std.mem.eql(u8, pair[0..eq], "pagelen") and length == null) length = value else return false;
+    }
+    return page == expected and (length == null or length == pagelen);
+}
+
+const MemberPageRecord = struct { number: u32, members: []types.WorkspaceMember };
+
+fn retainMemberPage(a: Allocator, pages: *std.ArrayList(MemberPageRecord), number: u32, wire: MemberPageWire) !void {
+    const members = try a.alloc(types.WorkspaceMember, wire.values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (members[0..initialized]) |member| deinitWorkspaceMember(a, member);
+        a.free(members);
+    }
+    for (wire.values, members) |entry, *member| {
+        member.* = try dupeWorkspaceMember(a, entry);
+        initialized += 1;
+    }
+    try pages.append(a, .{ .number = number, .members = members });
+}
+
+fn finishMemberPages(a: Allocator, pages: *std.ArrayList(MemberPageRecord), terminal: u32) ![]types.WorkspaceMember {
+    const Order = struct {
+        fn less(_: void, lhs: MemberPageRecord, rhs: MemberPageRecord) bool {
+            return lhs.number < rhs.number;
+        }
+    };
+    std.mem.sort(MemberPageRecord, pages.items, {}, Order.less);
+    var count: usize = 0;
+    for (pages.items) |page| if (page.number <= terminal) {
+        count = try std.math.add(usize, count, page.members.len);
+    };
+    const members = try a.alloc(types.WorkspaceMember, count);
+    var offset: usize = 0;
+    for (pages.items) |*page| {
+        if (page.number > terminal) continue;
+        @memcpy(members[offset..][0..page.members.len], page.members);
+        offset += page.members.len;
+        a.free(page.members);
+        page.members = &.{};
+    }
+    return members;
+}
 
 fn dupeWorkspaceMember(allocator: Allocator, entry: WorkspaceMemberEntry) !types.WorkspaceMember {
     const user = entry.user;
@@ -3678,6 +3925,290 @@ fn memberReadAllocations(a: Allocator) !void {
 
 test "Workspace Member read allocation failures release owned identities" {
     try testing.checkAllAllocationFailures(testing.allocator, memberReadAllocations, .{});
+}
+
+const MemberPagesFixture = struct {
+    arena: std.heap.ArenaAllocator,
+    responses: []httpc_fixture.Canned,
+
+    fn init(count: u32, include_size: bool) !MemberPagesFixture {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const responses = try a.alloc(httpc_fixture.Canned, count);
+        for (1..count + 1) |number| {
+            const next: ?[]const u8 = if (number < count)
+                try std.fmt.allocPrint(a, base_url ++ "/workspaces/check24/members?pagelen=1&page={d}", .{number + 1})
+            else
+                null;
+            const user: WorkspaceMemberEntry = .{ .user = .{
+                .uuid = try std.fmt.allocPrint(a, "{{{d}}}", .{number}),
+                .display_name = try std.fmt.allocPrint(a, "Member {d}", .{number}),
+            } };
+            const body = try std.json.Stringify.valueAlloc(a, .{
+                .values = &.{user},
+                .next = next,
+                .page = number,
+                .pagelen = 1,
+                .size = if (include_size) @as(?usize, count) else null,
+            }, .{ .emit_null_optional_fields = false });
+            // Longer numbered keys come first, so page=2 cannot match page=20.
+            const index = if (number == 1) 0 else count - number + 1;
+            responses[index] = .{
+                .body = body,
+                .request_key = if (number == 1) null else try std.fmt.allocPrint(a, "page={d}", .{number}),
+            };
+        }
+        return .{ .arena = arena, .responses = responses };
+    }
+
+    fn page(self: *MemberPagesFixture, number: usize) *httpc_fixture.Canned {
+        return &self.responses[if (number == 1) 0 else self.responses.len - number + 1];
+    }
+
+    fn setSize(self: *MemberPagesFixture, number: usize, size: usize) !void {
+        const a = self.arena.allocator();
+        var wire = try std.json.parseFromSliceLeaky(MemberPageWire, a, self.page(number).body, .{});
+        wire.size = size;
+        self.page(number).body = try std.json.Stringify.valueAlloc(a, wire, .{ .emit_null_optional_fields = false });
+    }
+};
+
+fn waitMemberCalls(fake: *FakeHttpClient, count: usize) !void {
+    for (0..100_000_000) |_| {
+        if (fake.callCount() >= count) return;
+        std.atomic.spinLoopHint();
+    }
+    return error.TestTimeout;
+}
+
+fn runMemberAcquisition(bb: Client, concurrency: usize, done: *std.atomic.Value(bool)) ![]types.WorkspaceMember {
+    defer done.store(true, .release);
+    return bb.listWorkspaceMembersConcurrent(testing.io, testing.allocator, 1, concurrency);
+}
+
+test "member acquisition refills eight slots while an earlier page remains blocked" {
+    var fixture = try MemberPagesFixture.init(19, true);
+    defer fixture.arena.deinit();
+    var first: std.atomic.Value(bool) = .init(false);
+    var slow: std.atomic.Value(bool) = .init(false);
+    var fast: std.atomic.Value(bool) = .init(false);
+    var rest: std.atomic.Value(bool) = .init(false);
+    var done: std.atomic.Value(bool) = .init(false);
+    for (fixture.responses) |*response| response.released = &rest;
+    fixture.page(1).released = &first;
+    fixture.page(2).released = &slow;
+    fixture.page(3).released = &fast;
+    var fake: FakeHttpClient = .{ .responses = fixture.responses };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    var claimed = false;
+    var future = try testing.io.concurrent(runMemberAcquisition, .{ bb, 8, &done });
+    defer {
+        first.store(true, .release);
+        slow.store(true, .release);
+        fast.store(true, .release);
+        rest.store(true, .release);
+        if (future.await(testing.io)) |members| {
+            if (!claimed) deinitWorkspaceMembers(testing.allocator, members);
+        } else |_| {}
+    }
+    try waitMemberCalls(&fake, 1);
+    try testing.expectEqual(@as(usize, 1), fake.callCount());
+    first.store(true, .release);
+    try waitMemberCalls(&fake, 9);
+    try testing.expectEqual(@as(usize, 8), fake.maxActiveRequests());
+    fast.store(true, .release);
+    try waitMemberCalls(&fake, 10);
+    try testing.expect(!slow.load(.acquire));
+    rest.store(true, .release);
+    try waitMemberCalls(&fake, 19);
+    try testing.expect(!done.load(.acquire));
+    slow.store(true, .release);
+    const members = try future.await(testing.io);
+    claimed = true;
+    defer deinitWorkspaceMembers(testing.allocator, members);
+    try testing.expectEqual(@as(usize, 19), members.len);
+    try testing.expectEqual(@as(usize, 19), fake.callCount());
+    try testing.expectEqual(@as(usize, 8), fake.maxActiveRequests());
+    try testing.expectEqual(@as(usize, 0), fake.activeRequestCount());
+    for (members, 1..) |member, number| {
+        const expected = try std.fmt.allocPrint(testing.allocator, "Member {d}", .{number});
+        defer testing.allocator.free(expected);
+        try testing.expectEqualStrings(expected, member.display_name);
+        const url = try std.fmt.allocPrint(testing.allocator, base_url ++ "/workspaces/check24/members?pagelen=1&page={d}", .{number});
+        defer testing.allocator.free(url);
+        var calls: usize = 0;
+        if (number == 1) {
+            try testing.expectEqualStrings(base_url ++ "/workspaces/check24/members?pagelen=1", fake.urlAt(0).?);
+        } else {
+            for (0..fake.callCount()) |index| if (std.mem.eql(u8, url, fake.urlAt(index).?)) {
+                calls += 1;
+            };
+            try testing.expectEqual(@as(usize, 1), calls);
+        }
+    }
+}
+
+test "unknown member page counts fetch ahead and retain slower pages before the end" {
+    var fixture = try MemberPagesFixture.init(3, false);
+    defer fixture.arena.deinit();
+    var slow: std.atomic.Value(bool) = .init(false);
+    var done: std.atomic.Value(bool) = .init(false);
+    fixture.page(3).released = &slow;
+    var fake: FakeHttpClient = .{ .responses = fixture.responses, .body = "{\"values\":[]}" };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    var claimed = false;
+    var future = try testing.io.concurrent(runMemberAcquisition, .{ bb, 2, &done });
+    defer {
+        slow.store(true, .release);
+        if (future.await(testing.io)) |members| {
+            if (!claimed) deinitWorkspaceMembers(testing.allocator, members);
+        } else |_| {}
+    }
+    try waitMemberCalls(&fake, 4);
+    try testing.expect(!done.load(.acquire));
+    slow.store(true, .release);
+    const members = try future.await(testing.io);
+    claimed = true;
+    defer deinitWorkspaceMembers(testing.allocator, members);
+    try testing.expectEqual(@as(usize, 3), members.len);
+    try testing.expectEqual(@as(usize, 4), fake.callCount());
+    try testing.expect(fake.maxActiveRequests() <= 2);
+    try testing.expectEqualStrings("Member 3", members[2].display_name);
+}
+
+test "member page failures drain active requests and report the lowest failed page" {
+    var fixture = try MemberPagesFixture.init(19, true);
+    defer fixture.arena.deinit();
+    var failure: std.atomic.Value(bool) = .init(false);
+    var rest: std.atomic.Value(bool) = .init(false);
+    var done: std.atomic.Value(bool) = .init(false);
+    for (2..10) |number| {
+        fixture.page(number).status = 404;
+        fixture.page(number).released = &rest;
+    }
+    fixture.page(2).status = 403;
+    fixture.page(2).released = &failure;
+    var fake: FakeHttpClient = .{ .responses = fixture.responses };
+    var future = try testing.io.concurrent(runMemberAcquisition, .{ Client.init(fake.httpClient(), testCredential()), 8, &done });
+    defer {
+        failure.store(true, .release);
+        rest.store(true, .release);
+        if (future.await(testing.io)) |members| deinitWorkspaceMembers(testing.allocator, members) else |_| {}
+    }
+    try waitMemberCalls(&fake, 9);
+    failure.store(true, .release);
+    try testing.expect(!done.load(.acquire));
+    rest.store(true, .release);
+    try testing.expectError(error.Forbidden, future.await(testing.io));
+    try testing.expectEqual(@as(usize, 9), fake.callCount());
+    try testing.expectEqual(@as(usize, 0), fake.activeRequestCount());
+}
+
+test "member acquisition preserves serial bounds cursor links and runtime fallback" {
+    for ([_]std.Io{ testing.io, std.Io.failing }) |io| {
+        var fixture = try MemberPagesFixture.init(3, true);
+        defer fixture.arena.deinit();
+        var fake: FakeHttpClient = .{ .responses = fixture.responses };
+        const members = try Client.init(fake.httpClient(), testCredential()).listWorkspaceMembersConcurrent(io, testing.allocator, 1, if (io.vtable == std.Io.failing.vtable) 8 else 1);
+        defer deinitWorkspaceMembers(testing.allocator, members);
+        try testing.expectEqual(@as(usize, 3), members.len);
+        try testing.expectEqual(@as(usize, 3), fake.callCount());
+        try testing.expectEqual(@as(usize, 1), fake.maxActiveRequests());
+    }
+    const responses = [_]httpc_fixture.Canned{
+        .{ .body = "{\"values\":[],\"next\":\"https://api.bitbucket.org/2.0/workspaces/check24/members?cursor=opaque\"}" },
+        .{ .body = members_fixture },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const members = try Client.init(fake.httpClient(), testCredential()).listWorkspaceMembersConcurrent(testing.io, testing.allocator, 100, 8);
+    defer deinitWorkspaceMembers(testing.allocator, members);
+    try testing.expectEqual(@as(usize, 3), members.len);
+    try testing.expectEqual(@as(usize, 2), fake.callCount());
+    try testing.expectEqual(@as(usize, 1), fake.maxActiveRequests());
+    try testing.expectEqualStrings("https://api.bitbucket.org/2.0/workspaces/check24/members?cursor=opaque", fake.urlAt(1).?);
+}
+
+test "member acquisition extends an outdated size hint and accepts later size changes" {
+    var fixture = try MemberPagesFixture.init(3, true);
+    defer fixture.arena.deinit();
+    try fixture.setSize(1, 2);
+    try fixture.setSize(2, 90);
+    var fake: FakeHttpClient = .{ .responses = fixture.responses, .body = "{\"values\":[]}" };
+    const members = try Client.init(fake.httpClient(), testCredential()).listWorkspaceMembersConcurrent(testing.io, testing.allocator, 1, 2);
+    defer deinitWorkspaceMembers(testing.allocator, members);
+    try testing.expectEqual(@as(usize, 3), members.len);
+    try testing.expectEqualStrings("Member 3", members[2].display_name);
+    try testing.expect(fake.callCount() >= 3 and fake.callCount() <= 4);
+}
+
+test "member acquisition treats speculative rate limiting as failure instead of an end marker" {
+    var fixture = try MemberPagesFixture.init(3, false);
+    defer fixture.arena.deinit();
+    var slow: std.atomic.Value(bool) = .init(false);
+    var done: std.atomic.Value(bool) = .init(false);
+    fixture.page(3).released = &slow;
+    var fake: FakeHttpClient = .{ .responses = fixture.responses, .status = 429 };
+    var future = try testing.io.concurrent(runMemberAcquisition, .{ Client.init(fake.httpClient(), testCredential()), 2, &done });
+    defer {
+        slow.store(true, .release);
+        if (future.await(testing.io)) |members| deinitWorkspaceMembers(testing.allocator, members) else |_| {}
+    }
+    try waitMemberCalls(&fake, 4);
+    try testing.expect(!done.load(.acquire));
+    slow.store(true, .release);
+    try testing.expectError(error.RateLimited, future.await(testing.io));
+    try testing.expectEqual(@as(usize, 4), fake.callCount());
+    try testing.expectEqual(@as(usize, 0), fake.activeRequestCount());
+}
+
+test "member acquisition rejects invalid pages and retains classified HTTP failures" {
+    for ([_]httpc_fixture.Canned{
+        .{ .status = 400 },                                                                .{ .status = 401 },                        .{ .status = 403 },                           .{ .status = 404 },
+        .{ .status = 429 },                                                                .{ .status = 500 },                        .{ .send_error = error.ConnectionReset },     .{ .body = "invalid" },
+        .{ .body = "{\"values\":[{\"user\":{\"uuid\":\"\",\"display_name\":\"Ada\"}}]}" }, .{ .body = "{\"values\":[],\"page\":9}" }, .{ .body = "{\"values\":[],\"pagelen\":0}" }, .{ .body = "{\"values\":[],\"next\":\"https://api.bitbucket.org/2.0/workspaces/check24/members?page=9\"}" },
+    }, [_]anyerror{
+        error.BadRequest,        error.Unauthorized,      error.Forbidden,         error.NotFound,
+        error.RateLimited,       error.ServerError,       error.ConnectionReset,   error.MalformedResponse,
+        error.MalformedResponse, error.MalformedResponse, error.MalformedResponse, error.MalformedResponse,
+    }) |failure, expected| {
+        var fixture = try MemberPagesFixture.init(3, true);
+        defer fixture.arena.deinit();
+        var controlled = failure;
+        controlled.request_key = fixture.page(2).request_key;
+        fixture.page(2).* = controlled;
+        var fake: FakeHttpClient = .{ .responses = fixture.responses };
+        try testing.expectError(expected, Client.init(fake.httpClient(), testCredential()).listWorkspaceMembersConcurrent(testing.io, testing.allocator, 1, 2));
+        try testing.expectEqual(@as(usize, 3), fake.callCount());
+        try testing.expectEqual(@as(usize, 0), fake.activeRequestCount());
+    }
+    for ([_][]const u8{ "{\"values\":[]}", members_fixture }) |body| {
+        var fake: FakeHttpClient = .{ .body = body };
+        const members = try Client.init(fake.httpClient(), testCredential()).listWorkspaceMembersConcurrent(testing.io, testing.allocator, 100, 8);
+        defer deinitWorkspaceMembers(testing.allocator, members);
+        try testing.expectEqual(@as(usize, 1), fake.callCount());
+    }
+    const responses = [_]httpc_fixture.Canned{
+        .{ .body = "{\"values\":[],\"next\":\"https://api.bitbucket.org/2.0/workspaces/check24/members?page=2\"}" },
+        .{ .body = members_fixture },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const members = try Client.init(fake.httpClient(), testCredential()).listWorkspaceMembersConcurrent(testing.io, testing.allocator, 100, 1);
+    defer deinitWorkspaceMembers(testing.allocator, members);
+    try testing.expectEqual(@as(usize, 3), members.len);
+    try testing.expectEqual(@as(usize, 2), fake.callCount());
+}
+
+fn concurrentMemberAllocations(a: Allocator) !void {
+    var fixture = try MemberPagesFixture.init(3, true);
+    defer fixture.arena.deinit();
+    var fake: FakeHttpClient = .{ .responses = fixture.responses };
+    const members = try Client.init(fake.httpClient(), testCredential()).listWorkspaceMembersConcurrent(testing.io, a, 1, 2);
+    defer deinitWorkspaceMembers(a, members);
+}
+
+test "member acquisition allocation failures release pages and join all workers" {
+    try testing.checkAllAllocationFailures(testing.allocator, concurrentMemberAllocations, .{});
 }
 
 test "listWorkspaces parses nested workspace entries" {

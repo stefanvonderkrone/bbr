@@ -113,9 +113,17 @@ Find a Workspace Member's UUID before assigning a reviewer:
 bbr api list-workspace-members --json
 bbr api search-workspace-members --name 'Ada Lovelace' --json
 bbr api search-workspace-members --name 'Kronechek Stefan' --limit 5 --json
+bbr api search-workspace-members --name 'Ada Lovelace' --concurrency 4 --json
 ```
 
 Member search reads every page in the selected Workspace before it ranks the results.
+It defaults to 100 members per page and eight concurrent page requests.
+`--concurrency N` accepts a positive integer and caps active requests at the logical CPU count.
+The search starts the next page when a request finishes.
+Without a total page count, the search can send extra requests beyond the last page.
+The extra request count is at most the effective concurrency minus one.
+An empty successful page without a next link marks the end. A failed request fails the complete search.
+HTTP 429 fails with `RateLimited` without automatic retries.
 It supports reversed name parts, omitted middle names, common German spelling forms, and small typos.
 Results rank as `exact`, `spelling`, `partial`, and `fuzzy`.
 Each match contains the member's UUID, display name, nickname, matched field, and edit distance.

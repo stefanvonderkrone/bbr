@@ -64,6 +64,9 @@ the main thread; the Epoch token still guards against stale results.
 - **No `std.heap.ThreadSafeAllocator` in this 0.16 build.** Don't share one allocator across
   threads: give worker threads the stateless `std.heap.page_allocator` and keep the main
   allocator (gpa) main-thread-only. Hand ownership across the thread boundary via the event.
+- `std.Io.failing` rejects concurrent starts but panics on `swapCancelProtection`
+  (`std/Io.zig:2745`). Enter cancel protection only after a worker starts successfully.
+  This lets the sequential fallback work with a runtime that does not support concurrency.
 - Shelling out: `std.process.run(gpa, io, .{ .argv, .cwd })` → `RunResult{ term, stdout, stderr }`
   (caller owns stdout/stderr). `Term` is `union(enum){ exited: u8, signal, stopped, unknown }`;
   `Cwd` is `union(enum){ inherit, dir: Io.Dir, path: []const u8 }`.

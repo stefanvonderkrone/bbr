@@ -460,13 +460,15 @@ test "completion metadata covers every verb" {
 test "Workspace Member completion exposes complete-search options without partial-page flags" {
     const search_flags = cli.flagsForVerb("search-workspace-members").?;
     const list_flags = cli.flagsForVerb("list-workspace-members").?;
-    try std.testing.expectEqual(@as(usize, 4), search_flags.len);
+    try std.testing.expectEqual(@as(usize, 5), search_flags.len);
     try std.testing.expectEqual(@as(usize, 5), list_flags.len);
-    for (search_flags, [_][]const u8{ "name", "pagelen", "limit", "json" }) |actual, expected|
+    for (search_flags, [_][]const u8{ "name", "pagelen", "concurrency", "limit", "json" }) |actual, expected|
         try std.testing.expectEqualStrings(expected, actual);
     for (list_flags, [_][]const u8{ "pagelen", "page", "no-follow", "limit", "json" }) |actual, expected|
         try std.testing.expectEqualStrings(expected, actual);
     try std.testing.expect(cli.completionTakesValue("name"));
+    try std.testing.expect(cli.completionTakesValue("concurrency"));
+    try std.testing.expect(std.mem.indexOf(u8, fish_script, "__fish_seen_subcommand_from search-workspace-members; and __fish_seen_subcommand_from api' -l concurrency -r") != null);
     try std.testing.expect(std.mem.indexOf(u8, fish_script, "__fish_seen_subcommand_from search-workspace-members; and __fish_seen_subcommand_from api' -l name -r") != null);
 }
 

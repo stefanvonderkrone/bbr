@@ -98,6 +98,7 @@ const value_flags = [_][]const u8{
     "verdict",          "profile",           "name",               "target",
     "title",            "source-repository", "destination-branch", "description",
     "description-file", "reviewer",          "draft",              "close-source-branch",
+    "concurrency",
 };
 
 fn takesValue(name: []const u8) bool {
@@ -130,7 +131,7 @@ pub const verb_flags = [_]VerbFlags{
     .{ .verb = "list-workspaces", .flags = &.{ "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
     .{ .verb = "get-workspace", .flags = &.{ "workspace", "json" } },
     .{ .verb = "list-workspace-members", .flags = &.{ "pagelen", "page", "no-follow", "limit", "json" } },
-    .{ .verb = "search-workspace-members", .flags = &.{ "name", "pagelen", "limit", "json" } },
+    .{ .verb = "search-workspace-members", .flags = &.{ "name", "pagelen", "concurrency", "limit", "json" } },
     .{ .verb = "list-repositories", .flags = &.{ "workspace", "pagelen", "page", "query", "sort", "no-follow", "limit", "json" } },
     .{ .verb = "get-repository", .flags = &.{ "repository", "workspace", "json" } },
     .{ .verb = "create-branch", .flags = &.{ "repository", "name", "target", "json" } },
@@ -741,7 +742,7 @@ test "API lifecycle pending commit lookup has no success output and has an actio
 }
 
 const member_page_one =
-    \\{"values":[{"user":{"uuid":"{partial}","display_name":"Adaline Lovelace"}}],
+    \\{"page":1,"pagelen":2,"size":3,"values":[{"user":{"uuid":"{partial}","display_name":"Adaline Lovelace"}}],
     \\"next":"https://api.bitbucket.org/2.0/workspaces/demo/members?page=2"}
 ;
 const member_page_two =
@@ -781,6 +782,7 @@ test "Workspace Member search scans later pages and reports all exact matches be
     const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
     var human: TestOutput = .{};
     try workspaces.runSearchMembers(human.init(&env, &arena), bb, &.{ "--name=Ada", "--limit=1" }, false);
+    try std.testing.expectEqualStrings("https://api.bitbucket.org/2.0/workspaces/demo/members?pagelen=100", fake.urlAt(0).?);
     try std.testing.expect(std.mem.indexOf(u8, human.stdoutBytes(), "{exact} Ada nickname: a match: exact field: display_name edits: 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, human.stdoutBytes(), "3 match(es), 2 exact, 1 shown") != null);
     var listed: TestOutput = .{};
@@ -813,6 +815,9 @@ test "Workspace Member commands reject invalid options before HTTP and preserve 
         .{ .args = &.{ "--name=Ada", "--page=2" }, .err = error.UnknownFlag },
         .{ .args = &.{ "--name=Ada", "--no-follow" }, .err = error.UnknownFlag },
         .{ .args = &.{ "--name=Ada", "--pagelen=0" }, .err = error.InvalidNumber },
+        .{ .args = &.{ "--name=Ada", "--concurrency=0" }, .err = error.InvalidNumber },
+        .{ .args = &.{ "--name=Ada", "--concurrency=-1" }, .err = error.InvalidNumber },
+        .{ .args = &.{ "--name=Ada", "--concurrency" }, .err = error.MissingValue },
     }) |case| try std.testing.expectError(case.err, workspaces.runSearchMembers(init, bb, case.args, true));
     try std.testing.expectError(error.UnknownFlag, workspaces.runListMembers(init, bb, &.{"--query=Ada"}, true));
     try std.testing.expectEqual(@as(usize, 0), fake.call_count);
@@ -827,6 +832,12 @@ test "Workspace Member commands reject invalid options before HTTP and preserve 
         var empty: TestOutput = .{};
         try workspaces.runSearchMembers(empty.init(&env, &arena), bb, parsed.rest, parsed.json);
         try std.testing.expectEqualStrings("{\"matches\":[],\"total_matches\":0,\"exact_matches\":0}\n", empty.stdoutBytes());
+        const concurrency = try parseGlobal(a, &.{ "search-workspace-members", "--name=Ada", "--concurrency", value, "--profile=work", "--workspace=demo", "--json" });
+        defer a.free(concurrency.rest);
+        try std.testing.expect(!concurrency.help_only);
+        try std.testing.expectEqualStrings(value, concurrency.rest[2]);
+        try std.testing.expectEqualStrings("demo", concurrency.workspace.?);
+        try std.testing.expectError(error.InvalidNumber, workspaces.runSearchMembers(init, bb, concurrency.rest, concurrency.json));
     }
 }
 

@@ -32,37 +32,65 @@ pub const members_help =
 ;
 
 pub const search_members_help =
-    \\usage: bbr api search-workspace-members --name TEXT [--pagelen N] [--limit N] [--json]
+    \\usage: bbr api search-workspace-members --name TEXT [--pagelen N] [--concurrency N] [--limit N] [--json]
     \\
     \\Search all members in the selected Workspace by display name or nickname.
     \\Rank exact, German spelling, partial, and typo matches in that order.
     \\Name parts can appear in any order. Middle names can be omitted.
     \\Small typos and common German spelling changes can be combined.
     \\Search always follows all pages. --limit caps results after ranking, not requests.
+    \\Page size defaults to 100, the maximum. --pagelen overrides it.
+    \\Concurrency defaults to 8. --concurrency accepts a positive integer, capped by logical CPUs.
+    \\Fetch the next page as a request finishes. Unknown page counts can cause extra empty-page requests.
+    \\A failed page fails the complete search. HTTP 429 is not retried.
     \\Counts include all matches before the result limit. No matches is a successful empty result.
     \\A name must be nonblank, with at most 256 Unicode code points and no control characters.
     \\Requires the read:workspace:bitbucket API token scope.
     \\
 ;
 
-const SearchOptions = struct { name: []const u8, page: bbr.bitbucket.PageOptions };
+const SearchOptions = struct { name: []const u8, page: bbr.bitbucket.PageOptions, concurrency: usize };
 
 fn searchOptions(args: []const []const u8) !SearchOptions {
     var cur: arg.Cursor = .{ .args = args };
     var name: ?[]const u8 = null;
+    var concurrency: ?usize = null;
     var page: bbr.bitbucket.PageOptions = .{};
     while (cur.peek()) |a| {
         const f = arg.splitFlag(a) orelse return error.UnknownFlag;
         if (std.mem.eql(u8, f.name, "name")) {
             _ = cur.next();
             try arg.setOption([]const u8, &name, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "concurrency")) {
+            _ = cur.next();
+            const value = try arg.parseUsize(try arg.takeValue(&cur, f));
+            if (value == 0) return error.InvalidNumber;
+            try arg.setOption(usize, &concurrency, value);
         } else if (std.mem.eql(u8, f.name, "pagelen") or std.mem.eql(u8, f.name, "limit")) {
             _ = try takePageFlag(&cur, f, &page);
         } else return error.UnknownFlag;
     }
     const query = name orelse return error.MissingRequired;
     try member_search.validateName(query);
-    return .{ .name = query, .page = page };
+    return .{ .name = query, .page = page, .concurrency = concurrency orelse 8 };
+}
+
+fn effectiveConcurrency(requested: usize, cpu_count: std.Thread.CpuCountError!usize) usize {
+    return @min(requested, cpu_count catch 1);
+}
+
+test "member search concurrency accepts positive values and caps them by logical CPUs" {
+    try std.testing.expectEqual(@as(usize, 8), (try searchOptions(&.{"--name=Ada"})).concurrency);
+    try std.testing.expectEqual(@as(usize, 100), (try searchOptions(&.{ "--name=Ada", "--concurrency", "100" })).concurrency);
+    try std.testing.expectEqual(@as(usize, 1), (try searchOptions(&.{ "--concurrency=1", "--name=Ada" })).concurrency);
+    try std.testing.expectEqual(@as(usize, 18), effectiveConcurrency(100, 18));
+    try std.testing.expectEqual(@as(usize, 2), effectiveConcurrency(8, 2));
+    try std.testing.expectEqual(@as(usize, 1), effectiveConcurrency(8, error.Unsupported));
+    try std.testing.expectEqual(@as(usize, 1), effectiveConcurrency(1, 18));
+    for ([_][]const u8{ "0", "-1", "1.5", "text", "184467440737095516160" }) |value|
+        try std.testing.expectError(error.InvalidNumber, searchOptions(&.{ "--name=Ada", "--concurrency", value }));
+    try std.testing.expectError(error.MissingValue, searchOptions(&.{ "--name=Ada", "--concurrency" }));
+    try std.testing.expectError(error.BadRequest, searchOptions(&.{ "--name=Ada", "--concurrency=1", "--concurrency=2" }));
 }
 
 pub fn runSearchMembers(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
@@ -70,7 +98,7 @@ pub fn runSearchMembers(init: std.process.Init, bb: bbr.bitbucket.Client, args: 
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    const members = try bb.listWorkspaceMembers(a, .{ .pagelen = opts.page.pagelen });
+    const members = try bb.listWorkspaceMembersConcurrent(init.io, a, opts.page.pagelen orelse 100, effectiveConcurrency(opts.concurrency, std.Thread.getCpuCount()));
     const result = try member_search.search(a, members, opts.name, opts.page.limit);
     if (json) return out.printJson(init, result);
     for (result.matches) |match| {

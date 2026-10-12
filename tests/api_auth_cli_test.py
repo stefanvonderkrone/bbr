@@ -81,6 +81,8 @@ with tempfile.TemporaryDirectory(prefix="bbr-api-auth-test-") as data_home:
             b"bbr api create-branch: InvalidProxyConfiguration")
         run(env, ["api", "search-workspace-members", "--name", value],
             b"bbr api search-workspace-members: InvalidProxyConfiguration")
+        run(direct, ["api", "search-workspace-members", "--name=Ada", "--concurrency", value],
+            b"bbr api search-workspace-members: bad options (InvalidNumber)")
 
     auth_file.write_text('[profiles.personal]\ntoken = "private-token"oops"\n')
     run(env, ["api", "whoami", "--json"], b"InvalidAuthFile")
@@ -98,7 +100,7 @@ with tempfile.TemporaryDirectory(prefix="bbr-api-auth-test-") as data_home:
         ("decline-pull-request", b"--pull-request-id N"),
         ("list-commit-pull-requests", b"--commit HASH"),
         ("list-workspace-members", b"--no-follow"),
-        ("search-workspace-members", b"--name TEXT"),
+        ("search-workspace-members", b"--concurrency N"),
     ):
         result = subprocess.run([binary, "api", verb, "--help"], capture_output=True, env=env, timeout=5)
         assert result.returncode == 0, result.stderr
