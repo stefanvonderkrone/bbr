@@ -13,6 +13,21 @@ replies, and suggestions that are published together on submit.
 - [Presentation](./src/tui/CONTEXT.md) — the terminal UI shell: panes, sidebar, overlays, the PR picker, keymap, and themes.
 - [Highlighting](./src/highlight/CONTEXT.md) — syntax coloring of file content via tree-sitter (post-MVP, behind a seam).
 
+## Code entry points
+
+The CLI and terminal adapters use the contexts above. These paths identify the implementation entry points within the current checkout.
+
+| Work | Entry points |
+|---|---|
+| Top-level commands and review startup | [`src/main.zig`](./src/main.zig) dispatches commands. [`src/startup.zig`](./src/startup.zig) selects the review source. |
+| Profiles and Credential selection | [`src/bitbucket/auth.zig`](./src/bitbucket/auth.zig) stores Profiles and resolves Credentials. [`src/main.zig`](./src/main.zig) handles login and logout. |
+| `bbr api` verbs and flags | [`src/api/cli.zig`](./src/api/cli.zig) holds the verb table and global parser. [`src/api/args.zig`](./src/api/args.zig) holds argument helpers. Resource files in [`src/api/`](./src/api/) handle each verb. |
+| API output and endpoint behavior | [`src/api/output.zig`](./src/api/output.zig) formats CLI output. [`src/bitbucket/client.zig`](./src/bitbucket/client.zig) implements the Bitbucket adapter. |
+| Shell completions | [`src/completion.zig`](./src/completion.zig) generates completion scripts from the API registry. |
+| Markdown, search, Selection, and terminal rendering | [Presentation entry points](./src/tui/CONTEXT.md#code-entry-points) map the semantic model, row projection, interaction owner, and terminal adapters. |
+| Specifications and tickets | [Issue discovery](./docs/agents/issue-tracker.md#when-a-skill-says-fetch-the-relevant-ticket) explains how to search `.scratch/` and follow feature maps. |
+| Tests | [`build.zig`](./build.zig) defines the test gates. `zig build --help` lists the available targets. `zig build test-cli` runs the Python CLI checks. `zig build test` includes those checks and the full hermetic suite. |
+
 ## Review modes
 
 bbr reviews changes from one of two sources, sharing all rendering and comment machinery:

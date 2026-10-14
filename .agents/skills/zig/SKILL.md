@@ -14,9 +14,9 @@ from repeating past mistakes. The version-pinned API catalog bbr relies on lives
 
 **Never assert a Zig stdlib API from memory. Read it from the installed stdlib source first.**
 
-- stdlib root: `/opt/homebrew/Cellar/zig/0.16.0_1/lib/zig/std` (confirm with `zig version` and
-  `zig env`). When you claim a function signature, field, or type, cite it as `file:line` you
-  actually opened — not what you remember the API to be.
+- Run `zig version` and `zig env`. Use the reported `std_dir` for stdlib searches.
+  Cite a function signature, field, or type as `file:line` from the source you opened.
+- For dependency source, follow [source lookup in ZIG.md](../../../ZIG.md#find-toolchain-and-dependency-sources).
 - If you're about to write `std.something(...)` without having opened its source this session,
   stop and grep the stdlib. The API has probably changed.
 

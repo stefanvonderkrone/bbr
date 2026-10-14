@@ -15,7 +15,7 @@ suggestions that stay **pending locally** until you submit them as a batch.
 |---|---|
 | [`docs/design.html`](docs/design.html) | The design document — architecture, seams, diff/rendering, pending review, concurrency, memory, milestones. **Start here.** |
 | [`CONTEXT-MAP.md`](CONTEXT-MAP.md) | Bounded contexts and how they relate. |
-| `src/*/CONTEXT.md` | Per-context glossary (ubiquitous language). Pure vocabulary, no implementation. |
+| `src/*/CONTEXT.md` | Per-context vocabulary. The Presentation context also maps code entry points. |
 | [`docs/adr/`](docs/adr/) | Architecture Decision Records for the hard-to-reverse choices. |
 | [`ZIG.md`](ZIG.md) | Zig 0.16.0 feature/API notes this project depends on. |
 | [`docs/m16-operations.md`](docs/m16-operations.md) | Mutation, Submission repair, External Edit, and opt-in checks. |
