@@ -82,25 +82,3 @@ _Avoid_: comment, thread, issue.
 **Resolve**:
 Closing a Thread or completing a Task without editing its prose: a resolved Comment Thread shows its resolution flag, a resolved Task shows its Resolved state. Reopening reverses it. Never means editing a body.
 _Avoid_: update, edit, fix.
-
-## API quirks (verified against live PRs)
-
-**Outdated comments.** The comments *list* endpoint
-(`/pullrequests/{id}/comments`) does **not** include `inline.outdated` — only
-the *single-comment* endpoint (`.../comments/{cid}`) does, and `?fields=` cannot
-force it into the list. Outdated status also can't be recomputed from line
-numbers: a stale comment's anchor line may still exist in the current diff (PR
-1726 comment 811927613 anchors new-line 38, which is inside a current hunk, yet
-Bitbucket marks it outdated). What *does* distinguish them: each comment's
-`links.code.href` embeds the diff revision it was anchored to
-(`.../diff/{ws}/{repo}:{src}..{dst}?path=…`). A comment is **current** iff that
-`{src}..{dst}` equals the PR's current `source.commit`/`destination.commit`;
-otherwise **outdated**. We derive it that way — authoritative (Bitbucket's own
-commit metadata, per ADR-0001) and free (no per-comment fetch). Hashes may be
-abbreviated on one side, so compare by prefix.
-
-**Mixed-side ranges.** Bitbucket may return both old-file (`from`/`start_from`)
-and new-file (`to`/`start_to`) projections for one inline range. The adapter
-normalizes that wire shape to the new-file projection because the Review
-context models an Anchor as single-sided and renders context lines on the new
-side when one is available.

@@ -2,7 +2,7 @@
 //! allocation-free: every field borrows the input URL. Handles both remote
 //! forms Bitbucket serves and this machine's `url.insteadof` rewrites.
 //!
-//! See `src/git/CONTEXT.md` (Remote) for the ubiquitous language.
+//! See `src/git/GLOSSARY.md` (Remote) for the ubiquitous language.
 
 const std = @import("std");
 

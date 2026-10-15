@@ -8,7 +8,7 @@ An implementation-ready M20 specification and dependency map for explicit old/ne
 
 ## Notes
 
-- Primary domains: Presentation and Diff. Consult `CONTEXT-MAP.md`, `src/tui/CONTEXT.md`, `src/diff/CONTEXT.md`, `TODO.md`, and the integrated M15 and M17 contracts.
+- Primary domains: Presentation and Diff. Consult `GLOSSARY-MAP.md`, `src/tui/GLOSSARY.md`, `src/diff/GLOSSARY.md`, `TODO.md`, and the integrated M15 and M17 contracts.
 - Use `prototype`, `grilling`, `domain-modeling`, `technical-writing`, and `zig` as each ticket requires.
 - Call the review-wide old/new choice the **Selected Version**. Do not use side for this choice because side also identifies a SideBySide column and an Anchor coordinate.
 - The Selected Version defaults to new. It survives Session replacement within the process but does not persist across application restarts.

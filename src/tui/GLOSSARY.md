@@ -1,25 +1,7 @@
 # Presentation
 
-The terminal UI shell built on libvaxis: how the screen is divided, what floats over it,
-and how the reviewer navigates. Owns no domain data — it projects the Diff and Review models.
-
-## Code entry points
-
-| Work | Owner |
-|---|---|
-| Authored Markdown meaning and source ranges | [`review_body.zig`](./review_body.zig) interprets a ReviewBody independently of terminal width. |
-| ReviewCard wrapping and disclosure | [`review_card.zig`](./review_card.zig) projects a ReviewBody into width-dependent rows with authored source ranges. |
-| DiffPane row order and Thread placement | [`buffer.zig`](./buffer.zig) combines source Lines, ReviewCards, Folds, and disclosures into a Buffer. |
-| Search matching and authored locations | [`search.zig`](./search.zig) defines the search corpus, mappings, and Search Occurrences. [`presentation.zig`](./presentation.zig) owns search interaction and navigation. |
-| Selection and clipboard commands | [`presentation.zig`](./presentation.zig) owns Selection and yank behavior. [`frame.zig`](./frame.zig) projects source targets for Selected Version. |
-| Geometry and terminal cells | [`frame.zig`](./frame.zig) builds the Presentation Frame. [`render.zig`](./render.zig) draws its rows with styles from [`theme.zig`](./theme.zig). |
-| Key input and Actions | [`keymap.zig`](./keymap.zig) resolves input. [`action.zig`](./action.zig) defines Actions. [`presentation.zig`](./presentation.zig) dispatches them. |
-| Session lifetime and owned commands | [`presentation.zig`](./presentation.zig) owns state transitions, command production, and completion admission under [ADR-0012](../../docs/adr/0012-presentation-is-a-typed-command-producing-state-machine.md). |
-| Command execution and terminal events | [`presentation_adapter.zig`](./presentation_adapter.zig) executes commands. [`presentation_runtime.zig`](./presentation_runtime.zig) transfers worker completions. [`app.zig`](./app.zig) connects Presentation to the terminal loop. |
-
-Markdown changes can affect search mappings, Selection bytes, and terminal cells through this projection chain.
-The relevant tests live beside their implementation and enter the build through the imports in [`../main.zig`](../main.zig).
-[`../../build.zig`](../../build.zig) defines focused test targets as well as the full `test` gate.
+The vocabulary of the terminal UI: screen regions, review navigation, and interaction state.
+Presentation projects the Diff and Review models.
 
 ## Language
 
@@ -114,8 +96,6 @@ _Avoid_: PR id (identifies the PullRequest, not one Session), generation, versio
 **Candidate Session**:
 A privately staged replacement for the published Session. For a LocalReview, loading it includes resolving every persisted root Draft CommentScope against the candidate's resolved Refs before publication. Every attempt finishes as `current`, `moved`, `outdated`, or `unavailable`; unavailable placement is usable fallback content, not a failed candidate. Presentation publishes the candidate only after this phase and initial Buffer construction complete.
 _Avoid_: partially loaded Session, hydration state, incremental refresh.
-
-All remote TUI work uses one TUI-lifetime `StdHttpClient` connection pool. Candidate Session acquisition uses at most two active requests. PullRequest, RawDiff, and Comments are required. Authenticated Account acquisition is independent. Comments wait for PullRequest commit data and take priority over RawDiff when both can start. Remote File Enrichment fetches its old and new sides concurrently, with at most two requests per File. All started branches complete without branch cancellation. LocalReview acquisition remains sequential. LocalReview File Enrichment also remains sequential.
 
 **ScopeProjection**:
 The Session-scoped placement of a PendingReview's root Draft CommentScopes, keyed by root TempId. It is derived from the durable authored scope plus the current Session and owns each ScopeResolution and projected scope; Replies reuse their root's entry. Review scope resolves unchanged, while File and inline scopes may move or become outdated or unavailable. It belongs to the published review aggregate, not to Session or PendingReview, and is rebuilt on Session replacement. A newly saved Draft enters it as `current` because it was authored against that Session.

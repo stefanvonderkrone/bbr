@@ -3,8 +3,8 @@
 The feature set of **bbr**, grouped by area and tagged with the milestone that delivers it
 (see `docs/design.html` §14 and `TODO.md`). Status: `planned` · `in progress` · `done`.
 
-> Vocabulary in this file is the ubiquitous language — see `CONTEXT-MAP.md` and each
-> context's `CONTEXT.md`. Rationale for the hard choices lives in `docs/adr/`.
+> Vocabulary in this file is the ubiquitous language. See `GLOSSARY-MAP.md` and each
+> context's `GLOSSARY.md`. Rationale for the hard choices lives in `docs/adr/`.
 
 ## Navigation & PR management
 - [x] **Open PR by id** — load a PullRequest from the workspace by integer id. `M0`

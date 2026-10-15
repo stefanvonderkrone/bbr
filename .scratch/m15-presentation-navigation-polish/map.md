@@ -8,7 +8,7 @@ An implementation-ready M15 specification and dependency map in which every pres
 
 ## Notes
 
-- Primary domain: Presentation. Consult `src/tui/CONTEXT.md`, with Review, Diff, and Bitbucket context where comment scope or rendered data crosses those boundaries.
+- Primary domain: Presentation. Consult `src/tui/GLOSSARY.md`, with Review, Diff, and Bitbucket context where comment scope or rendered data crosses those boundaries.
 - Use the `prototype`, `grilling`, `domain-modeling`, `research`, and `zig` skills as each ticket requires.
 - Treat the specific acceptance criteria already written under M15 in `TODO.md` as constraints rather than reopening them from first principles.
 - Keyboard operation must remain complete. Mouse support, if accepted, is additive and must retain keyboard parity.

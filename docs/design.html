@@ -186,8 +186,8 @@
   <h2 class="section">4 · Architecture</h2>
   <p>bbr is split into five bounded contexts. Dependencies point inward toward the domain;
   the two contexts that touch the outside world (Bitbucket, and the SQLite side of Review) do
-  so only through seams. The full glossary lives in each context's <code>CONTEXT.md</code>;
-  the <code>CONTEXT-MAP.md</code> at the repo root records their relationships.</p>
+  so only through seams. The full glossary lives in each context's <code>GLOSSARY.md</code>.
+  The <code>GLOSSARY-MAP.md</code> at the repo root records their relationships.</p>
 
   <div class="flow">
     <div class="box"><b>Presentation</b><div class="k">libvaxis · panes, sidebar, overlays, picker, composer, input</div></div>
@@ -548,7 +548,7 @@ DraftState = union(enum){ draft, submitting, posted: CommentId, failed: ApiError
 </section>
 
 <footer>
-  bbr design document · companions: <code>CONTEXT-MAP.md</code>, per-context <code>CONTEXT.md</code>,
+  bbr design document · companions: <code>GLOSSARY-MAP.md</code>, per-context <code>GLOSSARY.md</code>,
   <code>docs/adr/0001–0005</code>, <code>ZIG.md</code>, <code>FEATURES.md</code>, <code>TODO.md</code>. Reference codebase: ghostty.
 </footer>
 </main>

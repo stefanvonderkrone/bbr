@@ -14,4 +14,4 @@ Use the canonical `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-hu
 
 ### Domain docs
 
-This is a multi-context repository routed by `CONTEXT-MAP.md`, with system-wide decisions under `docs/adr/`. See `docs/agents/domain.md`.
+Read `GLOSSARY-MAP.md` for domain vocabulary and relationships. Read `docs/code-navigation.md` to find implementation owners. System-wide decisions live under `docs/adr/`. See `docs/agents/domain.md`.

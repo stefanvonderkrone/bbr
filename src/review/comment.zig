@@ -1,4 +1,4 @@
-//! The read-side comment model — the `src/review/CONTEXT.md` vocabulary as data.
+//! The read-side comment model — the `src/review/GLOSSARY.md` vocabulary as data.
 //!
 //! A `Comment` is one authored piece of prose on a PullRequest. It may be a root
 //! comment or a Reply (`parent_id`), and it may be anchored to a diff line

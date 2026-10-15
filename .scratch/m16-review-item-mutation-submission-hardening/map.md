@@ -8,7 +8,7 @@ An implementation-ready M16 specification and dependency map in which every revi
 
 ## Notes
 
-- Primary domains: Review, Presentation, and Bitbucket. Consult `src/review/CONTEXT.md`, `src/tui/CONTEXT.md`, `src/bitbucket/CONTEXT.md`, and ADR-0002, ADR-0005, ADR-0007, ADR-0008, ADR-0011, and ADR-0012 as relevant.
+- Primary domains: Review, Presentation, and Bitbucket. Consult `src/review/GLOSSARY.md`, `src/tui/GLOSSARY.md`, `src/bitbucket/GLOSSARY.md`, and ADR-0002, ADR-0005, ADR-0007, ADR-0008, ADR-0011, and ADR-0012 as relevant.
 - Use the `prototype`, `grilling`, `domain-modeling`, `research`, and `zig` skills as each ticket requires.
 - Treat M16 in `TODO.md` and the acceptance criteria in `.scratch/review-item-mutation/issues/` as constraints rather than reopening them from first principles.
 - Editing a Draft or an author-owned published Comment or Reply uses the same prefilled Composer interaction; their persistence and Reconciliation effects remain distinct.

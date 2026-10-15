@@ -1,8 +1,6 @@
 # Git
 
-Local git integration: what branch/worktree you are in, resolving refs to commits, and
-producing local diffs so a branch can be reviewed offline without Bitbucket. The only context
-that shells out to the `git` binary, behind the `GitClient` seam.
+The vocabulary of local Git review, repository identity, and Ref resolution.
 
 ## Language
 

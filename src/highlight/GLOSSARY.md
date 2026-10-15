@@ -1,8 +1,6 @@
 # Highlighting
 
-Syntax coloring of file content via tree-sitter, behind the `Highlighter` seam; plain and
-tree-sitter implementations ship today. Produces foreground colors only —
-diff backgrounds are composed over them per cell by Presentation.
+The vocabulary of syntax coloring, Grammars, and Themes.
 
 ## Language
 

@@ -19,7 +19,8 @@ Create a new file under `.scratch/<feature-slug>/`, creating the directory if ne
 Read the file at the referenced path. The user will normally pass the path or issue number directly.
 
 If you need to find a ticket, set the search directory to `.scratch/` and use a relative pattern.
-For example, use Glob with `path: <checkout>/.scratch` and `pattern: **/SPEC.md` or `**/issues/*.md`.
+For example, use Glob with `path: <checkout>/.scratch` and one of these patterns:
+`**/SPEC.md`, `**/PRD.md`, or `**/issues/*.md`.
 Root-level Glob patterns such as `.scratch/**/*.md` can return no files even when the files exist.
 Read the `.scratch/` directory before you treat an empty search result as an absent ticket.
 
