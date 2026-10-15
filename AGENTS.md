@@ -1,7 +1,5 @@
 # Agent guidance
 
-Only use subagents if the user explicitly requests them.
-
 ## Agent skills
 
 ### Issue tracker
@@ -14,4 +12,8 @@ Use the canonical `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-hu
 
 ### Domain docs
 
-This is a multi-context repository routed by `CONTEXT-MAP.md`, with system-wide decisions under `docs/adr/`. See `docs/agents/domain.md`.
+Read `GLOSSARY-MAP.md` for domain vocabulary and relationships. Read `docs/code-navigation.md` to find implementation owners. System-wide decisions live under `docs/adr/`. See `docs/agents/domain.md`.
+
+### Agent checks and tools
+
+After agent document or tracker changes, run `python3 tools/check_agent_docs.py`. See `docs/agents/tools.md` for project MCP defaults.

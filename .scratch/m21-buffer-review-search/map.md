@@ -8,7 +8,7 @@ An implementation-ready M21 specification and dependency map for Buffer Search a
 
 ## Notes
 
-- Primary domains: Presentation and Diff. Review owns authored bodies. Bitbucket and Git supply remote and local File Enrichment. Consult `CONTEXT-MAP.md`, each domain's `CONTEXT.md`, `TODO.md`, and the M20 Selected Version contract.
+- Primary domains: Presentation and Diff. Review owns authored bodies. Bitbucket and Git supply remote and local File Enrichment. Consult `GLOSSARY-MAP.md`, each domain's `GLOSSARY.md`, `TODO.md`, and the M20 Selected Version contract.
 - Use `prototype`, `grilling`, `domain-modeling`, `technical-writing`, and `zig` as each ticket requires.
 - Treat the M21 entries in `TODO.md` as requirements that tickets can refine when a conflict appears.
 - Buffer Search examines old and new source Lines in the current Buffer. A shared context Line counts once in Unified and SideBySide Layouts.

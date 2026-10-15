@@ -1,5 +1,6 @@
 Type: grilling
 Status: resolved
+Blocked by: none
 
 # Define the Selected Version projection
 

@@ -11,7 +11,7 @@
 - [`TreeSitterHighlighter`](../../../src/highlight/tree_sitter_highlighter.zig)
 - [Vendored runtime API](../../../vendors/tree-sitter/runtime/include/tree_sitter/api.h)
 - [Vendored source manifest](../../../vendors/tree-sitter/manifest.zig.zon)
-- [Highlighting context](../../../src/highlight/CONTEXT.md)
+- [Highlighting glossary](../../../src/highlight/GLOSSARY.md)
 - [ADR-0009](../../../docs/adr/0009-built-in-grammars-now-user-grammars-later.md)
 - [ADR-0010](../../../docs/adr/0010-file-enrichment-transfers-per-side-ownership.md)
 

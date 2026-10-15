@@ -1,6 +1,13 @@
 # M19 operational hardening and product gates
 
-Status: ready-for-agent
+Status: resolved
+
+## Completion
+
+All implementation tickets, 11 through 18, record completion.
+The [integrated acceptance ticket](issues/18-close-m19-operations-contract.md) records the format check, full suite, and four native CI checks.
+That ticket also records the final operations contract and Candidate Session policy.
+This status reconciliation uses the recorded acceptance evidence rather than a new product test run.
 
 ## Problem Statement
 
