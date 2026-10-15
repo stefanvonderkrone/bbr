@@ -290,26 +290,63 @@ Make the Browser and review Session feel like levels of one application, not sep
 - [ ] Extend the help Overlay so each Interaction Context shows its available Actions, including back, direct navigation, finding, settings, and global quit.
 - [ ] Add Presentation integration coverage for every navigation path, state restoration, recent-item failures, Picker scope, settings persistence, and ActionAvailability.
 
-## M26 - Credential login and logout  ·  S/M  ·  needs M19
+## M26 - Credential login and logout  ·  S/M  ·  partially implemented  ·  needs M19
 Replace shell setup as the normal remote-review login flow. Keep Credential management outside the
 TUI and keep `bbr local` free of Credential reads.
 
-The baseline follows OpenCode: store one Bitbucket Credential as JSON at
-`$XDG_DATA_HOME/bbr/auth.json`, falling back to `$HOME/.local/share/bbr/auth.json`. OpenCode uses an
-XDG data file with mode `0600`. GitHub CLI prefers the system credential store and falls back to a
-plaintext file. bbr will use the portable file baseline first. A native credential-store adapter is
-not part of this milestone.
+The accepted storage format is TOML at `$XDG_DATA_HOME/bbr/auth.toml`, with
+`$HOME/.local/share/bbr/auth.toml` as the fallback. The user confirmed TOML on 2026-10-14.
+Keep the implemented named Profiles. The portable file baseline uses mode `0600`.
+A native credential-store adapter is not part of this milestone.
+
+Planning: [Agree the M26 completion contract](.scratch/m26-credential-login-logout/map.md)
+tracks the remaining decisions. The map resolves the acceptance contract before implementation resumes.
 
 - [ ] Add `bbr auth login`, `bbr auth status`, and `bbr auth logout`. Keep login, status, and logout under one `auth` command instead of adding top-level aliases.
 - [ ] Make `bbr auth login` read the Atlassian account email, API token, and Workspace interactively. Do not accept the API token as a command-line argument or display it. Permit standard input for non-interactive setup only through an explicit flag.
-- [ ] Validate the Credential against Bitbucket Cloud before saving it. Prove the Authenticated Account and access to the named Workspace. Report `unauthorized` and `forbidden` separately without printing request headers or response data that can contain the token.
-- [ ] Store a small JSON object containing `username`, `token`, and `workspace`. Create the parent directory with mode `0700`, write the file with mode `0600`, reject unsafe non-regular targets, and replace the file atomically so an interrupted login does not erase a valid Credential.
-- [ ] Resolve exactly one Credential source. A complete `BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, and `BITBUCKET_WORKSPACE` set overrides `auth.json` for automation. Reject a partial environment set instead of combining environment and file values. Missing both sources reports the `bbr auth login` command.
+- [x] Validate the Credential against Bitbucket Cloud before saving it. Prove the Authenticated Account and access to the named Workspace. Report `unauthorized` and `forbidden` separately without printing request headers or response data that can contain the token. Login calls both probes before saving; failure and prior-Credential preservation integration coverage remains in the test item.
+- [ ] Store TOML Profiles containing `username`, `token`, and `workspace`. Create the parent directory with mode `0700`, write the file with mode `0600`, reject unsafe non-regular targets, and replace the file atomically so an interrupted login does not erase a valid Credential.
+- [ ] Resolve exactly one Credential source. A complete `BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, and `BITBUCKET_WORKSPACE` set overrides `auth.toml` for automation. Reject a partial environment set instead of combining environment and file values. Missing both sources reports the `bbr auth login` command.
 - [ ] Make `bbr auth status` show the source, account email, Workspace, and validation result without showing the API token. Status must distinguish a stored Credential from an environment override.
-- [ ] Make `bbr auth logout` delete only `auth.json` and succeed when the file does not exist. Explain that logout does not revoke the Atlassian API token and cannot remove an environment override.
+- [ ] Make `bbr auth logout` remove the selected Profile, with `--all` deleting only `auth.toml`, and succeed when the file does not exist. Explain that logout does not revoke the Atlassian API token and cannot remove an environment override.
 - [ ] Keep Credential bytes out of logs, diagnostics, SQLite, config files, crash output, and test snapshots. Redact the value if an upstream error includes an Authorization header or token-bearing URL.
 - [ ] Update the Bitbucket glossary, README, startup diagnostics, and M19 token-rotation guidance when the behavior ships. Document token expiry and the minimum Bitbucket API-token scopes used by read, comment, and mutation operations.
-- [ ] Add hermetic tests for command parsing, hidden input, JSON round trips, precedence, partial environment failure, file modes, atomic replacement, unsafe targets, redaction, status output, idempotent logout, and `bbr local` isolation.
+- [ ] Add hermetic tests for command parsing, hidden input, TOML round trips, precedence, partial environment failure, file modes, atomic replacement, unsafe targets, redaction, status output, idempotent logout, and `bbr local` isolation.
+
+M26 verification, 2026-10-14: the current implementation does not meet the milestone contract.
+TOML storage is accepted. Validation is implemented. The remaining checklist items are incomplete.
+
+Implemented and verified:
+
+- `src/main.zig` implements `bbr login [profile]` and `bbr logout [profile|--all]` outside the TUI.
+- Login prompts for email, token, and Workspace. Terminal input hides the token and restores terminal echo.
+- Login calls `GET /user` and the Workspace Repository list before saving. It reports classified errors without response bodies.
+- `src/bitbucket/auth.zig` writes named Profiles atomically to XDG `auth.toml` with mode `0600`.
+- Logout handles absent files and Profiles and reports environment overrides.
+- Submission diagnostic tests omit URL user information, query values, and response bodies in `src/http/std_client.zig`.
+- `bbr local` dispatches before Credential resolution. README, Bitbucket glossary, and M19 guidance describe the implemented Profile workflow.
+
+Remaining gaps:
+
+- Add the `auth` command group and status output. Top-level login/logout commands do not satisfy the required command grammar.
+- Require an explicit flag for non-interactive input. Current login accepts piped input without a flag.
+- Create the parent directory with mode `0700` and reject unsafe non-regular targets. Current storage has no explicit checks for these requirements. Both inspected bbr data directories have mode `0755`; the saved fallback `auth.toml` has mode `0600`.
+- Reject partial environment Credentials. Current resolution combines environment and Profile fields and loads the file before applying complete overrides.
+- Move the existing Profile logout behavior under `auth` and explain that logout does not revoke the Atlassian API token.
+- Verify Credential omission across remaining output paths, including Authorization headers and tokens in URL paths. Existing diagnostics strip URL user information and queries and omit response bodies. No Credential leak was confirmed by this review.
+- Align the glossary, README, startup diagnostics, and M19 guidance with the milestone contract. Document token expiry and minimum operation scopes.
+- Add missing acceptance tests for file and directory modes, unsafe targets, status, partial environment rejection, and LocalReview isolation.
+- Add login integration coverage for validation failures and preservation of the prior Credential. Current fixtures test the account and Workspace probes separately.
+
+Verification commands passed on native macOS `aarch64`, Zig 0.16.0:
+
+- `zig fmt --check build.zig src tests`
+- `zig build`
+- `zig build test --summary all`: 1,104/1,104 tests passed.
+- `python3 tests/auth_cli_test.py zig-out/bin/bbr`: hidden input, echo restoration, Profile selection, and override checks passed.
+- `python3 tests/api_auth_cli_test.py zig-out/bin/bbr`: Profile resolution, overrides, safe errors, and help checks passed.
+
+These checks use no live Bitbucket Credential. They verify the current implementation, not completion of the remaining M26 requirements.
 
 Research checked 2026-08-23: [OpenCode CLI auth](https://opencode.ai/docs/cli/#auth),
 [OpenCode auth storage](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/auth/index.ts),
