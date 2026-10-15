@@ -27,6 +27,7 @@ Implementation can then finish Credential login and logout without guessing at i
 ## Decisions so far
 
 - [Choose the M26 login input policy](issues/01-choose-login-input-policy.md): Require `--stdin` for piped token input, allow `--email` and `--workspace` args, forbid token in argv, exit 1 on abort or failure.
+- [Choose the M26 Credential source policy](issues/02-choose-credential-source-policy.md): Keep per-field env overlay, empty means missing, env rescues bad file, profile picks base, keep API workspace flag.
 
 ## Not yet specified
 

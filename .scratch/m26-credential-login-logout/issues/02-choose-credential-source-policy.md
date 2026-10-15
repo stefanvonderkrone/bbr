@@ -2,7 +2,7 @@
 
 Label: wayfinder:grilling
 Type: grilling
-Status: open
+Status: resolved
 Blocked by: none
 Parent: ../map.md
 
@@ -27,3 +27,19 @@ References:
 - `src/api/cli.zig`, `cliCredential` and global Workspace selection.
 - `README.md` and `docs/m19-operations.md`, environment and Keychain examples.
 - `tests/api_auth_cli_test.py`, current override expectations.
+
+## Answer
+
+M26 retains per-field environment overlay. It does not adopt the exactly-one-source rule.
+
+Each non-empty `BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, and `BITBUCKET_WORKSPACE` value overlays the same field from the selected Profile. An empty value counts as missing. An absent set uses the file Profile alone. A partial set fills the missing fields from the file. A complete set resolves without the file.
+
+A Credential that env can complete bypasses an absent, malformed, or unreadable auth file. File errors surface only when env alone cannot complete the Credential. This keeps automation alive when storage breaks.
+
+Explicit Profile selection still picks the file base: positional arg, then `--profile`, then `BBR_PROFILE`, then the Active Profile, then `default`. Env overlays that base. A complete env set needs no base Profile.
+
+`bbr api --workspace` stays as a single-field Workspace override after the same resolve. It applies to file, env, and mixed Credentials.
+
+One resolve path serves remote review, auth status, and API commands. No per-command source rule.
+
+Migration: scripts that export only `BITBUCKET_TOKEN` keep working against the stored email and Workspace. Docs describe overlay, not rejection. This consciously overrides the M26 checklist line that rejects partial sets.
