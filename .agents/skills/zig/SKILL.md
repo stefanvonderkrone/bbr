@@ -1,174 +1,40 @@
 ---
 name: zig
-description: Working in Zig 0.16.0 without repeating known mistakes. Use when writing, reviewing, or reasoning about Zig code, build.zig(.zon), stdlib APIs (std.Io, std.http, allocators), or when tempted to recall a Zig API from memory.
+description: Zig 0.16.0 source lookup and validation. Use for Zig source, build files, stdlib APIs, or Zig dependency changes.
 ---
 
 # Zig 0.16.0
 
-Zig's stdlib churns hard between minor versions. Training-time knowledge of Zig is **stale and
-untrustworthy**. This skill is the discipline and the accumulated corrections that keep Zig work
-from repeating past mistakes. The version-pinned API catalog bbr relies on lives in
-[`ZIG.md`](../../../ZIG.md) at the repo root — this skill is the *process*; that file is the *facts*.
+## Read the installed source first
 
-## The one rule that prevents most mistakes
+1. Run `zig version` and `zig env`.
+2. Use the reported `std_dir` to find the API in the installed stdlib.
+3. Open the declaration before using or describing that API.
+4. Cite the verified signature, field, or type with its source path and line.
 
-**Never assert a Zig stdlib API from memory. Read it from the installed stdlib source first.**
+Use [ZIG.md](../../../ZIG.md) for the version-pinned API catalog and dependency source lookup.
+Check every recalled API against the installed source.
 
-- Run `zig version` and `zig env`. Use the reported `std_dir` for stdlib searches.
-  Cite a function signature, field, or type as `file:line` from the source you opened.
-- For dependency source, follow [source lookup in ZIG.md](../../../ZIG.md#find-toolchain-and-dependency-sources).
-- If you're about to write `std.something(...)` without having opened its source this session,
-  stop and grep the stdlib. The API has probably changed.
+## Read the reference for the change
 
-## Validate a Zig change
+Before editing, read each reference that matches the work:
 
-1. For a CI failure, read the first failed step and its command in `.github/workflows/ci.yml`.
-   Diagnose that step before attributing the failure to the target architecture.
-2. After the final Zig source edit, run `zig fmt --check build.zig src tests` on any host.
-   Require exit code 0 across the full CI scope, including files outside the current diff.
-   CI runs this target-independent check only in the `linux-x86_64` job.
-   Commit `68eb744` and run `36868408670` both expose missed formatting in test fixture calls.
+- [Standard library](stdlib.md) covers process initialization, collections, readers, writers, file limits, paths, and reserved names.
+- [Runtime ownership](runtime.md) covers concurrent work, HTTP clients, terminal cell text, SQLite bindings, and dynamic library lifetimes.
+- [Tests](testing.md) covers test discovery, module ownership, hermetic fixtures, and stalled pagination tests.
+- [Builds and performance](build-performance.md) covers native dependencies, platform workarounds, benchmarks, allocation metrics, and bounded algorithms.
+
+## Validate the change
+
+1. For a CI failure, read the first failed step in `.github/workflows/ci.yml`.
+2. After the final Zig source edit, run `zig fmt --check build.zig src tests`.
+   Require exit code zero for the full scope on any host.
 3. For behavior or build changes, run `zig build` and `zig build test --summary all`.
-   State which native target you tested. Cross-compilation checks compilation, not native runtime behavior.
+4. State the native target tested. Cross-compilation proves compilation, not native runtime behavior.
+5. For tests in a new file, confirm that the appropriate test-step count increases.
 
-## Known corrections (mistakes already made — do not repeat)
+## Keep the references current
 
-- **Bounded file reads use an exclusive limit.** `std.Io.Dir.readFileAlloc` fails when it reaches `.limited(n)`, even at EOF. Pass `.limited(max_bytes + 1)` for an inclusive maximum. The API text-file tests cover exactly 1 MiB and one byte more.
-
-- **`main` takes `std.process.Init`; env vars come from it, not `getEnvVarOwned`.** 0.16 removed
-  `std.process.getEnvVarOwned`. Write `pub fn main(init: std.process.Init) !void` and the runtime
-  hands you `init.gpa`, `init.arena`, `init.io`, `init.environ_map` (`*Environ.Map`, use
-  `.get("KEY")`), and `init.minimal.args` (`.iterate()`). **`init.io` is already backed by
-  `std.Io.Threaded`** — don't build your own for the default runtime.
-- **`std.http.Client.fetch` returns only the status; the body is streamed to a writer.** Pass
-  `.response_writer = &aw.writer` with `aw: std.Io.Writer.Allocating = .init(alloc)`, then
-  `aw.toOwnedSlice()`. The client is a plain struct: `.{ .allocator = gpa, .io = io }`. Classify
-  with `status.class()`.
-- **`std.ArrayList(T)` is the UNMANAGED list; its methods take `gpa`.** Confirmed in the installed
-  stdlib: `std.zig:49` defines `ArrayList(T) = array_list.Aligned(T, null)`, and `Aligned`
-  (`array_list.zig:570`) is the unmanaged struct. So: init `var list: std.ArrayList(T) = .empty;`
-  (default `.{}` deprecated), then `list.append(gpa, item)`, `list.deinit(gpa)`,
-  `list.toOwnedSlice(gpa)`. The managed variant with `gpa`-free methods is `array_list.Managed(T)`;
-  `ArrayListUnmanaged` is now a deprecated alias *to* `ArrayList`.
-- **`iN`/`uN` are reserved primitive types — a local named `i2` won't compile.** Any arbitrary-width
-  integer name (`i2`, `u3`, `u8`, …) is a builtin type, so `var i2: usize = 0;` errors with
-  "name shadows primitive 'i2'". Rename scratch/loop vars (`oi`/`ni` instead of `i2`/`j2`).
-- **You can't read env vars inside a `test` block.** The env API flows through `Init`/`Io` and the
-  test runner hands tests neither (`Environ.Block.global` is wasi/freestanding-only). Keep tests
-  hermetic (fakes + `@embedFile` fixtures); put credential/network work in an executable step that
-  reads `Init.environ_map` in `main`.
-- **Concurrency is `std.Io` / `std.Io.Threaded`, NOT `std.Thread.Pool`.** 0.16 centralizes I/O and
-  concurrency behind the `std.Io` interface. `std.http.Client` has an `io: Io` field and *requires*
-  an `Io`, so you do not hand-roll a thread pool for network work. Build one `std.Io.Threaded`
-  runtime; spawn via its `Io` vtable (`async`/`concurrent`/`groupAsync`). (Originally proposed a
-  `Thread.Pool` — wrong.)
-- **Writergate: `std.Io.Reader` / `std.Io.Writer` are non-generic, vtable-based, and carry their
-  own buffer.** The old generic `std.io.Reader`/`Writer` are gone. You hand the interface a `[]u8`;
-  formatting goes through `writer.print(...)`. Take `*std.Io.Reader`, not a concrete stream type.
-- **`ArenaAllocator.reset` takes a `ResetMode` union**, not a bool:
-  `union(enum){ free_all, retain_capacity, retain_with_limit: usize }`.
-  `reset(.{ .retain_with_limit = bytes })` keeps bounded capacity. Use it for reused Buffer and
-  frame arenas so one large review does not remain resident. A `false` result means shrinking
-  failed, but the arena remains usable with its old memory released.
-- **`@ptrFromInt` to a *function-pointer* type fails the alignment check** ("pointer type … requires
-  aligned address") because fn pointers carry an alignment and an arbitrary int like `maxInt(usize)`
-  or `-1` isn't aligned. This blocks the classic `SQLITE_TRANSIENT = (sqlite3_destructor_type)-1`
-  trick. When the bound buffer outlives the call that reads it (bbr binds a Draft's borrowed slices,
-  then `sqlite3_step`s, then finalizes — all before returning), pass `null` (`SQLITE_STATIC`)
-  instead: SQLite won't copy, and the slice is still valid through `step`.
-- **`std.Io.Dir` has no `realpathAlloc` in 0.16.** `std.testing.tmpDir(.{})` returns
-  `TmpDir{ dir: Io.Dir, parent_dir: Io.Dir, sub_path: [N]u8 }` created at `.zig-cache/tmp/<sub_path>`
-  relative to cwd. To hand a C API (SQLite) a filesystem path, build the *relative* path from
-  `tmp.sub_path` — `".zig-cache/tmp/{s}/pending.db"` with `&tmp.sub_path` — rather than resolving an
-  absolute one; `tmp.cleanup()` removes the subtree. Make a NUL-terminated path with
-  `std.fmt.allocPrintSentinel(a, fmt, args, 0)` (returns `[:0]u8`); `allocPrintZ` is gone.
-- **Tests only run if reachable via `_ = @import` chains from the test-root file's `test` blocks.**
-  Calling a function in another file compiles that file but does **not** run its `test` blocks. If a
-  file's tests aren't chained in (root has `test { _ = @import("child.zig"); }`, child chains
-  onward), they silently never run and the suite still passes green. After adding tests in a new
-  file, confirm the per-step **count** rose with `zig build test --summary all` — a green run proves
-  nothing if the count didn't move. (This once hid a real vaxis rendering bug in bbr.)
-- **vaxis cells borrow their text until `render` — never hand `printSegment`/`writeCell` a stack
-  buffer that dies first.** A `var buf: [N]u8` filled inside a draw loop (or a helper that returns
-  before `render`) leaves every cell pointing at freed/overwritten bytes; you'll see the *last*
-  iteration's text on every row, or garbage. Use static string literals for fixed glyphs (status
-  chars, markers) and a per-frame **arena** (reset *after* render) for synthesized text. Long-lived
-  borrowed text (e.g. diff line bodies) is fine.
-- **A replaying fake + a `next`-following client = infinite loop.** `FakeHttpClient` returns the
-  same body every `send` unless given a scripted `responses` sequence. If that body carries a
-  pagination `next` link and the client loops until `next` is absent, it re-fetches the same page
-  forever — `zig build test` hangs and `ps` shows the `.../test --listen=-` **binary** (not the
-  compiler) stuck for minutes. Fix the fixture, not the client: use a `responses` sequence whose
-  last page omits `next`, or a single-page body with no `next`. To find *which* test wedged, run
-  `zig test src/root.zig` under a `sleep N; kill $PID` guard — it prints `N/M name...` live, no
-  `--listen` protocol in the way. And **don't `pkill -9` a live `zig build`** — it can orphan the
-  cache manager and make later builds block on the lock.
-- **A source file may belong to only ONE module.** From an exe-module file, `@import`ing a file the
-  library module already owns (`../http/fake_client.zig`) errors: `file exists in modules 'bbr' and
-  'root'`. Reach shared decls **through the module API** (`bbr.http.Canned`), never by path. Bites
-  cross-module test code pulling a library fixture/helper.
-- **`std.Io.concurrent(fn, args)` copies the args tuple by value.** A `[]const u8` copies only the
-  header — pass a fixed `[N]u8` for strings you don't own, or ensure the pointee outlives the task.
-  It returns `std.Io.Future(Ret)`; `future.await(io)` (mutating) reclaims it. **Await every future
-  before destroying state a worker still touches** (e.g. the vaxis loop's queue), or a late
-  `postEvent` is a use-after-free. There is **no `std.heap.ThreadSafeAllocator`** in this build:
-  give workers the stateless `std.heap.page_allocator`, keep `gpa` main-thread-only, and pass
-  ownership across the boundary via the event.
-- **`vaxis.Loop(T)` is generic over YOUR event union.** Add a variant (`load_done: …`) and
-  `loop.postEvent(...)` it from a worker; the tty reader only posts variants it recognises (guards
-  with `@hasField`). A `union(enum)` switch with every case handled must have **no `else =>`**
-  (compile error: "unreachable else prong").
-- **Unmanaged `std.ArrayList(u8)` has no `.writer()`.** Use `list.print(gpa, fmt, args)` and
-  `list.appendSlice(gpa, bytes)` (the managed variant's `.writer()`/`.print()` take no allocator —
-  don't confuse them). `std.process.run(gpa, io, .{.argv,.cwd})` → `RunResult{term,stdout,stderr}`;
-  `Term` is `union(enum){exited:u8,…}`, `Cwd` is `union(enum){inherit,dir,path}`.
-- **Share `std.http.Client`, not a `Request`.** `Client.request` and `fetch` are thread-safe, and
-  the connection pool locks itself. The Client allocator must be thread-safe. Give every worker
-  its own Request, deinitialize that Request in the same worker, await all workers, then deinitialize
-  the Client. bbr uses one TUI-lifetime Client backed by `page_allocator` to reuse connections.
-- **Use `std.Io.Clock.awake` for benchmark duration.** Take the start with `.now(io)`, then use
-  `start.untilNow(io, .awake).toNanoseconds()`. Pass the result or a semantic checksum to
-  `std.mem.doNotOptimizeAway`. Build fixtures before timing and reject checksum drift.
-- **Treat `std.simd.suggestVectorLength(T)` as optional and target-dependent.** Use the suggested
-  comptime length when present, then run a scalar tail. Keep a scalar reference test over short
-  lengths, unaligned starts, controls, and non-ASCII input. SIMD is an early-exit tool here, not a
-  reason to vectorize dependent algorithms such as LCS.
-- **Count allocations at one allocator layer.** A counter inside an arena measures workload
-  allocation calls. A counter outside an arena measures backing allocations. Do not compare or
-  label those as one metric. Record arena `queryCapacity()` separately for retained memory.
-- **Destroy cached C objects before unloading their dynamic library.** A cached tree-sitter query
-  and its language pointer depend on the UserGrammar library. Deinitialize the runtime package,
-  then call `DynLib.close`.
-- **Bound quadratic work before allocating its table.** Use saturating `*|` and `+|` for the work
-  estimate. Preserve exact results below a measured limit and choose a deterministic fallback
-  above it. This applies to intra-line LCS and SideBySide Line matching.
-- For Linux C or C++ dependency failures, check feature macros and platform-specific source files in `build.zig`.
-  Keep `-D_DEFAULT_SOURCE` on the tree-sitter runtime compiled with `-std=c11`.
-  Keep the Linux ELF, vDSO, address-probe, and futex implementations in the Abseil source list.
-  Commit `0164ee0` fixes these Linux build requirements. A macOS build does not verify them.
-  After changes to these dependencies, run the native Linux RE2 and UserGrammar CI steps.
-- **Zig 0.16 cannot build bundled libc++ with a macOS 26 deployment minimum.** Keep bbr's native
-  deployment minimum at macOS 15 on newer hosts. Add the active SDK framework and library paths
-  for that explicit target. Zig's C++ compiler also needs `-Wno-elaborated-enum-base` for current
-  CoreFoundation headers. Remove these workarounds after a Zig upgrade passes the full test step.
-
-## Idioms that are correct here (not hacks)
-
-- **The `ptr + *const VTable` type-erased interface is idiomatic Zig** — it's exactly how
-  `std.mem.Allocator`, `std.Io`, and `std.Io.Reader/Writer` are built. bbr's seams (`HttpClient`,
-  `PendingReviewStore`, `Highlighter`) copy this pattern deliberately.
-- **`std.testing.allocator` detects leaks per test** — pair every `alloc` with `defer free`, and
-  lean on it: domain tests use the seams' fakes so they need no network, disk, or C toolchain.
-- **Pin exact dependency commits in `build.zig.zon`** (`url` + `hash`, `minimum_zig_version`).
-  libvaxis uses lazy deps (`b.lazyDependency`). No floating refs.
-
-## Keep this skill and ZIG.md current
-
-When a Zig mistake, surprise, or newly-verified API fact surfaces during work:
-1. If it's a version-pinned API fact bbr depends on → add/update the relevant section in
-   [`ZIG.md`](../../../ZIG.md) and its re-verification checklist.
-2. If it's a recurring mistake or a durable "do it this way" lesson → add a bullet under **Known
-   corrections** or **Idioms** here, phrased as the rule to follow next time.
-
-Both files assume the installed toolchain. On a Zig upgrade, re-verify every API fact against the
-new stdlib (ZIG.md has the checklist) before trusting anything below.
+Put newly verified API facts in `ZIG.md` and its re-verification checklist.
+Put recurring mistakes and durable rules in the matching reference beside this skill.
+After a Zig upgrade, recheck the facts against the installed stdlib before using them.

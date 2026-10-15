@@ -1,7 +1,14 @@
 # M21 Buffer and Review Search
 
-Status: ready-for-agent
+Status: resolved
 Milestone: M21
+
+## Completion
+
+All implementation tickets, 10 through 15, are resolved.
+The [final hardening ticket](issues/15-eliminate-remaining-buffer-search-input-stalls.md) records completed checks and implementation progress.
+The [final latency evidence](final-latency-evidence.md) records the measured fixtures, commands, and results.
+This status reconciliation uses the recorded acceptance evidence rather than a new product test run.
 
 ## Problem Statement
 
