@@ -26,7 +26,7 @@ Implementation can then finish Credential login and logout without guessing at i
 
 ## Decisions so far
 
-No tickets resolved in this map yet. Previously accepted facts remain in the referenced milestone and conversation.
+- [Choose the M26 login input policy](issues/01-choose-login-input-policy.md): Require `--stdin` for piped token input, allow `--email` and `--workspace` args, forbid token in argv, exit 1 on abort or failure.
 
 ## Not yet specified
 
