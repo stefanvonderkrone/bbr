@@ -271,10 +271,17 @@ fn isOptionError(err: anyerror) bool {
         err == error.InvalidProfileName;
 }
 
-fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror) !void {
+fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror, detail: ?*const bbr.bitbucket.Client.ErrorDetail) !void {
     try writer.writeAll("bbr api");
     if (verb) |v| try writer.print(" {s}", .{v.name});
-    if (isOptionError(err)) {
+    const api_error = if (detail) |d| d.reason else null;
+    const reported_error = if (detail) |d| d.reported_error else null;
+    if (api_error != null and (api_error.? == err or (reported_error != null and reported_error.? == err))) {
+        if (api_error.? != err) try writer.print(": {s}", .{@errorName(err)});
+        try writer.print(": Bitbucket rejected request ({s})", .{@errorName(api_error.?)});
+        if (detail.?.message) |message| try writer.print(": {s}", .{message});
+        try writer.writeAll("\n");
+    } else if (isOptionError(err)) {
         try writer.print(": bad options ({s})\n", .{@errorName(err)});
         try writeHelp(writer, if (verb) |v| v.name else null);
     } else {
@@ -282,22 +289,22 @@ fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror) !void {
         if (err == error.MissingCredential) {
             try writer.writeAll("Run `bbr login` or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, and --workspace or BITBUCKET_WORKSPACE.\n");
         }
-        if (verb) |v| {
-            if (std.mem.eql(u8, v.name, "list-commit-pull-requests")) {
-                if (err == error.PullRequestLinksIndexing) {
-                    try writer.writeAll("Bitbucket still indexes PullRequest links. Run the command again after indexing completes.\n");
-                } else if (err == error.NotFound) {
-                    try writer.writeAll("The Repository or commit links were not found. Links can lack an index. Select 'Go to pull request' on the commit's details page to install the Pull Request Commit Links app.\n");
-                }
+    }
+    if (verb) |v| {
+        if (std.mem.eql(u8, v.name, "list-commit-pull-requests")) {
+            if (err == error.PullRequestLinksIndexing) {
+                try writer.writeAll("Bitbucket still indexes PullRequest links. Run the command again after indexing completes.\n");
+            } else if (err == error.NotFound) {
+                try writer.writeAll("The Repository or commit links were not found. Links can lack an index. Select 'Go to pull request' on the commit's details page to install the Pull Request Commit Links app.\n");
             }
         }
     }
 }
 
-fn printError(init: std.process.Init, verb: ?Verb, err: anyerror) !void {
+fn printError(init: std.process.Init, verb: ?Verb, err: anyerror, detail: ?*const bbr.bitbucket.Client.ErrorDetail) !void {
     var buf: [8192]u8 = undefined;
     var stderr = std.Io.File.stderr().writer(init.io, &buf);
-    try writeError(&stderr.interface, verb, err);
+    try writeError(&stderr.interface, verb, err, detail);
     try stderr.interface.flush();
 }
 
@@ -358,16 +365,18 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator, it: anytype, profile:
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     while (it.next()) |a| argv.append(gpa, a) catch |err| {
-        try printError(init, diagnosticVerb(argv.items), err);
+        try printError(init, diagnosticVerb(argv.items), err, null);
         return err;
     };
-    runArgs(init, gpa, argv.items, profile) catch |err| {
-        try printError(init, diagnosticVerb(argv.items), err);
+    var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = gpa, .io = init.io };
+    defer detail.deinit();
+    runArgs(init, gpa, argv.items, profile, &detail) catch |err| {
+        try printError(init, diagnosticVerb(argv.items), err, &detail);
         return err;
     };
 }
 
-fn runArgs(init: std.process.Init, gpa: std.mem.Allocator, argv: []const []const u8, profile: ?[]const u8) !void {
+fn runArgs(init: std.process.Init, gpa: std.mem.Allocator, argv: []const []const u8, profile: ?[]const u8, detail: *bbr.bitbucket.Client.ErrorDetail) !void {
     const parsed = try parseGlobal(gpa, argv);
     defer gpa.free(parsed.rest);
 
@@ -389,7 +398,8 @@ fn runArgs(init: std.process.Init, gpa: std.mem.Allocator, argv: []const []const
     var transport = bbr.http.StdHttpClient.init(gpa, init.io);
     defer transport.deinit();
     try transport.initDefaultProxies(init.arena.allocator(), init.environ_map);
-    const bb = bbr.bitbucket.Client.init(transport.httpClient(), owned.credential());
+    var bb = bbr.bitbucket.Client.init(transport.httpClient(), owned.credential());
+    bb.error_detail = detail;
 
     try entry.handler(init, bb, parsed.rest, parsed.json);
 }
@@ -627,12 +637,61 @@ test "credential handler and proxy initialization errors stay on stderr with jso
 test "error writer formats option help and runtime errors without user values" {
     var buffer: [8192]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try writeError(&writer, findVerb("get-pull-request"), error.InvalidNumber);
+    try writeError(&writer, findVerb("get-pull-request"), error.InvalidNumber, null);
     try std.testing.expect(std.mem.startsWith(u8, writer.buffered(), "bbr api get-pull-request: bad options (InvalidNumber)\nusage: bbr api get-pull-request"));
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), findVerb("get-pull-request").?.example) != null);
     writer = std.Io.Writer.fixed(&buffer);
-    try writeError(&writer, findVerb("set-verdict"), error.Forbidden);
+    try writeError(&writer, findVerb("set-verdict"), error.Forbidden, null);
     try std.testing.expectEqualStrings("bbr api set-verdict: Forbidden\n", writer.buffered());
+}
+
+test "Bitbucket rejection messages survive response cleanup and stay on stderr" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = a, .io = std.testing.io };
+    defer detail.deinit();
+    const cases = [_]struct { status: u16 = 400, body: []const u8, err: anyerror = error.BadRequest, expected: []const u8, username: []const u8 = "test-user", token: []const u8 = "test-token" }{
+        .{
+            .body = "{\"type\":\"error\",\"error\":{\"message\":\"Field \\\".resolution\\\" does not support filtering\",\"detail\":\"unused\"}}",
+            .expected = "bbr api list-comments: Bitbucket rejected request (BadRequest): Field \".resolution\" does not support filtering\n",
+        },
+        .{
+            .status = 403,
+            .body = "{\"error\":{\"message\":\"Repository access denied\"}}",
+            .err = error.Forbidden,
+            .expected = "bbr api list-comments: Bitbucket rejected request (Forbidden): Repository access denied\n",
+        },
+        .{
+            .body = "{\"error\":{\"message\":\"Unsupported\\nfilter\\u001b\"}}",
+            .expected = "bbr api list-comments: Bitbucket rejected request (BadRequest): Unsupported filter \n",
+        },
+        .{ .body = "not JSON", .expected = "bbr api list-comments: Bitbucket rejected request (BadRequest)\n" },
+        .{ .body = "{}", .expected = "bbr api list-comments: Bitbucket rejected request (BadRequest)\n" },
+        .{ .body = "{\"error\":{\"message\":null}}", .expected = "bbr api list-comments: Bitbucket rejected request (BadRequest)\n" },
+        .{ .body = "{\"error\":{\"message\":42}}", .expected = "bbr api list-comments: Bitbucket rejected request (BadRequest)\n" },
+        .{ .body = "{\"error\":{\"message\":\"\"}}", .expected = "bbr api list-comments: Bitbucket rejected request (BadRequest)\n" },
+        .{ .body = "{\"error\":{\"message\":\"test-token\"}}", .expected = "bbr api list-comments: Bitbucket rejected request (BadRequest): [redacted]\n" },
+        .{ .body = "{\"error\":{\"message\":\"Basic dTp0\"}}", .username = "u", .token = "t", .expected = "bbr api list-comments: Bitbucket rejected request (BadRequest): Basic [redacted]\n" },
+        .{ .body = "{\"error\":{\"message\":\"dTp0\"}}", .username = "u", .token = "t", .expected = "bbr api list-comments: Bitbucket rejected request (BadRequest): [redacted]\n" },
+        .{ .body = "{\"error\":{\"message\":\"Invalid test-token, test-token. Retry.\"}}", .expected = "bbr api list-comments: Bitbucket rejected request (BadRequest): Invalid [redacted], [redacted]. Retry.\n" },
+        .{ .body = "{\"error\":{\"message\":\"Bad Basic dTp0, dTp0, raw t.\"}}", .username = "u", .token = "t", .expected = "bbr api list-comments: Bitbucket rejected request (BadRequest): Bad Basic [redacted], [redacted], raw [redacted].\n" },
+        .{ .body = "{\"error\":{\"message\":\"Basic dTpk\"}}", .username = "u", .token = "d", .expected = "bbr api list-comments: Bitbucket rejected request (BadRequest): Basic [redacted]\n" },
+    };
+    for (cases) |case| {
+        var output: TestOutput = .{};
+        var fake: bbr.http.FakeHttpClient = .{ .status = case.status, .body = case.body };
+        var bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = case.username, .token = case.token, .workspace = "demo" });
+        bb.error_detail = &detail;
+        const init = output.init(&env, &arena);
+        try std.testing.expectError(case.err, comments.runList(init, bb, &.{ "--repository=sample", "--pull-request-id=42", "--query=resolution=null", "--no-head" }, true));
+        try printError(init, findVerb("list-comments"), case.err, &detail);
+        try std.testing.expectEqualStrings(case.expected, output.stderrBytes());
+        try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+        try std.testing.expectEqual(@as(usize, 1), fake.call_count);
+    }
 }
 
 test "failed verdict changes produce no stdout success result" {
@@ -660,6 +719,41 @@ test "failed verdict changes produce no stdout success result" {
             try std.testing.expectError(case.err, pullrequests.runSetVerdict(output.init(&env, &arena), bb, args, json));
             try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
             try std.testing.expectEqual(@as(usize, 2), fake.call_count);
+        }
+    }
+}
+
+test "unresolved verdict changes keep the domain error and the relevant API message" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const pr =
+        "{\"id\":42,\"title\":\"Review\",\"state\":\"OPEN\",\"author\":{\"display_name\":\"Ada\",\"uuid\":\"{author}\"}," ++
+        "\"source\":{\"branch\":{\"name\":\"feature\"},\"commit\":{\"hash\":\"abc123\"}}," ++
+        "\"destination\":{\"branch\":{\"name\":\"main\"},\"commit\":{\"hash\":\"def456\"}},\"participants\":[]}";
+    const limited: bbr.http.Canned = .{ .status = 429, .body = "{\"error\":{\"message\":\"Slow down\"}}" };
+    const forbidden: bbr.http.Canned = .{ .status = 403, .body = "{\"error\":{\"message\":\"Read denied\"}}" };
+    for ([_]struct { mutation: bbr.http.Canned, after: bbr.http.Canned, expected: []const u8 }{
+        .{ .mutation = limited, .after = .{ .body = pr }, .expected = "bbr api set-verdict: ReviewerVerdictChangeFailed: Bitbucket rejected request (RateLimited): Slow down\n" },
+        .{ .mutation = limited, .after = forbidden, .expected = "bbr api set-verdict: ReviewerVerdictChangeFailed: Bitbucket rejected request (Forbidden): Read denied\n" },
+        .{ .mutation = .{}, .after = forbidden, .expected = "bbr api set-verdict: ReviewerVerdictChangeFailed: Bitbucket rejected request (Forbidden): Read denied\n" },
+    }) |case| {
+        for ([_]bool{ false, true }) |json| {
+            const responses = [_]bbr.http.Canned{ .{ .body = "{\"uuid\":\"{account}\"}" }, .{ .body = pr }, case.mutation, case.after };
+            var output: TestOutput = .{};
+            var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+            var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = a, .io = std.testing.io };
+            defer detail.deinit();
+            var bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "test-user", .token = "test-token", .workspace = "demo" });
+            bb.error_detail = &detail;
+            const init = output.init(&env, &arena);
+            try std.testing.expectError(error.ReviewerVerdictChangeFailed, pullrequests.runSetVerdict(init, bb, &.{ "--repository=sample", "--pull-request-id=42", "--verdict=approved", "--expected-source-commit=abc123" }, json));
+            try printError(init, findVerb("set-verdict"), error.ReviewerVerdictChangeFailed, &detail);
+            try std.testing.expectEqualStrings(case.expected, output.stderrBytes());
+            try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+            try std.testing.expectEqual(@as(usize, 4), fake.call_count);
         }
     }
 }
@@ -730,12 +824,15 @@ test "API lifecycle pending commit lookup has no success output and has an actio
     for ([_]u16{ 202, 404 }, [_]anyerror{ error.PullRequestLinksIndexing, error.NotFound }) |status, expected| {
         var output: TestOutput = .{};
         var fake: bbr.http.FakeHttpClient = .{ .status = status, .body = "{\"values\":[]}" };
-        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+        var detail: bbr.bitbucket.Client.ErrorDetail = .{ .allocator = a, .io = std.testing.io };
+        defer detail.deinit();
+        var bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+        bb.error_detail = &detail;
         try std.testing.expectError(expected, pullrequests.runListCommit(output.init(&env, &arena), bb, &.{ "--repository=sample", "--commit=abc123" }, true));
         try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
         var buf: [2048]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buf);
-        try writeError(&writer, findVerb("list-commit-pull-requests"), expected);
+        try writeError(&writer, findVerb("list-commit-pull-requests"), expected, &detail);
         try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), if (status == 202) "still indexes" else "Go to pull request") != null);
         try std.testing.expectEqual(@as(usize, 1), fake.call_count);
     }
