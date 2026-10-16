@@ -2,7 +2,7 @@
 
 Label: wayfinder:grilling
 Type: grilling
-Status: open
+Status: resolved
 Blocked by: 02, 03
 Parent: ../map.md
 
@@ -31,3 +31,13 @@ References:
 - `src/main.zig`, current dispatch and login validation.
 - `src/bitbucket/client.zig`, account and Workspace probes.
 - `src/bitbucket/CONTEXT.md`, Credential, Profile, and Authenticated Account.
+
+## Answer
+
+`bbr auth status [profile]` always validates live. There is no local-only mode and no `--validate` flag. It runs the same two probes as login: `GET /user` for the Authenticated Account UUID and the Workspace repository check. Unknown arguments are usage errors with exit `1`.
+
+Selection follows the source policy: positional Profile, then `--profile`, then `BBR_PROFILE`, then the Active Profile, then `default`, with per-field env overlay. There is no `--workspace` override on status. Status never writes storage and never chmods.
+
+On success it reports the Profile name, the configured email, the Workspace, per-field file versus env source markers, the proven account UUID, and separate account and Workspace validation results. The token never prints in any form. Exit `0` only when both probes pass.
+
+Failures exit `1` with distinct reports: missing Credential hints `bbr auth login`; malformed or unsafe storage reports without repair; `401` reports invalid Credential; forbidden or invisible Workspace reports separately; transport, rate-limit, and server failures report as transport and never as invalid Credentials.

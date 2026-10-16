@@ -29,6 +29,7 @@ Implementation can then finish Credential login and logout without guessing at i
 - [Choose the M26 login input policy](issues/01-choose-login-input-policy.md): Require `--stdin` for piped token input, allow `--email` and `--workspace` args, forbid token in argv, exit 1 on abort or failure.
 - [Choose the M26 Credential source policy](issues/02-choose-credential-source-policy.md): Keep per-field env overlay, empty means missing, env rescues bad file, profile picks base, keep API workspace flag.
 - [Choose the M26 auth storage safety policy](issues/03-choose-auth-storage-safety-policy.md): Repair only the bbr dir with warn-continue, follow symlinks, refuse dir and special files, status is read-only.
+- [Define the M26 auth status contract](issues/04-define-auth-status-contract.md): Status always validates live, reports per-field source plus proven UUID, exits 1 distinctly per failure, never writes storage.
 
 ## Not yet specified
 
