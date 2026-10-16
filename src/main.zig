@@ -859,6 +859,19 @@ fn promptField(gpa: std.mem.Allocator, io: std.Io, stdin: *std.Io.Reader, prompt
     return error.LoginAborted;
 }
 
+/// Read one token line and reject nonempty trailing input before validation.
+fn readStdinToken(gpa: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
+    const line = (try reader.takeDelimiter('\n')) orelse return error.InvalidToken;
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (trimmed.len == 0 or trimmed.len > 1024) return error.InvalidToken;
+    const token = try gpa.dupe(u8, trimmed);
+    errdefer gpa.free(token);
+    while (try reader.takeDelimiter('\n')) |trailing| {
+        if (std.mem.trim(u8, trailing, " \t\r").len != 0) return error.InvalidToken;
+    }
+    return token;
+}
+
 fn warnEnvOverride(env_map: *std.process.Environ.Map) void {
     const auth = bbr.bitbucket.auth;
     if (auth.credentialEnvValue(env_map, "BITBUCKET_USERNAME") != null or
@@ -943,21 +956,12 @@ fn loginRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fla
             std.debug.print("bbr: --stdin needs --email and --workspace; missing workspace; nothing saved\n", .{});
             std.process.exit(1);
         };
-        const raw = stdin.interface.takeDelimiter('\n') catch {
-            std.debug.print("bbr: invalid token from --stdin; nothing saved\n", .{});
-            std.process.exit(1);
-        };
-        const line = raw orelse {
-            std.debug.print("bbr: invalid token from --stdin; nothing saved\n", .{});
-            std.process.exit(1);
-        };
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or trimmed.len > 1024) {
-            std.debug.print("bbr: invalid token from --stdin; nothing saved\n", .{});
-            std.process.exit(1);
-        }
-        const token = gpa.dupe(u8, trimmed) catch {
-            std.debug.print("bbr: login failed: OutOfMemory; nothing saved\n", .{});
+        const token = readStdinToken(gpa, &stdin.interface) catch |err| {
+            if (err == error.OutOfMemory) {
+                std.debug.print("bbr: login failed: OutOfMemory; nothing saved\n", .{});
+            } else {
+                std.debug.print("bbr: invalid token from --stdin; nothing saved\n", .{});
+            }
             std.process.exit(1);
         };
         defer gpa.free(token);
@@ -1121,6 +1125,18 @@ fn logoutRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
     warnEnvOverride(init.environ_map);
 }
 
+fn statusFailureMessage(err: anyerror, workspace_probe: bool) []const u8 {
+    return switch (err) {
+        error.Unauthorized => "invalid credential (401); run `bbr auth login`",
+        error.Forbidden => if (workspace_probe) "workspace not found or not visible" else "credential lacks account access (403)",
+        error.NotFound => if (workspace_probe) "workspace not found or not visible" else "account not found (404)",
+        error.BadRequest, error.Conflict, error.UnexpectedStatus => "request rejected",
+        error.MalformedResponse => "invalid response",
+        error.OutOfMemory => "out of memory",
+        else => "transport",
+    };
+}
+
 /// `bbr auth status [profile]`: always validates live with both probes and
 /// reports per-field source, the proven account UUID, and distinct failures.
 /// Never writes storage. Exit 0 only when both probes pass.
@@ -1168,11 +1184,7 @@ fn statusRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
     const bb = bbr.bitbucket.Client.init(http_client.httpClient(), owned.credential());
 
     const uuid = bb.getAuthenticatedAccountUuid(gpa) catch |err| {
-        if (err == error.Unauthorized) {
-            std.debug.print("bbr: status failed: invalid credential (401); run `bbr auth login`\n", .{});
-        } else {
-            std.debug.print("bbr: status failed: transport ({s})\n", .{@errorName(err)});
-        }
+        std.debug.print("bbr: status failed: {s} ({s})\n", .{ statusFailureMessage(err, false), @errorName(err) });
         std.process.exit(1);
     };
     defer gpa.free(uuid);
@@ -1180,7 +1192,7 @@ fn statusRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
         if (err == error.NotFound or err == error.Forbidden) {
             std.debug.print("bbr: status failed: workspace '{s}' not found or not visible\n", .{owned.workspace});
         } else {
-            std.debug.print("bbr: status failed: transport ({s})\n", .{@errorName(err)});
+            std.debug.print("bbr: status failed: {s} ({s})\n", .{ statusFailureMessage(err, true), @errorName(err) });
         }
         std.process.exit(1);
     };
@@ -1418,6 +1430,43 @@ test "login reader rejects input longer than 1024 bytes" {
     input[input.len - 1] = '\n';
     var reader = std.Io.Reader.fixed(&input);
     try std.testing.expectError(error.InputTooLong, promptInput(std.testing.allocator, std.testing.io, &reader, "", false));
+}
+
+test "stdin login accepts one token and rejects trailing content" {
+    for ([_][]const u8{ "fake-token", "fake-token\n", " \tfake-token \r\n\n", "fake-token\r\n \t\r\n" }) |input| {
+        var reader = std.Io.Reader.fixed(input);
+        const token = try readStdinToken(std.testing.allocator, &reader);
+        defer std.testing.allocator.free(token);
+        try std.testing.expectEqualStrings("fake-token", token);
+    }
+    for ([_][]const u8{ "", "\n", "fake-token\nextra", "fake-token\n\nextra\n" }) |input| {
+        var reader = std.Io.Reader.fixed(input);
+        try std.testing.expectError(error.InvalidToken, readStdinToken(std.testing.allocator, &reader));
+    }
+}
+
+test "status probe failures distinguish access, response, and transport errors" {
+    const cases = [_]struct { status: u16, body: []const u8 = "", send_error: ?anyerror = null, account: []const u8, workspace: []const u8 }{
+        .{ .status = 401, .account = "invalid credential (401); run `bbr auth login`", .workspace = "invalid credential (401); run `bbr auth login`" },
+        .{ .status = 403, .account = "credential lacks account access (403)", .workspace = "workspace not found or not visible" },
+        .{ .status = 404, .account = "account not found (404)", .workspace = "workspace not found or not visible" },
+        .{ .status = 400, .account = "request rejected", .workspace = "request rejected" },
+        .{ .status = 429, .account = "transport", .workspace = "transport" },
+        .{ .status = 503, .account = "transport", .workspace = "transport" },
+        .{ .status = 200, .send_error = error.ConnectionResetByPeer, .account = "transport", .workspace = "transport" },
+        .{ .status = 200, .send_error = error.OutOfMemory, .account = "out of memory", .workspace = "out of memory" },
+    };
+    for (cases) |case| {
+        var fake: bbr.http.FakeHttpClient = .{ .status = case.status, .body = case.body, .send_error = case.send_error };
+        const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "w" });
+        if (bb.getAuthenticatedAccountUuid(std.testing.allocator)) |uuid| {
+            std.testing.allocator.free(uuid);
+            return error.ExpectedProbeFailure;
+        } else |err| try std.testing.expectEqualStrings(case.account, statusFailureMessage(err, false));
+        if (bb.checkWorkspace(std.testing.allocator, "w")) |_| {
+            return error.ExpectedProbeFailure;
+        } else |err| try std.testing.expectEqualStrings(case.workspace, statusFailureMessage(err, true));
+    }
 }
 
 // The demo is our offline validation surface, so guard that its synthetic data

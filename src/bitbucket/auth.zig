@@ -542,9 +542,21 @@ pub fn save(
 
     try ensureAuthDir(allocator, io, env);
     try checkFileTarget(io, path);
-    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+    // Rename the resolved target, not the symlink directory entry.
+    const target: ?[:0]u8 = target: {
+        var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        _ = std.Io.Dir.cwd().readLink(io, path, &link_buffer) catch |err| switch (err) {
+            error.NotLink, error.FileNotFound => break :target null,
+            else => return err,
+        };
+        break :target try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator);
+    };
+    defer if (target) |resolved| allocator.free(resolved);
+    const write_path: []const u8 = if (target) |resolved| resolved else path;
+    var dir = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(write_path).?, .{});
     defer dir.close(io);
-    var atomic = try dir.createFileAtomic(io, "auth.toml", .{ .replace = true, .permissions = file_permissions });
+    const basename = std.fs.path.basename(write_path);
+    var atomic = try dir.createFileAtomic(io, basename, .{ .replace = true, .permissions = file_permissions });
     defer atomic.deinit(io);
     var buffer: [4096]u8 = undefined;
     var writer = atomic.file.writer(io, &buffer);
@@ -553,7 +565,7 @@ pub fn save(
     atomic.replace(io) catch |err| return err;
     // Enforce `0600` even when the atomic fallback preserved old modes.
     // Failed enforcement warns visibly and keeps the file.
-    dir.setFilePermissions(io, "auth.toml", file_permissions, .{}) catch {
+    dir.setFilePermissions(io, basename, file_permissions, .{}) catch {
         warnStorage(io, "could not secure {s}; continuing", .{path});
     };
     return path;
@@ -686,7 +698,7 @@ pub fn resolve(
         credentialEnvValue(env, "BITBUCKET_TOKEN") != null and
         credentialEnvValue(env, "BITBUCKET_WORKSPACE") != null;
     var loaded: ?Loaded = if (env_complete)
-        load(allocator, io, env) catch null
+        null
     else
         try load(allocator, io, env);
     defer if (loaded) |*l| l.deinit(allocator);
@@ -1389,6 +1401,53 @@ test "resolve with complete env bypasses a broken file" {
     try testing.expectEqualStrings("env-user", cred.username);
     try testing.expectEqualStrings("env-token", cred.token);
     try testing.expectEqualStrings("env-ws", cred.workspace);
+
+    // Even a valid file must not supply an Active Profile with complete env.
+    try dir.writeFile(testing.io, .{ .sub_path = "auth.toml", .data = "active_profile = \"work\"\n[profiles.work]\n" });
+    var without_file = try resolve(testing.allocator, testing.io, &env, null);
+    defer without_file.deinit(testing.allocator);
+    try testing.expectEqualStrings("default", without_file.profile);
+}
+
+test "Profile updates preserve file symlinks and replace the private target" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const a = testing.allocator;
+    const base = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer a.free(base);
+    var env = EnvMap.init(a);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", base);
+    var dir = try tmp.dir.createDirPathOpen(io, "bbr", .{});
+    defer dir.close(io);
+    try tmp.dir.writeFile(io, .{ .sub_path = "credentials.toml", .data = "" });
+    try tmp.dir.symLink(io, "credentials.toml", "alias.toml", .{});
+    const absolute = try tmp.dir.realPathFileAlloc(io, "alias.toml", a);
+    defer a.free(absolute);
+    for ([_][]const u8{ "../alias.toml", absolute }) |link_target| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "credentials.toml", .data = "[profiles.old]\nusername = \"old-user\"\ntoken = \"old-token\"\nworkspace = \"old-ws\"\n" });
+        try dir.symLink(io, link_target, "auth.toml", .{});
+        const path = try upsertProfile(a, io, &env, "new", .{ .username = "new-user", .token = "new-token", .workspace = "new-ws" });
+        defer a.free(path);
+        var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const link_len = try dir.readLink(io, "auth.toml", &link_buffer);
+        try testing.expectEqualStrings(link_target, link_buffer[0..link_len]);
+        const source = try tmp.dir.readFileAlloc(io, "credentials.toml", a, .limited(max_auth_file_size + 1));
+        defer a.free(source);
+        var file = try parse(a, source);
+        defer file.deinit(a);
+        try testing.expectEqualStrings("new-token", file.find("new").?.token);
+        try testing.expectEqualStrings("old-token", file.find("old").?.token);
+        try testing.expect(try removeProfile(a, io, &env, "new"));
+        var loaded = (try load(a, io, &env)).?;
+        defer loaded.deinit(a);
+        try testing.expectEqual(@as(usize, 1), loaded.file.profiles.len);
+        _ = try dir.readLink(io, "auth.toml", &link_buffer);
+        const st = try tmp.dir.statFile(io, "credentials.toml", .{});
+        try testing.expectEqual(@as(u32, 0o600), @as(u32, @intFromEnum(st.permissions)) & 0o777);
+        try dir.deleteFile(io, "auth.toml");
+    }
 }
 
 test "resolve surfaces file errors only when env is incomplete" {

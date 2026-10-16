@@ -73,10 +73,11 @@ bbr creates and repairs only the `bbr` directory to mode `0700` and writes the f
 
 Remote operations select a Profile in this order:
 
-1. The explicit `--profile <name>` flag.
-2. `BBR_PROFILE`.
-3. The Active Profile in the file's `active_profile` field.
-4. `default`.
+1. The positional `[profile]` argument for `bbr auth` commands.
+2. The explicit `--profile <name>` flag.
+3. `BBR_PROFILE`.
+4. The Active Profile in the file's `active_profile` field.
+5. `default`.
 
 These environment variables override the selected Profile per field:
 

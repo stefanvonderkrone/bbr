@@ -109,8 +109,9 @@ with tempfile.TemporaryDirectory(prefix="bbr-auth-test-") as data_home:
     # Failures name the bad field and never echo the token value.
     run_fail(env, ["auth", "login", "--stdin"], b"missing email", data=b"tok\n")
     run_fail(env, ["auth", "login", "--stdin", "--email", "a@b.c"], b"missing workspace", data=b"tok\n")
-    for bad in (b"\n", b"   \t \n"):
-        run_fail(env, ["auth", "login", "--stdin", "--email", "a@b.c", "--workspace", "w"], b"invalid token", data=bad)
+    for bad in (b"\n", b"   \t \n", b"fake-token\nunexpected\n", b"fake-token\n\nunexpected", b"fake-token\n" + b"x" * 5000):
+        output = run_fail(env, ["auth", "login", "--stdin", "--email", "a@b.c", "--workspace", "w"], b"invalid token", data=bad)
+        assert b"fake-token" not in output and b"unexpected" not in output
     # An over-length token is rejected before any network use and never echoed.
     long_secret = b"s3cr3t-" + b"x" * 2000 + b"\n"
     output = run_fail(env, ["auth", "login", "--stdin", "--email", "a@b.c", "--workspace", "w"], b"invalid token", data=long_secret)
@@ -141,6 +142,6 @@ with tempfile.TemporaryDirectory(prefix="bbr-auth-test-") as data_home:
     result = subprocess.run([binary, "local", "bad-base", "bad-source"], capture_output=True, env=env, timeout=5)
     combined = result.stdout + result.stderr
     assert b"credential" not in combined.lower(), combined
-    assert b"Missing" not in combined or b"credential" not in combined.lower(), combined
+    assert b"cannot resolve SourceRef" in combined, combined
 
 print("Auth CLI checks passed. Profile selection, overrides, piped refusal, strict --stdin, and terminal echo restoration.")
