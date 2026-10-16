@@ -59,14 +59,14 @@ pub fn main(init: std.process.Init) !void {
             arg_idx += 1;
             if (arg_idx >= argv.items.len) {
                 std.debug.print("bbr: --profile needs a value\n", .{});
-                return;
+                std.process.exit(1);
             }
             flag_profile = argv.items[arg_idx];
         } else if (std.mem.startsWith(u8, a, "--profile=")) {
             flag_profile = a["--profile=".len..];
             if (flag_profile.?.len == 0) {
                 std.debug.print("bbr: --profile needs a value\n", .{});
-                return;
+                std.process.exit(1);
             }
         } else {
             try filtered.append(gpa, a);
@@ -75,7 +75,7 @@ pub fn main(init: std.process.Init) !void {
     if (flag_profile) |p| {
         if (!auth.isValidProfileName(p)) {
             std.debug.print("bbr: invalid profile name '{s}'\n", .{p});
-            return;
+            std.process.exit(1);
         }
     }
 

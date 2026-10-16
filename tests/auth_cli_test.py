@@ -83,6 +83,25 @@ with tempfile.TemporaryDirectory(prefix="bbr-auth-test-") as data_home:
             del env[key]
     env["XDG_DATA_HOME"] = data_home
 
+    # Global Profile errors must fail before an auth command can report success.
+    for command in ("login", "status", "logout"):
+        for flags, expected in (
+            (["--profile", "bad name"], b"invalid profile name"),
+            (["--profile=bad name"], b"invalid profile name"),
+            (["--profile"], b"--profile needs a value"),
+            (["--profile="], b"--profile needs a value"),
+        ):
+            run_fail(env, ["auth", command, *flags], expected)
+
+    # Logout with no storage succeeds and does not create the auth directory.
+    no_home = dict(env)
+    no_home.pop("HOME", None)
+    no_home.pop("XDG_DATA_HOME", None)
+    for logout_env in (no_home, env):
+        for args in (["auth", "logout"], ["auth", "logout", "--all"]):
+            assert b"Already logged out" in run_ok(logout_env, args)
+            assert not (Path(data_home) / "bbr").exists()
+
     invalid = dict(env, BBR_PROFILE="bad name")
     run_fail(invalid, ["auth", "login"], b"could not select profile: InvalidProfileName")
     for args in (["auth", "login", "work"], ["--profile", "work", "auth", "login"]):

@@ -611,9 +611,9 @@ pub fn upsertProfile(
 /// Remove one profile, keeping the rest. Returns `true` when something was
 /// removed. When the last profile goes, the file is deleted.
 pub fn removeProfile(allocator: Allocator, io: std.Io, env: *const EnvMap, name: []const u8) !bool {
-    try ensureAuthDir(allocator, io, env);
     var loaded = (try load(allocator, io, env)) orelse return false;
     defer loaded.deinit(allocator);
+    try ensureAuthDir(allocator, io, env);
     var views: std.ArrayList(ProfileView) = .empty;
     defer views.deinit(allocator);
     for (loaded.file.profiles) |p| {
@@ -648,10 +648,14 @@ pub fn removeProfile(allocator: Allocator, io: std.Io, env: *const EnvMap, name:
 /// Attempts the directory repair, refuses unsafe file targets, and touches
 /// nothing else on disk.
 pub fn deleteAuthFile(allocator: Allocator, io: std.Io, env: *const EnvMap) !bool {
-    try ensureAuthDir(allocator, io, env);
     const path = (try authFilePath(allocator, env)) orelse return false;
     defer allocator.free(path);
-    try checkFileTarget(io, path);
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    if (st.kind != .file) return error.UnsafeAuthTarget;
+    try ensureAuthDir(allocator, io, env);
     std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
@@ -1303,6 +1307,41 @@ test "save creates private dir and file modes" {
     const file_stat = try std.Io.Dir.cwd().statFile(testing.io, path, .{});
     try testing.expectEqual(.file, file_stat.kind);
     try testing.expectEqual(@as(u32, 0o600), @as(u32, @intFromEnum(file_stat.permissions)) & 0o777);
+}
+
+test "logout skips absent storage and repairs existing storage without parsing for all" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var env = EnvMap.init(a);
+    defer env.deinit();
+    try testing.expect(!try removeProfile(a, io, &env, "default"));
+    try testing.expect(!try deleteAuthFile(a, io, &env));
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer a.free(base);
+    try env.put("XDG_DATA_HOME", base);
+    try testing.expect(!try removeProfile(a, io, &env, "default"));
+    try testing.expect(!try deleteAuthFile(a, io, &env));
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "bbr", .{}));
+
+    const path = try upsertProfile(a, io, &env, "default", .{ .username = "u", .token = "t", .workspace = "w" });
+    defer a.free(path);
+    for ([_]bool{ false, true }) |all| {
+        if (all) try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "not = [valid\n" });
+        try tmp.dir.setFilePermissions(io, "bbr", @enumFromInt(0o755), .{});
+        const removed = if (all) try deleteAuthFile(a, io, &env) else try removeProfile(a, io, &env, "default");
+        try testing.expect(removed);
+        try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, path, .{}));
+        const st = try tmp.dir.statFile(io, "bbr", .{});
+        try testing.expectEqual(@as(u32, 0o700), @as(u32, @intFromEnum(st.permissions)) & 0o777);
+    }
+    var dir = try tmp.dir.openDir(io, "bbr", .{});
+    defer dir.close(io);
+    try dir.createDir(io, "auth.toml", .default_dir);
+    try testing.expectError(error.UnsafeAuthTarget, removeProfile(a, io, &env, "default"));
+    try testing.expectError(error.UnsafeAuthTarget, deleteAuthFile(a, io, &env));
 }
 
 test "save repairs dir mode and refuses unsafe targets" {
