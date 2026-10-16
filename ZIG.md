@@ -314,7 +314,7 @@ Verified in `std/Io/Dir.zig:1326-1338` and `std/Io/Reader.zig:367-386`.
 - `std.posix.tcgetattr(fd)` returns `TermiosGetError!termios` (`std/posix.zig:1161-1173`).
   A pipe returns `error.NotATerminal`.
 - `std.posix.tcsetattr(fd, .NOW, term)` takes the `termios` value (`std/posix.zig:1176-1189`).
-  `bbr login` restores the original value with `defer` after each Token prompt.
+  `bbr auth login` restores the original value with `defer` after each Token prompt.
 - On macOS, `term.lflag.ECHO` and `term.lflag.ECHONL` are boolean fields (`std/c.zig:9332-9339`).
   The Token prompt clears both fields and writes its own newline.
 

@@ -13,10 +13,9 @@ const cli = @import("api/cli.zig");
 /// User-facing top-level commands offered by the scripts. Mirrors the
 /// dispatch in `main.zig` (debug aids like `raw-comments` stay out).
 pub const top_commands = [_][]const u8{
-    "api",         "completion",        "login",          "logout",
-    "local",       "grammar",           "demo",           "check",
-    "check-blobs", "check-acquisition", "check-mutation", "check-verdict",
-    "detect",
+    "api",               "completion",     "auth",          "local",
+    "grammar",           "demo",           "check",         "check-blobs",
+    "check-acquisition", "check-mutation", "check-verdict", "detect",
 };
 
 pub const usage =
@@ -229,7 +228,7 @@ pub const bash_script =
     \\    esac
     \\
     \\    # First two positionals after `bbr`: subcommand, then api verb.
-    \\    local i word cmd="" verb="" skip=0
+    \\    local i word cmd="" verb="" sub="" skip=0
     \\    for (( i = 1; i < cword; i++ )); do
     \\        word="${words[i]}"
     \\        if (( skip )); then skip=0; continue; fi
@@ -243,7 +242,7 @@ pub const bash_script =
     \\                ;;
     \\            -*) continue ;;
     \\        esac
-    \\        if [[ -z "$cmd" ]]; then cmd="$word"; elif [[ "$cmd" == "api" && -z "$verb" ]]; then verb="$word"; fi
+    \\        if [[ -z "$cmd" ]]; then cmd="$word"; elif [[ "$cmd" == "api" && -z "$verb" ]]; then verb="$word"; elif [[ "$cmd" == "auth" && -z "$sub" ]]; then sub="$word"; fi
     \\    done
     \\
     \\    local _bbr_words=""
@@ -267,9 +266,20 @@ pub const bash_script =
     \\        esac
     \\    elif [[ "$cmd" == "completion" ]]; then
     \\        _bbr_words=" bash zsh fish "
-    \\    elif [[ "$cmd" == "login" || "$cmd" == "logout" ]]; then
+    \\    elif [[ "$cmd" == "auth" && -z "$sub" ]]; then
     \\        if [[ "$cur" == -* ]]; then
     \\            _bbr_words="--profile --help "
+    \\        else
+    \\            _bbr_words=" login status logout "
+    \\        fi
+    \\    elif [[ "$cmd" == "auth" ]]; then
+    \\        case "$sub" in
+    \\            login) _bbr_flags="--email --workspace --stdin --profile --help " ;;
+    \\            logout) _bbr_flags="--all --profile --help " ;;
+    \\            *) _bbr_flags="--profile --help " ;;
+    \\        esac
+    \\        if [[ "$cur" == -* ]]; then
+    \\            _bbr_words="$_bbr_flags"
     \\        else
     \\            _bbr_words=" $(bbr completion --list-profiles 2>/dev/null) "
     \\        fi
@@ -368,9 +378,20 @@ pub const zsh_script =
     \\        esac
     \\    elif [[ "$cmd" == "completion" ]]; then
     \\        _bbr_words=(bash zsh fish)
-    \\    elif [[ "$cmd" == "login" || "$cmd" == "logout" ]]; then
+    \\    elif [[ "$cmd" == "auth" && -z "$verb" ]]; then
     \\        if [[ "$cur" == -* ]]; then
     \\            _bbr_words=(--profile --help)
+    \\        else
+    \\            _bbr_words=(login status logout)
+    \\        fi
+    \\    elif [[ "$cmd" == "auth" ]]; then
+    \\        case "$verb" in
+    \\            login) _bbr_flags=(--email --workspace --stdin --profile --help);;
+    \\            logout) _bbr_flags=(--all --profile --help);;
+    \\            *) _bbr_flags=(--profile --help);;
+    \\        esac
+    \\        if [[ "$cur" == -* ]]; then
+    \\            _bbr_words=($_bbr_flags)
     \\        else
     \\            _bbr_words=(${(f)"$(bbr completion --list-profiles 2>/dev/null)"})
     \\        fi
@@ -444,7 +465,10 @@ pub const fish_script =
     \\
 ++ fish_top_lines ++
     \\complete -c bbr -n '__fish_seen_subcommand_from completion' -f -a 'bash zsh fish'
-    \\complete -c bbr -n '__fish_seen_subcommand_from login logout' -f -a '(bbr completion --list-profiles)'
+    \\complete -c bbr -n '__fish_seen_subcommand_from auth; and not __fish_seen_subcommand_from login;status;logout' -f -a 'login status logout'
+    \\complete -c bbr -n '__fish_seen_subcommand_from auth' -f -a '(bbr completion --list-profiles)'
+    \\complete -c bbr -n '__fish_seen_subcommand_from login; and __fish_seen_subcommand_from auth' -l email -r -l workspace -r -l stdin -f
+    \\complete -c bbr -n '__fish_seen_subcommand_from logout; and __fish_seen_subcommand_from auth' -l all -f
     \\complete -c bbr -n '__fish_seen_subcommand_from api' -l profile -r -f -a '(bbr completion --list-profiles)'
     \\complete -c bbr -n '__fish_seen_subcommand_from api' -l workspace -r
     \\complete -c bbr -n '__fish_seen_subcommand_from api' -l json -f
@@ -479,6 +503,8 @@ test "bash script completes verbs, flags, and the profiles hook" {
     }
     try std.testing.expect(std.mem.indexOf(u8, bash_script, "bbr completion --list-profiles") != null);
     try std.testing.expect(std.mem.indexOf(u8, bash_script, "complete -F _bbr -o default bbr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash_script, " login status logout ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash_script, "--email --workspace --stdin") != null);
 }
 
 test "zsh script completes verbs, flags, and the profiles hook" {
@@ -488,6 +514,7 @@ test "zsh script completes verbs, flags, and the profiles hook" {
     }
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "bbr completion --list-profiles") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "#compdef bbr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "_bbr_words=(login status logout)") != null);
 }
 
 test "fish script completes verbs, flags, and the profiles hook" {
@@ -496,6 +523,8 @@ test "fish script completes verbs, flags, and the profiles hook" {
         try std.testing.expect(std.mem.indexOf(u8, fish_script, flag) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, fish_script, "(bbr completion --list-profiles)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fish_script, "__fish_seen_subcommand_from auth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fish_script, "__fish_seen_subcommand_from login logout") == null);
 }
 
 test "fish verb descriptions preserve quotes and backslashes" {
