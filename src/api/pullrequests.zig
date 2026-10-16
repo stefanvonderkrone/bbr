@@ -444,7 +444,11 @@ pub fn runSetVerdict(init: std.process.Init, bb: bbr.bitbucket.Client, args: []c
     switch (result) {
         .success, .reconciled_success => {},
         .api_error => |err| return err,
-        .stale_source_commit, .unresolved => return error.ReviewerVerdictChangeFailed,
+        .stale_source_commit => return error.ReviewerVerdictChangeFailed,
+        .unresolved => {
+            if (bb.error_detail) |detail| detail.reported_error = error.ReviewerVerdictChangeFailed;
+            return error.ReviewerVerdictChangeFailed;
+        },
     }
     const name: []const u8 = switch (result) {
         .success => "success",

@@ -340,9 +340,25 @@ Verified in `std/Io/Dir.zig:1326-1338` and `std/Io/Reader.zig:367-386`.
 - `std.posix.tcgetattr(fd)` returns `TermiosGetError!termios` (`std/posix.zig:1161-1173`).
   A pipe returns `error.NotATerminal`.
 - `std.posix.tcsetattr(fd, .NOW, term)` takes the `termios` value (`std/posix.zig:1176-1189`).
-  `bbr login` restores the original value with `defer` after each Token prompt.
+  `bbr auth login` restores the original value with `defer` after each Token prompt.
 - On macOS, `term.lflag.ECHO` and `term.lflag.ECHONL` are boolean fields (`std/c.zig:9332-9339`).
   The Token prompt clears both fields and writes its own newline.
+
+## 9. Directory permission changes
+
+On Linux, `openDir` uses `O_PATH` unless `OpenOptions.iterate` is true (`std/Io/Threaded.zig:5268-5269`).
+`Dir.setPermissions` calls `fchmod`, which rejects an `O_PATH` handle with `BADF` (`std/Io/Threaded.zig:8948-8961`).
+For directory permission changes, pass `.iterate = true` to `openDir`.
+For `createDirPathOpen`, pass `.open_options = .{ .iterate = true }` (`std/Io/Dir.zig:857-871`).
+The auth storage tests verify both directory creation and permission repair on Linux.
+
+## 10. Atomic saves through symlinks
+
+`Dir.readLink(io, sub_path, buffer)` returns the link length or `NotLink` for a regular file (`std/Io/Dir.zig:1263-1299`).
+`Dir.realPathFileAlloc(io, sub_path, allocator)` returns an owned, canonical absolute path (`std/Io/Dir.zig:918-947`).
+It follows symlink chains and requires an existing target.
+`File.Atomic.replace(io)` renames the temporary file over the destination entry (`std/Io/File/Atomic.zig:67-85`).
+To preserve a file symlink, create the atomic file in the resolved target directory and replace the target entry.
 
 ## Re-verification checklist (on any Zig upgrade)
 - [ ] `std.process.Init` shape (`gpa`/`arena`/`io`/`environ_map`/`minimal.args`) unchanged?
@@ -356,6 +372,8 @@ Verified in `std/Io/Dir.zig:1326-1338` and `std/Io/Reader.zig:367-386`.
 - [ ] `ArenaAllocator.reset(.{ .retain_with_limit = bytes })` failure semantics unchanged?
 - [ ] `ArenaAllocator.queryCapacity` semantics still exclude internal node storage?
 - [ ] `std.Io.Reader`/`Writer` method surface we use unchanged?
+- [ ] Directory handles still need `.iterate = true` for `setPermissions` on Linux?
+- [ ] `Dir.readLink`, `realPathFileAlloc`, and `File.Atomic.replace` still preserve the documented path and rename behavior?
 - [ ] `std.posix.tcgetattr`, `tcsetattr`, and the `ECHO` and `ECHONL` fields unchanged?
 - [ ] libvaxis still builds against the new toolchain; re-pin its commit.
 - [ ] libvaxis `Vaxis.copyToSystemClipboard` signature and OSC 52 behavior unchanged?

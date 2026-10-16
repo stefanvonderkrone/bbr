@@ -60,11 +60,11 @@ The Atlassian account email plus API token used for HTTP Basic auth, with the Wo
 _Avoid_: password, app password, secret, key.
 
 **Profile**:
-One named Credential set in `auth.toml` (`[profiles.<name>]`), selected by `--profile`, then `BBR_PROFILE`, then the file's Active Profile, then `default`. `bbr login [profile]` verifies live and saves; `bbr logout [profile|--all]` removes.
+One named Credential set in `auth.toml` (`[profiles.<name>]`), selected by positional arg, then `--profile`, then `BBR_PROFILE`, then the file's Active Profile, then `default`. `bbr auth login [profile]` verifies live and saves; `bbr auth logout [profile|--all]` removes.
 _Avoid_: account, provider, login (the command, not the thing).
 
 **Active Profile**:
-The Profile that runs when no override exists, recorded as `active_profile` in `auth.toml`. A successful `bbr login [profile]` selects it as active.
+The Profile that runs when no override exists, recorded as `active_profile` in `auth.toml`. A successful `bbr auth login [profile]` selects it as active.
 _Avoid_: default profile (that is only the fallback name), current user.
 
 **Authenticated Account**:

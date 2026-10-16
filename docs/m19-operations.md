@@ -66,17 +66,18 @@ validation publishes no binary, archive, source copy, GitHub release, or other a
 
 ## Credential handling
 
-`bbr login [profile]` verifies the Credential and Workspace against Bitbucket before it saves the named Profile.
+`bbr auth login [profile]` verifies the Credential and Workspace against Bitbucket before it saves the named Profile.
 A successful login sets that Profile as the Active Profile.
 bbr stores Profiles in `$XDG_DATA_HOME/bbr/auth.toml`, with `$HOME/.local/share/bbr/auth.toml` as the fallback.
-bbr writes the file atomically with mode `0600`.
+bbr creates and repairs only the `bbr` directory to mode `0700` and writes the file atomically with mode `0600`.
 
 Remote operations select a Profile in this order:
 
-1. The explicit `--profile <name>` flag.
-2. `BBR_PROFILE`.
-3. The Active Profile in the file's `active_profile` field.
-4. `default`.
+1. The positional `[profile]` argument for `bbr auth` commands.
+2. The explicit `--profile <name>` flag.
+3. `BBR_PROFILE`.
+4. The Active Profile in the file's `active_profile` field.
+5. `default`.
 
 These environment variables override the selected Profile per field:
 
@@ -84,8 +85,9 @@ These environment variables override the selected Profile per field:
 - `BITBUCKET_TOKEN` contains the Atlassian API token.
 - `BITBUCKET_WORKSPACE` contains the Bitbucket Workspace.
 
-`bbr logout [profile]` removes the selected Profile. Bare `bbr logout` uses the same Profile selection order.
-`bbr logout --all` deletes `auth.toml`. Logout does not clear environment overrides.
+`bbr auth logout [profile]` removes the selected Profile. Bare `bbr auth logout` uses the same Profile selection order.
+`bbr auth logout --all` deletes only `auth.toml` and succeeds when absent. Logout does not revoke the API token and does not clear environment overrides.
+`bbr auth status [profile]` always validates live, reports per-field source and the proven account UUID, and never writes storage.
 
 `auth.toml` is the only allowed Credential store for bbr. bbr never stores Credential data in SQLite or state files.
 Do not put Credential data in repository files or command arguments.
@@ -102,6 +104,8 @@ exec zig build run -- "$@"
 
 Replace each placeholder. Keep the wrapper outside the repository, and do not enable shell tracing.
 This wrapper supplies an optional environment override. It does not change the Credential in `auth.toml`.
+
+Rotate a token by creating a replacement API token (set an expiry date; workspace policy defaults to a 365-day maximum) and running `bbr auth login` again for the same Profile. Tokens cannot be viewed after creation, so replace rather than recover; `bbr auth logout` never revokes the token at Atlassian.
 
 ## HTTP and proxy policy
 

@@ -21,7 +21,7 @@ ls ~/.claude/skills/bbr/SKILL.md
 
 Use the Profile default Workspace. Add `--workspace SLUG` only for cross-Workspace work. Done when you name the Workspace source (default or flag).
 
-On `MissingCredential`, stop and run `bbr login`. Never paste tokens into Comments or Tasks.
+On `MissingCredential`, stop and run `bbr auth login`. Never paste tokens into Comments or Tasks.
 
 ## 2. Pick verb
 

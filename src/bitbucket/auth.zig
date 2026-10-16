@@ -43,6 +43,7 @@ pub const Error = error{
     MissingToken,
     MissingWorkspace,
     NoCredential,
+    UnsafeAuthTarget,
 };
 
 /// One named credential set. All slices are owned by the allocator passed to
@@ -439,6 +440,7 @@ pub const Loaded = struct {
 pub fn load(allocator: Allocator, io: std.Io, env: *const EnvMap) !?Loaded {
     const path = (try authFilePath(allocator, env)) orelse return null;
     errdefer allocator.free(path);
+    try checkFileTarget(io, path);
     const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_auth_file_size + 1)) catch |err| switch (err) {
         error.FileNotFound => {
             allocator.free(path);
@@ -475,6 +477,51 @@ fn reportParseDiagnostic(io: std.Io, path: []const u8, location: ParseLocation) 
 }
 
 const file_permissions: std.Io.File.Permissions = @enumFromInt(0o600);
+const dir_permissions: std.Io.File.Permissions = @enumFromInt(0o700);
+
+fn warnStorage(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.File.stderr().writerStreaming(io, &buffer);
+    writer.interface.print("warning: " ++ fmt ++ "\n", args) catch return;
+    writer.interface.flush() catch {};
+}
+
+/// Ensure the `bbr` data directory exists and is private (`0700`).
+/// Only the auth directory itself is ever chmodded, never parents.
+/// A non-directory at the path refuses with `UnsafeAuthTarget`.
+/// Failed repair warns and continues.
+pub fn ensureAuthDir(allocator: Allocator, io: std.Io, env: *const EnvMap) !void {
+    const dir_path = (try authDirPath(allocator, env)) orelse return error.NoDataHome;
+    defer allocator.free(dir_path);
+    // Permission changes need readable handles, not Linux O_PATH handles.
+    const st = std.Io.Dir.cwd().statFile(io, dir_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            var dir = try std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{ .open_options = .{ .iterate = true } });
+            defer dir.close(io);
+            dir.setPermissions(io, dir_permissions) catch {
+                warnStorage(io, "could not secure {s}; continuing", .{dir_path});
+            };
+            return;
+        },
+        else => return err,
+    };
+    if (st.kind != .directory) return error.UnsafeAuthTarget;
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| return err;
+    defer dir.close(io);
+    dir.setPermissions(io, dir_permissions) catch {
+        warnStorage(io, "could not secure {s}; continuing", .{dir_path});
+    };
+}
+
+/// Refuse a directory or special file at the auth file path.
+/// Symlinks are followed: the target kind decides. Missing files are fine.
+pub fn checkFileTarget(io: std.Io, path: []const u8) !void {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    if (st.kind != .file) return error.UnsafeAuthTarget;
+}
 
 /// Atomically write profiles. Creates the `bbr` data directory. Returns the
 /// file path (owned by `allocator`).
@@ -493,19 +540,33 @@ pub fn save(
     defer allocator.free(source);
     if (source.len > max_auth_file_size) return error.InvalidAuthFile;
 
-    var dir = try std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
+    try ensureAuthDir(allocator, io, env);
+    try checkFileTarget(io, path);
+    // Rename the resolved target, not the symlink directory entry.
+    const target: ?[:0]u8 = target: {
+        var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        _ = std.Io.Dir.cwd().readLink(io, path, &link_buffer) catch |err| switch (err) {
+            error.NotLink, error.FileNotFound => break :target null,
+            else => return err,
+        };
+        break :target try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator);
+    };
+    defer if (target) |resolved| allocator.free(resolved);
+    const write_path: []const u8 = if (target) |resolved| resolved else path;
+    var dir = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(write_path).?, .{});
     defer dir.close(io);
-    var atomic = try dir.createFileAtomic(io, "auth.toml", .{ .replace = true, .permissions = file_permissions });
+    const basename = std.fs.path.basename(write_path);
+    var atomic = try dir.createFileAtomic(io, basename, .{ .replace = true, .permissions = file_permissions });
     defer atomic.deinit(io);
     var buffer: [4096]u8 = undefined;
     var writer = atomic.file.writer(io, &buffer);
-    try writer.interface.writeAll(source);
-    try writer.interface.flush();
-    try atomic.replace(io);
+    writer.interface.writeAll(source) catch |err| return err;
+    writer.interface.flush() catch |err| return err;
+    atomic.replace(io) catch |err| return err;
     // Enforce `0600` even when the atomic fallback preserved old modes.
-    dir.setFilePermissions(io, "auth.toml", file_permissions, .{}) catch |err| switch (err) {
-        error.OperationUnsupported => {},
-        else => return err,
+    // Failed enforcement warns visibly and keeps the file.
+    dir.setFilePermissions(io, basename, file_permissions, .{}) catch {
+        warnStorage(io, "could not secure {s}; continuing", .{path});
     };
     return path;
 }
@@ -552,6 +613,7 @@ pub fn upsertProfile(
 pub fn removeProfile(allocator: Allocator, io: std.Io, env: *const EnvMap, name: []const u8) !bool {
     var loaded = (try load(allocator, io, env)) orelse return false;
     defer loaded.deinit(allocator);
+    try ensureAuthDir(allocator, io, env);
     var views: std.ArrayList(ProfileView) = .empty;
     defer views.deinit(allocator);
     for (loaded.file.profiles) |p| {
@@ -583,9 +645,17 @@ pub fn removeProfile(allocator: Allocator, io: std.Io, env: *const EnvMap, name:
 }
 
 /// Delete the whole file. Returns `true` when a file was removed.
+/// Attempts the directory repair, refuses unsafe file targets, and touches
+/// nothing else on disk.
 pub fn deleteAuthFile(allocator: Allocator, io: std.Io, env: *const EnvMap) !bool {
     const path = (try authFilePath(allocator, env)) orelse return false;
     defer allocator.free(path);
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    if (st.kind != .file) return error.UnsafeAuthTarget;
+    try ensureAuthDir(allocator, io, env);
     std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
@@ -628,7 +698,13 @@ pub fn resolve(
     env: *const EnvMap,
     explicit_profile: ?[]const u8,
 ) !OwnedCredential {
-    var loaded = try load(allocator, io, env);
+    const env_complete = credentialEnvValue(env, "BITBUCKET_USERNAME") != null and
+        credentialEnvValue(env, "BITBUCKET_TOKEN") != null and
+        credentialEnvValue(env, "BITBUCKET_WORKSPACE") != null;
+    var loaded: ?Loaded = if (env_complete)
+        null
+    else
+        try load(allocator, io, env);
     defer if (loaded) |*l| l.deinit(allocator);
     const file_active: ?[]const u8 = if (loaded) |*l| l.file.active_profile else null;
     const selected = try selectedProfileName(allocator, env, file_active, explicit_profile);
@@ -1209,4 +1285,223 @@ test "resolve reports the missing field" {
     try env.put("BITBUCKET_TOKEN", "t");
     try env.put("BITBUCKET_WORKSPACE", "");
     try testing.expectError(error.MissingWorkspace, resolve(testing.allocator, testing.io, &env, null));
+}
+
+test "save creates private dir and file modes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer testing.allocator.free(base);
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", base);
+    const path = try save(testing.allocator, testing.io, &env, "default", &.{
+        .{ .name = "default", .username = "u", .token = "t", .workspace = "w" },
+    });
+    defer testing.allocator.free(path);
+    const dir_path = (try authDirPath(testing.allocator, &env)).?;
+    defer testing.allocator.free(dir_path);
+    const dir_stat = try std.Io.Dir.cwd().statFile(testing.io, dir_path, .{});
+    try testing.expectEqual(.directory, dir_stat.kind);
+    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intFromEnum(dir_stat.permissions)) & 0o777);
+    const file_stat = try std.Io.Dir.cwd().statFile(testing.io, path, .{});
+    try testing.expectEqual(.file, file_stat.kind);
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intFromEnum(file_stat.permissions)) & 0o777);
+}
+
+test "logout skips absent storage and repairs existing storage without parsing for all" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var env = EnvMap.init(a);
+    defer env.deinit();
+    try testing.expect(!try removeProfile(a, io, &env, "default"));
+    try testing.expect(!try deleteAuthFile(a, io, &env));
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer a.free(base);
+    try env.put("XDG_DATA_HOME", base);
+    try testing.expect(!try removeProfile(a, io, &env, "default"));
+    try testing.expect(!try deleteAuthFile(a, io, &env));
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "bbr", .{}));
+
+    const path = try upsertProfile(a, io, &env, "default", .{ .username = "u", .token = "t", .workspace = "w" });
+    defer a.free(path);
+    for ([_]bool{ false, true }) |all| {
+        if (all) try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "not = [valid\n" });
+        try tmp.dir.setFilePermissions(io, "bbr", @enumFromInt(0o755), .{});
+        const removed = if (all) try deleteAuthFile(a, io, &env) else try removeProfile(a, io, &env, "default");
+        try testing.expect(removed);
+        try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, path, .{}));
+        const st = try tmp.dir.statFile(io, "bbr", .{});
+        try testing.expectEqual(@as(u32, 0o700), @as(u32, @intFromEnum(st.permissions)) & 0o777);
+    }
+    var dir = try tmp.dir.openDir(io, "bbr", .{});
+    defer dir.close(io);
+    try dir.createDir(io, "auth.toml", .default_dir);
+    try testing.expectError(error.UnsafeAuthTarget, removeProfile(a, io, &env, "default"));
+    try testing.expectError(error.UnsafeAuthTarget, deleteAuthFile(a, io, &env));
+}
+
+test "save repairs dir mode and refuses unsafe targets" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer testing.allocator.free(base);
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", base);
+    const dir_path = (try authDirPath(testing.allocator, &env)).?;
+    defer testing.allocator.free(dir_path);
+    var setup = try std.Io.Dir.cwd().createDirPathOpen(testing.io, dir_path, .{});
+    setup.close(testing.io);
+    // Repair: a lax dir converges to 0700 on save.
+    try std.Io.Dir.cwd().setFilePermissions(testing.io, dir_path, @enumFromInt(0o755), .{});
+    const path = try save(testing.allocator, testing.io, &env, "default", &.{
+        .{ .name = "default", .username = "u", .token = "t", .workspace = "w" },
+    });
+    defer testing.allocator.free(path);
+    const repaired = try std.Io.Dir.cwd().statFile(testing.io, dir_path, .{});
+    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intFromEnum(repaired.permissions)) & 0o777);
+    // A directory at the file path refuses.
+    try std.Io.Dir.cwd().deleteFile(testing.io, path);
+    var parent = try std.Io.Dir.cwd().openDir(testing.io, dir_path, .{});
+    defer parent.close(testing.io);
+    try parent.createDir(testing.io, "auth.toml", .default_dir);
+    try testing.expectError(error.UnsafeAuthTarget, save(testing.allocator, testing.io, &env, "default", &.{
+        .{ .name = "default", .username = "u", .token = "t", .workspace = "w" },
+    }));
+    try testing.expectError(error.UnsafeAuthTarget, load(testing.allocator, testing.io, &env));
+    try parent.deleteDir(testing.io, "auth.toml");
+}
+
+test "save refuses a non-directory at the dir path" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/plain", .{&tmp.sub_path});
+    defer testing.allocator.free(base);
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", base);
+    const dir_path = (try authDirPath(testing.allocator, &env)).?;
+    defer testing.allocator.free(dir_path);
+    // Create the parent chain, then plant a regular file where the dir goes.
+    const parent_end = std.mem.lastIndexOfScalar(u8, dir_path, '/').?;
+    try std.Io.Dir.cwd().createDirPath(testing.io, dir_path[0..parent_end]);
+    var marker = try std.Io.Dir.cwd().createFile(testing.io, dir_path, .{});
+    marker.close(testing.io);
+    try testing.expectError(error.UnsafeAuthTarget, save(testing.allocator, testing.io, &env, "default", &.{
+        .{ .name = "default", .username = "u", .token = "t", .workspace = "w" },
+    }));
+}
+
+test "save follows a symlinked dir" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/linkbase", .{&tmp.sub_path});
+    defer testing.allocator.free(base);
+    const real = try std.fmt.allocPrint(testing.allocator, "{s}/real", .{base});
+    defer testing.allocator.free(real);
+    try std.Io.Dir.cwd().createDirPath(testing.io, real);
+    const link = try std.fmt.allocPrint(testing.allocator, "{s}/bbr", .{base});
+    defer testing.allocator.free(link);
+    try std.Io.Dir.cwd().symLink(testing.io, "real", link, .{});
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", base);
+    const path = try save(testing.allocator, testing.io, &env, "default", &.{
+        .{ .name = "default", .username = "u", .token = "t", .workspace = "w" },
+    });
+    defer testing.allocator.free(path);
+    var loaded = (try load(testing.allocator, testing.io, &env)).?;
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqualStrings("u", loaded.file.find("default").?.username);
+}
+
+test "resolve with complete env bypasses a broken file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer testing.allocator.free(base);
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", base);
+    try env.put("BITBUCKET_USERNAME", "env-user");
+    try env.put("BITBUCKET_TOKEN", "env-token");
+    try env.put("BITBUCKET_WORKSPACE", "env-ws");
+    const dir_path = (try authDirPath(testing.allocator, &env)).?;
+    defer testing.allocator.free(dir_path);
+    var dir = try std.Io.Dir.cwd().createDirPathOpen(testing.io, dir_path, .{});
+    defer dir.close(testing.io);
+    try dir.writeFile(testing.io, .{ .sub_path = "auth.toml", .data = "not = [valid\n" });
+    var cred = try resolve(testing.allocator, testing.io, &env, null);
+    defer cred.deinit(testing.allocator);
+    try testing.expectEqualStrings("env-user", cred.username);
+    try testing.expectEqualStrings("env-token", cred.token);
+    try testing.expectEqualStrings("env-ws", cred.workspace);
+
+    // Even a valid file must not supply an Active Profile with complete env.
+    try dir.writeFile(testing.io, .{ .sub_path = "auth.toml", .data = "active_profile = \"work\"\n[profiles.work]\n" });
+    var without_file = try resolve(testing.allocator, testing.io, &env, null);
+    defer without_file.deinit(testing.allocator);
+    try testing.expectEqualStrings("default", without_file.profile);
+}
+
+test "Profile updates preserve file symlinks and replace the private target" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const a = testing.allocator;
+    const base = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer a.free(base);
+    var env = EnvMap.init(a);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", base);
+    var dir = try tmp.dir.createDirPathOpen(io, "bbr", .{});
+    defer dir.close(io);
+    try tmp.dir.writeFile(io, .{ .sub_path = "credentials.toml", .data = "" });
+    try tmp.dir.symLink(io, "credentials.toml", "alias.toml", .{});
+    const absolute = try tmp.dir.realPathFileAlloc(io, "alias.toml", a);
+    defer a.free(absolute);
+    for ([_][]const u8{ "../alias.toml", absolute }) |link_target| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "credentials.toml", .data = "[profiles.old]\nusername = \"old-user\"\ntoken = \"old-token\"\nworkspace = \"old-ws\"\n" });
+        try dir.symLink(io, link_target, "auth.toml", .{});
+        const path = try upsertProfile(a, io, &env, "new", .{ .username = "new-user", .token = "new-token", .workspace = "new-ws" });
+        defer a.free(path);
+        var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const link_len = try dir.readLink(io, "auth.toml", &link_buffer);
+        try testing.expectEqualStrings(link_target, link_buffer[0..link_len]);
+        const source = try tmp.dir.readFileAlloc(io, "credentials.toml", a, .limited(max_auth_file_size + 1));
+        defer a.free(source);
+        var file = try parse(a, source);
+        defer file.deinit(a);
+        try testing.expectEqualStrings("new-token", file.find("new").?.token);
+        try testing.expectEqualStrings("old-token", file.find("old").?.token);
+        try testing.expect(try removeProfile(a, io, &env, "new"));
+        var loaded = (try load(a, io, &env)).?;
+        defer loaded.deinit(a);
+        try testing.expectEqual(@as(usize, 1), loaded.file.profiles.len);
+        _ = try dir.readLink(io, "auth.toml", &link_buffer);
+        const st = try tmp.dir.statFile(io, "credentials.toml", .{});
+        try testing.expectEqual(@as(u32, 0o600), @as(u32, @intFromEnum(st.permissions)) & 0o777);
+        try dir.deleteFile(io, "auth.toml");
+    }
+}
+
+test "resolve surfaces file errors only when env is incomplete" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer testing.allocator.free(base);
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", base);
+    try env.put("BITBUCKET_USERNAME", "env-user");
+    const dir_path = (try authDirPath(testing.allocator, &env)).?;
+    defer testing.allocator.free(dir_path);
+    var dir = try std.Io.Dir.cwd().createDirPathOpen(testing.io, dir_path, .{});
+    defer dir.close(testing.io);
+    try dir.writeFile(testing.io, .{ .sub_path = "auth.toml", .data = "not = [valid\n" });
+    try testing.expectError(error.InvalidAuthFile, resolve(testing.allocator, testing.io, &env, null));
 }
