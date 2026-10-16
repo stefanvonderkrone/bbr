@@ -493,9 +493,10 @@ fn warnStorage(io: std.Io, comptime fmt: []const u8, args: anytype) void {
 pub fn ensureAuthDir(allocator: Allocator, io: std.Io, env: *const EnvMap) !void {
     const dir_path = (try authDirPath(allocator, env)) orelse return error.NoDataHome;
     defer allocator.free(dir_path);
+    // Permission changes need readable handles, not Linux O_PATH handles.
     const st = std.Io.Dir.cwd().statFile(io, dir_path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
-            var dir = try std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
+            var dir = try std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{ .open_options = .{ .iterate = true } });
             defer dir.close(io);
             dir.setPermissions(io, dir_permissions) catch {
                 warnStorage(io, "could not secure {s}; continuing", .{dir_path});
@@ -505,7 +506,7 @@ pub fn ensureAuthDir(allocator: Allocator, io: std.Io, env: *const EnvMap) !void
         else => return err,
     };
     if (st.kind != .directory) return error.UnsafeAuthTarget;
-    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch |err| return err;
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| return err;
     defer dir.close(io);
     dir.setPermissions(io, dir_permissions) catch {
         warnStorage(io, "could not secure {s}; continuing", .{dir_path});

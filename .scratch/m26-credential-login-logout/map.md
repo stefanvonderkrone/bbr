@@ -12,7 +12,7 @@ Implementation can then finish Credential login and logout without guessing at i
 - This map plans M26. Implementation remains follow-up work.
 - The user confirmed the destination and the five decision areas in this conversation.
 - Read the M26 section of [TODO.md](../../TODO.md) for requirements and verification evidence.
-- Read [the context map](../../CONTEXT-MAP.md) and [the Bitbucket glossary](../../src/bitbucket/CONTEXT.md). Use Credential, Profile, Active Profile, Workspace, and Authenticated Account consistently.
+- Read [the glossary map](../../GLOSSARY-MAP.md) and [the Bitbucket glossary](../../src/bitbucket/GLOSSARY.md). Use Credential, Profile, Active Profile, Workspace, and Authenticated Account consistently.
 - Consult `grilling` and `domain-modeling` for each decision. Use `technical-writing` and `unslop` for recorded answers. Consult `zig` when checking code facts.
 - TOML storage is accepted. Preserve named Profiles unless a later user decision changes them.
 - Account and Workspace validation already exist. Missing login integration tests do not mean validation is absent.
