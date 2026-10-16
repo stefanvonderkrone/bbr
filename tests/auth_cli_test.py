@@ -13,12 +13,22 @@ import time
 binary = str(Path(sys.argv[1]).resolve())
 
 
-def run(env, args, data=b""):
+def run_ok(env, args, data=b""):
     result = subprocess.run(
         [binary, *args], input=data, capture_output=True, env=env, timeout=5
     )
     assert result.returncode == 0, result.stderr
     return result.stdout + result.stderr
+
+
+def run_fail(env, args, expected, data=b""):
+    result = subprocess.run(
+        [binary, *args], input=data, capture_output=True, env=env, timeout=5
+    )
+    assert result.returncode != 0, result
+    output = result.stdout + result.stderr
+    assert expected in output, output
+    return output
 
 
 def check_terminal(env, token_lines, expected):
@@ -27,7 +37,7 @@ def check_terminal(env, token_lines, expected):
     original[3] |= termios.ECHO | termios.ECHONL
     termios.tcsetattr(slave, termios.TCSANOW, original)
     process = subprocess.Popen(
-        [binary, "login"], stdin=slave, stdout=slave, stderr=slave, env=env
+        [binary, "auth", "login"], stdin=slave, stdout=slave, stderr=slave, env=env
     )
     transcript = bytearray()
 
@@ -56,7 +66,7 @@ def check_terminal(env, token_lines, expected):
             assert b"Token: \r\nWorkspace: " in transcript
             os.write(master, b"\x04")
             until(b"login aborted (LoginAborted)")
-        assert process.wait(timeout=5) == 0
+        assert process.wait(timeout=5) == 1
         assert termios.tcgetattr(slave) == original
     finally:
         if process.poll() is None:
@@ -74,24 +84,63 @@ with tempfile.TemporaryDirectory(prefix="bbr-auth-test-") as data_home:
     env["XDG_DATA_HOME"] = data_home
 
     invalid = dict(env, BBR_PROFILE="bad name")
-    output = run(invalid, ["login"])
-    assert b"could not select profile: InvalidProfileName" in output
-    assert b"Email:" not in output
-    for args in (["login", "work"], ["--profile", "work", "login"]):
-        assert b"Email:" in run(invalid, args)
+    run_fail(invalid, ["auth", "login"], b"could not select profile: InvalidProfileName")
+    for args in (["auth", "login", "work"], ["--profile", "work", "auth", "login"]):
+        # An explicit profile overrides the invalid BBR_PROFILE: arg parsing
+        # passes and the command reaches piped-input refusal, not profile selection.
+        output = run_fail(invalid, args, b"piped input needs --stdin", data=b"\x04")
+        assert b"InvalidProfileName" not in output
 
     for key in ("BITBUCKET_USERNAME", "BITBUCKET_TOKEN", "BITBUCKET_WORKSPACE"):
         env[key] = ""
-    assert b"override the file" not in run(env, ["logout", "--all"])
+    assert b"override the file" not in run_ok(env, ["auth", "logout", "--all"])
     for key in ("BITBUCKET_USERNAME", "BITBUCKET_TOKEN", "BITBUCKET_WORKSPACE"):
-        assert b"override the file" in run(dict(env, **{key: "fake"}), ["logout", "--all"])
+        assert b"override the file" in run_ok(dict(env, **{key: "fake"}), ["auth", "logout", "--all"])
 
-    output = run(env, ["login"], b"fake-user@example.com\nfake-token\n")
-    assert b"Email: Token: Workspace: " in output
-    assert b"login aborted (LoginAborted)" in output
+    # Piped input without --stdin is refused before the first prompt.
+    output = run_fail(env, ["auth", "login"], b"piped input needs --stdin", data=b"fake-user@example.com\nfake-token\n")
+    assert b"Email:" not in output
+
+    # Unknown options are rejected with a hint that the token never rides as argv.
+    output = run_fail(env, ["auth", "login", "--token", "x"], b"token never rides as a CLI argument")
+    assert b"fake-token" not in output and b"Email:" not in output
+
+    # --stdin is strict: it needs email+workspace and a clean single token line.
+    # Failures name the bad field and never echo the token value.
+    run_fail(env, ["auth", "login", "--stdin"], b"missing email", data=b"tok\n")
+    run_fail(env, ["auth", "login", "--stdin", "--email", "a@b.c"], b"missing workspace", data=b"tok\n")
+    for bad in (b"\n", b"   \t \n"):
+        run_fail(env, ["auth", "login", "--stdin", "--email", "a@b.c", "--workspace", "w"], b"invalid token", data=bad)
+    # An over-length token is rejected before any network use and never echoed.
+    long_secret = b"s3cr3t-" + b"x" * 2000 + b"\n"
+    output = run_fail(env, ["auth", "login", "--stdin", "--email", "a@b.c", "--workspace", "w"], b"invalid token", data=long_secret)
+    assert b"s3cr3t-" not in output
+
+    # Top-level aliases hint at the auth group.
+    run_fail(env, ["login"], b"use `bbr auth login`")
+    run_fail(env, ["logout"], b"use `bbr auth logout`")
+
+    # Missing credentials hint at login; status never prints a token.
+    output = run_fail(env, ["auth", "status"], b"bbr auth login")
+    assert b"fake" not in output
+    output = run_fail(env, ["auth", "status", "work"], b"bbr auth login")
+
     check_terminal(env, [b"fake-token\n"], b"Workspace: ")
     check_terminal(env, [b"\x04"], b"login aborted (LoginAborted)")
     check_terminal(env, [b"\n", b"\n", b"\n"], b"login aborted (LoginAborted)")
     assert not (Path(data_home) / "bbr" / "auth.toml").exists()
 
-print("Auth CLI checks passed. Profile selection, overrides, piped input, and terminal echo restoration.")
+    # Logout is idempotent and documents its limits.
+    output = run_ok(env, ["auth", "logout", "--all"])
+    assert b"does not revoke" in output
+
+    # Local review never reports a credential error, even with broken storage.
+    auth_dir = Path(data_home) / "bbr"
+    auth_dir.mkdir(exist_ok=True)
+    (auth_dir / "auth.toml").write_text("not = [valid\n")
+    result = subprocess.run([binary, "local", "bad-base", "bad-source"], capture_output=True, env=env, timeout=5)
+    combined = result.stdout + result.stderr
+    assert b"credential" not in combined.lower(), combined
+    assert b"Missing" not in combined or b"credential" not in combined.lower(), combined
+
+print("Auth CLI checks passed. Profile selection, overrides, piped refusal, strict --stdin, and terminal echo restoration.")

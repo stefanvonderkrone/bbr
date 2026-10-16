@@ -540,7 +540,7 @@ pub const Client = struct {
     }
 
     /// GET /repositories/{workspace} to prove the workspace exists and the
-    /// credential can see it. Used by `bbr login` before saving.
+    /// credential can see it. Used by `bbr auth login` and `bbr auth status`.
     pub fn checkWorkspace(self: Client, allocator: Allocator, workspace: []const u8) !void {
         const url = try std.fmt.allocPrint(allocator, "{s}/repositories/{s}?pagelen=1", .{ base_url, workspace });
         defer allocator.free(url);

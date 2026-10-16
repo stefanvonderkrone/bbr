@@ -81,7 +81,7 @@ pub const help = blk: {
     var name_width: usize = 0;
     for (verbs) |verb| name_width = @max(name_width, verb.name.len);
     for (verbs) |verb| text = text ++ "  " ++ verb.name ++ (" " ** (name_width - verb.name.len + 2)) ++ verb.summary ++ "\n";
-    break :blk text ++ "\nAuth comes from `bbr login` Profiles with per-field BITBUCKET_* overrides.\n" ++
+    break :blk text ++ "\nAuth comes from `bbr auth login` Profiles with per-field BITBUCKET_* overrides.\n" ++
         "Profile selection: --profile, BBR_PROFILE, Active Profile, default.\n" ++
         "Workspace selection: --workspace, BITBUCKET_WORKSPACE, selected Profile.\n";
 };
@@ -287,7 +287,7 @@ fn writeError(writer: *std.Io.Writer, verb: ?Verb, err: anyerror, detail: ?*cons
     } else {
         try writer.print(": {s}\n", .{@errorName(err)});
         if (err == error.MissingCredential) {
-            try writer.writeAll("Run `bbr login` or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, and --workspace or BITBUCKET_WORKSPACE.\n");
+            try writer.writeAll("Run `bbr auth login` or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, and --workspace or BITBUCKET_WORKSPACE.\n");
         }
     }
     if (verb) |v| {

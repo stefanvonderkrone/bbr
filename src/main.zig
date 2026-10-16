@@ -114,13 +114,20 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("ok: External Edit PTY handoff, redraw, and recreated input verified\n", .{});
             return;
         }
-        if (std.mem.eql(u8, f, "login")) return loginRun(init, gpa, &rest, flag_profile);
-        if (std.mem.eql(u8, f, "logout")) return logoutRun(init, gpa, &rest, flag_profile);
+        if (std.mem.eql(u8, f, "auth")) return authRun(init, gpa, &rest, flag_profile);
+        if (std.mem.eql(u8, f, "login")) {
+            std.debug.print("bbr: use `bbr auth login` (login lives under the auth group)\n", .{});
+            std.process.exit(1);
+        }
+        if (std.mem.eql(u8, f, "logout")) {
+            std.debug.print("bbr: use `bbr auth logout` (logout lives under the auth group)\n", .{});
+            std.process.exit(1);
+        }
         if (std.mem.eql(u8, f, "completion")) return completion_cli.run(init, gpa, &rest);
         if (std.mem.eql(u8, f, "check-blobs")) {
             var blob_owned = auth.resolve(gpa, init.io, init.environ_map, flag_profile) catch |err| {
                 if (err == error.InvalidAuthFile) return;
-                std.debug.print("skipped: blob checker needs a login (`bbr login`) or BITBUCKET_USERNAME, BITBUCKET_TOKEN, and BITBUCKET_WORKSPACE\n", .{});
+                std.debug.print("skipped: blob checker needs a login (`bbr auth login`) or BITBUCKET_USERNAME, BITBUCKET_TOKEN, and BITBUCKET_WORKSPACE\n", .{});
                 return;
             };
             defer blob_owned.deinit(gpa);
@@ -130,7 +137,7 @@ pub fn main(init: std.process.Init) !void {
 
     var owned = auth.resolve(gpa, init.io, init.environ_map, flag_profile) catch |err| {
         if (err == error.InvalidAuthFile) return;
-        std.debug.print("bbr: missing credential: {s}\nRun `bbr login` to save credentials, or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, BITBUCKET_WORKSPACE.\n", .{
+        std.debug.print("bbr: missing credential: {s}\nRun `bbr auth login` to save credentials, or set BITBUCKET_USERNAME, BITBUCKET_TOKEN, BITBUCKET_WORKSPACE.\n", .{
             @errorName(err),
         });
         return;
@@ -862,85 +869,182 @@ fn warnEnvOverride(env_map: *std.process.Environ.Map) void {
     }
 }
 
-/// `bbr login [profile]`: prompt for Email, Token, Workspace, verify live
-/// against Bitbucket, then save the profile and select it as active.
+/// `bbr auth login [profile] [--email E] [--workspace W] [--stdin]`.
+/// Prompts for each missing field in Email, Token, Workspace order, proves
+/// the Credential live, then saves it as the Active Profile.
+/// Exit 0 only when the Credential validates and saves, else exit 1.
 fn loginRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag_profile: ?[]const u8) !void {
     const auth = bbr.bitbucket.auth;
-    const positional = rest.next();
-    if (rest.next() != null) return usage();
+    var positional: ?[]const u8 = null;
+    var flag_email: ?[]const u8 = null;
+    var flag_workspace: ?[]const u8 = null;
+    var want_stdin = false;
+    while (rest.next()) |a| {
+        if (std.mem.eql(u8, a, "--stdin")) {
+            want_stdin = true;
+        } else if (std.mem.eql(u8, a, "--email")) {
+            flag_email = rest.next() orelse {
+                std.debug.print("bbr: --email needs a value; the token never rides as a CLI argument\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.startsWith(u8, a, "--email=")) {
+            flag_email = a["--email=".len..];
+        } else if (std.mem.eql(u8, a, "--workspace")) {
+            flag_workspace = rest.next() orelse {
+                std.debug.print("bbr: --workspace needs a value; the token never rides as a CLI argument\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.startsWith(u8, a, "--workspace=")) {
+            flag_workspace = a["--workspace=".len..];
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            std.debug.print("bbr: unknown login option '{s}'; the token never rides as a CLI argument (use the hidden prompt or --stdin)\n", .{a});
+            std.process.exit(1);
+        } else if (positional == null) {
+            positional = a;
+        } else {
+            std.debug.print("bbr: unexpected argument '{s}'; the token never rides as a CLI argument\n", .{a});
+            std.process.exit(1);
+        }
+    }
     if (positional) |p| {
         if (!auth.isValidProfileName(p)) {
             std.debug.print("bbr: invalid profile name '{s}'\n", .{p});
-            return;
+            std.process.exit(1);
         }
     }
     if (positional != null and flag_profile != null and !std.mem.eql(u8, positional.?, flag_profile.?)) {
         std.debug.print("bbr: profile given twice (`{s}` vs `--profile {s}`); use one\n", .{ positional.?, flag_profile.? });
-        return;
+        std.process.exit(1);
     }
     const profile_name = auth.selectedProfileName(gpa, init.environ_map, null, positional orelse flag_profile) catch |err| {
         std.debug.print("bbr: could not select profile: {s}\n", .{@errorName(err)});
-        return;
+        std.process.exit(1);
     };
     defer gpa.free(profile_name);
 
     const auth_path = (try auth.authFilePath(gpa, init.environ_map)) orelse {
         std.debug.print("bbr: cannot save credentials: set XDG_DATA_HOME or HOME\n", .{});
-        return;
+        std.process.exit(1);
     };
     defer gpa.free(auth_path);
 
+    const email_arg = if (flag_email) |e| (if (e.len > 0) e else null) else null;
+    const workspace_arg = if (flag_workspace) |w| (if (w.len > 0) w else null) else null;
+
     var stdin_buffer: [4096]u8 = undefined;
     var stdin = std.Io.File.stdin().reader(init.io, &stdin_buffer);
-    const email = promptField(gpa, init.io, &stdin.interface, "Email: ", false) catch |err| {
-        std.debug.print("bbr: login aborted ({s})\n", .{@errorName(err)});
-        return;
-    };
-    defer gpa.free(email);
+
+    if (want_stdin) {
+        const email = email_arg orelse {
+            std.debug.print("bbr: --stdin needs --email and --workspace; missing email; nothing saved\n", .{});
+            std.process.exit(1);
+        };
+        const workspace = workspace_arg orelse {
+            std.debug.print("bbr: --stdin needs --email and --workspace; missing workspace; nothing saved\n", .{});
+            std.process.exit(1);
+        };
+        const raw = stdin.interface.takeDelimiter('\n') catch {
+            std.debug.print("bbr: invalid token from --stdin; nothing saved\n", .{});
+            std.process.exit(1);
+        };
+        const line = raw orelse {
+            std.debug.print("bbr: invalid token from --stdin; nothing saved\n", .{});
+            std.process.exit(1);
+        };
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed.len > 1024) {
+            std.debug.print("bbr: invalid token from --stdin; nothing saved\n", .{});
+            std.process.exit(1);
+        }
+        const token = gpa.dupe(u8, trimmed) catch {
+            std.debug.print("bbr: login failed: OutOfMemory; nothing saved\n", .{});
+            std.process.exit(1);
+        };
+        defer gpa.free(token);
+        return loginValidateAndSave(init, gpa, profile_name, email, token, workspace);
+    }
+
+    const stdin_is_tty = std.Io.File.stdin().isTty(init.io) catch false;
+    if (!stdin_is_tty) {
+        std.debug.print("bbr: piped input needs --stdin with --email and --workspace, or run in a terminal\n", .{});
+        std.process.exit(1);
+    }
+    var email_owned: ?[]u8 = null;
+    defer if (email_owned) |e| gpa.free(e);
+    var workspace_owned: ?[]u8 = null;
+    defer if (workspace_owned) |w| gpa.free(w);
+    if (email_arg) |e| {
+        email_owned = gpa.dupe(u8, e) catch {
+            std.debug.print("bbr: login failed: OutOfMemory; nothing saved\n", .{});
+            std.process.exit(1);
+        };
+    } else {
+        email_owned = promptField(gpa, init.io, &stdin.interface, "Email: ", false) catch |err| {
+            std.debug.print("bbr: login aborted ({s})\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    }
     const token = promptField(gpa, init.io, &stdin.interface, "Token: ", true) catch |err| {
         std.debug.print("bbr: login aborted ({s})\n", .{@errorName(err)});
-        return;
+        std.process.exit(1);
     };
     defer gpa.free(token);
-    const workspace = promptField(gpa, init.io, &stdin.interface, "Workspace: ", false) catch |err| {
-        std.debug.print("bbr: login aborted ({s})\n", .{@errorName(err)});
-        return;
-    };
-    defer gpa.free(workspace);
+    if (workspace_arg) |w| {
+        workspace_owned = gpa.dupe(u8, w) catch {
+            std.debug.print("bbr: login failed: OutOfMemory; nothing saved\n", .{});
+            std.process.exit(1);
+        };
+    } else {
+        workspace_owned = promptField(gpa, init.io, &stdin.interface, "Workspace: ", false) catch |err| {
+            std.debug.print("bbr: login aborted ({s})\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    }
+    return loginValidateAndSave(init, gpa, profile_name, email_owned.?, token, workspace_owned.?);
+}
 
+/// Prove the candidate live (account + Workspace probes) before any save.
+/// Preserves the prior stored Credential on any failure. Exit 1 on failure.
+fn loginValidateAndSave(init: std.process.Init, gpa: std.mem.Allocator, profile_name: []const u8, email: []const u8, token: []const u8, workspace: []const u8) !void {
+    const auth = bbr.bitbucket.auth;
     const candidate: bbr.bitbucket.Credential = .{ .username = email, .token = token, .workspace = workspace };
     var http_client = bbr.http.StdHttpClient.init(gpa, init.io);
     defer http_client.deinit();
-    try http_client.initDefaultProxies(init.arena.allocator(), init.environ_map);
+    http_client.initDefaultProxies(init.arena.allocator(), init.environ_map) catch |err| {
+        std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
     const bb = bbr.bitbucket.Client.init(http_client.httpClient(), candidate);
 
     const uuid = bb.getAuthenticatedAccountUuid(gpa) catch |err| {
         if (err == error.Unauthorized) std.debug.print("bbr: login failed: bad email/token (401); nothing saved\n", .{}) else std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)});
-        return;
+        std.process.exit(1);
     };
     defer gpa.free(uuid);
     bb.checkWorkspace(gpa, workspace) catch |err| {
-        if (err == error.NotFound) {
+        if (err == error.NotFound or err == error.Forbidden) {
             std.debug.print("bbr: login failed: workspace not found or not visible; nothing saved\n", .{});
         } else {
             std.debug.print("bbr: login failed: {s}; nothing saved\n", .{@errorName(err)});
         }
-        return;
+        std.process.exit(1);
     };
 
-    const path = auth.upsertProfile(gpa, init.io, init.environ_map, profile_name, candidate) catch |err| {
-        std.debug.print("bbr: could not save credentials: {s}\n", .{@errorName(err)});
-        if (err == error.InvalidAuthFile) return;
-        return err;
+    const path = auth.upsertProfile(gpa, init.io, init.environ_map, profile_name, candidate) catch |err| switch (err) {
+        error.UnsafeAuthTarget, error.InvalidAuthFile, error.NoDataHome, error.InvalidProfileName, error.MissingUsername, error.MissingToken, error.MissingWorkspace => {
+            std.debug.print("bbr: could not save credentials: {s}; nothing saved\n", .{@errorName(err)});
+            std.process.exit(1);
+        },
+        else => return err,
     };
     defer gpa.free(path);
     std.debug.print("Logged in as '{s}'. Saved to {s}.\n", .{ profile_name, path });
     warnEnvOverride(init.environ_map);
 }
 
-/// `bbr logout [profile]` removes one profile; `bbr logout --all` deletes the
-/// whole file. Bare `bbr logout` removes the selected Profile. Missing files or
-/// profiles exit quietly with "already logged out".
+/// `bbr auth logout [profile|--all]` removes one Profile or the whole file.
+/// Idempotent: absent files succeed. States that logout neither revokes the
+/// API token nor removes environment overrides.
 fn logoutRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag_profile: ?[]const u8) !void {
     const auth = bbr.bitbucket.auth;
     var positional: ?[]const u8 = null;
@@ -948,46 +1052,64 @@ fn logoutRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
     while (rest.next()) |a| {
         if (std.mem.eql(u8, a, "--all")) {
             want_all = true;
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            std.debug.print("bbr: unknown logout option '{s}'\n", .{a});
+            std.process.exit(1);
         } else if (positional == null) {
             positional = a;
         } else {
-            return usage();
+            std.debug.print("bbr: unexpected argument '{s}'\n", .{a});
+            std.process.exit(1);
         }
     }
     if (positional) |p| {
         if (!auth.isValidProfileName(p)) {
             std.debug.print("bbr: invalid profile name '{s}'\n", .{p});
-            return;
+            std.process.exit(1);
         }
     }
     if (!want_all and positional != null and flag_profile != null and !std.mem.eql(u8, positional.?, flag_profile.?)) {
         std.debug.print("bbr: profile given twice (`{s}` vs `--profile {s}`); use one\n", .{ positional.?, flag_profile.? });
-        return;
+        std.process.exit(1);
     }
 
     if (want_all) {
-        if (try auth.deleteAuthFile(gpa, init.io, init.environ_map)) {
+        const removed = auth.deleteAuthFile(gpa, init.io, init.environ_map) catch |err| switch (err) {
+            error.UnsafeAuthTarget, error.NoDataHome => {
+                std.debug.print("bbr: logout failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            },
+            else => return err,
+        };
+        if (removed) {
             std.debug.print("Logged out (all profiles removed).\n", .{});
         } else {
             std.debug.print("Already logged out.\n", .{});
         }
+        std.debug.print("Note: logout does not revoke the API token and cannot remove environment overrides.\n", .{});
         warnEnvOverride(init.environ_map);
         return;
     }
 
     var loaded = auth.load(gpa, init.io, init.environ_map) catch |err| switch (err) {
-        error.InvalidAuthFile => return,
+        error.InvalidAuthFile, error.UnsafeAuthTarget => {
+            std.debug.print("bbr: logout failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        },
         else => return err,
     };
     defer if (loaded) |*l| l.deinit(gpa);
     const file_active: ?[]const u8 = if (loaded) |*l| l.file.active_profile else null;
     const name = auth.selectedProfileName(gpa, init.environ_map, file_active, positional orelse flag_profile) catch |err| {
         std.debug.print("bbr: could not select profile: {s}\n", .{@errorName(err)});
-        return;
+        std.process.exit(1);
     };
     defer gpa.free(name);
     const removed = auth.removeProfile(gpa, init.io, init.environ_map, name) catch |err| switch (err) {
-        error.InvalidAuthFile => return,
+        error.InvalidAuthFile, error.UnsafeAuthTarget, error.NoDataHome => {
+            std.debug.print("bbr: logout failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        },
         else => return err,
     };
     if (removed) {
@@ -995,7 +1117,107 @@ fn logoutRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fl
     } else {
         std.debug.print("Already logged out (no credentials for '{s}').\n", .{name});
     }
+    std.debug.print("Note: logout does not revoke the API token and cannot remove environment overrides.\n", .{});
     warnEnvOverride(init.environ_map);
+}
+
+/// `bbr auth status [profile]`: always validates live with both probes and
+/// reports per-field source, the proven account UUID, and distinct failures.
+/// Never writes storage. Exit 0 only when both probes pass.
+fn statusRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag_profile: ?[]const u8) !void {
+    const auth = bbr.bitbucket.auth;
+    const positional = rest.next();
+    if (rest.next() != null) {
+        std.debug.print("bbr: `auth status` takes at most one profile\n", .{});
+        std.process.exit(1);
+    }
+    if (positional) |p| {
+        if (std.mem.startsWith(u8, p, "-")) {
+            std.debug.print("bbr: unknown status option '{s}'\n", .{p});
+            std.process.exit(1);
+        }
+        if (!auth.isValidProfileName(p)) {
+            std.debug.print("bbr: invalid profile name '{s}'\n", .{p});
+            std.process.exit(1);
+        }
+    }
+    if (positional != null and flag_profile != null and !std.mem.eql(u8, positional.?, flag_profile.?)) {
+        std.debug.print("bbr: profile given twice (`{s}` vs `--profile {s}`); use one\n", .{ positional.?, flag_profile.? });
+        std.process.exit(1);
+    }
+
+    var owned = auth.resolve(gpa, init.io, init.environ_map, positional orelse flag_profile) catch |err| switch (err) {
+        error.MissingUsername, error.MissingToken, error.MissingWorkspace => {
+            std.debug.print("bbr: no credential for profile; run `bbr auth login` ({s})\n", .{@errorName(err)});
+            std.process.exit(1);
+        },
+        error.InvalidAuthFile, error.UnsafeAuthTarget, error.InvalidProfileName => {
+            std.debug.print("bbr: stored credential is unusable ({s}); run `bbr auth login`\n", .{@errorName(err)});
+            std.process.exit(1);
+        },
+        else => return err,
+    };
+    defer owned.deinit(gpa);
+
+    var http_client = bbr.http.StdHttpClient.init(gpa, init.io);
+    defer http_client.deinit();
+    http_client.initDefaultProxies(init.arena.allocator(), init.environ_map) catch |err| {
+        std.debug.print("bbr: status failed: transport ({s})\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const bb = bbr.bitbucket.Client.init(http_client.httpClient(), owned.credential());
+
+    const uuid = bb.getAuthenticatedAccountUuid(gpa) catch |err| {
+        if (err == error.Unauthorized) {
+            std.debug.print("bbr: status failed: invalid credential (401); run `bbr auth login`\n", .{});
+        } else {
+            std.debug.print("bbr: status failed: transport ({s})\n", .{@errorName(err)});
+        }
+        std.process.exit(1);
+    };
+    defer gpa.free(uuid);
+    bb.checkWorkspace(gpa, owned.workspace) catch |err| {
+        if (err == error.NotFound or err == error.Forbidden) {
+            std.debug.print("bbr: status failed: workspace '{s}' not found or not visible\n", .{owned.workspace});
+        } else {
+            std.debug.print("bbr: status failed: transport ({s})\n", .{@errorName(err)});
+        }
+        std.process.exit(1);
+    };
+
+    const email_src: []const u8 = if (auth.credentialEnvValue(init.environ_map, "BITBUCKET_USERNAME") != null) "env" else "file";
+    const token_src: []const u8 = if (auth.credentialEnvValue(init.environ_map, "BITBUCKET_TOKEN") != null) "env" else "file";
+    const workspace_src: []const u8 = if (auth.credentialEnvValue(init.environ_map, "BITBUCKET_WORKSPACE") != null) "env" else "file";
+    var output_buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &output_buffer);
+    stdout.interface.print("profile: {s}\nemail: {s} ({s})\ntoken: set ({s})\nworkspace: {s} ({s})\naccount: {s}\naccount-check: ok\nworkspace-check: ok\n", .{
+        owned.profile, owned.username, email_src, token_src, owned.workspace, workspace_src, uuid,
+    }) catch {
+        std.debug.print("bbr: status failed: output error\n", .{});
+        std.process.exit(1);
+    };
+    stdout.interface.flush() catch {
+        std.debug.print("bbr: status failed: output error\n", .{});
+        std.process.exit(1);
+    };
+}
+
+/// `bbr auth login|status|logout` dispatcher. Credential management lives
+/// outside the TUI under this one group; there are no top-level aliases.
+fn authRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag_profile: ?[]const u8) !void {
+    const sub = rest.next() orelse {
+        std.debug.print("usage: bbr auth (login|status|logout) [...]\n", .{});
+        std.process.exit(1);
+    };
+    if (std.mem.eql(u8, sub, "login")) return loginRun(init, gpa, rest, flag_profile);
+    if (std.mem.eql(u8, sub, "status")) return statusRun(init, gpa, rest, flag_profile);
+    if (std.mem.eql(u8, sub, "logout")) return logoutRun(init, gpa, rest, flag_profile);
+    if (std.mem.eql(u8, sub, "--help") or std.mem.eql(u8, sub, "-h") or std.mem.eql(u8, sub, "help")) {
+        std.debug.print("usage:\n  bbr auth login [profile] [--email E] [--workspace W] [--stdin]\n  bbr auth status [profile]\n  bbr auth logout [profile|--all]\n", .{});
+        return;
+    }
+    std.debug.print("bbr: unknown auth command '{s}' (login, status, logout)\n", .{sub});
+    std.process.exit(1);
 }
 
 fn usage() void {
@@ -1005,8 +1227,9 @@ fn usage() void {
         \\  bbr [--profile <name>] <pr-url>  open a pasted Bitbucket PR URL
         \\  bbr [--profile <name>] <repo-slug>  detect the current branch's PR in <repo>
         \\  bbr [--profile <name>] <repo-slug> <pr-id>  open a specific PR in the TUI
-        \\  bbr login [profile]              save Bitbucket credentials (prompts for Email, Token, Workspace)
-        \\  bbr logout [profile|--all]       remove saved credentials
+        \\  bbr auth login [profile] [--email E] [--workspace W] [--stdin]
+        \\  bbr auth status [profile]       prove the Credential live (never prints the token)
+        \\  bbr auth logout [profile|--all] remove saved credentials (idempotent)
         \\  bbr local [base-ref] [source-ref] review committed local Git changes
         \\  bbr check <repo-slug> <pr-id>    live smoke check (fetch + print, no TUI)
         \\  bbr check-blobs <repo> <pr-id> [<class> <old|new> <path> <attrs|->]...
@@ -1022,7 +1245,7 @@ fn usage() void {
         \\  bbr completion (bash|zsh|fish)   print a shell completion script (no credentials needed)
         \\  bbr completion --list-profiles   saved Profile names, one per line (for completion scripts)
         \\
-        \\Credentials come from `$XDG_DATA_HOME/bbr/auth.toml` (see `bbr login`).
+        \\Credentials come from `$XDG_DATA_HOME/bbr/auth.toml` (see `bbr auth login`).
         \\`--profile <name>` (or BBR_PROFILE) selects a saved profile.
         \\BITBUCKET_USERNAME, BITBUCKET_TOKEN, BITBUCKET_WORKSPACE override the file per field.
         \\
