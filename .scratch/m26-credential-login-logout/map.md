@@ -30,12 +30,11 @@ Implementation can then finish Credential login and logout without guessing at i
 - [Choose the M26 Credential source policy](issues/02-choose-credential-source-policy.md): Keep per-field env overlay, empty means missing, env rescues bad file, profile picks base, keep API workspace flag.
 - [Choose the M26 auth storage safety policy](issues/03-choose-auth-storage-safety-policy.md): Repair only the bbr dir with warn-continue, follow symlinks, refuse dir and special files, status is read-only.
 - [Define the M26 auth status contract](issues/04-define-auth-status-contract.md): Status always validates live, reports per-field source plus proven UUID, exits 1 distinctly per failure, never writes storage.
+- [Define the M26 completion evidence](issues/05-define-m26-completion-evidence.md): Hermetic suite gates completion with omission-plus-redaction containment, full failure tests, docs bar, and live optional.
 
 ## Not yet specified
 
-The effect of the combined decisions on existing Profile-based automation is not yet clear.
-Revisit that transition after the input, source, and storage policies are settled.
-Create another decision ticket only if the combined contract leaves a concrete question unanswered.
+None. The source decision retains field overlay, so existing Profile-based automation keeps working with no new decision ticket.
 
 ## Out of scope
 
