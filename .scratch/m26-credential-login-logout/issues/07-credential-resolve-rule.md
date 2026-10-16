@@ -4,7 +4,7 @@
 
 **Blocked by:** 06 Auth storage safety.
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] Empty environment values count as missing; partial sets fill the rest from the file; complete sets resolve without the file and bypass absent, malformed, or unreadable files.
 - [x] File errors surface only when the environment cannot complete the Credential; otherwise resolution succeeds silently.

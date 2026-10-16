@@ -4,7 +4,7 @@
 
 **Blocked by:** 06 Auth storage safety; 07 Credential resolve rule.
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] `bbr auth status [profile]` uses the shared Profile selector, carries no Workspace override and no local-only mode, and validates live with both account and Workspace probes on every call.
 - [x] Output reports the Profile name, configured email, Workspace, per-field file-versus-environment source markers, the proven account UUID, and separate account and Workspace results; the token never prints in any form.

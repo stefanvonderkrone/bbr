@@ -1,6 +1,6 @@
 # M26 Credential login and logout
 
-Status: ready-for-agent
+Status: done
 Milestone: M26
 
 ## Problem Statement

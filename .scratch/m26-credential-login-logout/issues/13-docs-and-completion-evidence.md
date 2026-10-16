@@ -4,7 +4,7 @@
 
 **Blocked by:** 08 Interactive auth login; 09 Non-interactive auth login; 10 Auth status; 11 Auth logout and local isolation; 12 Credential containment.
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] README, glossary, startup diagnostics, and token-rotation guidance match the shipped `bbr auth` behavior; token expiry and minimum API scopes are cited from current official docs.
 - [x] The complete hermetic suite passes through the repository test command alongside formatting, build, and CLI script checks; new test files join the import chain and the reported count increases.

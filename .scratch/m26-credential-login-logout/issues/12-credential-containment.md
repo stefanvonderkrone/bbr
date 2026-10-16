@@ -4,7 +4,7 @@
 
 **Blocked by:** 08 Interactive auth login; 09 Non-interactive auth login; 10 Auth status; 11 Auth logout and local isolation.
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] No Credential value appears in diagnostics, logs, Authorization headers, token-bearing URLs, stored files beyond the private auth file, or test snapshots.
 - [x] Containment evidence combines omission where code never prints upstream text with redaction tests where it does, spanning diagnostics, logs, headers, URLs, storage, and snapshots.

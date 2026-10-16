@@ -4,7 +4,7 @@
 
 **Blocked by:** 06 Auth storage safety; 07 Credential resolve rule.
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] `bbr auth logout` removes the selected Profile and keeps the rest; `--all` deletes only the auth file and touches nothing else on disk; absent files succeed so cleanup scripts stay idempotent.
 - [x] Logout states that it does not revoke the API token and cannot remove environment overrides; it attempts the same directory repair as login yet still refuses unsafe file targets.

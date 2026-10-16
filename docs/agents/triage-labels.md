@@ -10,4 +10,4 @@ The skills use five canonical triage roles. Local issue files record the corresp
 | `ready-for-human` | `ready-for-human` | Requires human implementation |
 | `wontfix` | `wontfix` | Will not be actioned |
 
-When a skill mentions a triage role, use the corresponding local status from this table.
+When a skill mentions a triage role, use the corresponding local status from this table. Finished work uses a completion status instead (`resolved`, `done`, or `completed`); these are not triage roles.

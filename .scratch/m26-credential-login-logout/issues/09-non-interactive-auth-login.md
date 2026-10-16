@@ -4,7 +4,7 @@
 
 **Blocked by:** 08 Interactive auth login.
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] `--stdin` supplies only the token as one silent line with no prompts and no retries; it requires `--email` and `--workspace`; surrounding spaces, tabs, and carriage returns are trimmed and empty, missing, or over-length input is invalid, naming the bad field without printing values.
 - [x] Piped input without `--stdin` is refused before the first prompt, reads nothing, and directs the user to a terminal or to `--stdin` with `--email` and `--workspace`.

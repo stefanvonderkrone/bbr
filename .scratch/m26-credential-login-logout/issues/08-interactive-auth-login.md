@@ -4,7 +4,7 @@
 
 **Blocked by:** 06 Auth storage safety; 07 Credential resolve rule.
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] `bbr auth login [profile]` accepts only `--email`, `--workspace`, and `--stdin`; unknown arguments are usage errors that state the token never rides as a CLI argument without echoing any value; top-level login/logout entry points are removed or hint at the `auth` group.
 - [x] TTY login prompts for each missing field in Email, Token, Workspace order; `--email` and `--workspace` skip their prompts when present and non-empty; the token prompt hides input and restores echo on every exit path.

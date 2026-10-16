@@ -4,7 +4,7 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] New auth directories are created private and the auth directory alone is repaired to private on login and logout, never parents; failed repair warns and continues.
 - [x] Profile saves replace the file atomically, keep prior data on interruption or failure, merge the upserted Profile without dropping others, and enforce private file mode with a visible warning when enforcement fails.
