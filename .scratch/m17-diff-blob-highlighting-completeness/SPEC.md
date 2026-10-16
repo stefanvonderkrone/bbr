@@ -1,7 +1,15 @@
 # M17 Diff, Blob, and Highlighting Completeness
 
-Status: ready-for-agent
+Status: resolved
 Milestone: M17
+
+## Completion
+
+All implementation tickets, 12 through 27, record completed acceptance criteria.
+Their historical `done` and `completed` states mean `resolved` under the current tracker contract.
+The [decision map](map.md) retains the design record.
+The implementation tickets retain the acceptance evidence, including [native Grammar support](issues/26-prove-native-grammar-support.md).
+This status reconciliation uses that recorded evidence rather than a new product test run.
 
 ## Problem Statement
 

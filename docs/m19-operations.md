@@ -18,6 +18,15 @@ Each job uses Zig 0.16.0 on a native runner. Each job checks the native target, 
 dynamic UserGrammar loading, the UserGrammar CLI lifecycle, and `zig build test --summary all`.
 The Linux x86_64 job also runs `zig fmt --check build.zig src tests`.
 
+The `test` gate includes `test-cli`, which requires `python3` and runs the existing checks:
+
+- `tests/auth_cli_test.py` checks login input, Profile selection, and terminal echo restoration through an isolated local PTY.
+- `tests/api_auth_cli_test.py` checks Credential selection and API option errors without network access.
+- `tests/completion_cli_test.py` checks completion scripts, help, Profiles, and error output.
+
+The build passes its compiled executable directly to each script. The scripts use temporary data directories and fake Credentials.
+Run `zig build test-cli --summary all` for these checks without the full suite.
+
 Required CI has read-only repository access. It receives no Bitbucket Credential, runs no live
 check, and uploads no artifact. A newer run cancels an obsolete run for the same change. A failure
 on one target does not cancel the other targets.

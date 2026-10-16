@@ -4,12 +4,19 @@ How engineering skills consume this repository's domain documentation.
 
 ## Layout
 
-This is a multi-context repository. `CONTEXT-MAP.md` names the contexts, routes to their `CONTEXT.md` glossaries, and describes relationships between them. System-wide architectural decisions live in `docs/adr/`; context-specific decisions may live under `src/<context>/docs/adr/`.
+This is a multi-context repository.
+[`GLOSSARY-MAP.md`](../../GLOSSARY-MAP.md) names the contexts, links their `GLOSSARY.md` files, and describes their relationships.
+Each `GLOSSARY.md` contains domain vocabulary.
+[`Code navigation`](../code-navigation.md) maps implementation owners and seams.
+Context-specific `IMPLEMENTATION.md` files contain code entry points, API quirks, and runtime notes.
+System-wide architectural decisions live in `docs/adr/`.
+Context-specific decisions can live under `src/<context>/docs/adr/`.
 
 ## Before exploring
 
-- Read `CONTEXT-MAP.md`.
-- Read every per-context `CONTEXT.md` relevant to the work.
+- Read `GLOSSARY-MAP.md`.
+- Read every per-context `GLOSSARY.md` relevant to the work.
+- For implementation work, follow `docs/code-navigation.md` to the relevant code owners and implementation notes.
 - Read system-wide and context-specific ADRs touching the area.
 - If a file is absent, proceed silently; domain-modeling skills create documentation lazily when a term or decision is actually resolved.
 

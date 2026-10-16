@@ -4,15 +4,41 @@ Tracks the Zig features and stdlib APIs **bbr** relies on, pinned to the current
 toolchain. Zig's std churns hard between minor versions, so when you bump Zig, re-verify each
 section against the new stdlib and update this file.
 
-- **Installed:** `zig 0.16.0` (`/opt/homebrew/bin/zig`, Cellar `0.16.0_1`)
-- **stdlib root:** `/opt/homebrew/Cellar/zig/0.16.0_1/lib/zig/std`
-- **libvaxis:** `main` (v0.6.0) — `minimum_zig_version = "0.16.0"` ✓
+- **Toolchain:** Zig 0.16.0. `zig version` identifies the active compiler.
+- **Source locations:** `zig env` reports `std_dir` and `global_cache_dir` for the active compiler.
+- **Dependencies:** `build.zig.zon` pins the libvaxis and zf commits and package hashes.
 - All API facts below were read from the installed stdlib source, not from memory.
 - Companion: the [`zig` skill](.claude/skills/zig/SKILL.md) holds the *process* (verify-don't-recall
   discipline + recurring corrections). Keep both current — see this file's re-verification checklist
   and the skill's "Keep this skill and ZIG.md current" section.
 
 ---
+
+## Find toolchain and dependency sources
+
+1. Run `zig version` and `zig env` in the current checkout.
+   Use `std_dir` for stdlib searches and `global_cache_dir` for package searches.
+   These locations can change with the host, toolchain, or cache overrides.
+2. For a dependency, read its `hash` in `build.zig.zon`.
+   Search inside `<global_cache_dir>/p` for that exact hash.
+   Zig 0.16 can store package sources as `<hash>.tar.gz` rather than an extracted directory.
+3. If the package is an archive, list its members before you search for source files:
+
+   ```sh
+   archive="<global_cache_dir>/p/<hash>.tar.gz"
+   tar -tf "$archive"
+   tar -xOf "$archive" "<hash>/src/Cell.zig"
+   ```
+
+   Replace the placeholders with the active cache path and the pinned hash.
+   The `Cell.zig` example reads libvaxis cell definitions without extracting the package.
+   Use the member path from `tar -tf` for other source files.
+4. For searches across several package files, extract the archive into a temporary directory.
+   Search inside that directory.
+   If the cache already contains an extracted package, search inside its directory directly.
+
+An empty source-file search does not prove that a cached dependency lacks the file.
+The cache can contain several package versions. The hash in the current checkout selects the relevant source.
 
 ## 1. "Writergate": `std.Io.Reader` / `std.Io.Writer`
 

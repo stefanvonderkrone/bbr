@@ -1,5 +1,5 @@
 //! Typed Bitbucket domain values and the API error taxonomy. See
-//! `src/bitbucket/CONTEXT.md` for the ubiquitous language.
+//! `src/bitbucket/GLOSSARY.md` for the ubiquitous language.
 
 /// A pull request, reduced to what M0 renders. All slices are owned by the
 /// allocator passed to the adapter call that produced it.

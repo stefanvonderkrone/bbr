@@ -8,7 +8,7 @@ An implementation-ready M19 specification and dependency map that resolves CI po
 
 ## Notes
 
-- Primary domains: Bitbucket and Presentation. Consult `CONTEXT-MAP.md`, `src/bitbucket/CONTEXT.md`, `src/tui/CONTEXT.md`, `TODO.md`, ADR-0003, and ADR-0012.
+- Primary domains: Bitbucket and Presentation. Consult `GLOSSARY-MAP.md`, `src/bitbucket/GLOSSARY.md`, `src/tui/GLOSSARY.md`, `TODO.md`, ADR-0003, and ADR-0012.
 - Use `research`, `grilling`, `domain-modeling`, `technical-writing`, and `zig` as each ticket requires.
 - Keep live Bitbucket checks opt-in and Credential-gated. Never record Credential values, Authorization headers, or token-bearing URLs in issues, assets, logs, fixtures, or command output.
 - This map plans M19. It does not implement M19, except that exposed-Credential containment is an explicit security exception and must run when its task reaches the frontier.

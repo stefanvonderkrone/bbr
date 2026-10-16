@@ -8,7 +8,7 @@ An implementation-ready M17 specification and dependency map that resolves Diff,
 
 ## Notes
 
-- Primary domains: Diff, Highlighting, Presentation, Bitbucket, and Git. Consult the relevant `CONTEXT.md` files, `CONTEXT-MAP.md`, TODO.md, ADR-0001, ADR-0003, ADR-0004, ADR-0009, and ADR-0010.
+- Primary domains: Diff, Highlighting, Presentation, Bitbucket, and Git. Consult the relevant `GLOSSARY.md` files, `GLOSSARY-MAP.md`, TODO.md, ADR-0001, ADR-0003, ADR-0004, ADR-0009, and ADR-0010.
 - Use `research`, `prototype`, `grilling`, `domain-modeling`, and `zig` as each ticket requires.
 - M17 must preserve the shared Diff pipeline for remote and local review, the Highlighter seam, independent old/new File Enrichment ownership, and the existing inactive File cache policy.
 - Terminal image protocols are not baseline M17 scope. Persistent disk caching and bounded prefetch are decisions, not assumed deliverables.
