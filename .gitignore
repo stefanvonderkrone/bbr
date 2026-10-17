@@ -16,3 +16,4 @@ bbr-submit-response.log
 .DS_Store
 .opencode
 .scratch/performance-implementation/profiles
+.scratch/verify-bbr/
