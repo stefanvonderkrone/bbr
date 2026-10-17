@@ -5,6 +5,7 @@
 **Blocked by:** 05 — Present and search joined paragraphs and headings. 06 — Present literal code blocks and Suggestions.
 
 **Status:** resolved
+**Type:** task
 
 - [x] Use the pinned Atlassian standard fixture's exact names and Unicode fallback bytes, including listed compound skin-tone names.
 - [x] Retain the pinned source and applicable attribution with the shipped data. Describe the mapping as best-effort, not a complete Cloud catalog.

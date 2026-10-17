@@ -5,6 +5,7 @@
 **Blocked by:** None — can start immediately.
 
 **Status:** resolved
+**Type:** task
 
 - [x] Without Selection, every eligible header, body row, Suggestion label, Suggestion body row, and disclosure footer copies the same complete raw body.
 - [x] Copy hidden body content without changing disclosure or cursor. Do not copy generated labels in complete-body mode.

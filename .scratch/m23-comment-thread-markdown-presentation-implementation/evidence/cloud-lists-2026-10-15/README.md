@@ -42,7 +42,10 @@ Both comparisons passed.
 
 Both responses use `<strong>`, `<em>`, `<code>`, `<a>`, and `<del>` for the authored inline formatting.
 The terminal text capture shows hidden formatting delimiters, complete link destinations, list structure, and Reply indentation.
-Human review of the published formatting remains pending.
+[Ticket 14](../../issues/14-complete-human-review-and-capture-cloud-list-evidence.md#final-human-review-result) records the completed human review.
+The human approved the published list owners' inline styles in bbr, including Selection and search comparisons in Catppuccin Mocha.
+The later P01 through P16 published-format review includes mixed list nesting in Catppuccin Mocha, light, and system Themes.
+Those later approvals cover separate published examples, not independent terminal-style approval of these exact captured artifacts in each Theme.
 
 ## Human browser and terminal comparison
 
@@ -59,7 +62,7 @@ This observation identifies a presentation difference, not a numbering or nestin
 No browser stylesheet or screenshot was captured.
 
 The human also approved bold, italic, inline code, strikethrough, and links in both published examples in the browser.
-The corresponding human terminal-style review remains pending.
+Ticket 14 also records later bbr approvals for the published list owners and the separate three-Theme format examples.
 
 ## Evidence limits
 
@@ -69,6 +72,8 @@ This observation covers only the authored four-space mixed nesting and inline fo
 It does not establish behavior for other indentation, continuation paragraphs, nested fences, or all Cloud Markdown.
 The browser-presentation evidence above is the human's report for these two Comments.
 It is separate from the captured Cloud response fields and terminal text.
+The saved artifacts contain Cloud responses and bbr text, not browser screenshots or stylesheet evidence.
+The text capture alone does not establish terminal colors or style attributes.
 
 The human delegated authoring and publication to the agent during this session.
 These observations do not change the authorship of the earlier unpublished Draft fixtures.

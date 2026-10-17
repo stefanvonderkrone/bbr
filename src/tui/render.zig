@@ -145,6 +145,7 @@ fn drawReviewCardSyntaxAt(win: vaxis.Window, row: u16, card: buffer_mod.ReviewCa
             for (cell_start..@min(cell_start +| width, win.width)) |column| {
                 var cell = win.readCell(@intCast(column), row) orelse continue;
                 cell.style.fg = fg;
+                cell.style = theme.resolveStyle(cell.style);
                 win.writeCell(@intCast(column), row, cell);
             }
         };
@@ -242,6 +243,7 @@ fn paintSearchCells(win: vaxis.Window, row: u16, start: usize, width: usize, act
         const cell = win.readCell(@intCast(column), row) orelse continue;
         var style = cell.style;
         style.bg = if (active) theme.search_active else theme.search_match;
+        style = theme.resolveStyle(style);
         win.writeCell(@intCast(column), row, .{ .char = cell.char, .style = style });
     }
 }
@@ -512,25 +514,17 @@ fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: 
 
 fn cursorRowTheme(theme: Theme) Theme {
     var result = theme;
-    result.context.bg = theme.cursorBg(theme.context.bg);
-    result.added.bg = theme.cursorBg(theme.added.bg);
-    result.removed.bg = theme.cursorBg(theme.removed.bg);
-    result.added_emphasis.bg = theme.cursorBg(theme.added_emphasis.bg);
-    result.removed_emphasis.bg = theme.cursorBg(theme.removed_emphasis.bg);
-    result.gutter.bg = theme.cursorBg(theme.gutter.bg);
-    result.file_header.bg = theme.cursorBg(theme.file_header.bg);
-    result.hunk_header.bg = theme.cursorBg(theme.hunk_header.bg);
-    result.fold.bg = theme.cursorBg(theme.fold.bg);
-    result.comment.bg = theme.cursorBg(theme.comment.bg);
-    result.comment_reply.bg = theme.cursorBg(theme.comment_reply.bg);
-    result.suggestion.bg = theme.cursorBg(theme.suggestion.bg);
+    inline for (.{
+        "context",               "added",       "removed",      "added_emphasis", "removed_emphasis",
+        "gutter",                "file_header", "hunk_header",  "fold",           "comment",
+        "comment_reply",         "suggestion",  "draft",        "draft_reply",    "outcome_unknown",
+        "outcome_unknown_reply", "section",     "section_rule",
+    }) |field| {
+        var style = @field(theme, field);
+        style.bg = theme.cursorBg(style.bg);
+        @field(result, field) = theme.resolveStyle(style);
+    }
     result.code_background = theme.cursorBg(theme.code_background);
-    result.draft.bg = theme.cursorBg(theme.draft.bg);
-    result.draft_reply.bg = theme.cursorBg(theme.draft_reply.bg);
-    result.outcome_unknown.bg = theme.cursorBg(theme.outcome_unknown.bg);
-    result.outcome_unknown_reply.bg = theme.cursorBg(theme.outcome_unknown_reply.bg);
-    result.section.bg = theme.cursorBg(theme.section.bg);
-    result.section_rule.bg = theme.cursorBg(theme.section_rule.bg);
     return result;
 }
 
@@ -586,8 +580,8 @@ fn drawSideFileHeader(scratch: std.mem.Allocator, win: vaxis.Window, row: u16, h
     }
     const old = std.fmt.allocPrint(scratch, "OLD {s}", .{header.file.old_path}) catch "OLD";
     const new = std.fmt.allocPrint(scratch, "NEW {s}", .{header.file.new_path}) catch "NEW";
-    if (half > 0) _ = win.child(.{ .x_off = 0, .y_off = row, .width = half, .height = 1 }).printSegment(.{ .text = old, .style = old_style }, .{ .wrap = .none });
-    if (right_x < win.width) _ = win.child(.{ .x_off = right_x, .y_off = row, .width = win.width - right_x, .height = 1 }).printSegment(.{ .text = new, .style = new_style }, .{ .wrap = .none });
+    if (half > 0) _ = win.child(.{ .x_off = 0, .y_off = row, .width = half, .height = 1 }).printSegment(.{ .text = old, .style = theme.resolveStyle(old_style) }, .{ .wrap = .none });
+    if (right_x < win.width) _ = win.child(.{ .x_off = right_x, .y_off = row, .width = win.width - right_x, .height = 1 }).printSegment(.{ .text = new, .style = theme.resolveStyle(new_style) }, .{ .wrap = .none });
 }
 
 fn drawSelectedColumnEdge(win: vaxis.Window, row: u16, selected: ?buffer_mod.SelectedColumn, theme: Theme) void {
@@ -597,7 +591,7 @@ fn drawSelectedColumnEdge(win: vaxis.Window, row: u16, selected: ?buffer_mod.Sel
     const current = win.readCell(divider, row) orelse return;
     win.writeCell(divider, row, .{
         .char = .{ .grapheme = if (column.inner_gutter_edge == .right) "▐" else "▌", .width = 1 },
-        .style = .{ .fg = theme.accent, .bg = current.style.bg, .bold = true },
+        .style = theme.resolveStyle(.{ .fg = theme.accent, .bg = current.style.bg, .bold = true }),
     });
 }
 
@@ -790,7 +784,7 @@ fn drawLineBodyText(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, body_
         if (run.capture) |capture| {
             if (theme.captureColor(capture)) |fg| run_style.fg = fg;
         }
-        segs[index] = .{ .text = run.text[overlap_start - offset .. overlap_end - offset], .style = run_style };
+        segs[index] = .{ .text = run.text[overlap_start - offset .. overlap_end - offset], .style = theme.resolveStyle(run_style) };
         index += 1;
         offset = run_end;
     }
@@ -1222,7 +1216,7 @@ fn drawReviewSourcePreview(scratch: std.mem.Allocator, header: vaxis.Window, pre
                         segment_style.bg = theme.search_active;
                         segment_style.bold = true;
                     }
-                    segments.append(scratch, .{ .text = line[cursor..segment_end], .style = segment_style }) catch return;
+                    segments.append(scratch, .{ .text = line[cursor..segment_end], .style = theme.resolveStyle(segment_style) }) catch return;
                     cursor = segment_end;
                 }
                 run_start = run_end;
@@ -1241,6 +1235,7 @@ fn tintReviewSearchPreviewRow(win: vaxis.Window, row: u16, theme: Theme) void {
         var cell = win.readCell(@intCast(column), row) orelse continue;
         if (std.meta.eql(cell.style.bg, theme.search_active)) continue;
         cell.style.bg = theme.cursorBg(cell.style.bg);
+        cell.style = theme.resolveStyle(cell.style);
         win.writeCell(@intCast(column), row, cell);
     }
 }
@@ -1377,7 +1372,7 @@ fn drawReviewSearchPreview(scratch: std.mem.Allocator, win: vaxis.Window, result
                     break;
                 }
             };
-            segments[index] = .{ .text = segment.text, .style = style, .link = links.get(segment.link) };
+            segments[index] = .{ .text = segment.text, .style = theme.resolveStyle(style), .link = links.get(segment.link) };
             column += metrics.width(segment.text);
         }
         _ = win.print(segments, .{ .row_offset = row, .wrap = .none });
@@ -1521,17 +1516,17 @@ test "M23 tables Preview and ReviewCards share layouts and Theme styles as proje
             try testing.expect(win.readCell(value_col, state_row).?.style.italic);
             try testing.expectEqual(theme.markdown_italic, win.readCell(value_col, state_row).?.style.fg);
             try testing.expect(win.readCell(0, ada_row).?.style.strikethrough);
-            try testing.expectEqual(theme.markdown_inline_code, win.readCell(value_col, ready_row).?.style.fg);
+            try expectComposedForeground(theme, theme.markdown_inline_code, win.readCell(value_col, ready_row).?.style);
             try testing.expectEqual(theme.search_active, win.readCell(value_col, ready_row).?.style.bg);
             if (width == 40) for (0..12) |col| {
                 const divider = win.readCell(@intCast(col), 1).?;
                 try testing.expect(divider.style.dim);
-                try testing.expectEqual(theme.gutter.fg, divider.style.fg);
+                try expectComposedForeground(theme, theme.gutter.fg, divider.style);
             };
             if (width == 40) for ([_]u16{ 0, 2 }) |row| {
                 const divider = win.readCell(5, row).?;
                 try testing.expect(divider.style.dim);
-                try testing.expectEqual(theme.gutter.fg, divider.style.fg);
+                try expectComposedForeground(theme, theme.gutter.fg, divider.style);
             };
             if (width == 7) try testing.expectEqual(theme.picker.bg, win.readCell(0, 4).?.style.bg);
             for (rows[1..], 0..) |card, row| drawReviewCard(a, win, @intCast(row), card, theme);
@@ -1795,7 +1790,7 @@ test "M23 literal Preview shares code and Suggestion backgrounds and tab search 
             drawReviewSearchPreview(a, win, result, 0, theme, terminal_cell_metrics);
             const row: u16 = @intCast(kind * 2);
             const bg = if (kind == 0) theme.code_background else theme.suggestion.bg;
-            const fg = if (kind == 0) theme.context.fg else theme.suggestion.fg;
+            const fg = theme.resolveStyle(.{ .fg = if (kind == 0) theme.context.fg else theme.suggestion.fg, .bg = theme.cursorBg(bg) }).fg;
             try testing.expectEqualStrings("a", win.readCell(0, row).?.char.grapheme);
             try testing.expectEqual(fg, win.readCell(0, row).?.style.fg);
             try testing.expectEqual(theme.cursorBg(bg), win.readCell(0, row).?.style.bg);
@@ -1843,7 +1838,7 @@ test "M23 containers Preview keeps quote bars list styles and code tab search ce
             const cell = win.readCell(@intCast(col), 1).?;
             try testing.expectEqualStrings(" ", cell.char.grapheme);
             try testing.expectEqual(theme.search_active, cell.style.bg);
-            try testing.expectEqual(theme.context.fg, cell.style.fg);
+            try expectComposedForeground(theme, theme.context.fg, cell.style);
         }
         try testing.expectEqual(theme.cursorBg(theme.picker.bg), win.readCell(0, 1).?.style.bg);
         try testing.expectEqualStrings("│", win.readCell(2, 2).?.char.grapheme);
@@ -1911,7 +1906,7 @@ test "M23 inline Review Search Preview shares Markdown styles, literal code, and
         for (9..12) |col| {
             const cell = win.readCell(@intCast(col), 0).?;
             try testing.expectEqualStrings(" ", cell.char.grapheme);
-            try testing.expectEqual(theme.markdown_inline_code, cell.style.fg);
+            try expectComposedForeground(theme, theme.markdown_inline_code, cell.style);
             try testing.expectEqual(theme.search_active, cell.style.bg);
             try testing.expect(!cell.style.bold);
         }
@@ -2621,7 +2616,7 @@ test "M23 acceptance Preview line tint preserves query contrast for source Comme
             .new = .{ .content = .{ .blob = "before\nconst needle = 42;\nafter", .highlighting = .{ .ready = .{ .spans = &source_spans } } } },
         }, 0, 0, theme);
         try testing.expectEqual(theme.cursorBg(theme.picker.bg), win.readCell(0, 1).?.style.bg);
-        try testing.expectEqual(theme.syntax_keyword, win.readCell(0, 1).?.style.fg);
+        try expectComposedForeground(theme, theme.syntax_keyword, win.readCell(0, 1).?.style);
         try testing.expect(!win.readCell(0, 1).?.style.reverse);
         try testing.expect(!win.readCell(6, 1).?.style.reverse);
         try testing.expectEqual(theme.search_active, win.readCell(6, 1).?.style.bg);
@@ -3976,10 +3971,10 @@ test "M23 highlighting syntax foreground preserves tab cells and interaction bac
         drawReviewCardSearchRange(win, 1, rows[1], .{ .visual_row = 1, .relation = .neutral, .source = .{ .start = 7, .end = 8 }, .row = .{ .start = 0, .end = 1 }, .active = true }, true, theme);
         for (5..8) |col| {
             try testing.expectEqual(theme.search_active, win.readCell(@intCast(col), 1).?.style.bg);
-            try testing.expectEqual(theme.syntax_keyword, win.readCell(@intCast(col), 1).?.style.fg);
+            try expectComposedForeground(theme, theme.syntax_keyword, win.readCell(@intCast(col), 1).?.style);
         }
         try testing.expectEqual(theme.cursorBg(theme.code_background), win.readCell(4, 1).?.style.bg);
-        try testing.expectEqual(theme.syntax_keyword, win.readCell(4, 1).?.style.fg);
+        try expectComposedForeground(theme, theme.syntax_keyword, win.readCell(4, 1).?.style);
         try testing.expectEqualStrings("b", win.readCell(8, 1).?.char.grapheme);
     }
 }
@@ -4039,7 +4034,7 @@ test "M23 highlighting selected Suggestion Preview uses shared syntax and retain
         drawReviewSearch(a, win, after.review_search.?, theme);
         try testing.expectEqualStrings("s", preview.readCell(0, 0).?.char.grapheme);
         try testing.expectEqual(theme.suggestion.bg, preview.readCell(0, 0).?.style.bg);
-        try testing.expectEqual(theme.syntax_keyword, preview.readCell(0, 1).?.style.fg);
+        try expectComposedForeground(theme, theme.syntax_keyword, preview.readCell(0, 1).?.style);
         try testing.expectEqual(theme.search_active, preview.readCell(0, 1).?.style.bg);
         try testing.expectEqual(theme.cursorBg(theme.suggestion.bg), preview.readCell(10, 1).?.style.bg);
     }
@@ -4092,7 +4087,7 @@ test "M23 highlighting published Frame renders real syntax through wrapping Sele
     try state.dispatch(.{ .action = .down });
     for (@import("theme.zig").builtins) |builtin| {
         drawReview(a, win, state.projection().review.?, builtin.value, 0);
-        try testing.expectEqual(builtin.value.syntax_keyword, win.readCell(x, y).?.style.fg);
+        try expectComposedForeground(builtin.value, builtin.value.syntax_keyword, win.readCell(x, y).?.style);
         try testing.expectEqual(builtin.value.cursorBg(builtin.value.code_background), win.readCell(x, y).?.style.bg);
     }
     try state.dispatch(.{ .action = .clear_selection });
@@ -4104,7 +4099,7 @@ test "M23 highlighting published Frame renders real syntax through wrapping Sele
     try state.dispatch(.{ .buffer_search_scanned = completed });
     for (@import("theme.zig").builtins) |builtin| {
         drawReview(a, win, state.projection().review.?, builtin.value, 0);
-        try testing.expectEqual(builtin.value.syntax_keyword, win.readCell(x, y).?.style.fg);
+        try expectComposedForeground(builtin.value, builtin.value.syntax_keyword, win.readCell(x, y).?.style);
         try testing.expectEqual(builtin.value.search_active, win.readCell(x, y).?.style.bg);
     }
     try testing.expectEqual(spans, state.projection().review.?.frame.code_highlights[0].spans.ptr);
@@ -4135,13 +4130,13 @@ test "M23 literal code cells keep foreground under cursor Selection and search i
             try testing.expectEqualStrings("b", win.readCell(15, 1).?.char.grapheme);
             try testing.expectEqualStrings("*", win.readCell(17, 1).?.char.grapheme);
             const cell = win.readCell(11, 1).?;
-            try testing.expectEqual(theme.context.fg, cell.style.fg);
+            try expectComposedForeground(theme, theme.context.fg, cell.style);
             try testing.expectEqual(theme.cursorBg(theme.code_background), cell.style.bg);
             try testing.expect(!cell.style.bold and !cell.style.italic);
             drawReviewCardSearchRange(win, 1, rows[1], .{ .visual_row = 1, .relation = .neutral, .source = .{ .start = 8, .end = 9 }, .row = .{ .start = 0, .end = 1 }, .active = true }, true, theme);
             for (12..15) |col| {
                 try testing.expectEqual(theme.search_active, win.readCell(@intCast(col), 1).?.style.bg);
-                try testing.expectEqual(theme.context.fg, win.readCell(@intCast(col), 1).?.style.fg);
+                try expectComposedForeground(theme, theme.context.fg, win.readCell(@intCast(col), 1).?.style);
             }
         }
     };
@@ -4198,7 +4193,7 @@ test "M23 acceptance narrow lists tables links and compound emoji retain styles 
                         try testing.expect(cell.style.strikethrough);
                     } else if (segment.source.start == std.mem.indexOf(u8, raw, "Ready").?) {
                         seen[3] = true;
-                        try testing.expectEqual(theme.markdown_inline_code, cell.style.fg);
+                        try expectComposedForeground(theme, theme.markdown_inline_code, cell.style);
                         try testing.expect(!cell.style.bold and !cell.style.italic);
                     } else if (segment.source.start == std.mem.indexOf(u8, raw, "Heading").?) {
                         seen[4] = true;
@@ -4211,6 +4206,107 @@ test "M23 acceptance narrow lists tables links and compound emoji retain styles 
             for (seen) |found| try testing.expect(found);
         }
     }
+}
+
+test "M23 inline system light terminal keeps composed dark surfaces readable" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const theme = @import("theme.zig").system;
+    // Catppuccin Latte has dark default and ANSI foregrounds.
+    const palette = [_]u24{
+        0x5c5f77, 0xd20f39, 0x40a02b, 0xdf8e1d,
+        0x1e66f5, 0x8839ef, 0x179299, 0xacb0be,
+        0x6c6f85, 0xd20f39, 0x40a02b, 0xdf8e1d,
+        0x1e66f5, 0x8839ef, 0x179299, 0xbcc0cc,
+    };
+    var screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    for ([_]bbr.diff.LineKind{ .context, .added, .removed }) |kind| {
+        const line: bbr.diff.Line = .{ .old_no = 1, .new_no = 1, .kind = kind, .text = "abcd" };
+        const runs = [_]bbr.highlight.decoration.Run{
+            .{ .text = line.text[0..1] },
+            .{ .text = line.text[1..2], .emphasis = true },
+            .{ .text = line.text[2..3], .capture = bbr.highlight.Capture.init(0, "variable") },
+            .{ .text = line.text[3..4], .capture = bbr.highlight.Capture.init(1, "keyword") },
+        };
+        for ([_]bool{ false, true }) |focused| {
+            drawRow(a, win, 0, .unified, null, .{ .line = .{ .line = &line, .decoration = .{ .runs = &runs } } }, if (focused) cursorRowTheme(theme) else theme);
+            for (0..4) |column| {
+                const style = win.readCell(gutter_cols + @as(u16, @intCast(column)), 0).?.style;
+                if (kind != .context or focused) try testing.expect(style.bg == .rgb);
+                if (style.bg == .rgb) try expectLightTerminalContrast(style, palette);
+            }
+            if (kind == .context and !focused) try testing.expectEqual(vaxis.Cell.Color.default, win.readCell(gutter_cols, 0).?.style.fg);
+            for ([_]bool{ false, true }) |active| {
+                paintSearchCells(win, 0, gutter_cols, 4, active, theme);
+                for (0..4) |column| try expectLightTerminalContrast(win.readCell(gutter_cols + @as(u16, @intCast(column)), 0).?.style, palette);
+            }
+        }
+    }
+    const card_mod = @import("review_card.zig");
+    const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = "```text\nabcd\n```" };
+    const cards = try card_mod.project(a, try card_mod.ReviewBody.parse(a, comment.body), .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "Ada", .content_width = 36, .metrics = .bytes, .collapsed_rows = 0 });
+    var saw_code = false;
+    for (cards) |card| {
+        if (card.part != .code_body) continue;
+        saw_code = true;
+        for ([_]bool{ false, true }) |focused| {
+            drawReviewCard(a, win, 0, card, if (focused) cursorRowTheme(theme) else theme);
+            const column: u16 = @intCast(card.contentColumn());
+            try expectLightTerminalContrast(win.readCell(column, 0).?.style, palette);
+            drawReviewCardSyntax(win, 0, card, &.{.{ .source = .{ .start = 8, .end = 12 }, .capture = bbr.highlight.Capture.init(0, "variable") }}, theme);
+            try expectLightTerminalContrast(win.readCell(column, 0).?.style, palette);
+            paintSearchCells(win, 0, column, 4, true, theme);
+            try expectLightTerminalContrast(win.readCell(column, 0).?.style, palette);
+        }
+    }
+    try testing.expect(saw_code);
+    const ranges = [_]@import("search.zig").Range{.{ .start = 8, .end = 9 }};
+    var result: presentation.ReviewSearchResult = .{
+        .kind = "COMMENT",
+        .source = "Ada",
+        .body = comment.body,
+        .scope = .review,
+        .scope_state = .current,
+        .occurrence = .{ .location = .{ .review_body = .{ .owner = .{ .comment = 1 }, .logical_line = 2 } }, .ranges = @constCast(&ranges), .column = 1, .candidate_scalars = 4, .corpus_order = 0, .session_epoch = 1 },
+    };
+    drawReviewSearchPreview(a, win, result, 0, theme, terminal_cell_metrics);
+    try testing.expectEqual(theme.search_active, win.readCell(0, 0).?.style.bg);
+    for (0..4) |column| try expectLightTerminalContrast(win.readCell(@intCast(column), 0).?.style, palette);
+    const source_ranges = [_]@import("search.zig").Range{.{ .start = 1, .end = 2 }};
+    result.occurrence.location = .{ .source = .{ .file_index = 0, .relation = .new, .old_path = "a", .new_path = "a", .new_line = 1 } };
+    result.occurrence.ranges = @constCast(&source_ranges);
+    win.fill(.{ .style = theme.picker });
+    drawReviewSourcePreview(a, win.child(.{ .height = 0 }), win, result, .{
+        .old = .absent,
+        .new = .{ .content = .{ .blob = "abcd", .highlighting = .{ .ready = .{ .spans = &.{.{ .line = 1, .start = 0, .end = 1, .capture = bbr.highlight.Capture.init(0, "keyword") }} } } } },
+    }, 0, 0, theme);
+    try testing.expectEqual(theme.search_active, win.readCell(1, 0).?.style.bg);
+    for (0..4) |column| try expectLightTerminalContrast(win.readCell(@intCast(column), 0).?.style, palette);
+}
+
+fn expectComposedForeground(theme: Theme, foreground: vaxis.Cell.Color, style: vaxis.Style) !void {
+    try testing.expectEqual(theme.resolveStyle(.{ .fg = foreground, .bg = style.bg }).fg, style.fg);
+}
+
+fn expectLightTerminalContrast(style: vaxis.Style, palette: [16]u24) !void {
+    const colors = [_]vaxis.Cell.Color{ style.fg, style.bg };
+    var luminance: [2]f64 = undefined;
+    for (colors, 0..) |color, i| {
+        const channels = switch (color) {
+            .default => vaxis.Cell.Color.rgbFromUint(0x4c4f69).rgb,
+            .rgb => |channels| channels,
+            .index => |index| vaxis.Cell.Color.rgbFromUint(if (index < 16) palette[index] else 0xff8700).rgb,
+        };
+        luminance[i] = 0;
+        for (channels, [_]f64{ 0.2126, 0.7152, 0.0722 }) |channel, weight| {
+            const srgb = @as(f64, @floatFromInt(channel)) / 255;
+            luminance[i] += weight * if (srgb <= 0.04045) srgb / 12.92 else @exp(2.4 * @log((srgb + 0.055) / 1.055));
+        }
+    }
+    try testing.expect((@max(luminance[0], luminance[1]) + 0.05) / (@min(luminance[0], luminance[1]) + 0.05) >= 3);
 }
 
 test "M23 inline headless cells retain combined marks under overlapping interaction backgrounds in every Theme and role" {
@@ -4237,7 +4333,7 @@ test "M23 inline headless cells retain combined marks under overlapping interact
             try testing.expectEqual(theme.markdown_bold, link.fg);
             try testing.expect(link.bold and link.italic and link.strikethrough and link.ul_style == .single);
             const code = win.readCell(18, 0).?.style;
-            try testing.expectEqual(theme.markdown_inline_code, code.fg);
+            try expectComposedForeground(theme, theme.markdown_inline_code, code);
             try testing.expect(code.bold and code.italic and !code.strikethrough);
             for ([_]bool{ false, true }) |active| {
                 drawReviewCardSearchRange(win, 0, rows[1], .{ .visual_row = 0, .relation = .neutral, .source = .{ .start = 12, .end = 13 }, .row = .{ .start = 0, .end = 1 }, .active = active }, active, theme);

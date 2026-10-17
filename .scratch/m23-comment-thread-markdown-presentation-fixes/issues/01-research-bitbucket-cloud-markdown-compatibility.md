@@ -44,8 +44,7 @@ Raw and HTML pairs can support later fixtures, but this research captured no liv
 The asset separates documented Cloud inputs from upstream output examples and unknown cases.
 
 See [Bitbucket Cloud Comment Markdown compatibility](../research/cloud-markdown-compatibility.md) for the comparison, fixture candidates, and sources.
-The same asset is present on `research/m23-cloud-markdown-compatibility` in its temporary worktree.
-The worktree is `/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/m23-cloud-markdown-compatibility`.
-The research worktree copy is uncommitted.
+The research used branch `research/m23-cloud-markdown-compatibility`.
+The research worktree copy was uncommitted at handoff.
 
 [Choose Cloud compatibility and evidence policy](./09-choose-cloud-compatibility-and-evidence-policy.md) holds the resulting product decision.

@@ -5,6 +5,7 @@
 **Blocked by:** 06 — Present literal code blocks and Suggestions.
 
 **Status:** resolved
+**Type:** task
 
 - [x] Select a fence Grammar from its first whitespace-separated information token without ASCII case sensitivity. Later tokens affect neither selection nor visible fence labels.
 - [x] Use the approved alias-to-suffix table through normal GrammarMatch and synthetic paths without File acquisition.

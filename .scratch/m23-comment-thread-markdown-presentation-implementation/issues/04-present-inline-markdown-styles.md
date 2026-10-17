@@ -5,6 +5,7 @@
 **Blocked by:** 03 — Yank mixed source and ReviewCard Selection.
 
 **Status:** resolved
+**Type:** task
 
 - [x] Hide valid asterisk and underscore emphasis delimiters. Keep intraword underscores literal.
 - [x] Support literal inline code, including its whitespace, Markdown characters, HTML, and emoji shortcodes. Hide only recognized delimiters.

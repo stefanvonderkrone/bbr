@@ -5,6 +5,7 @@
 **Blocked by:** 04 — Present inline Markdown styles.
 
 **Status:** resolved
+**Type:** task
 
 - [x] Support ATX and Setext headings. Show generated `§1` through `§6` markers and bold heading text with the agreed inline style precedence.
 - [x] Hide recognized heading delimiters and Setext underlines. Preserve their authored ranges for copying.

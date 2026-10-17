@@ -38,8 +38,7 @@ Shortcode retention is the documented expectation, but this research captured no
 Cloud case, escape, code, URL, alias, and exact Unicode-output rules remain unproven.
 
 See [Bitbucket Cloud Comment emoji shortcodes](../research/cloud-emoji-shortcodes.md) for the evidence and catalog choices.
-The same asset is present on `research/m23-cloud-emoji-shortcodes` in its temporary worktree.
-The worktree is `/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/m23-cloud-emoji-shortcodes`.
-The research worktree copy is uncommitted.
+The research used branch `research/m23-cloud-emoji-shortcodes`.
+The research worktree copy was uncommitted at handoff.
 
 [Choose ReviewBody Markdown presentation](./04-choose-reviewbody-markdown-presentation.md) holds the catalog and conversion-context decision.

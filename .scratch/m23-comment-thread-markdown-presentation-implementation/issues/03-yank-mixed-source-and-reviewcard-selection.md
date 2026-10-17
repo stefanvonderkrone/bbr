@@ -5,6 +5,7 @@
 **Blocked by:** 02 — Yank complete authored ReviewBody content.
 
 **Status:** resolved
+**Type:** task
 
 - [x] Scan the inclusive Selection from top to bottom, regardless of its direction, starting owner, or cursor File.
 - [x] Keep source and ReviewCards in display order across Files. Do not collect source Lines across an intervening ReviewCard.

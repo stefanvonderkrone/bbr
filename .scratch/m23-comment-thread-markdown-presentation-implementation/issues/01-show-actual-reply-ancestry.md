@@ -5,6 +5,13 @@
 **Blocked by:** None — can start immediately.
 
 **Status:** resolved
+**Type:** task
+
+## Question
+
+How must Presentation show actual Reply ancestry and keep bodies readable at narrow widths?
+
+## Acceptance criteria
 
 - [x] Complete each parent's subtree before the next sibling. Published siblings retain input order and precede Draft siblings in creation order.
 - [x] Keep Draft descendants inside their parent's subtree. Each known parent relationship adds one depth level from a root at depth zero.

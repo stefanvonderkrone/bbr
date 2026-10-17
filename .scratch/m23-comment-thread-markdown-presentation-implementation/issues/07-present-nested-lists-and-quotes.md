@@ -5,6 +5,7 @@
 **Blocked by:** 05 — Present and search joined paragraphs and headings. 06 — Present literal code blocks and Suggestions.
 
 **Status:** resolved
+**Type:** task
 
 - [x] Display unordered list markers as bullets. Accept digit-plus-period ordered markers and keep closing-parenthesis markers literal.
 - [x] Increment ordered numbering from the first authored number, regardless of later authored numbers in that list.

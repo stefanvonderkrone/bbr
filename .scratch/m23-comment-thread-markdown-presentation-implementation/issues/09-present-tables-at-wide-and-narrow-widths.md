@@ -5,6 +5,7 @@
 **Blocked by:** 04 — Present inline Markdown styles.
 
 **Status:** resolved
+**Type:** task
 
 - [x] Recognize a table through its header and separator rows. Apply separator alignment and inline styles to cells.
 - [x] Escaped pipes and inline-code pipes do not split cells. Missing cells are empty.

@@ -307,7 +307,7 @@
 			choiceLabel.append(radio, document.createTextNode(` ${letter}. ${title}`));
 			option.append(choiceLabel);
 			if (recordedAnswers[index] === letter) option.append(element('span', 'badge', 'Recorded choice from chat.'));
-			else if (letter === 'a') option.append(element('span', 'badge', 'Recommended.'));
+			else if (!recordedAnswers[index] && letter === 'a') option.append(element('span', 'badge', 'Recommended.'));
 			option.append(element('p', '', description));
 			const text = clipboard(contributions(index, scenario, state.selection, letter));
 			option.append(element('h3', '', 'Clipboard result'));

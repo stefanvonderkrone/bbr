@@ -5,6 +5,7 @@
 **Blocked by:** 05 — Present and search joined paragraphs and headings. 11 — Highlight fenced code with bounded background work.
 
 **Status:** resolved
+**Type:** task
 
 - [x] A recognized Suggestion uses its root's authored inline File path and replacement code through normal GrammarMatch. Replies inherit that root context.
 - [x] Moved and Outdated Suggestions retain the original authored path. Missing context leaves the Suggestion plain.

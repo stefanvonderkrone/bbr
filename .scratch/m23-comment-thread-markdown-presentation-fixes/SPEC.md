@@ -426,15 +426,16 @@ Final acceptance also requires post-implementation human review:
 
 The user approved the integrated acceptance contract and closure of the map with `ok`.
 All planning tickets are resolved, and no in-scope fog remains.
-This specification is ready for implementation. The application does not yet implement this specification.
+At planning handoff, this specification was ready for implementation.
+[Ticket 14](../m23-comment-thread-markdown-presentation-implementation/issues/14-complete-human-review-and-capture-cloud-list-evidence.md#final-human-review-result) records the completed implementation review and accepted presentation changes.
 
-The current code supplies ReviewBody authored ranges, ReviewCard ownership, Presentation command handling, headless rendering, and M21 search tests.
-The current parser still makes a complete body literal for an unclosed Suggestion.
-The current Bitbucket adapter still discards Deleted Comment bodies.
-Implementation must replace those behaviors under the approved local-fallback and raw-copy contracts.
+At handoff, the code supplied ReviewBody authored ranges, ReviewCard ownership, Presentation command handling, headless rendering, and M21 search tests.
+The parser then made a complete body literal for an unclosed Suggestion.
+The Bitbucket adapter then discarded Deleted Comment bodies.
+The implementation replaced those behaviors under the approved local-fallback and raw-copy contracts.
 
 [Bitbucket Cloud Comment Markdown compatibility](./research/cloud-markdown-compatibility.md) records the Markdown facts and evidence limits.
 [Bitbucket Cloud Comment emoji shortcodes](./research/cloud-emoji-shortcodes.md) records the pinned fixture source, exact fallback examples, and provenance.
 Neither research asset contains live Cloud Comment observations.
-The later human review supplies the required observed list fixtures.
-Selecting its test PullRequest does not block implementation under the agreed project behavior and best-effort policy.
+Ticket 14 records the later authorized, agent-authored Cloud list observations and their evidence limits.
+Selection of the test PullRequest did not block implementation under the agreed project behavior and best-effort policy.

@@ -5,6 +5,7 @@
 **Blocked by:** 04 — Present inline Markdown styles.
 
 **Status:** resolved
+**Type:** task
 
 - [x] Show explicit links as `label ‹URL›` and images as `image: alt ‹URL›`. Show optional titles after destinations.
 - [x] Keep complete destinations visible through wrapping in ReviewCards and Preview. Relative destinations retain authored text without an inferred base URL.

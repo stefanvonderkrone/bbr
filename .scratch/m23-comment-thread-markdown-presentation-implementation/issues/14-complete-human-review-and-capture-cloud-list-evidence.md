@@ -538,7 +538,7 @@ This result covers the plain code fixture in the current Catppuccin Mocha Theme.
 Syntax-color review and other Theme variants remain pending.
 
 The agent then restarted `m23-review` with the built-in `light` Theme through a temporary `XDG_CONFIG_HOME`.
-The temporary configuration is `/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/m23-light/bbr/config.toml`.
+The temporary configuration used `bbr/config.toml` under the light-Theme `XDG_CONFIG_HOME`.
 The agent positioned Draft 39 at the top with the Buffer Search query `const x = 1`.
 Human light-Theme review remains pending.
 
@@ -552,7 +552,7 @@ The agent requested a comparison after clearing Selection.
 The human approved both states.
 
 The agent then restarted `m23-review` with the built-in `system` Theme through a temporary `XDG_CONFIG_HOME`.
-The temporary configuration is `/var/folders/dq/11fgn5lj5l539gh02ty2qjv40000gn/T/opencode/m23-system/bbr/config.toml`.
+The temporary configuration used `bbr/config.toml` under the system-Theme `XDG_CONFIG_HOME`.
 The agent positioned Draft 39 at the top with the Buffer Search query `const x = 1`.
 Human system-Theme review remains pending.
 

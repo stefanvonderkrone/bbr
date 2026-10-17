@@ -15,6 +15,8 @@ const Color = vaxis.Cell.Color;
 const review_card = @import("review_card.zig");
 
 pub const Theme = struct {
+    /// Pair fixed RGB bands with fixed foregrounds in the terminal-owned Theme.
+    fixed_band_foregrounds: bool = false,
     /// Frame-owned Pane and Overlay chrome.
     pane_border: Style = .{ .dim = true },
     pane_border_focused: Style = .{ .bold = true },
@@ -105,21 +107,34 @@ pub const Theme = struct {
 
     /// Style for a diff body line of the given kind.
     pub fn lineStyle(self: Theme, kind: LineKind) Style {
-        return switch (kind) {
+        return self.resolveStyle(switch (kind) {
             .context => self.context,
             .added => self.added,
             .removed => self.removed,
-        };
+        });
     }
 
     /// Style for the emphasized (changed) run within an added/removed line.
     /// Context lines have no emphasis, so they fall back to their base band.
     pub fn emphasisStyle(self: Theme, kind: LineKind) Style {
-        return switch (kind) {
+        return self.resolveStyle(switch (kind) {
             .context => self.context,
             .added => self.added_emphasis,
             .removed => self.removed_emphasis,
+        });
+    }
+
+    /// Resolve after foreground/background composition. Terminal palette colors
+    /// remain terminal-owned only while the background is terminal-owned too.
+    pub fn resolveStyle(self: Theme, base: Style) Style {
+        if (!self.fixed_band_foregrounds or base.bg != .rgb) return base;
+        var style = base;
+        style.fg = switch (base.fg) {
+            .default => rgb(0xcd_d6_f4),
+            .index => |index| if (index < band_foregrounds.len) rgb(band_foregrounds[index]) else base.fg,
+            .rgb => base.fg,
         };
+        return style;
     }
 
     /// Compose a ReviewCard surface, semantic part, and inline Markdown marks.
@@ -166,7 +181,7 @@ pub const Theme = struct {
             style.fg = self.gutter.fg;
             style.dim = true;
         }
-        return style;
+        return self.resolveStyle(style);
     }
 
     /// Highlighted background for a cell on the cursor row. A cell with an rgb
@@ -335,9 +350,19 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
     };
 }
 
-// Keep terminal foreground colors, but use muted backgrounds. ANSI red, green,
-// and yellow are text colors in many palettes, not readable diff/search bands.
+// Fixed foregrounds for fixed dark bands. Preserve ANSI hues without depending
+// on whether the terminal palette supplies light or dark text colors.
+const band_foregrounds = [_]u24{
+    0xcdd6f4, 0xf38ba8, 0xa6e3a1, 0xf9e2af,
+    0x89b4fa, 0xcba6f7, 0x94e2d5, 0xbac2de,
+    0xbac2de, 0xf38ba8, 0xa6e3a1, 0xf9e2af,
+    0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xa6adc8,
+};
+
+// Keep terminal colors on terminal backgrounds. Pair muted RGB bands with
+// readable RGB foregrounds through resolveStyle, including cursor and search.
 pub const system: Theme = .{
+    .fixed_band_foregrounds = true,
     .pane_border = .{ .fg = .{ .index = 8 }, .dim = true },
     .pane_border_focused = .{ .bold = true },
     .overlay_border = .{ .bold = true },

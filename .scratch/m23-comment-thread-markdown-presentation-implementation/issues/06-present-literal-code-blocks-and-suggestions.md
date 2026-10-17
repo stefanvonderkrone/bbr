@@ -5,6 +5,7 @@
 **Blocked by:** 04 — Present inline Markdown styles.
 
 **Status:** resolved
+**Type:** task
 
 - [x] Recognize root indented code and backtick or tilde fences. An opening fence has at least three matching characters.
 - [x] A closing fence uses the opening character and at least the opening length. Hide only recognized delimiters.

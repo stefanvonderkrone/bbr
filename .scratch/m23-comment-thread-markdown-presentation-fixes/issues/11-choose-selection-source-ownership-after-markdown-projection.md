@@ -60,7 +60,7 @@ They also include mixed-owner order, wrapped-line deduplication, a search reveal
 The prototype uses hand-built rows rather than the application parser.
 Its outputs remain proposals until the user confirms the copying rules.
 Browser checks covered all 22 examples, exact-byte results, upward Selection, and combined lettered and longform answers.
-This ticket remains claimed and unresolved.
+At that point, this ticket remained claimed and unresolved.
 
 ### User answers to the visual questions
 

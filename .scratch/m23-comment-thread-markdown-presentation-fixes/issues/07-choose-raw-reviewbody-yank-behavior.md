@@ -223,7 +223,7 @@ No system clipboard, live Bitbucket write, or terminal worker is required for th
 | --- | --- |
 | Any eligible ReviewCard part, no Selection | Copy the same complete raw body. Do not include generated labels. |
 | Collapsed footer, no Selection | Copy the complete body, including hidden lines, without expanding it. |
-| Authored body `  **keep** :smile:  \n\n` | Copy those exact bytes, including leading spaces, trailing spaces, the shortcode, and both final newlines. |
+| Authored body `··**keep**·:smile:··↵↵`, where `·` marks one space and `↵` marks one newline | Copy the represented bytes, including two leading spaces, two trailing spaces, the shortcode, and both final newlines. Do not copy the visible markers. |
 | Authored body with tabs and a fenced `suggestion` block | Complete-body copying retains all tabs and both authored fences. |
 | Selected row displays an emoji authored as `:smile:` | Copy the authored logical line containing `:smile:`, not the displayed emoji. |
 | Selection starts in source and ends in a Comment | Copy eligible source Lines and selected authored body lines in display order. |

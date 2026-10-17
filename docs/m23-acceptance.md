@@ -123,19 +123,19 @@ The follow-up review found no remaining Standards findings.
 ### Spec
 
 The Spec review found no missing requirements, scope changes, or incorrect acceptance claims.
-The human acceptance work remains in ticket 14.
+Ticket 14 records the completed human acceptance work.
 
 The targeted checks and the complete 1,086-test suite passed after the review fixes.
 
-## Remaining human work
+## Completed human review
 
-Ticket 14 owns the required human terminal review.
-The human must first agree on the test PullRequest and the Comment authoring scope.
-The test PullRequest and scope remain unset.
+[Ticket 14](../.scratch/m23-comment-thread-markdown-presentation-implementation/issues/14-complete-human-review-and-capture-cloud-list-evidence.md#final-human-review-result) records the final human review result.
+The human agreed on PullRequest 2425 in `check24/pr-webapp` and Review-level Comments, Replies, and local Drafts.
+The human later authorized the agent to author and publish the list examples.
 
-The human review covers the approved format combinations, narrow Replies, terminal attributes, Themes, disclosure, and clipboard output.
-The human must author the example Comments.
-The list cases require raw Markdown, returned Cloud HTML, and observed bbr output for the same Comment.
+The human approved the reviewed format combinations, narrow Replies, terminal attributes, Themes, and disclosure.
+Ticket 14 distinguishes human clipboard checks, live agent checks, and automated-only mixed source and inline-Comment checks.
+The [Cloud list evidence](../.scratch/m23-comment-thread-markdown-presentation-implementation/evidence/cloud-lists-2026-10-15/README.md) pairs authored Markdown, returned Cloud HTML, and bbr output for the same Comments.
 Each observation records its date and Comment context.
-Browser presentation observations remain separate from Cloud wire and bbr observations.
-Those observations establish only the tested cases.
+Browser reports remain separate from captured Cloud artifacts and bbr output.
+The evidence establishes only the tested cases.

@@ -5,6 +5,7 @@
 **Blocked by:** 01, 07, 08, 09, 10, 12
 
 **Status:** resolved
+**Type:** task
 
 - [x] Cover every row of the approved M23 acceptance matrix through its existing observable test seam. Each preceding ticket retains its own acceptance tests.
 - [x] Exercise parent-grouped mixed Replies with headings, styles, links, emoji, lists, quotes, code, Suggestions, and tables at narrow widths.
