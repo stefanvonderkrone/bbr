@@ -11636,6 +11636,8 @@ pub const Presentation = struct {
             self.discardQueuedReviewSearchScans();
             self.discardQueuedSearchEnrichments(current);
         }
+        // The File finder borrows the replaced Session's Files.
+        self.closeFileFinder();
         self.published = candidate;
         self.preferences = job.preferences;
         self.discardQueuedBufferSearchScans(null);
@@ -18852,6 +18854,27 @@ test "File finder Escape dismisses and reopening resets its query" {
     try testing.expect(presentation.projection().file_finder == null);
     try presentation.dispatch(.{ .action = .open_file_finder });
     try testing.expectEqualStrings("", presentation.projection().file_finder.?.query());
+}
+
+test "File finder opened during a replacement does not outlive the replaced Session" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    const load = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'F', .text = "F" } });
+    try testing.expect(presentation.projection().file_finder != null);
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testTwoFileSession(testing.allocator, 2) },
+    } });
+    try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.pull_request.?.id);
+    try testing.expect(presentation.projection().file_finder == null);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'b', .text = "b" } });
 }
 
 test "Comment Action ladder carries inline File and Review scopes" {
