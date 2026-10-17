@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const keymap = @import("keymap.zig");
-const theme = @import("theme.zig");
+const ThemeId = @import("theme_id.zig").ThemeId;
 
 const testing = std.testing;
 
@@ -22,8 +22,7 @@ pub const Configuration = struct {
     pub const default_comments_collapsed_rows: usize = 6;
     pub const default_external_edit_max_bytes: usize = 1024 * 1024;
 
-    theme_name: []const u8,
-    active_theme: theme.Theme,
+    theme: ThemeId,
     keymap: keymap.OwnedKeymap,
     highlight_max_file_bytes: usize,
     file_cache_enabled: bool,
@@ -34,7 +33,6 @@ pub const Configuration = struct {
     external_edit_max_bytes: usize,
 
     pub fn deinit(self: *Configuration, allocator: std.mem.Allocator) void {
-        allocator.free(self.theme_name);
         self.keymap.deinit(allocator);
     }
 };
@@ -90,8 +88,7 @@ pub const LoadResult = union(enum) {
 
 fn defaults(allocator: std.mem.Allocator) !Configuration {
     return .{
-        .theme_name = try allocator.dupe(u8, "system"),
-        .active_theme = theme.system,
+        .theme = .system,
         .keymap = try keymap.Keymap.fromOverrides(allocator, &.{}),
         .highlight_max_file_bytes = Configuration.default_highlight_max_file_bytes,
         .file_cache_enabled = true,
@@ -150,7 +147,7 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
     }
     var override_lines: std.ArrayList(usize) = .empty;
     defer override_lines.deinit(allocator);
-    var theme_name: []const u8 = "system";
+    var theme: ThemeId = .system;
     var theme_seen = false;
     var highlight_max_file_bytes = Configuration.default_highlight_max_file_bytes;
     var highlight_limit_seen = false;
@@ -290,9 +287,9 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
             .root => if (std.mem.eql(u8, key, "theme")) {
                 if (theme_seen) {
                     try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'theme' key", .hint = "keep exactly one top-level theme entry" });
-                } else if (!isThemeName(value)) {
-                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown Theme name", .hint = "use system, dark, light, Catppuccin, Gruvbox, or Solarized" });
-                } else theme_name = value;
+                } else if (ThemeId.fromName(value)) |id| {
+                    theme = id;
+                } else try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown Theme name", .hint = "use system, dark, light, Catppuccin, Gruvbox, or Solarized" });
                 theme_seen = true;
             } else try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown top-level key", .hint = "did you mean 'theme'?" }),
             .keymap => unreachable,
@@ -392,8 +389,7 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
         return .{ .invalid = try diagnostics.toOwnedSlice(allocator) };
     }
     return .{ .ok = .{
-        .theme_name = try allocator.dupe(u8, theme_name),
-        .active_theme = theme.byName(theme_name).?,
+        .theme = theme,
         .keymap = owned_keymap,
         .highlight_max_file_bytes = highlight_max_file_bytes,
         .file_cache_enabled = file_cache_enabled,
@@ -460,10 +456,6 @@ test "M21 kernel strict configuration rejects removed wrapping Action" {
     defer result.deinit(testing.allocator);
     try testing.expect(result == .invalid);
     try testing.expectEqualStrings("unknown Action name", result.invalid[0].message);
-}
-
-fn isThemeName(name: []const u8) bool {
-    return theme.byName(name) != null;
 }
 
 const LineParser = struct {
@@ -580,7 +572,7 @@ test "configuration resolves theme and keymap while collecting independent diagn
     var result = try parse(testing.allocator, source);
     defer result.deinit(testing.allocator);
     try testing.expect(result == .ok);
-    try testing.expectEqualStrings("catppuccin-mocha", result.ok.theme_name);
+    try testing.expectEqual(ThemeId.catppuccin_mocha, result.ok.theme);
 
     const broken =
         \\theem = "dark"
@@ -746,7 +738,7 @@ test "configuration intake owns missing valid malformed and unreadable file stat
     var missing = try load(testing.allocator, io, &env);
     defer missing.deinit(testing.allocator);
     try testing.expect(missing == .ok);
-    try testing.expectEqualStrings("system", missing.ok.theme_name);
+    try testing.expectEqual(ThemeId.system, missing.ok.theme);
 
     var bbr_dir = try tmp.dir.createDirPathOpen(io, "bbr", .{});
     defer bbr_dir.close(io);
@@ -760,8 +752,7 @@ test "configuration intake owns missing valid malformed and unreadable file stat
     var valid = try load(testing.allocator, io, &env);
     defer valid.deinit(testing.allocator);
     try testing.expect(valid == .ok);
-    try testing.expectEqualStrings("gruvbox-light", valid.ok.theme_name);
-    try testing.expect(std.meta.eql(theme.gruvbox_light, valid.ok.active_theme));
+    try testing.expectEqual(ThemeId.gruvbox_light, valid.ok.theme);
     var resolver = keymap.Resolver{};
     try testing.expectEqual(keymap.Action.page_down, resolver.feed(valid.ok.keymap.keymap(), .diff, .{ .codepoint = 'x', .mods = .{ .ctrl = true } }).action);
 

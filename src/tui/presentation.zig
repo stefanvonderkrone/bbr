@@ -13,6 +13,7 @@ const file_enrichment = @import("file_enrichment.zig");
 const keymap_mod = @import("keymap.zig");
 const list_overlay_mod = @import("list_overlay.zig");
 const ListOverlay = list_overlay_mod.ListOverlay;
+const ThemeId = @import("theme_id.zig").ThemeId;
 const frame_mod = @import("frame.zig");
 const file_tree = frame_mod.file_tree;
 const buffer_mod = @import("buffer.zig");
@@ -861,6 +862,8 @@ pub const Dependencies = struct {
     keymap: keymap_mod.Keymap = .default,
     remote_enabled: bool = true,
     cell_metrics: frame_mod.CellMetrics = .bytes,
+    /// The Theme config.toml named at startup.
+    configured_theme: ThemeId = .system,
 };
 
 pub const InitialReview = struct {
@@ -2867,6 +2870,9 @@ pub const Projection = struct {
     delete_confirmation: ?DeleteConfirmationProjection,
     list_overlay: ?*const ListOverlay,
     picker_tick_scope: ?WorkId,
+    /// The Theme to paint this frame.
+    theme: ThemeId,
+    configured_theme: ThemeId,
     help_visible: bool,
     action_availability: ActionAvailability,
     loading_pull_request_id: ?u64,
@@ -5507,6 +5513,7 @@ pub const Presentation = struct {
     speculative_enrichment: ?SpeculativeEnrichment = null,
     resolver: keymap_mod.Resolver = .{},
     list_overlay: ?ListOverlay = null,
+    configured_theme: ThemeId,
     help_visible: bool = false,
     durable_submission: ?*DurableSubmission = null,
     submission_tree: ?*SubmissionTree = null,
@@ -5558,6 +5565,7 @@ pub const Presentation = struct {
             .allocator = allocator,
             .dependencies = dependencies,
             .geometry = geometry,
+            .configured_theme = dependencies.configured_theme,
         };
         errdefer self.deinit();
         if (boot.initial) |initial| {
@@ -5801,6 +5809,8 @@ pub const Presentation = struct {
             } else null,
             .list_overlay = if (self.list_overlay) |*overlay| overlay else null,
             .picker_tick_scope = if (self.shutdown_requested) null else if (self.list_overlay) |*overlay| overlay.tickScope() else null,
+            .theme = self.configured_theme,
+            .configured_theme = self.configured_theme,
             .help_visible = self.help_visible,
             .action_availability = self.actionAvailability(),
             .loading_pull_request_id = if (self.replacement) |replacement|
@@ -18824,6 +18834,15 @@ test "File finder opened during a replacement does not outlive the replaced Sess
     try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.pull_request.?.id);
     try testing.expect(testListOverlay(&presentation, .file_finder) == null);
     try presentation.dispatch(.{ .key = .{ .codepoint = 'b', .text = "b" } });
+}
+
+test "the projected Theme is the configured Theme" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .configured_theme = .gruvbox_dark }, .{});
+    defer presentation.deinit();
+    try testing.expectEqual(ThemeId.gruvbox_dark, presentation.projection().theme);
+    try testing.expectEqual(ThemeId.gruvbox_dark, presentation.projection().configured_theme);
 }
 
 test "opening one List Overlay closes the open one" {

@@ -11,6 +11,7 @@ const bbr = @import("bbr");
 
 const render = @import("render.zig");
 const theme = @import("theme.zig");
+const ThemeId = @import("theme_id.zig").ThemeId;
 const Nav = @import("nav.zig").Nav;
 const keymap = @import("keymap.zig");
 const session = @import("session.zig");
@@ -34,7 +35,7 @@ pub const RunCtx = struct {
     bitbucket: ?bbr.bitbucket.Client = null,
     repo: []const u8,
     store: PendingReviewStore,
-    active_theme: theme.Theme,
+    theme: ThemeId,
     keymap: keymap.Keymap,
     highlighter: bbr.highlight.Highlighter,
     highlight_max_file_bytes: usize,
@@ -110,6 +111,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         .keymap = ctx.keymap,
         .remote_enabled = ctx.online,
         .cell_metrics = vaxis_cell_metrics,
+        .configured_theme = ctx.theme,
     }, .{
         .initial = if (initial) |loaded| .{
             .key = initial_key,
@@ -184,6 +186,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
 
         const projection = state.projection();
         if (painted_revision) |revision| if (std.meta.eql(revision, projection.revision)) continue;
+        const active_theme = theme.value(projection.theme);
         const win = vx.window();
         const content_win = win.child(.{
             .x_off = 0,
@@ -196,7 +199,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             const visual_cursor = review_projection.frame.navigation.cursor;
             const buffer_cursor = if (visual_cursor < review_projection.frame.visual_rows.len) review_projection.frame.visual_rows[visual_cursor].buffer_index else 0;
             const selected_file = review_projection.frame.buffer.fileIndexForRow(buffer_cursor) orelse 0;
-            render.drawReview(frame, content_win, review_projection, ctx.active_theme, selected_file);
+            render.drawReview(frame, content_win, review_projection, active_theme, selected_file);
             const status = presentationStatus(frame, projection, review_projection.key);
             drawStatus(
                 frame,
@@ -218,27 +221,27 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
                 status,
                 projection.buffer_search != null,
                 if (projection.buffer_search) |search_projection| search_projection.query.len > 0 and search_projection.total == 0 else false,
-                ctx.active_theme,
+                active_theme,
             );
         } else {
             const status = presentationStatus(frame, projection, null);
-            render.drawLoading(frame, content_win, projection.loading_pull_request_id, ctx.active_theme, status);
+            render.drawLoading(frame, content_win, projection.loading_pull_request_id, active_theme, status);
         }
-        if (projection.list_overlay) |overlay| render.drawListOverlay(frame, content_win, overlay, ctx.active_theme);
-        if (projection.review_search) |review_search| render.drawReviewSearch(frame, content_win, review_search, ctx.active_theme);
-        if (projection.composer) |composer| render.drawComposerProjection(frame, content_win, composer, ctx.active_theme);
+        if (projection.list_overlay) |overlay| render.drawListOverlay(frame, content_win, overlay, active_theme);
+        if (projection.review_search) |review_search| render.drawReviewSearch(frame, content_win, review_search, active_theme);
+        if (projection.composer) |composer| render.drawComposerProjection(frame, content_win, composer, active_theme);
         if (projection.unknown_resolution) |resolution| render.drawComposerProjection(frame, content_win, .{
             .label = "Link existing Bitbucket Comment ID",
             .body = resolution.comment_id,
-        }, ctx.active_theme);
+        }, active_theme);
         if (projection.delete_confirmation) |confirmation| render.drawComposerProjection(frame, content_win, .{
             .label = "Delete local Draft · Enter delete · Esc cancel",
             .body = deleteConfirmationText(frame, confirmation),
-        }, ctx.active_theme);
+        }, active_theme);
         if (projection.submission_tree) |tree| if (projection.review) |review_projection|
             if (presentation.OwnedReviewIdentity.eql(tree.key, review_projection.key))
-                render.drawSubmissionTree(frame, content_win, ctx.active_theme, tree);
-        if (projection.help_visible) render.drawHelp(frame, content_win, ctx.active_theme, ctx.keymap, projection.action_availability);
+                render.drawSubmissionTree(frame, content_win, active_theme, tree);
+        if (projection.help_visible) render.drawHelp(frame, content_win, active_theme, ctx.keymap, projection.action_availability);
         try vx.render(writer);
         painted_revision = projection.revision;
         _ = frame_arena.reset(.{ .retain_with_limit = frame_arena_retained_limit });
@@ -1299,6 +1302,7 @@ test {
     _ = @import("nav.zig");
     _ = @import("keymap.zig");
     _ = @import("list_overlay.zig");
+    _ = @import("theme_id.zig");
     _ = @import("session.zig");
     _ = @import("arena_ring.zig");
     _ = @import("composer.zig");
