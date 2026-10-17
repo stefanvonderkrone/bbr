@@ -1042,7 +1042,7 @@ fn drainPresentationCommands(
             continue;
         }
         futures.ensureUnusedCapacity(ctx.gpa, 1) catch {
-            try admitPresentationLaunchFailure(state, &command);
+            try state.dispatch(try command.launchFailed());
             continue;
         };
         const work_id = next_work_id.*;
@@ -1066,7 +1066,7 @@ fn drainPresentationCommands(
             .build_buffer_disclosure => |job| ctx.io.concurrent(presentationDisclosureWorker, .{ loop, work_id, job }),
             .scan_review_source => |scan| ctx.io.concurrent(presentationReviewSourceWorker, .{ loop, work_id, scan }),
         } catch {
-            try admitPresentationLaunchFailure(state, &command);
+            try state.dispatch(try command.launchFailed());
             continue;
         };
         futures.appendAssumeCapacity(.{ .id = work_id, .future = future });
@@ -1084,69 +1084,6 @@ fn workerBitbucketForEnrichment(client: ?bbr.bitbucket.Client, source: presentat
         .remote => client.?,
         .local => null,
     };
-}
-
-fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *presentation.OwnedCommand) !void {
-    const input: presentation.OwnedInput = switch (command.*) {
-        .highlight_code => |job| .{ .code_highlight_completed = job.launchFailed() },
-        .load_session => |load| .{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .failed = error.WorkerLaunchFailed } } },
-        .prepare_session => |job| job.launchFailed(),
-        .enrich_file => |enrich| .{ .file_enrichment_completed = .{
-            .command_id = enrich.command_id,
-            .work_id = enrich.work_id,
-            .session_epoch = enrich.session_epoch,
-            .file_index = enrich.file_index,
-            .outcome = .{ .failed = .launch_failed },
-        } },
-        .post_draft => |post| presentation_adapter.postLaunchFailed(post),
-        .update_comment => |update| presentation_adapter.commentEditLaunchFailed(update),
-        .delete_comment => |delete| presentation_adapter.commentDeleteLaunchFailed(delete),
-        .change_reviewer_verdict => |verdict| presentation_adapter.reviewerVerdictLaunchFailed(verdict),
-        .wait_submission => |wait| .{ .submission_wait_launch_failed = wait },
-        .check_recovery => |check| .{ .recovery_checked = .{ .command_id = check.command_id, .operation_id = check.operation_id, .identity = check.identity, .outcome = .failed } },
-        .find_duplicate => |check| blk: {
-            const input: presentation.OwnedInput = .{ .duplicate_checked = .{
-                .command_id = check.command_id,
-                .operation_id = check.operation_id,
-                .identity = check.identity,
-                .temp_id = check.draft.local_id,
-                .outcome = .failed,
-            } };
-            check.destroy();
-            break :blk input;
-        },
-        .list_pull_requests => |list| .{ .pull_requests_loaded = .{ .command_id = list.command_id, .work_id = list.work_id, .outcome = .failed } },
-        .copy_clipboard => |copy| blk: {
-            copy.destroy();
-            break :blk .{ .clipboard_completed = .{ .command_id = copy.command_id, .success = false } };
-        },
-        .persist_theme => |persist| .{ .theme_persisted = .{ .command_id = persist.command_id, .outcome = .write_failed } },
-        .external_edit => |edit| blk: {
-            const completed = try presentation.ExternalEditCompleted.create(edit.allocator, edit.command_id, edit.session_epoch);
-            completed.outcome = .failed;
-            edit.destroy();
-            break :blk .{ .external_edit_completed = completed };
-        },
-        .scan_buffer_search => |*scan| .{ .buffer_search_scanned = scan.launchFailed() },
-        .build_buffer_disclosure => |job| blk: {
-            job.failed = true;
-            break :blk .{ .buffer_disclosure_built = job };
-        },
-        .scan_review_source => |*scan| blk: {
-            const completed: presentation.ReviewSourceScanned = .{
-                .allocator = std.heap.page_allocator,
-                .command_id = scan.command_id,
-                .session_epoch = scan.session_epoch,
-                .request_id = scan.request_id,
-                .file_index = scan.file_index,
-                .outcome = .failed,
-            };
-            scan.deinit();
-            break :blk .{ .review_source_scanned = completed };
-        },
-    };
-    command.* = undefined;
-    try state.dispatch(input);
 }
 
 const TerminalHandoffContext = struct {

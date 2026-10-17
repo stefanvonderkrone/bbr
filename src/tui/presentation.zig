@@ -1195,11 +1195,6 @@ pub const PrepareSession = struct {
         self.ready = true;
     }
 
-    pub fn launchFailed(self: *PrepareSession) OwnedInput {
-        self.failure = .buffer_build_failed;
-        return .{ .session_prepared = self };
-    }
-
     pub fn destroy(self: *PrepareSession) void {
         if (self.candidate) |candidate| {
             if (self.ready) candidate.destroy() else candidate.destroyInputs();
@@ -1353,6 +1348,7 @@ pub const PostDraft = struct {
     pub fn destroy(self: *PostDraft) void {
         const allocator = self.allocator;
         self.arena.deinit();
+        self.* = undefined;
         allocator.destroy(self);
     }
 };
@@ -1379,6 +1375,7 @@ pub const UpdateComment = struct {
     pub fn destroy(self: *UpdateComment) void {
         const allocator = self.allocator;
         allocator.free(self.body);
+        self.* = undefined;
         allocator.destroy(self);
     }
 };
@@ -1396,7 +1393,9 @@ pub const DeleteComment = struct {
     }
 
     pub fn destroy(self: *DeleteComment) void {
-        self.allocator.destroy(self);
+        const allocator = self.allocator;
+        self.* = undefined;
+        allocator.destroy(self);
     }
 };
 
@@ -1452,6 +1451,110 @@ pub const OwnedCommand = union(enum) {
         }
         self.* = undefined;
     }
+
+    /// Consumes a command that never reached its worker and returns the input
+    /// that reports the failure. On error the caller still owns the command.
+    ///
+    /// No arm frees its payload. An arm whose payload moves into the input
+    /// returns at once. Every other arm only reads, and `deinit` frees the
+    /// payload after the input exists.
+    pub fn launchFailed(self: *OwnedCommand) error{OutOfMemory}!OwnedInput {
+        const input: OwnedInput = switch (self.*) {
+            .prepare_session => |job| {
+                job.failure = .buffer_build_failed;
+                self.* = undefined;
+                return .{ .session_prepared = job };
+            },
+            .build_buffer_disclosure => |job| {
+                job.failed = true;
+                self.* = undefined;
+                return .{ .buffer_disclosure_built = job };
+            },
+            .highlight_code => |job| .{ .code_highlight_completed = .{
+                .command_id = job.command_id,
+                .identity = job.identity,
+                .failure = error.WorkerLaunchFailed,
+            } },
+            .load_session => |load| .{ .session_loaded = .{
+                .command_id = load.command_id,
+                .intent = load.intent,
+                .outcome = .{ .failed = error.WorkerLaunchFailed },
+            } },
+            .enrich_file => |enrich| .{ .file_enrichment_completed = .{
+                .command_id = enrich.command_id,
+                .work_id = enrich.work_id,
+                .session_epoch = enrich.session_epoch,
+                .file_index = enrich.file_index,
+                .outcome = .{ .failed = .launch_failed },
+            } },
+            .post_draft => |post| .{ .post_draft_launch_failed = .{
+                .command_id = post.command_id,
+                .operation_id = post.operation_id,
+                .identity = post.identity,
+                .temp_id = post.draft.local_id,
+            } },
+            .update_comment => |update| .{ .comment_edit_launch_failed = .{
+                .command_id = update.command_id,
+                .identity = update.identity,
+                .comment_id = update.comment_id,
+            } },
+            .delete_comment => |delete| .{ .comment_delete_launch_failed = .{
+                .command_id = delete.command_id,
+                .identity = delete.identity,
+                .comment_id = delete.comment_id,
+            } },
+            .change_reviewer_verdict => |verdict| .{ .reviewer_verdict_changed = .{
+                .command_id = verdict.command_id,
+                .identity = verdict.identity,
+                .target = verdict.target,
+                .outcome = .launch_failed,
+            } },
+            .wait_submission => |wait| .{ .submission_wait_launch_failed = wait },
+            .check_recovery => |check| .{ .recovery_checked = .{
+                .command_id = check.command_id,
+                .operation_id = check.operation_id,
+                .identity = check.identity,
+                .outcome = .failed,
+            } },
+            .find_duplicate => |check| .{ .duplicate_checked = .{
+                .command_id = check.command_id,
+                .operation_id = check.operation_id,
+                .identity = check.identity,
+                .temp_id = check.draft.local_id,
+                .outcome = .failed,
+            } },
+            .list_pull_requests => |list| .{ .pull_requests_loaded = .{
+                .command_id = list.command_id,
+                .work_id = list.work_id,
+                .outcome = .failed,
+            } },
+            .copy_clipboard => |copy| .{ .clipboard_completed = .{ .command_id = copy.command_id, .success = false } },
+            .persist_theme => |persist| .{ .theme_persisted = .{ .command_id = persist.command_id, .outcome = .write_failed } },
+            .external_edit => |edit| blk: {
+                const completed = try ExternalEditCompleted.create(edit.allocator, edit.command_id, edit.session_epoch);
+                completed.outcome = .failed;
+                break :blk .{ .external_edit_completed = completed };
+            },
+            .scan_buffer_search => |scan| .{ .buffer_search_scanned = .{
+                .allocator = std.heap.page_allocator,
+                .command_id = scan.command_id,
+                .request_id = scan.request_id,
+                .session_epoch = scan.session_epoch,
+                .mode = scan.mode,
+                .outcome = .failed,
+            } },
+            .scan_review_source => |scan| .{ .review_source_scanned = .{
+                .allocator = std.heap.page_allocator,
+                .command_id = scan.command_id,
+                .session_epoch = scan.session_epoch,
+                .request_id = scan.request_id,
+                .file_index = scan.file_index,
+                .outcome = .failed,
+            } },
+        };
+        self.deinit();
+        return input;
+    }
 };
 
 const CommandTarget = std.meta.Tag(OwnedCommand);
@@ -1484,6 +1587,235 @@ fn setCommandId(command: *OwnedCommand, command_id: CommandId) void {
         .scan_buffer_search => |*value| value.command_id = command_id,
         .build_buffer_disclosure => |value| value.command_id = command_id,
         .scan_review_source => |*value| value.command_id = command_id,
+    }
+}
+
+const LaunchFailureFixture = struct {
+    const operation_id: bbr.review.OperationId = 30;
+    const temp_id: bbr.review.TempId = 41;
+    const comment_id: bbr.review.CommentId = 42;
+    const session_epoch: SessionEpoch = 7;
+    const request_id: u64 = 5;
+    const file_index: usize = 3;
+    const work_id: WorkId = 12;
+    const intent: LoadIntent = 21;
+
+    fn remote() !OwnedRemoteReviewIdentity {
+        return .init(try OwnedReviewIdentity.init("workspace", "repo", 1));
+    }
+
+    fn command(comptime target: CommandTarget, disclosure: *Presentation) !OwnedCommand {
+        const a = testing.allocator;
+        return switch (target) {
+            .load_session => .{ .load_session = .{ .intent = intent, .key = (try remote()).value } },
+            .prepare_session => blk: {
+                const job = try a.create(PrepareSession);
+                job.* = .{ .allocator = a, .intent = intent, .preferences = .{}, .review_revision = 0, .candidate = null };
+                break :blk .{ .prepare_session = job };
+            },
+            .enrich_file => .{ .enrich_file = .{
+                .work_id = work_id,
+                .session_epoch = session_epoch,
+                .file_index = file_index,
+                .source = .local,
+                .source_commit = undefined,
+                .destination_commit = undefined,
+                .old_path = undefined,
+                .new_path = undefined,
+                .status = .modified,
+                .max_file_bytes = 0,
+            } },
+            .highlight_code => blk: {
+                const job = try a.create(code_highlighting.Analyze);
+                job.* = .{
+                    .identity = .{ .session_epoch = session_epoch, .owner = .{ .draft = 1 }, .block = 0, .body_hash = 1, .context_hash = 1 },
+                    .arena = .init(a),
+                    .path = "",
+                    .content = "",
+                    .mapping = &.{},
+                };
+                break :blk .{ .highlight_code = job };
+            },
+            .post_draft, .find_duplicate => blk: {
+                const post = try a.create(PostDraft);
+                post.* = .{
+                    .allocator = a,
+                    .arena = .init(a),
+                    .operation_id = operation_id,
+                    .identity = try remote(),
+                    .draft = .{ .local_id = temp_id, .kind = .comment, .body = "body" },
+                    .parent = null,
+                    .dedupe = false,
+                };
+                break :blk @unionInit(OwnedCommand, @tagName(target), post);
+            },
+            .update_comment => .{ .update_comment = try UpdateComment.create(a, (try remote()).value, comment_id, "updated") },
+            .delete_comment => .{ .delete_comment = try DeleteComment.create(a, (try remote()).value, comment_id) },
+            .change_reviewer_verdict => .{ .change_reviewer_verdict = .{
+                .identity = try remote(),
+                .expected_source_commit = undefined,
+                .authenticated_account_uuid = undefined,
+                .target = .approved,
+            } },
+            .wait_submission => .{ .wait_submission = .{ .operation_id = operation_id, .identity = try remote(), .temp_id = temp_id, .ms = 1000 } },
+            .check_recovery => .{ .check_recovery = .{ .operation_id = operation_id, .identity = try remote(), .source_commit = undefined } },
+            .list_pull_requests => .{ .list_pull_requests = .{ .work_id = work_id, .repository = undefined } },
+            .copy_clipboard => blk: {
+                const copy = try a.create(ClipboardCopy);
+                copy.* = .{ .allocator = a, .text = try a.dupe(u8, "copy") };
+                break :blk .{ .copy_clipboard = copy };
+            },
+            .persist_theme => .{ .persist_theme = .{ .theme = .system } },
+            .external_edit => .{ .external_edit = try ExternalEdit.create(a, session_epoch, 64, "edit") },
+            .scan_buffer_search => .{ .scan_buffer_search = .{
+                .request_id = request_id,
+                .session_epoch = session_epoch,
+                .corpus = try BufferSearchCorpus.create(&.{}),
+                .query = try search.Query.init(std.heap.page_allocator, "query"),
+                .mode = .fuzzy,
+            } },
+            .build_buffer_disclosure => blk: {
+                try moveToRow(disclosure, findDisclosureRow(disclosure.projection().review.?.buffer.rows, .{ .resolved_thread = 1 }).?);
+                try disclosure.dispatch(.{ .action = .toggle_disclosure });
+                while (disclosure.takeCommand()) |value| {
+                    var other = value;
+                    if (other == .build_buffer_disclosure) break :blk other;
+                    other.deinit();
+                }
+                return error.MissingDisclosureBuild;
+            },
+            .scan_review_source => .{ .scan_review_source = .{
+                .session_epoch = session_epoch,
+                .request_id = request_id,
+                .file_index = file_index,
+                .arena = .init(std.heap.page_allocator),
+                .file = .{ .old_path = "a.zig", .new_path = "a.zig", .status = .modified, .hunks = &.{} },
+                .lease = .{ .view = .{ .old = .pending, .new = .pending }, .old = null, .new = null },
+                .query = try search.Query.init(std.heap.page_allocator, "query"),
+            } },
+        };
+    }
+
+    fn expectRemote(identity: ?OwnedRemoteReviewIdentity) !void {
+        try testing.expect(OwnedRemoteReviewIdentity.eql(try remote(), identity.?));
+    }
+
+    fn expectInput(input: OwnedInput, command_id: CommandId) !void {
+        switch (input) {
+            .session_loaded => |loaded| {
+                try testing.expectEqual(command_id, loaded.command_id);
+                try testing.expectEqual(intent, loaded.intent);
+                try testing.expect(loaded.outcome == .failed);
+            },
+            .session_prepared => |job| {
+                try testing.expectEqual(command_id, job.command_id);
+                try testing.expectEqual(intent, job.intent);
+                try testing.expectEqual(@as(?ReplacementError, .buffer_build_failed), job.failure);
+            },
+            .file_enrichment_completed => |completed| {
+                try testing.expectEqual(command_id, completed.command_id);
+                try testing.expectEqual(work_id, completed.work_id);
+                try testing.expectEqual(session_epoch, completed.session_epoch);
+                try testing.expectEqual(file_index, completed.file_index);
+                try testing.expect(completed.outcome == .failed);
+            },
+            .code_highlight_completed => |completed| {
+                try testing.expectEqual(command_id, completed.command_id);
+                try testing.expectEqual(session_epoch, completed.identity.session_epoch);
+                try testing.expect(completed.failure != null);
+            },
+            .post_draft_launch_failed => |failed| {
+                try testing.expectEqual(command_id, failed.command_id);
+                try testing.expectEqual(operation_id, failed.operation_id);
+                try testing.expectEqual(temp_id, failed.temp_id);
+                try expectRemote(failed.identity);
+            },
+            inline .comment_edit_launch_failed, .comment_delete_launch_failed => |failed| {
+                try testing.expectEqual(command_id, failed.command_id);
+                try testing.expectEqual(comment_id, failed.comment_id);
+                try expectRemote(failed.identity);
+            },
+            .reviewer_verdict_changed => |changed| {
+                try testing.expectEqual(command_id, changed.command_id);
+                try testing.expect(changed.outcome == .launch_failed);
+                try expectRemote(changed.identity);
+            },
+            .submission_wait_launch_failed => |wait| {
+                try testing.expectEqual(command_id, wait.command_id);
+                try testing.expectEqual(operation_id, wait.operation_id);
+                try testing.expectEqual(temp_id, wait.temp_id);
+            },
+            .recovery_checked => |checked| {
+                try testing.expectEqual(command_id, checked.command_id);
+                try testing.expectEqual(operation_id, checked.operation_id);
+                try testing.expect(checked.outcome == .failed);
+                try expectRemote(checked.identity);
+            },
+            .duplicate_checked => |checked| {
+                try testing.expectEqual(command_id, checked.command_id);
+                try testing.expectEqual(operation_id, checked.operation_id);
+                try testing.expectEqual(temp_id, checked.temp_id);
+                try testing.expect(checked.outcome == .failed);
+                try expectRemote(checked.identity);
+            },
+            .pull_requests_loaded => |loaded| {
+                try testing.expectEqual(command_id, loaded.command_id);
+                try testing.expectEqual(work_id, loaded.work_id);
+                try testing.expect(loaded.outcome == .failed);
+            },
+            .clipboard_completed => |completed| {
+                try testing.expectEqual(command_id, completed.command_id);
+                try testing.expect(!completed.success);
+            },
+            .theme_persisted => |persisted| {
+                try testing.expectEqual(command_id, persisted.command_id);
+                try testing.expectEqual(ThemePersisted.Outcome.write_failed, persisted.outcome);
+            },
+            .external_edit_completed => |completed| {
+                try testing.expectEqual(command_id, completed.command_id);
+                try testing.expectEqual(session_epoch, completed.session_epoch);
+                try testing.expect(completed.outcome == .failed);
+            },
+            .buffer_search_scanned => |scanned| {
+                try testing.expectEqual(command_id, scanned.command_id);
+                try testing.expectEqual(request_id, scanned.request_id);
+                try testing.expectEqual(session_epoch, scanned.session_epoch);
+                try testing.expectEqual(search.Mode.fuzzy, scanned.mode);
+                try testing.expect(scanned.outcome == .failed);
+            },
+            .buffer_disclosure_built => |job| {
+                try testing.expectEqual(command_id, job.command_id);
+                try testing.expect(job.failed);
+            },
+            .review_source_scanned => |scanned| {
+                try testing.expectEqual(command_id, scanned.command_id);
+                try testing.expectEqual(session_epoch, scanned.session_epoch);
+                try testing.expectEqual(request_id, scanned.request_id);
+                try testing.expectEqual(file_index, scanned.file_index);
+                try testing.expect(scanned.outcome == .failed);
+            },
+            else => return error.UnexpectedLaunchFailureInput,
+        }
+    }
+};
+
+test "every OwnedCommand launch failure keeps its correlation and frees the command" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var disclosure = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+    });
+    defer disclosure.deinit();
+    inline for (comptime std.meta.tags(CommandTarget), 0..) |target, index| {
+        var command = try LaunchFailureFixture.command(target, &disclosure);
+        const command_id: CommandId = 100 + index;
+        setCommandId(&command, command_id);
+        var input = try command.launchFailed();
+        defer input.deinit();
+        LaunchFailureFixture.expectInput(input, command_id) catch |err| {
+            std.debug.print("launch failure for {s} lost its correlation\n", .{@tagName(target)});
+            return err;
+        };
     }
 }
 
@@ -2604,19 +2936,6 @@ pub const ScanBufferSearch = struct {
     query: search.Query,
     mode: search.Mode = .literal,
 
-    pub fn launchFailed(self: *ScanBufferSearch) BufferSearchScanned {
-        const completed: BufferSearchScanned = .{
-            .allocator = std.heap.page_allocator,
-            .command_id = self.command_id,
-            .request_id = self.request_id,
-            .session_epoch = self.session_epoch,
-            .mode = self.mode,
-            .outcome = .failed,
-        };
-        self.deinit();
-        return completed;
-    }
-
     pub fn deinit(self: *ScanBufferSearch) void {
         self.query.deinit(std.heap.page_allocator);
         self.corpus.release();
@@ -2761,6 +3080,7 @@ pub const ClipboardCopy = struct {
     pub fn destroy(self: *ClipboardCopy) void {
         const allocator = self.allocator;
         allocator.free(self.text);
+        self.* = undefined;
         allocator.destroy(self);
     }
 };
@@ -2813,6 +3133,7 @@ pub const ExternalEdit = struct {
     pub fn destroy(self: *ExternalEdit) void {
         const allocator = self.allocator;
         allocator.free(self.body);
+        self.* = undefined;
         allocator.destroy(self);
     }
 };

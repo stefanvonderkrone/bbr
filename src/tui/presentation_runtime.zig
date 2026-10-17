@@ -57,24 +57,12 @@ pub fn executePost(
     deliver(sink, adapter.executePost(command, poster));
 }
 
-pub fn rejectPostLaunch(sink: CompletionSink, command: *presentation.PostDraft) void {
-    deliver(sink, adapter.postLaunchFailed(command));
-}
-
 pub fn executeCommentEdit(sink: CompletionSink, command: *presentation.UpdateComment, client: bbr.bitbucket.Client) void {
     deliver(sink, adapter.executeCommentEdit(command, client));
 }
 
-pub fn rejectCommentEditLaunch(sink: CompletionSink, command: *presentation.UpdateComment) void {
-    deliver(sink, adapter.commentEditLaunchFailed(command));
-}
-
 pub fn executeCommentDelete(sink: CompletionSink, command: *presentation.DeleteComment, client: bbr.bitbucket.Client) void {
     deliver(sink, adapter.executeCommentDelete(command, client));
-}
-
-pub fn rejectCommentDeleteLaunch(sink: CompletionSink, command: *presentation.DeleteComment) void {
-    deliver(sink, adapter.commentDeleteLaunchFailed(command));
 }
 
 const std = @import("std");
@@ -148,71 +136,7 @@ const ScriptedExecutor = struct {
         const self: *ScriptedExecutor = @ptrCast(@alignCast(ptr));
         self.tags[self.count] = std.meta.activeTag(command.*);
         self.count += 1;
-        const input: presentation.OwnedInput = switch (command.*) {
-            .highlight_code => |job| .{ .code_highlight_completed = job.launchFailed() },
-            .load_session => |value| .{ .session_loaded = .{ .command_id = value.command_id, .intent = value.intent, .outcome = .{ .failed = error.Scripted } } },
-            .prepare_session => |value| value.launchFailed(),
-            .enrich_file => |value| .{ .file_enrichment_completed = .{
-                .command_id = value.command_id,
-                .work_id = value.work_id,
-                .session_epoch = value.session_epoch,
-                .file_index = value.file_index,
-                .outcome = .{ .failed = .launch_failed },
-            } },
-            .post_draft => |value| adapter.postLaunchFailed(value),
-            .update_comment => |value| adapter.commentEditLaunchFailed(value),
-            .delete_comment => |value| adapter.commentDeleteLaunchFailed(value),
-            .change_reviewer_verdict => |value| adapter.reviewerVerdictLaunchFailed(value),
-            .wait_submission => |value| .{ .submission_wait_completed = value },
-            .check_recovery => |value| .{ .recovery_checked = .{
-                .command_id = value.command_id,
-                .operation_id = value.operation_id,
-                .identity = value.identity,
-                .outcome = .failed,
-            } },
-            .find_duplicate => |value| blk: {
-                const input: presentation.OwnedInput = .{ .duplicate_checked = .{
-                    .command_id = value.command_id,
-                    .operation_id = value.operation_id,
-                    .identity = value.identity,
-                    .temp_id = value.draft.local_id,
-                    .outcome = .failed,
-                } };
-                value.destroy();
-                break :blk input;
-            },
-            .list_pull_requests => |value| .{ .pull_requests_loaded = .{ .command_id = value.command_id, .work_id = value.work_id, .outcome = .failed } },
-            .copy_clipboard => |value| blk: {
-                const command_id = value.command_id;
-                value.destroy();
-                break :blk .{ .clipboard_completed = .{ .command_id = command_id, .success = true } };
-            },
-            .persist_theme => |value| .{ .theme_persisted = .{ .command_id = value.command_id, .outcome = .saved } },
-            .external_edit => |value| blk: {
-                const completed = try presentation.ExternalEditCompleted.create(value.allocator, value.command_id, value.session_epoch);
-                completed.outcome = .unchanged;
-                value.destroy();
-                break :blk .{ .external_edit_completed = completed };
-            },
-            .scan_buffer_search => |*value| .{ .buffer_search_scanned = value.launchFailed() },
-            .build_buffer_disclosure => |value| blk: {
-                value.failed = true;
-                break :blk .{ .buffer_disclosure_built = value };
-            },
-            .scan_review_source => |*value| blk: {
-                const completed: presentation.ReviewSourceScanned = .{
-                    .allocator = std.heap.page_allocator,
-                    .command_id = value.command_id,
-                    .session_epoch = value.session_epoch,
-                    .request_id = value.request_id,
-                    .file_index = value.file_index,
-                    .outcome = .failed,
-                };
-                value.deinit();
-                break :blk .{ .review_source_scanned = completed };
-            },
-        };
-        deliver(sink, input);
+        deliver(sink, try command.launchFailed());
     }
 };
 
@@ -335,8 +259,10 @@ test "Buffer Search launch failure keeps correlation and releases its command" {
             corpus.arena.deinit();
             std.heap.page_allocator.destroy(corpus);
         }
-        var completed = command.launchFailed();
-        defer completed.deinit();
+        var owned: presentation.OwnedCommand = .{ .scan_buffer_search = command };
+        var input = try owned.launchFailed();
+        defer input.deinit();
+        const completed = input.buffer_search_scanned;
         try testing.expectEqual(@as(presentation.CommandId, 41), completed.command_id);
         try testing.expectEqual(@as(u64, 1), completed.request_id);
         try testing.expectEqual(@as(presentation.SessionEpoch, 7), completed.session_epoch);
@@ -867,7 +793,7 @@ test "scripted terminal adapter drains every command family through the producti
     try testing.expectEqual(@as(presentation.CommandId, 4), sink.inputs[3].?.comment_edit_launch_failed.command_id);
     try testing.expectEqual(@as(presentation.CommandId, 5), sink.inputs[4].?.comment_delete_launch_failed.command_id);
     try testing.expectEqual(@as(presentation.CommandId, 6), sink.inputs[5].?.reviewer_verdict_changed.command_id);
-    try testing.expectEqual(@as(presentation.CommandId, 7), sink.inputs[6].?.submission_wait_completed.command_id);
+    try testing.expectEqual(@as(presentation.CommandId, 7), sink.inputs[6].?.submission_wait_launch_failed.command_id);
     try testing.expectEqual(@as(presentation.CommandId, 8), sink.inputs[7].?.recovery_checked.command_id);
     try testing.expectEqual(@as(presentation.CommandId, 9), sink.inputs[8].?.duplicate_checked.command_id);
     try testing.expectEqual(@as(presentation.CommandId, 10), sink.inputs[9].?.pull_requests_loaded.command_id);

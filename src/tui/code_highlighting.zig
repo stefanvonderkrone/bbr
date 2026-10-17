@@ -98,6 +98,7 @@ pub const Analyze = struct {
     pub fn destroy(self: *Analyze) void {
         const backing = self.arena.child_allocator;
         self.arena.deinit();
+        self.* = undefined;
         backing.destroy(self);
     }
 
