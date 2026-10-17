@@ -216,6 +216,8 @@ theme = "system"
 page_down = ["ctrl-f", "page-down"]
 quit = []
 review_comment = ["C", "space r c"]
+select_old_version = ["h", "left"]
+select_new_version = ["l", "right"]
 
 [highlight]
 max_file_bytes = 2097152
@@ -240,6 +242,21 @@ Fixed Themes are `dark`, `light`, all four `catppuccin-*` flavors, `gruvbox-ligh
 `gruvbox-dark`, `solarized-light`, and `solarized-dark`.
 
 DiffPane source Lines always wrap so every source location remains reachable.
+
+In the DiffPane, `h` or Left Arrow selects the old File version.
+`l` or Right Arrow selects the new File version.
+Cursor and visual-selection highlights show only source Lines from Selected Version.
+Copying a wrapped Line includes its complete source text once.
+Changing Selected Version clears visual selection.
+
+`j`, `k`, and vertical arrows skip source rows without a Line for Selected Version.
+Real blank Lines remain navigation stops.
+File headers, Hunk headers, Folds, and Comments also remain stops.
+These keys skip an entire deleted File when new is selected.
+They skip an entire added File when old is selected.
+Opening a File directly selects old for a deleted File and new for an added File.
+The absent version cannot be selected in these Files.
+The Sidebar keeps `h` and `l` for collapse and expand.
 
 Keymap entries map each Action name to one or more one-to-eight-chord sequences.
 An empty list unbinds that Action. Contextual Actions may deliberately share a chord—Enter, for

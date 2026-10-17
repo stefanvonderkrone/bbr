@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M23 combined presentation prototype</title>
+<style>
+	* { box-sizing: border-box; }
+	body { margin: 24px; padding-bottom: 70px; font: 15px/1.5 system-ui, sans-serif; color: #202630; background: #f2f3f5; }
+	h1 { margin: 0; font-size: 23px; }
+	p { max-width: 1000px; }
+	.controls { display: flex; flex-wrap: wrap; gap: 16px; margin: 16px 0; align-items: center; }
+	button, select { font: inherit; padding: 4px 8px; }
+	label { display: inline-flex; align-items: center; gap: 6px; }
+	#state, #location { padding: 8px 12px; background: white; border: 1px solid #cbd0d6; max-width: 1050px; }
+	.stage { overflow-x: auto; margin: 16px 0; }
+	.terminal { width: max-content; font: 14px/20px Menlo, Consolas, monospace; background: var(--base); color: var(--fg); border: 1px solid #888; }
+	.dark { --base: #101016; --fg: #c8c8d8; --card: #1c1c28; --draft: #2c2410; --code: #30303c; --suggestion: #142828; --bold: #f0a24d; --italic: #52c9cb; --inline: #98c379; --keyword: #c586c0; --string: #98c379; --function: #61afef; --cursor: #484858; --selected: #414155; --match: #5a4a18; --active: #9a7018; }
+	.light { --base: #fff; --fg: #303038; --card: #f1f1f7; --draft: #fff4d8; --code: #d7d7e0; --suggestion: #d3eded; --bold: #a95500; --italic: #006f78; --inline: #286525; --keyword: #802a88; --string: #286525; --function: #00629a; --cursor: #bdbdcd; --selected: #c1c1d4; --match: #e9d69b; --active: #d7ac54; }
+	.line { height: 20px; white-space: pre; }
+	.cell { display: inline-block; height: 20px; vertical-align: top; white-space: pre; }
+	.header { font-weight: bold; }
+	.b { color: var(--bold); font-weight: bold; }
+	.i { color: var(--italic); font-style: italic; }
+	.b.i { color: var(--bold); }
+	.ic { color: var(--inline) !important; }
+	.link { text-decoration: underline; }
+	.strike { text-decoration: line-through; }
+	.link.strike { text-decoration: underline line-through; }
+	.keyword { color: var(--keyword); }
+	.string { color: var(--string); }
+	.function { color: var(--function); }
+	.generated { opacity: .8; }
+	.card { background: var(--card); }
+	.draft { background: var(--draft); }
+	.code { background: var(--code); }
+	.suggestion { background: var(--suggestion); }
+	.cursor { background: var(--cursor); }
+	.selected { background: var(--selected); }
+	.hit { background: var(--match); }
+	.active { background: var(--active); }
+	#switcher { position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%); background: #202630; color: white; padding: 8px; border-radius: 8px; display: flex; gap: 12px; align-items: center; }
+	details { max-width: 1050px; margin-top: 18px; }
+	pre { overflow: auto; background: white; padding: 12px; border: 1px solid #cbd0d6; }
+	table { border-collapse: collapse; background: white; }
+	th, td { border: 1px solid #cbd0d6; padding: 4px 10px; text-align: left; }
+</style>
+<h1>M23 combined presentation prototype</h1>
+<p>Question: Do the agreed Reply and ReviewBody rules remain readable together at narrow widths?</p>
+<p>Throwaway planning example. The examples use hand-built semantic text, fixed search matches, and representative Theme colors.
+The browser does not run bbr, parse Markdown, or use tree-sitter. Emoji occupy two terminal cells in these examples.</p>
+<div class="controls">
+	<label>Root body columns <select id="width"><option>32</option><option>40</option><option>60</option><option selected>80</option><option>100</option></select></label>
+	<label>Resize <input id="resize" type="range" min="20" max="110" value="80"></label>
+	<label>Theme <select id="theme"><option value="dark">Dark</option><option value="light">Light</option></select></label>
+	<label>Ancestry <select id="ancestry"><option value="ordinary">Mixed, depth 3</option><option value="deep">Mixed, depth 20</option></select></label>
+</div>
+<div class="controls">
+	<label>Search example <select id="query"><option value="join">first second</option><option value="emoji">skin-tone-2</option><option value="code">:mask: in code</option><option value="none">No search</option></select></label>
+	<label><input id="colors" type="checkbox" checked>Syntax colors arrive</label>
+	<label><input id="collapsed" type="checkbox">Collapse root ReviewCard body</label>
+	<label><input id="reveal" type="checkbox">Temporary Buffer Search reveal</label>
+</div>
+<p>Collapse hides body rows after a six-row demonstration budget. Replies stay visible. Temporary reveal shows the root match.
+The six-row budget is an example, not a new M23 decision.</p>
+<div id="state" role="status"></div>
+<div class="stage"><div id="screen" class="terminal dark" aria-label="Terminal presentation example"></div></div>
+<div id="location"></div>
+<details><summary>Authored Markdown for the main example</summary><pre id="raw"></pre></details>
+<details><summary>Width comparison</summary>
+	<p>The current ReviewCard inset is four columns. Root body width B gives DiffPane width B + 4.</p>
+	<table><thead><tr><th>Root body B</th><th>DiffPane</th><th>Starting unit</th><th>Chosen unit</th><th>Depth 20 indent</th><th>Depth 20 body</th><th>Depth label</th></tr></thead><tbody id="widths"></tbody></table>
+</details>
+<p>Review the Thread first. Then inspect style combinations and formatted Review Search Preview with the bottom controls.
+Check both Themes. Resize, collapse the root body, and change the search example.</p>
+<p>Background swatches check style composition. They do not simulate Action availability.
+Existing Buffer Search requires a cleared Selection. Exact terminal fonts, system colors, and attributes need the later bbr review.</p>
+<nav id="switcher" aria-label="Prototype scenarios"><button id="previous" aria-label="Previous scenario">←</button><span id="scenario"></span><button id="next" aria-label="Next scenario">→</button></nav>
+<script>
+	// This prototype checks the agreed contract. Its three scenarios are not replacement UI designs.
+	const $ = id => document.getElementById(id);
+	const segmenter = new Intl.Segmenter('en', { granularity: 'grapheme' });
+	const scenarios = ['Combined Thread', 'Style combinations', 'Review Search Preview'];
+	let scenario = Math.max(0, scenarios.indexOf(new URL(location.href).searchParams.get('variant')));
+	const run = (text, cls = '', match = '') => ({ text, cls, match });
+	const plain = text => [run(text)];
+	const raw = [
+		'## Review _plan_ with `token`', '',
+		'first', 'second with **bold and _italic_** and :thumbsup::skin-tone-2:.', '',
+		'- Check [**_docs_**](https://example.invalid/guide).',
+		'    - Keep **`*literal* :mask:`** unchanged and align this long continuation.', '',
+		'> Quoted _text_ and a nested list.', '> ', '> - Check `a|b` and :white_check_mark:.',
+		'>     - Keep the parent context.', '',
+		'```typescript', 'const status = ":mask:";', 'console.log(status);', 'a\tb', 'abcd\te',
+		'const longName = "Keep **literal** :mask: and all remaining code when wrapping";', '```', '',
+		'```unknown', '#!python', '**literal** :mask: &amp;', '```', '',
+		'| State | Detail |', '| :--- | :--- |',
+		'| **Ready** | [guide](https://ex.invalid/) |', '| :mask: | `a|b` |', '',
+		'~~**_Old link_**~~ and ![diagram](images/diagram.png "Plan").', '',
+		'Unknown :NOT_LISTED: and escaped \\:mask: stay literal.', '',
+		'> - Literal code under a quoted list item.', '> ', '>     ```javascript',
+		'>     const value = ":mask:";', '>     a\tb', '>     ```'
+	].join('\n');
+	$('raw').textContent = raw;
+	function cells(runs) {
+		return runs.flatMap(r => [...segmenter.segment(r.text)].map(({ segment }) => ({
+			...r, text: segment, columns: /\p{Extended_Pictographic}/u.test(segment) ? 2 : 1
+		})));
+	}
+	const size = runs => cells(runs).reduce((n, cell) => n + cell.columns, 0);
+	function policy(body, depth) {
+		const pane = body + 4;
+		const start = pane >= 100 ? 4 : pane >= 80 ? 3 : pane >= 60 ? 2 : 1;
+		const budget = body - Math.min(40, body);
+		let unit = start;
+		while (unit > 1 && depth * unit > budget) unit--;
+		return { pane, start, unit, budget };
+	}
+	function wrap(runs, width, prefix = '', code = false) {
+		const prefixCells = cells([run(prefix, 'generated')]);
+		const available = width - prefixCells.length;
+		const input = cells(runs);
+		const rows = [];
+		let start = 0;
+		do {
+			let end = start, used = 0;
+			while (end < input.length && used + input[end].columns <= available) used += input[end++].columns;
+			if (!code && end < input.length) {
+				let lastSpace = end;
+				while (lastSpace > start && input[lastSpace - 1].text !== ' ') lastSpace--;
+				if (lastSpace > start) end = lastSpace;
+			}
+			const rowPrefix = rows.length ? cells([run(prefix.replace('•', ' '), 'generated')]) : prefixCells;
+			rows.push([...rowPrefix, ...input.slice(start, end)]);
+			start = end;
+		} while (start < input.length);
+		return rows;
+	}
+	function appendRow(content, offset, width, surface = 'card', background = '') {
+		const row = document.createElement('div');
+		row.className = 'line';
+		const contentWidth = content.reduce((n, c) => n + c.columns, 0);
+		const all = [...cells(plain(' '.repeat(4 + offset))), ...content.map(c => ({ ...c, surface })),
+			...cells(plain(' '.repeat(Math.max(0, width - contentWidth)))).map(c => ({ ...c, surface }))];
+		for (const c of all) {
+			const span = document.createElement('span');
+			const matched = c.match && c.match === $('query').value;
+			span.className = `cell ${c.cls} ${c.surface || ''} ${c.surface ? background : ''} ${matched ? 'active' : ''}`;
+			span.style.width = `${c.columns}ch`;
+			span.textContent = c.text;
+			row.append(span);
+		}
+		row.dataset.columns = all.reduce((n, c) => n + c.columns, 0);
+		row.setAttribute('role', 'img');
+		row.setAttribute('aria-label', all.map(c => c.text).join('').trim() || 'Blank row');
+		for (const span of row.children) span.setAttribute('aria-hidden', 'true');
+		$('screen').append(row);
+	}
+	function body(width) {
+		const rows = [];
+		const add = (runs, prefix = '', surface = '', code = false) =>
+			rows.push(...wrap(runs, width, prefix, code).map(content => ({ content, surface })));
+		add([run('§2 ', 'generated'), run('Review ', 'b'), run('plan', 'b i'), run(' with ', 'b'), run('token', 'b ic')]);
+		add(plain(''));
+		add([run('first second', '', 'join'), run(' with '), run('bold and ', 'b'), run('italic', 'b i'),
+			run(' and '), run('👍🏻', '', 'emoji'), run('.')]);
+		add(plain(''));
+		add([run('Check '), run('docs', 'b i link'), run(' ‹https://example.invalid/guide›', 'link')], '• ');
+		add([run('Keep '), run('*literal* :mask:', 'b ic'), run(' unchanged and align this long continuation.')], '  • ');
+		add(plain(''));
+		add([run('Quoted '), run('text', 'i'), run(' and a nested list.')], '│ ');
+		add([run('Check '), run('a|b', 'ic'), run(' and ✅.')], '│ • ');
+		add(plain('Keep the parent context.'), '│   • ');
+		add(plain(''));
+		const syntax = cls => $('colors').checked ? cls : '';
+		add([run('const', syntax('keyword')), run(' status = '), run('"', syntax('string')),
+			run(':mask:', syntax('string'), 'code'), run('"', syntax('string')), run(';')], '', 'code', true);
+		add([run('console.'), run('log', syntax('function')), run('(status);')], '', 'code', true);
+		add(plain('a   b'), '', 'code', true);
+		add(plain('abcd    e'), '', 'code', true);
+		add([run('const', syntax('keyword')), run(' longName = '),
+			run('"Keep **literal** :mask: and all remaining code when wrapping"', syntax('string')), run(';')], '', 'code', true);
+		add(plain(''));
+		add(plain('#!python'), '', 'code', true);
+		add(plain('**literal** :mask: &amp;'), '', 'code', true);
+		add(plain(''));
+		const headers = ['State', 'Detail'];
+		const data = [[ [run('Ready', 'b')], [run('guide ‹https://ex.invalid/›', 'link')] ], [plain('😷'), [run('a|b', 'ic')]]];
+		const lengths = headers.map((h, i) => Math.max(h.length, ...data.map(row => size(row[i]))));
+		const tableWidth = lengths.reduce((a, b) => a + b, 0) + 7;
+		if (tableWidth <= width) {
+			const tableRow = values => values.flatMap((value, i) => [run(i ? ' │ ' : '│ ', 'generated'), ...value,
+				run(' '.repeat(lengths[i] - size(value)), 'generated'), ...(i === 1 ? [run(' │', 'generated')] : [])]);
+			add(tableRow(headers.map(h => plain(h))));
+			add(plain('├' + '─'.repeat(lengths[0] + 2) + '┼' + '─'.repeat(lengths[1] + 2) + '┤'));
+			data.forEach(row => add(tableRow(row)));
+		} else {
+			data.forEach((row, index) => {
+				if (index) add(plain(''));
+				row.forEach((value, i) => add([run(headers[i] + ': ', 'generated'), ...value]));
+			});
+		}
+		add(plain(''));
+		add([run('Old link', 'b i strike'), run(' and image: diagram ‹images/diagram.png› "Plan".')]);
+		add(plain(''));
+		add(plain('Unknown :NOT_LISTED: and escaped :mask: stay literal.'));
+		add(plain(''));
+		add(plain('Literal code under a quoted list item.'), '│ • ');
+		add([run('const', syntax('keyword')), run(' value = '), run('":mask:"', syntax('string')), run(';')], '│   ', 'code', true);
+		add(plain('a   b'), '│   ', 'code', true);
+		return { rows, tableWidth };
+	}
+	function card(name, owner, parent, depth, rich, B, p, collapse = false) {
+		const firstRow = $('screen').children.length;
+		const offset = Math.min(depth * p.unit, p.budget);
+		const width = B - offset;
+		const capped = offset < depth * p.unit;
+		const surface = owner.startsWith('TempId') ? 'draft' : 'card';
+		// Depth comes first so a clipped author header cannot hide capped ancestry.
+		const header = `${capped ? 'depth ' + depth + ' · ' : ''}${name} · ${surface === 'draft' ? 'Draft' : 'published'}`;
+		wrap([run(header, 'header')], width).forEach(row => appendRow(row, offset, width, surface));
+		const rows = rich ? body(width).rows : wrap(plain(`${name} keeps its parent subtree.`), width).map(content => ({ content }));
+		const reveal = collapse && $('reveal').checked && $('query').value !== 'none';
+		const visible = collapse && !reveal ? rows.slice(0, 6) : rows;
+		visible.forEach(row => appendRow(row.content, offset, width, row.surface || surface));
+		if (rows.length > 6) {
+			const footer = reveal ? 'temporary search reveal' : collapse ? `${rows.length - 6} rows hidden · expand` : 'collapse body';
+			wrap([run(footer, 'generated')], width).forEach(row => appendRow(row, offset, width, surface));
+		}
+		for (const row of [...$('screen').children].slice(firstRow)) {
+			row.dataset.owner = owner;
+			row.dataset.parent = parent;
+		}
+		appendRow([], 0, B, '');
+	}
+	function thread(B, p, deep) {
+		card('Root', 'CommentId:root', 'none', 0, true, B, p, $('collapsed').checked);
+		if (deep) {
+			const owner = d => d <= 10 ? `CommentId:p${d}` : `TempId:d${d}`;
+			for (let d = 1; d <= 20; d++) card(`Reply ${d}`, owner(d),
+				d === 1 ? 'CommentId:root' : owner(d - 1), d, d === 20, B, p);
+			return;
+		}
+		[
+			['A', 'CommentId:A', 'CommentId:root', 1], ['C', 'CommentId:C', 'CommentId:A', 2],
+			['F', 'TempId:F', 'CommentId:C', 3], ['D', 'TempId:D', 'CommentId:A', 2],
+			['B', 'CommentId:B', 'CommentId:root', 1], ['E', 'TempId:E', 'CommentId:root', 1],
+			['H', 'TempId:H', 'TempId:E', 2]
+		].forEach(([name, owner, parent, depth]) => card(name, owner, parent, depth, name === 'F', B, p));
+	}
+	function combinations(B) {
+		const styles = [
+			[run('bold ', 'b'), run('italic', 'b i'), run(' then '), run('italic ', 'i'), run('bold', 'b i')],
+			[run('literal *text* :mask:', 'b i ic')],
+			[run('bold link', 'b link'), run(' / '), run('italic link', 'i link'), run(' / '), run('both', 'b i link')],
+			[run('struck bold italic link', 'b i link strike')],
+			[run('§2 ', 'generated'), run('Heading ', 'b'), run('italic', 'b i'), run(' token', 'b ic')],
+			[run('Emoji ', 'b i link'), run('👍🏻', 'b i link', 'emoji'), run(' and 😷', 'b i link')],
+			[run('Plain Draft body stays regular')]
+		];
+		for (const background of ['', 'cursor', 'selected', 'cursor selected']) {
+			wrap([run(background || 'ordinary background', 'header')], B).forEach(row => appendRow(row, 0, B, ''));
+			styles.forEach(runs => wrap(runs, B).forEach(row => appendRow(row, 0, B, 'draft', background)));
+			body(B).rows.filter(r => r.surface === 'code').slice(0, 2).forEach(row => appendRow(row.content, 0, B, 'code', background));
+			wrap([run('suggestion', 'header')], B).forEach(row => appendRow(row, 0, B, 'suggestion', background));
+			appendRow(cells([run('return ', $('colors').checked ? 'keyword' : ''), run('status;')]), 0, B, 'suggestion', background);
+			appendRow([], 0, B, '');
+		}
+	}
+	function render() {
+		const B = Number($('resize').value);
+		const deep = $('ancestry').value === 'deep';
+		const p = policy(B, deep ? 20 : 3);
+		$('screen').replaceChildren();
+		$('screen').className = `terminal ${$('theme').value}`;
+		$('screen').style.width = `${p.pane}ch`;
+		$('scenario').textContent = scenarios[scenario];
+		if (scenario === 0) thread(B, p, deep);
+		if (scenario === 1) combinations(B);
+		if (scenario === 2) {
+			wrap([run('Review Search · selected Preview', 'header')], B).forEach(row => appendRow(row, 0, B, ''));
+			body(B).rows.forEach(row => appendRow(row.content, 0, B, row.surface || 'card'));
+		}
+		$('state').textContent = `Root body ${B} columns. DiffPane ${p.pane}. Deepest Reply ${deep ? 20 : 3}. ` +
+			`Indent unit ${p.start} → ${p.unit}. Indent budget ${p.budget}. ` +
+			`Table requires ${body(B).tableWidth} columns. ${$('colors').checked ? 'Syntax colors shown.' : 'Plain code before color arrival.'}`;
+		const positions = { join: 'Root · authored lines 3 and 4, first scalar column 1. One joined-paragraph occurrence.',
+			emoji: 'Root · authored line 4, scalar column 39. Complete :thumbsup::skin-tone-2: range maps to both cells of 👍🏻.',
+			code: 'Root · authored line 15, scalar column 17. Literal :mask: stays code. Syntax foreground survives search background.',
+			none: 'No active Search Occurrence.' };
+		$('location').textContent = positions[$('query').value] +
+			' Resize, disclosure, and color arrival keep these authored locations. ' +
+			`The Thread repeats the sample at ${deep ? 'TempId:d20' : 'TempId:F'}. Search backgrounds show the fixed example, not a full search scan.`;
+	}
+	function choose(index) {
+		scenario = (index + scenarios.length) % scenarios.length;
+		const url = new URL(location.href);
+		url.searchParams.set('variant', scenarios[scenario]);
+		history.replaceState(null, '', url);
+		render();
+	}
+	$('width').onchange = () => { $('resize').value = $('width').value; render(); };
+	$('resize').oninput = () => { $('width').value = $('resize').value; render(); };
+	for (const id of ['theme', 'ancestry', 'query', 'colors', 'collapsed', 'reveal']) $(id).onchange = render;
+	$('previous').onclick = () => choose(scenario - 1);
+	$('next').onclick = () => choose(scenario + 1);
+	document.addEventListener('keydown', event => {
+		if (/INPUT|SELECT|TEXTAREA|BUTTON/.test(event.target.tagName)) return;
+		if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+			event.preventDefault();
+			choose(scenario + (event.key === 'ArrowRight' ? 1 : -1));
+		}
+	});
+	for (const B of [32, 40, 60, 80, 100]) {
+		const p = policy(B, 20), indent = Math.min(20 * p.unit, p.budget);
+		const row = document.createElement('tr');
+		for (const text of [B, p.pane, p.start, p.unit, indent, B - indent, indent < 20 * p.unit ? 'Required' : 'Not required']) {
+			const cell = document.createElement('td'); cell.textContent = text; row.append(cell);
+		}
+		$('widths').append(row);
+	}
+	render();
+</script>
+</html>

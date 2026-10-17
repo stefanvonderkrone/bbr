@@ -24,6 +24,8 @@ pub const Thread = struct {
     root: *const Comment,
     replies: []const *const Comment,
     resolved: bool,
+    /// Original input position, independent of an earlier encountered Reply.
+    root_input_order: usize = 0,
 
     /// The diff anchor this thread hangs off (the root's), or null for PR-level.
     pub fn anchor(self: Thread) ?Anchor {
@@ -63,13 +65,14 @@ pub fn build(allocator: Allocator, comments: []const Comment) ![]Thread {
 
     for (comments) |*c| {
         const root = rootOf(c, by_id);
+        const root_input_order = (@intFromPtr(root) - @intFromPtr(comments.ptr)) / @sizeOf(Comment);
         if (root == c) {
             // A root comment: open its thread slot — unless a reply seen earlier
             // already created it lazily (out-of-order input), in which case it's
             // already correct (the lazy slot used this same root pointer).
             if (thread_of.contains(c.id)) continue;
             try thread_of.put(allocator, c.id, threads.items.len);
-            try threads.append(allocator, .{ .root = c, .replies = &.{}, .resolved = c.resolved });
+            try threads.append(allocator, .{ .root = c, .replies = &.{}, .resolved = c.resolved, .root_input_order = root_input_order });
             try reply_lists.append(allocator, .empty);
         } else {
             // A reply: file it under its root's thread (creating the root's slot
@@ -78,7 +81,7 @@ pub fn build(allocator: Allocator, comments: []const Comment) ![]Thread {
             const slot = thread_of.get(root.id) orelse blk: {
                 const idx = threads.items.len;
                 try thread_of.put(allocator, root.id, idx);
-                try threads.append(allocator, .{ .root = root, .replies = &.{}, .resolved = root.resolved });
+                try threads.append(allocator, .{ .root = root, .replies = &.{}, .resolved = root.resolved, .root_input_order = root_input_order });
                 try reply_lists.append(allocator, .empty);
                 break :blk idx;
             };

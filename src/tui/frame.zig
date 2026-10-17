@@ -184,6 +184,13 @@ pub const YankCandidates = struct {
     new: ?*const bbr.diff.Line = null,
 };
 
+pub fn selectedSource(row: VisualRow, version: SelectedVersion) ?*const bbr.diff.Line {
+    return switch (version) {
+        .old => row.yank_candidates.old,
+        .new => row.yank_candidates.new,
+    };
+}
+
 pub const VisualHalf = struct {
     line: *const bbr.diff.Line,
     source_start: usize,
@@ -216,6 +223,7 @@ pub const ProjectedSourceRange = struct {
     row: search.Range,
     active: bool,
     occurrence_index: ?usize = null,
+    definition: ?search.Range = null,
 };
 
 pub const Projection = struct {
@@ -235,6 +243,8 @@ pub const Projection = struct {
     search_ranges_sorted: bool = false,
     buffer_search_active: ?usize = null,
     buffer_search_ranges: bool = false,
+    code_highlights: []const @import("code_highlighting.zig").View = &.{},
+    code_highlight_retained_bytes: usize = 0,
 };
 
 /// Resolve a cell solely against the immutable, already-published Frame. An

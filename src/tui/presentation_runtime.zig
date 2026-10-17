@@ -80,6 +80,23 @@ pub fn rejectCommentDeleteLaunch(sink: CompletionSink, command: *presentation.De
 const std = @import("std");
 const testing = std.testing;
 
+test "M23 highlighting closed completion sink releases owned result storage" {
+    const highlighting = @import("code_highlighting.zig");
+    const result = owned: {
+        const value = try testing.allocator.create(highlighting.Result);
+        errdefer testing.allocator.destroy(value);
+        value.* = .{ .allocator = testing.allocator, .spans = try testing.allocator.alloc(highlighting.SourceSpan, 1) };
+        break :owned value;
+    };
+    var sink: CapturingSink = .{ .reject = true };
+    deliver(sink.sink(), .{ .code_highlight_completed = .{
+        .command_id = 1,
+        .identity = .{ .session_epoch = 1, .owner = .{ .draft = 1 }, .block = 0, .body_hash = 1, .context_hash = 1 },
+        .result = result,
+    } });
+    try testing.expect(sink.input == null);
+}
+
 const CapturingSink = struct {
     input: ?presentation.OwnedInput = null,
     reject: bool = false,
@@ -132,6 +149,7 @@ const ScriptedExecutor = struct {
         self.tags[self.count] = std.meta.activeTag(command.*);
         self.count += 1;
         const input: presentation.OwnedInput = switch (command.*) {
+            .highlight_code => |job| .{ .code_highlight_completed = job.launchFailed() },
             .load_session => |value| .{ .session_loaded = .{ .command_id = value.command_id, .intent = value.intent, .outcome = .{ .failed = error.Scripted } } },
             .prepare_session => |value| value.launchFailed(),
             .enrich_file => |value| .{ .file_enrichment_completed = .{
@@ -437,7 +455,7 @@ test "M21 kernel view Frame launch failure and closed sink preserve the complete
         } else if (change == .resolved) {
             const initial = state.projection().review.?;
             for (initial.frame.visual_rows, 0..) |visual, index| if (initial.buffer.rows[visual.buffer_index] == .disclosure) {
-                for (0..index) |_| try state.dispatch(.{ .action = .down });
+                while (state.projection().review.?.navigation.cursor < index) try state.dispatch(.{ .action = .down });
                 break;
             };
         }

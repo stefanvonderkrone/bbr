@@ -57,7 +57,11 @@ A piece of authored prose in a Review. A root carries exactly one CommentScope; 
 _Avoid_: note, remark, message.
 
 **Deleted Comment**:
-The structural tombstone Bitbucket retains when a deleted Comment still has visible Replies. It keeps the original CommentId, author, parent relationship, and root CommentScope but has no authored body and cannot be mutated. Presentation keeps it in the Thread so surviving Replies retain their real root.
+The structural tombstone Bitbucket retains when a deleted Comment still has visible Replies.
+It retains the original CommentId, author, parent relationship, and root CommentScope.
+Authored body content can be absent, but any available authored content remains part of the Comment.
+A Deleted Comment cannot be mutated.
+Presentation keeps it in the Thread so surviving Replies retain their real root.
 _Avoid_: hidden Comment, removed Thread, orphaned Replies.
 
 **Review-level Comment**:
@@ -81,7 +85,15 @@ A Comment whose body contains a fenced ```suggestion``` block proposing replacem
 _Avoid_: patch, fix, edit, proposal.
 
 **Selection**:
-A contiguous run of diff lines the reviewer marks (via `v` or shift+arrow) to anchor a multi-line Comment or Suggestion. Maps to a **ranged Anchor**: a new-side selection (lines present in the new file) yields `{ start_to, to }`, an old-side one (a removed line) yields `{ start_from, from }`. A selection that mixes sides, crosses a hunk gap, spans files, or covers more than 30 inclusive lines — Bitbucket's verified envelope — is refused both when authored and when re-anchoring rather than anchored to the wrong lines, the same "refuse over guess" stance as the Stale-anchor guard.
+A contiguous range of DiffPane rows that the reviewer explicitly marks through `v` or Shift+arrow.
+It differs from the cursor, which names one row without a marked range.
+A Selection can contain source and ReviewCard rows for clipboard Actions.
+Source Selection also supplies the Lines for a multi-line Comment or Suggestion's ranged Anchor.
+A new-side source Selection yields `{ start_to, to }`.
+An old-side source Selection yields `{ start_from, from }`.
+Anchor authoring and re-anchoring refuse source ranges that mix sides, cross a Hunk gap, or span Files.
+They also refuse more than 30 inclusive source Lines, Bitbucket's verified envelope.
+These Anchor limits do not define clipboard eligibility.
 _Avoid_: highlight, mark, region.
 
 **Draft**:

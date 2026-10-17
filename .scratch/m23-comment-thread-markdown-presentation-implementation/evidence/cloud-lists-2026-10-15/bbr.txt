@@ -1,0 +1,14 @@
+▸ Stefan von der Krone
+  M23 Cloud list observation L01. Agent-authored test example.
+
+  3. L01 Ordered parent with bold, italic, and code.
+    • L01a Unordered child with docs ‹https://example.invalid/list-root›.
+    • L01b Unordered child with strike.
+  4. L02 Second ordered item. The authored marker is 8.
+    ↳ Stefan von der Krone
+      M23 Cloud list observation L03. Agent-authored test Reply.
+
+      • L03 Unordered parent with bold, italic, and code.
+        7. L03a Ordered child with docs ‹https://example.invalid/list-reply›.
+        8. L03b Second ordered child with strike. The authored marker is 2.
+      • L04 Second unordered parent.

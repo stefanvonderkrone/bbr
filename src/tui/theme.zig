@@ -15,6 +15,8 @@ const Color = vaxis.Cell.Color;
 const review_card = @import("review_card.zig");
 
 pub const Theme = struct {
+    /// Pair fixed RGB bands with fixed foregrounds in the terminal-owned Theme.
+    fixed_band_foregrounds: bool = false,
     /// Frame-owned Pane and Overlay chrome.
     pane_border: Style = .{ .dim = true },
     pane_border_focused: Style = .{ .bold = true },
@@ -75,6 +77,10 @@ pub const Theme = struct {
     /// A Draft whose POST outcome remains unresolved after Duplicate guards.
     outcome_unknown: Style,
     outcome_unknown_reply: Style,
+    markdown_italic: Color = .{ .rgb = .{ 0x40, 0xe0, 0xd0 } },
+    markdown_bold: Color = .{ .rgb = .{ 0xff, 0xa5, 0x00 } },
+    markdown_inline_code: Color = .{ .rgb = .{ 0x90, 0xee, 0x90 } },
+    code_background: Color = .{ .rgb = .{ 0x2c, 0x2c, 0x2c } },
     /// A section divider (PR comments / Pending / Outdated).
     section: Style,
     /// The PR picker overlay's background rows.
@@ -101,21 +107,34 @@ pub const Theme = struct {
 
     /// Style for a diff body line of the given kind.
     pub fn lineStyle(self: Theme, kind: LineKind) Style {
-        return switch (kind) {
+        return self.resolveStyle(switch (kind) {
             .context => self.context,
             .added => self.added,
             .removed => self.removed,
-        };
+        });
     }
 
     /// Style for the emphasized (changed) run within an added/removed line.
     /// Context lines have no emphasis, so they fall back to their base band.
     pub fn emphasisStyle(self: Theme, kind: LineKind) Style {
-        return switch (kind) {
+        return self.resolveStyle(switch (kind) {
             .context => self.context,
             .added => self.added_emphasis,
             .removed => self.removed_emphasis,
+        });
+    }
+
+    /// Resolve after foreground/background composition. Terminal palette colors
+    /// remain terminal-owned only while the background is terminal-owned too.
+    pub fn resolveStyle(self: Theme, base: Style) Style {
+        if (!self.fixed_band_foregrounds or base.bg != .rgb) return base;
+        var style = base;
+        style.fg = switch (base.fg) {
+            .default => rgb(0xcd_d6_f4),
+            .index => |index| if (index < band_foregrounds.len) rgb(band_foregrounds[index]) else base.fg,
+            .rgb => base.fg,
         };
+        return style;
     }
 
     /// Compose a ReviewCard surface, semantic part, and inline Markdown marks.
@@ -141,12 +160,28 @@ pub const Theme = struct {
                 style.dim = true;
             },
             .header => style.bold = true,
-            .body => {},
+            .body => style.bold = false,
+            .code_body => {
+                style = self.context;
+                style.bg = self.code_background;
+            },
         }
         style.italic = style.italic or marks.emphasis;
         style.bold = style.bold or marks.strong;
+        style.strikethrough = style.strikethrough or marks.strikethrough;
+        if (marks.inline_code) {
+            style.fg = self.markdown_inline_code;
+        } else if (marks.strong) {
+            style.fg = self.markdown_bold;
+        } else if (marks.emphasis) {
+            style.fg = self.markdown_italic;
+        }
         if (marks.link_label or marks.link_destination) style.ul_style = .single;
-        return style;
+        if (marks.heading_marker or marks.divider) {
+            style.fg = self.gutter.fg;
+            style.dim = true;
+        }
+        return self.resolveStyle(style);
     }
 
     /// Highlighted background for a cell on the cursor row. A cell with an rgb
@@ -234,7 +269,7 @@ pub const dark: Theme = .{
     .status_removed = rgb(0xd0_6c_6c),
     .status_renamed = rgb(0xb0_88_e0),
     .comment = .{ .bg = rgb(0x1c_1c_28), .fg = rgb(0xc8_c8_d8) },
-    .comment_reply = .{ .bg = rgb(0x18_18_22), .fg = rgb(0xb0_b0_c0) },
+    .comment_reply = .{ .bg = rgb(0x18_18_22), .fg = rgb(0xc8_c8_d8) },
     .suggestion = .{ .bg = rgb(0x14_28_28), .fg = rgb(0x9c_d0_c0) },
     .draft = .{ .bg = rgb(0x2c_24_10), .fg = rgb(0xe0_c8_88), .bold = true },
     .draft_reply = .{ .bg = rgb(0x24_1e_0c), .fg = rgb(0xc8_b0_78) },
@@ -285,12 +320,16 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
         .status_removed = rgb(p.red),
         .status_renamed = rgb(p.violet),
         .comment = .{ .fg = rgb(p.fg), .bg = rgb(p.surface) },
-        .comment_reply = .{ .fg = rgb(p.muted), .bg = rgb(p.surface) },
+        .comment_reply = .{ .fg = rgb(p.fg), .bg = rgb(p.surface) },
         .suggestion = .{ .fg = rgb(p.teal), .bg = rgb(p.surface) },
         .draft = .{ .fg = rgb(p.yellow), .bg = rgb(p.surface), .bold = true },
         .draft_reply = .{ .fg = rgb(p.yellow), .bg = rgb(p.surface) },
         .outcome_unknown = .{ .fg = rgb(p.fg), .bg = rgb(if (p.light) 0xff_e0_a3 else 0x5a_30_00), .bold = true },
         .outcome_unknown_reply = .{ .fg = rgb(p.fg), .bg = rgb(if (p.light) 0xff_e9_bd else 0x46_25_00) },
+        .markdown_italic = rgb(if (p.light) 0x00_80_80 else 0x40_e0_d0),
+        .markdown_bold = rgb(if (p.light) 0xa6_50_00 else 0xff_a5_00),
+        .markdown_inline_code = rgb(if (p.light) 0x20_7a_36 else 0x90_ee_90),
+        .code_background = rgb(p.surface2),
         .section = .{ .fg = rgb(p.muted), .bg = rgb(p.bg), .bold = true },
         .picker = .{ .fg = rgb(p.fg), .bg = rgb(p.surface) },
         .picker_selected = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2), .bold = true },
@@ -311,7 +350,19 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
     };
 }
 
+// Fixed foregrounds for fixed dark bands. Preserve ANSI hues without depending
+// on whether the terminal palette supplies light or dark text colors.
+const band_foregrounds = [_]u24{
+    0xcdd6f4, 0xf38ba8, 0xa6e3a1, 0xf9e2af,
+    0x89b4fa, 0xcba6f7, 0x94e2d5, 0xbac2de,
+    0xbac2de, 0xf38ba8, 0xa6e3a1, 0xf9e2af,
+    0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xa6adc8,
+};
+
+// Keep terminal colors on terminal backgrounds. Pair muted RGB bands with
+// readable RGB foregrounds through resolveStyle, including cursor and search.
 pub const system: Theme = .{
+    .fixed_band_foregrounds = true,
     .pane_border = .{ .fg = .{ .index = 8 }, .dim = true },
     .pane_border_focused = .{ .bold = true },
     .overlay_border = .{ .bold = true },
@@ -319,13 +370,13 @@ pub const system: Theme = .{
     .accent = .{ .index = 4 },
     .section_rule = .{ .fg = .{ .index = 8 }, .dim = true },
     .context = .{},
-    .added = .{ .bg = .{ .index = 2 } },
-    .removed = .{ .bg = .{ .index = 1 } },
-    .added_emphasis = .{ .bg = .{ .index = 10 } },
-    .removed_emphasis = .{ .bg = .{ .index = 9 } },
+    .added = .{ .bg = dark.added.bg },
+    .removed = .{ .bg = dark.removed.bg },
+    .added_emphasis = .{ .bg = rgb(0x2c_4c_2c) },
+    .removed_emphasis = .{ .bg = dark.removed_emphasis.bg },
     .gutter = .{ .fg = .{ .index = 8 } },
-    .cursor_line = .{ .index = 8 },
-    .cursor_line_shift = 0,
+    .cursor_line = rgb(0x30_30_44),
+    .cursor_line_shift = 12,
     .file_header = .{ .bold = true },
     .hunk_header = .{ .fg = .{ .index = 4 } },
     .fold = .{ .fg = .{ .index = 8 } },
@@ -336,20 +387,24 @@ pub const system: Theme = .{
     .status_removed = .{ .index = 1 },
     .status_renamed = .{ .index = 5 },
     .comment = .{ .fg = .{ .index = 6 } },
-    .comment_reply = .{ .fg = .{ .index = 8 } },
+    .comment_reply = .{ .fg = .{ .index = 6 } },
     .suggestion = .{ .fg = .{ .index = 6 } },
     .draft = .{ .fg = .{ .index = 3 }, .bold = true },
     .draft_reply = .{ .fg = .{ .index = 3 } },
     .outcome_unknown = .{ .fg = .{ .index = 0 }, .bg = .{ .index = 3 }, .bold = true },
     .outcome_unknown_reply = .{ .fg = .{ .index = 0 }, .bg = .{ .index = 3 } },
-    .section = .{ .fg = .{ .index = 8 }, .bold = true },
+    .markdown_italic = .{ .index = 6 },
+    .markdown_bold = .{ .index = 208 },
+    .markdown_inline_code = .{ .index = 2 },
+    .code_background = rgb(0x28_28_34),
+    .section = .{ .fg = .{ .index = 7 }, .bold = true },
     .picker = .{},
     .picker_selected = .{ .reverse = true, .bold = true },
     .picker_query = .{ .reverse = true },
-    .search_match = .{ .index = 12 },
-    .search_active = .{ .index = 11 },
+    .search_match = rgb(0x53_46_68),
+    .search_active = rgb(0x70_50_18),
     .search_no_match = .{ .index = 1 },
-    .syntax_comment = .{ .index = 8 },
+    .syntax_comment = .{ .index = 7 },
     .syntax_string = .{ .index = 2 },
     .syntax_keyword = .{ .index = 5 },
     .syntax_function = .{ .index = 4 },
@@ -357,7 +412,7 @@ pub const system: Theme = .{
     .syntax_constant = .{ .index = 3 },
     .syntax_variable = .default,
     .syntax_property = .{ .index = 6 },
-    .syntax_punctuation = .{ .index = 8 },
+    .syntax_punctuation = .{ .index = 7 },
     .syntax_tag = .{ .index = 1 },
 };
 
@@ -472,6 +527,10 @@ test "search matches stay distinct from ReviewCard and diff backgrounds in every
 
 test "every built-in Theme composes every ReviewCard role and Markdown refinement" {
     for (builtins) |builtin| {
+        const parent = builtin.value.reviewCardStyle(.comment, .body, .{});
+        const reply = builtin.value.reviewCardStyle(.comment_reply, .body, .{});
+        try testing.expectEqual(parent.fg, reply.fg);
+        try testing.expect(!reply.dim);
         inline for (std.meta.tags(review_card.CardRole)) |role| {
             const prose = builtin.value.reviewCardStyle(role, .body, .{ .emphasis = true });
             try testing.expect(prose.italic);
@@ -488,4 +547,82 @@ test "Capture colors resolve hierarchical names and preserve unknown foregrounds
     try testing.expectEqual(dark.syntax_function, dark.captureColor(bbr.highlight.Capture.init(0, "function.call.builtin")).?);
     try testing.expectEqual(dark.syntax_keyword, dark.captureColor(bbr.highlight.Capture.init(1, "operator")).?);
     try testing.expect(dark.captureColor(bbr.highlight.Capture.init(2, "unrecognized.future.capture")) == null);
+}
+
+test "M23 inline Theme colors and attributes combine without Draft body bold" {
+    try testing.expectEqual(rgb(0x40e0d0), dark.markdown_italic);
+    try testing.expectEqual(rgb(0xffa500), dark.markdown_bold);
+    try testing.expectEqual(rgb(0x90ee90), dark.markdown_inline_code);
+    for (builtins) |builtin| {
+        const theme = builtin.value;
+        inline for (std.meta.tags(review_card.CardRole)) |role| {
+            try testing.expect(!theme.reviewCardStyle(role, .body, .{}).bold);
+            const italic = theme.reviewCardStyle(role, .body, .{ .emphasis = true });
+            try testing.expectEqual(theme.markdown_italic, italic.fg);
+            const bold = theme.reviewCardStyle(role, .body, .{ .strong = true, .emphasis = true, .link_label = true });
+            try testing.expectEqual(theme.markdown_bold, bold.fg);
+            try testing.expect(bold.bold and bold.italic and bold.ul_style == .single);
+        }
+    }
+}
+
+test "M23 inline system bands keep Catppuccin Mocha text readable" {
+    // Resolve the terminal palette from the reported Ghostty Theme. Bright ANSI
+    // foreground colors must not become backgrounds behind the same syntax.
+    const palette = [_]u24{
+        0x45475a, 0xf38ba8, 0xa6e3a1, 0xf9e2af,
+        0x89b4fa, 0xcba6f7, 0x94e2d5, 0xbac2de,
+        0x585b70, 0xf38ba8, 0xa6e3a1, 0xf9e2af,
+        0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xa6adc8,
+    };
+    const backgrounds = [_]Color{
+        system.added.bg,                           system.removed.bg,
+        system.added_emphasis.bg,                  system.removed_emphasis.bg,
+        system.cursorBg(system.added.bg),          system.cursorBg(system.removed.bg),
+        system.cursorBg(system.added_emphasis.bg), system.cursorBg(system.removed_emphasis.bg),
+        system.cursor_line,                        system.code_background,
+        system.cursorBg(system.code_background),   system.search_match,
+        system.search_active,
+    };
+    const foregrounds = [_]Color{
+        system.context.fg,         system.syntax_comment,       system.syntax_string,
+        system.syntax_keyword,     system.syntax_function,      system.syntax_type,
+        system.syntax_constant,    system.syntax_variable,      system.syntax_property,
+        system.syntax_punctuation, system.syntax_tag,           system.markdown_italic,
+        system.markdown_bold,      system.markdown_inline_code,
+    };
+    for ([_]Color{ system.search_match, system.search_active }) |match| {
+        const match_luminance = systemTestLuminance(match, palette);
+        for ([_]Color{ system.cursor_line, system.cursorBg(system.code_background) }) |selected| {
+            const selected_luminance = systemTestLuminance(selected, palette);
+            try testing.expect((@max(match_luminance, selected_luminance) + 0.05) / (@min(match_luminance, selected_luminance) + 0.05) >= 1.4);
+        }
+    }
+    for (backgrounds) |background| {
+        const bg = systemTestLuminance(background, palette);
+        for (foregrounds) |foreground| {
+            const fg = systemTestLuminance(foreground, palette);
+            try testing.expect((@max(fg, bg) + 0.05) / (@min(fg, bg) + 0.05) >= 3);
+        }
+    }
+}
+
+fn systemTestLuminance(color: Color, palette: [16]u24) f64 {
+    const channels = switch (color) {
+        .default => rgb(0xcdd6f4).rgb,
+        .rgb => |channels| channels,
+        .index => |index| if (index < palette.len) rgb(palette[index]).rgb else blk: {
+            // The system Theme uses xterm orange for bold Markdown.
+            testing.expect(index == 208) catch unreachable;
+            break :blk rgb(0xff8700).rgb;
+        },
+    };
+    var result: f64 = 0;
+    const weights = [_]f64{ 0.2126, 0.7152, 0.0722 };
+    for (channels, weights) |channel, weight| {
+        const srgb = @as(f64, @floatFromInt(channel)) / 255;
+        const linear = if (srgb <= 0.04045) srgb / 12.92 else @exp(2.4 * @log((srgb + 0.055) / 1.055));
+        result += linear * weight;
+    }
+    return result;
 }

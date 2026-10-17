@@ -32,7 +32,11 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/bbr-version.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 export ZIG_LOCAL_CACHE_DIR="$tmp/zig-cache"
 
-git ls-files -co --exclude-standard >"$tmp/files"
+git ls-files -co --exclude-standard | while IFS= read -r path; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        printf '%s\n' "$path"
+    fi
+done >"$tmp/files"
 tar -cf "$tmp/source.tar" -T "$tmp/files"
 mkdir "$tmp/git" "$tmp/source-copy"
 tar -xf "$tmp/source.tar" -C "$tmp/git"

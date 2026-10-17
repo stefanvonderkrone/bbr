@@ -618,6 +618,7 @@ pub const Storage = struct {
     /// enforces the inactive cache budget after focus moves.
     pub fn focusAdmitted(self: *Storage, file_idx: usize) void {
         std.debug.assert(self.retired.items.len == 0);
+        if (self.focused_file == file_idx) return;
         self.recency +|= 1;
         self.files[file_idx].last_used = self.recency;
         self.cache_entries[file_idx].store(self.files[file_idx]);
