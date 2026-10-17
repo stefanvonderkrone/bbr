@@ -15,7 +15,7 @@ Two older paths still delete without that rule, and neither has a production cal
 - `PendingReviewStore.remove` (`src/review/store.zig`) — on the seam's **vtable**, so every adapter implements it and any future caller gets a single-row delete that silently strands Replies. Called only from `src/review/store.zig` and `src/persist/sqlite_store.zig` tests.
 - `PendingReview.remove` (`src/review/draft.zig`) — an in-memory cascade that now duplicates `collectCascade` + `deleteDraftSubtree`, and reports out-of-memory by returning `0` rather than failing. Called only from its own test, `remove takes a draft's reply-descendants with it`.
 
-The hazard is the vtable one: it is a documented, implemented, seam-level operation whose contract contradicts the Draft subtree entry in `src/review/CONTEXT.md`. Dead code is not the problem — a reachable delete with the wrong semantics is.
+The hazard is the vtable one: it is a documented, implemented, seam-level operation whose contract contradicts the Draft subtree entry in `src/review/GLOSSARY.md`. Dead code is not the problem — a reachable delete with the wrong semantics is.
 
 ## Decisions to make while implementing
 
@@ -26,7 +26,7 @@ The hazard is the vtable one: it is a documented, implemented, seam-level operat
 ## Acceptance
 
 - [x] No delete path reachable through `PendingReviewStore` can remove a Draft while leaving a Draft that reaches it through parentage.
-- [x] The surviving `deleteDraftSubtree` contract is documented, and `src/review/CONTEXT.md`'s Draft subtree entry matches the implemented rule.
+- [x] The surviving `deleteDraftSubtree` contract is documented, and `src/review/GLOSSARY.md`'s Draft subtree entry matches the implemented rule.
 - [x] Removing the vtable method leaves both adapters and every seam consumer compiling, with no behaviour change to submission, recovery, or resolution paths.
 - [x] Tests that only exercised the retired paths were deleted rather than retargeted; verification reports 552/552 tests passed.
 - [x] Deterministic adapter tests cover the surviving contract, including `DraftNotFound` for a missing confirmed root rather than idempotent deletion.

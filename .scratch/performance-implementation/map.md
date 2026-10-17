@@ -9,7 +9,7 @@ A measured, faster `bbr` with every P0 action implemented and each P1 or P2 acti
 ## Notes
 
 - This map carries execution. A task can change code, tests, benchmarks, and documentation when it resolves one action from `PERFORMANCE.md`.
-- Primary domains: Diff, Highlighting, Presentation, Bitbucket, and Git. Read `CONTEXT-MAP.md` and each affected `CONTEXT.md` before a change.
+- Primary domains: Diff, Highlighting, Presentation, Bitbucket, and Git. Read `GLOSSARY-MAP.md` and each affected `GLOSSARY.md` before a change.
 - Use `zig` and `ponytail` for every implementation task. Use `diagnosing-bugs` when a benchmark or regression needs diagnosis.
 - Use ReleaseFast benchmarks on the current macOS host as the first baseline. Record enough host data to reproduce each comparison, but keep production code portable.
 - Keep an optimization only when repeated measurements show a clear gain, output checksums stay stable, and related benchmarks show no material regression.

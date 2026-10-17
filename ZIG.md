@@ -4,15 +4,41 @@ Tracks the Zig features and stdlib APIs **bbr** relies on, pinned to the current
 toolchain. Zig's std churns hard between minor versions, so when you bump Zig, re-verify each
 section against the new stdlib and update this file.
 
-- **Installed:** `zig 0.16.0` (`/opt/homebrew/bin/zig`, Cellar `0.16.0_1`)
-- **stdlib root:** `/opt/homebrew/Cellar/zig/0.16.0_1/lib/zig/std`
-- **libvaxis:** `main` (v0.6.0) — `minimum_zig_version = "0.16.0"` ✓
+- **Toolchain:** Zig 0.16.0. `zig version` identifies the active compiler.
+- **Source locations:** `zig env` reports `std_dir` and `global_cache_dir` for the active compiler.
+- **Dependencies:** `build.zig.zon` pins the libvaxis and zf commits and package hashes.
 - All API facts below were read from the installed stdlib source, not from memory.
 - Companion: the [`zig` skill](.claude/skills/zig/SKILL.md) holds the *process* (verify-don't-recall
   discipline + recurring corrections). Keep both current — see this file's re-verification checklist
   and the skill's "Keep this skill and ZIG.md current" section.
 
 ---
+
+## Find toolchain and dependency sources
+
+1. Run `zig version` and `zig env` in the current checkout.
+   Use `std_dir` for stdlib searches and `global_cache_dir` for package searches.
+   These locations can change with the host, toolchain, or cache overrides.
+2. For a dependency, read its `hash` in `build.zig.zon`.
+   Search inside `<global_cache_dir>/p` for that exact hash.
+   Zig 0.16 can store package sources as `<hash>.tar.gz` rather than an extracted directory.
+3. If the package is an archive, list its members before you search for source files:
+
+   ```sh
+   archive="<global_cache_dir>/p/<hash>.tar.gz"
+   tar -tf "$archive"
+   tar -xOf "$archive" "<hash>/src/Cell.zig"
+   ```
+
+   Replace the placeholders with the active cache path and the pinned hash.
+   The `Cell.zig` example reads libvaxis cell definitions without extracting the package.
+   Use the member path from `tar -tf` for other source files.
+4. For searches across several package files, extract the archive into a temporary directory.
+   Search inside that directory.
+   If the cache already contains an extracted package, search inside its directory directly.
+
+An empty source-file search does not prove that a cached dependency lacks the file.
+The cache can contain several package versions. The hash in the current checkout selects the relevant source.
 
 ## 1. "Writergate": `std.Io.Reader` / `std.Io.Writer`
 
@@ -314,9 +340,25 @@ Verified in `std/Io/Dir.zig:1326-1338` and `std/Io/Reader.zig:367-386`.
 - `std.posix.tcgetattr(fd)` returns `TermiosGetError!termios` (`std/posix.zig:1161-1173`).
   A pipe returns `error.NotATerminal`.
 - `std.posix.tcsetattr(fd, .NOW, term)` takes the `termios` value (`std/posix.zig:1176-1189`).
-  `bbr login` restores the original value with `defer` after each Token prompt.
+  `bbr auth login` restores the original value with `defer` after each Token prompt.
 - On macOS, `term.lflag.ECHO` and `term.lflag.ECHONL` are boolean fields (`std/c.zig:9332-9339`).
   The Token prompt clears both fields and writes its own newline.
+
+## 9. Directory permission changes
+
+On Linux, `openDir` uses `O_PATH` unless `OpenOptions.iterate` is true (`std/Io/Threaded.zig:5268-5269`).
+`Dir.setPermissions` calls `fchmod`, which rejects an `O_PATH` handle with `BADF` (`std/Io/Threaded.zig:8948-8961`).
+For directory permission changes, pass `.iterate = true` to `openDir`.
+For `createDirPathOpen`, pass `.open_options = .{ .iterate = true }` (`std/Io/Dir.zig:857-871`).
+The auth storage tests verify both directory creation and permission repair on Linux.
+
+## 10. Atomic saves through symlinks
+
+`Dir.readLink(io, sub_path, buffer)` returns the link length or `NotLink` for a regular file (`std/Io/Dir.zig:1263-1299`).
+`Dir.realPathFileAlloc(io, sub_path, allocator)` returns an owned, canonical absolute path (`std/Io/Dir.zig:918-947`).
+It follows symlink chains and requires an existing target.
+`File.Atomic.replace(io)` renames the temporary file over the destination entry (`std/Io/File/Atomic.zig:67-85`).
+To preserve a file symlink, create the atomic file in the resolved target directory and replace the target entry.
 
 ## Re-verification checklist (on any Zig upgrade)
 - [ ] `std.process.Init` shape (`gpa`/`arena`/`io`/`environ_map`/`minimal.args`) unchanged?
@@ -330,6 +372,8 @@ Verified in `std/Io/Dir.zig:1326-1338` and `std/Io/Reader.zig:367-386`.
 - [ ] `ArenaAllocator.reset(.{ .retain_with_limit = bytes })` failure semantics unchanged?
 - [ ] `ArenaAllocator.queryCapacity` semantics still exclude internal node storage?
 - [ ] `std.Io.Reader`/`Writer` method surface we use unchanged?
+- [ ] Directory handles still need `.iterate = true` for `setPermissions` on Linux?
+- [ ] `Dir.readLink`, `realPathFileAlloc`, and `File.Atomic.replace` still preserve the documented path and rename behavior?
 - [ ] `std.posix.tcgetattr`, `tcsetattr`, and the `ECHO` and `ECHONL` fields unchanged?
 - [ ] libvaxis still builds against the new toolchain; re-pin its commit.
 - [ ] libvaxis `Vaxis.copyToSystemClipboard` signature and OSC 52 behavior unchanged?

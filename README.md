@@ -14,8 +14,9 @@ suggestions that stay **pending locally** until you submit them as a batch.
 | Document | What it is |
 |---|---|
 | [`docs/design.html`](docs/design.html) | The design document — architecture, seams, diff/rendering, pending review, concurrency, memory, milestones. **Start here.** |
-| [`CONTEXT-MAP.md`](CONTEXT-MAP.md) | Bounded contexts and how they relate. |
-| `src/*/CONTEXT.md` | Per-context glossary (ubiquitous language). Pure vocabulary, no implementation. |
+| [`GLOSSARY-MAP.md`](GLOSSARY-MAP.md) | Bounded contexts and how they relate. |
+| `src/*/GLOSSARY.md` | Per-context domain vocabulary. |
+| [`docs/code-navigation.md`](docs/code-navigation.md) | Code entry points, implementation seams, and links to context-specific implementation notes. |
 | [`docs/adr/`](docs/adr/) | Architecture Decision Records for the hard-to-reverse choices. |
 | [`ZIG.md`](ZIG.md) | Zig 0.16.0 feature/API notes this project depends on. |
 | [`docs/m16-operations.md`](docs/m16-operations.md) | Mutation, Submission repair, External Edit, and opt-in checks. |
@@ -26,7 +27,7 @@ suggestions that stay **pending locally** until you submit them as a batch.
 ## Key decisions at a glance
 
 - **Target:** Bitbucket Cloud (`api.bitbucket.org/2.0`), workspace `check24`; HTTP Basic with an
-  Atlassian API token saved via `bbr login` (environment override available).
+  Atlassian API token saved via `bbr auth login` (environment override available).
 - **Stack:** Zig 0.16.0, libvaxis (TUI), zf (fuzzy find), SQLite/libSQL (pending reviews),
   tree-sitter (highlighting, post-MVP).
 - **Pending review is client-side** — Bitbucket Cloud has no native draft concept
@@ -81,18 +82,37 @@ zig build run -- local [base-ref] [source-ref]  # committed local review (no cre
 Credential. The `check*` commands are explicit local opt-ins and are never part of `test`; see
 [`docs/m19-operations.md`](docs/m19-operations.md) for their gates and scope.
 
-Remote-review credentials are managed with `bbr login` / `bbr logout` and stored in
-`$XDG_DATA_HOME/bbr/auth.toml` (fallback `$HOME/.local/share/bbr/auth.toml`, mode `0600`).
-`bbr login [profile]` prompts for Email, API Token, and Workspace, verifies them live
-against Bitbucket (`GET /user` plus a workspace probe), then saves the profile and selects
-it as active. Named profiles hold one credential set each (`[profiles.<name>]`); selection is
-`--profile <name>`, then `BBR_PROFILE`, then the Active Profile in `active_profile`, then `default`.
-`bbr logout [profile]` removes the selected Profile. Bare `bbr logout` uses the same Profile selection order.
-`bbr logout --all` deletes the file.
-`BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, `BITBUCKET_WORKSPACE` override the selected
-profile per field for scripting. `bbr local` does not read or
-require them. Its SourceRef defaults to the current branch; its BaseRef defaults to the tracking
-remote's locally recorded default branch and must be supplied when Git has no such default.
+Remote-review credentials are managed with `bbr auth login` / `bbr auth status` /
+`bbr auth logout` and stored in `$XDG_DATA_HOME/bbr/auth.toml` (fallback
+`$HOME/.local/share/bbr/auth.toml`). The `bbr` directory is created and repaired to mode
+`0700` (parents untouched); `auth.toml` is replaced atomically with mode `0600`.
+`bbr auth login [profile]` prompts for each missing field in Email, Token, Workspace order
+(`--email` / `--workspace` skip their prompts; the token prompt hides input and restores echo
+on every exit), verifies the credential live against Bitbucket (`GET /user` plus a workspace
+probe), then saves the profile and selects it as active. `--stdin` reads only the token as one
+silent line and requires `--email` and `--workspace`; piped input without `--stdin` is refused
+before the first prompt. Unknown arguments are rejected: the token never rides as a CLI argument.
+`bbr auth status [profile]` always validates live and reports the profile, configured email,
+workspace, per-field file-versus-environment source, proven account UUID, and separate account
+and workspace results without ever printing the token. `bbr auth logout [profile]` removes the
+selected Profile and keeps the rest; `--all` deletes only `auth.toml`. Logout is idempotent,
+does not revoke the Atlassian API token, and cannot remove environment overrides.
+Named profiles hold one credential set each (`[profiles.<name>]`); selection is positional arg,
+then `--profile <name>`, then `BBR_PROFILE`, then the Active Profile in `active_profile`, then
+`default`. `BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, `BITBUCKET_WORKSPACE` override the selected
+profile per field (empty counts as missing; a complete set resolves without the file). `bbr local`
+does not read or require them. Its SourceRef defaults to the current branch; its BaseRef defaults
+to the tracking remote's locally recorded default branch and must be supplied when Git has no
+such default.
+
+Create the token at your Atlassian account (Security → API tokens) with an expiry date and the
+minimum scopes for your work: `read:account` (prove the account), `read:repository:bitbucket`
+(repositories, diffs, blobs), `read:pullrequest:bitbucket` (read, comment, tasks),
+`write:pullrequest:bitbucket` (approve, decline, mutate), `read:workspace:bitbucket` (workspace
+and member search). Rotate by creating a replacement token and running `bbr auth login` again;
+tokens cannot be viewed after creation, so replace rather than recover. See
+[API tokens](https://support.atlassian.com/bitbucket-cloud/docs/api-tokens/) and
+[API token permissions](https://support.atlassian.com/bitbucket-cloud/docs/api-token-permissions/).
 
 ### Bitbucket API commands
 

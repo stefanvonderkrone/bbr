@@ -21,7 +21,8 @@ Published Comment mutation is distinct from Draft mutation. Ownership comes from
 
 ## Blocked by
 
-None - capability verification is the first gate within this slice.
+None.
 
 ## Comments
 
+Capability verification is the first gate within this slice.

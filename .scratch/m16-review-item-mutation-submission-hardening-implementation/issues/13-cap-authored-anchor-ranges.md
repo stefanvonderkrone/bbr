@@ -10,7 +10,7 @@
 
 Ticket 04 introduced `Anchor.validateShape` and `max_anchor_lines` (30) and applied them to re-anchor candidates and to both store adapters' `reanchorDraft` path. Initial authoring — `i` and `S` through `openInlineComposer`/`spanFromLines` in `src/tui/presentation.zig` — was deliberately left alone because changing it was outside 04's scope.
 
-That leaves one inconsistency: a 40-line Selection can still *create* an inline Comment, but the identical Selection is refused when re-anchoring that same Comment, and Bitbucket's verified envelope is the same in both directions. The Selection entry in `src/review/CONTEXT.md` already states the 30-line rule unconditionally, so today the code is narrower than the documented language.
+That leaves one inconsistency: a 40-line Selection can still *create* an inline Comment, but the identical Selection is refused when re-anchoring that same Comment, and Bitbucket's verified envelope is the same in both directions. The Selection entry in `src/review/GLOSSARY.md` already states the 30-line rule unconditionally, so today the code is narrower than the documented language.
 
 ## Decisions to make while implementing
 
@@ -23,7 +23,7 @@ That leaves one inconsistency: a 40-line Selection can still *create* an inline 
 - [x] Exactly 30 inclusive lines is still accepted on both the new and old side, at creation and at re-anchor.
 - [x] The refusal is discoverable the same way every other authoring refusal is: a precise ActionError, not a silent no-op or a truncated range.
 - [x] Persisted Drafts whose Anchor predates the cap still load, project, and submit; the cap governs new authored Anchors, not stored history.
-- [x] `src/review/CONTEXT.md`'s Selection entry matches the implemented rule in both directions.
+- [x] `src/review/GLOSSARY.md`'s Selection entry matches the implemented rule in both directions.
 - [x] Deterministic tests cover the creation boundary on both sides, the refusal reason, and the legacy-row load path.
 
 ## Implementation

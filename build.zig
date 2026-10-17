@@ -205,6 +205,19 @@ pub fn build(b: *std.Build) void {
     const release_validation = b.addSystemCommand(&.{ "sh", "tests/release_validation_test.sh" });
     release_validation.setCwd(b.path("."));
 
+    const cli_test_step = b.step("test-cli", "Run hermetic Python CLI checks (requires python3)");
+    for ([_][]const u8{
+        "tests/auth_cli_test.py",
+        "tests/api_auth_cli_test.py",
+        "tests/completion_cli_test.py",
+    }) |script| {
+        const cli_test = b.addSystemCommand(&.{"python3"});
+        cli_test.addFileArg(b.path(script));
+        cli_test.addArtifactArg(exe);
+        cli_test.setCwd(b.path("."));
+        cli_test_step.dependOn(&cli_test.step);
+    }
+
     const re2_tests = b.addTest(.{
         .name = "re2-wrapper-tests",
         .root_module = exe.root_module,
@@ -366,6 +379,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&version_integration.step);
     test_step.dependOn(&release_validation.step);
     test_step.dependOn(&run_lifecycle_test.step);
+    test_step.dependOn(cli_test_step);
 }
 
 fn resolveVersion(b: *std.Build) []const u8 {

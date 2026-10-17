@@ -32,7 +32,7 @@ Sizes are relative effort (S/M/L), not calendar estimates. Dependencies noted pe
 - [x] Thread builder: flat comments → nested `Thread`s (by `parent.id`). ✅ `src/review/thread.zig` — resolves each comment to its ultimate root, buckets replies in creation order, promotes orphans, handles out-of-order input. Zero-copy over the comment slice.
 - [x] ThreadPane: inline threads + PR-level comments; render ```suggestion``` blocks distinctly. ✅ woven in `buffer.buildWithComments` (PR-level section at top; inline threads under their anchored line; root/reply rows) and drawn in `render.zig` (`▸` root, `↳` reply, `±` suggestion with its own band). Multi-line bodies show the lead line + `…` (full markdown rendering is M11).
 - [x] `resolved` state + reveal-resolved toggle (whole thread). ✅ M15 replaced the global `show_resolved` toggle with an in-place, per-Thread disclosure row that reveals the *whole* thread; status and keymap behavior are Session-scoped.
-- [x] AnchorState display (current/moved/outdated from Bitbucket verdict); per-file Outdated grouping. ✅ outdated threads grouped in a per-file "Outdated (N)" section and **never hidden** (even when resolved). Outdated is derived from each comment's `links.code` revision vs the PR's current source/destination commits — the list endpoint omits `inline.outdated` and it can't be recomputed from line numbers (see `bitbucket/CONTEXT.md`). Verified live on PR 1726 (8 outdated roots). `moved` isn't produced remotely; local diff-walk ships in M14. M15 adds independent collapse/re-expand state for Outdated groups.
+- [x] AnchorState display (current/moved/outdated from Bitbucket verdict); per-file Outdated grouping. ✅ outdated threads grouped in a per-file "Outdated (N)" section and **never hidden** (even when resolved). Outdated is derived from each comment's `links.code` revision vs the PR's current source/destination commits — the list endpoint omits `inline.outdated` and it can't be recomputed from line numbers (see `src/bitbucket/IMPLEMENTATION.md`). Verified live on PR 1726 (8 outdated roots). `moved` isn't produced remotely; local diff-walk ships in M14. M15 adds independent collapse/re-expand state for Outdated groups.
 - [x] Tests: thread nesting, resolved toggle, outdated grouping. ✅ thread nesting/orphan/out-of-order (`thread.zig`), weaving + resolved toggle + outdated grouping (`buffer.zig`), headless comment/suggestion render (`render.zig`), paginated `getComments` (`client.zig`). Suite green 62/62.
 
 ## M4 — PR discovery & switching  ·  M  ·  ✅ done
@@ -70,7 +70,7 @@ _Follow-through:_ `AnchorState.moved` via local diff-walk shipped in M14. Side-b
 _Follow-up:_ the scoped Picker tick and single-glyph spinner shipped in M15 without changing the blocking `nextEvent` model.
 
 ## M8 — File view scope (single-file)  ·  S/M  ·  ✅ done
-- [x] `only_file` scope in `BuildOptions`: project the Buffer to a single File's rows. ✅ `buffer.zig` `only_file: ?usize`; when set, only `diff.files[only_file]` is emitted (header, hunks, woven inline threads/drafts, outdated section) and the PR-level comment/pending sections plus other-file stranded drafts are suppressed (`draftInScope`). Reconciles the code with the domain language (`src/diff/CONTEXT.md` Buffer entry updated: whole-Diff scroll by default, single-File isolate view as the canonical review unit).
+- [x] `only_file` scope in `BuildOptions`: project the Buffer to a single File's rows. ✅ `buffer.zig` `only_file: ?usize`; when set, only `diff.files[only_file]` is emitted (header, hunks, woven inline threads/drafts, outdated section) and the PR-level comment/pending sections plus other-file stranded drafts are suppressed (`draftInScope`). Reconciles the code with the domain language (`src/diff/GLOSSARY.md` Buffer entry updated: whole-Diff scroll by default, single-File isolate view as the canonical review unit).
 - [x] Make the Sidebar a selector, not just a position indicator. ✅ `o` isolates the focused file (captures `fileIndexForRow(cursor)` into `isolate_file`); the sidebar highlight then tracks `isolate_file` directly. `o` again exits and lands the cursor back on that file's header (`fileHeaderRow`).
 - [x] Jump-to-file motion: scroll the pane to a File's header within the all-files buffer. ✅ `[`/`]` jump the cursor to the prev/next `file_header` (`prevFileHeaderRow`/`nextFileHeaderRow` + `Nav.jumpTo`); in the isolate view they step which file is isolated instead. Both readings (jump vs. isolate) are offered.
 - [x] Treat File Enrichment as Epoch-stamped work once focus has a real payload. ✅ M9 (blobs) and M13 (highlighting) implement the seam; M8 correctly keeps isolation as an in-memory projection.
@@ -290,26 +290,40 @@ Make the Browser and review Session feel like levels of one application, not sep
 - [ ] Extend the help Overlay so each Interaction Context shows its available Actions, including back, direct navigation, finding, settings, and global quit.
 - [ ] Add Presentation integration coverage for every navigation path, state restoration, recent-item failures, Picker scope, settings persistence, and ActionAvailability.
 
-## M26 - Credential login and logout  ·  S/M  ·  needs M19
+## M26 - Credential login and logout  ·  S/M  ·  done  ·  needs M19
 Replace shell setup as the normal remote-review login flow. Keep Credential management outside the
 TUI and keep `bbr local` free of Credential reads.
 
-The baseline follows OpenCode: store one Bitbucket Credential as JSON at
-`$XDG_DATA_HOME/bbr/auth.json`, falling back to `$HOME/.local/share/bbr/auth.json`. OpenCode uses an
-XDG data file with mode `0600`. GitHub CLI prefers the system credential store and falls back to a
-plaintext file. bbr will use the portable file baseline first. A native credential-store adapter is
-not part of this milestone.
+The accepted storage format is TOML at `$XDG_DATA_HOME/bbr/auth.toml`, with
+`$HOME/.local/share/bbr/auth.toml` as the fallback. The user confirmed TOML on 2026-10-14.
+Keep the implemented named Profiles. The portable file baseline uses mode `0600`.
+A native credential-store adapter is not part of this milestone.
 
-- [ ] Add `bbr auth login`, `bbr auth status`, and `bbr auth logout`. Keep login, status, and logout under one `auth` command instead of adding top-level aliases.
-- [ ] Make `bbr auth login` read the Atlassian account email, API token, and Workspace interactively. Do not accept the API token as a command-line argument or display it. Permit standard input for non-interactive setup only through an explicit flag.
-- [ ] Validate the Credential against Bitbucket Cloud before saving it. Prove the Authenticated Account and access to the named Workspace. Report `unauthorized` and `forbidden` separately without printing request headers or response data that can contain the token.
-- [ ] Store a small JSON object containing `username`, `token`, and `workspace`. Create the parent directory with mode `0700`, write the file with mode `0600`, reject unsafe non-regular targets, and replace the file atomically so an interrupted login does not erase a valid Credential.
-- [ ] Resolve exactly one Credential source. A complete `BITBUCKET_USERNAME`, `BITBUCKET_TOKEN`, and `BITBUCKET_WORKSPACE` set overrides `auth.json` for automation. Reject a partial environment set instead of combining environment and file values. Missing both sources reports the `bbr auth login` command.
-- [ ] Make `bbr auth status` show the source, account email, Workspace, and validation result without showing the API token. Status must distinguish a stored Credential from an environment override.
-- [ ] Make `bbr auth logout` delete only `auth.json` and succeed when the file does not exist. Explain that logout does not revoke the Atlassian API token and cannot remove an environment override.
-- [ ] Keep Credential bytes out of logs, diagnostics, SQLite, config files, crash output, and test snapshots. Redact the value if an upstream error includes an Authorization header or token-bearing URL.
-- [ ] Update the Bitbucket glossary, README, startup diagnostics, and M19 token-rotation guidance when the behavior ships. Document token expiry and the minimum Bitbucket API-token scopes used by read, comment, and mutation operations.
-- [ ] Add hermetic tests for command parsing, hidden input, JSON round trips, precedence, partial environment failure, file modes, atomic replacement, unsafe targets, redaction, status output, idempotent logout, and `bbr local` isolation.
+Contract: [M26 Credential login and logout](.scratch/m26-credential-login-logout/SPEC.md).
+The [decision map](.scratch/m26-credential-login-logout/map.md) records the accepted policies.
+The Credential source decision overrides the original checklist requirement to reject partial environment sets.
+
+- [x] Add `bbr auth login`, `bbr auth status`, and `bbr auth logout` under one `auth` command.
+- [x] Read email, token, and Workspace interactively. Hide the token and restore terminal echo. Require `--stdin` for piped tokens, with `--email` and `--workspace`.
+- [x] Prove the Authenticated Account and Workspace access before saving. Report classified failures without Credential data and preserve the prior Credential on failure.
+- [x] Store named TOML Profiles atomically with mode `0600`. Create and repair only the auth directory to mode `0700`. Follow symlinks and reject unsafe targets.
+- [x] Resolve environment overrides per field over the selected Profile. Treat empty values as missing. Complete environment Credentials bypass the file. Partial sets use file values for missing fields.
+- [x] Make status validate live and report per-field sources, configured email, Workspace, and proven account UUID without the token.
+- [x] Make logout remove the selected Profile or delete only `auth.toml` with `--all`. Succeed when absent and explain no token revocation or environment removal.
+- [x] Keep Credential data out of diagnostics, logs, SQLite, config files, and snapshots. Redact upstream token and Authorization values where error text is reported.
+- [x] Update README, the Bitbucket glossary, startup diagnostics, completions, and M19 token-rotation guidance. Cite token expiry and minimum API scopes.
+- [x] Add hermetic checks for hidden input, strict stdin, TOML storage, environment overlays, permissions, unsafe targets, redaction, logout, and LocalReview isolation.
+
+M26 completion evidence, 2026-10-16: ticket 13 records 1,113 passing tests and all three Python CLI harnesses.
+PR #12 follow-up verification on native macOS `aarch64`, Zig 0.16.0:
+
+- `zig fmt --check build.zig src tests` passed.
+- `zig build` passed.
+- `zig build test --summary all` passed all 22 steps and 1,116 tests, including all three Python CLI harnesses.
+- `python3 tools/check_agent_docs.py` passed.
+
+The follow-up adds checks for file symlink updates, strict stdin, and status failure classification.
+The checks use no live Bitbucket Credential. Live checks remain optional and Credential-gated.
 
 Research checked 2026-08-23: [OpenCode CLI auth](https://opencode.ai/docs/cli/#auth),
 [OpenCode auth storage](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/auth/index.ts),

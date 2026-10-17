@@ -1,4 +1,4 @@
-//! The parsed diff model — the vocabulary of `src/diff/CONTEXT.md` as data.
+//! The parsed diff model — the vocabulary of `src/diff/GLOSSARY.md` as data.
 //!
 //! Everything here is **zero-copy**: `Line.text`, hunk headers, and file paths
 //! all borrow slices of the raw unified-diff text passed to the parser. The raw

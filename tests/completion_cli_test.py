@@ -41,6 +41,7 @@ with tempfile.TemporaryDirectory(prefix="bbr-completion-test-") as data_home:
             b"create-pull-request", b"update-pull-request", b"decline-pull-request",
             b"list-commit-pull-requests",
             b"list-workspace-members", b"search-workspace-members",
+            b"auth", b"login status logout",
         ):
             assert expected in result.stdout, (shell, expected)
 

@@ -23,9 +23,80 @@ pub const base_url = "https://api.bitbucket.org/2.0";
 pub const Client = struct {
     http: HttpClient,
     cred: Credential,
+    error_detail: ?*ErrorDetail = null,
+
+    /// Optional CLI diagnostic storage. Read or free it only after requests finish.
+    pub const ErrorDetail = struct {
+        allocator: Allocator,
+        io: std.Io,
+        mutex: std.Io.Mutex = .init,
+        reason: ?ApiError = null,
+        reported_error: ?anyerror = null,
+        message: ?[]u8 = null,
+
+        pub fn deinit(self: *ErrorDetail) void {
+            if (self.message) |message| self.allocator.free(message);
+            self.message = null;
+            self.reason = null;
+            self.reported_error = null;
+        }
+
+        fn copyFrom(self: *ErrorDetail, source: ?*const ErrorDetail) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.deinit();
+            const detail = source orelse return;
+            self.reason = detail.reason;
+            self.reported_error = detail.reported_error;
+            if (detail.message) |message| self.message = self.allocator.dupe(u8, message) catch null;
+        }
+
+        fn record(self: *ErrorDetail, reason: ApiError, body: []const u8, token: []const u8, headers: []const httpc.Header) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.deinit();
+            self.reason = reason;
+            const Envelope = struct { @"error": ?struct { message: ?[]const u8 = null } = null };
+            const parsed = std.json.parseFromSlice(Envelope, self.allocator, body, .{ .ignore_unknown_fields = true }) catch return;
+            defer parsed.deinit();
+            const api_error = parsed.value.@"error" orelse return;
+            const message = api_error.message orelse return;
+            if (message.len == 0) return;
+            var redacted: std.ArrayList(u8) = .empty;
+            defer redacted.deinit(self.allocator);
+            var position: usize = 0;
+            while (position < message.len) {
+                const remaining = message[position..];
+                var secret_len: usize = if (std.mem.startsWith(u8, remaining, token)) token.len else 0;
+                for (headers) |header| {
+                    if (!std.mem.eql(u8, header.name, "authorization") and !std.mem.eql(u8, header.name, "proxy-authorization")) continue;
+                    const start = if (std.mem.indexOfScalar(u8, header.value, ' ')) |space| space + 1 else 0;
+                    const value = header.value[start..];
+                    if (std.mem.startsWith(u8, remaining, value)) secret_len = @max(secret_len, value.len);
+                }
+                if (secret_len != 0) {
+                    redacted.appendSlice(self.allocator, "[redacted]") catch return;
+                    position += secret_len;
+                } else {
+                    const byte = message[position];
+                    redacted.append(self.allocator, if (byte < 0x20 or byte == 0x7f) ' ' else byte) catch return;
+                    position += 1;
+                }
+            }
+            self.message = redacted.toOwnedSlice(self.allocator) catch return;
+        }
+    };
 
     pub fn init(http: HttpClient, cred: Credential) Client {
         return .{ .http = http, .cred = cred };
+    }
+
+    fn send(self: Client, allocator: Allocator, request: httpc.Request) !httpc.Response {
+        const response = try self.http.send(allocator, request);
+        if (self.error_detail) |detail| {
+            classify(response.status) catch |reason| detail.record(reason, response.body, self.cred.token, request.headers);
+        }
+        return response;
     }
 
     /// GET /repositories/{workspace}/{repo}/pullrequests/{id}.
@@ -46,7 +117,7 @@ pub const Client = struct {
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
 
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .GET,
             .url = url,
             .headers = &.{
@@ -159,7 +230,7 @@ pub const Client = struct {
             .{ .name = "accept", .value = "application/json" },
             .{ .name = "content-type", .value = "application/json" },
         };
-        const response = try self.http.send(allocator, .{
+        const response = try self.send(allocator, .{
             .method = method,
             .url = url,
             .headers = headers[0..if (body != null) 3 else 2],
@@ -240,7 +311,7 @@ pub const Client = struct {
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
 
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .GET,
             .url = url,
             .headers = &.{
@@ -329,7 +400,7 @@ pub const Client = struct {
 
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .GET,
             .url = url,
             .headers = &.{
@@ -420,7 +491,7 @@ pub const Client = struct {
         const body = try std.json.Stringify.valueAlloc(allocator, wire, .{ .emit_null_optional_fields = false });
         defer allocator.free(body);
 
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .POST,
             .url = url,
             .headers = &.{
@@ -451,7 +522,7 @@ pub const Client = struct {
         const url = base_url ++ "/user";
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .GET,
             .url = url,
             .headers = &.{
@@ -469,13 +540,13 @@ pub const Client = struct {
     }
 
     /// GET /repositories/{workspace} to prove the workspace exists and the
-    /// credential can see it. Used by `bbr login` before saving.
+    /// credential can see it. Used by `bbr auth login` and `bbr auth status`.
     pub fn checkWorkspace(self: Client, allocator: Allocator, workspace: []const u8) !void {
         const url = try std.fmt.allocPrint(allocator, "{s}/repositories/{s}?pagelen=1", .{ base_url, workspace });
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .GET,
             .url = url,
             .headers = &.{
@@ -555,7 +626,7 @@ pub const Client = struct {
         url: []const u8,
         auth: []const u8,
     ) !void {
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = method,
             .url = url,
             .headers = &.{
@@ -587,7 +658,7 @@ pub const Client = struct {
         defer allocator.free(auth);
         const body = try std.json.Stringify.valueAlloc(allocator, .{ .content = .{ .raw = body_raw } }, .{});
         defer allocator.free(body);
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .PUT,
             .url = url,
             .headers = &.{
@@ -618,7 +689,7 @@ pub const Client = struct {
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .DELETE,
             .url = url,
             .headers = &.{
@@ -648,7 +719,7 @@ pub const Client = struct {
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
 
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .GET,
             .url = url,
             .headers = &.{
@@ -681,7 +752,7 @@ pub const Client = struct {
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
 
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .GET,
             .url = url,
             .headers = &.{
@@ -884,17 +955,17 @@ pub const Client = struct {
             const slot = &slots[index];
             defer slot.deinit(allocator);
             if (slot.err) |err| {
-                recordMemberFailure(&failure, slot.number, err);
+                recordMemberFailure(&failure, slot, err, self.error_detail);
                 continue;
             }
             const page = slot.result.?.value;
             if (page.page != null and page.page.? != slot.number or page.pagelen != null and page.pagelen.? != actual_pagelen) {
-                recordMemberFailure(&failure, slot.number, error.MalformedResponse);
+                recordMemberFailure(&failure, slot, error.MalformedResponse, self.error_detail);
                 continue;
             }
             if (page.next) |next| {
                 if (slot.number == std.math.maxInt(u32) or !numberedMemberNext(next, endpoint, slot.number + 1, actual_pagelen)) {
-                    recordMemberFailure(&failure, slot.number, error.MalformedResponse);
+                    recordMemberFailure(&failure, slot, error.MalformedResponse, self.error_detail);
                     continue;
                 }
                 if (slot.number == horizon) horizon = std.math.maxInt(u32);
@@ -920,7 +991,7 @@ pub const Client = struct {
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .GET,
             .url = url,
             .headers = &.{
@@ -968,7 +1039,7 @@ pub const Client = struct {
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .GET,
             .url = url,
             .headers = &.{
@@ -1066,7 +1137,7 @@ pub const Client = struct {
         var url = try pageUrlWithBase(allocator, first_url, opts);
         defer allocator.free(url);
         while (true) {
-            const res = try self.http.send(allocator, .{
+            const res = try self.send(allocator, .{
                 .method = .GET,
                 .url = url,
                 .headers = &.{
@@ -1143,7 +1214,7 @@ pub const Client = struct {
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .GET,
             .url = url,
             .headers = &.{
@@ -1174,7 +1245,7 @@ pub const Client = struct {
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .GET,
             .url = url,
             .headers = &.{
@@ -1207,7 +1278,7 @@ pub const Client = struct {
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .POST,
             .url = url,
             .headers = &.{
@@ -1235,7 +1306,7 @@ pub const Client = struct {
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .DELETE,
             .url = url,
             .headers = &.{
@@ -1281,7 +1352,7 @@ pub const Client = struct {
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .GET,
             .url = url,
             .headers = &.{
@@ -1326,7 +1397,7 @@ pub const Client = struct {
         };
         const body = try std.json.Stringify.valueAlloc(allocator, wire, .{ .emit_null_optional_fields = false });
         defer allocator.free(body);
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .POST,
             .url = url,
             .headers = &.{
@@ -1378,7 +1449,7 @@ pub const Client = struct {
         };
         const body = try std.json.Stringify.valueAlloc(allocator, wire, .{ .emit_null_optional_fields = false });
         defer allocator.free(body);
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .PUT,
             .url = url,
             .headers = &.{
@@ -1413,7 +1484,7 @@ pub const Client = struct {
         defer allocator.free(url);
         const auth = try self.cred.basicAuthHeader(allocator);
         defer allocator.free(auth);
-        const res = try self.http.send(allocator, .{
+        const res = try self.send(allocator, .{
             .method = .DELETE,
             .url = url,
             .headers = &.{
@@ -1576,7 +1647,7 @@ fn fetchMemberPage(bb: Client, url: []const u8, backing: Allocator) !OwnedMember
     errdefer arena.deinit();
     const a = arena.allocator();
     const auth = try bb.cred.basicAuthHeader(a);
-    const response = try bb.http.send(a, .{
+    const response = try bb.send(a, .{
         .method = .GET,
         .url = url,
         .headers = &.{
@@ -1597,9 +1668,11 @@ const MemberPageSlot = struct {
     busy: bool = false,
     result: ?OwnedMemberPage = null,
     err: ?anyerror = null,
+    error_detail: ?Client.ErrorDetail = null,
 
     fn deinit(self: *MemberPageSlot, a: Allocator) void {
         if (self.result) |*result| result.arena.deinit();
+        if (self.error_detail) |*detail| detail.deinit();
         a.free(self.url);
         self.* = .{};
     }
@@ -1608,7 +1681,12 @@ const MemberPageSlot = struct {
 const MemberCompletion = union(enum) { page: usize };
 
 fn fetchMemberSlot(bb: Client, slot: *MemberPageSlot, index: usize) usize {
-    slot.result = fetchMemberPage(bb, slot.url, std.heap.page_allocator) catch |err| {
+    var scoped = bb;
+    if (bb.error_detail) |detail| {
+        slot.error_detail = .{ .allocator = std.heap.page_allocator, .io = detail.io };
+        scoped.error_detail = &slot.error_detail.?;
+    }
+    slot.result = fetchMemberPage(scoped, slot.url, std.heap.page_allocator) catch |err| {
         slot.err = err;
         return index;
     };
@@ -1617,9 +1695,11 @@ fn fetchMemberSlot(bb: Client, slot: *MemberPageSlot, index: usize) usize {
 
 const MemberPageFailure = struct { number: u32, reason: anyerror };
 
-fn recordMemberFailure(failure: *?MemberPageFailure, number: u32, reason: anyerror) void {
-    if (failure.* == null or number < failure.*.?.number)
-        failure.* = .{ .number = number, .reason = reason };
+fn recordMemberFailure(failure: *?MemberPageFailure, slot: *const MemberPageSlot, reason: anyerror, detail: ?*Client.ErrorDetail) void {
+    if (failure.* == null or slot.number < failure.*.?.number) {
+        failure.* = .{ .number = slot.number, .reason = reason };
+        if (detail) |destination| destination.copyFrom(if (slot.error_detail) |*source| source else null);
+    }
 }
 
 // A numbered link is an endpoint-specific optimization, not a cursor contract.
@@ -4138,6 +4218,53 @@ test "member page failures drain active requests and report the lowest failed pa
     try testing.expectError(error.Forbidden, future.await(testing.io));
     try testing.expectEqual(@as(usize, 9), fake.callCount());
     try testing.expectEqual(@as(usize, 0), fake.activeRequestCount());
+}
+
+test "concurrent member failure detail follows the selected page in either completion order" {
+    for ([_]u16{ 403, 429 }) |later_status| {
+        for ([_]usize{ 2, 3 }) |first_failure| {
+            var fixture = try MemberPagesFixture.init(3, true);
+            defer fixture.arena.deinit();
+            var release_two: std.atomic.Value(bool) = .init(false);
+            var release_three: std.atomic.Value(bool) = .init(false);
+            var done: std.atomic.Value(bool) = .init(false);
+            fixture.page(2).status = 403;
+            fixture.page(2).body = "{\"error\":{\"message\":\"Page two denied\"}}";
+            fixture.page(2).released = &release_two;
+            fixture.page(3).status = later_status;
+            fixture.page(3).body = "{\"error\":{\"message\":\"Page three failed\"}}";
+            fixture.page(3).released = &release_three;
+            var fake: FakeHttpClient = .{ .responses = fixture.responses };
+            var detail: Client.ErrorDetail = .{ .allocator = testing.allocator, .io = testing.io };
+            defer detail.deinit();
+            var bb = Client.init(fake.httpClient(), .{ .username = "test-user", .token = "test-token", .workspace = "check24" });
+            bb.error_detail = &detail;
+            var future = try testing.io.concurrent(runMemberAcquisition, .{ bb, 2, &done });
+            defer {
+                release_two.store(true, .release);
+                release_three.store(true, .release);
+                if (future.await(testing.io)) |members| deinitWorkspaceMembers(testing.allocator, members) else |_| {}
+            }
+            try waitMemberCalls(&fake, 3);
+            if (first_failure == 2) release_two.store(true, .release) else release_three.store(true, .release);
+            var observed = false;
+            for (0..100_000_000) |_| {
+                detail.mutex.lockUncancelable(testing.io);
+                observed = detail.reason != null;
+                detail.mutex.unlock(testing.io);
+                if (observed) break;
+                std.atomic.spinLoopHint();
+            }
+            try testing.expect(observed);
+            try testing.expect(!done.load(.acquire));
+            release_two.store(true, .release);
+            release_three.store(true, .release);
+            try testing.expectError(error.Forbidden, future.await(testing.io));
+            try testing.expectEqual(error.Forbidden, detail.reason.?);
+            try testing.expectEqualStrings("Page two denied", detail.message.?);
+            try testing.expectEqual(@as(usize, 0), fake.activeRequestCount());
+        }
+    }
 }
 
 test "member acquisition preserves serial bounds cursor links and runtime fallback" {
