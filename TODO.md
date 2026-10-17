@@ -248,11 +248,11 @@ File to inherit an obsolete read decision.
 - [ ] Add fingerprint fixtures and fake/SQLite round-trip tests, plus Presentation coverage for initial bold styling, successful and failed toggles, unchanged reload retention, selective invalidation when only one File changes, rename/removal/binary cases, storage failure fallback, and ReviewIdentity isolation.
 
 ## M23 — Comment thread and Markdown presentation fixes  ·  S  ·  needs M15
-- [ ] Indent each Reply one level deeper than its parent, including when the parent is a Reply. Add Presentation coverage for nested Replies.
-- [ ] Improve ReviewBody Markdown projection. Hide formatting characters, render italic text in turquoise, bold text in orange, and inline code in green. Add parser and Presentation coverage.
-- [ ] Convert Bitbucket-supported emoji shortcodes such as `:white_check_mark:` to their corresponding emoji characters. Preserve unknown shortcodes as authored text. Add parser and Presentation coverage.
-- [ ] Investigate Bitbucket's list formatting and match its supported ordered, unordered, and nested list behavior in ReviewBody. Add fixtures for the observed wire and presentation behavior.
-- [ ] Yank the raw authored Markdown from a Comment or Draft. Do not copy the projected ReviewBody text. Add clipboard integration coverage.
+- [x] Indent each Reply one level deeper than its parent, including when the parent is a Reply. Add Presentation coverage for nested Replies.
+- [x] Improve ReviewBody Markdown projection. Hide formatting characters, render italic text in turquoise, bold text in orange, and inline code in green. Add parser and Presentation coverage.
+- [x] Convert Bitbucket-supported emoji shortcodes such as `:white_check_mark:` to their corresponding emoji characters. Preserve unknown shortcodes as authored text. Add parser and Presentation coverage.
+- [x] Investigate Bitbucket's list formatting and match its supported ordered, unordered, and nested list behavior in ReviewBody. Add fixtures for the observed wire and presentation behavior.
+- [x] Yank the raw authored Markdown from a Comment or Draft. Do not copy the projected ReviewBody text. Add clipboard integration coverage.
 
 ## M24 - Remote-first Repository and PullRequest Browser  ·  L  ·  needs M4/M15
 Make `bbr` without arguments open a remote-first Browser for the configured Workspace. Keep direct

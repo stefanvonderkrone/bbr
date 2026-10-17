@@ -1,6 +1,6 @@
 # M23 Comment thread and Markdown presentation fixes
 
-Status: ready-for-agent
+Status: done
 Milestone: M23
 Map: [M23 Comment thread and Markdown presentation fixes](./map.md)
 
