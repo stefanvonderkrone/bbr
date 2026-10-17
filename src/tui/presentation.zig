@@ -428,13 +428,16 @@ test "M23 highlighting complete structural code qualifies exactly at the byte li
     }
 }
 
-test "M23 highlighting leaves invalid identifiers unlabelled fences and indented code plain" {
+test "M23 highlighting leaves invalid identifiers plain and qualifies auto-closed fences" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var state = try codeTestPresentation(testing.allocator, store.store(), &.{
         "```text/x-python\n#!/bin/bash\necho hi\n```\n\n```src/main.go\npackage main\n```\n\n```{.go}\npackage main\n```\n\n```\n#!/bin/bash\necho hi\n```\n\n    #!/bin/bash\n    echo hi\n\n```suggestion\necho hi\n```\n\n```go\nunclosed",
     }, 0, 40);
     defer state.deinit();
+    const job = state.takeCommand().?.highlight_code;
+    try testing.expectEqualStrings("unclosed", job.content);
+    try state.dispatch(.{ .code_highlight_completed = job.launchFailed() });
     try testing.expect(state.takeCommand() == null);
     try testing.expectEqual(@as(usize, 0), state.projection().review.?.frame.code_highlights.len);
 }
@@ -12679,7 +12682,7 @@ const CardYankLines = struct {
         }
         if (self.end > 0 and self.fence_index == 1) {
             self.fence_index = 2;
-            if (self.card.fences) |fences| return fences[1];
+            if (self.card.fences) |fences| if (fences[1].start < fences[1].end) return fences[1];
         }
         while (self.end > 0 and self.definition_index < self.card.segments.len) {
             const segment = self.card.segments[self.definition_index];
@@ -19111,6 +19114,9 @@ test "M23 acceptance yank completes the numbered transformed-row byte examples" 
         .{ .body = "A\n\n\nB", .first = "A", .last = "B", .expected = "A\n\nB" },
         .{ .body = "```zig\nconst x = 1;\nconst y = 2;\n```\nafter", .first = "const x", .last = "const y", .expected = "```zig\nconst x = 1;\nconst y = 2;\n```\n" },
         .{ .body = "```zig\nconst x = 1;\nconst y = 2;\n```\nafter", .first = "const x", .last = "const x", .expected = "```zig\nconst x = 1;\n```\n" },
+        .{ .body = "```zig\nconst x = 1;\nconst y = 2;", .first = "const x", .last = "const y", .expected = "```zig\nconst x = 1;\nconst y = 2;" },
+        .{ .body = "```zig\nconst x = 1;\nconst y = 2;", .first = "const x", .last = "const x", .expected = "```zig\nconst x = 1;\n" },
+        .{ .body = "> ```text\n> alpha\noutside", .first = "alpha", .last = "alpha", .expected = "> ```text\n> alpha\n" },
     };
     for (examples) |example| for ([_]Layout{ .unified, .side_by_side }) |layout| for ([_]bool{ false, true }) |upward| {
         var store = bbr.review.InMemoryStore.init(testing.allocator);
@@ -19839,7 +19845,7 @@ test "M23 yank Selection ignores generated heading markers and keeps authored he
     var marker: ?usize = null;
     for (presentation.projection().review.?.frame.visual_rows, 0..) |visual, index| {
         const row = presentation.projection().review.?.buffer.rows[visual.buffer_index];
-        if (row == .comment and std.mem.eql(u8, row.comment.text(), "§")) {
+        if (row == .comment and std.mem.eql(u8, row.comment.text(), "#")) {
             marker = index;
             break;
         }
@@ -19974,7 +19980,7 @@ test "M23 literal yank selected code adds existing fences without unselected lin
         .{ .raw = "  ````zig metadata\r\n  \tfirst  \r\n  second\n  `````\nafter", .expected = "  ````zig metadata\r\n  \tfirst  \r\n  `````\n" },
         .{ .raw = " ~~~suggestion\r\n \tfirst  \r\n second\n ~~~~", .expected = " ~~~suggestion\r\n \tfirst  \r\n ~~~~" },
         .{ .raw = "    \tfirst  \r\n    second\nafter", .expected = "    \tfirst  \r\n" },
-        .{ .raw = "**before**\n```suggestion\n\tfirst  \r\nsecond", .expected = "\tfirst  \r\n" },
+        .{ .raw = "**before**\n```suggestion\n\tfirst  \r\nsecond", .expected = "```suggestion\n\tfirst  \r\n" },
         .{ .raw = "```zig metadata\r\n\tfirst  \r\nsecond\nthird\n```\n", .expected = "```zig metadata\r\n\tfirst  \r\nsecond\n```\n", .second = true },
     };
     for (examples) |example| for ([_]Layout{ .unified, .side_by_side }) |layout| {

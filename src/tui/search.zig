@@ -1325,7 +1325,9 @@ test "M23 emoji counts authored locations and keeps smart case literal exclusion
         .{ .raw = "`:mask:`\n\n```\n:mask:\n```\n\n\\:mask: [label](url/:mask:) :unknown: :MASK:", .query = "😷", .literal = 0, .fuzzy = 0 },
         .{ .raw = "`:mask:`\n\n```\n:mask:\n```\n\n\\:mask: [label](url/:mask:) :MASK:", .query = "mask", .literal = 5, .fuzzy = 3 },
         .{ .raw = ":mask: :MASK:", .query = "MASK", .literal = 1, .fuzzy = 1 },
-        .{ .raw = ":heart:", .query = "❤️", .literal = 0, .fuzzy = 0 },
+        .{ .raw = ":heart:", .query = "❤️", .literal = 1, .fuzzy = 1 },
+        .{ .raw = ":heart:", .query = "❤", .literal = 1, .fuzzy = 1 },
+        .{ .raw = ":heart:", .query = ":heart:", .literal = 1, .fuzzy = 1 },
         .{ .raw = "[:mask:](url) :white_check_mark:", .query = "😷✅", .literal = 0, .fuzzy = 0 },
     };
     for (examples) |example| {
@@ -1446,7 +1448,7 @@ test "M23 emoji score ties prefer displayed forms and earliest authored alignmen
     const a = arena.allocator();
     const examples = [_]struct { raw: []const u8, query: []const u8, offset: usize }{
         .{ .raw = "mzzzzzzzzz m:mask:", .query = "m", .offset = 0 },
-        .{ .raw = "x" ** 3000 ++ ":a:zza", .query = "x" ** 100 ++ "a", .offset = 3005 },
+        .{ .raw = "x" ** 3000 ++ ":o:zzo", .query = "x" ** 100 ++ "o", .offset = 3005 },
         .{ .raw = "xzm" ++ "z" ** 158 ++ " m:mask:", .query = "xm", .offset = 2 },
     };
     for (examples) |example| {

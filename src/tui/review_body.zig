@@ -13,7 +13,7 @@ test "M23 highlighting keeps only the first fence information token" {
     try std.testing.expectEqualStrings("TS", whitespace.blocks[0].fence_identifier);
 }
 
-test "M23 emoji converts exact fixture sequences through shared prose rules" {
+test "M23 emoji converts fixture sequences with emoji-style symbols through shared prose rules" {
     const raw = "## **:heart: :one: :flag_gb: :woman_technologist::skin-tone-2:**\n\n- :mask:\n\n> [:thumbsup::skin-tone-2:](url/:mask:)\n\n| :white_check_mark: |\n| --- |\n| :mask: |";
     const body = try ReviewBody.parse(std.testing.allocator, raw);
     defer freeBlocks(std.testing.allocator, body.blocks);
@@ -22,11 +22,11 @@ test "M23 emoji converts exact fixture sequences through shared prose rules" {
     for (body.blocks) |block| for (block.spans) |span| {
         if (!span.hidden and !span.generated) try text.appendSlice(std.testing.allocator, span.text);
     };
-    try std.testing.expectEqualStrings("❤ 1️⃣ 🇬🇧 👩🏻‍💻😷👍🏻url/:mask:✅😷", text.items);
+    try std.testing.expectEqualStrings("❤️ 1️⃣ 🇬🇧 👩🏻‍💻😷👍🏻url/:mask:✅😷", text.items);
     try std.testing.expectEqualStrings(raw, body.source);
 }
 
-test "M23 emoji every pinned fixture entry and variation keeps exact Unicode bytes" {
+test "M23 emoji every pinned fixture entry and variation keeps exact catalog bytes and source ownership" {
     const Entry = struct {
         shortName: []const u8,
         fallback: []const u8,
@@ -38,7 +38,9 @@ test "M23 emoji every pinned fixture entry and variation keeps exact Unicode byt
             try std.testing.expectEqual(@as(usize, 1), body.blocks.len);
             try std.testing.expectEqual(@as(usize, 1), body.blocks[0].spans.len);
             const span = body.blocks[0].spans[0];
-            try std.testing.expectEqualStrings(self.fallback, span.text);
+            const converted = emoji.at(self.shortName).?;
+            try std.testing.expectEqualStrings(self.fallback, converted.fallback);
+            try std.testing.expectEqualStrings(converted.text, span.text);
             try std.testing.expectEqualStrings(self.shortName, span.emoji);
             try std.testing.expectEqual(SourceRange{ .start = 0, .end = self.shortName.len }, span.source);
             for (self.skinVariations) |variation| try variation.check();
@@ -75,12 +77,21 @@ pub const Marks = packed struct {
     link_label: bool = false,
     link_destination: bool = false,
     link_title: bool = false,
+    heading_marker: bool = false,
+    divider: bool = false,
+};
+
+pub const LinkTarget = struct {
+    destination: []const u8,
+    /// Authored link-use offset, shared by its label and destination spans.
+    start: usize,
 };
 
 pub const Span = struct {
     text: []const u8,
     source: SourceRange,
     marks: Marks = .{},
+    link: ?LinkTarget = null,
     /// Hidden syntax keeps exact authored ownership but supplies no semantic text.
     hidden: bool = false,
     /// Strikethrough syntax can be restored by a terminal without that attribute.
@@ -125,10 +136,23 @@ pub const Block = struct {
     outer_indent: usize = 0,
     quote_path: []const u8 = "",
     marker: ?ListMarker = null,
+    marker_padding: usize = 0,
+    marker_group: ?usize = null,
+    indent_alignment: ?ListAlignment = null,
+    outer_alignment: ?ListAlignment = null,
     fence_identifier: []const u8 = "",
 };
 
 pub const ListMarker = union(enum) { bullet, number: usize };
+const ListAlignment = struct { group: usize, width: usize };
+const ListState = struct {
+    marker: ListMarker,
+    group: usize,
+
+    fn alignment(self: ListState) ?ListAlignment {
+        return if (self.marker == .number) .{ .group = self.group, .width = markerWidth(self.marker) } else null;
+    }
+};
 
 pub const ReviewBody = struct {
     /// Borrowed, byte-for-byte authored Review storage.
@@ -172,6 +196,7 @@ pub const ReviewBody = struct {
         var pending_spacer: ?SourceRange = null;
         var spacer_quotes: usize = 0;
         var spacer_outer_indent: usize = 0;
+        var spacer_outer_alignment: ?ListAlignment = null;
         var spacer_quote_path: []const u8 = "";
         var after_table = false;
         var containers: Containers = .{};
@@ -190,7 +215,8 @@ pub const ReviewBody = struct {
                     spacer_quotes = quote.levels;
                     spacer_quote_path = line.text[0..quote.bytes];
                     const base = context.leading_spaces / 4;
-                    spacer_outer_indent = if (base > 0) (base - 1) * 2 + markerWidth(containers.lists.items[base - 1]) else 0;
+                    spacer_outer_indent = if (base > 0) (base - 1) * 2 + markerWidth(containers.lists.items[base - 1].marker) else 0;
+                    spacer_outer_alignment = if (base > 0) containers.lists.items[base - 1].alignment() else null;
                 }
                 if (pending_spacer) |*range| range.end = line.next else pending_spacer = .{ .start = pos, .end = line.next };
                 pos = line.next;
@@ -200,7 +226,7 @@ pub const ReviewBody = struct {
             const table_boundary = after_table;
             after_table = false;
             if (blocks.items.len > 0) if (pending_spacer) |range| {
-                try blocks.append(allocator, .{ .kind = .spacer, .source = range, .quotes = spacer_quotes, .outer_indent = spacer_outer_indent, .quote_path = spacer_quote_path });
+                try blocks.append(allocator, .{ .kind = .spacer, .source = range, .quotes = spacer_quotes, .outer_indent = spacer_outer_indent, .outer_alignment = spacer_outer_alignment, .quote_path = spacer_quote_path });
             };
             pending_spacer = null;
 
@@ -224,10 +250,14 @@ pub const ReviewBody = struct {
                 continue;
             }
 
-            if (try containers.read(allocator, line.text, after_blank or table_boundary or blocks.items.len == 0)) |container| {
+            if (try containers.read(allocator, line.text, after_blank or table_boundary or blocks.items.len == 0, blocks.items.len)) |container| {
                 const block = try containerBlock(allocator, source, pos, container, references);
                 errdefer allocator.free(block.spans);
                 try blocks.append(allocator, block);
+                if (block.marker_group) |group| {
+                    const first = &blocks.items[group];
+                    first.marker_padding = @max(first.marker_padding, markerWidth(block.marker.?) -| markerWidth(first.marker.?));
+                }
                 pos = block.source.end;
                 continue;
             }
@@ -248,10 +278,9 @@ pub const ReviewBody = struct {
                     scan = candidate.next;
                 }
                 if (scan >= source.len) {
-                    const spans = try allocator.alloc(Span, 1);
+                    const spans = try codeSpans(allocator, source, content_start, source.len, fence.indent);
                     errdefer allocator.free(spans);
-                    spans[0] = .{ .text = source[start..], .source = .{ .start = start, .end = source.len } };
-                    try blocks.append(allocator, .{ .kind = .literal, .source = .{ .start = start, .end = source.len }, .spans = spans });
+                    try blocks.append(allocator, .{ .kind = if (fence.suggestion) .suggestion else .code, .source = .{ .start = start, .end = source.len }, .spans = spans, .fence_identifier = fence.identifier, .fences = .{ .{ .start = start, .end = content_start }, .{ .start = source.len, .end = source.len } } });
                     pos = source.len;
                 }
                 continue;
@@ -318,6 +347,24 @@ pub const ReviewBody = struct {
             errdefer allocator.free(spans);
             try blocks.append(allocator, .{ .kind = if (level == 0) .paragraph else .{ .heading = level }, .source = .{ .start = start, .end = end }, .spans = spans, .hidden_line = underline });
             pos = next;
+        }
+        // Resolve group widths before reference-definition removal changes block indices.
+        for (blocks.items, 0..) |*block, ordinal| {
+            if (block.marker_group) |group| if (group != ordinal) {
+                const first = blocks.items[group];
+                block.marker_padding = markerWidth(first.marker.?) + first.marker_padding - markerWidth(block.marker.?);
+            };
+            if (block.indent_alignment) |alignment| {
+                const first = blocks.items[alignment.group];
+                block.indent += markerWidth(first.marker.?) + first.marker_padding - alignment.width;
+            }
+            if (block.outer_alignment) |alignment| {
+                const first = blocks.items[alignment.group];
+                block.outer_indent += markerWidth(first.marker.?) + first.marker_padding - alignment.width;
+            }
+            block.marker_group = null;
+            block.indent_alignment = null;
+            block.outer_alignment = null;
         }
         var kept: usize = 0;
         for (blocks.items) |block| {
@@ -520,6 +567,9 @@ const Container = struct {
     outer_indent: usize = 0,
     quote_path: []const u8 = "",
     marker: ?ListMarker = null,
+    marker_group: ?usize = null,
+    indent_alignment: ?ListAlignment = null,
+    outer_alignment: ?ListAlignment = null,
 
     fn strip(self: Container, text: []const u8) ?usize {
         const prefix_bytes = self.structural(text) orelse return null;
@@ -547,7 +597,7 @@ const Container = struct {
 };
 
 const Containers = struct {
-    lists: std.ArrayList(ListMarker) = .empty,
+    lists: std.ArrayList(ListState) = .empty,
     quotes: usize = 0,
     quote_base: usize = 0,
 
@@ -572,7 +622,7 @@ const Containers = struct {
         return .{ .prefix = .{ .bytes = pos, .levels = levels }, .base = base, .leading_spaces = leading };
     }
 
-    fn read(self: *Containers, allocator: std.mem.Allocator, text: []const u8, boundary: bool) !?Container {
+    fn read(self: *Containers, allocator: std.mem.Allocator, text: []const u8, boundary: bool, ordinal: usize) !?Container {
         const context = self.quoteContext(text);
         const quote_indent = context.leading_spaces;
         const quote = context.prefix;
@@ -582,19 +632,21 @@ const Containers = struct {
         self.quotes = quote.levels;
         self.quote_base = base;
         const leading_base = quote_indent / 4;
-        const outer_indent = if (leading_base > 0) (leading_base - 1) * 2 + markerWidth(self.lists.items[leading_base - 1]) else 0;
+        const outer_indent = if (leading_base > 0) (leading_base - 1) * 2 + markerWidth(self.lists.items[leading_base - 1].marker) else 0;
+        const outer_alignment = if (leading_base > 0) self.lists.items[leading_base - 1].alignment() else null;
         const structural = quote.bytes;
         const rest = text[structural..];
         if (itemPrefix(rest)) |item| {
             const level = base + item.spaces / 4;
             const sibling = level < self.lists.items.len;
-            const same_type = sibling and ((item.marker == .bullet) == (self.lists.items[level] == .bullet));
+            const same_type = sibling and ((item.marker == .bullet) == (self.lists.items[level].marker == .bullet));
             if (level <= self.lists.items.len and (level > base or boundary or sibling or changed_quote) and (!sibling or same_type or boundary)) {
                 var marker = item.marker;
-                if (same_type and marker == .number) marker = .{ .number = self.lists.items[level].number +| 1 };
+                if (same_type and marker == .number) marker = .{ .number = self.lists.items[level].marker.number +| 1 };
+                const group = if (same_type) self.lists.items[level].group else ordinal;
                 self.lists.items.len = @min(level, self.lists.items.len);
-                try self.lists.append(allocator, marker);
-                return .{ .quotes = quote.levels, .bytes = structural + item.bytes, .continuation = (level - base + 1) * 4, .indent = (level - base) * 2, .marker = marker, .outer_indent = outer_indent, .quote_path = text[0..structural] };
+                try self.lists.append(allocator, .{ .marker = marker, .group = group });
+                return .{ .quotes = quote.levels, .bytes = structural + item.bytes, .continuation = (level - base + 1) * 4, .indent = (level - base) * 2, .marker = marker, .marker_group = if (marker == .number) group else null, .outer_indent = outer_indent, .outer_alignment = outer_alignment, .quote_path = text[0..structural] };
             }
         }
         var spaces: usize = 0;
@@ -602,10 +654,10 @@ const Containers = struct {
         while (self.lists.items.len > base and spaces < (self.lists.items.len - base) * 4) self.lists.items.len -= 1;
         if (self.lists.items.len > base) {
             const level = self.lists.items.len - 1;
-            const marker = self.lists.items[level];
-            return .{ .quotes = quote.levels, .bytes = structural + (self.lists.items.len - base) * 4, .continuation = (self.lists.items.len - base) * 4, .indent = (level - base) * 2 + markerWidth(marker), .outer_indent = outer_indent, .quote_path = text[0..structural] };
+            const state = self.lists.items[level];
+            return .{ .quotes = quote.levels, .bytes = structural + (self.lists.items.len - base) * 4, .continuation = (self.lists.items.len - base) * 4, .indent = (level - base) * 2 + markerWidth(state.marker), .indent_alignment = state.alignment(), .outer_indent = outer_indent, .outer_alignment = outer_alignment, .quote_path = text[0..structural] };
         }
-        if (quote.levels > 0) return .{ .quotes = quote.levels, .bytes = structural, .continuation = 0, .indent = 0, .outer_indent = outer_indent, .quote_path = text[0..structural] };
+        if (quote.levels > 0) return .{ .quotes = quote.levels, .bytes = structural, .continuation = 0, .indent = 0, .outer_indent = outer_indent, .outer_alignment = outer_alignment, .quote_path = text[0..structural] };
         return null;
     }
 };
@@ -621,7 +673,7 @@ pub fn markerWidth(marker: ListMarker) usize {
 fn containerBlock(allocator: std.mem.Allocator, source: []const u8, start: usize, container: Container, references: *const ReferenceDefinitions) !Block {
     const first = nextLine(source, start);
     const text = first.text[container.bytes..];
-    var result: Block = .{ .kind = .paragraph, .source = .{ .start = start, .end = first.next }, .quotes = container.quotes, .indent = container.indent, .outer_indent = container.outer_indent, .quote_path = container.quote_path, .marker = container.marker };
+    var result: Block = .{ .kind = .paragraph, .source = .{ .start = start, .end = first.next }, .quotes = container.quotes, .indent = container.indent, .outer_indent = container.outer_indent, .quote_path = container.quote_path, .marker = container.marker, .marker_group = container.marker_group, .indent_alignment = container.indent_alignment, .outer_alignment = container.outer_alignment };
     var spans: std.ArrayList(Span) = .empty;
     errdefer spans.deinit(allocator);
     if (readDefinition(source, start + container.bytes, start + first.text.len) != null) {
@@ -634,7 +686,6 @@ fn containerBlock(allocator: std.mem.Allocator, source: []const u8, start: usize
     const indented = codeIndent(text) != null;
     if (fence != null or indented) {
         var pos = if (fence != null) first.next else start;
-        var found_close = false;
         while (pos < source.len) {
             const line = nextLine(source, pos);
             const removed = if (pos == start) container.bytes else container.strip(line.text) orelse break;
@@ -643,7 +694,6 @@ fn containerBlock(allocator: std.mem.Allocator, source: []const u8, start: usize
                 if (opening.closes(content)) {
                     result.fences = .{ .{ .start = start, .end = first.next }, .{ .start = pos, .end = line.next } };
                     result.source.end = line.next;
-                    found_close = true;
                     break;
                 }
             } else if (!isBlank(content) and codeIndent(content) == null) break;
@@ -655,23 +705,11 @@ fn containerBlock(allocator: std.mem.Allocator, source: []const u8, start: usize
             if (fence != null or !isBlank(content)) result.source.end = line.next;
             pos = line.next;
         }
-        if (fence == null or found_close) {
-            while (spans.items.len > 0 and spans.items[spans.items.len - 1].source.end > result.source.end) spans.items.len -= 1;
-            result.kind = if (fence != null and fence.?.suggestion) .suggestion else .code;
-            result.fence_identifier = if (fence) |opening| opening.identifier else "";
-            result.spans = try spans.toOwnedSlice(allocator);
-            return result;
-        }
-        // An unclosed container fence stays local and literal.
-        spans.items.len = 0;
-        result.kind = .literal;
-        var literal_pos = start;
-        while (literal_pos < result.source.end) {
-            const line = nextLine(source, literal_pos);
-            const removed = if (literal_pos == start) container.bytes else container.strip(line.text).?;
-            try spans.append(allocator, .{ .text = source[literal_pos + removed .. line.next], .source = .{ .start = literal_pos + removed, .end = line.next } });
-            literal_pos = line.next;
-        }
+        while (spans.items.len > 0 and spans.items[spans.items.len - 1].source.end > result.source.end) spans.items.len -= 1;
+        result.kind = if (fence != null and fence.?.suggestion) .suggestion else .code;
+        result.fence_identifier = if (fence) |opening| opening.identifier else "";
+        // A display-only closing fence owns no authored bytes.
+        if (fence != null and result.fences == null) result.fences = .{ .{ .start = start, .end = first.next }, .{ .start = result.source.end, .end = result.source.end } };
         result.spans = try spans.toOwnedSlice(allocator);
         return result;
     }
@@ -886,15 +924,17 @@ fn parseInline(allocator: std.mem.Allocator, source: []const u8, start: usize, e
                 if (image) try spans.append(allocator, .{ .text = "image: ", .source = .{ .start = pos, .end = pos }, .generated = true });
                 const label = try parseInline(allocator, source, label_start + 1, close_label, .{ .links = false });
                 defer allocator.free(label);
+                const target: LinkTarget = .{ .destination = source[link.destination.start..link.destination.end], .start = pos };
                 for (label) |span| {
                     var marked = span;
                     marked.marks.link_label = true;
+                    marked.link = target;
                     try spans.append(allocator, marked);
                 }
                 try appendHidden(&spans, allocator, close_label, if (explicit) close_label + 2 else link.next, false);
                 spans.items[spans.items.len - 1].boundary = true;
                 const navigation = SourceRange{ .start = close_label, .end = link.next };
-                try spans.append(allocator, .{ .text = source[link.destination.start..link.destination.end], .source = if (explicit) link.destination else navigation, .marks = .{ .link_destination = true }, .definition_source = if (explicit) null else link.destination, .required_definition = link.definition });
+                try spans.append(allocator, .{ .text = target.destination, .source = if (explicit) link.destination else navigation, .marks = .{ .link_destination = true }, .link = target, .definition_source = if (explicit) null else link.destination, .required_definition = link.definition });
                 if (link.title) |title| try spans.append(allocator, .{ .text = source[title.start..title.end], .source = if (explicit) title else navigation, .marks = .{ .link_title = true }, .boundary = true, .definition_source = if (explicit) null else title, .required_definition = link.definition });
                 if (explicit) try appendHidden(&spans, allocator, link.next - 1, link.next, false) else try spans.append(allocator, .{ .text = "", .source = .{ .start = link.next, .end = link.next }, .hidden = true });
                 spans.items[spans.items.len - 1].boundary = true;
@@ -925,7 +965,7 @@ fn parseInline(allocator: std.mem.Allocator, source: []const u8, start: usize, e
         }
         if (if (context.links) bareUrlEnd(source, pos, start, end, url_delimiters) else null) |url_end| {
             try appendSpan(&spans, allocator, source, plain, pos, .{});
-            try spans.append(allocator, .{ .text = source[pos..url_end], .source = .{ .start = pos, .end = url_end }, .marks = .{ .link_destination = true }, .boundary = true, .destination_brackets = false });
+            try spans.append(allocator, .{ .text = source[pos..url_end], .source = .{ .start = pos, .end = url_end }, .marks = .{ .link_destination = true }, .link = .{ .destination = source[pos..url_end], .start = pos }, .boundary = true, .destination_brackets = false });
             pos = url_end;
             plain = pos;
             try spans.append(allocator, .{ .text = "", .source = .{ .start = pos, .end = pos }, .hidden = true, .boundary = true });
@@ -1495,7 +1535,6 @@ test "M23 containers keep blank line rules malformed markers and code boundaries
     const raw = "prose\n- literal\n\n- item\n1. literal switch\n\n7. ordered\n2. next\n\n> - quoted\n>     ~~~zig\n>     a\tb **literal**\n>     ~~~\n>     continuation\n>\n>         indented\n>\n>     ```\n>     unfinished\n\noutside";
     const body = try ReviewBody.parse(a, raw);
     var codes: usize = 0;
-    var literal = false;
     var seven = false;
     var eight = false;
     for (body.blocks) |block| {
@@ -1509,15 +1548,14 @@ test "M23 containers keep blank line rules malformed markers and code boundaries
             if (codes == 1) {
                 try testing.expectEqualStrings("a\tb **literal**\n", block.spans[0].text);
                 try testing.expectEqualStrings(">     ~~~zig\n", raw[block.fences.?[0].start..block.fences.?[0].end]);
-            } else try testing.expectEqualStrings("indented\n", block.spans[0].text);
-        }
-        if (block.kind == .literal) {
-            literal = true;
-            try testing.expectEqualStrings("```\n", block.spans[0].text);
+            } else if (codes == 2) try testing.expectEqualStrings("indented\n", block.spans[0].text) else {
+                try testing.expectEqualStrings("unfinished\n", block.spans[0].text);
+                try testing.expectEqual(block.fences.?[1].start, block.fences.?[1].end);
+            }
         }
     }
-    try testing.expect(seven and eight and literal);
-    try testing.expectEqual(@as(usize, 2), codes);
+    try testing.expect(seven and eight);
+    try testing.expectEqual(@as(usize, 3), codes);
     var first: std.ArrayList(u8) = .empty;
     for (body.blocks[0].spans) |span| try first.appendSlice(a, span.text);
     try testing.expectEqualStrings("prose - literal", first.items);
@@ -1550,6 +1588,29 @@ test "M23 literal fences hide only valid delimiters and retain code bytes" {
     try testing.expect(body.blocks[3].spans[1].marks.strong);
 }
 
+test "M23 literal unclosed fences close for display without adding authored bytes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "```text\n:mask: **literal**", "~~~text\n:mask: **literal**", "> ```text\n> :mask: **literal**\noutside", "- ```text\n    :mask: **literal**\noutside" }) |raw| {
+        const body = try ReviewBody.parse(a, raw);
+        const block = body.blocks[0];
+        try testing.expect(block.kind == .code);
+        try testing.expectEqualStrings("text", block.fence_identifier);
+        const end = std.mem.indexOf(u8, raw, "outside") orelse raw.len;
+        try testing.expectEqual(end, block.fences.?[1].start);
+        try testing.expectEqual(end, block.fences.?[1].end);
+        var visible: std.ArrayList(u8) = .empty;
+        for (block.spans) |span| {
+            try visible.appendSlice(a, span.text);
+            try testing.expect(!span.marks.strong and !span.marks.emphasis);
+        }
+        try testing.expectEqualStrings(if (end == raw.len) ":mask: **literal**" else ":mask: **literal**\n", visible.items);
+        try testing.expectEqualStrings(raw, body.source);
+        if (end < raw.len) try testing.expectEqualStrings("outside", body.blocks[1].spans[0].text);
+    }
+}
+
 test "M23 literal indented code removes four columns and preserves remaining whitespace" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1562,8 +1623,12 @@ test "M23 literal indented code removes four columns and preserves remaining whi
     try testing.expect(body.blocks[2].spans[1].marks.strong);
     const malformed = try ReviewBody.parse(a, "**before**\n~~~~zig\n**literal**\n```\n~~~");
     try testing.expect(malformed.blocks[0].spans[1].marks.strong);
-    try testing.expectEqualStrings("~~~~zig\n**literal**\n```\n~~~", malformed.blocks[1].spans[0].text);
-    try testing.expect(malformed.blocks[1].fences == null);
+    visible.items.len = 0;
+    for (malformed.blocks[1].spans) |span| try visible.appendSlice(a, span.text);
+    try testing.expectEqualStrings("**literal**\n```\n~~~", visible.items);
+    try testing.expect(malformed.blocks[1].kind == .code);
+    try testing.expectEqual(malformed.source.len, malformed.blocks[1].fences.?[1].start);
+    try testing.expectEqual(malformed.source.len, malformed.blocks[1].fences.?[1].end);
 }
 
 test "M23 inline emphasis respects delimiter runs, escapes, and intraword underscores" {
@@ -1661,7 +1726,7 @@ test "ReviewBody parses supported structure while retaining authored ranges" {
     try testing.expect(saw_destination);
 }
 
-test "M23 inline unclosed Suggestion keeps earlier formatting and local literal content" {
+test "M23 inline unclosed Suggestion keeps earlier formatting and literal code content" {
     const source = "**before**\n```suggestion\n**still literal**";
     const body = try ReviewBody.parse(testing.allocator, source);
     defer {
@@ -1671,6 +1736,9 @@ test "M23 inline unclosed Suggestion keeps earlier formatting and local literal 
     try testing.expectEqual(@as(usize, 2), body.blocks.len);
     try testing.expect(body.blocks[0].kind == .paragraph);
     try testing.expect(body.blocks[0].spans[1].marks.strong);
-    try testing.expect(body.blocks[1].kind == .literal);
-    try testing.expectEqualStrings("```suggestion\n**still literal**", body.blocks[1].spans[0].text);
+    try testing.expect(body.blocks[1].kind == .suggestion);
+    try testing.expectEqualStrings("**still literal**", body.blocks[1].spans[0].text);
+    try testing.expectEqualStrings(source, body.source);
+    try testing.expectEqual(source.len, body.blocks[1].fences.?[1].start);
+    try testing.expectEqual(source.len, body.blocks[1].fences.?[1].end);
 }

@@ -34,6 +34,7 @@ pub const Segment = struct {
     text: []const u8,
     source: SourceRange,
     marks: Marks = .{},
+    link: ?body_mod.LinkTarget = null,
     /// False for terminal markers and generated spacing, even with a source range.
     authored: bool = true,
     atomic: bool = false,
@@ -60,6 +61,8 @@ pub const ReviewCardRow = struct {
     hidden_line: ?SourceRange = null,
     fences: ?[2]SourceRange = null,
     plain_label: ?[]const u8 = null,
+    /// Code-block rectangle relative to this row's content column.
+    code_area: ?struct { column: usize, width: usize } = null,
 
     pub fn contentColumn(self: ReviewCardRow) usize {
         return self.indent + if (self.part == .header) @as(usize, 2) else 4;
@@ -161,11 +164,27 @@ pub fn project(allocator: std.mem.Allocator, body: ReviewBody, options: Options)
                         columns[index] = @max(columns[index], width);
                     }
                 }
+                fitTableColumns(columns, writer.width);
             }
             try writer.table(block, ordinal, table_header.?, columns);
         } else try writer.block(block, ordinal);
     }
 
+    var start: usize = 0;
+    while (start < body_rows.items.len) {
+        const area = body_rows.items[start].code_area orelse {
+            start += 1;
+            continue;
+        };
+        var end = start + 1;
+        var width = area.width;
+        while (end < body_rows.items.len and body_rows.items[end].block_ordinal == body_rows.items[start].block_ordinal) : (end += 1) {
+            const next = body_rows.items[end].code_area orelse break;
+            width = @max(width, next.width);
+        }
+        for (body_rows.items[start..end]) |*row| row.code_area.?.width = @min(width, writer.width -| row.code_area.?.column);
+        start = end;
+    }
     const collapsible = options.collapsed_rows > 0 and body_rows.items.len > options.collapsed_rows;
     const visible_count = if (collapsible and !options.expanded) options.collapsed_rows else body_rows.items.len;
     const footer_count: usize = if (collapsible) 1 else 0;
@@ -198,6 +217,25 @@ fn ownerForSource(source: Source) Owner {
         .comment => |value| .{ .comment = value.id },
         .draft => |value| .{ .draft = value.local_id },
     };
+}
+
+fn fitTableColumns(columns: []usize, width: usize) void {
+    const separators = (columns.len - 1) * 3;
+    var natural = separators;
+    for (columns) |column| natural +|= column;
+    if (natural <= width) return;
+    const available = width -| separators;
+    var low: usize = 0;
+    var high = available;
+    while (low < high) {
+        const cap = low + (high - low + 1) / 2;
+        var used: usize = 0;
+        for (columns) |column| used +|= @min(column, cap);
+        if (used <= available) low = cap else high = cap - 1;
+    }
+    // Below 16 cells per reduced column, keep the header-labelled projection.
+    if (low < 16) return;
+    for (columns) |*column| column.* = @min(column.*, low);
 }
 
 fn oneSegment(allocator: std.mem.Allocator, segment: Segment) ![]const Segment {
@@ -239,6 +277,7 @@ const Writer = struct {
     first_row: bool = true,
     prefix_width: usize = 0,
     reference: ?body_mod.Span = null,
+    link: ?body_mod.LinkTarget = null,
 
     fn block(self: *Writer, value: body_mod.Block, ordinal: usize) !void {
         self.container = value;
@@ -264,8 +303,8 @@ const Writer = struct {
             },
             .heading => |level| {
                 self.part = .body;
-                const markers = [_][]const u8{ "§1 ", "§2 ", "§3 ", "§4 ", "§5 ", "§6 " };
-                try self.addToken(markers[level - 1], .{ .start = value.source.start, .end = value.source.start }, .{ .strong = true }, false);
+                const markers = [_][]const u8{ "# ", "## ", "### ", "#### ", "##### ", "###### " };
+                try self.addToken(markers[level - 1], .{ .start = value.source.start, .end = value.source.start }, .{ .heading_marker = true }, false);
                 for (value.spans) |span| try self.addSpan(span, true);
                 try self.flush();
             },
@@ -283,20 +322,29 @@ const Writer = struct {
     }
 
     fn cellSegments(self: *Writer, block_value: body_mod.Block, cell: body_mod.TableCell) ![]const Segment {
-        var rows: std.ArrayList(ReviewCardRow) = .empty;
+        const rows = try self.cellRows(block_value, cell, std.math.maxInt(usize));
         defer {
+            for (rows) |row| self.allocator.free(row.segments);
+            self.allocator.free(rows);
+        }
+        // Inline code can contain a hard break. Keep its complete content when measuring the cell.
+        var segments: std.ArrayList(Segment) = .empty;
+        errdefer segments.deinit(self.allocator);
+        for (rows) |row| try segments.appendSlice(self.allocator, row.segments);
+        return segments.toOwnedSlice(self.allocator);
+    }
+
+    fn cellRows(self: *Writer, value: body_mod.Block, cell: body_mod.TableCell, width: usize) ![]const ReviewCardRow {
+        var rows: std.ArrayList(ReviewCardRow) = .empty;
+        errdefer {
             for (rows.items) |row| self.allocator.free(row.segments);
             rows.deinit(self.allocator);
         }
-        var cell_writer = Writer{ .allocator = self.allocator, .rows = &rows, .options = self.options, .width = std.math.maxInt(usize) };
+        var cell_writer = Writer{ .allocator = self.allocator, .rows = &rows, .options = self.options, .width = @max(width, 1) };
         defer cell_writer.current.deinit(self.allocator);
-        for (block_value.spans[cell.spans.start..cell.spans.end]) |span| try cell_writer.addSpan(span, false);
-        // Inline code can contain a hard break. Keep its complete content when measuring the cell.
+        for (value.spans[cell.spans.start..cell.spans.end]) |span| try cell_writer.addSpan(span, false);
         try cell_writer.flush();
-        var segments: std.ArrayList(Segment) = .empty;
-        errdefer segments.deinit(self.allocator);
-        for (rows.items) |row| try segments.appendSlice(self.allocator, row.segments);
-        return segments.toOwnedSlice(self.allocator);
+        return rows.toOwnedSlice(self.allocator);
     }
 
     fn table(self: *Writer, value: body_mod.Block, ordinal: usize, header: body_mod.Block, columns: []const usize) !void {
@@ -309,35 +357,74 @@ const Writer = struct {
         var complete_width: usize = (columns.len - 1) * 3;
         for (columns) |width| complete_width += width;
         const wide = complete_width <= self.width;
-        for (value.kind.table.cells, 0..) |cell, index| {
-            if (wide) {
-                const segments = try self.cellSegments(value, cell);
-                defer self.allocator.free(segments);
-                var cell_width: usize = 0;
-                for (segments) |segment| cell_width += measuredWidth(self.options.metrics, segment.text);
-                const padding = columns[index] - cell_width;
-                const before = switch (cell.alignment) {
-                    .left => @as(usize, 0),
-                    .center => padding / 2,
-                    .right => padding,
-                };
-                try self.tablePadding(before);
-                for (segments) |segment| try self.append(segment, measuredWidth(self.options.metrics, segment.text));
-                try self.tablePadding(padding - before);
-                if (index + 1 < columns.len) try self.append(.{ .text = " │ ", .source = .{ .start = value.source.start, .end = value.source.start }, .authored = false }, 3);
-            } else {
-                // These labels are decoration. Only the actual header row owns header text.
-                if (value.source.start != header.source.start) {
-                    const label = try self.cellSegments(header, header.kind.table.cells[index]);
-                    defer self.allocator.free(label);
-                    for (label) |segment| try self.addToken(segment.text, .{ .start = value.source.start, .end = value.source.start }, segment.marks, false);
-                    try self.addToken(": ", .{ .start = value.source.start, .end = value.source.start }, .{}, false);
+        if (wide) {
+            const cells = try self.allocator.alloc([]const ReviewCardRow, columns.len);
+            @memset(cells, &.{});
+            defer {
+                for (cells) |rows| {
+                    for (rows) |row| self.allocator.free(row.segments);
+                    self.allocator.free(rows);
                 }
-                for (value.spans[cell.spans.start..cell.spans.end]) |span| try self.addSpan(span, false);
+                self.allocator.free(cells);
+            }
+            var height: usize = 1;
+            for (value.kind.table.cells, 0..) |cell, index| {
+                cells[index] = try self.cellRows(value, cell, columns[index]);
+                height = @max(height, cells[index].len);
+            }
+            for (0..height) |line| {
+                for (value.kind.table.cells, 0..) |cell, index| {
+                    const segments: []const Segment = if (line < cells[index].len) cells[index][line].segments else &.{};
+                    var cell_width: usize = 0;
+                    for (segments) |segment| cell_width += measuredWidth(self.options.metrics, segment.text);
+                    const padding = columns[index] - cell_width;
+                    const before = switch (cell.alignment) {
+                        .left => @as(usize, 0),
+                        .center => padding / 2,
+                        .right => padding,
+                    };
+                    try self.tablePadding(before);
+                    for (segments) |segment| try self.append(segment, measuredWidth(self.options.metrics, segment.text));
+                    try self.tablePadding(padding - before);
+                    if (index + 1 < columns.len) try self.append(.{ .text = " │ ", .source = .{ .start = value.source.start, .end = value.source.start }, .marks = .{ .divider = true }, .authored = false }, 3);
+                }
                 try self.flush();
             }
+            if (value.source.start == header.source.start) {
+                self.hidden_line = null;
+                for (columns, 0..) |width, index| {
+                    for (0..width) |_| try self.append(.{
+                        .text = "─",
+                        .source = .{ .start = value.source.start, .end = value.source.start },
+                        .marks = .{ .divider = true },
+                        .authored = false,
+                    }, 1);
+                    if (index + 1 < columns.len) try self.append(.{
+                        .text = "─┼─",
+                        .source = .{ .start = value.source.start, .end = value.source.start },
+                        .marks = .{ .divider = true },
+                        .authored = false,
+                    }, 3);
+                }
+                try self.flush();
+            }
+            return;
         }
-        if (wide) try self.flush();
+        for (value.kind.table.cells, 0..) |cell, index| {
+            // These labels are decoration. Only the actual header row owns header text.
+            if (value.source.start != header.source.start) {
+                const label = try self.cellSegments(header, header.kind.table.cells[index]);
+                defer self.allocator.free(label);
+                for (label) |segment| {
+                    self.link = segment.link;
+                    defer self.link = null;
+                    try self.addToken(segment.text, .{ .start = value.source.start, .end = value.source.start }, segment.marks, false);
+                }
+                try self.addToken(": ", .{ .start = value.source.start, .end = value.source.start }, .{}, false);
+            }
+            for (value.spans[cell.spans.start..cell.spans.end]) |span| try self.addSpan(span, false);
+            try self.flush();
+        }
     }
 
     fn tablePadding(self: *Writer, count: usize) !void {
@@ -345,6 +432,8 @@ const Writer = struct {
     }
 
     fn addSpan(self: *Writer, span: body_mod.Span, force_strong: bool) !void {
+        self.link = span.link;
+        defer self.link = null;
         if (span.hard_break) {
             if (span.marks.inline_code and self.current.items.len == 0) try self.emitEmpty(span.source) else try self.flush();
             return;
@@ -491,6 +580,7 @@ const Writer = struct {
         }
         for (0..self.container.indent) |_| try prefix.appendSlice(self.allocator, " ");
         if (self.container.marker) |marker| {
+            for (0..self.container.marker_padding) |_| try prefix.appendSlice(self.allocator, " ");
             if (self.first_row) {
                 switch (marker) {
                     .bullet => try prefix.appendSlice(self.allocator, "• "),
@@ -512,7 +602,9 @@ const Writer = struct {
     }
 
     fn append(self: *Writer, segment: Segment, cells: usize) !void {
-        try self.current.append(self.allocator, segment);
+        var linked = segment;
+        if (segment.marks.link_label or segment.marks.link_destination) linked.link = segment.link orelse self.link;
+        try self.current.append(self.allocator, linked);
         self.current_width += cells;
         if (!segment.authored) return;
         if (self.current_range) |*range| {
@@ -543,6 +635,9 @@ const Writer = struct {
         row.blank_source = blank_source;
         row.hidden_line = self.hidden_line;
         row.fences = self.fences;
+        if (self.part == .code_body or self.part == .suggestion_body or self.part == .suggestion_label) {
+            row.code_area = .{ .column = self.prefix_width, .width = self.current_width - self.prefix_width };
+        }
         try self.rows.append(self.allocator, row);
         self.current = .empty;
         self.current_width = 0;
@@ -628,6 +723,59 @@ test "M23 tables project aligned columns and wrapped generated labels as project
         try testing.expectEqualStrings("NameStateAdaReadyBoWaiting", authored.items);
         if (width == 40) try testing.expectEqualStrings("Ada  │   Ready", ada.items) else try testing.expectEqualStrings("Name: AdaState: Ready", ada.items);
     }
+}
+
+test "M23 tables wrap columns at the readability threshold without losing styles links or source ownership" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "First | Second\n--- | ---\n**abcdefghijklmnopqrstuvwxyz0123456789** | [docs](https://example.invalid/responsive/link)";
+    const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
+    const body = try ReviewBody.parse(a, raw);
+    for ([_]usize{ 120, 35, 34, 20, 1, 35 }) |width| {
+        const rows = try project(a, body, .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment_reply, .header = "Ada", .content_width = width, .metrics = TestMetrics.value, .collapsed_rows = 0 });
+        var authored: std.ArrayList(u8) = .empty;
+        var first: std.ArrayList(u8) = .empty;
+        var second: std.ArrayList(u8) = .empty;
+        var separators: usize = 0;
+        var dividers: usize = 0;
+        for (rows[1..]) |row| {
+            var cells: usize = 0;
+            var divider = false;
+            for (row.segments) |segment| {
+                cells += measuredWidth(TestMetrics.value, segment.text);
+                if (!segment.authored) {
+                    try testing.expectEqual(segment.source.start, segment.source.end);
+                    if (std.mem.eql(u8, segment.text, " │ ")) separators += 1;
+                    if (segment.marks.divider and !std.mem.eql(u8, segment.text, " │ ")) divider = true;
+                    continue;
+                }
+                // Wrapped cells are interleaved by displayed row. Recover authored cell order.
+                if (row.block_ordinal == 0) try authored.appendSlice(a, segment.text) else if (segment.marks.strong) {
+                    try first.appendSlice(a, segment.text);
+                } else try second.appendSlice(a, segment.text);
+                if (segment.marks.link_label or segment.marks.link_destination) {
+                    try testing.expectEqualStrings("https://example.invalid/responsive/link", segment.link.?.destination);
+                }
+            }
+            try testing.expect(cells <= width);
+            try testing.expectEqual(@as(u64, 1), row.owner.comment);
+            if (divider) {
+                try testing.expect(row.hidden_line == null and row.blank_source == null);
+                try testing.expectEqual(row.source_range.start, row.source_range.end);
+                dividers += 1;
+            }
+        }
+        try authored.appendSlice(a, first.items);
+        try authored.appendSlice(a, second.items);
+        try testing.expectEqualStrings("FirstSecondabcdefghijklmnopqrstuvwxyz0123456789docshttps://example.invalid/responsive/link", authored.items);
+        try testing.expectEqual(width >= 35, separators > 0);
+        try testing.expectEqual(@as(usize, if (width >= 35) 1 else 0), dividers);
+    }
+    var uneven = [_]usize{ 100, 3, 3 };
+    fitTableColumns(&uneven, 50);
+    try testing.expectEqualSlices(usize, &.{ 38, 3, 3 }, &uneven);
+    try testing.expectEqualStrings(raw, body.source);
 }
 
 test "M23 tables choose complete width with alignment links empty cells and literal fallback as project behavior" {
@@ -749,6 +897,36 @@ test "M23 containers reserve complete wide graphemes within narrow body widths a
     }
 }
 
+test "M23 containers align ordered dots across digit growth and retain independent list widths" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "9. first\n    > quote\n    >\n    after\n    99. child\n    1. child\n1. second\n\nreset\n\n1. separate\n\n> 9. quoted\n> 1. quoted";
+    const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
+    const body = try ReviewBody.parse(a, raw);
+    const rows = try project(a, body, .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment_reply, .header = "Ada", .content_width = 40, .metrics = TestMetrics.value, .collapsed_rows = 0 });
+    const expected = [_][]const u8{ "Ada", " 9. first", "    │ quote", "    │ ", "    after", "   99. child", "  100. child", "10. second", "", "reset", "", "1. separate", "", "│  9. quoted", "│ 10. quoted" };
+    try testing.expectEqual(expected.len, rows.len);
+    for (rows, expected) |row, text| {
+        var visible: std.ArrayList(u8) = .empty;
+        for (row.segments) |segment| {
+            try visible.appendSlice(a, segment.text);
+            if (!segment.authored) try testing.expectEqual(segment.source.start, segment.source.end);
+        }
+        try testing.expectEqualStrings(text, visible.items);
+    }
+    const wrapped: bbr.review.Comment = .{ .id = 2, .author = "Ada", .body = "9. abcdefghijkl\n1. x" };
+    const narrow = try project(a, try ReviewBody.parse(a, wrapped.body), .{ .owner = .{ .comment = 2 }, .source = .{ .comment = &wrapped }, .role = .comment_reply, .header = "Ada", .content_width = 10, .metrics = TestMetrics.value, .collapsed_rows = 0 });
+    const wrapped_expected = [_][]const u8{ "Ada", " 9. abcdef", "    ghijkl", "10. x" };
+    try testing.expectEqual(wrapped_expected.len, narrow.len);
+    for (narrow, wrapped_expected) |row, text| {
+        var visible: std.ArrayList(u8) = .empty;
+        for (row.segments) |segment| try visible.appendSlice(a, segment.text);
+        try testing.expectEqualStrings(text, visible.items);
+    }
+    try testing.expectEqualStrings(raw, body.source);
+}
+
 test "M23 containers show quotes and quote code inside list items as project behavior" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -812,14 +990,14 @@ test "M23 inline heading levels and paragraph rows hide syntax with exact source
     const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = "# One #\n## *Two*\n### `Three`\n#### Four\n##### Five\n###### Six\nSetext\n---\n\nfirst\nsecond\n\nthird  \nfourth" };
     const body = try ReviewBody.parse(a, comment.body);
     const rows = try project(a, body, .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "header", .content_width = 80, .metrics = TestMetrics.value, .collapsed_rows = 0 });
-    const expected = [_][]const u8{ "header", "§1 One", "§2 Two", "§3 Three", "§4 Four", "§5 Five", "§6 Six", "§2 Setext", "", "first second", "", "third", "fourth" };
+    const expected = [_][]const u8{ "header", "# One", "## Two", "### Three", "#### Four", "##### Five", "###### Six", "## Setext", "", "first second", "", "third", "fourth" };
     try testing.expectEqual(expected.len, rows.len);
     for (rows, expected) |row, text| {
         var visible: std.ArrayList(u8) = .empty;
         for (row.segments) |segment| try visible.appendSlice(a, segment.text);
         try testing.expectEqualStrings(text, visible.items);
         if (row.block_kind == .heading) for (row.segments) |segment| {
-            try testing.expect(segment.marks.strong);
+            try testing.expect(segment.marks.heading_marker or segment.marks.strong);
             if (!segment.authored) try testing.expectEqual(segment.source.start, segment.source.end);
         };
     }

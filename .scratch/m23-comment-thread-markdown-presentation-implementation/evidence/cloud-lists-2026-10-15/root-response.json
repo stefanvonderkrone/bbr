@@ -1,0 +1,14 @@
+{
+  "api_url": "https://api.bitbucket.org/2.0/repositories/check24/pr-webapp/pullrequests/2425/comments/883824183",
+  "id": 883824183,
+  "parent_id": null,
+  "created_on": "2026-10-15T14:25:15.153486+00:00",
+  "updated_on": "2026-10-15T14:25:15.173449+00:00",
+  "html_url": "https://bitbucket.org/check24/pr-webapp/pull-requests/2425/_/diff#comment-883824183",
+  "content": {
+    "type": "rendered",
+    "raw": "M23 Cloud list observation L01. Agent-authored test example.\n\n3. L01 Ordered parent with **bold**, _italic_, and `code`.\n    - L01a Unordered child with [docs](https://example.invalid/list-root).\n    - L01b Unordered child with ~~strike~~.\n8. L02 Second ordered item. The authored marker is 8.\n",
+    "markup": "markdown",
+    "html": "<p>M23 Cloud list observation L01. Agent-authored test example.</p>\n<ol start=\"3\">\n<li>L01 Ordered parent with <strong>bold</strong>, <em>italic</em>, and <code>code</code>.<ul>\n<li>L01a Unordered child with <a data-is-external-link=\"true\" href=\"https://example.invalid/list-root\" rel=\"nofollow\">docs</a>.</li>\n<li>L01b Unordered child with <del>strike</del>.</li>\n</ul>\n</li>\n<li>L02 Second ordered item. The authored marker is 8.</li>\n</ol>"
+  }
+}
