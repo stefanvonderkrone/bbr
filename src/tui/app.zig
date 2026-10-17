@@ -1299,7 +1299,7 @@ test {
     _ = @import("theme.zig");
     _ = @import("nav.zig");
     _ = @import("keymap.zig");
-    _ = @import("picker.zig");
+    _ = @import("list_overlay.zig");
     _ = @import("session.zig");
     _ = @import("arena_ring.zig");
     _ = @import("composer.zig");

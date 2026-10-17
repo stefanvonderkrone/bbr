@@ -27,8 +27,8 @@ const Section = buffer_mod.Section;
 const FileStatus = bbr.diff.FileStatus;
 const Thread = bbr.review.Thread;
 const Draft = bbr.review.Draft;
-const Picker = @import("picker.zig").Picker;
-const FileFinder = @import("picker.zig").FileFinder;
+const Picker = @import("list_overlay.zig").Picker;
+const FileFinder = @import("list_overlay.zig").FileFinder;
 const keymap = @import("keymap.zig");
 const buffer_mod = @import("buffer.zig");
 
@@ -936,8 +936,7 @@ pub fn drawPicker(scratch: std.mem.Allocator, win: vaxis.Window, picker: *const 
     }
 
     // Scroll so the selected row stays on screen.
-    var top: usize = 0;
-    if (picker.selected >= list_rows) top = picker.selected - list_rows + 1;
+    const top = picker.list.scrollTop(list_rows);
 
     var r: u16 = 1;
     while (r <= list_rows) : (r += 1) {
@@ -946,7 +945,7 @@ pub fn drawPicker(scratch: std.mem.Allocator, win: vaxis.Window, picker: *const 
             fillRow(modal, r, theme.picker);
             continue;
         }
-        const selected = mi == picker.selected;
+        const selected = mi == picker.list.selected;
         const style = if (selected) theme.picker_selected else theme.picker;
         fillRow(modal, r, style);
 
@@ -966,12 +965,11 @@ pub fn drawFileFinder(scratch: std.mem.Allocator, win: vaxis.Window, finder: *co
     _ = modal.printSegment(.{ .text = prompt, .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
     const list_rows = modal.height - 1;
     const matches = finder.matches();
-    var top: usize = 0;
-    if (finder.selected >= list_rows) top = finder.selected - list_rows + 1;
+    const top = finder.list.scrollTop(list_rows);
     var row: u16 = 1;
     while (row <= list_rows) : (row += 1) {
         const match_index = top + row - 1;
-        const selected = match_index < matches.len and match_index == finder.selected;
+        const selected = match_index < matches.len and match_index == finder.list.selected;
         const style = if (selected) theme.picker_selected else theme.picker;
         fillRow(modal, row, style);
         if (match_index < matches.len) {

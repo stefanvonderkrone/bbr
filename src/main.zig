@@ -1364,7 +1364,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
 
 // Test discovery only follows `_ = @import(...)` chains rooted in the *test
 // root* file's test blocks. This block roots the exe module's TUI test tree
-// (app → render → theme → nav → picker → session); the core `bbr` module's
+// (app → render → theme → nav → list_overlay → session); the core `bbr` module's
 // tests run via src/root.zig.
 test {
     _ = @import("completion.zig");

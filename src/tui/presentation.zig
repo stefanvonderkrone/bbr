@@ -11,8 +11,8 @@ const composer_mod = @import("composer.zig");
 const Composer = composer_mod.Composer;
 const file_enrichment = @import("file_enrichment.zig");
 const keymap_mod = @import("keymap.zig");
-const Picker = @import("picker.zig").Picker;
-const FileFinder = @import("picker.zig").FileFinder;
+const Picker = @import("list_overlay.zig").Picker;
+const FileFinder = @import("list_overlay.zig").FileFinder;
 const frame_mod = @import("frame.zig");
 const file_tree = frame_mod.file_tree;
 const buffer_mod = @import("buffer.zig");
@@ -5907,11 +5907,11 @@ pub const Presentation = struct {
             return otherOverlay(self.geometry);
         if (self.file_finder) |finder| {
             const rect = frame_mod.overlayRect(self.geometry, 60, 16) orelse return null;
-            return .{ .kind = .picker, .rect = rect, .row_count = finder.matches().len, .scroll = pickerTop(finder.selected, rect.height -| 1) };
+            return .{ .kind = .picker, .rect = rect, .row_count = finder.matches().len, .scroll = finder.list.scrollTop(rect.height -| 1) };
         }
         if (self.picker) |picker| {
             const rect = frame_mod.overlayRect(self.geometry, 60, 16) orelse return null;
-            return .{ .kind = .picker, .rect = rect, .row_count = picker.matches().len, .scroll = pickerTop(picker.selected, rect.height -| 1) };
+            return .{ .kind = .picker, .rect = rect, .row_count = picker.matches().len, .scroll = picker.list.scrollTop(rect.height -| 1) };
         }
         if (self.published) |published| if (published.composer != null) return otherOverlay(self.geometry);
         if (self.published) |published| if (published.review_search.open) {
@@ -13044,11 +13044,6 @@ fn collectSelectedLines(
 fn otherOverlay(geometry: frame_mod.Geometry) ?frame_mod.OverlayTarget {
     const rect = frame_mod.overlayRect(geometry, geometry.cols, geometry.rows) orelse return null;
     return .{ .kind = .other, .rect = rect };
-}
-
-fn pickerTop(selected: usize, visible_rows: usize) usize {
-    if (visible_rows == 0 or selected < visible_rows) return 0;
-    return selected - visible_rows + 1;
 }
 
 fn nextFileHeaderRow(buffer: buffer_mod.Buffer, cursor: usize) ?usize {
@@ -28177,7 +28172,7 @@ test "Picker mouse click selects only and non-Picker Overlay captures Pane click
     const overlay = presentation.projection().review.?.frame.overlay.?;
     try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 2, .button = .left, .type = .press } });
     try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 2, .button = .left, .type = .release } });
-    try testing.expectEqual(@as(usize, 1), presentation.projection().file_finder.?.selected);
+    try testing.expectEqual(@as(usize, 1), presentation.projection().file_finder.?.list.selected);
     try testing.expect(presentation.projection().file_finder != null); // click never confirms
 
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
@@ -28210,12 +28205,12 @@ test "PullRequest Picker wheel and click move selection while Enter alone confir
     try presentation.dispatch(.{ .pull_requests_loaded = .{ .work_id = list.work_id, .outcome = .{ .loaded = summaries } } });
     const overlay = presentation.projection().review.?.frame.overlay.?;
     try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 1, .button = .wheel_down, .type = .press } });
-    try testing.expectEqual(@as(usize, 3), presentation.projection().picker.?.selected);
+    try testing.expectEqual(@as(usize, 3), presentation.projection().picker.?.list.selected);
 
     const current_overlay = presentation.projection().review.?.frame.overlay.?;
     try presentation.dispatch(.{ .mouse = .{ .col = current_overlay.rect.x, .row = current_overlay.rect.y + 2, .button = .left, .type = .press } });
     try presentation.dispatch(.{ .mouse = .{ .col = current_overlay.rect.x, .row = current_overlay.rect.y + 2, .button = .left, .type = .release } });
-    try testing.expectEqual(@as(usize, 1), presentation.projection().picker.?.selected);
+    try testing.expectEqual(@as(usize, 1), presentation.projection().picker.?.list.selected);
     try testing.expect(presentation.takeCommand() == null);
 
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
