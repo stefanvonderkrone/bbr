@@ -29,6 +29,7 @@ const Thread = bbr.review.Thread;
 const Draft = bbr.review.Draft;
 const list_overlay_mod = @import("list_overlay.zig");
 const ListOverlay = list_overlay_mod.ListOverlay;
+const ThemeId = @import("theme_id.zig").ThemeId;
 const keymap = @import("keymap.zig");
 const buffer_mod = @import("buffer.zig");
 
@@ -910,7 +911,14 @@ fn centeredModal(win: vaxis.Window, max_w: u16, max_h: u16) ?vaxis.Window {
 /// per ranked match, scrolled to keep the selected row visible. `scratch`
 /// outlives render. A Command Palette row whose Action `availability` refuses
 /// is greyed.
-pub fn drawListOverlay(scratch: std.mem.Allocator, win: vaxis.Window, overlay: *const ListOverlay, availability: presentation.ActionAvailability, theme: Theme) void {
+pub fn drawListOverlay(
+    scratch: std.mem.Allocator,
+    win: vaxis.Window,
+    overlay: *const ListOverlay,
+    availability: presentation.ActionAvailability,
+    configured_theme: ThemeId,
+    theme: Theme,
+) void {
     const box = overlay.box();
     const modal = centeredModal(win, box.width, box.height) orelse return;
     const list = overlay.list();
@@ -939,7 +947,7 @@ pub fn drawListOverlay(scratch: std.mem.Allocator, win: vaxis.Window, overlay: *
         const selected = match_index == list.selected;
         const style = if (selected) theme.picker_selected else theme.picker;
         fillRow(modal, row, style);
-        _ = modal.print(listRow(scratch, overlay, matches[match_index], selected, style, availability, theme), .{ .row_offset = row, .wrap = .none });
+        _ = modal.print(listRow(scratch, overlay, matches[match_index], selected, style, availability, configured_theme, theme), .{ .row_offset = row, .wrap = .none });
     }
 }
 
@@ -948,6 +956,7 @@ fn listPrompt(overlay: *const ListOverlay) []const u8 {
         .pull_request_picker => "",
         .file_finder => "File ",
         .command_palette => "Command ",
+        .theme => "Theme ",
     };
 }
 
@@ -959,6 +968,7 @@ fn listPlaceholder(scratch: std.mem.Allocator, overlay: *const ListOverlay) ?[]c
         else if (picker.prs().len == 0) "  no open pull requests" else null,
         .file_finder => |*finder| if (finder.list.matches().len > 0) null else if (finder.files.len == 0) "  no changed files" else "  no matching files",
         .command_palette => |*palette| if (palette.list.matches().len > 0) null else "  no matching commands",
+        .theme => |*theme_overlay| if (theme_overlay.list.matches().len > 0) null else "  no matching Themes",
     };
 }
 
@@ -969,6 +979,7 @@ fn listRow(
     selected: bool,
     style: vaxis.Style,
     availability: presentation.ActionAvailability,
+    configured_theme: ThemeId,
     theme: Theme,
 ) []const vaxis.Segment {
     const marker: []const u8 = if (selected) "▸ " else "  ";
@@ -998,6 +1009,11 @@ fn listRow(
         .file_finder => |*finder| blk: {
             const path = finder.files[item].displayPath();
             break :blk std.fmt.allocPrint(scratch, "{s}{s}", .{ marker, path }) catch path;
+        },
+        .theme => blk: {
+            const id = ThemeId.at(item);
+            const suffix: []const u8 = if (id == configured_theme) "  (configured)" else "";
+            break :blk std.fmt.allocPrint(scratch, "{s}{s}{s}", .{ marker, id.name(), suffix }) catch id.name();
         },
     };
     const segments = scratch.alloc(vaxis.Segment, 1) catch return &.{};
@@ -3647,7 +3663,7 @@ test "picker overlay draws the query line and highlights the selection" {
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
 
-    drawListOverlay(a, win, &picker, .{ .remote = true }, theme_dark);
+    drawListOverlay(a, win, &picker, .{ .remote = true }, .system, theme_dark);
 
     // Modal geometry: 60×16, centered on 80×24 → origin (10, 4).
     const mx: u16 = 10;
@@ -3681,7 +3697,7 @@ test "Command Palette rows show a bold title, a regular description, and grey an
         defer palette.deinit();
         palette.insert(case.query);
         win.clear();
-        drawListOverlay(a, win, &palette, local_review, theme_dark);
+        drawListOverlay(a, win, &palette, local_review, .system, theme_dark);
 
         try testing.expectEqualStrings("C", win.readCell(mx, my).?.char.grapheme);
         const title = win.readCell(mx + 2, my + 1).?;
@@ -3697,6 +3713,57 @@ test "Command Palette rows show a bold title, a regular description, and grey an
     }
 }
 
+test "the Theme Overlay marks the Configured Theme and the screen repaints in the previewed Theme" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1);
+    const session = try @import("session.zig").create(testing.allocator);
+    session.source = .{ .remote = .{ .id = 1, .title = "Theme", .state = "OPEN", .author_display_name = "Ada", .source_branch = "feature", .destination_branch = "main", .source_commit = "source", .destination_commit = "base" } };
+    session.header = .{ .title = "Theme", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Bitbucket" };
+    session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1 @@\n-old\n+new\n");
+    try session.initializeEnrichment();
+    var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store(), .configured_theme = .dark }, .{
+        .initial = .{ .key = key, .session = session },
+        .geometry = .{ .cols = 60, .rows = 24 },
+    });
+    defer state.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 60, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const themes = @import("theme.zig");
+
+    try state.dispatch(.{ .action = .open_theme_overlay });
+    try state.dispatch(.{ .key = .{ .codepoint = keymap.special.down } });
+    var projection = state.projection();
+    try testing.expectEqual(ThemeId.light, projection.theme);
+    drawReview(a, win, projection.review.?, themes.value(projection.theme), 0);
+    try testing.expect(screenHasBackground(win, themes.light.added.bg));
+    try testing.expect(!screenHasBackground(win, themes.dark.added.bg));
+
+    drawListOverlay(a, win, projection.list_overlay.?, projection.action_availability, projection.configured_theme, themes.value(projection.theme));
+    // A 40x12 box centered on 60x24 starts at (10, 6); "dark" is its first Theme row after "system".
+    try testing.expectEqualStrings("d", win.readCell(12, 8).?.char.grapheme);
+    try testing.expectEqualStrings("(", win.readCell(18, 8).?.char.grapheme);
+    try testing.expectEqualStrings(" ", win.readCell(18, 7).?.char.grapheme);
+
+    try state.dispatch(.{ .key = .{ .codepoint = keymap.special.escape } });
+    projection = state.projection();
+    try testing.expectEqual(ThemeId.dark, projection.theme);
+    win.clear();
+    drawReview(a, win, projection.review.?, themes.value(projection.theme), 0);
+    try testing.expect(screenHasBackground(win, themes.dark.added.bg));
+}
+
+fn screenHasBackground(win: vaxis.Window, bg: vaxis.Cell.Color) bool {
+    for (0..win.height) |row| for (0..win.width) |col| {
+        if (std.meta.eql(win.readCell(@intCast(col), @intCast(row)).?.style.bg, bg)) return true;
+    };
+    return false;
+}
+
 test "a loading picker shows its single-glyph spinner beside the placeholder" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -3709,7 +3776,7 @@ test "a loading picker shows its single-glyph spinner beside the placeholder" {
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
 
-    drawListOverlay(a, win, &picker, .{ .remote = true }, theme_dark);
+    drawListOverlay(a, win, &picker, .{ .remote = true }, .system, theme_dark);
 
     // Modal at (10, 4); row 1 of the modal carries "  loading…".
     const mx: u16 = 10;

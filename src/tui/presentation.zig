@@ -864,6 +864,8 @@ pub const Dependencies = struct {
     cell_metrics: frame_mod.CellMetrics = .bytes,
     /// The Theme config.toml named at startup.
     configured_theme: ThemeId = .system,
+    /// False for the demo: choosing a Theme applies it to this process only.
+    persist_theme: bool = true,
 };
 
 pub const InitialReview = struct {
@@ -919,6 +921,7 @@ pub const OwnedInput = union(enum) {
     pull_requests_loaded: PullRequestsLoaded,
     picker_tick: WorkId,
     clipboard_completed: ClipboardCompleted,
+    theme_persisted: ThemePersisted,
     external_edit_completed: *ExternalEditCompleted,
     buffer_search_scanned: BufferSearchScanned,
     buffer_disclosure_built: *DisclosureBuild,
@@ -1427,6 +1430,7 @@ pub const OwnedCommand = union(enum) {
     find_duplicate: *PostDraft,
     list_pull_requests: ListPullRequests,
     copy_clipboard: *ClipboardCopy,
+    persist_theme: PersistTheme,
     external_edit: *ExternalEdit,
     scan_buffer_search: ScanBufferSearch,
     build_buffer_disclosure: *DisclosureBuild,
@@ -1444,7 +1448,7 @@ pub const OwnedCommand = union(enum) {
             .scan_buffer_search => |*command| command.deinit(),
             .build_buffer_disclosure => |command| command.destroy(),
             .scan_review_source => |*command| command.deinit(),
-            .load_session, .enrich_file, .change_reviewer_verdict, .wait_submission, .check_recovery, .list_pull_requests => {},
+            .load_session, .enrich_file, .change_reviewer_verdict, .wait_submission, .check_recovery, .list_pull_requests, .persist_theme => {},
         }
         self.* = undefined;
     }
@@ -1475,6 +1479,7 @@ fn setCommandId(command: *OwnedCommand, command_id: CommandId) void {
         .check_recovery => |*value| value.command_id = command_id,
         .list_pull_requests => |*value| value.command_id = command_id,
         .copy_clipboard => |value| value.command_id = command_id,
+        .persist_theme => |*value| value.command_id = command_id,
         .external_edit => |value| value.command_id = command_id,
         .scan_buffer_search => |*value| value.command_id = command_id,
         .build_buffer_disclosure => |value| value.command_id = command_id,
@@ -2765,6 +2770,27 @@ pub const ClipboardCompleted = struct {
     success: bool,
 };
 
+/// Write the chosen Theme to config.toml.
+pub const PersistTheme = struct {
+    command_id: CommandId = 0,
+    theme: ThemeId,
+};
+
+pub const ThemePersisted = struct {
+    command_id: CommandId,
+    outcome: Outcome,
+
+    pub const Outcome = enum {
+        saved,
+        /// Neither XDG_CONFIG_HOME nor HOME is set.
+        no_config_location,
+        /// config.toml does not parse with the new Theme.
+        config_invalid,
+        /// Reading or writing failed, or the command could not start.
+        write_failed,
+    };
+};
+
 pub const ExternalEdit = struct {
     allocator: Allocator,
     command_id: CommandId = 0,
@@ -3035,7 +3061,7 @@ pub const ActionAvailability = struct {
     pub fn available(self: ActionAvailability, action: Action) bool {
         if (!self.has_review) return switch (action) {
             .quit, .help, .open_pull_request_picker => self.remote,
-            .open_command_palette => true,
+            .open_command_palette, .open_theme_overlay => true,
             else => false,
         };
         if (!self.remote) switch (action) {
@@ -3195,6 +3221,8 @@ pub const ActionError = enum {
     buffer_search_hit_bottom,
     buffer_search_hit_top,
     out_of_memory,
+    theme_not_saved,
+    theme_not_saved_invalid_config,
     persistence_failed,
     submission_already_active,
     submission_launch_failed,
@@ -5674,6 +5702,7 @@ pub const Presentation = struct {
             .duplicate_checked => |checked| self.acceptDuplicateCheck(checked),
             .pull_requests_loaded => |loaded| self.acceptPullRequests(loaded),
             .picker_tick => |scope| if (!self.shutdown_requested) if (self.list_overlay) |*overlay| overlay.tick(scope),
+            .theme_persisted => |persisted| self.acceptThemePersisted(persisted),
             .clipboard_completed => |completed| {
                 if (!self.consumeCommand(completed.command_id, .copy_clipboard)) return;
                 self.clipboard_status = if (completed.success) .copied else .failed;
@@ -5746,6 +5775,7 @@ pub const Presentation = struct {
             },
             .list_pull_requests => self.outstanding_picker_loads += 1,
             .copy_clipboard => {},
+            .persist_theme => {},
             .external_edit => {},
             .scan_buffer_search => |scan| if (scan.mode == .fuzzy) {
                 if (self.published) |published| published.review_search.authored_scan_active = true;
@@ -5810,7 +5840,7 @@ pub const Presentation = struct {
             } else null,
             .list_overlay = if (self.list_overlay) |*overlay| overlay else null,
             .picker_tick_scope = if (self.shutdown_requested) null else if (self.list_overlay) |*overlay| overlay.tickScope() else null,
-            .theme = self.configured_theme,
+            .theme = self.activeTheme(),
             .configured_theme = self.configured_theme,
             .help_visible = self.help_visible,
             .action_availability = self.actionAvailability(),
@@ -7050,6 +7080,14 @@ pub const Presentation = struct {
             self.showListOverlay(overlay);
             return;
         }
+        if (action == .open_theme_overlay) {
+            const overlay = ListOverlay.openTheme(self.allocator, self.configured_theme) catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
+            self.showListOverlay(overlay);
+            return;
+        }
         if (self.replacement != null) return;
         const published = self.published orelse return;
         self.action_error = null;
@@ -7148,7 +7186,7 @@ pub const Presentation = struct {
             .resolve_unpublished => self.resolveSelectedUnknownAsUnpublished(published),
             .link_existing_comment => self.openUnknownResolutionEditor(published),
             .yank => self.yank(published, yank_count),
-            .open_file_finder, .open_pull_request_picker, .open_command_palette, .confirm_picker, .help => unreachable,
+            .open_file_finder, .open_pull_request_picker, .open_command_palette, .open_theme_overlay, .confirm_picker, .help => unreachable,
             .quit => unreachable,
         }
         clampSelectionAtUnavailableRow(published, selection_cursor_before, self.preferences.scope);
@@ -11372,7 +11410,36 @@ pub const Presentation = struct {
                 published.focus = .diff;
             },
             .action => |action| self.applyAction(action),
+            .theme => |id| self.chooseTheme(id),
         }
+    }
+
+    /// The chosen Theme applies at once. A failed save keeps it for this
+    /// process and reports the failure, because a snap back would read as a
+    /// bug.
+    fn chooseTheme(self: *Presentation, id: ThemeId) void {
+        self.configured_theme = id;
+        self.action_error = null;
+        if (!self.dependencies.persist_theme) return;
+        self.commands.append(self.allocator, .{ .persist_theme = .{ .theme = id } }) catch {
+            self.action_error = .out_of_memory;
+        };
+    }
+
+    fn acceptThemePersisted(self: *Presentation, persisted: ThemePersisted) void {
+        if (!self.consumeCommand(persisted.command_id, .persist_theme)) return;
+        switch (persisted.outcome) {
+            .saved => {},
+            .config_invalid => self.action_error = .theme_not_saved_invalid_config,
+            .no_config_location, .write_failed => self.action_error = .theme_not_saved,
+        }
+    }
+
+    /// The Theme Overlay's selection while it is open, else the Configured
+    /// Theme. Closing the Overlay therefore reverts the preview.
+    fn activeTheme(self: *const Presentation) ThemeId {
+        if (self.list_overlay) |*overlay| if (overlay.themePreview()) |preview| return preview;
+        return self.configured_theme;
     }
 
     fn acceptPullRequests(self: *Presentation, loaded: PullRequestsLoaded) void {
@@ -19071,6 +19138,103 @@ test "a Session replacement closes the Command Palette" {
     } });
     try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.pull_request.?.id);
     try testing.expect(presentation.projection().list_overlay == null);
+}
+
+test "Theme Overlay previews, reverts on Escape or ctrl-c, and persists on Enter" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .configured_theme = .system }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testType(&presentation, "theme");
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expect(testListOverlay(&presentation, .theme) != null);
+    try testing.expectEqual(keymap_mod.InteractionContext.theme_overlay, presentation.interactionContext());
+    try testing.expectEqual(ThemeId.system, presentation.projection().theme);
+
+    for ([_]keymap_mod.KeyStroke{ test_escape, test_ctrl_c }) |close| {
+        if (presentation.projection().list_overlay == null) try presentation.dispatch(.{ .action = .open_theme_overlay });
+        const before = presentation.projection().revision;
+        try presentation.dispatch(.{ .key = test_down });
+        try testing.expectEqual(ThemeId.dark, presentation.projection().theme);
+        try testing.expect(!std.meta.eql(before, presentation.projection().revision));
+        try presentation.dispatch(.{ .key = test_ctrl_n });
+        try testing.expectEqual(ThemeId.light, presentation.projection().theme);
+        try presentation.dispatch(.{ .key = close });
+        try testing.expect(presentation.projection().list_overlay == null);
+        try testing.expectEqual(ThemeId.system, presentation.projection().theme);
+        try testing.expect(presentation.takeCommand() == null);
+    }
+
+    try presentation.dispatch(.{ .action = .open_theme_overlay });
+    try presentation.dispatch(.{ .key = test_down });
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expect(presentation.projection().list_overlay == null);
+    try testing.expectEqual(ThemeId.dark, presentation.projection().theme);
+    try testing.expectEqual(ThemeId.dark, presentation.projection().configured_theme);
+    const command = presentation.takeCommand().?.persist_theme;
+    try testing.expectEqual(ThemeId.dark, command.theme);
+    try testing.expect(presentation.takeCommand() == null);
+    try presentation.dispatch(.{ .theme_persisted = .{ .command_id = command.command_id, .outcome = .saved } });
+    try testing.expect(presentation.projection().action_error == null);
+    try testing.expectEqual(@as(usize, 0), presentation.issued_commands.items.len);
+
+    try presentation.dispatch(.{ .action = .open_theme_overlay });
+    try testing.expectEqual(@as(usize, @intFromEnum(ThemeId.dark)), testListOverlay(&presentation, .theme).?.list().selectedItem().?);
+    try testing.expectEqual(ThemeId.dark, presentation.projection().theme);
+}
+
+test "a failed Theme save keeps the Theme and reports it, and a stale completion is ignored" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .configured_theme = .gruvbox_dark }, .{});
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testType(&presentation, "theme");
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expectEqual(ThemeId.gruvbox_dark, presentation.projection().theme);
+    try testType(&presentation, "solarized-light");
+    try testing.expectEqual(ThemeId.solarized_light, presentation.projection().theme);
+    try presentation.dispatch(.{ .key = test_enter });
+    const command = presentation.takeCommand().?.persist_theme;
+    try presentation.dispatch(.{ .theme_persisted = .{ .command_id = command.command_id +% 100, .outcome = .write_failed } });
+    try testing.expect(presentation.projection().action_error == null);
+    try presentation.dispatch(.{ .theme_persisted = .{ .command_id = command.command_id, .outcome = .config_invalid } });
+    try testing.expectEqual(ThemeId.solarized_light, presentation.projection().theme);
+    try testing.expectEqual(ActionError.theme_not_saved_invalid_config, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .theme_persisted = .{ .command_id = command.command_id, .outcome = .write_failed } });
+    try testing.expectEqual(ActionError.theme_not_saved_invalid_config, presentation.projection().action_error.?);
+}
+
+test "a Theme Overlay query that hides every Theme previews the Configured Theme" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .configured_theme = .light }, .{});
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_theme_overlay });
+    try testType(&presentation, "zzz");
+    try testing.expectEqual(ThemeId.light, presentation.projection().theme);
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expect(testListOverlay(&presentation, .theme) != null);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "without Theme persistence Enter applies the Theme and emits no command" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .persist_theme = false }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_theme_overlay });
+    try presentation.dispatch(.{ .key = test_down });
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expectEqual(ThemeId.dark, presentation.projection().theme);
+    try testing.expect(presentation.takeCommand() == null);
 }
 
 test "the projected Theme is the configured Theme" {

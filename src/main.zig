@@ -1359,6 +1359,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
         .mouse_vertical_scroll_rows = configuration.mouse_vertical_scroll_rows,
         .external_edit_max_bytes = configuration.external_edit_max_bytes,
         .online = false,
+        .persist_theme = false,
     }, s, try presentation.OwnedReviewIdentity.init("", "", pr.id));
 }
 

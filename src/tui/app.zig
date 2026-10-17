@@ -11,6 +11,7 @@ const bbr = @import("bbr");
 
 const render = @import("render.zig");
 const theme = @import("theme.zig");
+const config = @import("config.zig");
 const ThemeId = @import("theme_id.zig").ThemeId;
 const Nav = @import("nav.zig").Nav;
 const keymap = @import("keymap.zig");
@@ -36,6 +37,8 @@ pub const RunCtx = struct {
     repo: []const u8,
     store: PendingReviewStore,
     theme: ThemeId,
+    /// False for the demo, which must not change the reviewer's config.toml.
+    persist_theme: bool = true,
     keymap: keymap.Keymap,
     highlighter: bbr.highlight.Highlighter,
     highlight_max_file_bytes: usize,
@@ -112,6 +115,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         .remote_enabled = ctx.online,
         .cell_metrics = vaxis_cell_metrics,
         .configured_theme = ctx.theme,
+        .persist_theme = ctx.persist_theme,
     }, .{
         .initial = if (initial) |loaded| .{
             .key = initial_key,
@@ -227,7 +231,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             const status = presentationStatus(frame, projection, null);
             render.drawLoading(frame, content_win, projection.loading_pull_request_id, active_theme, status);
         }
-        if (projection.list_overlay) |overlay| render.drawListOverlay(frame, content_win, overlay, projection.action_availability, active_theme);
+        if (projection.list_overlay) |overlay| render.drawListOverlay(frame, content_win, overlay, projection.action_availability, projection.configured_theme, active_theme);
         if (projection.review_search) |review_search| render.drawReviewSearch(frame, content_win, review_search, active_theme);
         if (projection.composer) |composer| render.drawComposerProjection(frame, content_win, composer, active_theme);
         if (projection.unknown_resolution) |resolution| render.drawComposerProjection(frame, content_win, .{
@@ -462,6 +466,8 @@ fn reviewerVerdictOutcomeLabel(outcome: presentation.ReviewerVerdictCommandOutco
 fn actionErrorText(err: presentation.ActionError) []const u8 {
     return switch (err) {
         .local_review_no_picker => "Pull Request Picker is unavailable for a local review",
+        .theme_not_saved => "Theme applied, but config.toml could not be written",
+        .theme_not_saved_invalid_config => "Theme applied, but config.toml is invalid and was not changed",
         .local_review_no_submission => "Submit is unavailable for a local review; drafts remain local",
         .local_review_remote_action_unavailable => "This action is unavailable for a local review",
         .source_action_unavailable => "This action requires a source line or Selection",
@@ -1000,6 +1006,18 @@ fn drainPresentationCommands(
             try state.dispatch(input);
             continue;
         }
+        // config.toml is at most 64 KiB, so the write runs on the terminal
+        // thread and completes before the next event.
+        if (command == .persist_theme) {
+            const persist = command.persist_theme;
+            const outcome: presentation.ThemePersisted.Outcome = if (config.persistTheme(ctx.gpa, ctx.io, ctx.env_map, persist.theme)) |_| .saved else |err| switch (err) {
+                error.NoConfigLocation => .no_config_location,
+                error.ConfigInvalid => .config_invalid,
+                error.WriteFailed, error.OutOfMemory => .write_failed,
+            };
+            try state.dispatch(.{ .theme_persisted = .{ .command_id = persist.command_id, .outcome = outcome } });
+            continue;
+        }
         if (command == .external_edit) {
             var handoff_context: TerminalHandoffContext = .{
                 .ctx = ctx,
@@ -1042,7 +1060,7 @@ fn drainPresentationCommands(
             .check_recovery => |check| ctx.io.concurrent(presentationRecoveryCheckWorker, .{ loop, work_id, ctx.bitbucket.?, check }),
             .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, ctx.bitbucket.?, check }),
             .list_pull_requests => |list| ctx.io.concurrent(presentationListPullRequestsWorker, .{ loop, work_id, ctx.bitbucket.?, list }),
-            .copy_clipboard => unreachable,
+            .copy_clipboard, .persist_theme => unreachable,
             .external_edit => unreachable,
             .scan_buffer_search => |scan| ctx.io.concurrent(presentationBufferSearchWorker, .{ loop, work_id, scan }),
             .build_buffer_disclosure => |job| ctx.io.concurrent(presentationDisclosureWorker, .{ loop, work_id, job }),
@@ -1102,6 +1120,7 @@ fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *p
             copy.destroy();
             break :blk .{ .clipboard_completed = .{ .command_id = copy.command_id, .success = false } };
         },
+        .persist_theme => |persist| .{ .theme_persisted = .{ .command_id = persist.command_id, .outcome = .write_failed } },
         .external_edit => |edit| blk: {
             const completed = try presentation.ExternalEditCompleted.create(edit.allocator, edit.command_id, edit.session_epoch);
             completed.outcome = .failed;

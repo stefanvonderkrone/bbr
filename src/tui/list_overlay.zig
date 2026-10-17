@@ -20,6 +20,7 @@ const File = bbr.diff.File;
 const Action = @import("action.zig").Action;
 const InteractionContext = @import("action.zig").InteractionContext;
 const keymap = @import("keymap.zig");
+const ThemeId = @import("theme_id.zig").ThemeId;
 
 /// Max whitespace-separated needles honored in a query; extra words are ignored.
 const max_needles = 8;
@@ -329,6 +330,7 @@ pub const CommandPalette = struct {
         .{ .action = .resolve_unpublished, .title = "Mark Draft Unpublished", .description = "Confirm that an unknown-outcome Draft was not posted" },
         .{ .action = .link_existing_comment, .title = "Link Existing Comment", .description = "Link an unknown-outcome Draft to a posted Comment" },
         .{ .action = .focus_next_pane, .title = "Switch Pane", .description = "Move focus between the Sidebar and the DiffPane" },
+        .{ .action = .open_theme_overlay, .title = "Theme", .description = "Preview and choose the color Theme" },
         .{ .action = .help, .title = "Keybindings", .description = "Show the keybinding help" },
         .{ .action = .quit, .title = "Quit", .description = "Quit bbr" },
     };
@@ -368,12 +370,29 @@ pub const CommandPalette = struct {
     };
 };
 
+/// The Theme Overlay. It stores no original Theme: the Configured Theme is the
+/// original, and the preview derives from the selection, so closing reverts.
+pub const ThemeOverlay = struct {
+    list: FuzzyList,
+
+    const Haystack = struct {
+        fn len(_: Haystack) usize {
+            return ThemeId.count;
+        }
+
+        fn score(_: Haystack, index: usize, q: Query) ?f64 {
+            return q.rank(ThemeId.at(index).name());
+        }
+    };
+};
+
 /// The one List Overlay Presentation holds. Policy that differs per arm is an
 /// exhaustive switch here, so a new arm fails the build at every decision.
 pub const ListOverlay = union(enum) {
     pull_request_picker: PullRequestPicker,
     file_finder: FileFinder,
     command_palette: CommandPalette,
+    theme: ThemeOverlay,
 
     /// A loading Picker has no items, so opening it allocates nothing.
     pub fn openPullRequestPicker(allocator: Allocator, work_id: u64) ListOverlay {
@@ -400,6 +419,15 @@ pub const ListOverlay = union(enum) {
         return overlay;
     }
 
+    /// Opens with the cursor on `configured`, so opening changes nothing on
+    /// screen.
+    pub fn openTheme(allocator: Allocator, configured: ThemeId) Allocator.Error!ListOverlay {
+        var overlay: ListOverlay = .{ .theme = .{ .list = try FuzzyList.init(allocator, ThemeId.count) } };
+        overlay.refilter();
+        overlay.theme.list.selectItem(@intFromEnum(configured));
+        return overlay;
+    }
+
     pub fn deinit(self: *ListOverlay) void {
         switch (self.*) {
             .pull_request_picker => |*picker| {
@@ -408,6 +436,7 @@ pub const ListOverlay = union(enum) {
             },
             .file_finder => |*finder| finder.list.deinit(),
             .command_palette => |*palette| palette.list.deinit(),
+            .theme => |*overlay| overlay.list.deinit(),
         }
         self.* = undefined;
     }
@@ -449,6 +478,7 @@ pub const ListOverlay = union(enum) {
             .pull_request_picker => |*picker| .{ .pull_request = picker.prs()[item].id },
             .file_finder => .{ .file = item },
             .command_palette => |*palette| .{ .action = palette.command(item).action },
+            .theme => .{ .theme = ThemeId.at(item) },
         };
     }
 
@@ -457,15 +487,17 @@ pub const ListOverlay = union(enum) {
             .pull_request_picker => .pull_request_picker,
             .file_finder => .file_finder,
             .command_palette => .command_palette,
+            .theme => .theme_overlay,
         };
     }
 
     /// Which context ActionAvailability reports while this Overlay is open.
-    /// The Command Palette greys its rows against the Pane under it.
+    /// The Command Palette greys its rows against the Pane under it, and the
+    /// Theme Overlay runs no Action.
     pub fn availabilityContext(self: *const ListOverlay) enum { overlay, pane } {
         return switch (self.*) {
             .pull_request_picker, .file_finder => .overlay,
-            .command_palette => .pane,
+            .command_palette, .theme => .pane,
         };
     }
 
@@ -474,7 +506,15 @@ pub const ListOverlay = union(enum) {
     pub fn sessionBound(self: *const ListOverlay) bool {
         return switch (self.*) {
             .file_finder, .command_palette => true,
-            .pull_request_picker => false,
+            .pull_request_picker, .theme => false,
+        };
+    }
+
+    /// The Theme to paint while this Overlay is open, if it previews one.
+    pub fn themePreview(self: *const ListOverlay) ?ThemeId {
+        return switch (self.*) {
+            .theme => |*overlay| if (overlay.list.selectedItem()) |item| ThemeId.at(item) else null,
+            .pull_request_picker, .file_finder, .command_palette => null,
         };
     }
 
@@ -482,7 +522,7 @@ pub const ListOverlay = union(enum) {
     pub fn tickScope(self: *const ListOverlay) ?u64 {
         return switch (self.*) {
             .pull_request_picker => |*picker| if (picker.loading()) picker.work_id else null,
-            .file_finder, .command_palette => null,
+            .file_finder, .command_palette, .theme => null,
         };
     }
 
@@ -494,6 +534,7 @@ pub const ListOverlay = union(enum) {
         return switch (self.*) {
             .pull_request_picker, .file_finder => .{ .width = 60, .height = 16 },
             .command_palette => .{ .width = 80, .height = 16 },
+            .theme => .{ .width = 40, .height = ThemeId.count + 1 },
         };
     }
 
@@ -524,6 +565,7 @@ pub const ListOverlay = union(enum) {
             .pull_request_picker => |*picker| picker.list.refilter(PullRequestHaystack{ .prs = picker.prs() }),
             .file_finder => |*finder| finder.list.refilter(FileHaystack{ .files = finder.files }),
             .command_palette => |*palette| palette.list.refilter(CommandPalette.Haystack{ .palette = palette }),
+            .theme => |*overlay| overlay.list.refilter(ThemeOverlay.Haystack{}),
         }
     }
 };
@@ -533,6 +575,7 @@ pub const Choice = union(enum) {
     pull_request: u64,
     file: usize,
     action: Action,
+    theme: ThemeId,
 };
 
 const testing = std.testing;

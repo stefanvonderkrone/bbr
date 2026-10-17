@@ -187,6 +187,7 @@ const ScriptedExecutor = struct {
                 value.destroy();
                 break :blk .{ .clipboard_completed = .{ .command_id = command_id, .success = true } };
             },
+            .persist_theme => |value| .{ .theme_persisted = .{ .command_id = value.command_id, .outcome = .saved } },
             .external_edit => |value| blk: {
                 const completed = try presentation.ExternalEditCompleted.create(value.allocator, value.command_id, value.session_epoch);
                 completed.outcome = .unchanged;
