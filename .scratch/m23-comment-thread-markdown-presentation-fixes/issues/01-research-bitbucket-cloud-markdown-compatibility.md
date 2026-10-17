@@ -4,6 +4,7 @@ Parent: [M23 Comment thread and Markdown presentation fixes](../map.md)
 Label: wayfinder:research
 Type: research
 Status: resolved
+Blocked by: none
 Assignee: M23 Markdown research session
 Research branch: research/m23-cloud-markdown-compatibility
 

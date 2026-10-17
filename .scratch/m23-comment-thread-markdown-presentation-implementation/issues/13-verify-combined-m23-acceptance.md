@@ -2,7 +2,7 @@
 
 **What to build:** Verify that Reply ancestry, Markdown, search, Highlighting, and copying work together through the approved acceptance matrix. Fix gaps that appear only when those features combine.
 
-**Blocked by:** 01 — Show actual Reply ancestry. 07 — Present nested lists and quotes. 08 — Present links, references, and image text. 09 — Present tables at wide and narrow widths. 10 — Convert and search emoji shortcodes. 12 — Highlight Suggestions and prioritize selected Preview.
+**Blocked by:** 01, 07, 08, 09, 10, 12
 
 **Status:** resolved
 

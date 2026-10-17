@@ -4,6 +4,7 @@ Parent: [M23 Comment thread and Markdown presentation fixes](../map.md)
 Label: wayfinder:grilling
 Type: grilling
 Status: resolved
+Blocked by: none
 
 ## Question
 
