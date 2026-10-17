@@ -908,8 +908,9 @@ fn centeredModal(win: vaxis.Window, max_w: u16, max_h: u16) ?vaxis.Window {
 
 /// Draw the open List Overlay as a centered modal: a query row, then one row
 /// per ranked match, scrolled to keep the selected row visible. `scratch`
-/// outlives render.
-pub fn drawListOverlay(scratch: std.mem.Allocator, win: vaxis.Window, overlay: *const ListOverlay, theme: Theme) void {
+/// outlives render. A Command Palette row whose Action `availability` refuses
+/// is greyed.
+pub fn drawListOverlay(scratch: std.mem.Allocator, win: vaxis.Window, overlay: *const ListOverlay, availability: presentation.ActionAvailability, theme: Theme) void {
     const box = overlay.box();
     const modal = centeredModal(win, box.width, box.height) orelse return;
     const list = overlay.list();
@@ -938,7 +939,7 @@ pub fn drawListOverlay(scratch: std.mem.Allocator, win: vaxis.Window, overlay: *
         const selected = match_index == list.selected;
         const style = if (selected) theme.picker_selected else theme.picker;
         fillRow(modal, row, style);
-        _ = modal.print(listRow(scratch, overlay, matches[match_index], selected, style), .{ .row_offset = row, .wrap = .none });
+        _ = modal.print(listRow(scratch, overlay, matches[match_index], selected, style, availability, theme), .{ .row_offset = row, .wrap = .none });
     }
 }
 
@@ -946,6 +947,7 @@ fn listPrompt(overlay: *const ListOverlay) []const u8 {
     return switch (overlay.*) {
         .pull_request_picker => "",
         .file_finder => "File ",
+        .command_palette => "Command ",
     };
 }
 
@@ -956,12 +958,39 @@ fn listPlaceholder(scratch: std.mem.Allocator, overlay: *const ListOverlay) ?[]c
             std.fmt.allocPrint(scratch, "{s} Loading pull requests…", .{picker.spinnerGlyph()}) catch "  Loading pull requests…"
         else if (picker.prs().len == 0) "  no open pull requests" else null,
         .file_finder => |*finder| if (finder.list.matches().len > 0) null else if (finder.files.len == 0) "  no changed files" else "  no matching files",
+        .command_palette => |*palette| if (palette.list.matches().len > 0) null else "  no matching commands",
     };
 }
 
-fn listRow(scratch: std.mem.Allocator, overlay: *const ListOverlay, item: usize, selected: bool, style: vaxis.Style) []const vaxis.Segment {
+fn listRow(
+    scratch: std.mem.Allocator,
+    overlay: *const ListOverlay,
+    item: usize,
+    selected: bool,
+    style: vaxis.Style,
+    availability: presentation.ActionAvailability,
+    theme: Theme,
+) []const vaxis.Segment {
     const marker: []const u8 = if (selected) "▸ " else "  ";
     const text = switch (overlay.*) {
+        .command_palette => |*palette| {
+            const command = palette.command(item);
+            var row_style = style;
+            if (!availability.available(command.action)) row_style.fg = theme.gutter.fg;
+            var title_style = row_style;
+            title_style.bold = true;
+            row_style.bold = false;
+            const reason = sourceRefusalLabel(availability, command.action);
+            const description = if (reason) |label|
+                std.fmt.allocPrint(scratch, "  {s} ({s})", .{ command.description, label }) catch command.description
+            else
+                std.fmt.allocPrint(scratch, "  {s}", .{command.description}) catch command.description;
+            const segments = scratch.alloc(vaxis.Segment, 3) catch return &.{};
+            segments[0] = .{ .text = marker, .style = row_style };
+            segments[1] = .{ .text = command.title, .style = title_style };
+            segments[2] = .{ .text = description, .style = row_style };
+            return segments;
+        },
         .pull_request_picker => |*picker| blk: {
             const pr = picker.prs()[item];
             break :blk std.fmt.allocPrint(scratch, "{s}#{d}  {s}  ({s})", .{ marker, pr.id, pr.title, pr.source_branch }) catch pr.title;
@@ -3618,7 +3647,7 @@ test "picker overlay draws the query line and highlights the selection" {
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
 
-    drawListOverlay(a, win, &picker, theme_dark);
+    drawListOverlay(a, win, &picker, .{ .remote = true }, theme_dark);
 
     // Modal geometry: 60×16, centered on 80×24 → origin (10, 4).
     const mx: u16 = 10;
@@ -3633,6 +3662,41 @@ test "picker overlay draws the query line and highlights the selection" {
     try testing.expectEqual(theme_dark.picker.bg, win.readCell(mx, my + 1).?.style.bg);
 }
 
+test "Command Palette rows show a bold title, a regular description, and grey an unavailable Action" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 100, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const mx: u16 = 10;
+    const my: u16 = 4;
+    const local_review: presentation.ActionAvailability = .{ .remote = false };
+
+    for ([_]struct { query: []const u8, title: []const u8, available: bool }{
+        .{ .query = "toggle layout", .title = "Toggle Layout", .available = true },
+        .{ .query = "submit review", .title = "Submit Review", .available = false },
+    }) |case| {
+        var palette = try ListOverlay.openCommandPalette(a, .diff);
+        defer palette.deinit();
+        palette.insert(case.query);
+        win.clear();
+        drawListOverlay(a, win, &palette, local_review, theme_dark);
+
+        try testing.expectEqualStrings("C", win.readCell(mx, my).?.char.grapheme);
+        const title = win.readCell(mx + 2, my + 1).?;
+        try testing.expectEqualStrings(case.title[0..1], title.char.grapheme);
+        try testing.expect(title.style.bold);
+        const description = win.readCell(mx + 2 + @as(u16, @intCast(case.title.len)) + 2, my + 1).?;
+        try testing.expect(!description.style.bold);
+        try testing.expect(!std.mem.eql(u8, " ", description.char.grapheme));
+        const expected_fg = if (case.available) theme_dark.picker_selected.fg else theme_dark.gutter.fg;
+        try testing.expectEqual(expected_fg, title.style.fg);
+        try testing.expectEqual(expected_fg, description.style.fg);
+        try testing.expectEqual(theme_dark.picker_selected.bg, title.style.bg);
+    }
+}
+
 test "a loading picker shows its single-glyph spinner beside the placeholder" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -3645,7 +3709,7 @@ test "a loading picker shows its single-glyph spinner beside the placeholder" {
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
 
-    drawListOverlay(a, win, &picker, theme_dark);
+    drawListOverlay(a, win, &picker, .{ .remote = true }, theme_dark);
 
     // Modal at (10, 4); row 1 of the modal carries "  loading…".
     const mx: u16 = 10;

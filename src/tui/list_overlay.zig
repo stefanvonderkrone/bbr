@@ -17,7 +17,9 @@ const bbr = @import("bbr");
 const Allocator = std.mem.Allocator;
 const PullRequestSummary = bbr.bitbucket.PullRequestSummary;
 const File = bbr.diff.File;
+const Action = @import("action.zig").Action;
 const InteractionContext = @import("action.zig").InteractionContext;
+const keymap = @import("keymap.zig");
 
 /// Max whitespace-separated needles honored in a query; extra words are ignored.
 const max_needles = 8;
@@ -276,11 +278,102 @@ const FileHaystack = struct {
     }
 };
 
+/// One curated Command Palette row. The title and description live here and
+/// not in the Keymap, because an Action without a default chord needs text too.
+pub const Command = struct {
+    action: Action,
+    title: []const u8,
+    description: []const u8,
+};
+
+pub const CommandPalette = struct {
+    list: FuzzyList,
+    /// Indices into `commands` that the Pane context supported when the
+    /// palette opened. A supported but unavailable command stays listed.
+    rows: [commands.len]u8 = undefined,
+    row_count: u8 = 0,
+
+    pub fn command(self: *const CommandPalette, item: usize) Command {
+        return commands[self.rows[item]];
+    }
+
+    /// The curated non-Motion commands, in display order for an empty query.
+    pub const commands = [_]Command{
+        .{ .action = .open_file_finder, .title = "Find File", .description = "Jump to a changed File by path" },
+        .{ .action = .open_review_search, .title = "Search Review", .description = "Search every File version and Comment in this Review" },
+        .{ .action = .open_buffer_search, .title = "Search Buffer", .description = "Search the text of the DiffPane" },
+        .{ .action = .open_pull_request_picker, .title = "Switch Pull Request", .description = "Open another PullRequest in this Repository" },
+        .{ .action = .refresh, .title = "Refresh Review", .description = "Reload the current Review" },
+        .{ .action = .toggle_layout, .title = "Toggle Layout", .description = "Switch between unified and side-by-side" },
+        .{ .action = .cycle_scope, .title = "Cycle Diff Scope", .description = "Show changes, fetched context, or the whole File" },
+        .{ .action = .isolate, .title = "Isolate File", .description = "Show only the current File, or show every File again" },
+        .{ .action = .next_file, .title = "Next File", .description = "Move to the next changed File" },
+        .{ .action = .prev_file, .title = "Previous File", .description = "Move to the previous changed File" },
+        .{ .action = .select_old_version, .title = "Select Old Version", .description = "Inspect the old File version" },
+        .{ .action = .select_new_version, .title = "Select New Version", .description = "Inspect the new File version" },
+        .{ .action = .toggle_select, .title = "Toggle Selection", .description = "Start or end a visual Line selection" },
+        .{ .action = .inline_comment, .title = "Inline Comment", .description = "Comment on the Line or Selection" },
+        .{ .action = .suggest, .title = "Suggest Change", .description = "Propose replacement code for the Line or Selection" },
+        .{ .action = .file_comment, .title = "File Comment", .description = "Comment on the current File" },
+        .{ .action = .review_comment, .title = "Review Comment", .description = "Comment on the whole Review" },
+        .{ .action = .reply, .title = "Reply", .description = "Reply to the Comment under the cursor" },
+        .{ .action = .edit_review_item, .title = "Edit", .description = "Edit the Draft or own Comment under the cursor" },
+        .{ .action = .reanchor_review_item, .title = "Re-anchor Draft", .description = "Move a local root Draft to another Line" },
+        .{ .action = .delete_review_item, .title = "Delete", .description = "Delete the Draft or own Comment under the cursor" },
+        .{ .action = .yank, .title = "Copy", .description = "Copy the Line, Selection, or body to the clipboard" },
+        .{ .action = .set_verdict_approved, .title = "Approve", .description = "Set your Reviewer Verdict to Approved" },
+        .{ .action = .set_verdict_changes_requested, .title = "Request Changes", .description = "Set your Reviewer Verdict to Changes requested" },
+        .{ .action = .set_verdict_none, .title = "Clear Verdict", .description = "Set your Reviewer Verdict to No verdict" },
+        .{ .action = .submit, .title = "Submit Review", .description = "Publish every local Draft to Bitbucket" },
+        .{ .action = .recover_submission, .title = "Resume Submission", .description = "Continue an interrupted Submission" },
+        .{ .action = .resolve_unpublished, .title = "Mark Draft Unpublished", .description = "Confirm that an unknown-outcome Draft was not posted" },
+        .{ .action = .link_existing_comment, .title = "Link Existing Comment", .description = "Link an unknown-outcome Draft to a posted Comment" },
+        .{ .action = .focus_next_pane, .title = "Switch Pane", .description = "Move focus between the Sidebar and the DiffPane" },
+        .{ .action = .help, .title = "Keybindings", .description = "Show the keybinding help" },
+        .{ .action = .quit, .title = "Quit", .description = "Quit bbr" },
+    };
+
+    const pane_contexts = [_]InteractionContext{ .diff, .diff_source, .diff_disclosure, .diff_review_card, .sidebar, .sidebar_directory, .sidebar_file };
+
+    comptime {
+        @setEvalBranchQuota(100_000);
+        if (commands.len > std.math.maxInt(u8)) @compileError("the Command Palette holds at most 255 commands");
+        for (commands, 0..) |entry, index| {
+            const name = "Command Palette entry \"" ++ entry.title ++ "\"";
+            if (keymap.isMotion(entry.action)) @compileError(name ++ " is a Motion; the Command Palette lists commands only");
+            if (entry.action == .open_command_palette) @compileError(name ++ " reopens the Command Palette");
+            for (pane_contexts) |context| {
+                if (keymap.supportsContext(entry.action, context)) break;
+            } else @compileError(name ++ " is supported in no Pane context, so it can never show");
+            for (commands[0..index]) |earlier| {
+                if (earlier.action == entry.action) @compileError(name ++ " repeats the Action of \"" ++ earlier.title ++ "\"");
+                if (std.mem.eql(u8, earlier.title, entry.title)) @compileError(name ++ " repeats a title");
+            }
+        }
+    }
+
+    /// A title match ranks above any match found only in a description.
+    const Haystack = struct {
+        palette: *const CommandPalette,
+
+        fn len(self: Haystack) usize {
+            return self.palette.row_count;
+        }
+
+        fn score(self: Haystack, index: usize, q: Query) ?f64 {
+            const entry = self.palette.command(index);
+            if (q.rank(entry.title)) |rank| return rank + 1000;
+            return q.rank(entry.description);
+        }
+    };
+};
+
 /// The one List Overlay Presentation holds. Policy that differs per arm is an
 /// exhaustive switch here, so a new arm fails the build at every decision.
 pub const ListOverlay = union(enum) {
     pull_request_picker: PullRequestPicker,
     file_finder: FileFinder,
+    command_palette: CommandPalette,
 
     /// A loading Picker has no items, so opening it allocates nothing.
     pub fn openPullRequestPicker(allocator: Allocator, work_id: u64) ListOverlay {
@@ -293,6 +386,20 @@ pub const ListOverlay = union(enum) {
         return overlay;
     }
 
+    /// Lists the commands that `pane_context`, the Pane under the palette,
+    /// supports.
+    pub fn openCommandPalette(allocator: Allocator, pane_context: InteractionContext) Allocator.Error!ListOverlay {
+        var palette: CommandPalette = .{ .list = undefined };
+        for (CommandPalette.commands, 0..) |entry, index| if (keymap.supportsContext(entry.action, pane_context)) {
+            palette.rows[palette.row_count] = @intCast(index);
+            palette.row_count += 1;
+        };
+        palette.list = try FuzzyList.init(allocator, palette.row_count);
+        var overlay: ListOverlay = .{ .command_palette = palette };
+        overlay.refilter();
+        return overlay;
+    }
+
     pub fn deinit(self: *ListOverlay) void {
         switch (self.*) {
             .pull_request_picker => |*picker| {
@@ -300,6 +407,7 @@ pub const ListOverlay = union(enum) {
                 if (picker.summaries) |summaries| summaries.destroy();
             },
             .file_finder => |*finder| finder.list.deinit(),
+            .command_palette => |*palette| palette.list.deinit(),
         }
         self.* = undefined;
     }
@@ -340,6 +448,7 @@ pub const ListOverlay = union(enum) {
         return switch (self.*) {
             .pull_request_picker => |*picker| .{ .pull_request = picker.prs()[item].id },
             .file_finder => .{ .file = item },
+            .command_palette => |*palette| .{ .action = palette.command(item).action },
         };
     }
 
@@ -347,13 +456,24 @@ pub const ListOverlay = union(enum) {
         return switch (self.*) {
             .pull_request_picker => .pull_request_picker,
             .file_finder => .file_finder,
+            .command_palette => .command_palette,
         };
     }
 
-    /// True when the arm borrows data from the published Session.
+    /// Which context ActionAvailability reports while this Overlay is open.
+    /// The Command Palette greys its rows against the Pane under it.
+    pub fn availabilityContext(self: *const ListOverlay) enum { overlay, pane } {
+        return switch (self.*) {
+            .pull_request_picker, .file_finder => .overlay,
+            .command_palette => .pane,
+        };
+    }
+
+    /// True when the arm borrows data from the published Session, or lists
+    /// what the Session's Pane context supported.
     pub fn sessionBound(self: *const ListOverlay) bool {
         return switch (self.*) {
-            .file_finder => true,
+            .file_finder, .command_palette => true,
             .pull_request_picker => false,
         };
     }
@@ -362,7 +482,7 @@ pub const ListOverlay = union(enum) {
     pub fn tickScope(self: *const ListOverlay) ?u64 {
         return switch (self.*) {
             .pull_request_picker => |*picker| if (picker.loading()) picker.work_id else null,
-            .file_finder => null,
+            .file_finder, .command_palette => null,
         };
     }
 
@@ -373,6 +493,7 @@ pub const ListOverlay = union(enum) {
     pub fn box(self: *const ListOverlay) Box {
         return switch (self.*) {
             .pull_request_picker, .file_finder => .{ .width = 60, .height = 16 },
+            .command_palette => .{ .width = 80, .height = 16 },
         };
     }
 
@@ -402,6 +523,7 @@ pub const ListOverlay = union(enum) {
         switch (self.*) {
             .pull_request_picker => |*picker| picker.list.refilter(PullRequestHaystack{ .prs = picker.prs() }),
             .file_finder => |*finder| finder.list.refilter(FileHaystack{ .files = finder.files }),
+            .command_palette => |*palette| palette.list.refilter(CommandPalette.Haystack{ .palette = palette }),
         }
     }
 };
@@ -410,6 +532,7 @@ pub const ListOverlay = union(enum) {
 pub const Choice = union(enum) {
     pull_request: u64,
     file: usize,
+    action: Action,
 };
 
 const testing = std.testing;

@@ -3035,6 +3035,7 @@ pub const ActionAvailability = struct {
     pub fn available(self: ActionAvailability, action: Action) bool {
         if (!self.has_review) return switch (action) {
             .quit, .help, .open_pull_request_picker => self.remote,
+            .open_command_palette => true,
             else => false,
         };
         if (!self.remote) switch (action) {
@@ -6324,7 +6325,8 @@ pub const Presentation = struct {
     }
 
     fn actionAvailability(self: *const Presentation) ActionAvailability {
-        const context = if (self.help_visible) self.paneContext() else self.interactionContext();
+        const pane_under_overlay = self.help_visible or if (self.list_overlay) |*overlay| overlay.availabilityContext() == .pane else false;
+        const context = if (pane_under_overlay) self.paneContext() else self.interactionContext();
         const published = self.published orelse return .{
             .remote = self.dependencies.remote_enabled,
             .has_review = false,
@@ -7040,6 +7042,14 @@ pub const Presentation = struct {
             self.openFileFinder();
             return;
         }
+        if (action == .open_command_palette) {
+            const overlay = ListOverlay.openCommandPalette(self.allocator, self.paneContext()) catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
+            self.showListOverlay(overlay);
+            return;
+        }
         if (self.replacement != null) return;
         const published = self.published orelse return;
         self.action_error = null;
@@ -7138,7 +7148,7 @@ pub const Presentation = struct {
             .resolve_unpublished => self.resolveSelectedUnknownAsUnpublished(published),
             .link_existing_comment => self.openUnknownResolutionEditor(published),
             .yank => self.yank(published, yank_count),
-            .open_file_finder, .open_pull_request_picker, .confirm_picker, .help => unreachable,
+            .open_file_finder, .open_pull_request_picker, .open_command_palette, .confirm_picker, .help => unreachable,
             .quit => unreachable,
         }
         clampSelectionAtUnavailableRow(published, selection_cursor_before, self.preferences.scope);
@@ -11361,6 +11371,7 @@ pub const Presentation = struct {
                 self.focusFile(published, index);
                 published.focus = .diff;
             },
+            .action => |action| self.applyAction(action),
         }
     }
 
@@ -18834,6 +18845,232 @@ test "File finder opened during a replacement does not outlive the replaced Sess
     try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.pull_request.?.id);
     try testing.expect(testListOverlay(&presentation, .file_finder) == null);
     try presentation.dispatch(.{ .key = .{ .codepoint = 'b', .text = "b" } });
+}
+
+const test_ctrl_p: keymap_mod.KeyStroke = .{ .codepoint = 'p', .mods = .{ .ctrl = true } };
+const test_ctrl_n: keymap_mod.KeyStroke = .{ .codepoint = 'n', .mods = .{ .ctrl = true } };
+const test_ctrl_c: keymap_mod.KeyStroke = .{ .codepoint = 'c', .mods = .{ .ctrl = true } };
+const test_enter: keymap_mod.KeyStroke = .{ .codepoint = keymap_mod.special.enter };
+const test_escape: keymap_mod.KeyStroke = .{ .codepoint = keymap_mod.special.escape };
+const test_down: keymap_mod.KeyStroke = .{ .codepoint = keymap_mod.special.down };
+const test_up: keymap_mod.KeyStroke = .{ .codepoint = keymap_mod.special.up };
+
+fn testType(presentation: *Presentation, text: []const u8) !void {
+    try presentation.dispatch(.{ .key = .{ .codepoint = text[0], .text = text } });
+}
+
+fn testPaletteTitles(presentation: *const Presentation) ![]const []const u8 {
+    const overlay = testListOverlay(presentation, .command_palette) orelse return error.CommandPaletteClosed;
+    var titles: [list_overlay_mod.CommandPalette.commands.len][]const u8 = undefined;
+    for (overlay.list().matches(), 0..) |item, row| titles[row] = overlay.command_palette.command(item).title;
+    return testing.allocator.dupe([]const u8, titles[0..overlay.list().matches().len]);
+}
+
+fn testHasTitle(titles: []const []const u8, title: []const u8) bool {
+    for (titles) |candidate| if (std.mem.eql(u8, candidate, title)) return true;
+    return false;
+}
+
+fn testMoveToSourceLine(presentation: *Presentation) !void {
+    var steps: usize = 0;
+    while (presentation.paneContext() != .diff_source) : (steps += 1) {
+        if (steps == 16) return error.NoSourceLine;
+        try presentation.dispatch(.{ .action = .down });
+    }
+}
+
+test "ctrl-p opens the Command Palette from each Pane context" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer presentation.deinit();
+
+    try testing.expectEqual(keymap_mod.InteractionContext.diff, presentation.paneContext());
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testing.expectEqual(keymap_mod.InteractionContext.command_palette, presentation.interactionContext());
+    try presentation.dispatch(.{ .key = test_escape });
+
+    try testMoveToSourceLine(&presentation);
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    const source_titles = try testPaletteTitles(&presentation);
+    defer testing.allocator.free(source_titles);
+    try testing.expect(testHasTitle(source_titles, "Inline Comment"));
+    try testing.expect(!testHasTitle(source_titles, "Reply"));
+    try presentation.dispatch(.{ .key = test_escape });
+
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try testing.expectEqual(keymap_mod.InteractionContext.sidebar_file, presentation.paneContext());
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    const sidebar_titles = try testPaletteTitles(&presentation);
+    defer testing.allocator.free(sidebar_titles);
+    try testing.expect(testHasTitle(sidebar_titles, "File Comment"));
+    try testing.expect(!testHasTitle(sidebar_titles, "Inline Comment"));
+    for (sidebar_titles) |title| {
+        const command = for (list_overlay_mod.CommandPalette.commands) |command| {
+            if (std.mem.eql(u8, command.title, title)) break command;
+        } else unreachable;
+        try testing.expect(keymap_mod.supportsContext(command.action, .sidebar_file));
+    }
+    try presentation.dispatch(.{ .key = test_escape });
+    try testing.expect(presentation.projection().list_overlay == null);
+}
+
+test "ctrl-p stays Composer input and the previous Review Search Occurrence" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .review_comment });
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testing.expect(presentation.projection().list_overlay == null);
+    try testing.expect(presentation.projection().composer != null);
+    try presentation.dispatch(.{ .composer = .cancel });
+
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try testing.expectEqual(keymap_mod.InteractionContext.review_search, presentation.interactionContext());
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testing.expect(presentation.projection().list_overlay == null);
+    try testing.expectEqual(keymap_mod.InteractionContext.review_search, presentation.interactionContext());
+}
+
+test "Command Palette keys move the selection and Escape or ctrl-c close it without a command" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+
+    for ([_]keymap_mod.KeyStroke{ test_escape, test_ctrl_c }) |close| {
+        try presentation.dispatch(.{ .key = test_ctrl_p });
+        try presentation.dispatch(.{ .key = test_down });
+        try presentation.dispatch(.{ .key = test_ctrl_n });
+        try testing.expectEqual(@as(usize, 2), testListOverlay(&presentation, .command_palette).?.list().selected);
+        try presentation.dispatch(.{ .key = test_ctrl_p });
+        try testing.expectEqual(@as(usize, 1), testListOverlay(&presentation, .command_palette).?.list().selected);
+        try presentation.dispatch(.{ .key = test_up });
+        try testing.expectEqual(@as(usize, 0), testListOverlay(&presentation, .command_palette).?.list().selected);
+        try presentation.dispatch(.{ .key = close });
+        try testing.expect(presentation.projection().list_overlay == null);
+        try testing.expect(!presentation.shutdown_requested);
+        try testing.expect(presentation.takeCommand() == null);
+    }
+}
+
+test "Command Palette ranks a title match above a description match" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testType(&presentation, "file");
+    const titles = try testPaletteTitles(&presentation);
+    defer testing.allocator.free(titles);
+    const query: list_overlay_mod.Query = .{ .text = "file", .needles = &.{"file"} };
+    var last_title: usize = 0;
+    var first_description: ?usize = null;
+    for (titles, 0..) |title, row| {
+        if (query.rank(title) != null) last_title = row else if (first_description == null) first_description = row;
+    }
+    try testing.expect(testHasTitle(titles, "Find File"));
+    try testing.expect(testHasTitle(titles, "Cycle Diff Scope"));
+    try testing.expect(last_title < first_description.?);
+}
+
+test "Command Palette Enter closes the palette and then runs the Action once" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    const layout = presentation.preferences.layout;
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testType(&presentation, "toggle layout");
+    const titles = try testPaletteTitles(&presentation);
+    defer testing.allocator.free(titles);
+    try testing.expectEqualStrings("Toggle Layout", titles[0]);
+    const before = presentation.projection().revision.interaction;
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expectEqual(before +% 1, presentation.projection().revision.interaction);
+    try testing.expect(presentation.projection().list_overlay == null);
+    try testing.expect(presentation.published.?.pending_view.?.preferences.layout != layout);
+}
+
+test "an unavailable Command Palette entry is refused with the Action's own message" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature"), .session = try testLocalSession(testing.allocator) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testType(&presentation, "submit review");
+    try testing.expect(!presentation.projection().action_availability.available(.submit));
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expect(presentation.projection().list_overlay == null);
+    try testing.expectEqual(ActionError.local_review_no_submission, presentation.projection().action_error.?);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "Command Palette greys entries against the Pane under it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer presentation.deinit();
+    try testMoveToSourceLine(&presentation);
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    const availability = presentation.projection().action_availability;
+    try testing.expectEqual(keymap_mod.InteractionContext.diff_source, availability.context);
+    try testing.expect(availability.available(.inline_comment));
+}
+
+test "the Command Palette works with no Session" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{});
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    var load = presentation.takeCommand().?;
+    defer load.deinit();
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testing.expect(testListOverlay(&presentation, .command_palette) != null);
+    try testType(&presentation, "keybindings");
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expect(presentation.projection().help_visible);
+}
+
+test "a Session replacement closes the Command Palette" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    const load = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testing.expect(testListOverlay(&presentation, .command_palette) != null);
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testTwoFileSession(testing.allocator, 2) },
+    } });
+    try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.pull_request.?.id);
+    try testing.expect(presentation.projection().list_overlay == null);
 }
 
 test "the projected Theme is the configured Theme" {
