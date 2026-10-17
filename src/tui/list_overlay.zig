@@ -17,6 +17,7 @@ const bbr = @import("bbr");
 const Allocator = std.mem.Allocator;
 const PullRequestSummary = bbr.bitbucket.PullRequestSummary;
 const File = bbr.diff.File;
+const InteractionContext = @import("action.zig").InteractionContext;
 
 /// Max whitespace-separated needles honored in a query; extra words are ignored.
 const max_needles = 8;
@@ -185,85 +186,46 @@ pub const Query = struct {
     }
 };
 
+/// Owned PullRequest summaries for a populated Picker.
+pub const PullRequestSummaries = struct {
+    arena: std.heap.ArenaAllocator,
+    prs: []const PullRequestSummary,
+
+    pub fn create(backing: Allocator) !*PullRequestSummaries {
+        const summaries = try backing.create(PullRequestSummaries);
+        summaries.arena = std.heap.ArenaAllocator.init(backing);
+        summaries.prs = &.{};
+        return summaries;
+    }
+
+    pub fn destroy(self: *PullRequestSummaries) void {
+        const backing = self.arena.child_allocator;
+        self.arena.deinit();
+        backing.destroy(self);
+    }
+};
+
 /// The PullRequest Picker. While its summaries load it shows a spinner and
-/// still accepts a query, which applies the moment `populate` runs.
-pub const Picker = struct {
+/// still accepts a query, which applies the moment the summaries arrive.
+pub const PullRequestPicker = struct {
     list: FuzzyList,
-    prs: []const PullRequestSummary = &.{},
-    loading: bool = false,
+    /// The work id of its `list_pull_requests` command. A load or tick with
+    /// another id is stale.
+    work_id: u64,
+    /// Null while loading.
+    summaries: ?*PullRequestSummaries = null,
     spinner_phase: u3 = 0,
 
-    /// A ready Picker over `prs`. `prs` must outlive the Picker.
-    pub fn init(allocator: Allocator, prs: []const PullRequestSummary) Allocator.Error!Picker {
-        var self = initLoading(allocator);
-        try self.populate(prs);
-        return self;
+    pub fn loading(self: *const PullRequestPicker) bool {
+        return self.summaries == null;
     }
 
-    /// An empty loading Picker. It allocates nothing, so it cannot fail.
-    pub fn initLoading(allocator: Allocator) Picker {
-        return .{ .list = .{ .allocator = allocator }, .loading = true };
+    pub fn prs(self: *const PullRequestPicker) []const PullRequestSummary {
+        return if (self.summaries) |summaries| summaries.prs else &.{};
     }
 
-    /// Fill a loading Picker and refilter with any query typed while it
-    /// loaded. `prs` must outlive the Picker.
-    pub fn populate(self: *Picker, prs: []const PullRequestSummary) Allocator.Error!void {
-        try self.list.resize(prs.len);
-        self.prs = prs;
-        self.loading = false;
-        self.refilter();
-    }
-
-    pub fn deinit(self: *Picker) void {
-        self.list.deinit();
-        self.* = undefined;
-    }
-
-    pub fn query(self: *const Picker) []const u8 {
-        return self.list.query();
-    }
-
-    pub fn matches(self: *const Picker) []const usize {
-        return self.list.matches();
-    }
-
-    /// The PullRequest under the cursor, or null when nothing matches.
-    pub fn selection(self: *const Picker) ?PullRequestSummary {
-        return self.prs[self.list.selectedItem() orelse return null];
-    }
-
-    pub fn moveDown(self: *Picker) void {
-        self.list.moveDown();
-    }
-
-    pub fn moveUp(self: *Picker) void {
-        self.list.moveUp();
-    }
-
-    pub fn select(self: *Picker, row: usize) void {
-        self.list.selectRow(row);
-    }
-
-    pub fn insert(self: *Picker, bytes: []const u8) void {
-        self.list.appendQuery(bytes);
-        self.refilter();
-    }
-
-    pub fn backspace(self: *Picker) void {
-        self.list.popQuery();
-        self.refilter();
-    }
-
-    pub fn tick(self: *Picker) void {
-        if (self.loading) self.spinner_phase +%= 1;
-    }
-
-    pub fn spinnerGlyph(self: *const Picker) []const u8 {
+    pub fn spinnerGlyph(self: *const PullRequestPicker) []const u8 {
         return spinner_glyphs[self.spinner_phase];
-    }
-
-    fn refilter(self: *Picker) void {
-        self.list.refilter(PullRequestHaystack{ .prs = self.prs });
     }
 };
 
@@ -291,60 +253,12 @@ const PullRequestHaystack = struct {
     }
 };
 
-/// The Session-local File finder. It borrows the Diff's Files, so it must
-/// close before the Session that owns them is destroyed.
+/// The Session-local File Finder.
 pub const FileFinder = struct {
     list: FuzzyList,
+    /// Borrowed from the published Session. `ListOverlay.sessionBound` makes
+    /// Presentation close it before that Session is replaced.
     files: []const File,
-
-    pub fn init(allocator: Allocator, files: []const File) Allocator.Error!FileFinder {
-        var self: FileFinder = .{ .list = try FuzzyList.init(allocator, files.len), .files = files };
-        self.refilter();
-        return self;
-    }
-
-    pub fn deinit(self: *FileFinder) void {
-        self.list.deinit();
-        self.* = undefined;
-    }
-
-    pub fn query(self: *const FileFinder) []const u8 {
-        return self.list.query();
-    }
-
-    pub fn matches(self: *const FileFinder) []const usize {
-        return self.list.matches();
-    }
-
-    pub fn selection(self: *const FileFinder) ?usize {
-        return self.list.selectedItem();
-    }
-
-    pub fn moveDown(self: *FileFinder) void {
-        self.list.moveDown();
-    }
-
-    pub fn moveUp(self: *FileFinder) void {
-        self.list.moveUp();
-    }
-
-    pub fn select(self: *FileFinder, row: usize) void {
-        self.list.selectRow(row);
-    }
-
-    pub fn insert(self: *FileFinder, bytes: []const u8) void {
-        self.list.appendQuery(bytes);
-        self.refilter();
-    }
-
-    pub fn backspace(self: *FileFinder) void {
-        self.list.popQuery();
-        self.refilter();
-    }
-
-    fn refilter(self: *FileFinder) void {
-        self.list.refilter(FileHaystack{ .files = self.files });
-    }
 };
 
 /// A basename match ranks above any match found only in the full path.
@@ -362,6 +276,142 @@ const FileHaystack = struct {
     }
 };
 
+/// The one List Overlay Presentation holds. Policy that differs per arm is an
+/// exhaustive switch here, so a new arm fails the build at every decision.
+pub const ListOverlay = union(enum) {
+    pull_request_picker: PullRequestPicker,
+    file_finder: FileFinder,
+
+    /// A loading Picker has no items, so opening it allocates nothing.
+    pub fn openPullRequestPicker(allocator: Allocator, work_id: u64) ListOverlay {
+        return .{ .pull_request_picker = .{ .list = .{ .allocator = allocator }, .work_id = work_id } };
+    }
+
+    pub fn openFileFinder(allocator: Allocator, files: []const File) Allocator.Error!ListOverlay {
+        var overlay: ListOverlay = .{ .file_finder = .{ .list = try FuzzyList.init(allocator, files.len), .files = files } };
+        overlay.refilter();
+        return overlay;
+    }
+
+    pub fn deinit(self: *ListOverlay) void {
+        switch (self.*) {
+            .pull_request_picker => |*picker| {
+                picker.list.deinit();
+                if (picker.summaries) |summaries| summaries.destroy();
+            },
+            .file_finder => |*finder| finder.list.deinit(),
+        }
+        self.* = undefined;
+    }
+
+    pub fn list(self: *const ListOverlay) *const FuzzyList {
+        return switch (self.*) {
+            inline else => |*arm| &arm.list,
+        };
+    }
+
+    pub fn insert(self: *ListOverlay, bytes: []const u8) void {
+        self.listMut().appendQuery(bytes);
+        self.refilter();
+    }
+
+    pub fn backspace(self: *ListOverlay) void {
+        self.listMut().popQuery();
+        self.refilter();
+    }
+
+    pub fn moveUp(self: *ListOverlay) void {
+        self.listMut().moveUp();
+    }
+
+    pub fn moveDown(self: *ListOverlay) void {
+        self.listMut().moveDown();
+    }
+
+    /// A click selects a row and never confirms it.
+    pub fn selectRow(self: *ListOverlay, row: usize) void {
+        self.listMut().selectRow(row);
+    }
+
+    /// What Enter would choose, as a value that outlives `deinit`. Null keeps
+    /// the Overlay open: nothing matches, or the Picker is still loading.
+    pub fn choice(self: *const ListOverlay) ?Choice {
+        const item = self.list().selectedItem() orelse return null;
+        return switch (self.*) {
+            .pull_request_picker => |*picker| .{ .pull_request = picker.prs()[item].id },
+            .file_finder => .{ .file = item },
+        };
+    }
+
+    pub fn interactionContext(self: *const ListOverlay) InteractionContext {
+        return switch (self.*) {
+            .pull_request_picker => .pull_request_picker,
+            .file_finder => .file_finder,
+        };
+    }
+
+    /// True when the arm borrows data from the published Session.
+    pub fn sessionBound(self: *const ListOverlay) bool {
+        return switch (self.*) {
+            .file_finder => true,
+            .pull_request_picker => false,
+        };
+    }
+
+    /// The scoped tick a loading Picker needs. Null for every other state.
+    pub fn tickScope(self: *const ListOverlay) ?u64 {
+        return switch (self.*) {
+            .pull_request_picker => |*picker| if (picker.loading()) picker.work_id else null,
+            .file_finder => null,
+        };
+    }
+
+    pub const Box = struct { width: u16, height: u16 };
+
+    /// The box size in cells. Paint and hit-testing both read it. Each item
+    /// takes one row, below one query row.
+    pub fn box(self: *const ListOverlay) Box {
+        return switch (self.*) {
+            .pull_request_picker, .file_finder => .{ .width = 60, .height = 16 },
+        };
+    }
+
+    /// Fill the loading Picker that issued `work_id` and take ownership of
+    /// `summaries`. On any error the caller still owns `summaries`.
+    pub fn populatePullRequests(self: *ListOverlay, work_id: u64, summaries: *PullRequestSummaries) (Allocator.Error || error{NotLoadingPicker})!void {
+        if (self.tickScope() != work_id) return error.NotLoadingPicker;
+        const picker = &self.pull_request_picker;
+        try picker.list.resize(summaries.prs.len);
+        picker.summaries = summaries;
+        self.refilter();
+    }
+
+    /// Advance the spinner of the loading Picker that issued `scope`.
+    pub fn tick(self: *ListOverlay, scope: u64) void {
+        if (self.tickScope() != scope) return;
+        self.pull_request_picker.spinner_phase +%= 1;
+    }
+
+    fn listMut(self: *ListOverlay) *FuzzyList {
+        return switch (self.*) {
+            inline else => |*arm| &arm.list,
+        };
+    }
+
+    fn refilter(self: *ListOverlay) void {
+        switch (self.*) {
+            .pull_request_picker => |*picker| picker.list.refilter(PullRequestHaystack{ .prs = picker.prs() }),
+            .file_finder => |*finder| finder.list.refilter(FileHaystack{ .files = finder.files }),
+        }
+    }
+};
+
+/// What a confirmed List Overlay chose. A value, so no borrow survives close.
+pub const Choice = union(enum) {
+    pull_request: u64,
+    file: usize,
+};
+
 const testing = std.testing;
 
 fn samplePrs() []const PullRequestSummary {
@@ -372,31 +422,51 @@ fn samplePrs() []const PullRequestSummary {
     };
 }
 
+fn testPicker(prs: []const PullRequestSummary) !ListOverlay {
+    var overlay = ListOverlay.openPullRequestPicker(testing.allocator, 1);
+    errdefer overlay.deinit();
+    try testPopulate(&overlay, prs);
+    return overlay;
+}
+
+fn testPopulate(overlay: *ListOverlay, prs: []const PullRequestSummary) !void {
+    const summaries = try PullRequestSummaries.create(testing.allocator);
+    summaries.prs = prs;
+    overlay.populatePullRequests(1, summaries) catch |err| {
+        summaries.destroy();
+        return err;
+    };
+}
+
+fn chosenPullRequest(overlay: *const ListOverlay) ?u64 {
+    return (overlay.choice() orelse return null).pull_request;
+}
+
 test "empty query matches every PR in order" {
-    var p = try Picker.init(testing.allocator, samplePrs());
+    var p = try testPicker(samplePrs());
     defer p.deinit();
-    try testing.expectEqual(@as(usize, 3), p.matches().len);
-    try testing.expectEqual(@as(u64, 10), p.selection().?.id);
+    try testing.expectEqual(@as(usize, 3), p.list().matches().len);
+    try testing.expectEqual(@as(u64, 10), chosenPullRequest(&p).?);
 }
 
 test "a query narrows to fuzzy matches" {
-    var p = try Picker.init(testing.allocator, samplePrs());
+    var p = try testPicker(samplePrs());
     defer p.deinit();
     p.insert("nav");
-    try testing.expectEqual(@as(usize, 1), p.matches().len);
-    try testing.expectEqual(@as(u64, 11), p.selection().?.id);
+    try testing.expectEqual(@as(usize, 1), p.list().matches().len);
+    try testing.expectEqual(@as(u64, 11), chosenPullRequest(&p).?);
 }
 
 test "matching by id and by author" {
-    var p = try Picker.init(testing.allocator, samplePrs());
+    var p = try testPicker(samplePrs());
     defer p.deinit();
     p.insert("12");
-    try testing.expectEqual(@as(u64, 12), p.selection().?.id);
+    try testing.expectEqual(@as(u64, 12), chosenPullRequest(&p).?);
 
     p.backspace();
     p.backspace();
     p.insert("Grace");
-    try testing.expectEqual(@as(u64, 11), p.selection().?.id);
+    try testing.expectEqual(@as(u64, 11), chosenPullRequest(&p).?);
 }
 
 test "title ranks ahead of bare id while hash id is direct" {
@@ -404,101 +474,113 @@ test "title ranks ahead of bare id while hash id is direct" {
         .{ .id = 15, .title = "Routine cleanup", .state = "OPEN", .author_display_name = "Ada", .source_branch = "cleanup", .destination_branch = "main" },
         .{ .id = 42, .title = "M15 navigation polish", .state = "OPEN", .author_display_name = "Grace", .source_branch = "navigation", .destination_branch = "main" },
     };
-    var p = try Picker.init(testing.allocator, &prs);
+    var p = try testPicker(&prs);
     defer p.deinit();
     p.insert("15");
-    try testing.expectEqual(@as(u64, 42), p.selection().?.id);
+    try testing.expectEqual(@as(u64, 42), chosenPullRequest(&p).?);
     p.backspace();
     p.backspace();
     p.insert("#15");
-    try testing.expectEqual(@as(u64, 15), p.selection().?.id);
-    try testing.expectEqual(@as(usize, 1), p.matches().len);
+    try testing.expectEqual(@as(u64, 15), chosenPullRequest(&p).?);
+    try testing.expectEqual(@as(usize, 1), p.list().matches().len);
 }
 
-test "no match yields a null selection" {
-    var p = try Picker.init(testing.allocator, samplePrs());
+test "no match yields no choice" {
+    var p = try testPicker(samplePrs());
     defer p.deinit();
     p.insert("zzzznope");
-    try testing.expectEqual(@as(usize, 0), p.matches().len);
-    try testing.expect(p.selection() == null);
+    try testing.expectEqual(@as(usize, 0), p.list().matches().len);
+    try testing.expect(p.choice() == null);
 }
 
 test "navigation clamps at both ends" {
-    var p = try Picker.init(testing.allocator, samplePrs());
+    var p = try testPicker(samplePrs());
     defer p.deinit();
     p.moveUp();
-    try testing.expectEqual(@as(usize, 0), p.list.selected);
+    try testing.expectEqual(@as(usize, 0), p.list().selected);
     p.moveDown();
     p.moveDown();
     p.moveDown();
-    try testing.expectEqual(@as(usize, 2), p.list.selected);
+    try testing.expectEqual(@as(usize, 2), p.list().selected);
 }
 
 test "a loading picker has no matches until populated" {
-    var p = Picker.initLoading(testing.allocator);
+    var p = ListOverlay.openPullRequestPicker(testing.allocator, 1);
     defer p.deinit();
-    try testing.expect(p.loading);
-    try testing.expectEqual(@as(usize, 0), p.matches().len);
-    try testing.expect(p.selection() == null);
+    try testing.expectEqual(@as(?u64, 1), p.tickScope());
+    try testing.expectEqual(@as(usize, 0), p.list().matches().len);
+    try testing.expect(p.choice() == null);
 
     p.insert("nav");
-    try testing.expectEqual(@as(usize, 0), p.matches().len);
+    try testing.expectEqual(@as(usize, 0), p.list().matches().len);
 
-    try p.populate(samplePrs());
-    try testing.expect(!p.loading);
-    try testing.expectEqual(@as(usize, 1), p.matches().len);
-    try testing.expectEqual(@as(u64, 11), p.selection().?.id);
+    try testPopulate(&p, samplePrs());
+    try testing.expect(p.tickScope() == null);
+    try testing.expectEqual(@as(usize, 1), p.list().matches().len);
+    try testing.expectEqual(@as(u64, 11), chosenPullRequest(&p).?);
+}
+
+test "a stale or repeated load does not populate the Picker" {
+    var p = ListOverlay.openPullRequestPicker(testing.allocator, 1);
+    defer p.deinit();
+    const stale = try PullRequestSummaries.create(testing.allocator);
+    defer stale.destroy();
+    try testing.expectError(error.NotLoadingPicker, p.populatePullRequests(2, stale));
+    try testPopulate(&p, samplePrs());
+    try testing.expectError(error.NotLoadingPicker, p.populatePullRequests(1, stale));
 }
 
 test "loading Picker spinner advances one fixed-width glyph per scoped tick" {
-    var p = Picker.initLoading(testing.allocator);
+    var p = ListOverlay.openPullRequestPicker(testing.allocator, 1);
     defer p.deinit();
-    try testing.expectEqualStrings("\xe2\xa0\x8b", p.spinnerGlyph());
-    p.tick();
-    try testing.expectEqualStrings("\xe2\xa0\x99", p.spinnerGlyph());
-    try p.populate(&.{});
-    p.tick();
-    try testing.expectEqualStrings("\xe2\xa0\x99", p.spinnerGlyph());
+    try testing.expectEqualStrings("\xe2\xa0\x8b", p.pull_request_picker.spinnerGlyph());
+    p.tick(2);
+    try testing.expectEqualStrings("\xe2\xa0\x8b", p.pull_request_picker.spinnerGlyph());
+    p.tick(1);
+    try testing.expectEqualStrings("\xe2\xa0\x99", p.pull_request_picker.spinnerGlyph());
+    try testPopulate(&p, &.{});
+    p.tick(1);
+    try testing.expectEqualStrings("\xe2\xa0\x99", p.pull_request_picker.spinnerGlyph());
 }
 
 test "populate with an empty list leaves a ready, empty picker" {
-    var p = Picker.initLoading(testing.allocator);
+    var p = ListOverlay.openPullRequestPicker(testing.allocator, 1);
     defer p.deinit();
-    try p.populate(&.{});
-    try testing.expect(!p.loading);
-    try testing.expectEqual(@as(usize, 0), p.matches().len);
-    try testing.expect(p.selection() == null);
+    try testPopulate(&p, &.{});
+    try testing.expect(!p.pull_request_picker.loading());
+    try testing.expectEqual(@as(usize, 0), p.list().matches().len);
+    try testing.expect(p.choice() == null);
 }
 
 test "selection is clamped when the query shrinks the match set" {
-    var p = try Picker.init(testing.allocator, samplePrs());
+    var p = try testPicker(samplePrs());
     defer p.deinit();
     p.moveDown();
     p.moveDown();
     p.insert("diff");
-    try testing.expectEqual(@as(usize, 0), p.list.selected);
-    try testing.expectEqual(@as(u64, 10), p.selection().?.id);
+    try testing.expectEqual(@as(usize, 0), p.list().selected);
+    try testing.expectEqual(@as(u64, 10), chosenPullRequest(&p).?);
 }
 
-test "File finder ranks a basename match above a path-only match" {
+test "File Finder ranks a basename match above a path-only match" {
     const files = [_]File{
         .{ .old_path = "src/finder/main.zig", .new_path = "src/finder/main.zig", .status = .modified, .hunks = &.{} },
         .{ .old_path = "src/finder.zig", .new_path = "src/finder.zig", .status = .modified, .hunks = &.{} },
     };
-    var finder = try FileFinder.init(testing.allocator, &files);
+    var finder = try ListOverlay.openFileFinder(testing.allocator, &files);
     defer finder.deinit();
-    try testing.expectEqual(@as(usize, 2), finder.matches().len);
+    try testing.expectEqual(@as(usize, 2), finder.list().matches().len);
     finder.insert("finder");
-    try testing.expectEqual(@as(usize, 1), finder.selection().?);
-    try testing.expectEqual(@as(usize, 2), finder.matches().len);
+    try testing.expectEqual(Choice{ .file = 1 }, finder.choice().?);
+    try testing.expectEqual(@as(usize, 2), finder.list().matches().len);
 }
 
 test "scroll top keeps the selected row inside the viewport" {
-    var p = try Picker.init(testing.allocator, samplePrs());
+    var p = try testPicker(samplePrs());
     defer p.deinit();
-    try testing.expectEqual(@as(usize, 0), p.list.scrollTop(2));
+    try testing.expectEqual(@as(usize, 0), p.list().scrollTop(2));
     p.moveDown();
     p.moveDown();
-    try testing.expectEqual(@as(usize, 1), p.list.scrollTop(2));
-    try testing.expectEqual(@as(usize, 0), p.list.scrollTop(0));
+    try testing.expectEqual(@as(usize, 1), p.list().scrollTop(2));
+    try testing.expectEqual(@as(usize, 0), p.list().scrollTop(0));
 }

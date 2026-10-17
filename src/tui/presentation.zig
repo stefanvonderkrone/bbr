@@ -11,8 +11,8 @@ const composer_mod = @import("composer.zig");
 const Composer = composer_mod.Composer;
 const file_enrichment = @import("file_enrichment.zig");
 const keymap_mod = @import("keymap.zig");
-const Picker = @import("list_overlay.zig").Picker;
-const FileFinder = @import("list_overlay.zig").FileFinder;
+const list_overlay_mod = @import("list_overlay.zig");
+const ListOverlay = list_overlay_mod.ListOverlay;
 const frame_mod = @import("frame.zig");
 const file_tree = frame_mod.file_tree;
 const buffer_mod = @import("buffer.zig");
@@ -1041,23 +1041,7 @@ pub const DuplicateChecked = struct {
     retry_after_ms: ?u64 = null,
 };
 
-pub const PullRequestSummaries = struct {
-    arena: std.heap.ArenaAllocator,
-    prs: []const bbr.bitbucket.PullRequestSummary,
-
-    pub fn create(backing: Allocator) !*PullRequestSummaries {
-        const summaries = try backing.create(PullRequestSummaries);
-        summaries.arena = std.heap.ArenaAllocator.init(backing);
-        summaries.prs = &.{};
-        return summaries;
-    }
-
-    pub fn destroy(self: *PullRequestSummaries) void {
-        const backing = self.arena.child_allocator;
-        self.arena.deinit();
-        backing.destroy(self);
-    }
-};
+pub const PullRequestSummaries = list_overlay_mod.PullRequestSummaries;
 
 pub const PullRequestsLoadOutcome = union(enum) { loaded: *PullRequestSummaries, failed };
 pub const PullRequestsLoaded = struct { command_id: CommandId = 0, work_id: WorkId, outcome: PullRequestsLoadOutcome };
@@ -2881,9 +2865,8 @@ pub const Projection = struct {
     unknown_resolution: ?UnknownResolutionProjection,
     reanchor: ?ReanchorProjection,
     delete_confirmation: ?DeleteConfirmationProjection,
-    picker: ?*const Picker,
+    list_overlay: ?*const ListOverlay,
     picker_tick_scope: ?WorkId,
-    file_finder: ?*const FileFinder,
     help_visible: bool,
     action_availability: ActionAvailability,
     loading_pull_request_id: ?u64,
@@ -5523,10 +5506,7 @@ pub const Presentation = struct {
     prefetch_arm: ?PrefetchArm = null,
     speculative_enrichment: ?SpeculativeEnrichment = null,
     resolver: keymap_mod.Resolver = .{},
-    picker: ?Picker = null,
-    file_finder: ?FileFinder = null,
-    picker_summaries: ?*PullRequestSummaries = null,
-    picker_work_id: ?WorkId = null,
+    list_overlay: ?ListOverlay = null,
     help_visible: bool = false,
     durable_submission: ?*DurableSubmission = null,
     submission_tree: ?*SubmissionTree = null,
@@ -5614,9 +5594,7 @@ pub const Presentation = struct {
         if (self.submission_tree) |tree| tree.destroy();
         if (self.durable_comment_edit) |edit| edit.destroy();
         if (self.durable_comment_delete) |delete| delete.destroy();
-        if (self.picker) |*picker| picker.deinit();
-        if (self.file_finder) |*finder| finder.deinit();
-        if (self.picker_summaries) |summaries| summaries.destroy();
+        if (self.list_overlay) |*overlay| overlay.deinit();
         if (self.published) |published| published.destroy();
         self.commands.deinit(self.allocator);
         self.issued_commands.deinit(self.allocator);
@@ -5686,9 +5664,7 @@ pub const Presentation = struct {
             .recovery_checked => |checked| self.acceptRecoveryCheck(checked),
             .duplicate_checked => |checked| self.acceptDuplicateCheck(checked),
             .pull_requests_loaded => |loaded| self.acceptPullRequests(loaded),
-            .picker_tick => |scope| if (!self.shutdown_requested and self.picker_work_id == scope) {
-                if (self.picker) |*active_picker| active_picker.tick();
-            },
+            .picker_tick => |scope| if (!self.shutdown_requested) if (self.list_overlay) |*overlay| overlay.tick(scope),
             .clipboard_completed => |completed| {
                 if (!self.consumeCommand(completed.command_id, .copy_clipboard)) return;
                 self.clipboard_status = if (completed.success) .copied else .failed;
@@ -5823,12 +5799,8 @@ pub const Presentation = struct {
                 .descendant_count = confirmation.descendant_count,
                 .root_has_replies = confirmation.root_has_replies,
             } else null,
-            .picker = if (self.picker) |*picker| picker else null,
-            .picker_tick_scope = if (!self.shutdown_requested) if (self.picker) |*picker|
-                if (picker.loading) self.picker_work_id else null
-            else
-                null else null,
-            .file_finder = if (self.file_finder) |*finder| finder else null,
+            .list_overlay = if (self.list_overlay) |*overlay| overlay else null,
+            .picker_tick_scope = if (self.shutdown_requested) null else if (self.list_overlay) |*overlay| overlay.tickScope() else null,
             .help_visible = self.help_visible,
             .action_availability = self.actionAvailability(),
             .loading_pull_request_id = if (self.replacement) |replacement|
@@ -5905,13 +5877,10 @@ pub const Presentation = struct {
     fn overlayTarget(self: *const Presentation) ?frame_mod.OverlayTarget {
         if (self.help_visible or self.unknown_resolution != null or self.delete_confirmation != null or self.visibleSubmissionOverlay())
             return otherOverlay(self.geometry);
-        if (self.file_finder) |finder| {
-            const rect = frame_mod.overlayRect(self.geometry, 60, 16) orelse return null;
-            return .{ .kind = .picker, .rect = rect, .row_count = finder.matches().len, .scroll = finder.list.scrollTop(rect.height -| 1) };
-        }
-        if (self.picker) |picker| {
-            const rect = frame_mod.overlayRect(self.geometry, 60, 16) orelse return null;
-            return .{ .kind = .picker, .rect = rect, .row_count = picker.matches().len, .scroll = picker.list.scrollTop(rect.height -| 1) };
+        if (self.list_overlay) |*overlay| {
+            const box = overlay.box();
+            const rect = frame_mod.overlayRect(self.geometry, box.width, box.height) orelse return null;
+            return .{ .kind = .list, .rect = rect, .row_count = overlay.list().matches().len, .scroll = overlay.list().scrollTop(rect.height -| 1) };
         }
         if (self.published) |published| if (published.composer != null) return otherOverlay(self.geometry);
         if (self.published) |published| if (published.review_search.open) {
@@ -5930,7 +5899,7 @@ pub const Presentation = struct {
 
     fn submissionRepairInteractionActive(self: *const Presentation) bool {
         if (self.help_visible or self.unknown_resolution != null or self.delete_confirmation != null or self.reanchor != null) return true;
-        if (self.picker != null or self.file_finder != null) return true;
+        if (self.list_overlay != null) return true;
         if (self.published) |published| return published.composer != null;
         return false;
     }
@@ -5995,9 +5964,7 @@ pub const Presentation = struct {
         switch (target) {
             .select_old_version => return self.applyAction(.select_old_version),
             .select_new_version => return self.applyAction(.select_new_version),
-            .picker_entry => |index| {
-                if (self.file_finder) |*finder| finder.select(index) else if (self.picker) |*picker| picker.select(index) else return;
-            },
+            .list_entry => |row| if (self.list_overlay) |*overlay| overlay.selectRow(row) else return,
             .review_search_entry => |index| {
                 const prior = self.last_review_click;
                 const double_click = if (prior) |click| click.index == index and
@@ -6085,14 +6052,11 @@ pub const Presentation = struct {
                 const height = (frame_mod.reviewSearchGeometry(self.geometry) orelse return).preview.height;
                 state.preview_scroll = if (down) @min(state.preview_scroll +| rows, lines -| height) else state.preview_scroll -| rows;
             },
-            .picker_entry => {
+            .list_entry => {
                 var remaining = rows;
+                const overlay = if (self.list_overlay) |*overlay| overlay else return;
                 while (remaining > 0) : (remaining -= 1) {
-                    if (self.file_finder) |*finder| {
-                        if (down) finder.moveDown() else finder.moveUp();
-                    } else if (self.picker) |*picker| {
-                        if (down) picker.moveDown() else picker.moveUp();
-                    } else return;
+                    if (down) overlay.moveDown() else overlay.moveUp();
                 }
             },
             .sidebar_entry => {
@@ -6301,8 +6265,7 @@ pub const Presentation = struct {
     fn requestShutdown(self: *Presentation) void {
         self.shutdown_requested = true;
         if (self.published) |published| if (published.review_search.open) self.closeReviewSearch();
-        self.closePicker();
-        self.closeFileFinder();
+        self.closeListOverlay();
         self.help_visible = false;
         self.unknown_resolution = null;
         var write: usize = 0;
@@ -6329,8 +6292,7 @@ pub const Presentation = struct {
         if (self.help_visible) return .help;
         if (self.unknown_resolution != null) return .unknown_resolution;
         if (self.delete_confirmation != null) return .delete_confirmation;
-        if (self.file_finder != null) return .file_finder;
-        if (self.picker != null) return .pull_request_picker;
+        if (self.list_overlay) |*overlay| return overlay.interactionContext();
         if (self.published) |published| if (published.buffer_search.input != null) return .buffer_search_input;
         if (self.published) |published| if (published.review_search.open) return .review_search;
         return self.paneContext();
@@ -6773,43 +6735,18 @@ pub const Presentation = struct {
             if (key.text) |text| if (TextChunk.init(text)) |chunk| return self.applyComposerInput(.{ .insert = chunk }) else |_| {};
             return;
         };
-        if (self.file_finder) |*finder| {
+        if (self.list_overlay) |*overlay| {
             if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
-                self.closeFileFinder();
+                self.closeListOverlay();
             } else if (key.matches(keymap_mod.special.enter, .{})) {
-                const selected = finder.selection() orelse return;
-                self.closeFileFinder();
-                if (self.published) |published| {
-                    self.focusFile(published, selected);
-                    published.focus = .diff;
-                }
+                try self.confirmListOverlay();
             } else if (key.matches(keymap_mod.special.up, .{}) or key.matches('p', .{ .ctrl = true })) {
-                finder.moveUp();
+                overlay.moveUp();
             } else if (key.matches(keymap_mod.special.down, .{}) or key.matches('n', .{ .ctrl = true })) {
-                finder.moveDown();
+                overlay.moveDown();
             } else if (key.matches(keymap_mod.special.backspace, .{})) {
-                finder.backspace();
-            } else if (key.text) |text| finder.insert(text);
-            return;
-        }
-        if (self.picker) |*picker| {
-            if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
-                self.closePicker();
-            } else if (key.matches(keymap_mod.special.enter, .{})) {
-                const selected = picker.selection() orelse return;
-                self.closePicker();
-                try self.choosePullRequest(try OwnedReviewIdentity.init(
-                    if (self.published) |published| published.key.workspace() else self.replacement.?.key.workspace(),
-                    if (self.published) |published| published.key.repository() else self.replacement.?.key.repository(),
-                    selected.id,
-                ));
-            } else if (key.matches(keymap_mod.special.up, .{}) or key.matches('p', .{ .ctrl = true })) {
-                picker.moveUp();
-            } else if (key.matches(keymap_mod.special.down, .{}) or key.matches('n', .{ .ctrl = true })) {
-                picker.moveDown();
-            } else if (key.matches(keymap_mod.special.backspace, .{})) {
-                picker.backspace();
-            } else if (key.text) |text| picker.insert(text);
+                overlay.backspace();
+            } else if (key.text) |text| overlay.insert(text);
             return;
         }
         if (self.published) |published| if (published.buffer_search.input != null) {
@@ -11242,10 +11179,8 @@ pub const Presentation = struct {
             self.action_error = .action_refused;
             return;
         };
-        self.closePicker();
         self.next_work_id += 1;
-        self.picker = Picker.initLoading(self.allocator);
-        self.picker_work_id = self.next_work_id;
+        self.showListOverlay(ListOverlay.openPullRequestPicker(self.allocator, self.next_work_id));
         self.commands.appendAssumeCapacity(.{ .list_pull_requests = .{
             .work_id = self.next_work_id,
             .repository = repository,
@@ -11258,12 +11193,11 @@ pub const Presentation = struct {
             self.action_error = .action_refused;
             return;
         };
-        self.closeFileFinder();
-        self.file_finder = FileFinder.init(self.allocator, published.session.diff.files) catch {
+        const overlay = ListOverlay.openFileFinder(self.allocator, published.session.diff.files) catch {
             self.action_error = .out_of_memory;
             return;
         };
-        self.action_error = null;
+        self.showListOverlay(overlay);
     }
 
     fn yank(self: *Presentation, published: *Published, count: usize) void {
@@ -11389,17 +11323,35 @@ pub const Presentation = struct {
         self.action_error = null;
     }
 
-    fn closeFileFinder(self: *Presentation) void {
-        if (self.file_finder) |*finder| finder.deinit();
-        self.file_finder = null;
+    /// Opening one List Overlay closes any other, so two never coexist.
+    fn showListOverlay(self: *Presentation, overlay: ListOverlay) void {
+        self.closeListOverlay();
+        self.list_overlay = overlay;
+        self.action_error = null;
     }
 
-    fn closePicker(self: *Presentation) void {
-        if (self.picker) |*picker| picker.deinit();
-        self.picker = null;
-        if (self.picker_summaries) |summaries| summaries.destroy();
-        self.picker_summaries = null;
-        self.picker_work_id = null;
+    fn closeListOverlay(self: *Presentation) void {
+        if (self.list_overlay) |*overlay| overlay.deinit();
+        self.list_overlay = null;
+    }
+
+    /// The choice is copied out before close frees the list, and the Overlay
+    /// closes before the choice takes effect.
+    fn confirmListOverlay(self: *Presentation) !void {
+        const overlay = if (self.list_overlay) |*overlay| overlay else return;
+        const chosen = overlay.choice() orelse return;
+        self.closeListOverlay();
+        switch (chosen) {
+            .pull_request => |id| try self.choosePullRequest(try OwnedReviewIdentity.init(
+                if (self.published) |published| published.key.workspace() else self.replacement.?.key.workspace(),
+                if (self.published) |published| published.key.repository() else self.replacement.?.key.repository(),
+                id,
+            )),
+            .file => |index| if (self.published) |published| {
+                self.focusFile(published, index);
+                published.focus = .diff;
+            },
+        }
     }
 
     fn acceptPullRequests(self: *Presentation, loaded: PullRequestsLoaded) void {
@@ -11408,23 +11360,21 @@ pub const Presentation = struct {
             return;
         }
         if (self.outstanding_picker_loads > 0) self.outstanding_picker_loads -= 1;
-        if (self.picker_work_id != loaded.work_id or self.picker == null) {
-            if (loaded.outcome == .loaded) loaded.outcome.loaded.destroy();
-            return;
-        }
+        const overlay = if (self.list_overlay) |*overlay| overlay else null;
         switch (loaded.outcome) {
-            .failed => {
-                self.closePicker();
+            .failed => if (overlay != null and overlay.?.tickScope() == loaded.work_id) {
+                self.closeListOverlay();
                 self.action_error = .picker_load_failed;
             },
             .loaded => |summaries| {
-                self.picker.?.populate(summaries.prs) catch {
+                (overlay orelse return summaries.destroy()).populatePullRequests(loaded.work_id, summaries) catch |err| {
                     summaries.destroy();
-                    self.closePicker();
-                    self.action_error = .out_of_memory;
+                    if (err == error.OutOfMemory) {
+                        self.closeListOverlay();
+                        self.action_error = .out_of_memory;
+                    }
                     return;
                 };
-                self.picker_summaries = summaries;
                 self.action_error = null;
             },
         }
@@ -11636,8 +11586,7 @@ pub const Presentation = struct {
             self.discardQueuedReviewSearchScans();
             self.discardQueuedSearchEnrichments(current);
         }
-        // The File finder borrows the replaced Session's Files.
-        self.closeFileFinder();
+        if (self.list_overlay) |*overlay| if (overlay.sessionBound()) self.closeListOverlay();
         self.published = candidate;
         self.preferences = job.preferences;
         self.discardQueuedBufferSearchScans(null);
@@ -18808,6 +18757,11 @@ test "M21 kernel failed Sidebar changes preserve the File Tree and can retry" {
     }
 }
 
+fn testListOverlay(presentation: *const Presentation, kind: std.meta.Tag(ListOverlay)) ?*const ListOverlay {
+    const overlay = presentation.projection().list_overlay orelse return null;
+    return if (overlay.* == kind) overlay else null;
+}
+
 test "File finder filters synchronously and confirms within the same Session" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -18819,18 +18773,18 @@ test "File finder filters synchronously and confirms within the same Session" {
     const epoch = presentation.projection().review.?.session_epoch;
 
     try presentation.dispatch(.{ .key = .{ .codepoint = 'F', .text = "F" } });
-    try testing.expect(presentation.projection().file_finder != null);
+    try testing.expect(testListOverlay(&presentation, .file_finder) != null);
     try presentation.dispatch(.{ .key = .{ .codepoint = 'x', .text = "xyz" } });
-    try testing.expectEqual(@as(usize, 0), presentation.projection().file_finder.?.matches().len);
+    try testing.expectEqual(@as(usize, 0), testListOverlay(&presentation, .file_finder).?.list().matches().len);
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
-    try testing.expect(presentation.projection().file_finder != null);
+    try testing.expect(testListOverlay(&presentation, .file_finder) != null);
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
     try presentation.dispatch(.{ .action = .open_file_finder });
     try presentation.dispatch(.{ .key = .{ .codepoint = 'b', .text = "b" } });
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
 
     const projection = presentation.projection();
-    try testing.expect(projection.file_finder == null);
+    try testing.expect(projection.list_overlay == null);
     try testing.expectEqual(epoch, projection.review.?.session_epoch);
     try testing.expectEqual(@as(usize, 1), projection.review.?.buffer.fileIndexForRow(projection.review.?.navigation.cursor));
     try testing.expectEqual(frame_mod.PaneFocus.diff, projection.review.?.frame.focus);
@@ -18846,9 +18800,9 @@ test "File finder Escape dismisses and reopening resets its query" {
     try presentation.dispatch(.{ .action = .open_file_finder });
     try presentation.dispatch(.{ .key = .{ .codepoint = 'b', .text = "b" } });
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
-    try testing.expect(presentation.projection().file_finder == null);
+    try testing.expect(testListOverlay(&presentation, .file_finder) == null);
     try presentation.dispatch(.{ .action = .open_file_finder });
-    try testing.expectEqualStrings("", presentation.projection().file_finder.?.query());
+    try testing.expectEqualStrings("", testListOverlay(&presentation, .file_finder).?.list().query());
 }
 
 test "File finder opened during a replacement does not outlive the replaced Session" {
@@ -18861,15 +18815,32 @@ test "File finder opened during a replacement does not outlive the replaced Sess
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const load = presentation.takeCommand().?.load_session;
     try presentation.dispatch(.{ .key = .{ .codepoint = 'F', .text = "F" } });
-    try testing.expect(presentation.projection().file_finder != null);
+    try testing.expect(testListOverlay(&presentation, .file_finder) != null);
     try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
         .command_id = load.command_id,
         .intent = load.intent,
         .outcome = .{ .loaded = try testTwoFileSession(testing.allocator, 2) },
     } });
     try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.pull_request.?.id);
-    try testing.expect(presentation.projection().file_finder == null);
+    try testing.expect(testListOverlay(&presentation, .file_finder) == null);
     try presentation.dispatch(.{ .key = .{ .codepoint = 'b', .text = "b" } });
+}
+
+test "opening one List Overlay closes the open one" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_file_finder });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'b', .text = "b" } });
+    try presentation.dispatch(.{ .action = .open_pull_request_picker });
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) != null);
+    try testing.expectEqualStrings("", presentation.projection().list_overlay.?.list().query());
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expect(command == .list_pull_requests);
 }
 
 test "Comment Action ladder carries inline File and Review scopes" {
@@ -27019,7 +26990,7 @@ test "Submission Overlay permits Review switching without cancelling the run" {
     try testing.expect(presentation.projection().submission_tree != null);
 
     try presentation.dispatch(.{ .key = .{ .codepoint = 'p', .text = "p" } });
-    try testing.expect(presentation.projection().picker != null);
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) != null);
     var list = presentation.takeCommand().?;
     try testing.expect(list == .list_pull_requests);
     list.deinit();
@@ -27230,9 +27201,9 @@ test "portable Picker input loads summaries and selects a replacement" {
         .work_id = list.work_id,
         .outcome = .{ .loaded = summaries },
     } });
-    try testing.expect(presentation.projection().picker != null);
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) != null);
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
-    try testing.expect(presentation.projection().picker == null);
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) == null);
     try testing.expectEqual(@as(u64, 2), presentation.takeCommand().?.load_session.key.pull_request_id);
 }
 
@@ -27248,19 +27219,19 @@ test "Picker tick advances only its visible loading scope" {
 
     try presentation.dispatch(.{ .key = .{ .codepoint = 'p', .text = "p" } });
     const list = presentation.takeCommand().?.list_pull_requests;
-    const initial = presentation.projection().picker.?.spinnerGlyph();
+    const initial = testListOverlay(&presentation, .pull_request_picker).?.pull_request_picker.spinnerGlyph();
     try testing.expectEqual(list.work_id, presentation.projection().picker_tick_scope.?);
 
     try presentation.dispatch(.{ .picker_tick = list.work_id + 1 });
-    try testing.expectEqualStrings(initial, presentation.projection().picker.?.spinnerGlyph());
+    try testing.expectEqualStrings(initial, testListOverlay(&presentation, .pull_request_picker).?.pull_request_picker.spinnerGlyph());
     try presentation.dispatch(.{ .picker_tick = list.work_id });
-    try testing.expect(!std.mem.eql(u8, initial, presentation.projection().picker.?.spinnerGlyph()));
+    try testing.expect(!std.mem.eql(u8, initial, testListOverlay(&presentation, .pull_request_picker).?.pull_request_picker.spinnerGlyph()));
 
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
-    try testing.expect(presentation.projection().picker == null);
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) == null);
     try testing.expect(presentation.projection().picker_tick_scope == null);
     try presentation.dispatch(.{ .picker_tick = list.work_id });
-    try testing.expect(presentation.projection().picker == null);
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) == null);
 }
 
 test "shutdown closes Picker and disposes its late completion" {
@@ -27276,7 +27247,7 @@ test "shutdown closes Picker and disposes its late completion" {
     try presentation.dispatch(.{ .key = .{ .codepoint = 'p', .text = "p" } });
     const list = presentation.takeCommand().?.list_pull_requests;
     try presentation.dispatch(.request_shutdown);
-    try testing.expect(presentation.projection().picker == null);
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) == null);
     try testing.expect(!presentation.readyToExit());
 
     const summaries = try PullRequestSummaries.create(testing.allocator);
@@ -27284,7 +27255,7 @@ test "shutdown closes Picker and disposes its late completion" {
         .work_id = list.work_id,
         .outcome = .{ .loaded = summaries },
     } });
-    try testing.expect(presentation.projection().picker == null);
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) == null);
     try testing.expect(presentation.readyToExit());
 }
 
@@ -28172,8 +28143,8 @@ test "Picker mouse click selects only and non-Picker Overlay captures Pane click
     const overlay = presentation.projection().review.?.frame.overlay.?;
     try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 2, .button = .left, .type = .press } });
     try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 2, .button = .left, .type = .release } });
-    try testing.expectEqual(@as(usize, 1), presentation.projection().file_finder.?.list.selected);
-    try testing.expect(presentation.projection().file_finder != null); // click never confirms
+    try testing.expectEqual(@as(usize, 1), testListOverlay(&presentation, .file_finder).?.list().selected);
+    try testing.expect(testListOverlay(&presentation, .file_finder) != null); // click never confirms
 
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
     try presentation.dispatch(.{ .action = .review_comment });
@@ -28205,12 +28176,12 @@ test "PullRequest Picker wheel and click move selection while Enter alone confir
     try presentation.dispatch(.{ .pull_requests_loaded = .{ .work_id = list.work_id, .outcome = .{ .loaded = summaries } } });
     const overlay = presentation.projection().review.?.frame.overlay.?;
     try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 1, .button = .wheel_down, .type = .press } });
-    try testing.expectEqual(@as(usize, 3), presentation.projection().picker.?.list.selected);
+    try testing.expectEqual(@as(usize, 3), testListOverlay(&presentation, .pull_request_picker).?.list().selected);
 
     const current_overlay = presentation.projection().review.?.frame.overlay.?;
     try presentation.dispatch(.{ .mouse = .{ .col = current_overlay.rect.x, .row = current_overlay.rect.y + 2, .button = .left, .type = .press } });
     try presentation.dispatch(.{ .mouse = .{ .col = current_overlay.rect.x, .row = current_overlay.rect.y + 2, .button = .left, .type = .release } });
-    try testing.expectEqual(@as(usize, 1), presentation.projection().picker.?.list.selected);
+    try testing.expectEqual(@as(usize, 1), testListOverlay(&presentation, .pull_request_picker).?.list().selected);
     try testing.expect(presentation.takeCommand() == null);
 
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });

@@ -78,7 +78,7 @@ pub fn versionTitleTargets(diff: Rect, selected: SelectedVersion) VersionTitleTa
     };
 }
 
-pub const OverlayKind = enum { picker, review_search, other };
+pub const OverlayKind = enum { list, review_search, other };
 
 pub const ReviewSearchGeometry = struct {
     rect: Rect,
@@ -133,7 +133,7 @@ pub const HitTarget = union(enum) {
     diff,
     sidebar_entry: usize,
     diff_row: usize,
-    picker_entry: usize,
+    list_entry: usize,
     review_search_entry: usize,
     review_search_list,
     review_search_preview,
@@ -261,12 +261,12 @@ pub fn hitTest(frame: Projection, col: u16, row: u16) ?HitTarget {
             if (geometry.preview.contains(col, row)) return .review_search_preview;
             return null;
         }
-        if (overlay.kind != .picker or !overlay.rect.contains(col, row)) return null;
+        if (overlay.kind != .list or !overlay.rect.contains(col, row)) return null;
         const relative_row = row - overlay.rect.y;
         if (relative_row == 0) return null; // query/title row
         const index = overlay.scroll + relative_row - 1;
         if (index >= overlay.row_count) return null;
-        return .{ .picker_entry = index };
+        return .{ .list_entry = index };
     }
 
     if (frame.version_title_targets.old) |rect| if (rect.contains(col, row)) return .select_old_version;
@@ -1201,11 +1201,11 @@ test "published Frame hit testing gives Overlay rows precedence and clips blank 
         .buffer = .{ .rows = &.{}, .layout = .unified },
         .navigation = Nav.init(0, 5),
         .file_tree = .{ .entries = &entries, .viewport = 5 },
-        .overlay = .{ .kind = .picker, .rect = .{ .x = 5, .y = 1, .width = 10, .height = 4 }, .row_count = 2 },
+        .overlay = .{ .kind = .list, .rect = .{ .x = 5, .y = 1, .width = 10, .height = 4 }, .row_count = 2 },
     };
 
-    try testing.expectEqual(HitTarget{ .picker_entry = 0 }, hitTest(projection, 6, 2).?);
-    try testing.expectEqual(HitTarget{ .picker_entry = 1 }, hitTest(projection, 6, 3).?);
+    try testing.expectEqual(HitTarget{ .list_entry = 0 }, hitTest(projection, 6, 2).?);
+    try testing.expectEqual(HitTarget{ .list_entry = 1 }, hitTest(projection, 6, 3).?);
     try testing.expect(hitTest(projection, 6, 4) == null);
     try testing.expect(hitTest(projection, 1, 2) == null); // Overlay capture prevents Pane pass-through.
 

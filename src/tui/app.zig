@@ -224,8 +224,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             const status = presentationStatus(frame, projection, null);
             render.drawLoading(frame, content_win, projection.loading_pull_request_id, ctx.active_theme, status);
         }
-        if (projection.picker) |active_picker| render.drawPicker(frame, content_win, active_picker, ctx.active_theme);
-        if (projection.file_finder) |finder| render.drawFileFinder(frame, content_win, finder, ctx.active_theme);
+        if (projection.list_overlay) |overlay| render.drawListOverlay(frame, content_win, overlay, ctx.active_theme);
         if (projection.review_search) |review_search| render.drawReviewSearch(frame, content_win, review_search, ctx.active_theme);
         if (projection.composer) |composer| render.drawComposerProjection(frame, content_win, composer, ctx.active_theme);
         if (projection.unknown_resolution) |resolution| render.drawComposerProjection(frame, content_win, .{
