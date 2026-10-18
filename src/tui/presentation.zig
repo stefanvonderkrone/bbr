@@ -11744,7 +11744,13 @@ pub const Presentation = struct {
                 self.focusFile(published, index);
                 published.focus = .diff;
             },
-            .action => |action| self.applyAction(action),
+            // The palette listed its rows for the Pane context at open. A view
+            // build can move the cursor to another context before Enter.
+            .action => |action| if (keymap_mod.supportsContext(action, self.paneContext()))
+                self.applyAction(action)
+            else {
+                self.action_error = .target_action_unavailable;
+            },
             .theme => |id| self.chooseTheme(id),
         }
     }
@@ -19424,6 +19430,33 @@ test "Command Palette Enter after a query edit runs the top match, not the row u
     try testing.expectEqualStrings("Find File", titles[0]);
     try presentation.dispatch(.{ .key = test_enter });
     try testing.expect(testListOverlay(&presentation, .file_finder) != null);
+}
+
+test "the Command Palette refuses an Action the Pane context dropped while it was open" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCommentThreadSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer presentation.deinit();
+    for (0..32) |_| {
+        if (presentation.paneContext() == .diff_review_card) break;
+        try presentation.dispatch(.{ .action = .down });
+    } else return error.NoReviewCard;
+    try presentation.dispatch(.{ .action = .isolate });
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testType(&presentation, "reply");
+    const titles = try testPaletteTitles(&presentation);
+    defer testing.allocator.free(titles);
+    try testing.expectEqualStrings("Reply", titles[0]);
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(testListOverlay(&presentation, .command_palette) != null);
+    try testing.expect(!keymap_mod.supportsContext(.reply, presentation.paneContext()));
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expect(presentation.projection().list_overlay == null);
+    try testing.expect(presentation.projection().composer == null);
+    try testing.expectEqual(ActionError.target_action_unavailable, presentation.projection().action_error.?);
 }
 
 test "an unavailable Command Palette entry is refused with the Action's own message" {
