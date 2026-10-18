@@ -2,7 +2,7 @@
 //! `XDG_DATA_HOME`, and `XDG_STATE_HOME`, and `tools/check_xdg_reads.py` fails on any other
 //! reader. The XDG Base Directory spec says to ignore an empty or relative
 //! base, so a value like `relative/dir` never makes bbr read or create files
-//! under the working directory.
+//! under the working directory. The `HOME` fallback follows the same rule.
 
 const std = @import("std");
 
@@ -34,8 +34,9 @@ pub fn configFile(allocator: Allocator, env: *const EnvMap) !?[]u8 {
 
 fn home(allocator: Allocator, env: *const EnvMap, variable: []const u8, fallback: []const u8) !?[]u8 {
     if (env.get(variable)) |base| if (std.fs.path.isAbsolute(base)) return try allocator.dupe(u8, base);
-    if (env.get("HOME")) |user_home| return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ user_home, fallback });
-    return null;
+    const user_home = env.get("HOME") orelse return null;
+    if (!std.fs.path.isAbsolute(user_home)) return null;
+    return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ user_home, fallback });
 }
 
 const testing = std.testing;
@@ -90,4 +91,18 @@ test "no usable XDG base and no HOME resolve to null" {
     try expectResolved(null, try configHome(testing.allocator, &env));
     try expectResolved(null, try dataHome(testing.allocator, &env));
     try expectResolved(null, try stateHome(testing.allocator, &env));
+}
+
+test "an empty or relative HOME gives no fallback" {
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    for ([_][]const u8{ "", "relative/home", "./home" }) |user_home| {
+        try env.put("HOME", user_home);
+        try expectResolved(null, try configHome(testing.allocator, &env));
+        try expectResolved(null, try dataHome(testing.allocator, &env));
+        try expectResolved(null, try stateHome(testing.allocator, &env));
+        try expectResolved(null, try configFile(testing.allocator, &env));
+    }
+    try env.put("XDG_DATA_HOME", "/data");
+    try expectResolved("/data", try dataHome(testing.allocator, &env));
 }
