@@ -39,16 +39,20 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
-def tmux(state, *args):
-    return run("tmux", "-S", str(Path(state["scratch"]) / "tmux.sock"), *args)
+def tmux(state, *args, **kwargs):
+    return run("tmux", "-S", str(Path(state["scratch"]) / "tmux.sock"), *args, **kwargs)
+
+
+SERVER_GONE = ("no server running", "No such file or directory")
 
 
 def stop_server(state):
-    """A server that is already gone counts as stopped."""
+    """A server that is already gone counts as stopped. Any other failure, such as a denied socket, propagates."""
     try:
-        tmux(state, "kill-server")
-    except subprocess.CalledProcessError:
-        pass
+        tmux(state, "kill-server", stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as error:
+        if not any(reason in (error.stderr or "") for reason in SERVER_GONE):
+            raise
 
 
 def capture(state):
