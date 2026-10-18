@@ -3652,7 +3652,7 @@ test "picker overlay draws the query line and highlights the selection" {
         .{ .id = 10, .title = "Add diff parser", .state = "OPEN", .author_display_name = "Ada", .source_branch = "feature/diff", .destination_branch = "main" },
         .{ .id = 11, .title = "Fix navigation", .state = "OPEN", .author_display_name = "Grace", .source_branch = "feature/nav", .destination_branch = "main" },
     };
-    var picker = ListOverlay.openPullRequestPicker(a, 1);
+    var picker = ListOverlay.openPullRequestPicker(a, 1, .{});
     defer picker.deinit();
     const summaries = try list_overlay_mod.PullRequestSummaries.create(a);
     summaries.prs = &prs;
@@ -3769,7 +3769,7 @@ test "a loading picker shows its single-glyph spinner beside the placeholder" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var picker = ListOverlay.openPullRequestPicker(a, 1);
+    var picker = ListOverlay.openPullRequestPicker(a, 1, .{});
     defer picker.deinit();
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });

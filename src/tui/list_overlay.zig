@@ -212,10 +212,38 @@ pub const PullRequestSummaries = struct {
     }
 };
 
+/// The Repository a Picker lists, copied when the Picker opens. Enter builds
+/// its identity from this copy, so it needs no published or loading Session.
+pub const Repository = struct {
+    workspace_buf: [128]u8 = undefined,
+    workspace_len: u8 = 0,
+    name_buf: [256]u8 = undefined,
+    name_len: u16 = 0,
+
+    pub fn init(workspace_name: []const u8, repository_name: []const u8) error{NameTooLong}!Repository {
+        var self: Repository = .{};
+        if (workspace_name.len > self.workspace_buf.len or repository_name.len > self.name_buf.len) return error.NameTooLong;
+        @memcpy(self.workspace_buf[0..workspace_name.len], workspace_name);
+        @memcpy(self.name_buf[0..repository_name.len], repository_name);
+        self.workspace_len = @intCast(workspace_name.len);
+        self.name_len = @intCast(repository_name.len);
+        return self;
+    }
+
+    pub fn workspace(self: *const Repository) []const u8 {
+        return self.workspace_buf[0..self.workspace_len];
+    }
+
+    pub fn name(self: *const Repository) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+};
+
 /// The PullRequest Picker. While its summaries load it shows a spinner and
 /// still accepts a query, which applies the moment the summaries arrive.
 pub const PullRequestPicker = struct {
     list: FuzzyList,
+    repository: Repository,
     /// The work id of its `list_pull_requests` command. A load or tick with
     /// another id is stale.
     work_id: u64,
@@ -399,8 +427,8 @@ pub const ListOverlay = union(enum) {
     theme: ThemeOverlay,
 
     /// A loading Picker has no items, so opening it allocates nothing.
-    pub fn openPullRequestPicker(allocator: Allocator, work_id: u64) ListOverlay {
-        return .{ .pull_request_picker = .{ .list = .{ .allocator = allocator }, .work_id = work_id } };
+    pub fn openPullRequestPicker(allocator: Allocator, work_id: u64, repository: Repository) ListOverlay {
+        return .{ .pull_request_picker = .{ .list = .{ .allocator = allocator }, .repository = repository, .work_id = work_id } };
     }
 
     pub fn openFileFinder(allocator: Allocator, files: []const File) Allocator.Error!ListOverlay {
@@ -479,7 +507,7 @@ pub const ListOverlay = union(enum) {
     pub fn choice(self: *const ListOverlay) ?Choice {
         const item = self.list().selectedItem() orelse return null;
         return switch (self.*) {
-            .pull_request_picker => |*picker| .{ .pull_request = picker.prs()[item].id },
+            .pull_request_picker => |*picker| .{ .pull_request = .{ .repository = picker.repository, .id = picker.prs()[item].id } },
             .file_finder => .{ .file = item },
             .command_palette => |*palette| .{ .action = palette.command(item).action },
             .theme => .{ .theme = ThemeId.at(item) },
@@ -576,7 +604,7 @@ pub const ListOverlay = union(enum) {
 
 /// What a confirmed List Overlay chose. A value, so no borrow survives close.
 pub const Choice = union(enum) {
-    pull_request: u64,
+    pull_request: struct { repository: Repository, id: u64 },
     file: usize,
     action: Action,
     theme: ThemeId,
@@ -593,7 +621,7 @@ fn samplePrs() []const PullRequestSummary {
 }
 
 fn testPicker(prs: []const PullRequestSummary) !ListOverlay {
-    var overlay = ListOverlay.openPullRequestPicker(testing.allocator, 1);
+    var overlay = ListOverlay.openPullRequestPicker(testing.allocator, 1, .{});
     errdefer overlay.deinit();
     try testPopulate(&overlay, prs);
     return overlay;
@@ -609,7 +637,7 @@ fn testPopulate(overlay: *ListOverlay, prs: []const PullRequestSummary) !void {
 }
 
 fn chosenPullRequest(overlay: *const ListOverlay) ?u64 {
-    return (overlay.choice() orelse return null).pull_request;
+    return (overlay.choice() orelse return null).pull_request.id;
 }
 
 test "empty query matches every PR in order" {
@@ -675,7 +703,7 @@ test "navigation clamps at both ends" {
 }
 
 test "a loading picker has no matches until populated" {
-    var p = ListOverlay.openPullRequestPicker(testing.allocator, 1);
+    var p = ListOverlay.openPullRequestPicker(testing.allocator, 1, .{});
     defer p.deinit();
     try testing.expectEqual(@as(?u64, 1), p.tickScope());
     try testing.expectEqual(@as(usize, 0), p.list().matches().len);
@@ -691,7 +719,7 @@ test "a loading picker has no matches until populated" {
 }
 
 test "a stale or repeated load does not populate the Picker" {
-    var p = ListOverlay.openPullRequestPicker(testing.allocator, 1);
+    var p = ListOverlay.openPullRequestPicker(testing.allocator, 1, .{});
     defer p.deinit();
     const stale = try PullRequestSummaries.create(testing.allocator);
     defer stale.destroy();
@@ -701,7 +729,7 @@ test "a stale or repeated load does not populate the Picker" {
 }
 
 test "loading Picker spinner advances one fixed-width glyph per scoped tick" {
-    var p = ListOverlay.openPullRequestPicker(testing.allocator, 1);
+    var p = ListOverlay.openPullRequestPicker(testing.allocator, 1, .{});
     defer p.deinit();
     try testing.expectEqualStrings("\xe2\xa0\x8b", p.pull_request_picker.spinnerGlyph());
     p.tick(2);
@@ -714,7 +742,7 @@ test "loading Picker spinner advances one fixed-width glyph per scoped tick" {
 }
 
 test "populate with an empty list leaves a ready, empty picker" {
-    var p = ListOverlay.openPullRequestPicker(testing.allocator, 1);
+    var p = ListOverlay.openPullRequestPicker(testing.allocator, 1, .{});
     defer p.deinit();
     try testPopulate(&p, &.{});
     try testing.expect(!p.pull_request_picker.loading());

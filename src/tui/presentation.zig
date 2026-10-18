@@ -11558,8 +11558,12 @@ pub const Presentation = struct {
             self.action_error = .action_refused;
             return;
         };
+        const picker_repository = list_overlay_mod.Repository.init(key.workspace(), key.repository()) catch {
+            self.action_error = .action_refused;
+            return;
+        };
         self.next_work_id += 1;
-        self.showListOverlay(ListOverlay.openPullRequestPicker(self.allocator, self.next_work_id));
+        self.showListOverlay(ListOverlay.openPullRequestPicker(self.allocator, self.next_work_id, picker_repository));
         self.commands.appendAssumeCapacity(.{ .list_pull_requests = .{
             .work_id = self.next_work_id,
             .repository = repository,
@@ -11721,10 +11725,10 @@ pub const Presentation = struct {
         const chosen = overlay.choice() orelse return;
         self.closeListOverlay();
         switch (chosen) {
-            .pull_request => |id| try self.choosePullRequest(try OwnedReviewIdentity.init(
-                if (self.published) |published| published.key.workspace() else self.replacement.?.key.workspace(),
-                if (self.published) |published| published.key.repository() else self.replacement.?.key.repository(),
-                id,
+            .pull_request => |picked| try self.choosePullRequest(try OwnedReviewIdentity.init(
+                picked.repository.workspace(),
+                picked.repository.name(),
+                picked.id,
             )),
             .file => |index| if (self.published) |published| {
                 self.focusFile(published, index);
@@ -19597,6 +19601,28 @@ test "the projected Theme is the configured Theme" {
     defer presentation.deinit();
     try testing.expectEqual(ThemeId.gruvbox_dark, presentation.projection().theme);
     try testing.expectEqual(ThemeId.gruvbox_dark, presentation.projection().configured_theme);
+}
+
+test "the Picker chooses from its Repository after the initial load fails" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{});
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    const initial = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .action = .open_pull_request_picker });
+    const list = presentation.takeCommand().?.list_pull_requests;
+    try presentation.dispatch(.{ .session_loaded = .{ .command_id = initial.command_id, .intent = initial.intent, .outcome = .{ .failed = error.NetworkFailure } } });
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) != null);
+
+    const summaries = try PullRequestSummaries.create(testing.allocator);
+    summaries.prs = &.{.{ .id = 7, .title = "Retry", .state = "OPEN", .author_display_name = "Ada", .source_branch = "retry", .destination_branch = "main" }};
+    try presentation.dispatch(.{ .pull_requests_loaded = .{ .command_id = list.command_id, .work_id = list.work_id, .outcome = .{ .loaded = summaries } } });
+    try presentation.dispatch(.{ .key = test_enter });
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    const load = command.load_session;
+    try testing.expect(OwnedReviewIdentity.eql(try OwnedReviewIdentity.init("workspace", "repo", 7), load.key));
 }
 
 test "opening one List Overlay closes the open one" {
