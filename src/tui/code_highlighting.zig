@@ -102,12 +102,6 @@ pub const Analyze = struct {
         backing.destroy(self);
     }
 
-    pub fn launchFailed(self: *Analyze) Completed {
-        const completed: Completed = .{ .command_id = self.command_id, .identity = self.identity, .failure = error.WorkerLaunchFailed };
-        self.destroy();
-        return completed;
-    }
-
     /// Consumes the command. Only exact-sized source Spans leave worker scratch storage.
     pub fn execute(self: *Analyze, highlighter: bbr.highlight.Highlighter) Completed {
         defer self.destroy();

@@ -43,7 +43,7 @@ test "M23 highlighting Suggestions inherit authored inline context after LocalRe
     try testing.expectEqualStrings("before.js", job.path);
     try testing.expectEqualStrings("const value = 1;\n", job.content);
     try testing.expectEqualDeep(review_card.Owner{ .draft = 2 }, job.identity.owner);
-    try state.dispatch(.{ .code_highlight_completed = job.launchFailed() });
+    try state.dispatch(try highlightLaunchFailed(job));
 }
 
 test "M23 highlighting selected Preview precedes cards and closing removes pending Preview blocks" {
@@ -65,7 +65,7 @@ test "M23 highlighting selected Preview precedes cards and closing removes pendi
     try state.dispatch(.{ .code_highlight_completed = try codeCapacityCompletion(preview, 1) });
     const card = state.takeCommand().?.highlight_code;
     try testing.expectEqualStrings("review.json", card.path);
-    try state.dispatch(.{ .code_highlight_completed = card.launchFailed() });
+    try state.dispatch(try highlightLaunchFailed(card));
 }
 
 fn nextCodeTestJob(state: *Presentation) !?*code_highlighting.Analyze {
@@ -142,7 +142,7 @@ test "M23 highlighting offscreen Preview shares results and changing selected re
     const remaining = try nextCodeTestJob(&state);
     if (remaining) |job| {
         try testing.expectEqualStrings("review.json", job.path);
-        try state.dispatch(.{ .code_highlight_completed = job.launchFailed() });
+        try state.dispatch(try highlightLaunchFailed(job));
     }
     try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
     try visitCodeCard(&state, 31);
@@ -199,7 +199,7 @@ test "M23 highlighting publishes plain code before one complete hidden-block com
     try state.dispatch(.{ .code_highlight_completed = job.execute(plain.highlighter()) });
     const next = state.takeCommand().?.highlight_code;
     try testing.expectEqualStrings("review.json", next.path);
-    try state.dispatch(.{ .code_highlight_completed = next.launchFailed() });
+    try state.dispatch(try highlightLaunchFailed(next));
     try testing.expect(state.takeCommand() == null);
 }
 
@@ -222,9 +222,15 @@ fn visitCodeCard(state: *Presentation, id: u64) !void {
     return error.MissingCodeCard;
 }
 
+fn highlightLaunchFailed(job: *code_highlighting.Analyze) !OwnedInput {
+    var command: OwnedCommand = .{ .highlight_code = job };
+    errdefer command.deinit();
+    return command.launchFailed();
+}
+
 fn codeCapacityCompletion(job: *code_highlighting.Analyze, span_capacity: usize) !code_highlighting.Completed {
-    var completed = job.launchFailed();
-    completed.failure = null;
+    var completed: code_highlighting.Completed = .{ .command_id = job.command_id, .identity = job.identity };
+    job.destroy();
     const result = try testing.allocator.create(code_highlighting.Result);
     errdefer testing.allocator.destroy(result);
     const spans = try testing.allocator.alloc(code_highlighting.SourceSpan, span_capacity);
@@ -340,7 +346,7 @@ test "M23 highlighting releases stale Session work and permits a fresh attempt a
     try testing.expectEqual(@as(usize, 0), state.projection().review.?.frame.code_highlights.len);
     const new_job = state.takeCommand().?.highlight_code;
     try testing.expect(new_job.identity.session_epoch != old_epoch);
-    try state.dispatch(.{ .code_highlight_completed = new_job.launchFailed() });
+    try state.dispatch(try highlightLaunchFailed(new_job));
     try testing.expect(state.takeCommand() == null);
 }
 
@@ -371,7 +377,7 @@ test "M23 highlighting body replacement and deletion reject started work and res
         } else {
             const fresh = state.takeCommand().?.highlight_code;
             try testing.expectEqualStrings("x\n", fresh.content);
-            try state.dispatch(.{ .code_highlight_completed = fresh.launchFailed() });
+            try state.dispatch(try highlightLaunchFailed(fresh));
             try testing.expect(state.takeCommand() == null);
         }
     }
@@ -423,7 +429,7 @@ test "M23 highlighting complete structural code qualifies exactly at the byte li
         } else {
             const job = state.takeCommand().?.highlight_code;
             try testing.expectEqualStrings("  a\tb\n", job.content);
-            try state.dispatch(.{ .code_highlight_completed = job.launchFailed() });
+            try state.dispatch(try highlightLaunchFailed(job));
             try testing.expect(state.takeCommand() == null);
         }
     }
@@ -438,7 +444,7 @@ test "M23 highlighting leaves invalid identifiers plain and qualifies auto-close
     defer state.deinit();
     const job = state.takeCommand().?.highlight_code;
     try testing.expectEqualStrings("unclosed", job.content);
-    try state.dispatch(.{ .code_highlight_completed = job.launchFailed() });
+    try state.dispatch(try highlightLaunchFailed(job));
     try testing.expect(state.takeCommand() == null);
     try testing.expectEqual(@as(usize, 0), state.projection().review.?.frame.code_highlights.len);
 }
@@ -659,7 +665,7 @@ test "M23 acceptance Preview priority limits eviction body replacement and Sessi
     const restarted = state.takeCommand().?.highlight_code;
     try testing.expectEqualDeep(review_card.Owner{ .draft = 1 }, restarted.identity.owner);
     try testing.expect(restarted.identity.session_epoch != epoch);
-    try state.dispatch(.{ .code_highlight_completed = restarted.launchFailed() });
+    try state.dispatch(try highlightLaunchFailed(restarted));
 }
 
 test "M23 highlighting failed admission preserves the complete Frame and does not retry" {
