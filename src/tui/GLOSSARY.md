@@ -65,7 +65,7 @@ The List Overlay that ctrl-p opens from a Pane. It lists curated non-Motion Acti
 _Avoid_: palette (alone), launcher, command menu, Picker.
 
 **Configured Theme**:
-The Theme that config.toml names. bbr paints it unless the Theme Overlay previews another Theme.
+The Theme that bbr paints when no Theme Overlay preview is open. At startup it is the Theme that config.toml names. Choosing a Theme in the Theme Overlay makes that Theme the Configured Theme at once. A save to config.toml is a separate step, and it can fail or be off, as in the demo.
 _Avoid_: active theme (ambiguous during a preview), default theme.
 
 **Theme Overlay**:
