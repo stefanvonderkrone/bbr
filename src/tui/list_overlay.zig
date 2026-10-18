@@ -1,8 +1,9 @@
 //! List Overlays: Overlays made of one query line and one fuzzy-ranked list
 //! with one selection. `FuzzyList` owns the query, the ranked matches, and the
 //! selection for every one of them. It never owns or borrows items: each list
-//! passes a haystack value on refilter, so a borrow stays visible in the list
-//! that holds it.
+//! passes a haystack value on refilter. No arm holds a borrow either: data
+//! that another owner frees, such as the published Session's Files, comes in
+//! as an argument at each call.
 //!
 //! A haystack is any value with:
 //!     fn len(self) usize
@@ -288,12 +289,10 @@ const PullRequestHaystack = struct {
     }
 };
 
-/// The Session-local File Finder.
+/// The Session-local File Finder. Its items are the published Session's
+/// Files, which every call that reads them passes in.
 pub const FileFinder = struct {
     list: FuzzyList,
-    /// Borrowed from the published Session. `ListOverlay.sessionBound` makes
-    /// Presentation close it before that Session is replaced.
-    files: []const File,
 };
 
 /// A basename match ranks above any match found only in the full path.
@@ -432,8 +431,8 @@ pub const ListOverlay = union(enum) {
     }
 
     pub fn openFileFinder(allocator: Allocator, files: []const File) Allocator.Error!ListOverlay {
-        var overlay: ListOverlay = .{ .file_finder = .{ .list = try FuzzyList.init(allocator, files.len), .files = files } };
-        overlay.refilter();
+        var overlay: ListOverlay = .{ .file_finder = .{ .list = try FuzzyList.init(allocator, files.len) } };
+        overlay.refilter(files);
         return overlay;
     }
 
@@ -447,7 +446,7 @@ pub const ListOverlay = union(enum) {
         };
         palette.list = try FuzzyList.init(allocator, palette.row_count);
         var overlay: ListOverlay = .{ .command_palette = palette };
-        overlay.refilter();
+        overlay.refilter(&.{});
         return overlay;
     }
 
@@ -455,7 +454,7 @@ pub const ListOverlay = union(enum) {
     /// screen.
     pub fn openTheme(allocator: Allocator, configured: ThemeId) Allocator.Error!ListOverlay {
         var overlay: ListOverlay = .{ .theme = .{ .list = try FuzzyList.init(allocator, ThemeId.count) } };
-        overlay.refilter();
+        overlay.refilter(&.{});
         overlay.theme.list.selectItem(@intFromEnum(configured));
         return overlay;
     }
@@ -479,14 +478,17 @@ pub const ListOverlay = union(enum) {
         };
     }
 
-    pub fn insert(self: *ListOverlay, bytes: []const u8) void {
+    /// `files` are the published Session's Files. Only the File Finder
+    /// reads them.
+    pub fn insert(self: *ListOverlay, bytes: []const u8, files: []const File) void {
         self.listMut().appendQuery(bytes);
-        self.refilter();
+        self.refilter(files);
     }
 
-    pub fn backspace(self: *ListOverlay) void {
+    /// `files` as for `insert`.
+    pub fn backspace(self: *ListOverlay, files: []const File) void {
         self.listMut().popQuery();
-        self.refilter();
+        self.refilter(files);
     }
 
     pub fn moveUp(self: *ListOverlay) void {
@@ -533,9 +535,11 @@ pub const ListOverlay = union(enum) {
         };
     }
 
-    /// True when the arm borrows data from the published Session, or lists
-    /// what the Session's Pane context supported.
-    pub fn sessionBound(self: *const ListOverlay) bool {
+    /// True when the arm's items describe the published Session: the File
+    /// Finder's indices name its Files, and the Command Palette lists what its
+    /// Pane context supported. Presentation closes such an arm before it
+    /// replaces the Session.
+    pub fn closesOnReplacement(self: *const ListOverlay) bool {
         return switch (self.*) {
             .file_finder, .command_palette => true,
             .pull_request_picker, .theme => false,
@@ -577,7 +581,7 @@ pub const ListOverlay = union(enum) {
         const picker = &self.pull_request_picker;
         try picker.list.resize(summaries.prs.len);
         picker.summaries = summaries;
-        self.refilter();
+        picker.list.refilter(PullRequestHaystack{ .prs = picker.prs() });
     }
 
     /// Advance the spinner of the loading Picker that issued `scope`.
@@ -592,15 +596,41 @@ pub const ListOverlay = union(enum) {
         };
     }
 
-    fn refilter(self: *ListOverlay) void {
+    fn refilter(self: *ListOverlay, files: []const File) void {
         switch (self.*) {
             .pull_request_picker => |*picker| picker.list.refilter(PullRequestHaystack{ .prs = picker.prs() }),
-            .file_finder => |*finder| finder.list.refilter(FileHaystack{ .files = finder.files }),
+            .file_finder => |*finder| finder.list.refilter(FileHaystack{ .files = files }),
             .command_palette => |*palette| palette.list.refilter(CommandPalette.Haystack{ .palette = palette }),
             .theme => |*overlay| overlay.list.refilter(ThemeOverlay.Haystack{}),
         }
     }
 };
+
+// A Session replacement frees data that an open List Overlay could point
+// into. So an arm holds no pointer except the buffers it owns, and a borrow
+// must come in as an argument at each call.
+comptime {
+    for (std.meta.fields(ListOverlay)) |arm| for (std.meta.fields(arm.type)) |field| {
+        if (field.type == FuzzyList or field.type == ?*PullRequestSummaries) continue;
+        if (holdsPointer(field.type)) @compileError("ListOverlay arm ." ++ arm.name ++ " field ." ++ field.name ++
+            " holds a pointer. Pass borrowed data into each call instead, as `insert` takes the Session's Files.");
+    };
+}
+
+fn holdsPointer(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => true,
+        .optional => |optional| holdsPointer(optional.child),
+        .array => |array| holdsPointer(array.child),
+        .@"struct" => |info| for (info.fields) |field| {
+            if (holdsPointer(field.type)) break true;
+        } else false,
+        .@"union" => |info| for (info.fields) |field| {
+            if (holdsPointer(field.type)) break true;
+        } else false,
+        else => false,
+    };
+}
 
 /// What a confirmed List Overlay chose. A value, so no borrow survives close.
 pub const Choice = union(enum) {
@@ -650,7 +680,7 @@ test "empty query matches every PR in order" {
 test "a query narrows to fuzzy matches" {
     var p = try testPicker(samplePrs());
     defer p.deinit();
-    p.insert("nav");
+    p.insert("nav", &.{});
     try testing.expectEqual(@as(usize, 1), p.list().matches().len);
     try testing.expectEqual(@as(u64, 11), chosenPullRequest(&p).?);
 }
@@ -658,12 +688,12 @@ test "a query narrows to fuzzy matches" {
 test "matching by id and by author" {
     var p = try testPicker(samplePrs());
     defer p.deinit();
-    p.insert("12");
+    p.insert("12", &.{});
     try testing.expectEqual(@as(u64, 12), chosenPullRequest(&p).?);
 
-    p.backspace();
-    p.backspace();
-    p.insert("Grace");
+    p.backspace(&.{});
+    p.backspace(&.{});
+    p.insert("Grace", &.{});
     try testing.expectEqual(@as(u64, 11), chosenPullRequest(&p).?);
 }
 
@@ -674,11 +704,11 @@ test "title ranks ahead of bare id while hash id is direct" {
     };
     var p = try testPicker(&prs);
     defer p.deinit();
-    p.insert("15");
+    p.insert("15", &.{});
     try testing.expectEqual(@as(u64, 42), chosenPullRequest(&p).?);
-    p.backspace();
-    p.backspace();
-    p.insert("#15");
+    p.backspace(&.{});
+    p.backspace(&.{});
+    p.insert("#15", &.{});
     try testing.expectEqual(@as(u64, 15), chosenPullRequest(&p).?);
     try testing.expectEqual(@as(usize, 1), p.list().matches().len);
 }
@@ -686,7 +716,7 @@ test "title ranks ahead of bare id while hash id is direct" {
 test "no match yields no choice" {
     var p = try testPicker(samplePrs());
     defer p.deinit();
-    p.insert("zzzznope");
+    p.insert("zzzznope", &.{});
     try testing.expectEqual(@as(usize, 0), p.list().matches().len);
     try testing.expect(p.choice() == null);
 }
@@ -709,7 +739,7 @@ test "a loading picker has no matches until populated" {
     try testing.expectEqual(@as(usize, 0), p.list().matches().len);
     try testing.expect(p.choice() == null);
 
-    p.insert("nav");
+    p.insert("nav", &.{});
     try testing.expectEqual(@as(usize, 0), p.list().matches().len);
 
     try testPopulate(&p, samplePrs());
@@ -755,11 +785,11 @@ test "a query edit selects the best match" {
     defer p.deinit();
     p.moveDown();
     p.moveDown();
-    p.insert("feature");
+    p.insert("feature", &.{});
     try testing.expectEqual(@as(usize, 3), p.list().matches().len);
     try testing.expectEqual(samplePrs()[p.list().matches()[0]].id, chosenPullRequest(&p).?);
     p.moveDown();
-    p.backspace();
+    p.backspace(&.{});
     try testing.expectEqual(samplePrs()[p.list().matches()[0]].id, chosenPullRequest(&p).?);
 }
 
@@ -771,7 +801,7 @@ test "File Finder ranks a basename match above a path-only match" {
     var finder = try ListOverlay.openFileFinder(testing.allocator, &files);
     defer finder.deinit();
     try testing.expectEqual(@as(usize, 2), finder.list().matches().len);
-    finder.insert("finder");
+    finder.insert("finder", &files);
     try testing.expectEqual(Choice{ .file = 1 }, finder.choice().?);
     try testing.expectEqual(@as(usize, 2), finder.list().matches().len);
 }

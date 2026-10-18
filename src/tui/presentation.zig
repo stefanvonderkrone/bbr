@@ -7114,8 +7114,8 @@ pub const Presentation = struct {
             } else if (key.matches(keymap_mod.special.down, .{}) or key.matches('n', .{ .ctrl = true })) {
                 overlay.moveDown();
             } else if (key.matches(keymap_mod.special.backspace, .{})) {
-                overlay.backspace();
-            } else if (key.text) |text| overlay.insert(text);
+                overlay.backspace(self.publishedFiles());
+            } else if (key.text) |text| overlay.insert(text, self.publishedFiles());
             return;
         }
         if (self.published) |published| if (published.buffer_search.input != null) {
@@ -11719,6 +11719,10 @@ pub const Presentation = struct {
         self.action_error = null;
     }
 
+    fn publishedFiles(self: *const Presentation) []const bbr.diff.File {
+        return if (self.published) |published| published.session.diff.files else &.{};
+    }
+
     fn closeListOverlay(self: *Presentation) void {
         if (self.list_overlay) |*overlay| overlay.deinit();
         self.list_overlay = null;
@@ -12005,7 +12009,7 @@ pub const Presentation = struct {
             self.discardQueuedReviewSearchScans();
             self.discardQueuedSearchEnrichments(current);
         }
-        if (self.list_overlay) |*overlay| if (overlay.sessionBound()) self.closeListOverlay();
+        if (self.list_overlay) |*overlay| if (overlay.closesOnReplacement()) self.closeListOverlay();
         self.published = candidate;
         self.preferences = job.preferences;
         self.discardQueuedBufferSearchScans(null);

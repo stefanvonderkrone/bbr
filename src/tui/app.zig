@@ -231,7 +231,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             const status = presentationStatus(frame, projection, null);
             render.drawLoading(frame, content_win, projection.loading_pull_request_id, active_theme, status);
         }
-        if (projection.list_overlay) |overlay| render.drawListOverlay(frame, content_win, overlay, projection.action_availability, projection.configured_theme, active_theme);
+        if (projection.list_overlay) |overlay| render.drawListOverlay(frame, content_win, overlay, projection.action_availability, projection.configured_theme, if (projection.review) |review| review.diff.files else &.{}, active_theme);
         if (projection.review_search) |review_search| render.drawReviewSearch(frame, content_win, review_search, active_theme);
         if (projection.composer) |composer| render.drawComposerProjection(frame, content_win, composer, active_theme);
         if (projection.unknown_resolution) |resolution| render.drawComposerProjection(frame, content_win, .{
