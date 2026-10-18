@@ -6,10 +6,11 @@ import re
 import sys
 
 OWNER = Path("src/xdg.zig")
-VARIABLES = ('"XDG_CONFIG_HOME"', '"XDG_DATA_HOME"')
+VARIABLES = ('"XDG_CONFIG_HOME"', '"XDG_DATA_HOME"', '"XDG_STATE_HOME"')
 FIX = {
     '"XDG_CONFIG_HOME"': "xdg.configHome or xdg.configFile",
     '"XDG_DATA_HOME"': "xdg.dataHome",
+    '"XDG_STATE_HOME"': "xdg.stateHome",
 }
 TEST_START = re.compile(r"^test\b.*\{\s*$")
 
@@ -41,7 +42,7 @@ def main():
         print(message, file=sys.stderr)
     if found:
         return 1
-    print("Only src/xdg.zig reads XDG_CONFIG_HOME and XDG_DATA_HOME.")
+    print("Only src/xdg.zig reads XDG_CONFIG_HOME, XDG_DATA_HOME, and XDG_STATE_HOME.")
     return 0
 
 

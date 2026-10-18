@@ -412,9 +412,9 @@ fn tuiFatalMessage(err: anyerror) ?[]const u8 {
     };
 }
 
-/// Open the pending-review store at `~/.local/state/bbr/pending.db`, creating the
-/// directory. Falls back to an in-memory (non-durable) store when HOME is unset
-/// or the file can't be prepared, so the reviewer can still author this session.
+/// Open the pending-review store at `<state home>/bbr/pending.db`, creating the
+/// directory. Falls back to an in-memory (non-durable) store when no state home
+/// resolves or the file can't be prepared, so the reviewer can still author this session.
 fn openStore(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map) persist.SqliteStore {
     if (statePath(gpa, io, env_map)) |path| {
         defer gpa.free(path);
@@ -427,10 +427,11 @@ fn openStore(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.M
     return persist.SqliteStore.open(":memory:") catch @panic("sqlite :memory: open failed");
 }
 
-/// Build the state DB path, creating `~/.local/state/bbr`. Caller frees.
+/// Build the state DB path, creating `<state home>/bbr`. Caller frees.
 fn statePath(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map) ![:0]u8 {
-    const home = env_map.get("HOME") orelse return error.NoHome;
-    const dir = try std.fmt.allocPrint(gpa, "{s}/.local/state/bbr", .{home});
+    const base = (try bbr.xdg.stateHome(gpa, env_map)) orelse return error.NoStateHome;
+    defer gpa.free(base);
+    const dir = try std.fmt.allocPrint(gpa, "{s}/bbr", .{base});
     defer gpa.free(dir);
     var d = try std.Io.Dir.cwd().createDirPathOpen(io, dir, .{});
     d.close(io);
@@ -438,8 +439,9 @@ fn statePath(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.M
 }
 
 fn openSubmissionLockDir(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map) !std.Io.Dir {
-    const home = env_map.get("HOME") orelse return error.NoHome;
-    const path = try std.fmt.allocPrint(gpa, "{s}/.local/state/bbr/submission-locks", .{home});
+    const base = (try bbr.xdg.stateHome(gpa, env_map)) orelse return error.NoStateHome;
+    defer gpa.free(base);
+    const path = try std.fmt.allocPrint(gpa, "{s}/bbr/submission-locks", .{base});
     defer gpa.free(path);
     return std.Io.Dir.cwd().createDirPathOpen(io, path, .{});
 }
@@ -1258,6 +1260,8 @@ fn usage() void {
         \\  bbr completion --list-profiles   saved Profile names, one per line (for completion scripts)
         \\
         \\Credentials come from `$XDG_DATA_HOME/bbr/auth.toml` (see `bbr auth login`).
+        \\Pending reviews persist in `$XDG_STATE_HOME/bbr/pending.db`.
+        \\Each XDG base falls back under $HOME when unset, empty, or relative.
         \\`--profile <name>` (or BBR_PROFILE) selects a saved profile.
         \\BITBUCKET_USERNAME, BITBUCKET_TOKEN, BITBUCKET_WORKSPACE override the file per field.
         \\
@@ -1390,6 +1394,41 @@ test {
     _ = @import("tui/review_card.zig");
     _ = @import("tui/search.zig");
     _ = @import("persist/sqlite_store.zig");
+}
+
+test "pending.db and submission locks live under an absolute XDG_STATE_HOME, else HOME/.local/state" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const home = try std.fs.path.join(testing.allocator, &.{ root, "home" });
+    defer testing.allocator.free(home);
+    const state = try std.fs.path.join(testing.allocator, &.{ root, "state" });
+    defer testing.allocator.free(state);
+
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("HOME", home);
+    for ([_]struct { []const u8, []const u8 }{
+        .{ state, "state" },
+        .{ "", "home/.local/state" },
+        .{ "relative/state", "home/.local/state" },
+    }) |case| {
+        try env.put("XDG_STATE_HOME", case[0]);
+        const path = try statePath(testing.allocator, testing.io, &env);
+        defer testing.allocator.free(path);
+        const expected = try std.fmt.allocPrint(testing.allocator, "{s}/{s}/bbr/pending.db", .{ root, case[1] });
+        defer testing.allocator.free(expected);
+        try testing.expectEqualStrings(expected, path);
+        var lock_dir = try openSubmissionLockDir(testing.allocator, testing.io, &env);
+        lock_dir.close(testing.io);
+        const lock_path = try std.fmt.allocPrint(testing.allocator, "{s}/bbr/submission-locks", .{case[1]});
+        defer testing.allocator.free(lock_path);
+        var opened = try tmp.dir.openDir(testing.io, lock_path, .{});
+        opened.close(testing.io);
+    }
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, "relative/state", .{}));
 }
 
 test "File Enrichment OOM has a distinct fatal message" {

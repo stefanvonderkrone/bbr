@@ -176,7 +176,7 @@
     <tr><td>TUI library</td><td><b>libvaxis</b> 0.6.0 (pinned <code>main</code> commit)</td><td>Mature Zig TUI; <code>minimum_zig_version = 0.16.0</code> confirmed. Same lib ghostty vendors.</td></tr>
     <tr><td>Fuzzy finder</td><td><b>zf</b></td><td>Zig-native, in-process, zero-alloc. Chosen over <code>fff</code> (a Rust/C-FFI daemon built for 500k-file corpora — wrong scale, wrong toolchain here).</td></tr>
     <tr><td>Local git</td><td><b>shell out to <code>git</code></b> behind a <span class="seam">GitClient</span> seam</td><td>No libgit2 C dep; fakeable in tests. Powers local/offline review (ADR-0004).</td></tr>
-    <tr><td>Persistence</td><td><b>SQLite / libSQL</b> at <code>~/.local/state/bbr/…</code></td><td>Durable pending reviews across crashes and PR switches.</td></tr>
+    <tr><td>Persistence</td><td><b>SQLite / libSQL</b> at <code>$XDG_STATE_HOME/bbr/…</code> (default <code>~/.local/state/bbr/…</code>)</td><td>Durable pending reviews across crashes and PR switches.</td></tr>
     <tr><td>HTTP client</td><td><code>std.http.Client</code> behind a seam</td><td>Zero C deps; covers common proxies; libcurl swappable later (see ADR-0003).</td></tr>
     <tr><td>Highlighting</td><td>tree-sitter via Zig bindings, behind a seam (post-MVP)</td><td>Accurate coloring; kept off the critical path.</td></tr>
   </table>

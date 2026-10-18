@@ -209,6 +209,11 @@ The TUI reads `$XDG_CONFIG_HOME/bbr/config.toml`, falling back to
 `$HOME/.config/bbr/config.toml` when `XDG_CONFIG_HOME` is unset, empty, or relative. A missing file uses defaults; an existing invalid file reports
 all detected diagnostics and stops before entering the alternate screen.
 
+Pending reviews persist in `$XDG_STATE_HOME/bbr/pending.db`, and submission locks live in
+`$XDG_STATE_HOME/bbr/submission-locks`. When `XDG_STATE_HOME` is unset, empty, or relative, the
+state directory is `$HOME/.local/state/bbr`. If you change `XDG_STATE_HOME`, move the existing
+`pending.db` to the new directory, because bbr does not look for it in the old one.
+
 ```toml
 theme = "system"
 

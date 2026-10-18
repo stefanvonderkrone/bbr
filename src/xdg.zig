@@ -1,5 +1,5 @@
-//! XDG base directories. This module is the only reader of `XDG_CONFIG_HOME`
-//! and `XDG_DATA_HOME`, and `tools/check_xdg_reads.py` fails on any other
+//! XDG base directories. This module is the only reader of `XDG_CONFIG_HOME`,
+//! `XDG_DATA_HOME`, and `XDG_STATE_HOME`, and `tools/check_xdg_reads.py` fails on any other
 //! reader. The XDG Base Directory spec says to ignore an empty or relative
 //! base, so a value like `relative/dir` never makes bbr read or create files
 //! under the working directory.
@@ -17,6 +17,11 @@ pub fn configHome(allocator: Allocator, env: *const EnvMap) !?[]u8 {
 /// `$XDG_DATA_HOME`, else `$HOME/.local/share`, else `null`. Caller owns the result.
 pub fn dataHome(allocator: Allocator, env: *const EnvMap) !?[]u8 {
     return home(allocator, env, "XDG_DATA_HOME", ".local/share");
+}
+
+/// `$XDG_STATE_HOME`, else `$HOME/.local/state`, else `null`. Caller owns the result.
+pub fn stateHome(allocator: Allocator, env: *const EnvMap) !?[]u8 {
+    return home(allocator, env, "XDG_STATE_HOME", ".local/state");
 }
 
 /// Path of bbr's `config.toml`, or `null` when no config home resolves.
@@ -47,8 +52,10 @@ test "an absolute XDG base wins over HOME" {
     try env.put("HOME", "/home/ada");
     try env.put("XDG_CONFIG_HOME", "/cfg");
     try env.put("XDG_DATA_HOME", "/data");
+    try env.put("XDG_STATE_HOME", "/state");
     try expectResolved("/cfg", try configHome(testing.allocator, &env));
     try expectResolved("/data", try dataHome(testing.allocator, &env));
+    try expectResolved("/state", try stateHome(testing.allocator, &env));
     try expectResolved("/cfg/bbr/config.toml", try configFile(testing.allocator, &env));
 }
 
@@ -58,11 +65,14 @@ test "an unset, empty, or relative XDG base falls back to HOME" {
     try env.put("HOME", "/home/ada");
     try expectResolved("/home/ada/.config", try configHome(testing.allocator, &env));
     try expectResolved("/home/ada/.local/share", try dataHome(testing.allocator, &env));
+    try expectResolved("/home/ada/.local/state", try stateHome(testing.allocator, &env));
     for ([_][]const u8{ "", "relative/dir", "./dir" }) |base| {
         try env.put("XDG_CONFIG_HOME", base);
         try env.put("XDG_DATA_HOME", base);
+        try env.put("XDG_STATE_HOME", base);
         try expectResolved("/home/ada/.config", try configHome(testing.allocator, &env));
         try expectResolved("/home/ada/.local/share", try dataHome(testing.allocator, &env));
+        try expectResolved("/home/ada/.local/state", try stateHome(testing.allocator, &env));
         try expectResolved("/home/ada/.config/bbr/config.toml", try configFile(testing.allocator, &env));
     }
 }
@@ -72,9 +82,12 @@ test "no usable XDG base and no HOME resolve to null" {
     defer env.deinit();
     try expectResolved(null, try configHome(testing.allocator, &env));
     try expectResolved(null, try dataHome(testing.allocator, &env));
+    try expectResolved(null, try stateHome(testing.allocator, &env));
     try expectResolved(null, try configFile(testing.allocator, &env));
     try env.put("XDG_CONFIG_HOME", "relative");
     try env.put("XDG_DATA_HOME", "");
+    try env.put("XDG_STATE_HOME", "./state");
     try expectResolved(null, try configHome(testing.allocator, &env));
     try expectResolved(null, try dataHome(testing.allocator, &env));
+    try expectResolved(null, try stateHome(testing.allocator, &env));
 }

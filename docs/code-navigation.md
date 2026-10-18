@@ -9,7 +9,7 @@ These paths identify implementation entry points in the current checkout.
 |---|---|
 | Top-level commands and review startup | [`src/main.zig`](../src/main.zig) dispatches commands. [`src/startup.zig`](../src/startup.zig) selects the review source. |
 | Profiles and Credential selection | [`src/bitbucket/auth.zig`](../src/bitbucket/auth.zig) stores Profiles and resolves Credentials. [`src/main.zig`](../src/main.zig) handles login and logout. |
-| Config and data directories | [`src/xdg.zig`](../src/xdg.zig) resolves the config home, the data home, and the `config.toml` path. The `~/.local/state` paths in [`src/main.zig`](../src/main.zig) do not use it. |
+| Config, data, and state directories | [`src/xdg.zig`](../src/xdg.zig) resolves the config home, the data home, the state home, and the `config.toml` path. [`src/main.zig`](../src/main.zig) puts `pending.db` and the submission locks under the state home. |
 | `bbr api` verbs and flags | [`src/api/cli.zig`](../src/api/cli.zig) holds the verb table and global parser. [`src/api/args.zig`](../src/api/args.zig) holds argument helpers. Resource files in [`src/api/`](../src/api/) handle each verb. |
 | API output and endpoint behavior | [`src/api/output.zig`](../src/api/output.zig) formats CLI output. [`src/bitbucket/client.zig`](../src/bitbucket/client.zig) implements the Bitbucket adapter. [Bitbucket implementation notes](../src/bitbucket/IMPLEMENTATION.md) record verified API quirks. |
 | Shell completions | [`src/completion.zig`](../src/completion.zig) generates completion scripts from the API registry. |
