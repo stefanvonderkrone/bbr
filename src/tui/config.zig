@@ -171,7 +171,12 @@ pub fn persistTheme(allocator: std.mem.Allocator, io: std.Io, env: *const std.pr
 
 fn writeAtomically(allocator: std.mem.Allocator, io: std.Io, file_path: []const u8, bytes: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(io, std.fs.path.dirname(file_path).?);
+    const dir_path = std.fs.path.dirname(file_path).?;
+    // createDirPath fails with NotDir when the last component is a directory symlink.
+    cwd.access(io, dir_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => try cwd.createDirPath(io, dir_path),
+        else => return err,
+    };
     // Rename over the resolved target, not over the symlink entry.
     const target: ?[:0]u8 = target: {
         var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -934,4 +939,26 @@ test "persistTheme writes config.toml atomically through a symlink and refuses a
     const target = try tmp.dir.readFileAlloc(io, "dotfiles.toml", testing.allocator, .limited(1024));
     defer testing.allocator.free(target);
     try testing.expectEqualStrings("theme = \"light\"\n[keymap]\nquit = [\"q\"]\n", target);
+}
+
+test "persistTheme writes config.toml through a symlinked bbr directory" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer testing.allocator.free(base);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", base);
+
+    try tmp.dir.createDir(io, "dotfiles", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "dotfiles/config.toml", .data = "# mine\ntheme = \"dark\"\n[highlight]\nmax_file_bytes = 10\n" });
+    try tmp.dir.symLink(io, "dotfiles", "bbr", .{ .is_directory = true });
+    try persistTheme(testing.allocator, io, &env, .light);
+    var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const link_len = try tmp.dir.readLink(io, "bbr", &link_buffer);
+    try testing.expectEqualStrings("dotfiles", link_buffer[0..link_len]);
+    const target = try tmp.dir.readFileAlloc(io, "dotfiles/config.toml", testing.allocator, .limited(1024));
+    defer testing.allocator.free(target);
+    try testing.expectEqualStrings("# mine\ntheme = \"light\"\n[highlight]\nmax_file_bytes = 10\n", target);
 }
