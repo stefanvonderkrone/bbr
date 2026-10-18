@@ -19394,6 +19394,24 @@ test "Command Palette Enter closes the palette and then runs the Action once" {
     try testing.expect(presentation.published.?.pending_view.?.preferences.layout != layout);
 }
 
+test "Command Palette Enter after a query edit runs the top match, not the row under the old cursor" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    for (0..3) |_| try presentation.dispatch(.{ .key = test_down });
+    try testType(&presentation, "file");
+    const titles = try testPaletteTitles(&presentation);
+    defer testing.allocator.free(titles);
+    try testing.expect(titles.len > 3);
+    try testing.expectEqualStrings("Find File", titles[0]);
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expect(testListOverlay(&presentation, .file_finder) != null);
+}
+
 test "an unavailable Command Palette entry is refused with the Action's own message" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -19529,6 +19547,20 @@ test "a failed Theme save keeps the Theme and reports it, and a stale completion
     try testing.expectEqual(ActionError.theme_not_saved_invalid_config, presentation.projection().action_error.?);
     try presentation.dispatch(.{ .theme_persisted = .{ .command_id = command.command_id, .outcome = .write_failed } });
     try testing.expectEqual(ActionError.theme_not_saved_invalid_config, presentation.projection().action_error.?);
+}
+
+test "a Theme Overlay query edit previews the top match" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .configured_theme = .system }, .{});
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_theme_overlay });
+    try presentation.dispatch(.{ .key = test_down });
+    try presentation.dispatch(.{ .key = test_down });
+    try testType(&presentation, "dark");
+    try testing.expectEqual(ThemeId.dark, presentation.projection().theme);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.backspace } });
+    try testing.expectEqual(ThemeId.dark, presentation.projection().theme);
 }
 
 test "a Theme Overlay query that hides every Theme previews the Configured Theme" {

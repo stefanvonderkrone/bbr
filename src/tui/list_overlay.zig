@@ -83,16 +83,20 @@ pub const FuzzyList = struct {
         self.* = undefined;
     }
 
+    /// A query edit puts the cursor on the best match, so Enter never runs
+    /// whatever lands under the old cursor row.
     fn appendQuery(self: *FuzzyList, bytes: []const u8) void {
         for (bytes) |byte| {
             if (self.query_len == self.query_buf.len) break;
             self.query_buf[self.query_len] = byte;
             self.query_len += 1;
         }
+        self.selected = 0;
     }
 
     fn popQuery(self: *FuzzyList) void {
         if (self.query_len > 0) self.query_len -= 1;
+        self.selected = 0;
     }
 
     fn moveUp(self: *FuzzyList) void {
@@ -718,14 +722,17 @@ test "populate with an empty list leaves a ready, empty picker" {
     try testing.expect(p.choice() == null);
 }
 
-test "selection is clamped when the query shrinks the match set" {
+test "a query edit selects the best match" {
     var p = try testPicker(samplePrs());
     defer p.deinit();
     p.moveDown();
     p.moveDown();
-    p.insert("diff");
-    try testing.expectEqual(@as(usize, 0), p.list().selected);
-    try testing.expectEqual(@as(u64, 10), chosenPullRequest(&p).?);
+    p.insert("feature");
+    try testing.expectEqual(@as(usize, 3), p.list().matches().len);
+    try testing.expectEqual(samplePrs()[p.list().matches()[0]].id, chosenPullRequest(&p).?);
+    p.moveDown();
+    p.backspace();
+    try testing.expectEqual(samplePrs()[p.list().matches()[0]].id, chosenPullRequest(&p).?);
 }
 
 test "File Finder ranks a basename match above a path-only match" {
