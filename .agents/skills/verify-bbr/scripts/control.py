@@ -17,6 +17,10 @@ import uuid
 ROOT = Path(__file__).resolve().parents[4]
 
 
+def database_path(scratch):
+    return Path(scratch) / "home/.local/state/bbr/pending.db"
+
+
 def run(*args, **kwargs):
     return subprocess.check_output(args, text=True, **kwargs)
 
@@ -64,7 +68,7 @@ def launch(evidence, state):
     command = shlex.join([
         "env", "-i", f"PATH={os.environ['PATH']}", f"HOME={home}",
         f"XDG_CONFIG_HOME={home / '.config'}", f"XDG_DATA_HOME={home / '.local/share'}",
-        f"XDG_CACHE_HOME={home / '.cache'}", "TERM=tmux-256color", "LANG=en_US.UTF-8",
+        f"XDG_STATE_HOME={home / '.local/state'}", f"XDG_CACHE_HOME={home / '.cache'}", "TERM=tmux-256color", "LANG=en_US.UTF-8",
         str(binary), "local", "main", "review",
     ])
     state["command"] = command
@@ -91,7 +95,7 @@ def cleanup(evidence, state):
             (evidence / "cleanup-capture-error.txt").write_text(str(error) + "\n")
         finally:
             tmux(state, "kill-server")
-    database = scratch / "home/.local/state/bbr/pending.db"
+    database = database_path(scratch)
     if database.exists():
         with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as source:
             with sqlite3.connect(evidence / "pending.db") as target:
@@ -160,7 +164,7 @@ def main():
         assert info == f"{state['pane_pid']} 0", info
         process = run("ps", "-p", str(state["pane_pid"]), "-o", "command=")
         assert str(scratch / "bbr") in process and "local main review" in process, process
-        database = scratch / "home/.local/state/bbr/pending.db"
+        database = database_path(scratch)
         with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as db:
             assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         report = {"healthy": True, "version": state["version"], "pane": info, "database": str(database)}
@@ -179,7 +183,7 @@ def main():
         tmux(state, "kill-server")
         launch(evidence, state)
     elif args.command == "db":
-        database = scratch / "home/.local/state/bbr/pending.db"
+        database = database_path(scratch)
         with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as db:
             rows = db.execute("SELECT local_id, body, scope_kind, state_kind FROM drafts ORDER BY local_id").fetchall()
         save(evidence / "drafts.json", rows)

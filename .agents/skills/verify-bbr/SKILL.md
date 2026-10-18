@@ -29,7 +29,8 @@ The app creates and migrates its own SQLite store on startup.
 
 The helper uses `env -i` with explicit `PATH`, `HOME`, XDG paths, `LANG`, and `TERM`.
 Each drive gets a private tmux socket, Refs, config, and database. Concurrent runs can use separate run directories.
-The database path is `$HOME/.local/state/bbr/pending.db`. `XDG_STATE_HOME` alone does not isolate this store.
+The helper sets `XDG_STATE_HOME` to `$HOME/.local/state` inside the private `HOME`, so the database path is `$HOME/.local/state/bbr/pending.db`.
+`env -i` removes your own `XDG_STATE_HOME`, so the store never reaches your real state directory.
 Drive only the instance recorded in `$BBR_VERIFY_RUN/instance.json`.
 
 If launch fails, the helper runs cleanup and retains the failed run's evidence.
