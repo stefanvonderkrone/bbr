@@ -21,8 +21,14 @@ def database_path(scratch):
     return Path(scratch) / "home/.local/state/bbr/pending.db"
 
 
+COMMAND_TIMEOUT = 60
+
+
 def run(*args, **kwargs):
-    return subprocess.check_output(args, text=True, **kwargs)
+    try:
+        return subprocess.check_output(args, text=True, timeout=COMMAND_TIMEOUT, **kwargs)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"{shlex.join(args)} did not finish within {COMMAND_TIMEOUT} seconds. Run cleanup.") from error
 
 
 def digest(path):
@@ -35,6 +41,14 @@ def save(path, value):
 
 def tmux(state, *args):
     return run("tmux", "-S", str(Path(state["scratch"]) / "tmux.sock"), *args)
+
+
+def stop_server(state):
+    """A server that is already gone counts as stopped."""
+    try:
+        tmux(state, "kill-server")
+    except subprocess.CalledProcessError:
+        pass
 
 
 def capture(state):
@@ -72,9 +86,9 @@ def launch(evidence, state):
         str(binary), "local", "main", "review",
     ])
     state["command"] = command
-    tmux(state, "-f", "/dev/null", "new-session", "-d", "-s", "verify",
-         "-x", "140", "-y", "44", "-c", str(scratch / "repo"), command)
-    tmux(state, "set-option", "-g", "remain-on-exit", "on")
+    # Set remain-on-exit before the pane exists, so a bbr that exits at once keeps its output.
+    tmux(state, "-f", "/dev/null", "start-server", ";", "set-option", "-g", "remain-on-exit", "on", ";",
+         "new-session", "-d", "-s", "verify", "-x", "140", "-y", "44", "-c", str(scratch / "repo"), command)
     state["pane_pid"] = int(tmux(state, "display-message", "-p", "-t", "verify:0.0", "#{pane_pid}"))
     save(evidence / "instance.json", state)
     wait_for(state, "VERIFY_NEW")
@@ -91,10 +105,10 @@ def cleanup(evidence, state):
     if socket.exists():
         try:
             snapshot(evidence, state, "cleanup-screen")
-        except subprocess.CalledProcessError as error:
+        except (subprocess.CalledProcessError, RuntimeError) as error:
             (evidence / "cleanup-capture-error.txt").write_text(str(error) + "\n")
         finally:
-            tmux(state, "kill-server")
+            stop_server(state)
     database = database_path(scratch)
     if database.exists():
         with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as source:
@@ -111,7 +125,7 @@ def main():
     args = parser.parse_args()
     if args.command == "launch":
         evidence = ROOT / ".scratch/verify-bbr" / (time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6])
-        evidence.mkdir(parents=True)
+        evidence.mkdir(parents=True, mode=0o700)
         scratch = Path(tempfile.mkdtemp(prefix="bbr-"))
         state = {"scratch": str(scratch), "source_binary": str(ROOT / "zig-out/bin/bbr")}
         (scratch / "owner").write_text(str(evidence))
@@ -180,7 +194,7 @@ def main():
     elif args.command == "wait":
         wait_for(state, " ".join(args.values))
     elif args.command == "restart":
-        tmux(state, "kill-server")
+        stop_server(state)
         launch(evidence, state)
     elif args.command == "db":
         database = database_path(scratch)
