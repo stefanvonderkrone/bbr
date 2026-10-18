@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -43,15 +44,31 @@ def tmux(state, *args, **kwargs):
     return run("tmux", "-S", str(Path(state["scratch"]) / "tmux.sock"), *args, **kwargs)
 
 
-SERVER_GONE = ("no server running", "No such file or directory")
+def tmux_server_alive(pid):
+    try:
+        return "tmux" in run("ps", "-p", str(pid), "-o", "comm=")
+    except subprocess.CalledProcessError:
+        return False
 
 
 def stop_server(state):
-    """A server that is already gone counts as stopped. Any other failure, such as a denied socket, propagates."""
+    """Stop the private tmux server. A server that is gone counts as stopped. Any other failure propagates."""
+    socket = Path(state["scratch"]) / "tmux.sock"
+    pid = state.get("server_pid")
+    if not socket.exists():
+        if pid is None or not tmux_server_alive(pid):
+            return
+        # tmux recreates a deleted socket on SIGUSR1.
+        os.kill(pid, signal.SIGUSR1)
+        deadline = time.monotonic() + 5
+        while not socket.exists():
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"tmux server {pid} lost its socket and did not recreate it")
+            time.sleep(0.05)
     try:
         tmux(state, "kill-server", stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as error:
-        if not any(reason in (error.stderr or "") for reason in SERVER_GONE):
+        if "no server running" not in (error.stderr or ""):
             raise
 
 
@@ -93,6 +110,7 @@ def launch(evidence, state):
     # Set remain-on-exit before the pane exists, so a bbr that exits at once keeps its output.
     tmux(state, "-f", "/dev/null", "start-server", ";", "set-option", "-g", "remain-on-exit", "on", ";",
          "new-session", "-d", "-s", "verify", "-x", "140", "-y", "44", "-c", str(scratch / "repo"), command)
+    state["server_pid"] = int(tmux(state, "display-message", "-p", "#{pid}"))
     state["pane_pid"] = int(tmux(state, "display-message", "-p", "-t", "verify:0.0", "#{pane_pid}"))
     save(evidence / "instance.json", state)
     wait_for(state, "VERIFY_NEW")
@@ -105,14 +123,13 @@ def cleanup(evidence, state):
         return
     if (scratch / "owner").read_text() != str(evidence):
         raise RuntimeError("Scratch ownership does not match this evidence directory")
-    socket = scratch / "tmux.sock"
-    if socket.exists():
-        try:
+    try:
+        if (scratch / "tmux.sock").exists():
             snapshot(evidence, state, "cleanup-screen")
-        except (subprocess.CalledProcessError, RuntimeError) as error:
-            (evidence / "cleanup-capture-error.txt").write_text(str(error) + "\n")
-        finally:
-            stop_server(state)
+    except (subprocess.CalledProcessError, RuntimeError) as error:
+        (evidence / "cleanup-capture-error.txt").write_text(str(error) + "\n")
+    finally:
+        stop_server(state)
     database = database_path(scratch)
     if database.exists():
         with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as source:
