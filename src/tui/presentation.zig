@@ -11760,7 +11760,6 @@ pub const Presentation = struct {
     /// bug.
     fn chooseTheme(self: *Presentation, id: ThemeId) void {
         self.action_error = null;
-        if (id == self.configured_theme) return;
         self.configured_theme = id;
         if (!self.dependencies.persist_theme) return;
         self.commands.append(self.allocator, .{ .persist_theme = .{ .theme = id } }) catch {
@@ -19624,16 +19623,23 @@ test "a Theme Overlay query that hides every Theme previews the Configured Theme
     try testing.expect(presentation.takeCommand() == null);
 }
 
-test "choosing the Configured Theme emits no save" {
+test "choosing the Theme again retries a failed save" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
-    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .configured_theme = .light }, .{});
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .configured_theme = .system }, .{});
     defer presentation.deinit();
     try presentation.dispatch(.{ .action = .open_theme_overlay });
+    try presentation.dispatch(.{ .key = test_down });
     try presentation.dispatch(.{ .key = test_enter });
-    try testing.expect(presentation.projection().list_overlay == null);
-    try testing.expectEqual(ThemeId.light, presentation.projection().configured_theme);
-    try testing.expect(presentation.takeCommand() == null);
+    const failed = presentation.takeCommand().?.persist_theme;
+    try presentation.dispatch(.{ .theme_persisted = .{ .command_id = failed.command_id, .outcome = .write_failed } });
+    try testing.expectEqual(ActionError.theme_not_saved, presentation.projection().action_error.?);
+
+    try presentation.dispatch(.{ .action = .open_theme_overlay });
+    try presentation.dispatch(.{ .key = test_enter });
+    const retry = presentation.takeCommand().?.persist_theme;
+    try testing.expectEqual(ThemeId.dark, retry.theme);
+    try testing.expect(presentation.projection().action_error == null);
 }
 
 test "without Theme persistence Enter applies the Theme and emits no command" {
