@@ -11,6 +11,8 @@ const bbr = @import("bbr");
 
 const render = @import("render.zig");
 const theme = @import("theme.zig");
+const config = @import("config.zig");
+const ThemeId = @import("theme_id.zig").ThemeId;
 const Nav = @import("nav.zig").Nav;
 const keymap = @import("keymap.zig");
 const session = @import("session.zig");
@@ -34,7 +36,9 @@ pub const RunCtx = struct {
     bitbucket: ?bbr.bitbucket.Client = null,
     repo: []const u8,
     store: PendingReviewStore,
-    active_theme: theme.Theme,
+    theme: ThemeId,
+    /// False for the demo, which must not change the reviewer's config.toml.
+    persist_theme: bool = true,
     keymap: keymap.Keymap,
     highlighter: bbr.highlight.Highlighter,
     highlight_max_file_bytes: usize,
@@ -110,6 +114,8 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         .keymap = ctx.keymap,
         .remote_enabled = ctx.online,
         .cell_metrics = vaxis_cell_metrics,
+        .configured_theme = ctx.theme,
+        .persist_theme = ctx.persist_theme,
     }, .{
         .initial = if (initial) |loaded| .{
             .key = initial_key,
@@ -184,6 +190,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
 
         const projection = state.projection();
         if (painted_revision) |revision| if (std.meta.eql(revision, projection.revision)) continue;
+        const active_theme = theme.value(projection.theme);
         const win = vx.window();
         const content_win = win.child(.{
             .x_off = 0,
@@ -196,7 +203,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             const visual_cursor = review_projection.frame.navigation.cursor;
             const buffer_cursor = if (visual_cursor < review_projection.frame.visual_rows.len) review_projection.frame.visual_rows[visual_cursor].buffer_index else 0;
             const selected_file = review_projection.frame.buffer.fileIndexForRow(buffer_cursor) orelse 0;
-            render.drawReview(frame, content_win, review_projection, ctx.active_theme, selected_file);
+            render.drawReview(frame, content_win, review_projection, active_theme, selected_file);
             const status = presentationStatus(frame, projection, review_projection.key);
             drawStatus(
                 frame,
@@ -218,28 +225,27 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
                 status,
                 projection.buffer_search != null,
                 if (projection.buffer_search) |search_projection| search_projection.query.len > 0 and search_projection.total == 0 else false,
-                ctx.active_theme,
+                active_theme,
             );
         } else {
             const status = presentationStatus(frame, projection, null);
-            render.drawLoading(frame, content_win, projection.loading_pull_request_id, ctx.active_theme, status);
+            render.drawLoading(frame, content_win, projection.loading_pull_request_id, active_theme, status);
         }
-        if (projection.picker) |active_picker| render.drawPicker(frame, content_win, active_picker, ctx.active_theme);
-        if (projection.file_finder) |finder| render.drawFileFinder(frame, content_win, finder, ctx.active_theme);
-        if (projection.review_search) |review_search| render.drawReviewSearch(frame, content_win, review_search, ctx.active_theme);
-        if (projection.composer) |composer| render.drawComposerProjection(frame, content_win, composer, ctx.active_theme);
+        if (projection.list_overlay) |overlay| render.drawListOverlay(frame, content_win, overlay, projection.action_availability, projection.configured_theme, if (projection.review) |review| review.diff.files else &.{}, active_theme);
+        if (projection.review_search) |review_search| render.drawReviewSearch(frame, content_win, review_search, active_theme);
+        if (projection.composer) |composer| render.drawComposerProjection(frame, content_win, composer, active_theme);
         if (projection.unknown_resolution) |resolution| render.drawComposerProjection(frame, content_win, .{
             .label = "Link existing Bitbucket Comment ID",
             .body = resolution.comment_id,
-        }, ctx.active_theme);
+        }, active_theme);
         if (projection.delete_confirmation) |confirmation| render.drawComposerProjection(frame, content_win, .{
             .label = "Delete local Draft · Enter delete · Esc cancel",
             .body = deleteConfirmationText(frame, confirmation),
-        }, ctx.active_theme);
+        }, active_theme);
         if (projection.submission_tree) |tree| if (projection.review) |review_projection|
             if (presentation.OwnedReviewIdentity.eql(tree.key, review_projection.key))
-                render.drawSubmissionTree(frame, content_win, ctx.active_theme, tree);
-        if (projection.help_visible) render.drawHelp(frame, content_win, ctx.active_theme, ctx.keymap, projection.action_availability);
+                render.drawSubmissionTree(frame, content_win, active_theme, tree);
+        if (projection.help_visible) render.drawHelp(frame, content_win, active_theme, ctx.keymap, projection.action_availability);
         try vx.render(writer);
         painted_revision = projection.revision;
         _ = frame_arena.reset(.{ .retain_with_limit = frame_arena_retained_limit });
@@ -460,6 +466,8 @@ fn reviewerVerdictOutcomeLabel(outcome: presentation.ReviewerVerdictCommandOutco
 fn actionErrorText(err: presentation.ActionError) []const u8 {
     return switch (err) {
         .local_review_no_picker => "Pull Request Picker is unavailable for a local review",
+        .theme_not_saved => "Theme applied, but config.toml could not be written",
+        .theme_not_saved_invalid_config => "Theme applied, but config.toml is invalid and was not changed",
         .local_review_no_submission => "Submit is unavailable for a local review; drafts remain local",
         .local_review_remote_action_unavailable => "This action is unavailable for a local review",
         .source_action_unavailable => "This action requires a source line or Selection",
@@ -998,6 +1006,18 @@ fn drainPresentationCommands(
             try state.dispatch(input);
             continue;
         }
+        // config.toml is at most 64 KiB, so the write runs on the terminal
+        // thread and completes before the next event.
+        if (command == .persist_theme) {
+            const persist = command.persist_theme;
+            const outcome: presentation.ThemePersisted.Outcome = if (config.persistTheme(ctx.gpa, ctx.io, ctx.env_map, persist.theme)) |_| .saved else |err| switch (err) {
+                error.NoConfigLocation => .no_config_location,
+                error.ConfigInvalid => .config_invalid,
+                error.WriteFailed, error.OutOfMemory => .write_failed,
+            };
+            try state.dispatch(.{ .theme_persisted = .{ .command_id = persist.command_id, .outcome = outcome } });
+            continue;
+        }
         if (command == .external_edit) {
             var handoff_context: TerminalHandoffContext = .{
                 .ctx = ctx,
@@ -1022,7 +1042,7 @@ fn drainPresentationCommands(
             continue;
         }
         futures.ensureUnusedCapacity(ctx.gpa, 1) catch {
-            try admitPresentationLaunchFailure(state, &command);
+            try state.dispatch(try command.launchFailed());
             continue;
         };
         const work_id = next_work_id.*;
@@ -1040,13 +1060,13 @@ fn drainPresentationCommands(
             .check_recovery => |check| ctx.io.concurrent(presentationRecoveryCheckWorker, .{ loop, work_id, ctx.bitbucket.?, check }),
             .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, ctx.bitbucket.?, check }),
             .list_pull_requests => |list| ctx.io.concurrent(presentationListPullRequestsWorker, .{ loop, work_id, ctx.bitbucket.?, list }),
-            .copy_clipboard => unreachable,
+            .copy_clipboard, .persist_theme => unreachable,
             .external_edit => unreachable,
             .scan_buffer_search => |scan| ctx.io.concurrent(presentationBufferSearchWorker, .{ loop, work_id, scan }),
             .build_buffer_disclosure => |job| ctx.io.concurrent(presentationDisclosureWorker, .{ loop, work_id, job }),
             .scan_review_source => |scan| ctx.io.concurrent(presentationReviewSourceWorker, .{ loop, work_id, scan }),
         } catch {
-            try admitPresentationLaunchFailure(state, &command);
+            try state.dispatch(try command.launchFailed());
             continue;
         };
         futures.appendAssumeCapacity(.{ .id = work_id, .future = future });
@@ -1064,68 +1084,6 @@ fn workerBitbucketForEnrichment(client: ?bbr.bitbucket.Client, source: presentat
         .remote => client.?,
         .local => null,
     };
-}
-
-fn admitPresentationLaunchFailure(state: *presentation.Presentation, command: *presentation.OwnedCommand) !void {
-    const input: presentation.OwnedInput = switch (command.*) {
-        .highlight_code => |job| .{ .code_highlight_completed = job.launchFailed() },
-        .load_session => |load| .{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .failed = error.WorkerLaunchFailed } } },
-        .prepare_session => |job| job.launchFailed(),
-        .enrich_file => |enrich| .{ .file_enrichment_completed = .{
-            .command_id = enrich.command_id,
-            .work_id = enrich.work_id,
-            .session_epoch = enrich.session_epoch,
-            .file_index = enrich.file_index,
-            .outcome = .{ .failed = .launch_failed },
-        } },
-        .post_draft => |post| presentation_adapter.postLaunchFailed(post),
-        .update_comment => |update| presentation_adapter.commentEditLaunchFailed(update),
-        .delete_comment => |delete| presentation_adapter.commentDeleteLaunchFailed(delete),
-        .change_reviewer_verdict => |verdict| presentation_adapter.reviewerVerdictLaunchFailed(verdict),
-        .wait_submission => |wait| .{ .submission_wait_launch_failed = wait },
-        .check_recovery => |check| .{ .recovery_checked = .{ .command_id = check.command_id, .operation_id = check.operation_id, .identity = check.identity, .outcome = .failed } },
-        .find_duplicate => |check| blk: {
-            const input: presentation.OwnedInput = .{ .duplicate_checked = .{
-                .command_id = check.command_id,
-                .operation_id = check.operation_id,
-                .identity = check.identity,
-                .temp_id = check.draft.local_id,
-                .outcome = .failed,
-            } };
-            check.destroy();
-            break :blk input;
-        },
-        .list_pull_requests => |list| .{ .pull_requests_loaded = .{ .command_id = list.command_id, .work_id = list.work_id, .outcome = .failed } },
-        .copy_clipboard => |copy| blk: {
-            copy.destroy();
-            break :blk .{ .clipboard_completed = .{ .command_id = copy.command_id, .success = false } };
-        },
-        .external_edit => |edit| blk: {
-            const completed = try presentation.ExternalEditCompleted.create(edit.allocator, edit.command_id, edit.session_epoch);
-            completed.outcome = .failed;
-            edit.destroy();
-            break :blk .{ .external_edit_completed = completed };
-        },
-        .scan_buffer_search => |*scan| .{ .buffer_search_scanned = scan.launchFailed() },
-        .build_buffer_disclosure => |job| blk: {
-            job.failed = true;
-            break :blk .{ .buffer_disclosure_built = job };
-        },
-        .scan_review_source => |*scan| blk: {
-            const completed: presentation.ReviewSourceScanned = .{
-                .allocator = std.heap.page_allocator,
-                .command_id = scan.command_id,
-                .session_epoch = scan.session_epoch,
-                .request_id = scan.request_id,
-                .file_index = scan.file_index,
-                .outcome = .failed,
-            };
-            scan.deinit();
-            break :blk .{ .review_source_scanned = completed };
-        },
-    };
-    command.* = undefined;
-    try state.dispatch(input);
 }
 
 const TerminalHandoffContext = struct {
@@ -1299,7 +1257,8 @@ test {
     _ = @import("theme.zig");
     _ = @import("nav.zig");
     _ = @import("keymap.zig");
-    _ = @import("picker.zig");
+    _ = @import("list_overlay.zig");
+    _ = @import("theme_id.zig");
     _ = @import("session.zig");
     _ = @import("arena_ring.zig");
     _ = @import("composer.zig");

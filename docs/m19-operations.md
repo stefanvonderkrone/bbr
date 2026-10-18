@@ -68,7 +68,7 @@ validation publishes no binary, archive, source copy, GitHub release, or other a
 
 `bbr auth login [profile]` verifies the Credential and Workspace against Bitbucket before it saves the named Profile.
 A successful login sets that Profile as the Active Profile.
-bbr stores Profiles in `$XDG_DATA_HOME/bbr/auth.toml`, with `$HOME/.local/share/bbr/auth.toml` as the fallback.
+bbr stores Profiles in `$XDG_DATA_HOME/bbr/auth.toml`, with `$HOME/.local/share/bbr/auth.toml` as the fallback when `XDG_DATA_HOME` is unset, empty, or relative.
 bbr creates and repairs only the `bbr` directory to mode `0700` and writes the file atomically with mode `0600`.
 
 Remote operations select a Profile in this order:

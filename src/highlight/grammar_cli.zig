@@ -1,6 +1,7 @@
 //! UserGrammar lifecycle commands and XDG registry transactions.
 
 const std = @import("std");
+const xdg = @import("bbr").xdg;
 const user_grammar = @import("user_grammar.zig");
 const c = @import("query_predicates.zig").c;
 
@@ -26,12 +27,7 @@ pub const Store = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-        const data_home = if (env.get("XDG_DATA_HOME")) |path|
-            path
-        else if (env.get("HOME")) |home|
-            try std.fmt.allocPrint(a, "{s}/.local/share", .{home})
-        else
-            return error.NoDataHome;
+        const data_home = (try xdg.dataHome(a, env)) orelse return error.NoDataHome;
         const root_path = try std.fmt.allocPrint(a, "{s}/bbr/grammars", .{data_home});
         const dir = try std.Io.Dir.cwd().createDirPathOpen(io, root_path, .{});
         var result: Store = .{ .arena = arena, .io = io, .env = env, .root_path = root_path, .dir = dir };
@@ -127,9 +123,7 @@ pub const Store = struct {
 };
 
 pub fn loadOverrides(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) ![]user_grammar.MatchOverride {
-    const base = env.get("XDG_CONFIG_HOME") orelse if (env.get("HOME")) |home| try std.fmt.allocPrint(allocator, "{s}/.config", .{home}) else return &.{};
-    defer if (env.get("XDG_CONFIG_HOME") == null) allocator.free(base);
-    const path = try std.fmt.allocPrint(allocator, "{s}/bbr/config.toml", .{base});
+    const path = (try xdg.configFile(allocator, env)) orelse return &.{};
     defer allocator.free(path);
     const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return &.{},
@@ -383,9 +377,7 @@ fn list(allocator: std.mem.Allocator, store: *Store, writer: *std.Io.Writer) !vo
 }
 
 fn refuseConfiguredReference(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, name: []const u8) !void {
-    const base = env.get("XDG_CONFIG_HOME") orelse if (env.get("HOME")) |home| try std.fmt.allocPrint(allocator, "{s}/.config", .{home}) else return;
-    defer if (env.get("XDG_CONFIG_HOME") == null) allocator.free(base);
-    const path = try std.fmt.allocPrint(allocator, "{s}/bbr/config.toml", .{base});
+    const path = (try xdg.configFile(allocator, env)) orelse return;
     defer allocator.free(path);
     const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -421,7 +413,7 @@ fn safeName(name: []const u8) bool {
 test "lifecycle preconditions preserve registry" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(base);
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
@@ -433,4 +425,45 @@ test "lifecycle preconditions preserve registry" {
     var store = try Store.open(std.testing.allocator, std.testing.io, &env);
     defer store.deinit();
     try std.testing.expectEqual(@as(usize, 0), store.entries.items.len);
+}
+
+test "grammar store ignores an empty or relative XDG_DATA_HOME" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}/.local/share/bbr/grammars", .{home});
+    defer std.testing.allocator.free(expected);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("HOME", home);
+    for ([_][]const u8{ "", "bbr-xdg-relative-probe/data" }) |base| {
+        try env.put("XDG_DATA_HOME", base);
+        var store = try Store.open(std.testing.allocator, io, &env);
+        defer store.deinit();
+        try std.testing.expectEqualStrings(expected, store.root_path);
+    }
+    try tmp.dir.access(io, ".local/share/bbr/grammars", .{});
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, "bbr-xdg-relative-probe", .{}));
+}
+
+test "grammar configuration ignores a relative XDG_CONFIG_HOME" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".config/bbr");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".config/bbr/config.toml", .data = "[grammars.fixture]\nextensions = [\".fx\"]\n" });
+    const home = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("HOME", home);
+    try env.put("XDG_CONFIG_HOME", "relative-config");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const overrides = try loadOverrides(arena.allocator(), io, &env);
+    try std.testing.expectEqual(@as(usize, 1), overrides.len);
+    try std.testing.expectEqualStrings("fixture", overrides[0].name);
+    try std.testing.expectError(error.UserGrammarReferencedByConfiguration, refuseConfiguredReference(std.testing.allocator, io, &env, "fixture"));
 }

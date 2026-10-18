@@ -27,8 +27,9 @@ const Section = buffer_mod.Section;
 const FileStatus = bbr.diff.FileStatus;
 const Thread = bbr.review.Thread;
 const Draft = bbr.review.Draft;
-const Picker = @import("picker.zig").Picker;
-const FileFinder = @import("picker.zig").FileFinder;
+const list_overlay_mod = @import("list_overlay.zig");
+const ListOverlay = list_overlay_mod.ListOverlay;
+const ThemeId = @import("theme_id.zig").ThemeId;
 const keymap = @import("keymap.zig");
 const buffer_mod = @import("buffer.zig");
 
@@ -899,9 +900,6 @@ fn drawSection(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, sec: Secti
     _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .wrap = .none });
 }
 
-/// Draw the PR Picker as a centered modal over the current frame. Shows a
-/// query/prompt line, then the ranked matches (best first), the selected one
-/// highlighted, scrolled to keep the cursor visible. `scratch` outlives render.
 /// Center a modal box of up to `max_w`×`max_h` over `win`, bounded by it.
 /// Returns null when there's no room. The shared geometry behind every overlay.
 fn centeredModal(win: vaxis.Window, max_w: u16, max_h: u16) ?vaxis.Window {
@@ -909,80 +907,120 @@ fn centeredModal(win: vaxis.Window, max_w: u16, max_h: u16) ?vaxis.Window {
     return childRect(win, rect);
 }
 
-pub fn drawPicker(scratch: std.mem.Allocator, win: vaxis.Window, picker: *const Picker, theme: Theme) void {
-    // Modal geometry: centered, up to 60 cols × 16 rows, but bounded by the win.
-    const modal = centeredModal(win, 60, 16) orelse return;
-    const h = modal.height;
+/// Draw the open List Overlay as a centered modal: a query row, then one row
+/// per ranked match, scrolled to keep the selected row visible. `scratch`
+/// outlives render. A Command Palette row whose Action `availability` refuses
+/// is greyed.
+pub fn drawListOverlay(
+    scratch: std.mem.Allocator,
+    win: vaxis.Window,
+    overlay: *const ListOverlay,
+    availability: presentation.ActionAvailability,
+    configured_theme: ThemeId,
+    files: []const bbr.diff.File,
+    theme: Theme,
+) void {
+    const box = overlay.box();
+    const modal = centeredModal(win, box.width, box.height) orelse return;
+    const list = overlay.list();
 
-    // Row 0: prompt + query. Rows 1..h-1: matches.
     fillRow(modal, 0, theme.picker_query);
-    const prompt = std.fmt.allocPrint(scratch, "› {s}", .{picker.query()}) catch "›";
+    const prompt = std.fmt.allocPrint(scratch, "{s}› {s}", .{ listPrompt(overlay), list.query() }) catch "›";
     _ = modal.printSegment(.{ .text = prompt, .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
 
-    const list_rows: u16 = h - 1;
-    const matches = picker.matches();
-
-    // Before the summaries fetch returns (async open) show a placeholder in the
-    // list area; an empty repo after loading gets a distinct "none" line.
-    if (picker.loading or picker.prs.len == 0) {
-        var r: u16 = 1;
-        while (r <= list_rows) : (r += 1) fillRow(modal, r, theme.picker);
-        const msg: []const u8 = if (picker.loading)
-            (std.fmt.allocPrint(scratch, "{s} Loading pull requests…", .{picker.spinnerGlyph()}) catch "  Loading pull requests…")
-        else
-            "  no open pull requests";
-        _ = modal.printSegment(.{ .text = msg, .style = theme.picker }, .{ .row_offset = 1, .wrap = .none });
+    const list_rows = modal.height - 1;
+    if (listPlaceholder(scratch, overlay, files)) |message| {
+        var row: u16 = 1;
+        while (row <= list_rows) : (row += 1) fillRow(modal, row, theme.picker);
+        _ = modal.printSegment(.{ .text = message, .style = theme.picker }, .{ .row_offset = 1, .wrap = .none });
         return;
     }
 
-    // Scroll so the selected row stays on screen.
-    var top: usize = 0;
-    if (picker.selected >= list_rows) top = picker.selected - list_rows + 1;
-
-    var r: u16 = 1;
-    while (r <= list_rows) : (r += 1) {
-        const mi = top + (r - 1);
-        if (mi >= matches.len) {
-            fillRow(modal, r, theme.picker);
-            continue;
-        }
-        const selected = mi == picker.selected;
-        const style = if (selected) theme.picker_selected else theme.picker;
-        fillRow(modal, r, style);
-
-        const pr = picker.prs[matches[mi]];
-        const marker: []const u8 = if (selected) "▸ " else "  ";
-        const text = std.fmt.allocPrint(scratch, "{s}#{d}  {s}  ({s})", .{
-            marker, pr.id, pr.title, pr.source_branch,
-        }) catch pr.title;
-        _ = modal.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .wrap = .none });
-    }
-}
-
-pub fn drawFileFinder(scratch: std.mem.Allocator, win: vaxis.Window, finder: *const FileFinder, theme: Theme) void {
-    const modal = centeredModal(win, 60, 16) orelse return;
-    fillRow(modal, 0, theme.picker_query);
-    const prompt = std.fmt.allocPrint(scratch, "File › {s}", .{finder.query()}) catch "File ›";
-    _ = modal.printSegment(.{ .text = prompt, .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
-    const list_rows = modal.height - 1;
-    const matches = finder.matches();
-    var top: usize = 0;
-    if (finder.selected >= list_rows) top = finder.selected - list_rows + 1;
+    const matches = list.matches();
+    const top = list.scrollTop(list_rows);
     var row: u16 = 1;
     while (row <= list_rows) : (row += 1) {
         const match_index = top + row - 1;
-        const selected = match_index < matches.len and match_index == finder.selected;
+        if (match_index >= matches.len) {
+            fillRow(modal, row, theme.picker);
+            continue;
+        }
+        const selected = match_index == list.selected;
         const style = if (selected) theme.picker_selected else theme.picker;
         fillRow(modal, row, style);
-        if (match_index < matches.len) {
-            const file = finder.files[matches[match_index]];
-            const text = std.fmt.allocPrint(scratch, "{s}{s}", .{ if (selected) "▸ " else "  ", file.displayPath() }) catch file.displayPath();
-            _ = modal.printSegment(.{ .text = text, .style = style }, .{ .row_offset = row, .wrap = .none });
-        } else if (row == 1 and matches.len == 0) {
-            const message = if (finder.files.len == 0) "  no changed files" else "  no matching files";
-            _ = modal.printSegment(.{ .text = message, .style = style }, .{ .row_offset = row, .wrap = .none });
-        }
+        _ = modal.print(listRow(scratch, overlay, matches[match_index], selected, style, availability, configured_theme, files, theme), .{ .row_offset = row, .wrap = .none });
     }
+}
+
+fn listPrompt(overlay: *const ListOverlay) []const u8 {
+    return switch (overlay.*) {
+        .pull_request_picker => "",
+        .file_finder => "File ",
+        .command_palette => "Command ",
+        .theme => "Theme ",
+    };
+}
+
+/// The list-area message when there are no rows to draw, or null.
+fn listPlaceholder(scratch: std.mem.Allocator, overlay: *const ListOverlay, files: []const bbr.diff.File) ?[]const u8 {
+    return switch (overlay.*) {
+        .pull_request_picker => |*picker| if (picker.loading())
+            std.fmt.allocPrint(scratch, "{s} Loading pull requests…", .{picker.spinnerGlyph()}) catch "  Loading pull requests…"
+        else if (picker.prs().len == 0) "  no open pull requests" else null,
+        .file_finder => |*finder| if (finder.list.matches().len > 0) null else if (files.len == 0) "  no changed files" else "  no matching files",
+        .command_palette => |*palette| if (palette.list.matches().len > 0) null else "  no matching commands",
+        .theme => |*theme_overlay| if (theme_overlay.list.matches().len > 0) null else "  no matching Themes",
+    };
+}
+
+fn listRow(
+    scratch: std.mem.Allocator,
+    overlay: *const ListOverlay,
+    item: usize,
+    selected: bool,
+    style: vaxis.Style,
+    availability: presentation.ActionAvailability,
+    configured_theme: ThemeId,
+    files: []const bbr.diff.File,
+    theme: Theme,
+) []const vaxis.Segment {
+    const marker: []const u8 = if (selected) "▸ " else "  ";
+    const text = switch (overlay.*) {
+        .command_palette => |*palette| {
+            const command = palette.command(item);
+            var row_style = style;
+            if (!availability.available(command.action)) row_style.fg = theme.gutter.fg;
+            var title_style = row_style;
+            title_style.bold = true;
+            row_style.bold = false;
+            const reason = sourceRefusalLabel(availability, command.action);
+            const description = if (reason) |label|
+                std.fmt.allocPrint(scratch, "  {s} ({s})", .{ command.description, label }) catch command.description
+            else
+                std.fmt.allocPrint(scratch, "  {s}", .{command.description}) catch command.description;
+            const segments = scratch.alloc(vaxis.Segment, 3) catch return &.{};
+            segments[0] = .{ .text = marker, .style = row_style };
+            segments[1] = .{ .text = command.title, .style = title_style };
+            segments[2] = .{ .text = description, .style = row_style };
+            return segments;
+        },
+        .pull_request_picker => |*picker| blk: {
+            const pr = picker.prs()[item];
+            break :blk std.fmt.allocPrint(scratch, "{s}#{d}  {s}  ({s})", .{ marker, pr.id, pr.title, pr.source_branch }) catch pr.title;
+        },
+        .file_finder => blk: {
+            const path = files[item].displayPath();
+            break :blk std.fmt.allocPrint(scratch, "{s}{s}", .{ marker, path }) catch path;
+        },
+        .theme => blk: {
+            const id = ThemeId.at(item);
+            const suffix: []const u8 = if (id == configured_theme) "  (configured)" else "";
+            break :blk std.fmt.allocPrint(scratch, "{s}{s}{s}", .{ marker, id.name(), suffix }) catch id.name();
+        },
+    };
+    const segments = scratch.alloc(vaxis.Segment, 1) catch return &.{};
+    segments[0] = .{ .text = text, .style = style };
+    return segments;
 }
 
 /// Draw only the immutable Review Search projection. The same rectangles give
@@ -3616,15 +3654,18 @@ test "picker overlay draws the query line and highlights the selection" {
         .{ .id = 10, .title = "Add diff parser", .state = "OPEN", .author_display_name = "Ada", .source_branch = "feature/diff", .destination_branch = "main" },
         .{ .id = 11, .title = "Fix navigation", .state = "OPEN", .author_display_name = "Grace", .source_branch = "feature/nav", .destination_branch = "main" },
     };
-    var picker = try Picker.init(a, &prs);
+    var picker = ListOverlay.openPullRequestPicker(a, 1, .{});
     defer picker.deinit();
+    const summaries = try list_overlay_mod.PullRequestSummaries.create(a);
+    summaries.prs = &prs;
+    try picker.populatePullRequests(1, summaries);
     picker.moveDown(); // select the second entry
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
 
-    drawPicker(a, win, &picker, theme_dark);
+    drawListOverlay(a, win, &picker, .{ .remote = true }, .system, &.{}, theme_dark);
 
     // Modal geometry: 60×16, centered on 80×24 → origin (10, 4).
     const mx: u16 = 10;
@@ -3639,25 +3680,118 @@ test "picker overlay draws the query line and highlights the selection" {
     try testing.expectEqual(theme_dark.picker.bg, win.readCell(mx, my + 1).?.style.bg);
 }
 
+test "Command Palette rows show a bold title, a regular description, and grey an unavailable Action" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 100, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const mx: u16 = 10;
+    const my: u16 = 4;
+    const local_review: presentation.ActionAvailability = .{ .remote = false };
+
+    for ([_]struct { query: []const u8, title: []const u8, available: bool }{
+        .{ .query = "toggle layout", .title = "Toggle Layout", .available = true },
+        .{ .query = "submit review", .title = "Submit Review", .available = false },
+    }) |case| {
+        var palette = try ListOverlay.openCommandPalette(a, .diff);
+        defer palette.deinit();
+        palette.insert(case.query, &.{});
+        win.clear();
+        drawListOverlay(a, win, &palette, local_review, .system, &.{}, theme_dark);
+
+        try testing.expectEqualStrings("C", win.readCell(mx, my).?.char.grapheme);
+        const title = win.readCell(mx + 2, my + 1).?;
+        try testing.expectEqualStrings(case.title[0..1], title.char.grapheme);
+        try testing.expect(title.style.bold);
+        const description = win.readCell(mx + 2 + @as(u16, @intCast(case.title.len)) + 2, my + 1).?;
+        try testing.expect(!description.style.bold);
+        try testing.expect(!std.mem.eql(u8, " ", description.char.grapheme));
+        const expected_fg = if (case.available) theme_dark.picker_selected.fg else theme_dark.gutter.fg;
+        try testing.expectEqual(expected_fg, title.style.fg);
+        try testing.expectEqual(expected_fg, description.style.fg);
+        try testing.expectEqual(theme_dark.picker_selected.bg, title.style.bg);
+    }
+}
+
+test "the Theme Overlay marks the Configured Theme and the screen repaints in the previewed Theme" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1);
+    const session = try @import("session.zig").create(testing.allocator);
+    session.source = .{ .remote = .{ .id = 1, .title = "Theme", .state = "OPEN", .author_display_name = "Ada", .source_branch = "feature", .destination_branch = "main", .source_commit = "source", .destination_commit = "base" } };
+    session.header = .{ .title = "Theme", .source_ref = "feature", .base_ref = "main", .source_commit = "source", .base_commit = "base", .locator = "repo", .source_label = "Bitbucket" };
+    session.diff = try bbr.diff.parse(session.arena.allocator(), "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1 @@\n-old\n+new\n");
+    try session.initializeEnrichment();
+    var state = try presentation.Presentation.init(testing.allocator, .{ .reviews = store.store(), .configured_theme = .dark }, .{
+        .initial = .{ .key = key, .session = session },
+        .geometry = .{ .cols = 60, .rows = 24 },
+    });
+    defer state.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 60, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const themes = @import("theme.zig");
+
+    try state.dispatch(.{ .action = .open_theme_overlay });
+    try state.dispatch(.{ .key = .{ .codepoint = keymap.special.down } });
+    var projection = state.projection();
+    try testing.expectEqual(ThemeId.light, projection.theme);
+    drawReview(a, win, projection.review.?, themes.value(projection.theme), 0);
+    try testing.expect(screenHasBackground(win, themes.light.added.bg));
+    try testing.expect(!screenHasBackground(win, themes.dark.added.bg));
+
+    drawListOverlay(a, win, projection.list_overlay.?, projection.action_availability, projection.configured_theme, &.{}, themes.value(projection.theme));
+    // A 40x12 box centered on 60x24 starts at (10, 6); "dark" is its first Theme row after "system".
+    try testing.expectEqualStrings("d", win.readCell(12, 8).?.char.grapheme);
+    try testing.expectEqualStrings("(", win.readCell(18, 8).?.char.grapheme);
+    try testing.expectEqualStrings(" ", win.readCell(18, 7).?.char.grapheme);
+
+    try state.dispatch(.{ .key = .{ .codepoint = keymap.special.escape } });
+    projection = state.projection();
+    try testing.expectEqual(ThemeId.dark, projection.theme);
+    win.clear();
+    drawReview(a, win, projection.review.?, themes.value(projection.theme), 0);
+    try testing.expect(screenHasBackground(win, themes.dark.added.bg));
+
+    try state.dispatch(.{ .action = .open_file_finder });
+    projection = state.projection();
+    win.clear();
+    drawListOverlay(a, win, projection.list_overlay.?, projection.action_availability, projection.configured_theme, projection.review.?.diff.files, themes.value(projection.theme));
+    // A 60x16 box centered on 60x24 starts at (0, 4). Its first File row follows the query row.
+    try expectScreenText(win.child(.{ .x_off = 2, .y_off = 5 }), 0, "a.zig");
+}
+
+fn screenHasBackground(win: vaxis.Window, bg: vaxis.Cell.Color) bool {
+    for (0..win.height) |row| for (0..win.width) |col| {
+        if (std.meta.eql(win.readCell(@intCast(col), @intCast(row)).?.style.bg, bg)) return true;
+    };
+    return false;
+}
+
 test "a loading picker shows its single-glyph spinner beside the placeholder" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    var picker = Picker.initLoading(a);
+    var picker = ListOverlay.openPullRequestPicker(a, 1, .{});
     defer picker.deinit();
 
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
 
-    drawPicker(a, win, &picker, theme_dark);
+    drawListOverlay(a, win, &picker, .{ .remote = true }, .system, &.{}, theme_dark);
 
     // Modal at (10, 4); row 1 of the modal carries "  loading…".
     const mx: u16 = 10;
     const my: u16 = 4;
     try testing.expectEqualStrings("L", win.readCell(mx + 2, my + 1).?.char.grapheme);
-    try testing.expectEqualStrings(picker.spinnerGlyph(), win.readCell(mx, my + 1).?.char.grapheme);
+    try testing.expectEqualStrings(picker.pull_request_picker.spinnerGlyph(), win.readCell(mx, my + 1).?.char.grapheme);
 }
 
 test "the boot loading view floats a Loading PR dialog" {

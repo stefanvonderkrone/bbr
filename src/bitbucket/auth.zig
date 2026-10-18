@@ -25,6 +25,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const EnvMap = std.process.Environ.Map;
 const Credential = @import("credential.zig").Credential;
+const xdg = @import("../xdg.zig");
 
 /// The profile used when nothing selects another one.
 pub const default_profile: []const u8 = "default";
@@ -122,23 +123,17 @@ pub fn isValidProfileName(name: []const u8) bool {
     return true;
 }
 
-fn dataHome(allocator: Allocator, env: *const EnvMap) !?[]u8 {
-    if (env.get("XDG_DATA_HOME")) |base| return try allocator.dupe(u8, base);
-    if (env.get("HOME")) |home| return try std.fmt.allocPrint(allocator, "{s}/.local/share", .{home});
-    return null;
-}
-
-/// Full path of `auth.toml`, or `null` when neither `XDG_DATA_HOME` nor
-/// `HOME` is set. Caller owns the result.
+/// Full path of `auth.toml`, or `null` when `xdg.dataHome` resolves no
+/// directory. Caller owns the result.
 pub fn authFilePath(allocator: Allocator, env: *const EnvMap) !?[]u8 {
-    const base = (try dataHome(allocator, env)) orelse return null;
+    const base = (try xdg.dataHome(allocator, env)) orelse return null;
     defer allocator.free(base);
     return try std.fmt.allocPrint(allocator, "{s}/bbr/auth.toml", .{base});
 }
 
 /// Directory holding `auth.toml` (`.../bbr`). Caller owns the result.
 fn authDirPath(allocator: Allocator, env: *const EnvMap) !?[]u8 {
-    const base = (try dataHome(allocator, env)) orelse return null;
+    const base = (try xdg.dataHome(allocator, env)) orelse return null;
     defer allocator.free(base);
     return try std.fmt.allocPrint(allocator, "{s}/bbr", .{base});
 }
@@ -739,6 +734,13 @@ fn envWith(map: *EnvMap, pairs: []const [2][]const u8) !void {
     for (pairs) |p| try map.put(p[0], p[1]);
 }
 
+/// An absolute path under `tmp`, because `xdg.dataHome` ignores a relative base.
+fn tmpPath(allocator: Allocator, tmp: *const testing.TmpDir, sub_path: []const u8) ![]u8 {
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(root);
+    return std.fs.path.join(allocator, &.{ root, sub_path });
+}
+
 test "profile names accept alphanumerics, dash, underscore" {
     try testing.expect(isValidProfileName("default"));
     try testing.expect(isValidProfileName("work-2_x"));
@@ -755,9 +757,9 @@ test "auth file path prefers XDG and falls back to HOME" {
         .{ "XDG_DATA_HOME", "/data" },
         .{ "HOME", "/home/ada" },
     });
-    const xdg = (try authFilePath(testing.allocator, &map)).?;
-    defer testing.allocator.free(xdg);
-    try testing.expectEqualStrings("/data/bbr/auth.toml", xdg);
+    const xdg_path = (try authFilePath(testing.allocator, &map)).?;
+    defer testing.allocator.free(xdg_path);
+    try testing.expectEqualStrings("/data/bbr/auth.toml", xdg_path);
 
     var home_map = EnvMap.init(testing.allocator);
     defer home_map.deinit();
@@ -769,6 +771,18 @@ test "auth file path prefers XDG and falls back to HOME" {
     var empty = EnvMap.init(testing.allocator);
     defer empty.deinit();
     try testing.expect(try authFilePath(testing.allocator, &empty) == null);
+}
+
+test "auth file path ignores an empty or relative XDG_DATA_HOME" {
+    var map = EnvMap.init(testing.allocator);
+    defer map.deinit();
+    try map.put("HOME", "/home/ada");
+    for ([_][]const u8{ "", "relative/data" }) |base| {
+        try map.put("XDG_DATA_HOME", base);
+        const resolved = (try authFilePath(testing.allocator, &map)).?;
+        defer testing.allocator.free(resolved);
+        try testing.expectEqualStrings("/home/ada/.local/share/bbr/auth.toml", resolved);
+    }
 }
 
 test "parse round-trips two profiles" {
@@ -1031,7 +1045,7 @@ test "parse diagnostics give exact positions without source or Credential values
 test "save rejects oversized output before creating directories and retains prior data" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/new", .{&tmp.sub_path});
+    const base = try tmpPath(testing.allocator, &tmp, "new");
     defer testing.allocator.free(base);
     var env = EnvMap.init(testing.allocator);
     defer env.deinit();
@@ -1067,7 +1081,7 @@ test "save rejects oversized output before creating directories and retains prio
 test "load classifies corrupt and oversized files as InvalidAuthFile" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmpPath(testing.allocator, &tmp, "");
     defer testing.allocator.free(base);
     var env = EnvMap.init(testing.allocator);
     defer env.deinit();
@@ -1089,7 +1103,7 @@ test "load classifies corrupt and oversized files as InvalidAuthFile" {
 test "resolve fills missing Profile fields from the environment" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmpPath(testing.allocator, &tmp, "");
     defer testing.allocator.free(base);
     var env = EnvMap.init(testing.allocator);
     defer env.deinit();
@@ -1109,7 +1123,7 @@ test "resolve fills missing Profile fields from the environment" {
 test "upsert and logout preserve unrelated incomplete Profiles and environment filling" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmpPath(testing.allocator, &tmp, "");
     defer testing.allocator.free(base);
     var env = EnvMap.init(testing.allocator);
     defer env.deinit();
@@ -1165,7 +1179,7 @@ test "upsert and logout preserve unrelated incomplete Profiles and environment f
 test "upsert rejects incomplete new and replacement Credentials without changing the file" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmpPath(testing.allocator, &tmp, "");
     defer testing.allocator.free(base);
     var env = EnvMap.init(testing.allocator);
     defer env.deinit();
@@ -1200,7 +1214,7 @@ test "resolve merges env over file per field" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmpPath(testing.allocator, &tmp, "");
     defer testing.allocator.free(base);
     var env = EnvMap.init(testing.allocator);
     defer env.deinit();
@@ -1225,7 +1239,7 @@ test "resolve merges env over file per field" {
 test "resolve ignores empty environment overrides for every Credential field" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmpPath(testing.allocator, &tmp, "");
     defer testing.allocator.free(base);
     var env = EnvMap.init(testing.allocator);
     defer env.deinit();
@@ -1290,7 +1304,7 @@ test "resolve reports the missing field" {
 test "save creates private dir and file modes" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmpPath(testing.allocator, &tmp, "");
     defer testing.allocator.free(base);
     var env = EnvMap.init(testing.allocator);
     defer env.deinit();
@@ -1319,7 +1333,7 @@ test "logout skips absent storage and repairs existing storage without parsing f
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmpPath(a, &tmp, "");
     defer a.free(base);
     try env.put("XDG_DATA_HOME", base);
     try testing.expect(!try removeProfile(a, io, &env, "default"));
@@ -1347,7 +1361,7 @@ test "logout skips absent storage and repairs existing storage without parsing f
 test "save repairs dir mode and refuses unsafe targets" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmpPath(testing.allocator, &tmp, "");
     defer testing.allocator.free(base);
     var env = EnvMap.init(testing.allocator);
     defer env.deinit();
@@ -1379,7 +1393,7 @@ test "save repairs dir mode and refuses unsafe targets" {
 test "save refuses a non-directory at the dir path" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/plain", .{&tmp.sub_path});
+    const base = try tmpPath(testing.allocator, &tmp, "plain");
     defer testing.allocator.free(base);
     var env = EnvMap.init(testing.allocator);
     defer env.deinit();
@@ -1399,7 +1413,7 @@ test "save refuses a non-directory at the dir path" {
 test "save follows a symlinked dir" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/linkbase", .{&tmp.sub_path});
+    const base = try tmpPath(testing.allocator, &tmp, "linkbase");
     defer testing.allocator.free(base);
     const real = try std.fmt.allocPrint(testing.allocator, "{s}/real", .{base});
     defer testing.allocator.free(real);
@@ -1422,7 +1436,7 @@ test "save follows a symlinked dir" {
 test "resolve with complete env bypasses a broken file" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmpPath(testing.allocator, &tmp, "");
     defer testing.allocator.free(base);
     var env = EnvMap.init(testing.allocator);
     defer env.deinit();
@@ -1453,7 +1467,7 @@ test "Profile updates preserve file symlinks and replace the private target" {
     defer tmp.cleanup();
     const io = testing.io;
     const a = testing.allocator;
-    const base = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmpPath(a, &tmp, "");
     defer a.free(base);
     var env = EnvMap.init(a);
     defer env.deinit();
@@ -1492,7 +1506,7 @@ test "Profile updates preserve file symlinks and replace the private target" {
 test "resolve surfaces file errors only when env is incomplete" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmpPath(testing.allocator, &tmp, "");
     defer testing.allocator.free(base);
     var env = EnvMap.init(testing.allocator);
     defer env.deinit();

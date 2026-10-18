@@ -217,17 +217,6 @@ pub fn executePost(command: *presentation.PostDraft, poster: bbr.review.CommentP
     } };
 }
 
-/// Consumes a command that could not be transferred to a worker.
-pub fn postLaunchFailed(command: *presentation.PostDraft) presentation.OwnedInput {
-    defer command.destroy();
-    return .{ .post_draft_launch_failed = .{
-        .command_id = command.command_id,
-        .operation_id = command.operation_id,
-        .identity = command.identity,
-        .temp_id = command.draft.local_id,
-    } };
-}
-
 pub fn executeCommentEdit(command: *presentation.UpdateComment, client: bbr.bitbucket.Client) presentation.OwnedInput {
     defer command.destroy();
     const outcome: presentation.CommentEditOutcome = if (client.updateComment(
@@ -253,15 +242,6 @@ pub fn executeCommentEdit(command: *presentation.UpdateComment, client: bbr.bitb
         .identity = command.identity,
         .comment_id = command.comment_id,
         .outcome = outcome,
-    } };
-}
-
-pub fn commentEditLaunchFailed(command: *presentation.UpdateComment) presentation.OwnedInput {
-    defer command.destroy();
-    return .{ .comment_edit_launch_failed = .{
-        .command_id = command.command_id,
-        .identity = command.identity,
-        .comment_id = command.comment_id,
     } };
 }
 
@@ -292,15 +272,6 @@ pub fn executeCommentDelete(command: *presentation.DeleteComment, client: bbr.bi
     } };
 }
 
-pub fn commentDeleteLaunchFailed(command: *presentation.DeleteComment) presentation.OwnedInput {
-    defer command.destroy();
-    return .{ .comment_delete_launch_failed = .{
-        .command_id = command.command_id,
-        .identity = command.identity,
-        .comment_id = command.comment_id,
-    } };
-}
-
 pub fn executeReviewerVerdict(
     allocator: std.mem.Allocator,
     command: presentation.ChangeReviewerVerdict,
@@ -324,15 +295,6 @@ pub fn executeReviewerVerdict(
         .identity = command.identity,
         .target = command.target,
         .outcome = .{ .completed = result },
-    } };
-}
-
-pub fn reviewerVerdictLaunchFailed(command: presentation.ChangeReviewerVerdict) presentation.OwnedInput {
-    return .{ .reviewer_verdict_changed = .{
-        .command_id = command.command_id,
-        .identity = command.identity,
-        .target = command.target,
-        .outcome = .launch_failed,
     } };
 }
 
@@ -549,11 +511,4 @@ test "executePost returns correlated ambiguity when execution errors" {
     try testing.expectEqual(@as(bbr.review.OperationId, 23), input.post_draft_completed.operation_id);
     try testing.expectEqual(@as(bbr.review.TempId, 41), input.post_draft_completed.temp_id);
     try testing.expect(input.post_draft_completed.outcome == .ambiguous);
-}
-
-test "postLaunchFailed consumes the command and preserves correlation" {
-    const input = postLaunchFailed(try testCommand(29, false));
-
-    try testing.expectEqual(@as(bbr.review.OperationId, 29), input.post_draft_launch_failed.operation_id);
-    try testing.expectEqual(@as(bbr.review.TempId, 41), input.post_draft_launch_failed.temp_id);
 }

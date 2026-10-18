@@ -48,9 +48,29 @@ _Avoid_: File Read Receipt (the durable evidence), viewed state, bold flag.
 A floating surface drawn over the Panes — keybinding help, the PR picker, a comment composer. Dismissible; captures input while open.
 _Avoid_: popup, modal, dialog, hover (describe the trigger, not the thing).
 
+**List Overlay**:
+An Overlay made of one query line and one fuzzy-ranked list with one selection: the Picker, the File Finder, the Command Palette, or the Theme Overlay. At most one List Overlay is open, and opening one closes another. Enter chooses the selected entry, Escape and ctrl-c close the List Overlay, up, down, ctrl-p, and ctrl-n move the selection, and a click selects an entry without choosing it.
+_Avoid_: picker (one specific List Overlay), menu, list modal.
+
 **Picker**:
-The Overlay for fuzzy-finding a PullRequest by id or title (backed by `zf`) to switch the loaded PR. While its PullRequest list loads, a scoped low-frequency tick advances a single-glyph spinner without changing the blocking input loop.
+The List Overlay for fuzzy-finding a PullRequest by id or title (backed by `zf`) to switch the loaded PR. While its PullRequest list loads, a scoped low-frequency tick advances a single-glyph spinner without changing the blocking input loop.
 _Avoid_: search, finder, switcher, palette.
+
+**File Finder**:
+The List Overlay for jumping to a changed File of the current Session by path. A basename match ranks above a match in the full path. A Session replacement closes it.
+_Avoid_: file picker, quick open.
+
+**Command Palette**:
+The List Overlay that ctrl-p opens from a Pane. It lists curated non-Motion Actions by title and description, and it ranks a title match above a description match. It lists only the Actions that the Pane under it supports. An entry that ActionAvailability refuses stays visible but greyed. Choosing an entry closes the Command Palette and then runs the Action, so a refused Action shows its usual message. A Session replacement closes it.
+_Avoid_: palette (alone), launcher, command menu, Picker.
+
+**Configured Theme**:
+The Theme that bbr paints when no Theme Overlay preview is open. At startup it is the Theme that config.toml names. Choosing a Theme in the Theme Overlay makes that Theme the Configured Theme at once. A save to config.toml is a separate step, and it can fail or be off, as in the demo.
+_Avoid_: active theme (ambiguous during a preview), default theme.
+
+**Theme Overlay**:
+The List Overlay that lists the built-in Themes and paints the selected Theme as a live preview. The Configured Theme row carries a marker. Enter makes the selected Theme the Configured Theme and writes it to config.toml. Escape and ctrl-c close the Theme Overlay, and the Configured Theme returns. A failed write keeps the chosen Theme for the process and shows a status message.
+_Avoid_: theme picker, theme palette, theme switcher.
 
 **Buffer Search**:
 The `/`-initiated search over semantic text owned by the current DiffPane Buffer. Layout, Scope, and File isolation define its corpus, but a Fold or authored-content disclosure does not remove hidden text. Buffer Search never starts File Enrichment. It highlights every Search Occurrence and gives `n` and `N` a current occurrence to traverse.

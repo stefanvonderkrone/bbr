@@ -17,3 +17,17 @@ Read `GLOSSARY-MAP.md` for domain vocabulary and relationships. Read `docs/code-
 ### Agent checks and tools
 
 After agent document or tracker changes, run `python3 tools/check_agent_docs.py`. See `docs/agents/tools.md` for project MCP defaults.
+
+## Rules and enforcement
+
+Each rule names the check that fails when you break it. A rule marked "convention (no check)" fails nowhere, so read it before you change that code.
+
+| Rule | Enforcement |
+| --- | --- |
+| A List Overlay arm holds no pointer except the buffers it owns. Borrowed data, such as the Session's Files, comes in as an argument at each call. | The `comptime` block after `ListOverlay` in `src/tui/list_overlay.zig` (compile error). |
+| The File Finder and the Command Palette close before Session replacement. | The exhaustive switch in `ListOverlay.closesOnReplacement` in `src/tui/list_overlay.zig` (compile error for a new arm). The tests "File finder opened during a replacement does not outlive the replaced Session" and "a Session replacement closes the Command Palette" in `src/tui/presentation.zig`. |
+| A new List Overlay is one arm of the `ListOverlay` union in `src/tui/list_overlay.zig`. | The exhaustive switches in the `ListOverlay` methods (compile error). |
+| An `OwnedCommand` converts to its launch-failure `OwnedInput` only in `OwnedCommand.launchFailed` in `src/tui/presentation.zig`. No arm frees its payload. | The exhaustive switch in `OwnedCommand.launchFailed` (compile error). The test "every OwnedCommand launch failure keeps its correlation and frees the command". |
+| Each `ThemeId` has one built-in Theme with the same name. | The `comptime` block after `theme.value` in `src/tui/theme.zig` (compile error). The test "every ThemeId resolves to the built-in Theme of the same name". |
+| Only `src/xdg.zig` reads `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_STATE_HOME`. Other code calls `xdg.configHome`, `xdg.dataHome`, `xdg.stateHome`, or `xdg.configFile`, which ignore an empty or relative base. | `tools/check_xdg_reads.py`, run by `zig build test`. It skips `test` blocks and `env.put(` lines. |
+| `presentation.zig` does not import vaxis or `theme.zig`. The Theme reaches Presentation only as a `ThemeId`. | Convention (no check). `presentation.zig` imports `keymap.zig`, and `keymap.zig` imports vaxis. |

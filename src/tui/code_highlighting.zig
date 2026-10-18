@@ -98,13 +98,8 @@ pub const Analyze = struct {
     pub fn destroy(self: *Analyze) void {
         const backing = self.arena.child_allocator;
         self.arena.deinit();
+        self.* = undefined;
         backing.destroy(self);
-    }
-
-    pub fn launchFailed(self: *Analyze) Completed {
-        const completed: Completed = .{ .command_id = self.command_id, .identity = self.identity, .failure = error.WorkerLaunchFailed };
-        self.destroy();
-        return completed;
     }
 
     /// Consumes the command. Only exact-sized source Spans leave worker scratch storage.

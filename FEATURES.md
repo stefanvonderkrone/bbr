@@ -79,6 +79,8 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 - [x] **Overlay: keybinding help** `M11`
 - [x] **Config file** — TOML at the XDG config location. `M12`
 - [x] **Themes** — built-in Catppuccin / Gruvbox / Solarized + plain light/dark. `M12`
+- [x] **Command Palette** — `ctrl-p` in a Pane lists curated commands by title and description, greys unavailable commands, and runs the chosen one.
+- [x] **Theme Overlay** — preview each built-in Theme live from the Command Palette, and save the chosen Theme to config.toml.
 - [ ] **Credential login and logout** — `bbr auth` manages one validated Bitbucket Credential in an XDG auth file; complete environment credentials remain available for automation. `M26`
 - [ ] **Markdown comment bodies and long-body folding** `M15`
 - [x] **External editor handoff** `M16`

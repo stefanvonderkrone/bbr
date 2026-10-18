@@ -11,8 +11,9 @@ const composer_mod = @import("composer.zig");
 const Composer = composer_mod.Composer;
 const file_enrichment = @import("file_enrichment.zig");
 const keymap_mod = @import("keymap.zig");
-const Picker = @import("picker.zig").Picker;
-const FileFinder = @import("picker.zig").FileFinder;
+const list_overlay_mod = @import("list_overlay.zig");
+const ListOverlay = list_overlay_mod.ListOverlay;
+const ThemeId = @import("theme_id.zig").ThemeId;
 const frame_mod = @import("frame.zig");
 const file_tree = frame_mod.file_tree;
 const buffer_mod = @import("buffer.zig");
@@ -42,7 +43,7 @@ test "M23 highlighting Suggestions inherit authored inline context after LocalRe
     try testing.expectEqualStrings("before.js", job.path);
     try testing.expectEqualStrings("const value = 1;\n", job.content);
     try testing.expectEqualDeep(review_card.Owner{ .draft = 2 }, job.identity.owner);
-    try state.dispatch(.{ .code_highlight_completed = job.launchFailed() });
+    try state.dispatch(try highlightLaunchFailed(job));
 }
 
 test "M23 highlighting selected Preview precedes cards and closing removes pending Preview blocks" {
@@ -64,7 +65,7 @@ test "M23 highlighting selected Preview precedes cards and closing removes pendi
     try state.dispatch(.{ .code_highlight_completed = try codeCapacityCompletion(preview, 1) });
     const card = state.takeCommand().?.highlight_code;
     try testing.expectEqualStrings("review.json", card.path);
-    try state.dispatch(.{ .code_highlight_completed = card.launchFailed() });
+    try state.dispatch(try highlightLaunchFailed(card));
 }
 
 fn nextCodeTestJob(state: *Presentation) !?*code_highlighting.Analyze {
@@ -141,7 +142,7 @@ test "M23 highlighting offscreen Preview shares results and changing selected re
     const remaining = try nextCodeTestJob(&state);
     if (remaining) |job| {
         try testing.expectEqualStrings("review.json", job.path);
-        try state.dispatch(.{ .code_highlight_completed = job.launchFailed() });
+        try state.dispatch(try highlightLaunchFailed(job));
     }
     try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
     try visitCodeCard(&state, 31);
@@ -198,7 +199,7 @@ test "M23 highlighting publishes plain code before one complete hidden-block com
     try state.dispatch(.{ .code_highlight_completed = job.execute(plain.highlighter()) });
     const next = state.takeCommand().?.highlight_code;
     try testing.expectEqualStrings("review.json", next.path);
-    try state.dispatch(.{ .code_highlight_completed = next.launchFailed() });
+    try state.dispatch(try highlightLaunchFailed(next));
     try testing.expect(state.takeCommand() == null);
 }
 
@@ -221,9 +222,15 @@ fn visitCodeCard(state: *Presentation, id: u64) !void {
     return error.MissingCodeCard;
 }
 
+fn highlightLaunchFailed(job: *code_highlighting.Analyze) !OwnedInput {
+    var command: OwnedCommand = .{ .highlight_code = job };
+    errdefer command.deinit();
+    return command.launchFailed();
+}
+
 fn codeCapacityCompletion(job: *code_highlighting.Analyze, span_capacity: usize) !code_highlighting.Completed {
-    var completed = job.launchFailed();
-    completed.failure = null;
+    var completed: code_highlighting.Completed = .{ .command_id = job.command_id, .identity = job.identity };
+    job.destroy();
     const result = try testing.allocator.create(code_highlighting.Result);
     errdefer testing.allocator.destroy(result);
     const spans = try testing.allocator.alloc(code_highlighting.SourceSpan, span_capacity);
@@ -339,7 +346,7 @@ test "M23 highlighting releases stale Session work and permits a fresh attempt a
     try testing.expectEqual(@as(usize, 0), state.projection().review.?.frame.code_highlights.len);
     const new_job = state.takeCommand().?.highlight_code;
     try testing.expect(new_job.identity.session_epoch != old_epoch);
-    try state.dispatch(.{ .code_highlight_completed = new_job.launchFailed() });
+    try state.dispatch(try highlightLaunchFailed(new_job));
     try testing.expect(state.takeCommand() == null);
 }
 
@@ -370,7 +377,7 @@ test "M23 highlighting body replacement and deletion reject started work and res
         } else {
             const fresh = state.takeCommand().?.highlight_code;
             try testing.expectEqualStrings("x\n", fresh.content);
-            try state.dispatch(.{ .code_highlight_completed = fresh.launchFailed() });
+            try state.dispatch(try highlightLaunchFailed(fresh));
             try testing.expect(state.takeCommand() == null);
         }
     }
@@ -422,7 +429,7 @@ test "M23 highlighting complete structural code qualifies exactly at the byte li
         } else {
             const job = state.takeCommand().?.highlight_code;
             try testing.expectEqualStrings("  a\tb\n", job.content);
-            try state.dispatch(.{ .code_highlight_completed = job.launchFailed() });
+            try state.dispatch(try highlightLaunchFailed(job));
             try testing.expect(state.takeCommand() == null);
         }
     }
@@ -437,7 +444,7 @@ test "M23 highlighting leaves invalid identifiers plain and qualifies auto-close
     defer state.deinit();
     const job = state.takeCommand().?.highlight_code;
     try testing.expectEqualStrings("unclosed", job.content);
-    try state.dispatch(.{ .code_highlight_completed = job.launchFailed() });
+    try state.dispatch(try highlightLaunchFailed(job));
     try testing.expect(state.takeCommand() == null);
     try testing.expectEqual(@as(usize, 0), state.projection().review.?.frame.code_highlights.len);
 }
@@ -658,7 +665,7 @@ test "M23 acceptance Preview priority limits eviction body replacement and Sessi
     const restarted = state.takeCommand().?.highlight_code;
     try testing.expectEqualDeep(review_card.Owner{ .draft = 1 }, restarted.identity.owner);
     try testing.expect(restarted.identity.session_epoch != epoch);
-    try state.dispatch(.{ .code_highlight_completed = restarted.launchFailed() });
+    try state.dispatch(try highlightLaunchFailed(restarted));
 }
 
 test "M23 highlighting failed admission preserves the complete Frame and does not retry" {
@@ -861,6 +868,10 @@ pub const Dependencies = struct {
     keymap: keymap_mod.Keymap = .default,
     remote_enabled: bool = true,
     cell_metrics: frame_mod.CellMetrics = .bytes,
+    /// The Theme config.toml named at startup.
+    configured_theme: ThemeId = .system,
+    /// False for the demo: choosing a Theme applies it to this process only.
+    persist_theme: bool = true,
 };
 
 pub const InitialReview = struct {
@@ -916,6 +927,7 @@ pub const OwnedInput = union(enum) {
     pull_requests_loaded: PullRequestsLoaded,
     picker_tick: WorkId,
     clipboard_completed: ClipboardCompleted,
+    theme_persisted: ThemePersisted,
     external_edit_completed: *ExternalEditCompleted,
     buffer_search_scanned: BufferSearchScanned,
     buffer_disclosure_built: *DisclosureBuild,
@@ -1041,23 +1053,7 @@ pub const DuplicateChecked = struct {
     retry_after_ms: ?u64 = null,
 };
 
-pub const PullRequestSummaries = struct {
-    arena: std.heap.ArenaAllocator,
-    prs: []const bbr.bitbucket.PullRequestSummary,
-
-    pub fn create(backing: Allocator) !*PullRequestSummaries {
-        const summaries = try backing.create(PullRequestSummaries);
-        summaries.arena = std.heap.ArenaAllocator.init(backing);
-        summaries.prs = &.{};
-        return summaries;
-    }
-
-    pub fn destroy(self: *PullRequestSummaries) void {
-        const backing = self.arena.child_allocator;
-        self.arena.deinit();
-        backing.destroy(self);
-    }
-};
+pub const PullRequestSummaries = list_overlay_mod.PullRequestSummaries;
 
 pub const PullRequestsLoadOutcome = union(enum) { loaded: *PullRequestSummaries, failed };
 pub const PullRequestsLoaded = struct { command_id: CommandId = 0, work_id: WorkId, outcome: PullRequestsLoadOutcome };
@@ -1203,11 +1199,6 @@ pub const PrepareSession = struct {
             return;
         };
         self.ready = true;
-    }
-
-    pub fn launchFailed(self: *PrepareSession) OwnedInput {
-        self.failure = .buffer_build_failed;
-        return .{ .session_prepared = self };
     }
 
     pub fn destroy(self: *PrepareSession) void {
@@ -1363,6 +1354,7 @@ pub const PostDraft = struct {
     pub fn destroy(self: *PostDraft) void {
         const allocator = self.allocator;
         self.arena.deinit();
+        self.* = undefined;
         allocator.destroy(self);
     }
 };
@@ -1389,6 +1381,7 @@ pub const UpdateComment = struct {
     pub fn destroy(self: *UpdateComment) void {
         const allocator = self.allocator;
         allocator.free(self.body);
+        self.* = undefined;
         allocator.destroy(self);
     }
 };
@@ -1406,7 +1399,9 @@ pub const DeleteComment = struct {
     }
 
     pub fn destroy(self: *DeleteComment) void {
-        self.allocator.destroy(self);
+        const allocator = self.allocator;
+        self.* = undefined;
+        allocator.destroy(self);
     }
 };
 
@@ -1440,6 +1435,7 @@ pub const OwnedCommand = union(enum) {
     find_duplicate: *PostDraft,
     list_pull_requests: ListPullRequests,
     copy_clipboard: *ClipboardCopy,
+    persist_theme: PersistTheme,
     external_edit: *ExternalEdit,
     scan_buffer_search: ScanBufferSearch,
     build_buffer_disclosure: *DisclosureBuild,
@@ -1457,9 +1453,113 @@ pub const OwnedCommand = union(enum) {
             .scan_buffer_search => |*command| command.deinit(),
             .build_buffer_disclosure => |command| command.destroy(),
             .scan_review_source => |*command| command.deinit(),
-            .load_session, .enrich_file, .change_reviewer_verdict, .wait_submission, .check_recovery, .list_pull_requests => {},
+            .load_session, .enrich_file, .change_reviewer_verdict, .wait_submission, .check_recovery, .list_pull_requests, .persist_theme => {},
         }
         self.* = undefined;
+    }
+
+    /// Consumes a command that never reached its worker and returns the input
+    /// that reports the failure. On error the caller still owns the command.
+    ///
+    /// No arm frees its payload. An arm whose payload moves into the input
+    /// returns at once. Every other arm only reads, and `deinit` frees the
+    /// payload after the input exists.
+    pub fn launchFailed(self: *OwnedCommand) error{OutOfMemory}!OwnedInput {
+        const input: OwnedInput = switch (self.*) {
+            .prepare_session => |job| {
+                job.failure = .buffer_build_failed;
+                self.* = undefined;
+                return .{ .session_prepared = job };
+            },
+            .build_buffer_disclosure => |job| {
+                job.failed = true;
+                self.* = undefined;
+                return .{ .buffer_disclosure_built = job };
+            },
+            .highlight_code => |job| .{ .code_highlight_completed = .{
+                .command_id = job.command_id,
+                .identity = job.identity,
+                .failure = error.WorkerLaunchFailed,
+            } },
+            .load_session => |load| .{ .session_loaded = .{
+                .command_id = load.command_id,
+                .intent = load.intent,
+                .outcome = .{ .failed = error.WorkerLaunchFailed },
+            } },
+            .enrich_file => |enrich| .{ .file_enrichment_completed = .{
+                .command_id = enrich.command_id,
+                .work_id = enrich.work_id,
+                .session_epoch = enrich.session_epoch,
+                .file_index = enrich.file_index,
+                .outcome = .{ .failed = .launch_failed },
+            } },
+            .post_draft => |post| .{ .post_draft_launch_failed = .{
+                .command_id = post.command_id,
+                .operation_id = post.operation_id,
+                .identity = post.identity,
+                .temp_id = post.draft.local_id,
+            } },
+            .update_comment => |update| .{ .comment_edit_launch_failed = .{
+                .command_id = update.command_id,
+                .identity = update.identity,
+                .comment_id = update.comment_id,
+            } },
+            .delete_comment => |delete| .{ .comment_delete_launch_failed = .{
+                .command_id = delete.command_id,
+                .identity = delete.identity,
+                .comment_id = delete.comment_id,
+            } },
+            .change_reviewer_verdict => |verdict| .{ .reviewer_verdict_changed = .{
+                .command_id = verdict.command_id,
+                .identity = verdict.identity,
+                .target = verdict.target,
+                .outcome = .launch_failed,
+            } },
+            .wait_submission => |wait| .{ .submission_wait_launch_failed = wait },
+            .check_recovery => |check| .{ .recovery_checked = .{
+                .command_id = check.command_id,
+                .operation_id = check.operation_id,
+                .identity = check.identity,
+                .outcome = .failed,
+            } },
+            .find_duplicate => |check| .{ .duplicate_checked = .{
+                .command_id = check.command_id,
+                .operation_id = check.operation_id,
+                .identity = check.identity,
+                .temp_id = check.draft.local_id,
+                .outcome = .failed,
+            } },
+            .list_pull_requests => |list| .{ .pull_requests_loaded = .{
+                .command_id = list.command_id,
+                .work_id = list.work_id,
+                .outcome = .failed,
+            } },
+            .copy_clipboard => |copy| .{ .clipboard_completed = .{ .command_id = copy.command_id, .success = false } },
+            .persist_theme => |persist| .{ .theme_persisted = .{ .command_id = persist.command_id, .outcome = .write_failed } },
+            .external_edit => |edit| blk: {
+                const completed = try ExternalEditCompleted.create(edit.allocator, edit.command_id, edit.session_epoch);
+                completed.outcome = .failed;
+                break :blk .{ .external_edit_completed = completed };
+            },
+            .scan_buffer_search => |scan| .{ .buffer_search_scanned = .{
+                .allocator = std.heap.page_allocator,
+                .command_id = scan.command_id,
+                .request_id = scan.request_id,
+                .session_epoch = scan.session_epoch,
+                .mode = scan.mode,
+                .outcome = .failed,
+            } },
+            .scan_review_source => |scan| .{ .review_source_scanned = .{
+                .allocator = std.heap.page_allocator,
+                .command_id = scan.command_id,
+                .session_epoch = scan.session_epoch,
+                .request_id = scan.request_id,
+                .file_index = scan.file_index,
+                .outcome = .failed,
+            } },
+        };
+        self.deinit();
+        return input;
     }
 };
 
@@ -1488,10 +1588,240 @@ fn setCommandId(command: *OwnedCommand, command_id: CommandId) void {
         .check_recovery => |*value| value.command_id = command_id,
         .list_pull_requests => |*value| value.command_id = command_id,
         .copy_clipboard => |value| value.command_id = command_id,
+        .persist_theme => |*value| value.command_id = command_id,
         .external_edit => |value| value.command_id = command_id,
         .scan_buffer_search => |*value| value.command_id = command_id,
         .build_buffer_disclosure => |value| value.command_id = command_id,
         .scan_review_source => |*value| value.command_id = command_id,
+    }
+}
+
+const LaunchFailureFixture = struct {
+    const operation_id: bbr.review.OperationId = 30;
+    const temp_id: bbr.review.TempId = 41;
+    const comment_id: bbr.review.CommentId = 42;
+    const session_epoch: SessionEpoch = 7;
+    const request_id: u64 = 5;
+    const file_index: usize = 3;
+    const work_id: WorkId = 12;
+    const intent: LoadIntent = 21;
+
+    fn remote() !OwnedRemoteReviewIdentity {
+        return .init(try OwnedReviewIdentity.init("workspace", "repo", 1));
+    }
+
+    fn command(comptime target: CommandTarget, disclosure: *Presentation) !OwnedCommand {
+        const a = testing.allocator;
+        return switch (target) {
+            .load_session => .{ .load_session = .{ .intent = intent, .key = (try remote()).value } },
+            .prepare_session => blk: {
+                const job = try a.create(PrepareSession);
+                job.* = .{ .allocator = a, .intent = intent, .preferences = .{}, .review_revision = 0, .candidate = null };
+                break :blk .{ .prepare_session = job };
+            },
+            .enrich_file => .{ .enrich_file = .{
+                .work_id = work_id,
+                .session_epoch = session_epoch,
+                .file_index = file_index,
+                .source = .local,
+                .source_commit = undefined,
+                .destination_commit = undefined,
+                .old_path = undefined,
+                .new_path = undefined,
+                .status = .modified,
+                .max_file_bytes = 0,
+            } },
+            .highlight_code => blk: {
+                const job = try a.create(code_highlighting.Analyze);
+                job.* = .{
+                    .identity = .{ .session_epoch = session_epoch, .owner = .{ .draft = 1 }, .block = 0, .body_hash = 1, .context_hash = 1 },
+                    .arena = .init(a),
+                    .path = "",
+                    .content = "",
+                    .mapping = &.{},
+                };
+                break :blk .{ .highlight_code = job };
+            },
+            .post_draft, .find_duplicate => blk: {
+                const post = try a.create(PostDraft);
+                post.* = .{
+                    .allocator = a,
+                    .arena = .init(a),
+                    .operation_id = operation_id,
+                    .identity = try remote(),
+                    .draft = .{ .local_id = temp_id, .kind = .comment, .body = "body" },
+                    .parent = null,
+                    .dedupe = false,
+                };
+                break :blk @unionInit(OwnedCommand, @tagName(target), post);
+            },
+            .update_comment => .{ .update_comment = try UpdateComment.create(a, (try remote()).value, comment_id, "updated") },
+            .delete_comment => .{ .delete_comment = try DeleteComment.create(a, (try remote()).value, comment_id) },
+            .change_reviewer_verdict => .{ .change_reviewer_verdict = .{
+                .identity = try remote(),
+                .expected_source_commit = undefined,
+                .authenticated_account_uuid = undefined,
+                .target = .approved,
+            } },
+            .wait_submission => .{ .wait_submission = .{ .operation_id = operation_id, .identity = try remote(), .temp_id = temp_id, .ms = 1000 } },
+            .check_recovery => .{ .check_recovery = .{ .operation_id = operation_id, .identity = try remote(), .source_commit = undefined } },
+            .list_pull_requests => .{ .list_pull_requests = .{ .work_id = work_id, .repository = undefined } },
+            .copy_clipboard => blk: {
+                const copy = try a.create(ClipboardCopy);
+                copy.* = .{ .allocator = a, .text = try a.dupe(u8, "copy") };
+                break :blk .{ .copy_clipboard = copy };
+            },
+            .persist_theme => .{ .persist_theme = .{ .theme = .system } },
+            .external_edit => .{ .external_edit = try ExternalEdit.create(a, session_epoch, 64, "edit") },
+            .scan_buffer_search => .{ .scan_buffer_search = .{
+                .request_id = request_id,
+                .session_epoch = session_epoch,
+                .corpus = try BufferSearchCorpus.create(&.{}),
+                .query = try search.Query.init(std.heap.page_allocator, "query"),
+                .mode = .fuzzy,
+            } },
+            .build_buffer_disclosure => blk: {
+                try moveToRow(disclosure, findDisclosureRow(disclosure.projection().review.?.buffer.rows, .{ .resolved_thread = 1 }).?);
+                try disclosure.dispatch(.{ .action = .toggle_disclosure });
+                while (disclosure.takeCommand()) |value| {
+                    var other = value;
+                    if (other == .build_buffer_disclosure) break :blk other;
+                    other.deinit();
+                }
+                return error.MissingDisclosureBuild;
+            },
+            .scan_review_source => .{ .scan_review_source = .{
+                .session_epoch = session_epoch,
+                .request_id = request_id,
+                .file_index = file_index,
+                .arena = .init(std.heap.page_allocator),
+                .file = .{ .old_path = "a.zig", .new_path = "a.zig", .status = .modified, .hunks = &.{} },
+                .lease = .{ .view = .{ .old = .pending, .new = .pending }, .old = null, .new = null },
+                .query = try search.Query.init(std.heap.page_allocator, "query"),
+            } },
+        };
+    }
+
+    fn expectRemote(identity: ?OwnedRemoteReviewIdentity) !void {
+        try testing.expect(OwnedRemoteReviewIdentity.eql(try remote(), identity.?));
+    }
+
+    fn expectInput(input: OwnedInput, command_id: CommandId) !void {
+        switch (input) {
+            .session_loaded => |loaded| {
+                try testing.expectEqual(command_id, loaded.command_id);
+                try testing.expectEqual(intent, loaded.intent);
+                try testing.expect(loaded.outcome == .failed);
+            },
+            .session_prepared => |job| {
+                try testing.expectEqual(command_id, job.command_id);
+                try testing.expectEqual(intent, job.intent);
+                try testing.expectEqual(@as(?ReplacementError, .buffer_build_failed), job.failure);
+            },
+            .file_enrichment_completed => |completed| {
+                try testing.expectEqual(command_id, completed.command_id);
+                try testing.expectEqual(work_id, completed.work_id);
+                try testing.expectEqual(session_epoch, completed.session_epoch);
+                try testing.expectEqual(file_index, completed.file_index);
+                try testing.expect(completed.outcome == .failed);
+            },
+            .code_highlight_completed => |completed| {
+                try testing.expectEqual(command_id, completed.command_id);
+                try testing.expectEqual(session_epoch, completed.identity.session_epoch);
+                try testing.expect(completed.failure != null);
+            },
+            .post_draft_launch_failed => |failed| {
+                try testing.expectEqual(command_id, failed.command_id);
+                try testing.expectEqual(operation_id, failed.operation_id);
+                try testing.expectEqual(temp_id, failed.temp_id);
+                try expectRemote(failed.identity);
+            },
+            inline .comment_edit_launch_failed, .comment_delete_launch_failed => |failed| {
+                try testing.expectEqual(command_id, failed.command_id);
+                try testing.expectEqual(comment_id, failed.comment_id);
+                try expectRemote(failed.identity);
+            },
+            .reviewer_verdict_changed => |changed| {
+                try testing.expectEqual(command_id, changed.command_id);
+                try testing.expect(changed.outcome == .launch_failed);
+                try expectRemote(changed.identity);
+            },
+            .submission_wait_launch_failed => |wait| {
+                try testing.expectEqual(command_id, wait.command_id);
+                try testing.expectEqual(operation_id, wait.operation_id);
+                try testing.expectEqual(temp_id, wait.temp_id);
+            },
+            .recovery_checked => |checked| {
+                try testing.expectEqual(command_id, checked.command_id);
+                try testing.expectEqual(operation_id, checked.operation_id);
+                try testing.expect(checked.outcome == .failed);
+                try expectRemote(checked.identity);
+            },
+            .duplicate_checked => |checked| {
+                try testing.expectEqual(command_id, checked.command_id);
+                try testing.expectEqual(operation_id, checked.operation_id);
+                try testing.expectEqual(temp_id, checked.temp_id);
+                try testing.expect(checked.outcome == .failed);
+                try expectRemote(checked.identity);
+            },
+            .pull_requests_loaded => |loaded| {
+                try testing.expectEqual(command_id, loaded.command_id);
+                try testing.expectEqual(work_id, loaded.work_id);
+                try testing.expect(loaded.outcome == .failed);
+            },
+            .clipboard_completed => |completed| {
+                try testing.expectEqual(command_id, completed.command_id);
+                try testing.expect(!completed.success);
+            },
+            .theme_persisted => |persisted| {
+                try testing.expectEqual(command_id, persisted.command_id);
+                try testing.expectEqual(ThemePersisted.Outcome.write_failed, persisted.outcome);
+            },
+            .external_edit_completed => |completed| {
+                try testing.expectEqual(command_id, completed.command_id);
+                try testing.expectEqual(session_epoch, completed.session_epoch);
+                try testing.expect(completed.outcome == .failed);
+            },
+            .buffer_search_scanned => |scanned| {
+                try testing.expectEqual(command_id, scanned.command_id);
+                try testing.expectEqual(request_id, scanned.request_id);
+                try testing.expectEqual(session_epoch, scanned.session_epoch);
+                try testing.expectEqual(search.Mode.fuzzy, scanned.mode);
+                try testing.expect(scanned.outcome == .failed);
+            },
+            .buffer_disclosure_built => |job| {
+                try testing.expectEqual(command_id, job.command_id);
+                try testing.expect(job.failed);
+            },
+            .review_source_scanned => |scanned| {
+                try testing.expectEqual(command_id, scanned.command_id);
+                try testing.expectEqual(session_epoch, scanned.session_epoch);
+                try testing.expectEqual(request_id, scanned.request_id);
+                try testing.expectEqual(file_index, scanned.file_index);
+                try testing.expect(scanned.outcome == .failed);
+            },
+            else => return error.UnexpectedLaunchFailureInput,
+        }
+    }
+};
+
+test "every OwnedCommand launch failure keeps its correlation and frees the command" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var disclosure = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+    });
+    defer disclosure.deinit();
+    inline for (comptime std.meta.tags(CommandTarget), 0..) |target, index| {
+        var command = try LaunchFailureFixture.command(target, &disclosure);
+        const command_id: CommandId = 100 + index;
+        setCommandId(&command, command_id);
+        var input = try command.launchFailed();
+        defer input.deinit();
+        LaunchFailureFixture.expectInput(input, command_id) catch |err| {
+            std.debug.print("launch failure for {s} lost its correlation\n", .{@tagName(target)});
+            return err;
+        };
     }
 }
 
@@ -2612,19 +2942,6 @@ pub const ScanBufferSearch = struct {
     query: search.Query,
     mode: search.Mode = .literal,
 
-    pub fn launchFailed(self: *ScanBufferSearch) BufferSearchScanned {
-        const completed: BufferSearchScanned = .{
-            .allocator = std.heap.page_allocator,
-            .command_id = self.command_id,
-            .request_id = self.request_id,
-            .session_epoch = self.session_epoch,
-            .mode = self.mode,
-            .outcome = .failed,
-        };
-        self.deinit();
-        return completed;
-    }
-
     pub fn deinit(self: *ScanBufferSearch) void {
         self.query.deinit(std.heap.page_allocator);
         self.corpus.release();
@@ -2769,6 +3086,7 @@ pub const ClipboardCopy = struct {
     pub fn destroy(self: *ClipboardCopy) void {
         const allocator = self.allocator;
         allocator.free(self.text);
+        self.* = undefined;
         allocator.destroy(self);
     }
 };
@@ -2776,6 +3094,27 @@ pub const ClipboardCopy = struct {
 pub const ClipboardCompleted = struct {
     command_id: CommandId,
     success: bool,
+};
+
+/// Write the chosen Theme to config.toml.
+pub const PersistTheme = struct {
+    command_id: CommandId = 0,
+    theme: ThemeId,
+};
+
+pub const ThemePersisted = struct {
+    command_id: CommandId,
+    outcome: Outcome,
+
+    pub const Outcome = enum {
+        saved,
+        /// No absolute XDG_CONFIG_HOME and no HOME.
+        no_config_location,
+        /// config.toml does not parse with the new Theme.
+        config_invalid,
+        /// Reading or writing failed, or the command could not start.
+        write_failed,
+    };
 };
 
 pub const ExternalEdit = struct {
@@ -2800,6 +3139,7 @@ pub const ExternalEdit = struct {
     pub fn destroy(self: *ExternalEdit) void {
         const allocator = self.allocator;
         allocator.free(self.body);
+        self.* = undefined;
         allocator.destroy(self);
     }
 };
@@ -2881,9 +3221,11 @@ pub const Projection = struct {
     unknown_resolution: ?UnknownResolutionProjection,
     reanchor: ?ReanchorProjection,
     delete_confirmation: ?DeleteConfirmationProjection,
-    picker: ?*const Picker,
+    list_overlay: ?*const ListOverlay,
     picker_tick_scope: ?WorkId,
-    file_finder: ?*const FileFinder,
+    /// The Theme to paint this frame.
+    theme: ThemeId,
+    configured_theme: ThemeId,
     help_visible: bool,
     action_availability: ActionAvailability,
     loading_pull_request_id: ?u64,
@@ -3046,6 +3388,7 @@ pub const ActionAvailability = struct {
     pub fn available(self: ActionAvailability, action: Action) bool {
         if (!self.has_review) return switch (action) {
             .quit, .help, .open_pull_request_picker => self.remote,
+            .open_command_palette, .open_theme_overlay => true,
             else => false,
         };
         if (!self.remote) switch (action) {
@@ -3205,6 +3548,8 @@ pub const ActionError = enum {
     buffer_search_hit_bottom,
     buffer_search_hit_top,
     out_of_memory,
+    theme_not_saved,
+    theme_not_saved_invalid_config,
     persistence_failed,
     submission_already_active,
     submission_launch_failed,
@@ -5523,10 +5868,8 @@ pub const Presentation = struct {
     prefetch_arm: ?PrefetchArm = null,
     speculative_enrichment: ?SpeculativeEnrichment = null,
     resolver: keymap_mod.Resolver = .{},
-    picker: ?Picker = null,
-    file_finder: ?FileFinder = null,
-    picker_summaries: ?*PullRequestSummaries = null,
-    picker_work_id: ?WorkId = null,
+    list_overlay: ?ListOverlay = null,
+    configured_theme: ThemeId,
     help_visible: bool = false,
     durable_submission: ?*DurableSubmission = null,
     submission_tree: ?*SubmissionTree = null,
@@ -5578,6 +5921,7 @@ pub const Presentation = struct {
             .allocator = allocator,
             .dependencies = dependencies,
             .geometry = geometry,
+            .configured_theme = dependencies.configured_theme,
         };
         errdefer self.deinit();
         if (boot.initial) |initial| {
@@ -5614,9 +5958,7 @@ pub const Presentation = struct {
         if (self.submission_tree) |tree| tree.destroy();
         if (self.durable_comment_edit) |edit| edit.destroy();
         if (self.durable_comment_delete) |delete| delete.destroy();
-        if (self.picker) |*picker| picker.deinit();
-        if (self.file_finder) |*finder| finder.deinit();
-        if (self.picker_summaries) |summaries| summaries.destroy();
+        if (self.list_overlay) |*overlay| overlay.deinit();
         if (self.published) |published| published.destroy();
         self.commands.deinit(self.allocator);
         self.issued_commands.deinit(self.allocator);
@@ -5686,9 +6028,8 @@ pub const Presentation = struct {
             .recovery_checked => |checked| self.acceptRecoveryCheck(checked),
             .duplicate_checked => |checked| self.acceptDuplicateCheck(checked),
             .pull_requests_loaded => |loaded| self.acceptPullRequests(loaded),
-            .picker_tick => |scope| if (!self.shutdown_requested and self.picker_work_id == scope) {
-                if (self.picker) |*active_picker| active_picker.tick();
-            },
+            .picker_tick => |scope| if (!self.shutdown_requested) if (self.list_overlay) |*overlay| overlay.tick(scope),
+            .theme_persisted => |persisted| self.acceptThemePersisted(persisted),
             .clipboard_completed => |completed| {
                 if (!self.consumeCommand(completed.command_id, .copy_clipboard)) return;
                 self.clipboard_status = if (completed.success) .copied else .failed;
@@ -5761,6 +6102,7 @@ pub const Presentation = struct {
             },
             .list_pull_requests => self.outstanding_picker_loads += 1,
             .copy_clipboard => {},
+            .persist_theme => {},
             .external_edit => {},
             .scan_buffer_search => |scan| if (scan.mode == .fuzzy) {
                 if (self.published) |published| published.review_search.authored_scan_active = true;
@@ -5823,12 +6165,10 @@ pub const Presentation = struct {
                 .descendant_count = confirmation.descendant_count,
                 .root_has_replies = confirmation.root_has_replies,
             } else null,
-            .picker = if (self.picker) |*picker| picker else null,
-            .picker_tick_scope = if (!self.shutdown_requested) if (self.picker) |*picker|
-                if (picker.loading) self.picker_work_id else null
-            else
-                null else null,
-            .file_finder = if (self.file_finder) |*finder| finder else null,
+            .list_overlay = if (self.list_overlay) |*overlay| overlay else null,
+            .picker_tick_scope = if (self.shutdown_requested) null else if (self.list_overlay) |*overlay| overlay.tickScope() else null,
+            .theme = self.activeTheme(),
+            .configured_theme = self.configured_theme,
             .help_visible = self.help_visible,
             .action_availability = self.actionAvailability(),
             .loading_pull_request_id = if (self.replacement) |replacement|
@@ -5905,13 +6245,10 @@ pub const Presentation = struct {
     fn overlayTarget(self: *const Presentation) ?frame_mod.OverlayTarget {
         if (self.help_visible or self.unknown_resolution != null or self.delete_confirmation != null or self.visibleSubmissionOverlay())
             return otherOverlay(self.geometry);
-        if (self.file_finder) |finder| {
-            const rect = frame_mod.overlayRect(self.geometry, 60, 16) orelse return null;
-            return .{ .kind = .picker, .rect = rect, .row_count = finder.matches().len, .scroll = pickerTop(finder.selected, rect.height -| 1) };
-        }
-        if (self.picker) |picker| {
-            const rect = frame_mod.overlayRect(self.geometry, 60, 16) orelse return null;
-            return .{ .kind = .picker, .rect = rect, .row_count = picker.matches().len, .scroll = pickerTop(picker.selected, rect.height -| 1) };
+        if (self.list_overlay) |*overlay| {
+            const box = overlay.box();
+            const rect = frame_mod.overlayRect(self.geometry, box.width, box.height) orelse return null;
+            return .{ .kind = .list, .rect = rect, .row_count = overlay.list().matches().len, .scroll = overlay.list().scrollTop(rect.height -| 1) };
         }
         if (self.published) |published| if (published.composer != null) return otherOverlay(self.geometry);
         if (self.published) |published| if (published.review_search.open) {
@@ -5930,7 +6267,7 @@ pub const Presentation = struct {
 
     fn submissionRepairInteractionActive(self: *const Presentation) bool {
         if (self.help_visible or self.unknown_resolution != null or self.delete_confirmation != null or self.reanchor != null) return true;
-        if (self.picker != null or self.file_finder != null) return true;
+        if (self.list_overlay != null) return true;
         if (self.published) |published| return published.composer != null;
         return false;
     }
@@ -5995,9 +6332,7 @@ pub const Presentation = struct {
         switch (target) {
             .select_old_version => return self.applyAction(.select_old_version),
             .select_new_version => return self.applyAction(.select_new_version),
-            .picker_entry => |index| {
-                if (self.file_finder) |*finder| finder.select(index) else if (self.picker) |*picker| picker.select(index) else return;
-            },
+            .list_entry => |row| if (self.list_overlay) |*overlay| overlay.selectRow(row) else return,
             .review_search_entry => |index| {
                 const prior = self.last_review_click;
                 const double_click = if (prior) |click| click.index == index and
@@ -6085,14 +6420,11 @@ pub const Presentation = struct {
                 const height = (frame_mod.reviewSearchGeometry(self.geometry) orelse return).preview.height;
                 state.preview_scroll = if (down) @min(state.preview_scroll +| rows, lines -| height) else state.preview_scroll -| rows;
             },
-            .picker_entry => {
+            .list_entry => {
                 var remaining = rows;
+                const overlay = if (self.list_overlay) |*overlay| overlay else return;
                 while (remaining > 0) : (remaining -= 1) {
-                    if (self.file_finder) |*finder| {
-                        if (down) finder.moveDown() else finder.moveUp();
-                    } else if (self.picker) |*picker| {
-                        if (down) picker.moveDown() else picker.moveUp();
-                    } else return;
+                    if (down) overlay.moveDown() else overlay.moveUp();
                 }
             },
             .sidebar_entry => {
@@ -6301,8 +6633,7 @@ pub const Presentation = struct {
     fn requestShutdown(self: *Presentation) void {
         self.shutdown_requested = true;
         if (self.published) |published| if (published.review_search.open) self.closeReviewSearch();
-        self.closePicker();
-        self.closeFileFinder();
+        self.closeListOverlay();
         self.help_visible = false;
         self.unknown_resolution = null;
         var write: usize = 0;
@@ -6329,8 +6660,7 @@ pub const Presentation = struct {
         if (self.help_visible) return .help;
         if (self.unknown_resolution != null) return .unknown_resolution;
         if (self.delete_confirmation != null) return .delete_confirmation;
-        if (self.file_finder != null) return .file_finder;
-        if (self.picker != null) return .pull_request_picker;
+        if (self.list_overlay) |*overlay| return overlay.interactionContext();
         if (self.published) |published| if (published.buffer_search.input != null) return .buffer_search_input;
         if (self.published) |published| if (published.review_search.open) return .review_search;
         return self.paneContext();
@@ -6352,7 +6682,8 @@ pub const Presentation = struct {
     }
 
     fn actionAvailability(self: *const Presentation) ActionAvailability {
-        const context = if (self.help_visible) self.paneContext() else self.interactionContext();
+        const pane_under_overlay = self.help_visible or if (self.list_overlay) |*overlay| overlay.availabilityContext() == .pane else false;
+        const context = if (pane_under_overlay) self.paneContext() else self.interactionContext();
         const published = self.published orelse return .{
             .remote = self.dependencies.remote_enabled,
             .has_review = false,
@@ -6773,43 +7104,18 @@ pub const Presentation = struct {
             if (key.text) |text| if (TextChunk.init(text)) |chunk| return self.applyComposerInput(.{ .insert = chunk }) else |_| {};
             return;
         };
-        if (self.file_finder) |*finder| {
+        if (self.list_overlay) |*overlay| {
             if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
-                self.closeFileFinder();
+                self.closeListOverlay();
             } else if (key.matches(keymap_mod.special.enter, .{})) {
-                const selected = finder.selection() orelse return;
-                self.closeFileFinder();
-                if (self.published) |published| {
-                    self.focusFile(published, selected);
-                    published.focus = .diff;
-                }
+                try self.confirmListOverlay();
             } else if (key.matches(keymap_mod.special.up, .{}) or key.matches('p', .{ .ctrl = true })) {
-                finder.moveUp();
+                overlay.moveUp();
             } else if (key.matches(keymap_mod.special.down, .{}) or key.matches('n', .{ .ctrl = true })) {
-                finder.moveDown();
+                overlay.moveDown();
             } else if (key.matches(keymap_mod.special.backspace, .{})) {
-                finder.backspace();
-            } else if (key.text) |text| finder.insert(text);
-            return;
-        }
-        if (self.picker) |*picker| {
-            if (key.matches(keymap_mod.special.escape, .{}) or key.matches('c', .{ .ctrl = true })) {
-                self.closePicker();
-            } else if (key.matches(keymap_mod.special.enter, .{})) {
-                const selected = picker.selection() orelse return;
-                self.closePicker();
-                try self.choosePullRequest(try OwnedReviewIdentity.init(
-                    if (self.published) |published| published.key.workspace() else self.replacement.?.key.workspace(),
-                    if (self.published) |published| published.key.repository() else self.replacement.?.key.repository(),
-                    selected.id,
-                ));
-            } else if (key.matches(keymap_mod.special.up, .{}) or key.matches('p', .{ .ctrl = true })) {
-                picker.moveUp();
-            } else if (key.matches(keymap_mod.special.down, .{}) or key.matches('n', .{ .ctrl = true })) {
-                picker.moveDown();
-            } else if (key.matches(keymap_mod.special.backspace, .{})) {
-                picker.backspace();
-            } else if (key.text) |text| picker.insert(text);
+                overlay.backspace(self.publishedFiles());
+            } else if (key.text) |text| overlay.insert(text, self.publishedFiles());
             return;
         }
         if (self.published) |published| if (published.buffer_search.input != null) {
@@ -7093,6 +7399,22 @@ pub const Presentation = struct {
             self.openFileFinder();
             return;
         }
+        if (action == .open_command_palette) {
+            const overlay = ListOverlay.openCommandPalette(self.allocator, self.paneContext()) catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
+            self.showListOverlay(overlay);
+            return;
+        }
+        if (action == .open_theme_overlay) {
+            const overlay = ListOverlay.openTheme(self.allocator, self.configured_theme) catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
+            self.showListOverlay(overlay);
+            return;
+        }
         if (self.replacement != null) return;
         const published = self.published orelse return;
         self.action_error = null;
@@ -7191,7 +7513,7 @@ pub const Presentation = struct {
             .resolve_unpublished => self.resolveSelectedUnknownAsUnpublished(published),
             .link_existing_comment => self.openUnknownResolutionEditor(published),
             .yank => self.yank(published, yank_count),
-            .open_file_finder, .open_pull_request_picker, .confirm_picker, .help => unreachable,
+            .open_file_finder, .open_pull_request_picker, .open_command_palette, .open_theme_overlay, .confirm_picker, .help => unreachable,
             .quit => unreachable,
         }
         clampSelectionAtUnavailableRow(published, selection_cursor_before, self.preferences.scope);
@@ -11242,10 +11564,12 @@ pub const Presentation = struct {
             self.action_error = .action_refused;
             return;
         };
-        self.closePicker();
+        const picker_repository = list_overlay_mod.Repository.init(key.workspace(), key.repository()) catch {
+            self.action_error = .action_refused;
+            return;
+        };
         self.next_work_id += 1;
-        self.picker = Picker.initLoading(self.allocator);
-        self.picker_work_id = self.next_work_id;
+        self.showListOverlay(ListOverlay.openPullRequestPicker(self.allocator, self.next_work_id, picker_repository));
         self.commands.appendAssumeCapacity(.{ .list_pull_requests = .{
             .work_id = self.next_work_id,
             .repository = repository,
@@ -11258,12 +11582,11 @@ pub const Presentation = struct {
             self.action_error = .action_refused;
             return;
         };
-        self.closeFileFinder();
-        self.file_finder = FileFinder.init(self.allocator, published.session.diff.files) catch {
+        const overlay = ListOverlay.openFileFinder(self.allocator, published.session.diff.files) catch {
             self.action_error = .out_of_memory;
             return;
         };
-        self.action_error = null;
+        self.showListOverlay(overlay);
     }
 
     fn yank(self: *Presentation, published: *Published, count: usize) void {
@@ -11389,17 +11712,75 @@ pub const Presentation = struct {
         self.action_error = null;
     }
 
-    fn closeFileFinder(self: *Presentation) void {
-        if (self.file_finder) |*finder| finder.deinit();
-        self.file_finder = null;
+    /// Opening one List Overlay closes any other, so two never coexist.
+    fn showListOverlay(self: *Presentation, overlay: ListOverlay) void {
+        self.closeListOverlay();
+        self.list_overlay = overlay;
+        self.action_error = null;
     }
 
-    fn closePicker(self: *Presentation) void {
-        if (self.picker) |*picker| picker.deinit();
-        self.picker = null;
-        if (self.picker_summaries) |summaries| summaries.destroy();
-        self.picker_summaries = null;
-        self.picker_work_id = null;
+    fn publishedFiles(self: *const Presentation) []const bbr.diff.File {
+        return if (self.published) |published| published.session.diff.files else &.{};
+    }
+
+    fn closeListOverlay(self: *Presentation) void {
+        if (self.list_overlay) |*overlay| overlay.deinit();
+        self.list_overlay = null;
+    }
+
+    /// The choice is copied out before close frees the list, and the Overlay
+    /// closes before the choice takes effect.
+    fn confirmListOverlay(self: *Presentation) !void {
+        const overlay = if (self.list_overlay) |*overlay| overlay else return;
+        const chosen = overlay.choice() orelse return;
+        self.closeListOverlay();
+        switch (chosen) {
+            .pull_request => |picked| try self.choosePullRequest(try OwnedReviewIdentity.init(
+                picked.repository.workspace(),
+                picked.repository.name(),
+                picked.id,
+            )),
+            .file => |index| if (self.published) |published| {
+                self.focusFile(published, index);
+                published.focus = .diff;
+            },
+            // The palette listed its rows for the Pane context at open. A view
+            // build can move the cursor to another context before Enter.
+            .action => |action| if (keymap_mod.supportsContext(action, self.paneContext()))
+                self.applyAction(action)
+            else {
+                self.action_error = .target_action_unavailable;
+            },
+            .theme => |id| self.chooseTheme(id),
+        }
+    }
+
+    /// The chosen Theme applies at once. A failed save keeps it for this
+    /// process and reports the failure, because a snap back would read as a
+    /// bug.
+    fn chooseTheme(self: *Presentation, id: ThemeId) void {
+        self.action_error = null;
+        self.configured_theme = id;
+        if (!self.dependencies.persist_theme) return;
+        self.commands.append(self.allocator, .{ .persist_theme = .{ .theme = id } }) catch {
+            self.action_error = .out_of_memory;
+        };
+    }
+
+    fn acceptThemePersisted(self: *Presentation, persisted: ThemePersisted) void {
+        if (!self.consumeCommand(persisted.command_id, .persist_theme)) return;
+        switch (persisted.outcome) {
+            .saved => {},
+            .config_invalid => self.action_error = .theme_not_saved_invalid_config,
+            .no_config_location, .write_failed => self.action_error = .theme_not_saved,
+        }
+    }
+
+    /// The Theme Overlay's selection while it is open, else the Configured
+    /// Theme. Closing the Overlay therefore reverts the preview.
+    fn activeTheme(self: *const Presentation) ThemeId {
+        if (self.list_overlay) |*overlay| if (overlay.themePreview()) |preview| return preview;
+        return self.configured_theme;
     }
 
     fn acceptPullRequests(self: *Presentation, loaded: PullRequestsLoaded) void {
@@ -11408,23 +11789,21 @@ pub const Presentation = struct {
             return;
         }
         if (self.outstanding_picker_loads > 0) self.outstanding_picker_loads -= 1;
-        if (self.picker_work_id != loaded.work_id or self.picker == null) {
-            if (loaded.outcome == .loaded) loaded.outcome.loaded.destroy();
-            return;
-        }
+        const overlay = if (self.list_overlay) |*overlay| overlay else null;
         switch (loaded.outcome) {
-            .failed => {
-                self.closePicker();
+            .failed => if (overlay != null and overlay.?.tickScope() == loaded.work_id) {
+                self.closeListOverlay();
                 self.action_error = .picker_load_failed;
             },
             .loaded => |summaries| {
-                self.picker.?.populate(summaries.prs) catch {
+                (overlay orelse return summaries.destroy()).populatePullRequests(loaded.work_id, summaries) catch |err| {
                     summaries.destroy();
-                    self.closePicker();
-                    self.action_error = .out_of_memory;
+                    if (err == error.OutOfMemory) {
+                        self.closeListOverlay();
+                        self.action_error = .out_of_memory;
+                    }
                     return;
                 };
-                self.picker_summaries = summaries;
                 self.action_error = null;
             },
         }
@@ -11636,6 +12015,7 @@ pub const Presentation = struct {
             self.discardQueuedReviewSearchScans();
             self.discardQueuedSearchEnrichments(current);
         }
+        if (self.list_overlay) |*overlay| if (overlay.closesOnReplacement()) self.closeListOverlay();
         self.published = candidate;
         self.preferences = job.preferences;
         self.discardQueuedBufferSearchScans(null);
@@ -13042,11 +13422,6 @@ fn collectSelectedLines(
 fn otherOverlay(geometry: frame_mod.Geometry) ?frame_mod.OverlayTarget {
     const rect = frame_mod.overlayRect(geometry, geometry.cols, geometry.rows) orelse return null;
     return .{ .kind = .other, .rect = rect };
-}
-
-fn pickerTop(selected: usize, visible_rows: usize) usize {
-    if (visible_rows == 0 or selected < visible_rows) return 0;
-    return selected - visible_rows + 1;
 }
 
 fn nextFileHeaderRow(buffer: buffer_mod.Buffer, cursor: usize) ?usize {
@@ -18811,6 +19186,11 @@ test "M21 kernel failed Sidebar changes preserve the File Tree and can retry" {
     }
 }
 
+fn testListOverlay(presentation: *const Presentation, kind: std.meta.Tag(ListOverlay)) ?*const ListOverlay {
+    const overlay = presentation.projection().list_overlay orelse return null;
+    return if (overlay.* == kind) overlay else null;
+}
+
 test "File finder filters synchronously and confirms within the same Session" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -18822,18 +19202,18 @@ test "File finder filters synchronously and confirms within the same Session" {
     const epoch = presentation.projection().review.?.session_epoch;
 
     try presentation.dispatch(.{ .key = .{ .codepoint = 'F', .text = "F" } });
-    try testing.expect(presentation.projection().file_finder != null);
+    try testing.expect(testListOverlay(&presentation, .file_finder) != null);
     try presentation.dispatch(.{ .key = .{ .codepoint = 'x', .text = "xyz" } });
-    try testing.expectEqual(@as(usize, 0), presentation.projection().file_finder.?.matches().len);
+    try testing.expectEqual(@as(usize, 0), testListOverlay(&presentation, .file_finder).?.list().matches().len);
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
-    try testing.expect(presentation.projection().file_finder != null);
+    try testing.expect(testListOverlay(&presentation, .file_finder) != null);
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
     try presentation.dispatch(.{ .action = .open_file_finder });
     try presentation.dispatch(.{ .key = .{ .codepoint = 'b', .text = "b" } });
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
 
     const projection = presentation.projection();
-    try testing.expect(projection.file_finder == null);
+    try testing.expect(projection.list_overlay == null);
     try testing.expectEqual(epoch, projection.review.?.session_epoch);
     try testing.expectEqual(@as(usize, 1), projection.review.?.buffer.fileIndexForRow(projection.review.?.navigation.cursor));
     try testing.expectEqual(frame_mod.PaneFocus.diff, projection.review.?.frame.focus);
@@ -18849,9 +19229,479 @@ test "File finder Escape dismisses and reopening resets its query" {
     try presentation.dispatch(.{ .action = .open_file_finder });
     try presentation.dispatch(.{ .key = .{ .codepoint = 'b', .text = "b" } });
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
-    try testing.expect(presentation.projection().file_finder == null);
+    try testing.expect(testListOverlay(&presentation, .file_finder) == null);
     try presentation.dispatch(.{ .action = .open_file_finder });
-    try testing.expectEqualStrings("", presentation.projection().file_finder.?.query());
+    try testing.expectEqualStrings("", testListOverlay(&presentation, .file_finder).?.list().query());
+}
+
+test "File finder opened during a replacement does not outlive the replaced Session" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    const load = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'F', .text = "F" } });
+    try testing.expect(testListOverlay(&presentation, .file_finder) != null);
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testTwoFileSession(testing.allocator, 2) },
+    } });
+    try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.pull_request.?.id);
+    try testing.expect(testListOverlay(&presentation, .file_finder) == null);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'b', .text = "b" } });
+}
+
+const test_ctrl_p: keymap_mod.KeyStroke = .{ .codepoint = 'p', .mods = .{ .ctrl = true } };
+const test_ctrl_n: keymap_mod.KeyStroke = .{ .codepoint = 'n', .mods = .{ .ctrl = true } };
+const test_ctrl_c: keymap_mod.KeyStroke = .{ .codepoint = 'c', .mods = .{ .ctrl = true } };
+const test_enter: keymap_mod.KeyStroke = .{ .codepoint = keymap_mod.special.enter };
+const test_escape: keymap_mod.KeyStroke = .{ .codepoint = keymap_mod.special.escape };
+const test_down: keymap_mod.KeyStroke = .{ .codepoint = keymap_mod.special.down };
+const test_up: keymap_mod.KeyStroke = .{ .codepoint = keymap_mod.special.up };
+
+fn testType(presentation: *Presentation, text: []const u8) !void {
+    try presentation.dispatch(.{ .key = .{ .codepoint = text[0], .text = text } });
+}
+
+fn testPaletteTitles(presentation: *const Presentation) ![]const []const u8 {
+    const overlay = testListOverlay(presentation, .command_palette) orelse return error.CommandPaletteClosed;
+    var titles: [list_overlay_mod.CommandPalette.commands.len][]const u8 = undefined;
+    for (overlay.list().matches(), 0..) |item, row| titles[row] = overlay.command_palette.command(item).title;
+    return testing.allocator.dupe([]const u8, titles[0..overlay.list().matches().len]);
+}
+
+fn testHasTitle(titles: []const []const u8, title: []const u8) bool {
+    for (titles) |candidate| if (std.mem.eql(u8, candidate, title)) return true;
+    return false;
+}
+
+fn testMoveToSourceLine(presentation: *Presentation) !void {
+    var steps: usize = 0;
+    while (presentation.paneContext() != .diff_source) : (steps += 1) {
+        if (steps == 16) return error.NoSourceLine;
+        try presentation.dispatch(.{ .action = .down });
+    }
+}
+
+test "ctrl-p opens the Command Palette from each Pane context" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer presentation.deinit();
+
+    try testing.expectEqual(keymap_mod.InteractionContext.diff, presentation.paneContext());
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testing.expectEqual(keymap_mod.InteractionContext.command_palette, presentation.interactionContext());
+    try presentation.dispatch(.{ .key = test_escape });
+
+    try testMoveToSourceLine(&presentation);
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    const source_titles = try testPaletteTitles(&presentation);
+    defer testing.allocator.free(source_titles);
+    try testing.expect(testHasTitle(source_titles, "Inline Comment"));
+    try testing.expect(!testHasTitle(source_titles, "Reply"));
+    try presentation.dispatch(.{ .key = test_escape });
+
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try testing.expectEqual(keymap_mod.InteractionContext.sidebar_file, presentation.paneContext());
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    const sidebar_titles = try testPaletteTitles(&presentation);
+    defer testing.allocator.free(sidebar_titles);
+    try testing.expect(testHasTitle(sidebar_titles, "File Comment"));
+    try testing.expect(!testHasTitle(sidebar_titles, "Inline Comment"));
+    for (sidebar_titles) |title| {
+        const command = for (list_overlay_mod.CommandPalette.commands) |command| {
+            if (std.mem.eql(u8, command.title, title)) break command;
+        } else unreachable;
+        try testing.expect(keymap_mod.supportsContext(command.action, .sidebar_file));
+    }
+    try presentation.dispatch(.{ .key = test_escape });
+    try testing.expect(presentation.projection().list_overlay == null);
+}
+
+test "ctrl-p stays Composer input and the previous Review Search Occurrence" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .action = .review_comment });
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testing.expect(presentation.projection().list_overlay == null);
+    try testing.expect(presentation.projection().composer != null);
+    try presentation.dispatch(.{ .composer = .cancel });
+
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try testing.expectEqual(keymap_mod.InteractionContext.review_search, presentation.interactionContext());
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testing.expect(presentation.projection().list_overlay == null);
+    try testing.expectEqual(keymap_mod.InteractionContext.review_search, presentation.interactionContext());
+}
+
+test "Command Palette keys move the selection and Escape or ctrl-c close it without a command" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+
+    for ([_]keymap_mod.KeyStroke{ test_escape, test_ctrl_c }) |close| {
+        try presentation.dispatch(.{ .key = test_ctrl_p });
+        try presentation.dispatch(.{ .key = test_down });
+        try presentation.dispatch(.{ .key = test_ctrl_n });
+        try testing.expectEqual(@as(usize, 2), testListOverlay(&presentation, .command_palette).?.list().selected);
+        try presentation.dispatch(.{ .key = test_ctrl_p });
+        try testing.expectEqual(@as(usize, 1), testListOverlay(&presentation, .command_palette).?.list().selected);
+        try presentation.dispatch(.{ .key = test_up });
+        try testing.expectEqual(@as(usize, 0), testListOverlay(&presentation, .command_palette).?.list().selected);
+        try presentation.dispatch(.{ .key = close });
+        try testing.expect(presentation.projection().list_overlay == null);
+        try testing.expect(!presentation.shutdown_requested);
+        try testing.expect(presentation.takeCommand() == null);
+    }
+}
+
+test "Command Palette ranks a title match above a description match" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testType(&presentation, "file");
+    const titles = try testPaletteTitles(&presentation);
+    defer testing.allocator.free(titles);
+    const query: list_overlay_mod.Query = .{ .text = "file", .needles = &.{"file"} };
+    var last_title: usize = 0;
+    var first_description: ?usize = null;
+    for (titles, 0..) |title, row| {
+        if (query.rank(title) != null) last_title = row else if (first_description == null) first_description = row;
+    }
+    try testing.expect(testHasTitle(titles, "Find File"));
+    try testing.expect(testHasTitle(titles, "Cycle Diff Scope"));
+    try testing.expect(last_title < first_description.?);
+}
+
+test "Command Palette Enter closes the palette and then runs the Action once" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    const layout = presentation.preferences.layout;
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testType(&presentation, "toggle layout");
+    const titles = try testPaletteTitles(&presentation);
+    defer testing.allocator.free(titles);
+    try testing.expectEqualStrings("Toggle Layout", titles[0]);
+    const before = presentation.projection().revision.interaction;
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expectEqual(before +% 1, presentation.projection().revision.interaction);
+    try testing.expect(presentation.projection().list_overlay == null);
+    try testing.expect(presentation.published.?.pending_view.?.preferences.layout != layout);
+}
+
+test "Command Palette Enter after a query edit runs the top match, not the row under the old cursor" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    for (0..3) |_| try presentation.dispatch(.{ .key = test_down });
+    try testType(&presentation, "file");
+    const titles = try testPaletteTitles(&presentation);
+    defer testing.allocator.free(titles);
+    try testing.expect(titles.len > 3);
+    try testing.expectEqualStrings("Find File", titles[0]);
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expect(testListOverlay(&presentation, .file_finder) != null);
+}
+
+test "the Command Palette refuses an Action the Pane context dropped while it was open" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCommentThreadSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer presentation.deinit();
+    for (0..32) |_| {
+        if (presentation.paneContext() == .diff_review_card) break;
+        try presentation.dispatch(.{ .action = .down });
+    } else return error.NoReviewCard;
+    try presentation.dispatch(.{ .action = .isolate });
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testType(&presentation, "reply");
+    const titles = try testPaletteTitles(&presentation);
+    defer testing.allocator.free(titles);
+    try testing.expectEqualStrings("Reply", titles[0]);
+    try completeDisclosureBuild(&presentation);
+    try testing.expect(testListOverlay(&presentation, .command_palette) != null);
+    try testing.expect(!keymap_mod.supportsContext(.reply, presentation.paneContext()));
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expect(presentation.projection().list_overlay == null);
+    try testing.expect(presentation.projection().composer == null);
+    try testing.expectEqual(ActionError.target_action_unavailable, presentation.projection().action_error.?);
+}
+
+test "an unavailable Command Palette entry is refused with the Action's own message" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature"), .session = try testLocalSession(testing.allocator) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testType(&presentation, "submit review");
+    try testing.expect(!presentation.projection().action_availability.available(.submit));
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expect(presentation.projection().list_overlay == null);
+    try testing.expectEqual(ActionError.local_review_no_submission, presentation.projection().action_error.?);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "Command Palette greys entries against the Pane under it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer presentation.deinit();
+    try testMoveToSourceLine(&presentation);
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    const availability = presentation.projection().action_availability;
+    try testing.expectEqual(keymap_mod.InteractionContext.diff_source, availability.context);
+    try testing.expect(availability.available(.inline_comment));
+}
+
+test "the Command Palette works with no Session" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{});
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    var load = presentation.takeCommand().?;
+    defer load.deinit();
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testing.expect(testListOverlay(&presentation, .command_palette) != null);
+    try testType(&presentation, "keybindings");
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expect(presentation.projection().help_visible);
+}
+
+test "a Session replacement closes the Command Palette" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    const load = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testing.expect(testListOverlay(&presentation, .command_palette) != null);
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testTwoFileSession(testing.allocator, 2) },
+    } });
+    try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.pull_request.?.id);
+    try testing.expect(presentation.projection().list_overlay == null);
+}
+
+test "Theme Overlay previews, reverts on Escape or ctrl-c, and persists on Enter" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .configured_theme = .system }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testType(&presentation, "theme");
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expect(testListOverlay(&presentation, .theme) != null);
+    try testing.expectEqual(keymap_mod.InteractionContext.theme_overlay, presentation.interactionContext());
+    try testing.expectEqual(ThemeId.system, presentation.projection().theme);
+
+    for ([_]keymap_mod.KeyStroke{ test_escape, test_ctrl_c }) |close| {
+        if (presentation.projection().list_overlay == null) try presentation.dispatch(.{ .action = .open_theme_overlay });
+        const before = presentation.projection().revision;
+        try presentation.dispatch(.{ .key = test_down });
+        try testing.expectEqual(ThemeId.dark, presentation.projection().theme);
+        try testing.expect(!std.meta.eql(before, presentation.projection().revision));
+        try presentation.dispatch(.{ .key = test_ctrl_n });
+        try testing.expectEqual(ThemeId.light, presentation.projection().theme);
+        try presentation.dispatch(.{ .key = close });
+        try testing.expect(presentation.projection().list_overlay == null);
+        try testing.expectEqual(ThemeId.system, presentation.projection().theme);
+        try testing.expect(presentation.takeCommand() == null);
+    }
+
+    try presentation.dispatch(.{ .action = .open_theme_overlay });
+    try presentation.dispatch(.{ .key = test_down });
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expect(presentation.projection().list_overlay == null);
+    try testing.expectEqual(ThemeId.dark, presentation.projection().theme);
+    try testing.expectEqual(ThemeId.dark, presentation.projection().configured_theme);
+    const command = presentation.takeCommand().?.persist_theme;
+    try testing.expectEqual(ThemeId.dark, command.theme);
+    try testing.expect(presentation.takeCommand() == null);
+    try presentation.dispatch(.{ .theme_persisted = .{ .command_id = command.command_id, .outcome = .saved } });
+    try testing.expect(presentation.projection().action_error == null);
+    try testing.expectEqual(@as(usize, 0), presentation.issued_commands.items.len);
+
+    try presentation.dispatch(.{ .action = .open_theme_overlay });
+    try testing.expectEqual(@as(usize, @intFromEnum(ThemeId.dark)), testListOverlay(&presentation, .theme).?.list().selectedItem().?);
+    try testing.expectEqual(ThemeId.dark, presentation.projection().theme);
+}
+
+test "a failed Theme save keeps the Theme and reports it, and a stale completion is ignored" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .configured_theme = .gruvbox_dark }, .{});
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .key = test_ctrl_p });
+    try testType(&presentation, "theme");
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expectEqual(ThemeId.gruvbox_dark, presentation.projection().theme);
+    try testType(&presentation, "solarized-light");
+    try testing.expectEqual(ThemeId.solarized_light, presentation.projection().theme);
+    try presentation.dispatch(.{ .key = test_enter });
+    const command = presentation.takeCommand().?.persist_theme;
+    try presentation.dispatch(.{ .theme_persisted = .{ .command_id = command.command_id +% 100, .outcome = .write_failed } });
+    try testing.expect(presentation.projection().action_error == null);
+    try presentation.dispatch(.{ .theme_persisted = .{ .command_id = command.command_id, .outcome = .config_invalid } });
+    try testing.expectEqual(ThemeId.solarized_light, presentation.projection().theme);
+    try testing.expectEqual(ActionError.theme_not_saved_invalid_config, presentation.projection().action_error.?);
+    try presentation.dispatch(.{ .theme_persisted = .{ .command_id = command.command_id, .outcome = .write_failed } });
+    try testing.expectEqual(ActionError.theme_not_saved_invalid_config, presentation.projection().action_error.?);
+}
+
+test "a Theme Overlay query edit previews the top match" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .configured_theme = .system }, .{});
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_theme_overlay });
+    try presentation.dispatch(.{ .key = test_down });
+    try presentation.dispatch(.{ .key = test_down });
+    try testType(&presentation, "dark");
+    try testing.expectEqual(ThemeId.dark, presentation.projection().theme);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.backspace } });
+    try testing.expectEqual(ThemeId.dark, presentation.projection().theme);
+}
+
+test "a Theme Overlay query that hides every Theme previews the Configured Theme" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .configured_theme = .light }, .{});
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_theme_overlay });
+    try testType(&presentation, "zzz");
+    try testing.expectEqual(ThemeId.light, presentation.projection().theme);
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expect(testListOverlay(&presentation, .theme) != null);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "choosing the Theme again retries a failed save" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .configured_theme = .system }, .{});
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_theme_overlay });
+    try presentation.dispatch(.{ .key = test_down });
+    try presentation.dispatch(.{ .key = test_enter });
+    const failed = presentation.takeCommand().?.persist_theme;
+    try presentation.dispatch(.{ .theme_persisted = .{ .command_id = failed.command_id, .outcome = .write_failed } });
+    try testing.expectEqual(ActionError.theme_not_saved, presentation.projection().action_error.?);
+
+    try presentation.dispatch(.{ .action = .open_theme_overlay });
+    try presentation.dispatch(.{ .key = test_enter });
+    const retry = presentation.takeCommand().?.persist_theme;
+    try testing.expectEqual(ThemeId.dark, retry.theme);
+    try testing.expect(presentation.projection().action_error == null);
+}
+
+test "without Theme persistence Enter applies the Theme and emits no command" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .persist_theme = false }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_theme_overlay });
+    try presentation.dispatch(.{ .key = test_down });
+    try presentation.dispatch(.{ .key = test_enter });
+    try testing.expectEqual(ThemeId.dark, presentation.projection().theme);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "the projected Theme is the configured Theme" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .configured_theme = .gruvbox_dark }, .{});
+    defer presentation.deinit();
+    try testing.expectEqual(ThemeId.gruvbox_dark, presentation.projection().theme);
+    try testing.expectEqual(ThemeId.gruvbox_dark, presentation.projection().configured_theme);
+}
+
+test "the Picker chooses from its Repository after the initial load fails" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{});
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    const initial = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .action = .open_pull_request_picker });
+    const list = presentation.takeCommand().?.list_pull_requests;
+    try presentation.dispatch(.{ .session_loaded = .{ .command_id = initial.command_id, .intent = initial.intent, .outcome = .{ .failed = error.NetworkFailure } } });
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) != null);
+
+    const summaries = try PullRequestSummaries.create(testing.allocator);
+    summaries.prs = &.{.{ .id = 7, .title = "Retry", .state = "OPEN", .author_display_name = "Ada", .source_branch = "retry", .destination_branch = "main" }};
+    try presentation.dispatch(.{ .pull_requests_loaded = .{ .command_id = list.command_id, .work_id = list.work_id, .outcome = .{ .loaded = summaries } } });
+    try presentation.dispatch(.{ .key = test_enter });
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    const load = command.load_session;
+    try testing.expect(OwnedReviewIdentity.eql(try OwnedReviewIdentity.init("workspace", "repo", 7), load.key));
+}
+
+test "opening one List Overlay closes the open one" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_file_finder });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'b', .text = "b" } });
+    try presentation.dispatch(.{ .action = .open_pull_request_picker });
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) != null);
+    try testing.expectEqualStrings("", presentation.projection().list_overlay.?.list().query());
+    var command = presentation.takeCommand().?;
+    defer command.deinit();
+    try testing.expect(command == .list_pull_requests);
 }
 
 test "Comment Action ladder carries inline File and Review scopes" {
@@ -27001,7 +27851,7 @@ test "Submission Overlay permits Review switching without cancelling the run" {
     try testing.expect(presentation.projection().submission_tree != null);
 
     try presentation.dispatch(.{ .key = .{ .codepoint = 'p', .text = "p" } });
-    try testing.expect(presentation.projection().picker != null);
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) != null);
     var list = presentation.takeCommand().?;
     try testing.expect(list == .list_pull_requests);
     list.deinit();
@@ -27212,9 +28062,9 @@ test "portable Picker input loads summaries and selects a replacement" {
         .work_id = list.work_id,
         .outcome = .{ .loaded = summaries },
     } });
-    try testing.expect(presentation.projection().picker != null);
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) != null);
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
-    try testing.expect(presentation.projection().picker == null);
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) == null);
     try testing.expectEqual(@as(u64, 2), presentation.takeCommand().?.load_session.key.pull_request_id);
 }
 
@@ -27230,19 +28080,19 @@ test "Picker tick advances only its visible loading scope" {
 
     try presentation.dispatch(.{ .key = .{ .codepoint = 'p', .text = "p" } });
     const list = presentation.takeCommand().?.list_pull_requests;
-    const initial = presentation.projection().picker.?.spinnerGlyph();
+    const initial = testListOverlay(&presentation, .pull_request_picker).?.pull_request_picker.spinnerGlyph();
     try testing.expectEqual(list.work_id, presentation.projection().picker_tick_scope.?);
 
     try presentation.dispatch(.{ .picker_tick = list.work_id + 1 });
-    try testing.expectEqualStrings(initial, presentation.projection().picker.?.spinnerGlyph());
+    try testing.expectEqualStrings(initial, testListOverlay(&presentation, .pull_request_picker).?.pull_request_picker.spinnerGlyph());
     try presentation.dispatch(.{ .picker_tick = list.work_id });
-    try testing.expect(!std.mem.eql(u8, initial, presentation.projection().picker.?.spinnerGlyph()));
+    try testing.expect(!std.mem.eql(u8, initial, testListOverlay(&presentation, .pull_request_picker).?.pull_request_picker.spinnerGlyph()));
 
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
-    try testing.expect(presentation.projection().picker == null);
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) == null);
     try testing.expect(presentation.projection().picker_tick_scope == null);
     try presentation.dispatch(.{ .picker_tick = list.work_id });
-    try testing.expect(presentation.projection().picker == null);
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) == null);
 }
 
 test "shutdown closes Picker and disposes its late completion" {
@@ -27258,7 +28108,7 @@ test "shutdown closes Picker and disposes its late completion" {
     try presentation.dispatch(.{ .key = .{ .codepoint = 'p', .text = "p" } });
     const list = presentation.takeCommand().?.list_pull_requests;
     try presentation.dispatch(.request_shutdown);
-    try testing.expect(presentation.projection().picker == null);
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) == null);
     try testing.expect(!presentation.readyToExit());
 
     const summaries = try PullRequestSummaries.create(testing.allocator);
@@ -27266,7 +28116,7 @@ test "shutdown closes Picker and disposes its late completion" {
         .work_id = list.work_id,
         .outcome = .{ .loaded = summaries },
     } });
-    try testing.expect(presentation.projection().picker == null);
+    try testing.expect(testListOverlay(&presentation, .pull_request_picker) == null);
     try testing.expect(presentation.readyToExit());
 }
 
@@ -28154,8 +29004,8 @@ test "Picker mouse click selects only and non-Picker Overlay captures Pane click
     const overlay = presentation.projection().review.?.frame.overlay.?;
     try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 2, .button = .left, .type = .press } });
     try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 2, .button = .left, .type = .release } });
-    try testing.expectEqual(@as(usize, 1), presentation.projection().file_finder.?.selected);
-    try testing.expect(presentation.projection().file_finder != null); // click never confirms
+    try testing.expectEqual(@as(usize, 1), testListOverlay(&presentation, .file_finder).?.list().selected);
+    try testing.expect(testListOverlay(&presentation, .file_finder) != null); // click never confirms
 
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
     try presentation.dispatch(.{ .action = .review_comment });
@@ -28187,12 +29037,12 @@ test "PullRequest Picker wheel and click move selection while Enter alone confir
     try presentation.dispatch(.{ .pull_requests_loaded = .{ .work_id = list.work_id, .outcome = .{ .loaded = summaries } } });
     const overlay = presentation.projection().review.?.frame.overlay.?;
     try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 1, .button = .wheel_down, .type = .press } });
-    try testing.expectEqual(@as(usize, 3), presentation.projection().picker.?.selected);
+    try testing.expectEqual(@as(usize, 3), testListOverlay(&presentation, .pull_request_picker).?.list().selected);
 
     const current_overlay = presentation.projection().review.?.frame.overlay.?;
     try presentation.dispatch(.{ .mouse = .{ .col = current_overlay.rect.x, .row = current_overlay.rect.y + 2, .button = .left, .type = .press } });
     try presentation.dispatch(.{ .mouse = .{ .col = current_overlay.rect.x, .row = current_overlay.rect.y + 2, .button = .left, .type = .release } });
-    try testing.expectEqual(@as(usize, 1), presentation.projection().picker.?.selected);
+    try testing.expectEqual(@as(usize, 1), testListOverlay(&presentation, .pull_request_picker).?.list().selected);
     try testing.expect(presentation.takeCommand() == null);
 
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });

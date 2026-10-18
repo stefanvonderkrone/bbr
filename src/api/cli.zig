@@ -506,7 +506,7 @@ test "API credentials use saved Profiles and per-field overrides" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(base);
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();

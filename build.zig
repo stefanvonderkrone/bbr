@@ -204,6 +204,9 @@ pub fn build(b: *std.Build) void {
     version_integration.setCwd(b.path("."));
     const release_validation = b.addSystemCommand(&.{ "sh", "tests/release_validation_test.sh" });
     release_validation.setCwd(b.path("."));
+    const xdg_reads = b.addSystemCommand(&.{"python3"});
+    xdg_reads.addFileArg(b.path("tools/check_xdg_reads.py"));
+    xdg_reads.addDirectoryArg(b.path("."));
 
     const cli_test_step = b.step("test-cli", "Run hermetic Python CLI checks (requires python3)");
     for ([_][]const u8{
@@ -378,6 +381,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&version_command.step);
     test_step.dependOn(&version_integration.step);
     test_step.dependOn(&release_validation.step);
+    test_step.dependOn(&xdg_reads.step);
     test_step.dependOn(&run_lifecycle_test.step);
     test_step.dependOn(cli_test_step);
 }

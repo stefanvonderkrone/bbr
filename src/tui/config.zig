@@ -1,11 +1,13 @@
-//! Configuration intake owns the complete startup path: XDG/HOME discovery,
-//! missing-file defaults, bounded file I/O, parsing, semantic validation,
-//! diagnostics, and materialization of the runtime Theme and Keymap. Callers
-//! cross one seam (`load`) and never learn TOML or selection rules.
+//! Configuration intake owns the complete startup path: the file location
+//! from `xdg.configFile`, missing-file defaults, bounded file I/O, parsing,
+//! semantic validation, diagnostics, and materialization of the runtime Theme
+//! and Keymap. It also owns the one write, `persistTheme`. Callers cross these
+//! two seams and never learn TOML or selection rules.
 
 const std = @import("std");
+const xdg = @import("bbr").xdg;
 const keymap = @import("keymap.zig");
-const theme = @import("theme.zig");
+const ThemeId = @import("theme_id.zig").ThemeId;
 
 const testing = std.testing;
 
@@ -22,8 +24,7 @@ pub const Configuration = struct {
     pub const default_comments_collapsed_rows: usize = 6;
     pub const default_external_edit_max_bytes: usize = 1024 * 1024;
 
-    theme_name: []const u8,
-    active_theme: theme.Theme,
+    theme: ThemeId,
     keymap: keymap.OwnedKeymap,
     highlight_max_file_bytes: usize,
     file_cache_enabled: bool,
@@ -34,7 +35,6 @@ pub const Configuration = struct {
     external_edit_max_bytes: usize,
 
     pub fn deinit(self: *Configuration, allocator: std.mem.Allocator) void {
-        allocator.free(self.theme_name);
         self.keymap.deinit(allocator);
     }
 };
@@ -90,8 +90,7 @@ pub const LoadResult = union(enum) {
 
 fn defaults(allocator: std.mem.Allocator) !Configuration {
     return .{
-        .theme_name = try allocator.dupe(u8, "system"),
-        .active_theme = theme.system,
+        .theme = .system,
         .keymap = try keymap.Keymap.fromOverrides(allocator, &.{}),
         .highlight_max_file_bytes = Configuration.default_highlight_max_file_bytes,
         .file_cache_enabled = true,
@@ -103,14 +102,8 @@ fn defaults(allocator: std.mem.Allocator) !Configuration {
     };
 }
 
-fn path(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]u8 {
-    if (env.get("XDG_CONFIG_HOME")) |base| return try std.fmt.allocPrint(allocator, "{s}/bbr/config.toml", .{base});
-    if (env.get("HOME")) |home| return try std.fmt.allocPrint(allocator, "{s}/.config/bbr/config.toml", .{home});
-    return null;
-}
-
 pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !LoadResult {
-    const config_path = (try path(allocator, env)) orelse return .{ .ok = try defaults(allocator) };
+    const config_path = (try xdg.configFile(allocator, env)) orelse return .{ .ok = try defaults(allocator) };
     errdefer allocator.free(config_path);
     const source = std.Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(64 * 1024 + 1)) catch |err| switch (err) {
         error.FileNotFound => {
@@ -136,6 +129,116 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.En
     };
 }
 
+pub const PersistThemeError = error{
+    /// `xdg.configFile` resolves no path: no absolute XDG_CONFIG_HOME and no HOME.
+    NoConfigLocation,
+    /// The file is over 64 KiB, or the rewritten file does not parse.
+    /// Nothing is written.
+    ConfigInvalid,
+    WriteFailed,
+    OutOfMemory,
+};
+
+/// Write `id` as the root `theme` of config.toml and keep every other byte.
+/// The rewritten file must parse before it replaces the old one. An existing
+/// file that already names `id` is not written. The write is atomic and
+/// durable, keeps the file's permissions, follows a symlinked config.toml to
+/// its target, and creates the `bbr` directory when it is absent.
+pub fn persistTheme(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, id: ThemeId) PersistThemeError!void {
+    const config_path = (try xdg.configFile(allocator, env)) orelse return error.NoConfigLocation;
+    defer allocator.free(config_path);
+    var exists = true;
+    const source = std.Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(64 * 1024 + 1)) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            exists = false;
+            break :blk try allocator.dupe(u8, "");
+        },
+        error.StreamTooLong => return error.ConfigInvalid,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.WriteFailed,
+    };
+    defer allocator.free(source);
+    const next = try rewriteTheme(allocator, source, id.name());
+    defer allocator.free(next);
+    if (exists and std.mem.eql(u8, source, next)) return;
+    var parsed = try parse(allocator, next);
+    defer parsed.deinit(allocator);
+    if (parsed == .invalid) return error.ConfigInvalid;
+    writeAtomically(allocator, io, config_path, next) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.WriteFailed,
+    };
+}
+
+fn writeAtomically(allocator: std.mem.Allocator, io: std.Io, file_path: []const u8, bytes: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const dir_path = std.fs.path.dirname(file_path).?;
+    // createDirPath fails with NotDir when the last component is a directory symlink.
+    cwd.access(io, dir_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => try cwd.createDirPath(io, dir_path),
+        else => return err,
+    };
+    // Rename over the resolved target, not over the symlink entry.
+    const target: ?[:0]u8 = target: {
+        var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        _ = cwd.readLink(io, file_path, &link_buffer) catch |err| switch (err) {
+            error.NotLink, error.FileNotFound => break :target null,
+            else => return err,
+        };
+        break :target try cwd.realPathFileAlloc(io, file_path, allocator);
+    };
+    defer if (target) |resolved| allocator.free(resolved);
+    const write_path = target orelse file_path;
+    var dir = try cwd.openDir(io, std.fs.path.dirname(write_path).?, .{});
+    defer dir.close(io);
+    const name = std.fs.path.basename(write_path);
+    // The stat mode carries the file type bits, and the umask narrows the
+    // create mode, so mask the mode and set it again on the open file.
+    const permissions: ?std.Io.File.Permissions = if (dir.statFile(io, name, .{})) |stat|
+        .fromMode(stat.permissions.toMode() & 0o7777)
+    else |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    var atomic = try dir.createFileAtomic(io, name, .{ .replace = true, .permissions = permissions orelse .default_file });
+    defer atomic.deinit(io);
+    if (permissions) |kept| try atomic.file.setPermissions(io, kept);
+    var buffer: [4096]u8 = undefined;
+    var writer = atomic.file.writer(io, &buffer);
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
+    try atomic.file.sync(io);
+    try atomic.replace(io);
+}
+
+/// Replace the value of the root `theme` key, or add the key before the first
+/// table when the root has none. Every other byte stays as it was. `name` is a
+/// ThemeId name, so it never needs escaping.
+fn rewriteTheme(allocator: std.mem.Allocator, source: []const u8, name: []const u8) error{OutOfMemory}![]u8 {
+    var line_start: usize = 0;
+    const insert_at = while (line_start < source.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
+        var parser = LineParser{ .text = source[line_start..line_end] };
+        parser.space();
+        if (!parser.done() and parser.peek() == '[') break line_start;
+        if (!parser.done() and parser.peek() != '#') theme_line: {
+            const key = parser.key() catch break :theme_line;
+            if (!std.mem.eql(u8, key, "theme")) break :theme_line;
+            parser.space();
+            if (!parser.take('=')) break :theme_line;
+            parser.space();
+            const value_start = line_start + parser.pos;
+            const value = parser.quoted() catch break :theme_line;
+            // `value` sits between the quotes that start at `value_start`.
+            const start = value_start + 1;
+            return std.mem.concat(allocator, u8, &.{ source[0..start], name, source[start + value.len ..] });
+        }
+        line_start = line_end + 1;
+    } else source.len;
+    const separator: []const u8 = if (insert_at == source.len and source.len > 0 and source[source.len - 1] != '\n') "\n" else "";
+    return std.mem.concat(allocator, u8, &.{ source[0..insert_at], separator, "theme = \"", name, "\"\n", source[insert_at..] });
+}
+
 fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
     if (source.len > 64 * 1024) {
         return .{ .invalid = try tooLargeDiagnostics(allocator) };
@@ -150,7 +253,7 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
     }
     var override_lines: std.ArrayList(usize) = .empty;
     defer override_lines.deinit(allocator);
-    var theme_name: []const u8 = "system";
+    var theme: ThemeId = .system;
     var theme_seen = false;
     var highlight_max_file_bytes = Configuration.default_highlight_max_file_bytes;
     var highlight_limit_seen = false;
@@ -290,9 +393,9 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
             .root => if (std.mem.eql(u8, key, "theme")) {
                 if (theme_seen) {
                     try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "duplicate 'theme' key", .hint = "keep exactly one top-level theme entry" });
-                } else if (!isThemeName(value)) {
-                    try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown Theme name", .hint = "use system, dark, light, Catppuccin, Gruvbox, or Solarized" });
-                } else theme_name = value;
+                } else if (ThemeId.fromName(value)) |id| {
+                    theme = id;
+                } else try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown Theme name", .hint = "use system, dark, light, Catppuccin, Gruvbox, or Solarized" });
                 theme_seen = true;
             } else try diagnostics.append(allocator, .{ .line = line_number, .column = 1, .message = "unknown top-level key", .hint = "did you mean 'theme'?" }),
             .keymap => unreachable,
@@ -392,8 +495,7 @@ fn parse(allocator: std.mem.Allocator, source: []const u8) !Result {
         return .{ .invalid = try diagnostics.toOwnedSlice(allocator) };
     }
     return .{ .ok = .{
-        .theme_name = try allocator.dupe(u8, theme_name),
-        .active_theme = theme.byName(theme_name).?,
+        .theme = theme,
         .keymap = owned_keymap,
         .highlight_max_file_bytes = highlight_max_file_bytes,
         .file_cache_enabled = file_cache_enabled,
@@ -460,10 +562,6 @@ test "M21 kernel strict configuration rejects removed wrapping Action" {
     defer result.deinit(testing.allocator);
     try testing.expect(result == .invalid);
     try testing.expectEqualStrings("unknown Action name", result.invalid[0].message);
-}
-
-fn isThemeName(name: []const u8) bool {
-    return theme.byName(name) != null;
 }
 
 const LineParser = struct {
@@ -580,7 +678,7 @@ test "configuration resolves theme and keymap while collecting independent diagn
     var result = try parse(testing.allocator, source);
     defer result.deinit(testing.allocator);
     try testing.expect(result == .ok);
-    try testing.expectEqualStrings("catppuccin-mocha", result.ok.theme_name);
+    try testing.expectEqual(ThemeId.catppuccin_mocha, result.ok.theme);
 
     const broken =
         \\theem = "dark"
@@ -719,25 +817,11 @@ test "External Edit defaults to 1 MiB and rejects zero or unknown keys" {
     try testing.expectEqualStrings("External Edit max_bytes must be greater than zero", zero.invalid[0].message);
 }
 
-test "configuration path prefers XDG and falls back to HOME" {
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-    try env.put("HOME", "/home/ada");
-    const home_path = (try path(testing.allocator, &env)).?;
-    defer testing.allocator.free(home_path);
-    try testing.expectEqualStrings("/home/ada/.config/bbr/config.toml", home_path);
-
-    try env.put("XDG_CONFIG_HOME", "/cfg");
-    const xdg_path = (try path(testing.allocator, &env)).?;
-    defer testing.allocator.free(xdg_path);
-    try testing.expectEqualStrings("/cfg/bbr/config.toml", xdg_path);
-}
-
 test "configuration intake owns missing valid malformed and unreadable file states" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(base);
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
@@ -746,7 +830,7 @@ test "configuration intake owns missing valid malformed and unreadable file stat
     var missing = try load(testing.allocator, io, &env);
     defer missing.deinit(testing.allocator);
     try testing.expect(missing == .ok);
-    try testing.expectEqualStrings("system", missing.ok.theme_name);
+    try testing.expectEqual(ThemeId.system, missing.ok.theme);
 
     var bbr_dir = try tmp.dir.createDirPathOpen(io, "bbr", .{});
     defer bbr_dir.close(io);
@@ -760,8 +844,7 @@ test "configuration intake owns missing valid malformed and unreadable file stat
     var valid = try load(testing.allocator, io, &env);
     defer valid.deinit(testing.allocator);
     try testing.expect(valid == .ok);
-    try testing.expectEqualStrings("gruvbox-light", valid.ok.theme_name);
-    try testing.expect(std.meta.eql(theme.gruvbox_light, valid.ok.active_theme));
+    try testing.expectEqual(ThemeId.gruvbox_light, valid.ok.theme);
     var resolver = keymap.Resolver{};
     try testing.expectEqual(keymap.Action.page_down, resolver.feed(valid.ok.keymap.keymap(), .diff, .{ .codepoint = 'x', .mods = .{ .ctrl = true } }).action);
 
@@ -790,4 +873,132 @@ test "configuration intake owns missing valid malformed and unreadable file stat
     defer unreadable.deinit(testing.allocator);
     try testing.expect(unreadable == .invalid);
     try testing.expect(unreadable.invalid.read_error != null);
+}
+
+fn expectRewrite(source: []const u8, expected: []const u8) !void {
+    const rewritten = try rewriteTheme(testing.allocator, source, "solarized-dark");
+    defer testing.allocator.free(rewritten);
+    try testing.expectEqualStrings(expected, rewritten);
+    var result = try parse(testing.allocator, rewritten);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result == .ok);
+    try testing.expectEqual(ThemeId.solarized_dark, result.ok.theme);
+}
+
+test "rewriteTheme replaces or adds only the root theme value" {
+    try expectRewrite(
+        "# colors\ntheme = \"dark\" # keep\n\n[keymap]\nquit = [\"q\"]\n",
+        "# colors\ntheme = \"solarized-dark\" # keep\n\n[keymap]\nquit = [\"q\"]\n",
+    );
+    try expectRewrite("theme=\"light\"\r\n[highlight]\r\nmax_file_bytes = 10\r\n", "theme=\"solarized-dark\"\r\n[highlight]\r\nmax_file_bytes = 10\r\n");
+    try expectRewrite(
+        "# theme = \"dark\"\n[keymap]\nquit = [\"q\"]\n",
+        "# theme = \"dark\"\ntheme = \"solarized-dark\"\n[keymap]\nquit = [\"q\"]\n",
+    );
+    try expectRewrite("# only a comment", "# only a comment\ntheme = \"solarized-dark\"\n");
+    try expectRewrite("# only a comment\n", "# only a comment\ntheme = \"solarized-dark\"\n");
+    try expectRewrite("", "theme = \"solarized-dark\"\n");
+}
+
+test "persistTheme writes config.toml atomically through a symlink and refuses an invalid file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const base = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(base);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try testing.expectError(error.NoConfigLocation, persistTheme(testing.allocator, io, &env, .dark));
+    try env.put("XDG_CONFIG_HOME", base);
+
+    try persistTheme(testing.allocator, io, &env, .gruvbox_dark);
+    const created = try tmp.dir.readFileAlloc(io, "bbr/config.toml", testing.allocator, .limited(1024));
+    defer testing.allocator.free(created);
+    try testing.expectEqualStrings("theme = \"gruvbox-dark\"\n", created);
+    try persistTheme(testing.allocator, io, &env, .gruvbox_dark);
+    const again = try tmp.dir.readFileAlloc(io, "bbr/config.toml", testing.allocator, .limited(1024));
+    defer testing.allocator.free(again);
+    try testing.expectEqualStrings(created, again);
+
+    const invalid = "theme = \"dark\"\n[keymap]\nfly = [\"x\"]\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "bbr/config.toml", .data = invalid });
+    try testing.expectError(error.ConfigInvalid, persistTheme(testing.allocator, io, &env, .light));
+    const untouched = try tmp.dir.readFileAlloc(io, "bbr/config.toml", testing.allocator, .limited(1024));
+    defer testing.allocator.free(untouched);
+    try testing.expectEqualStrings(invalid, untouched);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "dotfiles.toml", .data = "theme = \"dark\"\n[keymap]\nquit = [\"q\"]\n" });
+    try tmp.dir.deleteFile(io, "bbr/config.toml");
+    try tmp.dir.symLink(io, "../dotfiles.toml", "bbr/config.toml", .{});
+    try persistTheme(testing.allocator, io, &env, .light);
+    var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const link_len = try tmp.dir.readLink(io, "bbr/config.toml", &link_buffer);
+    try testing.expectEqualStrings("../dotfiles.toml", link_buffer[0..link_len]);
+    const target = try tmp.dir.readFileAlloc(io, "dotfiles.toml", testing.allocator, .limited(1024));
+    defer testing.allocator.free(target);
+    try testing.expectEqualStrings("theme = \"light\"\n[keymap]\nquit = [\"q\"]\n", target);
+}
+
+test "persistTheme writes config.toml through a symlinked bbr directory" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const base = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(base);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", base);
+
+    try tmp.dir.createDir(io, "dotfiles", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "dotfiles/config.toml", .data = "# mine\ntheme = \"dark\"\n[highlight]\nmax_file_bytes = 10\n" });
+    try tmp.dir.symLink(io, "dotfiles", "bbr", .{ .is_directory = true });
+    try persistTheme(testing.allocator, io, &env, .light);
+    var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const link_len = try tmp.dir.readLink(io, "bbr", &link_buffer);
+    try testing.expectEqualStrings("dotfiles", link_buffer[0..link_len]);
+    const target = try tmp.dir.readFileAlloc(io, "dotfiles/config.toml", testing.allocator, .limited(1024));
+    defer testing.allocator.free(target);
+    try testing.expectEqualStrings("# mine\ntheme = \"light\"\n[highlight]\nmax_file_bytes = 10\n", target);
+}
+
+test "persistTheme keeps the permissions of config.toml" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const base = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(base);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", base);
+
+    try tmp.dir.createDir(io, "bbr", .default_dir);
+    var file = try tmp.dir.createFile(io, "bbr/config.toml", .{ .permissions = .fromMode(0o600) });
+    try file.writeStreamingAll(io, "theme = \"dark\"\n");
+    try file.setPermissions(io, .fromMode(0o600));
+    file.close(io);
+    try persistTheme(testing.allocator, io, &env, .light);
+    const stat = try tmp.dir.statFile(io, "bbr/config.toml", .{});
+    try testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o7777);
+    const saved = try tmp.dir.readFileAlloc(io, "bbr/config.toml", testing.allocator, .limited(1024));
+    defer testing.allocator.free(saved);
+    try testing.expectEqualStrings("theme = \"light\"\n", saved);
+}
+
+test "persistTheme leaves an unchanged config.toml alone" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const base = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(base);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", base);
+
+    try tmp.dir.createDir(io, "bbr", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "bbr/config.toml", .data = "theme = \"dark\" # mine\n" });
+    const before = try tmp.dir.statFile(io, "bbr/config.toml", .{});
+    try persistTheme(testing.allocator, io, &env, .dark);
+    const after = try tmp.dir.statFile(io, "bbr/config.toml", .{});
+    try testing.expectEqual(before.inode, after.inode);
+    try testing.expectEqual(before.mtime, after.mtime);
 }

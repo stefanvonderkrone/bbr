@@ -13,6 +13,7 @@ const LineKind = bbr.diff.LineKind;
 const Style = vaxis.Style;
 const Color = vaxis.Cell.Color;
 const review_card = @import("review_card.zig");
+const ThemeId = @import("theme_id.zig").ThemeId;
 
 pub const Theme = struct {
     /// Pair fixed RGB bands with fixed foregrounds in the terminal-owned Theme.
@@ -447,6 +448,19 @@ pub fn byName(name: []const u8) ?Theme {
     return null;
 }
 
+pub fn value(id: ThemeId) Theme {
+    return builtins[@intFromEnum(id)].value;
+}
+
+comptime {
+    if (builtins.len != ThemeId.count) @compileError("theme.builtins must have one entry per ThemeId");
+    for (builtins, 0..) |entry, index| {
+        const id = ThemeId.at(index);
+        if (!std.mem.eql(u8, entry.name, id.name()))
+            @compileError("theme.builtins[" ++ std.fmt.comptimePrint("{d}", .{index}) ++ "] must be named \"" ++ id.name() ++ "\" to match ThemeId." ++ @tagName(id));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -500,6 +514,11 @@ test "every built-in Theme resolves by its exact name and keeps diff bands disti
         try testing.expect(selected.section_rule.dim);
     }
     try testing.expect(byName("catppuccin") == null);
+}
+
+test "every ThemeId resolves to the built-in Theme of the same name" {
+    for (std.meta.tags(ThemeId)) |id| try testing.expect(std.meta.eql(byName(id.name()).?, value(id)));
+    try testing.expect(std.meta.eql(gruvbox_light, value(.gruvbox_light)));
 }
 
 test "search matches stay distinct from ReviewCard and diff backgrounds in every built-in Theme" {
