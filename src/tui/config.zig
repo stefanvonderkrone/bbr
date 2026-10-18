@@ -101,8 +101,11 @@ fn defaults(allocator: std.mem.Allocator) !Configuration {
     };
 }
 
+/// The XDG Base Directory spec says to ignore an empty or relative
+/// XDG_CONFIG_HOME, so both fall back to HOME.
 fn path(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]u8 {
-    if (env.get("XDG_CONFIG_HOME")) |base| return try std.fmt.allocPrint(allocator, "{s}/bbr/config.toml", .{base});
+    if (env.get("XDG_CONFIG_HOME")) |base| if (std.fs.path.isAbsolute(base))
+        return try std.fmt.allocPrint(allocator, "{s}/bbr/config.toml", .{base});
     if (env.get("HOME")) |home| return try std.fmt.allocPrint(allocator, "{s}/.config/bbr/config.toml", .{home});
     return null;
 }
@@ -836,11 +839,23 @@ test "configuration path prefers XDG and falls back to HOME" {
     try testing.expectEqualStrings("/cfg/bbr/config.toml", xdg_path);
 }
 
+test "configuration path ignores an empty or relative XDG_CONFIG_HOME" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("HOME", "/home/ada");
+    for ([_][]const u8{ "", "relative/cfg" }) |base| {
+        try env.put("XDG_CONFIG_HOME", base);
+        const resolved = (try path(testing.allocator, &env)).?;
+        defer testing.allocator.free(resolved);
+        try testing.expectEqualStrings("/home/ada/.config/bbr/config.toml", resolved);
+    }
+}
+
 test "configuration intake owns missing valid malformed and unreadable file states" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(base);
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
@@ -923,7 +938,7 @@ test "persistTheme writes config.toml atomically through a symlink and refuses a
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(base);
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
@@ -962,7 +977,7 @@ test "persistTheme writes config.toml through a symlinked bbr directory" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(base);
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
@@ -984,7 +999,7 @@ test "persistTheme keeps the permissions of config.toml" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(base);
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
@@ -1007,7 +1022,7 @@ test "persistTheme leaves an unchanged config.toml alone" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
-    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(base);
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
