@@ -1,7 +1,8 @@
 //! XDG base directories. This module is the only reader of `XDG_CONFIG_HOME`
-//! and `XDG_DATA_HOME`. The XDG Base Directory spec says to ignore an empty or relative base, so a
-//! value like `relative/dir` never makes bbr read or create files under the
-//! working directory.
+//! and `XDG_DATA_HOME`, and `tools/check_xdg_reads.py` fails on any other
+//! reader. The XDG Base Directory spec says to ignore an empty or relative
+//! base, so a value like `relative/dir` never makes bbr read or create files
+//! under the working directory.
 
 const std = @import("std");
 
