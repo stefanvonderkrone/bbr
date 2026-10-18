@@ -1,10 +1,11 @@
-//! Configuration intake owns the complete startup path: XDG/HOME discovery,
-//! missing-file defaults, bounded file I/O, parsing, semantic validation,
-//! diagnostics, and materialization of the runtime Theme and Keymap. It also
-//! owns the one write, `persistTheme`. Callers cross these two seams and never
-//! learn TOML or selection rules.
+//! Configuration intake owns the complete startup path: the file location
+//! from `xdg.configFile`, missing-file defaults, bounded file I/O, parsing,
+//! semantic validation, diagnostics, and materialization of the runtime Theme
+//! and Keymap. It also owns the one write, `persistTheme`. Callers cross these
+//! two seams and never learn TOML or selection rules.
 
 const std = @import("std");
+const xdg = @import("bbr").xdg;
 const keymap = @import("keymap.zig");
 const ThemeId = @import("theme_id.zig").ThemeId;
 
@@ -101,17 +102,8 @@ fn defaults(allocator: std.mem.Allocator) !Configuration {
     };
 }
 
-/// The XDG Base Directory spec says to ignore an empty or relative
-/// XDG_CONFIG_HOME, so both fall back to HOME.
-fn path(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]u8 {
-    if (env.get("XDG_CONFIG_HOME")) |base| if (std.fs.path.isAbsolute(base))
-        return try std.fmt.allocPrint(allocator, "{s}/bbr/config.toml", .{base});
-    if (env.get("HOME")) |home| return try std.fmt.allocPrint(allocator, "{s}/.config/bbr/config.toml", .{home});
-    return null;
-}
-
 pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !LoadResult {
-    const config_path = (try path(allocator, env)) orelse return .{ .ok = try defaults(allocator) };
+    const config_path = (try xdg.configFile(allocator, env)) orelse return .{ .ok = try defaults(allocator) };
     errdefer allocator.free(config_path);
     const source = std.Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(64 * 1024 + 1)) catch |err| switch (err) {
         error.FileNotFound => {
@@ -138,7 +130,7 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.En
 }
 
 pub const PersistThemeError = error{
-    /// Neither XDG_CONFIG_HOME nor HOME is set.
+    /// `xdg.configFile` resolves no path: no absolute XDG_CONFIG_HOME and no HOME.
     NoConfigLocation,
     /// The file is over 64 KiB, or the rewritten file does not parse.
     /// Nothing is written.
@@ -153,7 +145,7 @@ pub const PersistThemeError = error{
 /// durable, keeps the file's permissions, follows a symlinked config.toml to
 /// its target, and creates the `bbr` directory when it is absent.
 pub fn persistTheme(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, id: ThemeId) PersistThemeError!void {
-    const config_path = (try path(allocator, env)) orelse return error.NoConfigLocation;
+    const config_path = (try xdg.configFile(allocator, env)) orelse return error.NoConfigLocation;
     defer allocator.free(config_path);
     var exists = true;
     const source = std.Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(64 * 1024 + 1)) catch |err| switch (err) {
@@ -823,32 +815,6 @@ test "External Edit defaults to 1 MiB and rejects zero or unknown keys" {
     defer zero.deinit(testing.allocator);
     try testing.expect(zero == .invalid);
     try testing.expectEqualStrings("External Edit max_bytes must be greater than zero", zero.invalid[0].message);
-}
-
-test "configuration path prefers XDG and falls back to HOME" {
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-    try env.put("HOME", "/home/ada");
-    const home_path = (try path(testing.allocator, &env)).?;
-    defer testing.allocator.free(home_path);
-    try testing.expectEqualStrings("/home/ada/.config/bbr/config.toml", home_path);
-
-    try env.put("XDG_CONFIG_HOME", "/cfg");
-    const xdg_path = (try path(testing.allocator, &env)).?;
-    defer testing.allocator.free(xdg_path);
-    try testing.expectEqualStrings("/cfg/bbr/config.toml", xdg_path);
-}
-
-test "configuration path ignores an empty or relative XDG_CONFIG_HOME" {
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-    try env.put("HOME", "/home/ada");
-    for ([_][]const u8{ "", "relative/cfg" }) |base| {
-        try env.put("XDG_CONFIG_HOME", base);
-        const resolved = (try path(testing.allocator, &env)).?;
-        defer testing.allocator.free(resolved);
-        try testing.expectEqualStrings("/home/ada/.config/bbr/config.toml", resolved);
-    }
 }
 
 test "configuration intake owns missing valid malformed and unreadable file states" {

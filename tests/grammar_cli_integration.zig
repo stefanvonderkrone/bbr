@@ -65,9 +65,15 @@ pub fn main(init: std.process.Init) !void {
 
     var env = std.process.Environ.Map.init(init.gpa);
     defer env.deinit();
-    try env.put("XDG_DATA_HOME", ".zig-cache/grammar-cli-integration/data");
-    try env.put("XDG_CONFIG_HOME", ".zig-cache/grammar-cli-integration/config");
-    try env.put("HOME", ".zig-cache/grammar-cli-integration");
+    const root = try tmp.realPathFileAlloc(init.io, ".", init.gpa);
+    defer init.gpa.free(root);
+    const data_home = try std.fs.path.join(init.gpa, &.{ root, "data" });
+    defer init.gpa.free(data_home);
+    const config_home = try std.fs.path.join(init.gpa, &.{ root, "config" });
+    defer init.gpa.free(config_home);
+    try env.put("XDG_DATA_HOME", data_home);
+    try env.put("XDG_CONFIG_HOME", config_home);
+    try env.put("HOME", root);
 
     const check = try command(init, &env, &.{ bbr, "grammar", "check", ".zig-cache/grammar-cli-integration/bundle" });
     defer freeResult(init.gpa, check);

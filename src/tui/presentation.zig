@@ -3108,7 +3108,7 @@ pub const ThemePersisted = struct {
 
     pub const Outcome = enum {
         saved,
-        /// Neither XDG_CONFIG_HOME nor HOME is set.
+        /// No absolute XDG_CONFIG_HOME and no HOME.
         no_config_location,
         /// config.toml does not parse with the new Theme.
         config_invalid,

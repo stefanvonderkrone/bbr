@@ -936,7 +936,7 @@ fn loginRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, fla
     defer gpa.free(profile_name);
 
     const auth_path = (try auth.authFilePath(gpa, init.environ_map)) orelse {
-        std.debug.print("bbr: cannot save credentials: set XDG_DATA_HOME or HOME\n", .{});
+        std.debug.print("bbr: cannot save credentials: set HOME or an absolute XDG_DATA_HOME\n", .{});
         std.process.exit(1);
     };
     defer gpa.free(auth_path);

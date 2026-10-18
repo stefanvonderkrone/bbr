@@ -84,7 +84,7 @@ Credential. The `check*` commands are explicit local opt-ins and are never part 
 
 Remote-review credentials are managed with `bbr auth login` / `bbr auth status` /
 `bbr auth logout` and stored in `$XDG_DATA_HOME/bbr/auth.toml` (fallback
-`$HOME/.local/share/bbr/auth.toml`). The `bbr` directory is created and repaired to mode
+`$HOME/.local/share/bbr/auth.toml` when `XDG_DATA_HOME` is unset, empty, or relative). The `bbr` directory is created and repaired to mode
 `0700` (parents untouched); `auth.toml` is replaced atomically with mode `0600`.
 `bbr auth login [profile]` prompts for each missing field in Email, Token, Workspace order
 (`--email` / `--workspace` skip their prompts; the token prompt hides input and restores echo
@@ -206,7 +206,7 @@ bbr completion fish > ~/.config/fish/completions/bbr.fish
 ## Configuration
 
 The TUI reads `$XDG_CONFIG_HOME/bbr/config.toml`, falling back to
-`$HOME/.config/bbr/config.toml`. A missing file uses defaults; an existing invalid file reports
+`$HOME/.config/bbr/config.toml` when `XDG_CONFIG_HOME` is unset, empty, or relative. A missing file uses defaults; an existing invalid file reports
 all detected diagnostics and stops before entering the alternate screen.
 
 ```toml
