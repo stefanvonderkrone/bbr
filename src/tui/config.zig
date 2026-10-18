@@ -145,14 +145,19 @@ pub const PersistThemeError = error{
 };
 
 /// Write `id` as the root `theme` of config.toml and keep every other byte.
-/// The rewritten file must parse before it replaces the old one. The write is
-/// atomic, follows a symlinked config.toml to its target, and creates the
-/// `bbr` directory when it is absent.
+/// The rewritten file must parse before it replaces the old one. An existing
+/// file that already names `id` is not written. The write is atomic and
+/// durable, keeps the file's permissions, follows a symlinked config.toml to
+/// its target, and creates the `bbr` directory when it is absent.
 pub fn persistTheme(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, id: ThemeId) PersistThemeError!void {
     const config_path = (try path(allocator, env)) orelse return error.NoConfigLocation;
     defer allocator.free(config_path);
+    var exists = true;
     const source = std.Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(64 * 1024 + 1)) catch |err| switch (err) {
-        error.FileNotFound => try allocator.dupe(u8, ""),
+        error.FileNotFound => blk: {
+            exists = false;
+            break :blk try allocator.dupe(u8, "");
+        },
         error.StreamTooLong => return error.ConfigInvalid,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.WriteFailed,
@@ -160,6 +165,7 @@ pub fn persistTheme(allocator: std.mem.Allocator, io: std.Io, env: *const std.pr
     defer allocator.free(source);
     const next = try rewriteTheme(allocator, source, id.name());
     defer allocator.free(next);
+    if (exists and std.mem.eql(u8, source, next)) return;
     var parsed = try parse(allocator, next);
     defer parsed.deinit(allocator);
     if (parsed == .invalid) return error.ConfigInvalid;
@@ -190,12 +196,23 @@ fn writeAtomically(allocator: std.mem.Allocator, io: std.Io, file_path: []const 
     const write_path = target orelse file_path;
     var dir = try cwd.openDir(io, std.fs.path.dirname(write_path).?, .{});
     defer dir.close(io);
-    var atomic = try dir.createFileAtomic(io, std.fs.path.basename(write_path), .{ .replace = true });
+    const name = std.fs.path.basename(write_path);
+    // The stat mode carries the file type bits, and the umask narrows the
+    // create mode, so mask the mode and set it again on the open file.
+    const permissions: ?std.Io.File.Permissions = if (dir.statFile(io, name, .{})) |stat|
+        .fromMode(stat.permissions.toMode() & 0o7777)
+    else |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    var atomic = try dir.createFileAtomic(io, name, .{ .replace = true, .permissions = permissions orelse .default_file });
     defer atomic.deinit(io);
+    if (permissions) |kept| try atomic.file.setPermissions(io, kept);
     var buffer: [4096]u8 = undefined;
     var writer = atomic.file.writer(io, &buffer);
     try writer.interface.writeAll(bytes);
     try writer.interface.flush();
+    try atomic.file.sync(io);
     try atomic.replace(io);
 }
 
@@ -961,4 +978,46 @@ test "persistTheme writes config.toml through a symlinked bbr directory" {
     const target = try tmp.dir.readFileAlloc(io, "dotfiles/config.toml", testing.allocator, .limited(1024));
     defer testing.allocator.free(target);
     try testing.expectEqualStrings("# mine\ntheme = \"light\"\n[highlight]\nmax_file_bytes = 10\n", target);
+}
+
+test "persistTheme keeps the permissions of config.toml" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer testing.allocator.free(base);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", base);
+
+    try tmp.dir.createDir(io, "bbr", .default_dir);
+    var file = try tmp.dir.createFile(io, "bbr/config.toml", .{ .permissions = .fromMode(0o600) });
+    try file.writeStreamingAll(io, "theme = \"dark\"\n");
+    try file.setPermissions(io, .fromMode(0o600));
+    file.close(io);
+    try persistTheme(testing.allocator, io, &env, .light);
+    const stat = try tmp.dir.statFile(io, "bbr/config.toml", .{});
+    try testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o7777);
+    const saved = try tmp.dir.readFileAlloc(io, "bbr/config.toml", testing.allocator, .limited(1024));
+    defer testing.allocator.free(saved);
+    try testing.expectEqualStrings("theme = \"light\"\n", saved);
+}
+
+test "persistTheme leaves an unchanged config.toml alone" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const base = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer testing.allocator.free(base);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", base);
+
+    try tmp.dir.createDir(io, "bbr", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "bbr/config.toml", .data = "theme = \"dark\" # mine\n" });
+    const before = try tmp.dir.statFile(io, "bbr/config.toml", .{});
+    try persistTheme(testing.allocator, io, &env, .dark);
+    const after = try tmp.dir.statFile(io, "bbr/config.toml", .{});
+    try testing.expectEqual(before.inode, after.inode);
+    try testing.expectEqual(before.mtime, after.mtime);
 }
