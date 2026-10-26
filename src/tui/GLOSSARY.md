@@ -49,6 +49,10 @@ _Avoid_: nav, drawer.
 The collapsible repository-path hierarchy shown inside the Sidebar. Its entries are Directories and Files.
 _Avoid_: Sidebar (the containing Pane), flat file list.
 
+**File Jump**:
+A move of the DiffPane cursor to the File header of another File: `]`, `[`, a File Tree File, the File Finder, or the isolate view. The File header lands on the top DiffPane row, unless the end of the Buffer stops the scroll.
+_Avoid_: file navigation, go to file.
+
 **File Read State**:
 The current Presentation projection of a File Read Receipt against its File Review Fingerprint. An unread File is bold in the File Tree; a read File uses regular weight. It is derived from durable review state and the current Session rather than persisted as a bare boolean.
 _Avoid_: File Read Receipt (the durable evidence), viewed state, bold flag.

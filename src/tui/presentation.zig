@@ -4810,6 +4810,12 @@ const Published = struct {
         return frame_mod.visualIndexForBufferIndex(self.visual_rows, buffer_index);
     }
 
+    fn jumpToFileHeader(self: *Published, file_index: usize) void {
+        const row = fileHeaderRow(self.buffer, file_index) orelse return;
+        self.navigation.jumpTo(self.visualIndexForBufferIndex(row) orelse return);
+        self.navigation.scrollCursorTop();
+    }
+
     fn sidebarEntry(self: *const Published) ?file_tree.Entry {
         if (self.tree.cursor >= self.tree.entries.len) return null;
         return self.tree.entries[self.tree.cursor];
@@ -6286,6 +6292,8 @@ pub const Presentation = struct {
             self.mouse_press = null;
             return;
         }
+        const active_before = if (self.published) |published| published.activeFile() else null;
+        defer if (self.published) |published| if (published.focus == .diff and active_before != published.activeFile()) self.revealActiveFile(published);
         switch (mouse.button) {
             .wheel_up, .wheel_down => {
                 self.mouse_press = null;
@@ -9021,7 +9029,8 @@ pub const Presentation = struct {
             published.session.enrichment.commitCacheUpdate();
         }
         if (job.navigation_policy == .file_header) {
-            if (job.navigation_file) |file_index| if (fileHeaderRow(published.buffer, file_index)) |row| if (published.visualIndexForBufferIndex(row)) |visual_index| published.navigation.jumpTo(visual_index);
+            if (job.navigation_file) |file_index| published.jumpToFileHeader(file_index);
+            self.revealActiveFile(published);
         } else if (job.navigation_policy == .center) published.centerActiveFile();
         if (job.navigation_policy == .version or version_changed) {
             published.navigation.count = 0;
@@ -9650,6 +9659,7 @@ pub const Presentation = struct {
         switch (entry.identity) {
             .directory => if (entry.expanded) self.sidebarLeft(published) else self.sidebarRight(published),
             .file => |file_index| {
+                self.focusPane(published, .diff);
                 self.focusFile(published, file_index);
             },
         }
@@ -9670,7 +9680,8 @@ pub const Presentation = struct {
             self.commands.items[self.commands.items.len - 1].build_buffer_disclosure.navigation_file = file_index;
             self.commands.items[self.commands.items.len - 1].build_buffer_disclosure.active_file = file_index;
             return;
-        } else if (fileHeaderRow(published.buffer, file_index)) |row| if (published.visualIndexForBufferIndex(row)) |visual_index| published.navigation.jumpTo(visual_index);
+        }
+        published.jumpToFileHeader(file_index);
         self.revealActiveFile(published);
     }
 
@@ -9692,6 +9703,7 @@ pub const Presentation = struct {
                     break :blk path.len > directory.len and std.mem.startsWith(u8, path, directory) and path[directory.len] == '/';
                 } else false;
             }
+            if (published.focus == .diff) published.cursorToActiveFile();
             published.centerActiveFile();
             published.frame_revision += 1;
             return;
@@ -9715,6 +9727,7 @@ pub const Presentation = struct {
             return;
         };
         for (removed.items) |candidate| published.allocator.free(candidate);
+        if (published.focus == .diff) published.cursorToActiveFile();
         published.centerActiveFile();
     }
 
@@ -11742,8 +11755,8 @@ pub const Presentation = struct {
                 picked.id,
             )),
             .file => |index| if (self.published) |published| {
-                self.focusFile(published, index);
                 published.focus = .diff;
+                self.focusFile(published, index);
             },
             // The palette listed its rows for the Pane context at open. A view
             // build can move the cursor to another context before Enter.
@@ -19062,6 +19075,83 @@ test "M21 kernel Sidebar Directory changes preserve DiffPane rows and search ran
     try testing.expectEqual(before.navigation, frame.navigation);
 }
 
+fn fileTreeIndex(frame: frame_mod.Projection, file_index: usize) usize {
+    for (frame.file_tree.entries, 0..) |entry, index| if (entry.identity.eql(.{ .file = file_index })) return index;
+    unreachable;
+}
+
+fn expectFileHeaderOnTop(frame: frame_mod.Projection, file_index: usize) !void {
+    const nav = frame.navigation;
+    const row = frame.visual_rows[nav.cursor];
+    try testing.expectEqual(buffer_mod.RowKind.file_header, row.kind);
+    try testing.expectEqual(file_index, frame.buffer.fileIndexForRow(row.buffer_index).?);
+    try testing.expectEqual(@min(nav.cursor, nav.row_count -| nav.viewport), nav.scroll);
+    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = file_index }));
+}
+
+test "every File jump puts the File header on the top DiffPane row and the File Tree cursor on the File" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 12) },
+        .geometry = .{ .cols = 80, .rows = 12 },
+    });
+    defer presentation.deinit();
+
+    for (1..12) |file_index| {
+        try presentation.dispatch(.{ .action = .next_file });
+        try expectFileHeaderOnTop(presentation.projection().review.?.frame, file_index);
+    }
+    var frame = presentation.projection().review.?.frame;
+    try testing.expect(frame.navigation.scroll < frame.navigation.cursor);
+    var file_index: usize = 11;
+    while (file_index > 0) {
+        file_index -= 1;
+        try presentation.dispatch(.{ .action = .prev_file });
+        try expectFileHeaderOnTop(presentation.projection().review.?.frame, file_index);
+    }
+
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    for (0..fileTreeIndex(presentation.projection().review.?.frame, 5)) |_| try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .focus_file });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
+    try expectFileHeaderOnTop(frame, 5);
+
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .down });
+    frame = presentation.projection().review.?.frame;
+    const moved_to = frame.buffer.fileIndexForRow(frame.visual_rows[frame.navigation.cursor].buffer_index).?;
+    try testing.expectEqual(@as(usize, 6), moved_to);
+    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 6 }));
+
+    const content = frame.panes.sidebar_content;
+    const target_row = content.y + @as(u16, @intCast(fileTreeIndex(frame, 8) - frame.file_tree.scroll));
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = target_row, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = target_row, .button = .left, .type = .release } });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
+    try expectFileHeaderOnTop(frame, 8);
+
+    const diff = frame.panes.diff_content;
+    var scrolled_to: usize = 8;
+    for (0..10) |_| {
+        try presentation.dispatch(.{ .mouse = .{ .col = diff.x + 2, .row = diff.y, .button = .wheel_down, .type = .press } });
+        frame = presentation.projection().review.?.frame;
+        scrolled_to = frame.buffer.fileIndexForRow(frame.visual_rows[frame.navigation.cursor].buffer_index).?;
+        if (scrolled_to != 8) break;
+    }
+    try testing.expect(scrolled_to != 8);
+    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = scrolled_to }));
+
+    try dispatchView(&presentation, .{ .action = .isolate });
+    try dispatchView(&presentation, .{ .action = .next_file });
+    try expectFileHeaderOnTop(presentation.projection().review.?.frame, scrolled_to + 1);
+    try dispatchView(&presentation, .{ .action = .isolate });
+    try expectFileHeaderOnTop(presentation.projection().review.?.frame, scrolled_to + 1);
+}
+
 test "Pane focus gives the Sidebar an independent cursor while DiffPane File motions remain complete" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -19080,19 +19170,23 @@ test "Pane focus gives the Sidebar an independent cursor while DiffPane File mot
     frame = presentation.projection().review.?.frame;
     try testing.expectEqual(frame_mod.PaneFocus.sidebar, frame.focus);
     try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 1 }));
-    try presentation.dispatch(.{ .action = .toggle_directory });
-    frame = presentation.projection().review.?.frame;
-    try testing.expectEqual(@as(usize, 1), frame.buffer.fileIndexForRow(frame.navigation.cursor));
 
     // File Actions are scoped to the DiffPane and do not consume Sidebar state.
     try presentation.dispatch(.{ .action = .prev_file });
     frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(frame_mod.PaneFocus.sidebar, frame.focus);
+    try testing.expectEqual(@as(usize, 0), frame.buffer.fileIndexForRow(frame.navigation.cursor));
+    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 1 }));
+
+    // Entering a File moves focus to the DiffPane, where File Actions apply.
+    try presentation.dispatch(.{ .action = .toggle_directory });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
     try testing.expectEqual(@as(usize, 1), frame.buffer.fileIndexForRow(frame.navigation.cursor));
-    try presentation.dispatch(.{ .action = .focus_next_pane });
     try presentation.dispatch(.{ .action = .prev_file });
     frame = presentation.projection().review.?.frame;
     try testing.expectEqual(@as(usize, 0), frame.buffer.fileIndexForRow(frame.navigation.cursor));
-    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 1 }));
+    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 0 }));
 }
 
 test "M21 kernel active File reveal without collapsed ancestors needs no allocation or Buffer rebuild" {
@@ -19117,7 +19211,7 @@ test "M21 kernel active File reveal without collapsed ancestors needs no allocat
     try testing.expect(!frame.file_tree.entries[1].active);
     try testing.expect(frame.file_tree.entries[2].active);
     try testing.expect(frame.file_tree.entries[0].active_descendant);
-    try testing.expectEqual(before.file_tree.cursor, frame.file_tree.cursor);
+    try testing.expectEqual(@as(usize, 2), frame.file_tree.cursor);
 }
 
 test "M21 kernel active File reveal opens only its collapsed ancestors" {
@@ -21687,7 +21781,8 @@ test "selecting the current Selected Version is an exact no-op" {
     try testing.expect(std.meta.eql(before.review.?.navigation, after.review.?.navigation));
     try testing.expect(presentation.takeCommand() == null);
     try presentation.dispatch(.{ .mouse = .{ .col = target.x, .row = target.y, .button = .left, .type = .release } });
-    try testing.expectEqual(frame_mod.PaneFocus.sidebar, presentation.projection().review.?.frame.focus);
+    try testing.expectEqual(frame_mod.PaneFocus.diff, presentation.projection().review.?.frame.focus);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.cursor);
 }
 
 test "a Selected Version change publishes one Frame and then clears Count and Selection" {
@@ -21746,7 +21841,8 @@ test "a failed Selected Version change preserves the complete published interact
     try testing.expectEqual(SelectedVersion.new, after.review.?.selected_version);
     failing.fail_index = std.math.maxInt(usize);
     try presentation.dispatch(.{ .mouse = .{ .col = target.x, .row = target.y, .button = .left, .type = .release } });
-    try testing.expectEqual(frame_mod.PaneFocus.sidebar, presentation.projection().review.?.frame.focus);
+    try testing.expectEqual(frame_mod.PaneFocus.diff, presentation.projection().review.?.frame.focus);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.cursor);
 }
 
 test "WholeFile Selected Version restoration chooses the closest source row and retains context offsets" {
@@ -29125,7 +29221,8 @@ test "mouse activates Sidebar Files and disclosures and replacement cancels a pr
     const sidebar = opened.frame.panes.sidebar_content;
     try presentation.dispatch(.{ .mouse = .{ .col = sidebar.x, .row = sidebar.y, .button = .left, .type = .press } });
     try presentation.dispatch(.{ .mouse = .{ .col = sidebar.x, .row = sidebar.y, .button = .left, .type = .release } });
-    try testing.expectEqual(frame_mod.PaneFocus.sidebar, presentation.projection().review.?.frame.focus);
+    try testing.expectEqual(frame_mod.PaneFocus.diff, presentation.projection().review.?.frame.focus);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.cursor);
 
     const current = presentation.projection().review.?.frame;
     try presentation.dispatch(.{ .mouse = .{ .col = current.panes.diff_content.x, .row = current.panes.diff_content.y + 1, .button = .left, .type = .press } });
@@ -29197,7 +29294,7 @@ test "Sidebar mouse click toggles a Directory and focuses a child File" {
     try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 1, .button = .left, .type = .press } });
     try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 1, .button = .left, .type = .release } });
     frame = presentation.projection().review.?.frame;
-    try testing.expectEqual(frame_mod.PaneFocus.sidebar, frame.focus);
+    try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
     try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 0 }));
     try testing.expectEqual(@as(usize, 0), frame.navigation.cursor);
 }
