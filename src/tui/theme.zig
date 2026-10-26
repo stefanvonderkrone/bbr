@@ -15,7 +15,14 @@ const Color = vaxis.Cell.Color;
 const review_card = @import("review_card.zig");
 const ThemeId = @import("theme_id.zig").ThemeId;
 
+/// One kind of content on the status row. Each kind has its own Style.
+pub const StatusPart = enum { bar, separator, pull_request, title, ref, position, key, hint, drafts, verdict_approved, verdict_changes_requested, verdict_none, message, busy, no_match };
+
+/// The status row palette. Its polarity follows the Theme.
+pub const StatusBar = struct { bg: Color, fg: Color, muted: Color };
+
 pub const Theme = struct {
+    status_bar: StatusBar,
     /// Pair fixed RGB bands with fixed foregrounds in the terminal-owned Theme.
     fixed_band_foregrounds: bool = false,
     /// Frame-owned Pane and Overlay chrome.
@@ -185,6 +192,47 @@ pub const Theme = struct {
         return self.resolveStyle(style);
     }
 
+    /// Every status part keeps the bar background, so the whole row reads as one bar.
+    pub fn statusStyle(self: Theme, part: StatusPart) Style {
+        const bar = self.status_bar;
+        var style: Style = .{ .fg = bar.fg, .bg = bar.bg };
+        switch (part) {
+            .bar, .position => {},
+            .separator, .hint => style.fg = bar.muted,
+            .pull_request, .key => {
+                style.fg = self.accent;
+                style.bold = true;
+            },
+            .title, .message => style.bold = true,
+            .ref => style.fg = self.syntax_property,
+            .drafts => {
+                style.fg = self.draft.fg;
+                style.bold = true;
+            },
+            .verdict_approved => {
+                style.fg = self.status_added;
+                style.bold = true;
+            },
+            .verdict_changes_requested => {
+                style.fg = self.status_removed;
+                style.bold = true;
+            },
+            .verdict_none => {
+                style.fg = bar.muted;
+                style.italic = true;
+            },
+            .busy => {
+                style.fg = self.status_modified;
+                style.italic = true;
+            },
+            .no_match => {
+                style.fg = self.search_no_match;
+                style.bold = true;
+            },
+        }
+        return style;
+    }
+
     /// Highlighted background for a cell on the cursor row. A cell with an rgb
     /// background (a diff band) keeps its hue, nudged by `cursor_line_shift`; a
     /// cell on the terminal-default (or palette) background takes `cursor_line`.
@@ -246,6 +294,7 @@ fn shiftChannel(v: u8, delta: i16) u8 {
 /// The default dark theme. Backgrounds are muted so foreground text stays
 /// readable; foregrounds are left `default` except where contrast needs it.
 pub const dark: Theme = .{
+    .status_bar = .{ .bg = rgb(0x20_20_2c), .fg = rgb(0xd0_d0_d0), .muted = rgb(0x80_80_90) },
     .pane_border = .{ .fg = rgb(0x70_70_80), .dim = true },
     .pane_border_focused = .{ .fg = rgb(0xd0_d0_d0), .bold = true },
     .overlay_border = .{ .fg = rgb(0xd0_d0_d0), .bold = true },
@@ -297,6 +346,7 @@ pub const dark: Theme = .{
 
 fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24, muted: u24, green: u24, red: u24, yellow: u24, blue: u24, violet: u24, teal: u24, light: bool }) Theme {
     return .{
+        .status_bar = .{ .bg = rgb(p.surface), .fg = rgb(p.fg), .muted = rgb(p.muted) },
         .pane_border = .{ .fg = rgb(p.muted), .bg = rgb(p.bg), .dim = true },
         .pane_border_focused = .{ .fg = rgb(p.fg), .bg = rgb(p.bg), .bold = true },
         .overlay_border = .{ .fg = rgb(p.fg), .bg = rgb(p.surface), .bold = true },
@@ -363,6 +413,7 @@ const band_foregrounds = [_]u24{
 // Keep terminal colors on terminal backgrounds. Pair muted RGB bands with
 // readable RGB foregrounds through resolveStyle, including cursor and search.
 pub const system: Theme = .{
+    .status_bar = .{ .bg = .default, .fg = .default, .muted = .{ .index = 8 } },
     .fixed_band_foregrounds = true,
     .pane_border = .{ .fg = .{ .index = 8 }, .dim = true },
     .pane_border_focused = .{ .bold = true },

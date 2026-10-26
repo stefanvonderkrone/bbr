@@ -1201,52 +1201,107 @@ fn drawStatus(
     active_theme: theme.Theme,
 ) void {
     if (win.height == 0) return;
-    const layout_hint: []const u8 = if (layout == .unified) "s split" else "s unified";
-    // Names the *current* scope; `f` cycles Changes → fetched → whole.
-    const scope_hint: []const u8 = switch (scope) {
-        .changes => "f: changes",
-        .fetched => "f: fetched",
-        .whole => "f: whole",
-    };
-    const file_hint: []const u8 = if (isolate) "o all files" else "o isolate";
+    var start: StatusLine = .{ .theme = active_theme };
+    var end: StatusLine = .{ .theme = active_theme };
+    const tail = if (searching) &start else &end;
+    if (!searching) {
+        if (header.pull_request_id) |id| {
+            start.add(std.fmt.allocPrint(frame, "#{d}", .{id}) catch "#", .pull_request);
+            start.add(" ", .bar);
+        }
+        start.add(header.title, .title);
+        if (header.pull_request_id != null) {
+            start.separator();
+            start.add(reviewerVerdictLabel(reviewer_verdict), if (reviewer_verdict) |verdict| switch (verdict) {
+                .approved => .verdict_approved,
+                .changes_requested => .verdict_changes_requested,
+                .no_verdict => .verdict_none,
+            } else .verdict_none);
+        }
+        start.separator();
+        start.add(header.source_ref, .ref);
+        start.add(" → ", .separator);
+        start.add(header.base_ref, .ref);
+        start.separator();
+        start.add(std.fmt.allocPrint(frame, "{d}/{d}", .{ @min(nav.cursor + 1, buf.rows.len), buf.rows.len }) catch "", .position);
+
+        end.hint("s", if (layout == .unified) " split" else " unified");
+        end.separator();
+        // Names the *current* scope; `f` cycles Changes → fetched → whole.
+        end.hint("f", switch (scope) {
+            .changes => ": changes",
+            .fetched => ": fetched",
+            .whole => ": whole",
+        });
+        end.separator();
+        end.hint("o", if (isolate) " all files" else " isolate");
+        end.separator();
+    }
     // A transient message (error/summary) or an in-progress indicator takes the
     // tail slot; otherwise the key hints, with the pending-draft count on `X`.
-    const default_tail: []const u8 = if (draft_count > 0)
-        (std.fmt.allocPrint(frame, "X submit {d}  ·  c/i comment  ·  [ ] file  ·  p switch  ·  ? help  ·  q quit", .{draft_count}) catch "q quit")
-    else
-        "c/i comment  ·  [ ] file  ·  p switch  ·  ? help  ·  q quit";
-    const tail: []const u8 = if (status_msg) |m| m else if (submitting) "submitting…" else if (loading) "loading…" else default_tail;
-    const identity = if (header.pull_request_id) |id|
-        (std.fmt.allocPrint(frame, "#{d} {s}  ·  {s}", .{ id, header.title, reviewerVerdictLabel(reviewer_verdict) }) catch header.title)
-    else
-        header.title;
-    const start = if (searching)
-        tail
-    else
-        std.fmt.allocPrint(frame, "{s}  ·  {s} → {s}  ·  {d}/{d}", .{
-            identity,
-            header.source_ref,
-            header.base_ref,
-            @min(nav.cursor + 1, buf.rows.len),
-            buf.rows.len,
-        }) catch "";
-    const end = if (searching)
-        ""
-    else
-        std.fmt.allocPrint(frame, "{s}  ·  {s}  ·  {s}  ·  {s}", .{ layout_hint, scope_hint, file_hint, tail }) catch "q quit";
-    const style: vaxis.Style = if (search_has_no_matches)
-        .{ .fg = active_theme.search_no_match, .bg = .{ .index = 7 }, .bold = true }
-    else
-        .{ .fg = .{ .index = 0 }, .bg = .{ .index = 7 } };
-    win.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
+    if (status_msg) |message| {
+        tail.add(message, if (search_has_no_matches) .no_match else .message);
+    } else if (submitting) {
+        tail.add("submitting…", .busy);
+    } else if (loading) {
+        tail.add("loading…", .busy);
+    } else {
+        if (draft_count > 0) {
+            tail.add("X", .key);
+            tail.add(std.fmt.allocPrint(frame, " submit {d}", .{draft_count}) catch " submit", .drafts);
+            tail.separator();
+        }
+        tail.hint("c/i", " comment");
+        tail.separator();
+        tail.hint("[ ]", " file");
+        tail.separator();
+        tail.hint("p", " switch");
+        tail.separator();
+        tail.hint("?", " help");
+        tail.separator();
+        tail.hint("q", " quit");
+    }
+    win.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = active_theme.statusStyle(.bar) });
     const regions = view.solve(layouts.StatusSlot, layouts.status, layouts.Status{
-        .start = cellWidth(start),
-        .end = cellWidth(end),
+        .start = start.width(),
+        .end = end.width(),
         .padding = if (searching) 0 else 1,
     }, .{ .width = win.width, .height = win.height });
-    _ = childRect(win, regions.get(.start).content).printSegment(.{ .text = start, .style = style }, .{ .wrap = .none });
-    _ = childRect(win, regions.get(.end).content).printSegment(.{ .text = end, .style = style }, .{ .wrap = .none });
+    _ = childRect(win, regions.get(.start).content).print(start.items(), .{ .wrap = .none });
+    _ = childRect(win, regions.get(.end).content).print(end.items(), .{ .wrap = .none });
 }
+
+/// One status region as styled Segments. The texts must outlive render.
+const StatusLine = struct {
+    theme: theme.Theme,
+    segments: [32]vaxis.Segment = undefined,
+    len: usize = 0,
+
+    fn add(self: *StatusLine, text: []const u8, part: theme.StatusPart) void {
+        std.debug.assert(self.len < self.segments.len);
+        self.segments[self.len] = .{ .text = text, .style = self.theme.statusStyle(part) };
+        self.len += 1;
+    }
+
+    fn hint(self: *StatusLine, key: []const u8, label: []const u8) void {
+        self.add(key, .key);
+        self.add(label, .hint);
+    }
+
+    fn separator(self: *StatusLine) void {
+        self.add("  ·  ", .separator);
+    }
+
+    fn items(self: *const StatusLine) []const vaxis.Segment {
+        return self.segments[0..self.len];
+    }
+
+    fn width(self: *const StatusLine) u16 {
+        var total: u16 = 0;
+        for (self.items()) |segment| total +|= cellWidth(segment.text);
+        return total;
+    }
+};
 
 fn cellWidth(text: []const u8) u16 {
     return @intCast(@min(vaxis.gwidth.gwidth(text, .unicode), std.math.maxInt(u16)));
@@ -1345,6 +1400,102 @@ test "the status row puts the identity at the start and the key hints at the end
         } else {
             try std.testing.expectEqualStrings("s", win.readCell(1 + cellWidth("Local review  ·  review → main  ·  0/0") + 2, 0).?.char.grapheme);
         }
+    }
+}
+
+const TestStatus = struct {
+    verdict: ?bbr.bitbucket.ReviewerVerdict = .approved,
+    loading: bool = false,
+    status_msg: ?[]const u8 = null,
+    searching: bool = false,
+    search_has_no_matches: bool = false,
+};
+
+fn testDrawStatus(arena: std.mem.Allocator, active_theme: theme.Theme, case: TestStatus) !vaxis.Window {
+    const header: session.ReviewHeader = .{ .pull_request_id = 7, .title = "Fix parser", .source_ref = "review", .base_ref = "main", .source_commit = "", .base_commit = "", .locator = "", .source_label = "" };
+    const buf: buffer_mod.Buffer = .{ .rows = &.{}, .layout = .unified };
+    const screen = try arena.create(vaxis.Screen);
+    screen.* = try vaxis.Screen.init(arena, .{ .rows = 1, .cols = 200, .x_pixel = 0, .y_pixel = 0 });
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = screen.width, .height = screen.height, .screen = screen };
+    drawStatus(arena, win, header, case.verdict, Nav.init(0, 1), buf, .unified, .changes, false, case.loading, false, 2, case.status_msg, case.searching, case.search_has_no_matches, active_theme);
+    return win;
+}
+
+/// The first column where the row's cells spell `needle`.
+fn testStatusColumn(win: vaxis.Window, needle: []const u8) !u16 {
+    for (0..win.width) |start| {
+        var offset: usize = 0;
+        var col: u16 = @intCast(start);
+        while (offset < needle.len and col < win.width) : (col += 1) {
+            const grapheme = win.readCell(col, 0).?.char.grapheme;
+            if (!std.mem.startsWith(u8, needle[offset..], grapheme)) break;
+            offset += grapheme.len;
+        }
+        if (offset == needle.len) return @intCast(start);
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn testStatusStyle(win: vaxis.Window, needle: []const u8, skip: u16) !vaxis.Style {
+    return win.readCell(try testStatusColumn(win, needle) + skip, 0).?.style;
+}
+
+fn testLuminance(color: vaxis.Cell.Color) f64 {
+    const channels = color.rgb;
+    return (0.2126 * @as(f64, @floatFromInt(channels[0])) + 0.7152 * @as(f64, @floatFromInt(channels[1])) + 0.0722 * @as(f64, @floatFromInt(channels[2]))) / 255;
+}
+
+test "the status row follows the Theme polarity and emphasizes its parts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for (theme.builtins) |builtin| {
+        const active = builtin.value;
+        const bar = active.statusStyle(.bar);
+        const muted = active.statusStyle(.separator).fg;
+        const win = try testDrawStatus(arena.allocator(), active, .{});
+        for (0..win.width) |col| try std.testing.expectEqual(bar.bg, win.readCell(@intCast(col), 0).?.style.bg);
+        if (bar.bg == .rgb) {
+            const bg = testLuminance(bar.bg);
+            const fg = testLuminance(bar.fg);
+            if (bg < 0.5) try std.testing.expect(fg > bg) else try std.testing.expect(fg < bg);
+            if (std.mem.eql(u8, builtin.name, "dark")) try std.testing.expect(bg < 0.5);
+            if (std.mem.eql(u8, builtin.name, "light")) try std.testing.expect(bg >= 0.5);
+        }
+        const pull_request = try testStatusStyle(win, "#7", 0);
+        try std.testing.expectEqual(active.accent, pull_request.fg);
+        try std.testing.expect(pull_request.bold);
+        try std.testing.expect((try testStatusStyle(win, "Fix parser", 0)).bold);
+        try std.testing.expectEqual(active.status_added, (try testStatusStyle(win, "Approved", 0)).fg);
+        const key = try testStatusStyle(win, "s split", 0);
+        try std.testing.expectEqual(active.accent, key.fg);
+        try std.testing.expect(key.bold);
+        const hint = try testStatusStyle(win, "s split", 2);
+        try std.testing.expectEqual(muted, hint.fg);
+        try std.testing.expect(!hint.bold);
+        try std.testing.expectEqual(muted, (try testStatusStyle(win, "·", 0)).fg);
+        try std.testing.expect(!std.meta.eql(bar.fg, muted));
+    }
+}
+
+test "the status row colors each Reviewer Verdict, Buffer Search miss, and busy state" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for (theme.builtins) |builtin| {
+        const active = builtin.value;
+        const muted = active.statusStyle(.separator).fg;
+        const changes = try testDrawStatus(arena.allocator(), active, .{ .verdict = .changes_requested });
+        try std.testing.expectEqual(active.status_removed, (try testStatusStyle(changes, "Changes requested", 0)).fg);
+        const unavailable = try testStatusStyle(try testDrawStatus(arena.allocator(), active, .{ .verdict = null }), "Verdict unavailable", 0);
+        try std.testing.expectEqual(muted, unavailable.fg);
+        try std.testing.expect(unavailable.italic);
+        const missed = try testDrawStatus(arena.allocator(), active, .{ .status_msg = "/nope 0/0", .searching = true, .search_has_no_matches = true });
+        const no_match = try testStatusStyle(missed, "/nope 0/0", 0);
+        try std.testing.expectEqual(active.search_no_match, no_match.fg);
+        try std.testing.expect(no_match.bold);
+        try std.testing.expectEqual(active.search_no_match, (try testStatusStyle(missed, "/nope 0/0", 6)).fg);
+        const busy = try testStatusStyle(try testDrawStatus(arena.allocator(), active, .{ .loading = true }), "loading…", 0);
+        try std.testing.expectEqual(active.status_modified, busy.fg);
+        try std.testing.expect(busy.italic);
     }
 }
 
