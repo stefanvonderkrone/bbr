@@ -485,7 +485,7 @@ fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: 
     const style = theme.lineStyle(line_row.line.kind);
     fillRow(win, r, style);
     if (!visual_row.continuation) {
-        drawUnifiedGutter(win, r, line_row.oldNo(), line_row.newNo(), theme.gutter);
+        drawUnifiedGutter(win, r, line_row.oldNo(), line_row.newNo(), gutterStyle(theme, style));
     }
     drawLineBodyText(
         scratch,
@@ -516,6 +516,14 @@ fn cursorRowTheme(theme: Theme) Theme {
     return result;
 }
 
+/// The line numbers of a Diff Line: the muted gutter digits on the Line's
+/// band, so an added or removed band starts at the left edge of its row.
+fn gutterStyle(theme: Theme, band: vaxis.Style) vaxis.Style {
+    var style = theme.gutter;
+    style.bg = band.bg;
+    return style;
+}
+
 /// Gutter is two 4-wide line-number columns; body text starts after it.
 const gutter_cols: u16 = @intCast(@import("frame.zig").unified_gutter_cols);
 
@@ -540,7 +548,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer
             const style = theme.lineStyle(ln.kind);
             fillRow(win, r, style);
 
-            drawUnifiedGutter(win, r, lr.oldNo(), lr.newNo(), theme.gutter);
+            drawUnifiedGutter(win, r, lr.oldNo(), lr.newNo(), gutterStyle(theme, style));
             drawLineBody(scratch, win, r, gutter_cols, lr, theme, style);
         },
         .line_pair => |pair| drawLinePair(scratch, win, r, pair, theme, null),
@@ -700,7 +708,7 @@ fn drawVisualHalf(scratch: std.mem.Allocator, win: vaxis.Window, half: ?@import(
     fillRow(win, 0, style);
     if (!value.continuation) {
         const no = if (side == .old) value.line.oldNo() else value.line.newNo();
-        drawSideGutter(win, 0, no, theme.gutter);
+        drawSideGutter(win, 0, no, gutterStyle(theme, style));
     }
     drawLineBodyText(
         scratch,
@@ -732,7 +740,7 @@ fn drawHalf(scratch: std.mem.Allocator, win: vaxis.Window, side_row: ?LineRow, t
         .old => lr.line.oldNo(),
         .new => lr.line.newNo(),
     };
-    drawSideGutter(win, 0, no, theme.gutter);
+    drawSideGutter(win, 0, no, gutterStyle(theme, style));
     drawLineBody(scratch, win, 0, side_gutter, lr, theme, style);
 }
 
@@ -2733,6 +2741,49 @@ test "Review Search draws titled borders, top query, Position, and separated Pre
     try testing.expectEqualStrings("t", win.readCell(geometry.preview.x, geometry.preview.y).?.char.grapheme);
 }
 
+test "an added or removed Line paints its band from the first gutter cell of every row" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try bbr.diff.parse(a,
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1,2 +1,2 @@
+        \\ keep
+        \\-old line that is long enough to wrap twice in a narrow pane
+        \\+new line that is long enough to wrap twice in a narrow pane
+        \\
+    );
+    var screen = try vaxis.Screen.init(a, .{ .rows = 16, .cols = 48, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    for (@import("theme.zig").builtins) |builtin| for ([_]buffer_mod.Layout{ .unified, .side_by_side }) |layout| {
+        const theme = builtin.value;
+        const buf = try buffer_mod.build(a, diff, layout);
+        const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, buf.rows, .bytes, .{ .layout = layout, .width = win.width });
+        try testing.expect(visual_rows.len <= win.height);
+        win.clear();
+        drawVisualPane(a, win, buf, visual_rows, theme, Nav.init(visual_rows.len, win.height));
+        var banded: usize = 0;
+        for (visual_rows, 0..) |visual, index| {
+            const row: u16 = @intCast(index);
+            if (visual.halves) |halves| {
+                for ([_]?@import("frame.zig").VisualHalf{ halves.left, halves.right }, [_]u16{ 0, win.width / 2 + 1 }) |half, x| {
+                    const value = half orelse continue;
+                    if (value.line.kind == .context) continue;
+                    try testing.expectEqual(theme.lineStyle(value.line.kind).bg, win.readCell(x, row).?.style.bg);
+                    banded += 1;
+                }
+            } else if (visual.owner == .line and visual.owner.line.kind != .context) {
+                try testing.expectEqual(theme.lineStyle(visual.owner.line.kind).bg, win.readCell(0, row).?.style.bg);
+                banded += 1;
+            }
+        }
+        try testing.expect(banded >= 4);
+    };
+}
+
 test "diff lines render with their band background at the text cells" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -3285,9 +3336,9 @@ test "the cursor source row is highlighted only for Selected Version, keeping ba
     // The tint reaches the far edge of the row (whole-line highlight).
     try testing.expectEqual(expected, win.readCell(79, 3).?.style.bg);
 
-    // A neutral cell on the cursor row (the gutter, default bg) takes the plain
-    // cursor_line tint.
-    try testing.expectEqual(theme_dark.cursor_line, win.readCell(px, 3).?.style.bg);
+    // The gutter carries the same cursor band, so the row is tinted from its
+    // first cell.
+    try testing.expectEqual(expected, win.readCell(px, 3).?.style.bg);
 
     // An off-cursor line keeps its untinted band.
     try testing.expectEqual(theme_dark.added.bg, win.readCell(body_x, 4).?.style.bg);
