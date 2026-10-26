@@ -13272,29 +13272,50 @@ fn versionNavigationStop(published: *const Published, index: usize) bool {
     return row.owner != .line or frame_mod.selectedSource(row, published.selected_version) != null;
 }
 
+/// A wrapped Diff Line spans `start..end` visual rows. Up and down move by
+/// Diff Line, so they stop only on the first row of a span.
+const LineSpan = struct { start: usize, end: usize };
+
+fn lineSpan(rows: []const frame_mod.VisualRow, index: usize) LineSpan {
+    var start = index;
+    while (start > 0 and rows[start].continuation and rows[start - 1].buffer_index == rows[index].buffer_index) start -= 1;
+    var end = index + 1;
+    while (end < rows.len and rows[end].continuation and rows[end].buffer_index == rows[index].buffer_index) end += 1;
+    return .{ .start = start, .end = end };
+}
+
 fn moveVersionVertical(published: *Published, direction: i2) void {
     var remaining = @max(published.navigation.count, 1);
     published.navigation.count = 0;
+    const rows = published.visual_rows;
     var cursor = published.navigation.cursor;
     while (remaining > 0) : (remaining -= 1) {
         const previous = cursor;
-        var target = cursor;
+        const span: LineSpan = if (cursor < rows.len) lineSpan(rows, cursor) else .{ .start = cursor, .end = cursor + 1 };
+        var target = if (direction > 0) span.end -| 1 else span.start;
         while (true) {
             if (direction > 0) {
-                if (target + 1 >= published.visual_rows.len) break;
+                if (target + 1 >= rows.len) break;
                 target += 1;
             } else {
                 if (target == 0) break;
                 target -= 1;
             }
-            if (versionNavigationStop(published, target)) {
-                cursor = target;
+            const head = lineSpan(rows, target).start;
+            if (versionNavigationStop(published, head)) {
+                cursor = head;
                 break;
             }
+            target = if (direction > 0) lineSpan(rows, target).end - 1 else head;
         }
         if (cursor == previous) break;
     }
     published.navigation.jumpTo(cursor);
+    if (cursor < rows.len) {
+        const nav = &published.navigation;
+        const end = lineSpan(rows, cursor).end;
+        if (end > nav.scroll + nav.viewport) nav.scroll = @min(cursor, end - nav.viewport);
+    }
 }
 
 fn canStartSelection(scope: Scope, row: ?buffer_mod.Row) bool {
@@ -18778,7 +18799,44 @@ test "SideBySide wrapping Anchors an active old-only continuation" {
     try testing.expect(draft.anchor.?.to == null);
 }
 
-test "Unconditional Unified wrapping uses visual-row navigation and semantic Anchors" {
+test "up and down move by Diff Line and keep a wrapped Line in view" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testWrappingSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 60, .rows = 10 },
+    });
+    defer presentation.deinit();
+
+    for ([_]bool{ false, true }) |side_by_side| {
+        if (side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        try presentation.dispatch(.{ .action = .to_top });
+        var review = presentation.projection().review.?;
+        var wrapped_lines: usize = 0;
+        var moves: usize = 0;
+        while (moves < review.frame.visual_rows.len) : (moves += 1) {
+            const rows = review.frame.visual_rows;
+            const from = review.navigation.cursor;
+            try testing.expect(!rows[from].continuation);
+            var end = from + 1;
+            while (end < rows.len and rows[end].continuation and rows[end].buffer_index == rows[from].buffer_index) end += 1;
+            if (end - from > 1) wrapped_lines += 1;
+            try testing.expect(review.navigation.scroll <= from);
+            if (end - from <= review.navigation.viewport) try testing.expect(end <= review.navigation.scroll + review.navigation.viewport);
+            try presentation.dispatch(.{ .action = .down });
+            review = presentation.projection().review.?;
+            if (review.navigation.cursor == from) break;
+            try testing.expect(review.navigation.cursor >= end);
+            try presentation.dispatch(.{ .action = .up });
+            try testing.expectEqual(from, presentation.projection().review.?.navigation.cursor);
+            try presentation.dispatch(.{ .action = .down });
+            review = presentation.projection().review.?;
+        }
+        try testing.expect(wrapped_lines > 0);
+    }
+}
+
+test "Unconditional Unified wrapping keeps semantic Anchors" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -18798,11 +18856,10 @@ test "Unconditional Unified wrapping uses visual-row navigation and semantic Anc
         if (visual_row.owner.line.new_no == 2 and second == null) second = index;
     }
     presentation.published.?.navigation.jumpTo(first.?);
-    const line_owner = presentation.projection().review.?.frame.visual_rows[first.?].owner;
     try presentation.dispatch(.{ .action = .down });
     var current = presentation.projection().review.?;
-    try testing.expect(current.frame.visual_rows[current.navigation.cursor].continuation);
-    try testing.expect(current.frame.visual_rows[current.navigation.cursor].owner.eql(line_owner));
+    try testing.expectEqual(second.?, current.navigation.cursor);
+    presentation.published.?.navigation.jumpTo(first.?);
 
     try presentation.dispatch(.{ .action = .suggest });
     const draft = presentation.published.?.composer.?.toNewDraft();
@@ -21742,7 +21799,7 @@ test "WholeFile Selected Version restoration chooses the closest source row and 
         };
         return error.MissingContextLine;
     };
-    try presentation.dispatch(.{ .action = .down });
+    try moveToRow(&presentation, presentation.projection().review.?.navigation.cursor + 1);
     const offset = presentation.projection().review.?.frame.visual_rows[presentation.projection().review.?.navigation.cursor].source_start;
     try testing.expect(offset > 0);
     try dispatchView(&presentation, .{ .action = .select_new_version });
