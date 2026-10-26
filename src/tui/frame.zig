@@ -7,6 +7,8 @@ const buffer_mod = @import("buffer.zig");
 const search = @import("search.zig");
 pub const file_tree = @import("file_tree.zig");
 pub const CellMetrics = @import("cell_metrics.zig").CellMetrics;
+const view = @import("view.zig");
+const layouts = @import("layouts.zig");
 
 pub const Revision = u64;
 
@@ -15,17 +17,7 @@ pub const Geometry = struct {
     rows: u16,
 };
 
-pub const Rect = struct {
-    x: u16,
-    y: u16,
-    width: u16,
-    height: u16,
-
-    pub fn contains(self: Rect, col: u16, row: u16) bool {
-        return col >= self.x and row >= self.y and
-            col - self.x < self.width and row - self.y < self.height;
-    }
-};
+pub const Rect = view.Rect;
 
 pub const PaneRects = struct {
     sidebar: Rect,
@@ -45,12 +37,13 @@ pub const VersionTitleTargets = struct {
 
 const version_title_segment_width: u16 = 6;
 
-/// Place the Selected Version control inside the DiffPane's top border. The
-/// path title receives only the cells before these published rectangles.
+/// Place the Selected Version control inside the DiffPane's top border, with
+/// one blank cell on each side as every Title has. The path title receives
+/// only the cells before these published rectangles.
 pub fn versionTitleTargets(diff: Rect, selected: SelectedVersion) VersionTitleTargets {
-    if (diff.height == 0 or diff.width <= 4) return .{};
-    const start = diff.x + 2;
-    const available = diff.width - 4;
+    if (diff.height == 0 or diff.width <= 6) return .{};
+    const start = diff.x + 3;
+    const available = diff.width - 6;
     const full_width = version_title_segment_width * 2 + 1;
     if (available >= full_width) return .{
         .old = .{ .x = start + available - full_width, .y = diff.y, .width = version_title_segment_width, .height = 1 },
@@ -91,36 +84,31 @@ pub const ReviewSearchGeometry = struct {
 };
 
 pub fn reviewSearchGeometry(geometry: Geometry) ?ReviewSearchGeometry {
-    const rect = overlayRect(geometry, @min(geometry.cols, @max(64, @as(u16, @intCast(@as(u32, geometry.cols) * 4 / 5)))), @min(geometry.rows, @max(14, @as(u16, @intCast(@as(u32, geometry.rows) * 4 / 5))))) orelse return null;
-    const body = Rect{ .x = rect.x, .y = rect.y +| @min(rect.height, 3), .width = rect.width, .height = rect.height -| 3 };
+    const rects = view.solve(layouts.SearchSlot, layouts.reviewSearch, layouts.ReviewSearch{}, area(geometry));
+    const rect = rects.get(.surface).border;
+    if (rect.isEmpty()) return null;
+    const divider = rects.get(.divider).border;
     const landscape = geometry.cols >= geometry.rows;
-    if (landscape) {
-        const divider = @min(body.width -| 1, @as(u16, @intCast(@as(u32, body.width) * 3 / 10)));
-        return .{
-            .rect = rect,
-            .body = body,
-            .list = .{ .x = body.x +| 1, .y = body.y +| @min(body.height, 1), .width = divider -| 1, .height = body.height -| 2 },
-            .header = .{ .x = body.x +| divider +| 1, .y = body.y +| @min(body.height, 1), .width = body.width -| divider -| 2, .height = @min(body.height -| 2, 1) },
-            .preview = .{ .x = body.x +| divider +| 1, .y = body.y +| @min(body.height, 3), .width = body.width -| divider -| 2, .height = body.height -| 4 },
-            .divider = body.x +| divider,
-            .landscape = true,
-        };
-    }
-    const divider = @min(body.height -| 1, @max(3, @as(u16, @intCast(@as(u32, body.height) * 3 / 10))));
     return .{
         .rect = rect,
-        .body = body,
-        .list = .{ .x = body.x +| 1, .y = body.y +| @min(body.height, 1), .width = body.width -| 2, .height = divider -| 1 },
-        .header = .{ .x = body.x +| 1, .y = body.y +| @min(body.height, divider +| 1), .width = body.width -| 2, .height = @min(body.height -| divider -| 2, 1) },
-        .preview = .{ .x = body.x +| 1, .y = body.y +| @min(body.height, divider +| 3), .width = body.width -| 2, .height = body.height -| divider -| 4 },
-        .divider = body.y +| divider,
-        .landscape = false,
+        .body = rects.get(.body).border,
+        .list = rects.get(.list).content,
+        .preview = rects.get(.preview).content,
+        .header = rects.get(.header).content,
+        .divider = if (landscape) divider.x else divider.y,
+        .landscape = landscape,
     };
+}
+
+fn area(geometry: Geometry) Rect {
+    return .{ .width = geometry.cols, .height = geometry.rows };
 }
 
 pub const OverlayTarget = struct {
     kind: OverlayKind,
     rect: Rect,
+    /// The rows of a List Overlay's entries, below its query row.
+    entries: Rect = .{},
     row_count: usize = 0,
     scroll: usize = 0,
     review_search: ?ReviewSearchGeometry = null,
@@ -261,10 +249,8 @@ pub fn hitTest(frame: Projection, col: u16, row: u16) ?HitTarget {
             if (geometry.preview.contains(col, row)) return .review_search_preview;
             return null;
         }
-        if (overlay.kind != .list or !overlay.rect.contains(col, row)) return null;
-        const relative_row = row - overlay.rect.y;
-        if (relative_row == 0) return null; // query/title row
-        const index = overlay.scroll + relative_row - 1;
+        if (overlay.kind != .list or !overlay.entries.contains(col, row)) return null;
+        const index = overlay.scroll + row - overlay.entries.y;
         if (index >= overlay.row_count) return null;
         return .{ .list_entry = index };
     }
@@ -286,41 +272,28 @@ pub fn hitTest(frame: Projection, col: u16, row: u16) ?HitTarget {
 }
 
 pub fn paneRects(geometry: Geometry) PaneRects {
-    const gap: u16 = if (geometry.cols >= 60) 1 else 0;
-    const sidebar_width: u16 = if (geometry.cols < 6) geometry.cols / 2 else @min(28, geometry.cols - 3 - gap);
-    const diff_x: u16 = @min(sidebar_width +| gap, geometry.cols);
-    const diff_width = geometry.cols - diff_x;
-    const sidebar: Rect = .{ .x = 0, .y = 0, .width = sidebar_width, .height = geometry.rows };
-    const diff: Rect = .{ .x = diff_x, .y = 0, .width = diff_width, .height = geometry.rows };
+    const rects = view.solve(layouts.PaneSlot, layouts.panes, layouts.Panes{}, area(geometry));
     return .{
-        .sidebar = sidebar,
-        .diff = diff,
-        .sidebar_content = paneContent(sidebar),
-        .diff_content = paneContent(diff),
+        .sidebar = rects.get(.sidebar).border,
+        .diff = rects.get(.diff).border,
+        .sidebar_content = rects.get(.sidebar).content,
+        .diff_content = rects.get(.diff).content,
     };
 }
 
-/// Shared centered Overlay geometry used by both rendering and semantic input
-/// targeting. A zero-sized Frame has no targetable Overlay.
-pub fn overlayRect(geometry: Geometry, max_width: u16, max_height: u16) ?Rect {
-    const width = @min(max_width, geometry.cols);
-    const height = @min(max_height, geometry.rows);
-    if (width == 0 or height == 0) return null;
-    return .{
-        .x = (geometry.cols - width) / 2,
-        .y = (geometry.rows - height) / 2,
-        .width = width,
-        .height = height,
-    };
+/// The List Overlay geometry that rendering and input targeting share. A
+/// zero-sized Frame has no targetable Overlay.
+pub fn listOverlayTarget(geometry: Geometry, box: layouts.Box) ?OverlayTarget {
+    const rects = view.solve(layouts.ListSlot, layouts.listOverlay, box, area(geometry));
+    const rect = rects.get(.surface).border;
+    if (rect.isEmpty()) return null;
+    return .{ .kind = .list, .rect = rect, .entries = rects.get(.entries).content };
 }
 
-fn paneContent(rect: Rect) Rect {
-    return .{
-        .x = rect.x +| @min(rect.width, 1),
-        .y = rect.y +| @min(rect.height, 2),
-        .width = rect.width -| 2,
-        .height = rect.height -| 3,
-    };
+/// An Overlay without row targets captures the whole Frame.
+pub fn screenOverlayTarget(geometry: Geometry) ?OverlayTarget {
+    if (geometry.cols == 0 or geometry.rows == 0) return null;
+    return .{ .kind = .other, .rect = area(geometry) };
 }
 
 pub fn buildVisualRowsWithOptions(
@@ -1144,10 +1117,48 @@ test "framed Pane geometry is bounded at zero narrow ordinary and wide sizes" {
     try testing.expectEqual(@as(u16, 0), paneRects(.{ .cols = 40, .rows = 24 }).diff.x - paneRects(.{ .cols = 40, .rows = 24 }).sidebar.width);
 }
 
-test "Overlay geometry is centered and clipped to the published Frame" {
-    try testing.expectEqual(Rect{ .x = 10, .y = 4, .width = 60, .height = 16 }, overlayRect(.{ .cols = 80, .rows = 24 }, 60, 16).?);
-    try testing.expectEqual(Rect{ .x = 0, .y = 0, .width = 20, .height = 8 }, overlayRect(.{ .cols = 20, .rows = 8 }, 60, 16).?);
-    try testing.expect(overlayRect(.{ .cols = 0, .rows = 8 }, 60, 16) == null);
+fn expectSameCells(expected: Rect, actual: Rect) !void {
+    if (expected.isEmpty()) return testing.expect(actual.isEmpty());
+    try testing.expectEqual(expected, actual);
+}
+
+test "View Pane geometry keeps the cells of the previous formulas" {
+    const legacy = struct {
+        fn content(rect: Rect) Rect {
+            return .{ .x = rect.x +| @min(rect.width, 1), .y = rect.y +| @min(rect.height, 1), .width = rect.width -| 2, .height = rect.height -| 2 };
+        }
+        fn panes(geometry: Geometry) PaneRects {
+            const gap: u16 = if (geometry.cols >= 60) 1 else 0;
+            const sidebar_width: u16 = if (geometry.cols < 6) geometry.cols / 2 else @min(28, geometry.cols - 3 - gap);
+            const diff_x: u16 = @min(sidebar_width +| gap, geometry.cols);
+            const sidebar: Rect = .{ .x = 0, .y = 0, .width = sidebar_width, .height = geometry.rows };
+            const diff: Rect = .{ .x = diff_x, .y = 0, .width = geometry.cols - diff_x, .height = geometry.rows };
+            return .{ .sidebar = sidebar, .diff = diff, .sidebar_content = content(sidebar), .diff_content = content(diff) };
+        }
+    };
+    var cols: u16 = 5;
+    while (cols <= 320) : (cols += 1) {
+        var rows: u16 = 0;
+        while (rows <= 60) : (rows += 1) {
+            const geometry: Geometry = .{ .cols = cols, .rows = rows };
+            const expected = legacy.panes(geometry);
+            const actual = paneRects(geometry);
+            try expectSameCells(expected.sidebar, actual.sidebar);
+            try expectSameCells(expected.diff, actual.diff);
+            try expectSameCells(expected.sidebar_content, actual.sidebar_content);
+            try expectSameCells(expected.diff_content, actual.diff_content);
+        }
+    }
+}
+
+test "List Overlay geometry is centered, bordered, and clipped to the published Frame" {
+    const wide = listOverlayTarget(.{ .cols = 80, .rows = 24 }, .{ .width = 60, .height = 16 }).?;
+    try testing.expectEqual(Rect{ .x = 9, .y = 3, .width = 62, .height = 18 }, wide.rect);
+    try testing.expectEqual(Rect{ .x = 10, .y = 5, .width = 60, .height = 15 }, wide.entries);
+    const clipped = listOverlayTarget(.{ .cols = 20, .rows = 8 }, .{ .width = 60, .height = 16 }).?;
+    try testing.expectEqual(Rect{ .x = 0, .y = 0, .width = 20, .height = 8 }, clipped.rect);
+    try testing.expectEqual(Rect{ .x = 1, .y = 2, .width = 18, .height = 5 }, clipped.entries);
+    try testing.expect(listOverlayTarget(.{ .cols = 0, .rows = 8 }, .{ .width = 60, .height = 16 }) == null);
 }
 
 test "Review Search geometry keeps bordered content and pointer targets aligned" {
@@ -1201,24 +1212,24 @@ test "published Frame hit testing gives Overlay rows precedence and clips blank 
         .buffer = .{ .rows = &.{}, .layout = .unified },
         .navigation = Nav.init(0, 5),
         .file_tree = .{ .entries = &entries, .viewport = 5 },
-        .overlay = .{ .kind = .list, .rect = .{ .x = 5, .y = 1, .width = 10, .height = 4 }, .row_count = 2 },
+        .overlay = .{ .kind = .list, .rect = .{ .x = 5, .y = 0, .width = 10, .height = 6 }, .entries = .{ .x = 6, .y = 2, .width = 8, .height = 3 }, .row_count = 2 },
     };
 
     try testing.expectEqual(HitTarget{ .list_entry = 0 }, hitTest(projection, 6, 2).?);
     try testing.expectEqual(HitTarget{ .list_entry = 1 }, hitTest(projection, 6, 3).?);
     try testing.expect(hitTest(projection, 6, 4) == null);
-    try testing.expect(hitTest(projection, 1, 2) == null); // Overlay capture prevents Pane pass-through.
+    try testing.expect(hitTest(projection, 1, 1) == null); // Overlay capture prevents Pane pass-through.
 
     projection.overlay = null;
-    try testing.expectEqual(HitTarget{ .sidebar_entry = 0 }, hitTest(projection, 1, 2).?);
-    try testing.expectEqual(HitTarget.sidebar, hitTest(projection, 1, 3).?);
-    try testing.expect(hitTest(projection, 0, 2) == null); // Pane border.
+    try testing.expectEqual(HitTarget{ .sidebar_entry = 0 }, hitTest(projection, 1, 1).?);
+    try testing.expectEqual(HitTarget.sidebar, hitTest(projection, 1, 2).?);
+    try testing.expect(hitTest(projection, 0, 1) == null); // Pane border.
 }
 
 test "Presentation Frame metadata exposes exact version title targets" {
     const targets = versionTitleTargets(.{ .x = 29, .y = 0, .width = 51, .height = 8 }, .old);
-    try testing.expectEqual(Rect{ .x = 65, .y = 0, .width = 6, .height = 1 }, targets.old.?);
-    try testing.expectEqual(Rect{ .x = 72, .y = 0, .width = 6, .height = 1 }, targets.new.?);
+    try testing.expectEqual(Rect{ .x = 64, .y = 0, .width = 6, .height = 1 }, targets.old.?);
+    try testing.expectEqual(Rect{ .x = 71, .y = 0, .width = 6, .height = 1 }, targets.new.?);
 
     var projection: Projection = .{
         .revision = 1,
@@ -1241,7 +1252,7 @@ test "Presentation Frame metadata exposes exact version title targets" {
     try testing.expect(hitTest(projection, 31, 0) == null);
 
     const clipped = versionTitleTargets(.{ .x = 3, .y = 0, .width = 9, .height = 4 }, .old);
-    try testing.expectEqual(Rect{ .x = 5, .y = 0, .width = 5, .height = 1 }, clipped.old.?);
+    try testing.expectEqual(Rect{ .x = 6, .y = 0, .width = 3, .height = 1 }, clipped.old.?);
     try testing.expect(clipped.new == null);
 }
 
@@ -1249,7 +1260,7 @@ test "M20 hardening keeps the default new title segment visible when clipped" {
     const targets = versionTitleTargets(.{ .x = 3, .y = 0, .width = 9, .height = 4 }, .new);
 
     try testing.expect(targets.new != null);
-    try testing.expectEqual(@as(u16, 5), targets.new.?.width);
+    try testing.expectEqual(@as(u16, 3), targets.new.?.width);
 }
 
 test "navigation restoration follows stable owners and clears a shifted Selection" {

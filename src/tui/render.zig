@@ -32,6 +32,8 @@ const ListOverlay = list_overlay_mod.ListOverlay;
 const ThemeId = @import("theme_id.zig").ThemeId;
 const keymap = @import("keymap.zig");
 const buffer_mod = @import("buffer.zig");
+const layouts = @import("layouts.zig");
+const view_paint = @import("view_paint.zig");
 
 pub const sidebar_width: u16 = 28;
 
@@ -89,24 +91,28 @@ pub fn drawReview(
 ) void {
     _ = selected_file;
     win.clear();
-    drawPaneFrame(win, review.frame.panes.sidebar, "Files", theme, review.frame.focus == .sidebar);
     const frame = review.frame;
+    const panes = view_paint.paint(layouts.PaneSlot, layouts.panes, layouts.Panes{
+        .sidebar_focused = frame.focus == .sidebar,
+        .sidebar_scroll = .{ .total = frame.file_tree.entries.len, .offset = frame.file_tree.scroll },
+        .diff_scroll = .{ .total = frame.visual_rows.len, .offset = frame.navigation.scroll },
+    }, win, theme);
     const cursor = frame.navigation.cursor;
     const buffer_index = if (cursor < frame.visual_rows.len) frame.visual_rows[cursor].buffer_index else 0;
     const path = if (frame.buffer.fileIndexForRow(buffer_index)) |index|
         frame.buffer.rows[frame.buffer.fileHeaderRow(index).?].file_header.path
     else
         "Diff";
-    drawDiffPaneFrame(scratch, win, frame, path, review.preferences.scope, theme);
-    const sidebar = childRect(win, review.frame.panes.sidebar_content);
-    const diff_pane = childRect(win, review.frame.panes.diff_content);
+    drawDiffPaneTitle(scratch, win, frame, path, review.preferences.scope, theme);
+    const sidebar = childRect(win, panes.get(.sidebar).content);
+    const diff_pane = childRect(win, panes.get(.diff).content);
     var diff_theme = theme;
     diff_theme.section_rule = if (frame.focus == .diff) theme.pane_border_focused else theme.pane_border;
     drawFileTree(sidebar, review.frame.file_tree, theme);
     drawVisualPane(scratch, diff_pane, review.frame.buffer, review.frame.visual_rows, diff_theme, review.frame.navigation);
     drawCodeHighlights(diff_pane, review.frame, theme);
     drawSearchRanges(diff_pane, review.frame, theme);
-    joinSectionRules(win, review.frame.panes.diff, review.frame.panes.diff_content, review.frame.visual_rows, review.frame.navigation);
+    joinSectionRules(win, panes.get(.diff).border, panes.get(.diff).content, review.frame.visual_rows, review.frame.navigation);
 }
 
 fn drawCodeHighlights(win: vaxis.Window, frame: @import("frame.zig").Projection, theme: Theme) void {
@@ -249,20 +255,27 @@ fn paintSearchCells(win: vaxis.Window, row: u16, start: usize, width: usize, act
     }
 }
 
-fn drawDiffPaneFrame(scratch: std.mem.Allocator, win: vaxis.Window, frame: @import("frame.zig").Projection, path: []const u8, scope: presentation.Scope, theme: Theme) void {
+/// The DiffPane title is a control strip: the path and Scope, then the
+/// published Selected Version targets. It sits on the top border that
+/// view_paint.zig paints.
+fn drawDiffPaneTitle(scratch: std.mem.Allocator, win: vaxis.Window, frame: @import("frame.zig").Projection, path: []const u8, scope: presentation.Scope, theme: Theme) void {
     const focused = frame.focus == .diff;
-    drawPaneFrame(win, frame.panes.diff, "", theme, focused);
     const title_x = frame.panes.diff.x +| @min(frame.panes.diff.width, 2);
-    const control_x = if (frame.version_title_targets.old) |old| old.x else if (frame.version_title_targets.new) |new| new.x else frame.panes.diff.x +| frame.panes.diff.width -| 2;
+    const control_x = (if (frame.version_title_targets.old) |old| old.x else if (frame.version_title_targets.new) |new| new.x else frame.panes.diff.x +| frame.panes.diff.width -| 1) -| 1;
     const title_width = control_x -| title_x -| 1;
     if (title_width > 0) {
         const title = std.fmt.allocPrint(scratch, "{s} · {s}", .{ path, scopeLabel(scope) }) catch path;
         const style = if (focused) theme.pane_border_focused else theme.pane_border;
-        _ = childRect(win, .{ .x = title_x, .y = frame.panes.diff.y, .width = title_width, .height = 1 }).printSegment(.{ .text = title, .style = style }, .{ .wrap = .none });
+        view_paint.titleText(win, .{ .x = title_x, .y = frame.panes.diff.y, .width = title_width, .height = 1 }, title, style);
     }
     const buffer_index = if (frame.navigation.cursor < frame.visual_rows.len) frame.visual_rows[frame.navigation.cursor].buffer_index else 0;
     drawVersionTitleSegment(win, frame.version_title_targets.old, "h← OLD", frame.selected_version == .old, frame.buffer.hasFileVersion(buffer_index, .old), theme, focused);
     drawVersionTitleSegment(win, frame.version_title_targets.new, "NEW l→", frame.selected_version == .new, frame.buffer.hasFileVersion(buffer_index, .new), theme, focused);
+    const old = frame.version_title_targets.old orelse frame.version_title_targets.new orelse return;
+    const new = frame.version_title_targets.new orelse old;
+    const x = @min(old.x, new.x);
+    const end = @max(old.x + old.width, new.x + new.width);
+    view_paint.titleGaps(win, .{ .x = x, .y = old.y, .width = end - x, .height = 1 }, if (focused) theme.pane_border_focused else theme.pane_border);
 }
 
 fn scopeLabel(scope: presentation.Scope) []const u8 {
@@ -296,39 +309,13 @@ fn joinSectionRules(win: vaxis.Window, outer: @import("frame.zig").Rect, content
         };
         if (!joined) continue;
         const row = content.y + screen_row;
-        if (win.readCell(outer.x, row)) |cell| win.writeCell(outer.x, row, .{ .char = .{ .grapheme = "├", .width = 1 }, .style = cell.style });
-        if (outer.width > 1) {
-            const right = outer.x + outer.width - 1;
-            if (win.readCell(right, row)) |cell| win.writeCell(right, row, .{ .char = .{ .grapheme = "┤", .width = 1 }, .style = cell.style });
-        }
+        view_paint.join(win, outer.x, row, .{ .right = true });
+        if (outer.width > 1) view_paint.join(win, outer.x + outer.width - 1, row, .{ .left = true });
     }
 }
 
 fn childRect(win: vaxis.Window, rect: @import("frame.zig").Rect) vaxis.Window {
     return win.child(.{ .x_off = rect.x, .y_off = rect.y, .width = rect.width, .height = rect.height });
-}
-
-fn drawPaneFrame(win: vaxis.Window, rect: @import("frame.zig").Rect, title: []const u8, theme: Theme, focused: bool) void {
-    if (rect.width == 0 or rect.height == 0) return;
-    const pane = childRect(win, rect);
-    const style = if (focused) theme.pane_border_focused else theme.pane_border;
-    const last_col = rect.width - 1;
-    const last_row = rect.height - 1;
-    var col: u16 = 0;
-    while (col < rect.width) : (col += 1) {
-        pane.writeCell(col, 0, .{ .char = .{ .grapheme = if (col == 0) "┌" else if (col == last_col) "┐" else "─", .width = 1 }, .style = style });
-        if (last_row > 0) pane.writeCell(col, last_row, .{ .char = .{ .grapheme = if (col == 0) "└" else if (col == last_col) "┘" else "─", .width = 1 }, .style = style });
-    }
-    var row: u16 = 1;
-    while (row < last_row) : (row += 1) {
-        pane.writeCell(0, row, .{ .char = .{ .grapheme = if (row == 1) "├" else "│", .width = 1 }, .style = style });
-        if (last_col > 0) pane.writeCell(last_col, row, .{ .char = .{ .grapheme = if (row == 1) "┤" else "│", .width = 1 }, .style = style });
-    }
-    if (rect.height > 1 and rect.width > 2) {
-        col = 1;
-        while (col < last_col) : (col += 1) pane.writeCell(col, 1, .{ .char = .{ .grapheme = "─", .width = 1 }, .style = style });
-    }
-    if (rect.width > 4) _ = pane.printSegment(.{ .text = title, .style = style }, .{ .row_offset = 0, .col_offset = 2, .wrap = .none });
 }
 
 fn drawFileTree(win: vaxis.Window, tree: @import("file_tree.zig").Projection, theme: Theme) void {
@@ -900,13 +887,6 @@ fn drawSection(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, sec: Secti
     _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .wrap = .none });
 }
 
-/// Center a modal box of up to `max_w`×`max_h` over `win`, bounded by it.
-/// Returns null when there's no room. The shared geometry behind every overlay.
-fn centeredModal(win: vaxis.Window, max_w: u16, max_h: u16) ?vaxis.Window {
-    const rect = @import("frame.zig").overlayRect(.{ .cols = win.width, .rows = win.height }, max_w, max_h) orelse return null;
-    return childRect(win, rect);
-}
-
 /// Draw the open List Overlay as a centered modal: a query row, then one row
 /// per ranked match, scrolled to keep the selected row visible. `scratch`
 /// outlives render. A Command Palette row whose Action `availability` refuses
@@ -920,35 +900,30 @@ pub fn drawListOverlay(
     files: []const bbr.diff.File,
     theme: Theme,
 ) void {
-    const box = overlay.box();
-    const modal = centeredModal(win, box.width, box.height) orelse return;
+    const rects = view_paint.paint(layouts.ListSlot, layouts.listOverlay, overlay.box(), win, theme);
+    if (rects.get(.surface).border.isEmpty()) return;
+    const query = childRect(win, rects.get(.query).content);
+    const entries = childRect(win, rects.get(.entries).content);
     const list = overlay.list();
 
-    fillRow(modal, 0, theme.picker_query);
     const prompt = std.fmt.allocPrint(scratch, "{s}› {s}", .{ listPrompt(overlay), list.query() }) catch "›";
-    _ = modal.printSegment(.{ .text = prompt, .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
+    _ = query.printSegment(.{ .text = prompt, .style = theme.picker_query }, .{ .wrap = .none });
 
-    const list_rows = modal.height - 1;
     if (listPlaceholder(scratch, overlay, files)) |message| {
-        var row: u16 = 1;
-        while (row <= list_rows) : (row += 1) fillRow(modal, row, theme.picker);
-        _ = modal.printSegment(.{ .text = message, .style = theme.picker }, .{ .row_offset = 1, .wrap = .none });
+        _ = entries.printSegment(.{ .text = message, .style = theme.picker }, .{ .wrap = .none });
         return;
     }
 
     const matches = list.matches();
-    const top = list.scrollTop(list_rows);
-    var row: u16 = 1;
-    while (row <= list_rows) : (row += 1) {
-        const match_index = top + row - 1;
-        if (match_index >= matches.len) {
-            fillRow(modal, row, theme.picker);
-            continue;
-        }
+    const top = list.scrollTop(entries.height);
+    var row: u16 = 0;
+    while (row < entries.height) : (row += 1) {
+        const match_index = top + row;
+        if (match_index >= matches.len) break;
         const selected = match_index == list.selected;
         const style = if (selected) theme.picker_selected else theme.picker;
-        fillRow(modal, row, style);
-        _ = modal.print(listRow(scratch, overlay, matches[match_index], selected, style, availability, configured_theme, files, theme), .{ .row_offset = row, .wrap = .none });
+        fillRow(entries, row, style);
+        _ = entries.print(listRow(scratch, overlay, matches[match_index], selected, style, availability, configured_theme, files, theme), .{ .row_offset = row, .wrap = .none });
     }
 }
 
@@ -1030,61 +1005,27 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
     // A terminal shrink can precede publication of the replacement geometry.
     // Keep the shared paint and pointer geometry intact until it fits again.
     if (geometry.rect.width > win.width -| geometry.rect.x or geometry.rect.height > win.height -| geometry.rect.y) return;
-    const modal = childRect(win, geometry.rect);
-    modal.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = theme.picker });
-    const search_box = childRect(win, .{ .x = geometry.rect.x, .y = geometry.rect.y, .width = geometry.rect.width, .height = @min(geometry.rect.height, 3) });
-    drawSearchBorder(search_box, theme);
-    searchBorderTitle(search_box, 0, search_box.width, "Review Search", theme);
-    if (search_box.height > 1 and search_box.width > 2) {
-        const input = search_box.child(.{ .x_off = 1, .y_off = 1, .width = search_box.width - 2, .height = 1 });
-        const query = std.fmt.allocPrint(scratch, "> {s}", .{projection.query}) catch "> ";
-        _ = input.printSegment(.{ .text = query, .style = theme.picker }, .{ .wrap = .none });
-    }
-    if (search_box.height > 2) {
-        const status = std.fmt.allocPrint(scratch, "{d}/{d} matches · {d} candidates{s}", .{
-            if (projection.selected) |index| index + 1 else @as(usize, 0), projection.results.len, projection.candidate_count,
-            if (projection.pending) " · searching" else "",
-        }) catch "";
-        const short_status = std.fmt.allocPrint(scratch, "{d} matches · {d} candidates", .{ projection.results.len, projection.candidate_count }) catch "";
-        const tiny_status = std.fmt.allocPrint(scratch, "{d}/{d}", .{ projection.results.len, projection.candidate_count }) catch "";
-        const label = if (searchCellWidth(status) + 4 <= search_box.width) status else if (searchCellWidth(short_status) + 4 <= search_box.width) short_status else if (searchCellWidth(tiny_status) + 4 <= search_box.width) tiny_status else "";
-        if (label.len > 0) _ = search_box.printSegment(.{ .text = label, .style = theme.overlay_border }, .{ .row_offset = 2, .col_offset = search_box.width - @as(u16, @intCast(searchCellWidth(label))) - 2, .wrap = .none });
-    }
-    const body = childRect(win, geometry.body);
-    drawSearchBorder(body, theme);
-    if (geometry.landscape) {
-        const split = geometry.divider - geometry.body.x;
-        searchBorderTitle(body, 0, split, if (split > searchCellWidth("Results · Position") + 2) "Results · Position" else "Position", theme);
-        searchBorderTitle(body, split, body.width - split, "Preview", theme);
-        for (0..body.height) |row| body.writeCell(split, @intCast(row), .{
-            .char = .{ .grapheme = if (row == 0) "┬" else if (row == body.height - 1) "┴" else "│", .width = 1 },
-            .style = theme.overlay_border,
-        });
-    } else {
-        searchBorderTitle(body, 0, body.width, if (body.width > searchCellWidth("Results · Position") + 2) "Results · Position" else "Position", theme);
-        if (body.height > 0) {
-            const split = geometry.divider - geometry.body.y;
-            for (0..body.width) |col| body.writeCell(@intCast(col), split, .{
-                .char = .{ .grapheme = if (col == 0) "├" else if (col == body.width - 1) "┤" else "─", .width = 1 },
-                .style = theme.overlay_border,
-            });
-            const preview_line = body.child(.{ .y_off = split, .height = 1 });
-            searchBorderTitle(preview_line, 0, body.width, "Preview", theme);
-        }
-    }
-    const list = childRect(win, geometry.list);
+    const full_status = std.fmt.allocPrint(scratch, "{d}/{d} matches · {d} candidates{s}", .{
+        if (projection.selected) |index| index + 1 else @as(usize, 0), projection.results.len, projection.candidate_count,
+        if (projection.pending) " · searching" else "",
+    }) catch "";
+    const short_status = std.fmt.allocPrint(scratch, "{d} matches · {d} candidates", .{ projection.results.len, projection.candidate_count }) catch "";
+    const tiny_status = std.fmt.allocPrint(scratch, "{d}/{d}", .{ projection.results.len, projection.candidate_count }) catch "";
+    const box_width = geometry.rect.width;
+    const status_label = if (searchCellWidth(full_status) + 6 <= box_width) full_status else if (searchCellWidth(short_status) + 6 <= box_width) short_status else if (searchCellWidth(tiny_status) + 6 <= box_width) tiny_status else "";
+    const results_span = if (geometry.landscape) geometry.divider - geometry.body.x else geometry.body.width;
     const list_total = if (projection.results.len > 0) projection.results.len else projection.files.len;
-    const has_scrollbar = list.width > 1 and list.height > 0 and list_total > list.height;
-    const list_text = if (has_scrollbar) list.child(.{ .width = list.width - 1 }) else list;
-    const preview = childRect(win, geometry.preview);
-    const header = childRect(win, geometry.header);
-    if (geometry.header.height > 0) {
-        const separator = childRect(win, .{ .x = geometry.header.x -| 1, .y = geometry.header.y +| 1, .width = geometry.header.width +| 2, .height = 1 });
-        for (0..separator.width) |col| separator.writeCell(@intCast(col), 0, .{
-            .char = .{ .grapheme = if (col == 0) "├" else if (col == separator.width - 1) "┤" else "─", .width = 1 },
-            .style = theme.overlay_border,
-        });
-    }
+    const rects = view_paint.paint(layouts.SearchSlot, layouts.reviewSearch, layouts.ReviewSearch{
+        .status = status_label,
+        .results_title = if (results_span > searchCellWidth("Results · Position") + 4) "Results · Position" else "Position",
+        .list_scroll = .{ .total = list_total, .offset = projection.list_scroll },
+    }, win, theme);
+    const input = childRect(win, rects.get(.query).content);
+    const query = std.fmt.allocPrint(scratch, "> {s}", .{projection.query}) catch "> ";
+    _ = input.printSegment(.{ .text = query, .style = theme.picker }, .{ .wrap = .none });
+    const list = childRect(win, rects.get(.list).content);
+    const preview = childRect(win, rects.get(.preview).content);
+    const header = childRect(win, rects.get(.header).content);
     if (projection.results.len == 0 and list.height > 0) {
         for (0..list.height) |row| {
             const index = projection.list_scroll + row;
@@ -1093,14 +1034,14 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
             const content = projection.content_statuses[index];
             const status = projection.highlight_statuses[index];
             const label = std.fmt.allocPrint(scratch, "{s}  old {s} · new {s}", .{
-                shortSearchPath(scratch, file.displayPath(), @max(list_text.width / 2, 1)),
+                shortSearchPath(scratch, file.displayPath(), @max(list.width / 2, 1)),
                 sourceContentLabel(scratch, content.old, status.old),
                 sourceContentLabel(scratch, content.new, status.new),
             }) catch file.displayPath();
-            _ = list_text.printSegment(.{ .text = label, .style = theme.picker }, .{ .row_offset = @intCast(row), .wrap = .none });
+            _ = list.printSegment(.{ .text = label, .style = theme.picker }, .{ .row_offset = @intCast(row), .wrap = .none });
         }
         if (projection.files.len == 0)
-            _ = list_text.printSegment(.{ .text = if (projection.pending) "Searching ReviewBodies…" else "No matching occurrence", .style = theme.picker }, .{ .wrap = .none });
+            _ = list.printSegment(.{ .text = if (projection.pending) "Searching ReviewBodies…" else "No matching occurrence", .style = theme.picker }, .{ .wrap = .none });
     }
     for (0..list.height) |row_index| {
         const index = projection.list_scroll + row_index;
@@ -1108,7 +1049,7 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
         const result = projection.results[index];
         const selected = projection.selected == index;
         const style = if (selected) theme.picker_selected else theme.picker;
-        fillRow(list_text, @intCast(row_index), style);
+        fillRow(list, @intCast(row_index), style);
         const position = switch (result.occurrence.location) {
             .review_body => |owner| std.fmt.allocPrint(scratch, " L{d}:C{d}", .{ owner.logical_line, result.occurrence.column }) catch "",
             .source => |source| std.fmt.allocPrint(scratch, " {s} L{d}:C{d}", .{ @tagName(source.relation), source.new_line orelse source.old_line orelse 0, result.occurrence.column }) catch "",
@@ -1121,15 +1062,14 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
                 .@"inline" => |anchor| std.fmt.allocPrint(scratch, "{s}:{d}", .{ anchor.path, anchor.line() orelse 0 }) catch anchor.path,
             },
         };
-        const available = list_text.width -| 2;
+        const available = list.width -| 2;
         const filename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| path[slash + 1 ..] else path;
         const show_position = available > position.len + 2 and searchCellWidth(filename) <= available - position.len;
         const location = shortSearchPath(scratch, path, available -| (if (show_position) position.len else @as(usize, 0)));
         const suffix = if (show_position) position else "";
         const row_text = std.fmt.allocPrint(scratch, "{s}{s}{s}", .{ if (selected) "▸ " else "  ", location, suffix }) catch location;
-        _ = list_text.printSegment(.{ .text = row_text, .style = style }, .{ .row_offset = @intCast(row_index), .wrap = .none });
+        _ = list.printSegment(.{ .text = row_text, .style = style }, .{ .row_offset = @intCast(row_index), .wrap = .none });
     }
-    if (has_scrollbar) drawReviewSearchScrollbar(list, list_total, projection.list_scroll, theme);
     const selected = projection.selected orelse {
         if (projection.status_preview) |view| {
             if (projection.list_scroll < projection.files.len) {
@@ -1154,17 +1094,6 @@ pub fn drawReviewSearch(scratch: std.mem.Allocator, win: vaxis.Window, projectio
             drawReviewSearchPreview(scratch, preview, result, projection.preview_scroll, theme, projection.cell_metrics orelse terminal_cell_metrics);
         }
     }
-}
-
-fn drawReviewSearchScrollbar(list: vaxis.Window, total: usize, scroll: usize, theme: Theme) void {
-    const height: usize = list.height;
-    const thumb = @max(1, (height * height + total - 1) / total);
-    const max_scroll = total - height;
-    const first = @min(scroll, max_scroll) * (height - thumb) / max_scroll;
-    for (first..first + thumb) |row| list.writeCell(list.width - 1, @intCast(row), .{
-        .char = .{ .grapheme = "│", .width = 1 },
-        .style = theme.picker,
-    });
 }
 
 fn sourceContentLabel(scratch: std.mem.Allocator, content: ?@import("bbr").diff.FileContentStatus, state: @import("bbr").highlight.SideState) []const u8 {
@@ -1294,28 +1223,6 @@ fn sourceSideState(scratch: std.mem.Allocator, side: @import("file_enrichment.zi
         .fetch_failed => "acquisition failure",
         .content => "text",
     };
-}
-
-fn drawSearchBorder(win: vaxis.Window, theme: Theme) void {
-    if (win.width == 0 or win.height == 0) return;
-    const last_col = win.width - 1;
-    const last_row = win.height - 1;
-    for (0..win.width) |col| {
-        win.writeCell(@intCast(col), 0, .{ .char = .{ .grapheme = if (col == 0) "┌" else if (col == last_col) "┐" else "─", .width = 1 }, .style = theme.overlay_border });
-        if (last_row > 0) win.writeCell(@intCast(col), last_row, .{ .char = .{ .grapheme = if (col == 0) "└" else if (col == last_col) "┘" else "─", .width = 1 }, .style = theme.overlay_border });
-    }
-    if (last_row > 1) {
-        for (1..last_row) |row| {
-            win.writeCell(0, @intCast(row), .{ .char = .{ .grapheme = "│", .width = 1 }, .style = theme.overlay_border });
-            if (last_col > 0) win.writeCell(last_col, @intCast(row), .{ .char = .{ .grapheme = "│", .width = 1 }, .style = theme.overlay_border });
-        }
-    }
-}
-
-fn searchBorderTitle(win: vaxis.Window, start: u16, width: u16, title: []const u8, theme: Theme) void {
-    const title_width = searchCellWidth(title);
-    if (win.height == 0 or width <= title_width + 2) return;
-    _ = win.printSegment(.{ .text = title, .style = theme.overlay_border }, .{ .col_offset = start + (width - @as(u16, @intCast(title_width))) / 2, .wrap = .none });
 }
 
 fn searchCellWidth(text: []const u8) usize {
@@ -1968,26 +1875,19 @@ pub fn drawComposerProjection(scratch: std.mem.Allocator, win: vaxis.Window, com
 }
 
 fn drawComposerText(scratch: std.mem.Allocator, win: vaxis.Window, label: []const u8, body: []const u8, footer: ?[]const u8, pending: bool, theme: Theme) void {
-    const modal = centeredModal(win, 72, 14) orelse return;
-    const h = modal.height;
-
-    // Header (row 0) and hint (last row).
-    fillRow(modal, 0, theme.picker_query);
+    const rects = view_paint.paint(layouts.DialogSlot, layouts.dialog, layouts.composer, win, theme);
+    if (rects.get(.surface).border.isEmpty()) return;
     const header = std.fmt.allocPrint(scratch, "✎ {s}", .{label}) catch "✎ compose";
-    _ = modal.printSegment(.{ .text = header, .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
-
-    const hint_row = h - 1;
-    fillRow(modal, hint_row, theme.picker_query);
-    _ = modal.printSegment(
+    _ = childRect(win, rects.get(.header).content).printSegment(.{ .text = header, .style = theme.picker_query }, .{ .wrap = .none });
+    _ = childRect(win, rects.get(.hint).content).printSegment(
         .{ .text = footer orelse if (pending) "External Edit in progress…" else "^D submit · ^E external · ^W del word · ^U del line · esc cancel", .style = theme.picker_query },
-        .{ .row_offset = hint_row, .wrap = .none },
+        .{ .wrap = .none },
     );
 
-    // Body region: rows 1..hint_row-1. Split the body into lines, scroll so the
-    // tail (where the cursor is) stays visible, and mark the end with a block.
-    const body_rows: u16 = if (hint_row > 1) hint_row - 1 else 0;
-    var r: u16 = 1;
-    while (r < hint_row) : (r += 1) fillRow(modal, r, theme.picker);
+    // Split the body into lines, scroll so the tail (where the cursor is)
+    // stays visible, and mark the end with a block.
+    const body_win = childRect(win, rects.get(.body).content);
+    const body_rows = body_win.height;
 
     var total: u16 = 1; // one line, plus one per newline
     for (body) |ch| {
@@ -1996,17 +1896,17 @@ fn drawComposerText(scratch: std.mem.Allocator, win: vaxis.Window, label: []cons
     const first_visible: u16 = if (total > body_rows) total - body_rows else 0;
 
     var li: u16 = 0;
-    var out_row: u16 = 1;
+    var out_row: u16 = 0;
     var it = std.mem.splitScalar(u8, body, '\n');
     while (it.next()) |line| : (li += 1) {
         if (li < first_visible) continue;
-        if (out_row >= hint_row) break;
+        if (out_row >= body_rows) break;
         const is_last = it.peek() == null;
         const text = if (is_last)
             std.fmt.allocPrint(scratch, "{s}▌", .{line}) catch line
         else
             line;
-        _ = modal.printSegment(.{ .text = text, .style = theme.picker }, .{ .row_offset = out_row, .col_offset = 1, .wrap = .none });
+        _ = body_win.printSegment(.{ .text = text, .style = theme.picker }, .{ .row_offset = out_row, .wrap = .none });
         out_row += 1;
     }
 }
@@ -2015,22 +1915,11 @@ fn drawComposerText(scratch: std.mem.Allocator, win: vaxis.Window, label: []cons
 /// runs (M10b). A small centered box: a title, an `n / total posted` line, and
 /// a note that it can't be interrupted. `scratch` outlives render.
 pub fn drawSubmit(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, seen: usize, total: usize) void {
-    const modal = centeredModal(win, 40, 5) orelse return;
-    var r: u16 = 0;
-    while (r < modal.height) : (r += 1) fillRow(modal, r, theme.picker);
-
-    fillRow(modal, 0, theme.picker_query);
-    _ = modal.printSegment(.{ .text = " Submitting review", .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
-
-    if (modal.height > 2) {
-        const line = std.fmt.allocPrint(scratch, "  {d} / {d} items", .{ seen, total }) catch "  submitting…";
-        _ = modal.printSegment(.{ .text = line, .style = theme.picker }, .{ .row_offset = 2, .wrap = .none });
-    }
-    const hint_row = modal.height - 1;
-    if (hint_row >= 3) {
-        fillRow(modal, hint_row, theme.picker_query);
-        _ = modal.printSegment(.{ .text = " publishing to Bitbucket…", .style = theme.picker_query }, .{ .row_offset = hint_row, .wrap = .none });
-    }
+    const rects = view_paint.paint(layouts.DialogSlot, layouts.dialog, layouts.submit_progress, win, theme);
+    _ = childRect(win, rects.get(.header).content).printSegment(.{ .text = " Submitting review", .style = theme.picker_query }, .{ .wrap = .none });
+    const line = std.fmt.allocPrint(scratch, "  {d} / {d} items", .{ seen, total }) catch "  submitting…";
+    _ = childRect(win, rects.get(.body).content).printSegment(.{ .text = line, .style = theme.picker }, .{ .wrap = .none });
+    _ = childRect(win, rects.get(.hint).content).printSegment(.{ .text = " publishing to Bitbucket…", .style = theme.picker_query }, .{ .wrap = .none });
 }
 
 /// Draw the finished-Submission result dialog (M10b): a title reflecting the
@@ -2046,11 +1935,7 @@ pub fn drawSubmitResult(
     aborted: ?[]const u8,
     stale: bool,
 ) void {
-    const modal = centeredModal(win, 48, 6) orelse return;
-    var r: u16 = 0;
-    while (r < modal.height) : (r += 1) fillRow(modal, r, theme.picker);
-
-    fillRow(modal, 0, theme.picker_query);
+    const rects = view_paint.paint(layouts.DialogSlot, layouts.dialog, layouts.submit_result, win, theme);
     const title: []const u8 = if (stale)
         " Submit refused — PR moved"
     else if (aborted != null)
@@ -2059,23 +1944,15 @@ pub fn drawSubmitResult(
         " Submission completed with issues"
     else
         " Review submitted";
-    _ = modal.printSegment(.{ .text = title, .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
-
-    if (modal.height > 2) {
-        const line: []const u8 = if (stale)
-            "  reopen the PR before submitting"
-        else if (aborted) |name|
-            std.fmt.allocPrint(scratch, "  {s} — all kept pending", .{name}) catch "  aborted"
-        else
-            std.fmt.allocPrint(scratch, "  {d} posted · {d} failed · {d} skipped", .{ posted, failed, skipped }) catch "  done";
-        _ = modal.printSegment(.{ .text = line, .style = theme.picker }, .{ .row_offset = 2, .wrap = .none });
-    }
-
-    const hint_row = modal.height - 1;
-    if (hint_row >= 3) {
-        fillRow(modal, hint_row, theme.picker_query);
-        _ = modal.printSegment(.{ .text = " press any key to dismiss", .style = theme.picker_query }, .{ .row_offset = hint_row, .wrap = .none });
-    }
+    _ = childRect(win, rects.get(.header).content).printSegment(.{ .text = title, .style = theme.picker_query }, .{ .wrap = .none });
+    const line: []const u8 = if (stale)
+        "  reopen the PR before submitting"
+    else if (aborted) |name|
+        std.fmt.allocPrint(scratch, "  {s} — all kept pending", .{name}) catch "  aborted"
+    else
+        std.fmt.allocPrint(scratch, "  {d} posted · {d} failed · {d} skipped", .{ posted, failed, skipped }) catch "  done";
+    _ = childRect(win, rects.get(.body).content).printSegment(.{ .text = line, .style = theme.picker }, .{ .wrap = .none });
+    _ = childRect(win, rects.get(.hint).content).printSegment(.{ .text = " press any key to dismiss", .style = theme.picker_query }, .{ .wrap = .none });
 }
 
 /// Draw one dependency-tree Overlay for both live progress and terminal
@@ -2087,30 +1964,24 @@ pub fn drawSubmissionTree(
     theme: Theme,
     tree: @import("presentation.zig").SubmissionTreeProjection,
 ) void {
-    const modal = centeredModal(win, 78, 22) orelse return;
-    var row: u16 = 0;
-    while (row < modal.height) : (row += 1) fillRow(modal, row, theme.picker);
-
-    fillRow(modal, 0, theme.picker_query);
+    const rects = view_paint.paint(layouts.SubmissionSlot, layouts.submission, {}, win, theme);
     const title = std.fmt.allocPrint(scratch, " Submission for {s}#{d}", .{ tree.key.repository(), tree.key.pull_request_id }) catch " Submission";
-    _ = modal.printSegment(.{ .text = title, .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
-    if (modal.height < 4) return;
+    _ = childRect(win, rects.get(.title).content).printSegment(.{ .text = title, .style = theme.picker_query }, .{ .wrap = .none });
     const summary = std.fmt.allocPrint(scratch, " {d} posted | {d} failed | {d} skipped | {d} outcome unknown", .{
         tree.posted,
         tree.failed,
         tree.skipped,
         tree.outcome_unknown,
     }) catch " Submission progress";
-    _ = modal.printSegment(.{ .text = summary, .style = theme.picker }, .{ .row_offset = 1, .wrap = .none });
+    _ = childRect(win, rects.get(.summary).content).printSegment(.{ .text = summary, .style = theme.picker }, .{ .wrap = .none });
 
-    const detail_rows: u16 = @min(6, modal.height - 3);
-    const detail_start = modal.height - detail_rows;
-    const list_height = detail_start -| 2;
+    const items = childRect(win, rects.get(.items).content);
+    const list_height = items.height;
     const selected: u16 = @intCast(@min(tree.selected, std.math.maxInt(u16)));
     const top: usize = if (selected >= list_height and list_height > 0) selected - list_height + 1 else 0;
-    var item_row: u16 = 2;
+    var item_row: u16 = 0;
     var index = top;
-    while (index < tree.items.len and item_row < detail_start) : ({
+    while (index < tree.items.len and item_row < list_height) : ({
         index += 1;
         item_row += 1;
     }) {
@@ -2127,11 +1998,11 @@ pub fn drawSubmissionTree(
             body,
         }) catch "Draft";
         const style = if (index == tree.selected) theme.picker_selected else if (item.state == .outcome_unknown) theme.outcome_unknown else theme.picker;
-        fillRow(modal, item_row, style);
-        _ = modal.printSegment(.{ .text = text, .style = style }, .{ .row_offset = item_row, .wrap = .none });
+        fillRow(items, item_row, style);
+        _ = items.printSegment(.{ .text = text, .style = style }, .{ .row_offset = item_row, .wrap = .none });
     }
 
-    if (tree.selectedItem()) |item| drawSubmissionDetail(scratch, modal, theme, tree, item, detail_start);
+    if (tree.selectedItem()) |item| drawSubmissionDetail(scratch, childRect(win, rects.get(.detail).content), theme, tree, item);
 }
 
 fn tryIndent(scratch: std.mem.Allocator, depth: usize) []const u8 {
@@ -2157,27 +2028,26 @@ fn submissionStateText(state: @import("presentation.zig").SubmissionItemState) [
 
 fn drawSubmissionDetail(
     scratch: std.mem.Allocator,
-    modal: vaxis.Window,
+    detail: vaxis.Window,
     theme: Theme,
     tree: @import("presentation.zig").SubmissionTreeProjection,
     item: @import("presentation.zig").SubmissionItemProjection,
-    start: u16,
 ) void {
-    if (start >= modal.height) return;
-    fillRow(modal, start, theme.picker_query);
+    if (detail.height == 0) return;
+    fillRow(detail, 0, theme.picker_query);
     const identity = std.fmt.allocPrint(scratch, " Draft #{d}: {s}; {d} Reply descendant(s)", .{ item.temp_id, item.context, item.reply_descendants }) catch " Draft detail";
-    _ = modal.printSegment(.{ .text = identity, .style = theme.picker_query }, .{ .row_offset = start, .wrap = .none });
-    var row = start + 1;
-    if (tree.stale_repair) |stale| if (row < modal.height) {
+    _ = detail.printSegment(.{ .text = identity, .style = theme.picker_query }, .{ .wrap = .none });
+    var row: u16 = 1;
+    if (tree.stale_repair) |stale| if (row < detail.height) {
         const source = std.fmt.allocPrint(scratch, " Stale repair: loaded {s}; observed {s}; {s}", .{
             stale.loaded_source_commit,
             stale.observed_source_commit,
             if (stale.reloaded) "reloaded - repair this scope before retry" else "R reload PullRequest; no submit-anyway",
         }) catch " Stale repair required";
-        _ = modal.printSegment(.{ .text = source, .style = theme.outcome_unknown }, .{ .row_offset = row, .wrap = .none });
+        _ = detail.printSegment(.{ .text = source, .style = theme.outcome_unknown }, .{ .row_offset = row, .wrap = .none });
         row += 1;
     };
-    if (row < modal.height) {
+    if (row < detail.height) {
         const reason = if (item.reason) |err|
             std.fmt.allocPrint(scratch, " Reason: {s}", .{@errorName(err)}) catch " Reason unavailable"
         else if (item.blocking_ancestor) |ancestor|
@@ -2186,30 +2056,30 @@ fn drawSubmissionDetail(
             " outcome unknown - resolve before editing"
         else
             " Reason: none";
-        _ = modal.printSegment(.{ .text = reason, .style = if (item.state == .outcome_unknown) theme.outcome_unknown else theme.picker }, .{ .row_offset = row, .wrap = .none });
+        _ = detail.printSegment(.{ .text = reason, .style = if (item.state == .outcome_unknown) theme.outcome_unknown else theme.picker }, .{ .row_offset = row, .wrap = .none });
         row += 1;
     }
-    if (row < modal.height) {
+    if (row < detail.height) {
         const attempts = std.fmt.allocPrint(scratch, " Attempts: POST {d}/{d}; publication checks {d}/{d}", .{
             item.post_attempts,
             bbr.review.submission.max_attempts,
             item.publication_checks,
             bbr.review.submission.max_attempts,
         }) catch " Attempts unavailable";
-        _ = modal.printSegment(.{ .text = attempts, .style = theme.picker }, .{ .row_offset = row, .wrap = .none });
+        _ = detail.printSegment(.{ .text = attempts, .style = theme.picker }, .{ .row_offset = row, .wrap = .none });
         row += 1;
     }
-    if (row < modal.height) {
+    if (row < detail.height) {
         const delay = if (item.retry) |retry| std.fmt.allocPrint(scratch, " Static delay: local {d}ms; server {s}; effective {d}ms", .{
             retry.local_delay_ms,
             if (retry.server_delay_ms) |server| std.fmt.allocPrint(scratch, "{d}ms", .{server}) catch "set" else "none",
             retry.effective_delay_ms,
         }) catch " Static delay unavailable" else " Static delay: none";
-        _ = modal.printSegment(.{ .text = delay, .style = theme.picker }, .{ .row_offset = row, .wrap = .none });
+        _ = detail.printSegment(.{ .text = delay, .style = theme.picker }, .{ .row_offset = row, .wrap = .none });
         row += 1;
     }
-    if (row < modal.height) {
-        fillRow(modal, row, theme.picker_query);
+    if (row < detail.height) {
+        fillRow(detail, row, theme.picker_query);
         const footer: []const u8 = if (tree.completion == null)
             " In progress; A abandons recovered ambiguity only"
         else if (item.retry_eligible)
@@ -2224,7 +2094,7 @@ fn drawSubmissionDetail(
             " Select its blocking ancestor to repair or retry | Esc dismiss"
         else
             " j/k select | Esc dismiss";
-        _ = modal.printSegment(.{ .text = footer, .style = theme.picker_query }, .{ .row_offset = row, .wrap = .none });
+        _ = detail.printSegment(.{ .text = footer, .style = theme.picker_query }, .{ .row_offset = row, .wrap = .none });
     }
 }
 
@@ -2331,35 +2201,28 @@ fn sourceRefusalLabel(availability: presentation.ActionAvailability, action: key
 pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, km: keymap.Keymap, availability: presentation.ActionAvailability) void {
     const rows = buildHelpRows(scratch, km, availability);
     const n = @max(rows.motions.len, rows.commands.len);
-    const want_h: u16 = @intCast(@min(n + 5, 255));
-    const modal = centeredModal(win, 74, want_h) orelse return;
-    var r: u16 = 0;
-    while (r < modal.height) : (r += 1) fillRow(modal, r, theme.picker);
+    const rects = view_paint.paint(layouts.HelpSlot, layouts.help, n, win, theme);
+    if (rects.get(.surface).border.isEmpty()) return;
+    _ = childRect(win, rects.get(.title).content).printSegment(.{ .text = " Keybindings", .style = theme.picker_query }, .{ .wrap = .none });
 
-    fillRow(modal, 0, theme.picker_query);
-    _ = modal.printSegment(.{ .text = " Keybindings", .style = theme.picker_query }, .{ .row_offset = 0, .wrap = .none });
-
-    const col_right: u16 = modal.width / 2 + 1;
-    const keyboard_rows = @min(n, modal.height -| 5);
-    var i: usize = 0;
-    while (i < keyboard_rows) : (i += 1) {
-        const rr: u16 = 1 + @as(u16, @intCast(i));
-        if (i < rows.motions.len)
-            _ = modal.printSegment(.{ .text = rows.motions[i].text, .style = if (rows.motions[i].available) theme.picker else theme.gutter }, .{ .row_offset = rr, .col_offset = 2, .wrap = .none });
-        if (i < rows.commands.len)
-            _ = modal.printSegment(.{ .text = rows.commands[i].text, .style = if (rows.commands[i].available) theme.picker else theme.gutter }, .{ .row_offset = rr, .col_offset = col_right, .wrap = .none });
+    const motions = childRect(win, rects.get(.motions).content);
+    const commands = childRect(win, rects.get(.commands).content);
+    for (rows.motions, 0..) |row, i| {
+        if (i >= motions.height) break;
+        _ = motions.printSegment(.{ .text = row.text, .style = if (row.available) theme.picker else theme.gutter }, .{ .row_offset = @intCast(i), .wrap = .none });
+    }
+    for (rows.commands, 0..) |row, i| {
+        if (i >= commands.height) break;
+        _ = commands.printSegment(.{ .text = row.text, .style = if (row.available) theme.picker else theme.gutter }, .{ .row_offset = @intCast(i), .wrap = .none });
     }
 
-    const mouse_row: u16 = @intCast(keyboard_rows + 1);
-    if (mouse_row + 2 < modal.height) {
-        _ = modal.printSegment(.{ .text = " Mouse", .style = theme.picker_query }, .{ .row_offset = mouse_row, .col_offset = 1, .wrap = .none });
-        _ = modal.printSegment(.{ .text = " click focus/select/toggle · wheel scroll", .style = theme.picker }, .{ .row_offset = mouse_row + 1, .col_offset = 2, .wrap = .none });
-        _ = modal.printSegment(.{ .text = " Shift/Option: native selection · [input.mouse] enabled=false", .style = theme.gutter }, .{ .row_offset = mouse_row + 2, .col_offset = 2, .wrap = .none });
+    const mouse = childRect(win, rects.get(.mouse).content);
+    if (mouse.height == 3) {
+        _ = mouse.printSegment(.{ .text = " Mouse", .style = theme.picker_query }, .{ .wrap = .none });
+        _ = mouse.printSegment(.{ .text = " click focus/select/toggle · wheel scroll", .style = theme.picker }, .{ .row_offset = 1, .col_offset = 1, .wrap = .none });
+        _ = mouse.printSegment(.{ .text = " Shift/Option: native selection · [input.mouse] enabled=false", .style = theme.gutter }, .{ .row_offset = 2, .col_offset = 1, .wrap = .none });
     }
-
-    const hint_row = modal.height - 1;
-    fillRow(modal, hint_row, theme.picker_query);
-    _ = modal.printSegment(.{ .text = " press any key to dismiss", .style = theme.picker_query }, .{ .row_offset = hint_row, .wrap = .none });
+    _ = childRect(win, rects.get(.hint).content).printSegment(.{ .text = " press any key to dismiss", .style = theme.picker_query }, .{ .wrap = .none });
 }
 
 /// The boot/switch frame shown until a Session arrives: a centered floating
@@ -2370,17 +2233,14 @@ pub fn drawLoading(scratch: std.mem.Allocator, win: vaxis.Window, id: ?u64, them
     // Blank the whole window first: on a switch the previous viewer frame is
     // still in the screen buffer behind the dialog.
     win.clear();
-    const modal = centeredModal(win, 48, 3) orelse return;
-    var r: u16 = 0;
-    while (r < modal.height) : (r += 1) fillRow(modal, r, theme.picker);
+    const rects = view_paint.paint(layouts.LoadingSlot, layouts.loading, {}, win, theme);
     const text: []const u8 = if (status_msg) |m|
         if (id) |pr_id| std.fmt.allocPrint(scratch, " PR #{d}: {s}", .{ pr_id, m }) catch m else m
     else if (id) |pr_id|
         std.fmt.allocPrint(scratch, " Loading PR #{d}…", .{pr_id}) catch "Loading…"
     else
         " Loading local review…";
-    const row = modal.height / 2;
-    _ = modal.printSegment(.{ .text = text, .style = theme.picker_query }, .{ .row_offset = row, .wrap = .none });
+    _ = childRect(win, rects.get(.line).content).printSegment(.{ .text = text, .style = theme.picker_query }, .{ .wrap = .none });
 }
 
 fn drawUnifiedGutter(win: vaxis.Window, row: u16, old_no: ?u32, new_no: ?u32, style: vaxis.Style) void {
@@ -2764,7 +2624,7 @@ test "M21 authored Review Search list shows a scroll bar for long results" {
         .geometry = geometry,
     };
     drawReviewSearch(a, win, projection, theme_dark);
-    const list = childRect(win, geometry.list);
+    const list = childRect(win, .{ .x = geometry.list.x, .y = geometry.list.y, .width = geometry.list.width + 1, .height = geometry.list.height });
     const bar_col = list.width - 1;
     const thumb = @max(@as(usize, 1), (@as(usize, list.height) * list.height + results.len - 1) / results.len);
     try testing.expect(thumb < list.height);
@@ -2861,11 +2721,11 @@ test "Review Search draws titled borders, top query, Position, and separated Pre
         .pending = false,
         .geometry = geometry,
     }, theme_dark);
-    try testing.expectEqualStrings("┌", win.readCell(geometry.rect.x, geometry.rect.y).?.char.grapheme);
+    try testing.expectEqualStrings("╭", win.readCell(geometry.rect.x, geometry.rect.y).?.char.grapheme);
     try testing.expectEqualStrings(">", win.readCell(geometry.rect.x + 1, geometry.rect.y + 1).?.char.grapheme);
     const status = "1/1 matches · 2 candidates";
-    try testing.expectEqualStrings("1", win.readCell(geometry.rect.x + geometry.rect.width - @as(u16, @intCast(searchCellWidth(status))) - 2, geometry.rect.y + 2).?.char.grapheme);
-    try testing.expectEqualStrings("┌", win.readCell(geometry.body.x, geometry.body.y).?.char.grapheme);
+    try testing.expectEqualStrings("1", win.readCell(geometry.rect.x + geometry.rect.width - @as(u16, @intCast(searchCellWidth(status))) - 3, geometry.rect.y + 2).?.char.grapheme);
+    try testing.expectEqualStrings("╭", win.readCell(geometry.body.x, geometry.body.y).?.char.grapheme);
     try testing.expectEqualStrings("┬", win.readCell(geometry.divider, geometry.body.y).?.char.grapheme);
     try testing.expectEqualStrings("▸", win.readCell(geometry.list.x, geometry.list.y).?.char.grapheme);
     try testing.expectEqualStrings("C", win.readCell(geometry.header.x, geometry.header.y).?.char.grapheme);
@@ -3746,10 +3606,11 @@ test "the Theme Overlay marks the Configured Theme and the screen repaints in th
     try testing.expect(!screenHasBackground(win, themes.dark.added.bg));
 
     drawListOverlay(a, win, projection.list_overlay.?, projection.action_availability, projection.configured_theme, &.{}, themes.value(projection.theme));
-    // A 40x12 box centered on 60x24 starts at (10, 6); "dark" is its first Theme row after "system".
-    try testing.expectEqualStrings("d", win.readCell(12, 8).?.char.grapheme);
-    try testing.expectEqualStrings("(", win.readCell(18, 8).?.char.grapheme);
-    try testing.expectEqualStrings(" ", win.readCell(18, 7).?.char.grapheme);
+    // "dark" is the first Theme row after "system".
+    const themes_at = @import("frame.zig").listOverlayTarget(.{ .cols = 60, .rows = 24 }, projection.list_overlay.?.box()).?.entries;
+    try testing.expectEqualStrings("d", win.readCell(themes_at.x + 2, themes_at.y + 1).?.char.grapheme);
+    try testing.expectEqualStrings("(", win.readCell(themes_at.x + 8, themes_at.y + 1).?.char.grapheme);
+    try testing.expectEqualStrings(" ", win.readCell(themes_at.x + 8, themes_at.y).?.char.grapheme);
 
     try state.dispatch(.{ .key = .{ .codepoint = keymap.special.escape } });
     projection = state.projection();
@@ -3762,8 +3623,8 @@ test "the Theme Overlay marks the Configured Theme and the screen repaints in th
     projection = state.projection();
     win.clear();
     drawListOverlay(a, win, projection.list_overlay.?, projection.action_availability, projection.configured_theme, projection.review.?.diff.files, themes.value(projection.theme));
-    // A 60x16 box centered on 60x24 starts at (0, 4). Its first File row follows the query row.
-    try expectScreenText(win.child(.{ .x_off = 2, .y_off = 5 }), 0, "a.zig");
+    const files_at = @import("frame.zig").listOverlayTarget(.{ .cols = 60, .rows = 24 }, projection.list_overlay.?.box()).?.entries;
+    try expectScreenText(win.child(.{ .x_off = files_at.x + 2, .y_off = files_at.y }), 0, "a.zig");
 }
 
 fn screenHasBackground(win: vaxis.Window, bg: vaxis.Cell.Color) bool {
@@ -3794,6 +3655,34 @@ test "a loading picker shows its single-glyph spinner beside the placeholder" {
     try testing.expectEqualStrings(picker.pull_request_picker.spinnerGlyph(), win.readCell(mx, my + 1).?.char.grapheme);
 }
 
+test "every Overlay surface has a rounded border" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Check = struct {
+        fn corners(win: vaxis.Window, rect: @import("frame.zig").Rect) !void {
+            try testing.expect(!rect.isEmpty());
+            const right = rect.x + rect.width - 1;
+            const bottom = rect.y + rect.height - 1;
+            try testing.expectEqualStrings("╭", win.readCell(rect.x, rect.y).?.char.grapheme);
+            try testing.expectEqualStrings("╮", win.readCell(right, rect.y).?.char.grapheme);
+            try testing.expectEqualStrings("╰", win.readCell(rect.x, bottom).?.char.grapheme);
+            try testing.expectEqualStrings("╯", win.readCell(right, bottom).?.char.grapheme);
+        }
+    };
+    for ([_][2]u16{ .{ 120, 40 }, .{ 50, 12 } }) |size| {
+        var screen = try vaxis.Screen.init(a, .{ .rows = size[1], .cols = size[0], .x_pixel = 0, .y_pixel = 0 });
+        const win = headlessWindow(&screen);
+        try Check.corners(win, view_paint.paint(layouts.ListSlot, layouts.listOverlay, layouts.Box{ .width = 60, .height = 16 }, win, theme_dark).get(.surface).border);
+        for ([_]layouts.Dialog{ layouts.composer, layouts.submit_progress, layouts.submit_result }) |dialog|
+            try Check.corners(win, view_paint.paint(layouts.DialogSlot, layouts.dialog, dialog, win, theme_dark).get(.surface).border);
+        try Check.corners(win, view_paint.paint(layouts.LoadingSlot, layouts.loading, {}, win, theme_dark).get(.surface).border);
+        try Check.corners(win, view_paint.paint(layouts.HelpSlot, layouts.help, @as(usize, 20), win, theme_dark).get(.surface).border);
+        try Check.corners(win, view_paint.paint(layouts.SubmissionSlot, layouts.submission, {}, win, theme_dark).get(.surface).border);
+        try Check.corners(win, view_paint.paint(layouts.SearchSlot, layouts.reviewSearch, layouts.ReviewSearch{}, win, theme_dark).get(.surface).border);
+    }
+}
+
 test "the boot loading view floats a Loading PR dialog" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -3805,17 +3694,18 @@ test "the boot loading view floats a Loading PR dialog" {
 
     drawLoading(a, win, 42, theme_dark, null);
 
-    // Dialog: 48×3 centered on 80×24 → x=16, y=10; text on the middle row (11),
-    // one leading space, so 'L' of "Loading" is at col 17.
-    try testing.expectEqualStrings("L", win.readCell(17, 11).?.char.grapheme);
-    try testing.expectEqualStrings("#", win.readCell(28, 11).?.char.grapheme);
+    // Dialog: 48×3 centered on 80×24 → x=16, y=10. The text sits inside the
+    // rounded border on row 11 after one leading space, so 'L' is at col 18.
+    try testing.expectEqualStrings("╭", win.readCell(16, 10).?.char.grapheme);
+    try testing.expectEqualStrings("L", win.readCell(18, 11).?.char.grapheme);
+    try testing.expectEqualStrings("#", win.readCell(29, 11).?.char.grapheme);
 
     // With a status message the id-prefixed error takes its place.
     var screen2 = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen2.deinit(a);
     const win2 = headlessWindow(&screen2);
     drawLoading(a, win2, 42, theme_dark, "NotFound");
-    try testing.expectEqualStrings("P", win2.readCell(17, 11).?.char.grapheme);
+    try testing.expectEqualStrings("P", win2.readCell(18, 11).?.char.grapheme);
 }
 
 test "sidebar prefix shows selection marker and status, borrowing no stack" {
@@ -3873,12 +3763,14 @@ test "focused Pane frames and File Tree tallies use Frame-owned geometry" {
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
     const panes = @import("frame.zig").paneRects(.{ .cols = 32, .rows = 8 });
-    drawPaneFrame(win, panes.sidebar, "Files", theme_dark, true);
-    drawPaneFrame(win, panes.diff, "Diff", theme_dark, false);
-    try testing.expectEqualStrings("┌", win.readCell(panes.sidebar.x, 0).?.char.grapheme);
+    _ = view_paint.paint(layouts.PaneSlot, layouts.panes, layouts.Panes{ .sidebar_focused = true }, win, theme_dark);
+    try testing.expectEqualStrings("╭", win.readCell(panes.sidebar.x, 0).?.char.grapheme);
     try testing.expect(win.readCell(panes.sidebar.x, 0).?.style.bold);
     try testing.expect(!win.readCell(panes.diff.x, 0).?.style.bold);
-    try testing.expectEqualStrings("├", win.readCell(panes.sidebar.x, 1).?.char.grapheme);
+    try testing.expectEqualStrings("│", win.readCell(panes.sidebar.x, 1).?.char.grapheme);
+    try testing.expectEqualStrings("│", win.readCell(panes.diff.x, 1).?.char.grapheme);
+    try testing.expectEqual(@as(u16, 1), panes.sidebar_content.y);
+    try testing.expectEqual(@as(u16, 1), panes.diff_content.y);
 
     const entries = [_]@import("file_tree.zig").Entry{.{
         .identity = .{ .file = 0 },
@@ -3911,8 +3803,23 @@ test "File header junctions keep the DiffPane border style" {
     const outer: @import("frame.zig").Rect = .{ .x = 2, .y = 0, .width = 12, .height = 6 };
     const content: @import("frame.zig").Rect = .{ .x = 3, .y = 2, .width = 10, .height = 3 };
 
+    const BodySlot = enum { body };
+    const framed = struct {
+        fn tree(focused: bool, area: @import("view.zig").Rect, visitor: anytype) void {
+            const V = @import("view.zig").View(BodySlot);
+            const stroke: @import("view.zig").Stroke = .{ .focused = focused };
+            const root: V = .{
+                .margin = @import("view.zig").Edges.sides(2),
+                .border = .{ .stroke = stroke },
+                .composition = .{ .flow = .{} },
+                .children = &.{ .{ .composition = .{ .rule = stroke } }, .{ .slot = .body } },
+            };
+            @import("view.zig").walk(BodySlot, &root, area, visitor);
+        }
+    };
     for ([_]bool{ false, true }) |focused| {
-        drawPaneFrame(win, outer, "", theme_dark, focused);
+        const body = view_paint.paint(BodySlot, framed.tree, focused, win, theme_dark).get(.body).content;
+        try testing.expectEqual(content, body);
         joinSectionRules(win, outer, content, visual_rows, Nav.init(visual_rows.len, content.height));
 
         try testing.expectEqualStrings("├", win.readCell(outer.x, content.y).?.char.grapheme);
@@ -4501,7 +4408,8 @@ test "DiffPane title reserves and renders published Selected Version targets" {
         .version_title_targets = targets,
     };
 
-    drawDiffPaneFrame(arena.allocator(), win, frame, "src/a-very-long-file-name.zig", .whole, theme_dark);
+    _ = view_paint.paint(layouts.PaneSlot, layouts.panes, layouts.Panes{ .sidebar_focused = true }, win, theme_dark);
+    drawDiffPaneTitle(arena.allocator(), win, frame, "src/a-very-long-file-name.zig", .whole, theme_dark);
 
     try testing.expectEqualStrings("h", win.readCell(targets.old.?.x, 0).?.char.grapheme);
     try testing.expectEqualStrings("D", win.readCell(targets.old.?.x + 5, 0).?.char.grapheme);
@@ -4509,7 +4417,21 @@ test "DiffPane title reserves and renders published Selected Version targets" {
     try testing.expectEqual(theme_dark.accent, win.readCell(targets.old.?.x, 0).?.style.fg);
     try testing.expect(win.readCell(targets.old.?.x, 0).?.style.bold);
     try testing.expect(!std.meta.eql(win.readCell(targets.new.?.x, 0).?.style.fg, theme_dark.accent));
-    try testing.expectEqualStrings("─", win.readCell(targets.old.?.x - 1, 0).?.char.grapheme);
+    try testing.expectEqualStrings(" ", win.readCell(targets.old.?.x - 1, 0).?.char.grapheme);
+    try testing.expectEqualStrings("─", win.readCell(targets.old.?.x - 2, 0).?.char.grapheme);
+    try testing.expectEqualStrings("─", win.readCell(targets.new.?.x - 1, 0).?.char.grapheme);
+    try testing.expectEqualStrings(" ", win.readCell(targets.new.?.x + targets.new.?.width, 0).?.char.grapheme);
+    try testing.expectEqualStrings("─", win.readCell(targets.new.?.x + targets.new.?.width + 1, 0).?.char.grapheme);
+    for ([_]struct { x: u16, text: []const u8 }{
+        .{ .x = panes.sidebar.x + 1, .text = "─" },
+        .{ .x = panes.sidebar.x + 2, .text = " " },
+        .{ .x = panes.sidebar.x + 3, .text = "F" },
+        .{ .x = panes.sidebar.x + 8, .text = " " },
+        .{ .x = panes.sidebar.x + 9, .text = "─" },
+        .{ .x = panes.diff.x + 1, .text = "─" },
+        .{ .x = panes.diff.x + 2, .text = " " },
+        .{ .x = panes.diff.x + 3, .text = "s" },
+    }) |cell| try testing.expectEqualStrings(cell.text, win.readCell(cell.x, 0).?.char.grapheme);
 }
 
 test "SideBySide WholeFile accents only the selected header and inner gutter edge" {
@@ -4599,15 +4521,18 @@ test "the help overlay floats a centered Keybindings modal from the Keymap" {
     drawHelp(a, win, theme_dark, keymap.Keymap.default, .{ .remote = true });
 
     const rows = buildHelpRows(a, keymap.Keymap.default, .{ .remote = true });
-    const modal_height: u16 = @intCast(@min(@max(rows.motions.len, rows.commands.len) + 5, screen.height));
-    const modal_y = (screen.height - modal_height) / 2;
-    // Title " Keybindings" begins one cell into the centered 74-column modal.
-    try testing.expectEqualStrings("K", win.readCell(4, modal_y).?.char.grapheme);
-    // First motion row starts at col_offset 2 and one row below the title →
-    // screen col 5, and the first motion binding is `j`/`↓` → down.
-    try testing.expectEqualStrings("j", win.readCell(5, modal_y + 1).?.char.grapheme);
-    const mouse_row: u16 = @intCast(@min(@max(rows.motions.len, rows.commands.len), modal_height -| 5) + 1);
-    try testing.expectEqualStrings("M", win.readCell(5, modal_y + mouse_row).?.char.grapheme);
+    const rects = @import("view.zig").solve(layouts.HelpSlot, layouts.help, @max(rows.motions.len, rows.commands.len), .{ .width = 80, .height = 24 });
+    const modal = rects.get(.surface).border;
+    try testing.expectEqualStrings("╭", win.readCell(modal.x, modal.y).?.char.grapheme);
+    try testing.expectEqualStrings("╯", win.readCell(modal.x + modal.width - 1, modal.y + modal.height - 1).?.char.grapheme);
+    // Title " Keybindings" begins one cell into the title row.
+    const title = rects.get(.title).content;
+    try testing.expectEqualStrings("K", win.readCell(title.x + 1, title.y).?.char.grapheme);
+    // The first motion binding is `j`/`↓` → down.
+    const motions = rects.get(.motions).content;
+    try testing.expectEqualStrings("j", win.readCell(motions.x, motions.y).?.char.grapheme);
+    const mouse = rects.get(.mouse).content;
+    try testing.expectEqualStrings("M", win.readCell(mouse.x + 1, mouse.y).?.char.grapheme);
 }
 
 test "Selected Version help names horizontal keys and the absent File version" {

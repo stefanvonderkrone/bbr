@@ -562,7 +562,7 @@ pub const ListOverlay = union(enum) {
         };
     }
 
-    pub const Box = struct { width: u16, height: u16 };
+    pub const Box = @import("layouts.zig").Box;
 
     /// The box size in cells. Paint and hit-testing both read it. Each item
     /// takes one row, below one query row.

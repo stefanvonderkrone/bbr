@@ -10,6 +10,8 @@ const vaxis = @import("vaxis");
 const bbr = @import("bbr");
 
 const render = @import("render.zig");
+const view = @import("view.zig");
+const layouts = @import("layouts.zig");
 const theme = @import("theme.zig");
 const config = @import("config.zig");
 const ThemeId = @import("theme_id.zig").ThemeId;
@@ -192,12 +194,9 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         if (painted_revision) |revision| if (std.meta.eql(revision, projection.revision)) continue;
         const active_theme = theme.value(projection.theme);
         const win = vx.window();
-        const content_win = win.child(.{
-            .x_off = 0,
-            .y_off = 0,
-            .width = win.width,
-            .height = win.height -| 1,
-        });
+        const regions = windowRegions(win);
+        const content_win = childRect(win, regions.get(.content).content);
+        const status_win = childRect(win, regions.get(.status).content);
         const frame = frame_arena.allocator();
         if (projection.review) |review_projection| {
             const visual_cursor = review_projection.frame.navigation.cursor;
@@ -207,7 +206,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             const status = presentationStatus(frame, projection, review_projection.key);
             drawStatus(
                 frame,
-                win,
+                status_win,
                 review_projection.header,
                 review_projection.reviewer_verdict,
                 review_projection.navigation,
@@ -298,8 +297,18 @@ fn syncPickerTick(
 
 const vaxis_cell_metrics = render.terminal_cell_metrics;
 
+fn windowRegions(win: vaxis.Window) view.Rects(layouts.AppSlot) {
+    return view.solve(layouts.AppSlot, layouts.app, {}, .{ .width = win.width, .height = win.height });
+}
+
+fn childRect(win: vaxis.Window, rect: view.Rect) vaxis.Window {
+    return win.child(.{ .x_off = rect.x, .y_off = rect.y, .width = rect.width, .height = rect.height });
+}
+
+/// Presentation lays out the content region. It keeps at least one row.
 fn contentGeometry(win: vaxis.Window) presentation.FrameGeometry {
-    return .{ .cols = win.width, .rows = @intCast(contentViewportRows(win.height)) };
+    const content = windowRegions(win).get(.content).content;
+    return .{ .cols = content.width, .rows = @max(content.height, 1) };
 }
 
 fn presentationStatus(
@@ -1171,11 +1180,7 @@ fn cancelPresentationWork(work: *std.ArrayList(PresentationWork), io: std.Io, id
     }
 }
 
-fn contentViewportRows(window_rows: u16) usize {
-    return @max(window_rows -| 1, 1);
-}
-
-/// A one-line status bar across the bottom row. `frame` is the per-frame arena
+/// The one-row status bar in its own window. `frame` is the per-frame arena
 /// (outlives render); a stack buffer would dangle since cells borrow the text.
 fn drawStatus(
     frame: std.mem.Allocator,
@@ -1196,7 +1201,6 @@ fn drawStatus(
     active_theme: theme.Theme,
 ) void {
     if (win.height == 0) return;
-    const row = win.height - 1;
     const layout_hint: []const u8 = if (layout == .unified) "s split" else "s unified";
     // Names the *current* scope; `f` cycles Changes → fetched → whole.
     const scope_hint: []const u8 = switch (scope) {
@@ -1216,27 +1220,36 @@ fn drawStatus(
         (std.fmt.allocPrint(frame, "#{d} {s}  ·  {s}", .{ id, header.title, reviewerVerdictLabel(reviewer_verdict) }) catch header.title)
     else
         header.title;
-    const text = if (searching)
+    const start = if (searching)
         tail
     else
-        std.fmt.allocPrint(frame, " {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s}  ·  {s}  ·  {s} ", .{
+        std.fmt.allocPrint(frame, "{s}  ·  {s} → {s}  ·  {d}/{d}", .{
             identity,
             header.source_ref,
             header.base_ref,
             @min(nav.cursor + 1, buf.rows.len),
             buf.rows.len,
-            layout_hint,
-            scope_hint,
-            file_hint,
-            tail,
-        }) catch " q quit ";
+        }) catch "";
+    const end = if (searching)
+        ""
+    else
+        std.fmt.allocPrint(frame, "{s}  ·  {s}  ·  {s}  ·  {s}", .{ layout_hint, scope_hint, file_hint, tail }) catch "q quit";
     const style: vaxis.Style = if (search_has_no_matches)
         .{ .fg = active_theme.search_no_match, .bg = .{ .index = 7 }, .bold = true }
     else
         .{ .fg = .{ .index = 0 }, .bg = .{ .index = 7 } };
-    var c: u16 = 0;
-    while (c < win.width) : (c += 1) win.writeCell(c, row, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
-    _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = row, .wrap = .none });
+    win.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
+    const regions = view.solve(layouts.StatusSlot, layouts.status, layouts.Status{
+        .start = cellWidth(start),
+        .end = cellWidth(end),
+        .padding = if (searching) 0 else 1,
+    }, .{ .width = win.width, .height = win.height });
+    _ = childRect(win, regions.get(.start).content).printSegment(.{ .text = start, .style = style }, .{ .wrap = .none });
+    _ = childRect(win, regions.get(.end).content).printSegment(.{ .text = end, .style = style }, .{ .wrap = .none });
+}
+
+fn cellWidth(text: []const u8) u16 {
+    return @intCast(@min(vaxis.gwidth.gwidth(text, .unicode), std.math.maxInt(u16)));
 }
 
 fn reviewerVerdictLabel(verdict: ?bbr.bitbucket.ReviewerVerdict) []const u8 {
@@ -1252,6 +1265,9 @@ test {
     _ = @import("cell_metrics.zig");
     _ = @import("buffer.zig");
     _ = @import("frame.zig");
+    _ = @import("view.zig");
+    _ = @import("layouts.zig");
+    _ = @import("view_paint.zig");
     _ = @import("file_tree.zig");
     _ = @import("render.zig");
     _ = @import("theme.zig");
@@ -1311,10 +1327,35 @@ test "qualified Reviewer Verdict results retain their outcome" {
     try std.testing.expectEqualStrings("outcome unresolved", reviewerVerdictOutcomeLabel(.{ .completed = .{ .unresolved = null } }));
 }
 
+test "the status row puts the identity at the start and the key hints at the end" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const header: session.ReviewHeader = .{ .title = "Local review", .source_ref = "review", .base_ref = "main", .source_commit = "", .base_commit = "", .locator = "", .source_label = "" };
+    const buf: buffer_mod.Buffer = .{ .rows = &.{}, .layout = .unified };
+    for ([_]u16{ 200, 60 }) |cols| {
+        var screen = try vaxis.Screen.init(arena.allocator(), .{ .rows = 1, .cols = cols, .x_pixel = 0, .y_pixel = 0 });
+        const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = screen.width, .height = screen.height, .screen = &screen };
+        drawStatus(arena.allocator(), win, header, null, Nav.init(0, 1), buf, .unified, .changes, false, false, false, 0, null, false, false, theme.dark);
+        try std.testing.expectEqualStrings(" ", win.readCell(0, 0).?.char.grapheme);
+        try std.testing.expectEqualStrings("L", win.readCell(1, 0).?.char.grapheme);
+        try std.testing.expectEqualStrings(" ", win.readCell(cols - 1, 0).?.char.grapheme);
+        if (cols == 200) {
+            try std.testing.expectEqualStrings("t", win.readCell(cols - 2, 0).?.char.grapheme);
+            try std.testing.expectEqualStrings(" ", win.readCell(cols / 2, 0).?.char.grapheme);
+        } else {
+            try std.testing.expectEqualStrings("s", win.readCell(1 + cellWidth("Local review  ·  review → main  ·  0/0") + 2, 0).?.char.grapheme);
+        }
+    }
+}
+
 test "content viewport reserves the bottom status row" {
-    try std.testing.expectEqual(@as(usize, 9), contentViewportRows(10));
-    try std.testing.expectEqual(@as(usize, 1), contentViewportRows(1));
-    try std.testing.expectEqual(@as(usize, 1), contentViewportRows(0));
+    for ([_][2]u16{ .{ 10, 9 }, .{ 1, 1 }, .{ 0, 1 } }) |case| {
+        var screen = try vaxis.Screen.init(std.testing.allocator, .{ .rows = case[0], .cols = 4, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(std.testing.allocator);
+        const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = screen.width, .height = screen.height, .screen = &screen };
+        try std.testing.expectEqual(case[1], contentGeometry(win).rows);
+        if (case[0] > 0) try std.testing.expectEqual(case[0] - 1, windowRegions(win).get(.status).content.y);
+    }
 }
 
 test "M21 narrow Buffer Search status keeps the Query end before the count" {

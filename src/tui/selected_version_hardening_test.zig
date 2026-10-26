@@ -367,7 +367,8 @@ test "M20 hardening renders the selected renamed path in the DiffPane title" {
     const window = headlessWindow(&screen);
     render.drawReview(scratch.allocator(), window, review, theme, 0);
 
-    const title_x = review.frame.panes.diff.x + 2;
+    const title_x = review.frame.panes.diff.x + 3;
+    try testing.expectEqualStrings(" ", window.readCell(title_x - 1, review.frame.panes.diff.y).?.char.grapheme);
     for ("old.txt", 0..) |char, offset| {
         try testing.expectEqualStrings(&.{char}, window.readCell(title_x + @as(u16, @intCast(offset)), review.frame.panes.diff.y).?.char.grapheme);
     }
@@ -409,12 +410,12 @@ test "M20 hardening accepts only an unmodified same-target title click" {
     try testing.expectEqual(SelectedVersion.new, presentation.projection().review.?.selected_version);
     try presentation.dispatch(.{ .composer = .cancel });
 
-    try dispatchView(&presentation, .{ .resize = .{ .cols = 34, .rows = 10 } });
+    try dispatchView(&presentation, .{ .resize = .{ .cols = 36, .rows = 10 } });
     const clipped = presentation.projection().review.?.frame.version_title_targets;
     try testing.expect(clipped.old == null);
     try testing.expect(clipped.new != null);
-    try presentation.dispatch(.{ .mouse = .{ .col = 33, .row = 0, .button = .left, .type = .press } });
-    try presentation.dispatch(.{ .mouse = .{ .col = 33, .row = 0, .button = .left, .type = .release } });
+    try presentation.dispatch(.{ .mouse = .{ .col = 35, .row = 0, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = 35, .row = 0, .button = .left, .type = .release } });
     try testing.expectEqual(SelectedVersion.new, presentation.projection().review.?.selected_version);
 
     try dispatchView(&presentation, .{ .resize = .{ .cols = 80, .rows = 10 } });

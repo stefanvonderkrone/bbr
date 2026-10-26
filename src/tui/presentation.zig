@@ -155,7 +155,7 @@ test "M23 highlighting eviction protects only visible Preview blocks within the 
     defer store.deinit();
     const body = "needle\n\n```js\nconst visible = 1;\n```\n\n" ++ "paragraph  \n" ** 40 ++ "\n```json\n{}\n```";
     const bodies = [_][]const u8{ body, "```css\na {}\n```" } ++ [_][]const u8{"plain card"} ** 30;
-    var state = try codeTestPresentation(testing.allocator, store.store(), &bodies, 0, 40);
+    var state = try codeTestPresentation(testing.allocator, store.store(), &bodies, 0, 39);
     defer state.deinit();
     const capacity = 3 * 1024 * 1024 / @sizeOf(code_highlighting.SourceSpan);
     for (0..2) |_| {
@@ -6244,13 +6244,14 @@ pub const Presentation = struct {
 
     fn overlayTarget(self: *const Presentation) ?frame_mod.OverlayTarget {
         if (self.help_visible or self.unknown_resolution != null or self.delete_confirmation != null or self.visibleSubmissionOverlay())
-            return otherOverlay(self.geometry);
+            return frame_mod.screenOverlayTarget(self.geometry);
         if (self.list_overlay) |*overlay| {
-            const box = overlay.box();
-            const rect = frame_mod.overlayRect(self.geometry, box.width, box.height) orelse return null;
-            return .{ .kind = .list, .rect = rect, .row_count = overlay.list().matches().len, .scroll = overlay.list().scrollTop(rect.height -| 1) };
+            var target = frame_mod.listOverlayTarget(self.geometry, overlay.box()) orelse return null;
+            target.row_count = overlay.list().matches().len;
+            target.scroll = overlay.list().scrollTop(target.entries.height);
+            return target;
         }
-        if (self.published) |published| if (published.composer != null) return otherOverlay(self.geometry);
+        if (self.published) |published| if (published.composer != null) return frame_mod.screenOverlayTarget(self.geometry);
         if (self.published) |published| if (published.review_search.open) {
             const geometry = frame_mod.reviewSearchGeometry(self.geometry) orelse return null;
             return .{ .kind = .review_search, .rect = geometry.rect, .review_search = geometry, .row_count = if (published.review_search.pending) 0 else if (published.review_search.batch) |batch| batch.occurrences.len else 0, .scroll = published.review_search.list_scroll };
@@ -13417,11 +13418,6 @@ fn collectSelectedLines(
         const line = lineAtVisualRow(published.buffer, visual_row) orelse continue;
         if (lines.items.len == 0 or lines.items[lines.items.len - 1] != line) try lines.append(allocator, line);
     }
-}
-
-fn otherOverlay(geometry: frame_mod.Geometry) ?frame_mod.OverlayTarget {
-    const rect = frame_mod.overlayRect(geometry, geometry.cols, geometry.rows) orelse return null;
-    return .{ .kind = .other, .rect = rect };
 }
 
 fn nextFileHeaderRow(buffer: buffer_mod.Buffer, cursor: usize) ?usize {
@@ -29002,8 +28998,8 @@ test "Picker mouse click selects only and non-Picker Overlay captures Pane click
 
     try presentation.dispatch(.{ .action = .open_file_finder });
     const overlay = presentation.projection().review.?.frame.overlay.?;
-    try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 2, .button = .left, .type = .press } });
-    try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 2, .button = .left, .type = .release } });
+    try presentation.dispatch(.{ .mouse = .{ .col = overlay.entries.x, .row = overlay.entries.y + 1, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = overlay.entries.x, .row = overlay.entries.y + 1, .button = .left, .type = .release } });
     try testing.expectEqual(@as(usize, 1), testListOverlay(&presentation, .file_finder).?.list().selected);
     try testing.expect(testListOverlay(&presentation, .file_finder) != null); // click never confirms
 
@@ -29036,12 +29032,12 @@ test "PullRequest Picker wheel and click move selection while Enter alone confir
     });
     try presentation.dispatch(.{ .pull_requests_loaded = .{ .work_id = list.work_id, .outcome = .{ .loaded = summaries } } });
     const overlay = presentation.projection().review.?.frame.overlay.?;
-    try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 1, .button = .wheel_down, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = overlay.entries.x, .row = overlay.entries.y, .button = .wheel_down, .type = .press } });
     try testing.expectEqual(@as(usize, 3), testListOverlay(&presentation, .pull_request_picker).?.list().selected);
 
     const current_overlay = presentation.projection().review.?.frame.overlay.?;
-    try presentation.dispatch(.{ .mouse = .{ .col = current_overlay.rect.x, .row = current_overlay.rect.y + 2, .button = .left, .type = .press } });
-    try presentation.dispatch(.{ .mouse = .{ .col = current_overlay.rect.x, .row = current_overlay.rect.y + 2, .button = .left, .type = .release } });
+    try presentation.dispatch(.{ .mouse = .{ .col = current_overlay.entries.x, .row = current_overlay.entries.y + 1, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = current_overlay.entries.x, .row = current_overlay.entries.y + 1, .button = .left, .type = .release } });
     try testing.expectEqual(@as(usize, 1), testListOverlay(&presentation, .pull_request_picker).?.list().selected);
     try testing.expect(presentation.takeCommand() == null);
 
