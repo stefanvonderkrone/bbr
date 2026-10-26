@@ -30,7 +30,16 @@ _Avoid_: selected side, active side, Anchor side.
 
 **Pane**:
 A tiled region of the screen with a defined role (Sidebar, DiffPane, ThreadPane). Panes tile; they do not overlap.
+A View lays out each Pane, but a Pane is the role, not the View.
 _Avoid_: window (reserved for vaxis's surface), view, panel.
+
+**View**:
+One rectangular node of a layout tree. It has margin, an optional border, padding, and content, in that order from the outside. Its border always has rounded corners and can have a Title. Its scroll bar sits in its padding, border, or margin ring and never moves its content. One Composition places its child Views in its content. A View paints only decoration. A content painter fills its content.
+_Avoid_: widget, component, box, container.
+
+**Composition**:
+The rule by which a View places its child Views: flow, cluster, repel, sidebar, switcher, grid, reel, or center. A Composition places children and paints nothing. A rule is a View that draws a line across a flow and joins the lines at its ends.
+_Avoid_: layout (the whole tree), container type.
 
 **Sidebar**:
 The persistent Pane containing the current review's File Tree, with change status and comment/draft counts.
