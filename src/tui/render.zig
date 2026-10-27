@@ -416,7 +416,7 @@ fn drawVisualPane(
     nav: Nav,
 ) void {
     const sel = nav.selection() orelse .{ nav.cursor, nav.cursor };
-    const bands = if (nav.cursor < visual_rows.len) buf.ancestryBands(scratch, visual_rows[nav.cursor].buffer_index) catch &.{} else &.{};
+    const path = if (nav.cursor < visual_rows.len) buf.activePath(scratch, visual_rows[nav.cursor].buffer_index) catch buffer_mod.ActivePath{} else buffer_mod.ActivePath{};
     const ancestry_theme = ancestryRowTheme(theme);
     var screen_row: u16 = 0;
     while (screen_row < win.height) : (screen_row += 1) {
@@ -425,30 +425,26 @@ fn drawVisualPane(
         const visual_row = visual_rows[index];
         const row = buf.rows[visual_row.buffer_index];
         const selected = visual_row.kind != .status_placeholder and buf.hasFileVersion(visual_row.buffer_index, buf.selected_version) and visualRowSelected(visual_rows, sel, index, buf.selected_version);
-        const row_theme = if (inBands(bands, visual_row.buffer_index)) ancestry_theme else theme;
-        drawVisualRow(scratch, win, screen_row, buf.layout, buf.selected_column, row, visual_row, row_theme, if (selected) buf.selected_version else null);
-        drawAnchorMark(win, screen_row, buf.anchorMark(visual_row.buffer_index), visual_row.continuation, row_theme);
+        const row_theme = if (path.banded(buf, visual_row.buffer_index)) ancestry_theme else theme;
+        drawVisualRow(scratch, win, screen_row, buf.layout, buf.selected_column, row, visual_row, row_theme, if (selected) buf.selected_version else null, .{ .path = path, .row = visual_row.buffer_index });
+        if (path.indicator(visual_row.buffer_index)) |part| {
+            var style = row_theme.reviewCardStyle(path.cards[0].role, .body, .{});
+            style.bg = (win.readCell(0, screen_row) orelse continue).style.bg;
+            style = row_theme.resolveStyle(style);
+            switch (part) {
+                .top, .through => view_paint.anchorIndicator(win, screen_row, part == .top and !visual_row.continuation, style),
+                .corner => view_paint.anchorCorner(win, screen_row, style),
+            }
+        }
     }
 }
 
-fn inBands(bands: []const buffer_mod.RowRange, index: usize) bool {
-    for (bands) |band| if (index >= band.start and index < band.end) return true;
-    return false;
-}
-
-/// The Anchor Indicator keeps the background of the Diff Line under it and
-/// takes its color from the border of the root card.
-fn drawAnchorMark(win: vaxis.Window, row: u16, mark: buffer_mod.AnchorMark, continuation: bool, theme: Theme) void {
-    switch (mark.kind) {
-        .none => {},
-        .top, .through => {
-            var style = theme.reviewCardStyle(mark.role, .body, .{});
-            style.bg = (win.readCell(0, row) orelse return).style.bg;
-            view_paint.anchorIndicator(win, row, mark.kind == .top and !continuation, theme.resolveStyle(style));
-        },
-        .junction => view_paint.join(win, 0, row, .{ .up = true }),
-    }
-}
+/// The row of a ReviewCard and the Active Path, which decide whether its
+/// border, Title, and lines take the normal or the dim card border style.
+const CardChrome = struct {
+    path: buffer_mod.ActivePath = .{},
+    row: usize = 0,
+};
 
 fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, buf: Buffer, theme: Theme, nav: Nav) void {
     const rows = buf.rows;
@@ -469,7 +465,7 @@ fn drawProjectedRows(scratch: std.mem.Allocator, win: vaxis.Window, buf: Buffer,
         } else {
             const eligible = row != .line or (if (buf.selected_version == .old) row.line.oldNo() != null else row.line.newNo() != null);
             const row_theme = if (active and eligible and row != .status_placeholder) cursorRowTheme(theme) else theme;
-            drawRow(scratch, win, screen_row, buf.layout, buf.selected_column, row, row_theme);
+            drawRow(scratch, win, screen_row, buf.layout, buf.selected_column, row, row_theme, .{});
         }
     }
 }
@@ -486,7 +482,7 @@ fn visualRowSelected(rows: []const @import("frame.zig").VisualRow, selection: [2
     return false;
 }
 
-fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, selected_column: ?buffer_mod.SelectedColumn, row: Row, visual_row: @import("frame.zig").VisualRow, base_theme: Theme, highlighted_version: ?buffer_mod.SelectedVersion) void {
+fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, selected_column: ?buffer_mod.SelectedColumn, row: Row, visual_row: @import("frame.zig").VisualRow, base_theme: Theme, highlighted_version: ?buffer_mod.SelectedVersion, chrome: CardChrome) void {
     if (layout == .side_by_side and visual_row.halves != null) {
         drawVisualLinePair(scratch, win, r, visual_row.halves.?, row.line_pair, base_theme, highlighted_version);
         drawSelectedColumnEdge(win, r, selected_column, base_theme);
@@ -499,7 +495,7 @@ fn drawVisualRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: 
     }
     const theme = if (highlighted_version != null) cursorRowTheme(base_theme) else base_theme;
     if (row != .line or layout != .unified) {
-        drawRow(scratch, win, r, layout, selected_column, row, theme);
+        drawRow(scratch, win, r, layout, selected_column, row, theme, chrome);
         return;
     }
     const line_row = row.line;
@@ -532,10 +528,10 @@ fn ancestryRowTheme(theme: Theme) Theme {
 fn tintedRowTheme(theme: Theme, comptime tint: fn (Theme, vaxis.Cell.Color) vaxis.Cell.Color) Theme {
     var result = theme;
     inline for (.{
-        "context",               "added",       "removed",      "added_emphasis", "removed_emphasis",
-        "gutter",                "file_header", "hunk_header",  "fold",           "comment",
-        "comment_reply",         "suggestion",  "draft",        "draft_reply",    "outcome_unknown",
-        "outcome_unknown_reply", "section",     "section_rule",
+        "context",               "added",       "removed",      "added_emphasis",  "removed_emphasis",
+        "gutter",                "file_header", "hunk_header",  "fold",            "comment",
+        "comment_reply",         "suggestion",  "draft",        "draft_reply",     "outcome_unknown",
+        "outcome_unknown_reply", "section",     "section_rule", "card_border_dim",
     }) |field| {
         var style = @field(theme, field);
         style.bg = tint(theme, style.bg);
@@ -556,7 +552,7 @@ fn gutterStyle(theme: Theme, band: vaxis.Style) vaxis.Style {
 /// Gutter is two 4-wide line-number columns; body text starts after it.
 const gutter_cols: u16 = @intCast(@import("frame.zig").unified_gutter_cols);
 
-fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, selected_column: ?buffer_mod.SelectedColumn, row: Row, theme: Theme) void {
+fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer_mod.Layout, selected_column: ?buffer_mod.SelectedColumn, row: Row, theme: Theme, chrome: CardChrome) void {
     switch (row) {
         .file_header => |header| {
             if (selected_column) |selected| {
@@ -582,7 +578,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer
         },
         .line_pair => |pair| drawLinePair(scratch, win, r, pair, theme, null),
         .disclosure => |value| drawDisclosure(scratch, win, r, value, theme),
-        .comment, .draft => |card| drawReviewCard(scratch, win, r, card, theme),
+        .comment, .draft => |card| drawReviewCard(scratch, win, r, card, theme, chrome),
         .snapshot => |snapshot| drawSnapshot(win, r, snapshot, theme),
         .section => |sec| drawSection(scratch, win, r, sec, theme),
     }
@@ -817,11 +813,17 @@ fn drawLineBodyText(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, body_
 }
 
 /// One row of a bordered ReviewCard. The cells left of its left border keep the
-/// Theme base background. view_paint.cardEdge paints the border and Titles.
-fn drawReviewCard(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, card: buffer_mod.ReviewCardRow, theme: Theme) void {
+/// Theme base background. view_paint.cardEdge paints the border and Titles. A
+/// card on the Active Path takes the border style of its role, every other
+/// card the dim one.
+fn drawReviewCard(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, card: buffer_mod.ReviewCardRow, theme: Theme, chrome: CardChrome) void {
     var base = theme.reviewCardStyle(card.role, card.part, .{});
     if (card.block_kind == .heading) base.bold = true;
-    const border = theme.reviewCardStyle(card.role, .body, .{});
+    const dim = theme.resolveStyle(theme.card_border_dim);
+    const on_path = chrome.path.holds(chrome.row);
+    const border = if (on_path) theme.reviewCardStyle(card.role, .body, .{}) else dim;
+    var title = base;
+    if (!on_path) title.fg = dim.fg;
     const left = card.indent;
     const right = card.rightBorderColumn();
     const col: u16 = @intCast(card.contentColumn());
@@ -835,9 +837,10 @@ fn drawReviewCard(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, card: b
         .bottom => .{ .bottom = "" },
         .body, .code_body, .suggestion_label, .suggestion_body => .side,
     };
-    view_paint.cardEdge(win, r, left, right, edge, border, base);
+    view_paint.cardEdge(win, r, left, right, edge, border, title);
     // A Reply's line joins the border right above its gap row, and its own
     // top-left corner. A Title cell above the gap holds no line, so it stays.
+    // The join cell keeps the style of the border that holds it.
     switch (card.part) {
         .gap => if (r > 0) view_paint.join(win, left, r - 1, .{ .down = true }),
         .header => if (card.depth > 0) view_paint.join(win, left, r, .{ .up = true }),
@@ -846,7 +849,10 @@ fn drawReviewCard(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, card: b
     // The line from a card to its later sibling: `├` at the card's bottom-left
     // corner, then `│` at that column on every row between them.
     if (card.sibling_below) view_paint.join(win, left, r, .{ .down = true });
-    for (card.rails) |column| view_paint.rail(win, column, r, border);
+    for (card.rails) |rail| {
+        const target = chrome.path.railTarget(chrome.row, rail);
+        view_paint.rail(win, rail.column, r, if (target) |path_card| theme.reviewCardStyle(path_card.role, .body, .{}) else dim);
+    }
     if (card.part.isBorder() or card.segments.len == 0) return;
     const segments = scratch.alloc(vaxis.Segment, card.segments.len) catch return;
     var links: TerminalLinks = .{ .scratch = scratch, .owner = card.owner };
@@ -1451,7 +1457,7 @@ test "M23 emoji ReviewCards and Preview paint complete sequences with shared ter
                     else => false,
                 };
                 const rows = try card_mod.project(a, body, .{ .owner = if (is_draft) .{ .draft = 1 } else .{ .comment = 1 }, .source = if (is_draft) .{ .draft = &draft } else .{ .comment = &comment }, .role = role, .header = "Ada", .content_width = cells + 3, .metrics = terminal_cell_metrics, .collapsed_rows = 0 });
-                drawReviewCard(a, win, 1, rows[1], theme);
+                drawReviewCard(a, win, 1, rows[1], theme, .{});
                 drawReviewCardSearchRange(win, 1, rows[1], .{ .visual_row = 1, .relation = .neutral, .source = ranges[0], .row = ranges[0], .active = true }, true, theme);
                 try testing.expectEqualStrings(example.text, win.readCell(2, 1).?.char.grapheme);
                 try testing.expectEqualStrings("x", win.readCell(@intCast(2 + cells + 1), 1).?.char.grapheme);
@@ -1520,7 +1526,7 @@ test "M23 tables Preview and ReviewCards share layouts and Theme styles as proje
                 try expectComposedForeground(theme, theme.gutter.fg, divider.style);
             };
             if (width == 7) try testing.expectEqual(theme.picker.bg, win.readCell(0, 4).?.style.bg);
-            for (rows[1..], 0..) |card, row| drawReviewCard(a, win, @intCast(row), card, theme);
+            for (rows[1..], 0..) |card, row| drawReviewCard(a, win, @intCast(row), card, theme, .{});
             try testing.expectEqual(theme.markdown_inline_code, win.readCell(value_col + 4, ready_row).?.style.fg);
             drawReviewCardSearchRange(win, ready_row, rows[ready_row + 1], .{ .visual_row = ready_row, .relation = .neutral, .source = ranges[0], .row = ranges[0], .active = true }, true, theme);
             try testing.expectEqual(theme.search_active, win.readCell(value_col + 4, ready_row).?.style.bg);
@@ -1556,7 +1562,7 @@ test "M23 links highlight only the matched reference use in ReviewCards and Prev
         const card_mod = @import("review_card.zig");
         const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
         const rows = try card_mod.project(a, try card_mod.ReviewBody.parse(a, raw), .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "Ada", .content_width = 76, .metrics = terminal_cell_metrics, .collapsed_rows = 0 });
-        drawReviewCard(a, win, 0, rows[1], theme);
+        drawReviewCard(a, win, 0, rows[1], theme, .{});
         const before = win.readCell(18, 0).?.style.bg;
         drawReviewCardSearchRange(win, 0, rows[1], .{ .visual_row = 0, .relation = .neutral, .source = use[0], .definition = definition[0], .row = use[0], .active = true }, true, theme);
         try testing.expectEqual(theme.search_active, win.readCell(8, 0).?.style.bg);
@@ -1630,7 +1636,7 @@ test "M23 links terminal hyperlinks retain complete destinations across wrapped 
             const rows = try card_mod.project(a, try card_mod.ReviewBody.parse(a, raw), .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "Ada", .content_width = width - 4, .metrics = terminal_cell_metrics, .collapsed_rows = 0 });
             var destination_rows: usize = 0;
             for (rows[1..]) |row| {
-                drawReviewCard(a, win, 0, row, @import("theme.zig").dark);
+                drawReviewCard(a, win, 0, row, @import("theme.zig").dark, .{});
                 var col: u16 = @intCast(row.contentColumn());
                 var has_destination = false;
                 for (row.segments) |segment| {
@@ -1687,7 +1693,7 @@ test "M23 links terminal targets exclude relative destinations controls and unre
         const win = headlessWindow(&screen);
         var linked_cells: usize = 0;
         for (rows) |row| {
-            drawReviewCard(a, win, 0, row, @import("theme.zig").dark);
+            drawReviewCard(a, win, 0, row, @import("theme.zig").dark, .{});
             for (0..win.width) |col| {
                 const cell = win.readCell(@intCast(col), 0).?;
                 if (cell.link.uri.len > 0) {
@@ -1727,7 +1733,7 @@ test "M23 literal code backgrounds follow block rectangles in Comments Drafts an
             const theme = if (focused) cursorRowTheme(builtin.value) else builtin.value;
             var code_rows: usize = 0;
             for (rows[1..], 0..) |card, row| {
-                drawReviewCard(a, win, @intCast(row), card, theme);
+                drawReviewCard(a, win, @intCast(row), card, theme, .{});
                 const area = card.code_area;
                 if (area) |rect| {
                     try testing.expectEqual(@as(usize, 2), rect.column);
@@ -3593,8 +3599,8 @@ test "a pending draft renders in the draft band with its marker" {
     }
     const dr = draft_row.?;
     const px = sidebar_width + 1;
-    try testing.expectEqualStrings("✎", win.readCell(px + 3, dr).?.char.grapheme);
-    try testing.expectEqual(theme_dark.draft.bg, win.readCell(px + 3, dr).?.style.bg);
+    try testing.expectEqualStrings("✎", win.readCell(px + 4, dr).?.char.grapheme);
+    try testing.expectEqual(theme_dark.draft.bg, win.readCell(px + 4, dr).?.style.bg);
 }
 
 test "picker overlay draws the query line and highlights the selection" {
@@ -4061,8 +4067,8 @@ test "File and PR Comment headers end in DiffPane border rules" {
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
 
-    drawRow(a, win, 0, .unified, null, .{ .file_header = .{ .file = &file, .path = file.new_path } }, theme);
-    drawRow(a, win, 1, .unified, null, .{ .section = .{ .kind = .pr_comments, .count = 2 } }, theme);
+    drawRow(a, win, 0, .unified, null, .{ .file_header = .{ .file = &file, .path = file.new_path } }, theme, .{});
+    drawRow(a, win, 1, .unified, null, .{ .section = .{ .kind = .pr_comments, .count = 2 } }, theme, .{});
 
     try testing.expectEqualStrings("─", win.readCell(win.width - 1, 0).?.char.grapheme);
     try testing.expectEqual(theme.pane_border_focused.fg, win.readCell(win.width - 1, 0).?.style.fg);
@@ -4074,9 +4080,9 @@ test "File and PR Comment headers end in DiffPane border rules" {
 
 test "M23 ancestry renders shared offsets and visible capped depth with search cells" {
     const cases = [_]struct { width: u16, depth: usize, indent: usize }{
-        .{ .width = 100, .depth = 2, .indent = 8 },
-        .{ .width = 60, .depth = 2, .indent = 4 },
-        .{ .width = 40, .depth = 2, .indent = 0 },
+        .{ .width = 100, .depth = 2, .indent = 9 },
+        .{ .width = 60, .depth = 2, .indent = 5 },
+        .{ .width = 40, .depth = 2, .indent = 1 },
         .{ .width = 60, .depth = 20, .indent = 16 },
     };
     for (cases) |case| for ([_]buffer_mod.Layout{ .unified, .side_by_side }) |layout| {
@@ -4102,7 +4108,7 @@ test "M23 ancestry renders shared offsets and visible capped depth with search c
                 const card = row.comment;
                 const left = 29 + case.indent;
                 const start = left + 2;
-                if (card.part == .header and (case.indent == 0 or case.depth == 20)) {
+                if (card.part == .header and (case.indent == 1 or case.depth == 20)) {
                     var text: std.ArrayList(u8) = .empty;
                     for (start..win.width) |col| try text.appendSlice(a, win.readCell(@intCast(col), @intCast(index)).?.char.grapheme);
                     const label = try std.fmt.allocPrint(a, "depth {d}", .{case.depth});
@@ -4236,7 +4242,7 @@ test "M23 highlighting syntax foreground preserves tab cells and interaction bac
     const spans = [_]@import("code_highlighting.zig").SourceSpan{.{ .source = .{ .start = 6, .end = 9 }, .capture = bbr.highlight.Capture.init(1, "keyword") }};
     for (@import("theme.zig").builtins) |builtin| {
         const theme = builtin.value;
-        drawReviewCard(a, win, 1, rows[1], cursorRowTheme(theme));
+        drawReviewCard(a, win, 1, rows[1], cursorRowTheme(theme), .{});
         drawReviewCardSyntax(win, 1, rows[1], &spans, theme);
         drawReviewCardSearchRange(win, 1, rows[1], .{ .visual_row = 1, .relation = .neutral, .source = .{ .start = 7, .end = 8 }, .row = .{ .start = 0, .end = 1 }, .active = true }, true, theme);
         for (3..6) |col| {
@@ -4343,7 +4349,7 @@ test "M23 highlighting published Frame renders real syntax through wrapping Sele
     }
     try testing.expect(wrapped_rows > 1);
     for (0..code_row.?) |_| try state.dispatch(.{ .action = .down });
-    const x = plain.frame.panes.diff_content.x + 2;
+    const x = plain.frame.panes.diff_content.x + 3;
     const y = plain.frame.panes.diff_content.y + @as(u16, @intCast(code_row.?));
     drawReview(a, win, state.projection().review.?, theme_dark, 0);
     try testing.expectEqualStrings("c", win.readCell(x, y).?.char.grapheme);
@@ -4502,7 +4508,7 @@ test "M23 inline system light terminal keeps composed dark surfaces readable" {
             .{ .text = line.text[3..4], .capture = bbr.highlight.Capture.init(1, "keyword") },
         };
         for ([_]bool{ false, true }) |focused| {
-            drawRow(a, win, 0, .unified, null, .{ .line = .{ .line = &line, .decoration = .{ .runs = &runs } } }, if (focused) cursorRowTheme(theme) else theme);
+            drawRow(a, win, 0, .unified, null, .{ .line = .{ .line = &line, .decoration = .{ .runs = &runs } } }, if (focused) cursorRowTheme(theme) else theme, .{});
             for (0..4) |column| {
                 const style = win.readCell(gutter_cols + @as(u16, @intCast(column)), 0).?.style;
                 if (kind != .context or focused) try testing.expect(style.bg == .rgb);
@@ -4523,7 +4529,7 @@ test "M23 inline system light terminal keeps composed dark surfaces readable" {
         if (card.part != .code_body) continue;
         saw_code = true;
         for ([_]bool{ false, true }) |focused| {
-            drawReviewCard(a, win, 0, card, if (focused) cursorRowTheme(theme) else theme);
+            drawReviewCard(a, win, 0, card, if (focused) cursorRowTheme(theme) else theme, .{});
             const column: u16 = @intCast(card.contentColumn());
             try expectLightTerminalContrast(win.readCell(column, 0).?.style, palette);
             drawReviewCardSyntax(win, 0, card, &.{.{ .source = .{ .start = 8, .end = 12 }, .capture = bbr.highlight.Capture.init(0, "variable") }}, theme);
@@ -4594,7 +4600,7 @@ test "M23 inline headless cells retain combined marks under overlapping interact
         const rows = try card_mod.project(a, body, .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = role, .header = "Ada", .content_width = 76, .metrics = .bytes, .collapsed_rows = 0 });
         try testing.expectEqual(@as(usize, 3), rows.len);
         for ([_]bool{ false, true }) |focused| {
-            drawReviewCard(a, win, 0, rows[1], if (focused) cursorRowTheme(theme) else theme);
+            drawReviewCard(a, win, 0, rows[1], if (focused) cursorRowTheme(theme) else theme, .{});
             try testing.expectEqualStrings("p", win.readCell(2, 0).?.char.grapheme);
             try testing.expect(!win.readCell(2, 0).?.style.bold);
             try testing.expectEqualStrings("x", win.readCell(8, 0).?.char.grapheme);
@@ -4729,16 +4735,16 @@ test "M23 ancestry woven Comment and Suggestion retain distinct markers and styl
     // Fences themselves are structural, not displayed.
     const px = sidebar_width + 1;
     // The root Title "Ada" sits in the top border after "╭─ ".
-    try testing.expectEqualStrings("A", win.readCell(px + 3, 4).?.char.grapheme);
-    try testing.expectEqual(theme_dark.comment.bg, win.readCell(px + 3, 4).?.style.bg);
+    try testing.expectEqualStrings("A", win.readCell(px + 4, 4).?.char.grapheme);
+    try testing.expectEqual(theme_dark.comment.bg, win.readCell(px + 4, 4).?.style.bg);
     var title: std.ArrayList(u8) = .empty;
-    for (px + 4..px + 19) |col| try title.appendSlice(a, win.readCell(@intCast(col), 8).?.char.grapheme);
+    for (px + 5..px + 20) |col| try title.appendSlice(a, win.readCell(@intCast(col), 8).?.char.grapheme);
     try testing.expectEqualStrings("Bo (suggestion)", title.items);
-    try testing.expectEqual(theme_dark.comment_reply.bg, win.readCell(px + 4, 8).?.style.bg);
-    try testing.expectEqualStrings("s", win.readCell(px + 3, 9).?.char.grapheme);
-    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 3, 9).?.style.bg);
-    try testing.expectEqualStrings("r", win.readCell(px + 3, 10).?.char.grapheme);
-    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 3, 10).?.style.bg);
+    try testing.expectEqual(theme_dark.comment_reply.bg, win.readCell(px + 5, 8).?.style.bg);
+    try testing.expectEqualStrings("s", win.readCell(px + 4, 9).?.char.grapheme);
+    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 4, 9).?.style.bg);
+    try testing.expectEqualStrings("r", win.readCell(px + 4, 10).?.char.grapheme);
+    try testing.expectEqual(theme_dark.suggestion.bg, win.readCell(px + 4, 10).?.style.bg);
 }
 
 const CardTestCursor = enum { plain_line, reply_draft };
@@ -4805,8 +4811,14 @@ fn paintCardThread(a: std.mem.Allocator, layout: buffer_mod.Layout, width: u16, 
 
 /// Paint the cards of `comments` and `drafts` on `card_test_diff` through the
 /// DiffPane path, with the cursor on a new line or on the first body row of a card.
-fn paintCards(a: std.mem.Allocator, comments: []const bbr.review.Comment, drafts: []const bbr.review.Draft, layout: buffer_mod.Layout, width: u16, focus: union(enum) { line: u32, card: @import("review_card.zig").Owner }, theme: Theme) !CardTestPane {
-    const diff = try bbr.diff.parse(a, card_test_diff);
+fn paintCards(a: std.mem.Allocator, comments: []const bbr.review.Comment, drafts: []const bbr.review.Draft, layout: buffer_mod.Layout, width: u16, focus: CardTestFocus, theme: Theme) !CardTestPane {
+    return paintCardsOn(a, card_test_diff, comments, drafts, layout, width, focus, theme);
+}
+
+const CardTestFocus = union(enum) { line: u32, card: @import("review_card.zig").Owner };
+
+fn paintCardsOn(a: std.mem.Allocator, diff_text: []const u8, comments: []const bbr.review.Comment, drafts: []const bbr.review.Draft, layout: buffer_mod.Layout, width: u16, focus: CardTestFocus, theme: Theme) !CardTestPane {
+    const diff = try bbr.diff.parse(a, diff_text);
     const threads = try bbr.review.buildThreads(a, comments);
     const buf = try buffer_mod.buildWithComments(a, diff, layout, threads, .{ .drafts = drafts, .card_width = width, .collapsed_rows = 2 });
     const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, buf.rows, .bytes, .{ .layout = layout, .width = width });
@@ -4824,13 +4836,13 @@ fn paintCards(a: std.mem.Allocator, comments: []const bbr.review.Comment, drafts
 
 test "M23 ancestry ReviewCards have rounded borders, Titles, an anchor indicator, and reply gaps" {
     for ([_]buffer_mod.Layout{ .unified, .side_by_side }) |layout| for ([_]struct { width: u16, reply: usize, nested: usize }{
-        .{ .width = 100, .reply = 4, .nested = 8 },
-        .{ .width = 60, .reply = 2, .nested = 4 },
+        .{ .width = 100, .reply = 5, .nested = 9 },
+        .{ .width = 60, .reply = 3, .nested = 5 },
     }) |case| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const pane = try paintCardThread(a, layout, case.width, .plain_line, theme_dark);
+        const pane = try paintCardThread(a, layout, case.width, .reply_draft, theme_dark);
         const right = case.width - 1;
 
         try testing.expectEqualStrings(" ", pane.glyph(0, pane.lineRow(1)));
@@ -4841,13 +4853,13 @@ test "M23 ancestry ReviewCards have rounded borders, Titles, an anchor indicator
 
         const root = pane.cardRow(.{ .comment = 1 }, .header);
         try testing.expectEqual(pane.lineRow(4) + 1, root);
-        try testing.expect(std.mem.startsWith(u8, try pane.text(a, root), "├─ Ada ─"));
+        try testing.expect(std.mem.startsWith(u8, try pane.text(a, root), "╰┬─ Ada ─"));
         try testing.expectEqualStrings("╮", pane.glyph(right, root));
-        try testing.expect(std.mem.startsWith(u8, try pane.text(a, root + 1), "│ one "));
+        try testing.expect(std.mem.startsWith(u8, try pane.text(a, root + 1), " │ one "));
         try testing.expectEqualStrings("│", pane.glyph(right, root + 1));
         const footer = pane.cardRow(.{ .comment = 1 }, .disclosure_footer);
         const footer_text = try pane.text(a, footer);
-        try testing.expect(std.mem.startsWith(u8, footer_text, "╰─"));
+        try testing.expect(std.mem.startsWith(u8, footer_text, " ╰─"));
         try testing.expect(std.mem.endsWith(u8, footer_text, " ▸ 3 hidden rows · 5 total · enter to expand ─╯"));
 
         try testing.expectEqualStrings("┬", pane.glyph(case.reply, footer));
@@ -4896,7 +4908,7 @@ test "M23 ancestry a Reply joins the border above with ┬ and its own top-left 
         const nested = pane.cardIndent(.{ .comment = 3 });
         try testing.expect(reply > 0 and nested > reply);
         const root_bottom = pane.cardRow(.{ .comment = 1 }, .bottom);
-        try testing.expectEqualStrings("╰", pane.glyph(0, root_bottom));
+        try testing.expectEqualStrings("╰", pane.glyph(1, root_bottom));
         try testing.expectEqualStrings("┬", pane.glyph(reply, root_bottom));
         try testing.expectEqual(root_bottom + 2, pane.cardRow(.{ .comment = 2 }, .header));
         try testing.expectEqualStrings("├", pane.glyph(reply, pane.cardRow(.{ .comment = 2 }, .header)));
@@ -5066,6 +5078,127 @@ test "M23 ancestry the dim band covers the anchored Diff Lines and every ancesto
         try testing.expectEqual(theme.draft_reply.bg, pane.bg(9, draft));
         try testing.expectEqual(theme.cursorBg(theme.draft_reply.bg), pane.bg(10, draft + 1));
         try testing.expectEqual(theme.draft_reply.bg, pane.bg(9, pane.cardRow(.{ .draft = 1 }, .bottom)));
+    };
+}
+
+const stack_test_diff =
+    \\diff --git a/a.zig b/a.zig
+    \\--- a/a.zig
+    \\+++ b/a.zig
+    \\@@ -19,8 +19,8 @@
+    \\ l19
+    \\ l20
+    \\ l21
+    \\-old22
+    \\+l22
+    \\ l23
+    \\ l24
+    \\ l25
+    \\ l26
+    \\
+;
+
+test "M23 ancestry only the active path shows its Anchor Indicator" {
+    const check = struct {
+        fn isBoxGlyph(grapheme: []const u8) bool {
+            for ([_][]const u8{ "╭", "╮", "╰", "╯", "│", "─", "├", "┤", "┬", "┴", "┼" }) |box| if (std.mem.eql(u8, grapheme, box)) return true;
+            return false;
+        }
+
+        /// Every border cell and the Title of the card that `owner` names has the
+        /// normal or the dim card border foreground. A `┬` right of the left border
+        /// joins a Reply, so the caller checks it.
+        fn expectCardChrome(pane: CardTestPane, theme: Theme, owner: @import("review_card.zig").Owner, normal: bool) !void {
+            var seen = false;
+            for (pane.visual_rows, 0..) |visual, row| switch (pane.buf.rows[visual.buffer_index]) {
+                .comment, .draft => |card| if (std.meta.eql(card.owner, owner)) {
+                    seen = true;
+                    const expected = if (normal) theme.reviewCardStyle(card.role, .body, .{}).fg else theme.card_border_dim.fg;
+                    for (card.indent..card.rightBorderColumn() + 1) |col| {
+                        const cell = pane.win.readCell(@intCast(col), @intCast(row)).?;
+                        const title = card.part == .header and col == card.indent + 3;
+                        if (!title and !isBoxGlyph(cell.char.grapheme)) continue;
+                        if (col > card.indent and std.mem.eql(u8, cell.char.grapheme, "┬")) continue;
+                        errdefer std.debug.print("card {any} {t} cell {d},{d} '{s}'\n", .{ owner, card.part, col, row, cell.char.grapheme });
+                        try testing.expectEqual(expected, cell.style.fg);
+                    }
+                },
+                else => {},
+            };
+            try testing.expect(seen);
+        }
+
+        /// Column 0 holds `╭` on row `top`, `│` down to the root card's top border,
+        /// and `╰` there, which joins the card's top-left corner `┬` in column 1.
+        /// Every other Diff Line and card row has a blank column 0.
+        fn expectIndicator(pane: CardTestPane, theme: Theme, indicator: ?struct { top: u16, root: u16 }) !void {
+            for (pane.visual_rows, 0..) |visual, index| {
+                const row: u16 = @intCast(index);
+                switch (pane.buf.rows[visual.buffer_index]) {
+                    .line, .line_pair, .comment, .draft => {},
+                    else => continue,
+                }
+                const expected = if (indicator) |span|
+                    (if (row == span.top) "╭" else if (row > span.top and row < span.root) "│" else if (row == span.root) "╰" else " ")
+                else
+                    " ";
+                errdefer std.debug.print("indicator row {d}\n", .{row});
+                try testing.expectEqualStrings(expected, pane.glyph(0, row));
+                if (indicator != null and !std.mem.eql(u8, expected, " ")) {
+                    try testing.expectEqual(theme.reviewCardStyle(.comment, .body, .{}).fg, pane.win.readCell(0, row).?.style.fg);
+                }
+            }
+            if (indicator) |span| try testing.expectEqualStrings("┬", pane.glyph(1, span.root));
+        }
+    };
+    const Owner = @import("review_card.zig").Owner;
+    const comments = [_]bbr.review.Comment{
+        .{ .id = 1, .author = "Ada", .body = "a", .scope = .{ .@"inline" = .{ .path = "a.zig", .start_to = 21, .to = 23 } } },
+        .{ .id = 2, .author = "Bob", .body = "b", .scope = .{ .@"inline" = .{ .path = "a.zig", .start_to = 22, .to = 23 } } },
+        .{ .id = 3, .author = "Cy", .body = "c", .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 23 } } },
+        .{ .id = 4, .author = "Dee", .body = "d", .scope = .{ .@"inline" = .{ .path = "a.zig", .start_to = 22, .to = 25 } } },
+        .{ .id = 5, .author = "Eve", .body = "e", .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 26 } } },
+        .{ .id = 6, .parent_id = 5, .author = "Fay", .body = "reply" },
+        .{ .id = 7, .parent_id = 6, .author = "Gus", .body = "nested" },
+        .{ .id = 8, .parent_id = 5, .author = "Hal", .body = "sibling" },
+        .{ .id = 9, .parent_id = 7, .author = "Ivy", .body = "child" },
+    };
+    const all = [_]Owner{ .{ .comment = 1 }, .{ .comment = 2 }, .{ .comment = 3 }, .{ .comment = 4 }, .{ .comment = 5 }, .{ .comment = 6 }, .{ .comment = 7 }, .{ .comment = 8 }, .{ .comment = 9 } };
+    const Case = struct { focus: CardTestFocus, normal: []const u64, top: ?u32 = null };
+    const cases = [_]Case{
+        .{ .focus = .{ .line = 19 }, .normal = &.{} },
+        .{ .focus = .{ .card = .{ .comment = 2 } }, .normal = &.{2}, .top = 22 },
+        .{ .focus = .{ .card = .{ .comment = 4 } }, .normal = &.{4}, .top = 22 },
+        .{ .focus = .{ .card = .{ .comment = 7 } }, .normal = &.{ 5, 6, 7 }, .top = 26 },
+        .{ .focus = .{ .card = .{ .comment = 8 } }, .normal = &.{ 5, 8 }, .top = 26 },
+    };
+    const theme = theme_dark;
+    for ([_]buffer_mod.Layout{ .unified, .side_by_side }) |layout| for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        errdefer std.debug.print("layout {t} focus {any}\n", .{ layout, case.focus });
+        const pane = try paintCardsOn(a, stack_test_diff, &comments, &.{}, layout, 140, case.focus, theme);
+        const root_id: u64 = if (case.normal.len > 0) case.normal[0] else 0;
+        try check.expectIndicator(pane, theme, if (case.top) |top| .{ .top = pane.lineRow(top), .root = pane.cardRow(.{ .comment = root_id }, .header) } else null);
+        for (all) |owner| try check.expectCardChrome(pane, theme, owner, std.mem.indexOfScalar(u64, case.normal, owner.comment) != null);
+
+        const dim = theme.card_border_dim.fg;
+        const reply = pane.cardIndent(.{ .comment = 6 });
+        const nested_join = pane.win.readCell(@intCast(pane.cardIndent(.{ .comment = 9 })), pane.cardRow(.{ .comment = 7 }, .bottom)).?;
+        try testing.expectEqualStrings("┬", nested_join.char.grapheme);
+        // A join cell is part of the border above it, so it takes that card's style.
+        try testing.expectEqual(if (std.mem.indexOfScalar(u64, case.normal, 7) != null) theme.comment_reply.fg else dim, nested_join.style.fg);
+        const reply_join = pane.win.readCell(@intCast(pane.cardIndent(.{ .comment = 7 })), pane.cardRow(.{ .comment = 6 }, .bottom)).?;
+        try testing.expectEqualStrings("┬", reply_join.char.grapheme);
+        try testing.expectEqual(if (std.mem.indexOfScalar(u64, case.normal, 6) != null) theme.comment_reply.fg else dim, reply_join.style.fg);
+        const rail_fg = if (case.focus == .card and case.focus.card.comment == 8) theme.comment_reply.fg else dim;
+        for (pane.cardRow(.{ .comment = 6 }, .bottom) + 1..pane.cardRow(.{ .comment = 8 }, .header) - 1) |row| {
+            const rail = pane.win.readCell(@intCast(reply), @intCast(row)).?;
+            errdefer std.debug.print("rail row {d}\n", .{row});
+            try testing.expectEqualStrings("│", rail.char.grapheme);
+            try testing.expectEqual(rail_fg, rail.style.fg);
+        }
     };
 }
 

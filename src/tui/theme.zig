@@ -90,6 +90,9 @@ pub const Theme = struct {
     /// takes the red foreground, so it never reads as a plain Draft.
     outcome_unknown: Style,
     outcome_unknown_reply: Style,
+    /// The border, Title, and lines of a ReviewCard off the Active Path. It has
+    /// the `context` background.
+    card_border_dim: Style,
     markdown_italic: Color = .{ .rgb = .{ 0x40, 0xe0, 0xd0 } },
     markdown_bold: Color = .{ .rgb = .{ 0xff, 0xa5, 0x00 } },
     markdown_inline_code: Color = .{ .rgb = .{ 0x90, 0xee, 0x90 } },
@@ -343,6 +346,7 @@ pub const dark: Theme = .{
     .draft_reply = .{ .fg = rgb(0xc8_b0_78) },
     .outcome_unknown = .{ .fg = rgb(0xd0_6c_6c), .bold = true },
     .outcome_unknown_reply = .{ .fg = rgb(0xd0_6c_6c) },
+    .card_border_dim = .{ .fg = rgb(0x58_58_66) },
     .section = .{ .fg = rgb(0x88_88_a0), .bold = true },
     .picker = .{ .fg = rgb(0xc8_c8_d8) },
     .picker_selected = .{ .bg = rgb(0x3a_3a_52), .fg = rgb(0xff_ff_ff), .bold = true },
@@ -395,6 +399,7 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
         .draft_reply = .{ .fg = rgb(p.yellow), .bg = rgb(p.bg) },
         .outcome_unknown = .{ .fg = rgb(p.red), .bg = rgb(p.bg), .bold = true },
         .outcome_unknown_reply = .{ .fg = rgb(p.red), .bg = rgb(p.bg) },
+        .card_border_dim = .{ .fg = rgb(blend(p.muted, p.bg)), .bg = rgb(p.bg) },
         .markdown_italic = rgb(if (p.light) 0x00_80_80 else 0x40_e0_d0),
         .markdown_bold = rgb(if (p.light) 0xa6_50_00 else 0xff_a5_00),
         .markdown_inline_code = rgb(if (p.light) 0x20_7a_36 else 0x90_ee_90),
@@ -417,6 +422,17 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
         .syntax_punctuation = rgb(p.muted),
         .syntax_tag = rgb(p.red),
     };
+}
+
+/// Two parts `fg` and one part `bg`, per channel.
+fn blend(fg: u24, bg: u24) u24 {
+    var result: u24 = 0;
+    inline for (.{ 16, 8, 0 }) |shift| {
+        const a: u24 = (fg >> shift) & 0xff;
+        const b: u24 = (bg >> shift) & 0xff;
+        result |= ((2 * a + b) / 3) << shift;
+    }
+    return result;
 }
 
 // Fixed foregrounds for fixed dark bands. Preserve ANSI hues without depending
@@ -463,6 +479,7 @@ pub const system: Theme = .{
     .draft_reply = .{ .fg = .{ .index = 3 } },
     .outcome_unknown = .{ .fg = .{ .index = 1 }, .bold = true },
     .outcome_unknown_reply = .{ .fg = .{ .index = 1 } },
+    .card_border_dim = .{ .fg = .{ .index = 8 } },
     .markdown_italic = .{ .index = 6 },
     .markdown_bold = .{ .index = 208 },
     .markdown_inline_code = .{ .index = 2 },
@@ -532,6 +549,8 @@ comptime {
             if (!std.meta.eql(style.bg, entry.value.context.bg) or style.reverse)
                 @compileError("Theme \"" ++ entry.name ++ "\" field " ++ field ++ " must have the context background and no reverse, because an Overlay paints the Theme base background");
         }
+        if (!std.meta.eql(entry.value.card_border_dim.bg, entry.value.context.bg))
+            @compileError("Theme \"" ++ entry.name ++ "\" field card_border_dim must have the context background, because a ReviewCard paints the Theme base background");
         @setEvalBranchQuota(100_000);
         for (std.meta.tags(review_card.CardRole)) |role| for (std.meta.tags(review_card.Part)) |part| {
             if (part.hasCodeBackground()) continue;
@@ -581,6 +600,17 @@ test "the ancestry band differs from the plain and cursor backgrounds in every b
             const base = @field(theme, field).bg;
             try testing.expect(!std.meta.eql(base, theme.ancestryBg(base)));
             try testing.expect(!std.meta.eql(theme.cursorBg(base), theme.ancestryBg(base)));
+        }
+    }
+}
+
+test "the dim card border differs from every normal card border in every built-in Theme" {
+    for (builtins) |builtin| {
+        const theme = builtin.value;
+        try testing.expectEqual(theme.context.bg, theme.card_border_dim.bg);
+        for (std.meta.tags(review_card.CardRole)) |role| {
+            errdefer std.debug.print("Theme {s} role {t}\n", .{ builtin.name, role });
+            try testing.expect(!std.meta.eql(theme.card_border_dim.fg, theme.reviewCardStyle(role, .body, .{}).fg));
         }
     }
 }

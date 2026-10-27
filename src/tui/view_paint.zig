@@ -178,11 +178,17 @@ pub fn rail(win: vaxis.Window, col: usize, row: u16, style: vaxis.Style) void {
     writeGlyph(win, col, row, "│", style);
 }
 
-/// The piece of an Anchor Indicator in column 0 of one Diff Line row: `╭` on
-/// the top anchored row and `│` below it. The root card's top-left corner
-/// joins the line with `join`.
+/// The piece of an Anchor Indicator in column 0 of a row above the root card:
+/// `╭` on the top anchored Diff Line and `│` on every row below it.
 pub fn anchorIndicator(win: vaxis.Window, row: u16, top: bool, style: vaxis.Style) void {
     writeGlyph(win, 0, row, if (top) "╭" else "│", style);
+}
+
+/// The end of an Anchor Indicator on the root card's top border row: `╰` in
+/// column 0, which joins the card's top-left corner in column 1.
+pub fn anchorCorner(win: vaxis.Window, row: u16, style: vaxis.Style) void {
+    writeGlyph(win, 0, row, "╰", style);
+    join(win, 1, row, .{ .left = true });
 }
 
 fn drawScrollbar(win: vaxis.Window, track: view.Rect, bar: view.Scrollbar, style: vaxis.Style) void {
@@ -238,8 +244,9 @@ fn glyphOf(arms: Arms) []const u8 {
     return if (arms.left or arms.right) "─" else "│";
 }
 
-/// Add `arms` to the line glyph at one cell and keep its style. A cell that
-/// holds no line glyph, such as a scroll bar thumb or text, does not change.
+/// Add `arms` to the line glyph at one cell. A changed cell takes `style`, or
+/// keeps its own when `style` is null. A cell that holds no line glyph, such
+/// as a scroll bar thumb or text, does not change.
 pub fn join(win: vaxis.Window, col: usize, row: usize, arms: Arms) void {
     if (col >= win.width or row >= win.height) return;
     const cell = win.readCell(@intCast(col), @intCast(row)) orelse return;

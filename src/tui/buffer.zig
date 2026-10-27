@@ -22,6 +22,7 @@ const Parent = bbr.review.draft.Parent;
 const anchor_projection = bbr.review.anchor;
 const review_card = @import("review_card.zig");
 const search = @import("search.zig");
+const anchor_cols = @import("frame.zig").anchor_cols;
 pub const CellMetrics = @import("cell_metrics.zig").CellMetrics;
 pub const CellMeasurement = @import("cell_metrics.zig").Measurement;
 
@@ -377,40 +378,66 @@ pub const Buffer = struct {
     file_tallies: []const FileTally = &.{},
     file_rows: []const FileRow = &.{},
     file_rows_end: usize = 0,
-    /// Index-aligned with `rows`. Empty when no row carries an Anchor Indicator.
-    anchor_marks: []const AnchorMark = &.{},
-
-    pub fn anchorMark(self: Buffer, index: usize) AnchorMark {
-        return if (self.anchor_marks.len == self.rows.len) self.anchor_marks[index] else .{};
-    }
-
-    /// The rows of the dim ancestry band while the cursor is on row `cursor`:
-    /// every ancestor card of the card there, then the anchored Diff Lines of
-    /// the thread root. A cursor outside a card has no band.
-    pub fn ancestryBands(self: Buffer, allocator: std.mem.Allocator, cursor: usize) ![]const RowRange {
-        if (cursor >= self.rows.len) return &.{};
-        var depth = (cardAt(self.rows[cursor]) orelse return &.{}).depth;
-        var bands: std.ArrayList(RowRange) = .empty;
+    /// The Active Path while the cursor is on row `cursor`. A cursor outside a
+    /// card has none.
+    pub fn activePath(self: Buffer, allocator: std.mem.Allocator, cursor: usize) !ActivePath {
+        if (cursor >= self.rows.len) return .{};
+        const own = cardAt(self.rows[cursor]) orelse return .{};
+        var cards: std.ArrayList(ActivePath.Card) = .empty;
         var top = self.cardStart(cursor);
+        var end = cursor + 1;
+        while (end < self.rows.len and sameCard(self.rows[end], own.owner)) end += 1;
+        try cards.append(allocator, .{ .rows = .{ .start = top, .end = end }, .depth = own.depth, .role = own.role });
+        var depth = own.depth;
         while (depth > 0) {
             var above = top;
-            const parent = while (above > 0) : (above -= 1) {
-                const card = cardAt(self.rows[above - 1]) orelse return bands.toOwnedSlice(allocator);
+            const parent: ?usize = while (above > 0) : (above -= 1) {
+                const card = cardAt(self.rows[above - 1]) orelse break null;
                 if (card.depth < depth) break above - 1;
-            } else return bands.toOwnedSlice(allocator);
-            top = self.cardStart(parent);
-            try bands.append(allocator, .{ .start = top, .end = parent + 1 });
-            depth = cardAt(self.rows[parent]).?.depth;
+            } else null;
+            const last = parent orelse break;
+            const card = cardAt(self.rows[last]).?;
+            top = self.cardStart(last);
+            depth = card.depth;
+            try cards.append(allocator, .{ .rows = .{ .start = top, .end = last + 1 }, .depth = depth, .role = card.role });
         }
-        var start = top;
-        while (start > 0) {
-            const kind = self.anchorMark(start - 1).kind;
-            if (kind != .through and kind != .top) break;
-            start -= 1;
-            if (kind == .top) break;
-        }
-        if (start < top) try bands.append(allocator, .{ .start = start, .end = top });
-        return bands.toOwnedSlice(allocator);
+        std.mem.reverse(ActivePath.Card, cards.items);
+        return .{
+            .cards = try cards.toOwnedSlice(allocator),
+            .anchored = if (depth == 0) self.anchoredAbove(top) else .{ .start = top, .end = top },
+        };
+    }
+
+    /// The rows from the top anchored Diff Line of the inline root card at row
+    /// `root` down to the row above the card. Other cards and Diff Lines of the
+    /// Anchor in between stay inside. A line without a number on the Anchor
+    /// side, such as a removed line in a new-side range, does too. When the top
+    /// line is not in the Buffer, the range starts at the topmost anchored line
+    /// that is.
+    fn anchoredAbove(self: Buffer, root: usize) RowRange {
+        const none: RowRange = .{ .start = root, .end = root };
+        const anchor = switch (cardAt(self.rows[root]).?.scope) {
+            .@"inline" => |value| value,
+            .review, .file => return none,
+        };
+        const bottom = anchor.line() orelse return none;
+        const top = anchor.top() orelse return none;
+        const side: SelectedVersion = if (anchor.to != null) .new else .old;
+        var first = root;
+        var above = root;
+        while (above > 0) : (above -= 1) switch (self.rows[above - 1]) {
+            .comment, .draft => {},
+            .line, .line_pair => switch (lineOnSide(self.rows[above - 1], side)) {
+                .not_line, .absent => {},
+                .number => |number| {
+                    if (number < top or number > bottom) break;
+                    first = above - 1;
+                    if (number == top) break;
+                },
+            },
+            else => break,
+        };
+        return .{ .start = first, .end = root };
     }
 
     fn cardStart(self: Buffer, index: usize) usize {
@@ -472,15 +499,54 @@ pub const Buffer = struct {
 
 pub const RowRange = struct { start: usize, end: usize };
 
-/// The piece of an Anchor Indicator that one row carries. The indicator runs in
-/// column 0 from the top anchored Diff Line down to the root ReviewCard, whose
-/// top-left corner it joins.
-pub const AnchorMark = struct {
-    kind: Kind = .none,
-    /// The role of the root card, which styles the indicator.
-    role: review_card.CardRole = .comment,
+/// The card under the cursor and every ancestor card up to its thread root,
+/// with the root's anchored Diff Lines. Presentation owns the cursor, so the
+/// renderer computes the path for each frame and the Buffer stays
+/// cursor-independent.
+pub const ActivePath = struct {
+    /// Root first. The last card holds the cursor.
+    cards: []const Card = &.{},
+    /// From the root's top anchored Diff Line to the row above the root card.
+    /// Empty when the root has no anchored Diff Line in the Buffer.
+    anchored: RowRange = .{ .start = 0, .end = 0 },
 
-    pub const Kind = enum { none, top, through, junction };
+    pub const Card = struct { rows: RowRange, depth: usize, role: review_card.CardRole };
+
+    /// The piece of the Anchor Indicator in column 0 of one row.
+    pub const Indicator = enum { top, through, corner };
+
+    pub fn holds(self: ActivePath, row: usize) bool {
+        for (self.cards) |card| if (card.rows.start <= row and row < card.rows.end) return true;
+        return false;
+    }
+
+    /// The Ancestry Band: every ancestor card and the anchored Diff Lines.
+    pub fn banded(self: ActivePath, buf: Buffer, row: usize) bool {
+        if (self.cards.len == 0) return false;
+        for (self.cards[0 .. self.cards.len - 1]) |card| if (card.rows.start <= row and row < card.rows.end) return true;
+        const kind = buf.kindAt(row);
+        return self.anchored.start <= row and row < self.anchored.end and (kind == .line or kind == .line_pair);
+    }
+
+    /// The Anchor Indicator runs from the top anchored Diff Line to the root
+    /// card's top border.
+    pub fn indicator(self: ActivePath, row: usize) ?Indicator {
+        if (self.anchored.start == self.anchored.end) return null;
+        if (row == self.anchored.start) return .top;
+        if (row == self.anchored.end) return .corner;
+        return if (row > self.anchored.start and row < self.anchored.end) .through else null;
+    }
+
+    /// The path card that `rail` on row `row` leads down to, if any. The line
+    /// of a parent's Replies past row `row` leads to the path Reply when the
+    /// parent is on the path and that Reply sits below the row.
+    pub fn railTarget(self: ActivePath, row: usize, rail: review_card.Rail) ?Card {
+        if (self.cards.len < 2) return null;
+        for (self.cards[1..], self.cards[0 .. self.cards.len - 1]) |card, parent| {
+            if (card.depth == rail.depth) return if (parent.rows.start < row and row < card.rows.start) card else null;
+        }
+        return null;
+    }
 };
 
 fn cardAt(row: Row) ?ReviewCardRow {
@@ -511,38 +577,6 @@ fn lineOnSide(row: Row, side: SelectedVersion) LineOnSide {
         else => return .not_line,
     };
     return .{ .number = (if (side == .new) line.newNo() else line.oldNo()) orelse return .absent };
-}
-
-/// Mark the Diff Lines of each inline root card's Anchor that sit directly
-/// above the card. A line without a number on the Anchor side, such as a
-/// removed line in a new-side range, continues the run. Any other row ends it.
-fn markAnchors(rows: []const Row, marks: []AnchorMark) void {
-    for (rows, 0..) |row, index| {
-        const card = cardAt(row) orelse continue;
-        if (card.part != .header or card.depth != 0) continue;
-        const anchor = switch (card.scope) {
-            .@"inline" => |value| value,
-            .review, .file => continue,
-        };
-        const bottom = anchor.line() orelse continue;
-        const top = anchor.top() orelse continue;
-        const side: SelectedVersion = if (anchor.to != null) .new else .old;
-        var first: ?usize = null;
-        var above = index;
-        while (above > 0) : (above -= 1) switch (lineOnSide(rows[above - 1], side)) {
-            .not_line => break,
-            .absent => {},
-            .number => |number| {
-                if (number < top or number > bottom) break;
-                first = above - 1;
-                if (number == top) break;
-            },
-        };
-        const start = first orelse continue;
-        marks[start] = .{ .kind = .top, .role = card.role };
-        for (marks[start + 1 .. index]) |*mark| mark.* = .{ .kind = .through, .role = card.role };
-        marks[index] = .{ .kind = .junction, .role = card.role };
-    }
 }
 
 pub const FileTally = struct { comments: usize = 0, drafts: usize = 0 };
@@ -845,13 +879,9 @@ pub fn buildWithComments(
     const owned_rows = try rows.toOwnedSlice(allocator);
     const row_kinds = try allocator.alloc(RowKind, owned_rows.len);
     for (owned_rows, row_kinds) |row, *kind| kind.* = std.meta.activeTag(row);
-    const anchor_marks = try allocator.alloc(AnchorMark, owned_rows.len);
-    @memset(anchor_marks, .{});
-    markAnchors(owned_rows, anchor_marks);
     return .{
         .rows = owned_rows,
         .row_kinds = row_kinds,
-        .anchor_marks = anchor_marks,
         .layout = layout,
         .selected_version = opts.selected_version,
         .selected_column = if (layout == .side_by_side) .{
@@ -1114,19 +1144,16 @@ const Weave = struct {
             }
             try open.append(w.a, .{ .depth = card.depth, .index = index });
         }
-        const Line = struct { depth: usize, column: usize };
-        var lines: std.ArrayList(Line) = .empty;
-        var columns: []const usize = &.{};
+        var lines: std.ArrayList(review_card.Rail) = .empty;
+        var columns: []const review_card.Rail = &.{};
         for (rows, 0..) |*row, index| {
             const card = cardMut(row) orelse continue;
             if (index == 0 or !sameCard(rows[index - 1], card.owner)) {
                 while (lines.items.len > 0 and lines.items[lines.items.len - 1].depth >= card.depth) _ = lines.pop();
-                const next = try w.a.alloc(usize, lines.items.len);
-                for (lines.items, next) |line, *column| column.* = line.column;
-                columns = next;
+                columns = try w.a.dupe(review_card.Rail, lines.items);
             }
             card.rails = columns;
-            if (card.sibling_below) try lines.append(w.a, .{ .depth = card.depth, .column = card.indent });
+            if (card.sibling_below) try lines.append(w.a, .{ .column = card.indent, .depth = card.depth });
         }
     }
 
@@ -1655,15 +1682,16 @@ const CardIndentation = struct {
     relative: bool = false,
 
     fn init(width: usize, deepest: usize) CardIndentation {
-        const body_width = cardContentWidth(width, 0);
+        const body_width = cardContentWidth(width, anchor_cols);
         const budget = body_width -| 40;
         var unit: usize = if (width >= 100) 4 else if (width >= 80) 3 else if (width >= 60) 2 else 1;
         while (unit > 1 and deepest *| unit > budget) unit -= 1;
         return .{ .unit = unit, .budget = budget };
     }
 
+    /// The left border column. Column 0 stays free for the Anchor Indicator.
     fn offset(self: CardIndentation, depth: usize) usize {
-        return @min(depth *| self.unit, self.budget);
+        return anchor_cols + @min(depth *| self.unit, self.budget);
     }
 
     /// The ancestry state that the Title names first when the indent cannot show it.
@@ -3098,7 +3126,7 @@ test "M23 acceptance mixed Reply subtrees retain combined Markdown at every widt
                     try testing.expect(headers < expected.len);
                     try testing.expectEqualDeep(expected[headers], card.owner);
                     try testing.expectEqual(depths[headers], card.depth);
-                    try testing.expectEqual(@min(depths[headers] * case.unit, case.width -| 44), card.indent);
+                    try testing.expectEqual(1 + @min(depths[headers] * case.unit, case.width -| 45), card.indent);
                     headers += 1;
                 } else if (card.part == .disclosure_footer) {
                     footers += 1;
@@ -3141,18 +3169,18 @@ test "M23 acceptance mixed Reply subtrees retain combined Markdown at every widt
 
 test "M23 ancestry shares a width unit and caps indentation at readable body width" {
     const cases = [_]struct { width: usize, depth: usize, unit: usize, indent: usize, body_width: usize }{
-        .{ .width = 100, .depth = 3, .unit = 4, .indent = 12, .body_width = 84 },
-        .{ .width = 100, .depth = 20, .unit = 2, .indent = 40, .body_width = 56 },
-        .{ .width = 80, .depth = 12, .unit = 3, .indent = 36, .body_width = 40 },
-        .{ .width = 60, .depth = 12, .unit = 1, .indent = 12, .body_width = 44 },
+        .{ .width = 100, .depth = 3, .unit = 4, .indent = 13, .body_width = 83 },
+        .{ .width = 100, .depth = 20, .unit = 2, .indent = 41, .body_width = 55 },
+        .{ .width = 80, .depth = 12, .unit = 2, .indent = 25, .body_width = 51 },
+        .{ .width = 60, .depth = 12, .unit = 1, .indent = 13, .body_width = 43 },
         .{ .width = 60, .depth = 20, .unit = 1, .indent = 16, .body_width = 40 },
-        .{ .width = 40, .depth = 3, .unit = 1, .indent = 0, .body_width = 36 },
-        .{ .width = 44, .depth = 3, .unit = 1, .indent = 0, .body_width = 40 },
-        .{ .width = 59, .depth = 3, .unit = 1, .indent = 3, .body_width = 52 },
-        .{ .width = 60, .depth = 3, .unit = 2, .indent = 6, .body_width = 50 },
-        .{ .width = 79, .depth = 3, .unit = 2, .indent = 6, .body_width = 69 },
-        .{ .width = 80, .depth = 3, .unit = 3, .indent = 9, .body_width = 67 },
-        .{ .width = 99, .depth = 3, .unit = 3, .indent = 9, .body_width = 86 },
+        .{ .width = 40, .depth = 3, .unit = 1, .indent = 1, .body_width = 35 },
+        .{ .width = 44, .depth = 3, .unit = 1, .indent = 1, .body_width = 39 },
+        .{ .width = 59, .depth = 3, .unit = 1, .indent = 4, .body_width = 51 },
+        .{ .width = 60, .depth = 3, .unit = 2, .indent = 7, .body_width = 49 },
+        .{ .width = 79, .depth = 3, .unit = 2, .indent = 7, .body_width = 68 },
+        .{ .width = 80, .depth = 3, .unit = 3, .indent = 10, .body_width = 66 },
+        .{ .width = 99, .depth = 3, .unit = 3, .indent = 10, .body_width = 85 },
     };
     const body = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnop";
     for (cases) |case| for ([_]Layout{ .unified, .side_by_side }) |layout| {
@@ -3173,9 +3201,9 @@ test "M23 ancestry shares a width unit and caps indentation at readable body wid
             const card = row.draft;
             const depth = card.draftItem().local_id - 1;
             try testing.expectEqual(depth, card.depth);
-            try testing.expectEqual(@min(depth * case.unit, case.width -| 44), card.indent);
+            try testing.expectEqual(1 + @min(depth * case.unit, case.width -| 45), card.indent);
             if (card.part == .header) {
-                try testing.expectEqual(depth * case.unit > case.width -| 44, std.mem.indexOf(u8, card.text(), "depth") != null);
+                try testing.expectEqual(depth * case.unit > case.width -| 45, std.mem.indexOf(u8, card.text(), "depth") != null);
             }
             if (card.draftItem().local_id != case.depth + 1 or card.part != .body) continue;
             var columns: usize = 0;
@@ -3254,7 +3282,7 @@ test "M23 ancestry labels absent parents and keeps known relative depth" {
                 try testing.expect(index < expected.len);
                 try testing.expectEqualDeep(expected[index], card.owner);
                 try testing.expectEqual(depths[index], card.depth);
-                try testing.expectEqual(@as(usize, 0), card.indent);
+                try testing.expectEqual(@as(usize, 1), card.indent);
                 try testing.expectEqual(depths[index] == 0, std.mem.indexOf(u8, card.text(), "parent unavailable") != null);
                 if (depths[index] > 0) try testing.expect(std.mem.indexOf(u8, card.text(), "known relative depth") != null);
                 index += 1;
@@ -3299,7 +3327,7 @@ test "M23 ancestry attaches a fetched Reply to an unfetched posted parent" {
                     try testing.expect(index < expected.len);
                     try testing.expectEqualDeep(expected[index], card.owner);
                     try testing.expectEqual(index, card.depth);
-                    try testing.expectEqual(index * 4, card.indent);
+                    try testing.expectEqual(1 + index * 4, card.indent);
                     try testing.expect(std.mem.indexOf(u8, card.text(), "parent unavailable") == null);
                     try testing.expectEqual(@as(?usize, 0), buf.fileIndexForRow(row_index));
                     index += 1;

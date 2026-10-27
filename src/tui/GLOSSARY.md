@@ -133,11 +133,15 @@ The bounded DiffPane presentation of one Comment or Draft: a rounded border, Rev
 _Avoid_: Comment (the Review entity), panel, box.
 
 **Anchor Indicator**:
-The line in column 0 of the DiffPane that joins a root ReviewCard to its anchored Diff Lines: `╭` on the top anchored line, `│` below it, and `├` at the card's top-left corner. It covers only the anchored lines that sit directly above the card. A Reply, a File-level card, and a Review-level card have none.
+The line in column 0 of the DiffPane that joins the thread root of the Active Path to its anchored Diff Lines: `╭` on the top anchored line, `│` on every row below it, including other cards and other anchored lines, and `╰` beside the root card's top-left corner, which becomes `┬`. Only the Active Path has one, so a cursor outside a card shows none. A Reply, a File-level card, and a Review-level card have none.
 _Avoid_: gutter marker, range bar.
 
+**Active Path**:
+The ReviewCard that holds the cursor and every ancestor card up to its thread root. Its cards draw their border, Title, and lines in the border style of their role, its root draws the Anchor Indicator, and its ancestors and anchored Diff Lines carry the Ancestry Band. Every other card draws its border dim. The descendants of the cursor's card are not on it.
+_Avoid_: selection, focus chain.
+
 **Ancestry Band**:
-The dim background on the anchored Diff Lines and on every ancestor ReviewCard of the card under the cursor. The cursor band stays stronger.
+The dim background on the anchored Diff Lines and on every ancestor ReviewCard of the Active Path. The cursor band stays stronger.
 _Avoid_: highlight (the cursor and search have their own), thread focus.
 
 **Presentation Frame**:

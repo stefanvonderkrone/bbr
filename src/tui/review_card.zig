@@ -71,6 +71,10 @@ pub const Segment = struct {
     required_definition: ?SourceRange = null,
 };
 
+/// The line from a card down to its later sibling: the left border column of
+/// both cards, and their depth.
+pub const Rail = struct { column: usize, depth: usize };
+
 pub const ReviewCardRow = struct {
     owner: Owner,
     source: Source,
@@ -86,9 +90,9 @@ pub const ReviewCardRow = struct {
     depth: usize = 0,
     /// The column of the left border.
     indent: usize = 0,
-    /// The left border columns of the ancestor cards whose line runs past
-    /// this row down to a later sibling.
-    rails: []const usize = &.{},
+    /// The lines of the ancestor cards that run past this row down to a
+    /// later sibling.
+    rails: []const Rail = &.{},
     /// The bottom row of a card that a later sibling follows. Its line runs
     /// down from the bottom-left corner to that sibling.
     sibling_below: bool = false,
