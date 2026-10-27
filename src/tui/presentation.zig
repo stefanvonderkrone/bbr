@@ -18525,6 +18525,12 @@ test "M23 ancestry retains typed cursor and search ownership across resize and f
         try testing.expectEqualDeep(before.geometry, after.geometry);
         try testing.expectEqualDeep(before.navigation, after.navigation);
         try testing.expectEqual(before.visual_rows_revision, after.visual_rows_revision);
+        const cursor = after.visual_rows[after.navigation.cursor].buffer_index;
+        const metadata = after.buffer.rows[cursor].draft.card.?;
+        const path = try after.buffer.activePath(testing.allocator, cursor);
+        defer testing.allocator.free(path.by_depth);
+        try testing.expect(path.holds(metadata));
+        try testing.expect(path.holds(metadata.root));
     };
 }
 

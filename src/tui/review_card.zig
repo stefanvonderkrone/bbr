@@ -71,9 +71,24 @@ pub const Segment = struct {
     required_definition: ?SourceRange = null,
 };
 
-/// The line from a card down to its later sibling: the left border column of
-/// both cards, and their depth.
-pub const Rail = struct { column: usize, depth: usize };
+pub const RowRange = struct { start: usize, end: usize };
+
+/// Buffer-owned geometry shared by every row of one ReviewCard. Subtrees are
+/// contiguous, so membership in the Active Path needs no parent or body scan.
+pub const Card = struct {
+    rows: RowRange,
+    subtree_end: usize,
+    parent: ?*const Card,
+    root: *const Card,
+    depth: usize,
+    role: CardRole,
+    anchored: RowRange,
+    next_sibling: ?*const Card = null,
+};
+
+/// A shared ancestor rail and its next sibling. Each chain has distinct
+/// columns. The shallowest rail wins when indentation reaches its limit.
+pub const Rail = struct { column: usize, target: *const Card, next: ?*const Rail };
 
 pub const ReviewCardRow = struct {
     owner: Owner,
@@ -92,7 +107,8 @@ pub const ReviewCardRow = struct {
     indent: usize = 0,
     /// The lines of the ancestor cards that run past this row down to a
     /// later sibling.
-    rails: []const Rail = &.{},
+    rails: ?*const Rail = null,
+    card: ?*const Card = null,
     /// The bottom row of a card that a later sibling follows. Its line runs
     /// down from the bottom-left corner to that sibling.
     sibling_below: bool = false,
@@ -157,47 +173,71 @@ pub const Options = struct {
 };
 
 pub fn projectPreview(allocator: std.mem.Allocator, body: ReviewBody, options: Options, scroll: usize, height: usize) ![]const ReviewCardRow {
-    const rows = try project(allocator, body, options);
-    defer allocator.free(rows);
     var start: usize = 0;
     var logical_line: usize = 0;
     while (logical_line < scroll and start < body.source.len) : (logical_line += 1) {
         const newline = std.mem.indexOfScalarPos(u8, body.source, start, '\n') orelse body.source.len;
         start = newline + @intFromBool(newline < body.source.len);
     }
-    var visible: std.ArrayList(ReviewCardRow) = .empty;
-    errdefer visible.deinit(allocator);
-    for (rows) |row| {
-        if (row.part.isBorder()) continue;
-        if (start > 0 and row.source_range.end <= start) continue;
-        if (visible.items.len >= height) break;
-        try visible.append(allocator, row);
-    }
-    return visible.toOwnedSlice(allocator);
+    var sink = RowCollector{ .allocator = allocator, .preview_start = start, .height = height };
+    defer sink.rows.deinit(allocator);
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    try projectInto(allocator, scratch.allocator(), body, options, &sink);
+    return sink.rows.toOwnedSlice(allocator);
 }
 
 pub fn project(allocator: std.mem.Allocator, body: ReviewBody, options: Options) ![]const ReviewCardRow {
+    var sink = RowCollector{ .allocator = allocator };
+    defer sink.rows.deinit(allocator);
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    try projectInto(allocator, scratch.allocator(), body, options, &sink);
+    return sink.rows.toOwnedSlice(allocator);
+}
+
+const RowCollector = struct {
+    allocator: std.mem.Allocator,
+    rows: std.ArrayList(ReviewCardRow) = .empty,
+    preview_start: ?usize = null,
+    height: usize = std.math.maxInt(usize),
+
+    pub fn append(self: *RowCollector, row: ReviewCardRow) !void {
+        if (self.preview_start) |start| {
+            if (row.part.isBorder()) return;
+            if (start > 0 and row.source_range.end <= start) return;
+        }
+        if (self.rows.items.len < self.height) try self.rows.append(self.allocator, row);
+    }
+};
+
+/// Append normalized rows to the sink. Result storage owns Segments and generated text.
+/// Scratch storage holds only temporary arrays and can be released after this call.
+/// A sink failure can leave partial output. The caller must discard that output.
+pub fn projectInto(allocator: std.mem.Allocator, scratch_allocator: std.mem.Allocator, body: ReviewBody, options: Options, sink: anytype) !void {
     std.debug.assert(std.meta.eql(options.owner, ownerForSource(options.source)));
     std.debug.assert(options.source.body().ptr == body.source.ptr and options.source.body().len == body.source.len);
 
     var body_rows: std.ArrayList(ReviewCardRow) = .empty;
-    errdefer body_rows.deinit(allocator);
+    defer body_rows.deinit(scratch_allocator);
     var writer = Writer{
         .allocator = allocator,
+        .row_allocator = scratch_allocator,
         .rows = &body_rows,
         .options = options,
         .width = @max(options.content_width, 1),
     };
+    defer writer.current.deinit(allocator);
     var table_header: ?body_mod.Block = null;
     var columns: []usize = &.{};
-    defer allocator.free(columns);
+    defer scratch_allocator.free(columns);
     for (body.blocks, 0..) |block, ordinal| {
         if (block.kind == .table) {
             if (table_header == null or table_header.?.source.start != block.kind.table.header.start) {
                 table_header = block;
-                allocator.free(columns);
+                scratch_allocator.free(columns);
                 columns = &.{};
-                columns = try allocator.alloc(usize, block.kind.table.cells.len);
+                columns = try scratch_allocator.alloc(usize, block.kind.table.cells.len);
                 @memset(columns, 0);
                 for (body.blocks[ordinal..]) |row| {
                     if (row.kind != .table) {
@@ -236,33 +276,31 @@ pub fn project(allocator: std.mem.Allocator, body: ReviewBody, options: Options)
     }
     const collapsible = options.collapsed_rows > 0 and body_rows.items.len > options.collapsed_rows;
     const visible_count = if (collapsible and !options.expanded) options.collapsed_rows else body_rows.items.len;
-    const gap: usize = @intFromBool(options.depth > 0);
-    const rows = try allocator.alloc(ReviewCardRow, gap + 1 + visible_count + 1);
-    if (gap > 0) rows[0] = makeRow(options, .gap, 0, .literal, .{ .start = 0, .end = 0 }, &.{});
-    rows[gap] = makeRow(options, .header, 0, .literal, .{ .start = 0, .end = 0 }, try oneSegment(allocator, .{
+    if (options.depth > 0) try sink.append(makeRow(options, .gap, 0, .literal, .{ .start = 0, .end = 0 }, &.{}));
+    var header = makeRow(options, .header, 0, .literal, .{ .start = 0, .end = 0 }, try oneSegment(allocator, .{
         .text = options.header,
         .source = .{ .start = 0, .end = 0 },
     }));
-    rows[gap].plain_label = options.plain_header;
-    @memcpy(rows[gap + 1 .. gap + 1 + visible_count], body_rows.items[0..visible_count]);
+    header.plain_label = options.plain_header;
+    try sink.append(header);
+    for (body_rows.items[0..visible_count]) |row| try sink.append(row);
     const body_end: SourceRange = .{ .start = body.source.len, .end = body.source.len };
     if (!collapsible) {
-        rows[rows.len - 1] = makeRow(options, .bottom, body_rows.items.len, .literal, body_end, &.{});
+        try sink.append(makeRow(options, .bottom, body_rows.items.len, .literal, body_end, &.{}));
     } else {
         const hidden = body_rows.items.len - visible_count;
         const footer = if (options.expanded)
             try std.fmt.allocPrint(allocator, "▾ {d} total rows · enter to collapse", .{body_rows.items.len})
         else
             try std.fmt.allocPrint(allocator, "▸ {d} hidden rows · {d} total · enter to expand", .{ hidden, body_rows.items.len });
-        rows[rows.len - 1] = makeRow(options, .disclosure_footer, body_rows.items.len, .literal, body_end, try oneSegment(allocator, .{
+        var footer_row = makeRow(options, .disclosure_footer, body_rows.items.len, .literal, body_end, try oneSegment(allocator, .{
             .text = footer,
             .source = body_end,
         }));
-        rows[rows.len - 1].hidden_rows = hidden;
-        rows[rows.len - 1].total_rows = body_rows.items.len;
+        footer_row.hidden_rows = hidden;
+        footer_row.total_rows = body_rows.items.len;
+        try sink.append(footer_row);
     }
-    body_rows.deinit(allocator);
-    return rows;
 }
 
 fn ownerForSource(source: Source) Owner {
@@ -316,6 +354,7 @@ fn makeRow(options: Options, part: Part, ordinal: usize, kind: BlockKind, range:
 
 const Writer = struct {
     allocator: std.mem.Allocator,
+    row_allocator: std.mem.Allocator,
     rows: *std.ArrayList(ReviewCardRow),
     options: Options,
     width: usize,
@@ -379,7 +418,7 @@ const Writer = struct {
         const rows = try self.cellRows(block_value, cell, std.math.maxInt(usize));
         defer {
             for (rows) |row| self.allocator.free(row.segments);
-            self.allocator.free(rows);
+            self.row_allocator.free(rows);
         }
         // Inline code can contain a hard break. Keep its complete content when measuring the cell.
         var segments: std.ArrayList(Segment) = .empty;
@@ -392,13 +431,13 @@ const Writer = struct {
         var rows: std.ArrayList(ReviewCardRow) = .empty;
         errdefer {
             for (rows.items) |row| self.allocator.free(row.segments);
-            rows.deinit(self.allocator);
+            rows.deinit(self.row_allocator);
         }
-        var cell_writer = Writer{ .allocator = self.allocator, .rows = &rows, .options = self.options, .width = @max(width, 1) };
+        var cell_writer = Writer{ .allocator = self.allocator, .row_allocator = self.row_allocator, .rows = &rows, .options = self.options, .width = @max(width, 1) };
         defer cell_writer.current.deinit(self.allocator);
         for (value.spans[cell.spans.start..cell.spans.end]) |span| try cell_writer.addSpan(span, false);
         try cell_writer.flush();
-        return rows.toOwnedSlice(self.allocator);
+        return rows.toOwnedSlice(self.row_allocator);
     }
 
     fn table(self: *Writer, value: body_mod.Block, ordinal: usize, header: body_mod.Block, columns: []const usize) !void {
@@ -412,14 +451,14 @@ const Writer = struct {
         for (columns) |width| complete_width += width;
         const wide = complete_width <= self.width;
         if (wide) {
-            const cells = try self.allocator.alloc([]const ReviewCardRow, columns.len);
+            const cells = try self.row_allocator.alloc([]const ReviewCardRow, columns.len);
             @memset(cells, &.{});
             defer {
                 for (cells) |rows| {
                     for (rows) |row| self.allocator.free(row.segments);
-                    self.allocator.free(rows);
+                    self.row_allocator.free(rows);
                 }
-                self.allocator.free(cells);
+                self.row_allocator.free(cells);
             }
             var height: usize = 1;
             for (value.kind.table.cells, 0..) |cell, index| {
@@ -692,7 +731,7 @@ const Writer = struct {
         if (self.part == .code_body or self.part == .suggestion_body or self.part == .suggestion_label) {
             row.code_area = .{ .column = self.prefix_width, .width = self.current_width - self.prefix_width };
         }
-        try self.rows.append(self.allocator, row);
+        try self.rows.append(self.row_allocator, row);
         self.current = .empty;
         self.current_width = 0;
         self.current_range = null;
@@ -723,6 +762,90 @@ fn measuredWidth(metrics: CellMetrics, text: []const u8) usize {
 }
 
 const testing = std.testing;
+
+test "sink projection survives scratch destruction and matches projection and preview rows" {
+    var result = std.heap.ArenaAllocator.init(testing.allocator);
+    defer result.deinit();
+    const a = result.allocator();
+    const bodies = [_][]const u8{
+        "one **two**\nthree four five\n\nsix",
+        "> 12. wrapped list item with generated prefixes\n>     another line",
+        "```zig\n\tconst x = 1;\nlonger code line\n```",
+        "First | Second\n--- | ---\n**abcdefghijklmnopqrstuvwxyz0123456789** | [docs](https://example.invalid/link)",
+    };
+    for (bodies) |raw| {
+        const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
+        const body = try ReviewBody.parse(a, raw);
+        for ([_]usize{ 8, 35, 120 }) |width| for ([_]bool{ false, true }) |expanded| {
+            const options: Options = .{
+                .owner = .{ .comment = 1 },
+                .source = .{ .comment = &comment },
+                .role = .comment_reply,
+                .header = "Ada",
+                .plain_header = "Ada plain",
+                .content_width = width,
+                .metrics = TestMetrics.value,
+                .collapsed_rows = 2,
+                .expanded = expanded,
+                .depth = 1,
+            };
+            const expected = try project(a, body, options);
+            var sink = RowCollector{ .allocator = testing.allocator };
+            defer sink.rows.deinit(testing.allocator);
+            {
+                var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+                defer scratch.deinit();
+                try projectInto(a, scratch.allocator(), body, options, &sink);
+            }
+            try testing.expectEqualDeep(expected, sink.rows.items);
+            for ([_]usize{ 0, 1, 20 }) |scroll| for ([_]usize{ 0, 1, 4 }) |height| {
+                const preview = try projectPreview(a, body, options, scroll, height);
+                var start: usize = 0;
+                for (0..scroll) |_| {
+                    if (start >= raw.len) break;
+                    const newline = std.mem.indexOfScalarPos(u8, raw, start, '\n') orelse raw.len;
+                    start = newline + @intFromBool(newline < raw.len);
+                }
+                var index: usize = 0;
+                for (expected) |row| {
+                    if (row.part.isBorder() or (start > 0 and row.source_range.end <= start)) continue;
+                    if (index == height) break;
+                    try testing.expectEqualDeep(row, preview[index]);
+                    index += 1;
+                }
+                try testing.expectEqual(index, preview.len);
+            };
+        };
+    }
+}
+
+test "sink projection releases scratch rows after allocation and sink failures" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var result = std.heap.ArenaAllocator.init(backing);
+            defer result.deinit();
+            const a = result.allocator();
+            const raw = "First | Second\n--- | ---\n**long first cell** | second cell\n\n> 1. wrapped text\n\n```zig\nlong code line\n```";
+            const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
+            const body = try ReviewBody.parse(a, raw);
+            for ([_]usize{ 8, 40 }) |width| {
+                var sink = RowCollector{ .allocator = backing };
+                defer sink.rows.deinit(backing);
+                try projectInto(a, backing, body, .{
+                    .owner = .{ .comment = 1 },
+                    .source = .{ .comment = &comment },
+                    .role = .comment_reply,
+                    .header = "Ada",
+                    .content_width = width,
+                    .metrics = TestMetrics.value,
+                    .collapsed_rows = 2,
+                    .depth = 1,
+                }, &sink);
+                try testing.expectEqual(Part.disclosure_footer, sink.rows.items[sink.rows.items.len - 1].part);
+            }
+        }
+    }.run, .{});
+}
 
 test "M23 emoji projection preserves compounds with adapter supplied terminal widths" {
     const Metrics = struct {

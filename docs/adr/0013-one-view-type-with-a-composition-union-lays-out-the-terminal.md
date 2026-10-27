@@ -36,3 +36,11 @@ A comptime tree with a comptime Slot check was also sketched. It needs a second 
 - Only the thread root of the Active Path, the card under the cursor and its ancestors, shows its Anchor Indicator. The line passes over every row between the top anchored Diff Line and the root card, such as the cards of other roots that end on the same line, and ends with `╰` in column 0 beside the root's `┬` corner. Every card moved one column right, so its body is one cell narrower and its right border stays in place. Cards off the Active Path paint their border, Title, and lines in the dim `Theme.card_border_dim`. With the cursor outside a card, every card is dim and no indicator shows.
 - The gap line of a Reply joins the border row above it with `┬` and the Reply's top-left corner with `├` through `view_paint.join`. A disclosure footer Title above the gap keeps its text, so the join skips that cell.
 - Every ReviewCard paints the Theme's base background, like an Overlay. A Draft, a Comment, a deleted Comment, and a Draft with an unknown outcome differ only by text color and emphasis. A Draft with an unknown outcome now has a red foreground in place of its orange band. Code and Suggestion rows keep their own background.
+
+## ReviewCard geometry and bounded paint work
+
+The Buffer builds one stable geometry record for each ReviewCard. Every row of that card shares the record. It holds the card bounds, the exclusive subtree end, the parent, the root, and the anchored Diff Line range. Subtree bounds give constant-time Active Path membership. Active Path construction follows parent links and builds a depth index for rail styles. It does not scan off-screen body rows or sibling subtrees.
+
+Rail chains share immutable nodes. Each node names the next sibling and the next ancestor rail. A chain keeps only distinct columns. The shallowest rail owns a column when indentation reaches its limit. Storage grows with the card count, not with the sum of ancestry depths. Paint visits at most one rail per column on each visible row. A depth lookup finds the role of any later sibling on the Active Path. That sibling can follow the immediate rail target.
+
+The weaver records each tree's start before the geometry pass. A hidden submitting Draft can leave its first visible descendant at a positive depth. That depth does not join separate trees.

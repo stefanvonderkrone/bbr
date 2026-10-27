@@ -8,8 +8,8 @@ pub const Context = struct {
     diff: bbr.diff.Diff,
 };
 
-pub fn run(allocator: std.mem.Allocator, context: *const Context) !buffer_mod.Buffer {
-    return buffer_mod.build(allocator, context.diff, .unified);
+pub fn run(allocator: std.mem.Allocator, scratch_allocator: std.mem.Allocator, context: *const Context) !buffer_mod.Buffer {
+    return buffer_mod.buildWithComments(allocator, context.diff, .unified, &.{}, .{ .scratch_allocator = scratch_allocator });
 }
 
 pub fn checksum(buffer: buffer_mod.Buffer) u64 {

@@ -215,6 +215,8 @@ pub const Fold = struct {
 /// deferred.) Every hidden-content owner keeps a persistent disclosure row and
 /// is expanded only when its tagged semantic key is explicitly present.
 pub const BuildOptions = struct {
+    /// Reclaimable storage for temporary rows. It must not be the result arena.
+    scratch_allocator: std.mem.Allocator = std.heap.page_allocator,
     fold_context: bool = false,
     context_margin: usize = 3,
     min_fold: usize = 2,
@@ -383,71 +385,12 @@ pub const Buffer = struct {
     pub fn activePath(self: Buffer, allocator: std.mem.Allocator, cursor: usize) !ActivePath {
         if (cursor >= self.rows.len) return .{};
         const own = cardAt(self.rows[cursor]) orelse return .{};
-        var cards: std.ArrayList(ActivePath.Card) = .empty;
-        var top = self.cardStart(cursor);
-        var end = cursor + 1;
-        while (end < self.rows.len and sameCard(self.rows[end], own.owner)) end += 1;
-        try cards.append(allocator, .{ .rows = .{ .start = top, .end = end }, .depth = own.depth, .role = own.role });
-        var depth = own.depth;
-        while (depth > 0) {
-            var above = top;
-            const parent: ?usize = while (above > 0) : (above -= 1) {
-                const card = cardAt(self.rows[above - 1]) orelse break null;
-                if (card.depth < depth) break above - 1;
-            } else null;
-            const last = parent orelse break;
-            const card = cardAt(self.rows[last]).?;
-            top = self.cardStart(last);
-            depth = card.depth;
-            try cards.append(allocator, .{ .rows = .{ .start = top, .end = last + 1 }, .depth = depth, .role = card.role });
-        }
-        std.mem.reverse(ActivePath.Card, cards.items);
-        return .{
-            .cards = try cards.toOwnedSlice(allocator),
-            .anchored = if (depth == 0) self.anchoredAbove(top) else .{ .start = top, .end = top },
-        };
-    }
-
-    /// The rows from the top anchored Diff Line of the inline root card at row
-    /// `root` down to the row above the card. Other cards and Diff Lines of the
-    /// Anchor in between stay inside. A line without a number on the Anchor
-    /// side, such as a removed line in a new-side range, does too. When the top
-    /// line is not in the Buffer, the range starts at the topmost anchored line
-    /// that is.
-    fn anchoredAbove(self: Buffer, root: usize) RowRange {
-        const none: RowRange = .{ .start = root, .end = root };
-        const anchor = switch (cardAt(self.rows[root]).?.scope) {
-            .@"inline" => |value| value,
-            .review, .file => return none,
-        };
-        const bottom = anchor.line() orelse return none;
-        const top = anchor.top() orelse return none;
-        const side: SelectedVersion = if (anchor.to != null) .new else .old;
-        var first = root;
-        var above = root;
-        while (above > 0) : (above -= 1) switch (self.rows[above - 1]) {
-            .comment, .draft => {},
-            .line, .line_pair => switch (lineOnSide(self.rows[above - 1], side)) {
-                .not_line, .absent => {},
-                .number => |number| {
-                    if (number < top or number > bottom) break;
-                    first = above - 1;
-                    if (number == top) break;
-                },
-            },
-            else => break,
-        };
-        return .{ .start = first, .end = root };
-    }
-
-    fn cardStart(self: Buffer, index: usize) usize {
-        const owner = cardAt(self.rows[index]).?.owner;
-        var start = index;
-        while (start > 0) : (start -= 1) {
-            const card = cardAt(self.rows[start - 1]) orelse break;
-            if (!std.meta.eql(card.owner, owner)) break;
-        }
-        return start;
+        const card = own.card orelse return .{};
+        const by_depth = try allocator.alloc(?*const review_card.Card, card.depth + 1);
+        @memset(by_depth, null);
+        var ancestor: ?*const review_card.Card = card;
+        while (ancestor) |value| : (ancestor = value.parent) by_depth[value.depth] = value;
+        return .{ .card = card, .by_depth = by_depth };
     }
 
     pub fn kindAt(self: Buffer, index: usize) RowKind {
@@ -497,55 +440,55 @@ pub const Buffer = struct {
     }
 };
 
-pub const RowRange = struct { start: usize, end: usize };
+pub const RowRange = review_card.RowRange;
 
 /// The card under the cursor and every ancestor card up to its thread root,
-/// with the root's anchored Diff Lines. Presentation owns the cursor, so the
-/// renderer computes the path for each frame and the Buffer stays
-/// cursor-independent.
+/// with the root's anchored Diff Lines. The cursor selects immutable Buffer
+/// geometry. The depth index follows parent links, never off-screen body rows.
 pub const ActivePath = struct {
-    /// Root first. The last card holds the cursor.
-    cards: []const Card = &.{},
-    /// From the root's top anchored Diff Line to the row above the root card.
-    /// Empty when the root has no anchored Diff Line in the Buffer.
-    anchored: RowRange = .{ .start = 0, .end = 0 },
-
-    pub const Card = struct { rows: RowRange, depth: usize, role: review_card.CardRole };
+    card: ?*const review_card.Card = null,
+    by_depth: []const ?*const review_card.Card = &.{},
 
     /// The piece of the Anchor Indicator in column 0 of one row.
     pub const Indicator = enum { top, through, corner };
 
-    pub fn holds(self: ActivePath, row: usize) bool {
-        for (self.cards) |card| if (card.rows.start <= row and row < card.rows.end) return true;
-        return false;
+    pub fn root(self: ActivePath) ?*const review_card.Card {
+        return if (self.card) |card| card.root else null;
+    }
+
+    pub fn holds(self: ActivePath, candidate: ?*const review_card.Card) bool {
+        const cursor = self.card orelse return false;
+        const ancestor = candidate orelse return false;
+        return ancestor.rows.start <= cursor.rows.start and cursor.rows.start < ancestor.subtree_end;
     }
 
     /// The Ancestry Band: every ancestor card and the anchored Diff Lines.
     pub fn banded(self: ActivePath, buf: Buffer, row: usize) bool {
-        if (self.cards.len == 0) return false;
-        for (self.cards[0 .. self.cards.len - 1]) |card| if (card.rows.start <= row and row < card.rows.end) return true;
+        const cursor = self.card orelse return false;
+        if (cardAt(buf.rows[row])) |value| if (value.card != cursor and self.holds(value.card)) return true;
         const kind = buf.kindAt(row);
-        return self.anchored.start <= row and row < self.anchored.end and (kind == .line or kind == .line_pair);
+        const anchored = cursor.root.anchored;
+        return anchored.start <= row and row < anchored.end and (kind == .line or kind == .line_pair);
     }
 
     /// The Anchor Indicator runs from the top anchored Diff Line to the root
     /// card's top border.
     pub fn indicator(self: ActivePath, row: usize) ?Indicator {
-        if (self.anchored.start == self.anchored.end) return null;
-        if (row == self.anchored.start) return .top;
-        if (row == self.anchored.end) return .corner;
-        return if (row > self.anchored.start and row < self.anchored.end) .through else null;
+        const anchored = (self.root() orelse return null).anchored;
+        if (anchored.start == anchored.end) return null;
+        if (row == anchored.start) return .top;
+        if (row == anchored.end) return .corner;
+        return if (row > anchored.start and row < anchored.end) .through else null;
     }
 
-    /// The path card that `rail` on row `row` leads down to, if any. The line
-    /// of a parent's Replies past row `row` leads to the path Reply when the
-    /// parent is on the path and that Reply sits below the row.
-    pub fn railTarget(self: ActivePath, row: usize, rail: review_card.Rail) ?Card {
-        if (self.cards.len < 2) return null;
-        for (self.cards[1..], self.cards[0 .. self.cards.len - 1]) |card, parent| {
-            if (card.depth == rail.depth) return if (parent.rows.start < row and row < card.rows.start) card else null;
-        }
-        return null;
+    /// A rail can lead to any later sibling on the Active Path, not only its
+    /// immediate target. A depth lookup keeps its role without a path scan.
+    pub fn railTarget(self: ActivePath, row: usize, rail: review_card.Rail) ?*const review_card.Card {
+        const depth = rail.target.depth;
+        if (depth >= self.by_depth.len) return null;
+        const card = self.by_depth[depth] orelse return null;
+        const parent = card.parent orelse return null;
+        return if (parent.rows.start < row and row < card.rows.start) card else null;
     }
 };
 
@@ -579,6 +522,142 @@ fn lineOnSide(row: Row, side: SelectedVersion) LineOnSide {
     return .{ .number = (if (side == .new) line.newNo() else line.oldNo()) orelse return .absent };
 }
 
+/// Source rows in the current uninterrupted Diff Line run. Cards do not end
+/// the run. Folds and section boundaries do. The line numbers are ordered.
+const SourceRows = struct {
+    side: SelectedVersion,
+    needed: bool = false,
+    ranged: bool = false,
+    last: ?usize = null,
+    indices: std.ArrayList(usize) = .empty,
+
+    fn add(self: *SourceRows, a: std.mem.Allocator, rows: []const Row, index: usize) !void {
+        if (!self.needed or lineOnSide(rows[index], self.side) != .number) return;
+        self.last = index;
+        if (self.ranged) try self.indices.append(a, index);
+    }
+
+    fn clear(self: *SourceRows) void {
+        self.last = null;
+        self.indices.clearRetainingCapacity();
+    }
+
+    fn anchorStart(self: SourceRows, rows: []const Row, top: u32, bottom: u32) ?usize {
+        const last = self.last orelse return null;
+        const number = lineOnSide(rows[last], self.side).number;
+        if (number < top or number > bottom) return null;
+        if (!self.ranged) return last;
+        var low: usize = 0;
+        var high = self.indices.items.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (lineOnSide(rows[self.indices.items[middle]], self.side).number < top) low = middle + 1 else high = middle;
+        }
+        return self.indices.items[low];
+    }
+};
+
+/// Index each card once. Every row borrows its stable arena-owned metadata.
+/// Shared rail chains contain one node per distinct visible column, not one
+/// copy of the ancestor list per card.
+fn indexCards(a: std.mem.Allocator, rows: []Row, tree_starts: []const usize, row_kinds: []RowKind, cards: []review_card.Card) !void {
+    var open: std.ArrayList(*review_card.Card) = .empty;
+    defer open.deinit(a);
+    var old: SourceRows = .{ .side = .old };
+    defer old.indices.deinit(a);
+    var new: SourceRows = .{ .side = .new };
+    defer new.indices.deinit(a);
+    for (tree_starts) |start| {
+        const card = cardAt(rows[start]).?;
+        if (card.depth != 0 or card.scope != .@"inline") continue;
+        const anchor = card.scope.@"inline";
+        const source = if (anchor.to != null) &new else &old;
+        source.needed = true;
+        source.ranged = source.ranged or anchor.top() != anchor.line();
+    }
+    var index: usize = 0;
+    var tree: usize = 0;
+    var card_index: usize = 0;
+    while (index < rows.len) {
+        row_kinds[index] = std.meta.activeTag(rows[index]);
+        const value = cardMut(&rows[index]) orelse {
+            while (open.pop()) |card| card.subtree_end = index;
+            switch (rows[index]) {
+                .line, .line_pair => {
+                    try old.add(a, rows, index);
+                    try new.add(a, rows, index);
+                },
+                else => {
+                    old.clear();
+                    new.clear();
+                },
+            }
+            index += 1;
+            continue;
+        };
+        var end = index + 1;
+        while (end < rows.len and sameCard(rows[end], value.owner)) end += 1;
+        if (tree < tree_starts.len and tree_starts[tree] == index) {
+            while (open.pop()) |card| card.subtree_end = index;
+            tree += 1;
+        }
+        var sibling: ?*review_card.Card = null;
+        while (open.getLastOrNull()) |previous| {
+            if (previous.depth < value.depth) break;
+            _ = open.pop();
+            previous.subtree_end = index;
+            if (previous.depth == value.depth and value.depth > 0) sibling = previous;
+        }
+        const parent = open.getLastOrNull();
+        const card = &cards[card_index];
+        card_index += 1;
+        card.* = .{
+            .rows = .{ .start = index, .end = end },
+            .subtree_end = end,
+            .parent = parent,
+            .root = if (parent) |p| p.root else card,
+            .depth = value.depth,
+            .role = value.role,
+            .anchored = .{ .start = index, .end = index },
+        };
+        if (value.depth == 0 and value.scope == .@"inline") {
+            const anchor = value.scope.@"inline";
+            if (anchor.top()) |top| if (anchor.line()) |bottom| {
+                const source = if (anchor.to != null) new else old;
+                card.anchored.start = source.anchorStart(rows, top, bottom) orelse index;
+            };
+        }
+        if (sibling) |previous| {
+            previous.next_sibling = card;
+            cardMut(&rows[previous.rows.end - 1]).?.sibling_below = true;
+        }
+        for (rows[index..end], row_kinds[index..end]) |*row, *kind| {
+            kind.* = std.meta.activeTag(row.*);
+            cardMut(row).?.card = card;
+        }
+        try open.append(a, card);
+        index = end;
+    }
+    std.debug.assert(card_index == cards.len);
+    while (open.pop()) |card| card.subtree_end = rows.len;
+
+    var rails: ?*const review_card.Rail = null;
+    for (cards) |*card| {
+        if (card.parent == null) rails = null;
+        while (rails) |rail| {
+            if (rail.target.depth < card.depth) break;
+            rails = rail.next;
+        }
+        for (rows[card.rows.start..card.rows.end]) |*row| cardMut(row).?.rails = rails;
+        const indent = cardAt(rows[card.rows.start]).?.indent;
+        if (card.next_sibling) |next| if (rails == null or rails.?.column != indent) {
+            const rail = try a.create(review_card.Rail);
+            rail.* = .{ .column = indent, .target = next, .next = rails };
+            rails = rail;
+        };
+    }
+}
+
 pub const FileTally = struct { comments: usize = 0, drafts: usize = 0 };
 pub const FileRow = struct {
     file_index: usize,
@@ -610,7 +689,12 @@ pub fn buildWithComments(
     opts: BuildOptions,
 ) BuildError!Buffer {
     var rows: std.ArrayList(Row) = .empty;
+    defer rows.deinit(opts.scratch_allocator);
+    var projection_scratch = std.heap.ArenaAllocator.init(opts.scratch_allocator);
+    defer projection_scratch.deinit();
     var file_rows: std.ArrayList(FileRow) = .empty;
+    var tree_starts: std.ArrayList(usize) = .empty;
+    defer tree_starts.deinit(allocator);
 
     // A Draft is placed exactly once: a root Draft by its anchor (inline line, or
     // the PR-level "Pending" section); a reply Draft after its parent's row (a
@@ -680,6 +764,8 @@ pub fn buildWithComments(
     var w: Weave = .{
         .a = allocator,
         .rows = &rows,
+        .projection_scratch = &projection_scratch,
+        .tree_starts = &tree_starts,
         .threads = threads,
         .drafts = opts.drafts,
         .emitted = emitted,
@@ -699,7 +785,7 @@ pub fn buildWithComments(
         if (!emitted_threads[index] and isPrLevel(thread)) pr_count += 1;
     };
     if (pr_count > 0) {
-        try rows.append(allocator, .{ .section = .{ .kind = .pr_comments, .count = pr_count } });
+        try rows.append(opts.scratch_allocator, .{ .section = .{ .kind = .pr_comments, .count = pr_count } });
         for (threads) |*t| {
             if (isPrLevel(t.*)) try w.emitThread(t);
         }
@@ -710,7 +796,7 @@ pub fn buildWithComments(
     // emitThread / emitDraft), not here.
     const pending_count = if (opts.only_file == null) countPendingRoots(opts.drafts) else 0;
     if (pending_count > 0) {
-        try rows.append(allocator, .{ .section = .{ .kind = .pending, .count = pending_count } });
+        try rows.append(opts.scratch_allocator, .{ .section = .{ .kind = .pending, .count = pending_count } });
         for (opts.drafts, 0..) |*d, i| {
             if (d.parent == null and draftScope(d, opts) == .review) try w.emitDraft(i);
         }
@@ -732,7 +818,7 @@ pub fn buildWithComments(
             file.old_path
         else
             file.new_path;
-        try rows.append(allocator, .{ .file_header = .{ .file = file, .path = header_path } });
+        try rows.append(opts.scratch_allocator, .{ .file_header = .{ .file = file, .path = header_path } });
 
         // File-level roots live at the File header, before hunks/folds/lines.
         for (threads) |*t| {
@@ -743,15 +829,15 @@ pub fn buildWithComments(
         }
 
         if (whole_unified) {
-            if (wholeFileState(opts, fi, file.*)) |state| try rows.append(allocator, .{ .status_placeholder = switch (opts.selected_version) {
+            if (wholeFileState(opts, fi, file.*)) |state| try rows.append(opts.scratch_allocator, .{ .status_placeholder = switch (opts.selected_version) {
                 .old => .{ .file = file, .old = state },
                 .new => .{ .file = file, .new = state },
             } });
         } else if (whole_side_by_side) {
             const old = wholeFileStateFor(opts, fi, file.*, .old);
             const new = wholeFileStateFor(opts, fi, file.*, .new);
-            if (old != null or new != null) try rows.append(allocator, .{ .status_placeholder = .{ .file = file, .old = old, .new = new } });
-        } else try emitStatusPlaceholders(allocator, &rows, layout, file, contentStatus(opts.content_statuses, fi));
+            if (old != null or new != null) try rows.append(opts.scratch_allocator, .{ .status_placeholder = .{ .file = file, .old = old, .new = new } });
+        } else try emitStatusPlaceholders(opts.scratch_allocator, &rows, layout, file, contentStatus(opts.content_statuses, fi));
 
         // True-whole-file: splice the fetched Hunk lines into the selected side's
         // unchanged lines and emit one continuous sequence without headers or
@@ -767,7 +853,7 @@ pub fn buildWithComments(
             try w.emitSideBySideWholeFile(file, old, new);
         } else if (!whole_unified) {
             for (file.hunks) |*hunk| {
-                try rows.append(allocator, .{ .hunk_header = hunk });
+                try rows.append(opts.scratch_allocator, .{ .hunk_header = hunk });
                 const folds = try computeFolds(allocator, hunk.lines, opts);
                 switch (layout) {
                     .unified => try w.emitUnifiedHunk(file, hunk.lines, if (opts.emphasis_cache) |cache| cache.entries.get(hunk).? else try computeEmphasis(allocator, hunk.lines), folds),
@@ -784,7 +870,7 @@ pub fn buildWithComments(
         if (od_count > 0) {
             const key: DisclosureKey = .{ .outdated_file = file };
             const expanded = w.expanded_disclosures.contains(disclosureId(key));
-            try rows.append(allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = od_count, .path = file.displayPath() } });
+            try rows.append(opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = od_count, .path = file.displayPath() } });
             if (expanded) {
                 for (threads) |*t| {
                     if (isFileOutdated(t.*, file.*)) try w.emitThreadContent(t);
@@ -823,7 +909,7 @@ pub fn buildWithComments(
     if (fallback_outdated_count > 0) {
         const key: DisclosureKey = .outdated_review;
         const expanded = w.expanded_disclosures.contains(disclosureId(key));
-        try rows.append(allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = fallback_outdated_count } });
+        try rows.append(opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = fallback_outdated_count } });
         if (expanded) {
             if (opts.only_file == null) for (threads, 0..) |*thread, thread_index| {
                 if (!emitted_threads[thread_index] and thread.root.state == .outdated) try w.emitThreadContent(thread);
@@ -844,7 +930,7 @@ pub fn buildWithComments(
         }
     }
     if (unavailable_count > 0) {
-        try rows.append(allocator, .{ .section = .{ .kind = .unavailable, .count = unavailable_count } });
+        try rows.append(opts.scratch_allocator, .{ .section = .{ .kind = .unavailable, .count = unavailable_count } });
         for (opts.drafts, 0..) |*draft, draft_index| {
             if (draft.parent != null or emitted[draft_index]) continue;
             if (!draftInScope(draft, diff, opts)) continue;
@@ -869,16 +955,21 @@ pub fn buildWithComments(
             (opts.only_file == null and w.parentUnavailable(d.parent)))) stranded += 1;
     }
     if (stranded > 0) {
-        try rows.append(allocator, .{ .section = .{ .kind = .pending, .count = stranded } });
+        try rows.append(opts.scratch_allocator, .{ .section = .{ .kind = .pending, .count = stranded } });
         for (opts.drafts, 0..) |*d, i| {
             if (!emitted[i] and ((d.parent == null and draftInScope(d, diff, opts)) or
                 (opts.only_file == null and w.parentUnavailable(d.parent)))) try w.emitDraft(i);
         }
     }
 
-    const owned_rows = try rows.toOwnedSlice(allocator);
+    const owned_rows = try allocator.dupe(Row, rows.items);
     const row_kinds = try allocator.alloc(RowKind, owned_rows.len);
-    for (owned_rows, row_kinds) |row, *kind| kind.* = std.meta.activeTag(row);
+    if (tree_starts.items.len > 0) {
+        const cards = try allocator.alloc(review_card.Card, w.card_count);
+        try indexCards(allocator, owned_rows, tree_starts.items, row_kinds, cards);
+    } else {
+        for (owned_rows, row_kinds) |row, *kind| kind.* = std.meta.activeTag(row);
+    }
     return .{
         .rows = owned_rows,
         .row_kinds = row_kinds,
@@ -1084,6 +1175,9 @@ fn emitStatusPlaceholders(
 const Weave = struct {
     a: std.mem.Allocator,
     rows: *std.ArrayList(Row),
+    tree_starts: *std.ArrayList(usize),
+    projection_scratch: *std.heap.ArenaAllocator,
+    card_count: usize = 0,
     threads: []const Thread,
     drafts: []const Draft,
     /// Index-aligned with `drafts`; set once the Draft has been placed.
@@ -1105,7 +1199,7 @@ const Weave = struct {
         if (t.resolved) {
             const key: DisclosureKey = .{ .resolved_thread = t.root.id };
             const expanded = w.expanded_disclosures.contains(disclosureId(key));
-            try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .resolved_thread, .expanded = expanded, .count = t.replies.len } });
+            try w.rows.append(w.opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .resolved_thread, .expanded = expanded, .count = t.replies.len } });
             if (!expanded) return;
         }
         try w.emitThreadContent(t);
@@ -1122,39 +1216,7 @@ const Weave = struct {
         const start = w.rows.items.len;
         try w.emitComment(t.root, 0, indentation);
         try w.emitRepliesTo(parent, 1, indentation);
-        try w.markSiblingLines(w.rows.items[start..]);
-    }
-
-    /// Mark each card that a later sibling follows, and give each card row the
-    /// columns of the ancestor lines that run past it to a later sibling.
-    /// `rows` holds the cards of one tree in weave order.
-    fn markSiblingLines(w: *Weave, rows: []Row) !void {
-        const Open = struct { depth: usize, index: usize };
-        var open: std.ArrayList(Open) = .empty;
-        for (rows, 0..) |*row, index| {
-            const card = cardMut(row) orelse continue;
-            if (index > 0 and sameCard(rows[index - 1], card.owner)) {
-                open.items[open.items.len - 1].index = index;
-                continue;
-            }
-            while (open.getLastOrNull()) |previous| {
-                if (previous.depth < card.depth) break;
-                _ = open.pop();
-                if (previous.depth == card.depth) cardMut(&rows[previous.index]).?.sibling_below = true;
-            }
-            try open.append(w.a, .{ .depth = card.depth, .index = index });
-        }
-        var lines: std.ArrayList(review_card.Rail) = .empty;
-        var columns: []const review_card.Rail = &.{};
-        for (rows, 0..) |*row, index| {
-            const card = cardMut(row) orelse continue;
-            if (index == 0 or !sameCard(rows[index - 1], card.owner)) {
-                while (lines.items.len > 0 and lines.items[lines.items.len - 1].depth >= card.depth) _ = lines.pop();
-                columns = try w.a.dupe(review_card.Rail, lines.items);
-            }
-            card.rails = columns;
-            if (card.sibling_below) try lines.append(w.a, .{ .column = card.indent, .depth = card.depth });
-        }
+        try w.tree_starts.append(w.a, start);
     }
 
     /// Parse authored bytes into a width-independent ReviewBody and project the
@@ -1167,7 +1229,7 @@ const Weave = struct {
             if (c.suggestion() != null) "suggestion" else null,
         });
         const parsed = try review_card.ReviewBody.parse(w.a, c.body);
-        const projected = try review_card.project(w.a, parsed, .{
+        try w.projectCard(parsed, .{
             .owner = owner,
             .source = .{ .comment = c },
             .scope = w.card_scope,
@@ -1186,7 +1248,19 @@ const Weave = struct {
             .collapsed_rows = w.opts.collapsed_rows,
             .expanded = w.expanded_disclosures.contains(disclosureId(.{ .review_card = owner })),
         });
-        for (projected) |row| try w.rows.append(w.a, .{ .comment = row });
+    }
+
+    fn projectCard(w: *Weave, body: review_card.ReviewBody, options: review_card.Options) !void {
+        defer _ = w.projection_scratch.reset(.{ .retain_with_limit = 64 * 1024 });
+        try review_card.projectInto(w.a, w.projection_scratch.allocator(), body, options, w);
+        w.card_count += 1;
+    }
+
+    pub fn append(w: *Weave, row: ReviewCardRow) !void {
+        try w.rows.append(w.opts.scratch_allocator, switch (row.owner) {
+            .comment => .{ .comment = row },
+            .draft => .{ .draft = row },
+        });
     }
 
     /// Append one Draft row (marking it emitted), then cascade its own pending
@@ -1201,7 +1275,7 @@ const Weave = struct {
         indentation.relative = w.parentUnavailable(w.drafts[i].parent);
         const start = w.rows.items.len;
         try w.emitDraftAt(i, 0, indentation);
-        try w.markSiblingLines(w.rows.items[start..]);
+        if (w.rows.items.len > start) try w.tree_starts.append(w.a, start);
     }
 
     fn emitDraftAt(w: *Weave, i: usize, depth: usize, indentation: CardIndentation) std.mem.Allocator.Error!void {
@@ -1225,7 +1299,7 @@ const Weave = struct {
                 .draft_reply
             else
                 .draft;
-            const projected = try review_card.project(w.a, parsed, .{
+            try w.projectCard(parsed, .{
                 .owner = owner,
                 .source = .{ .draft = d },
                 .scope = w.card_scope,
@@ -1239,7 +1313,6 @@ const Weave = struct {
                 .collapsed_rows = w.opts.collapsed_rows,
                 .expanded = w.expanded_disclosures.contains(disclosureId(.{ .review_card = owner })),
             });
-            for (projected) |row| try w.rows.append(w.a, .{ .draft = row });
         }
         try w.emitRepliesTo(.{ .draft = d.local_id }, depth + 1, indentation);
     }
@@ -1250,7 +1323,7 @@ const Weave = struct {
             var lines = std.mem.splitScalar(u8, snapshot.text, '\n');
             var line_index: u32 = 0;
             while (lines.next()) |line| : (line_index += 1) {
-                try w.rows.append(w.a, .{ .snapshot = .{
+                try w.rows.append(w.opts.scratch_allocator, .{ .snapshot = .{
                     .draft = draft,
                     .line = line,
                     .selected = line_index >= snapshot.selection_start and line_index < snapshot.selection_start +| snapshot.selection_len,
@@ -1306,13 +1379,13 @@ const Weave = struct {
             if (foldStartingAt(folds, &lines[i])) |f| {
                 const key: DisclosureKey = .{ .fold = f.id };
                 const expanded = w.expanded_disclosures.contains(disclosureId(key));
-                try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
+                try w.rows.append(w.opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
                 if (!expanded) {
                     i += f.lines.len;
                     continue;
                 }
             }
-            try w.rows.append(w.a, .{ .line = try decoratedLine(w.a, &lines[i], w.span_cursors.lineSpans(lines[i]), emphasis[i]) });
+            try w.rows.append(w.opts.scratch_allocator, .{ .line = try decoratedLine(w.a, &lines[i], w.span_cursors.lineSpans(lines[i]), emphasis[i]) });
             try w.weaveInline(file, &lines[i]);
             i += 1;
         }
@@ -1322,7 +1395,7 @@ const Weave = struct {
         for (lines) |line| {
             var projected = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
             projected.display_version = side;
-            try w.rows.append(w.a, .{ .line = projected });
+            try w.rows.append(w.opts.scratch_allocator, .{ .line = projected });
             try w.weaveInlineSide(file, line, side);
         }
     }
@@ -1349,7 +1422,7 @@ const Weave = struct {
         if (count == 0) return;
         const key: DisclosureKey = .{ .opposite_version = file };
         const expanded = w.expanded_disclosures.contains(disclosureId(key));
-        try w.rows.append(w.a, .{ .disclosure = .{
+        try w.rows.append(w.opts.scratch_allocator, .{ .disclosure = .{
             .key = key,
             .kind = .opposite_version,
             .expanded = expanded,
@@ -1423,7 +1496,7 @@ const Weave = struct {
             pair.right = try decoratedLine(w.a, line, w.span_cursors.lineSpansForSide(line.*, .new), &.{});
             pair.right.?.display_version = .new;
         }
-        try w.rows.append(w.a, .{ .line_pair = pair });
+        try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = pair });
     }
 
     fn emitWholeFileSideHunk(w: *Weave, file: *const model.File, lines: []const model.Line, side: SelectedVersion) !void {
@@ -1449,7 +1522,7 @@ const Weave = struct {
             if (foldStartingAt(folds, &lines[i])) |f| {
                 const key: DisclosureKey = .{ .fold = f.id };
                 const expanded = w.expanded_disclosures.contains(disclosureId(key));
-                try w.rows.append(w.a, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
+                try w.rows.append(w.opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .fold, .expanded = expanded, .count = f.lines.len } });
                 if (!expanded) {
                     i += f.lines.len;
                     continue;
@@ -1464,7 +1537,7 @@ const Weave = struct {
                         .{ .right = line }
                     else
                         .{ .left = line, .right = line };
-                    try w.rows.append(w.a, .{ .line_pair = pair });
+                    try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = pair });
                     try w.weaveInline(file, &lines[i]);
                     i += 1;
                 },
@@ -1474,7 +1547,7 @@ const Weave = struct {
                     while (i < lines.len and lines[i].kind == .added) i += 1;
                     var p = start;
                     while (p < i) : (p += 1) {
-                        try w.rows.append(w.a, .{ .line_pair = .{ .right = try decoratedLine(w.a, &lines[p], w.span_cursors.lineSpans(lines[p]), &.{}) } });
+                        try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .right = try decoratedLine(w.a, &lines[p], w.span_cursors.lineSpans(lines[p]), &.{}) } });
                         try w.weaveInline(file, &lines[p]);
                     }
                 },
@@ -1580,7 +1653,7 @@ const Weave = struct {
                     const pair = try intraline.diff(w.a, removed[old_cursor].text, added[new_cursor].text);
                     const left = try decoratedLine(w.a, &removed[old_cursor], w.span_cursors.lineSpans(removed[old_cursor]), pair.old);
                     const right = try decoratedLine(w.a, &added[new_cursor], w.span_cursors.lineSpans(added[new_cursor]), pair.new);
-                    try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
+                    try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .left = left, .right = right } });
                     try w.weaveInline(file, right.line);
                     try w.weaveInline(file, left.line);
                     old_cursor += 1;
@@ -1588,13 +1661,13 @@ const Weave = struct {
                 },
                 .right => {
                     const right = try decoratedLine(w.a, &added[new_cursor], w.span_cursors.lineSpans(added[new_cursor]), &.{});
-                    try w.rows.append(w.a, .{ .line_pair = .{ .right = right } });
+                    try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .right = right } });
                     try w.weaveInline(file, right.line);
                     new_cursor += 1;
                 },
                 .left => {
                     const left = try decoratedLine(w.a, &removed[old_cursor], w.span_cursors.lineSpans(removed[old_cursor]), &.{});
-                    try w.rows.append(w.a, .{ .line_pair = .{ .left = left } });
+                    try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .left = left } });
                     try w.weaveInline(file, left.line);
                     old_cursor += 1;
                 },
@@ -1615,18 +1688,18 @@ const Weave = struct {
             const emphasize = pair.whole_line or intraline.similarity(pair) >= emphasis_threshold;
             const left = try decoratedLine(w.a, &removed[i], w.span_cursors.lineSpans(removed[i]), if (emphasize) pair.old else &.{});
             const right = try decoratedLine(w.a, &added[i], w.span_cursors.lineSpans(added[i]), if (emphasize) pair.new else &.{});
-            try w.rows.append(w.a, .{ .line_pair = .{ .left = left, .right = right } });
+            try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .left = left, .right = right } });
             try w.weaveInline(file, right.line);
             try w.weaveInline(file, left.line);
         }
         for (removed[pair_count..]) |*line| {
             const left = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
-            try w.rows.append(w.a, .{ .line_pair = .{ .left = left } });
+            try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .left = left } });
             try w.weaveInline(file, left.line);
         }
         for (added[pair_count..]) |*line| {
             const right = try decoratedLine(w.a, line, w.span_cursors.lineSpans(line.*), &.{});
-            try w.rows.append(w.a, .{ .line_pair = .{ .right = right } });
+            try w.rows.append(w.opts.scratch_allocator, .{ .line_pair = .{ .right = right } });
             try w.weaveInline(file, right.line);
         }
     }
@@ -2121,6 +2194,114 @@ pub fn fileTallies(allocator: std.mem.Allocator, diff: model.Diff, threads: []co
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "ReviewCard rail storage stays linear in Reply count" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const depth = 128;
+    const comments = try a.alloc(Comment, depth * 2 + 1);
+    comments[0] = .{ .id = 1, .author = "A", .body = "x" };
+    for (1..depth + 1) |d| comments[d] = .{ .id = d + 1, .parent_id = d, .author = "A", .body = "x" };
+    for (0..depth) |d| comments[depth + 1 + d] = .{ .id = depth + 2 + d, .parent_id = d + 1, .author = "A", .body = "x" };
+    const replies = try a.alloc(*const Comment, comments.len - 1);
+    for (replies, comments[1..]) |*reply, *comment| reply.* = comment;
+    const threads = [_]Thread{.{ .root = &comments[0], .replies = replies, .resolved = false }};
+    const buf = try buildWithComments(a, .{ .files = &.{} }, .unified, &threads, .{ .card_width = 60 });
+    var stored: std.AutoHashMapUnmanaged(*const review_card.Rail, void) = .empty;
+    defer stored.deinit(a);
+    for (buf.rows) |row| if (row == .comment and row.comment.part == .header) {
+        var rails = row.comment.rails;
+        var columns: usize = 0;
+        var previous_column: usize = 60;
+        while (rails) |rail| : (rails = rail.next) {
+            const entry = try stored.getOrPut(a, rail);
+            entry.value_ptr.* = {};
+            try testing.expect(rail.column < previous_column);
+            previous_column = rail.column;
+            columns += 1;
+        }
+        try testing.expect(columns <= 60);
+    };
+    const rail_bytes = stored.count() * @sizeOf(review_card.Rail);
+    try testing.expect(rail_bytes <= comments.len * 2 * @sizeOf(review_card.Rail));
+}
+
+test "Active Path lookup needs only the cursor row and shared card geometry" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const comments = [_]Comment{
+        .{ .id = 1, .author = "Root", .body = "```\n" ++ "x\n" ** 4096 ++ "```" },
+        .{ .id = 2, .parent_id = 1, .author = "Reply", .body = "reply" },
+    };
+    const threads = try bbr.review.buildThreads(a, &comments);
+    const buf = try buildWithComments(a, .{ .files = &.{} }, .unified, threads, .{ .collapsed_rows = 0 });
+    const cursor = buf.rows.len - 1;
+    const own = buf.rows[cursor].comment.card.?;
+    try testing.expect(own.rows.start > 4096);
+    // No off-screen row is available to the lookup, including the parent body.
+    const visible: Buffer = .{ .rows = buf.rows[cursor .. cursor + 1], .layout = .unified };
+    const path = try visible.activePath(a, 0);
+    try testing.expectEqual(own, path.card.?);
+    try testing.expectEqual(own.root, path.root().?);
+    try testing.expect(path.holds(own.parent));
+    try testing.expectEqual(@as(usize, 2), path.by_depth.len);
+    try testing.expectEqual(own.root, path.by_depth[0].?);
+    try testing.expectEqual(own, path.by_depth[1].?);
+}
+
+test "ReviewCard metadata construction releases every failed arena" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const comments = [_]Comment{
+                .{ .id = 1, .author = "Root", .body = "x" },
+                .{ .id = 2, .parent_id = 1, .author = "First", .body = "x" },
+                .{ .id = 3, .parent_id = 2, .author = "Nested", .body = "x" },
+                .{ .id = 4, .parent_id = 1, .author = "Last", .body = "x" },
+            };
+            const threads = try bbr.review.buildThreads(a, &comments);
+            const buf = try buildWithComments(a, .{ .files = &.{} }, .unified, threads, .{ .scratch_allocator = backing });
+            const path = try buf.activePath(a, buf.rows.len - 1);
+            try testing.expect(path.holds(path.root()));
+        }
+    }.run, .{});
+}
+
+test "hidden Draft parents keep separate card trees and sparse Active Path depths" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const drafts = [_]Draft{
+        .{ .local_id = 1, .kind = .comment, .body = "hidden", .state = .submitting },
+        .{ .local_id = 2, .kind = .comment, .body = "first", .parent = .{ .draft = 1 } },
+        .{ .local_id = 3, .kind = .comment, .body = "hidden", .state = .submitting },
+        .{ .local_id = 4, .kind = .comment, .body = "second", .parent = .{ .draft = 3 } },
+        .{ .local_id = 5, .kind = .comment, .body = "nested", .parent = .{ .draft = 2 } },
+    };
+    const buf = try buildWithComments(a, .{ .files = &.{} }, .unified, &.{}, .{ .drafts = &drafts });
+    var roots: [2]*const review_card.Card = undefined;
+    var count: usize = 0;
+    for (buf.rows) |row| if (row == .draft) {
+        const card = row.draft.card.?;
+        try testing.expect(!row.draft.sibling_below);
+        try testing.expect(row.draft.rails == null);
+        if (row.draft.part == .header and card.parent == null) {
+            roots[count] = card;
+            count += 1;
+            try testing.expectEqual(@as(usize, 1), card.depth);
+            const path = try buf.activePath(a, card.rows.start);
+            try testing.expect(path.by_depth[0] == null);
+            try testing.expectEqual(card, path.root().?);
+        }
+    };
+    try testing.expectEqual(@as(usize, 2), count);
+    const path = try buf.activePath(a, roots[1].rows.start);
+    try testing.expect(!path.holds(roots[0]));
+}
 const parse = bbr.diff.parse;
 
 const two_file_diff =
@@ -3054,6 +3235,7 @@ test "M23 ancestry completes mixed parent subtrees before published siblings" {
         .{ .draft = 2 },   .{ .comment = 3 }, .{ .draft = 3 },   .{ .draft = 4 },
     };
     const depths = [_]usize{ 0, 1, 2, 3, 2, 1, 1, 2 };
+    const parent_indices = [_]?usize{ null, 0, 1, 2, 1, 0, 0, 6 };
     for ([_]Layout{ .unified, .side_by_side }) |layout| for (0..3) |disclosure| {
         comments[0].resolved = disclosure == 1;
         threads[0].resolved = disclosure == 1;
@@ -3066,16 +3248,30 @@ test "M23 ancestry completes mixed parent subtrees before published siblings" {
         }
         const buf = try buildWithComments(a, diff, layout, threads, .{ .drafts = &drafts, .expanded_disclosures = &keys });
         var index: usize = 0;
+        var geometry: [expected.len]*const review_card.Card = undefined;
         for (buf.rows) |row| switch (row) {
             .comment, .draft => |card| if (card.part == .header) {
                 try testing.expect(index < expected.len);
                 try testing.expectEqualDeep(expected[index], card.owner);
                 try testing.expectEqual(depths[index], card.depth);
+                geometry[index] = card.card.?;
                 index += 1;
             },
             else => {},
         };
         try testing.expectEqual(expected.len, index);
+        for (geometry, parent_indices, 0..) |card, parent, cursor| {
+            try testing.expectEqual(if (parent) |p| geometry[p] else null, card.parent);
+            try testing.expectEqual(geometry[0], card.root);
+            for (buf.rows[card.rows.start..card.rows.end]) |row| try testing.expectEqual(card, cardAt(row).?.card.?);
+            const path = try buf.activePath(a, card.rows.start);
+            for (geometry, 0..) |candidate, target| {
+                var ancestor: ?usize = cursor;
+                while (ancestor != null and ancestor.? != target) ancestor = parent_indices[ancestor.?];
+                try testing.expectEqual(ancestor != null, path.holds(candidate));
+                try testing.expectEqual(ancestor != null and cursor != target, path.banded(buf, candidate.rows.start));
+            }
+        }
     };
 }
 

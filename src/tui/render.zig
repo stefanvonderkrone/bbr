@@ -428,7 +428,7 @@ fn drawVisualPane(
         const row_theme = if (path.banded(buf, visual_row.buffer_index)) ancestry_theme else theme;
         drawVisualRow(scratch, win, screen_row, buf.layout, buf.selected_column, row, visual_row, row_theme, if (selected) buf.selected_version else null, .{ .path = path, .row = visual_row.buffer_index });
         if (path.indicator(visual_row.buffer_index)) |part| {
-            var style = row_theme.reviewCardStyle(path.cards[0].role, .body, .{});
+            var style = row_theme.reviewCardStyle(path.root().?.role, .body, .{});
             style.bg = (win.readCell(0, screen_row) orelse continue).style.bg;
             style = row_theme.resolveStyle(style);
             switch (part) {
@@ -820,7 +820,7 @@ fn drawReviewCard(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, card: b
     var base = theme.reviewCardStyle(card.role, card.part, .{});
     if (card.block_kind == .heading) base.bold = true;
     const dim = theme.resolveStyle(theme.card_border_dim);
-    const on_path = chrome.path.holds(chrome.row);
+    const on_path = chrome.path.holds(card.card);
     const border = if (on_path) theme.reviewCardStyle(card.role, .body, .{}) else dim;
     var title = base;
     if (!on_path) title.fg = dim.fg;
@@ -849,8 +849,9 @@ fn drawReviewCard(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, card: b
     // The line from a card to its later sibling: `├` at the card's bottom-left
     // corner, then `│` at that column on every row between them.
     if (card.sibling_below) view_paint.join(win, left, r, .{ .down = true });
-    for (card.rails) |rail| {
-        const target = chrome.path.railTarget(chrome.row, rail);
+    var rails = card.rails;
+    while (rails) |rail| : (rails = rail.next) {
+        const target = chrome.path.railTarget(chrome.row, rail.*);
         view_paint.rail(win, rail.column, r, if (target) |path_card| theme.reviewCardStyle(path_card.role, .body, .{}) else dim);
     }
     if (card.part.isBorder() or card.segments.len == 0) return;
@@ -5198,6 +5199,34 @@ test "M23 ancestry only the active path shows its Anchor Indicator" {
             errdefer std.debug.print("rail row {d}\n", .{row});
             try testing.expectEqualStrings("│", rail.char.grapheme);
             try testing.expectEqual(rail_fg, rail.style.fg);
+        }
+    };
+}
+
+test "sibling rails use the Active Path role past more than one sibling" {
+    const comments = [_]bbr.review.Comment{
+        .{ .id = 1, .author = "Root", .body = "x", .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 4 } } },
+        .{ .id = 2, .parent_id = 1, .author = "A", .body = "x" },
+        .{ .id = 3, .parent_id = 2, .author = "A child", .body = "x" },
+        .{ .id = 4, .parent_id = 1, .author = "B", .body = "x" },
+        .{ .id = 5, .parent_id = 4, .author = "B child", .body = "x" },
+    };
+    const drafts = [_]bbr.review.Draft{.{ .local_id = 1, .kind = .comment, .body = "x", .parent = .{ .comment = 1 }, .state = .outcome_unknown }};
+    for ([_]buffer_mod.Layout{ .unified, .side_by_side }) |layout| for ([_]u16{ 60, 100 }) |width| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const pane = try paintCards(arena.allocator(), &comments, &drafts, layout, width, .{ .card = .{ .draft = 1 } }, theme_dark);
+        const expected = theme_dark.reviewCardStyle(.outcome_unknown_reply, .body, .{}).fg;
+        for ([_][2]@import("review_card.zig").Owner{
+            .{ .{ .comment = 2 }, .{ .comment = 4 } },
+            .{ .{ .comment = 4 }, .{ .draft = 1 } },
+        }) |pair| {
+            const column = pane.cardIndent(pair[0]);
+            for (pane.cardRow(pair[0], .bottom) + 1..pane.cardRow(pair[1], .header) - 1) |row| {
+                const cell = pane.win.readCell(@intCast(column), @intCast(row)).?;
+                try testing.expectEqualStrings("│", cell.char.grapheme);
+                try testing.expectEqual(expected, cell.style.fg);
+            }
         }
     };
 }

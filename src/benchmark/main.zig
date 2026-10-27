@@ -75,7 +75,7 @@ pub fn main(init: std.process.Init) !void {
     var navigation_arena = std.heap.ArenaAllocator.init(init.gpa);
     defer navigation_arena.deinit();
     const navigation_context: buffer_navigation.Context = .{
-        .buffer = try buffer_projection.run(navigation_arena.allocator(), &projection_context),
+        .buffer = try buffer_projection.run(navigation_arena.allocator(), init.gpa, &projection_context),
     };
     var comment_arena = std.heap.ArenaAllocator.init(init.gpa);
     defer comment_arena.deinit();
@@ -198,6 +198,7 @@ pub fn main(init: std.process.Init) !void {
                 init.gpa,
                 benchmark.name,
                 count,
+                .arena,
                 &benchmark.context,
                 highlight.runSplit,
                 highlight.checksum,
@@ -209,6 +210,7 @@ pub fn main(init: std.process.Init) !void {
                 benchmark.name,
                 .instruction_throughput,
                 benchmark.context.content.len,
+                .arena,
                 &benchmark.context,
                 highlight.runSplit,
                 highlight.checksum,
@@ -225,7 +227,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (selected == null or std.mem.eql(u8, selected.?, "whole_file_line_starts_5000")) {
         matched = true;
-        if (repeat_count) |count| try harness.repeat(writer, init.gpa, "whole_file_line_starts_5000", count, &whole_file_context, p1_actions.wholeFile, p1_actions.bufferChecksum) else try harness.run(writer, init.io, init.gpa, calibrations, "whole_file_line_starts_5000", .memory_bandwidth, whole_file_blob.len, &whole_file_context, p1_actions.wholeFile, p1_actions.bufferChecksum);
+        if (repeat_count) |count| try harness.repeatSplit(writer, init.gpa, "whole_file_line_starts_5000", count, .reclaimable, &whole_file_context, p1_actions.wholeFile, p1_actions.bufferChecksum) else try harness.runSplit(writer, init.io, init.gpa, calibrations, "whole_file_line_starts_5000", .memory_bandwidth, whole_file_blob.len, .reclaimable, &whole_file_context, p1_actions.wholeFile, p1_actions.bufferChecksum);
     }
     const visual_benchmarks = [_]struct { name: []const u8, context: p1_actions.VisualRowsContext }{
         .{ .name = "visual_rows_wide_50000", .context = visual_rows_wide_context },
@@ -261,15 +263,16 @@ pub fn main(init: std.process.Init) !void {
     }
     if (selected == null or std.mem.eql(u8, selected.?, buffer_projection.name)) {
         matched = true;
-        if (repeat_count) |count| try harness.repeat(
+        if (repeat_count) |count| try harness.repeatSplit(
             writer,
             init.gpa,
             buffer_projection.name,
             count,
+            .reclaimable,
             &projection_context,
             buffer_projection.run,
             buffer_projection.checksum,
-        ) else try harness.run(
+        ) else try harness.runSplit(
             writer,
             init.io,
             init.gpa,
@@ -277,6 +280,7 @@ pub fn main(init: std.process.Init) !void {
             buffer_projection.name,
             .memory_bandwidth,
             raw.len,
+            .reclaimable,
             &projection_context,
             buffer_projection.run,
             buffer_projection.checksum,
@@ -310,15 +314,16 @@ pub fn main(init: std.process.Init) !void {
         const name = try std.fmt.bufPrint(&name_buffer, "comment_anchors_{d}", .{context.threads.len});
         if (selected == null or std.mem.eql(u8, selected.?, name)) {
             matched = true;
-            if (repeat_count) |count| try harness.repeat(
+            if (repeat_count) |count| try harness.repeatSplit(
                 writer,
                 init.gpa,
                 name,
                 count,
+                .reclaimable,
                 context,
                 comment_anchors.run,
                 comment_anchors.checksum,
-            ) else try harness.run(
+            ) else try harness.runSplit(
                 writer,
                 init.io,
                 init.gpa,
@@ -326,6 +331,7 @@ pub fn main(init: std.process.Init) !void {
                 name,
                 .instruction_throughput,
                 parsed.files.len * (context.threads.len + context.drafts.len),
+                .reclaimable,
                 context,
                 comment_anchors.run,
                 comment_anchors.checksum,
@@ -341,15 +347,16 @@ pub fn main(init: std.process.Init) !void {
     for (&span_benchmarks) |*benchmark| {
         if (selected == null or std.mem.eql(u8, selected.?, benchmark.name)) {
             matched = true;
-            if (repeat_count) |count| try harness.repeat(
+            if (repeat_count) |count| try harness.repeatSplit(
                 writer,
                 init.gpa,
                 benchmark.name,
                 count,
+                .reclaimable,
                 &benchmark.context,
                 span_projection.run,
                 span_projection.checksum,
-            ) else try harness.run(
+            ) else try harness.runSplit(
                 writer,
                 init.io,
                 init.gpa,
@@ -357,6 +364,7 @@ pub fn main(init: std.process.Init) !void {
                 benchmark.name,
                 .instruction_throughput,
                 benchmark.context.highlights[0].new.?.spans.len * 5_000,
+                .reclaimable,
                 &benchmark.context,
                 span_projection.run,
                 span_projection.checksum,

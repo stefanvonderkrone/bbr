@@ -1371,6 +1371,31 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
 // root* file's test blocks. This block roots the exe module's TUI test tree
 // (app → render → theme → nav → list_overlay → session); the core `bbr` module's
 // tests run via src/root.zig.
+test "bordered Reply trees keep combined build memory below the main baseline" {
+    const testing = std.testing;
+    var fixture = std.heap.ArenaAllocator.init(testing.allocator);
+    defer fixture.deinit();
+    const a = fixture.allocator();
+    const depth = 4000;
+    const comments = try a.alloc(bbr.review.Comment, depth * 2 + 1);
+    comments[0] = .{ .id = 1, .author = "A", .body = "x" };
+    for (1..depth + 1) |d| comments[d] = .{ .id = d + 1, .parent_id = d, .author = "A", .body = "x" };
+    for (0..depth) |d| comments[depth + 1 + d] = .{ .id = depth + 2 + d, .parent_id = d + 1, .author = "A", .body = "x" };
+    const replies = try a.alloc(*const bbr.review.Comment, comments.len - 1);
+    for (replies, comments[1..]) |*reply, *comment| reply.* = comment;
+    const threads = [_]bbr.review.Thread{.{ .root = &comments[0], .replies = replies, .resolved = false }};
+    var memory: @import("benchmark/harness.zig").CountingAllocator = .{ .backing = testing.allocator };
+    var result = std.heap.ArenaAllocator.init(memory.allocator());
+    defer result.deinit();
+    const buf = try buffer_mod.buildWithComments(result.allocator(), .{ .files = &.{} }, .unified, &threads, .{
+        .card_width = 100,
+        .scratch_allocator = memory.allocator(),
+    });
+    try testing.expectEqual(@as(usize, 32_004), buf.rows.len);
+    // Both result and scratch allocations pass through the same counter.
+    try testing.expect(memory.peak_bytes < 80_000_000);
+}
+
 test {
     _ = @import("completion.zig");
     _ = @import("api/cli.zig");

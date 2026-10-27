@@ -54,10 +54,11 @@ pub const WholeFileContext = struct {
     blobs: []const bbr.diff.FileBlob,
 };
 
-pub fn wholeFile(allocator: std.mem.Allocator, context: *const WholeFileContext) !tui.buffer.Buffer {
+pub fn wholeFile(allocator: std.mem.Allocator, scratch_allocator: std.mem.Allocator, context: *const WholeFileContext) !tui.buffer.Buffer {
     return tui.buffer.buildWithComments(allocator, context.diff, .unified, &.{}, .{
         .whole_file = true,
         .blobs = context.blobs,
+        .scratch_allocator = scratch_allocator,
     });
 }
 

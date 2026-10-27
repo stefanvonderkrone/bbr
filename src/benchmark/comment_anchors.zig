@@ -11,10 +11,11 @@ pub const Context = struct {
     expanded_disclosures: []const buffer_mod.DisclosureKey,
 };
 
-pub fn run(allocator: std.mem.Allocator, context: *const Context) !buffer_mod.Buffer {
+pub fn run(allocator: std.mem.Allocator, scratch_allocator: std.mem.Allocator, context: *const Context) !buffer_mod.Buffer {
     return buffer_mod.buildWithComments(allocator, context.diff, .unified, context.threads, .{
         .drafts = context.drafts,
         .expanded_disclosures = context.expanded_disclosures,
+        .scratch_allocator = scratch_allocator,
     });
 }
 
