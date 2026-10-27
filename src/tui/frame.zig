@@ -405,7 +405,10 @@ fn appendRangeIntersections(
 
 const SideBodyWidths = struct { left: usize, right: usize };
 
-pub const side_gutter_cols: usize = 5;
+/// Column 0 of the DiffPane holds the Anchor Indicator, so each gutter starts
+/// after it.
+pub const anchor_cols: usize = 1;
+pub const side_gutter_cols: usize = anchor_cols + 5;
 pub const side_divider_cols: usize = 1;
 
 fn sideBodyWidths(width: usize) ?SideBodyWidths {
@@ -520,7 +523,7 @@ fn candidatesForLine(line: *const bbr.diff.Line) YankCandidates {
     };
 }
 
-pub const unified_gutter_cols: usize = 10;
+pub const unified_gutter_cols: usize = anchor_cols + 10;
 
 fn wrapEnd(text: []const u8, start: usize, width: usize, metrics: CellMetrics) usize {
     var pos = start;
@@ -589,10 +592,10 @@ pub const NavigationIndex = struct {
                     try result.add(a, .{ .line = half.line }, half.source_start, half.source_end, index);
             } else switch (row.owner) {
                 .line => try result.add(a, row.owner, row.source_start, row.source_end, index),
-                .comment => |value| if (value.part != .header) {
+                .comment => |value| if (value.part != .header and value.part != .gap) {
                     try result.add(a, .{ .comment = .{ .id = value.id, .source_offset = 0 } }, value.source_offset, row.source_end, index);
                 },
-                .draft => |value| if (value.part != .header) {
+                .draft => |value| if (value.part != .header and value.part != .gap) {
                     try result.add(a, .{ .draft = .{ .id = value.id, .source_offset = 0 } }, value.source_offset, row.source_end, index);
                 },
                 else => {},
@@ -740,11 +743,11 @@ fn findOwner(visual_rows: []const VisualRow, wanted: RowOwner) ?usize {
     var nearest: ?usize = null;
     var nearest_offset: usize = std.math.maxInt(usize);
     for (visual_rows, 0..) |visual_row, index| switch (wanted) {
-        .comment => |value| if (visual_row.owner == .comment and visual_row.owner.comment.id == value.id and visual_row.owner.comment.part != .header and ((visual_row.owner.comment.source_offset <= value.source_offset and value.source_offset < visual_row.source_end) or visual_row.owner.comment.source_offset >= value.source_offset) and visual_row.owner.comment.source_offset < nearest_offset) {
+        .comment => |value| if (visual_row.owner == .comment and visual_row.owner.comment.id == value.id and visual_row.owner.comment.part != .header and visual_row.owner.comment.part != .gap and ((visual_row.owner.comment.source_offset <= value.source_offset and value.source_offset < visual_row.source_end) or visual_row.owner.comment.source_offset >= value.source_offset) and visual_row.owner.comment.source_offset < nearest_offset) {
             nearest = index;
             nearest_offset = visual_row.owner.comment.source_offset;
         },
-        .draft => |value| if (visual_row.owner == .draft and visual_row.owner.draft.id == value.id and visual_row.owner.draft.part != .header and ((visual_row.owner.draft.source_offset <= value.source_offset and value.source_offset < visual_row.source_end) or visual_row.owner.draft.source_offset >= value.source_offset) and visual_row.owner.draft.source_offset < nearest_offset) {
+        .draft => |value| if (visual_row.owner == .draft and visual_row.owner.draft.id == value.id and visual_row.owner.draft.part != .header and visual_row.owner.draft.part != .gap and ((visual_row.owner.draft.source_offset <= value.source_offset and value.source_offset < visual_row.source_end) or visual_row.owner.draft.source_offset >= value.source_offset) and visual_row.owner.draft.source_offset < nearest_offset) {
             nearest = index;
             nearest_offset = visual_row.owner.draft.source_offset;
         },
@@ -782,8 +785,8 @@ fn owner(row: buffer_mod.Row) RowOwner {
 
 fn anchorPart(part: @import("review_card.zig").Part) ?@import("review_card.zig").Part {
     return switch (part) {
-        .header, .disclosure_footer => part,
-        else => null,
+        .gap, .header, .disclosure_footer, .bottom => part,
+        .body, .code_body, .suggestion_label, .suggestion_body => null,
     };
 }
 
@@ -910,7 +913,7 @@ test "Unified visual rows prefer whitespace" {
 
     const visual_rows = try buildVisualRowsWithOptions(arena.allocator(), &rows, .bytes, .{
         .layout = .unified,
-        .width = 16,
+        .width = unified_gutter_cols + 6,
     });
     try testing.expectEqual(@as(usize, 2), visual_rows.len);
     try testing.expectEqual(@as(usize, 0), visual_rows[0].source_start);
@@ -941,7 +944,7 @@ test "Unified hard wrapping keeps wide and combining graphemes complete" {
 
     const visual_rows = try buildVisualRowsWithOptions(arena.allocator(), &rows, metrics, .{
         .layout = .unified,
-        .width = 12,
+        .width = unified_gutter_cols + 2,
     });
     try testing.expectEqual(@as(usize, 2), visual_rows.len);
     try testing.expectEqual(@as(usize, 3), visual_rows[0].source_end);
@@ -982,7 +985,7 @@ test "SideBySide halves wrap independently and align absent continuations" {
 
     const visual_rows = try buildVisualRowsWithOptions(arena.allocator(), &rows, .bytes, .{
         .layout = .side_by_side,
-        .width = 27,
+        .width = 2 * (side_gutter_cols + 8) + side_divider_cols,
     });
 
     try testing.expectEqual(@as(usize, 2), visual_rows.len);

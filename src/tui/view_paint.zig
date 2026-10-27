@@ -129,6 +129,62 @@ pub fn titleGaps(win: vaxis.Window, span: view.Rect, style: vaxis.Style) void {
     writeGlyph(win, span.x +| span.width, span.y, " ", style);
 }
 
+/// One row of a ReviewCard border. A ReviewCard is a run of Buffer rows, not
+/// one View, so its painter asks for its border one row at a time.
+pub const CardEdge = union(enum) {
+    /// The top border with the Title after `╭─`.
+    top: []const u8,
+    /// The left and right borders of a content row.
+    side,
+    /// The bottom border, with an optional Title before `─╯`.
+    bottom: []const u8,
+    /// The gap row above a Reply: one line at the left border column.
+    gap,
+};
+
+/// Paint the `edge` of a ReviewCard whose borders sit in columns `left` and
+/// `right` of `row`. The Title gets one blank cell on each side.
+pub fn cardEdge(win: vaxis.Window, row: u16, left: usize, right: usize, edge: CardEdge, border: vaxis.Style, title: vaxis.Style) void {
+    if (right <= left) return;
+    switch (edge) {
+        .gap => writeGlyph(win, left, row, "│", border),
+        .side => {
+            writeGlyph(win, left, row, "│", border);
+            writeGlyph(win, right, row, "│", border);
+        },
+        .top => |text| {
+            cardRule(win, row, left, right, "╭", "╮", border);
+            if (text.len > 0) titleText(win, .{ .x = @intCast(left + 2), .y = row, .width = @intCast((right - left) -| 3), .height = 1 }, text, title);
+        },
+        .bottom => |text| {
+            cardRule(win, row, left, right, "╰", "╯", border);
+            if (text.len == 0) return;
+            const x = @max(left + 2, (right - 1) -| (vaxis.gwidth.gwidth(text, .unicode) + 2));
+            titleText(win, .{ .x = @intCast(x), .y = row, .width = @intCast((right - 1) -| x), .height = 1 }, text, title);
+        },
+    }
+}
+
+fn cardRule(win: vaxis.Window, row: u16, left: usize, right: usize, start: []const u8, end: []const u8, style: vaxis.Style) void {
+    for (left..right + 1) |col| writeGlyph(win, col, row, if (col == left) start else if (col == right) end else "─", style);
+}
+
+/// The line that runs past one row down to a later sibling card. It paints
+/// `│` only in a blank cell, so it never covers a border or text.
+pub fn rail(win: vaxis.Window, col: usize, row: u16, style: vaxis.Style) void {
+    if (col >= win.width or row >= win.height) return;
+    const cell = win.readCell(@intCast(col), row) orelse return;
+    if (!std.mem.eql(u8, cell.char.grapheme, " ")) return;
+    writeGlyph(win, col, row, "│", style);
+}
+
+/// The piece of an Anchor Indicator in column 0 of one Diff Line row: `╭` on
+/// the top anchored row and `│` below it. The root card's top-left corner
+/// joins the line with `join`.
+pub fn anchorIndicator(win: vaxis.Window, row: u16, top: bool, style: vaxis.Style) void {
+    writeGlyph(win, 0, row, if (top) "╭" else "│", style);
+}
+
 fn drawScrollbar(win: vaxis.Window, track: view.Rect, bar: view.Scrollbar, style: vaxis.Style) void {
     const extent = if (bar.axis == .vertical) track.height else track.width;
     const range = view.thumb(extent, bar.total, bar.offset) orelse return;

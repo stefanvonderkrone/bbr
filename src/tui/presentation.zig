@@ -1954,10 +1954,10 @@ const SearchProjection = struct {
                 if (halves.right) |half| row.right = .{ .old_line = half.line.oldNo(), .new_line = half.line.newNo(), .start = half.source_start, .end = half.source_end };
             } else switch (visual.owner) {
                 .line => |line| row.single = .{ .old_line = line.oldNo(), .new_line = line.newNo(), .start = visual.source_start, .end = visual.source_end },
-                .comment => |owner| if (owner.part != .header and owner.part != .disclosure_footer) {
+                .comment => |owner| if (owner.part == null) {
                     row.owner = .{ .comment = owner.id };
                 },
-                .draft => |owner| if (owner.part != .header and owner.part != .disclosure_footer) {
+                .draft => |owner| if (owner.part == null) {
                     row.owner = .{ .draft = owner.id };
                 },
                 else => {},
@@ -13015,7 +13015,7 @@ fn selectionYankRow(published: *const Published, visual: frame_mod.VisualRow) ?S
 }
 
 fn plainCardLabel(text: []const u8) []const u8 {
-    for ([_][]const u8{ "▸ ", "▾ ", "± ", "↳ ", "✎ " }) |marker| {
+    for ([_][]const u8{ "▸ ", "▾ " }) |marker| {
         if (std.mem.startsWith(u8, text, marker)) return text[marker.len..];
     }
     return text;
@@ -21153,7 +21153,9 @@ test "M23 yank Selection filters inherited scope in both layouts while keeping R
             const card = if (row == .comment) row.comment else row.draft;
             const old_card = card.owner == .draft or (card.owner == .comment and (card.owner.comment == 1 or card.owner.comment == 2));
             const new_card = card.owner == .comment and card.owner.comment == 3;
-            const eligible = (!old_card and !new_card) or (if (version == .old) old_card else new_card);
+            // A bare border row has no text to yank.
+            const text = card.part != .gap and card.part != .bottom;
+            const eligible = text and ((!old_card and !new_card) or (if (version == .old) old_card else new_card));
             try selectRows(&presentation, index, index);
             try testing.expectEqual(eligible, presentation.projection().action_availability.available(.yank));
             try presentation.dispatch(.{ .push_count_digit = 7 });
@@ -21162,7 +21164,7 @@ test "M23 yank Selection filters inherited scope in both layouts while keeping R
                 var command = presentation.takeCommand().?;
                 defer command.deinit();
                 try testing.expect(command.copy_clipboard.text.len > 0);
-                if (card.owner == .comment and card.owner.comment == 6) try testing.expectEqualStrings("Deleted Comment", command.copy_clipboard.text);
+                if (card.owner == .comment and card.owner.comment == 6) try testing.expectEqualStrings("Gone (deleted)", command.copy_clipboard.text);
                 try testing.expect(presentation.projection().review.?.navigation.mark == null);
             } else {
                 try testing.expect(presentation.takeCommand() == null);

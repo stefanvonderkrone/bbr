@@ -52,6 +52,10 @@ pub const Theme = struct {
     /// preserved but the row still reads as current. Positive lightens (a dark
     /// theme); a light theme would use a negative value.
     cursor_line_shift: i16,
+    /// The dim band on the anchored Diff Lines and ancestor ReviewCards of the
+    /// card under the cursor, for a row with no rgb band. A banded row moves by
+    /// half of `cursor_line_shift`, so the cursor row stays stronger.
+    ancestry_line: Color,
     /// `diff --git` file separator rows.
     file_header: Style,
     /// `@@ … @@` hunk headers.
@@ -76,12 +80,14 @@ pub const Theme = struct {
     comment_reply: Style,
     /// A ```suggestion block, called out distinctly.
     suggestion: Style,
-    /// A pending Draft (the reviewer's own unsent comment) — a distinct band so
-    /// it never reads as already-published.
+    /// A pending Draft (the reviewer's own unsent comment). Its foreground
+    /// tells it from a published Comment. Every ReviewCard role style has the
+    /// `context` background.
     draft: Style,
     /// A reply Draft, indented under whatever it replies to.
     draft_reply: Style,
-    /// A Draft whose POST outcome remains unresolved after Duplicate guards.
+    /// A Draft whose POST outcome remains unresolved after Duplicate guards. It
+    /// takes the red foreground, so it never reads as a plain Draft.
     outcome_unknown: Style,
     outcome_unknown_reply: Style,
     markdown_italic: Color = .{ .rgb = .{ 0x40, 0xe0, 0xd0 } },
@@ -167,7 +173,7 @@ pub const Theme = struct {
                 style.dim = true;
             },
             .header => style.bold = true,
-            .body => style.bold = false,
+            .body, .bottom, .gap => style.bold = false,
             .code_body => {
                 style = self.context;
                 style.bg = self.code_background;
@@ -251,6 +257,19 @@ pub const Theme = struct {
         };
     }
 
+    /// Background for a cell in the dim ancestry band. It follows `cursorBg`
+    /// with half the shift and `ancestry_line` in place of `cursor_line`.
+    pub fn ancestryBg(self: Theme, base: Color) Color {
+        return switch (base) {
+            .rgb => |ch| .{ .rgb = .{
+                shiftChannel(ch[0], @divTrunc(self.cursor_line_shift, 2)),
+                shiftChannel(ch[1], @divTrunc(self.cursor_line_shift, 2)),
+                shiftChannel(ch[2], @divTrunc(self.cursor_line_shift, 2)),
+            } },
+            else => self.ancestry_line,
+        };
+    }
+
     /// File-list name color for a change status: green add, yellow modify, red
     /// remove, violet rename.
     pub fn statusColor(self: Theme, status: bbr.diff.FileStatus) Color {
@@ -307,6 +326,7 @@ pub const dark: Theme = .{
     .gutter = .{ .fg = rgb(0x80_80_80) },
     .cursor_line = rgb(0x2c_2c_38),
     .cursor_line_shift = 0x1c,
+    .ancestry_line = rgb(0x22_22_2c),
     .file_header = .{ .fg = rgb(0xd0_d0_d0), .bold = true },
     .hunk_header = .{ .fg = rgb(0x6c_9c_d0) },
     .fold = .{ .fg = rgb(0x70_70_80), .bg = rgb(0x1a_1a_22) },
@@ -316,13 +336,13 @@ pub const dark: Theme = .{
     .status_modified = rgb(0xd7_af_5f),
     .status_removed = rgb(0xd0_6c_6c),
     .status_renamed = rgb(0xb0_88_e0),
-    .comment = .{ .bg = rgb(0x1c_1c_28), .fg = rgb(0xc8_c8_d8) },
-    .comment_reply = .{ .bg = rgb(0x18_18_22), .fg = rgb(0xc8_c8_d8) },
+    .comment = .{ .fg = rgb(0xc8_c8_d8) },
+    .comment_reply = .{ .fg = rgb(0xc8_c8_d8) },
     .suggestion = .{ .bg = rgb(0x14_28_28), .fg = rgb(0x9c_d0_c0) },
-    .draft = .{ .bg = rgb(0x2c_24_10), .fg = rgb(0xe0_c8_88), .bold = true },
-    .draft_reply = .{ .bg = rgb(0x24_1e_0c), .fg = rgb(0xc8_b0_78) },
-    .outcome_unknown = .{ .bg = rgb(0x5a_30_00), .fg = rgb(0xff_d0_70), .bold = true },
-    .outcome_unknown_reply = .{ .bg = rgb(0x46_25_00), .fg = rgb(0xf0_b8_58) },
+    .draft = .{ .fg = rgb(0xe0_c8_88), .bold = true },
+    .draft_reply = .{ .fg = rgb(0xc8_b0_78) },
+    .outcome_unknown = .{ .fg = rgb(0xd0_6c_6c), .bold = true },
+    .outcome_unknown_reply = .{ .fg = rgb(0xd0_6c_6c) },
     .section = .{ .fg = rgb(0x88_88_a0), .bold = true },
     .picker = .{ .fg = rgb(0xc8_c8_d8) },
     .picker_selected = .{ .bg = rgb(0x3a_3a_52), .fg = rgb(0xff_ff_ff), .bold = true },
@@ -358,6 +378,7 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
         .gutter = .{ .fg = rgb(p.muted), .bg = rgb(p.bg) },
         .cursor_line = rgb(p.surface2),
         .cursor_line_shift = if (p.light) -18 else 18,
+        .ancestry_line = rgb(p.surface),
         .file_header = .{ .fg = rgb(p.fg), .bg = rgb(p.bg), .bold = true },
         .hunk_header = .{ .fg = rgb(p.blue), .bg = rgb(p.bg) },
         .fold = .{ .fg = rgb(p.muted), .bg = rgb(p.surface) },
@@ -367,13 +388,13 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
         .status_modified = rgb(p.yellow),
         .status_removed = rgb(p.red),
         .status_renamed = rgb(p.violet),
-        .comment = .{ .fg = rgb(p.fg), .bg = rgb(p.surface) },
-        .comment_reply = .{ .fg = rgb(p.fg), .bg = rgb(p.surface) },
+        .comment = .{ .fg = rgb(p.fg), .bg = rgb(p.bg) },
+        .comment_reply = .{ .fg = rgb(p.fg), .bg = rgb(p.bg) },
         .suggestion = .{ .fg = rgb(p.teal), .bg = rgb(p.surface) },
-        .draft = .{ .fg = rgb(p.yellow), .bg = rgb(p.surface), .bold = true },
-        .draft_reply = .{ .fg = rgb(p.yellow), .bg = rgb(p.surface) },
-        .outcome_unknown = .{ .fg = rgb(p.fg), .bg = rgb(if (p.light) 0xff_e0_a3 else 0x5a_30_00), .bold = true },
-        .outcome_unknown_reply = .{ .fg = rgb(p.fg), .bg = rgb(if (p.light) 0xff_e9_bd else 0x46_25_00) },
+        .draft = .{ .fg = rgb(p.yellow), .bg = rgb(p.bg), .bold = true },
+        .draft_reply = .{ .fg = rgb(p.yellow), .bg = rgb(p.bg) },
+        .outcome_unknown = .{ .fg = rgb(p.red), .bg = rgb(p.bg), .bold = true },
+        .outcome_unknown_reply = .{ .fg = rgb(p.red), .bg = rgb(p.bg) },
         .markdown_italic = rgb(if (p.light) 0x00_80_80 else 0x40_e0_d0),
         .markdown_bold = rgb(if (p.light) 0xa6_50_00 else 0xff_a5_00),
         .markdown_inline_code = rgb(if (p.light) 0x20_7a_36 else 0x90_ee_90),
@@ -425,6 +446,7 @@ pub const system: Theme = .{
     .gutter = .{ .fg = .{ .index = 8 } },
     .cursor_line = rgb(0x30_30_44),
     .cursor_line_shift = 12,
+    .ancestry_line = rgb(0x24_24_32),
     .file_header = .{ .bold = true },
     .hunk_header = .{ .fg = .{ .index = 4 } },
     .fold = .{ .fg = .{ .index = 8 } },
@@ -439,8 +461,8 @@ pub const system: Theme = .{
     .suggestion = .{ .fg = .{ .index = 6 } },
     .draft = .{ .fg = .{ .index = 3 }, .bold = true },
     .draft_reply = .{ .fg = .{ .index = 3 } },
-    .outcome_unknown = .{ .fg = .{ .index = 0 }, .bg = .{ .index = 3 }, .bold = true },
-    .outcome_unknown_reply = .{ .fg = .{ .index = 0 }, .bg = .{ .index = 3 } },
+    .outcome_unknown = .{ .fg = .{ .index = 1 }, .bold = true },
+    .outcome_unknown_reply = .{ .fg = .{ .index = 1 } },
     .markdown_italic = .{ .index = 6 },
     .markdown_bold = .{ .index = 208 },
     .markdown_inline_code = .{ .index = 2 },
@@ -510,6 +532,12 @@ comptime {
             if (!std.meta.eql(style.bg, entry.value.context.bg) or style.reverse)
                 @compileError("Theme \"" ++ entry.name ++ "\" field " ++ field ++ " must have the context background and no reverse, because an Overlay paints the Theme base background");
         }
+        @setEvalBranchQuota(100_000);
+        for (std.meta.tags(review_card.CardRole)) |role| for (std.meta.tags(review_card.Part)) |part| {
+            if (part.hasCodeBackground()) continue;
+            if (!std.meta.eql(entry.value.reviewCardStyle(role, part, .{}).bg, entry.value.context.bg))
+                @compileError("Theme \"" ++ entry.name ++ "\" ReviewCard role " ++ @tagName(role) ++ " part " ++ @tagName(part) ++ " must have the context background, because a ReviewCard paints the Theme base background. Only code and Suggestion rows keep their own");
+        };
     }
 }
 
@@ -544,6 +572,17 @@ test "cursorBg tints a neutral row and nudges a banded one, keeping its hue" {
     }
     // Still distinct from the un-highlighted band.
     try testing.expect(!std.meta.eql(added_bg, lit));
+}
+
+test "the ancestry band differs from the plain and cursor backgrounds in every built-in Theme" {
+    for (builtins) |builtin| {
+        const theme = builtin.value;
+        inline for (.{ "context", "added", "removed", "comment", "comment_reply", "draft", "draft_reply" }) |field| {
+            const base = @field(theme, field).bg;
+            try testing.expect(!std.meta.eql(base, theme.ancestryBg(base)));
+            try testing.expect(!std.meta.eql(theme.cursorBg(base), theme.ancestryBg(base)));
+        }
+    }
 }
 
 test "lineStyle maps each kind to its band" {
@@ -652,7 +691,8 @@ test "M23 inline system bands keep Catppuccin Mocha text readable" {
         system.cursorBg(system.added_emphasis.bg), system.cursorBg(system.removed_emphasis.bg),
         system.cursor_line,                        system.code_background,
         system.cursorBg(system.code_background),   system.search_match,
-        system.search_active,
+        system.search_active,                      system.ancestry_line,
+        system.ancestryBg(system.added.bg),        system.ancestryBg(system.removed.bg),
     };
     const foregrounds = [_]Color{
         system.context.fg,         system.syntax_comment,       system.syntax_string,

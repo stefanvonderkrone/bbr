@@ -28,7 +28,36 @@ pub const Source = union(enum) {
 };
 
 pub const CardRole = enum { comment, comment_reply, deleted_comment, deleted_reply, draft, draft_reply, outcome_unknown, outcome_unknown_reply };
-pub const Part = enum { header, body, code_body, suggestion_label, suggestion_body, disclosure_footer };
+/// The rows of a ReviewCard from top to bottom. A Reply starts with a gap row.
+/// The header is the top border with the Title. The disclosure footer or the
+/// bottom part is the bottom border.
+pub const Part = enum {
+    gap,
+    header,
+    body,
+    code_body,
+    suggestion_label,
+    suggestion_body,
+    disclosure_footer,
+    bottom,
+
+    /// A code or Suggestion row. Its code area keeps its own background. Every
+    /// other row paints the Theme base background.
+    pub fn hasCodeBackground(self: Part) bool {
+        return switch (self) {
+            .code_body, .suggestion_label, .suggestion_body => true,
+            .gap, .header, .body, .disclosure_footer, .bottom => false,
+        };
+    }
+
+    /// A border row or the gap row. It carries no ReviewBody text.
+    pub fn isBorder(self: Part) bool {
+        return switch (self) {
+            .gap, .header, .disclosure_footer, .bottom => true,
+            .body, .code_body, .suggestion_label, .suggestion_body => false,
+        };
+    }
+};
 
 pub const Segment = struct {
     text: []const u8,
@@ -55,7 +84,16 @@ pub const ReviewCardRow = struct {
     hidden_rows: usize = 0,
     total_rows: usize = 0,
     depth: usize = 0,
+    /// The column of the left border.
     indent: usize = 0,
+    /// The left border columns of the ancestor cards whose line runs past
+    /// this row down to a later sibling.
+    rails: []const usize = &.{},
+    /// The bottom row of a card that a later sibling follows. Its line runs
+    /// down from the bottom-left corner to that sibling.
+    sibling_below: bool = false,
+    /// The cells between the padding inside the left and right borders.
+    content_width: usize = 0,
     /// Only the first authored blank line represented by an empty row.
     blank_source: ?usize = null,
     hidden_line: ?SourceRange = null,
@@ -64,8 +102,14 @@ pub const ReviewCardRow = struct {
     /// Code-block rectangle relative to this row's content column.
     code_area: ?struct { column: usize, width: usize } = null,
 
+    /// The first content cell: the left border, then one padding cell.
     pub fn contentColumn(self: ReviewCardRow) usize {
-        return self.indent + if (self.part == .header) @as(usize, 2) else 4;
+        return self.indent + 2;
+    }
+
+    /// The right border, after the content and one padding cell.
+    pub fn rightBorderColumn(self: ReviewCardRow) usize {
+        return self.contentColumn() + @max(self.content_width, 1) + 1;
     }
     pub fn text(self: ReviewCardRow) []const u8 {
         return if (self.segments.len == 1) self.segments[0].text else "";
@@ -119,7 +163,8 @@ pub fn projectPreview(allocator: std.mem.Allocator, body: ReviewBody, options: O
     }
     var visible: std.ArrayList(ReviewCardRow) = .empty;
     errdefer visible.deinit(allocator);
-    for (rows[1..]) |row| {
+    for (rows) |row| {
+        if (row.part.isBorder()) continue;
         if (start > 0 and row.source_range.end <= start) continue;
         if (visible.items.len >= height) break;
         try visible.append(allocator, row);
@@ -187,23 +232,27 @@ pub fn project(allocator: std.mem.Allocator, body: ReviewBody, options: Options)
     }
     const collapsible = options.collapsed_rows > 0 and body_rows.items.len > options.collapsed_rows;
     const visible_count = if (collapsible and !options.expanded) options.collapsed_rows else body_rows.items.len;
-    const footer_count: usize = if (collapsible) 1 else 0;
-    const rows = try allocator.alloc(ReviewCardRow, 1 + visible_count + footer_count);
-    rows[0] = makeRow(options, .header, 0, .literal, .{ .start = 0, .end = 0 }, try oneSegment(allocator, .{
+    const gap: usize = @intFromBool(options.depth > 0);
+    const rows = try allocator.alloc(ReviewCardRow, gap + 1 + visible_count + 1);
+    if (gap > 0) rows[0] = makeRow(options, .gap, 0, .literal, .{ .start = 0, .end = 0 }, &.{});
+    rows[gap] = makeRow(options, .header, 0, .literal, .{ .start = 0, .end = 0 }, try oneSegment(allocator, .{
         .text = options.header,
         .source = .{ .start = 0, .end = 0 },
     }));
-    rows[0].plain_label = options.plain_header;
-    @memcpy(rows[1 .. 1 + visible_count], body_rows.items[0..visible_count]);
-    if (collapsible) {
+    rows[gap].plain_label = options.plain_header;
+    @memcpy(rows[gap + 1 .. gap + 1 + visible_count], body_rows.items[0..visible_count]);
+    const body_end: SourceRange = .{ .start = body.source.len, .end = body.source.len };
+    if (!collapsible) {
+        rows[rows.len - 1] = makeRow(options, .bottom, body_rows.items.len, .literal, body_end, &.{});
+    } else {
         const hidden = body_rows.items.len - visible_count;
         const footer = if (options.expanded)
             try std.fmt.allocPrint(allocator, "▾ {d} total rows · enter to collapse", .{body_rows.items.len})
         else
             try std.fmt.allocPrint(allocator, "▸ {d} hidden rows · {d} total · enter to expand", .{ hidden, body_rows.items.len });
-        rows[rows.len - 1] = makeRow(options, .disclosure_footer, body_rows.items.len, .literal, .{ .start = body.source.len, .end = body.source.len }, try oneSegment(allocator, .{
+        rows[rows.len - 1] = makeRow(options, .disclosure_footer, body_rows.items.len, .literal, body_end, try oneSegment(allocator, .{
             .text = footer,
-            .source = .{ .start = body.source.len, .end = body.source.len },
+            .source = body_end,
         }));
         rows[rows.len - 1].hidden_rows = hidden;
         rows[rows.len - 1].total_rows = body_rows.items.len;
@@ -257,6 +306,7 @@ fn makeRow(options: Options, part: Part, ordinal: usize, kind: BlockKind, range:
         .segments = segments,
         .depth = options.depth,
         .indent = options.indent,
+        .content_width = options.content_width,
     };
 }
 
@@ -839,7 +889,7 @@ test "M23 containers align wrapped item text and mixed quote nesting as project 
     const raw = "4. first words\n    more\n    - child\n        8. grandchild\n1. second\n\n> quoted\n> continuation\n>> deeper";
     const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
     const rows = try project(a, try ReviewBody.parse(a, raw), .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment_reply, .header = "Ada", .content_width = 16, .metrics = TestMetrics.value, .collapsed_rows = 0 });
-    const expected = [_][]const u8{ "Ada", "4. first words ", "   more", "  • child", "    8. grandchil", "       d", "5. second", "", "│ quoted ", "│ continuation", "│ │ deeper" };
+    const expected = [_][]const u8{ "Ada", "4. first words ", "   more", "  • child", "    8. grandchil", "       d", "5. second", "", "│ quoted ", "│ continuation", "│ │ deeper", "" };
     try testing.expectEqual(expected.len, rows.len);
     for (rows, expected) |row, text| {
         var visible: std.ArrayList(u8) = .empty;
@@ -870,7 +920,7 @@ test "M23 containers keep code tab stops and authored ranges in narrow Replies a
     }
     const empty: bbr.review.Comment = .{ .id = 2, .author = "Ada", .body = "- " };
     const rows = try project(a, try ReviewBody.parse(a, empty.body), .{ .owner = .{ .comment = 2 }, .source = .{ .comment = &empty }, .role = .comment, .header = "Ada", .content_width = 8, .metrics = TestMetrics.value, .collapsed_rows = 0 });
-    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqual(@as(usize, 3), rows.len);
     for (rows[1].segments) |segment| try testing.expect(!segment.authored);
     try testing.expect(rows[1].blank_source == null);
 }
@@ -905,7 +955,7 @@ test "M23 containers align ordered dots across digit growth and retain independe
     const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
     const body = try ReviewBody.parse(a, raw);
     const rows = try project(a, body, .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment_reply, .header = "Ada", .content_width = 40, .metrics = TestMetrics.value, .collapsed_rows = 0 });
-    const expected = [_][]const u8{ "Ada", " 9. first", "    │ quote", "    │ ", "    after", "   99. child", "  100. child", "10. second", "", "reset", "", "1. separate", "", "│  9. quoted", "│ 10. quoted" };
+    const expected = [_][]const u8{ "Ada", " 9. first", "    │ quote", "    │ ", "    after", "   99. child", "  100. child", "10. second", "", "reset", "", "1. separate", "", "│  9. quoted", "│ 10. quoted", "" };
     try testing.expectEqual(expected.len, rows.len);
     for (rows, expected) |row, text| {
         var visible: std.ArrayList(u8) = .empty;
@@ -917,7 +967,7 @@ test "M23 containers align ordered dots across digit growth and retain independe
     }
     const wrapped: bbr.review.Comment = .{ .id = 2, .author = "Ada", .body = "9. abcdefghijkl\n1. x" };
     const narrow = try project(a, try ReviewBody.parse(a, wrapped.body), .{ .owner = .{ .comment = 2 }, .source = .{ .comment = &wrapped }, .role = .comment_reply, .header = "Ada", .content_width = 10, .metrics = TestMetrics.value, .collapsed_rows = 0 });
-    const wrapped_expected = [_][]const u8{ "Ada", " 9. abcdef", "    ghijkl", "10. x" };
+    const wrapped_expected = [_][]const u8{ "Ada", " 9. abcdef", "    ghijkl", "10. x", "" };
     try testing.expectEqual(wrapped_expected.len, narrow.len);
     for (narrow, wrapped_expected) |row, text| {
         var visible: std.ArrayList(u8) = .empty;
@@ -934,7 +984,7 @@ test "M23 containers show quotes and quote code inside list items as project beh
     const raw = "- parent\n    > quoted\n    > continuation\n    >\n    > - child\n    >     ```\n    >     a\tb\n    >     ```\n    after\n- sibling";
     const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
     const rows = try project(a, try ReviewBody.parse(a, raw), .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "Ada", .content_width = 40, .metrics = TestMetrics.value, .collapsed_rows = 0 });
-    const expected = [_][]const u8{ "Ada", "• parent", "  │ quoted continuation", "  │ ", "  │ • child", "  │   a   b", "  after", "• sibling" };
+    const expected = [_][]const u8{ "Ada", "• parent", "  │ quoted continuation", "  │ ", "  │ • child", "  │   a   b", "  after", "• sibling", "" };
     for (expected, 0..) |text, index| {
         var visible: std.ArrayList(u8) = .empty;
         for (rows[index].segments) |segment| try visible.appendSlice(a, segment.text);
@@ -950,7 +1000,7 @@ test "M23 containers show alternating quote and list nesting as project behavior
     const raw = "> - parent\n>     > quoted\n>     > continuation\n>     > ~~~\n>     > a\tb\n>     > ~~~\n>     after\n> - sibling";
     const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = raw };
     const rows = try project(a, try ReviewBody.parse(a, raw), .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "Ada", .content_width = 40, .metrics = TestMetrics.value, .collapsed_rows = 0 });
-    const expected = [_][]const u8{ "Ada", "│ • parent", "│   │ quoted continuation", "│   │ a   b", "│   after", "│ • sibling" };
+    const expected = [_][]const u8{ "Ada", "│ • parent", "│   │ quoted continuation", "│   │ a   b", "│   after", "│ • sibling", "" };
     try testing.expectEqual(expected.len, rows.len);
     for (rows, expected) |row, text| {
         var visible: std.ArrayList(u8) = .empty;
@@ -969,8 +1019,8 @@ test "M23 literal code wraps complete whitespace from its own tab origin" {
             const rows = try project(a, try ReviewBody.parse(a, raw), .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment_reply, .header = "Ada", .content_width = width, .metrics = TestMetrics.value, .collapsed_rows = 0, .indent = indent });
             var visible: std.ArrayList(u8) = .empty;
             var blanks: usize = 0;
-            for (rows[1..]) |row| {
-                if (row.part == .suggestion_label) continue;
+            for (rows) |row| {
+                if (row.part.isBorder() or row.part == .suggestion_label) continue;
                 if (row.segments.len == 0) blanks += 1;
                 for (row.segments) |segment| {
                     try testing.expect(!segment.marks.inline_code and !segment.marks.strong);
@@ -990,7 +1040,7 @@ test "M23 inline heading levels and paragraph rows hide syntax with exact source
     const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = "# One #\n## *Two*\n### `Three`\n#### Four\n##### Five\n###### Six\nSetext\n---\n\nfirst\nsecond\n\nthird  \nfourth" };
     const body = try ReviewBody.parse(a, comment.body);
     const rows = try project(a, body, .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "header", .content_width = 80, .metrics = TestMetrics.value, .collapsed_rows = 0 });
-    const expected = [_][]const u8{ "header", "# One", "## Two", "### Three", "#### Four", "##### Five", "###### Six", "## Setext", "", "first second", "", "third", "fourth" };
+    const expected = [_][]const u8{ "header", "# One", "## Two", "### Three", "#### Four", "##### Five", "###### Six", "## Setext", "", "first second", "", "third", "fourth", "" };
     try testing.expectEqual(expected.len, rows.len);
     for (rows, expected) |row, text| {
         var visible: std.ArrayList(u8) = .empty;
@@ -1021,7 +1071,7 @@ test "M23 inline code keeps leading empty authored rows" {
     const a = arena.allocator();
     const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = "`\nfirst`" };
     const rows = try project(a, try ReviewBody.parse(a, comment.body), .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment, .header = "header", .content_width = 80, .metrics = TestMetrics.value, .collapsed_rows = 0 });
-    try testing.expectEqual(@as(usize, 3), rows.len);
+    try testing.expectEqual(@as(usize, 4), rows.len);
     try testing.expectEqual(@as(?usize, 1), rows[1].blank_source);
     try testing.expectEqual(@as(usize, 0), rows[1].segments.len);
     try testing.expectEqual(SourceRange{ .start = 2, .end = 7 }, rows[2].source_range);
@@ -1049,7 +1099,7 @@ test "ReviewCard wraps only at complete graphemes and keeps links visible" {
         .owner = .{ .comment = comment.id },
         .source = .{ .comment = &comment },
         .role = .comment,
-        .header = "▸ Ada",
+        .header = "Ada",
         .content_width = 4,
         .metrics = TestMetrics.value,
         .collapsed_rows = 0,
@@ -1073,7 +1123,7 @@ test "collapsed row budget is hard across Suggestions and spacers" {
         .owner = .{ .draft = draft.local_id },
         .source = .{ .draft = &draft },
         .role = .draft,
-        .header = "± draft",
+        .header = "✎ draft (suggestion)",
         .content_width = 5,
         .metrics = TestMetrics.value,
         .collapsed_rows = 3,
@@ -1100,7 +1150,7 @@ test "zero and narrow widths preserve invalid bytes and complete graphemes" {
         .owner = .{ .comment = 12 },
         .source = .{ .comment = &comment },
         .role = .comment,
-        .header = "▸ Ada",
+        .header = "Ada",
         .content_width = 0,
         .metrics = TestMetrics.value,
         .collapsed_rows = 0,
@@ -1124,8 +1174,8 @@ test "Comment Reply and Draft share identical body projection" {
     const comment: bbr.review.Comment = .{ .id = 1, .parent_id = 9, .author = "Ada", .body = text };
     const draft: bbr.review.Draft = .{ .local_id = 2, .kind = .comment, .parent = .{ .comment = 9 }, .body = text };
     const parsed = try ReviewBody.parse(allocator, text);
-    const comment_rows = try project(allocator, parsed, .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment_reply, .header = "↳ Ada", .content_width = 12, .metrics = TestMetrics.value, .collapsed_rows = 0 });
-    const draft_rows = try project(allocator, parsed, .{ .owner = .{ .draft = 2 }, .source = .{ .draft = &draft }, .role = .draft_reply, .header = "↳ draft", .content_width = 12, .metrics = TestMetrics.value, .collapsed_rows = 0 });
+    const comment_rows = try project(allocator, parsed, .{ .owner = .{ .comment = 1 }, .source = .{ .comment = &comment }, .role = .comment_reply, .header = "Ada", .content_width = 12, .metrics = TestMetrics.value, .collapsed_rows = 0 });
+    const draft_rows = try project(allocator, parsed, .{ .owner = .{ .draft = 2 }, .source = .{ .draft = &draft }, .role = .draft_reply, .header = "✎ draft", .content_width = 12, .metrics = TestMetrics.value, .collapsed_rows = 0 });
     try testing.expectEqual(comment_rows.len, draft_rows.len);
     for (comment_rows[1..], draft_rows[1..]) |left, right| {
         try testing.expectEqual(left.part, right.part);
@@ -1190,7 +1240,7 @@ test "M23 inline code keeps authored line breaks" {
     const multiline: bbr.review.Comment = .{ .id = 2, .author = "Ada", .body = "`first\r\n  last  `" };
     const body = try ReviewBody.parse(a, multiline.body);
     const rows = try project(a, body, .{ .owner = .{ .comment = 2 }, .source = .{ .comment = &multiline }, .role = .comment, .header = "Ada", .content_width = 80, .metrics = TestMetrics.value, .collapsed_rows = 0 });
-    try testing.expectEqual(@as(usize, 3), rows.len);
+    try testing.expectEqual(@as(usize, 4), rows.len);
     var last: std.ArrayList(u8) = .empty;
     for (rows[2].segments) |segment| try last.appendSlice(a, segment.text);
     try testing.expectEqualStrings("  last  ", last.items);

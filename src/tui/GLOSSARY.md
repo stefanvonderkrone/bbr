@@ -129,8 +129,16 @@ Presentation's width-independent semantic reading of a Comment or Draft's author
 _Avoid_: parsed Comment, rendered Markdown, Markdown document.
 
 **ReviewCard**:
-The bounded DiffPane presentation of one Comment or Draft: an identifying header, ReviewBody rows, and an in-place disclosure footer when the projected body exceeds its row budget. Every row belongs to the same stable Comment or Draft identity.
+The bounded DiffPane presentation of one Comment or Draft: a rounded border, ReviewBody rows, and an in-place disclosure footer when the projected body exceeds its row budget. Its Title in the top border names the author or `✎ draft`, and any other state follows in parentheses, as in `✎ draft (posted)` or `Ada (deleted)`. The disclosure footer is the Title in the bottom border. A Reply sits at its ancestry indent below one gap row, whose line joins the border above with `┬` and the Reply's top-left corner with `├`. A card with a later sibling keeps its line down to that sibling: its bottom-left corner becomes `├`, and the line passes every row of the card's Replies. A ReviewCard has the Theme base background. Its role shows only in its text color and emphasis. Every row belongs to the same stable Comment or Draft identity.
 _Avoid_: Comment (the Review entity), panel, box.
+
+**Anchor Indicator**:
+The line in column 0 of the DiffPane that joins a root ReviewCard to its anchored Diff Lines: `╭` on the top anchored line, `│` below it, and `├` at the card's top-left corner. It covers only the anchored lines that sit directly above the card. A Reply, a File-level card, and a Review-level card have none.
+_Avoid_: gutter marker, range bar.
+
+**Ancestry Band**:
+The dim background on the anchored Diff Lines and on every ancestor ReviewCard of the card under the cursor. The cursor band stays stronger.
+_Avoid_: highlight (the cursor and search have their own), thread focus.
 
 **Presentation Frame**:
 One internally consistent projection of the published Session and its Session-relative interaction state at the current terminal geometry. It is the shared source for rendering, navigation restoration, and semantic mouse targeting; a failed reprojection preserves the previous complete Frame.
