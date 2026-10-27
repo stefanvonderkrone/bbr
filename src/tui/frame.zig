@@ -1113,8 +1113,7 @@ test "framed Pane geometry is bounded at zero narrow ordinary and wide sizes" {
         try testing.expect(panes.sidebar_content.x + panes.sidebar_content.width <= geometry.cols);
         try testing.expect(panes.diff_content.y + panes.diff_content.height <= geometry.rows);
     }
-    try testing.expectEqual(@as(u16, 1), paneRects(.{ .cols = 80, .rows = 24 }).diff.x - paneRects(.{ .cols = 80, .rows = 24 }).sidebar.width);
-    try testing.expectEqual(@as(u16, 0), paneRects(.{ .cols = 40, .rows = 24 }).diff.x - paneRects(.{ .cols = 40, .rows = 24 }).sidebar.width);
+    for ([_]u16{ 40, 80 }) |cols| try testing.expectEqual(paneRects(.{ .cols = cols, .rows = 24 }).sidebar.width, paneRects(.{ .cols = cols, .rows = 24 }).diff.x);
 }
 
 fn expectSameCells(expected: Rect, actual: Rect) !void {
@@ -1128,9 +1127,8 @@ test "View Pane geometry keeps the cells of the previous formulas" {
             return .{ .x = rect.x +| @min(rect.width, 1), .y = rect.y +| @min(rect.height, 1), .width = rect.width -| 2, .height = rect.height -| 2 };
         }
         fn panes(geometry: Geometry) PaneRects {
-            const gap: u16 = if (geometry.cols >= 60) 1 else 0;
-            const sidebar_width: u16 = if (geometry.cols < 6) geometry.cols / 2 else @min(28, geometry.cols - 3 - gap);
-            const diff_x: u16 = @min(sidebar_width +| gap, geometry.cols);
+            const sidebar_width: u16 = if (geometry.cols < 6) geometry.cols / 2 else @min(28, geometry.cols - 3);
+            const diff_x: u16 = @min(sidebar_width, geometry.cols);
             const sidebar: Rect = .{ .x = 0, .y = 0, .width = sidebar_width, .height = geometry.rows };
             const diff: Rect = .{ .x = diff_x, .y = 0, .width = geometry.cols - diff_x, .height = geometry.rows };
             return .{ .sidebar = sidebar, .diff = diff, .sidebar_content = content(sidebar), .diff_content = content(diff) };

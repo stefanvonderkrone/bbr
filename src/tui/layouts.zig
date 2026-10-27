@@ -67,7 +67,7 @@ pub fn panes(params: Panes, area: Rect, visitor: anytype) void {
     const sidebar_stroke: view.Stroke = .{ .focused = params.sidebar_focused };
     const diff_stroke: view.Stroke = .{ .focused = !params.sidebar_focused };
     const root: V = .{
-        .composition = .{ .sidebar = .{ .content_min = 3, .gap = if (area.width >= 60) 1 else 0, .wrap = false } },
+        .composition = .{ .sidebar = .{ .content_min = 3, .wrap = false } },
         .children = &.{
             .{
                 .slot = .sidebar,
@@ -294,11 +294,11 @@ test "every layout places each of its Slots" {
     }
 }
 
-test "the Panes keep a one-cell gap from 60 columns and a 28-cell Sidebar" {
+test "the Panes touch with no gap and a 28-cell Sidebar" {
     const wide = view.solve(PaneSlot, panes, Panes{}, .{ .width = 80, .height = 24 });
     try testing.expectEqual(Rect{ .x = 0, .y = 0, .width = 28, .height = 24 }, wide.get(.sidebar).border);
-    try testing.expectEqual(Rect{ .x = 29, .y = 0, .width = 51, .height = 24 }, wide.get(.diff).border);
-    try testing.expectEqual(Rect{ .x = 30, .y = 1, .width = 49, .height = 22 }, wide.get(.diff).content);
+    try testing.expectEqual(Rect{ .x = 28, .y = 0, .width = 52, .height = 24 }, wide.get(.diff).border);
+    try testing.expectEqual(Rect{ .x = 29, .y = 1, .width = 50, .height = 22 }, wide.get(.diff).content);
     try testing.expectEqual(Rect{ .x = 1, .y = 1, .width = 26, .height = 22 }, wide.get(.sidebar).content);
     const narrow = view.solve(PaneSlot, panes, Panes{}, .{ .width = 40, .height = 24 });
     try testing.expectEqual(narrow.get(.sidebar).border.width, narrow.get(.diff).border.x);

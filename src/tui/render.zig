@@ -4015,7 +4015,7 @@ test "ReviewCard wide grapheme keeps the DiffPane right border" {
         .cell_metrics = Metrics.value,
     }, .{
         .initial = .{ .key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
-        .geometry = .{ .cols = 60, .rows = 10 },
+        .geometry = .{ .cols = 59, .rows = 10 },
     });
     defer state.deinit();
     const review = state.projection().review.?;
@@ -4026,7 +4026,7 @@ test "ReviewCard wide grapheme keeps the DiffPane right border" {
     };
     try testing.expectEqual(@as(usize, 2), projected_body_rows);
 
-    var screen = try vaxis.Screen.init(a, .{ .rows = 10, .cols = 60, .x_pixel = 0, .y_pixel = 0 });
+    var screen = try vaxis.Screen.init(a, .{ .rows = 10, .cols = 59, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
     drawReview(a, win, review, theme_dark, 0);
