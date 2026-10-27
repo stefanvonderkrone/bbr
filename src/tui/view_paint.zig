@@ -25,10 +25,7 @@ fn Painter(comptime Slot: type) type {
 
         pub fn visit(self: *Self, node: *const view.View(Slot), placed: view.Placed) void {
             self.solver.visit(node, placed);
-            if (node.fill) |fill| fillRect(self.win, placed.border, switch (fill) {
-                .surface => self.theme.picker,
-                .header => self.theme.picker_query,
-            });
+            if (node.fill) fillRect(self.win, placed.border, self.theme.picker);
             if (node.border) |border| drawBorder(self.win, placed.border, strokeStyle(self.theme, border.stroke));
             if (node.composition == .rule) drawRule(self.win, placed.border, strokeStyle(self.theme, node.composition.rule));
             if (node.title) |title| drawTitle(self.win, node, placed, title);

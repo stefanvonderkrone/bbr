@@ -29,7 +29,6 @@ pub const Theme = struct {
     pane_border: Style = .{ .dim = true },
     pane_border_focused: Style = .{ .bold = true },
     overlay_border: Style = .{ .bold = true },
-    overlay_title: Style = .{ .bold = true },
     /// Selected Version chrome. It never replaces diff or syntax colors.
     accent: Color,
     section_rule: Style = .{ .dim = true },
@@ -91,11 +90,11 @@ pub const Theme = struct {
     code_background: Color = .{ .rgb = .{ 0x2c, 0x2c, 0x2c } },
     /// A section divider (PR comments / Pending / Outdated).
     section: Style,
-    /// The PR picker overlay's background rows.
+    /// Overlay text and fill. Its background is the `context` background.
     picker: Style,
-    /// The picker's highlighted (selected) row.
+    /// The selected entry of an Overlay list.
     picker_selected: Style,
-    /// The picker's query/prompt line.
+    /// Overlay header and hint text. Its background is the `context` background.
     picker_query: Style,
     /// Buffer Search overlays replace only the background, so syntax marks remain.
     search_match: Color,
@@ -298,7 +297,6 @@ pub const dark: Theme = .{
     .pane_border = .{ .fg = rgb(0x70_70_80), .dim = true },
     .pane_border_focused = .{ .fg = rgb(0xd0_d0_d0), .bold = true },
     .overlay_border = .{ .fg = rgb(0xd0_d0_d0), .bold = true },
-    .overlay_title = .{ .fg = rgb(0xff_ff_ff), .bold = true },
     .accent = rgb(0x6c_9c_d0),
     .section_rule = .{ .fg = rgb(0x70_70_80), .dim = true },
     .context = .{},
@@ -326,9 +324,9 @@ pub const dark: Theme = .{
     .outcome_unknown = .{ .bg = rgb(0x5a_30_00), .fg = rgb(0xff_d0_70), .bold = true },
     .outcome_unknown_reply = .{ .bg = rgb(0x46_25_00), .fg = rgb(0xf0_b8_58) },
     .section = .{ .fg = rgb(0x88_88_a0), .bold = true },
-    .picker = .{ .bg = rgb(0x20_20_2c), .fg = rgb(0xc8_c8_d8) },
+    .picker = .{ .fg = rgb(0xc8_c8_d8) },
     .picker_selected = .{ .bg = rgb(0x3a_3a_52), .fg = rgb(0xff_ff_ff), .bold = true },
-    .picker_query = .{ .bg = rgb(0x28_28_36), .fg = rgb(0xff_ff_ff) },
+    .picker_query = .{ .fg = rgb(0xff_ff_ff), .bold = true },
     .search_match = rgb(0x5a_4a_18),
     .search_active = rgb(0x9a_70_18),
     .search_no_match = rgb(0xd0_6c_6c),
@@ -349,8 +347,7 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
         .status_bar = .{ .bg = rgb(p.surface), .fg = rgb(p.fg), .muted = rgb(p.muted) },
         .pane_border = .{ .fg = rgb(p.muted), .bg = rgb(p.bg), .dim = true },
         .pane_border_focused = .{ .fg = rgb(p.fg), .bg = rgb(p.bg), .bold = true },
-        .overlay_border = .{ .fg = rgb(p.fg), .bg = rgb(p.surface), .bold = true },
-        .overlay_title = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2), .bold = true },
+        .overlay_border = .{ .fg = rgb(p.fg), .bg = rgb(p.bg), .bold = true },
         .accent = rgb(p.blue),
         .section_rule = .{ .fg = rgb(p.muted), .bg = rgb(p.bg), .dim = true },
         .context = .{ .fg = rgb(p.fg), .bg = rgb(p.bg) },
@@ -382,9 +379,9 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
         .markdown_inline_code = rgb(if (p.light) 0x20_7a_36 else 0x90_ee_90),
         .code_background = rgb(p.surface2),
         .section = .{ .fg = rgb(p.muted), .bg = rgb(p.bg), .bold = true },
-        .picker = .{ .fg = rgb(p.fg), .bg = rgb(p.surface) },
+        .picker = .{ .fg = rgb(p.fg), .bg = rgb(p.bg) },
         .picker_selected = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2), .bold = true },
-        .picker_query = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2) },
+        .picker_query = .{ .fg = rgb(p.fg), .bg = rgb(p.bg), .bold = true },
         .search_match = rgb(if (p.light) 0xff_ef_a8 else 0x5a_4a_18),
         .search_active = rgb(if (p.light) 0xff_cf_58 else 0x9a_70_18),
         .search_no_match = rgb(p.red),
@@ -418,7 +415,6 @@ pub const system: Theme = .{
     .pane_border = .{ .fg = .{ .index = 8 }, .dim = true },
     .pane_border_focused = .{ .bold = true },
     .overlay_border = .{ .bold = true },
-    .overlay_title = .{ .reverse = true, .bold = true },
     .accent = .{ .index = 4 },
     .section_rule = .{ .fg = .{ .index = 8 }, .dim = true },
     .context = .{},
@@ -452,7 +448,7 @@ pub const system: Theme = .{
     .section = .{ .fg = .{ .index = 7 }, .bold = true },
     .picker = .{},
     .picker_selected = .{ .reverse = true, .bold = true },
-    .picker_query = .{ .reverse = true },
+    .picker_query = .{ .bold = true },
     .search_match = rgb(0x53_46_68),
     .search_active = rgb(0x70_50_18),
     .search_no_match = .{ .index = 1 },
@@ -509,6 +505,11 @@ comptime {
         const id = ThemeId.at(index);
         if (!std.mem.eql(u8, entry.name, id.name()))
             @compileError("theme.builtins[" ++ std.fmt.comptimePrint("{d}", .{index}) ++ "] must be named \"" ++ id.name() ++ "\" to match ThemeId." ++ @tagName(id));
+        for (.{ "picker", "picker_query", "overlay_border" }) |field| {
+            const style = @field(entry.value, field);
+            if (!std.meta.eql(style.bg, entry.value.context.bg) or style.reverse)
+                @compileError("Theme \"" ++ entry.name ++ "\" field " ++ field ++ " must have the context background and no reverse, because an Overlay paints the Theme base background");
+        }
     }
 }
 
@@ -561,7 +562,6 @@ test "every built-in Theme resolves by its exact name and keeps diff bands disti
         try testing.expect(selected.pane_border.dim);
         try testing.expect(selected.pane_border_focused.bold);
         try testing.expect(selected.overlay_border.bold);
-        try testing.expect(selected.overlay_title.bold);
         try testing.expect(selected.section_rule.dim);
     }
     try testing.expect(byName("catppuccin") == null);

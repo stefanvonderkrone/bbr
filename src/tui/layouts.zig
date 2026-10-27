@@ -168,7 +168,7 @@ fn overlaySurface(comptime Slot: type, box: Box, node: view.View(Slot)) view.Vie
     var result = node;
     result.width = .cells(box.width +| 2);
     result.height = .cells(box.height +| 2);
-    result.fill = .surface;
+    result.fill = true;
     result.border = .{ .stroke = overlay_stroke };
     return result;
 }
@@ -180,7 +180,7 @@ fn overlaySurface(comptime Slot: type, box: Box, node: view.View(Slot)) view.Vie
 fn inputSurface(comptime Slot: type, slot: Slot, width: Size, height: Size, boxes: *[2]view.View(Slot)) view.View(Slot) {
     boxes[0].height = .cells(3);
     for (boxes) |*box| box.border = .{ .stroke = overlay_stroke };
-    return .{ .slot = slot, .width = width, .height = height, .fill = .surface, .composition = .{ .flow = .{} }, .children = boxes };
+    return .{ .slot = slot, .width = width, .height = height, .fill = true, .composition = .{ .flow = .{} }, .children = boxes };
 }
 
 /// A List Overlay: the query box, with the Overlay's Title, above the box of
@@ -224,9 +224,9 @@ pub fn dialog(params: Dialog, area: Rect, visitor: anytype) void {
             .slot = .surface,
             .composition = .{ .flow = .{} },
             .children = &.{
-                .{ .slot = .header, .height = .cells(1), .fill = .header },
+                .{ .slot = .header, .height = .cells(1) },
                 .{ .slot = .body, .padding = params.body_padding },
-                .{ .slot = .hint, .height = .cells(1), .fill = .header },
+                .{ .slot = .hint, .height = .cells(1) },
             },
         })},
     };
@@ -259,7 +259,7 @@ pub fn help(rows: usize, area: Rect, visitor: anytype) void {
             .slot = .surface,
             .composition = .{ .flow = .{} },
             .children = &.{
-                .{ .slot = .title, .height = .cells(1), .fill = .header },
+                .{ .slot = .title, .height = .cells(1) },
                 .{
                     .composition = .{ .flow = .{ .axis = .horizontal } },
                     .children = &.{
@@ -268,7 +268,7 @@ pub fn help(rows: usize, area: Rect, visitor: anytype) void {
                     },
                 },
                 .{ .slot = .mouse, .height = .cells(3), .padding = .{ .left = 1 } },
-                .{ .slot = .hint, .height = .cells(1), .fill = .header },
+                .{ .slot = .hint, .height = .cells(1) },
             },
         })},
     };
@@ -286,7 +286,7 @@ pub fn submission(_: void, area: Rect, visitor: anytype) void {
             .slot = .surface,
             .composition = .{ .flow = .{} },
             .children = &.{
-                .{ .slot = .title, .height = .cells(1), .fill = .header },
+                .{ .slot = .title, .height = .cells(1) },
                 .{ .slot = .summary, .height = .cells(1) },
                 .{ .slot = .items },
                 .{ .slot = .detail, .height = .cells(6) },

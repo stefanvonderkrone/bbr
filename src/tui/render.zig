@@ -2360,10 +2360,10 @@ test "M21 authored Overlay renders ranked rows and matched Preview in landscape 
         const preview = childRect(win, geometry.preview);
         const input = childRect(win, .{ .x = geometry.rect.x + 1, .y = geometry.rect.y + 1, .width = geometry.rect.width - 2, .height = 1 });
         const header = childRect(win, geometry.header);
-        try testing.expectEqual(theme_dark.picker.bg, input.readCell(0, 0).?.style.bg);
-        try testing.expectEqual(theme_dark.picker.bg, input.readCell(2, 0).?.style.bg);
-        try testing.expectEqual(theme_dark.picker.bg, header.readCell(0, 0).?.style.bg);
-        try testing.expectEqual(theme_dark.picker.bg, header.readCell(header.width - 1, 0).?.style.bg);
+        try testing.expectEqual(theme_dark.context.bg, input.readCell(0, 0).?.style.bg);
+        try testing.expectEqual(theme_dark.context.bg, input.readCell(2, 0).?.style.bg);
+        try testing.expectEqual(theme_dark.context.bg, header.readCell(0, 0).?.style.bg);
+        try testing.expectEqual(theme_dark.context.bg, header.readCell(header.width - 1, 0).?.style.bg);
         try testing.expectEqualStrings("▸", list.readCell(0, 0).?.char.grapheme);
         try testing.expectEqualStrings("b", preview.readCell(0, 0).?.char.grapheme);
         try testing.expect(geometry.landscape == (cols == 100));
@@ -3503,10 +3503,10 @@ test "the Composer Overlay draws its projected header and body" {
     const mx: u16 = (80 - 72) / 2;
     const my: u16 = (24 - 14) / 2;
     try testing.expectEqualStrings("✎", win.readCell(mx, my).?.char.grapheme);
-    try testing.expectEqual(theme_dark.picker_query.bg, win.readCell(mx, my).?.style.bg);
+    try testing.expectEqual(theme_dark.context.bg, win.readCell(mx, my).?.style.bg);
     // The body's first line sits one column in on the first body row.
     try testing.expectEqualStrings("l", win.readCell(mx + 1, my + 1).?.char.grapheme);
-    try testing.expectEqual(theme_dark.picker.bg, win.readCell(mx + 1, my + 1).?.style.bg);
+    try testing.expectEqual(theme_dark.context.bg, win.readCell(mx + 1, my + 1).?.style.bg);
 }
 
 test "a pending draft renders in the draft band with its marker" {
@@ -3576,12 +3576,12 @@ test "picker overlay draws the query line and highlights the selection" {
     const qy: u16 = 3;
     const ey: u16 = 6;
     try testing.expectEqualStrings("›", win.readCell(mx, qy).?.char.grapheme);
-    try testing.expectEqual(theme_dark.picker.bg, win.readCell(mx, qy).?.style.bg);
+    try testing.expectEqual(theme_dark.context.bg, win.readCell(mx, qy).?.style.bg);
     // The selected (second) entry carries the ▸ marker and the selected
     // background. The first entry does not.
     try testing.expectEqualStrings("▸", win.readCell(mx, ey + 1).?.char.grapheme);
     try testing.expectEqual(theme_dark.picker_selected.bg, win.readCell(mx, ey + 1).?.style.bg);
-    try testing.expectEqual(theme_dark.picker.bg, win.readCell(mx, ey).?.style.bg);
+    try testing.expectEqual(theme_dark.context.bg, win.readCell(mx, ey).?.style.bg);
 }
 
 test "Command Palette rows show a bold title, a regular description, and grey an unavailable Action" {
@@ -3773,6 +3773,84 @@ test "an input Overlay is a bordered input box above a bordered result list" {
         win.clear();
         const rects = view_paint.paint(layouts.SearchSlot, layouts.reviewSearch, layouts.ReviewSearch{}, win, theme_dark);
         try Check.shape(win, rects.get(.surface).border, rects.get(.query).content, " Review Search ");
+    }
+}
+
+test "every Overlay paints the Theme base background" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const frame = @import("frame.zig");
+    const view = @import("view.zig");
+    const geometry: frame.Geometry = .{ .cols = 120, .rows = 40 };
+    const area: view.Rect = .{ .width = geometry.cols, .height = geometry.rows };
+    const backdrop: vaxis.Cell.Color = .{ .rgb = .{ 1, 2, 3 } };
+    const Check = struct {
+        fn surface(win: vaxis.Window, rect: frame.Rect, base: vaxis.Cell.Color, highlight: frame.Rect) !void {
+            try testing.expect(!rect.isEmpty());
+            for (rect.y..rect.y + rect.height) |row| for (rect.x..rect.x + rect.width) |col| {
+                const inside_highlight = row >= highlight.y and row < highlight.y + highlight.height and col >= highlight.x and col < highlight.x + highlight.width;
+                if (!inside_highlight) {
+                    const style = win.readCell(@intCast(col), @intCast(row)).?.style;
+                    try testing.expectEqual(base, style.bg);
+                    try testing.expect(!style.reverse);
+                }
+            };
+        }
+    };
+    const prs = [_]bbr.bitbucket.PullRequestSummary{
+        .{ .id = 10, .title = "Add diff parser", .state = "OPEN", .author_display_name = "Ada", .source_branch = "feature/diff", .destination_branch = "main" },
+        .{ .id = 11, .title = "Fix navigation", .state = "OPEN", .author_display_name = "Grace", .source_branch = "feature/nav", .destination_branch = "main" },
+    };
+    var picker = ListOverlay.openPullRequestPicker(a, 1, .{});
+    defer picker.deinit();
+    const summaries = try list_overlay_mod.PullRequestSummaries.create(a);
+    summaries.prs = &prs;
+    try picker.populatePullRequests(1, summaries);
+    picker.moveDown();
+    const target = frame.listOverlayTarget(geometry, picker.box()).?;
+    const selected: frame.Rect = .{ .x = target.entries.x, .y = target.entries.y + 1, .width = target.entries.width, .height = 1 };
+    const search = frame.reviewSearchGeometry(geometry).?;
+    const key = try presentation.OwnedReviewIdentity.init("workspace", "repo", 1);
+
+    var screen = try vaxis.Screen.init(a, .{ .rows = geometry.rows, .cols = geometry.cols, .x_pixel = 0, .y_pixel = 0 });
+    const win = headlessWindow(&screen);
+    for (@import("theme.zig").builtins) |builtin| {
+        const theme = builtin.value;
+        const base = theme.context.bg;
+
+        win.fill(.{ .style = .{ .bg = backdrop } });
+        drawListOverlay(a, win, &picker, .{ .remote = true }, .system, &.{}, theme);
+        try Check.surface(win, target.rect, base, selected);
+
+        win.fill(.{ .style = .{ .bg = backdrop } });
+        drawReviewSearch(a, win, .{ .query = "needle", .occurrences = &.{}, .results = &.{}, .candidate_count = 0, .selected = null, .list_scroll = 0, .preview_scroll = 0, .pending = false, .geometry = search }, theme);
+        try Check.surface(win, search.rect, base, .{});
+
+        win.fill(.{ .style = .{ .bg = backdrop } });
+        drawComposerProjection(a, win, .{ .label = "New comment", .body = "looks good" }, theme);
+        try Check.surface(win, view.solve(layouts.DialogSlot, layouts.dialog, layouts.composer, area).get(.surface).border, base, .{});
+
+        win.fill(.{ .style = .{ .bg = backdrop } });
+        drawSubmit(a, win, theme, 1, 3);
+        try Check.surface(win, view.solve(layouts.DialogSlot, layouts.dialog, layouts.submit_progress, area).get(.surface).border, base, .{});
+
+        win.fill(.{ .style = .{ .bg = backdrop } });
+        drawSubmitResult(a, win, theme, 2, 1, 0, null, false);
+        try Check.surface(win, view.solve(layouts.DialogSlot, layouts.dialog, layouts.submit_result, area).get(.surface).border, base, .{});
+
+        win.fill(.{ .style = .{ .bg = backdrop } });
+        drawHelp(a, win, theme, keymap.Keymap.default, .{ .remote = true });
+        const help_rows = buildHelpRows(a, keymap.Keymap.default, .{ .remote = true });
+        try Check.surface(win, view.solve(layouts.HelpSlot, layouts.help, @max(help_rows.motions.len, help_rows.commands.len), area).get(.surface).border, base, .{});
+
+        win.fill(.{ .style = .{ .bg = backdrop } });
+        drawLoading(a, win, 42, theme, null);
+        try Check.surface(win, view.solve(layouts.LoadingSlot, layouts.loading, {}, area).get(.surface).border, base, .{});
+
+        win.fill(.{ .style = .{ .bg = backdrop } });
+        drawSubmissionTree(a, win, theme, .{ .operation_id = 1, .key = key, .items = &.{}, .selected = 0, .completion = null, .posted = 0, .failed = 0, .skipped = 0, .outcome_unknown = 0 });
+        try Check.surface(win, view.solve(layouts.SubmissionSlot, layouts.submission, {}, area).get(.surface).border, base, .{});
     }
 }
 

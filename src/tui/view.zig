@@ -78,9 +78,6 @@ pub const Border = struct {
     stroke: Stroke = .{},
 };
 
-/// A background that view_paint.zig fills across the border box.
-pub const Fill = enum { surface, header };
-
 pub const Align = enum { start, center, end };
 
 /// Text on a line. A bordered View puts its Title on its own top or bottom
@@ -222,7 +219,8 @@ pub fn View(comptime Slot: type) type {
         margin: Edges = .{},
         border: ?Border = null,
         padding: Edges = .{},
-        fill: ?Fill = null,
+        /// Paint the Theme base background across the border box.
+        fill: bool = false,
         title: ?Title = null,
         scrollbar: ?Scrollbar = null,
         composition: Composition = .leaf,

@@ -22,6 +22,7 @@ A comptime tree with a comptime Slot check was also sketched. It needs a second 
 
 ## Consequences
 
+- Every Overlay paints the Theme's base background, including its border, input, header, and hint rows. Content highlights keep their backgrounds.
 - `paneRects`, `overlayRect`, and `reviewSearchGeometry` in `frame.zig` read their rects from `layouts.zig`. A test compares the Pane and Overlay rects with the previous formulas at every terminal size from 5 to 320 columns. A rect with no cells only has to stay empty.
 - Review Search places its divider at 3/10 of the body content width, not 3/10 of the body border width. The Results list keeps one padding column for its scroll bar. These moves are one cell or less.
 - The Sidebar and the DiffPane have rounded corners. The rule under their Title row is gone, so each body gains one row.
