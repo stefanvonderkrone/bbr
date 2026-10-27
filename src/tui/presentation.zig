@@ -7309,10 +7309,11 @@ pub const Presentation = struct {
             return;
         };
         if (self.geometry.cols == geometry.cols and published.pending_view == null) {
+            // The status height follows its text, so a status message can
+            // cause this resize. Clearing the message here would remove it.
             published.resizeHeight(geometry);
             published.centerActiveFile();
             self.geometry = geometry;
-            self.action_error = null;
             return;
         }
         const desired = published.pending_view;
@@ -18001,6 +18002,21 @@ test "Unified WholeFile authoring uses only selected-version Hunk Lines" {
     try presentation.dispatch(.{ .composer = .cancel });
     try presentation.dispatch(.{ .action = .suggest });
     try testing.expectEqual(ActionError.suggestion_requires_new_version, presentation.projection().action_error.?);
+}
+
+test "a height-only resize keeps the status message" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testLocalSession(testing.allocator) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_pull_request_picker });
+    try presentation.dispatch(.{ .resize = .{ .cols = presentation.geometry.cols, .rows = presentation.geometry.rows - 2 } });
+    try testing.expectEqual(@as(?ActionError, .local_review_no_picker), presentation.projection().action_error);
+    try testing.expect(presentation.takeCommand() == null);
 }
 
 test "local review gates remote actions and refreshes the same identity" {

@@ -5,7 +5,7 @@ The terminal UI had hand-written geometry in `frame.zig` and hand-written border
 ## Decision
 
 - `src/tui/view.zig` owns `Rect`, the box model, the `Composition` union, and `walk`. It imports only `std`. It does not allocate.
-- `src/tui/layouts.zig` owns the View tree of each surface: the Panes, the status row, each Overlay, and Review Search. A tree is a function `fn (params, area, visitor) void`. The tree lives on the stack of that function, and `walk` visits each View once with its placed rings.
+- `src/tui/layouts.zig` owns the View tree of each surface: the Panes, the status, each Overlay, and Review Search. A tree is a function `fn (params, area, visitor) void`. The tree lives on the stack of that function, and `walk` visits each View once with its placed rings.
 - `view.solve` collects the rects of the named Slots. Presentation, `frame.hitTest`, and `app.zig` read these rects.
 - `src/tui/view_paint.zig` is the only painter of decoration: fill, border, rounded corners, titles, rules, junctions, and scroll bars. Content painters draw only into a content rect.
 - A scroll bar sits in the padding, the border, or the margin ring. It never changes the content rect, so a hit target does not move when the content starts to overflow.
@@ -28,6 +28,6 @@ A comptime tree with a comptime Slot check was also sketched. It needs a second 
 - Every Title has one blank cell on each side. The Review Search status and Results titles need two more cells before they show.
 - Every border has rounded corners, and every Overlay surface has a border. `overlaySurface` adds the border around the Overlay's content box, so each Overlay is two cells wider and taller than before. The loading dialog keeps its 48 by 3 size. List Overlay hit testing reads the entries rect from the layout tree.
 - An input Overlay, which is every List Overlay and Review Search, has no outer border. `inputSurface` stacks a bordered input box above a bordered result box. A List Overlay names itself in the Title of its input box, so its query row drops the old prefix, and the surface is two rows taller than before.
-- The status row is a repel without wrap. The review identity sits at the start and the key hints at the end. When both do not fit, the hints shrink from their end. The bar follows the Theme polarity, and each part, such as a key, its hint, a ref, or the Reviewer Verdict, gets its own color and weight from `Theme.statusStyle`.
+- The status is a flow of two clusters: the meta part, with the review identity, above the hint part, with the key hints. Each cluster wraps by item and never inside an item, and app.zig paints a separator in the gap between two items on one row. `layouts.statusHeight` solves the same tree for the rows the status needs, so the content area gets the rest, and Presentation gets the new content geometry when the status text changes its height. The bar follows the Theme polarity, and each part, such as a key, its hint, a ref, or the Reviewer Verdict, gets its own color and weight from `Theme.statusStyle`.
 - The Sidebar and the DiffPane show a scroll bar in their right border when their rows overflow.
 - `tools/check_box_glyphs.py` fails when code outside `view_paint.zig` writes a border corner or junction glyph in `render.zig` or `app.zig`.

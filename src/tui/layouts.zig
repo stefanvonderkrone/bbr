@@ -18,35 +18,106 @@ fn bar(scroll: Scroll, ring: view.Ring, stroke: view.Stroke) view.Scrollbar {
     return .{ .ring = ring, .total = scroll.total, .offset = scroll.offset, .stroke = stroke };
 }
 
-/// The terminal window: the content area above one status row.
+/// The terminal window: the content area above the status rows, as many as
+/// `statusHeight` returns.
 pub const AppSlot = enum { content, status };
 
-pub fn app(_: void, area: Rect, visitor: anytype) void {
+pub fn app(status_rows: u16, area: Rect, visitor: anytype) void {
     const root: view.View(AppSlot) = .{
         .composition = .{ .flow = .{} },
-        .children = &.{ .{ .slot = .content }, .{ .slot = .status, .height = .cells(1) } },
+        .children = &.{ .{ .slot = .content }, .{ .slot = .status, .height = .cells(status_rows) } },
     };
     view.walk(AppSlot, &root, area, visitor);
 }
 
-/// The status row: the review identity at the start and the key hints at the
-/// end. When both do not fit, the hints shrink.
-pub const StatusSlot = enum { start, end };
+/// The status: the meta part above the hint part. Each part is a cluster of
+/// one-row items that wraps by item and never inside one. The meta part is
+/// the Slots before `layout`, the hint part the rest.
+pub const StatusSlot = enum {
+    search,
+    title,
+    verdict,
+    refs,
+    position,
+    layout,
+    scope,
+    isolate,
+    message,
+    submit,
+    comment,
+    file,
+    switch_review,
+    help,
+    quit,
 
-pub const Status = struct {
-    /// Cell widths of the two texts.
-    start: u16,
-    end: u16 = 0,
-    padding: u16 = 1,
+    fn inMeta(self: StatusSlot) bool {
+        return @intFromEnum(self) < @intFromEnum(StatusSlot.layout);
+    }
 };
 
+/// The cell width of each status item. An item of width 0 is absent: the
+/// tree leaves it out, and its rects stay empty.
+pub const Status = std.EnumArray(StatusSlot, u16);
+
+pub const status_padding: u16 = 1;
+/// The cells between two items on one row, where app.zig paints `  ·  `.
+pub const status_gap: u16 = 5;
+
 pub fn status(params: Status, area: Rect, visitor: anytype) void {
-    const root: view.View(StatusSlot) = .{
-        .padding = view.Edges.sides(params.padding),
-        .composition = .{ .repel = .{ .gap = 2, .wrap = false } },
-        .children = &.{ .{ .slot = .start, .width = .cells(params.start) }, .{ .slot = .end, .width = .cells(params.end) } },
-    };
+    const V = view.View(StatusSlot);
+    var meta: [std.enums.values(StatusSlot).len]V = undefined;
+    var hints: [meta.len]V = undefined;
+    var meta_len: usize = 0;
+    var hints_len: usize = 0;
+    for (std.enums.values(StatusSlot)) |slot| {
+        const width = params.get(slot);
+        if (width == 0) continue;
+        const item: V = .{ .slot = slot, .width = .cells(width), .height = .cells(1) };
+        if (slot.inMeta()) {
+            meta[meta_len] = item;
+            meta_len += 1;
+        } else {
+            hints[hints_len] = item;
+            hints_len += 1;
+        }
+    }
+    const padding = view.Edges.sides(status_padding);
+    const width = area.inset(padding).width;
+    const parts = [_]V{ statusPart(meta[0..meta_len], width), statusPart(hints[0..hints_len], width) };
+    const root: V = .{ .padding = padding, .composition = .{ .flow = .{} }, .children = &parts };
     view.walk(StatusSlot, &root, area, visitor);
+}
+
+/// A cluster of `items`, as tall as its rows at `width`.
+fn statusPart(items: []const view.View(StatusSlot), width: u16) view.View(StatusSlot) {
+    var part: view.View(StatusSlot) = .{ .composition = .{ .cluster = .{ .gap = status_gap } }, .children = items };
+    var bottom: ItemsBottom = .{};
+    view.walk(StatusSlot, &part, .{ .width = width, .height = std.math.maxInt(u16) }, &bottom);
+    part.height = .cells(bottom.row);
+    return part;
+}
+
+/// The rows the status needs at `width`: the bottom of its lowest item when
+/// the status tree lays out from row 0.
+pub fn statusHeight(params: Status, width: u16) u16 {
+    var bottom: ItemsBottom = .{};
+    status(params, .{ .width = width, .height = std.math.maxInt(u16) }, &bottom);
+    return bottom.row;
+}
+
+const ItemsBottom = struct {
+    row: u16 = 0,
+
+    pub fn visit(self: *ItemsBottom, node: *const view.View(StatusSlot), placed: view.Placed) void {
+        if (node.slot != null) self.row = @max(self.row, placed.margin.y +| placed.margin.height);
+    }
+};
+
+/// The rects of each status item in `area`. An absent item keeps empty rects.
+pub fn statusRects(params: Status, area: Rect) view.Rects(StatusSlot) {
+    var solver: view.Solver(StatusSlot) = .{};
+    status(params, area, &solver);
+    return solver.rects;
 }
 
 /// The Sidebar and the DiffPane. Each Pane has a rounded border with its
@@ -293,8 +364,8 @@ const testing = std.testing;
 test "every layout places each of its Slots" {
     const areas = [_]Rect{ .{}, .{ .width = 1, .height = 1 }, .{ .width = 80, .height = 24 }, .{ .width = 40, .height = 100 } };
     for (areas) |area| {
-        _ = view.solve(AppSlot, app, {}, area);
-        _ = view.solve(StatusSlot, status, Status{ .start = 30, .end = 60 }, area);
+        _ = view.solve(AppSlot, app, @as(u16, 3), area);
+        _ = view.solve(StatusSlot, status, Status.initFill(9), area);
         _ = view.solve(PaneSlot, panes, Panes{ .diff_scroll = .{ .total = 100, .offset = 3 } }, area);
         _ = view.solve(ListSlot, listOverlay, ListOverlay{ .box = .{ .width = 60, .height = 16 } }, area);
         _ = view.solve(DialogSlot, dialog, composer, area);
@@ -315,13 +386,35 @@ test "the Panes touch with no gap and a 28-cell Sidebar" {
     try testing.expectEqual(narrow.get(.sidebar).border.width, narrow.get(.diff).border.x);
 }
 
-test "the status row puts the hints at the end and shrinks them first" {
-    const wide = view.solve(StatusSlot, status, Status{ .start = 10, .end = 20 }, .{ .y = 9, .width = 80, .height = 1 });
-    try testing.expectEqual(Rect{ .x = 1, .y = 9, .width = 10, .height = 1 }, wide.get(.start).content);
-    try testing.expectEqual(Rect{ .x = 59, .y = 9, .width = 20, .height = 1 }, wide.get(.end).content);
-    const narrow = view.solve(StatusSlot, status, Status{ .start = 10, .end = 20 }, .{ .width = 24, .height = 1 });
-    try testing.expectEqual(Rect{ .x = 1, .y = 0, .width = 10, .height = 1 }, narrow.get(.start).content);
-    try testing.expectEqual(Rect{ .x = 13, .y = 0, .width = 10, .height = 1 }, narrow.get(.end).content);
+test "the status parts wrap by item and stack the hints under the meta information" {
+    const params: Status = .initDefault(0, .{ .title = 20, .verdict = 8, .refs = 14, .position = 7, .layout = 7, .scope = 10, .isolate = 9, .comment = 11, .quit = 6 });
+    const meta = [_]StatusSlot{ .title, .verdict, .refs, .position };
+    const hints = [_]StatusSlot{ .layout, .scope, .isolate, .comment, .quit };
+
+    try testing.expectEqual(@as(u16, 2), statusHeight(params, 120));
+    const wide = statusRects(params, .{ .y = 30, .width = 120, .height = 2 });
+    try testing.expectEqual(Rect{ .x = 1, .y = 30, .width = 20, .height = 1 }, wide.get(.title).content);
+    try testing.expectEqual(Rect{ .x = 26, .y = 30, .width = 8, .height = 1 }, wide.get(.verdict).content);
+    for (meta) |slot| try testing.expectEqual(@as(u16, 30), wide.get(slot).content.y);
+    for (hints) |slot| try testing.expectEqual(@as(u16, 31), wide.get(slot).content.y);
+    try testing.expect(wide.get(.search).content.isEmpty());
+    try testing.expect(wide.get(.submit).content.isEmpty());
+
+    const height = statusHeight(params, 30);
+    try testing.expect(height > 4);
+    const narrow = statusRects(params, .{ .y = 5, .width = 30, .height = height });
+    var bottom: u16 = 0;
+    var last_meta: u16 = 0;
+    for (meta ++ hints) |slot| {
+        const rect = narrow.get(slot).content;
+        try testing.expectEqual(params.get(slot), rect.width);
+        try testing.expect(rect.x >= 1 and rect.x + rect.width <= 29);
+        bottom = @max(bottom, rect.y + rect.height);
+        if (std.mem.indexOfScalar(StatusSlot, &meta, slot) != null) last_meta = @max(last_meta, rect.y);
+    }
+    try testing.expect(last_meta > 5);
+    for (hints) |slot| try testing.expect(narrow.get(slot).content.y > last_meta);
+    try testing.expectEqual(height, bottom - 5);
 }
 
 test "the Help columns start at column 2 and one cell after the middle" {
