@@ -27,6 +27,7 @@ A comptime tree with a comptime Slot check was also sketched. It needs a second 
 - The Sidebar and the DiffPane have rounded corners. The rule under their Title row is gone, so each body gains one row.
 - Every Title has one blank cell on each side. The Review Search status and Results titles need two more cells before they show.
 - Every border has rounded corners, and every Overlay surface has a border. `overlaySurface` adds the border around the Overlay's content box, so each Overlay is two cells wider and taller than before. The loading dialog keeps its 48 by 3 size. List Overlay hit testing reads the entries rect from the layout tree.
+- An input Overlay, which is every List Overlay and Review Search, has no outer border. `inputSurface` stacks a bordered input box above a bordered result box. A List Overlay names itself in the Title of its input box, so its query row drops the old prefix, and the surface is two rows taller than before.
 - The status row is a repel without wrap. The review identity sits at the start and the key hints at the end. When both do not fit, the hints shrink from their end. The bar follows the Theme polarity, and each part, such as a key, its hint, a ref, or the Reviewer Verdict, gets its own color and weight from `Theme.statusStyle`.
 - The Sidebar and the DiffPane show a scroll bar in their right border when their rows overflow.
 - `tools/check_box_glyphs.py` fails when code outside `view_paint.zig` writes a border corner or junction glyph in `render.zig` or `app.zig`.

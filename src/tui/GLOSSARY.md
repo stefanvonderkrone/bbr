@@ -65,6 +65,10 @@ _Avoid_: popup, modal, dialog, hover (describe the trigger, not the thing).
 An Overlay made of one query line and one fuzzy-ranked list with one selection: the Picker, the File Finder, the Command Palette, or the Theme Overlay. At most one List Overlay is open, and opening one closes another. Enter chooses the selected entry, Escape and ctrl-c close the List Overlay, up, down, ctrl-p, and ctrl-n move the selection, and a click selects an entry without choosing it.
 _Avoid_: picker (one specific List Overlay), menu, list modal.
 
+**Input Overlay**:
+An Overlay with a text input, which is every List Overlay and Review Search, drawn as a bordered input box above a bordered result box with no outer border.
+_Avoid_: search dialog.
+
 **Picker**:
 The List Overlay for fuzzy-finding a PullRequest by id or title (backed by `zf`) to switch the loaded PR. While its PullRequest list loads, a scoped low-frequency tick advances a single-glyph spinner without changing the blocking input loop.
 _Avoid_: search, finder, switcher, palette.

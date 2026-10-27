@@ -908,14 +908,14 @@ pub fn drawListOverlay(
     files: []const bbr.diff.File,
     theme: Theme,
 ) void {
-    const rects = view_paint.paint(layouts.ListSlot, layouts.listOverlay, overlay.box(), win, theme);
+    const rects = view_paint.paint(layouts.ListSlot, layouts.listOverlay, layouts.ListOverlay{ .box = overlay.box(), .title = overlay.title() }, win, theme);
     if (rects.get(.surface).border.isEmpty()) return;
     const query = childRect(win, rects.get(.query).content);
     const entries = childRect(win, rects.get(.entries).content);
     const list = overlay.list();
 
-    const prompt = std.fmt.allocPrint(scratch, "{s}› {s}", .{ listPrompt(overlay), list.query() }) catch "›";
-    _ = query.printSegment(.{ .text = prompt, .style = theme.picker_query }, .{ .wrap = .none });
+    const prompt = std.fmt.allocPrint(scratch, "› {s}", .{list.query()}) catch "›";
+    _ = query.printSegment(.{ .text = prompt, .style = theme.picker }, .{ .wrap = .none });
 
     if (listPlaceholder(scratch, overlay, files)) |message| {
         _ = entries.printSegment(.{ .text = message, .style = theme.picker }, .{ .wrap = .none });
@@ -933,15 +933,6 @@ pub fn drawListOverlay(
         fillRow(entries, row, style);
         _ = entries.print(listRow(scratch, overlay, matches[match_index], selected, style, availability, configured_theme, files, theme), .{ .row_offset = row, .wrap = .none });
     }
-}
-
-fn listPrompt(overlay: *const ListOverlay) []const u8 {
-    return switch (overlay.*) {
-        .pull_request_picker => "",
-        .file_finder => "File ",
-        .command_palette => "Command ",
-        .theme => "Theme ",
-    };
 }
 
 /// The list-area message when there are no rows to draw, or null.
@@ -3578,17 +3569,19 @@ test "picker overlay draws the query line and highlights the selection" {
 
     drawListOverlay(a, win, &picker, .{ .remote = true }, .system, &.{}, theme_dark);
 
-    // Modal geometry: 60×16, centered on 80×24 → origin (10, 4).
+    // Surface geometry: 62×20, centered on 80×24 → origin (9, 2). The query
+    // row sits inside the input box at (10, 3). The entries start inside the
+    // result box at (10, 6).
     const mx: u16 = 10;
-    const my: u16 = 4;
-    // Row 0 of the modal is the query prompt "› …".
-    try testing.expectEqualStrings("›", win.readCell(mx, my).?.char.grapheme);
-    try testing.expectEqual(theme_dark.picker_query.bg, win.readCell(mx, my).?.style.bg);
-    // Match rows follow. The selected (second) entry carries the ▸ marker and the
-    // selected background; the first entry does not.
-    try testing.expectEqualStrings("▸", win.readCell(mx, my + 2).?.char.grapheme);
-    try testing.expectEqual(theme_dark.picker_selected.bg, win.readCell(mx, my + 2).?.style.bg);
-    try testing.expectEqual(theme_dark.picker.bg, win.readCell(mx, my + 1).?.style.bg);
+    const qy: u16 = 3;
+    const ey: u16 = 6;
+    try testing.expectEqualStrings("›", win.readCell(mx, qy).?.char.grapheme);
+    try testing.expectEqual(theme_dark.picker.bg, win.readCell(mx, qy).?.style.bg);
+    // The selected (second) entry carries the ▸ marker and the selected
+    // background. The first entry does not.
+    try testing.expectEqualStrings("▸", win.readCell(mx, ey + 1).?.char.grapheme);
+    try testing.expectEqual(theme_dark.picker_selected.bg, win.readCell(mx, ey + 1).?.style.bg);
+    try testing.expectEqual(theme_dark.picker.bg, win.readCell(mx, ey).?.style.bg);
 }
 
 test "Command Palette rows show a bold title, a regular description, and grey an unavailable Action" {
@@ -3599,7 +3592,8 @@ test "Command Palette rows show a bold title, a regular description, and grey an
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
     const mx: u16 = 10;
-    const my: u16 = 4;
+    const qy: u16 = 3;
+    const ey: u16 = 6;
     const local_review: presentation.ActionAvailability = .{ .remote = false };
 
     for ([_]struct { query: []const u8, title: []const u8, available: bool }{
@@ -3612,11 +3606,11 @@ test "Command Palette rows show a bold title, a regular description, and grey an
         win.clear();
         drawListOverlay(a, win, &palette, local_review, .system, &.{}, theme_dark);
 
-        try testing.expectEqualStrings("C", win.readCell(mx, my).?.char.grapheme);
-        const title = win.readCell(mx + 2, my + 1).?;
+        try testing.expectEqualStrings("›", win.readCell(mx, qy).?.char.grapheme);
+        const title = win.readCell(mx + 2, ey).?;
         try testing.expectEqualStrings(case.title[0..1], title.char.grapheme);
         try testing.expect(title.style.bold);
-        const description = win.readCell(mx + 2 + @as(u16, @intCast(case.title.len)) + 2, my + 1).?;
+        const description = win.readCell(mx + 2 + @as(u16, @intCast(case.title.len)) + 2, ey).?;
         try testing.expect(!description.style.bold);
         try testing.expect(!std.mem.eql(u8, " ", description.char.grapheme));
         const expected_fg = if (case.available) theme_dark.picker_selected.fg else theme_dark.gutter.fg;
@@ -3699,11 +3693,11 @@ test "a loading picker shows its single-glyph spinner beside the placeholder" {
 
     drawListOverlay(a, win, &picker, .{ .remote = true }, .system, &.{}, theme_dark);
 
-    // Modal at (10, 4); row 1 of the modal carries "  loading…".
+    // The first entry row, at (10, 6), carries "  loading…".
     const mx: u16 = 10;
-    const my: u16 = 4;
-    try testing.expectEqualStrings("L", win.readCell(mx + 2, my + 1).?.char.grapheme);
-    try testing.expectEqualStrings(picker.pull_request_picker.spinnerGlyph(), win.readCell(mx, my + 1).?.char.grapheme);
+    const ey: u16 = 6;
+    try testing.expectEqualStrings("L", win.readCell(mx + 2, ey).?.char.grapheme);
+    try testing.expectEqualStrings(picker.pull_request_picker.spinnerGlyph(), win.readCell(mx, ey).?.char.grapheme);
 }
 
 test "every Overlay surface has a rounded border" {
@@ -3724,13 +3718,61 @@ test "every Overlay surface has a rounded border" {
     for ([_][2]u16{ .{ 120, 40 }, .{ 50, 12 } }) |size| {
         var screen = try vaxis.Screen.init(a, .{ .rows = size[1], .cols = size[0], .x_pixel = 0, .y_pixel = 0 });
         const win = headlessWindow(&screen);
-        try Check.corners(win, view_paint.paint(layouts.ListSlot, layouts.listOverlay, layouts.Box{ .width = 60, .height = 16 }, win, theme_dark).get(.surface).border);
+        try Check.corners(win, view_paint.paint(layouts.ListSlot, layouts.listOverlay, layouts.ListOverlay{ .box = .{ .width = 60, .height = 16 } }, win, theme_dark).get(.surface).border);
         for ([_]layouts.Dialog{ layouts.composer, layouts.submit_progress, layouts.submit_result }) |dialog|
             try Check.corners(win, view_paint.paint(layouts.DialogSlot, layouts.dialog, dialog, win, theme_dark).get(.surface).border);
         try Check.corners(win, view_paint.paint(layouts.LoadingSlot, layouts.loading, {}, win, theme_dark).get(.surface).border);
         try Check.corners(win, view_paint.paint(layouts.HelpSlot, layouts.help, @as(usize, 20), win, theme_dark).get(.surface).border);
         try Check.corners(win, view_paint.paint(layouts.SubmissionSlot, layouts.submission, {}, win, theme_dark).get(.surface).border);
         try Check.corners(win, view_paint.paint(layouts.SearchSlot, layouts.reviewSearch, layouts.ReviewSearch{}, win, theme_dark).get(.surface).border);
+    }
+}
+
+test "an input Overlay is a bordered input box above a bordered result list" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const frame = @import("frame.zig");
+    const Check = struct {
+        fn shape(win: vaxis.Window, surface: frame.Rect, query: frame.Rect, title: []const u8) !void {
+            try testing.expect(!surface.isEmpty());
+            const bottom = surface.y + surface.height - 1;
+            try testing.expectEqualStrings("╭", win.readCell(surface.x, surface.y).?.char.grapheme);
+            try testing.expectEqualStrings("╰", win.readCell(surface.x, surface.y + 2).?.char.grapheme);
+            try testing.expectEqualStrings("╭", win.readCell(surface.x, surface.y + 3).?.char.grapheme);
+            try testing.expectEqualStrings("╰", win.readCell(surface.x, bottom).?.char.grapheme);
+            try testing.expectEqual(surface.x + 1, query.x);
+            try testing.expectEqual(surface.y + 1, query.y);
+            var top: [1024]u8 = undefined;
+            var len: usize = 0;
+            for (0..surface.width) |col| {
+                const grapheme = win.readCell(surface.x + @as(u16, @intCast(col)), surface.y).?.char.grapheme;
+                @memcpy(top[len..][0..grapheme.len], grapheme);
+                len += grapheme.len;
+            }
+            try testing.expect(std.mem.indexOf(u8, top[0..len], title) != null);
+        }
+    };
+    var overlays = [_]struct { overlay: ListOverlay, title: []const u8 }{
+        .{ .overlay = ListOverlay.openPullRequestPicker(a, 1, .{}), .title = " Pull Requests " },
+        .{ .overlay = try ListOverlay.openFileFinder(a, &.{}), .title = " File Finder " },
+        .{ .overlay = try ListOverlay.openCommandPalette(a, .diff), .title = " Command Palette " },
+        .{ .overlay = try ListOverlay.openTheme(a, .dark), .title = " Theme " },
+    };
+    for ([_][2]u16{ .{ 120, 40 }, .{ 50, 12 } }) |size| {
+        var screen = try vaxis.Screen.init(a, .{ .rows = size[1], .cols = size[0], .x_pixel = 0, .y_pixel = 0 });
+        const win = headlessWindow(&screen);
+        for (&overlays) |*case| {
+            win.clear();
+            drawListOverlay(a, win, &case.overlay, .{ .remote = true }, .system, &.{}, theme_dark);
+            const target = frame.listOverlayTarget(.{ .cols = size[0], .rows = size[1] }, case.overlay.box()).?;
+            try testing.expectEqualStrings("›", win.readCell(target.rect.x + 1, target.rect.y + 1).?.char.grapheme);
+            try Check.shape(win, target.rect, .{ .x = target.rect.x + 1, .y = target.rect.y + 1 }, case.title);
+            try testing.expectEqual(target.rect.y + 4, target.entries.y);
+        }
+        win.clear();
+        const rects = view_paint.paint(layouts.SearchSlot, layouts.reviewSearch, layouts.ReviewSearch{}, win, theme_dark);
+        try Check.shape(win, rects.get(.surface).border, rects.get(.query).content, " Review Search ");
     }
 }
 

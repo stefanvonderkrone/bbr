@@ -284,7 +284,7 @@ pub fn paneRects(geometry: Geometry) PaneRects {
 /// The List Overlay geometry that rendering and input targeting share. A
 /// zero-sized Frame has no targetable Overlay.
 pub fn listOverlayTarget(geometry: Geometry, box: layouts.Box) ?OverlayTarget {
-    const rects = view.solve(layouts.ListSlot, layouts.listOverlay, box, area(geometry));
+    const rects = view.solve(layouts.ListSlot, layouts.listOverlay, layouts.ListOverlay{ .box = box }, area(geometry));
     const rect = rects.get(.surface).border;
     if (rect.isEmpty()) return null;
     return .{ .kind = .list, .rect = rect, .entries = rects.get(.entries).content };
@@ -1151,11 +1151,11 @@ test "View Pane geometry keeps the cells of the previous formulas" {
 
 test "List Overlay geometry is centered, bordered, and clipped to the published Frame" {
     const wide = listOverlayTarget(.{ .cols = 80, .rows = 24 }, .{ .width = 60, .height = 16 }).?;
-    try testing.expectEqual(Rect{ .x = 9, .y = 3, .width = 62, .height = 18 }, wide.rect);
-    try testing.expectEqual(Rect{ .x = 10, .y = 5, .width = 60, .height = 15 }, wide.entries);
+    try testing.expectEqual(Rect{ .x = 9, .y = 2, .width = 62, .height = 20 }, wide.rect);
+    try testing.expectEqual(Rect{ .x = 10, .y = 6, .width = 60, .height = 15 }, wide.entries);
     const clipped = listOverlayTarget(.{ .cols = 20, .rows = 8 }, .{ .width = 60, .height = 16 }).?;
     try testing.expectEqual(Rect{ .x = 0, .y = 0, .width = 20, .height = 8 }, clipped.rect);
-    try testing.expectEqual(Rect{ .x = 1, .y = 2, .width = 18, .height = 5 }, clipped.entries);
+    try testing.expectEqual(Rect{ .x = 1, .y = 4, .width = 18, .height = 3 }, clipped.entries);
     try testing.expect(listOverlayTarget(.{ .cols = 0, .rows = 8 }, .{ .width = 60, .height = 16 }) == null);
 }
 

@@ -90,8 +90,9 @@ pub const Box = struct { width: u16, height: u16 };
 
 const overlay_stroke: view.Stroke = .{ .tone = .overlay };
 
-/// The one way to build an Overlay surface: a filled box with a rounded
-/// border around `box` content cells, centered in its area.
+/// The surface of an Overlay without a text input: a filled box with a
+/// rounded border around `box` content cells. An Overlay with a text input
+/// uses `inputSurface`.
 fn overlaySurface(comptime Slot: type, box: Box, node: view.View(Slot)) view.View(Slot) {
     var result = node;
     result.width = .cells(box.width +| 2);
@@ -101,20 +102,33 @@ fn overlaySurface(comptime Slot: type, box: Box, node: view.View(Slot)) view.Vie
     return result;
 }
 
-/// A List Overlay: the query row above the ranked entries.
+/// The surface of an Overlay with a text input. It is a filled flow of the
+/// input box, one row inside a rounded border, above the result box, which
+/// takes the rest inside its own rounded border. The surface has no border.
+/// An Overlay without a text input uses `overlaySurface`.
+fn inputSurface(comptime Slot: type, slot: Slot, width: Size, height: Size, boxes: *[2]view.View(Slot)) view.View(Slot) {
+    boxes[0].height = .cells(3);
+    for (boxes) |*box| box.border = .{ .stroke = overlay_stroke };
+    return .{ .slot = slot, .width = width, .height = height, .fill = .surface, .composition = .{ .flow = .{} }, .children = boxes };
+}
+
+/// A List Overlay: the query box, with the Overlay's Title, above the box of
+/// ranked entries. `box` counts one query row plus the entry rows.
 pub const ListSlot = enum { surface, query, entries };
 
-pub fn listOverlay(box: Box, area: Rect, visitor: anytype) void {
+pub const ListOverlay = struct {
+    box: Box,
+    title: []const u8 = "",
+};
+
+pub fn listOverlay(params: ListOverlay, area: Rect, visitor: anytype) void {
+    var boxes = [_]view.View(ListSlot){
+        .{ .slot = .query, .title = .{ .text = params.title, .@"align" = .center, .inset = 1 } },
+        .{ .slot = .entries },
+    };
     const root: view.View(ListSlot) = .{
         .composition = .{ .center = .{} },
-        .children = &.{overlaySurface(ListSlot, box, .{
-            .slot = .surface,
-            .composition = .{ .flow = .{} },
-            .children = &.{
-                .{ .slot = .query, .height = .cells(1), .fill = .header },
-                .{ .slot = .entries },
-            },
-        })},
+        .children = &.{inputSurface(ListSlot, .surface, .cells(params.box.width +| 2), .cells(params.box.height +| 4), &boxes)},
     };
     view.walk(ListSlot, &root, area, visitor);
 }
@@ -248,31 +262,28 @@ pub fn reviewSearch(params: ReviewSearch, area: Rect, visitor: anytype) void {
             .children = &preview_children,
         },
     };
+    var boxes = [_]V{
+        .{
+            .slot = .search_box,
+            .title = .{ .text = "Review Search", .@"align" = .center, .inset = 1 },
+            .composition = .{ .flow = .{} },
+            .children = &.{.{ .slot = .query, .title = .{ .text = params.status, .edge = .bottom, .@"align" = .end } }},
+        },
+        .{
+            .slot = .body,
+            .composition = .{ .flow = .{ .axis = if (landscape) .horizontal else .vertical } },
+            .children = &body_children,
+        },
+    };
     const root: V = .{
         .composition = .{ .center = .{} },
-        .children = &.{.{
-            .slot = .surface,
-            .width = .{ .basis = .{ .fraction = .{ .num = 4, .den = 5 } }, .min = 64 },
-            .height = .{ .basis = .{ .fraction = .{ .num = 4, .den = 5 } }, .min = 14 },
-            .fill = .surface,
-            .composition = .{ .flow = .{} },
-            .children = &.{
-                .{
-                    .slot = .search_box,
-                    .height = .cells(3),
-                    .border = .{ .stroke = overlay_stroke },
-                    .title = .{ .text = "Review Search", .@"align" = .center, .inset = 1 },
-                    .composition = .{ .flow = .{} },
-                    .children = &.{.{ .slot = .query, .title = .{ .text = params.status, .edge = .bottom, .@"align" = .end } }},
-                },
-                .{
-                    .slot = .body,
-                    .border = .{ .stroke = overlay_stroke },
-                    .composition = .{ .flow = .{ .axis = if (landscape) .horizontal else .vertical } },
-                    .children = &body_children,
-                },
-            },
-        }},
+        .children = &.{inputSurface(
+            SearchSlot,
+            .surface,
+            .{ .basis = .{ .fraction = .{ .num = 4, .den = 5 } }, .min = 64 },
+            .{ .basis = .{ .fraction = .{ .num = 4, .den = 5 } }, .min = 14 },
+            &boxes,
+        )},
     };
     view.walk(SearchSlot, &root, area, visitor);
 }
@@ -285,7 +296,7 @@ test "every layout places each of its Slots" {
         _ = view.solve(AppSlot, app, {}, area);
         _ = view.solve(StatusSlot, status, Status{ .start = 30, .end = 60 }, area);
         _ = view.solve(PaneSlot, panes, Panes{ .diff_scroll = .{ .total = 100, .offset = 3 } }, area);
-        _ = view.solve(ListSlot, listOverlay, Box{ .width = 60, .height = 16 }, area);
+        _ = view.solve(ListSlot, listOverlay, ListOverlay{ .box = .{ .width = 60, .height = 16 } }, area);
         _ = view.solve(DialogSlot, dialog, composer, area);
         _ = view.solve(LoadingSlot, loading, {}, area);
         _ = view.solve(HelpSlot, help, @as(usize, 20), area);

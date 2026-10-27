@@ -574,6 +574,16 @@ pub const ListOverlay = union(enum) {
         };
     }
 
+    /// The name in the top border of the query box.
+    pub fn title(self: *const ListOverlay) []const u8 {
+        return switch (self.*) {
+            .pull_request_picker => "Pull Requests",
+            .file_finder => "File Finder",
+            .command_palette => "Command Palette",
+            .theme => "Theme",
+        };
+    }
+
     /// Fill the loading Picker that issued `work_id` and take ownership of
     /// `summaries`. On any error the caller still owns `summaries`.
     pub fn populatePullRequests(self: *ListOverlay, work_id: u64, summaries: *PullRequestSummaries) (Allocator.Error || error{NotLoadingPicker})!void {
