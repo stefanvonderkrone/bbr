@@ -427,6 +427,27 @@ test "M20 hardening accepts only an unmodified same-target title click" {
     try testing.expectEqual(SelectedVersion.old, presentation.projection().review.?.selected_version);
 }
 
+test "M20 hardening a clipped unselected title changes the Selected Version" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try initPresentation(testing.allocator, store.store(), .{ .cols = 80, .rows = 10 });
+    defer presentation.deinit();
+
+    try dispatchView(&presentation, .{ .action = .select_old_version });
+    try dispatchView(&presentation, .{ .resize = .{ .cols = 44, .rows = 10 } });
+    const review = presentation.projection().review.?;
+    try testing.expectEqual(SelectedVersion.old, review.selected_version);
+    const clipped = review.frame.version_title_targets.new.?;
+    try testing.expect(clipped.width > 0);
+    try testing.expect(clipped.width < review.frame.version_title_targets.old.?.width);
+    try testing.expectEqual(@import("frame.zig").HitTarget.select_new_version, @import("frame.zig").hitTest(review.frame, clipped.x, clipped.y).?);
+
+    try presentation.dispatch(.{ .mouse = .{ .col = clipped.x, .row = clipped.y, .button = .left, .type = .press } });
+    try testing.expectEqual(SelectedVersion.old, presentation.projection().review.?.selected_version);
+    try dispatchView(&presentation, .{ .mouse = .{ .col = clipped.x, .row = clipped.y, .button = .left, .type = .release } });
+    try testing.expectEqual(SelectedVersion.new, presentation.projection().review.?.selected_version);
+}
+
 test "M20 hardening disabled mouse input cannot select a title segment" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
