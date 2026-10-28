@@ -28,11 +28,10 @@ pub const Source = union(enum) {
 };
 
 pub const CardRole = enum { comment, comment_reply, deleted_comment, deleted_reply, draft, draft_reply, outcome_unknown, outcome_unknown_reply };
-/// The rows of a ReviewCard from top to bottom. A Reply starts with a gap row.
+/// The rows of a ReviewCard from top to bottom.
 /// The header is the top border with the Title. The disclosure footer or the
 /// bottom part is the bottom border.
 pub const Part = enum {
-    gap,
     header,
     body,
     code_body,
@@ -46,14 +45,14 @@ pub const Part = enum {
     pub fn hasCodeBackground(self: Part) bool {
         return switch (self) {
             .code_body, .suggestion_label, .suggestion_body => true,
-            .gap, .header, .body, .disclosure_footer, .bottom => false,
+            .header, .body, .disclosure_footer, .bottom => false,
         };
     }
 
-    /// A border row or the gap row. It carries no ReviewBody text.
+    /// A border row. It carries no ReviewBody text.
     pub fn isBorder(self: Part) bool {
         return switch (self) {
-            .gap, .header, .disclosure_footer, .bottom => true,
+            .header, .disclosure_footer, .bottom => true,
             .body, .code_body, .suggestion_label, .suggestion_body => false,
         };
     }
@@ -276,7 +275,6 @@ pub fn projectInto(allocator: std.mem.Allocator, scratch_allocator: std.mem.Allo
     }
     const collapsible = options.collapsed_rows > 0 and body_rows.items.len > options.collapsed_rows;
     const visible_count = if (collapsible and !options.expanded) options.collapsed_rows else body_rows.items.len;
-    if (options.depth > 0) try sink.append(makeRow(options, .gap, 0, .literal, .{ .start = 0, .end = 0 }, &.{}));
     var header = makeRow(options, .header, 0, .literal, .{ .start = 0, .end = 0 }, try oneSegment(allocator, .{
         .text = options.header,
         .source = .{ .start = 0, .end = 0 },
@@ -370,6 +368,7 @@ const Writer = struct {
     first_row: bool = true,
     prefix_width: usize = 0,
     reference: ?body_mod.Span = null,
+    mention_source: ?SourceRange = null,
     link: ?body_mod.LinkTarget = null,
 
     fn block(self: *Writer, value: body_mod.Block, ordinal: usize) !void {
@@ -542,6 +541,12 @@ const Writer = struct {
         marks.strong = marks.strong or force_strong;
         self.reference = if (span.definition_source != null) span else null;
         defer self.reference = null;
+        if (span.mention.len > 0) {
+            self.mention_source = span.source;
+            defer self.mention_source = null;
+            try self.addToken(span.text, span.source, marks, true);
+            return;
+        }
         if (span.emoji.len > 0) {
             const cells = self.options.metrics.width(span.text);
             try self.addPrefix(cells);
@@ -639,9 +644,10 @@ const Writer = struct {
             }
             try self.append(.{
                 .text = display,
-                .source = if (authored and self.reference == null) .{ .start = range.start + pos, .end = @min(range.start + pos + measured.byte_len, range.end) } else range,
+                .source = self.mention_source orelse if (authored and self.reference == null) .{ .start = range.start + pos, .end = @min(range.start + pos + measured.byte_len, range.end) } else range,
                 .marks = marks,
                 .authored = authored,
+                .atomic = self.mention_source != null,
                 .definition_source = if (authored and self.reference != null) .{ .start = self.reference.?.definition_source.?.start + pos, .end = self.reference.?.definition_source.?.start + pos + measured.byte_len } else null,
                 .required_definition = if (authored and self.reference != null) self.reference.?.required_definition else null,
             }, measured.cell_width);

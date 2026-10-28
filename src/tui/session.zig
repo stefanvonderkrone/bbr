@@ -15,6 +15,7 @@ const Io = std.Io;
 const bbr = @import("bbr");
 const file_enrichment = @import("file_enrichment.zig");
 const buffer = @import("buffer.zig");
+const review_body = @import("review_body.zig");
 
 const PullRequest = bbr.bitbucket.PullRequest;
 const Client = bbr.bitbucket.Client;
@@ -48,6 +49,7 @@ pub const Session = struct {
     source: SourceContext,
     diff: bbr.diff.Diff,
     threads: []const bbr.review.Thread,
+    mention_names: review_body.MentionNames = .empty,
     enrichment: file_enrichment.Storage,
     emphasis_cache: ?buffer.EmphasisCache = null,
     /// Independently acquired mutation capability. A missing UUID never makes
@@ -80,6 +82,30 @@ pub const Session = struct {
         self.emphasis_cache = try buffer.EmphasisCache.build(self.arena.allocator(), self.diff);
     }
 
+    fn resolveMentions(self: *Session, bb: Client, comments: []const bbr.review.Comment) !void {
+        const a = self.arena.allocator();
+        var scratch = std.heap.ArenaAllocator.init(self.arena.child_allocator);
+        defer scratch.deinit();
+        for (comments) |comment| {
+            if (comment.deleted or std.mem.indexOf(u8, comment.body, "@{") == null) continue;
+            const body = try review_body.ReviewBody.parse(scratch.allocator(), comment.body);
+            for (body.blocks) |block| for (block.spans) |span| {
+                if (span.mention.len == 0) continue;
+                const entry = try self.mention_names.getOrPut(a, span.mention);
+                if (entry.found_existing) continue;
+                entry.key_ptr.* = try a.dupe(u8, span.mention);
+                entry.value_ptr.* = "";
+                const user = bb.getUser(scratch.allocator(), span.mention) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => continue,
+                };
+                const name = if (user.display_name.len > 0) user.display_name else user.nickname;
+                if (validMentionName(name)) entry.value_ptr.* = try std.fmt.allocPrint(a, "@{s}", .{name});
+            };
+            if (!scratch.reset(.{ .retain_with_limit = 64 * 1024 })) return error.OutOfMemory;
+        }
+    }
+
     pub fn remotePullRequest(self: *Session) ?*PullRequest {
         return switch (self.source) {
             .remote => |*pr| pr,
@@ -95,6 +121,12 @@ pub const Session = struct {
     }
 };
 
+fn validMentionName(name: []const u8) bool {
+    if (name.len == 0 or !std.unicode.utf8ValidateSlice(name)) return false;
+    for (name) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    return true;
+}
+
 /// Allocate an empty Session (arena initialized, fields unset) so a caller can
 /// fill it from data it owns — used by the offline `demo`, which has no network
 /// fetch. Fill `header`, `source`, `diff`, and `threads` using its arena.
@@ -105,6 +137,7 @@ pub fn create(backing: Allocator) !*Session {
     s.references = .init(1);
     s.acquisition_arenas = @splat(null);
     s.emphasis_cache = null;
+    s.mention_names = .empty;
     errdefer s.arena.deinit();
     s.threads = &.{};
     s.enrichment = try file_enrichment.Storage.init(s.arena.allocator(), &.{});
@@ -189,6 +222,7 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
     s.references = .init(1);
     s.acquisition_arenas = @splat(null);
     s.emphasis_cache = null;
+    s.mention_names = .empty;
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
 
@@ -215,6 +249,7 @@ pub fn loadWith(io: Io, backing: Allocator, bb: Client, repo: []const u8, id: u6
     errdefer s.enrichment.deinit();
     const comments = comments_branch.value.?;
     s.threads = try bbr.review.buildThreads(a, comments);
+    try s.resolveMentions(bb, comments);
     try s.prepareEmphasis();
     const account_arena: ?std.heap.ArenaAllocator = if (account_branch.err == null)
         account_branch.arena
@@ -237,6 +272,7 @@ pub fn loadSequentialWith(backing: Allocator, bb: Client, repo: []const u8, id: 
     s.references = .init(1);
     s.acquisition_arenas = @splat(null);
     s.emphasis_cache = null;
+    s.mention_names = .empty;
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
 
@@ -255,6 +291,7 @@ pub fn loadSequentialWith(backing: Allocator, bb: Client, repo: []const u8, id: 
     errdefer s.enrichment.deinit();
     const comments = try bb.getComments(a, repo, id, .{ .source = pr.source_commit, .destination = pr.destination_commit });
     s.threads = try bbr.review.buildThreads(a, comments);
+    try s.resolveMentions(bb, comments);
     try s.prepareEmphasis();
     return s;
 }
@@ -328,6 +365,7 @@ pub fn loadLocalWith(
     s.references = .init(1);
     s.acquisition_arenas = @splat(null);
     s.emphasis_cache = null;
+    s.mention_names = .empty;
     errdefer s.arena.deinit();
     const a = s.arena.allocator();
 
@@ -410,6 +448,67 @@ test "loadWith builds a session in order and owns everything" {
     try testing.expect(projection.blobs[0].new == null);
     try testing.expect(s.enrichment.status(0).old == .pending);
     try testing.expect(s.enrichment.status(0).new == .pending);
+}
+
+test "remote Session resolves each prose mention once and retains failed mentions" {
+    const base = testRemoteResponses(200);
+    const responses = [_]Canned{
+        .{ .request_key = "/users/id", .body = "{\"uuid\":\"{id}\",\"display_name\":\"Stefan von der Krone\"}" },
+        .{ .request_key = "/users/nick", .body = "{\"uuid\":\"{nick}\",\"nickname\":\"Ada\"}" },
+        .{ .request_key = "/users/missing", .status = 404 },
+        .{ .request_key = "/users/control", .body = "{\"uuid\":\"{control}\",\"display_name\":\"bad\\nname\"}" },
+        base[0],
+        base[1],
+        .{ .request_key = "/pullrequests/7/comments", .body =
+        \\{"values":[
+        \\ {"id":1,"content":{"raw":"@{id} @{id} @{missing} @{nick} @{control} `@{code}` [link](url/@{url})"},"user":{"display_name":"Ada"}},
+        \\ {"id":2,"parent":{"id":1},"content":{"raw":"**@{id}** @{missing}"},"user":{"display_name":"Bo"}}
+        \\]}
+        },
+        base[3],
+    };
+    for ([_]bool{ false, true }) |sequential| {
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+        const s = if (sequential) try loadSequentialWith(testing.allocator, bb, "repo", 7) else try loadWith(testing.io, std.heap.page_allocator, bb, "repo", 7);
+        defer s.destroy();
+        try testing.expectEqualStrings("@Stefan von der Krone", s.mention_names.get("id").?);
+        try testing.expectEqualStrings("@Ada", s.mention_names.get("nick").?);
+        try testing.expectEqualStrings("", s.mention_names.get("missing").?);
+        try testing.expectEqualStrings("", s.mention_names.get("control").?);
+        try testing.expectEqual(@as(usize, 4), s.mention_names.count());
+        try testing.expectEqual(@as(usize, 8), fake.callCount());
+        try testing.expect(fake.maxActiveRequests() <= 2);
+        try testing.expect(std.mem.startsWith(u8, s.threads[0].root.body, "@{id} @{id}"));
+    }
+}
+
+test "mention acquisition failures keep a usable Session and release failed allocations" {
+    for ([_]u16{ 401, 403, 404, 429, 503 }) |status| {
+        const base = testRemoteResponses(200);
+        const responses = [_]Canned{
+            .{ .request_key = "/users/id", .status = status },
+            base[0],
+            base[1],
+            .{ .request_key = "/pullrequests/7/comments", .body = "{\"values\":[{\"id\":1,\"content\":{\"raw\":\"@{id} @{id}\"},\"user\":{\"display_name\":\"Ada\"}}]}" },
+            base[3],
+        };
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+        const s = try loadSequentialWith(testing.allocator, bb, "repo", 7);
+        defer s.destroy();
+        try testing.expectEqualStrings("", s.mention_names.get("id").?);
+        try testing.expectEqual(@as(usize, 5), fake.callCount());
+    }
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(a: Allocator) !void {
+            const s = try create(a);
+            defer s.destroy();
+            var fake: FakeHttpClient = .{ .body = "{\"uuid\":\"{id}\",\"display_name\":\"Ada\"}" };
+            const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "ws" });
+            try s.resolveMentions(bb, &.{.{ .id = 1, .author = "Bo", .body = "@{id} @{id}" }});
+        }
+    }.run, .{});
 }
 
 test "loadLocalWith resolves defaults and builds a source-neutral Session" {

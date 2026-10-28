@@ -29,6 +29,8 @@ All remote TUI work uses one TUI-lifetime `StdHttpClient` connection pool.
 Candidate Session acquisition uses at most two active requests.
 PullRequest, RawDiff, and Comments are required.
 Authenticated Account acquisition is independent.
+After the required acquisitions complete, remote Session loading resolves distinct prose mention IDs with sequential `getUser` calls.
+The Session keeps successful labels and failed lookups until Session replacement. Paint and search never fetch account profiles.
 Comments wait for PullRequest commit data and take priority over RawDiff when both can start.
 Remote File Enrichment fetches its old and new sides concurrently, with at most two requests per File.
 All started branches complete without branch cancellation.

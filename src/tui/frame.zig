@@ -592,10 +592,10 @@ pub const NavigationIndex = struct {
                     try result.add(a, .{ .line = half.line }, half.source_start, half.source_end, index);
             } else switch (row.owner) {
                 .line => try result.add(a, row.owner, row.source_start, row.source_end, index),
-                .comment => |value| if (value.part != .header and value.part != .gap) {
+                .comment => |value| if (value.part != .header) {
                     try result.add(a, .{ .comment = .{ .id = value.id, .source_offset = 0 } }, value.source_offset, row.source_end, index);
                 },
-                .draft => |value| if (value.part != .header and value.part != .gap) {
+                .draft => |value| if (value.part != .header) {
                     try result.add(a, .{ .draft = .{ .id = value.id, .source_offset = 0 } }, value.source_offset, row.source_end, index);
                 },
                 else => {},
@@ -743,11 +743,11 @@ fn findOwner(visual_rows: []const VisualRow, wanted: RowOwner) ?usize {
     var nearest: ?usize = null;
     var nearest_offset: usize = std.math.maxInt(usize);
     for (visual_rows, 0..) |visual_row, index| switch (wanted) {
-        .comment => |value| if (visual_row.owner == .comment and visual_row.owner.comment.id == value.id and visual_row.owner.comment.part != .header and visual_row.owner.comment.part != .gap and ((visual_row.owner.comment.source_offset <= value.source_offset and value.source_offset < visual_row.source_end) or visual_row.owner.comment.source_offset >= value.source_offset) and visual_row.owner.comment.source_offset < nearest_offset) {
+        .comment => |value| if (visual_row.owner == .comment and visual_row.owner.comment.id == value.id and visual_row.owner.comment.part != .header and ((visual_row.owner.comment.source_offset <= value.source_offset and value.source_offset < visual_row.source_end) or visual_row.owner.comment.source_offset >= value.source_offset) and visual_row.owner.comment.source_offset < nearest_offset) {
             nearest = index;
             nearest_offset = visual_row.owner.comment.source_offset;
         },
-        .draft => |value| if (visual_row.owner == .draft and visual_row.owner.draft.id == value.id and visual_row.owner.draft.part != .header and visual_row.owner.draft.part != .gap and ((visual_row.owner.draft.source_offset <= value.source_offset and value.source_offset < visual_row.source_end) or visual_row.owner.draft.source_offset >= value.source_offset) and visual_row.owner.draft.source_offset < nearest_offset) {
+        .draft => |value| if (visual_row.owner == .draft and visual_row.owner.draft.id == value.id and visual_row.owner.draft.part != .header and ((visual_row.owner.draft.source_offset <= value.source_offset and value.source_offset < visual_row.source_end) or visual_row.owner.draft.source_offset >= value.source_offset) and visual_row.owner.draft.source_offset < nearest_offset) {
             nearest = index;
             nearest_offset = visual_row.owner.draft.source_offset;
         },
@@ -785,7 +785,7 @@ fn owner(row: buffer_mod.Row) RowOwner {
 
 fn anchorPart(part: @import("review_card.zig").Part) ?@import("review_card.zig").Part {
     return switch (part) {
-        .gap, .header, .disclosure_footer, .bottom => part,
+        .header, .disclosure_footer, .bottom => part,
         .body, .code_body, .suggestion_label, .suggestion_body => null,
     };
 }

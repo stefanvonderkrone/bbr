@@ -138,8 +138,6 @@ pub const CardEdge = union(enum) {
     side,
     /// The bottom border, with an optional Title before `─╯`.
     bottom: []const u8,
-    /// The gap row above a Reply: one line at the left border column.
-    gap,
 };
 
 /// Paint the `edge` of a ReviewCard whose borders sit in columns `left` and
@@ -147,7 +145,6 @@ pub const CardEdge = union(enum) {
 pub fn cardEdge(win: vaxis.Window, row: u16, left: usize, right: usize, edge: CardEdge, border: vaxis.Style, title: vaxis.Style) void {
     if (right <= left) return;
     switch (edge) {
-        .gap => writeGlyph(win, left, row, "│", border),
         .side => {
             writeGlyph(win, left, row, "│", border);
             writeGlyph(win, right, row, "│", border);

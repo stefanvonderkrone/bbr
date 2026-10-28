@@ -1859,6 +1859,9 @@ pub const BufferSearchCorpus = struct {
                 .corpus_order = source.corpus_order,
                 .session_epoch = source.session_epoch,
             };
+            for (@constCast(target.mapping)) |*mapping| {
+                if (mapping.alternative.len > 0) mapping.alternative = try allocator.dupe(u8, mapping.alternative);
+            }
         }
         corpus.candidates = owned;
         return corpus;
@@ -2796,6 +2799,7 @@ pub const DisclosureBuild = struct {
                 .cell_metrics = self.cell_metrics,
                 .collapsed_rows = self.collapsed_rows,
                 .emphasis_cache = &self.session.emphasis_cache.?,
+                .mention_names = &self.session.mention_names,
             }, self.epoch);
             self.search_corpus = try BufferSearchCorpus.create(candidates);
             if (self.accepted_query_text) |text| {
@@ -2878,6 +2882,7 @@ pub const DisclosureBuild = struct {
             .cell_metrics = self.cell_metrics,
             .collapsed_rows = self.collapsed_rows,
             .emphasis_cache = &self.session.emphasis_cache.?,
+            .mention_names = &self.session.mention_names,
         });
     }
 
@@ -3249,6 +3254,7 @@ pub const BufferSearchProjection = struct {
 };
 
 pub const ReviewSearchResult = struct {
+    mention_names: *const @import("review_body.zig").MentionNames = &.empty,
     code_highlights: []const code_highlighting.View = &.{},
     kind: []const u8,
     source: []const u8,
@@ -4129,6 +4135,7 @@ const Published = struct {
                 .cell_metrics = cell_metrics,
                 .collapsed_rows = published.comments_collapsed_rows,
                 .emphasis_cache = &published.emphasis_cache,
+                .mention_names = &session.mention_names,
             },
         ) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -4446,6 +4453,7 @@ const Published = struct {
                 .cell_metrics = self.cell_metrics,
                 .collapsed_rows = self.commentsCollapsedRows(),
                 .emphasis_cache = &self.emphasis_cache,
+                .mention_names = &self.session.mention_names,
             },
         ) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -4627,6 +4635,7 @@ const Published = struct {
                 .cell_metrics = self.cell_metrics,
                 .collapsed_rows = self.commentsCollapsedRows(),
                 .emphasis_cache = &self.emphasis_cache,
+                .mention_names = &self.session.mention_names,
             },
             self.epoch,
         );
@@ -4659,6 +4668,7 @@ const Published = struct {
                 .cell_metrics = self.cell_metrics,
                 .collapsed_rows = self.commentsCollapsedRows(),
                 .emphasis_cache = &self.emphasis_cache,
+                .mention_names = &self.session.mention_names,
             },
             self.epoch,
         );
@@ -4673,17 +4683,17 @@ const Published = struct {
         var order: usize = 0;
         for (self.session.threads) |thread| {
             if (!thread.root.deleted) {
-                const body = try review_card.ReviewBody.parse(allocator, thread.root.body);
+                const body = try review_card.ReviewBody.parseWithMentions(allocator, thread.root.body, &self.session.mention_names);
                 try search.appendReviewBodyCandidates(allocator, body, .{ .comment = thread.root.id }, self.epoch, &order, &candidates);
             }
             for (thread.replies) |reply| {
                 if (reply.deleted) continue;
-                const body = try review_card.ReviewBody.parse(allocator, reply.body);
+                const body = try review_card.ReviewBody.parseWithMentions(allocator, reply.body, &self.session.mention_names);
                 try search.appendReviewBodyCandidates(allocator, body, .{ .comment = reply.id }, self.epoch, &order, &candidates);
             }
         }
         for (self.review.drafts.items) |draft| {
-            const body = try review_card.ReviewBody.parse(allocator, draft.body);
+            const body = try review_card.ReviewBody.parseWithMentions(allocator, draft.body, &self.session.mention_names);
             try search.appendReviewBodyCandidates(allocator, body, .{ .draft = draft.local_id }, self.epoch, &order, &candidates);
         }
         return BufferSearchCorpus.create(candidates.items);
@@ -10993,6 +11003,7 @@ pub const Presentation = struct {
             body.visible = true;
         }
         if (self.codePreviewBody(published)) |body| {
+            body.parsed.applyMentionNames(&published.session.mention_names);
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
             const geometry = frame_mod.reviewSearchGeometry(self.geometry) orelse return;
@@ -12510,6 +12521,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
     switch (owner) {
         .comment => |id| for (published.session.threads) |thread| {
             if (thread.root.id == id) return .{
+                .mention_names = &published.session.mention_names,
                 .kind = "COMMENT",
                 .source = thread.root.author,
                 .body = thread.root.body,
@@ -12518,6 +12530,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
                 .occurrence = occurrence,
             };
             for (thread.replies) |reply| if (reply.id == id) return .{
+                .mention_names = &published.session.mention_names,
                 .kind = "REPLY",
                 .source = reply.author,
                 .body = reply.body,
@@ -12538,6 +12551,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
                     .comment => |parent_id| {
                         for (published.session.threads) |thread| {
                             if (thread.root.id == parent_id) return .{
+                                .mention_names = &published.session.mention_names,
                                 .kind = "DRAFT",
                                 .source = "local",
                                 .body = draft.body,
@@ -12546,6 +12560,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
                                 .occurrence = occurrence,
                             };
                             for (thread.replies) |reply| if (reply.id == parent_id) return .{
+                                .mention_names = &published.session.mention_names,
                                 .kind = "DRAFT",
                                 .source = "local",
                                 .body = draft.body,
@@ -12567,7 +12582,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
                 }
                 break;
             };
-            return .{ .kind = "DRAFT", .source = "local", .body = draft.body, .scope = scope, .scope_state = scope_state, .occurrence = occurrence };
+            return .{ .mention_names = &published.session.mention_names, .kind = "DRAFT", .source = "local", .body = draft.body, .scope = scope, .scope_state = scope_state, .occurrence = occurrence };
         },
     }
     unreachable;
@@ -20121,6 +20136,69 @@ test "M23 acceptance authored Markdown storage editing and Submission stay byte 
     }
 }
 
+test "mention display survives reprojection and both searches while yank keeps authored bytes" {
+    const raw = "@{id} thanks :pray:{: data-emoji-id='1f64f' data-emoji-text='🙏' }";
+    for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        try store.store().put(.{ .workspace = "workspace", .repository = "repo", .pull_request_id = 1 }, .{ .local_id = 1, .kind = .comment, .body = raw });
+        const session = try testCommentSession(testing.allocator, 1);
+        @constCast(session.threads[0].root).body = raw;
+        try session.mention_names.put(session.arena.allocator(), "id", "@Stefan von der Krone");
+        var state = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 0 }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+            .geometry = .{ .cols = 100, .rows = 40 },
+        });
+        defer state.deinit();
+        if (layout == .side_by_side) try dispatchView(&state, .{ .action = .toggle_layout });
+        for ([_]u16{ 38, 160, 38 }) |cols| {
+            try dispatchView(&state, .{ .resize = .{ .cols = cols, .rows = 40 } });
+            const published = state.published.?;
+            var label: std.ArrayList(u8) = .empty;
+            defer label.deinit(testing.allocator);
+            var emoji_count: usize = 0;
+            var first: ?usize = null;
+            for (published.visual_rows, 0..) |visual, index| {
+                const row = published.buffer.rows[visual.buffer_index];
+                if (row != .comment or row.comment.part != .body) continue;
+                for (row.comment.segments) |segment| {
+                    if (segment.atomic and segment.source.start == 0) {
+                        try label.appendSlice(testing.allocator, segment.text);
+                        if (first == null) first = index;
+                        try testing.expectEqual(@as(usize, 5), segment.source.end);
+                    }
+                    if (std.mem.eql(u8, segment.text, "🙏")) emoji_count += 1;
+                    try testing.expect(std.mem.indexOf(u8, segment.text, "data-emoji") == null);
+                }
+            }
+            try testing.expectEqualStrings("@Stefan von der Krone", label.items);
+            try testing.expectEqual(@as(usize, 1), emoji_count);
+            const buffer_corpus = try published.bufferSearchCorpus(state.preferences, &.{}, null, state.geometry);
+            defer buffer_corpus.release();
+            const review_corpus = try published.reviewSearchCorpus();
+            defer review_corpus.release();
+            for ([_]*BufferSearchCorpus{ buffer_corpus, review_corpus }) |corpus| {
+                for ([_][]const u8{ "Stefan", "@{id}", "pray", "🙏" }) |text| {
+                    var query = try search.Query.init(testing.allocator, text);
+                    defer query.deinit(testing.allocator);
+                    var batch = try search.scan(testing.allocator, query, corpus.candidates, if (corpus == buffer_corpus) .literal else .fuzzy);
+                    defer batch.deinit(testing.allocator);
+                    try testing.expectEqual(@as(usize, 2), batch.occurrences.len);
+                    const result = reviewSearchResult(published, batch.occurrences[0]);
+                    try testing.expectEqualStrings(raw, result.body);
+                    try testing.expect(result.mention_names == &session.mention_names);
+                }
+            }
+            try selectRows(&state, first.?, first.?);
+            try state.dispatch(.{ .action = .yank });
+            var copy = state.takeCommand().?;
+            defer copy.deinit();
+            try testing.expectEqualStrings(raw, copy.copy_clipboard.text);
+            try state.dispatch(.{ .clipboard_completed = .{ .command_id = copy.copy_clipboard.command_id, .success = true } });
+        }
+    }
+}
+
 test "M23 acceptance yank completes the numbered transformed-row byte examples" {
     const examples = [_]struct { body: []const u8, first: []const u8, last: []const u8, expected: []const u8, wide_expected: ?[]const u8 = null }{
         .{ .body = "first\nsecond", .first = "first", .last = "second", .expected = "first\nsecond" },
@@ -21160,7 +21238,7 @@ test "M23 yank Selection filters inherited scope in both layouts while keeping R
             const old_card = card.owner == .draft or (card.owner == .comment and (card.owner.comment == 1 or card.owner.comment == 2));
             const new_card = card.owner == .comment and card.owner.comment == 3;
             // A bare border row has no text to yank.
-            const text = card.part != .gap and card.part != .bottom;
+            const text = card.part != .bottom;
             const eligible = text and ((!old_card and !new_card) or (if (version == .old) old_card else new_card));
             try selectRows(&presentation, index, index);
             try testing.expectEqual(eligible, presentation.projection().action_availability.available(.yank));

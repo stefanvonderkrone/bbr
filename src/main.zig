@@ -1391,7 +1391,7 @@ test "bordered Reply trees keep combined build memory below the main baseline" {
         .card_width = 100,
         .scratch_allocator = memory.allocator(),
     });
-    try testing.expectEqual(@as(usize, 32_004), buf.rows.len);
+    try testing.expectEqual(@as(usize, 24_004), buf.rows.len);
     // Both result and scratch allocations pass through the same counter.
     try testing.expect(memory.peak_bytes < 80_000_000);
 }
@@ -1409,6 +1409,7 @@ test {
     _ = @import("api/files.zig");
     _ = @import("api/commits.zig");
     _ = @import("api/branches.zig");
+    _ = @import("api/users.zig");
     _ = @import("highlight/tree_sitter_highlighter.zig");
     _ = @import("highlight/query_regex.zig");
     _ = @import("highlight/user_grammar.zig");

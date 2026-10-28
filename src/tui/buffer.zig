@@ -252,6 +252,7 @@ pub const BuildOptions = struct {
     cell_metrics: CellMetrics = .bytes,
     collapsed_rows: usize = 6,
     emphasis_cache: ?*const EmphasisCache = null,
+    mention_names: *const @import("review_body.zig").MentionNames = &.empty,
 };
 
 /// Hunk emphasis depends only on the Diff. Keep its segments in the Session
@@ -462,10 +463,9 @@ pub const ActivePath = struct {
         return ancestor.rows.start <= cursor.rows.start and cursor.rows.start < ancestor.subtree_end;
     }
 
-    /// The Ancestry Band: every ancestor card and the anchored Diff Lines.
+    /// The Ancestry Band covers only the anchored Diff Lines.
     pub fn banded(self: ActivePath, buf: Buffer, row: usize) bool {
         const cursor = self.card orelse return false;
-        if (cardAt(buf.rows[row])) |value| if (value.card != cursor and self.holds(value.card)) return true;
         const kind = buf.kindAt(row);
         const anchored = cursor.root.anchored;
         return anchored.start <= row and row < anchored.end and (kind == .line or kind == .line_pair);
@@ -1038,14 +1038,14 @@ pub fn buildSearchCandidates(
         .comment => |card| {
             const comment = card.commentItem();
             if (!comment.deleted and !hasBodyOwner(candidates.items, .{ .comment = comment.id })) {
-                const body = try review_card.ReviewBody.parse(allocator, comment.body);
+                const body = try review_card.ReviewBody.parseWithMentions(allocator, comment.body, opts.mention_names);
                 try search.appendReviewBodyCandidates(allocator, body, .{ .comment = comment.id }, session_epoch, &corpus_order, &candidates);
             }
         },
         .draft => |card| {
             const draft = card.draftItem();
             if (!hasBodyOwner(candidates.items, .{ .draft = draft.local_id })) {
-                const body = try review_card.ReviewBody.parse(allocator, draft.body);
+                const body = try review_card.ReviewBody.parseWithMentions(allocator, draft.body, opts.mention_names);
                 try search.appendReviewBodyCandidates(allocator, body, .{ .draft = draft.local_id }, session_epoch, &corpus_order, &candidates);
             }
         },
@@ -1228,7 +1228,7 @@ const Weave = struct {
             if (c.deleted) "deleted" else null,
             if (c.suggestion() != null) "suggestion" else null,
         });
-        const parsed = try review_card.ReviewBody.parse(w.a, c.body);
+        const parsed = try review_card.ReviewBody.parseWithMentions(w.a, c.body, w.opts.mention_names);
         try w.projectCard(parsed, .{
             .owner = owner,
             .source = .{ .comment = c },
@@ -1292,7 +1292,7 @@ const Weave = struct {
                 if (d.state == .outcome_unknown) "outcome unknown" else if (d.state == .posted) "posted" else null,
                 if (d.kind == .suggestion) "suggestion" else null,
             };
-            const parsed = try review_card.ReviewBody.parse(w.a, d.body);
+            const parsed = try review_card.ReviewBody.parseWithMentions(w.a, d.body, w.opts.mention_names);
             const role: review_card.CardRole = if (d.state == .outcome_unknown)
                 (if (is_reply) .outcome_unknown_reply else .outcome_unknown)
             else if (is_reply)
@@ -3016,18 +3016,17 @@ test "an inline thread is woven right under its anchored line, replies indented"
     const buf = try buildWithComments(a, diff, .unified, threads, .{});
 
     // Each ReviewCard has a top border, its projected body, and a bottom
-    // border. The Reply starts with a gap row.
-    try testing.expectEqual(@as(usize, 12), buf.rows.len);
+    // border. The Reply header directly follows the parent's bottom border.
+    try testing.expectEqual(@as(usize, 11), buf.rows.len);
     try testing.expect(buf.rows[4] == .line);
     try testing.expectEqual(@as(?u32, 2), buf.rows[4].line.line.newNo());
     try testing.expect(buf.rows[5] == .comment);
     try testing.expect(!buf.rows[5].comment.isReply());
     try testing.expectEqual(@as(review.CommentId, 1), buf.rows[5].comment.commentItem().id);
     try testing.expectEqual(review_card.Part.bottom, buf.rows[7].comment.part);
-    try testing.expectEqual(review_card.Part.gap, buf.rows[8].comment.part);
-    try testing.expect(buf.rows[9] == .comment);
-    try testing.expect(buf.rows[9].comment.isReply());
-    try testing.expectEqualStrings("Bo", buf.rows[9].comment.text());
+    try testing.expectEqual(review_card.Part.header, buf.rows[8].comment.part);
+    try testing.expect(buf.rows[8].comment.isReply());
+    try testing.expectEqualStrings("Bo", buf.rows[8].comment.text());
 }
 
 test "Deleted Comment tombstone retains its real Thread and neutral role" {
@@ -3269,7 +3268,7 @@ test "M23 ancestry completes mixed parent subtrees before published siblings" {
                 var ancestor: ?usize = cursor;
                 while (ancestor != null and ancestor.? != target) ancestor = parent_indices[ancestor.?];
                 try testing.expectEqual(ancestor != null, path.holds(candidate));
-                try testing.expectEqual(ancestor != null and cursor != target, path.banded(buf, candidate.rows.start));
+                try testing.expect(!path.banded(buf, candidate.rows.start));
             }
         }
     };
@@ -3316,9 +3315,7 @@ test "M23 acceptance mixed Reply subtrees retain combined Markdown at every widt
             .comment, .draft => |card| {
                 try testing.expectEqualDeep(scope, card.scope);
                 try testing.expectEqualStrings(raw, card.source.body());
-                if (card.part == .gap) {
-                    try testing.expect(card.depth > 0);
-                } else if (card.part == .header) {
+                if (card.part == .header) {
                     try testing.expect(headers < expected.len);
                     try testing.expectEqualDeep(expected[headers], card.owner);
                     try testing.expectEqual(depths[headers], card.depth);
@@ -3613,13 +3610,13 @@ test "a reply draft to a PR-level comment nests under it, not in the pending sec
     };
     const buf = try buildWithComments(a, diff, .unified, threads, .{ .drafts = &drafts });
 
-    // Row 0: the PR-comments section. Rows 1 to 3: the comment. Row 4: the gap
-    // row of the reply draft, sitting directly under the comment it answers,
+    // Row 0: the PR-comments section. Rows 1 to 3: the comment. Row 4: the
+    // header of the reply draft, sitting directly under the comment it answers,
     // not in a pending section.
     try testing.expectEqual(SectionKind.pr_comments, buf.rows[0].section.kind);
     try testing.expect(buf.rows[1] == .comment and buf.rows[1].comment.commentItem().id == 1);
     try testing.expect(buf.rows[3] == .comment and buf.rows[3].comment.part == .bottom);
-    try testing.expect(buf.rows[4] == .draft and buf.rows[4].draft.isReply() and buf.rows[4].draft.part == .gap);
+    try testing.expect(buf.rows[4] == .draft and buf.rows[4].draft.isReply() and buf.rows[4].draft.part == .header);
     try testing.expectEqual(@as(usize, 1), countKind(buf, .draft));
     // No pending section was emitted for the reply.
     for (buf.rows) |r| {
@@ -4529,9 +4526,9 @@ test "ScopeProjection places each root and Replies once and tallies roots per Fi
         try testing.expectEqual(@as(usize, 0), buf.file_tallies[1].comments);
         try testing.expect(buf.rows[0] == .file_header);
         try testing.expect(buf.rows[1] == .comment and buf.rows[1].comment.commentItem().id == 1);
-        try testing.expect(buf.rows[5] == .comment and buf.rows[5].comment.commentItem().id == 2 and buf.rows[5].comment.part == .header);
-        try testing.expect(buf.rows[8] == .draft and buf.rows[8].draft.draftItem().local_id == 10 and buf.rows[8].draft.part == .header);
-        try testing.expect(buf.rows[12] == .draft and buf.rows[12].draft.draftItem().local_id == 11 and buf.rows[12].draft.part == .header);
+        try testing.expect(buf.rows[4] == .comment and buf.rows[4].comment.commentItem().id == 2 and buf.rows[4].comment.part == .header);
+        try testing.expect(buf.rows[7] == .draft and buf.rows[7].draft.draftItem().local_id == 10 and buf.rows[7].draft.part == .header);
+        try testing.expect(buf.rows[10] == .draft and buf.rows[10].draft.draftItem().local_id == 11 and buf.rows[10].draft.part == .header);
         var roots: usize = 0;
         var replies: usize = 0;
         for (buf.rows) |row| switch (row) {

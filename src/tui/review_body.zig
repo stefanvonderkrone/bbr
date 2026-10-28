@@ -3,6 +3,90 @@
 const std = @import("std");
 const emoji = @import("emoji.zig");
 
+/// Session-owned account IDs and their display labels, including the leading @.
+pub const MentionNames = std.StringHashMapUnmanaged([]const u8);
+
+test "mentions resolve prose and link labels without changing authored bytes or code" {
+    const a = std.testing.allocator;
+    var names: MentionNames = .empty;
+    defer names.deinit(a);
+    try names.put(a, "63ac09cbfa5fbde2ba44ac24", "@Stefan von der Krone");
+    const token = "@{63ac09cbfa5fbde2ba44ac24}";
+    const raw = "# **" ++ token ++ "**\n\n> " ++ token ++ "\n\n- [" ++ token ++ "](url/" ++ token ++ ")\n\n| Who |\n| --- |\n| " ++ token ++ " |\n\n\\" ++ token ++ " `" ++ token ++ "` @{missing} @{} @{bad id}\n\n```\n" ++ token ++ "\n```\n\n    " ++ token ++ "\n\n```suggestion\n" ++ token ++ "\n```";
+    const body = try ReviewBody.parseWithMentions(a, raw, &names);
+    defer freeBlocks(a, body.blocks);
+    var count: usize = 0;
+    for (body.blocks) |block| for (block.spans) |span| {
+        try std.testing.expectEqual(span.mention.len > 0, span.marks.mention);
+        if (span.mention.len == 0) continue;
+        if (std.mem.eql(u8, span.mention, "missing")) {
+            try std.testing.expectEqualStrings("@{missing}", span.text);
+        } else {
+            count += 1;
+            try std.testing.expectEqualStrings("@Stefan von der Krone", span.text);
+            try std.testing.expectEqualStrings(token, raw[span.source.start..span.source.end]);
+            try std.testing.expect(block.kind != .code and block.kind != .suggestion);
+            try std.testing.expect(!span.marks.inline_code and !span.marks.link_destination);
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expectEqualStrings(raw, body.source);
+}
+
+test "emoji metadata belongs to its catalog emoji and leaves unsupported text literal" {
+    const a = std.testing.allocator;
+    const examples = [_]struct { raw: []const u8, converted: bool }{
+        .{ .raw = ":pray:{: data-emoji-id='1f64f' data-emoji-text='🙏' }", .converted = true },
+        .{ .raw = ":pray:{: data-emoji-id='1F64F' }", .converted = true },
+        .{ .raw = ":pray:{: data-emoji-text=\"🙏\" data-emoji-id=\"1f64f\" }", .converted = true },
+        .{ .raw = ":thumbsup::skin-tone-2:{: data-emoji-id='1f44d-1f3fb' data-emoji-text='👍🏻' }", .converted = true },
+        .{ .raw = ":pray:{: data-emoji-id='custom' data-emoji-text='🙏' }", .converted = false },
+        .{ .raw = ":pray:{: data-emoji-id='1f64f' data-emoji-text='😷' }", .converted = false },
+        .{ .raw = ":pray:{: data-emoji-id='1f637' }", .converted = false },
+        .{ .raw = ":pray:{: data-emoji-text='🙏' }", .converted = false },
+        .{ .raw = ":pray:{: data-emoji-id='1f64f' extra='x' }", .converted = false },
+        .{ .raw = ":pray:{: data-emoji-id='1f64f' data-emoji-id='1f64f' }", .converted = false },
+        .{ .raw = ":pray:{: data-emoji-id='1f64f }", .converted = false },
+        .{ .raw = ":pray:{: data-emoji-id='1f64f'", .converted = false },
+        .{ .raw = ":pray:{: data-emoji-id='1f64f'\n}", .converted = false },
+        .{ .raw = ":pray: {: data-emoji-id='1f64f' }", .converted = false },
+    };
+    for (examples) |example| {
+        const body = try ReviewBody.parse(a, example.raw);
+        defer freeBlocks(a, body.blocks);
+        const span = body.blocks[0].spans[0];
+        try std.testing.expectEqual(if (example.converted) example.raw.len else @as(usize, 6), span.source.end);
+        try std.testing.expectEqualStrings(example.raw, body.source);
+        if (example.converted) try std.testing.expectEqual(@as(usize, 1), body.blocks[0].spans.len);
+    }
+    for ([_][]const u8{
+        "`:pray:{: data-emoji-id='1f64f' }`",
+        "\\:pray:{: data-emoji-id='1f64f' }",
+        "```\n:pray:{: data-emoji-id='1f64f' }\n```",
+        "    :pray:{: data-emoji-id='1f64f' }",
+        "```suggestion\n:pray:{: data-emoji-id='1f64f' }\n```",
+        "[label](url/:pray:{:data-emoji-id='1f64f'})",
+        ":unknown:{: data-emoji-id='1f64f' }",
+        "text{: data-emoji-id='1f64f' }",
+    }) |raw| {
+        const body = try ReviewBody.parse(a, raw);
+        defer freeBlocks(a, body.blocks);
+        for (body.blocks) |block| for (block.spans) |span| try std.testing.expectEqual(@as(usize, 0), span.emoji.len);
+    }
+}
+
+test "mention and emoji metadata parsing releases partial allocations" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(a: std.mem.Allocator) !void {
+            var names: MentionNames = .empty;
+            defer names.deinit(a);
+            try names.put(a, "id", "@Ada");
+            const body = try ReviewBody.parseWithMentions(a, "**@{id}** :pray:{: data-emoji-id='1f64f' data-emoji-text='🙏' }\n\n| Who |\n| --- |\n| [@{id}][user] |\n\n[user]: /account", &names);
+            defer freeBlocks(a, body.blocks);
+        }
+    }.run, .{});
+}
+
 test "M23 highlighting keeps only the first fence information token" {
     const body = try ReviewBody.parse(std.testing.allocator, "```TS extra\nconst a = 1;\n```\n\n> ~~~javascript extra\n> let b = 2;\n> ~~~");
     defer freeBlocks(std.testing.allocator, body.blocks);
@@ -79,6 +163,7 @@ pub const Marks = packed struct {
     link_title: bool = false,
     heading_marker: bool = false,
     divider: bool = false,
+    mention: bool = false,
 };
 
 pub const LinkTarget = struct {
@@ -102,6 +187,8 @@ pub const Span = struct {
     boundary: bool = false,
     /// One indivisible conversion with an exact authored matching alternative.
     emoji: []const u8 = "",
+    /// The account ID inside an authored @{ID} mention. Code never has one.
+    mention: []const u8 = "",
     destination_brackets: bool = true,
     /// Reference text retains definition bytes apart from visible-use coordinates.
     definition_source: ?SourceRange = null,
@@ -158,6 +245,23 @@ pub const ReviewBody = struct {
     /// Borrowed, byte-for-byte authored Review storage.
     source: []const u8,
     blocks: []const Block,
+
+    pub fn parseWithMentions(allocator: std.mem.Allocator, source: []const u8, names: *const MentionNames) !ReviewBody {
+        const body = try parse(allocator, source);
+        body.applyMentionNames(names);
+        return body;
+    }
+
+    /// Labels borrow Session storage. Authored ranges and source never change.
+    pub fn applyMentionNames(self: ReviewBody, names: *const MentionNames) void {
+        if (names.count() == 0) return;
+        for (self.blocks) |block| for (@constCast(block.spans)) |*span| {
+            if (span.mention.len == 0) continue;
+            if (names.get(span.mention)) |label| if (label.len > 0) {
+                span.text = label;
+            };
+        };
+    }
 
     pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ReviewBody {
         const first = try parseBlocks(allocator, source, &.{});
@@ -898,10 +1002,19 @@ fn parseInline(allocator: std.mem.Allocator, source: []const u8, start: usize, e
     var pos = start;
     var plain = start;
     while (pos < end) {
+        if (mentionAt(source[pos..end])) |id| {
+            try appendSpan(&spans, allocator, source, plain, pos, .{});
+            const next = pos + id.len + 3;
+            try spans.append(allocator, .{ .text = source[pos..next], .source = .{ .start = pos, .end = next }, .marks = .{ .mention = true }, .mention = id });
+            pos = next;
+            plain = pos;
+            continue;
+        }
         if (source[pos] == ':') if (emoji.at(source[pos..end])) |converted| {
             try appendSpan(&spans, allocator, source, plain, pos, .{});
-            try spans.append(allocator, .{ .text = converted.text, .source = .{ .start = pos, .end = pos + converted.authored_len }, .emoji = converted.name });
-            pos += converted.authored_len;
+            const length = converted.authored_len + emoji.metadataLen(source[pos + converted.authored_len .. end], converted);
+            try spans.append(allocator, .{ .text = converted.text, .source = .{ .start = pos, .end = pos + length }, .emoji = converted.name });
+            pos += length;
             plain = pos;
             continue;
         };
@@ -1049,6 +1162,16 @@ fn parseInline(allocator: std.mem.Allocator, source: []const u8, start: usize, e
         } else try result.append(allocator, span);
     }
     return result.toOwnedSlice(allocator);
+}
+
+fn mentionAt(text: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, text, "@{")) return null;
+    var pos: usize = 2;
+    while (pos < text.len) : (pos += 1) {
+        if (text[pos] == '}') return if (pos > 2) text[2..pos] else null;
+        if (!std.ascii.isAlphanumeric(text[pos]) and text[pos] != '-' and text[pos] != ':') return null;
+    }
+    return null;
 }
 
 const Delimiter = struct {

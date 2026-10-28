@@ -29,7 +29,7 @@ pub const Theme = struct {
     pane_border: Style = .{ .dim = true },
     pane_border_focused: Style = .{ .bold = true },
     overlay_border: Style = .{ .bold = true },
-    /// Selected Version chrome. It never replaces diff or syntax colors.
+    /// Blue accent for Selected Version chrome and account mentions.
     accent: Color,
     section_rule: Style = .{ .dim = true },
     /// Unchanged lines — terminal default background.
@@ -176,7 +176,7 @@ pub const Theme = struct {
                 style.dim = true;
             },
             .header => style.bold = true,
-            .body, .bottom, .gap => style.bold = false,
+            .body, .bottom => style.bold = false,
             .code_body => {
                 style = self.context;
                 style.bg = self.code_background;
@@ -187,6 +187,9 @@ pub const Theme = struct {
         style.strikethrough = style.strikethrough or marks.strikethrough;
         if (marks.inline_code) {
             style.fg = self.markdown_inline_code;
+        } else if (marks.mention) {
+            style.fg = self.accent;
+            style.bold = true;
         } else if (marks.strong) {
             style.fg = self.markdown_bold;
         } else if (marks.emphasis) {
@@ -701,6 +704,15 @@ test "M23 inline Theme colors and attributes combine without Draft body bold" {
             const bold = theme.reviewCardStyle(role, .body, .{ .strong = true, .emphasis = true, .link_label = true });
             try testing.expectEqual(theme.markdown_bold, bold.fg);
             try testing.expect(bold.bold and bold.italic and bold.ul_style == .single);
+            for ([_]review_card.Marks{
+                .{ .mention = true },
+                .{ .mention = true, .strong = true, .emphasis = true, .link_label = true },
+            }) |marks| {
+                const mention = theme.reviewCardStyle(role, .body, marks);
+                try testing.expectEqual(theme.accent, mention.fg);
+                try testing.expect(mention.bold);
+                try testing.expectEqual(theme.reviewCardStyle(role, .body, .{}).bg, mention.bg);
+            }
         }
     }
 }

@@ -1,6 +1,6 @@
 ---
 name: bbr
-description: Bitbucket Cloud work through bbr api. Use for member UUID lookup by name, reviewer assignment, Branches, PullRequest creation, draft-to-ready updates, decline, commit lookup, and Reviewer Verdicts. Also use for Workspaces, Repositories, diffs, file bytes, Comments, Tasks, and the Authenticated Account.
+description: Bitbucket Cloud work through bbr api. Use for account ID or UUID lookup, member UUID lookup by name, reviewer assignment, Branches, PullRequest creation, draft-to-ready updates, decline, commit lookup, and Reviewer Verdicts. Also use for Workspaces, Repositories, diffs, file bytes, Comments, Tasks, and the Authenticated Account.
 ---
 
 # bbr api — Bitbucket Cloud CLI
@@ -43,7 +43,14 @@ Add `--json` for scripts. Default prints human lines. `get-diff`, `get-compare-d
 
 Reads run free. Writes need approval unless the user ordered the write. The write commands are `create-branch`, `create-pull-request`, `update-pull-request`, `decline-pull-request`, `create-comment`, `update-comment`, `delete-comment`, `resolve-comment`, `reopen-comment`, `create-task`, `update-task`, `delete-task`, `resolve-task`, `reopen-task`, and `set-verdict`. Done when approval exists or the user ordered it.
 
-`Resolve` closes without editing prose. `reopen` reverses it. A PullRequest Author cannot set a Reviewer Verdict on that PullRequest. `set-verdict` needs `--expected-source-commit`. Use `--body-file`, `--content-file`, or `--description-file` for long text. Use `whoami` for the Authenticated Account's UUID. For another account, follow the member lookup steps below.
+`Resolve` closes without editing prose. `reopen` reverses it. A PullRequest Author cannot set a Reviewer Verdict on that PullRequest. `set-verdict` needs `--expected-source-commit`. Use `--body-file`, `--content-file`, or `--description-file` for long text. Use `whoami` for the Authenticated Account's UUID. For another account named by the user, follow the member lookup steps below.
+
+## Resolve an account ID or UUID
+
+Run `bbr api get-user --help`, then `bbr api get-user --user-id ID --json`.
+Use the exact ID supplied by the user. For a Bitbucket mention `@{ID}`, pass the ID without the mention wrapper.
+The response has `uuid`, `account_id`, `display_name`, and `nickname`. This read does not require Workspace membership.
+A public profile does not prove Repository access. Keep an unresolved mention literal if the lookup fails.
 
 Files supplied through `--description-file` must not exceed 1 MiB.
 
