@@ -915,11 +915,15 @@ const TerminalLinks = struct {
 };
 
 fn drawDisclosure(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, value: buffer_mod.Disclosure, theme: Theme) void {
-    const style = if (value.kind == .fold) theme.fold else theme.section;
+    const style = switch (value.kind) {
+        .resolved_thread => theme.resolveStyle(.{ .fg = theme.status_added, .bg = theme.context.bg, .bold = true }),
+        .fold => theme.fold,
+        else => theme.section,
+    };
     fillRow(win, r, style);
     const glyph: []const u8 = if (value.expanded) "▾" else "▸";
     const text = switch (value.kind) {
-        .resolved_thread => std.fmt.allocPrint(scratch, "{s} ✓ Resolved thread · {d} replies", .{ glyph, value.count }) catch glyph,
+        .resolved_thread => std.fmt.allocPrint(scratch, "{s} thread by {s} (resolved) · {d} replies", .{ glyph, value.author, value.count }) catch glyph,
         .fold => std.fmt.allocPrint(scratch, "{s} ⋯ {d} unchanged lines", .{ glyph, value.count }) catch glyph,
         .outdated => if (value.path.len > 0)
             std.fmt.allocPrint(scratch, "{s} Outdated · {s} · {d} threads", .{ glyph, value.path, value.count }) catch glyph
@@ -928,7 +932,8 @@ fn drawDisclosure(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, value: 
         .opposite_version => std.fmt.allocPrint(scratch, "{s} {s} · {d} threads", .{ glyph, value.path, value.count }) catch glyph,
         .review_card => unreachable,
     };
-    _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = gutter_cols, .wrap = .none });
+    const column = if (value.kind == .resolved_thread) anchor_cols else gutter_cols;
+    _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = column, .wrap = .none });
 }
 
 /// A section divider: "── PR comments (N)" or "── Outdated · path (N)".
@@ -4847,15 +4852,15 @@ fn paintCardThread(a: std.mem.Allocator, layout: buffer_mod.Layout, width: u16, 
 /// Paint the cards of `comments` and `drafts` on `card_test_diff` through the
 /// DiffPane path, with the cursor on a new line or on the first body row of a card.
 fn paintCards(a: std.mem.Allocator, comments: []const bbr.review.Comment, drafts: []const bbr.review.Draft, layout: buffer_mod.Layout, width: u16, focus: CardTestFocus, theme: Theme) !CardTestPane {
-    return paintCardsOn(a, card_test_diff, comments, drafts, layout, width, focus, theme);
+    return paintCardsOn(a, card_test_diff, comments, drafts, layout, width, focus, theme, &.{});
 }
 
 const CardTestFocus = union(enum) { line: u32, card: @import("review_card.zig").Owner };
 
-fn paintCardsOn(a: std.mem.Allocator, diff_text: []const u8, comments: []const bbr.review.Comment, drafts: []const bbr.review.Draft, layout: buffer_mod.Layout, width: u16, focus: CardTestFocus, theme: Theme) !CardTestPane {
+fn paintCardsOn(a: std.mem.Allocator, diff_text: []const u8, comments: []const bbr.review.Comment, drafts: []const bbr.review.Draft, layout: buffer_mod.Layout, width: u16, focus: CardTestFocus, theme: Theme, expanded_disclosures: []const buffer_mod.DisclosureKey) !CardTestPane {
     const diff = try bbr.diff.parse(a, diff_text);
     const threads = try bbr.review.buildThreads(a, comments);
-    const buf = try buffer_mod.buildWithComments(a, diff, layout, threads, .{ .drafts = drafts, .card_width = width, .collapsed_rows = 2 });
+    const buf = try buffer_mod.buildWithComments(a, diff, layout, threads, .{ .drafts = drafts, .card_width = width, .collapsed_rows = 2, .expanded_disclosures = expanded_disclosures });
     const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, buf.rows, .bytes, .{ .layout = layout, .width = width });
     const screen = try a.create(vaxis.Screen);
     screen.* = try vaxis.Screen.init(a, .{ .rows = @intCast(visual_rows.len), .cols = width, .x_pixel = 0, .y_pixel = 0 });
@@ -4867,6 +4872,75 @@ fn paintCardsOn(a: std.mem.Allocator, diff_text: []const u8, comments: []const b
     });
     drawVisualPane(a, pane.win, buf, visual_rows, theme, nav);
     return pane;
+}
+
+test "M23 ancestry expanded resolved Threads keep their Anchor Indicator" {
+    const comments = [_]bbr.review.Comment{
+        .{ .id = 4, .author = "Dee", .body = "collapsed root", .resolved = true, .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 4 } } },
+        .{ .id = 1, .author = "Ada", .body = "root", .resolved = true, .scope = .{ .@"inline" = .{ .path = "a.zig", .start_to = 2, .to = 4 } } },
+        .{ .id = 2, .parent_id = 1, .author = "Bob", .body = "reply" },
+        .{ .id = 3, .author = "Cy", .body = "other root", .resolved = true, .scope = .{ .@"inline" = .{ .path = "a.zig", .to = 4 } } },
+    };
+    const drafts = [_]bbr.review.Draft{.{ .local_id = 1, .kind = .comment, .body = "draft reply", .parent = .{ .comment = 2 } }};
+    for ([_]buffer_mod.Layout{ .unified, .side_by_side }) |layout| for ([_]CardTestFocus{
+        .{ .card = .{ .comment = 1 } },
+        .{ .card = .{ .comment = 2 } },
+        .{ .card = .{ .draft = 1 } },
+        .{ .card = .{ .comment = 3 } },
+        .{ .line = 5 },
+    }) |focus| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const pane = try paintCardsOn(a, card_test_diff, &comments, &drafts, layout, 120, focus, theme_dark, &.{ .{ .resolved_thread = 1 }, .{ .resolved_thread = 3 } });
+        if (focus == .line) {
+            for (pane.lineRow(2)..pane.cardRow(.{ .comment = 3 }, .bottom) + 1) |row| try testing.expectEqualStrings(" ", pane.glyph(0, @intCast(row)));
+            continue;
+        }
+        const other_root = std.meta.eql(focus.card, @import("review_card.zig").Owner{ .comment = 3 });
+        const top = pane.lineRow(if (other_root) 4 else 2);
+        const root = pane.cardRow(.{ .comment = if (other_root) 3 else 1 }, .header);
+        try testing.expectEqualStrings("╭", pane.glyph(0, top));
+        for (top + 1..root) |row| try testing.expectEqualStrings("│", pane.glyph(0, @intCast(row)));
+        try testing.expectEqualStrings("╰", pane.glyph(0, root));
+        try testing.expectEqualStrings("┬", pane.glyph(1, root));
+        if (!other_root) try testing.expectEqualStrings(" ", pane.glyph(0, pane.cardRow(.{ .comment = 3 }, .header)));
+    };
+}
+
+test "M23 ancestry resolved Thread disclosure names its author in bold green text" {
+    const themes = @import("theme.zig");
+    for (std.enums.values(ThemeId)) |id| for ([_]bool{ false, true }) |expanded| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const comments = [_]bbr.review.Comment{
+            .{ .id = 1, .author = "Ada", .body = "root", .resolved = true },
+            .{ .id = 2, .parent_id = 1, .author = "Bob", .body = "reply" },
+        };
+        const threads = try bbr.review.buildThreads(a, &comments);
+        const buf = try buffer_mod.buildWithComments(a, .{ .files = &.{} }, .unified, threads, .{
+            .expanded_disclosures = if (expanded) &.{.{ .resolved_thread = 1 }} else &.{},
+        });
+        const theme = themes.value(id);
+        var screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 120, .x_pixel = 0, .y_pixel = 0 });
+        const win = headlessWindow(&screen);
+        var found = false;
+        for (buf.rows) |row| if (row == .disclosure and row.disclosure.kind == .resolved_thread) {
+            found = true;
+            drawDisclosure(a, win, 0, row.disclosure, theme);
+        };
+        try testing.expect(found);
+        const pane: CardTestPane = .{ .win = win, .buf = buf, .visual_rows = &.{} };
+        const text = try pane.text(a, 0);
+        try testing.expect(std.mem.startsWith(u8, text, if (expanded) " ▾ thread by Ada (resolved)" else " ▸ thread by Ada (resolved)"));
+        try testing.expect(std.mem.indexOf(u8, text, "1 replies") != null);
+        const cell = win.readCell(anchor_cols + 2, 0).?;
+        try testing.expect(cell.style.bold);
+        try testing.expect(!cell.style.dim);
+        try testing.expectEqual(theme.status_added, cell.style.fg);
+        try testing.expectEqual(theme.context.bg, cell.style.bg);
+    };
 }
 
 test "M23 ancestry ReviewCards have rounded borders, Titles, an anchor indicator, and no Reply gaps" {
@@ -5228,7 +5302,7 @@ test "M23 ancestry only the active path shows its Anchor Indicator" {
         defer arena.deinit();
         const a = arena.allocator();
         errdefer std.debug.print("layout {t} focus {any}\n", .{ layout, case.focus });
-        const pane = try paintCardsOn(a, stack_test_diff, &comments, &.{}, layout, 140, case.focus, theme);
+        const pane = try paintCardsOn(a, stack_test_diff, &comments, &.{}, layout, 140, case.focus, theme, &.{});
         const root_id: u64 = if (case.normal.len > 0) case.normal[0] else 0;
         try check.expectIndicator(pane, theme, if (case.top) |top| .{ .top = pane.lineRow(top), .root = pane.cardRow(.{ .comment = root_id }, .header) } else null);
         for (all) |owner| try check.expectCardChrome(pane, theme, owner, std.mem.indexOfScalar(u64, case.normal, owner.comment) != null);

@@ -74,6 +74,7 @@ pub const Disclosure = struct {
     expanded: bool,
     count: usize,
     path: []const u8 = "",
+    author: []const u8 = "",
 };
 
 /// A diff body line plus any intra-line emphasis. `emphasis` is empty for
@@ -586,6 +587,10 @@ fn indexCards(a: std.mem.Allocator, rows: []Row, tree_starts: []const usize, row
                 .line, .line_pair => {
                     try old.add(a, rows, index);
                     try new.add(a, rows, index);
+                },
+                .disclosure => |disclosure| if (disclosure.kind != .resolved_thread) {
+                    old.clear();
+                    new.clear();
                 },
                 else => {
                     old.clear();
@@ -1199,7 +1204,7 @@ const Weave = struct {
         if (t.resolved) {
             const key: DisclosureKey = .{ .resolved_thread = t.root.id };
             const expanded = w.expanded_disclosures.contains(disclosureId(key));
-            try w.rows.append(w.opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .resolved_thread, .expanded = expanded, .count = t.replies.len } });
+            try w.rows.append(w.opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .resolved_thread, .expanded = expanded, .count = t.replies.len, .author = t.root.author } });
             if (!expanded) return;
         }
         try w.emitThreadContent(t);
