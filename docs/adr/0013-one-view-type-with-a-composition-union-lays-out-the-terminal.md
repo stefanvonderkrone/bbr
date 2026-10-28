@@ -46,3 +46,11 @@ Rail chains share immutable nodes. Each node names the next sibling and the next
 The weaver records each tree's start before the geometry pass. A hidden submitting Draft can leave its first visible descendant at a positive depth. That depth does not join separate trees.
 
 The Ancestry Band covers only the anchored Diff Lines. Parent Comments and Drafts keep their normal background. Their borders, Titles, and rails still use the Active Path role style.
+
+## Resolved Thread headers
+
+A collapsed resolved Thread uses a green disclosure rule from `view_paint.titledRule`.
+When expanded, its root ReviewCard header replaces the rule and keeps the green border and Title outside the Active Path.
+The triangle precedes the checkmark in both states.
+The header retains the resolved Thread's disclosure identity, so keyboard and mouse toggles keep the cursor on the same control.
+Column 0 stays free for the Anchor Indicator.

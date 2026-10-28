@@ -118,6 +118,8 @@ pub const ReviewCardRow = struct {
     hidden_line: ?SourceRange = null,
     fences: ?[2]SourceRange = null,
     plain_label: ?[]const u8 = null,
+    /// This header toggles the whole resolved Thread, not its ReviewBody.
+    resolved_thread: bool = false,
     /// Code-block rectangle relative to this row's content column.
     code_area: ?struct { column: usize, width: usize } = null,
 
@@ -163,6 +165,7 @@ pub const Options = struct {
     role: CardRole,
     header: []const u8,
     plain_header: ?[]const u8 = null,
+    resolved_thread: bool = false,
     content_width: usize,
     metrics: CellMetrics,
     collapsed_rows: usize = 6,
@@ -280,6 +283,7 @@ pub fn projectInto(allocator: std.mem.Allocator, scratch_allocator: std.mem.Allo
         .source = .{ .start = 0, .end = 0 },
     }));
     header.plain_label = options.plain_header;
+    header.resolved_thread = options.resolved_thread;
     try sink.append(header);
     for (body_rows.items[0..visible_count]) |row| try sink.append(row);
     const body_end: SourceRange = .{ .start = body.source.len, .end = body.source.len };

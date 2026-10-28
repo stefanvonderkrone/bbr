@@ -166,6 +166,13 @@ fn cardRule(win: vaxis.Window, row: u16, left: usize, right: usize, start: []con
     for (left..right + 1) |col| writeGlyph(win, col, row, if (col == left) start else if (col == right) end else "─", style);
 }
 
+/// A horizontal rule with a Title at the same inset as a ReviewCard header.
+pub fn titledRule(win: vaxis.Window, row: u16, left: usize, right: usize, text: []const u8, style: vaxis.Style) void {
+    if (right <= left) return;
+    cardRule(win, row, left, right, "─", "─", style);
+    titleText(win, .{ .x = @intCast(left + 2), .y = row, .width = @intCast((right - left) -| 3), .height = 1 }, text, style);
+}
+
 /// The line that runs past one row down to a later sibling card. It paints
 /// `│` only in a blank cell, so it never covers a border or text.
 pub fn rail(win: vaxis.Window, col: usize, row: u16, style: vaxis.Style) void {
@@ -310,4 +317,20 @@ test "a join leaves text and thumbs alone" {
     join(win, 2, 0, .{ .right = true });
     var buffer: [16]u8 = undefined;
     try testing.expectEqualStrings("├┃a", rowText(win, 0, &buffer));
+}
+
+test "M23 ancestry titled rules clip Unicode text and keep the Anchor Indicator column free" {
+    for (1..50) |width| {
+        var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = @intCast(width), .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(testing.allocator);
+        const win = headless(&screen);
+        const style = @import("theme.zig").dark.resolvedThreadStyle();
+        titledRule(win, 0, 1, width - 1, "▸ ✓ Resolved · Åda · 3 replies", style);
+        try testing.expectEqualStrings(" ", win.readCell(0, 0).?.char.grapheme);
+        if (width >= 3) {
+            const last = win.readCell(@intCast(width - 1), 0).?;
+            try testing.expectEqualStrings("─", last.char.grapheme);
+            try testing.expectEqual(style, last.style);
+        }
+    }
 }

@@ -132,12 +132,15 @@ _Avoid_: parsed Comment, rendered Markdown, Markdown document.
 The bounded DiffPane presentation of one Comment or Draft: a rounded border, ReviewBody rows, and an in-place disclosure footer when the projected body exceeds its row budget. Its Title in the top border names the author or `✎ draft`, and any other state follows in parentheses, as in `✎ draft (posted)` or `Ada (deleted)`. The disclosure footer is the Title in the bottom border. A Reply sits at its ancestry indent directly below the preceding card, with no blank row. Its top-left corner joins the border above with `┬` and becomes `├`. A card with a later sibling keeps its line down to that sibling: its bottom-left corner becomes `├`, and the line passes every row of the card's Replies. A ReviewCard has the Theme base background. Its role shows only in its text color and emphasis. Every row belongs to the same stable Comment or Draft identity.
 _Avoid_: Comment (the Review entity), panel, box.
 
+A resolved Thread's header identifies its root author, resolved state, and reply count.
+It also controls whether the Thread's root and Replies are visible.
+
 **Anchor Indicator**:
 The line in column 0 of the DiffPane that joins the thread root of the Active Path to its anchored Diff Lines: `╭` on the top anchored line, `│` on every row below it, including other cards and other anchored lines, and `╰` beside the root card's top-left corner, which becomes `┬`. Only the Active Path has one, so a cursor outside a card shows none. A Reply, a File-level card, and a Review-level card have none.
 _Avoid_: gutter marker, range bar.
 
 **Active Path**:
-The ReviewCard that holds the cursor and every ancestor card up to its thread root. Its cards draw their border, Title, and lines in the border style of their role. Its root draws the Anchor Indicator, and its anchored Diff Lines carry the Ancestry Band. Parent cards keep their normal background. Every other card draws its border dim. The descendants of the cursor's card are not on it.
+The ReviewCard that holds the cursor and every ancestor card up to its thread root. Its cards draw their border, Title, and lines in the border style of their role. Its root draws the Anchor Indicator, and its anchored Diff Lines carry the Ancestry Band. Parent cards keep their normal background. Cards outside the Active Path draw their border dim, except for resolved Thread headers. The descendants of the cursor's card are not on it.
 _Avoid_: selection, focus chain.
 
 **Ancestry Band**:

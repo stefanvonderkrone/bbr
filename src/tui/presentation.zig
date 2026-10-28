@@ -6695,7 +6695,7 @@ pub const Presentation = struct {
         return switch (published.cursorRow() orelse return .diff) {
             .line, .line_pair => .diff_source,
             .disclosure => .diff_disclosure,
-            .comment, .draft => |card| if (card.part == .disclosure_footer) .diff_review_card else .diff_review_card,
+            .comment, .draft => |card| if (card.resolved_thread) .diff_disclosure else .diff_review_card,
             else => .diff,
         };
     }
@@ -15201,7 +15201,7 @@ test "M21 kernel every small Session view change waits for a complete worker Fra
         switch (change) {
             .layout => try testing.expectEqual(Layout.side_by_side, after.preferences.layout),
             .scope => try testing.expectEqual(Scope.fetched, after.preferences.scope),
-            .resolved => try testing.expect(after.buffer.rows[findDisclosureRow(after.buffer.rows, .{ .resolved_thread = 1 }).?].disclosure.expanded),
+            .resolved => try testing.expect(after.buffer.rows[findDisclosureRow(after.buffer.rows, .{ .resolved_thread = 1 }).?].comment.resolved_thread),
             .version => try testing.expectEqual(SelectedVersion.old, after.selected_version),
             .isolate => try testing.expectEqual(@as(?usize, 0), after.isolated_file),
             .movement, .focus => try testing.expectEqual(@as(?usize, 1), after.isolated_file),
@@ -23235,11 +23235,22 @@ test "Session disclosures toggle independently persist through rebuilds and rese
     try testing.expect(findDisclosureRow(initial.buffer.rows, .{ .outdated_file = &initial.diff.files[0] }) != null);
 
     try moveToRow(&presentation, thread_row);
-    try presentation.dispatch(.{ .action = .toggle_disclosure });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try completeDisclosureBuild(&presentation);
+    const header = presentation.projection().review.?;
+    try testing.expect(header.buffer.rows[header.navigation.cursor] == .comment);
+    try testing.expect(header.buffer.rows[header.navigation.cursor].comment.resolved_thread);
+    try testing.expectEqualDeep(thread_key, buffer_mod.disclosureKey(header.buffer.rows[header.navigation.cursor]).?);
+    try testing.expectEqual(frame_mod.RowOwner{ .disclosure = thread_key }, header.frame.visual_rows[header.navigation.cursor].owner);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try completeDisclosureBuild(&presentation);
+    const closed = presentation.projection().review.?;
+    try testing.expect(!closed.buffer.rows[closed.navigation.cursor].disclosure.expanded);
+    try testing.expectEqualDeep(thread_key, closed.buffer.rows[closed.navigation.cursor].disclosure.key);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
     try completeDisclosureBuild(&presentation);
     const opened = presentation.projection().review.?;
-    try testing.expect(opened.buffer.rows[opened.navigation.cursor] == .disclosure);
-    try testing.expect(std.meta.eql(thread_key, opened.buffer.rows[opened.navigation.cursor].disclosure.key));
 
     const card_key: buffer_mod.DisclosureKey = .{ .review_card = .{ .comment = 1 } };
     const card_row = findDisclosureRow(opened.buffer.rows, card_key).?;
@@ -23274,13 +23285,13 @@ test "Session disclosures toggle independently persist through rebuilds and rese
     try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("new review note") } });
     try presentation.dispatch(.{ .composer = .save });
     try completeDisclosureBuild(&presentation);
-    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
+    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].comment.resolved_thread);
 
     // Width and isolation rebuild the Frame but preserve both explicit choices.
     try dispatchView(&presentation, .{ .resize = .{ .cols = 72, .rows = 8 } });
-    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
+    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].comment.resolved_thread);
     try dispatchView(&presentation, .{ .action = .isolate });
-    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
+    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].comment.resolved_thread);
 
     // Selecting disclosed content and then collapsing its semantic owner drops
     // the Selection because that content no longer exists in the new Frame.
@@ -23301,7 +23312,7 @@ test "Session disclosures toggle independently persist through rebuilds and rese
     const failed_command = presentation.takeCommand().?.load_session;
     try presentation.dispatch(.{ .session_loaded = .{ .intent = failed_command.intent, .outcome = .{ .failed = error.NetworkFailure } } });
     try testing.expectEqual(before_failed.buffer.rows.ptr, presentation.projection().review.?.buffer.rows.ptr);
-    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
+    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].comment.resolved_thread);
 
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const replacement = presentation.takeCommand().?.load_session;
@@ -29318,9 +29329,16 @@ test "mouse activates Sidebar Files and disclosures and replacement cancels a pr
     try presentation.dispatch(.{ .mouse = .{ .col = frame.panes.diff_content.x, .row = screen_row, .button = .left, .type = .release } });
     try completeDisclosureBuild(&presentation);
     const opened = presentation.projection().review.?;
-    try testing.expect(opened.buffer.rows[findDisclosureRow(opened.buffer.rows, disclosure_key).?].disclosure.expanded);
+    try testing.expect(opened.buffer.rows[findDisclosureRow(opened.buffer.rows, disclosure_key).?].comment.resolved_thread);
 
     const sidebar = opened.frame.panes.sidebar_content;
+    const header_row: u16 = opened.frame.panes.diff_content.y + @as(u16, @intCast(opened.navigation.cursor - opened.navigation.scroll));
+    try presentation.dispatch(.{ .mouse = .{ .col = opened.frame.panes.diff_content.x + 4, .row = header_row, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = presentation.projection().review.?.frame.panes.diff_content.x + 4, .row = header_row, .button = .left, .type = .release } });
+    try completeDisclosureBuild(&presentation);
+    const closed = presentation.projection().review.?;
+    try testing.expect(!closed.buffer.rows[findDisclosureRow(closed.buffer.rows, disclosure_key).?].disclosure.expanded);
+
     try presentation.dispatch(.{ .mouse = .{ .col = sidebar.x, .row = sidebar.y, .button = .left, .type = .press } });
     try presentation.dispatch(.{ .mouse = .{ .col = sidebar.x, .row = sidebar.y, .button = .left, .type = .release } });
     try testing.expectEqual(frame_mod.PaneFocus.diff, presentation.projection().review.?.frame.focus);

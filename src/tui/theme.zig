@@ -203,6 +203,10 @@ pub const Theme = struct {
         return self.resolveStyle(style);
     }
 
+    pub fn resolvedThreadStyle(self: Theme) Style {
+        return self.resolveStyle(.{ .fg = self.status_added, .bg = self.context.bg, .bold = true });
+    }
+
     /// Every status part keeps the bar background, so the whole row reads as one bar.
     pub fn statusStyle(self: Theme, part: StatusPart) Style {
         const bar = self.status_bar;

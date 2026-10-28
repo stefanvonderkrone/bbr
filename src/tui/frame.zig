@@ -763,6 +763,7 @@ fn visualRowAt(visual_rows: []const VisualRow, index: usize) ?VisualRow {
 }
 
 fn owner(row: buffer_mod.Row) RowOwner {
+    if (buffer_mod.disclosureKey(row)) |key| if (key == .resolved_thread) return .{ .disclosure = key };
     return switch (row) {
         .file_header => |header| .{ .file = header.file },
         .hunk_header => |hunk| .{ .hunk = hunk },

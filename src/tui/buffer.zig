@@ -274,7 +274,7 @@ pub const EmphasisCache = struct {
 pub fn disclosureKey(row: Row) ?DisclosureKey {
     return switch (row) {
         .disclosure => |value| value.key,
-        .comment, .draft => |card| if (card.part == .disclosure_footer) .{ .review_card = card.owner } else null,
+        .comment, .draft => |card| if (card.resolved_thread) .{ .resolved_thread = card.owner.comment } else if (card.part == .disclosure_footer) .{ .review_card = card.owner } else null,
         else => null,
     };
 }
@@ -878,7 +878,7 @@ pub fn buildWithComments(
             try rows.append(opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = od_count, .path = file.displayPath() } });
             if (expanded) {
                 for (threads) |*t| {
-                    if (isFileOutdated(t.*, file.*)) try w.emitThreadContent(t);
+                    if (isFileOutdated(t.*, file.*)) try w.emitThreadContent(t, false);
                 }
                 for (opts.drafts, 0..) |*draft, draft_index| {
                     if (draft.parent != null or w.emitted[draft_index]) continue;
@@ -917,7 +917,7 @@ pub fn buildWithComments(
         try rows.append(opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .outdated, .expanded = expanded, .count = fallback_outdated_count } });
         if (expanded) {
             if (opts.only_file == null) for (threads, 0..) |*thread, thread_index| {
-                if (!emitted_threads[thread_index] and thread.root.state == .outdated) try w.emitThreadContent(thread);
+                if (!emitted_threads[thread_index] and thread.root.state == .outdated) try w.emitThreadContent(thread, false);
             };
             for (opts.drafts, 0..) |*draft, draft_index| {
                 if (draft.parent != null or emitted[draft_index]) continue;
@@ -1204,13 +1204,15 @@ const Weave = struct {
         if (t.resolved) {
             const key: DisclosureKey = .{ .resolved_thread = t.root.id };
             const expanded = w.expanded_disclosures.contains(disclosureId(key));
-            try w.rows.append(w.opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .resolved_thread, .expanded = expanded, .count = t.replies.len, .author = t.root.author } });
-            if (!expanded) return;
+            if (!expanded) {
+                try w.rows.append(w.opts.scratch_allocator, .{ .disclosure = .{ .key = key, .kind = .resolved_thread, .expanded = false, .count = t.replies.len, .author = t.root.author } });
+                return;
+            }
         }
-        try w.emitThreadContent(t);
+        try w.emitThreadContent(t, t.resolved);
     }
 
-    fn emitThreadContent(w: *Weave, t: *const Thread) !void {
+    fn emitThreadContent(w: *Weave, t: *const Thread, resolved_header: bool) !void {
         const index = (@intFromPtr(t) - @intFromPtr(w.threads.ptr)) / @sizeOf(Thread);
         if (w.emitted_threads[index]) return;
         w.emitted_threads[index] = true;
@@ -1219,17 +1221,18 @@ const Weave = struct {
         var indentation = CardIndentation.init(w.opts.card_width, w.maxReplyDepth(parent, w.ancestry_limit));
         indentation.relative = w.parentUnavailable(if (t.root.parent_id) |id| .{ .comment = id } else null);
         const start = w.rows.items.len;
-        try w.emitComment(t.root, 0, indentation);
+        try w.emitComment(t.root, 0, indentation, if (resolved_header) t else null);
         try w.emitRepliesTo(parent, 1, indentation);
         try w.tree_starts.append(w.a, start);
     }
 
     /// Parse authored bytes into a width-independent ReviewBody and project the
     /// shared ReviewCardRow shape used by root Comments, Replies, and Drafts.
-    fn emitComment(w: *Weave, c: *const Comment, depth: usize, indentation: CardIndentation) !void {
+    fn emitComment(w: *Weave, c: *const Comment, depth: usize, indentation: CardIndentation, resolved_thread: ?*const Thread) !void {
         const is_reply = depth > 0 or c.parent_id != null;
         const owner: review_card.Owner = .{ .comment = c.id };
-        const title = try cardTitle(w.a, try indentation.state(w.a, depth), c.author, &.{
+        const author = if (resolved_thread) |thread| try std.fmt.allocPrint(w.a, "▾ ✓ Resolved · {s} · {d} replies", .{ c.author, thread.replies.len }) else c.author;
+        const title = try cardTitle(w.a, try indentation.state(w.a, depth), author, &.{
             if (c.deleted) "deleted" else null,
             if (c.suggestion() != null) "suggestion" else null,
         });
@@ -1246,6 +1249,7 @@ const Weave = struct {
                 .comment,
             .header = title,
             .plain_header = title,
+            .resolved_thread = resolved_thread != null,
             .content_width = cardContentWidth(w.opts.card_width, indentation.offset(depth)),
             .depth = depth,
             .indent = indentation.offset(depth),
@@ -1345,7 +1349,7 @@ const Weave = struct {
         const children = w.replies.get(parentKey(parent)) orelse return;
         for (children.items) |item| switch (item) {
             .comment => |comment| {
-                try w.emitComment(comment, depth, indentation);
+                try w.emitComment(comment, depth, indentation, null);
                 try w.emitRepliesTo(.{ .comment = comment.id }, depth + 1, indentation);
             },
             .draft => |index| try w.emitDraftAt(index, depth, indentation),
@@ -3095,7 +3099,7 @@ test "resolved threads hide behind the toggle, whole thread revealed when on" {
     try testing.expectEqual(@as(usize, 2), countKind(shown, .comment));
 }
 
-test "resolved Thread disclosure remains present while independently expanded" {
+test "M23 ancestry resolved Thread header replaces its disclosure while independently expanded" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -3113,8 +3117,12 @@ test "resolved Thread disclosure remains present while independently expanded" {
     const expanded = try buildWithComments(a, diff, .unified, threads, .{
         .expanded_disclosures = &.{.{ .resolved_thread = 41 }},
     });
-    try testing.expectEqual(@as(usize, 2), countKind(expanded, .disclosure));
+    try testing.expectEqual(@as(usize, 1), countKind(expanded, .disclosure));
     try testing.expectEqual(@as(usize, 1), countKind(expanded, .comment));
+    for (expanded.rows, 0..) |row, index| if (row == .comment and row.comment.part == .header) {
+        try testing.expectEqualDeep(DisclosureKey{ .resolved_thread = 41 }, disclosureKey(row).?);
+        try testing.expect(expanded.rows[index - 1] != .disclosure);
+    };
 }
 
 test "outdated threads remain represented by a per-File disclosure" {

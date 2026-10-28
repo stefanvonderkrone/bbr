@@ -821,9 +821,9 @@ fn drawReviewCard(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, card: b
     if (card.block_kind == .heading) base.bold = true;
     const dim = theme.resolveStyle(theme.card_border_dim);
     const on_path = chrome.path.holds(card.card);
-    const border = if (on_path) theme.reviewCardStyle(card.role, .body, .{}) else dim;
+    const border = if (card.resolved_thread) theme.resolvedThreadStyle() else if (on_path) theme.reviewCardStyle(card.role, .body, .{}) else dim;
     var title = base;
-    if (!on_path) title.fg = dim.fg;
+    if (card.resolved_thread) title = theme.resolvedThreadStyle() else if (!on_path) title.fg = dim.fg;
     const left = card.indent;
     const right = card.rightBorderColumn();
     const col: u16 = @intCast(card.contentColumn());
@@ -916,14 +916,14 @@ const TerminalLinks = struct {
 
 fn drawDisclosure(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, value: buffer_mod.Disclosure, theme: Theme) void {
     const style = switch (value.kind) {
-        .resolved_thread => theme.resolveStyle(.{ .fg = theme.status_added, .bg = theme.context.bg, .bold = true }),
+        .resolved_thread => theme.resolvedThreadStyle(),
         .fold => theme.fold,
         else => theme.section,
     };
     fillRow(win, r, style);
     const glyph: []const u8 = if (value.expanded) "▾" else "▸";
     const text = switch (value.kind) {
-        .resolved_thread => std.fmt.allocPrint(scratch, "{s} thread by {s} (resolved) · {d} replies", .{ glyph, value.author, value.count }) catch glyph,
+        .resolved_thread => std.fmt.allocPrint(scratch, "{s} ✓ Resolved · {s} · {d} replies", .{ glyph, value.author, value.count }) catch glyph,
         .fold => std.fmt.allocPrint(scratch, "{s} ⋯ {d} unchanged lines", .{ glyph, value.count }) catch glyph,
         .outdated => if (value.path.len > 0)
             std.fmt.allocPrint(scratch, "{s} Outdated · {s} · {d} threads", .{ glyph, value.path, value.count }) catch glyph
@@ -932,8 +932,11 @@ fn drawDisclosure(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, value: 
         .opposite_version => std.fmt.allocPrint(scratch, "{s} {s} · {d} threads", .{ glyph, value.path, value.count }) catch glyph,
         .review_card => unreachable,
     };
-    const column = if (value.kind == .resolved_thread) anchor_cols else gutter_cols;
-    _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = column, .wrap = .none });
+    if (value.kind == .resolved_thread) {
+        view_paint.titledRule(win, r, anchor_cols, win.width -| 1, text, style);
+    } else {
+        _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = r, .col_offset = gutter_cols, .wrap = .none });
+    }
 }
 
 /// A section divider: "── PR comments (N)" or "── Outdated · path (N)".
@@ -4920,22 +4923,28 @@ test "M23 ancestry resolved Thread disclosure names its author in bold green tex
         };
         const threads = try bbr.review.buildThreads(a, &comments);
         const buf = try buffer_mod.buildWithComments(a, .{ .files = &.{} }, .unified, threads, .{
+            .card_width = 120,
             .expanded_disclosures = if (expanded) &.{.{ .resolved_thread = 1 }} else &.{},
         });
         const theme = themes.value(id);
         var screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 120, .x_pixel = 0, .y_pixel = 0 });
         const win = headlessWindow(&screen);
         var found = false;
-        for (buf.rows) |row| if (row == .disclosure and row.disclosure.kind == .resolved_thread) {
+        for (buf.rows) |row| if (if (buffer_mod.disclosureKey(row)) |key| key == .resolved_thread else false) {
             found = true;
-            drawDisclosure(a, win, 0, row.disclosure, theme);
+            if (expanded) {
+                try testing.expect(row == .comment);
+                try testing.expectEqual(@import("review_card.zig").Part.header, row.comment.part);
+            }
+            drawRow(a, win, 0, .unified, null, row, theme, .{});
         };
         try testing.expect(found);
         const pane: CardTestPane = .{ .win = win, .buf = buf, .visual_rows = &.{} };
         const text = try pane.text(a, 0);
-        try testing.expect(std.mem.startsWith(u8, text, if (expanded) " ▾ thread by Ada (resolved)" else " ▸ thread by Ada (resolved)"));
+        try testing.expect(std.mem.startsWith(u8, text, if (expanded) " ╭─ ▾ ✓ Resolved · Ada · 1 replies " else " ── ▸ ✓ Resolved · Ada · 1 replies "));
+        try testing.expectEqualStrings(if (expanded) "╮" else "─", pane.glyph(win.width - 1, 0));
         try testing.expect(std.mem.indexOf(u8, text, "1 replies") != null);
-        const cell = win.readCell(anchor_cols + 2, 0).?;
+        const cell = win.readCell(anchor_cols + 3, 0).?;
         try testing.expect(cell.style.bold);
         try testing.expect(!cell.style.dim);
         try testing.expectEqual(theme.status_added, cell.style.fg);
