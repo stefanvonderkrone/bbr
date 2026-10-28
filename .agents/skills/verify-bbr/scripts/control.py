@@ -146,8 +146,6 @@ def main():
     parser.add_argument("values", nargs="*")
     args = parser.parse_args()
     if args.command == "launch":
-        # A stale zig-out binary would pass a drive that the source fails.
-        subprocess.run(["zig", "build"], cwd=ROOT, check=True, stdout=sys.stderr)
         evidence = ROOT / ".scratch/verify-bbr" / (time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6])
         evidence.mkdir(parents=True, mode=0o700)
         scratch = Path(tempfile.mkdtemp(prefix="bbr-"))
@@ -155,6 +153,8 @@ def main():
         (scratch / "owner").write_text(str(evidence))
         save(evidence / "instance.json", state)
         try:
+            # A stale zig-out binary would pass a drive that the source fails.
+            subprocess.run(["zig", "build"], cwd=ROOT, check=True, stdout=sys.stderr, timeout=COMMAND_TIMEOUT)
             shutil.copy2(state["source_binary"], scratch / "bbr")
             state["sha256"] = digest(scratch / "bbr")
             state["version"] = run(str(scratch / "bbr"), "--version").strip()

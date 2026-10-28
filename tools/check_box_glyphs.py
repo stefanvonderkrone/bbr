@@ -6,7 +6,7 @@ import re
 import sys
 
 PAINTERS = (Path("src/tui/render.zig"), Path("src/tui/app.zig"))
-GLYPHS = re.compile("[┌┐└┘├┤┬┴┼╭╮╰╯]")
+GLYPHS = re.compile("[\u250c-\u254b\u2552-\u2570]")
 TEST_START = re.compile(r"^test\b.*\{\s*$")
 FIX = (
     "Declare a border, a rule, or a Title on a View in src/tui/layouts.zig and paint it with view_paint.paint. "
@@ -17,7 +17,7 @@ FIX = (
 def violations(root):
     for relative in PAINTERS:
         in_test = False
-        for number, line in enumerate((root / relative).read_text().splitlines(), 1):
+        for number, line in enumerate((root / relative).read_text(encoding="utf-8").splitlines(), 1):
             if in_test:
                 in_test = line != "}"
                 continue

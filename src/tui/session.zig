@@ -99,7 +99,7 @@ pub const Session = struct {
                     error.OutOfMemory => return err,
                     else => continue,
                 };
-                const name = if (user.display_name.len > 0) user.display_name else user.nickname;
+                const name = if (validMentionName(user.display_name)) user.display_name else user.nickname;
                 if (validMentionName(name)) entry.value_ptr.* = try std.fmt.allocPrint(a, "@{s}", .{name});
             };
             if (!scratch.reset(.{ .retain_with_limit = 64 * 1024 })) return error.OutOfMemory;
@@ -457,12 +457,13 @@ test "remote Session resolves each prose mention once and retains failed mention
         .{ .request_key = "/users/nick", .body = "{\"uuid\":\"{nick}\",\"nickname\":\"Ada\"}" },
         .{ .request_key = "/users/missing", .status = 404 },
         .{ .request_key = "/users/control", .body = "{\"uuid\":\"{control}\",\"display_name\":\"bad\\nname\"}" },
+        .{ .request_key = "/users/fallback", .body = "{\"uuid\":\"{fallback}\",\"display_name\":\"bad\\nname\",\"nickname\":\"Bo\"}" },
         base[0],
         base[1],
         .{ .request_key = "/pullrequests/7/comments", .body =
         \\{"values":[
         \\ {"id":1,"content":{"raw":"@{id} @{id} @{missing} @{nick} @{control} `@{code}` [link](url/@{url})"},"user":{"display_name":"Ada"}},
-        \\ {"id":2,"parent":{"id":1},"content":{"raw":"**@{id}** @{missing}"},"user":{"display_name":"Bo"}}
+        \\ {"id":2,"parent":{"id":1},"content":{"raw":"**@{id}** @{missing} @{fallback}"},"user":{"display_name":"Bo"}}
         \\]}
         },
         base[3],
@@ -476,8 +477,9 @@ test "remote Session resolves each prose mention once and retains failed mention
         try testing.expectEqualStrings("@Ada", s.mention_names.get("nick").?);
         try testing.expectEqualStrings("", s.mention_names.get("missing").?);
         try testing.expectEqualStrings("", s.mention_names.get("control").?);
-        try testing.expectEqual(@as(usize, 4), s.mention_names.count());
-        try testing.expectEqual(@as(usize, 8), fake.callCount());
+        try testing.expectEqualStrings("@Bo", s.mention_names.get("fallback").?);
+        try testing.expectEqual(@as(usize, 5), s.mention_names.count());
+        try testing.expectEqual(@as(usize, 9), fake.callCount());
         try testing.expect(fake.maxActiveRequests() <= 2);
         try testing.expect(std.mem.startsWith(u8, s.threads[0].root.body, "@{id} @{id}"));
     }
