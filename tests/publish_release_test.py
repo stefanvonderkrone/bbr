@@ -70,9 +70,12 @@ class PublishReleaseTest(unittest.TestCase):
         elif action == "upload":
             self.assertTrue(self.release["draft"])
             self.assertIn("--clobber", command)
-            for name, data in self.assets.items():
-                self.assertTrue(any(Path(arg).name == name for arg in command))
-                self.release["assets"][name] = data
+            paths = [Path(arg) for arg in command[4:] if arg != "--clobber"]
+            self.assertEqual(len(paths), len({path.name for path in paths}))
+            for path in paths:
+                data = path.read_bytes()
+                self.assertEqual(data, self.assets[path.name])
+                self.release["assets"][path.name] = data
                 if self.fail_upload:
                     raise subprocess.CalledProcessError(1, command)
         elif action == "edit":
@@ -132,6 +135,49 @@ class PublishReleaseTest(unittest.TestCase):
     def test_missing_checksums_are_rejected_before_publication(self):
         Path("SHA256SUMS").unlink()
         with self.assertRaisesRegex(ValueError, "SHA256SUMS"):
+            publisher.publish(TAG)
+        self.assertEqual(self.commands, [])
+
+    def test_missing_target_is_rejected_before_api_calls(self):
+        name = f"bbr-{TAG}-macos-aarch64.tar.gz"
+        Path(name).unlink()
+        del self.assets[name]
+        with self.assertRaisesRegex(ValueError, "all four"):
+            publisher.publish(TAG)
+        self.assertEqual(self.commands, [])
+        self.assertTrue(self.release["draft"])
+
+    def test_single_surviving_archive_cannot_publish_a_release(self):
+        self.release = None
+        for name in list(self.assets):
+            if name.endswith(".tar.gz") and "linux-x86_64" not in name:
+                Path(name).unlink()
+                del self.assets[name]
+        with self.assertRaisesRegex(ValueError, "all four"):
+            publisher.publish(TAG)
+        self.assertEqual(self.commands, [])
+        self.assertIsNone(self.release)
+
+    def test_unexpected_target_is_rejected_before_api_calls(self):
+        name = f"bbr-{TAG}-windows-x86_64.tar.gz"
+        self.assets[name] = b"unexpected"
+        Path(name).write_bytes(self.assets[name])
+        with self.assertRaisesRegex(ValueError, "all four"):
+            publisher.publish(TAG)
+        self.assertEqual(self.commands, [])
+        self.assertTrue(self.release["draft"])
+
+    def test_archive_for_another_tag_is_rejected_before_api_calls(self):
+        Path("bbr-v2024.3.24-2-linux-x86_64.tar.gz").write_bytes(b"another tag")
+        with self.assertRaisesRegex(ValueError, "all four"):
+            publisher.publish(TAG)
+        self.assertEqual(self.commands, [])
+
+    def test_directory_cannot_replace_a_target_archive(self):
+        archive = Path(f"bbr-{TAG}-linux-aarch64.tar.gz")
+        archive.unlink()
+        archive.mkdir()
+        with self.assertRaisesRegex(ValueError, "all four"):
             publisher.publish(TAG)
         self.assertEqual(self.commands, [])
 

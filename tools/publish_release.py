@@ -7,6 +7,9 @@ import subprocess
 import sys
 
 
+TARGETS = ("macos-x86_64", "macos-aarch64", "linux-x86_64", "linux-aarch64")
+
+
 def version_key(tag):
     """Return numeric date and sequence fields for release ordering."""
     return tuple(int(part) for part in tag.removeprefix("v").replace("-", ".").split("."))
@@ -14,9 +17,10 @@ def version_key(tag):
 
 def publish(tag):
     """Resume a draft, replace its expected assets, and publish only after upload succeeds."""
-    archives = sorted(str(path) for path in Path.cwd().glob(f"bbr-{tag}-*.tar.gz"))
-    if not archives or not Path("SHA256SUMS").is_file():
-        raise ValueError("release archives and SHA256SUMS are required")
+    archives = sorted(str(path) for path in Path.cwd().glob("*.tar.gz") if path.is_file())
+    expected = {f"bbr-{tag}-{target}.tar.gz" for target in TARGETS}
+    if {Path(archive).name for archive in archives} != expected or not Path("SHA256SUMS").is_file():
+        raise ValueError("all four release archives and SHA256SUMS are required")
     owner, name = os.environ["GH_REPO"].split("/", 1)
     query = """query($owner: String!, $name: String!, $tag: String!) {
       repository(owner: $owner, name: $name) {
