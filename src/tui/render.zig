@@ -565,7 +565,7 @@ fn drawRow(scratch: std.mem.Allocator, win: vaxis.Window, r: u16, layout: buffer
         },
         .hunk_header => |hunk| {
             fillRow(win, r, theme.hunk_header);
-            _ = win.printSegment(.{ .text = hunk.header, .style = theme.hunk_header }, .{ .row_offset = r, .wrap = .none });
+            _ = win.printSegment(.{ .text = hunk.header, .style = theme.hunk_header }, .{ .row_offset = r, .col_offset = if (layout == .side_by_side) anchor_cols else 0, .wrap = .none });
         },
         .status_placeholder => |value| drawStatusPlaceholder(scratch, win, r, layout, value, theme),
         .line => |lr| {
@@ -601,16 +601,15 @@ fn drawSideFileHeader(scratch: std.mem.Allocator, win: vaxis.Window, row: u16, h
     }
     const old = std.fmt.allocPrint(scratch, "OLD {s}", .{header.file.old_path}) catch "OLD";
     const new = std.fmt.allocPrint(scratch, "NEW {s}", .{header.file.new_path}) catch "NEW";
-    if (half > 0) _ = win.child(.{ .x_off = 0, .y_off = row, .width = half, .height = 1 }).printSegment(.{ .text = old, .style = theme.resolveStyle(old_style) }, .{ .wrap = .none });
+    if (half > 0) _ = win.child(.{ .x_off = anchor_cols, .y_off = row, .width = half - anchor_cols, .height = 1 }).printSegment(.{ .text = old, .style = theme.resolveStyle(old_style) }, .{ .wrap = .none });
     if (right_x < win.width) _ = win.child(.{ .x_off = right_x, .y_off = row, .width = win.width - right_x, .height = 1 }).printSegment(.{ .text = new, .style = theme.resolveStyle(new_style) }, .{ .wrap = .none });
 }
 
 fn drawSelectedColumnEdge(win: vaxis.Window, row: u16, selected: ?buffer_mod.SelectedColumn, theme: Theme) void {
     const column = selected orelse return;
-    const divider = win.width / 2;
-    if (divider >= win.width) return;
-    const current = win.readCell(divider, row) orelse return;
-    win.writeCell(divider, row, .{
+    const edge: u16 = if (column.version == .old) 0 else win.width / 2;
+    const current = win.readCell(edge, row) orelse return;
+    win.writeCell(edge, row, .{
         .char = .{ .grapheme = if (column.inner_gutter_edge == .right) "▐" else "▌", .width = 1 },
         .style = theme.resolveStyle(.{ .fg = theme.accent, .bg = current.style.bg, .bold = true }),
     });
@@ -639,10 +638,10 @@ fn drawStatusPlaceholder(
     const half = win.width / 2;
     if (half == 0) return;
     if (value.old) |status| {
-        const left = win.child(.{ .x_off = 0, .y_off = row, .width = half, .height = 1 });
+        const left = win.child(.{ .x_off = anchor_cols, .y_off = row, .width = half - anchor_cols, .height = 1 });
         _ = left.printSegment(.{ .text = statusPlaceholderText(scratch, .old, status), .style = theme.section }, .{ .wrap = .none });
     } else if (value.file.status == .added) {
-        const left = win.child(.{ .x_off = 0, .y_off = row, .width = half, .height = 1 });
+        const left = win.child(.{ .x_off = anchor_cols, .y_off = row, .width = half - anchor_cols, .height = 1 });
         _ = left.printSegment(.{ .text = "Old content absent", .style = theme.section }, .{ .wrap = .none });
     }
     const right_x = half + 1;
@@ -3275,14 +3274,16 @@ test "SideBySide Status Placeholders render each side independently" {
         .old = .{ .binary = 3 },
         .new = .{ .unavailable = .{ .unavailable = .{ .reason = .{ .acquisition_failed = error.NotFound } } } },
     } }};
-    const buf: Buffer = .{ .rows = &rows, .layout = .side_by_side };
+    const buf: Buffer = .{ .rows = &rows, .layout = .side_by_side, .selected_version = .old, .selected_column = .{ .version = .old, .inner_gutter_edge = .right } };
     var screen = try vaxis.Screen.init(a, .{ .rows = 1, .cols = 100, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
 
     drawPane(a, win, buf, theme_dark, Nav.init(1, 1));
 
-    try expectScreenText(win, 0, "Old content binary, 3 bytes");
+    try testing.expectEqualStrings("▐", win.readCell(0, 0).?.char.grapheme);
+    const left = win.child(.{ .x_off = 1, .width = win.width / 2 - 1, .height = 1 });
+    try expectScreenText(left, 0, "Old content binary, 3 bytes");
     const right = win.child(.{ .x_off = win.width / 2 + 1, .width = win.width - (win.width / 2 + 1), .height = 1 });
     try expectScreenText(right, 0, "New content unavailable: acquisition failed");
 }
@@ -3304,10 +3305,11 @@ test "binary Status Placeholder renders an unknown size" {
 
     drawPane(a, win, buf, theme_dark, Nav.init(2, 2));
 
-    try expectScreenText(win, 0, "Old content absent");
+    const left = win.child(.{ .x_off = 1, .width = win.width / 2 - 1, .height = 2 });
+    try expectScreenText(left, 0, "Old content absent");
     const right = win.child(.{ .x_off = win.width / 2 + 1, .width = win.width - (win.width / 2 + 1), .height = 2 });
     try expectScreenText(right, 0, "New content binary, size unavailable");
-    try expectScreenText(win, 1, "Old content binary, 7 bytes");
+    try expectScreenText(left, 1, "Old content binary, 7 bytes");
     try expectScreenText(right, 1, "New content absent");
 }
 
@@ -4712,7 +4714,61 @@ test "DiffPane title reserves and renders published Selected Version targets" {
     }) |cell| try testing.expectEqualStrings(cell.text, win.readCell(cell.x, 0).?.char.grapheme);
 }
 
-test "SideBySide WholeFile accents only the selected header and inner gutter edge" {
+test "Selected Version markers stay left of their SideBySide column and off Unified rows" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try bbr.diff.parse(a,
+        \\diff --git a/a.txt b/a.txt
+        \\--- a/a.txt
+        \\+++ b/a.txt
+        \\@@ -1 +1 @@
+        \\-old source that wraps over several rows
+        \\+new source that wraps over several rows
+    );
+    const blobs = [_]bbr.diff.FileBlob{.{ .old = "old source that wraps over several rows\n", .new = "new source that wraps over several rows\n" }};
+    for ([_]u16{ 40, 41 }) |width| for ([_]bool{ false, true }) |whole_file| for ([_]buffer_mod.Layout{ .side_by_side, .unified }) |layout| for ([_]buffer_mod.SelectedVersion{ .old, .new }) |version| {
+        const buf = try buffer_mod.buildWithComments(a, diff, layout, &.{}, .{ .whole_file = whole_file, .selected_version = version, .blobs = &blobs });
+        const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, buf.rows, .bytes, .{ .layout = layout, .width = width });
+        var screen = try vaxis.Screen.init(a, .{ .rows = 16, .cols = width, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(a);
+        const win = headlessWindow(&screen);
+        for ([_]bool{ false, true }) |wrapped| {
+            win.clear();
+            const count = if (wrapped) visual_rows.len else buf.rows.len;
+            try testing.expect(count <= win.height);
+            const nav = Nav.init(count, win.height);
+            if (wrapped) {
+                drawVisualPane(a, win, buf, visual_rows, theme_dark, nav);
+            } else {
+                drawPane(a, win, buf, theme_dark, nav);
+            }
+            for (0..count) |row| {
+                const y: u16 = @intCast(row);
+                if (layout == .side_by_side) {
+                    const marker_x: u16 = if (version == .old) 0 else width / 2;
+                    try testing.expectEqualStrings(if (version == .old) "▐" else "▌", win.readCell(marker_x, y).?.char.grapheme);
+                    try testing.expectEqual(theme_dark.accent, win.readCell(marker_x, y).?.style.fg);
+                }
+                for (0..width) |col| {
+                    const glyph = win.readCell(@intCast(col), y).?.char.grapheme;
+                    const is_marker = std.mem.eql(u8, glyph, "▐") or std.mem.eql(u8, glyph, "▌");
+                    const expected_marker = layout == .side_by_side and col == (if (version == .old) @as(usize, 0) else width / 2);
+                    try testing.expectEqual(expected_marker, is_marker);
+                }
+            }
+            if (layout == .side_by_side) {
+                const left = win.child(.{ .x_off = 1, .width = width / 2 - 1, .height = win.height });
+                const right = win.child(.{ .x_off = width / 2 + 1, .width = width - (width / 2 + 1), .height = win.height });
+                try expectScreenText(left, 0, "OLD a.txt");
+                try expectScreenText(right, 0, "NEW a.txt");
+                if (!whole_file) try expectScreenText(left, 1, "@@ -1 +1 @@");
+            }
+        }
+    };
+}
+
+test "SideBySide WholeFile accents only the selected header and left gutter edge" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -4738,8 +4794,9 @@ test "SideBySide WholeFile accents only the selected header and inner gutter edg
     const half = win.width / 2;
     try testing.expectEqual(theme_dark.accent, win.readCell(0, 0).?.style.fg);
     try testing.expect(!std.meta.eql(win.readCell(half + 1, 0).?.style.fg, theme_dark.accent));
-    try testing.expectEqualStrings("▐", win.readCell(half, 1).?.char.grapheme);
-    try testing.expectEqual(theme_dark.accent, win.readCell(half, 1).?.style.fg);
+    try testing.expectEqualStrings("▐", win.readCell(0, 1).?.char.grapheme);
+    try testing.expectEqual(theme_dark.accent, win.readCell(0, 1).?.style.fg);
+    try testing.expectEqualStrings(" ", win.readCell(half, 1).?.char.grapheme);
     try testing.expectEqual(theme_dark.removed.bg, win.readCell(side_gutter, 1).?.style.bg);
     try testing.expectEqual(theme_dark.added.bg, win.readCell(half + 1 + side_gutter, 1).?.style.bg);
 }
