@@ -18479,7 +18479,7 @@ test "External Edit footer ends with its Composer and appears after another acce
     });
     defer state.deinit();
 
-    for ([_]bool{ false, true }) |cancel| {
+    for ([_]enum { save, cancel, replace }{ .save, .cancel, .replace }) |end| {
         try state.dispatch(.{ .action = .review_comment });
         try testing.expect(state.projection().composer.?.footer == null);
         try state.dispatch(.{ .composer = .external_edit });
@@ -18489,8 +18489,22 @@ test "External Edit footer ends with its Composer and appears after another acce
         accepted.outcome = .{ .changed = try accepted.arena.allocator().dupe(u8, "accepted body") };
         try state.dispatch(.{ .external_edit_completed = accepted });
         try testing.expectEqualStrings("External Edit accepted", state.projection().composer.?.footer.?);
-        try state.dispatch(.{ .composer = if (cancel) .cancel else .save });
-        if (!cancel) try completeDisclosureBuild(&state);
+        switch (end) {
+            .save => {
+                try state.dispatch(.{ .composer = .save });
+                try completeDisclosureBuild(&state);
+            },
+            .cancel => try state.dispatch(.{ .composer = .cancel }),
+            .replace => {
+                try state.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.initLocal(43, "refs/remotes/origin/main", "refs/heads/other") });
+                const load = state.takeCommand().?.load_session;
+                try dispatchSessionLoadForTest(&state, .{ .session_loaded = .{
+                    .command_id = load.command_id,
+                    .intent = load.intent,
+                    .outcome = .{ .loaded = try testLocalSession(testing.allocator) },
+                } });
+            },
+        }
         try testing.expect(state.projection().composer == null);
     }
     try state.dispatch(.{ .action = .review_comment });
