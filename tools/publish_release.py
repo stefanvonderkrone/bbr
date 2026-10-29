@@ -1,8 +1,10 @@
 """Publish the archives and checksum file for a validated release tag."""
 
+from datetime import date
 from pathlib import Path
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -11,12 +13,25 @@ TARGETS = ("macos-x86_64", "macos-aarch64", "linux-x86_64", "linux-aarch64")
 
 
 def version_key(tag):
-    """Return numeric date and sequence fields for release ordering."""
-    return tuple(int(part) for part in tag.removeprefix("v").replace("-", ".").split("."))
+    """Return date and sequence fields for a canonical release tag, or None."""
+    match = re.fullmatch(
+        r"v([0-9]{4})\.([1-9]|1[0-2])\.([1-9]|[12][0-9]|3[01])-([1-9][0-9]*)", tag
+    )
+    if match is None:
+        return None
+    try:
+        key = tuple(int(part) for part in match.groups())
+        date(*key[:3])
+    except ValueError:
+        return None
+    return key
 
 
 def publish(tag):
     """Resume a draft, replace its expected assets, and publish only after upload succeeds."""
+    key = version_key(tag)
+    if key is None:
+        raise ValueError(f"malformed release tag: {tag}")
     archives = sorted(str(path) for path in Path.cwd().glob("*.tar.gz") if path.is_file())
     expected = {f"bbr-{tag}-{target}.tar.gz" for target in TARGETS}
     if {Path(archive).name for archive in archives} != expected or not Path("SHA256SUMS").is_file():
@@ -53,7 +68,13 @@ def publish(tag):
         if unexpected:
             raise ValueError(f"release {tag} has unexpected assets: {', '.join(sorted(unexpected))}")
     latest = repository["latestRelease"]
-    make_latest = latest is None or version_key(tag) >= version_key(latest["tagName"])
+    latest_key = version_key(latest["tagName"]) if latest is not None else None
+    if latest is None:
+        make_latest = True
+    elif latest_key is None:
+        make_latest = False
+    else:
+        make_latest = key >= latest_key
     if release is None:
         subprocess.run([
             "gh", "release", "create", tag, "--draft", "--verify-tag",

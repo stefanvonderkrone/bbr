@@ -190,6 +190,62 @@ class PublishReleaseTest(unittest.TestCase):
         publisher.publish(TAG)
         self.assertIn("--latest=true", self.commands[-1])
 
+    def test_uncomparable_latest_does_not_block_or_replace_a_release(self):
+        for existing_draft in (False, True):
+            for latest_tag in (
+                "v1.2.0-rc1", "v1.2.0", "nightly", "v2024.2.30-1",
+                "v2024.03.9-1", "v2024.3.9-01", "v2024.3.9-0",
+            ):
+                with self.subTest(existing_draft=existing_draft, latest_tag=latest_tag):
+                    self.release = {"draft": True, "assets": {}} if existing_draft else None
+                    self.latest = {"tagName": latest_tag}
+                    self.commands = []
+                    publisher.publish(TAG)
+                    self.assertFalse(self.release["draft"])
+                    self.assertEqual(self.release["assets"], self.assets)
+                    self.assertIn("--latest=false", self.commands[-1])
+                    self.assertEqual(
+                        any(command[1:3] == ["release", "create"] for command in self.commands),
+                        not existing_draft,
+                    )
+
+    def test_valid_dated_latest_keeps_calendar_and_sequence_order(self):
+        for latest_tag, make_latest in (
+            ("v2023.12.31-10", True),
+            ("v2024.2.29-10", True),
+            (TAG, True),
+            ("v2024.3.24-10", False),
+            ("v2024.4.1-1", False),
+        ):
+            with self.subTest(latest_tag=latest_tag):
+                self.release = {"draft": True, "assets": {}}
+                self.latest = {"tagName": latest_tag}
+                self.commands = []
+                publisher.publish(TAG)
+                self.assertFalse(self.release["draft"])
+                self.assertEqual(self.release["assets"], self.assets)
+                self.assertIn(f"--latest={str(make_latest).lower()}", self.commands[-1])
+
+    def test_malformed_incoming_tag_is_rejected_before_api_calls(self):
+        current_tag = TAG
+        for tag in (
+            "v1.2.0-rc1", "v1.2.0", "v2023.2.29-1", "v2024.03.24-1",
+            "v2024.3.024-1", "v2024.3.24-01", "v2024.3.24-0", "2024.3.24-1",
+        ):
+            with self.subTest(tag=tag):
+                for name in list(self.assets):
+                    if name.endswith(".tar.gz"):
+                        renamed = name.replace(current_tag, tag)
+                        Path(name).rename(renamed)
+                        self.assets[renamed] = self.assets.pop(name)
+                current_tag = tag
+                self.release = {"draft": True, "assets": {}}
+                self.commands = []
+                with self.assertRaisesRegex(ValueError, "malformed release tag"):
+                    publisher.publish(tag)
+                self.assertEqual(self.commands, [])
+                self.assertEqual(self.release, {"draft": True, "assets": {}})
+
     def test_api_failure_does_not_create_or_change_a_release(self):
         self.api_error = "HTTP 503"
         with self.assertRaises(subprocess.CalledProcessError):
