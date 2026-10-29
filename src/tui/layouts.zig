@@ -122,8 +122,9 @@ pub fn statusRects(params: Status, area: Rect) view.Rects(StatusSlot) {
 
 /// The Sidebar and the DiffPane. Each Pane has a rounded border with its
 /// Title in the top border, and its body starts in the next row. The scroll
-/// bars sit in the right border.
-pub const PaneSlot = enum { sidebar, diff };
+/// bars sit in the right border. Inside its border, the DiffPane has a
+/// one-column Selected Version marker column left of its body.
+pub const PaneSlot = enum { sidebar, diff, version_marker, diff_body };
 
 pub const Panes = struct {
     sidebar_focused: bool = false,
@@ -151,6 +152,8 @@ pub fn panes(params: Panes, area: Rect, visitor: anytype) void {
                 .slot = .diff,
                 .border = .{ .stroke = diff_stroke },
                 .scrollbar = bar(params.diff_scroll, .border, diff_stroke),
+                .composition = .{ .flow = .{ .axis = .horizontal } },
+                .children = &.{ .{ .slot = .version_marker, .width = .cells(1) }, .{ .slot = .diff_body } },
             },
         },
     };
@@ -381,6 +384,8 @@ test "the Panes touch with no gap and a 28-cell Sidebar" {
     try testing.expectEqual(Rect{ .x = 0, .y = 0, .width = 28, .height = 24 }, wide.get(.sidebar).border);
     try testing.expectEqual(Rect{ .x = 28, .y = 0, .width = 52, .height = 24 }, wide.get(.diff).border);
     try testing.expectEqual(Rect{ .x = 29, .y = 1, .width = 50, .height = 22 }, wide.get(.diff).content);
+    try testing.expectEqual(Rect{ .x = 29, .y = 1, .width = 1, .height = 22 }, wide.get(.version_marker).content);
+    try testing.expectEqual(Rect{ .x = 30, .y = 1, .width = 49, .height = 22 }, wide.get(.diff_body).content);
     try testing.expectEqual(Rect{ .x = 1, .y = 1, .width = 26, .height = 22 }, wide.get(.sidebar).content);
     const narrow = view.solve(PaneSlot, panes, Panes{}, .{ .width = 40, .height = 24 });
     try testing.expectEqual(narrow.get(.sidebar).border.width, narrow.get(.diff).border.x);

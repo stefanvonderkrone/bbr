@@ -103,13 +103,14 @@ pub fn drawReview(
         "Diff";
     drawDiffPaneTitle(scratch, win, frame, path, review.preferences.scope, theme);
     const sidebar = childRect(win, panes.get(.sidebar).content);
-    const diff_pane = childRect(win, panes.get(.diff).content);
+    const diff_pane = childRect(win, panes.get(.diff_body).content);
     var diff_theme = theme;
     diff_theme.section_rule = if (frame.focus == .diff) theme.pane_border_focused else theme.pane_border;
     drawFileTree(sidebar, review.frame.file_tree, theme);
     drawVisualPane(scratch, diff_pane, review.frame.buffer, review.frame.visual_rows, diff_theme, review.frame.navigation);
     drawCodeHighlights(diff_pane, review.frame, theme);
     drawSearchRanges(diff_pane, review.frame, theme);
+    drawVersionMarkerColumn(childRect(win, panes.get(.version_marker).content), diff_pane, review.frame.buffer, review.frame.visual_rows, review.frame.navigation, diff_theme);
     joinSectionRules(win, panes.get(.diff).border, panes.get(.diff).content, review.frame.visual_rows, review.frame.navigation);
 }
 
@@ -605,9 +606,41 @@ fn drawSideFileHeader(scratch: std.mem.Allocator, win: vaxis.Window, row: u16, h
     if (right_x < win.width) _ = win.child(.{ .x_off = right_x, .y_off = row, .width = win.width - right_x, .height = 1 }).printSegment(.{ .text = new, .style = theme.resolveStyle(new_style) }, .{ .wrap = .none });
 }
 
+/// The new version marker on the divider. The old version marker sits in the
+/// Selected Version marker column, which `drawVersionMarkerColumn` paints.
 fn drawSelectedColumnEdge(win: vaxis.Window, row: u16, selected: ?buffer_mod.SelectedColumn, theme: Theme) void {
     const column = selected orelse return;
-    const edge: u16 = if (column.version == .old) 0 else win.width / 2;
+    if (column.version == .old) return;
+    drawSelectedVersionMarker(win, win.width / 2, row, column, theme);
+}
+
+/// The Selected Version marker column between the DiffPane border and the
+/// body. It continues the rule of a rule row and the background of every
+/// other row. With the old version selected in SideBySide, it holds the old
+/// version marker on each row outside a ReviewCard.
+fn drawVersionMarkerColumn(marker: vaxis.Window, body: vaxis.Window, buf: Buffer, visual_rows: []const @import("frame.zig").VisualRow, nav: Nav, theme: Theme) void {
+    if (marker.width == 0) return;
+    const old_column: ?buffer_mod.SelectedColumn = blk: {
+        const column = buf.selected_column orelse break :blk null;
+        break :blk if (buf.layout == .side_by_side and column.version == .old) column else null;
+    };
+    var screen_row: u16 = 0;
+    while (screen_row < marker.height) : (screen_row += 1) {
+        const index = nav.scroll + screen_row;
+        if (index >= visual_rows.len) break;
+        const beside = body.readCell(0, screen_row) orelse continue;
+        const visual_row = visual_rows[index];
+        switch (visual_row.kind) {
+            .file_header, .section => marker.writeCell(0, screen_row, beside),
+            else => marker.writeCell(0, screen_row, .{ .style = .{ .bg = beside.style.bg } }),
+        }
+        const row = buf.rows[visual_row.buffer_index];
+        if (row == .comment or row == .draft) continue;
+        if (old_column) |column| drawSelectedVersionMarker(marker, 0, screen_row, column, theme);
+    }
+}
+
+fn drawSelectedVersionMarker(win: vaxis.Window, edge: u16, row: u16, column: buffer_mod.SelectedColumn, theme: Theme) void {
     const current = win.readCell(edge, row) orelse return;
     win.writeCell(edge, row, .{
         .char = .{ .grapheme = if (column.inner_gutter_edge == .right) "▐" else "▌", .width = 1 },
@@ -3281,7 +3314,7 @@ test "SideBySide Status Placeholders render each side independently" {
 
     drawPane(a, win, buf, theme_dark, Nav.init(1, 1));
 
-    try testing.expectEqualStrings("▐", win.readCell(0, 0).?.char.grapheme);
+    try testing.expectEqualStrings(" ", win.readCell(0, 0).?.char.grapheme);
     const left = win.child(.{ .x_off = 1, .width = win.width / 2 - 1, .height = 1 });
     try expectScreenText(left, 0, "Old content binary, 3 bytes");
     const right = win.child(.{ .x_off = win.width / 2 + 1, .width = win.width - (win.width / 2 + 1), .height = 1 });
@@ -4730,42 +4763,77 @@ test "Selected Version markers stay left of their SideBySide column and off Unif
     for ([_]u16{ 40, 41 }) |width| for ([_]bool{ false, true }) |whole_file| for ([_]buffer_mod.Layout{ .side_by_side, .unified }) |layout| for ([_]buffer_mod.SelectedVersion{ .old, .new }) |version| {
         const buf = try buffer_mod.buildWithComments(a, diff, layout, &.{}, .{ .whole_file = whole_file, .selected_version = version, .blobs = &blobs });
         const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, buf.rows, .bytes, .{ .layout = layout, .width = width });
-        var screen = try vaxis.Screen.init(a, .{ .rows = 16, .cols = width, .x_pixel = 0, .y_pixel = 0 });
+        var screen = try vaxis.Screen.init(a, .{ .rows = 16, .cols = width + 1, .x_pixel = 0, .y_pixel = 0 });
         defer screen.deinit(a);
-        const win = headlessWindow(&screen);
-        for ([_]bool{ false, true }) |wrapped| {
-            win.clear();
-            const count = if (wrapped) visual_rows.len else buf.rows.len;
-            try testing.expect(count <= win.height);
-            const nav = Nav.init(count, win.height);
-            if (wrapped) {
-                drawVisualPane(a, win, buf, visual_rows, theme_dark, nav);
-            } else {
-                drawPane(a, win, buf, theme_dark, nav);
-            }
-            for (0..count) |row| {
-                const y: u16 = @intCast(row);
-                if (layout == .side_by_side) {
-                    const marker_x: u16 = if (version == .old) 0 else width / 2;
-                    try testing.expectEqualStrings(if (version == .old) "▐" else "▌", win.readCell(marker_x, y).?.char.grapheme);
-                    try testing.expectEqual(theme_dark.accent, win.readCell(marker_x, y).?.style.fg);
-                }
-                for (0..width) |col| {
-                    const glyph = win.readCell(@intCast(col), y).?.char.grapheme;
-                    const is_marker = std.mem.eql(u8, glyph, "▐") or std.mem.eql(u8, glyph, "▌");
-                    const expected_marker = layout == .side_by_side and col == (if (version == .old) @as(usize, 0) else width / 2);
-                    try testing.expectEqual(expected_marker, is_marker);
-                }
-            }
+        const pane = drawMarkedDiffPane(a, headlessWindow(&screen), buf, visual_rows, theme_dark);
+        for (0..visual_rows.len) |row| {
+            const y: u16 = @intCast(row);
             if (layout == .side_by_side) {
-                const left = win.child(.{ .x_off = 1, .width = width / 2 - 1, .height = win.height });
-                const right = win.child(.{ .x_off = width / 2 + 1, .width = width - (width / 2 + 1), .height = win.height });
-                try expectScreenText(left, 0, "OLD a.txt");
-                try expectScreenText(right, 0, "NEW a.txt");
-                if (!whole_file) try expectScreenText(left, 1, "@@ -1 +1 @@");
+                const marker = if (version == .old) pane.marker.readCell(0, y).? else pane.body.readCell(width / 2, y).?;
+                try testing.expectEqualStrings(if (version == .old) "▐" else "▌", marker.char.grapheme);
+                try testing.expectEqual(theme_dark.accent, marker.style.fg);
+            } else {
+                try testing.expect(!isVersionMarker(pane.marker.readCell(0, y).?.char.grapheme));
+            }
+            for (0..width) |col| {
+                const expected_marker = layout == .side_by_side and version == .new and col == width / 2;
+                try testing.expectEqual(expected_marker, isVersionMarker(pane.body.readCell(@intCast(col), y).?.char.grapheme));
             }
         }
+        if (layout == .side_by_side) {
+            const left = pane.body.child(.{ .x_off = 1, .width = width / 2 - 1, .height = pane.body.height });
+            const right = pane.body.child(.{ .x_off = width / 2 + 1, .width = width - (width / 2 + 1), .height = pane.body.height });
+            try expectScreenText(left, 0, "OLD a.txt");
+            try expectScreenText(right, 0, "NEW a.txt");
+            if (!whole_file) try expectScreenText(left, 1, "@@ -1 +1 @@");
+        }
     };
+}
+
+test "the old version marker and the Anchor Indicator keep separate columns" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diff = try bbr.diff.parse(a, card_test_diff);
+    const comments = [_]bbr.review.Comment{.{ .id = 1, .author = "Ada", .body = "root", .scope = .{ .@"inline" = .{ .path = "a.zig", .start_to = 2, .to = 4 } } }};
+    const threads = try bbr.review.buildThreads(a, &comments);
+    const width: u16 = 80;
+    const buf = try buffer_mod.buildWithComments(a, diff, .side_by_side, threads, .{ .card_width = width, .selected_version = .old });
+    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, buf.rows, .bytes, .{ .layout = .side_by_side, .width = width });
+    var screen = try vaxis.Screen.init(a, .{ .rows = @intCast(visual_rows.len), .cols = width + 1, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    var nav = Nav.init(visual_rows.len, visual_rows.len);
+    const probe: CardTestPane = .{ .win = headlessWindow(&screen), .buf = buf, .visual_rows = visual_rows };
+    nav.jumpTo(probe.cardRow(.{ .comment = 1 }, .body));
+    const pane = drawMarkedDiffPaneAt(a, headlessWindow(&screen), buf, visual_rows, theme_dark, nav);
+
+    const top = probe.lineRow(2);
+    const corner = probe.cardRow(.{ .comment = 1 }, .header);
+    try testing.expectEqualStrings("╭", pane.body.readCell(0, @intCast(top)).?.char.grapheme);
+    try testing.expectEqualStrings("╰", pane.body.readCell(0, @intCast(corner)).?.char.grapheme);
+    for (top..corner) |row| try testing.expectEqualStrings("▐", pane.marker.readCell(0, @intCast(row)).?.char.grapheme);
+}
+
+const MarkedDiffPane = struct { marker: vaxis.Window, body: vaxis.Window };
+
+/// The Selected Version marker column and the DiffPane body, side by side
+/// as `layouts.panes` places them, painted as `drawReview` paints them.
+fn drawMarkedDiffPane(a: std.mem.Allocator, win: vaxis.Window, buf: Buffer, visual_rows: []const @import("frame.zig").VisualRow, theme: Theme) MarkedDiffPane {
+    return drawMarkedDiffPaneAt(a, win, buf, visual_rows, theme, Nav.init(visual_rows.len, win.height));
+}
+
+fn drawMarkedDiffPaneAt(a: std.mem.Allocator, win: vaxis.Window, buf: Buffer, visual_rows: []const @import("frame.zig").VisualRow, theme: Theme, nav: Nav) MarkedDiffPane {
+    const pane: MarkedDiffPane = .{
+        .marker = win.child(.{ .width = 1, .height = win.height }),
+        .body = win.child(.{ .x_off = 1, .width = win.width - 1, .height = win.height }),
+    };
+    drawVisualPane(a, pane.body, buf, visual_rows, theme, nav);
+    drawVersionMarkerColumn(pane.marker, pane.body, buf, visual_rows, nav, theme);
+    return pane;
+}
+
+fn isVersionMarker(glyph: []const u8) bool {
+    return std.mem.eql(u8, glyph, "▐") or std.mem.eql(u8, glyph, "▌");
 }
 
 test "SideBySide WholeFile accents only the selected header and left gutter edge" {
@@ -4785,17 +4853,18 @@ test "SideBySide WholeFile accents only the selected header and left gutter edge
     );
     const blobs = [_]bbr.diff.FileBlob{.{ .old = "let value = 1\n", .new = "let value = 2\n" }};
     const buf = try buffer_mod.buildWithComments(a, diff, .side_by_side, &.{}, .{ .whole_file = true, .selected_version = .old, .blobs = &blobs });
-    var screen = try vaxis.Screen.init(a, .{ .rows = 6, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    const visual_rows = try @import("frame.zig").buildVisualRowsWithOptions(a, buf.rows, .bytes, .{ .layout = .side_by_side, .width = 40 });
+    var screen = try vaxis.Screen.init(a, .{ .rows = 6, .cols = 41, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
-    const win = headlessWindow(&screen);
-
-    drawPane(a, win, buf, theme_dark, Nav.init(buf.rows.len, 6));
+    const pane = drawMarkedDiffPane(a, headlessWindow(&screen), buf, visual_rows, theme_dark);
+    const win = pane.body;
 
     const half = win.width / 2;
-    try testing.expectEqual(theme_dark.accent, win.readCell(0, 0).?.style.fg);
+    try testing.expectEqual(theme_dark.accent, pane.marker.readCell(0, 0).?.style.fg);
+    try testing.expectEqual(theme_dark.accent, win.readCell(anchor_cols, 0).?.style.fg);
     try testing.expect(!std.meta.eql(win.readCell(half + 1, 0).?.style.fg, theme_dark.accent));
-    try testing.expectEqualStrings("▐", win.readCell(0, 1).?.char.grapheme);
-    try testing.expectEqual(theme_dark.accent, win.readCell(0, 1).?.style.fg);
+    try testing.expectEqualStrings("▐", pane.marker.readCell(0, 1).?.char.grapheme);
+    try testing.expectEqual(theme_dark.accent, pane.marker.readCell(0, 1).?.style.fg);
     try testing.expectEqualStrings(" ", win.readCell(half, 1).?.char.grapheme);
     try testing.expectEqual(theme_dark.removed.bg, win.readCell(side_gutter, 1).?.style.bg);
     try testing.expectEqual(theme_dark.added.bg, win.readCell(half + 1 + side_gutter, 1).?.style.bg);

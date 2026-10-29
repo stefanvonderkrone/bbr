@@ -15790,7 +15790,7 @@ test "M21 kernel File-header navigation matches row order at boundaries and insi
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testTwoFileSession(testing.allocator, 1) },
-        .geometry = .{ .cols = 42, .rows = 12 },
+        .geometry = .{ .cols = 43, .rows = 12 },
     });
     defer presentation.deinit();
     const published = presentation.published.?;
@@ -20648,7 +20648,7 @@ test "M23 links search navigates reference uses across resize and disclosure as 
         try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .target = if (local) .local else .bitbucket });
         var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 1 }, .{
             .initial = .{ .key = key, .session = if (local) try testLocalSession(testing.allocator) else try testSession(testing.allocator, 1, 'a') },
-            .geometry = .{ .cols = 39, .rows = 20 },
+            .geometry = .{ .cols = 40, .rows = 20 },
         });
         defer presentation.deinit();
         if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
@@ -20671,7 +20671,7 @@ test "M23 links search navigates reference uses across resize and disclosure as 
         for (review.frame.search_ranges) |range| try testing.expect(range.definition != null);
         try presentation.dispatch(.{ .action = .next_search_occurrence });
         const retained_active = presentation.projection().buffer_search.?.active;
-        for ([_]u16{ 160, 39 }) |cols| {
+        for ([_]u16{ 160, 40 }) |cols| {
             try dispatchView(&presentation, .{ .resize = .{ .cols = cols, .rows = 20 } });
             try testing.expectEqual(@as(usize, 4), presentation.projection().buffer_search.?.total);
             try testing.expectEqual(retained_active, presentation.projection().buffer_search.?.active);
