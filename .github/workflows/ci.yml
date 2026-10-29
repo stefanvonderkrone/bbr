@@ -84,6 +84,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes tmux neovim
+      - name: Build bbr
+        if: matrix.target == 'linux-x86_64'
+        run: zig build --summary all
       - name: External Edit terminal lifecycle
         if: matrix.target == 'linux-x86_64'
         run: python3 tests/external_edit_pty_test.py
