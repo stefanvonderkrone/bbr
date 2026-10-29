@@ -139,3 +139,8 @@ expect_fail indirect v2024.3.24-1
 
 make_fixture source-mismatch v2024.3.24-1 2024.3.24-1 '' 1
 expect_fail source-mismatch v2024.3.24-1
+
+make_fixture automatic v2024.3.24-1 0.0.0
+git -C "$tmp/automatic" tag -d v2024.3.24-1 >/dev/null
+(cd "$tmp/automatic" && python3 "$root/tools/prepare_release.py") >"$tmp/automatic-output"
+expect_pass automatic v2024.3.24-1

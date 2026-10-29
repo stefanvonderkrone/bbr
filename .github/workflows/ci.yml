@@ -71,6 +71,9 @@ jobs:
       - name: Check formatting
         if: matrix.target == 'linux-x86_64'
         run: zig fmt --check build.zig src tests
+      - name: Test release preparation
+        if: matrix.target == 'linux-x86_64'
+        run: python3 tests/prepare_release_test.py
       - name: RE2 wrapper
         run: zig build test-re2 --summary all
       - name: Dynamic UserGrammar load
