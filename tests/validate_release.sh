@@ -65,22 +65,19 @@ EOF
 commit_date="$year.${month#0}.${day#0}"
 [ "$release_date" = "$commit_date" ] || fail "tag date does not match the UTC committer date"
 
-prior_count=0
-prior_max=0
-for prior_tag in $(git tag --list "v$release_date-*"); do
-    [ "$prior_tag" = "$tag" ] && continue
-    printf '%s\n' "$prior_tag" | grep -Eq '^v[0-9]{4}\.([1-9]|1[0-2])\.([1-9]|[12][0-9]|3[01])-[1-9][0-9]*$' \
+release_count=1
+release_max=$sequence
+for other_tag in $(git tag --list "v$release_date-*"); do
+    [ "$other_tag" = "$tag" ] && continue
+    printf '%s\n' "$other_tag" | grep -Eq '^v[0-9]{4}\.([1-9]|1[0-2])\.([1-9]|[12][0-9]|3[01])-[1-9][0-9]*$' \
         || fail "malformed release tag exists for $release_date"
-    prior_sequence=${prior_tag##*-}
-    prior_count=$((prior_count + 1))
-    if [ "$prior_sequence" -gt "$prior_max" ]; then
-        prior_max=$prior_sequence
+    other_sequence=${other_tag##*-}
+    release_count=$((release_count + 1))
+    if [ "$other_sequence" -gt "$release_max" ]; then
+        release_max=$other_sequence
     fi
 done
-[ "$prior_count" = "$prior_max" ] || fail "release sequence history has a reuse or skip"
-expected_sequence=$((prior_max + 1))
-[ "$sequence" = "$expected_sequence" ] \
-    || fail "release sequence must be $expected_sequence for $release_date"
+[ "$release_count" = "$release_max" ] || fail "release sequence history has a reuse or skip"
 
 package_version=
 package_count=0

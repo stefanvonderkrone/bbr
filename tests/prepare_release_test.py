@@ -39,6 +39,7 @@ class PrepareReleaseTest(unittest.TestCase):
         ).strip()
 
     def prepare(self):
+        """Run preparation and return its reported tag and commit."""
         result = subprocess.run(
             ["python3", str(SCRIPT)], cwd=self.root, env=self.env,
             text=True, capture_output=True,
@@ -82,6 +83,14 @@ class PrepareReleaseTest(unittest.TestCase):
         self.git("checkout", "--detach", self.source)
         self.assertEqual(self.prepare(), first)
         self.assertEqual(self.git("tag", "--list"), first["tag"])
+
+    def test_retry_reuses_tag_after_a_later_same_day_release(self):
+        first = self.prepare()
+        self.git("checkout", "main")
+        self.git("-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "next merge")
+        self.assertEqual(self.prepare()["tag"], "v2024.3.24-2")
+        self.git("checkout", "--detach", self.source)
+        self.assertEqual(self.prepare(), first)
 
     def test_sequence_resets_on_next_commit_date(self):
         self.prepare()

@@ -102,6 +102,16 @@ chmod +x "$tmp/bin/zig"
 make_fixture valid v2024.3.24-2 2024.3.24-2 1
 expect_pass valid v2024.3.24-2
 
+make_fixture older-release v2024.3.24-1 2024.3.24-1
+older_commit=$(git -C "$tmp/older-release" rev-parse HEAD)
+GIT_AUTHOR_DATE='@1711283696 +0000' GIT_COMMITTER_DATE='@1711283696 +0000' \
+    git -C "$tmp/older-release" -c user.name=bbr -c user.email=bbr@example.invalid \
+    commit -q --allow-empty -m later
+git -C "$tmp/older-release" -c user.name=bbr -c user.email=bbr@example.invalid \
+    tag -a v2024.3.24-2 -m release
+git -C "$tmp/older-release" checkout -q --detach "$older_commit"
+expect_pass older-release v2024.3.24-1
+
 make_fixture dirty v2024.3.24-1 2024.3.24-1
 printf '%s\n' dirty >>"$tmp/dirty/source.txt"
 expect_fail dirty v2024.3.24-1
@@ -117,8 +127,11 @@ expect_fail conflicting v2024.3.24-1
 make_fixture wrong-date v2024.3.25-1 2024.3.25-1
 expect_fail wrong-date v2024.3.25-1
 
-make_fixture reused-sequence v2024.3.24-2 2024.3.24-2 '1 3'
-expect_fail reused-sequence v2024.3.24-2
+make_fixture older-middle-release v2024.3.24-2 2024.3.24-2 '1 3'
+expect_pass older-middle-release v2024.3.24-2
+
+make_fixture gap-after-release v2024.3.24-1 2024.3.24-1 3
+expect_fail gap-after-release v2024.3.24-1
 
 make_fixture skipped-sequence v2024.3.24-3 2024.3.24-3 1
 expect_fail skipped-sequence v2024.3.24-3
@@ -142,5 +155,14 @@ expect_fail source-mismatch v2024.3.24-1
 
 make_fixture automatic v2024.3.24-1 0.0.0
 git -C "$tmp/automatic" tag -d v2024.3.24-1 >/dev/null
+automatic_source=$(git -C "$tmp/automatic" rev-parse HEAD)
 (cd "$tmp/automatic" && python3 "$root/tools/prepare_release.py") >"$tmp/automatic-output"
+git -C "$tmp/automatic" checkout -q --detach "$automatic_source"
+GIT_AUTHOR_DATE='@1711283696 +0000' GIT_COMMITTER_DATE='@1711283696 +0000' \
+    git -C "$tmp/automatic" -c user.name=bbr -c user.email=bbr@example.invalid \
+    commit -q --allow-empty -m 'next merge'
+(cd "$tmp/automatic" && python3 "$root/tools/prepare_release.py") >"$tmp/automatic-later-output"
+git -C "$tmp/automatic" checkout -q --detach "$automatic_source"
+(cd "$tmp/automatic" && python3 "$root/tools/prepare_release.py") >"$tmp/automatic-retry-output"
+cmp "$tmp/automatic-output" "$tmp/automatic-retry-output" || fail "retry changed the release identity"
 expect_pass automatic v2024.3.24-1

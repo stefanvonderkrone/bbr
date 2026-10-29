@@ -12,6 +12,7 @@ def git(*args, env=None):
 
 
 def prepare():
+    """Create or reuse the release tag for the current source commit."""
     if git("status", "--porcelain=v1", "--untracked-files=all", "--ignored=no"):
         raise ValueError("checkout is dirty")
 

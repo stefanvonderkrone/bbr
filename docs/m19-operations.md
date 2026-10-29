@@ -69,7 +69,8 @@ Builds and publication run in the same workflow because tags from `GITHUB_TOKEN`
 
 The workflow also accepts a manual `v*` tag push. It requires an annotated
 `vYYYY.M.D-N` tag that points directly at `HEAD`. The tag date must match the commit's UTC date, and
-the sequence must be the next sequence for that date.
+the sequence history must contain every number from `1` through that date's maximum sequence.
+An existing tag remains valid when newer same-day tags exist, so an earlier release can be retried.
 
 The workflow also checks the clean checkout, `build.zig.zon`, `bbr --version`, and a source-copy
 build without `.git`. Git metadata and explicit metadata must produce the same version.
@@ -81,12 +82,20 @@ The archive retains the binary's execute permission.
 
 After all four builds pass, the publish job creates a GitHub release for the existing tag.
 The release contains `bbr-vYYYY.M.D-N-<target>.tar.gz` for each target and `SHA256SUMS`.
-GitHub generates the release notes. The workflow marks the release as latest.
+GitHub generates the release notes. The workflow marks the release as latest unless a newer published release exists.
 Only the prepare and publish jobs have repository write access. The workflow needs no custom secret.
-A repeat run refuses to replace an existing release.
+A repeat run refuses to replace an already published release.
+
+Publication uses a draft until all archive and checksum uploads succeed.
+If publication stops, use `Re-run failed jobs` on the original workflow run.
+Preparation reuses its tag, even after a later same-day release.
+`tools/publish_release.py` finds the existing draft and replaces its expected archives and `SHA256SUMS`.
+It publishes the draft only after every upload succeeds. The assets then become available for download.
+The recovery path never changes an already published release or replaces a newer release as latest.
 
 Merge a pull request into `main` to make a release automatically. No version edit or tag command is required.
 Run `python3 tests/prepare_release_test.py` to check release preparation locally without pushing a tag.
+Run `python3 tests/publish_release_test.py` to check draft recovery with a fake GitHub CLI.
 
 To make a manual release instead:
 
