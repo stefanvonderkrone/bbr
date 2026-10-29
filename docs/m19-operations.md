@@ -87,7 +87,9 @@ Only the prepare and publish jobs have repository write access. The workflow nee
 A repeat run refuses to replace an already published release.
 
 Publication uses a draft until all archive and checksum uploads succeed.
-If publication stops, use `Re-run failed jobs` on the original workflow run.
+If publication stops, use `Re-run failed jobs` on the original workflow run within seven days of the build.
+The build archives expire after seven days. The publish job needs these archives.
+After expiry, a failed-job rerun cannot recover the release.
 Preparation reuses its tag, even after a later same-day release.
 `tools/publish_release.py` finds the existing draft and replaces its expected archives and `SHA256SUMS`.
 It publishes the draft only after every upload succeeds. The assets then become available for download.
