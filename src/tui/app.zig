@@ -10,6 +10,8 @@ const vaxis = @import("vaxis");
 const bbr = @import("bbr");
 
 const render = @import("render.zig");
+const view = @import("view.zig");
+const layouts = @import("layouts.zig");
 const theme = @import("theme.zig");
 const config = @import("config.zig");
 const ThemeId = @import("theme_id.zig").ThemeId;
@@ -140,7 +142,6 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
     vx.screen.width_method = .unicode;
     try vx.enterAltScreen(writer);
     if (ctx.mouse_enabled) try vx.setMouseMode(writer, true);
-    try state.dispatch(.{ .resize = contentGeometry(vx.window()) });
 
     var futures: std.ArrayList(PresentationWork) = .empty;
     defer {
@@ -152,7 +153,9 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
     var frame_arena = std.heap.ArenaAllocator.init(ctx.gpa);
     defer frame_arena.deinit();
     var painted_revision: ?presentation.PaintRevision = null;
+    var sent_geometry: ?presentation.FrameGeometry = null;
 
+    _ = try syncContentGeometry(&state, &frame_arena, vx.window(), &sent_geometry);
     try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, &vx, &tty, &tty_active, &write_buf);
     try syncPickerTick(&state, ctx, &loop, &futures, &next_work_id, &picker_tick_work);
     while (true) {
@@ -163,7 +166,6 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             .winsize => |winsize| {
                 try vx.resize(ctx.gpa, writer, winsize);
                 vx.screen.width_method = .unicode;
-                try state.dispatch(.{ .resize = contentGeometry(vx.window()) });
             },
             .presentation_done => |done| {
                 reapPresentationWork(&futures, ctx.io, done.work_id);
@@ -183,6 +185,8 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, &vx, &tty, &tty_active, &write_buf);
         }
         try syncPickerTick(&state, ctx, &loop, &futures, &next_work_id, &picker_tick_work);
+        if (try syncContentGeometry(&state, &frame_arena, vx.window(), &sent_geometry))
+            try drainPresentationCommands(&state, ctx, &loop, &futures, &next_work_id, &vx, &tty, &tty_active, &write_buf);
         // A completed worker may still own a payload queued for Presentation.
         // Keep the loop alive until every completion has been received and
         // reaped so shutdown cannot strand that payload in the event queue.
@@ -192,41 +196,16 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         if (painted_revision) |revision| if (std.meta.eql(revision, projection.revision)) continue;
         const active_theme = theme.value(projection.theme);
         const win = vx.window();
-        const content_win = win.child(.{
-            .x_off = 0,
-            .y_off = 0,
-            .width = win.width,
-            .height = win.height -| 1,
-        });
         const frame = frame_arena.allocator();
+        const status_items = projectionStatusItems(frame, projection);
+        const regions = windowRegions(win, statusRows(&status_items, win));
+        const content_win = childRect(win, regions.get(.content).content);
+        drawStatus(childRect(win, regions.get(.status).content), &status_items);
         if (projection.review) |review_projection| {
             const visual_cursor = review_projection.frame.navigation.cursor;
             const buffer_cursor = if (visual_cursor < review_projection.frame.visual_rows.len) review_projection.frame.visual_rows[visual_cursor].buffer_index else 0;
             const selected_file = review_projection.frame.buffer.fileIndexForRow(buffer_cursor) orelse 0;
             render.drawReview(frame, content_win, review_projection, active_theme, selected_file);
-            const status = presentationStatus(frame, projection, review_projection.key);
-            drawStatus(
-                frame,
-                win,
-                review_projection.header,
-                review_projection.reviewer_verdict,
-                review_projection.navigation,
-                review_projection.buffer,
-                review_projection.preferences.layout,
-                switch (review_projection.preferences.scope) {
-                    .changes => .changes,
-                    .fetched => .fetched,
-                    .whole => .whole,
-                },
-                review_projection.isolated_file != null,
-                projection.replacing,
-                projection.submission != null,
-                review_projection.drafts.len,
-                status,
-                projection.buffer_search != null,
-                if (projection.buffer_search) |search_projection| search_projection.query.len > 0 and search_projection.total == 0 else false,
-                active_theme,
-            );
         } else {
             const status = presentationStatus(frame, projection, null);
             render.drawLoading(frame, content_win, projection.loading_pull_request_id, active_theme, status);
@@ -298,8 +277,45 @@ fn syncPickerTick(
 
 const vaxis_cell_metrics = render.terminal_cell_metrics;
 
-fn contentGeometry(win: vaxis.Window) presentation.FrameGeometry {
-    return .{ .cols = win.width, .rows = @intCast(contentViewportRows(win.height)) };
+fn windowRegions(win: vaxis.Window, status_rows: u16) view.Rects(layouts.AppSlot) {
+    return view.solve(layouts.AppSlot, layouts.app, status_rows, .{ .width = win.width, .height = win.height });
+}
+
+fn childRect(win: vaxis.Window, rect: view.Rect) vaxis.Window {
+    return win.child(.{ .x_off = rect.x, .y_off = rect.y, .width = rect.width, .height = rect.height });
+}
+
+/// Presentation lays out the content region. It keeps at least one row.
+fn contentGeometry(win: vaxis.Window, status_rows: u16) presentation.FrameGeometry {
+    const content = windowRegions(win, status_rows).get(.content).content;
+    return .{ .cols = content.width, .rows = @max(content.height, 1) };
+}
+
+/// The rows the status needs at the window width, leaving the content at
+/// least one row.
+fn statusRows(items: *const StatusItems, win: vaxis.Window) u16 {
+    return @min(layouts.statusHeight(items.params(), win.width), win.height -| 1);
+}
+
+/// The status height depends on the projection text, so the content geometry
+/// can change without a window resize. Sends Presentation the content
+/// geometry when it differs from the last one sent, and returns whether it
+/// did. The cursor position never changes the height (see
+/// `StatusItems.position_width`), so a resize does not feed back into
+/// another one.
+fn syncContentGeometry(
+    state: *presentation.Presentation,
+    frame_arena: *std.heap.ArenaAllocator,
+    win: vaxis.Window,
+    sent: *?presentation.FrameGeometry,
+) !bool {
+    defer _ = frame_arena.reset(.{ .retain_with_limit = frame_arena_retained_limit });
+    const items = projectionStatusItems(frame_arena.allocator(), state.projection());
+    const geometry = contentGeometry(win, statusRows(&items, win));
+    if (sent.*) |previous| if (std.meta.eql(previous, geometry)) return false;
+    sent.* = geometry;
+    try state.dispatch(.{ .resize = geometry });
+    return true;
 }
 
 fn presentationStatus(
@@ -410,7 +426,7 @@ fn presentationStatus(
 }
 
 fn bufferSearchStatus(frame: std.mem.Allocator, projection: presentation.Projection, search_projection: presentation.BufferSearchProjection) []const u8 {
-    const width = if (projection.review) |review| review.frame.geometry.cols else 80;
+    const width = (if (projection.review) |review| review.frame.geometry.cols else 80) -| 2 * layouts.status_padding;
     return formatBufferSearchStatus(frame, width, projection.action_error, search_projection);
 }
 
@@ -1171,72 +1187,187 @@ fn cancelPresentationWork(work: *std.ArrayList(PresentationWork), io: std.Io, id
     }
 }
 
-fn contentViewportRows(window_rows: u16) usize {
-    return @max(window_rows -| 1, 1);
-}
-
-/// A one-line status bar across the bottom row. `frame` is the per-frame arena
-/// (outlives render); a stack buffer would dangle since cells borrow the text.
-fn drawStatus(
-    frame: std.mem.Allocator,
-    win: vaxis.Window,
+/// What the status shows for a published review.
+const StatusFacts = struct {
     header: session.ReviewHeader,
     reviewer_verdict: ?bbr.bitbucket.ReviewerVerdict,
-    nav: Nav,
-    buf: buffer_mod.Buffer,
+    /// The 1-based cursor row, or 0 in an empty Buffer.
+    position: usize,
+    total: usize,
     layout: buffer_mod.Layout,
     scope: presentation.Scope,
     isolate: bool,
-    loading: bool,
-    submitting: bool,
-    draft_count: usize,
-    status_msg: ?[]const u8,
-    searching: bool,
-    search_has_no_matches: bool,
-    active_theme: theme.Theme,
-) void {
-    if (win.height == 0) return;
-    const row = win.height - 1;
-    const layout_hint: []const u8 = if (layout == .unified) "s split" else "s unified";
+    loading: bool = false,
+    submitting: bool = false,
+    draft_count: usize = 0,
+    status_msg: ?[]const u8 = null,
+    searching: bool = false,
+    search_has_no_matches: bool = false,
+};
+
+fn projectionStatusItems(frame: std.mem.Allocator, projection: presentation.Projection) StatusItems {
+    const active_theme = theme.value(projection.theme);
+    const review = projection.review orelse return loadingStatusItems(active_theme, presentationStatus(frame, projection, null));
+    const visual_cursor = review.navigation.cursor;
+    return statusItems(frame, active_theme, .{
+        .header = review.header,
+        .reviewer_verdict = review.reviewer_verdict,
+        .position = @min(visual_cursor + 1, review.buffer.rows.len),
+        .total = review.buffer.rows.len,
+        .layout = review.preferences.layout,
+        .scope = switch (review.preferences.scope) {
+            .changes => .changes,
+            .fetched => .fetched,
+            .whole => .whole,
+        },
+        .isolate = review.isolated_file != null,
+        .loading = projection.replacing,
+        .submitting = projection.submission != null,
+        .draft_count = review.drafts.len,
+        .status_msg = presentationStatus(frame, projection, review.key),
+        .searching = projection.buffer_search != null,
+        .search_has_no_matches = if (projection.buffer_search) |search| search.query.len > 0 and search.total == 0 else false,
+    });
+}
+
+/// The meta items, then the hint items. In Buffer Search the search status
+/// replaces the meta items, and the hint items stay.
+fn statusItems(frame: std.mem.Allocator, active_theme: theme.Theme, facts: StatusFacts) StatusItems {
+    var items: StatusItems = .init(active_theme);
+    if (facts.searching) {
+        if (facts.status_msg) |message| items.add(.search, message, if (facts.search_has_no_matches) .no_match else .message);
+    } else {
+        if (facts.header.pull_request_id) |id| {
+            items.add(.title, std.fmt.allocPrint(frame, "#{d}", .{id}) catch "#", .pull_request);
+            items.add(.title, " ", .bar);
+            items.add(.verdict, reviewerVerdictLabel(facts.reviewer_verdict), if (facts.reviewer_verdict) |verdict| switch (verdict) {
+                .approved => .verdict_approved,
+                .changes_requested => .verdict_changes_requested,
+                .no_verdict => .verdict_none,
+            } else .verdict_none);
+        }
+        items.add(.title, facts.header.title, .title);
+        items.add(.refs, facts.header.source_ref, .ref);
+        items.add(.refs, " → ", .separator);
+        items.add(.refs, facts.header.base_ref, .ref);
+        items.add(.position, std.fmt.allocPrint(frame, "{d}/{d}", .{ facts.position, facts.total }) catch "", .position);
+        items.position_width = @intCast(std.fmt.count("{d}/{d}", .{ facts.total, facts.total }));
+    }
+    items.hint(.layout, "s", if (facts.layout == .unified) " split" else " unified");
     // Names the *current* scope; `f` cycles Changes → fetched → whole.
-    const scope_hint: []const u8 = switch (scope) {
-        .changes => "f: changes",
-        .fetched => "f: fetched",
-        .whole => "f: whole",
-    };
-    const file_hint: []const u8 = if (isolate) "o all files" else "o isolate";
+    items.hint(.scope, "f", switch (facts.scope) {
+        .changes => ": changes",
+        .fetched => ": fetched",
+        .whole => ": whole",
+    });
+    items.hint(.isolate, "o", if (facts.isolate) " all files" else " isolate");
     // A transient message (error/summary) or an in-progress indicator takes the
-    // tail slot; otherwise the key hints, with the pending-draft count on `X`.
-    const default_tail: []const u8 = if (draft_count > 0)
-        (std.fmt.allocPrint(frame, "X submit {d}  ·  c/i comment  ·  [ ] file  ·  p switch  ·  ? help  ·  q quit", .{draft_count}) catch "q quit")
-    else
-        "c/i comment  ·  [ ] file  ·  p switch  ·  ? help  ·  q quit";
-    const tail: []const u8 = if (status_msg) |m| m else if (submitting) "submitting…" else if (loading) "loading…" else default_tail;
-    const identity = if (header.pull_request_id) |id|
-        (std.fmt.allocPrint(frame, "#{d} {s}  ·  {s}", .{ id, header.title, reviewerVerdictLabel(reviewer_verdict) }) catch header.title)
-    else
-        header.title;
-    const text = if (searching)
-        tail
-    else
-        std.fmt.allocPrint(frame, " {s}  ·  {s} → {s}  ·  {d}/{d}  ·  {s}  ·  {s}  ·  {s}  ·  {s} ", .{
-            identity,
-            header.source_ref,
-            header.base_ref,
-            @min(nav.cursor + 1, buf.rows.len),
-            buf.rows.len,
-            layout_hint,
-            scope_hint,
-            file_hint,
-            tail,
-        }) catch " q quit ";
-    const style: vaxis.Style = if (search_has_no_matches)
-        .{ .fg = active_theme.search_no_match, .bg = .{ .index = 7 }, .bold = true }
-    else
-        .{ .fg = .{ .index = 0 }, .bg = .{ .index = 7 } };
-    var c: u16 = 0;
-    while (c < win.width) : (c += 1) win.writeCell(c, row, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
-    _ = win.printSegment(.{ .text = text, .style = style }, .{ .row_offset = row, .wrap = .none });
+    // place of the key hints, with the pending-draft count on `X`.
+    const message = if (facts.searching) null else facts.status_msg;
+    if (message) |text| {
+        items.add(.message, text, .message);
+    } else if (facts.submitting) {
+        items.add(.message, "submitting…", .busy);
+    } else if (facts.loading) {
+        items.add(.message, "loading…", .busy);
+    } else {
+        if (facts.draft_count > 0) {
+            items.add(.submit, "X", .key);
+            items.add(.submit, std.fmt.allocPrint(frame, " submit {d}", .{facts.draft_count}) catch " submit", .drafts);
+        }
+        items.hint(.comment, "c/i", " comment");
+        items.hint(.file, "[ ]", " file");
+        items.hint(.switch_review, "p", " switch");
+        items.hint(.help, "?", " help");
+        items.hint(.quit, "q", " quit");
+    }
+    return items;
+}
+
+/// Before a review exists, the hint part holds the loading message alone.
+fn loadingStatusItems(active_theme: theme.Theme, status_msg: ?[]const u8) StatusItems {
+    var items: StatusItems = .init(active_theme);
+    if (status_msg) |message| items.add(.message, message, .message) else items.add(.message, "loading…", .busy);
+    return items;
+}
+
+/// The status in its own window: each item in its rect from
+/// `layouts.statusRects`, and a separator in the gap between two items on
+/// one row.
+fn drawStatus(win: vaxis.Window, items: *const StatusItems) void {
+    if (win.height == 0) return;
+    win.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = items.theme.statusStyle(.bar) });
+    const rects = layouts.statusRects(items.params(), .{ .width = win.width, .height = win.height });
+    const separator = [_]vaxis.Segment{.{ .text = "  ·  ", .style = items.theme.statusStyle(.separator) }};
+    var previous: ?view.Rect = null;
+    for (std.enums.values(layouts.StatusSlot)) |slot| {
+        const segments = items.lines.getPtrConst(slot).items();
+        const rect = rects.get(slot).content;
+        if (segments.len == 0 or rect.isEmpty()) continue;
+        if (previous) |before| if (before.y == rect.y) {
+            const x = before.x + before.width;
+            _ = childRect(win, .{ .x = x, .y = rect.y, .width = rect.x -| x, .height = 1 }).print(&separator, .{ .wrap = .none });
+        };
+        _ = childRect(win, rect).print(segments, .{ .wrap = .none });
+        previous = rect;
+    }
+}
+
+/// The styled Segments of each status item. The texts live in the frame
+/// arena because cells borrow them until render.
+const StatusItems = struct {
+    theme: theme.Theme,
+    lines: std.EnumArray(layouts.StatusSlot, StatusLine) = .initFill(.{}),
+    /// The layout width of the position: the width of `total/total`, the
+    /// widest the position gets. A cursor move then never changes the status
+    /// height, and with it the content geometry.
+    position_width: u16 = 0,
+
+    fn init(active_theme: theme.Theme) StatusItems {
+        return .{ .theme = active_theme };
+    }
+
+    fn add(self: *StatusItems, slot: layouts.StatusSlot, text: []const u8, part: theme.StatusPart) void {
+        self.lines.getPtr(slot).add(.{ .text = text, .style = self.theme.statusStyle(part) });
+    }
+
+    fn hint(self: *StatusItems, slot: layouts.StatusSlot, key: []const u8, label: []const u8) void {
+        self.add(slot, key, .key);
+        self.add(slot, label, .hint);
+    }
+
+    fn params(self: *const StatusItems) layouts.Status {
+        var result: layouts.Status = .initFill(0);
+        for (std.enums.values(layouts.StatusSlot)) |slot| result.set(slot, self.lines.getPtrConst(slot).width());
+        if (result.get(.position) > 0) result.set(.position, self.position_width);
+        return result;
+    }
+};
+
+/// One status item as styled Segments.
+const StatusLine = struct {
+    segments: [3]vaxis.Segment = undefined,
+    len: usize = 0,
+
+    fn add(self: *StatusLine, segment: vaxis.Segment) void {
+        std.debug.assert(self.len < self.segments.len);
+        self.segments[self.len] = segment;
+        self.len += 1;
+    }
+
+    fn items(self: *const StatusLine) []const vaxis.Segment {
+        return self.segments[0..self.len];
+    }
+
+    fn width(self: *const StatusLine) u16 {
+        var total: u16 = 0;
+        for (self.items()) |segment| total +|= cellWidth(segment.text);
+        return total;
+    }
+};
+
+fn cellWidth(text: []const u8) u16 {
+    return @intCast(@min(vaxis.gwidth.gwidth(text, .unicode), std.math.maxInt(u16)));
 }
 
 fn reviewerVerdictLabel(verdict: ?bbr.bitbucket.ReviewerVerdict) []const u8 {
@@ -1252,6 +1383,9 @@ test {
     _ = @import("cell_metrics.zig");
     _ = @import("buffer.zig");
     _ = @import("frame.zig");
+    _ = @import("view.zig");
+    _ = @import("layouts.zig");
+    _ = @import("view_paint.zig");
     _ = @import("file_tree.zig");
     _ = @import("render.zig");
     _ = @import("theme.zig");
@@ -1311,10 +1445,197 @@ test "qualified Reviewer Verdict results retain their outcome" {
     try std.testing.expectEqualStrings("outcome unresolved", reviewerVerdictOutcomeLabel(.{ .completed = .{ .unresolved = null } }));
 }
 
-test "content viewport reserves the bottom status row" {
-    try std.testing.expectEqual(@as(usize, 9), contentViewportRows(10));
-    try std.testing.expectEqual(@as(usize, 1), contentViewportRows(1));
-    try std.testing.expectEqual(@as(usize, 1), contentViewportRows(0));
+const TestStatus = struct {
+    title: []const u8 = "Fix parser",
+    verdict: ?bbr.bitbucket.ReviewerVerdict = .approved,
+    position: usize = 1,
+    total: usize = 1,
+    loading: bool = false,
+    status_msg: ?[]const u8 = null,
+    searching: bool = false,
+    search_has_no_matches: bool = false,
+};
+
+fn testStatusItems(arena: std.mem.Allocator, active_theme: theme.Theme, case: TestStatus) StatusItems {
+    return statusItems(arena, active_theme, .{
+        .header = .{ .pull_request_id = 7, .title = case.title, .source_ref = "review", .base_ref = "main", .source_commit = "", .base_commit = "", .locator = "", .source_label = "" },
+        .reviewer_verdict = case.verdict,
+        .position = case.position,
+        .total = case.total,
+        .layout = .unified,
+        .scope = .changes,
+        .isolate = false,
+        .loading = case.loading,
+        .draft_count = 2,
+        .status_msg = case.status_msg,
+        .searching = case.searching,
+        .search_has_no_matches = case.search_has_no_matches,
+    });
+}
+
+/// The status drawn in a window `cols` wide and as tall as the status needs.
+fn testDrawStatusAt(arena: std.mem.Allocator, active_theme: theme.Theme, case: TestStatus, cols: u16) !vaxis.Window {
+    const items = testStatusItems(arena, active_theme, case);
+    const screen = try arena.create(vaxis.Screen);
+    screen.* = try vaxis.Screen.init(arena, .{ .rows = layouts.statusHeight(items.params(), cols), .cols = cols, .x_pixel = 0, .y_pixel = 0 });
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = screen.width, .height = screen.height, .screen = screen };
+    drawStatus(win, &items);
+    return win;
+}
+
+fn testDrawStatus(arena: std.mem.Allocator, active_theme: theme.Theme, case: TestStatus) !vaxis.Window {
+    return testDrawStatusAt(arena, active_theme, case, 200);
+}
+
+/// The text of each status row without its side padding.
+fn testStatusRows(arena: std.mem.Allocator, win: vaxis.Window) ![]const []const u8 {
+    const rows = try arena.alloc([]const u8, win.height);
+    for (rows, 0..) |*row, index| {
+        var text: std.ArrayList(u8) = .empty;
+        for (0..win.width) |col| try text.appendSlice(arena, win.readCell(@intCast(col), @intCast(index)).?.char.grapheme);
+        row.* = std.mem.trim(u8, text.items, " ");
+    }
+    return rows;
+}
+
+test "the status puts the meta items above the hint items and separates items on one row" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const wide = try testStatusRows(a, try testDrawStatus(a, theme.dark, .{}));
+    try std.testing.expectEqual(@as(usize, 2), wide.len);
+    try std.testing.expectEqualStrings("#7 Fix parser  ·  Approved  ·  review → main  ·  1/1", wide[0]);
+    try std.testing.expectEqualStrings("s split  ·  f: changes  ·  o isolate  ·  X submit 2  ·  c/i comment  ·  [ ] file  ·  p switch  ·  ? help  ·  q quit", wide[1]);
+
+    const case: TestStatus = .{ .title = "Teach the parser to keep comments" };
+    const win = try testDrawStatusAt(a, theme.dark, case, 50);
+    const narrow = try testStatusRows(a, win);
+    const bar = theme.dark.statusStyle(.bar);
+    for (0..win.height) |row| for (0..win.width) |col|
+        try std.testing.expectEqual(bar.bg, win.readCell(@intCast(col), @intCast(row)).?.style.bg);
+    try std.testing.expectEqualStrings("#7 Teach the parser to keep comments", narrow[0]);
+    try std.testing.expect(std.mem.startsWith(u8, narrow[1], "Approved  ·  review → main"));
+    try std.testing.expect(narrow.len > 3);
+    try std.testing.expect(std.mem.startsWith(u8, narrow[2], "s split"));
+    for (narrow) |row| {
+        try std.testing.expect(!std.mem.startsWith(u8, row, "·"));
+        try std.testing.expect(!std.mem.endsWith(u8, row, "·"));
+    }
+    const items = [_][]const u8{ "1/1", "o isolate", "X submit 2", "c/i comment", "[ ] file", "p switch", "? help", "q quit" };
+    for (items) |item| {
+        var rows_with_item: usize = 0;
+        for (narrow) |row| rows_with_item += @intFromBool(std.mem.indexOf(u8, row, item) != null);
+        try std.testing.expectEqual(@as(usize, 1), rows_with_item);
+    }
+}
+
+test "the status height does not change when only the cursor moves" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for (20..200) |cols| {
+        const first = testStatusItems(arena.allocator(), theme.dark, .{ .position = 1, .total = 120 });
+        const last = testStatusItems(arena.allocator(), theme.dark, .{ .position = 120, .total = 120 });
+        try std.testing.expectEqual(layouts.statusHeight(first.params(), @intCast(cols)), layouts.statusHeight(last.params(), @intCast(cols)));
+    }
+}
+
+test "content geometry leaves the rows the status needs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const items = testStatusItems(arena.allocator(), theme.dark, .{});
+    for ([_][2]u16{ .{ 200, 40 }, .{ 50, 40 }, .{ 20, 3 }, .{ 4, 1 }, .{ 4, 0 } }) |size| {
+        var screen = try vaxis.Screen.init(arena.allocator(), .{ .cols = size[0], .rows = size[1], .x_pixel = 0, .y_pixel = 0 });
+        const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = screen.width, .height = screen.height, .screen = &screen };
+        const status_rows = statusRows(&items, win);
+        const geometry = contentGeometry(win, status_rows);
+        try std.testing.expect(geometry.rows >= 1);
+        try std.testing.expectEqual(size[0], geometry.cols);
+        if (size[1] < 10) continue;
+        const needed = layouts.statusHeight(items.params(), size[0]);
+        try std.testing.expect(needed >= 2);
+        try std.testing.expectEqual(size[1] - needed, geometry.rows);
+        try std.testing.expectEqual(size[1] - needed, windowRegions(win, status_rows).get(.status).content.y);
+    }
+}
+
+/// The first cell where a row's cells spell `needle`.
+fn testStatusCell(win: vaxis.Window, needle: []const u8) !struct { col: u16, row: u16 } {
+    for (0..win.height) |row| for (0..win.width) |start| {
+        var offset: usize = 0;
+        var col: u16 = @intCast(start);
+        while (offset < needle.len and col < win.width) : (col += 1) {
+            const grapheme = win.readCell(col, @intCast(row)).?.char.grapheme;
+            if (!std.mem.startsWith(u8, needle[offset..], grapheme)) break;
+            offset += grapheme.len;
+        }
+        if (offset == needle.len) return .{ .col = @intCast(start), .row = @intCast(row) };
+    };
+    return error.TestUnexpectedResult;
+}
+
+fn testStatusStyle(win: vaxis.Window, needle: []const u8, skip: u16) !vaxis.Style {
+    const cell = try testStatusCell(win, needle);
+    return win.readCell(cell.col + skip, cell.row).?.style;
+}
+
+fn testLuminance(color: vaxis.Cell.Color) f64 {
+    const channels = color.rgb;
+    return (0.2126 * @as(f64, @floatFromInt(channels[0])) + 0.7152 * @as(f64, @floatFromInt(channels[1])) + 0.0722 * @as(f64, @floatFromInt(channels[2]))) / 255;
+}
+
+test "the status follows the Theme polarity and emphasizes its parts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for (theme.builtins) |builtin| {
+        const active = builtin.value;
+        const bar = active.statusStyle(.bar);
+        const muted = active.statusStyle(.separator).fg;
+        const win = try testDrawStatus(arena.allocator(), active, .{});
+        for (0..win.height) |row| for (0..win.width) |col|
+            try std.testing.expectEqual(bar.bg, win.readCell(@intCast(col), @intCast(row)).?.style.bg);
+        if (bar.bg == .rgb) {
+            const bg = testLuminance(bar.bg);
+            const fg = testLuminance(bar.fg);
+            if (bg < 0.5) try std.testing.expect(fg > bg) else try std.testing.expect(fg < bg);
+            if (std.mem.eql(u8, builtin.name, "dark")) try std.testing.expect(bg < 0.5);
+            if (std.mem.eql(u8, builtin.name, "light")) try std.testing.expect(bg >= 0.5);
+        }
+        const pull_request = try testStatusStyle(win, "#7", 0);
+        try std.testing.expectEqual(active.accent, pull_request.fg);
+        try std.testing.expect(pull_request.bold);
+        try std.testing.expect((try testStatusStyle(win, "Fix parser", 0)).bold);
+        try std.testing.expectEqual(active.status_added, (try testStatusStyle(win, "Approved", 0)).fg);
+        const key = try testStatusStyle(win, "s split", 0);
+        try std.testing.expectEqual(active.accent, key.fg);
+        try std.testing.expect(key.bold);
+        const hint = try testStatusStyle(win, "s split", 2);
+        try std.testing.expectEqual(muted, hint.fg);
+        try std.testing.expect(!hint.bold);
+        try std.testing.expectEqual(muted, (try testStatusStyle(win, "·", 0)).fg);
+        try std.testing.expect(!std.meta.eql(bar.fg, muted));
+    }
+}
+
+test "the status colors each Reviewer Verdict, Buffer Search miss, and busy state" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for (theme.builtins) |builtin| {
+        const active = builtin.value;
+        const muted = active.statusStyle(.separator).fg;
+        const changes = try testDrawStatus(arena.allocator(), active, .{ .verdict = .changes_requested });
+        try std.testing.expectEqual(active.status_removed, (try testStatusStyle(changes, "Changes requested", 0)).fg);
+        const unavailable = try testStatusStyle(try testDrawStatus(arena.allocator(), active, .{ .verdict = null }), "Verdict unavailable", 0);
+        try std.testing.expectEqual(muted, unavailable.fg);
+        try std.testing.expect(unavailable.italic);
+        const missed = try testDrawStatus(arena.allocator(), active, .{ .status_msg = "/nope 0/0", .searching = true, .search_has_no_matches = true });
+        const no_match = try testStatusStyle(missed, "/nope 0/0", 0);
+        try std.testing.expectEqual(active.search_no_match, no_match.fg);
+        try std.testing.expect(no_match.bold);
+        try std.testing.expectEqual(active.search_no_match, (try testStatusStyle(missed, "/nope 0/0", 6)).fg);
+        const busy = try testStatusStyle(try testDrawStatus(arena.allocator(), active, .{ .loading = true }), "loading…", 0);
+        try std.testing.expectEqual(active.status_modified, busy.fg);
+        try std.testing.expect(busy.italic);
+    }
 }
 
 test "M21 narrow Buffer Search status keeps the Query end before the count" {

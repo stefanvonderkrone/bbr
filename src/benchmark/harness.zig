@@ -180,6 +180,9 @@ pub fn run(
     );
 }
 
+/// Reclaimable scratch uses the counted backing allocator so individual frees take effect.
+pub const Scratch = enum { arena, reclaimable };
+
 pub fn runSplit(
     writer: *std.Io.Writer,
     io: std.Io,
@@ -188,6 +191,7 @@ pub fn runSplit(
     name: []const u8,
     ceiling: Ceiling,
     units_per_sample: usize,
+    comptime scratch: Scratch,
     context: anytype,
     comptime benchmark: anytype,
     comptime checksumOutput: anytype,
@@ -197,7 +201,7 @@ pub fn runSplit(
         var result_arena = std.heap.ArenaAllocator.init(counting.allocator());
         defer result_arena.deinit();
         var scratch_arena = std.heap.ArenaAllocator.init(counting.allocator());
-        const output = try benchmark(result_arena.allocator(), scratch_arena.allocator(), context);
+        const output = try benchmark(result_arena.allocator(), if (scratch == .arena) scratch_arena.allocator() else counting.allocator(), context);
         scratch_arena.deinit();
         std.mem.doNotOptimizeAway(checksumOutput(output));
     }
@@ -213,7 +217,7 @@ pub fn runSplit(
         var result_arena = std.heap.ArenaAllocator.init(counting.allocator());
         var scratch_arena = std.heap.ArenaAllocator.init(counting.allocator());
         const start = std.Io.Clock.awake.now(io);
-        const output = try benchmark(result_arena.allocator(), scratch_arena.allocator(), context);
+        const output = try benchmark(result_arena.allocator(), if (scratch == .arena) scratch_arena.allocator() else counting.allocator(), context);
         durations[sample] = elapsedNanoseconds(start, io);
         scratch_arena.deinit();
         const checksum = checksumOutput(output);
@@ -277,6 +281,7 @@ pub fn repeatSplit(
     gpa: std.mem.Allocator,
     name: []const u8,
     count: usize,
+    comptime scratch: Scratch,
     context: anytype,
     comptime benchmark: anytype,
     comptime checksumOutput: anytype,
@@ -286,7 +291,7 @@ pub fn repeatSplit(
         var result_arena = std.heap.ArenaAllocator.init(gpa);
         defer result_arena.deinit();
         var scratch_arena = std.heap.ArenaAllocator.init(gpa);
-        const output = try benchmark(result_arena.allocator(), scratch_arena.allocator(), context);
+        const output = try benchmark(result_arena.allocator(), if (scratch == .arena) scratch_arena.allocator() else gpa, context);
         scratch_arena.deinit();
         const checksum = checksumOutput(output);
         std.mem.doNotOptimizeAway(checksum);

@@ -15,15 +15,21 @@ const Color = vaxis.Cell.Color;
 const review_card = @import("review_card.zig");
 const ThemeId = @import("theme_id.zig").ThemeId;
 
+/// One kind of content on the status row. Each kind has its own Style.
+pub const StatusPart = enum { bar, separator, pull_request, title, ref, position, key, hint, drafts, verdict_approved, verdict_changes_requested, verdict_none, message, busy, no_match };
+
+/// The status row palette. Its polarity follows the Theme.
+pub const StatusBar = struct { bg: Color, fg: Color, muted: Color };
+
 pub const Theme = struct {
+    status_bar: StatusBar,
     /// Pair fixed RGB bands with fixed foregrounds in the terminal-owned Theme.
     fixed_band_foregrounds: bool = false,
     /// Frame-owned Pane and Overlay chrome.
     pane_border: Style = .{ .dim = true },
     pane_border_focused: Style = .{ .bold = true },
     overlay_border: Style = .{ .bold = true },
-    overlay_title: Style = .{ .bold = true },
-    /// Selected Version chrome. It never replaces diff or syntax colors.
+    /// Blue accent for Selected Version chrome and account mentions.
     accent: Color,
     section_rule: Style = .{ .dim = true },
     /// Unchanged lines — terminal default background.
@@ -46,6 +52,10 @@ pub const Theme = struct {
     /// preserved but the row still reads as current. Positive lightens (a dark
     /// theme); a light theme would use a negative value.
     cursor_line_shift: i16,
+    /// The dim band on the anchored Diff Lines and ancestor ReviewCards of the
+    /// card under the cursor, for a row with no rgb band. A banded row moves by
+    /// half of `cursor_line_shift`, so the cursor row stays stronger.
+    ancestry_line: Color,
     /// `diff --git` file separator rows.
     file_header: Style,
     /// `@@ … @@` hunk headers.
@@ -70,25 +80,30 @@ pub const Theme = struct {
     comment_reply: Style,
     /// A ```suggestion block, called out distinctly.
     suggestion: Style,
-    /// A pending Draft (the reviewer's own unsent comment) — a distinct band so
-    /// it never reads as already-published.
+    /// A pending Draft (the reviewer's own unsent comment). Its foreground
+    /// tells it from a published Comment. Every ReviewCard role style has the
+    /// `context` background.
     draft: Style,
     /// A reply Draft, indented under whatever it replies to.
     draft_reply: Style,
-    /// A Draft whose POST outcome remains unresolved after Duplicate guards.
+    /// A Draft whose POST outcome remains unresolved after Duplicate guards. It
+    /// takes the red foreground, so it never reads as a plain Draft.
     outcome_unknown: Style,
     outcome_unknown_reply: Style,
+    /// The border, Title, and lines of a ReviewCard off the Active Path. It has
+    /// the `context` background.
+    card_border_dim: Style,
     markdown_italic: Color = .{ .rgb = .{ 0x40, 0xe0, 0xd0 } },
     markdown_bold: Color = .{ .rgb = .{ 0xff, 0xa5, 0x00 } },
     markdown_inline_code: Color = .{ .rgb = .{ 0x90, 0xee, 0x90 } },
     code_background: Color = .{ .rgb = .{ 0x2c, 0x2c, 0x2c } },
     /// A section divider (PR comments / Pending / Outdated).
     section: Style,
-    /// The PR picker overlay's background rows.
+    /// Overlay text and fill. Its background is the `context` background.
     picker: Style,
-    /// The picker's highlighted (selected) row.
+    /// The selected entry of an Overlay list.
     picker_selected: Style,
-    /// The picker's query/prompt line.
+    /// Overlay header and hint text. Its background is the `context` background.
     picker_query: Style,
     /// Buffer Search overlays replace only the background, so syntax marks remain.
     search_match: Color,
@@ -161,7 +176,7 @@ pub const Theme = struct {
                 style.dim = true;
             },
             .header => style.bold = true,
-            .body => style.bold = false,
+            .body, .bottom => style.bold = false,
             .code_body => {
                 style = self.context;
                 style.bg = self.code_background;
@@ -172,6 +187,9 @@ pub const Theme = struct {
         style.strikethrough = style.strikethrough or marks.strikethrough;
         if (marks.inline_code) {
             style.fg = self.markdown_inline_code;
+        } else if (marks.mention) {
+            style.fg = self.accent;
+            style.bold = true;
         } else if (marks.strong) {
             style.fg = self.markdown_bold;
         } else if (marks.emphasis) {
@@ -183,6 +201,51 @@ pub const Theme = struct {
             style.dim = true;
         }
         return self.resolveStyle(style);
+    }
+
+    pub fn resolvedThreadStyle(self: Theme) Style {
+        return self.resolveStyle(.{ .fg = self.status_added, .bg = self.context.bg, .bold = true });
+    }
+
+    /// Every status part keeps the bar background, so the whole row reads as one bar.
+    pub fn statusStyle(self: Theme, part: StatusPart) Style {
+        const bar = self.status_bar;
+        var style: Style = .{ .fg = bar.fg, .bg = bar.bg };
+        switch (part) {
+            .bar, .position => {},
+            .separator, .hint => style.fg = bar.muted,
+            .pull_request, .key => {
+                style.fg = self.accent;
+                style.bold = true;
+            },
+            .title, .message => style.bold = true,
+            .ref => style.fg = self.syntax_property,
+            .drafts => {
+                style.fg = self.draft.fg;
+                style.bold = true;
+            },
+            .verdict_approved => {
+                style.fg = self.status_added;
+                style.bold = true;
+            },
+            .verdict_changes_requested => {
+                style.fg = self.status_removed;
+                style.bold = true;
+            },
+            .verdict_none => {
+                style.fg = bar.muted;
+                style.italic = true;
+            },
+            .busy => {
+                style.fg = self.status_modified;
+                style.italic = true;
+            },
+            .no_match => {
+                style.fg = self.search_no_match;
+                style.bold = true;
+            },
+        }
+        return style;
     }
 
     /// Highlighted background for a cell on the cursor row. A cell with an rgb
@@ -201,6 +264,19 @@ pub const Theme = struct {
                 else => self.cursor_line,
             },
             else => self.cursor_line,
+        };
+    }
+
+    /// Background for a cell in the dim ancestry band. It follows `cursorBg`
+    /// with half the shift and `ancestry_line` in place of `cursor_line`.
+    pub fn ancestryBg(self: Theme, base: Color) Color {
+        return switch (base) {
+            .rgb => |ch| .{ .rgb = .{
+                shiftChannel(ch[0], @divTrunc(self.cursor_line_shift, 2)),
+                shiftChannel(ch[1], @divTrunc(self.cursor_line_shift, 2)),
+                shiftChannel(ch[2], @divTrunc(self.cursor_line_shift, 2)),
+            } },
+            else => self.ancestry_line,
         };
     }
 
@@ -246,10 +322,10 @@ fn shiftChannel(v: u8, delta: i16) u8 {
 /// The default dark theme. Backgrounds are muted so foreground text stays
 /// readable; foregrounds are left `default` except where contrast needs it.
 pub const dark: Theme = .{
+    .status_bar = .{ .bg = rgb(0x20_20_2c), .fg = rgb(0xd0_d0_d0), .muted = rgb(0x80_80_90) },
     .pane_border = .{ .fg = rgb(0x70_70_80), .dim = true },
     .pane_border_focused = .{ .fg = rgb(0xd0_d0_d0), .bold = true },
     .overlay_border = .{ .fg = rgb(0xd0_d0_d0), .bold = true },
-    .overlay_title = .{ .fg = rgb(0xff_ff_ff), .bold = true },
     .accent = rgb(0x6c_9c_d0),
     .section_rule = .{ .fg = rgb(0x70_70_80), .dim = true },
     .context = .{},
@@ -260,6 +336,7 @@ pub const dark: Theme = .{
     .gutter = .{ .fg = rgb(0x80_80_80) },
     .cursor_line = rgb(0x2c_2c_38),
     .cursor_line_shift = 0x1c,
+    .ancestry_line = rgb(0x22_22_2c),
     .file_header = .{ .fg = rgb(0xd0_d0_d0), .bold = true },
     .hunk_header = .{ .fg = rgb(0x6c_9c_d0) },
     .fold = .{ .fg = rgb(0x70_70_80), .bg = rgb(0x1a_1a_22) },
@@ -269,17 +346,18 @@ pub const dark: Theme = .{
     .status_modified = rgb(0xd7_af_5f),
     .status_removed = rgb(0xd0_6c_6c),
     .status_renamed = rgb(0xb0_88_e0),
-    .comment = .{ .bg = rgb(0x1c_1c_28), .fg = rgb(0xc8_c8_d8) },
-    .comment_reply = .{ .bg = rgb(0x18_18_22), .fg = rgb(0xc8_c8_d8) },
+    .comment = .{ .fg = rgb(0xc8_c8_d8) },
+    .comment_reply = .{ .fg = rgb(0xc8_c8_d8) },
     .suggestion = .{ .bg = rgb(0x14_28_28), .fg = rgb(0x9c_d0_c0) },
-    .draft = .{ .bg = rgb(0x2c_24_10), .fg = rgb(0xe0_c8_88), .bold = true },
-    .draft_reply = .{ .bg = rgb(0x24_1e_0c), .fg = rgb(0xc8_b0_78) },
-    .outcome_unknown = .{ .bg = rgb(0x5a_30_00), .fg = rgb(0xff_d0_70), .bold = true },
-    .outcome_unknown_reply = .{ .bg = rgb(0x46_25_00), .fg = rgb(0xf0_b8_58) },
+    .draft = .{ .fg = rgb(0xe0_c8_88), .bold = true },
+    .draft_reply = .{ .fg = rgb(0xc8_b0_78) },
+    .outcome_unknown = .{ .fg = rgb(0xd0_6c_6c), .bold = true },
+    .outcome_unknown_reply = .{ .fg = rgb(0xd0_6c_6c) },
+    .card_border_dim = .{ .fg = rgb(0x58_58_66) },
     .section = .{ .fg = rgb(0x88_88_a0), .bold = true },
-    .picker = .{ .bg = rgb(0x20_20_2c), .fg = rgb(0xc8_c8_d8) },
+    .picker = .{ .fg = rgb(0xc8_c8_d8) },
     .picker_selected = .{ .bg = rgb(0x3a_3a_52), .fg = rgb(0xff_ff_ff), .bold = true },
-    .picker_query = .{ .bg = rgb(0x28_28_36), .fg = rgb(0xff_ff_ff) },
+    .picker_query = .{ .fg = rgb(0xff_ff_ff), .bold = true },
     .search_match = rgb(0x5a_4a_18),
     .search_active = rgb(0x9a_70_18),
     .search_no_match = rgb(0xd0_6c_6c),
@@ -297,10 +375,10 @@ pub const dark: Theme = .{
 
 fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24, muted: u24, green: u24, red: u24, yellow: u24, blue: u24, violet: u24, teal: u24, light: bool }) Theme {
     return .{
+        .status_bar = .{ .bg = rgb(p.surface), .fg = rgb(p.fg), .muted = rgb(p.muted) },
         .pane_border = .{ .fg = rgb(p.muted), .bg = rgb(p.bg), .dim = true },
         .pane_border_focused = .{ .fg = rgb(p.fg), .bg = rgb(p.bg), .bold = true },
-        .overlay_border = .{ .fg = rgb(p.fg), .bg = rgb(p.surface), .bold = true },
-        .overlay_title = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2), .bold = true },
+        .overlay_border = .{ .fg = rgb(p.fg), .bg = rgb(p.bg), .bold = true },
         .accent = rgb(p.blue),
         .section_rule = .{ .fg = rgb(p.muted), .bg = rgb(p.bg), .dim = true },
         .context = .{ .fg = rgb(p.fg), .bg = rgb(p.bg) },
@@ -311,6 +389,7 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
         .gutter = .{ .fg = rgb(p.muted), .bg = rgb(p.bg) },
         .cursor_line = rgb(p.surface2),
         .cursor_line_shift = if (p.light) -18 else 18,
+        .ancestry_line = rgb(p.surface),
         .file_header = .{ .fg = rgb(p.fg), .bg = rgb(p.bg), .bold = true },
         .hunk_header = .{ .fg = rgb(p.blue), .bg = rgb(p.bg) },
         .fold = .{ .fg = rgb(p.muted), .bg = rgb(p.surface) },
@@ -320,21 +399,22 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
         .status_modified = rgb(p.yellow),
         .status_removed = rgb(p.red),
         .status_renamed = rgb(p.violet),
-        .comment = .{ .fg = rgb(p.fg), .bg = rgb(p.surface) },
-        .comment_reply = .{ .fg = rgb(p.fg), .bg = rgb(p.surface) },
+        .comment = .{ .fg = rgb(p.fg), .bg = rgb(p.bg) },
+        .comment_reply = .{ .fg = rgb(p.fg), .bg = rgb(p.bg) },
         .suggestion = .{ .fg = rgb(p.teal), .bg = rgb(p.surface) },
-        .draft = .{ .fg = rgb(p.yellow), .bg = rgb(p.surface), .bold = true },
-        .draft_reply = .{ .fg = rgb(p.yellow), .bg = rgb(p.surface) },
-        .outcome_unknown = .{ .fg = rgb(p.fg), .bg = rgb(if (p.light) 0xff_e0_a3 else 0x5a_30_00), .bold = true },
-        .outcome_unknown_reply = .{ .fg = rgb(p.fg), .bg = rgb(if (p.light) 0xff_e9_bd else 0x46_25_00) },
+        .draft = .{ .fg = rgb(p.yellow), .bg = rgb(p.bg), .bold = true },
+        .draft_reply = .{ .fg = rgb(p.yellow), .bg = rgb(p.bg) },
+        .outcome_unknown = .{ .fg = rgb(p.red), .bg = rgb(p.bg), .bold = true },
+        .outcome_unknown_reply = .{ .fg = rgb(p.red), .bg = rgb(p.bg) },
+        .card_border_dim = .{ .fg = rgb(blend(p.muted, p.bg)), .bg = rgb(p.bg) },
         .markdown_italic = rgb(if (p.light) 0x00_80_80 else 0x40_e0_d0),
         .markdown_bold = rgb(if (p.light) 0xa6_50_00 else 0xff_a5_00),
         .markdown_inline_code = rgb(if (p.light) 0x20_7a_36 else 0x90_ee_90),
         .code_background = rgb(p.surface2),
         .section = .{ .fg = rgb(p.muted), .bg = rgb(p.bg), .bold = true },
-        .picker = .{ .fg = rgb(p.fg), .bg = rgb(p.surface) },
+        .picker = .{ .fg = rgb(p.fg), .bg = rgb(p.bg) },
         .picker_selected = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2), .bold = true },
-        .picker_query = .{ .fg = rgb(p.fg), .bg = rgb(p.surface2) },
+        .picker_query = .{ .fg = rgb(p.fg), .bg = rgb(p.bg), .bold = true },
         .search_match = rgb(if (p.light) 0xff_ef_a8 else 0x5a_4a_18),
         .search_active = rgb(if (p.light) 0xff_cf_58 else 0x9a_70_18),
         .search_no_match = rgb(p.red),
@@ -351,6 +431,17 @@ fn fixedTheme(comptime p: struct { bg: u24, fg: u24, surface: u24, surface2: u24
     };
 }
 
+/// Two parts `fg` and one part `bg`, per channel.
+fn blend(fg: u24, bg: u24) u24 {
+    var result: u24 = 0;
+    inline for (.{ 16, 8, 0 }) |shift| {
+        const a: u24 = (fg >> shift) & 0xff;
+        const b: u24 = (bg >> shift) & 0xff;
+        result |= ((2 * a + b) / 3) << shift;
+    }
+    return result;
+}
+
 // Fixed foregrounds for fixed dark bands. Preserve ANSI hues without depending
 // on whether the terminal palette supplies light or dark text colors.
 const band_foregrounds = [_]u24{
@@ -363,11 +454,11 @@ const band_foregrounds = [_]u24{
 // Keep terminal colors on terminal backgrounds. Pair muted RGB bands with
 // readable RGB foregrounds through resolveStyle, including cursor and search.
 pub const system: Theme = .{
+    .status_bar = .{ .bg = .default, .fg = .default, .muted = .{ .index = 8 } },
     .fixed_band_foregrounds = true,
     .pane_border = .{ .fg = .{ .index = 8 }, .dim = true },
     .pane_border_focused = .{ .bold = true },
     .overlay_border = .{ .bold = true },
-    .overlay_title = .{ .reverse = true, .bold = true },
     .accent = .{ .index = 4 },
     .section_rule = .{ .fg = .{ .index = 8 }, .dim = true },
     .context = .{},
@@ -378,6 +469,7 @@ pub const system: Theme = .{
     .gutter = .{ .fg = .{ .index = 8 } },
     .cursor_line = rgb(0x30_30_44),
     .cursor_line_shift = 12,
+    .ancestry_line = rgb(0x24_24_32),
     .file_header = .{ .bold = true },
     .hunk_header = .{ .fg = .{ .index = 4 } },
     .fold = .{ .fg = .{ .index = 8 } },
@@ -392,8 +484,9 @@ pub const system: Theme = .{
     .suggestion = .{ .fg = .{ .index = 6 } },
     .draft = .{ .fg = .{ .index = 3 }, .bold = true },
     .draft_reply = .{ .fg = .{ .index = 3 } },
-    .outcome_unknown = .{ .fg = .{ .index = 0 }, .bg = .{ .index = 3 }, .bold = true },
-    .outcome_unknown_reply = .{ .fg = .{ .index = 0 }, .bg = .{ .index = 3 } },
+    .outcome_unknown = .{ .fg = .{ .index = 1 }, .bold = true },
+    .outcome_unknown_reply = .{ .fg = .{ .index = 1 } },
+    .card_border_dim = .{ .fg = .{ .index = 8 } },
     .markdown_italic = .{ .index = 6 },
     .markdown_bold = .{ .index = 208 },
     .markdown_inline_code = .{ .index = 2 },
@@ -401,7 +494,7 @@ pub const system: Theme = .{
     .section = .{ .fg = .{ .index = 7 }, .bold = true },
     .picker = .{},
     .picker_selected = .{ .reverse = true, .bold = true },
-    .picker_query = .{ .reverse = true },
+    .picker_query = .{ .bold = true },
     .search_match = rgb(0x53_46_68),
     .search_active = rgb(0x70_50_18),
     .search_no_match = .{ .index = 1 },
@@ -458,6 +551,19 @@ comptime {
         const id = ThemeId.at(index);
         if (!std.mem.eql(u8, entry.name, id.name()))
             @compileError("theme.builtins[" ++ std.fmt.comptimePrint("{d}", .{index}) ++ "] must be named \"" ++ id.name() ++ "\" to match ThemeId." ++ @tagName(id));
+        for (.{ "picker", "picker_query", "overlay_border" }) |field| {
+            const style = @field(entry.value, field);
+            if (!std.meta.eql(style.bg, entry.value.context.bg) or style.reverse)
+                @compileError("Theme \"" ++ entry.name ++ "\" field " ++ field ++ " must have the context background and no reverse, because an Overlay paints the Theme base background");
+        }
+        if (!std.meta.eql(entry.value.card_border_dim.bg, entry.value.context.bg))
+            @compileError("Theme \"" ++ entry.name ++ "\" field card_border_dim must have the context background, because a ReviewCard paints the Theme base background");
+        @setEvalBranchQuota(100_000);
+        for (std.meta.tags(review_card.CardRole)) |role| for (std.meta.tags(review_card.Part)) |part| {
+            if (part.hasCodeBackground()) continue;
+            if (!std.meta.eql(entry.value.reviewCardStyle(role, part, .{}).bg, entry.value.context.bg))
+                @compileError("Theme \"" ++ entry.name ++ "\" ReviewCard role " ++ @tagName(role) ++ " part " ++ @tagName(part) ++ " must have the context background, because a ReviewCard paints the Theme base background. Only code and Suggestion rows keep their own");
+        };
     }
 }
 
@@ -494,6 +600,28 @@ test "cursorBg tints a neutral row and nudges a banded one, keeping its hue" {
     try testing.expect(!std.meta.eql(added_bg, lit));
 }
 
+test "the ancestry band differs from the plain and cursor backgrounds in every built-in Theme" {
+    for (builtins) |builtin| {
+        const theme = builtin.value;
+        inline for (.{ "context", "added", "removed", "comment", "comment_reply", "draft", "draft_reply" }) |field| {
+            const base = @field(theme, field).bg;
+            try testing.expect(!std.meta.eql(base, theme.ancestryBg(base)));
+            try testing.expect(!std.meta.eql(theme.cursorBg(base), theme.ancestryBg(base)));
+        }
+    }
+}
+
+test "the dim card border differs from every normal card border in every built-in Theme" {
+    for (builtins) |builtin| {
+        const theme = builtin.value;
+        try testing.expectEqual(theme.context.bg, theme.card_border_dim.bg);
+        for (std.meta.tags(review_card.CardRole)) |role| {
+            errdefer std.debug.print("Theme {s} role {t}\n", .{ builtin.name, role });
+            try testing.expect(!std.meta.eql(theme.card_border_dim.fg, theme.reviewCardStyle(role, .body, .{}).fg));
+        }
+    }
+}
+
 test "lineStyle maps each kind to its band" {
     try testing.expect(dark.lineStyle(.context).bg == .default);
     try testing.expectEqual(dark.added.bg, dark.lineStyle(.added).bg);
@@ -510,7 +638,6 @@ test "every built-in Theme resolves by its exact name and keeps diff bands disti
         try testing.expect(selected.pane_border.dim);
         try testing.expect(selected.pane_border_focused.bold);
         try testing.expect(selected.overlay_border.bold);
-        try testing.expect(selected.overlay_title.bold);
         try testing.expect(selected.section_rule.dim);
     }
     try testing.expect(byName("catppuccin") == null);
@@ -581,6 +708,15 @@ test "M23 inline Theme colors and attributes combine without Draft body bold" {
             const bold = theme.reviewCardStyle(role, .body, .{ .strong = true, .emphasis = true, .link_label = true });
             try testing.expectEqual(theme.markdown_bold, bold.fg);
             try testing.expect(bold.bold and bold.italic and bold.ul_style == .single);
+            for ([_]review_card.Marks{
+                .{ .mention = true },
+                .{ .mention = true, .strong = true, .emphasis = true, .link_label = true },
+            }) |marks| {
+                const mention = theme.reviewCardStyle(role, .body, marks);
+                try testing.expectEqual(theme.accent, mention.fg);
+                try testing.expect(mention.bold);
+                try testing.expectEqual(theme.reviewCardStyle(role, .body, .{}).bg, mention.bg);
+            }
         }
     }
 }
@@ -601,7 +737,8 @@ test "M23 inline system bands keep Catppuccin Mocha text readable" {
         system.cursorBg(system.added_emphasis.bg), system.cursorBg(system.removed_emphasis.bg),
         system.cursor_line,                        system.code_background,
         system.cursorBg(system.code_background),   system.search_match,
-        system.search_active,
+        system.search_active,                      system.ancestry_line,
+        system.ancestryBg(system.added.bg),        system.ancestryBg(system.removed.bg),
     };
     const foregrounds = [_]Color{
         system.context.fg,         system.syntax_comment,       system.syntax_string,

@@ -12,16 +12,15 @@ This skill seeds a LocalReview without a Remote or Credential. It does not prove
 ## Launch
 
 Run from the checkout root on macOS or Linux with Zig 0.16.0, Git, Python 3, and tmux on `PATH`.
-Use the documented build command. No server, port, migration command, or login is required.
+`launch` builds the binary. No server, port, migration command, or login is required.
 
 ```sh
 zig version
-zig build
 export BBR_VERIFY_RUN="$(.agents/skills/verify-bbr/scripts/control.py launch)"
 .agents/skills/verify-bbr/scripts/control.py doctor
 ```
 
-`launch` copies the binary into a new temporary directory. It creates an empty private `HOME` and a disposable Git WorkingCopy.
+`launch` runs `zig build` first, so the drive never uses a stale binary. It copies the binary into a new temporary directory. It creates an empty private `HOME` and a disposable Git WorkingCopy.
 It commits `main` and `review` Refs there. `sample.txt` replaces `VERIFY_OLD` with `VERIFY_NEW` at line 20.
 `notes.txt` adds `VERIFY_NOTES`. The app runs `bbr local main review` from this WorkingCopy in a 140 by 44 terminal.
 Readiness requires the rendered `VERIFY_NEW` source text, not just a live process.

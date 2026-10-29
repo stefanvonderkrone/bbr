@@ -11,6 +11,7 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -152,6 +153,8 @@ def main():
         (scratch / "owner").write_text(str(evidence))
         save(evidence / "instance.json", state)
         try:
+            # A stale zig-out binary would pass a drive that the source fails.
+            subprocess.run(["zig", "build"], cwd=ROOT, check=True, stdout=sys.stderr, timeout=COMMAND_TIMEOUT)
             shutil.copy2(state["source_binary"], scratch / "bbr")
             state["sha256"] = digest(scratch / "bbr")
             state["version"] = run(str(scratch / "bbr"), "--version").strip()

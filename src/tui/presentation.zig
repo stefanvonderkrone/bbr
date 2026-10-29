@@ -155,7 +155,7 @@ test "M23 highlighting eviction protects only visible Preview blocks within the 
     defer store.deinit();
     const body = "needle\n\n```js\nconst visible = 1;\n```\n\n" ++ "paragraph  \n" ** 40 ++ "\n```json\n{}\n```";
     const bodies = [_][]const u8{ body, "```css\na {}\n```" } ++ [_][]const u8{"plain card"} ** 30;
-    var state = try codeTestPresentation(testing.allocator, store.store(), &bodies, 0, 40);
+    var state = try codeTestPresentation(testing.allocator, store.store(), &bodies, 0, 39);
     defer state.deinit();
     const capacity = 3 * 1024 * 1024 / @sizeOf(code_highlighting.SourceSpan);
     for (0..2) |_| {
@@ -1859,6 +1859,9 @@ pub const BufferSearchCorpus = struct {
                 .corpus_order = source.corpus_order,
                 .session_epoch = source.session_epoch,
             };
+            for (@constCast(target.mapping)) |*mapping| {
+                if (mapping.alternative.len > 0) mapping.alternative = try allocator.dupe(u8, mapping.alternative);
+            }
         }
         corpus.candidates = owned;
         return corpus;
@@ -1954,10 +1957,10 @@ const SearchProjection = struct {
                 if (halves.right) |half| row.right = .{ .old_line = half.line.oldNo(), .new_line = half.line.newNo(), .start = half.source_start, .end = half.source_end };
             } else switch (visual.owner) {
                 .line => |line| row.single = .{ .old_line = line.oldNo(), .new_line = line.newNo(), .start = visual.source_start, .end = visual.source_end },
-                .comment => |owner| if (owner.part != .header and owner.part != .disclosure_footer) {
+                .comment => |owner| if (owner.part == null) {
                     row.owner = .{ .comment = owner.id };
                 },
-                .draft => |owner| if (owner.part != .header and owner.part != .disclosure_footer) {
+                .draft => |owner| if (owner.part == null) {
                     row.owner = .{ .draft = owner.id };
                 },
                 else => {},
@@ -2796,6 +2799,7 @@ pub const DisclosureBuild = struct {
                 .cell_metrics = self.cell_metrics,
                 .collapsed_rows = self.collapsed_rows,
                 .emphasis_cache = &self.session.emphasis_cache.?,
+                .mention_names = &self.session.mention_names,
             }, self.epoch);
             self.search_corpus = try BufferSearchCorpus.create(candidates);
             if (self.accepted_query_text) |text| {
@@ -2878,6 +2882,7 @@ pub const DisclosureBuild = struct {
             .cell_metrics = self.cell_metrics,
             .collapsed_rows = self.collapsed_rows,
             .emphasis_cache = &self.session.emphasis_cache.?,
+            .mention_names = &self.session.mention_names,
         });
     }
 
@@ -3249,6 +3254,7 @@ pub const BufferSearchProjection = struct {
 };
 
 pub const ReviewSearchResult = struct {
+    mention_names: *const @import("review_body.zig").MentionNames = &.empty,
     code_highlights: []const code_highlighting.View = &.{},
     kind: []const u8,
     source: []const u8,
@@ -4129,6 +4135,7 @@ const Published = struct {
                 .cell_metrics = cell_metrics,
                 .collapsed_rows = published.comments_collapsed_rows,
                 .emphasis_cache = &published.emphasis_cache,
+                .mention_names = &session.mention_names,
             },
         ) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -4446,6 +4453,7 @@ const Published = struct {
                 .cell_metrics = self.cell_metrics,
                 .collapsed_rows = self.commentsCollapsedRows(),
                 .emphasis_cache = &self.emphasis_cache,
+                .mention_names = &self.session.mention_names,
             },
         ) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -4627,6 +4635,7 @@ const Published = struct {
                 .cell_metrics = self.cell_metrics,
                 .collapsed_rows = self.commentsCollapsedRows(),
                 .emphasis_cache = &self.emphasis_cache,
+                .mention_names = &self.session.mention_names,
             },
             self.epoch,
         );
@@ -4659,6 +4668,7 @@ const Published = struct {
                 .cell_metrics = self.cell_metrics,
                 .collapsed_rows = self.commentsCollapsedRows(),
                 .emphasis_cache = &self.emphasis_cache,
+                .mention_names = &self.session.mention_names,
             },
             self.epoch,
         );
@@ -4673,17 +4683,17 @@ const Published = struct {
         var order: usize = 0;
         for (self.session.threads) |thread| {
             if (!thread.root.deleted) {
-                const body = try review_card.ReviewBody.parse(allocator, thread.root.body);
+                const body = try review_card.ReviewBody.parseWithMentions(allocator, thread.root.body, &self.session.mention_names);
                 try search.appendReviewBodyCandidates(allocator, body, .{ .comment = thread.root.id }, self.epoch, &order, &candidates);
             }
             for (thread.replies) |reply| {
                 if (reply.deleted) continue;
-                const body = try review_card.ReviewBody.parse(allocator, reply.body);
+                const body = try review_card.ReviewBody.parseWithMentions(allocator, reply.body, &self.session.mention_names);
                 try search.appendReviewBodyCandidates(allocator, body, .{ .comment = reply.id }, self.epoch, &order, &candidates);
             }
         }
         for (self.review.drafts.items) |draft| {
-            const body = try review_card.ReviewBody.parse(allocator, draft.body);
+            const body = try review_card.ReviewBody.parseWithMentions(allocator, draft.body, &self.session.mention_names);
             try search.appendReviewBodyCandidates(allocator, body, .{ .draft = draft.local_id }, self.epoch, &order, &candidates);
         }
         return BufferSearchCorpus.create(candidates.items);
@@ -4808,6 +4818,12 @@ const Published = struct {
 
     fn visualIndexForBufferIndex(self: *const Published, buffer_index: usize) ?usize {
         return frame_mod.visualIndexForBufferIndex(self.visual_rows, buffer_index);
+    }
+
+    fn jumpToFileHeader(self: *Published, file_index: usize) void {
+        const row = fileHeaderRow(self.buffer, file_index) orelse return;
+        self.navigation.jumpTo(self.visualIndexForBufferIndex(row) orelse return);
+        self.navigation.scrollCursorTop();
     }
 
     fn sidebarEntry(self: *const Published) ?file_tree.Entry {
@@ -6244,13 +6260,14 @@ pub const Presentation = struct {
 
     fn overlayTarget(self: *const Presentation) ?frame_mod.OverlayTarget {
         if (self.help_visible or self.unknown_resolution != null or self.delete_confirmation != null or self.visibleSubmissionOverlay())
-            return otherOverlay(self.geometry);
+            return frame_mod.screenOverlayTarget(self.geometry);
         if (self.list_overlay) |*overlay| {
-            const box = overlay.box();
-            const rect = frame_mod.overlayRect(self.geometry, box.width, box.height) orelse return null;
-            return .{ .kind = .list, .rect = rect, .row_count = overlay.list().matches().len, .scroll = overlay.list().scrollTop(rect.height -| 1) };
+            var target = frame_mod.listOverlayTarget(self.geometry, overlay.box()) orelse return null;
+            target.row_count = overlay.list().matches().len;
+            target.scroll = overlay.list().scrollTop(target.entries.height);
+            return target;
         }
-        if (self.published) |published| if (published.composer != null) return otherOverlay(self.geometry);
+        if (self.published) |published| if (published.composer != null) return frame_mod.screenOverlayTarget(self.geometry);
         if (self.published) |published| if (published.review_search.open) {
             const geometry = frame_mod.reviewSearchGeometry(self.geometry) orelse return null;
             return .{ .kind = .review_search, .rect = geometry.rect, .review_search = geometry, .row_count = if (published.review_search.pending) 0 else if (published.review_search.batch) |batch| batch.occurrences.len else 0, .scroll = published.review_search.list_scroll };
@@ -6285,6 +6302,8 @@ pub const Presentation = struct {
             self.mouse_press = null;
             return;
         }
+        const active_before = if (self.published) |published| published.activeFile() else null;
+        defer if (self.published) |published| if (published.focus == .diff and active_before != published.activeFile()) self.revealActiveFile(published);
         switch (mouse.button) {
             .wheel_up, .wheel_down => {
                 self.mouse_press = null;
@@ -6676,7 +6695,7 @@ pub const Presentation = struct {
         return switch (published.cursorRow() orelse return .diff) {
             .line, .line_pair => .diff_source,
             .disclosure => .diff_disclosure,
-            .comment, .draft => |card| if (card.part == .disclosure_footer) .diff_review_card else .diff_review_card,
+            .comment, .draft => |card| if (card.resolved_thread) .diff_disclosure else .diff_review_card,
             else => .diff,
         };
     }
@@ -7300,10 +7319,11 @@ pub const Presentation = struct {
             return;
         };
         if (self.geometry.cols == geometry.cols and published.pending_view == null) {
+            // The status height follows its text, so a status message can
+            // cause this resize. Clearing the message here would remove it.
             published.resizeHeight(geometry);
             published.centerActiveFile();
             self.geometry = geometry;
-            self.action_error = null;
             return;
         }
         const desired = published.pending_view;
@@ -9020,7 +9040,8 @@ pub const Presentation = struct {
             published.session.enrichment.commitCacheUpdate();
         }
         if (job.navigation_policy == .file_header) {
-            if (job.navigation_file) |file_index| if (fileHeaderRow(published.buffer, file_index)) |row| if (published.visualIndexForBufferIndex(row)) |visual_index| published.navigation.jumpTo(visual_index);
+            if (job.navigation_file) |file_index| published.jumpToFileHeader(file_index);
+            self.revealActiveFile(published);
         } else if (job.navigation_policy == .center) published.centerActiveFile();
         if (job.navigation_policy == .version or version_changed) {
             published.navigation.count = 0;
@@ -9649,6 +9670,7 @@ pub const Presentation = struct {
         switch (entry.identity) {
             .directory => if (entry.expanded) self.sidebarLeft(published) else self.sidebarRight(published),
             .file => |file_index| {
+                self.focusPane(published, .diff);
                 self.focusFile(published, file_index);
             },
         }
@@ -9669,7 +9691,8 @@ pub const Presentation = struct {
             self.commands.items[self.commands.items.len - 1].build_buffer_disclosure.navigation_file = file_index;
             self.commands.items[self.commands.items.len - 1].build_buffer_disclosure.active_file = file_index;
             return;
-        } else if (fileHeaderRow(published.buffer, file_index)) |row| if (published.visualIndexForBufferIndex(row)) |visual_index| published.navigation.jumpTo(visual_index);
+        }
+        published.jumpToFileHeader(file_index);
         self.revealActiveFile(published);
     }
 
@@ -9691,6 +9714,7 @@ pub const Presentation = struct {
                     break :blk path.len > directory.len and std.mem.startsWith(u8, path, directory) and path[directory.len] == '/';
                 } else false;
             }
+            if (published.focus == .diff) published.cursorToActiveFile();
             published.centerActiveFile();
             published.frame_revision += 1;
             return;
@@ -9714,6 +9738,7 @@ pub const Presentation = struct {
             return;
         };
         for (removed.items) |candidate| published.allocator.free(candidate);
+        if (published.focus == .diff) published.cursorToActiveFile();
         published.centerActiveFile();
     }
 
@@ -10978,6 +11003,7 @@ pub const Presentation = struct {
             body.visible = true;
         }
         if (self.codePreviewBody(published)) |body| {
+            body.parsed.applyMentionNames(&published.session.mention_names);
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
             const geometry = frame_mod.reviewSearchGeometry(self.geometry) orelse return;
@@ -11741,8 +11767,8 @@ pub const Presentation = struct {
                 picked.id,
             )),
             .file => |index| if (self.published) |published| {
-                self.focusFile(published, index);
                 published.focus = .diff;
+                self.focusFile(published, index);
             },
             // The palette listed its rows for the Pane context at open. A view
             // build can move the cursor to another context before Enter.
@@ -12495,6 +12521,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
     switch (owner) {
         .comment => |id| for (published.session.threads) |thread| {
             if (thread.root.id == id) return .{
+                .mention_names = &published.session.mention_names,
                 .kind = "COMMENT",
                 .source = thread.root.author,
                 .body = thread.root.body,
@@ -12503,6 +12530,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
                 .occurrence = occurrence,
             };
             for (thread.replies) |reply| if (reply.id == id) return .{
+                .mention_names = &published.session.mention_names,
                 .kind = "REPLY",
                 .source = reply.author,
                 .body = reply.body,
@@ -12523,6 +12551,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
                     .comment => |parent_id| {
                         for (published.session.threads) |thread| {
                             if (thread.root.id == parent_id) return .{
+                                .mention_names = &published.session.mention_names,
                                 .kind = "DRAFT",
                                 .source = "local",
                                 .body = draft.body,
@@ -12531,6 +12560,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
                                 .occurrence = occurrence,
                             };
                             for (thread.replies) |reply| if (reply.id == parent_id) return .{
+                                .mention_names = &published.session.mention_names,
                                 .kind = "DRAFT",
                                 .source = "local",
                                 .body = draft.body,
@@ -12552,7 +12582,7 @@ fn reviewSearchResult(published: *const Published, occurrence: search.Occurrence
                 }
                 break;
             };
-            return .{ .kind = "DRAFT", .source = "local", .body = draft.body, .scope = scope, .scope_state = scope_state, .occurrence = occurrence };
+            return .{ .mention_names = &published.session.mention_names, .kind = "DRAFT", .source = "local", .body = draft.body, .scope = scope, .scope_state = scope_state, .occurrence = occurrence };
         },
     }
     unreachable;
@@ -13000,7 +13030,7 @@ fn selectionYankRow(published: *const Published, visual: frame_mod.VisualRow) ?S
 }
 
 fn plainCardLabel(text: []const u8) []const u8 {
-    for ([_][]const u8{ "▸ ", "▾ ", "± ", "↳ ", "✎ " }) |marker| {
+    for ([_][]const u8{ "▸ ", "▾ " }) |marker| {
         if (std.mem.startsWith(u8, text, marker)) return text[marker.len..];
     }
     return text;
@@ -13271,29 +13301,50 @@ fn versionNavigationStop(published: *const Published, index: usize) bool {
     return row.owner != .line or frame_mod.selectedSource(row, published.selected_version) != null;
 }
 
+/// A wrapped Diff Line spans `start..end` visual rows. Up and down move by
+/// Diff Line, so they stop only on the first row of a span.
+const LineSpan = struct { start: usize, end: usize };
+
+fn lineSpan(rows: []const frame_mod.VisualRow, index: usize) LineSpan {
+    var start = index;
+    while (start > 0 and rows[start].continuation and rows[start - 1].buffer_index == rows[index].buffer_index) start -= 1;
+    var end = index + 1;
+    while (end < rows.len and rows[end].continuation and rows[end].buffer_index == rows[index].buffer_index) end += 1;
+    return .{ .start = start, .end = end };
+}
+
 fn moveVersionVertical(published: *Published, direction: i2) void {
     var remaining = @max(published.navigation.count, 1);
     published.navigation.count = 0;
+    const rows = published.visual_rows;
     var cursor = published.navigation.cursor;
     while (remaining > 0) : (remaining -= 1) {
         const previous = cursor;
-        var target = cursor;
+        const span: LineSpan = if (cursor < rows.len) lineSpan(rows, cursor) else .{ .start = cursor, .end = cursor + 1 };
+        var target = if (direction > 0) span.end -| 1 else span.start;
         while (true) {
             if (direction > 0) {
-                if (target + 1 >= published.visual_rows.len) break;
+                if (target + 1 >= rows.len) break;
                 target += 1;
             } else {
                 if (target == 0) break;
                 target -= 1;
             }
-            if (versionNavigationStop(published, target)) {
-                cursor = target;
+            const head = lineSpan(rows, target).start;
+            if (versionNavigationStop(published, head)) {
+                cursor = head;
                 break;
             }
+            target = if (direction > 0) lineSpan(rows, target).end - 1 else head;
         }
         if (cursor == previous) break;
     }
     published.navigation.jumpTo(cursor);
+    if (cursor < rows.len) {
+        const nav = &published.navigation;
+        const end = lineSpan(rows, cursor).end;
+        if (end > nav.scroll + nav.viewport) nav.scroll = @min(cursor, end - nav.viewport);
+    }
 }
 
 fn canStartSelection(scope: Scope, row: ?buffer_mod.Row) bool {
@@ -13417,11 +13468,6 @@ fn collectSelectedLines(
         const line = lineAtVisualRow(published.buffer, visual_row) orelse continue;
         if (lines.items.len == 0 or lines.items[lines.items.len - 1] != line) try lines.append(allocator, line);
     }
-}
-
-fn otherOverlay(geometry: frame_mod.Geometry) ?frame_mod.OverlayTarget {
-    const rect = frame_mod.overlayRect(geometry, geometry.cols, geometry.rows) orelse return null;
-    return .{ .kind = .other, .rect = rect };
 }
 
 fn nextFileHeaderRow(buffer: buffer_mod.Buffer, cursor: usize) ?usize {
@@ -15155,7 +15201,7 @@ test "M21 kernel every small Session view change waits for a complete worker Fra
         switch (change) {
             .layout => try testing.expectEqual(Layout.side_by_side, after.preferences.layout),
             .scope => try testing.expectEqual(Scope.fetched, after.preferences.scope),
-            .resolved => try testing.expect(after.buffer.rows[findDisclosureRow(after.buffer.rows, .{ .resolved_thread = 1 }).?].disclosure.expanded),
+            .resolved => try testing.expect(after.buffer.rows[findDisclosureRow(after.buffer.rows, .{ .resolved_thread = 1 }).?].comment.resolved_thread),
             .version => try testing.expectEqual(SelectedVersion.old, after.selected_version),
             .isolate => try testing.expectEqual(@as(?usize, 0), after.isolated_file),
             .movement, .focus => try testing.expectEqual(@as(?usize, 1), after.isolated_file),
@@ -17973,6 +18019,21 @@ test "Unified WholeFile authoring uses only selected-version Hunk Lines" {
     try testing.expectEqual(ActionError.suggestion_requires_new_version, presentation.projection().action_error.?);
 }
 
+test "a height-only resize keeps the status message" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testLocalSession(testing.allocator) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_pull_request_picker });
+    try presentation.dispatch(.{ .resize = .{ .cols = presentation.geometry.cols, .rows = presentation.geometry.rows - 2 } });
+    try testing.expectEqual(@as(?ActionError, .local_review_no_picker), presentation.projection().action_error);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
 test "local review gates remote actions and refreshes the same identity" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -18479,6 +18540,12 @@ test "M23 ancestry retains typed cursor and search ownership across resize and f
         try testing.expectEqualDeep(before.geometry, after.geometry);
         try testing.expectEqualDeep(before.navigation, after.navigation);
         try testing.expectEqual(before.visual_rows_revision, after.visual_rows_revision);
+        const cursor = after.visual_rows[after.navigation.cursor].buffer_index;
+        const metadata = after.buffer.rows[cursor].draft.card.?;
+        const path = try after.buffer.activePath(testing.allocator, cursor);
+        defer testing.allocator.free(path.by_depth);
+        try testing.expect(path.holds(metadata));
+        try testing.expect(path.holds(metadata.root));
     };
 }
 
@@ -18782,7 +18849,44 @@ test "SideBySide wrapping Anchors an active old-only continuation" {
     try testing.expect(draft.anchor.?.to == null);
 }
 
-test "Unconditional Unified wrapping uses visual-row navigation and semantic Anchors" {
+test "up and down move by Diff Line and keep a wrapped Line in view" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testWrappingSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 60, .rows = 10 },
+    });
+    defer presentation.deinit();
+
+    for ([_]bool{ false, true }) |side_by_side| {
+        if (side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
+        try presentation.dispatch(.{ .action = .to_top });
+        var review = presentation.projection().review.?;
+        var wrapped_lines: usize = 0;
+        var moves: usize = 0;
+        while (moves < review.frame.visual_rows.len) : (moves += 1) {
+            const rows = review.frame.visual_rows;
+            const from = review.navigation.cursor;
+            try testing.expect(!rows[from].continuation);
+            var end = from + 1;
+            while (end < rows.len and rows[end].continuation and rows[end].buffer_index == rows[from].buffer_index) end += 1;
+            if (end - from > 1) wrapped_lines += 1;
+            try testing.expect(review.navigation.scroll <= from);
+            if (end - from <= review.navigation.viewport) try testing.expect(end <= review.navigation.scroll + review.navigation.viewport);
+            try presentation.dispatch(.{ .action = .down });
+            review = presentation.projection().review.?;
+            if (review.navigation.cursor == from) break;
+            try testing.expect(review.navigation.cursor >= end);
+            try presentation.dispatch(.{ .action = .up });
+            try testing.expectEqual(from, presentation.projection().review.?.navigation.cursor);
+            try presentation.dispatch(.{ .action = .down });
+            review = presentation.projection().review.?;
+        }
+        try testing.expect(wrapped_lines > 0);
+    }
+}
+
+test "Unconditional Unified wrapping keeps semantic Anchors" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -18802,11 +18906,10 @@ test "Unconditional Unified wrapping uses visual-row navigation and semantic Anc
         if (visual_row.owner.line.new_no == 2 and second == null) second = index;
     }
     presentation.published.?.navigation.jumpTo(first.?);
-    const line_owner = presentation.projection().review.?.frame.visual_rows[first.?].owner;
     try presentation.dispatch(.{ .action = .down });
     var current = presentation.projection().review.?;
-    try testing.expect(current.frame.visual_rows[current.navigation.cursor].continuation);
-    try testing.expect(current.frame.visual_rows[current.navigation.cursor].owner.eql(line_owner));
+    try testing.expectEqual(second.?, current.navigation.cursor);
+    presentation.published.?.navigation.jumpTo(first.?);
 
     try presentation.dispatch(.{ .action = .suggest });
     const draft = presentation.published.?.composer.?.toNewDraft();
@@ -19009,6 +19112,83 @@ test "M21 kernel Sidebar Directory changes preserve DiffPane rows and search ran
     try testing.expectEqual(before.navigation, frame.navigation);
 }
 
+fn fileTreeIndex(frame: frame_mod.Projection, file_index: usize) usize {
+    for (frame.file_tree.entries, 0..) |entry, index| if (entry.identity.eql(.{ .file = file_index })) return index;
+    unreachable;
+}
+
+fn expectFileHeaderOnTop(frame: frame_mod.Projection, file_index: usize) !void {
+    const nav = frame.navigation;
+    const row = frame.visual_rows[nav.cursor];
+    try testing.expectEqual(buffer_mod.RowKind.file_header, row.kind);
+    try testing.expectEqual(file_index, frame.buffer.fileIndexForRow(row.buffer_index).?);
+    try testing.expectEqual(@min(nav.cursor, nav.row_count -| nav.viewport), nav.scroll);
+    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = file_index }));
+}
+
+test "every File jump puts the File header on the top DiffPane row and the File Tree cursor on the File" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 12) },
+        .geometry = .{ .cols = 80, .rows = 12 },
+    });
+    defer presentation.deinit();
+
+    for (1..12) |file_index| {
+        try presentation.dispatch(.{ .action = .next_file });
+        try expectFileHeaderOnTop(presentation.projection().review.?.frame, file_index);
+    }
+    var frame = presentation.projection().review.?.frame;
+    try testing.expect(frame.navigation.scroll < frame.navigation.cursor);
+    var file_index: usize = 11;
+    while (file_index > 0) {
+        file_index -= 1;
+        try presentation.dispatch(.{ .action = .prev_file });
+        try expectFileHeaderOnTop(presentation.projection().review.?.frame, file_index);
+    }
+
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    for (0..fileTreeIndex(presentation.projection().review.?.frame, 5)) |_| try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .focus_file });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
+    try expectFileHeaderOnTop(frame, 5);
+
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .down });
+    frame = presentation.projection().review.?.frame;
+    const moved_to = frame.buffer.fileIndexForRow(frame.visual_rows[frame.navigation.cursor].buffer_index).?;
+    try testing.expectEqual(@as(usize, 6), moved_to);
+    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 6 }));
+
+    const content = frame.panes.sidebar_content;
+    const target_row = content.y + @as(u16, @intCast(fileTreeIndex(frame, 8) - frame.file_tree.scroll));
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = target_row, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = target_row, .button = .left, .type = .release } });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
+    try expectFileHeaderOnTop(frame, 8);
+
+    const diff = frame.panes.diff_content;
+    var scrolled_to: usize = 8;
+    for (0..10) |_| {
+        try presentation.dispatch(.{ .mouse = .{ .col = diff.x + 2, .row = diff.y, .button = .wheel_down, .type = .press } });
+        frame = presentation.projection().review.?.frame;
+        scrolled_to = frame.buffer.fileIndexForRow(frame.visual_rows[frame.navigation.cursor].buffer_index).?;
+        if (scrolled_to != 8) break;
+    }
+    try testing.expect(scrolled_to != 8);
+    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = scrolled_to }));
+
+    try dispatchView(&presentation, .{ .action = .isolate });
+    try dispatchView(&presentation, .{ .action = .next_file });
+    try expectFileHeaderOnTop(presentation.projection().review.?.frame, scrolled_to + 1);
+    try dispatchView(&presentation, .{ .action = .isolate });
+    try expectFileHeaderOnTop(presentation.projection().review.?.frame, scrolled_to + 1);
+}
+
 test "Pane focus gives the Sidebar an independent cursor while DiffPane File motions remain complete" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -19027,19 +19207,23 @@ test "Pane focus gives the Sidebar an independent cursor while DiffPane File mot
     frame = presentation.projection().review.?.frame;
     try testing.expectEqual(frame_mod.PaneFocus.sidebar, frame.focus);
     try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 1 }));
-    try presentation.dispatch(.{ .action = .toggle_directory });
-    frame = presentation.projection().review.?.frame;
-    try testing.expectEqual(@as(usize, 1), frame.buffer.fileIndexForRow(frame.navigation.cursor));
 
     // File Actions are scoped to the DiffPane and do not consume Sidebar state.
     try presentation.dispatch(.{ .action = .prev_file });
     frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(frame_mod.PaneFocus.sidebar, frame.focus);
+    try testing.expectEqual(@as(usize, 0), frame.buffer.fileIndexForRow(frame.navigation.cursor));
+    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 1 }));
+
+    // Entering a File moves focus to the DiffPane, where File Actions apply.
+    try presentation.dispatch(.{ .action = .toggle_directory });
+    frame = presentation.projection().review.?.frame;
+    try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
     try testing.expectEqual(@as(usize, 1), frame.buffer.fileIndexForRow(frame.navigation.cursor));
-    try presentation.dispatch(.{ .action = .focus_next_pane });
     try presentation.dispatch(.{ .action = .prev_file });
     frame = presentation.projection().review.?.frame;
     try testing.expectEqual(@as(usize, 0), frame.buffer.fileIndexForRow(frame.navigation.cursor));
-    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 1 }));
+    try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 0 }));
 }
 
 test "M21 kernel active File reveal without collapsed ancestors needs no allocation or Buffer rebuild" {
@@ -19064,7 +19248,7 @@ test "M21 kernel active File reveal without collapsed ancestors needs no allocat
     try testing.expect(!frame.file_tree.entries[1].active);
     try testing.expect(frame.file_tree.entries[2].active);
     try testing.expect(frame.file_tree.entries[0].active_descendant);
-    try testing.expectEqual(before.file_tree.cursor, frame.file_tree.cursor);
+    try testing.expectEqual(@as(usize, 2), frame.file_tree.cursor);
 }
 
 test "M21 kernel active File reveal opens only its collapsed ancestors" {
@@ -19952,6 +20136,69 @@ test "M23 acceptance authored Markdown storage editing and Submission stay byte 
     }
 }
 
+test "mention display survives reprojection and both searches while yank keeps authored bytes" {
+    const raw = "@{id} thanks :pray:{: data-emoji-id='1f64f' data-emoji-text='🙏' }";
+    for ([_]Layout{ .unified, .side_by_side }) |layout| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        try store.store().put(.{ .workspace = "workspace", .repository = "repo", .pull_request_id = 1 }, .{ .local_id = 1, .kind = .comment, .body = raw });
+        const session = try testCommentSession(testing.allocator, 1);
+        @constCast(session.threads[0].root).body = raw;
+        try session.mention_names.put(session.arena.allocator(), "id", "@Stefan von der Krone");
+        var state = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 0 }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+            .geometry = .{ .cols = 100, .rows = 40 },
+        });
+        defer state.deinit();
+        if (layout == .side_by_side) try dispatchView(&state, .{ .action = .toggle_layout });
+        for ([_]u16{ 38, 160, 38 }) |cols| {
+            try dispatchView(&state, .{ .resize = .{ .cols = cols, .rows = 40 } });
+            const published = state.published.?;
+            var label: std.ArrayList(u8) = .empty;
+            defer label.deinit(testing.allocator);
+            var emoji_count: usize = 0;
+            var first: ?usize = null;
+            for (published.visual_rows, 0..) |visual, index| {
+                const row = published.buffer.rows[visual.buffer_index];
+                if (row != .comment or row.comment.part != .body) continue;
+                for (row.comment.segments) |segment| {
+                    if (segment.atomic and segment.source.start == 0) {
+                        try label.appendSlice(testing.allocator, segment.text);
+                        if (first == null) first = index;
+                        try testing.expectEqual(@as(usize, 5), segment.source.end);
+                    }
+                    if (std.mem.eql(u8, segment.text, "🙏")) emoji_count += 1;
+                    try testing.expect(std.mem.indexOf(u8, segment.text, "data-emoji") == null);
+                }
+            }
+            try testing.expectEqualStrings("@Stefan von der Krone", label.items);
+            try testing.expectEqual(@as(usize, 1), emoji_count);
+            const buffer_corpus = try published.bufferSearchCorpus(state.preferences, &.{}, null, state.geometry);
+            defer buffer_corpus.release();
+            const review_corpus = try published.reviewSearchCorpus();
+            defer review_corpus.release();
+            for ([_]*BufferSearchCorpus{ buffer_corpus, review_corpus }) |corpus| {
+                for ([_][]const u8{ "Stefan", "@{id}", "pray", "🙏" }) |text| {
+                    var query = try search.Query.init(testing.allocator, text);
+                    defer query.deinit(testing.allocator);
+                    var batch = try search.scan(testing.allocator, query, corpus.candidates, if (corpus == buffer_corpus) .literal else .fuzzy);
+                    defer batch.deinit(testing.allocator);
+                    try testing.expectEqual(@as(usize, 2), batch.occurrences.len);
+                    const result = reviewSearchResult(published, batch.occurrences[0]);
+                    try testing.expectEqualStrings(raw, result.body);
+                    try testing.expect(result.mention_names == &session.mention_names);
+                }
+            }
+            try selectRows(&state, first.?, first.?);
+            try state.dispatch(.{ .action = .yank });
+            var copy = state.takeCommand().?;
+            defer copy.deinit();
+            try testing.expectEqualStrings(raw, copy.copy_clipboard.text);
+            try state.dispatch(.{ .clipboard_completed = .{ .command_id = copy.copy_clipboard.command_id, .success = true } });
+        }
+    }
+}
+
 test "M23 acceptance yank completes the numbered transformed-row byte examples" {
     const examples = [_]struct { body: []const u8, first: []const u8, last: []const u8, expected: []const u8, wide_expected: ?[]const u8 = null }{
         .{ .body = "first\nsecond", .first = "first", .last = "second", .expected = "first\nsecond" },
@@ -20359,7 +20606,7 @@ test "M23 links search navigates reference uses across resize and disclosure as 
         try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = raw, .target = if (local) .local else .bitbucket });
         var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 1 }, .{
             .initial = .{ .key = key, .session = if (local) try testLocalSession(testing.allocator) else try testSession(testing.allocator, 1, 'a') },
-            .geometry = .{ .cols = 38, .rows = 20 },
+            .geometry = .{ .cols = 39, .rows = 20 },
         });
         defer presentation.deinit();
         if (layout == .side_by_side) try dispatchView(&presentation, .{ .action = .toggle_layout });
@@ -20382,7 +20629,7 @@ test "M23 links search navigates reference uses across resize and disclosure as 
         for (review.frame.search_ranges) |range| try testing.expect(range.definition != null);
         try presentation.dispatch(.{ .action = .next_search_occurrence });
         const retained_active = presentation.projection().buffer_search.?.active;
-        for ([_]u16{ 160, 38 }) |cols| {
+        for ([_]u16{ 160, 39 }) |cols| {
             try dispatchView(&presentation, .{ .resize = .{ .cols = cols, .rows = 20 } });
             try testing.expectEqual(@as(usize, 4), presentation.projection().buffer_search.?.total);
             try testing.expectEqual(retained_active, presentation.projection().buffer_search.?.active);
@@ -20990,7 +21237,9 @@ test "M23 yank Selection filters inherited scope in both layouts while keeping R
             const card = if (row == .comment) row.comment else row.draft;
             const old_card = card.owner == .draft or (card.owner == .comment and (card.owner.comment == 1 or card.owner.comment == 2));
             const new_card = card.owner == .comment and card.owner.comment == 3;
-            const eligible = (!old_card and !new_card) or (if (version == .old) old_card else new_card);
+            // A bare border row has no text to yank.
+            const text = card.part != .bottom;
+            const eligible = text and ((!old_card and !new_card) or (if (version == .old) old_card else new_card));
             try selectRows(&presentation, index, index);
             try testing.expectEqual(eligible, presentation.projection().action_availability.available(.yank));
             try presentation.dispatch(.{ .push_count_digit = 7 });
@@ -20999,7 +21248,7 @@ test "M23 yank Selection filters inherited scope in both layouts while keeping R
                 var command = presentation.takeCommand().?;
                 defer command.deinit();
                 try testing.expect(command.copy_clipboard.text.len > 0);
-                if (card.owner == .comment and card.owner.comment == 6) try testing.expectEqualStrings("Deleted Comment", command.copy_clipboard.text);
+                if (card.owner == .comment and card.owner.comment == 6) try testing.expectEqualStrings("Gone (deleted)", command.copy_clipboard.text);
                 try testing.expect(presentation.projection().review.?.navigation.mark == null);
             } else {
                 try testing.expect(presentation.takeCommand() == null);
@@ -21634,7 +21883,8 @@ test "selecting the current Selected Version is an exact no-op" {
     try testing.expect(std.meta.eql(before.review.?.navigation, after.review.?.navigation));
     try testing.expect(presentation.takeCommand() == null);
     try presentation.dispatch(.{ .mouse = .{ .col = target.x, .row = target.y, .button = .left, .type = .release } });
-    try testing.expectEqual(frame_mod.PaneFocus.sidebar, presentation.projection().review.?.frame.focus);
+    try testing.expectEqual(frame_mod.PaneFocus.diff, presentation.projection().review.?.frame.focus);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.cursor);
 }
 
 test "a Selected Version change publishes one Frame and then clears Count and Selection" {
@@ -21693,7 +21943,8 @@ test "a failed Selected Version change preserves the complete published interact
     try testing.expectEqual(SelectedVersion.new, after.review.?.selected_version);
     failing.fail_index = std.math.maxInt(usize);
     try presentation.dispatch(.{ .mouse = .{ .col = target.x, .row = target.y, .button = .left, .type = .release } });
-    try testing.expectEqual(frame_mod.PaneFocus.sidebar, presentation.projection().review.?.frame.focus);
+    try testing.expectEqual(frame_mod.PaneFocus.diff, presentation.projection().review.?.frame.focus);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.cursor);
 }
 
 test "WholeFile Selected Version restoration chooses the closest source row and retains context offsets" {
@@ -21746,7 +21997,7 @@ test "WholeFile Selected Version restoration chooses the closest source row and 
         };
         return error.MissingContextLine;
     };
-    try presentation.dispatch(.{ .action = .down });
+    try moveToRow(&presentation, presentation.projection().review.?.navigation.cursor + 1);
     const offset = presentation.projection().review.?.frame.visual_rows[presentation.projection().review.?.navigation.cursor].source_start;
     try testing.expect(offset > 0);
     try dispatchView(&presentation, .{ .action = .select_new_version });
@@ -22984,11 +23235,22 @@ test "Session disclosures toggle independently persist through rebuilds and rese
     try testing.expect(findDisclosureRow(initial.buffer.rows, .{ .outdated_file = &initial.diff.files[0] }) != null);
 
     try moveToRow(&presentation, thread_row);
-    try presentation.dispatch(.{ .action = .toggle_disclosure });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try completeDisclosureBuild(&presentation);
+    const header = presentation.projection().review.?;
+    try testing.expect(header.buffer.rows[header.navigation.cursor] == .comment);
+    try testing.expect(header.buffer.rows[header.navigation.cursor].comment.resolved_thread);
+    try testing.expectEqualDeep(thread_key, buffer_mod.disclosureKey(header.buffer.rows[header.navigation.cursor]).?);
+    try testing.expectEqual(frame_mod.RowOwner{ .disclosure = thread_key }, header.frame.visual_rows[header.navigation.cursor].owner);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try completeDisclosureBuild(&presentation);
+    const closed = presentation.projection().review.?;
+    try testing.expect(!closed.buffer.rows[closed.navigation.cursor].disclosure.expanded);
+    try testing.expectEqualDeep(thread_key, closed.buffer.rows[closed.navigation.cursor].disclosure.key);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
     try completeDisclosureBuild(&presentation);
     const opened = presentation.projection().review.?;
-    try testing.expect(opened.buffer.rows[opened.navigation.cursor] == .disclosure);
-    try testing.expect(std.meta.eql(thread_key, opened.buffer.rows[opened.navigation.cursor].disclosure.key));
 
     const card_key: buffer_mod.DisclosureKey = .{ .review_card = .{ .comment = 1 } };
     const card_row = findDisclosureRow(opened.buffer.rows, card_key).?;
@@ -23023,13 +23285,13 @@ test "Session disclosures toggle independently persist through rebuilds and rese
     try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("new review note") } });
     try presentation.dispatch(.{ .composer = .save });
     try completeDisclosureBuild(&presentation);
-    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
+    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].comment.resolved_thread);
 
     // Width and isolation rebuild the Frame but preserve both explicit choices.
     try dispatchView(&presentation, .{ .resize = .{ .cols = 72, .rows = 8 } });
-    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
+    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].comment.resolved_thread);
     try dispatchView(&presentation, .{ .action = .isolate });
-    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
+    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].comment.resolved_thread);
 
     // Selecting disclosed content and then collapsing its semantic owner drops
     // the Selection because that content no longer exists in the new Frame.
@@ -23050,7 +23312,7 @@ test "Session disclosures toggle independently persist through rebuilds and rese
     const failed_command = presentation.takeCommand().?.load_session;
     try presentation.dispatch(.{ .session_loaded = .{ .intent = failed_command.intent, .outcome = .{ .failed = error.NetworkFailure } } });
     try testing.expectEqual(before_failed.buffer.rows.ptr, presentation.projection().review.?.buffer.rows.ptr);
-    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].disclosure.expanded);
+    try testing.expect(presentation.projection().review.?.buffer.rows[findDisclosureRow(presentation.projection().review.?.buffer.rows, thread_key).?].comment.resolved_thread);
 
     try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
     const replacement = presentation.takeCommand().?.load_session;
@@ -29002,8 +29264,8 @@ test "Picker mouse click selects only and non-Picker Overlay captures Pane click
 
     try presentation.dispatch(.{ .action = .open_file_finder });
     const overlay = presentation.projection().review.?.frame.overlay.?;
-    try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 2, .button = .left, .type = .press } });
-    try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 2, .button = .left, .type = .release } });
+    try presentation.dispatch(.{ .mouse = .{ .col = overlay.entries.x, .row = overlay.entries.y + 1, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = overlay.entries.x, .row = overlay.entries.y + 1, .button = .left, .type = .release } });
     try testing.expectEqual(@as(usize, 1), testListOverlay(&presentation, .file_finder).?.list().selected);
     try testing.expect(testListOverlay(&presentation, .file_finder) != null); // click never confirms
 
@@ -29036,12 +29298,12 @@ test "PullRequest Picker wheel and click move selection while Enter alone confir
     });
     try presentation.dispatch(.{ .pull_requests_loaded = .{ .work_id = list.work_id, .outcome = .{ .loaded = summaries } } });
     const overlay = presentation.projection().review.?.frame.overlay.?;
-    try presentation.dispatch(.{ .mouse = .{ .col = overlay.rect.x, .row = overlay.rect.y + 1, .button = .wheel_down, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = overlay.entries.x, .row = overlay.entries.y, .button = .wheel_down, .type = .press } });
     try testing.expectEqual(@as(usize, 3), testListOverlay(&presentation, .pull_request_picker).?.list().selected);
 
     const current_overlay = presentation.projection().review.?.frame.overlay.?;
-    try presentation.dispatch(.{ .mouse = .{ .col = current_overlay.rect.x, .row = current_overlay.rect.y + 2, .button = .left, .type = .press } });
-    try presentation.dispatch(.{ .mouse = .{ .col = current_overlay.rect.x, .row = current_overlay.rect.y + 2, .button = .left, .type = .release } });
+    try presentation.dispatch(.{ .mouse = .{ .col = current_overlay.entries.x, .row = current_overlay.entries.y + 1, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = current_overlay.entries.x, .row = current_overlay.entries.y + 1, .button = .left, .type = .release } });
     try testing.expectEqual(@as(usize, 1), testListOverlay(&presentation, .pull_request_picker).?.list().selected);
     try testing.expect(presentation.takeCommand() == null);
 
@@ -29067,12 +29329,20 @@ test "mouse activates Sidebar Files and disclosures and replacement cancels a pr
     try presentation.dispatch(.{ .mouse = .{ .col = frame.panes.diff_content.x, .row = screen_row, .button = .left, .type = .release } });
     try completeDisclosureBuild(&presentation);
     const opened = presentation.projection().review.?;
-    try testing.expect(opened.buffer.rows[findDisclosureRow(opened.buffer.rows, disclosure_key).?].disclosure.expanded);
+    try testing.expect(opened.buffer.rows[findDisclosureRow(opened.buffer.rows, disclosure_key).?].comment.resolved_thread);
 
     const sidebar = opened.frame.panes.sidebar_content;
+    const header_row: u16 = opened.frame.panes.diff_content.y + @as(u16, @intCast(opened.navigation.cursor - opened.navigation.scroll));
+    try presentation.dispatch(.{ .mouse = .{ .col = opened.frame.panes.diff_content.x + 4, .row = header_row, .button = .left, .type = .press } });
+    try presentation.dispatch(.{ .mouse = .{ .col = presentation.projection().review.?.frame.panes.diff_content.x + 4, .row = header_row, .button = .left, .type = .release } });
+    try completeDisclosureBuild(&presentation);
+    const closed = presentation.projection().review.?;
+    try testing.expect(!closed.buffer.rows[findDisclosureRow(closed.buffer.rows, disclosure_key).?].disclosure.expanded);
+
     try presentation.dispatch(.{ .mouse = .{ .col = sidebar.x, .row = sidebar.y, .button = .left, .type = .press } });
     try presentation.dispatch(.{ .mouse = .{ .col = sidebar.x, .row = sidebar.y, .button = .left, .type = .release } });
-    try testing.expectEqual(frame_mod.PaneFocus.sidebar, presentation.projection().review.?.frame.focus);
+    try testing.expectEqual(frame_mod.PaneFocus.diff, presentation.projection().review.?.frame.focus);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().review.?.navigation.cursor);
 
     const current = presentation.projection().review.?.frame;
     try presentation.dispatch(.{ .mouse = .{ .col = current.panes.diff_content.x, .row = current.panes.diff_content.y + 1, .button = .left, .type = .press } });
@@ -29144,7 +29414,7 @@ test "Sidebar mouse click toggles a Directory and focuses a child File" {
     try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 1, .button = .left, .type = .press } });
     try presentation.dispatch(.{ .mouse = .{ .col = content.x, .row = content.y + 1, .button = .left, .type = .release } });
     frame = presentation.projection().review.?.frame;
-    try testing.expectEqual(frame_mod.PaneFocus.sidebar, frame.focus);
+    try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
     try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 0 }));
     try testing.expectEqual(@as(usize, 0), frame.navigation.cursor);
 }

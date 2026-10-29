@@ -30,7 +30,16 @@ _Avoid_: selected side, active side, Anchor side.
 
 **Pane**:
 A tiled region of the screen with a defined role (Sidebar, DiffPane, ThreadPane). Panes tile; they do not overlap.
+A View lays out each Pane, but a Pane is the role, not the View.
 _Avoid_: window (reserved for vaxis's surface), view, panel.
+
+**View**:
+One rectangular node of a layout tree. It has margin, an optional border, padding, and content, in that order from the outside. Its border always has rounded corners and can have a Title. Its scroll bar sits in its padding, border, or margin ring and never moves its content. One Composition places its child Views in its content. A View paints only decoration. A content painter fills its content.
+_Avoid_: widget, component, box, container.
+
+**Composition**:
+The rule by which a View places its child Views: flow, cluster, repel, sidebar, switcher, grid, reel, or center. A Composition places children and paints nothing. A rule is a View that draws a line across a flow and joins the lines at its ends.
+_Avoid_: layout (the whole tree), container type.
 
 **Sidebar**:
 The persistent Pane containing the current review's File Tree, with change status and comment/draft counts.
@@ -39,6 +48,10 @@ _Avoid_: nav, drawer.
 **File Tree**:
 The collapsible repository-path hierarchy shown inside the Sidebar. Its entries are Directories and Files.
 _Avoid_: Sidebar (the containing Pane), flat file list.
+
+**File Jump**:
+A move of the DiffPane cursor to the File header of another File: `]`, `[`, a File Tree File, the File Finder, or the isolate view. The File header lands on the top DiffPane row, unless the end of the Buffer stops the scroll.
+_Avoid_: file navigation, go to file.
 
 **File Read State**:
 The current Presentation projection of a File Read Receipt against its File Review Fingerprint. An unread File is bold in the File Tree; a read File uses regular weight. It is derived from durable review state and the current Session rather than persisted as a bare boolean.
@@ -51,6 +64,10 @@ _Avoid_: popup, modal, dialog, hover (describe the trigger, not the thing).
 **List Overlay**:
 An Overlay made of one query line and one fuzzy-ranked list with one selection: the Picker, the File Finder, the Command Palette, or the Theme Overlay. At most one List Overlay is open, and opening one closes another. Enter chooses the selected entry, Escape and ctrl-c close the List Overlay, up, down, ctrl-p, and ctrl-n move the selection, and a click selects an entry without choosing it.
 _Avoid_: picker (one specific List Overlay), menu, list modal.
+
+**Input Overlay**:
+An Overlay with a text input, which is every List Overlay and Review Search, drawn as a bordered input box above a bordered result box with no outer border.
+_Avoid_: search dialog.
 
 **Picker**:
 The List Overlay for fuzzy-finding a PullRequest by id or title (backed by `zf`) to switch the loaded PR. While its PullRequest list loads, a scoped low-frequency tick advances a single-glyph spinner without changing the blocking input loop.
@@ -112,8 +129,23 @@ Presentation's width-independent semantic reading of a Comment or Draft's author
 _Avoid_: parsed Comment, rendered Markdown, Markdown document.
 
 **ReviewCard**:
-The bounded DiffPane presentation of one Comment or Draft: an identifying header, ReviewBody rows, and an in-place disclosure footer when the projected body exceeds its row budget. Every row belongs to the same stable Comment or Draft identity.
+The bounded DiffPane presentation of one Comment or Draft: a rounded border, ReviewBody rows, and an in-place disclosure footer when the projected body exceeds its row budget. Its Title in the top border names the author or `✎ draft`, and any other state follows in parentheses, as in `✎ draft (posted)` or `Ada (deleted)`. The disclosure footer is the Title in the bottom border. A Reply sits at its ancestry indent directly below the preceding card, with no blank row. Its top-left corner joins the border above with `┬` and becomes `├`. A card with a later sibling keeps its line down to that sibling: its bottom-left corner becomes `├`, and the line passes every row of the card's Replies. A ReviewCard has the Theme base background. Its role shows only in its text color and emphasis. Every row belongs to the same stable Comment or Draft identity.
 _Avoid_: Comment (the Review entity), panel, box.
+
+A resolved Thread's header identifies its root author, resolved state, and reply count.
+It also controls whether the Thread's root and Replies are visible.
+
+**Anchor Indicator**:
+The line in column 0 of the DiffPane that joins the thread root of the Active Path to its anchored Diff Lines: `╭` on the top anchored line, `│` on every row below it, including other cards and other anchored lines, and `╰` beside the root card's top-left corner, which becomes `┬`. Only the Active Path has one, so a cursor outside a card shows none. A Reply, a File-level card, and a Review-level card have none.
+_Avoid_: gutter marker, range bar.
+
+**Active Path**:
+The ReviewCard that holds the cursor and every ancestor card up to its thread root. Its cards draw their border, Title, and lines in the border style of their role. Its root draws the Anchor Indicator, and its anchored Diff Lines carry the Ancestry Band. Parent cards keep their normal background. Cards outside the Active Path draw their border dim, except for resolved Thread headers. The descendants of the cursor's card are not on it.
+_Avoid_: selection, focus chain.
+
+**Ancestry Band**:
+The dim background on the anchored Diff Lines of the Active Path. ReviewCards keep their normal background. The cursor band stays stronger.
+_Avoid_: highlight (the cursor and search have their own), thread focus.
 
 **Presentation Frame**:
 One internally consistent projection of the published Session and its Session-relative interaction state at the current terminal geometry. It is the shared source for rendering, navigation restoration, and semantic mouse targeting; a failed reprojection preserves the previous complete Frame.

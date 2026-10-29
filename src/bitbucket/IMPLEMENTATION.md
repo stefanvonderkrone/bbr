@@ -25,3 +25,33 @@ Hashes can use abbreviated forms on one side, so the adapter compares them by pr
 Bitbucket can return old-file `from` and `start_from` fields alongside new-file `to` and `start_to` fields for one inline range.
 The adapter selects the new-file projection.
 The Review context defines an Anchor as single-sided and renders context Lines on the new side when available.
+
+### Account mentions
+
+Bitbucket stores a mention as `@{ACCOUNT_ID}`. The identifier is an Atlassian account ID, not a Bitbucket UUID.
+`GET /2.0/users/{user_id}` accepts either identifier and returns the public profile.
+`bbr api get-user --user-id ID --json` exposes the account ID, UUID, display name, and nickname.
+The Workspace Member commands currently return UUIDs and names, but omit account IDs.
+Keep the authored mention unchanged when a lookup fails or when saving the Comment.
+Remote Session loading resolves each distinct prose mention once through `getUser`.
+The Session keeps the display label as `@Display Name`, with the nickname as a fallback.
+A failed lookup keeps the authored token visible and does not fail the Session.
+Code, escaped mentions, and link destinations do not cause lookups.
+ReviewCards, both searches, and Review Search previews use the same Session labels.
+Drafts use labels already acquired for that Session. A new account ID stays literal until a remote Comment supplies it.
+Selection, editing, and Submission keep the authored account ID, not the display label.
+
+Sources: [Atlassian's mention API guide](https://support.atlassian.com/bitbucket-cloud/kb/how-to-mention-users-in-pull-request-comments-through-the-bitbucket-cloud-rest-api/) and a live account-ID and UUID lookup.
+
+### Emoji metadata
+
+Atlassian's Bitbucket serializer can emit `:pray:{: data-emoji-id='1f64f' data-emoji-text='🙏' }`.
+The suffix belongs to the preceding emoji. It is not visible prose or a second emoji.
+For this example, ReviewBody shows one `🙏` and hides the recognized suffix.
+It consumes a suffix only when its Unicode ID matches the preceding catalog emoji.
+The optional text attribute must also match that emoji.
+Unknown attributes, custom IDs, malformed metadata, and text inside code stay unchanged.
+The emoji's authored range includes the suffix, so Selection keeps the original bytes.
+Both searches accept the emoji and its shortcode, but exclude the consumed metadata.
+
+Source: the [emoji serializer in `@atlaskit/editor-bitbucket-transformer` 10.2.3](https://unpkg.com/@atlaskit/editor-bitbucket-transformer@10.2.3/dist/esm/serializer.js).

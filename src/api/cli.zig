@@ -15,6 +15,7 @@ const tasks = @import("tasks.zig");
 const files = @import("files.zig");
 const commits = @import("commits.zig");
 const branches = @import("branches.zig");
+const users = @import("users.zig");
 
 pub const Verb = struct {
     name: []const u8,
@@ -60,6 +61,7 @@ pub const verbs = [_]Verb{
     .{ .name = "resolve-task", .summary = "resolve a task", .help = tasks.resolve_help, .example = "bbr api resolve-task --repository sample --pull-request-id 42 --task-id 3", .handler = tasks.runResolve },
     .{ .name = "reopen-task", .summary = "reopen a task", .help = tasks.reopen_help, .example = "bbr api reopen-task --repository sample --pull-request-id 42 --task-id 3", .handler = tasks.runReopen },
     .{ .name = "whoami", .summary = "authenticated account UUID", .help = pullrequests.whoami_help, .example = "bbr api whoami --json", .handler = pullrequests.runWhoami },
+    .{ .name = "get-user", .summary = "get an account by account ID or UUID", .help = users.get_help, .example = "bbr api get-user --user-id ACCOUNT_ID --json", .handler = users.runGet },
     .{ .name = "get-verdict", .summary = "reviewer verdict for an account", .help = pullrequests.get_verdict_help, .example = "bbr api get-verdict --repository sample --pull-request-id 42 --uuid '{reviewer}'", .handler = pullrequests.runGetVerdict },
     .{ .name = "set-verdict", .summary = "set the reviewer verdict", .help = pullrequests.set_verdict_help, .example = "bbr api set-verdict --repository sample --pull-request-id 42 --verdict approved --expected-source-commit abc123", .handler = pullrequests.runSetVerdict },
 };
@@ -98,7 +100,7 @@ const value_flags = [_][]const u8{
     "verdict",          "profile",           "name",               "target",
     "title",            "source-repository", "destination-branch", "description",
     "description-file", "reviewer",          "draft",              "close-source-branch",
-    "concurrency",
+    "concurrency",      "user-id",
 };
 
 fn takesValue(name: []const u8) bool {
@@ -163,6 +165,7 @@ pub const verb_flags = [_]VerbFlags{
     .{ .verb = "resolve-task", .flags = &.{ "repository", "pull-request-id", "task-id", "json" } },
     .{ .verb = "reopen-task", .flags = &.{ "repository", "pull-request-id", "task-id", "json" } },
     .{ .verb = "whoami", .flags = &.{"json"} },
+    .{ .verb = "get-user", .flags = &.{ "user-id", "json" } },
     .{ .verb = "get-verdict", .flags = &.{ "repository", "pull-request-id", "uuid", "json" } },
     .{ .verb = "set-verdict", .flags = &.{ "repository", "pull-request-id", "verdict", "expected-source-commit", "json" } },
 };
@@ -448,7 +451,7 @@ test "parseGlobal extracts Profiles without consuming verb flag values" {
 }
 
 test "verb registry is unique and every entry has matching help" {
-    try std.testing.expectEqual(@as(usize, 37), verbs.len);
+    try std.testing.expectEqual(@as(usize, 38), verbs.len);
     var summary_column: ?usize = null;
     inline for (verbs, 0..) |verb, index| {
         for (verbs[index + 1 ..]) |other| try std.testing.expect(!std.mem.eql(u8, verb.name, other.name));
@@ -811,6 +814,29 @@ test "API lifecycle command handlers emit domain JSON and human draft state" {
             var human: TestOutput = .{};
             try findVerb(case.verb).?.handler(human.init(&env, &arena), bb, case.args, false);
             try std.testing.expect(std.mem.indexOf(u8, human.stdoutBytes(), if (case.list) "OPEN draft" else "draft: true") != null);
+        }
+    }
+}
+
+test "get-user prints public identity as JSON and human text" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var fake: bbr.http.FakeHttpClient = .{ .body = "{\"uuid\":\"{user}\",\"account_id\":\"id\",\"display_name\":\"Ada\",\"nickname\":\"ada\"}" };
+    const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+    for ([_]bool{ true, false }) |json| {
+        var output: TestOutput = .{};
+        try findVerb("get-user").?.handler(output.init(&env, &arena), bb, &.{"--user-id=id"}, json);
+        try std.testing.expectEqual(@as(usize, 0), output.stderr_len);
+        if (json) {
+            const decoded = try std.json.parseFromSlice(bbr.bitbucket.User, a, output.stdoutBytes(), .{});
+            defer decoded.deinit();
+            try std.testing.expectEqualStrings("id", decoded.value.account_id);
+            try std.testing.expectEqualStrings("Ada", decoded.value.display_name);
+        } else {
+            try std.testing.expectEqualStrings("{user} Ada\naccount_id: id\nnickname: ada\n", output.stdoutBytes());
         }
     }
 }

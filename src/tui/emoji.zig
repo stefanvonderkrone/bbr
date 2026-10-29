@@ -29,6 +29,58 @@ fn match(index: usize, authored_len: usize) Match {
     return .{ .text = displayed[index], .fallback = catalog.values()[index], .name = catalog.keys()[index], .authored_len = authored_len };
 }
 
+/// Consume only metadata that proves it describes the preceding catalog emoji.
+pub fn metadataLen(text: []const u8, converted: Match) usize {
+    if (!std.mem.startsWith(u8, text, "{:")) return 0;
+    var pos: usize = 2;
+    var id: ?[]const u8 = null;
+    var label: ?[]const u8 = null;
+    while (pos < text.len) {
+        const before = pos;
+        while (pos < text.len and (text[pos] == ' ' or text[pos] == '\t')) pos += 1;
+        if (pos == text.len) return 0;
+        if (text[pos] == '}') {
+            if (!matchesId(id orelse return 0, converted.fallback)) return 0;
+            if (label) |value| if (!std.mem.eql(u8, value, converted.fallback) and !std.mem.eql(u8, value, converted.text)) return 0;
+            return pos + 1;
+        }
+        if (pos == before) return 0;
+        const start = pos;
+        while (pos < text.len and (std.ascii.isAlphabetic(text[pos]) or text[pos] == '-')) pos += 1;
+        const name = text[start..pos];
+        if (pos + 1 >= text.len or text[pos] != '=') return 0;
+        pos += 1;
+        const quote = text[pos];
+        if (quote != '\'' and quote != '"') return 0;
+        pos += 1;
+        const value_start = pos;
+        while (pos < text.len and text[pos] != quote) : (pos += 1) {
+            if (text[pos] == '\r' or text[pos] == '\n') return 0;
+        }
+        if (pos == text.len) return 0;
+        const value = text[value_start..pos];
+        pos += 1;
+        if (std.mem.eql(u8, name, "data-emoji-id") and id == null) {
+            id = value;
+        } else if (std.mem.eql(u8, name, "data-emoji-text") and label == null) {
+            label = value;
+        } else return 0;
+    }
+    return 0;
+}
+
+fn matchesId(id: []const u8, fallback: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, id, '-');
+    var scalars = std.unicode.Utf8View.initUnchecked(fallback).iterator();
+    while (parts.next()) |part| {
+        if (part.len == 0 or part.len > 6) return false;
+        for (part) |byte| if (!std.ascii.isHex(byte)) return false;
+        const scalar = std.fmt.parseInt(u21, part, 16) catch return false;
+        if (scalar != (scalars.nextCodepoint() orelse return false)) return false;
+    }
+    return scalars.nextCodepoint() == null;
+}
+
 fn emojiStyle(comptime fallback: []const u8) []const u8 {
     var iterator = std.unicode.Utf8View.initComptime(fallback).iterator();
     const codepoint = iterator.nextCodepoint() orelse return fallback;

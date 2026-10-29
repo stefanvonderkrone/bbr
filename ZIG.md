@@ -182,6 +182,9 @@ the main thread; the Epoch token still guards against stale results.
     so one unusually large review does not become the retained baseline.
 - **`std.heap.GeneralPurposeAllocator`** (or `c_allocator` when we link C) backs the global tier
   and provides leak detection in debug builds.
+- `StringHashMapUnmanaged.getOrPut(self, allocator, key)` returns borrowed key and value pointers plus `found_existing`.
+  The caller initializes a new value and owns any referenced strings (`std/hash_map.zig:1094-1104`).
+  Session mention labels use this map to keep one result per account ID.
 
 ## 5. Build system (`build.zig` / `build.zig.zon`)
 
@@ -371,6 +374,7 @@ To preserve a file symlink, create the atomic file in the resolved target direct
 - [ ] `ArenaAllocator.ResetMode` variants unchanged?
 - [ ] `ArenaAllocator.reset(.{ .retain_with_limit = bytes })` failure semantics unchanged?
 - [ ] `ArenaAllocator.queryCapacity` semantics still exclude internal node storage?
+- [ ] `StringHashMapUnmanaged.getOrPut` still borrows keys and leaves new values for the caller to initialize?
 - [ ] `std.Io.Reader`/`Writer` method surface we use unchanged?
 - [ ] Directory handles still need `.iterate = true` for `setPermissions` on Linux?
 - [ ] `Dir.readLink`, `realPathFileAlloc`, and `File.Atomic.replace` still preserve the documented path and rename behavior?

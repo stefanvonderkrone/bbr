@@ -8,8 +8,8 @@ pub const Context = struct {
     layout: buffer_mod.Layout,
 };
 
-pub fn run(allocator: std.mem.Allocator, context: *const Context) !buffer_mod.Buffer {
-    return buffer_mod.buildWithComments(allocator, context.diff, context.layout, &.{}, .{ .highlights = context.highlights });
+pub fn run(allocator: std.mem.Allocator, scratch_allocator: std.mem.Allocator, context: *const Context) !buffer_mod.Buffer {
+    return buffer_mod.buildWithComments(allocator, context.diff, context.layout, &.{}, .{ .highlights = context.highlights, .scratch_allocator = scratch_allocator });
 }
 
 pub fn checksum(buffer: buffer_mod.Buffer) u64 {

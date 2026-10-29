@@ -562,7 +562,7 @@ pub const ListOverlay = union(enum) {
         };
     }
 
-    pub const Box = struct { width: u16, height: u16 };
+    pub const Box = @import("layouts.zig").Box;
 
     /// The box size in cells. Paint and hit-testing both read it. Each item
     /// takes one row, below one query row.
@@ -571,6 +571,16 @@ pub const ListOverlay = union(enum) {
             .pull_request_picker, .file_finder => .{ .width = 60, .height = 16 },
             .command_palette => .{ .width = 80, .height = 16 },
             .theme => .{ .width = 40, .height = ThemeId.count + 1 },
+        };
+    }
+
+    /// The name in the top border of the query box.
+    pub fn title(self: *const ListOverlay) []const u8 {
+        return switch (self.*) {
+            .pull_request_picker => "Pull Requests",
+            .file_finder => "File Finder",
+            .command_palette => "Command Palette",
+            .theme => "Theme",
         };
     }
 

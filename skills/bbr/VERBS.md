@@ -1,6 +1,6 @@
 # bbr api verbs
 
-37 verbs. Run `bbr api VERB --help` for flags. No flag tables here.
+38 verbs. Run `bbr api VERB --help` for flags. No flag tables here.
 
 ## Workspaces
 
@@ -60,5 +60,6 @@
 ## Identity
 
 - `whoami` — Authenticated Account UUID. Example: `bbr api whoami --json`
+- `get-user`. Read public account information by Atlassian account ID or Bitbucket UUID. Example: `bbr api get-user --user-id ACCOUNT_ID --json`
 - `get-verdict` — Reviewer Verdict for an account. Example: `bbr api get-verdict --repository sample --pull-request-id 42 --uuid '{reviewer}'`
 - `set-verdict` — set Reviewer Verdict (live). Example: `bbr api set-verdict --repository sample --pull-request-id 42 --verdict approved --expected-source-commit abc123`

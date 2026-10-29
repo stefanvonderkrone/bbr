@@ -19,7 +19,7 @@ pub const Mapping = struct {
     authored_column: ?usize = null,
     authored_line: ?u32 = null,
     definition_source: ?Range = null,
-    /// Static catalog bytes. Either branch consumes this authored location once.
+    /// Catalog or authored bytes. Either branch consumes this authored location once.
     alternative: []const u8 = "",
 };
 
@@ -1221,8 +1221,8 @@ pub fn appendReviewBodyCandidates(
                     try text.appendSlice(allocator, span.text[pos..end]);
                     try mappings.append(allocator, .{
                         .semantic = .{ .start = semantic_start, .end = text.items.len },
-                        .authored = .{ .start = start, .end = if (span.join or span.emoji.len > 0) span.source.end else start + end - pos },
-                        .alternative = span.emoji,
+                        .authored = .{ .start = start, .end = if (span.join or span.emoji.len > 0 or span.mention.len > 0) span.source.end else start + end - pos },
+                        .alternative = if (span.mention.len > 0) body.source[span.source.start..span.source.end] else span.emoji,
                         .definition_source = if (span.definition_source) |definition| .{ .start = definition.start + pos, .end = definition.start + end } else null,
                         .authored_column = 1 + (std.unicode.utf8CountCodepoints(body.source[authored_line_start..start]) catch start - authored_line_start),
                         .authored_line = authored_line,
@@ -1260,6 +1260,33 @@ fn appendBodyRegion(allocator: std.mem.Allocator, owner: ReviewBodyOwner, epoch:
 }
 
 const testing = std.testing;
+
+test "both searches map mention labels and filtered emoji to complete authored tokens" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var names: review_body.MentionNames = .empty;
+    try names.put(a, "id", "@Stefan von der Krone");
+    const suffix = ":pray:{: data-emoji-id='1f64f' data-emoji-text='🙏' }";
+    const raw = "π **@{id}** thanks " ++ suffix ++ " tail";
+    const body = try review_body.ReviewBody.parseWithMentions(a, raw, &names);
+    var candidates: std.ArrayList(Candidate) = .empty;
+    var order: usize = 0;
+    try appendReviewBodyCandidates(a, body, .{ .comment = 7 }, 9, &order, &candidates);
+    try testing.expectEqualStrings("π @Stefan von der Krone thanks 🙏 tail", candidates.items[0].text);
+    for ([_]Mode{ .literal, .fuzzy }) |mode| {
+        for ([_][]const u8{ "Stefan", "von der Krone", "@{id}", "🙏", "pray" }) |query| {
+            const batch = try scan(a, try Query.init(a, query), candidates.items, mode);
+            try testing.expectEqual(@as(usize, 1), batch.occurrences.len);
+            const ranges = batch.occurrences[0].ranges;
+            try testing.expectEqual(@as(usize, 1), ranges.len);
+            const expected = if (std.mem.eql(u8, query, "🙏") or std.mem.eql(u8, query, "pray")) suffix else "@{id}";
+            try testing.expectEqualStrings(expected, raw[ranges[0].start..ranges[0].end]);
+        }
+        const batch = try scan(a, try Query.init(a, "data-emoji-id"), candidates.items, mode);
+        try testing.expectEqual(@as(usize, 0), batch.occurrences.len);
+    }
+}
 
 test "M23 emoji both searches accept mixed forms and map partial matches to complete compounds" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

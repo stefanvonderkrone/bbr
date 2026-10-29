@@ -517,6 +517,41 @@ pub const Client = struct {
         return .{ .posted = parsed.value.id };
     }
 
+    /// GET /users/{user_id}, using an Atlassian account ID or Bitbucket UUID.
+    /// The result owns its strings. Release it with `deinitUser`.
+    pub fn getUser(self: Client, allocator: Allocator, user_id: []const u8) !types.User {
+        if (user_id.len == 0) return error.BadRequest;
+        var url: std.ArrayList(u8) = .empty;
+        defer url.deinit(allocator);
+        try url.appendSlice(allocator, base_url ++ "/users/");
+        try percentEncodeInto(allocator, &url, user_id);
+        const body = try self.requestJson(allocator, .GET, url.items, null);
+        defer allocator.free(body);
+        const parsed = std.json.parseFromSlice(struct {
+            uuid: []const u8,
+            account_id: ?[]const u8 = null,
+            display_name: ?[]const u8 = null,
+            nickname: ?[]const u8 = null,
+        }, allocator, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.MalformedResponse,
+        };
+        defer parsed.deinit();
+        if (parsed.value.uuid.len == 0) return error.MalformedResponse;
+        const uuid = try allocator.dupe(u8, parsed.value.uuid);
+        errdefer allocator.free(uuid);
+        const account_id = try allocator.dupe(u8, parsed.value.account_id orelse "");
+        errdefer allocator.free(account_id);
+        const display_name = try allocator.dupe(u8, parsed.value.display_name orelse "");
+        errdefer allocator.free(display_name);
+        return .{
+            .uuid = uuid,
+            .account_id = account_id,
+            .display_name = display_name,
+            .nickname = try allocator.dupe(u8, parsed.value.nickname orelse ""),
+        };
+    }
+
     /// GET /user and return the UUID proven by the current Credential.
     pub fn getAuthenticatedAccountUuid(self: Client, allocator: Allocator) ![]u8 {
         const url = base_url ++ "/user";
@@ -1763,6 +1798,13 @@ fn dupeWorkspaceMember(allocator: Allocator, entry: WorkspaceMemberEntry) !types
     const name = try allocator.dupe(u8, user.display_name);
     errdefer allocator.free(name);
     return .{ .uuid = uuid, .display_name = name, .nickname = try allocator.dupe(u8, user.nickname orelse "") };
+}
+
+pub fn deinitUser(allocator: Allocator, user: types.User) void {
+    allocator.free(user.uuid);
+    allocator.free(user.account_id);
+    allocator.free(user.display_name);
+    allocator.free(user.nickname);
 }
 
 fn deinitWorkspaceMember(allocator: Allocator, member: types.WorkspaceMember) void {
@@ -3498,6 +3540,56 @@ test "createComment surfaces ApiError on non-2xx" {
     var fake: FakeHttpClient = .{ .status = 400, .body = "bad anchor" };
     const bb = Client.init(fake.httpClient(), testCredential());
     try testing.expectError(error.BadRequest, bb.createComment(a, "myrepo", 7, .{ .body = "x" }));
+}
+
+test "getUser resolves account IDs and UUIDs without Workspace membership" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{ .body = "{\"uuid\":\"{user-uuid}\",\"account_id\":\"account-id\",\"display_name\":\"Ada\",\"nickname\":\"ada\",\"type\":\"user\"}" };
+    const bb = Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "" });
+    for ([_][]const u8{ "account-id", "{user-uuid}", "id/with?query" }, [_][]const u8{ "account-id", "%7Buser-uuid%7D", "id%2Fwith%3Fquery" }) |id, encoded| {
+        const user = try bb.getUser(a, id);
+        defer deinitUser(a, user);
+        try testing.expectEqualStrings("{user-uuid}", user.uuid);
+        try testing.expectEqualStrings("account-id", user.account_id);
+        try testing.expectEqualStrings("Ada", user.display_name);
+        try testing.expectEqualStrings("ada", user.nickname);
+        const expected = try std.fmt.allocPrint(a, "{s}/users/{s}", .{ base_url, encoded });
+        defer a.free(expected);
+        try testing.expectEqualStrings(expected, fake.lastUrl().?);
+        try testing.expectEqual(httpc.Method.GET, fake.last_method.?);
+    }
+    fake.body = "{\"uuid\":\"{user-uuid}\",\"account_id\":null,\"nickname\":null}";
+    const user = try bb.getUser(a, "account-id");
+    defer deinitUser(a, user);
+    try testing.expectEqualStrings("", user.account_id);
+    try testing.expectEqualStrings("", user.display_name);
+    try testing.expectEqualStrings("", user.nickname);
+}
+
+test "getUser rejects empty IDs and malformed profiles and classifies API failures" {
+    const a = testing.allocator;
+    var fake: FakeHttpClient = .{};
+    const bb = Client.init(fake.httpClient(), testCredential());
+    try testing.expectError(error.BadRequest, bb.getUser(a, ""));
+    try testing.expectEqual(@as(usize, 0), fake.call_count);
+    for ([_][]const u8{ "bad json", "{}", "{\"uuid\":\"\"}", "{\"uuid\":3}" }) |body| {
+        fake.body = body;
+        try testing.expectError(error.MalformedResponse, bb.getUser(a, "id"));
+    }
+    for ([_]u16{ 401, 403, 404, 429 }, [_]anyerror{ error.Unauthorized, error.Forbidden, error.NotFound, error.RateLimited }) |status, expected| {
+        fake.status = status;
+        try testing.expectError(expected, bb.getUser(a, "id"));
+    }
+}
+
+test "getUser releases every partial allocation" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(a: Allocator) !void {
+            var fake: FakeHttpClient = .{ .body = "{\"uuid\":\"{user}\",\"account_id\":\"id\",\"display_name\":\"Ada\",\"nickname\":\"ada\"}" };
+            const user = try Client.init(fake.httpClient(), testCredential()).getUser(a, "id");
+            defer deinitUser(a, user);
+        }
+    }.run, .{});
 }
 
 test "authenticated account acquisition returns UUID and classifies unauthorized" {

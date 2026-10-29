@@ -12,6 +12,7 @@ The [Presentation glossary](./GLOSSARY.md) defines the domain terms used here.
 | Search matching and authored locations | [`search.zig`](./search.zig) defines the search corpus, mappings, and Search Occurrences. [`presentation.zig`](./presentation.zig) owns search interaction and navigation. |
 | Selection and clipboard commands | [`presentation.zig`](./presentation.zig) owns Selection and yank behavior. [`frame.zig`](./frame.zig) projects source targets for Selected Version. |
 | Geometry and terminal cells | [`frame.zig`](./frame.zig) builds the Presentation Frame. [`render.zig`](./render.zig) draws its rows with styles from [`theme.zig`](./theme.zig). |
+| Views, Compositions, and decoration | [`view.zig`](./view.zig) places a View tree without vaxis. [`layouts.zig`](./layouts.zig) holds the View tree of each Pane, Overlay, and the status row. [`view_paint.zig`](./view_paint.zig) paints fills, borders, rules, Titles, and scroll bars. See [ADR-0013](../../docs/adr/0013-one-view-type-with-a-composition-union-lays-out-the-terminal.md). |
 | Key input and Actions | [`keymap.zig`](./keymap.zig) resolves input. [`action.zig`](./action.zig) defines Actions. [`presentation.zig`](./presentation.zig) dispatches them. |
 | List Overlays and the Command Palette | [`list_overlay.zig`](./list_overlay.zig) owns ranking, selection, per-Overlay policy, and the curated Command Palette table. [`presentation.zig`](./presentation.zig) acts on the confirmed choice. [`render.zig`](./render.zig) draws every List Overlay. |
 | Theme selection and persistence | [`theme_id.zig`](./theme_id.zig) names the built-in Themes without vaxis. [`theme.zig`](./theme.zig) maps each one to styles. [`config.zig`](./config.zig) reads the Configured Theme and writes it back to config.toml. |
@@ -28,6 +29,8 @@ All remote TUI work uses one TUI-lifetime `StdHttpClient` connection pool.
 Candidate Session acquisition uses at most two active requests.
 PullRequest, RawDiff, and Comments are required.
 Authenticated Account acquisition is independent.
+After the required acquisitions complete, remote Session loading resolves distinct prose mention IDs with sequential `getUser` calls.
+The Session keeps successful labels and failed lookups until Session replacement. Paint and search never fetch account profiles.
 Comments wait for PullRequest commit data and take priority over RawDiff when both can start.
 Remote File Enrichment fetches its old and new sides concurrently, with at most two requests per File.
 All started branches complete without branch cancellation.
