@@ -24,6 +24,7 @@ Each rule names the check that fails when you break it. A rule marked "conventio
 
 | Rule | Enforcement |
 | --- | --- |
+| Release publication requires exactly four local target archives and `SHA256SUMS`. Every existing remote draft asset must have an expected name. Read all remote asset pages before a write. Reject unexpected assets without deleting them. | `python3 tests/publish_release_test.py`, run by CI. The tests cover incomplete local archives, unexpected remote assets, later asset pages, and a failed later page. |
 | A List Overlay arm holds no pointer except the buffers it owns. Borrowed data, such as the Session's Files, comes in as an argument at each call. | The `comptime` block after `ListOverlay` in `src/tui/list_overlay.zig` (compile error). |
 | The File Finder and the Command Palette close before Session replacement. | The exhaustive switch in `ListOverlay.closesOnReplacement` in `src/tui/list_overlay.zig` (compile error for a new arm). The tests "File finder opened during a replacement does not outlive the replaced Session" and "a Session replacement closes the Command Palette" in `src/tui/presentation.zig`. |
 | A new List Overlay is one arm of the `ListOverlay` union in `src/tui/list_overlay.zig`. | The exhaustive switches in the `ListOverlay` methods (compile error). |

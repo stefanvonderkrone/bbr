@@ -92,6 +92,8 @@ The build archives expire after seven days. The publish job needs these archives
 After expiry, a failed-job rerun cannot recover the release.
 Preparation reuses its tag, even after a later same-day release.
 `tools/publish_release.py` finds the existing draft and replaces its expected archives and `SHA256SUMS`.
+If the draft contains an unexpected asset, publication stops before any write and leaves the draft unchanged.
+Inspect the named assets before you change the draft and retry.
 It publishes the draft only after every upload succeeds. The assets then become available for download.
 The recovery path never changes an already published release or replaces a newer release as latest.
 

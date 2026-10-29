@@ -22,20 +22,36 @@ def publish(tag):
     if {Path(archive).name for archive in archives} != expected or not Path("SHA256SUMS").is_file():
         raise ValueError("all four release archives and SHA256SUMS are required")
     owner, name = os.environ["GH_REPO"].split("/", 1)
-    query = """query($owner: String!, $name: String!, $tag: String!) {
+    query = """query($owner: String!, $name: String!, $tag: String!, $endCursor: String) {
       repository(owner: $owner, name: $name) {
-        release(tagName: $tag) { isDraft }
+        release(tagName: $tag) {
+          isDraft
+          releaseAssets(first: 100, after: $endCursor) {
+            nodes { name }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
         latestRelease { tagName }
       }
     }"""
     response = subprocess.run([
-        "gh", "api", "graphql", "-f", f"query={query}",
+        "gh", "api", "graphql", "--paginate", "--slurp", "-f", f"query={query}",
         "-f", f"owner={owner}", "-f", f"name={name}", "-f", f"tag={tag}",
     ], check=True, text=True, capture_output=True)
-    repository = json.loads(response.stdout)["data"]["repository"]
+    repositories = [page["data"]["repository"] for page in json.loads(response.stdout)]
+    repository = repositories[0]
     release = repository["release"]
     if release is not None and not release["isDraft"]:
         raise ValueError(f"release {tag} is already published")
+    if release is not None:
+        remote_assets = {
+            asset["name"]
+            for page in repositories
+            for asset in page["release"]["releaseAssets"]["nodes"]
+        }
+        unexpected = remote_assets - (expected | {"SHA256SUMS"})
+        if unexpected:
+            raise ValueError(f"release {tag} has unexpected assets: {', '.join(sorted(unexpected))}")
     latest = repository["latestRelease"]
     make_latest = latest is None or version_key(tag) >= version_key(latest["tagName"])
     if release is None:
