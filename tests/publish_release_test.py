@@ -45,6 +45,7 @@ class PublishReleaseTest(unittest.TestCase):
         self.latest = None
         self.commands = []
         self.fail_upload = False
+        self.after_upload = None
         self.api_error = None
         self.api_error_page = None
         self.process = patch.object(publisher.subprocess, "run", side_effect=self.gh)
@@ -103,6 +104,8 @@ class PublishReleaseTest(unittest.TestCase):
                 self.release["assets"][path.name] = data
                 if self.fail_upload:
                     raise subprocess.CalledProcessError(1, command)
+            if self.after_upload is not None:
+                self.after_upload()
         elif action == "edit":
             self.assertIn("--draft=false", command)
             self.release["draft"] = False
@@ -133,6 +136,86 @@ class PublishReleaseTest(unittest.TestCase):
         self.assertTrue(self.release["draft"])
         self.assertEqual(self.release["assets"], original_assets)
         self.assertTrue(all(command[1] == "api" for command in self.commands))
+
+    def test_unexpected_asset_added_during_upload_stays_private(self):
+        for existing_draft in (False, True):
+            with self.subTest(existing_draft=existing_draft):
+                self.release = {"draft": True, "assets": {}} if existing_draft else None
+                self.commands = []
+
+                def add_private_asset():
+                    self.release["assets"]["late-private-notes.txt"] = b"must stay private"
+
+                self.after_upload = add_private_asset
+                with self.assertRaisesRegex(ValueError, "late-private-notes.txt"):
+                    publisher.publish(TAG)
+                self.assertTrue(self.release["draft"])
+                self.assertEqual(
+                    self.release["assets"],
+                    self.assets | {"late-private-notes.txt": b"must stay private"},
+                )
+                self.assertFalse(any(command[1:3] == ["release", "edit"] for command in self.commands))
+
+    def test_late_asset_names_after_the_first_hundred_are_checked(self):
+        private_assets = {f"late-{index:03}.txt": b"private" for index in range(101)}
+        self.after_upload = lambda: self.release["assets"].update(private_assets)
+        with self.assertRaisesRegex(ValueError, "late-100.txt"):
+            publisher.publish(TAG)
+        self.assertTrue(self.release["draft"])
+        self.assertEqual(self.release["assets"], self.assets | private_assets)
+        self.assertFalse(any(command[1:3] == ["release", "edit"] for command in self.commands))
+
+    def test_final_api_failure_leaves_uploaded_release_unpublished(self):
+        self.after_upload = lambda: setattr(self, "api_error", "HTTP 503")
+        with self.assertRaises(subprocess.CalledProcessError):
+            publisher.publish(TAG)
+        self.assertTrue(self.release["draft"])
+        self.assertEqual(self.release["assets"], self.assets)
+        self.assertFalse(any(command[1:3] == ["release", "edit"] for command in self.commands))
+
+    def test_final_asset_page_failure_leaves_uploaded_release_unpublished(self):
+        private_assets = {f"late-{index:03}.txt": b"private" for index in range(101)}
+
+        def fail_later_page():
+            self.release["assets"].update(private_assets)
+            self.api_error_page = 2
+
+        self.after_upload = fail_later_page
+        with self.assertRaises(subprocess.CalledProcessError):
+            publisher.publish(TAG)
+        self.assertTrue(self.release["draft"])
+        self.assertEqual(self.release["assets"], self.assets | private_assets)
+        self.assertFalse(any(command[1:3] == ["release", "edit"] for command in self.commands))
+
+    def test_release_published_during_upload_is_not_edited(self):
+        self.after_upload = lambda: self.release.update(draft=False)
+        with self.assertRaisesRegex(ValueError, "already published"):
+            publisher.publish(TAG)
+        self.assertFalse(self.release["draft"])
+        self.assertEqual(self.release["assets"], self.assets)
+        self.assertFalse(any(command[1:3] == ["release", "edit"] for command in self.commands))
+
+    def test_asset_removed_during_upload_prevents_publication(self):
+        for missing in ("SHA256SUMS", f"bbr-{TAG}-linux-aarch64.tar.gz"):
+            with self.subTest(missing=missing):
+                self.release = {"draft": True, "assets": {}}
+                self.commands = []
+                self.after_upload = lambda: self.release["assets"].pop(missing)
+                with self.assertRaisesRegex(ValueError, "missing assets"):
+                    publisher.publish(TAG)
+                self.assertTrue(self.release["draft"])
+                self.assertEqual(
+                    self.release["assets"],
+                    {name: data for name, data in self.assets.items() if name != missing},
+                )
+                self.assertFalse(any(command[1:3] == ["release", "edit"] for command in self.commands))
+
+    def test_release_removed_during_upload_prevents_publication(self):
+        self.after_upload = lambda: setattr(self, "release", None)
+        with self.assertRaisesRegex(ValueError, "missing assets"):
+            publisher.publish(TAG)
+        self.assertIsNone(self.release)
+        self.assertFalse(any(command[1:3] == ["release", "edit"] for command in self.commands))
 
     def test_asset_pagination_failure_does_not_change_a_release(self):
         self.release["assets"].update({f"unexpected-{index:03}.txt": b"private" for index in range(101)})
@@ -184,6 +267,23 @@ class PublishReleaseTest(unittest.TestCase):
         self.latest = {"tagName": "v2024.3.24-2"}
         publisher.publish(TAG)
         self.assertIn("--latest=false", self.commands[-1])
+
+    def test_latest_decision_uses_the_release_after_upload(self):
+        for initial, final, make_latest in (
+            (None, {"tagName": "v2024.3.24-2"}, False),
+            ({"tagName": "v2024.3.9-10"}, {"tagName": "nightly"}, False),
+            ({"tagName": "v2024.3.24-2"}, None, True),
+            ({"tagName": "nightly"}, {"tagName": "v2024.3.9-10"}, True),
+        ):
+            with self.subTest(initial=initial, final=final):
+                self.release = {"draft": True, "assets": {}}
+                self.latest = initial
+                self.commands = []
+                self.after_upload = lambda: setattr(self, "latest", final)
+                publisher.publish(TAG)
+                self.assertFalse(self.release["draft"])
+                self.assertEqual(self.release["assets"], self.assets)
+                self.assertIn(f"--latest={str(make_latest).lower()}", self.commands[-1])
 
     def test_latest_comparison_uses_numbers(self):
         self.latest = {"tagName": "v2024.3.9-10"}
