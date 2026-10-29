@@ -6058,6 +6058,7 @@ pub const Presentation = struct {
             .dismiss_submission_result => self.dismissSubmissionTree(),
             .request_shutdown => self.requestShutdown(),
         }
+        if (self.published == null or self.published.?.composer == null) self.composer_footer.clearRetainingCapacity();
         if (self.code_work != null or (self.published != null and self.published.?.code_highlighting.bodies.items.len > 0)) self.refreshCodeVisibility();
     }
 
@@ -10864,7 +10865,6 @@ pub const Presentation = struct {
                 composer.deinit();
                 published.composer = null;
                 self.action_error = null;
-                self.composer_footer.clearRetainingCapacity();
             },
             .save => self.saveComposer(published),
             .external_edit => {
@@ -18467,6 +18467,34 @@ test "External Edit snapshots exactly once blocks input and accepts only matchin
     try testing.expectEqualStrings("changed", presentation.projection().composer.?.body);
     try testing.expect(!presentation.projection().composer.?.pending_external_edit);
     try testing.expectEqualStrings("External Edit accepted", presentation.projection().composer.?.footer.?);
+}
+
+test "External Edit footer ends with its Composer and appears after another accepted edit" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testLocalSession(testing.allocator) },
+        .viewport_rows = 8,
+    });
+    defer state.deinit();
+
+    for ([_]bool{ false, true }) |cancel| {
+        try state.dispatch(.{ .action = .review_comment });
+        try testing.expect(state.projection().composer.?.footer == null);
+        try state.dispatch(.{ .composer = .external_edit });
+        const command = state.takeCommand().?.external_edit;
+        const accepted = try ExternalEditCompleted.create(testing.allocator, command.command_id, command.session_epoch);
+        command.destroy();
+        accepted.outcome = .{ .changed = try accepted.arena.allocator().dupe(u8, "accepted body") };
+        try state.dispatch(.{ .external_edit_completed = accepted });
+        try testing.expectEqualStrings("External Edit accepted", state.projection().composer.?.footer.?);
+        try state.dispatch(.{ .composer = if (cancel) .cancel else .save });
+        if (!cancel) try completeDisclosureBuild(&state);
+        try testing.expect(state.projection().composer == null);
+    }
+    try state.dispatch(.{ .action = .review_comment });
+    try testing.expect(state.projection().composer.?.footer == null);
 }
 
 test "M23 ancestry retains typed cursor and search ownership across resize and failed projection" {

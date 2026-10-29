@@ -79,3 +79,11 @@ jobs:
         run: zig build test-user-grammar --summary all
       - name: Complete hermetic suite
         run: zig build test --summary all
+      - name: Install External Edit test tools
+        if: matrix.target == 'linux-x86_64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tmux neovim
+      - name: External Edit terminal lifecycle
+        if: matrix.target == 'linux-x86_64'
+        run: python3 tests/external_edit_pty_test.py

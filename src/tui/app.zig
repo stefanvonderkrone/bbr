@@ -166,6 +166,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
             .winsize => |winsize| {
                 try vx.resize(ctx.gpa, writer, winsize);
                 vx.screen.width_method = .unicode;
+                painted_revision = null;
             },
             .presentation_done => |done| {
                 reapPresentationWork(&futures, ctx.io, done.work_id);
