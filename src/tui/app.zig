@@ -1314,6 +1314,7 @@ fn browserStatusItems(frame: std.mem.Allocator, active_theme: theme.Theme, proje
     } else {
         items.hint(.open_entry, "Enter", " open");
         items.hint(.refresh, "R", " refresh");
+        items.hint(.sort, "s", " sort");
         items.hint(.switch_review, "b", " review");
         items.hint(.help, "?", " help");
         items.hint(.quit, "q", " quit");
@@ -1748,12 +1749,14 @@ test "M24 browser the status shows the Browser hints, the Candidate Session load
     const hints = projectionStatusItems(arena.allocator(), state.projection());
     try std.testing.expectEqualStrings("Enter", hints.lines.get(.open_entry).items()[0].text);
     try std.testing.expectEqualStrings("b", hints.lines.get(.switch_review).items()[0].text);
+    try std.testing.expectEqualStrings("s", hints.lines.get(.sort).items()[0].text);
 
     try state.dispatch(.{ .choose_pull_request = try presentation.OwnedReviewIdentity.init("check24", "repo", 7) });
     try std.testing.expect(state.projection().browser != null);
     const loading = projectionStatusItems(arena.allocator(), state.projection());
     try std.testing.expectEqualStrings("Loading PR #7…", loading.lines.get(.message).items()[0].text);
     try std.testing.expectEqual(@as(usize, 0), loading.lines.get(.open_entry).items().len);
+    try std.testing.expectEqual(@as(usize, 0), loading.lines.get(.sort).items().len);
 
     try std.testing.expectEqualStrings("Browser is unavailable for a local review", actionErrorText(.local_review_no_browser));
     try std.testing.expectEqualStrings("No review is open", actionErrorText(.no_review_open));

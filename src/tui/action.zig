@@ -68,6 +68,7 @@ pub const Action = enum {
     open_browser,
     close_browser,
     open_browser_entry,
+    cycle_browser_sort,
 };
 
 /// The terminal-independent input surface and semantic cursor target used to

@@ -220,6 +220,7 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one('b'), .action = .close_browser, .help = "back to the review" },
     .{ .chord = Chord.one(vaxis.Key.escape), .action = .close_browser, .help = "back to the review" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .open_browser_entry, .help = "toggle Repository / open PullRequest" },
+    .{ .chord = Chord.one('s'), .action = .cycle_browser_sort, .help = "sort by update time / name" },
 };
 
 pub const Keymap = struct {
@@ -486,7 +487,7 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             else => false,
         },
         .browser => switch (action) {
-            .quit, .help, .refresh, .close_browser => true,
+            .quit, .help, .refresh, .close_browser, .cycle_browser_sort => true,
             else => false,
         },
         .browser_repository, .browser_pull_request => switch (action) {
@@ -907,4 +908,18 @@ test "M24 browser Actions resolve only in their contexts and remain configurable
     try testing.expect(resolver.feed(configured.keymap(), .browser, plain(special.escape)) == .none);
     try testing.expect(resolver.feed(configured.keymap(), .browser_repository, plain(special.enter)) == .none);
     try testing.expectEqual(Action.open_browser_entry, resolver.feed(configured.keymap(), .browser_pull_request, plain('o')).action);
+}
+
+test "M24 browser s cycles the Browser Sort only in the Browser contexts" {
+    var resolver: Resolver = .{};
+    for (std.enums.values(InteractionContext)) |context| {
+        const browser = context == .browser or context == .browser_repository or context == .browser_pull_request;
+        try testing.expectEqual(browser, supportsContext(.cycle_browser_sort, context));
+    }
+    inline for (.{ InteractionContext.browser, .browser_repository, .browser_pull_request }) |context| {
+        try testing.expectEqual(Action.cycle_browser_sort, resolver.feed(.default, context, plain('s')).action);
+    }
+    inline for (.{ InteractionContext.diff, .diff_source, .diff_disclosure, .diff_review_card, .sidebar_directory, .sidebar_file }) |context| {
+        try testing.expectEqual(Action.toggle_layout, resolver.feed(.default, context, plain('s')).action);
+    }
 }

@@ -559,6 +559,18 @@ pub const Browser = struct {
         self.scroll = @min(self.scroll, self.entries.len -| self.viewport);
     }
 
+    /// Switches between the updated-time Sort and the name Sort. The cursor
+    /// keeps its Selection. On error the previous Sort and Entries stay.
+    pub fn cycleSort(self: *Browser) Allocator.Error!void {
+        const previous = self.sort;
+        self.sort = switch (previous) {
+            .updated => .name,
+            .name => .updated,
+        };
+        errdefer self.sort = previous;
+        try self.rebuild();
+    }
+
     pub fn setViewport(self: *Browser, rows: usize) void {
         self.viewport = @max(rows, 1);
         self.keepCursorVisible();
@@ -700,6 +712,24 @@ test "M24 browser entries order Repositories and PullRequests by update time, ne
     try testing.expectEqual(Entry{ .repository = 1 }, list[6]);
 }
 
+test "M24 browser the name Sort orders Repositories by name without ASCII case, then slug, and PullRequests by id" {
+    const prs = try testPullRequests(&.{ testPr(3, 900), testPr(9, null), testPr(5, 1) });
+    var nodes = [_]RepositoryNode{
+        .{ .summary = .{ .slug = "b-2", .name = "beta", .updated_on = 40 } },
+        .{ .summary = .{ .slug = "a", .name = "Alpha", .updated_on = null }, .expanded = true, .pull_requests = .{ .settled = .{ .loaded = prs } } },
+        .{ .summary = .{ .slug = "b-1", .name = "Beta", .updated_on = 10 } },
+        .{ .summary = .{ .slug = "z", .name = "alpha2", .updated_on = 90 } },
+    };
+    defer nodes[1].pull_requests.settled.deinit();
+    const list = try entries(testing.allocator, &nodes, .{}, .name);
+    defer testing.allocator.free(list);
+    try testing.expectEqual(@as(usize, 7), list.len);
+    try testing.expectEqual(Entry{ .repository = 1 }, list[0]);
+    const ids = [_]u64{ 9, 5, 3 };
+    for (ids, list[1..4]) |id, entry| try testing.expectEqual(id, prs.prs[entry.pull_request.index].id);
+    try testing.expectEqualSlices(Entry, &.{ .{ .repository = 3 }, .{ .repository = 2 }, .{ .repository = 0 } }, list[4..]);
+}
+
 test "M24 browser entries show the loading, empty, and failure message entries" {
     var empty_nodes = [_]RepositoryNode{};
     const loading = try entries(testing.allocator, &empty_nodes, .{ .work = 1 }, .updated);
@@ -797,6 +827,60 @@ test "M24 browser a Repository list keeps the expansion and load of a known node
     try browser.rebuild();
     try testing.expectEqual(@as(usize, 1), browser.nodes.items.len);
     try testing.expect(browser.findNode("lost") == null);
+}
+
+test "M24 browser a Sort change keeps the selected Repository and moves the scroll only when its row leaves the viewport" {
+    var browser = try Browser.create(testing.allocator, try testStart(null, null), 4);
+    defer browser.destroy();
+    try browser.replaceRepositories(try testRepositories(&.{
+        .{ .slug = "r0", .name = "F", .updated_on = 6 },
+        .{ .slug = "r1", .name = "e", .updated_on = 5 },
+        .{ .slug = "r2", .name = "D", .updated_on = 4 },
+        .{ .slug = "r3", .name = "c", .updated_on = 3 },
+        .{ .slug = "r4", .name = "B", .updated_on = 2 },
+        .{ .slug = "r5", .name = "a", .updated_on = 1 },
+    }));
+    try browser.rebuild();
+    browser.select(2);
+    browser.scrollBy(1);
+    try testing.expectEqual(@as(usize, 1), browser.scroll);
+
+    try browser.cycleSort();
+    try testing.expectEqual(Sort.name, browser.sort);
+    try testing.expectEqual(Entry{ .repository = 5 }, browser.entries[0]);
+    try testing.expect(browser.cursor.?.repository.eql("r2"));
+    try testing.expectEqual(@as(?usize, 3), browser.cursor_index);
+    try testing.expectEqual(@as(usize, 1), browser.scroll);
+
+    try browser.cycleSort();
+    try testing.expectEqual(Sort.updated, browser.sort);
+    try testing.expect(browser.cursor.?.repository.eql("r2"));
+    try testing.expectEqual(@as(?usize, 2), browser.cursor_index);
+    try testing.expectEqual(@as(usize, 1), browser.scroll);
+
+    browser.select(0);
+    try testing.expectEqual(@as(usize, 0), browser.scroll);
+    try browser.cycleSort();
+    try testing.expect(browser.cursor.?.repository.eql("r0"));
+    try testing.expectEqual(@as(?usize, 5), browser.cursor_index);
+    try testing.expectEqual(@as(usize, 2), browser.scroll);
+}
+
+test "M24 browser a Sort change keeps the selected PullRequest" {
+    var browser = try Browser.create(testing.allocator, try testStart("repo", 7), 10);
+    defer browser.destroy();
+    browser.nodes.items[0].pull_requests.request = .{ .issued = 1 };
+    browser.storePullRequests(0, .{ .loaded = try testPullRequests(&.{ testPr(7, 300), testPr(9, 100), testPr(8, null) }) });
+    try browser.rebuild();
+    try testing.expectEqual(@as(?usize, 1), browser.cursor_index);
+
+    try browser.cycleSort();
+    try testing.expectEqual(@as(u64, 7), browser.cursor.?.pull_request.id);
+    try testing.expectEqual(@as(?usize, 3), browser.cursor_index);
+    try testing.expectEqual(@as(u64, 9), browser.pullRequest(browser.entries[1]).?.id);
+    try browser.cycleSort();
+    try testing.expectEqual(@as(u64, 7), browser.cursor.?.pull_request.id);
+    try testing.expectEqual(@as(?usize, 1), browser.cursor_index);
 }
 
 test "M24 browser dates format as UTC days" {

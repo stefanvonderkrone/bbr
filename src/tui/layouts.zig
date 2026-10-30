@@ -48,6 +48,7 @@ pub const StatusSlot = enum {
     file,
     open_entry,
     refresh,
+    sort,
     switch_review,
     help,
     quit,

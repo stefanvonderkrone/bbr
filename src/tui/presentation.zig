@@ -7645,7 +7645,7 @@ pub const Presentation = struct {
             .link_existing_comment => self.openUnknownResolutionEditor(published),
             .yank => self.yank(published, yank_count),
             .open_file_finder, .open_pull_request_picker, .open_command_palette, .open_theme_overlay, .confirm_picker, .help, .open_browser => unreachable,
-            .close_browser, .open_browser_entry => {},
+            .close_browser, .open_browser_entry, .cycle_browser_sort => {},
             .quit => unreachable,
         }
         clampSelectionAtUnavailableRow(published, selection_cursor_before, self.preferences.scope);
@@ -12266,6 +12266,7 @@ pub const Presentation = struct {
             },
             .open_browser_entry => self.openBrowserEntry(state),
             .refresh => self.refreshBrowser(state),
+            .cycle_browser_sort => state.cycleSort() catch self.refuse(.out_of_memory),
             .close_browser => if (self.published == null) {
                 self.action_error = .no_review_open;
             } else {
@@ -30233,6 +30234,52 @@ test "M24 browser shutdown starts no Browser load and waits for the loads in fli
     try completeBrowserPullRequests(&presentation, a, &.{2});
     try expectNoCommand(&presentation);
     try testing.expect(presentation.readyToExit());
+}
+
+test "M24 browser s switches the Sort, keeps the Selection, and survives a return and a Session replacement" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined });
+    defer presentation.deinit();
+    try openLoadedBrowser(&presentation, &.{ "repo", "other" }, &.{ 1, 2 });
+    try testing.expectEqualSlices(browser_mod.Entry, &.{
+        .{ .repository = 0 },
+        .{ .pull_request = .{ .repository = 0, .index = 0 } },
+        .{ .pull_request = .{ .repository = 0, .index = 1 } },
+        .{ .repository = 1 },
+    }, browserRows(&presentation));
+    try testing.expectEqual(@as(?usize, 1), presentation.projection().browser.?.cursor);
+
+    try browserKey(&presentation, 's');
+    try expectNoCommand(&presentation);
+    try testing.expectEqualSlices(browser_mod.Entry, &.{
+        .{ .repository = 1 },
+        .{ .repository = 0 },
+        .{ .pull_request = .{ .repository = 0, .index = 1 } },
+        .{ .pull_request = .{ .repository = 0, .index = 0 } },
+    }, browserRows(&presentation));
+    try testing.expectEqual(@as(u64, 1), browserCursor(&presentation).?.pull_request.id);
+    try testing.expectEqual(@as(?usize, 3), presentation.projection().browser.?.cursor);
+
+    try browserKey(&presentation, keymap_mod.special.escape);
+    try browserKey(&presentation, 'b');
+    try expectNoCommand(&presentation);
+    try expectBrowserPullRequests(&presentation, "repo", &.{ 2, 1 });
+    try browserKey(&presentation, keymap_mod.special.escape);
+
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("check24", "repo", 2) });
+    const load = presentation.takeCommand().?.load_session;
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') } } });
+    try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.key.pull_request_id);
+    try browserKey(&presentation, 'b');
+    try expectNoCommand(&presentation);
+    try expectBrowserPullRequests(&presentation, "repo", &.{ 2, 1 });
+    try testing.expectEqual(@as(u64, 1), browserCursor(&presentation).?.pull_request.id);
+
+    try browserKey(&presentation, 's');
+    try expectBrowserPullRequests(&presentation, "repo", &.{ 1, 2 });
+    try testing.expectEqual(@as(u64, 1), browserCursor(&presentation).?.pull_request.id);
+    try testing.expectEqual(@as(?usize, 1), presentation.projection().browser.?.cursor);
 }
 
 test "M24 browser Session replacement keeps the Browser scroll" {
