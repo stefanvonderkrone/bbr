@@ -18,6 +18,10 @@ pub const BuiltInGrammar = enum {
     cpp,
     rust,
     odin,
+    java,
+    kotlin,
+    groovy,
+    c_sharp,
 
     pub fn name(self: BuiltInGrammar) []const u8 {
         return switch (self) {

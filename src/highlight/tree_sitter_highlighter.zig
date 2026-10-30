@@ -726,6 +726,10 @@ test "interval merge matches byte planes for every BuiltInGrammar fixture" {
         .{ .path = "point.h", .source = c_header_fixture },
         .{ .path = "main.rs", .source = rust_fixture },
         .{ .path = "main.odin", .source = odin_fixture },
+        .{ .path = "Greeter.java", .source = java_fixture },
+        .{ .path = "Greeter.kt", .source = kotlin_fixture },
+        .{ .path = "build.gradle", .source = groovy_fixture },
+        .{ .path = "Greeter.cs", .source = c_sharp_fixture },
     };
     var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
     defer highlighter.deinit();
@@ -1714,4 +1718,154 @@ test "M27 grammar Odin fixture has comment, string, keyword, function, and type 
     try expectSpan(result, 4, 7, 11, "keyword.function");
     try expectSpan(result, 5, 4, 10, "keyword.return");
     try expectSpan(result, 7, 8, 14, "string");
+}
+
+// M27 ticket 05 fixtures
+
+test "M27 grammar GrammarMatch selects Java, Kotlin, Groovy, and C#" {
+    const cases = [_]struct { path: []const u8, grammar: ?BuiltInGrammar }{
+        .{ .path = "src/Main.java", .grammar = .java },
+        .{ .path = "src/Main.kt", .grammar = .kotlin },
+        .{ .path = "build.gradle.kts", .grammar = .kotlin },
+        .{ .path = "settings.gradle.kts", .grammar = .kotlin },
+        .{ .path = "build.gradle", .grammar = .groovy },
+        .{ .path = "src/Main.groovy", .grammar = .groovy },
+        .{ .path = "Jenkinsfile", .grammar = .groovy },
+        .{ .path = "ci/Jenkinsfile", .grammar = .groovy },
+        .{ .path = "Jenkinsfile.bak", .grammar = null },
+        .{ .path = "src/Program.cs", .grammar = .c_sharp },
+        .{ .path = "src/Program.csx", .grammar = null },
+    };
+    for (cases) |case| try testing.expectEqual(case.grammar, grammar_match.selectBuiltIn(case.path, ""));
+}
+
+test "M27 grammar fence names resolve to Java, Kotlin, Groovy, and C#" {
+    const cases = [_]struct { name: []const u8, grammar: BuiltInGrammar }{
+        .{ .name = "java", .grammar = .java },
+        .{ .name = "kotlin", .grammar = .kotlin },
+        .{ .name = "kt", .grammar = .kotlin },
+        .{ .name = "groovy", .grammar = .groovy },
+        .{ .name = "gradle", .grammar = .groovy },
+        .{ .name = "cs", .grammar = .c_sharp },
+        .{ .name = "csharp", .grammar = .c_sharp },
+        .{ .name = "c#", .grammar = .c_sharp },
+        .{ .name = "C#", .grammar = .c_sharp },
+    };
+    for (cases) |case| try testing.expectEqual(case.grammar, grammar_match.selectInjection(case.name).?);
+}
+
+const java_fixture =
+    \\// Greets a user.
+    \\package demo;
+    \\public class Greeter {
+    \\    String greet(String name) {
+    \\        return "hi " + name;
+    \\    }
+    \\}
+    \\
+;
+
+test "M27 grammar Java fixture has comment, string, keyword, function, and type roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/Greeter.java", java_fixture);
+    defer freeResult(result);
+
+    try expectRoleAt(result, java_fixture, "// Greets a user.", .comment);
+    try expectRoleAt(result, java_fixture, "\"hi \"", .string);
+    try expectRoleAt(result, java_fixture, "package", .keyword);
+    try expectRoleAt(result, java_fixture, "class", .keyword);
+    try expectRoleAt(result, java_fixture, "return", .keyword);
+    try expectRoleAt(result, java_fixture, "greet(", .function);
+    try expectRoleAt(result, java_fixture, "Greeter", .type);
+    try expectRoleAt(result, java_fixture, "String", .type);
+}
+
+const kotlin_fixture =
+    \\// Greets a user.
+    \\class Greeter {
+    \\    fun greet(name: String): String {
+    \\        return "hi " + name
+    \\    }
+    \\}
+    \\
+;
+
+test "M27 grammar Kotlin fixture has comment, string, keyword, function, and type roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/Greeter.kt", kotlin_fixture);
+    defer freeResult(result);
+
+    try expectRoleAt(result, kotlin_fixture, "// Greets a user.", .comment);
+    try expectRoleAt(result, kotlin_fixture, "\"hi \"", .string);
+    try expectRoleAt(result, kotlin_fixture, "class", .keyword);
+    try expectRoleAt(result, kotlin_fixture, "fun", .keyword);
+    try expectRoleAt(result, kotlin_fixture, "return", .keyword);
+    try expectRoleAt(result, kotlin_fixture, "greet(", .function);
+    try expectRoleAt(result, kotlin_fixture, "Greeter", .type);
+    try expectRoleAt(result, kotlin_fixture, "String", .type);
+}
+
+const groovy_fixture =
+    \\// Greets a user.
+    \\class Greeter {
+    \\    String greet(String name) {
+    \\        return "hi " + name
+    \\    }
+    \\}
+    \\println(new Greeter().greet("you"))
+    \\
+;
+
+test "M27 grammar Groovy fixture has comment, string, keyword, function, and type roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "build.gradle", groovy_fixture);
+    defer freeResult(result);
+
+    try expectRoleAt(result, groovy_fixture, "// Greets a user.", .comment);
+    try expectRoleAt(result, groovy_fixture, "\"hi \"", .string);
+    try expectRoleAt(result, groovy_fixture, "class", .keyword);
+    try expectRoleAt(result, groovy_fixture, "return", .keyword);
+    try expectRoleAt(result, groovy_fixture, "greet(", .function);
+    try expectRoleAt(result, groovy_fixture, "Greeter", .type);
+    try expectRoleAt(result, groovy_fixture, "String", .type);
+}
+
+const c_sharp_fixture =
+    \\// Greets a user.
+    \\namespace Demo {
+    \\    public class Greeter {
+    \\        public string Greet(string name) {
+    \\            return "hi " + name;
+    \\        }
+    \\    }
+    \\}
+    \\
+;
+
+test "M27 grammar C# fixture has comment, string, keyword, function, and type roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/Greeter.cs", c_sharp_fixture);
+    defer freeResult(result);
+
+    try expectRoleAt(result, c_sharp_fixture, "// Greets a user.", .comment);
+    try expectRoleAt(result, c_sharp_fixture, "\"hi \"", .string);
+    try expectRoleAt(result, c_sharp_fixture, "namespace", .keyword);
+    try expectRoleAt(result, c_sharp_fixture, "class", .keyword);
+    try expectRoleAt(result, c_sharp_fixture, "return", .keyword);
+    try expectRoleAt(result, c_sharp_fixture, "Greet(", .function);
+    try expectRoleAt(result, c_sharp_fixture, "Greeter", .type);
+    try expectRoleAt(result, c_sharp_fixture, "string", .type);
+}
+
+test "M27 grammar C# namespace module Capture has the type role" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/Greeter.cs", c_sharp_fixture);
+    defer freeResult(result);
+
+    try expectSpan(result, 2, 10, 14, "module");
 }
