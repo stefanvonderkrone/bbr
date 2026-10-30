@@ -52,6 +52,9 @@ pub const RunCtx = struct {
     external_edit_max_bytes: usize = 1024 * 1024,
     submission_locks: ?bbr.review.SubmissionLocks = null,
     online: bool = true,
+    /// `$XDG_STATE_HOME/bbr/browser-cache.json`, or null to disable the
+    /// Summary Cache. `src/main.zig` builds it.
+    summary_cache_path: ?[]const u8 = null,
 };
 
 /// Terminal events plus the single typed completion channel used by every
@@ -118,6 +121,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         .cell_metrics = vaxis_cell_metrics,
         .configured_theme = ctx.theme,
         .persist_theme = ctx.persist_theme,
+        .summary_cache = ctx.summary_cache_path != null,
     }, .{
         .initial = if (initial) |loaded| .{
             .key = initial_key,
@@ -1014,6 +1018,16 @@ fn presentationBrowserPullRequestsWorker(loop: *Loop, work_id: u64, client: bbr.
     presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.listBrowserPullRequests(std.heap.page_allocator, client, command));
 }
 
+fn presentationSummaryCacheLoadWorker(loop: *Loop, work_id: u64, io: std.Io, path: []const u8, command: presentation.LoadSummaryCache) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.loadSummaryCache(std.heap.page_allocator, io, path, command));
+}
+
+fn presentationSummaryCacheSaveWorker(loop: *Loop, work_id: u64, io: std.Io, path: []const u8, command: *presentation.SaveSummaryCache) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.saveSummaryCache(io, path, command));
+}
+
 fn presentationCodeHighlightWorker(loop: *Loop, work_id: u64, highlighter: bbr.highlight.Highlighter, command: *@import("code_highlighting.zig").Analyze) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .code_highlight_completed = command.execute(highlighter) });
@@ -1094,6 +1108,8 @@ fn drainPresentationCommands(
             .list_pull_requests => |list| ctx.io.concurrent(presentationListPullRequestsWorker, .{ loop, work_id, ctx.bitbucket.?, list }),
             .list_browser_repositories => |list| ctx.io.concurrent(presentationBrowserRepositoriesWorker, .{ loop, work_id, ctx.bitbucket.?, list }),
             .list_browser_pull_requests => |list| ctx.io.concurrent(presentationBrowserPullRequestsWorker, .{ loop, work_id, ctx.bitbucket.?, list }),
+            .load_summary_cache => |load| ctx.io.concurrent(presentationSummaryCacheLoadWorker, .{ loop, work_id, ctx.io, ctx.summary_cache_path.?, load }),
+            .save_summary_cache => |save| ctx.io.concurrent(presentationSummaryCacheSaveWorker, .{ loop, work_id, ctx.io, ctx.summary_cache_path.?, save }),
             .copy_clipboard, .persist_theme => unreachable,
             .external_edit => unreachable,
             .scan_buffer_search => |scan| ctx.io.concurrent(presentationBufferSearchWorker, .{ loop, work_id, scan }),

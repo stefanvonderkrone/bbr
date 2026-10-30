@@ -285,6 +285,8 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
     }
     var tree_sitter_highlighter = try TreeSitterHighlighter.init(gpa, if (grammar_registry) |*registry| registry else null);
     defer tree_sitter_highlighter.deinit();
+    const summary_cache_path = summaryCachePath(gpa, init.environ_map);
+    defer if (summary_cache_path) |path| gpa.free(path);
 
     app.run(.{
         .io = init.io,
@@ -304,6 +306,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .mouse_vertical_scroll_rows = configuration.mouse_vertical_scroll_rows,
         .external_edit_max_bytes = configuration.external_edit_max_bytes,
         .submission_locks = os_locks.locks(),
+        .summary_cache_path = summary_cache_path,
     }, null, try presentation.OwnedReviewIdentity.init(cred.workspace, target.repo, target.id)) catch |err| {
         if (tuiFatalMessage(err)) |message| {
             std.debug.print("{s}\n", .{message});
@@ -437,6 +440,14 @@ fn statePath(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.M
     var d = try std.Io.Dir.cwd().createDirPathOpen(io, dir, .{});
     d.close(io);
     return std.fmt.allocPrintSentinel(gpa, "{s}/pending.db", .{dir}, 0);
+}
+
+/// `<state home>/bbr/browser-cache.json`, or null without a state home. The
+/// save worker creates the directory. Caller frees.
+fn summaryCachePath(gpa: std.mem.Allocator, env_map: *std.process.Environ.Map) ?[]u8 {
+    const base = (bbr.xdg.stateHome(gpa, env_map) catch return null) orelse return null;
+    defer gpa.free(base);
+    return std.fmt.allocPrint(gpa, "{s}/bbr/browser-cache.json", .{base}) catch null;
 }
 
 fn openSubmissionLockDir(gpa: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map) !std.Io.Dir {
@@ -1487,6 +1498,25 @@ test "pending.db and submission locks live under an absolute XDG_STATE_HOME, els
         opened.close(testing.io);
     }
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, "relative/state", .{}));
+}
+
+test "M24 cache the Summary Cache path lives under the XDG state home" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("HOME", "/home/ada");
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "/state", "/state/bbr/browser-cache.json" },
+        .{ "", "/home/ada/.local/state/bbr/browser-cache.json" },
+        .{ "relative/state", "/home/ada/.local/state/bbr/browser-cache.json" },
+    }) |case| {
+        try env.put("XDG_STATE_HOME", case[0]);
+        const path = summaryCachePath(std.testing.allocator, &env).?;
+        defer std.testing.allocator.free(path);
+        try std.testing.expectEqualStrings(case[1], path);
+    }
+    _ = env.swapRemove("HOME");
+    _ = env.swapRemove("XDG_STATE_HOME");
+    try std.testing.expect(summaryCachePath(std.testing.allocator, &env) == null);
 }
 
 test "M24 acquisition check-browser fails when a required field is missing" {

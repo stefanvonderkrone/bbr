@@ -5649,6 +5649,32 @@ test "M24 browser the Browser Pane has rounded corners and the Workspace Title" 
     try testing.expectEqualStrings("│", win.readCell(79, 6).?.char.grapheme);
 }
 
+test "M24 cache a cached count paints dim and a loaded count paints normal" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 8, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    var nodes = try browserTestNodes(a, "Fix the cart");
+    const summaries = nodes[0].pull_requests.settled.loaded;
+    defer summaries.destroy();
+    const content = childRect(win, @import("frame.zig").browserEntries(.{ .cols = 80, .rows = 8 }));
+    const count_col = content.width - 1;
+    const date_col = count_col - 3;
+
+    nodes[0].pull_requests.settled = .{ .cached = summaries };
+    drawBrowser(a, win, .{ .workspace = "check24", .nodes = &nodes, .entries = &browser_test_entries, .cursor = 1, .scroll = 0 }, theme_dark);
+    try testing.expectEqualStrings("1", content.readCell(count_col, 0).?.char.grapheme);
+    try testing.expect(content.readCell(count_col, 0).?.style.dim);
+    try testing.expect(!content.readCell(date_col, 0).?.style.dim);
+
+    nodes[0].pull_requests.settled = .{ .loaded = summaries };
+    drawBrowser(a, win, .{ .workspace = "check24", .nodes = &nodes, .entries = &browser_test_entries, .cursor = 1, .scroll = 0 }, theme_dark);
+    try testing.expectEqualStrings("1", content.readCell(count_col, 0).?.char.grapheme);
+    try testing.expect(!content.readCell(count_col, 0).?.style.dim);
+}
+
 test "M24 browser entries show their facts and truncate the title first" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

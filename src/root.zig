@@ -179,6 +179,7 @@ pub const bitbucket = struct {
     pub const ReviewerVerdict = types.ReviewerVerdict;
     pub const ReviewerVerdictChangeResult = types.ReviewerVerdictChangeResult;
     pub const url = @import("bitbucket/url.zig");
+    pub const summary_cache = @import("bitbucket/summary_cache.zig");
 };
 
 pub const startup = @import("startup.zig");
@@ -193,6 +194,7 @@ test {
     _ = @import("bitbucket/client.zig");
     _ = @import("bitbucket/poster.zig");
     _ = @import("bitbucket/types.zig");
+    _ = @import("bitbucket/summary_cache.zig");
     _ = @import("diff/model.zig");
     _ = @import("diff/parser.zig");
     _ = @import("diff/intraline.zig");

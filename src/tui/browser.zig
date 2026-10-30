@@ -9,6 +9,7 @@ const bbr = @import("bbr");
 const Allocator = std.mem.Allocator;
 
 pub const RepositorySummary = bbr.bitbucket.RepositorySummary;
+const summary_cache = bbr.bitbucket.summary_cache;
 pub const PullRequestSummary = bbr.bitbucket.PullRequestSummary;
 pub const WorkId = u64;
 
@@ -45,6 +46,24 @@ pub const PullRequestSummaries = struct {
         self.arena.deinit();
         backing.destroy(self);
     }
+
+    /// Copies `items` and every string they hold.
+    pub fn copy(backing: Allocator, items: []const PullRequestSummary) Allocator.Error!*PullRequestSummaries {
+        const summaries = try create(backing);
+        errdefer summaries.destroy();
+        const a = summaries.arena.allocator();
+        const prs = try a.alloc(PullRequestSummary, items.len);
+        for (items, prs) |item, *pr| {
+            pr.* = item;
+            pr.title = try a.dupe(u8, item.title);
+            pr.state = try a.dupe(u8, item.state);
+            pr.author_display_name = try a.dupe(u8, item.author_display_name);
+            pr.source_branch = try a.dupe(u8, item.source_branch);
+            pr.destination_branch = try a.dupe(u8, item.destination_branch);
+        }
+        summaries.prs = prs;
+        return summaries;
+    }
 };
 
 /// Owned Repository Summaries from one Repository list load.
@@ -60,6 +79,25 @@ pub const RepositorySummaries = struct {
     }
 
     pub fn destroy(self: *RepositorySummaries) void {
+        const backing = self.arena.child_allocator;
+        self.arena.deinit();
+        backing.destroy(self);
+    }
+};
+
+/// An owned Summary Cache Snapshot from one Summary Cache load.
+pub const CachedSummaries = struct {
+    arena: std.heap.ArenaAllocator,
+    snapshot: summary_cache.Snapshot,
+
+    pub fn create(backing: Allocator) !*CachedSummaries {
+        const cached = try backing.create(CachedSummaries);
+        cached.arena = std.heap.ArenaAllocator.init(backing);
+        cached.snapshot = .{ .workspace = "", .repositories = &.{} };
+        return cached;
+    }
+
+    pub fn destroy(self: *CachedSummaries) void {
         const backing = self.arena.child_allocator;
         self.arena.deinit();
         backing.destroy(self);
@@ -309,6 +347,9 @@ pub const Browser = struct {
     start_repository: Name = .{},
     nodes: std.ArrayList(RepositoryNode) = .empty,
     repositories: RepositoryList = .{},
+    /// The Summary Cache that the node summaries borrow until the first
+    /// Repository list success replaces them.
+    cached: ?*CachedSummaries = null,
     sort: Sort = .updated,
     entries: []Entry = &.{},
     cursor: ?Selection = null,
@@ -340,6 +381,7 @@ pub const Browser = struct {
         for (self.nodes.items) |*node| node.pull_requests.settled.deinit();
         self.nodes.deinit(self.allocator);
         if (self.repositories.loaded) |loaded| loaded.destroy();
+        if (self.cached) |cached| cached.destroy();
         self.allocator.free(self.entries);
         self.allocator.destroy(self);
     }
@@ -448,6 +490,53 @@ pub const Browser = struct {
         if (self.repositories.loaded) |old| old.destroy();
         self.repositories.loaded = list;
         self.repositories.failure = null;
+        if (self.cached) |cached| cached.destroy();
+        self.cached = null;
+    }
+
+    /// Fills the Browser from the Summary Cache, which the Browser then owns.
+    /// Call it only before the first Repository list success. A cached
+    /// Repository updates its node or adds one. A cached PullRequest list
+    /// fills only a node with no settled list. On error the caller still owns
+    /// `cache`.
+    pub fn fillFromCache(self: *Browser, cache: *CachedSummaries) Allocator.Error!void {
+        std.debug.assert(self.repositories.loaded == null);
+        const repositories = cache.snapshot.repositories;
+        try self.nodes.ensureUnusedCapacity(self.allocator, repositories.len);
+        const lists = try self.allocator.alloc(?*PullRequestSummaries, repositories.len);
+        defer self.allocator.free(lists);
+        @memset(lists, null);
+        defer for (lists) |unused| if (unused) |owner| owner.destroy();
+        for (repositories, lists) |repository, *list| {
+            const prs = repository.pull_requests orelse continue;
+            list.* = try PullRequestSummaries.copy(self.allocator, prs);
+        }
+
+        for (repositories, lists) |repository, *list| {
+            const index = self.findNode(repository.summary.slug) orelse blk: {
+                self.nodes.appendAssumeCapacity(.{ .summary = repository.summary });
+                break :blk self.nodes.items.len - 1;
+            };
+            const node = &self.nodes.items[index];
+            node.summary = repository.summary;
+            if (node.pull_requests.settled == .unknown) if (list.*) |owner| {
+                node.pull_requests.settled = .{ .cached = owner };
+                list.* = null;
+            };
+        }
+        if (self.cached) |old| old.destroy();
+        self.cached = cache;
+    }
+
+    /// The Summary Cache Snapshot of the current nodes. It borrows the
+    /// Browser data. The caller frees only `repositories`.
+    pub fn snapshot(self: *const Browser, allocator: Allocator) Allocator.Error!summary_cache.Snapshot {
+        const repositories = try allocator.alloc(summary_cache.Repository, self.nodes.items.len);
+        for (self.nodes.items, repositories) |node, *repository| repository.* = .{
+            .summary = node.summary,
+            .pull_requests = node.pull_requests.settled.list(),
+        };
+        return .{ .workspace = self.workspace.slice(), .repositories = repositories };
     }
 
     /// Stores a current PullRequest list completion. The Browser takes the
@@ -895,4 +984,28 @@ test "M24 browser failure keeps ApiError names and maps other errors" {
     try testing.expectEqual(@as(Failure, error.RateLimited), failure(error.RateLimited));
     try testing.expectEqual(@as(Failure, error.OutOfMemory), failure(error.OutOfMemory));
     try testing.expectEqual(@as(Failure, error.ConnectionFailed), failure(error.ConnectionResetByPeer));
+}
+
+test "M24 cache the Summary Cache fills only nodes with no settled list and copies its PullRequests" {
+    var browser = try Browser.create(testing.allocator, try testStart("repo", null), 10);
+    defer browser.destroy();
+    browser.nodes.items[0].pull_requests.request = .{ .issued = 1 };
+    browser.storePullRequests(0, .{ .loaded = try testPullRequests(&.{testPr(1, 1)}) });
+
+    const cache = try CachedSummaries.create(testing.allocator);
+    const a = cache.arena.allocator();
+    cache.snapshot = .{ .workspace = "check24", .repositories = try a.dupe(summary_cache.Repository, &.{
+        .{ .summary = .{ .slug = "repo", .name = "Repo", .updated_on = 4 }, .pull_requests = try a.dupe(PullRequestSummary, &.{testPr(9, 1)}) },
+        .{ .summary = .{ .slug = "api", .name = "API", .updated_on = 3 }, .pull_requests = try a.dupe(PullRequestSummary, &.{testPr(5, 1)}) },
+    }) };
+    try browser.fillFromCache(cache);
+    try testing.expectEqualStrings("Repo", browser.nodes.items[0].summary.name);
+    try testing.expect(browser.nodes.items[0].pull_requests.settled == .loaded);
+    try testing.expectEqual(@as(u64, 1), browser.nodes.items[0].pull_requests.settled.list().?[0].id);
+    const api = browser.findNode("api").?;
+    try testing.expect(browser.nodes.items[api].pull_requests.settled == .cached);
+
+    try browser.replaceRepositories(try testRepositories(&.{.{ .slug = "api", .name = "API", .updated_on = 3 }}));
+    try testing.expect(browser.cached == null);
+    try testing.expectEqual(@as(u64, 5), browser.nodes.items[0].pull_requests.settled.list().?[0].id);
 }

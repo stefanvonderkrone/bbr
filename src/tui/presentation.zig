@@ -873,6 +873,8 @@ pub const Dependencies = struct {
     configured_theme: ThemeId = .system,
     /// False for the demo: choosing a Theme applies it to this process only.
     persist_theme: bool = true,
+    /// True when a Summary Cache path exists. The adapter owns the path.
+    summary_cache: bool = false,
 };
 
 pub const InitialReview = struct {
@@ -931,6 +933,8 @@ pub const OwnedInput = union(enum) {
     picker_tick: WorkId,
     browser_repositories_loaded: BrowserRepositoriesLoaded,
     browser_pull_requests_loaded: BrowserPullRequestsLoaded,
+    summary_cache_loaded: SummaryCacheLoaded,
+    summary_cache_saved: SummaryCacheSaved,
     clipboard_completed: ClipboardCompleted,
     theme_persisted: ThemePersisted,
     external_edit_completed: *ExternalEditCompleted,
@@ -954,6 +958,7 @@ pub const OwnedInput = union(enum) {
             .pull_requests_loaded => |loaded| if (loaded.outcome == .loaded) loaded.outcome.loaded.destroy(),
             .browser_repositories_loaded => |loaded| if (loaded.outcome == .loaded) loaded.outcome.loaded.destroy(),
             .browser_pull_requests_loaded => |loaded| if (loaded.outcome == .loaded) loaded.outcome.loaded.destroy(),
+            .summary_cache_loaded => |loaded| if (loaded.cache) |cache| cache.destroy(),
             .external_edit_completed => |completed| completed.destroy(),
             .buffer_search_scanned => |*completed| completed.deinit(),
             .buffer_disclosure_built => |completed| completed.destroy(),
@@ -1105,6 +1110,47 @@ pub const BrowserPullRequestsLoaded = struct {
     command_id: CommandId = 0,
     work_id: WorkId,
     outcome: browser_mod.PullRequestsOutcome,
+};
+
+pub const LoadSummaryCache = struct {
+    command_id: CommandId = 0,
+    workspace: browser_mod.Name,
+
+    pub fn workspaceName(self: *const LoadSummaryCache) []const u8 {
+        return self.workspace.slice();
+    }
+};
+
+/// A null cache is an empty Summary Cache: a missing file, a parse error, or
+/// another Workspace.
+pub const SummaryCacheLoaded = struct {
+    command_id: CommandId = 0,
+    cache: ?*browser_mod.CachedSummaries,
+};
+
+/// One encoded Summary Cache Snapshot to write.
+pub const SaveSummaryCache = struct {
+    allocator: Allocator,
+    command_id: CommandId = 0,
+    bytes: []u8,
+
+    /// Takes `bytes`, which `allocator` owns. On error the caller still owns them.
+    pub fn create(allocator: Allocator, bytes: []u8) Allocator.Error!*SaveSummaryCache {
+        const command = try allocator.create(SaveSummaryCache);
+        command.* = .{ .allocator = allocator, .bytes = bytes };
+        return command;
+    }
+
+    pub fn destroy(self: *SaveSummaryCache) void {
+        const allocator = self.allocator;
+        allocator.free(self.bytes);
+        allocator.destroy(self);
+    }
+};
+
+pub const SummaryCacheSaved = struct {
+    command_id: CommandId = 0,
+    saved: bool,
 };
 
 /// The most `list_browser_pull_requests` commands outstanding at one time.
@@ -1479,6 +1525,8 @@ pub const OwnedCommand = union(enum) {
     list_pull_requests: ListPullRequests,
     list_browser_repositories: ListBrowserRepositories,
     list_browser_pull_requests: ListBrowserPullRequests,
+    load_summary_cache: LoadSummaryCache,
+    save_summary_cache: *SaveSummaryCache,
     copy_clipboard: *ClipboardCopy,
     persist_theme: PersistTheme,
     external_edit: *ExternalEdit,
@@ -1494,11 +1542,12 @@ pub const OwnedCommand = union(enum) {
             .update_comment => |command| command.destroy(),
             .delete_comment => |command| command.destroy(),
             .copy_clipboard => |command| command.destroy(),
+            .save_summary_cache => |command| command.destroy(),
             .external_edit => |command| command.destroy(),
             .scan_buffer_search => |*command| command.deinit(),
             .build_buffer_disclosure => |command| command.destroy(),
             .scan_review_source => |*command| command.deinit(),
-            .load_session, .enrich_file, .change_reviewer_verdict, .wait_submission, .check_recovery, .list_pull_requests, .list_browser_repositories, .list_browser_pull_requests, .persist_theme => {},
+            .load_session, .enrich_file, .change_reviewer_verdict, .wait_submission, .check_recovery, .list_pull_requests, .list_browser_repositories, .list_browser_pull_requests, .load_summary_cache, .persist_theme => {},
         }
         self.* = undefined;
     }
@@ -1589,6 +1638,8 @@ pub const OwnedCommand = union(enum) {
                 .work_id = list.work_id,
                 .outcome = .{ .failed = error.WorkerLaunchFailed },
             } },
+            .load_summary_cache => |load| .{ .summary_cache_loaded = .{ .command_id = load.command_id, .cache = null } },
+            .save_summary_cache => |save| .{ .summary_cache_saved = .{ .command_id = save.command_id, .saved = false } },
             .copy_clipboard => |copy| .{ .clipboard_completed = .{ .command_id = copy.command_id, .success = false } },
             .persist_theme => |persist| .{ .theme_persisted = .{ .command_id = persist.command_id, .outcome = .write_failed } },
             .external_edit => |edit| blk: {
@@ -1644,6 +1695,8 @@ fn setCommandId(command: *OwnedCommand, command_id: CommandId) void {
         .list_pull_requests => |*value| value.command_id = command_id,
         .list_browser_repositories => |*value| value.command_id = command_id,
         .list_browser_pull_requests => |*value| value.command_id = command_id,
+        .load_summary_cache => |*value| value.command_id = command_id,
+        .save_summary_cache => |value| value.command_id = command_id,
         .copy_clipboard => |value| value.command_id = command_id,
         .persist_theme => |*value| value.command_id = command_id,
         .external_edit => |value| value.command_id = command_id,
@@ -1725,6 +1778,8 @@ const LaunchFailureFixture = struct {
             .list_pull_requests => .{ .list_pull_requests = .{ .work_id = work_id, .repository = undefined } },
             .list_browser_repositories => .{ .list_browser_repositories = .{ .work_id = work_id } },
             .list_browser_pull_requests => .{ .list_browser_pull_requests = .{ .work_id = work_id, .repository = try browser_mod.Name.init("repo") } },
+            .load_summary_cache => .{ .load_summary_cache = .{ .workspace = try browser_mod.Name.init("workspace") } },
+            .save_summary_cache => .{ .save_summary_cache = try SaveSummaryCache.create(a, try a.dupe(u8, "{}")) },
             .copy_clipboard => blk: {
                 const copy = try a.create(ClipboardCopy);
                 copy.* = .{ .allocator = a, .text = try a.dupe(u8, "copy") };
@@ -1832,6 +1887,14 @@ const LaunchFailureFixture = struct {
                 try testing.expectEqual(command_id, loaded.command_id);
                 try testing.expectEqual(work_id, loaded.work_id);
                 try testing.expectEqual(@as(browser_mod.Failure, error.WorkerLaunchFailed), loaded.outcome.failed);
+            },
+            .summary_cache_loaded => |loaded| {
+                try testing.expectEqual(command_id, loaded.command_id);
+                try testing.expect(loaded.cache == null);
+            },
+            .summary_cache_saved => |saved| {
+                try testing.expectEqual(command_id, saved.command_id);
+                try testing.expect(!saved.saved);
             },
             .clipboard_completed => |completed| {
                 try testing.expectEqual(command_id, completed.command_id);
@@ -5969,6 +6032,9 @@ pub const Presentation = struct {
     surface: Surface = .review,
     /// Queued and issued `list_browser_pull_requests` commands.
     browser_pull_request_commands: usize = 0,
+    /// A save wanted while another save runs. Its completion queues a
+    /// Snapshot of the Browser at that time.
+    summary_cache_save_waiting: bool = false,
     configured_theme: ThemeId,
     help_visible: bool = false,
     durable_submission: ?*DurableSubmission = null,
@@ -6133,6 +6199,8 @@ pub const Presentation = struct {
             .picker_tick => |scope| if (!self.shutdown_requested) if (self.list_overlay) |*overlay| overlay.tick(scope),
             .browser_repositories_loaded => |loaded| self.acceptBrowserRepositories(loaded),
             .browser_pull_requests_loaded => |loaded| self.acceptBrowserPullRequests(loaded),
+            .summary_cache_loaded => |loaded| self.acceptSummaryCache(loaded),
+            .summary_cache_saved => |saved| self.acceptSummaryCacheSaved(saved),
             .theme_persisted => |persisted| self.acceptThemePersisted(persisted),
             .clipboard_completed => |completed| {
                 if (!self.consumeCommand(completed.command_id, .copy_clipboard)) return;
@@ -6206,6 +6274,7 @@ pub const Presentation = struct {
             },
             .list_pull_requests => self.outstanding_picker_loads += 1,
             .list_browser_repositories, .list_browser_pull_requests => {},
+            .load_summary_cache, .save_summary_cache => {},
             .copy_clipboard => {},
             .persist_theme => {},
             .external_edit => {},
@@ -12199,7 +12268,7 @@ pub const Presentation = struct {
     /// start only shows it.
     fn startBrowser(self: *Presentation, start: BrowserStart) void {
         if (self.browser == null) {
-            self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+            self.commands.ensureUnusedCapacity(self.allocator, 2) catch {
                 self.action_error = .out_of_memory;
                 return;
             };
@@ -12208,6 +12277,7 @@ pub const Presentation = struct {
                 return;
             };
             self.browser = state;
+            if (self.dependencies.summary_cache) self.commands.appendAssumeCapacity(.{ .load_summary_cache = .{ .workspace = start.workspace } });
             self.next_work_id += 1;
             state.repositories.work = self.next_work_id;
             self.commands.appendAssumeCapacity(.{ .list_browser_repositories = .{ .work_id = self.next_work_id } });
@@ -12369,7 +12439,9 @@ pub const Presentation = struct {
         if (state.repositories.work != loaded.work_id) return input.deinit();
         state.repositories.work = null;
         switch (loaded.outcome) {
-            .loaded => |list| state.replaceRepositories(list) catch {
+            .loaded => |list| if (state.replaceRepositories(list)) |_| {
+                self.saveSummaryCache(state);
+            } else |_| {
                 list.destroy();
                 self.action_error = .out_of_memory;
             },
@@ -12396,8 +12468,56 @@ pub const Presentation = struct {
             state.dropWaiting();
             self.action_error = .browser_rate_limited;
         }
+        if (loaded.outcome == .loaded) self.saveSummaryCache(state);
         self.pumpBrowserLoads(state);
         self.rebuildBrowser(state);
+    }
+
+    /// Fills the Browser from the Summary Cache until the first Repository
+    /// list success. After it, the cache completion changes nothing.
+    fn acceptSummaryCache(self: *Presentation, loaded: SummaryCacheLoaded) void {
+        var input: OwnedInput = .{ .summary_cache_loaded = loaded };
+        if (!self.consumeCommand(loaded.command_id, .load_summary_cache)) return input.deinit();
+        const cache = loaded.cache orelse return;
+        const state = self.browser orelse return input.deinit();
+        if (state.repositories.loaded != null) return input.deinit();
+        state.fillFromCache(cache) catch return input.deinit();
+        self.rebuildBrowser(state);
+    }
+
+    /// A failed save changes nothing visible. The next save retries.
+    fn acceptSummaryCacheSaved(self: *Presentation, saved: SummaryCacheSaved) void {
+        if (!self.consumeCommand(saved.command_id, .save_summary_cache)) return;
+        if (!self.summary_cache_save_waiting) return;
+        self.summary_cache_save_waiting = false;
+        if (self.browser) |state| self.saveSummaryCache(state);
+    }
+
+    /// Queues a save of the current Browser. At most one save runs. A save
+    /// that waits for a worker takes the newer Snapshot. Only a Browser that
+    /// a Repository list filled is saved, so a save never drops the
+    /// Repositories that the Summary Cache still holds.
+    fn saveSummaryCache(self: *Presentation, state: *const browser_mod.Browser) void {
+        if (!self.dependencies.summary_cache or self.shutdown_requested or state.repositories.loaded == null) return;
+        for (self.issued_commands.items) |issued| if (issued.target == .save_summary_cache) {
+            self.summary_cache_save_waiting = true;
+            return;
+        };
+        const command = self.encodeSummaryCache(state) catch return;
+        for (self.commands.items) |*queued| if (queued.* == .save_summary_cache) {
+            queued.deinit();
+            queued.* = .{ .save_summary_cache = command };
+            return;
+        };
+        self.commands.append(self.allocator, .{ .save_summary_cache = command }) catch command.destroy();
+    }
+
+    fn encodeSummaryCache(self: *Presentation, state: *const browser_mod.Browser) Allocator.Error!*SaveSummaryCache {
+        const snapshot = try state.snapshot(self.allocator);
+        defer self.allocator.free(snapshot.repositories);
+        const bytes = try bbr.bitbucket.summary_cache.encode(self.allocator, snapshot);
+        errdefer self.allocator.free(bytes);
+        return SaveSummaryCache.create(self.allocator, bytes);
     }
 
     fn finishReviewerVerdictReconciliation(self: *Presentation, key: OwnedReviewIdentity) void {
@@ -30305,4 +30425,244 @@ test "M24 browser Session replacement keeps the Browser scroll" {
     try expectNoCommand(&presentation);
     try testing.expectEqual(scroll, presentation.projection().browser.?.scroll);
     try testing.expectEqual(cursor, presentation.projection().browser.?.cursor);
+}
+
+const CachedRepositoryFixture = struct { slug: []const u8, name: []const u8, ids: ?[]const u64 };
+
+fn summaryCacheFixture(workspace: []const u8, repositories: []const CachedRepositoryFixture) !*browser_mod.CachedSummaries {
+    const cache = try browser_mod.CachedSummaries.create(testing.allocator);
+    errdefer cache.destroy();
+    const a = cache.arena.allocator();
+    const items = try a.alloc(bbr.bitbucket.summary_cache.Repository, repositories.len);
+    for (repositories, items, 0..) |fixture, *item, index| {
+        item.* = .{ .summary = .{ .slug = fixture.slug, .name = fixture.name, .updated_on = @intCast(1000 - index) }, .pull_requests = null };
+        const ids = fixture.ids orelse continue;
+        const prs = try a.alloc(bbr.bitbucket.PullRequestSummary, ids.len);
+        for (prs, ids) |*pr, id| pr.* = .{ .id = id, .title = "cached", .state = "OPEN", .author_display_name = "Ada", .source_branch = "feature", .destination_branch = "main" };
+        item.pull_requests = prs;
+    }
+    cache.snapshot = .{ .workspace = workspace, .repositories = items };
+    return cache;
+}
+
+fn takeLoadSummaryCacheCommand(presentation: *Presentation) !LoadSummaryCache {
+    const command = presentation.takeCommand() orelse return error.MissingCommand;
+    if (command != .load_summary_cache) {
+        var value = command;
+        value.deinit();
+        return error.UnexpectedCommand;
+    }
+    return command.load_summary_cache;
+}
+
+/// Takes the next command, which must be a save, and decodes its Snapshot.
+fn takeSaveSummaryCacheCommand(presentation: *Presentation, arena: Allocator) !struct { command_id: CommandId, snapshot: bbr.bitbucket.summary_cache.Snapshot } {
+    var command = presentation.takeCommand() orelse return error.MissingCommand;
+    defer command.deinit();
+    if (command != .save_summary_cache) return error.UnexpectedCommand;
+    const save = command.save_summary_cache;
+    return .{ .command_id = save.command_id, .snapshot = bbr.bitbucket.summary_cache.decode(arena, save.bytes) orelse return error.InvalidSnapshot };
+}
+
+fn queuedSummaryCacheSaves(presentation: *const Presentation) usize {
+    var count: usize = 0;
+    for (presentation.commands.items) |command| {
+        if (command == .save_summary_cache) count += 1;
+    }
+    return count;
+}
+
+fn snapshotPullRequestIds(snapshot: bbr.bitbucket.summary_cache.Snapshot, slug: []const u8) ?[]const u64 {
+    const S = struct {
+        var ids: [16]u64 = undefined;
+    };
+    for (snapshot.repositories) |repository| if (std.mem.eql(u8, repository.summary.slug, slug)) {
+        const prs = repository.pull_requests orelse return null;
+        for (prs, 0..) |pr, index| S.ids[index] = pr.id;
+        return S.ids[0..prs.len];
+    };
+    return null;
+}
+
+test "M24 cache the Browser shows cached rows before any network completion, and a Repository list success replaces them" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined, .summary_cache = true });
+    defer presentation.deinit();
+
+    try browserKey(&presentation, 'b');
+    const load = try takeLoadSummaryCacheCommand(&presentation);
+    try testing.expectEqualStrings("check24", load.workspaceName());
+    const repositories = try takeBrowserRepositoriesCommand(&presentation);
+    const pull_requests = try takeBrowserPullRequestsCommand(&presentation, "repo");
+    try expectNoCommand(&presentation);
+
+    try presentation.dispatch(.{ .summary_cache_loaded = .{ .command_id = load.command_id, .cache = try summaryCacheFixture("check24", &.{
+        .{ .slug = "repo", .name = "Repo", .ids = &.{ 7, 8 } },
+        .{ .slug = "lost", .name = "Lost", .ids = &.{5} },
+        .{ .slug = "api", .name = "API", .ids = null },
+    }) } });
+    const state = presentation.browser.?;
+    try testing.expectEqual(@as(usize, 3), state.nodes.items.len);
+    try testing.expectEqualStrings("Repo", state.nodes.items[state.findNode("repo").?].summary.name);
+    try testing.expect(state.nodes.items[state.findNode("repo").?].pull_requests.settled == .cached);
+    try testing.expect(state.nodes.items[state.findNode("lost").?].pull_requests.settled == .cached);
+    try testing.expect(state.nodes.items[state.findNode("api").?].pull_requests.settled == .unknown);
+    try expectBrowserPullRequests(&presentation, "repo", &.{ 8, 7 });
+    try testing.expect(browserCursor(&presentation).? == .repository);
+    try expectNoCommand(&presentation);
+
+    try completeBrowserRepositories(&presentation, repositories, &.{ "repo", "api" });
+    try testing.expectEqual(@as(usize, 2), state.nodes.items.len);
+    try testing.expect(state.findNode("lost") == null);
+    try testing.expectEqualStrings("repo", state.nodes.items[state.findNode("repo").?].summary.name);
+    try testing.expect(state.cached == null);
+    try expectBrowserPullRequests(&presentation, "repo", &.{ 8, 7 });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const saved = try takeSaveSummaryCacheCommand(&presentation, arena.allocator());
+    try testing.expectEqualStrings("check24", saved.snapshot.workspace);
+    try testing.expectEqual(@as(usize, 2), saved.snapshot.repositories.len);
+    try testing.expectEqualSlices(u64, &.{ 7, 8 }, snapshotPullRequestIds(saved.snapshot, "repo").?);
+    try testing.expect(snapshotPullRequestIds(saved.snapshot, "api") == null);
+
+    try completeBrowserPullRequests(&presentation, pull_requests, &.{ 2, 1 });
+    try testing.expect(state.nodes.items[state.findNode("repo").?].pull_requests.settled == .loaded);
+    try testing.expectEqual(@as(u64, 1), browserCursor(&presentation).?.pull_request.id);
+}
+
+test "M24 cache a Summary Cache completion after a Repository list success changes nothing" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined, .summary_cache = true });
+    defer presentation.deinit();
+
+    try browserKey(&presentation, 'b');
+    const load = try takeLoadSummaryCacheCommand(&presentation);
+    const repositories = try takeBrowserRepositoriesCommand(&presentation);
+    _ = try takeBrowserPullRequestsCommand(&presentation, "repo");
+    try completeBrowserRepositories(&presentation, repositories, &.{ "repo", "api" });
+    const rows = try testing.allocator.dupe(browser_mod.Entry, browserRows(&presentation));
+    defer testing.allocator.free(rows);
+
+    try presentation.dispatch(.{ .summary_cache_loaded = .{ .command_id = load.command_id, .cache = try summaryCacheFixture("check24", &.{
+        .{ .slug = "gone", .name = "Gone", .ids = &.{3} },
+        .{ .slug = "api", .name = "Cached API", .ids = &.{4} },
+    }) } });
+    try testing.expectEqualSlices(browser_mod.Entry, rows, browserRows(&presentation));
+    try testing.expect(presentation.browser.?.findNode("gone") == null);
+    try testing.expectEqualStrings("api", presentation.browser.?.nodes.items[presentation.browser.?.findNode("api").?].summary.name);
+    try testing.expect(presentation.browser.?.cached == null);
+}
+
+test "M24 cache a cached PullRequest list shows as a cached load, and its first expansion queues a refresh" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined, .summary_cache = true });
+    defer presentation.deinit();
+
+    try browserKey(&presentation, 'b');
+    const load = try takeLoadSummaryCacheCommand(&presentation);
+    _ = try takeBrowserRepositoriesCommand(&presentation);
+    _ = try takeBrowserPullRequestsCommand(&presentation, "repo");
+    try presentation.dispatch(.{ .summary_cache_loaded = .{ .command_id = load.command_id, .cache = try summaryCacheFixture("check24", &.{
+        .{ .slug = "repo", .name = "Repo", .ids = null },
+        .{ .slug = "api", .name = "API", .ids = &.{ 4, 3 } },
+    }) } });
+    const state = presentation.browser.?;
+    const api = state.findNode("api").?;
+    try testing.expect(state.nodes.items[api].pull_requests.settled == .cached);
+    try testing.expectEqual(@as(?usize, 2), state.nodes.items[api].count());
+    try expectBrowserPullRequests(&presentation, "api", &.{});
+
+    try browserCursorTo(&presentation, "api");
+    try browserKey(&presentation, 'l');
+    const refresh = try takeBrowserPullRequestsCommand(&presentation, "api");
+    try expectBrowserPullRequests(&presentation, "api", &.{ 4, 3 });
+    try completeBrowserPullRequests(&presentation, refresh, &.{4});
+    try testing.expect(state.nodes.items[api].pull_requests.settled == .loaded);
+    try expectBrowserPullRequests(&presentation, "api", &.{4});
+
+    try browserKey(&presentation, 'h');
+    try browserKey(&presentation, 'l');
+    try expectNoCommand(&presentation);
+}
+
+test "M24 cache a newer Snapshot replaces a waiting save, and only one save runs at a time" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined, .summary_cache = true });
+    defer presentation.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    try browserKey(&presentation, 'b');
+    _ = try takeLoadSummaryCacheCommand(&presentation);
+    const repositories = try takeBrowserRepositoriesCommand(&presentation);
+    const repo = try takeBrowserPullRequestsCommand(&presentation, "repo");
+    try completeBrowserRepositories(&presentation, repositories, &.{ "repo", "api", "web" });
+    try testing.expectEqual(@as(usize, 1), queuedSummaryCacheSaves(&presentation));
+    try completeBrowserPullRequests(&presentation, repo, &.{1});
+    try testing.expectEqual(@as(usize, 1), queuedSummaryCacheSaves(&presentation));
+    const first = try takeSaveSummaryCacheCommand(&presentation, arena.allocator());
+    try testing.expectEqualSlices(u64, &.{1}, snapshotPullRequestIds(first.snapshot, "repo").?);
+    try testing.expect(snapshotPullRequestIds(first.snapshot, "api") == null);
+
+    inline for (.{ .{ "api", &[_]u64{ 6, 5 } }, .{ "web", &[_]u64{9} } }) |load| {
+        try browserCursorTo(&presentation, load[0]);
+        try browserKey(&presentation, 'l');
+        const command = try takeBrowserPullRequestsCommand(&presentation, load[0]);
+        try completeBrowserPullRequests(&presentation, command, load[1]);
+        try testing.expectEqual(@as(usize, 0), queuedSummaryCacheSaves(&presentation));
+        try expectNoCommand(&presentation);
+    }
+
+    try presentation.dispatch(.{ .summary_cache_saved = .{ .command_id = first.command_id, .saved = true } });
+    const second = try takeSaveSummaryCacheCommand(&presentation, arena.allocator());
+    try testing.expectEqualSlices(u64, &.{ 6, 5 }, snapshotPullRequestIds(second.snapshot, "api").?);
+    try testing.expectEqualSlices(u64, &.{9}, snapshotPullRequestIds(second.snapshot, "web").?);
+    try presentation.dispatch(.{ .summary_cache_saved = .{ .command_id = second.command_id, .saved = true } });
+    try expectNoCommand(&presentation);
+}
+
+test "M24 cache a failed save leaves the Browser unchanged" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined, .summary_cache = true });
+    defer presentation.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    try browserKey(&presentation, 'b');
+    _ = try takeLoadSummaryCacheCommand(&presentation);
+    const repositories = try takeBrowserRepositoriesCommand(&presentation);
+    _ = try takeBrowserPullRequestsCommand(&presentation, "repo");
+    try completeBrowserRepositories(&presentation, repositories, &.{ "repo", "api" });
+    const save = try takeSaveSummaryCacheCommand(&presentation, arena.allocator());
+    const rows = try testing.allocator.dupe(browser_mod.Entry, browserRows(&presentation));
+    defer testing.allocator.free(rows);
+    const before = presentation.projection();
+
+    try presentation.dispatch(.{ .summary_cache_saved = .{ .command_id = save.command_id, .saved = false } });
+    const after = presentation.projection();
+    try testing.expectEqualSlices(browser_mod.Entry, rows, after.browser.?.entries);
+    try testing.expectEqual(before.browser.?.cursor, after.browser.?.cursor);
+    try testing.expect(after.action_error == null);
+    try expectNoCommand(&presentation);
+}
+
+test "M24 cache a null Summary Cache path issues no Summary Cache command" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined });
+    defer presentation.deinit();
+
+    try browserKey(&presentation, 'b');
+    const repositories = try takeBrowserRepositoriesCommand(&presentation);
+    const pull_requests = try takeBrowserPullRequestsCommand(&presentation, "repo");
+    try expectNoCommand(&presentation);
+    try completeBrowserRepositories(&presentation, repositories, &.{"repo"});
+    try completeBrowserPullRequests(&presentation, pull_requests, &.{1});
+    try expectNoCommand(&presentation);
 }
