@@ -539,6 +539,7 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .buffer_search_hit_bottom => "Search hit BOTTOM, continuing at TOP",
         .buffer_search_hit_top => "Search hit TOP, continuing at BOTTOM",
         .file_read_save_failed => "File read state not saved",
+        .file_read_load_failed => "File read state unavailable, all Files show unread",
         .file_read_unverifiable => "File cannot be verified, so it stays unread",
         else => @tagName(err),
     };
@@ -1434,6 +1435,10 @@ test "pinned vaxis fixtures preserve Shift Arrow selection input" {
         try std.testing.expectEqual(fixture.codepoint, portable.codepoint);
         try std.testing.expect(portable.mods.shift);
     }
+}
+
+test "M22 read the receipt load failure status names the unread fallback" {
+    try std.testing.expectEqualStrings("File read state unavailable, all Files show unread", actionErrorText(.file_read_load_failed));
 }
 
 test "status labels project every Reviewer Verdict" {

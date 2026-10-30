@@ -112,6 +112,7 @@ pub const InMemoryFileReadStore = struct {
     arena: std.heap.ArenaAllocator,
     entries: std.ArrayList(Entry) = .empty,
     fail_load: bool = false,
+    load_error: ?anyerror = null,
     fail_put: bool = false,
     fail_delete: bool = false,
     /// Every `put` and `delete` call, failed calls included.
@@ -144,6 +145,7 @@ pub const InMemoryFileReadStore = struct {
 
     fn loadImpl(ptr: *anyopaque, allocator: Allocator, identity: ReviewIdentity) anyerror![]FileReadReceipt {
         const self: *InMemoryFileReadStore = @ptrCast(@alignCast(ptr));
+        if (self.load_error) |err| return err;
         if (self.fail_load) return error.InjectedLoadFailure;
         var receipts: std.ArrayList(FileReadReceipt) = .empty;
         errdefer {

@@ -4094,6 +4094,37 @@ test "M22 read the File Tree weight follows File Read State on every row" {
     };
 }
 
+test "M22 read Directory row weight follows descendants in every Theme including selected rows" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 3, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const Entry = @import("file_tree.zig").Entry;
+    for (@import("theme.zig").builtins) |builtin| for ([_]bool{ false, true }) |unread| {
+        const theme = builtin.value;
+        const entries = [_]Entry{
+            .{ .identity = .{ .directory = "src" }, .parent = null, .depth = 0, .label = "src/", .expanded = true, .active_descendant = true, .unread = unread },
+            .{ .identity = .{ .directory = "docs" }, .parent = null, .depth = 0, .label = "docs/", .unread = unread },
+            .{ .identity = .{ .directory = "test" }, .parent = null, .depth = 0, .label = "test/", .unread = !unread },
+        };
+        for (0..entries.len) |cursor| {
+            win.clear();
+            drawFileTree(win, .{ .entries = &entries, .cursor = cursor, .viewport = 3 }, theme);
+            for (entries, 0..) |entry, row| {
+                const row_style = if (row == cursor) theme.sidebar_selected else theme.sidebar_item;
+                for (0..win.width) |col| {
+                    const cell = win.readCell(@intCast(col), @intCast(row)).?;
+                    try testing.expectEqual(entry.unread, cell.style.bold);
+                    try testing.expectEqual(row_style.fg, cell.style.fg);
+                    try testing.expectEqual(row_style.bg, cell.style.bg);
+                }
+            }
+        }
+    };
+}
+
 test "File header junctions keep the DiffPane border style" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

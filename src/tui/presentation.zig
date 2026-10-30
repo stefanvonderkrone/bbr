@@ -2405,7 +2405,7 @@ const DisclosureInputs = struct {
     leased: usize = 0,
 
     fn create(published: *Published) !*DisclosureInputs {
-        const self = try clone(std.heap.page_allocator, published.review.drafts.items, published.scope_projection.items, published.collapsed_directories.items, published.file_reads, published.session.enrichment.projection());
+        const self = try clone(std.heap.page_allocator, published.review.drafts.items, published.scope_projection.items, published.collapsed_directories.items, published.file_reads.entries, published.session.enrichment.projection());
         errdefer self.release();
         self.leases = try self.arena.allocator().alloc(file_enrichment.ReadLease, published.session.enrichment.len());
         for (self.leases) |*lease| {
@@ -3570,6 +3570,7 @@ pub const ActionError = enum {
     theme_not_saved_invalid_config,
     persistence_failed,
     file_read_save_failed,
+    file_read_load_failed,
     file_read_unverifiable,
     submission_already_active,
     submission_launch_failed,
@@ -3830,6 +3831,11 @@ fn activeNumber(index: ?usize) ?usize {
 const BufferTransactionError = error{ BufferBuildFailed, SearchFailed, OutOfMemory };
 const FileReadToggleError = error{ FileUnverifiable, PersistenceFailed, OutOfMemory };
 
+const FileReadState = struct {
+    entries: []FileReadEntry,
+    load_failed: bool = false,
+};
+
 /// Reads File Read Receipts and never writes them. A File is read only when a
 /// receipt has its canonical path and its current fingerprint.
 fn loadFileReads(
@@ -3838,14 +3844,16 @@ fn loadFileReads(
     store: ?bbr.review.FileReadStore,
     identity: bbr.review.ReviewIdentity,
     diff: bbr.diff.Diff,
-) error{ OutOfMemory, FileReadLoadFailed }![]FileReadEntry {
+) error{OutOfMemory}!FileReadState {
     const entries = try allocator.alloc(FileReadEntry, diff.files.len);
     for (entries, diff.files) |*entry, file| entry.* = .{ .fingerprint = bbr.review.file_read.fingerprint(file) };
-    const reads = store orelse return entries;
+    const reads = store orelse return .{ .entries = entries };
     var scratch = std.heap.ArenaAllocator.init(scratch_backing);
     defer scratch.deinit();
-    const receipts = reads.load(scratch.allocator(), identity) catch |err|
-        return if (err == error.OutOfMemory) error.OutOfMemory else error.FileReadLoadFailed;
+    const receipts = reads.load(scratch.allocator(), identity) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .entries = entries, .load_failed = true };
+    };
     var by_path: std.StringHashMapUnmanaged(bbr.review.FileReviewFingerprint) = .empty;
     try by_path.ensureTotalCapacity(scratch.allocator(), @intCast(receipts.len));
     for (receipts) |receipt| by_path.putAssumeCapacity(receipt.path, receipt.fingerprint);
@@ -3854,7 +3862,7 @@ fn loadFileReads(
         const stored = by_path.get(file.displayPath()) orelse continue;
         entry.read = stored.eql(current);
     }
-    return entries;
+    return .{ .entries = entries };
 }
 const SaveDraftError = BufferTransactionError || error{ PersistenceFailed, AnchorRangeTooLong, InvalidDraftScope };
 
@@ -3982,7 +3990,7 @@ const Published = struct {
     review: bbr.review.PendingReview,
     scope_projection: std.ArrayList(bbr.review.ScopeProjectionEntry),
     /// Index-aligned with `session.diff.files`, in `review_arena`.
-    file_reads: []FileReadEntry,
+    file_reads: FileReadState,
     emphasis_cache: buffer_mod.EmphasisCache,
     buffers: ArenaRing(2),
     trees: ArenaRing(2),
@@ -4204,7 +4212,7 @@ const Published = struct {
             buffer_allocator,
             session.diff,
             published.buffer.file_tallies,
-            published.file_reads,
+            published.file_reads.entries,
             published.collapsed_directories.items,
             if (session.diff.files.len == 0) null else 0,
             panes.sidebar_content.width,
@@ -4525,7 +4533,7 @@ const Published = struct {
             allocator,
             self.session.diff,
             candidate.file_tallies,
-            self.file_reads,
+            self.file_reads.entries,
             self.collapsed_directories.items,
             active_file,
             panes.sidebar_content.width,
@@ -4888,7 +4896,7 @@ const Published = struct {
     }
 
     fn rebuildFileTree(self: *Published) !void {
-        const staged = try self.stageFileTree(self.file_reads);
+        const staged = try self.stageFileTree(self.file_reads.entries);
         staged.publish(self);
     }
 
@@ -4923,10 +4931,10 @@ const Published = struct {
     /// Stages the File Tree, persists the receipt change, and then publishes
     /// through an infallible step. A failure leaves the previous Frame.
     fn toggleFileRead(self: *Published, store: ?bbr.review.FileReadStore, file_index: usize) FileReadToggleError!void {
-        const entry = self.file_reads[file_index];
+        const entry = self.file_reads.entries[file_index];
         const value = entry.fingerprint orelse return error.FileUnverifiable;
         const reads = store orelse return error.PersistenceFailed;
-        const staged_reads = try self.allocator.dupe(FileReadEntry, self.file_reads);
+        const staged_reads = try self.allocator.dupe(FileReadEntry, self.file_reads.entries);
         defer self.allocator.free(staged_reads);
         staged_reads[file_index].read = !entry.read;
         const staged = try self.stageFileTree(staged_reads);
@@ -4937,7 +4945,7 @@ const Published = struct {
             staged.discard(self);
             return error.PersistenceFailed;
         };
-        self.file_reads[file_index].read = !entry.read;
+        self.file_reads.entries[file_index].read = !entry.read;
         staged.publish(self);
     }
 
@@ -6061,6 +6069,8 @@ pub const Presentation = struct {
             if (initial.session.authenticated_account_uuid) |uuid|
                 self.authenticated_account_uuid = BoundedText(256).init(uuid) catch null;
             if (initial.session.authenticated_account_unauthorized) self.authenticated_account_uuid = null;
+            // A later recovery claim failure replaces this warning, because it concerns a Durable Operation.
+            if (self.published.?.file_reads.load_failed) self.action_error = .file_read_load_failed;
         }
         self.discoverRecovery();
         return self;
@@ -12172,7 +12182,7 @@ pub const Presentation = struct {
         self.interaction_revision +%= 1;
         self.replacement = null;
         self.replacement_error = null;
-        self.action_error = null;
+        self.action_error = if (candidate.file_reads.load_failed) .file_read_load_failed else null;
         if (replacement.cause == .reconciliation) if (self.durable_comment_edit) |durable| {
             if (OwnedReviewIdentity.eql(durable.key, replacement.key)) {
                 self.durable_comment_edit = null;
@@ -30031,4 +30041,224 @@ test "M22 read a worker Frame started before a toggle publishes the new File Rea
     while (presentation.commands.items.len > 0) try completeDisclosureBuild(&presentation);
     try testing.expectEqual(buffer_mod.Layout.side_by_side, presentation.projection().review.?.buffer.layout);
     try testing.expect(!try testFileUnread(&presentation, 0));
+}
+
+test "M22 read marking the last unread File makes its Directory regular in the same Frame" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDirectorySession(testing.allocator, 1) },
+    });
+    defer presentation.deinit();
+    try testing.expect(presentation.projection().review.?.frame.file_tree.entries[0].unread);
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expect(presentation.projection().review.?.frame.file_tree.entries[0].unread);
+    try presentation.dispatch(.{ .action = .next_file });
+    const before = presentation.projection().review.?.frame;
+    try presentation.dispatch(.{ .key = test_m });
+    const after = presentation.projection().review.?.frame;
+    try testing.expect(after.revision > before.revision);
+    try testing.expect(after.file_tree.entries[0].identity.eql(.{ .directory = "src" }));
+    try testing.expect(!after.file_tree.entries[0].unread);
+    try testing.expect(!try testFileUnread(&presentation, 0));
+    try testing.expect(!try testFileUnread(&presentation, 1));
+    try testing.expectEqual(before.navigation, after.navigation);
+    try testing.expectEqual(before.file_tree.cursor, after.file_tree.cursor);
+    try testing.expectEqual(@as(usize, 2), try testReceiptCount(reads.store(), m22_remote));
+}
+
+test "M22 read an initial receipt load failure opens all Files unread and m still stores a receipt" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    const session = try testFileReadSession(testing.allocator, 1, m22_two_files);
+    try reads.store().put(m22_remote, "a.zig", bbr.review.file_read.fingerprint(session.diff.files[0]).?);
+    const writes = reads.writes;
+    reads.fail_load = true;
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = session },
+    });
+    defer presentation.deinit();
+    try testing.expectEqual(@as(u64, 1), presentation.projection().review.?.pull_request.?.id);
+    try testing.expect(try testFileUnread(&presentation, 0));
+    try testing.expect(try testFileUnread(&presentation, 1));
+    try testing.expectEqual(ActionError.file_read_load_failed, presentation.projection().action_error.?);
+    try testing.expectEqual(writes, reads.writes);
+
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expect(!try testFileUnread(&presentation, 0));
+    try testing.expect(try testFileUnread(&presentation, 1));
+    try testing.expect(presentation.projection().action_error == null);
+    reads.fail_load = false;
+    try testing.expectEqual(@as(usize, 1), try testReceiptCount(reads.store(), m22_remote));
+    try presentation.dispatch(.{ .action = .refresh });
+    try testLoadNextSession(&presentation, try testFileReadSession(testing.allocator, 1, m22_two_files));
+    try testing.expect(!try testFileUnread(&presentation, 0));
+    try testing.expect(presentation.projection().action_error == null);
+}
+
+test "M22 read a receipt load failure warns only when each replacement Candidate Session publishes" {
+    for ([_]SessionLoadCause{ .refresh, .picker, .reconciliation }) |cause| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+        defer reads.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .key = test_m });
+        const before = presentation.projection().review.?;
+        reads.fail_load = true;
+        const next_id: u64 = if (cause == .picker) 2 else 1;
+        switch (cause) {
+            .refresh => try presentation.dispatch(.{ .action = .refresh }),
+            .picker => try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", next_id) }),
+            .reconciliation => {
+                try presentation.commands.ensureUnusedCapacity(testing.allocator, 1);
+                presentation.queueReconciliation(try OwnedReviewIdentity.init("workspace", "repo", next_id));
+            },
+        }
+        const load = presentation.takeCommand().?.load_session;
+        try testing.expectEqual(cause, load.cause);
+        try presentation.dispatch(.{ .session_loaded = .{
+            .command_id = load.command_id,
+            .intent = load.intent,
+            .outcome = .{ .loaded = try testFileReadSession(testing.allocator, next_id, m22_two_files) },
+        } });
+        const prepare = presentation.takeCommand().?.prepare_session;
+        try testing.expect(presentation.projection().action_error == null);
+        try testing.expectEqual(before.session_epoch, presentation.projection().review.?.session_epoch);
+        try testing.expect(!try testFileUnread(&presentation, 0));
+        prepare.build();
+        try testing.expect(presentation.projection().action_error == null);
+        try presentation.dispatch(.{ .session_prepared = prepare });
+        try testing.expect(presentation.projection().replacement_error == null);
+        try testing.expectEqual(@as(u64, next_id), presentation.projection().review.?.pull_request.?.id);
+        try testing.expect(presentation.projection().review.?.session_epoch > before.session_epoch);
+        try testing.expect(try testFileUnread(&presentation, 0));
+        try testing.expect(try testFileUnread(&presentation, 1));
+        try testing.expectEqual(ActionError.file_read_load_failed, presentation.projection().action_error.?);
+        try testing.expectEqual(@as(usize, 1), reads.writes);
+    }
+}
+
+test "M22 read a LocalReview receipt load failure publishes unread Files and a warning after Ref refresh" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    const key = try OwnedReviewIdentity.initLocal(7, "refs/heads/main", "refs/heads/feature");
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = key, .session = try testLocalFileReadSession(testing.allocator, "source-1", m22_two_files) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_m });
+    reads.fail_load = true;
+    try presentation.dispatch(.{ .action = .refresh });
+    try testLoadNextSession(&presentation, try testLocalFileReadSession(testing.allocator, "source-2", m22_two_files));
+    try testing.expectEqualStrings("source-2", presentation.projection().review.?.header.source_commit);
+    try testing.expect(try testFileUnread(&presentation, 0));
+    try testing.expect(try testFileUnread(&presentation, 1));
+    try testing.expectEqual(ActionError.file_read_load_failed, presentation.projection().action_error.?);
+}
+
+test "M22 read receipt load OutOfMemory fails the candidate and preserves the published Session and Frame" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_m });
+    reads.load_error = error.OutOfMemory;
+    try presentation.dispatch(.{ .action = .refresh });
+    const before = presentation.projection().review.?;
+    try testLoadNextSession(&presentation, try testFileReadSession(testing.allocator, 1, m22_two_files));
+    const after = presentation.projection().review.?;
+    try testing.expectEqual(ReplacementError.out_of_memory, presentation.projection().replacement_error.?);
+    try testing.expect(presentation.projection().action_error == null);
+    try testing.expectEqual(before.session_epoch, after.session_epoch);
+    try testing.expectEqual(before.frame.revision, after.frame.revision);
+    try testing.expectEqual(before.frame.file_tree.entries.ptr, after.frame.file_tree.entries.ptr);
+    try testing.expectEqual(before.frame.navigation, after.frame.navigation);
+    try testing.expect(!try testFileUnread(&presentation, 0));
+    try testing.expectEqual(@as(usize, 1), reads.writes);
+}
+
+test "M22 read receipt load OutOfMemory also fails the initial Session" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    reads.load_error = error.OutOfMemory;
+    try testing.expectError(error.OutOfMemory, Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+    }));
+    try testing.expectEqual(@as(usize, 0), reads.writes);
+}
+
+test "M22 read an abandoned Candidate Session never publishes its receipt load warning" {
+    for ([_]bool{ false, true }) |superseded| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+        defer reads.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .key = test_m });
+        const before = presentation.projection().review.?;
+        reads.fail_load = true;
+        try presentation.dispatch(.{ .action = .refresh });
+        const load = presentation.takeCommand().?.load_session;
+        try presentation.dispatch(.{ .session_loaded = .{
+            .command_id = load.command_id,
+            .intent = load.intent,
+            .outcome = .{ .loaded = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+        } });
+        const prepare = presentation.takeCommand().?.prepare_session;
+        prepare.build();
+        if (superseded) {
+            try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+        } else {
+            prepare.failure = .buffer_build_failed;
+        }
+        try presentation.dispatch(.{ .session_prepared = prepare });
+        try testing.expect(presentation.projection().action_error == null);
+        try testing.expectEqual(before.session_epoch, presentation.projection().review.?.session_epoch);
+        try testing.expect(!try testFileUnread(&presentation, 0));
+        try testing.expectEqual(@as(usize, 1), reads.writes);
+        if (superseded) {
+            reads.fail_load = false;
+            try testLoadNextSession(&presentation, try testFileReadSession(testing.allocator, 2, m22_two_files));
+            try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.pull_request.?.id);
+            try testing.expect(presentation.projection().action_error == null);
+        } else {
+            try testing.expectEqual(ReplacementError.buffer_build_failed, presentation.projection().replacement_error.?);
+        }
+    }
+}
+
+test "M22 read a null FileReadStore opens and replaces a Session with unread Files and no warning" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+    });
+    defer presentation.deinit();
+    try testing.expect(try testFileUnread(&presentation, 0));
+    try testing.expect(try testFileUnread(&presentation, 1));
+    try testing.expect(presentation.projection().action_error == null);
+    try presentation.dispatch(.{ .action = .refresh });
+    try testLoadNextSession(&presentation, try testFileReadSession(testing.allocator, 1, m22_two_files));
+    try testing.expect(try testFileUnread(&presentation, 0));
+    try testing.expect(try testFileUnread(&presentation, 1));
+    try testing.expect(presentation.projection().action_error == null);
 }

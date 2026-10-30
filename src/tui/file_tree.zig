@@ -33,7 +33,6 @@ pub const Entry = struct {
     expanded: bool = false,
     active: bool = false,
     active_descendant: bool = false,
-    /// Only File entries follow File Read State.
     unread: bool = false,
     status: ?bbr.diff.FileStatus = null,
     comments: usize = 0,
@@ -55,6 +54,7 @@ const Node = struct {
     file_index: usize = 0,
     parent: ?usize,
     children: std.ArrayList(usize) = .empty,
+    unread: bool = false,
 };
 
 pub fn build(
@@ -75,8 +75,16 @@ pub fn build(
     for (diff.files, 0..) |file, file_index| try insertFile(allocator, &nodes, file.displayPath(), file_index);
     sortChildren(&nodes, 0);
 
+    var index = nodes.items.len;
+    while (index > 1) {
+        index -= 1;
+        const node = &nodes.items[index];
+        if (node.kind == .file) node.unread = !reads[node.file_index].read;
+        if (node.unread) nodes.items[node.parent.?].unread = true;
+    }
+
     var entries: std.ArrayList(Entry) = .empty;
-    for (nodes.items[0].children.items) |child| try emit(allocator, &nodes, child, null, 0, diff, tallies, reads, collapsed, active_file, content_width, metrics, &entries);
+    for (nodes.items[0].children.items) |child| try emit(allocator, &nodes, child, null, 0, diff, tallies, collapsed, active_file, content_width, metrics, &entries);
 
     var cursor: usize = 0;
     if (wanted_cursor) |wanted| cursor = findVisible(entries.items, wanted) orelse nearestVisibleAncestor(entries.items, nodes.items, wanted) orelse 0;
@@ -138,7 +146,6 @@ fn emit(
     depth: usize,
     diff: bbr.diff.Diff,
     tallies: []const buffer_mod.FileTally,
-    reads: []const FileReadEntry,
     collapsed: []const []const u8,
     active_file: ?usize,
     content_width: usize,
@@ -159,7 +166,7 @@ fn emit(
             .depth = indent / 2,
             .label = try truncate(allocator, leaf(start.path), available, metrics),
             .active = active_file != null and active_file.? == start.file_index,
-            .unread = !reads[start.file_index].read,
+            .unread = start.unread,
             .status = file.status,
             .comments = file_tally.comments,
             .drafts = file_tally.drafts,
@@ -191,10 +198,11 @@ fn emit(
         .depth = @min(depth, (content_width -| 2) / 2),
         .label = try truncate(allocator, directory_label, content_width -| prefix, metrics),
         .expanded = expanded,
+        .unread = end.unread,
         .active_descendant = if (active_file) |index| pathDescends(diff.files[index].displayPath(), end.path) else false,
     });
     if (!expanded) return;
-    for (end.children.items) |child| try emit(allocator, nodes, child, identity, depth + 1, diff, tallies, reads, collapsed, active_file, content_width, metrics, entries);
+    for (end.children.items) |child| try emit(allocator, nodes, child, identity, depth + 1, diff, tallies, collapsed, active_file, content_width, metrics, entries);
 }
 
 fn truncate(allocator: std.mem.Allocator, text: []const u8, width: usize, metrics: CellMetrics) ![]const u8 {
@@ -300,4 +308,36 @@ test "M22 read File entries follow File Read State" {
     try testing.expect(tree.entries[0].identity.eql(.{ .file = 0 }));
     try testing.expect(!tree.entries[0].unread);
     try testing.expect(tree.entries[1].unread);
+}
+
+test "M22 read Directories follow deep descendants through expanded and collapsed Directories" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = [_]bbr.diff.File{
+        .{ .old_path = "src/a.zig", .new_path = "src/a.zig", .status = .modified, .hunks = &.{} },
+        .{ .old_path = "src/lib/b.zig", .new_path = "src/lib/b.zig", .status = .modified, .hunks = &.{} },
+        .{ .old_path = "src/lib/deep/c.zig", .new_path = "src/lib/deep/c.zig", .status = .modified, .hunks = &.{} },
+        .{ .old_path = "src/lib/deep/d.zig", .new_path = "src/lib/deep/d.zig", .status = .modified, .hunks = &.{} },
+        .{ .old_path = "docs/e.md", .new_path = "docs/e.md", .status = .modified, .hunks = &.{} },
+    };
+    const cases = [_]struct { collapsed: []const []const u8, rows: usize }{
+        .{ .collapsed = &.{}, .rows = 9 },
+        .{ .collapsed = &.{"src/lib/deep"}, .rows = 7 },
+        .{ .collapsed = &.{"src/lib"}, .rows = 5 },
+        .{ .collapsed = &.{"src"}, .rows = 3 },
+    };
+    for (cases) |case| for ([_]bool{ false, true }) |last_read| {
+        const tree = try build(arena.allocator(), .{ .files = &files }, &.{ .{}, .{}, .{}, .{}, .{} }, &.{
+            .{ .read = true }, .{ .read = true }, .{ .read = last_read }, .{ .read = true }, .{ .read = true },
+        }, case.collapsed, 2, 28, 10, null, 0, .bytes);
+        try testing.expectEqual(case.rows, tree.entries.len);
+        for (tree.entries) |entry| {
+            if (entry.identity != .directory) continue;
+            const expected_unread = !last_read and !std.mem.eql(u8, entry.identity.directory, "docs");
+            try testing.expectEqual(expected_unread, entry.unread);
+            try testing.expectEqualStrings("", entry.tally);
+            try testing.expectEqual(@as(usize, 0), entry.comments);
+            try testing.expectEqual(@as(usize, 0), entry.drafts);
+        }
+    };
 }
