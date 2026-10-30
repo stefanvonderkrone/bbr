@@ -57,6 +57,8 @@ pub const special = struct {
     pub const down = vaxis.Key.down;
     pub const left = vaxis.Key.left;
     pub const right = vaxis.Key.right;
+    pub const page_up = vaxis.Key.page_up;
+    pub const page_down = vaxis.Key.page_down;
 };
 
 /// Is this Action a Motion (movement within a Pane) rather than a command? The
@@ -84,6 +86,105 @@ pub fn isMotion(a: Action) bool {
         .select_up,
         => true,
         else => false,
+    };
+}
+
+/// The help Overlay section that lists an Action. The order of the tags is the
+/// order of the sections.
+pub const HelpSection = enum {
+    motions,
+    panes_and_files,
+    search,
+    selection,
+    comments_and_drafts,
+    review_and_submission,
+    general,
+
+    pub fn title(self: HelpSection) []const u8 {
+        return switch (self) {
+            .motions => "Motions",
+            .panes_and_files => "Panes and Files",
+            .search => "Search",
+            .selection => "Selection",
+            .comments_and_drafts => "Comments and Drafts",
+            .review_and_submission => "Review and Submission",
+            .general => "General",
+        };
+    }
+};
+
+pub fn helpSection(a: Action) HelpSection {
+    return switch (a) {
+        .down,
+        .up,
+        .left,
+        .right,
+        .half_page_down,
+        .half_page_up,
+        .page_down,
+        .page_up,
+        .to_top,
+        .to_bottom,
+        .center,
+        .scroll_cursor_top,
+        .scroll_cursor_bottom,
+        .cursor_view_top,
+        .cursor_view_middle,
+        .cursor_view_bottom,
+        .scroll_row_up,
+        .scroll_row_down,
+        .select_down,
+        .select_up,
+        => .motions,
+        .focus_next_pane,
+        .next_file,
+        .prev_file,
+        .isolate,
+        .open_file_finder,
+        .toggle_directory,
+        .focus_file,
+        .toggle_layout,
+        .cycle_scope,
+        .select_old_version,
+        .select_new_version,
+        .toggle_disclosure,
+        .toggle_review_card,
+        => .panes_and_files,
+        .open_buffer_search,
+        .open_review_search,
+        .next_review_search_occurrence,
+        .previous_review_search_occurrence,
+        .open_search_occurrence,
+        .next_search_occurrence,
+        .previous_search_occurrence,
+        => .search,
+        .toggle_select, .clear_selection, .yank => .selection,
+        .inline_comment,
+        .file_comment,
+        .review_comment,
+        .suggest,
+        .reply,
+        .edit_review_item,
+        .external_edit,
+        .reanchor_review_item,
+        .delete_review_item,
+        => .comments_and_drafts,
+        .refresh,
+        .set_verdict_approved,
+        .set_verdict_changes_requested,
+        .set_verdict_none,
+        .submit,
+        .recover_submission,
+        .resolve_unpublished,
+        .link_existing_comment,
+        => .review_and_submission,
+        .quit,
+        .help,
+        .open_pull_request_picker,
+        .open_command_palette,
+        .open_theme_overlay,
+        .confirm_picker,
+        => .general,
     };
 }
 
@@ -209,7 +310,7 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .toggle_directory, .help = "toggle Directory" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .focus_file, .help = "focus File" },
     .{ .chord = Chord.one(vaxis.Key.enter), .action = .confirm_picker, .help = "confirm selection" },
-    .{ .chord = Chord.one('X'), .action = .submit, .help = "submit review" },
+    .{ .chord = Chord.one('X'), .action = .submit, .help = "submit review / show hidden Submission" },
     .{ .chord = Chord.one('Y'), .action = .recover_submission, .help = "resume interrupted submission" },
     .{ .chord = Chord.one('U'), .action = .resolve_unpublished, .help = "mark unknown draft unpublished" },
     .{ .chord = Chord.two('g', 'C'), .action = .link_existing_comment, .help = "link unknown draft to comment" },

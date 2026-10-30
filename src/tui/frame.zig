@@ -106,6 +106,11 @@ fn area(geometry: Geometry) Rect {
     return .{ .width = geometry.cols, .height = geometry.rows };
 }
 
+/// The help lines that the help Overlay shows at once.
+pub fn helpBodyRows(geometry: Geometry, rows: usize) u16 {
+    return view.solve(layouts.HelpSlot, layouts.help, layouts.Help{ .rows = rows }, area(geometry)).get(.body).content.height;
+}
+
 pub const OverlayTarget = struct {
     kind: OverlayKind,
     rect: Rect,

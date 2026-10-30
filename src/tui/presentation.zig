@@ -11,6 +11,7 @@ const composer_mod = @import("composer.zig");
 const Composer = composer_mod.Composer;
 const file_enrichment = @import("file_enrichment.zig");
 const keymap_mod = @import("keymap.zig");
+const help_mod = @import("help.zig");
 const list_overlay_mod = @import("list_overlay.zig");
 const ListOverlay = list_overlay_mod.ListOverlay;
 const ThemeId = @import("theme_id.zig").ThemeId;
@@ -2498,7 +2499,7 @@ const DraftMutation = struct {
 const DraftMutationError = error{ OutOfMemory, DraftLocked, DraftEditConflict, DraftNotAnchorable, InvalidAnchor, PersistenceFailed };
 
 pub const DisclosureBuild = struct {
-    const Kind = enum { input, accepted, restore, general, clear_input, open_input, view, enrichment, cache_update, draft_save, draft_mutation, review_destination };
+    const Kind = enum { input, accepted, restore, general, clear_input, open_input, view, enrichment, cache_update, draft_save, draft_mutation, review_destination, draft_destination };
     const NavigationPolicy = enum { restore, reset, file_header, center, version };
     arena: std.heap.ArenaAllocator,
     session: *Session,
@@ -2564,6 +2565,12 @@ pub const DisclosureBuild = struct {
     review_request_id: u64 = 0,
     review_destination_id: u64 = 0,
     destination_row: ?usize = null,
+    /// The Draft whose ReviewCard header a `draft_destination` build finds.
+    destination_draft: ?bbr.review.TempId = null,
+    destination_id: u64 = 0,
+    /// 0 for the first build, 1 for the build with the disclosures that the
+    /// first build found.
+    destination_attempt: u1 = 0,
     buffer: buffer_mod.Buffer = undefined,
     visual_rows: []const frame_mod.VisualRow = &.{},
     projection: ?*SearchProjection = null,
@@ -2783,7 +2790,7 @@ pub const DisclosureBuild = struct {
                 }
             }
         }
-        if (self.kind == .view or self.kind == .enrichment or self.kind == .cache_update or self.kind == .draft_save or self.kind == .draft_mutation or self.kind == .review_destination) {
+        if (self.kind == .view or self.kind == .enrichment or self.kind == .cache_update or self.kind == .draft_save or self.kind == .draft_mutation or self.kind == .review_destination or self.kind == .draft_destination) {
             const candidates = try buffer_mod.buildSearchCandidates(a, self.session.diff, self.preferences.layout, self.session.threads, .{
                 .fold_context = self.preferences.scope == .changes,
                 .whole_file = self.preferences.scope == .whole,
@@ -2842,6 +2849,9 @@ pub const DisclosureBuild = struct {
         });
         if (self.kind == .review_destination) {
             self.destination_row = occurrenceVisualRowFor(self.buffer, self.visual_rows, self.review_snapshot.?.occurrences[self.review_selected.?]);
+        }
+        if (self.kind == .draft_destination) {
+            self.destination_row = self.projection.?.navigation.owners.get(.{ .draft = .{ .id = self.destination_draft.?, .source_offset = 0, .part = .header } });
         }
         if (self.batch orelse self.rebuilt_batch orelse self.accepted_snapshot) |batch| {
             const result = try self.projection.?.project(std.heap.page_allocator, batch);
@@ -3232,6 +3242,7 @@ pub const Projection = struct {
     theme: ThemeId,
     configured_theme: ThemeId,
     help_visible: bool,
+    help_scroll: usize,
     action_availability: ActionAvailability,
     loading_pull_request_id: ?u64,
     composer: ?ComposerProjection,
@@ -3967,6 +3978,9 @@ const Published = struct {
     pending_draft_save: ?bbr.review.TempId = null,
     draft_mutation_generation: u64 = 0,
     pending_draft_mutation: ?u64 = null,
+    draft_destination_generation: u64 = 0,
+    /// The jump to a Draft's ReviewCard that waits for its Buffer build.
+    pending_draft_destination: ?u64 = null,
     buffer_search: BufferSearchState,
     search_generation: u64 = 0,
     view_generation: u64 = 0,
@@ -5537,6 +5551,8 @@ const SubmissionTree = struct {
     selected: usize = 0,
     completion: ?bbr.review.SubmissionCompletion = null,
     stale_repair: ?StaleRepairProjection = null,
+    /// A jump to a Draft hides a terminal tree. Submit shows it again.
+    hidden: bool = false,
 
     fn create(allocator: Allocator, durable: *const DurableSubmission, order: []const bbr.review.TempId) !*SubmissionTree {
         const tree = try allocator.create(SubmissionTree);
@@ -5886,6 +5902,8 @@ pub const Presentation = struct {
     list_overlay: ?ListOverlay = null,
     configured_theme: ThemeId,
     help_visible: bool = false,
+    /// The first help line on screen. `applyHelpKey` keeps it in range.
+    help_scroll: usize = 0,
     durable_submission: ?*DurableSubmission = null,
     submission_tree: ?*SubmissionTree = null,
     durable_comment_edit: ?*DurableCommentEdit = null,
@@ -6163,7 +6181,7 @@ pub const Presentation = struct {
             } else null,
             .submission_result = self.submission_result,
             .submission_tree = if (self.submission_tree) |tree| blk: {
-                if (self.submissionRepairInteractionActive()) break :blk null;
+                if (tree.hidden or self.submissionRepairInteractionActive()) break :blk null;
                 break :blk tree.projection();
             } else null,
             .comment_edit_result = self.comment_edit_result,
@@ -6186,6 +6204,7 @@ pub const Presentation = struct {
             .theme = self.activeTheme(),
             .configured_theme = self.configured_theme,
             .help_visible = self.help_visible,
+            .help_scroll = self.help_scroll,
             .action_availability = self.actionAvailability(),
             .loading_pull_request_id = if (self.replacement) |replacement|
                 if (replacement.key.isRemote()) replacement.key.pull_request_id else null
@@ -6278,7 +6297,7 @@ pub const Presentation = struct {
     fn visibleSubmissionOverlay(self: *const Presentation) bool {
         const published = self.published orelse return false;
         if (self.submissionRepairInteractionActive()) return false;
-        if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) return true;
+        if (self.submission_tree) |tree| if (!tree.hidden and OwnedReviewIdentity.eql(tree.key, published.key)) return true;
         return false;
     }
 
@@ -7090,7 +7109,7 @@ pub const Presentation = struct {
             return;
         }
         if (self.help_visible) {
-            self.help_visible = false;
+            self.applyHelpKey(key);
             return;
         }
         if (self.unknown_resolution != null) {
@@ -7203,6 +7222,10 @@ pub const Presentation = struct {
         if (self.replacement != null) return;
         const published = self.published orelse return;
         if (!OwnedReviewIdentity.eql(published.key, tree.key)) return;
+        if (key.matches(keymap_mod.special.enter, .{})) {
+            self.jumpToSubmissionDraft(published, tree, item.temp_id);
+            return;
+        }
         if (item.state == .outcome_unknown) {
             if (key.matches('U', .{})) self.resolveUnknownAsUnpublished(published, item.temp_id) else if (key.matches('L', .{})) self.openUnknownResolutionEditorFor(published, item.temp_id) else if (key.matches('A', .{})) self.dismissSubmissionTree();
             return;
@@ -7241,6 +7264,84 @@ pub const Presentation = struct {
             if (!item.retry_eligible) return;
             self.startSubmissionSelection(published, item.temp_id);
         }
+    }
+
+    /// Scroll keys move the help lines. Every other key closes the help.
+    fn applyHelpKey(self: *Presentation, key: keymap_mod.KeyStroke) void {
+        const total = help_mod.lineCount(self.dependencies.keymap);
+        const page = frame_mod.helpBodyRows(self.geometry, total);
+        const last = total -| page;
+        const half = @max(page / 2, 1);
+        if (key.matches('j', .{}) or key.matches(keymap_mod.special.down, .{})) {
+            self.help_scroll = @min(self.help_scroll + 1, last);
+        } else if (key.matches('k', .{}) or key.matches(keymap_mod.special.up, .{})) {
+            self.help_scroll -|= 1;
+        } else if (key.matches('d', .{ .ctrl = true }) or key.matches(keymap_mod.special.page_down, .{})) {
+            self.help_scroll = @min(self.help_scroll + half, last);
+        } else if (key.matches('u', .{ .ctrl = true }) or key.matches(keymap_mod.special.page_up, .{})) {
+            self.help_scroll -|= half;
+        } else if (key.matches('g', .{})) {
+            self.help_scroll = 0;
+        } else if (key.matches('G', .{})) {
+            self.help_scroll = last;
+        } else {
+            self.help_visible = false;
+            self.help_scroll = 0;
+        }
+    }
+
+    /// Hide the terminal Submission Overlay and put the DiffPane cursor on the
+    /// header of `temp_id`'s ReviewCard. A card that a disclosure or File
+    /// isolation hides comes into view through a Buffer build first.
+    fn jumpToSubmissionDraft(self: *Presentation, published: *Published, tree: *SubmissionTree, temp_id: bbr.review.TempId) void {
+        if (published.review.getConst(temp_id) == null) {
+            self.action_error = .no_review_item;
+            return;
+        }
+        tree.hidden = true;
+        self.action_error = null;
+        if (published.search_projection.navigation.owners.get(.{ .draft = .{ .id = temp_id, .source_offset = 0, .part = .header } })) |row| {
+            self.landOnDraftCard(published, row);
+            return;
+        }
+        const required = published.search_projection.body_disclosures.get(.{ .draft = temp_id }) orelse SearchDisclosureSet{};
+        const isolated = if (published.isolated_file) |index|
+            if (draftFileIndex(published, temp_id) == index) index else null
+        else
+            null;
+        self.queueDraftDestination(published, temp_id, required, isolated, 0) catch {
+            self.action_error = .out_of_memory;
+        };
+    }
+
+    fn queueDraftDestination(self: *Presentation, published: *Published, temp_id: bbr.review.TempId, required: SearchDisclosureSet, isolated: ?usize, attempt: u1) !void {
+        try self.commands.ensureUnusedCapacity(self.allocator, 1);
+        const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys, .add = required }, published.search_generation, published.buffer_search.active);
+        job.kind = .draft_destination;
+        job.destination_draft = temp_id;
+        job.destination_attempt = attempt;
+        job.isolated_file = isolated;
+        published.draft_destination_generation +%= 1;
+        job.destination_id = published.draft_destination_generation;
+        published.pending_draft_destination = job.destination_id;
+        var index: usize = 0;
+        while (index < self.commands.items.len) {
+            const command = self.commands.items[index];
+            if (command == .build_buffer_disclosure and command.build_buffer_disclosure.kind == .draft_destination) {
+                var discarded = self.commands.orderedRemove(index);
+                discarded.deinit();
+            } else index += 1;
+        }
+        self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
+    }
+
+    fn landOnDraftCard(self: *Presentation, published: *Published, row: usize) void {
+        published.navigation.clearMark();
+        published.navigation.jumpTo(row);
+        published.focus = .diff;
+        published.frame_revision += 1;
+        self.revealActiveFile(published);
+        self.action_error = null;
     }
 
     fn setMutationActionError(self: *Presentation, refusal: MutationRefusal) void {
@@ -7403,6 +7504,7 @@ pub const Presentation = struct {
         }
         if (action == .help) {
             self.help_visible = true;
+            self.help_scroll = 0;
             return;
         }
         if (action == .open_pull_request_picker) {
@@ -8690,7 +8792,7 @@ pub const Presentation = struct {
         if (!self.consumeCommand(job.command_id, .build_buffer_disclosure)) return;
         const published = self.published orelse return;
         if (self.shutdown_requested or published.epoch != job.epoch) return;
-        if (job.kind == .view or job.kind == .enrichment or job.kind == .cache_update or job.kind == .draft_save or job.kind == .draft_mutation or job.kind == .review_destination) {
+        if (job.kind == .view or job.kind == .enrichment or job.kind == .cache_update or job.kind == .draft_save or job.kind == .draft_mutation or job.kind == .review_destination or job.kind == .draft_destination) {
             self.acceptViewBuild(published, job, &owned);
             return;
         }
@@ -8824,7 +8926,8 @@ pub const Presentation = struct {
         }
         if (job.kind == .draft_save and (published.composer == null or published.pending_draft_save != job.new_draft.?.local_id)) return;
         if (job.kind == .draft_mutation and published.pending_draft_mutation != job.mutation_id) return;
-        if ((job.kind == .draft_save or job.kind == .draft_mutation) and !std.meta.eql(job.geometry, published.geometry)) {
+        if (job.kind == .draft_destination and published.pending_draft_destination != job.destination_id) return;
+        if ((job.kind == .draft_save or job.kind == .draft_mutation or job.kind == .draft_destination) and !std.meta.eql(job.geometry, published.geometry)) {
             self.retryContentBuild(published, job);
             return;
         }
@@ -8884,6 +8987,7 @@ pub const Presentation = struct {
             if (job.kind == .view) published.pending_view = null;
             if (job.kind == .draft_save) published.pending_draft_save = null;
             if (job.kind == .draft_mutation) published.pending_draft_mutation = null;
+            if (job.kind == .draft_destination) published.pending_draft_destination = null;
             if (!job.enrichment_speculative) self.action_error = .buffer_build_failed;
             if (job.enrichment_file) |index| published.session.enrichment.resetLoading(index);
             return;
@@ -8908,6 +9012,26 @@ pub const Presentation = struct {
             {
                 review_saved = published.disclosure_keys.retain();
             }
+        }
+        if (job.kind == .draft_destination) {
+            if (job.destination_row == null) {
+                published.pending_draft_destination = null;
+                if (job.destination_attempt == 0) {
+                    // The first build can uncover a disclosure that hid the
+                    // card, such as the outdated section of a File that
+                    // isolation left out. Build once more with it.
+                    const required = job.projection.?.body_disclosures.get(.{ .draft = job.destination_draft.? }) orelse SearchDisclosureSet{};
+                    self.queueDraftDestination(published, job.destination_draft.?, required, null, 1) catch {
+                        self.action_error = .out_of_memory;
+                    };
+                } else self.action_error = .no_review_item;
+                return;
+            }
+            disclosures.appendSlice(self.allocator, job.disclosures) catch {
+                published.pending_draft_destination = null;
+                self.action_error = .out_of_memory;
+                return;
+            };
         }
         if (job.new_draft) |draft| published.persistPreparedDraft(self.dependencies.reviews, draft) catch |err| {
             published.pending_draft_save = null;
@@ -9066,6 +9190,16 @@ pub const Presentation = struct {
             self.action_error = null;
             return;
         }
+        if (job.kind == .draft_destination) {
+            published.expanded_disclosures.deinit(self.allocator);
+            published.expanded_disclosures = disclosures;
+            disclosures = .empty;
+            published.disclosure_keys.release();
+            published.disclosure_keys = job.disclosure_keys.?.retain();
+            published.pending_draft_destination = null;
+            self.landOnDraftCard(published, job.destination_row.?);
+            return;
+        }
         if (job.kind == .draft_save) {
             published.pending_draft_save = null;
             published.composer.?.deinit();
@@ -9140,6 +9274,10 @@ pub const Presentation = struct {
             },
             .draft_mutation => self.queueDraftMutation(published, job.mutation.?, job.mutation_id) catch {
                 published.pending_draft_mutation = null;
+                self.action_error = .out_of_memory;
+            },
+            .draft_destination => self.queueDraftDestination(published, job.destination_draft.?, job.target.add, job.isolated_file, job.destination_attempt) catch {
+                published.pending_draft_destination = null;
                 self.action_error = .out_of_memory;
             },
             else => self.retryViewBuild(published, job),
@@ -9840,6 +9978,11 @@ pub const Presentation = struct {
     }
 
     fn startSubmission(self: *Presentation, published: *Published) void {
+        if (self.submission_tree) |tree| if (tree.hidden and OwnedReviewIdentity.eql(tree.key, published.key)) {
+            tree.hidden = false;
+            self.action_error = null;
+            return;
+        };
         self.startSubmissionSelection(published, null);
     }
 
@@ -12115,6 +12258,21 @@ fn recoveryMatches(notice: RecoveryNotice, active: bbr.review.ActiveSubmissionRu
         std.mem.eql(u8, notice.source_commit.slice(), active.source_commit);
 }
 
+/// The File of the Draft's root scope, or null for a Review-level root or a
+/// path that no File of the Diff matches.
+fn draftFileIndex(published: *const Published, temp_id: bbr.review.TempId) ?usize {
+    var root = published.review.getConst(temp_id) orelse return null;
+    const scope = while (true) {
+        const parent = root.parent orelse break root.effectiveScope();
+        switch (parent) {
+            .comment => |comment_id| break (threadRootOf(published, comment_id) orelse return null).effectiveScope(),
+            .draft => |id| root = published.review.getConst(id) orelse return null,
+        }
+    };
+    for (published.session.diff.files, 0..) |file, index| if (scopePathMatchesFile(scope, file)) return index;
+    return null;
+}
+
 fn staleSubtreeEligible(published: *const Published, selected: bbr.review.TempId) bool {
     const selected_draft = published.review.getConst(selected) orelse return false;
     switch (selected_draft.state) {
@@ -12409,6 +12567,14 @@ fn reviewCardTarget(published: *const Published) ?MutationTarget {
         .draft => |row| .{ .draft = row.owner.draft },
         else => null,
     };
+}
+
+fn threadRootOf(published: *const Published, id: bbr.review.CommentId) ?*const bbr.review.Comment {
+    for (published.session.threads) |thread| {
+        if (thread.root.id == id) return thread.root;
+        for (thread.replies) |reply| if (reply.id == id) return thread.root;
+    }
+    return null;
 }
 
 fn findPublishedComment(published: *const Published, id: bbr.review.CommentId) ?*const bbr.review.Comment {
@@ -28250,6 +28416,147 @@ test "Submission Overlay permits Review switching without cancelling the run" {
     try testing.expect(presentation.projection().submission != null);
 }
 
+/// Submit Draft 1 alone, fail its POST definitively, and complete the
+/// reconciliation load with `session`, so the Submission Overlay is terminal.
+fn failSoleDraftSubmission(presentation: *Presentation, key: OwnedReviewIdentity, session: *session_mod.Session) !void {
+    try presentation.dispatch(.{ .action = .submit });
+    var post = presentation.takeCommand().?;
+    const command_id = post.post_draft.command_id;
+    const operation_id = post.post_draft.operation_id;
+    post.deinit();
+    try presentation.dispatch(.{ .post_draft_completed = .{
+        .command_id = command_id,
+        .operation_id = operation_id,
+        .identity = .init(key),
+        .temp_id = 1,
+        .outcome = .{ .rejected = error.NotFound },
+    } });
+    var loaded = false;
+    while (presentation.takeCommand()) |command| {
+        if (command == .load_session and !loaded) {
+            loaded = true;
+            try dispatchSessionLoadForTest(presentation, .{ .session_loaded = .{
+                .command_id = command.load_session.command_id,
+                .intent = command.load_session.intent,
+                .outcome = .{ .loaded = session },
+            } });
+        } else {
+            var discarded = command;
+            discarded.deinit();
+        }
+    }
+    if (!loaded) session.destroy();
+    try testing.expect(presentation.projection().submission_tree.?.completion.? == .partial);
+}
+
+/// Run the next Buffer build and discard the other queued commands.
+fn completeNextDisclosureBuild(presentation: *Presentation) !void {
+    while (presentation.commands.items.len > 0 and presentation.commands.items[0] != .build_buffer_disclosure) {
+        var other = presentation.takeCommand().?;
+        other.deinit();
+    }
+    try completeDisclosureBuild(presentation);
+}
+
+fn cursorOwner(presentation: *Presentation) frame_mod.RowOwner {
+    const review = presentation.projection().review.?;
+    return review.frame.visual_rows[review.navigation.cursor].owner;
+}
+
+test "Enter in the terminal Submission Overlay jumps to the Draft and X shows the Overlay again" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "failed root" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer presentation.deinit();
+    try failSoleDraftSubmission(&presentation, key, try testSession(testing.allocator, 1, 'a'));
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(presentation.projection().submission_tree == null);
+    const owner = cursorOwner(&presentation);
+    try testing.expect(owner == .draft and owner.draft.id == 1 and owner.draft.part == .header);
+    try testing.expectEqual(frame_mod.PaneFocus.diff, presentation.published.?.focus);
+
+    // The hidden Overlay no longer captures keys. X shows the same terminal
+    // Overlay again and starts no Submission.
+    while (presentation.takeCommand()) |command| {
+        var discarded = command;
+        discarded.deinit();
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'X', .text = "X" } });
+    const shown = presentation.projection().submission_tree.?;
+    try testing.expect(shown.completion.? == .partial);
+    try testing.expectEqual(SubmissionItemState.failed, shown.items[0].state);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "Enter reveals a Draft that File isolation hides before it jumps" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "on b", .scope = .{ .@"inline" = .{ .path = "b.zig", .to = 1, .commit = "source" } } });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer presentation.deinit();
+    try failSoleDraftSubmission(&presentation, key, try testTwoFileSession(testing.allocator, 1));
+
+    try presentation.dispatch(.{ .action = .isolate });
+    try completeNextDisclosureBuild(&presentation);
+    try testing.expectEqual(@as(?usize, 0), presentation.projection().review.?.isolated_file);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(presentation.projection().submission_tree == null);
+    try completeNextDisclosureBuild(&presentation);
+    const review = presentation.projection().review.?;
+    try testing.expect(review.isolated_file == null);
+    const owner = cursorOwner(&presentation);
+    try testing.expect(owner == .draft and owner.draft.id == 1 and owner.draft.part == .header);
+    try testing.expectEqual(@as(?usize, 1), review.buffer.fileIndexForRow(review.frame.visual_rows[review.navigation.cursor].buffer_index));
+}
+
+test "help scroll keys move within the help lines and any other key closes the help" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        .geometry = .{ .cols = 100, .rows = 20 },
+    });
+    defer presentation.deinit();
+    const total = help_mod.lineCount(presentation.dependencies.keymap);
+    const last = total - frame_mod.helpBodyRows(presentation.geometry, total);
+
+    try presentation.dispatch(.{ .action = .help });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'k', .text = "k" } });
+    try testing.expectEqual(@as(usize, 0), presentation.projection().help_scroll);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'j', .text = "j" } });
+    try testing.expectEqual(@as(usize, 1), presentation.projection().help_scroll);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'G', .text = "G" } });
+    try testing.expectEqual(last, presentation.projection().help_scroll);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'j', .text = "j" } });
+    try testing.expectEqual(last, presentation.projection().help_scroll);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+    try testing.expect(presentation.projection().help_scroll < last);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'g', .text = "g" } });
+    try testing.expectEqual(@as(usize, 0), presentation.projection().help_scroll);
+    try testing.expect(presentation.projection().help_visible);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'x', .text = "x" } });
+    try testing.expect(!presentation.projection().help_visible);
+}
+
 test "stale repair reload evaluates each root scope independently and checks the refreshed source again" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
@@ -28426,8 +28733,13 @@ test "portable key input owns help overlay capture" {
 
     try presentation.dispatch(.{ .key = .{ .codepoint = '?', .text = "?" } });
     try testing.expect(presentation.projection().help_visible);
+    const cursor = presentation.published.?.navigation.cursor;
     try presentation.dispatch(.{ .key = .{ .codepoint = 'j', .text = "j" } });
+    try testing.expect(presentation.projection().help_visible);
+    try testing.expectEqual(cursor, presentation.published.?.navigation.cursor);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'q', .text = "q" } });
     try testing.expect(!presentation.projection().help_visible);
+    try testing.expect(!presentation.projection().shutting_down);
 }
 
 test "portable Picker input loads summaries and selects a replacement" {

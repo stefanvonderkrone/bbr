@@ -32,6 +32,8 @@ const keymap = @import("keymap.zig");
 const buffer_mod = @import("buffer.zig");
 const layouts = @import("layouts.zig");
 const view_paint = @import("view_paint.zig");
+const view_mod = @import("view.zig");
+const help_mod = @import("help.zig");
 
 pub const sidebar_width: u16 = 28;
 
@@ -2212,88 +2214,41 @@ fn drawSubmissionDetail(
         const footer: []const u8 = if (tree.completion == null)
             " In progress; A abandons recovered ambiguity only"
         else if (item.retry_eligible)
-            " e edit | a re-anchor | D delete | X retry selected subtree | Esc dismiss"
+            " ⏎ jump | e edit | a re-anchor | D delete | X retry subtree | Esc dismiss"
         else if (item.repair_eligible)
-            " e edit | a re-anchor | D delete | R reload | repair before retry | Esc dismiss"
+            " ⏎ jump | e edit | a re-anchor | D delete | R reload | repair first"
         else if (item.state == .outcome_unknown)
-            " L link author-owned Comment | U confirm not published | A decide later"
+            " ⏎ jump | L link Comment | U confirm not published | A decide later"
         else if (item.state == .posted)
-            " Posted items are inspectable, never retryable | Esc dismiss"
+            " ⏎ jump | Posted items are never retryable | Esc dismiss"
         else if (item.state == .skipped)
-            " Select its blocking ancestor to repair or retry | Esc dismiss"
+            " ⏎ jump | Repair or retry its blocking ancestor | Esc dismiss"
         else
-            " j/k select | Esc dismiss";
+            " j/k select | ⏎ jump | Esc dismiss";
         _ = detail.printSegment(.{ .text = footer, .style = theme.picker_query }, .{ .row_offset = row, .wrap = .none });
     }
 }
 
-/// A short display label for a key codepoint: named for the special keys,
-/// otherwise the codepoint's own utf8. `scratch` outlives render.
-fn keyName(scratch: std.mem.Allocator, cp: u21) []const u8 {
-    return switch (cp) {
-        vaxis.Key.enter => "⏎",
-        vaxis.Key.escape => "esc",
-        vaxis.Key.up => "↑",
-        vaxis.Key.down => "↓",
-        vaxis.Key.left => "←",
-        vaxis.Key.right => "→",
-        vaxis.Key.home => "home",
-        vaxis.Key.end => "end",
-        vaxis.Key.page_up => "pgup",
-        vaxis.Key.page_down => "pgdn",
-        else => blk: {
-            var b: [4]u8 = undefined;
-            const n = std.unicode.utf8Encode(cp, &b) catch break :blk "?";
-            break :blk scratch.dupe(u8, b[0..n]) catch "?";
-        },
-    };
-}
+/// One help line with the availability of its Action. A refused Action keeps
+/// its reason after the description.
+const HelpRow = struct { line: help_mod.Line, text: []const u8 = "", available: bool = true };
 
-/// Format a Chord for the help overlay, including configured multi-chord Actions.
-fn chordLabel(scratch: std.mem.Allocator, c: keymap.Chord) []const u8 {
-    var out: []const u8 = "";
-    for (0..c.len()) |i| {
-        const stroke = c.at(i);
-        var label = keyName(scratch, stroke.cp);
-        if (stroke.mods.shift) label = std.fmt.allocPrint(scratch, "shift-{s}", .{label}) catch label;
-        if (stroke.mods.alt) label = std.fmt.allocPrint(scratch, "alt-{s}", .{label}) catch label;
-        if (stroke.mods.ctrl) label = std.fmt.allocPrint(scratch, "ctrl-{s}", .{label}) catch label;
-        if (stroke.mods.super) label = std.fmt.allocPrint(scratch, "super-{s}", .{label}) catch label;
-        if (stroke.mods.hyper) label = std.fmt.allocPrint(scratch, "hyper-{s}", .{label}) catch label;
-        if (stroke.mods.meta) label = std.fmt.allocPrint(scratch, "meta-{s}", .{label}) catch label;
-        out = std.fmt.allocPrint(scratch, "{s}{s}{s}", .{ out, if (i == 0) "" else " ", label }) catch label;
+fn buildHelpRows(scratch: std.mem.Allocator, km: keymap.Keymap, availability: presentation.ActionAvailability) []HelpRow {
+    const lines = help_mod.build(scratch, km) catch return &.{};
+    const rows = scratch.alloc(HelpRow, lines.len) catch return &.{};
+    for (lines, rows) |line, *row| {
+        row.* = .{ .line = line };
+        const entry = switch (line) {
+            .entry => |entry| entry,
+            else => continue,
+        };
+        row.text = entry.description;
+        const action = entry.action orelse continue;
+        row.available = availability.available(action);
+        if (sourceRefusalLabel(availability, action)) |label|
+            row.text = std.fmt.allocPrint(scratch, "{s} ({s})", .{ entry.description, label }) catch entry.description;
     }
-    return out;
-}
-
-/// Coalesce the Keymap into two help columns — Motions and commands — one line
-/// per Action ("keys  label"), merging the (adjacent) alternate bindings of an
-/// Action into one "j ↓"-style key list.
-const HelpRow = struct { text: []const u8, available: bool };
-const HelpRows = struct { motions: []HelpRow, commands: []HelpRow };
-fn buildHelpRows(scratch: std.mem.Allocator, km: keymap.Keymap, availability: presentation.ActionAvailability) HelpRows {
-    var motions: std.ArrayList(HelpRow) = .empty;
-    var commands: std.ArrayList(HelpRow) = .empty;
-    var i: usize = 0;
-    while (i < km.bindings.len) {
-        const act = km.bindings[i].action;
-        const help = km.bindings[i].help;
-        var keys: std.ArrayList(u8) = .empty;
-        while (i < km.bindings.len and km.bindings[i].action == act) : (i += 1) {
-            if (keys.items.len > 0) keys.append(scratch, ' ') catch {};
-            keys.appendSlice(scratch, chordLabel(scratch, km.bindings[i].chord)) catch {};
-        }
-        const reason = sourceRefusalLabel(availability, act);
-        const line = if (reason) |label|
-            std.fmt.allocPrint(scratch, "{s:<8}{s} ({s})", .{ keys.items, help, label }) catch help
-        else
-            std.fmt.allocPrint(scratch, "{s:<8}{s}", .{ keys.items, help }) catch help;
-        (if (keymap.isMotion(act)) &motions else &commands).append(scratch, .{
-            .text = line,
-            .available = availability.available(act),
-        }) catch {};
-    }
-    return .{ .motions = motions.items, .commands = commands.items };
+    return rows;
 }
 
 fn sourceRefusalLabel(availability: presentation.ActionAvailability, action: keymap.Action) ?[]const u8 {
@@ -2323,35 +2278,46 @@ fn sourceRefusalLabel(availability: presentation.ActionAvailability, action: key
     };
 }
 
-/// Draw the keybinding-help Overlay: a centered modal with Motions in the left
-/// column and commands in the right, read straight from the Keymap so it can
-/// never drift from the live bindings. Dismissed by any key. `scratch` outlives
-/// render for the synthesized rows.
-pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, km: keymap.Keymap, availability: presentation.ActionAvailability) void {
+/// The cells between the key column and the description column.
+const help_key_gap: u16 = 3;
+/// The widest key column. A longer key list pushes only its own description.
+const help_key_column_max: u16 = 24;
+
+/// Draw the keybinding-help Overlay: a centered modal that lists the help
+/// lines from `help.zig`, scrolled by `scroll`. Keys are bold in the accent
+/// color, and a refused Action is grey. `scratch` outlives render for the
+/// synthesized rows.
+pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, km: keymap.Keymap, availability: presentation.ActionAvailability, scroll: usize) void {
     const rows = buildHelpRows(scratch, km, availability);
-    const n = @max(rows.motions.len, rows.commands.len);
-    const rects = view_paint.paint(layouts.HelpSlot, layouts.help, n, win, theme);
+    const body_rows = view_mod.solve(layouts.HelpSlot, layouts.help, layouts.Help{ .rows = rows.len }, .{ .width = win.width, .height = win.height }).get(.body).content.height;
+    const offset = @min(scroll, rows.len -| body_rows);
+    const rects = view_paint.paint(layouts.HelpSlot, layouts.help, layouts.Help{ .rows = rows.len, .scroll = .{ .total = rows.len, .offset = offset } }, win, theme);
     if (rects.get(.surface).border.isEmpty()) return;
-    _ = childRect(win, rects.get(.title).content).printSegment(.{ .text = " Keybindings", .style = theme.picker_query }, .{ .wrap = .none });
 
-    const motions = childRect(win, rects.get(.motions).content);
-    const commands = childRect(win, rects.get(.commands).content);
-    for (rows.motions, 0..) |row, i| {
-        if (i >= motions.height) break;
-        _ = motions.printSegment(.{ .text = row.text, .style = if (row.available) theme.picker else theme.gutter }, .{ .row_offset = @intCast(i), .wrap = .none });
+    var key_column: u16 = 0;
+    for (rows) |row| if (row.line == .entry) {
+        key_column = @max(key_column, @as(u16, @intCast(@min(vaxis.gwidth.gwidth(row.line.entry.keys, .unicode), help_key_column_max))));
+    };
+    const indent: u16 = 1;
+    const body = childRect(win, rects.get(.body).content);
+    for (rows[offset..], 0..) |row, index| {
+        if (index >= body.height) break;
+        const line_row: u16 = @intCast(index);
+        switch (row.line) {
+            .blank => {},
+            .heading => |title| _ = body.printSegment(.{ .text = title, .style = theme.picker_query }, .{ .row_offset = line_row, .wrap = .none }),
+            .entry => |entry| {
+                var key_style = if (row.available) theme.helpKeyStyle() else theme.gutter;
+                key_style.bold = true;
+                const keys_width: u16 = @intCast(@min(vaxis.gwidth.gwidth(entry.keys, .unicode), std.math.maxInt(u16)));
+                _ = body.printSegment(.{ .text = entry.keys, .style = key_style }, .{ .row_offset = line_row, .col_offset = indent, .wrap = .none });
+                const description_column = indent + @max(key_column, keys_width) + help_key_gap;
+                _ = body.printSegment(.{ .text = row.text, .style = if (row.available) theme.picker else theme.gutter }, .{ .row_offset = line_row, .col_offset = description_column, .wrap = .none });
+            },
+        }
     }
-    for (rows.commands, 0..) |row, i| {
-        if (i >= commands.height) break;
-        _ = commands.printSegment(.{ .text = row.text, .style = if (row.available) theme.picker else theme.gutter }, .{ .row_offset = @intCast(i), .wrap = .none });
-    }
-
-    const mouse = childRect(win, rects.get(.mouse).content);
-    if (mouse.height == 3) {
-        _ = mouse.printSegment(.{ .text = " Mouse", .style = theme.picker_query }, .{ .wrap = .none });
-        _ = mouse.printSegment(.{ .text = " click focus/select/toggle · wheel scroll", .style = theme.picker }, .{ .row_offset = 1, .col_offset = 1, .wrap = .none });
-        _ = mouse.printSegment(.{ .text = " Shift/Option: native selection · [input.mouse] enabled=false", .style = theme.gutter }, .{ .row_offset = 2, .col_offset = 1, .wrap = .none });
-    }
-    _ = childRect(win, rects.get(.hint).content).printSegment(.{ .text = " press any key to dismiss", .style = theme.picker_query }, .{ .wrap = .none });
+    const hint = if (rows.len > body.height) " j k scroll · ctrl-d ctrl-u half page · g G top / bottom · other key closes" else " press any key to close";
+    _ = childRect(win, rects.get(.hint).content).printSegment(.{ .text = hint, .style = theme.picker_query }, .{ .wrap = .none });
 }
 
 /// The boot/switch frame shown until a Session arrives: a centered floating
@@ -3857,7 +3823,7 @@ test "every Overlay surface has a rounded border" {
         for ([_]layouts.Dialog{ layouts.composer, layouts.submit_progress, layouts.submit_result }) |dialog|
             try Check.corners(win, view_paint.paint(layouts.DialogSlot, layouts.dialog, dialog, win, theme_dark).get(.surface).border);
         try Check.corners(win, view_paint.paint(layouts.LoadingSlot, layouts.loading, {}, win, theme_dark).get(.surface).border);
-        try Check.corners(win, view_paint.paint(layouts.HelpSlot, layouts.help, @as(usize, 20), win, theme_dark).get(.surface).border);
+        try Check.corners(win, view_paint.paint(layouts.HelpSlot, layouts.help, layouts.Help{ .rows = 20 }, win, theme_dark).get(.surface).border);
         try Check.corners(win, view_paint.paint(layouts.SubmissionSlot, layouts.submission, {}, win, theme_dark).get(.surface).border);
         try Check.corners(win, view_paint.paint(layouts.SearchSlot, layouts.reviewSearch, layouts.ReviewSearch{}, win, theme_dark).get(.surface).border);
     }
@@ -3916,7 +3882,7 @@ test "every Overlay paints the Theme base background" {
     defer arena.deinit();
     const a = arena.allocator();
     const frame = @import("frame.zig");
-    const view = @import("view.zig");
+    const view = view_mod;
     const geometry: frame.Geometry = .{ .cols = 120, .rows = 40 };
     const area: view.Rect = .{ .width = geometry.cols, .height = geometry.rows };
     const backdrop: vaxis.Cell.Color = .{ .rgb = .{ 1, 2, 3 } };
@@ -3975,9 +3941,9 @@ test "every Overlay paints the Theme base background" {
         try Check.surface(win, view.solve(layouts.DialogSlot, layouts.dialog, layouts.submit_result, area).get(.surface).border, base, .{});
 
         win.fill(.{ .style = .{ .bg = backdrop } });
-        drawHelp(a, win, theme, keymap.Keymap.default, .{ .remote = true });
+        drawHelp(a, win, theme, keymap.Keymap.default, .{ .remote = true }, 0);
         const help_rows = buildHelpRows(a, keymap.Keymap.default, .{ .remote = true });
-        try Check.surface(win, view.solve(layouts.HelpSlot, layouts.help, @max(help_rows.motions.len, help_rows.commands.len), area).get(.surface).border, base, .{});
+        try Check.surface(win, view.solve(layouts.HelpSlot, layouts.help, layouts.Help{ .rows = help_rows.len }, area).get(.surface).border, base, .{});
 
         win.fill(.{ .style = .{ .bg = backdrop } });
         drawLoading(a, win, 42, theme, null);
@@ -5498,21 +5464,49 @@ test "the help overlay floats a centered Keybindings modal from the Keymap" {
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
 
-    drawHelp(a, win, theme_dark, keymap.Keymap.default, .{ .remote = true });
+    drawHelp(a, win, theme_dark, keymap.Keymap.default, .{ .remote = true }, 0);
 
     const rows = buildHelpRows(a, keymap.Keymap.default, .{ .remote = true });
-    const rects = @import("view.zig").solve(layouts.HelpSlot, layouts.help, @max(rows.motions.len, rows.commands.len), .{ .width = 80, .height = 24 });
+    const rects = view_mod.solve(layouts.HelpSlot, layouts.help, layouts.Help{ .rows = rows.len }, .{ .width = 80, .height = 24 });
     const modal = rects.get(.surface).border;
     try testing.expectEqualStrings("╭", win.readCell(modal.x, modal.y).?.char.grapheme);
     try testing.expectEqualStrings("╯", win.readCell(modal.x + modal.width - 1, modal.y + modal.height - 1).?.char.grapheme);
-    // Title " Keybindings" begins one cell into the title row.
-    const title = rects.get(.title).content;
-    try testing.expectEqualStrings("K", win.readCell(title.x + 1, title.y).?.char.grapheme);
-    // The first motion binding is `j`/`↓` → down.
-    const motions = rects.get(.motions).content;
-    try testing.expectEqualStrings("j", win.readCell(motions.x, motions.y).?.char.grapheme);
-    const mouse = rects.get(.mouse).content;
-    try testing.expectEqualStrings("M", win.readCell(mouse.x + 1, mouse.y).?.char.grapheme);
+    var top: std.ArrayList(u8) = .empty;
+    for (modal.x..modal.x + modal.width) |col| try top.appendSlice(a, win.readCell(@intCast(col), modal.y).?.char.grapheme);
+    try testing.expect(std.mem.indexOf(u8, top.items, " Keybindings ") != null);
+
+    // The Motions heading, then `j ↓` in the bold accent, then at least three
+    // blank cells before the description.
+    const body = rects.get(.body).content;
+    try testing.expectEqualStrings("M", win.readCell(body.x, body.y).?.char.grapheme);
+    const key = win.readCell(body.x + 1, body.y + 1).?;
+    try testing.expectEqualStrings("j", key.char.grapheme);
+    try testing.expectEqual(theme_dark.accent, key.style.fg);
+    try testing.expect(key.style.bold);
+    const keys_end = body.x + 1 + 3;
+    for (keys_end..keys_end + 3) |col| try testing.expectEqualStrings(" ", win.readCell(@intCast(col), body.y + 1).?.char.grapheme);
+    try testing.expect(rows.len > body.height);
+}
+
+test "the help overlay scrolls its lines and clamps the scroll at the end" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const rows = buildHelpRows(a, keymap.Keymap.default, .{ .remote = true });
+    const body = view_mod.solve(layouts.HelpSlot, layouts.help, layouts.Help{ .rows = rows.len }, .{ .width = 80, .height = 24 }).get(.body).content;
+
+    // Scrolled one line, the body starts with the first `j ↓` entry.
+    drawHelp(a, win, theme_dark, keymap.Keymap.default, .{ .remote = true }, 1);
+    try testing.expectEqualStrings("j", win.readCell(body.x + 1, body.y).?.char.grapheme);
+
+    // A scroll past the end shows the last line on the last body row.
+    win.clear();
+    drawHelp(a, win, theme_dark, keymap.Keymap.default, .{ .remote = true }, std.math.maxInt(usize));
+    const last = rows[rows.len - 1].line.entry.keys;
+    try testing.expectEqualStrings(last[0..1], win.readCell(body.x + 1, body.y + body.height - 1).?.char.grapheme);
 }
 
 test "Selected Version help names horizontal keys and the absent File version" {
@@ -5521,17 +5515,18 @@ test "Selected Version help names horizontal keys and the absent File version" {
     const rows = buildHelpRows(arena.allocator(), .default, .{ .remote = true, .old_version = false });
     var old_found = false;
     var new_found = false;
-    for (rows.commands) |row| {
+    for (rows) |row| {
+        if (row.line != .entry) continue;
         if (std.mem.indexOf(u8, row.text, "select old File version") != null) {
             old_found = true;
             try testing.expect(!row.available);
-            try testing.expect(std.mem.indexOf(u8, row.text, "h ←") != null);
+            try testing.expectEqualStrings("h ←", row.line.entry.keys);
             try testing.expect(std.mem.indexOf(u8, row.text, "old File version absent") != null);
         }
         if (std.mem.indexOf(u8, row.text, "select new File version") != null) {
             new_found = true;
             try testing.expect(row.available);
-            try testing.expect(std.mem.indexOf(u8, row.text, "l →") != null);
+            try testing.expectEqualStrings("l →", row.line.entry.keys);
         }
     }
     try testing.expect(old_found and new_found);
@@ -5542,12 +5537,12 @@ test "local help projection marks remote-only commands unavailable" {
     defer arena.deinit();
     const rows = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = false });
     var unavailable: usize = 0;
-    for (rows.commands) |row| {
+    for (rows) |row| {
         if (!row.available) unavailable += 1;
+        if (row.line == .entry) if (row.line.entry.action) |action| if (keymap.isMotion(action)) try testing.expect(row.available);
     }
     // Remote-only commands, plus edit, re-anchor, and delete, stay visible.
     try testing.expectEqual(@as(usize, 11), unavailable);
-    for (rows.motions) |row| try testing.expect(row.available);
 }
 
 test "help keeps refused source Actions visible with typed reasons" {
@@ -5560,9 +5555,9 @@ test "help keeps refused source Actions visible with typed reasons" {
         .inline_comment_refusal = .not_hunk_line,
         .suggestion_refusal = .old_version,
     });
-    try testing.expect(!helpRowAvailable(rows.commands, "yank text (old content unavailable)").?);
-    try testing.expect(!helpRowAvailable(rows.commands, "inline comment (not a Hunk Line)").?);
-    try testing.expect(!helpRowAvailable(rows.commands, "suggestion (requires new File version)").?);
+    try testing.expect(!helpRowAvailable(rows, "yank text (old content unavailable)").?);
+    try testing.expect(!helpRowAvailable(rows, "inline comment (not a Hunk Line)").?);
+    try testing.expect(!helpRowAvailable(rows, "suggestion (requires new File version)").?);
 }
 
 test "delete stays discoverable in the help Overlay when it is refused" {
@@ -5570,8 +5565,8 @@ test "delete stays discoverable in the help Overlay when it is refused" {
     defer arena.deinit();
     const refused = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .delete_refusal = .descendant_locked });
     const deletable = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .delete_refusal = null });
-    try testing.expect(!helpRowAvailable(refused.commands, "delete Comment or Draft").?);
-    try testing.expect(helpRowAvailable(deletable.commands, "delete Comment or Draft").?);
+    try testing.expect(!helpRowAvailable(refused, "delete Comment or Draft").?);
+    try testing.expect(helpRowAvailable(deletable, "delete Comment or Draft").?);
 }
 
 test "re-anchor stays discoverable in the help Overlay when it is refused" {
@@ -5579,8 +5574,8 @@ test "re-anchor stays discoverable in the help Overlay when it is refused" {
     defer arena.deinit();
     const refused = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .reanchor_refusal = .reply_inherits_scope });
     const anchorable = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .reanchor_refusal = null });
-    try testing.expect(!helpRowAvailable(refused.commands, "re-anchor local root Draft").?);
-    try testing.expect(helpRowAvailable(anchorable.commands, "re-anchor local root Draft").?);
+    try testing.expect(!helpRowAvailable(refused, "re-anchor local root Draft").?);
+    try testing.expect(helpRowAvailable(anchorable, "re-anchor local root Draft").?);
 }
 
 test "edit stays discoverable in the help Overlay when it is refused" {
@@ -5588,11 +5583,11 @@ test "edit stays discoverable in the help Overlay when it is refused" {
     defer arena.deinit();
     const refused = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .edit_refusal = .submission_owns_draft });
     const editable = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .edit_refusal = null });
-    try testing.expect(!helpRowAvailable(refused.commands, "edit local Draft").?);
-    try testing.expect(helpRowAvailable(editable.commands, "edit local Draft").?);
+    try testing.expect(!helpRowAvailable(refused, "edit local Draft").?);
+    try testing.expect(helpRowAvailable(editable, "edit local Draft").?);
 }
 
 fn helpRowAvailable(rows: []const HelpRow, help: []const u8) ?bool {
-    for (rows) |row| if (std.mem.indexOf(u8, row.text, help) != null) return row.available;
+    for (rows) |row| if (row.line == .entry and std.mem.indexOf(u8, row.text, help) != null) return row.available;
     return null;
 }
