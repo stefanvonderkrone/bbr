@@ -18737,8 +18737,8 @@ fn testManyFileSession(backing: std.mem.Allocator, id: u64, file_count: usize) !
         .source_label = "Bitbucket",
         .pull_request_id = pr.id,
     };
+    // The Diff borrows its text from `raw`, so the Session arena keeps it.
     var raw: std.ArrayList(u8) = .empty;
-    defer raw.deinit(a);
     for (0..file_count) |index| try raw.print(
         a,
         "diff --git a/{d}.zig b/{d}.zig\n--- a/{d}.zig\n+++ b/{d}.zig\n@@ -1 +1 @@\n-old {d}\n+new {d}\n",
