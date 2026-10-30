@@ -734,6 +734,9 @@ test "interval merge matches byte planes for every BuiltInGrammar fixture" {
         .{ .path = "lib/add.rb", .source = ruby_fixture },
         .{ .path = "App.swift", .source = swift_fixture },
         .{ .path = "query.sql", .source = sql_fixture },
+        .{ .path = "Cargo.toml", .source = toml_fixture },
+        .{ .path = "docker/Dockerfile", .source = dockerfile_fixture },
+        .{ .path = "Makefile", .source = make_fixture },
     };
     var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
     defer highlighter.deinit();
@@ -2012,4 +2015,139 @@ test "M27 grammar GrammarMatch selects Swift and SQL" {
         .{ .path = "notes/a.swiftinterface", .grammar = null },
     };
     for (cases) |case| try testing.expectEqual(case.grammar, grammar_match.selectBuiltIn(case.path, ""));
+}
+
+// M27 ticket 08 fixtures
+
+const toml_fixture =
+    \\# Settings.
+    \\[package]
+    \\name = "bbr"
+    \\ready = true
+    \\
+;
+
+const dockerfile_fixture =
+    \\# Base image.
+    \\FROM alpine:3.20 AS build
+    \\ENV MODE="release"
+    \\RUN <<EOF
+    \\echo ${MODE}
+    \\EOF
+    \\
+;
+
+const make_fixture = "# Build all.\ninclude rules.mk\nCC := gcc\nall: main.o\n\t@$(CC) -o $@ $^\n";
+
+test "M27 grammar GrammarMatch selects TOML, Dockerfile, and Make" {
+    const cases = [_]struct { path: []const u8, grammar: ?BuiltInGrammar }{
+        .{ .path = "Cargo.toml", .grammar = .toml },
+        .{ .path = "Dockerfile", .grammar = .dockerfile },
+        .{ .path = "Containerfile", .grammar = .dockerfile },
+        .{ .path = "app.dockerfile", .grammar = .dockerfile },
+        .{ .path = "docker/Dockerfile", .grammar = .dockerfile },
+        .{ .path = "Dockerfile.dev", .grammar = null },
+        .{ .path = "dockerfile", .grammar = null },
+        .{ .path = "Makefile", .grammar = .make },
+        .{ .path = "makefile", .grammar = .make },
+        .{ .path = "GNUmakefile", .grammar = .make },
+        .{ .path = "build/rules.mk", .grammar = .make },
+        .{ .path = "Makefile.am", .grammar = null },
+    };
+    for (cases) |case| try testing.expectEqual(case.grammar, grammar_match.selectBuiltIn(case.path, ""));
+}
+
+test "M27 grammar TOML fixture has comment, string, keyword, property, and constant roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "Cargo.toml", toml_fixture);
+    defer freeResult(result);
+
+    try expectSpan(result, 1, 0, 11, "comment");
+    try expectSpan(result, 3, 7, 12, "string");
+    try expectSpan(result, 3, 5, 6, "operator");
+    try expectSpan(result, 3, 0, 4, "property");
+    try expectSpan(result, 4, 8, 12, "boolean");
+}
+
+test "M27 grammar Dockerfile fixture has comment, string, keyword, and property roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "Dockerfile", dockerfile_fixture);
+    defer freeResult(result);
+
+    try expectSpan(result, 1, 0, 13, "comment");
+    try expectSpan(result, 2, 0, 4, "keyword");
+    try expectSpan(result, 2, 17, 19, "keyword");
+    try expectSpan(result, 3, 0, 3, "keyword");
+    try expectSpan(result, 3, 4, 8, "property");
+    try expectSpan(result, 3, 9, 18, "string");
+    try expectSpan(result, 5, 0, 12, "string");
+}
+
+test "M27 grammar Make fixture has comment, string, keyword, and function roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "Makefile", make_fixture);
+    defer freeResult(result);
+
+    try expectSpan(result, 1, 0, 12, "comment");
+    try expectSpan(result, 2, 0, 7, "keyword");
+    try expectSpan(result, 2, 8, 16, "string");
+    try expectSpan(result, 3, 0, 2, "string");
+    try expectSpan(result, 4, 0, 3, "function");
+    try expectSpan(result, 5, 11, 12, "operator");
+    try expectSpan(result, 5, 12, 13, "string");
+}
+
+test "M27 grammar Make set priority 105 beats a later pattern at default priority" {
+    const query = embeddedQuery(.make, "highlights") ++ "\n[(automatic_variable) (variable_reference)] @variable\n";
+    const result = try highlightWithQuery(testing.allocator, language(.make).?, query, "", make_fixture);
+    defer freeResult(result);
+
+    try expectRoleAt(result, make_fixture, "$(CC)", .variable);
+    try expectSpan(result, 5, 11, 12, "operator");
+}
+
+test "M27 grammar Dockerfile set priority 90 loses to an earlier pattern at default priority" {
+    const query = "[(heredoc_line) (double_quoted_string)] @comment\n" ++ embeddedQuery(.dockerfile, "highlights");
+    const result = try highlightWithQuery(testing.allocator, language(.dockerfile).?, query, "", dockerfile_fixture);
+    defer freeResult(result);
+
+    try expectSpan(result, 3, 9, 18, "string");
+    try expectSpan(result, 5, 0, 12, "comment");
+}
+
+test "M27 injection docker and make names select the Dockerfile and Make BuiltInGrammars" {
+    const cases = [_]struct { name: []const u8, grammar: BuiltInGrammar }{
+        .{ .name = "docker", .grammar = .dockerfile },
+        .{ .name = "dockerfile", .grammar = .dockerfile },
+        .{ .name = "Dockerfile", .grammar = .dockerfile },
+        .{ .name = "make", .grammar = .make },
+        .{ .name = "makefile", .grammar = .make },
+        .{ .name = "toml", .grammar = .toml },
+    };
+    for (cases) |case| try testing.expectEqual(case.grammar, grammar_match.selectInjection(case.name).?);
+}
+
+test "M27 grammar docker and make ReviewBody fences highlight with the new BuiltInGrammars" {
+    const cases = [_]struct { fence: []const u8, path: []const u8 }{
+        .{ .fence = "docker", .path = "review.dockerfile" },
+        .{ .fence = "dockerfile", .path = "review.dockerfile" },
+        .{ .fence = "make", .path = "review.mk" },
+        .{ .fence = "makefile", .path = "review.mk" },
+    };
+    for (cases) |case| try testing.expectEqualStrings(case.path["review.".len..], bbr.highlight.grammar_name.extension(case.fence).?);
+
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const dockerfile = try highlighter.highlighter().highlight(testing.allocator, "review.dockerfile", dockerfile_fixture);
+    defer freeResult(dockerfile);
+    try expectSpan(dockerfile, 2, 0, 4, "keyword");
+    const make = try highlighter.highlighter().highlight(testing.allocator, "review.mk", make_fixture);
+    defer freeResult(make);
+    try expectSpan(make, 4, 0, 3, "function");
+    const toml = try highlighter.highlighter().highlight(testing.allocator, "review.toml", toml_fixture);
+    defer freeResult(toml);
+    try expectSpan(toml, 3, 7, 12, "string");
 }

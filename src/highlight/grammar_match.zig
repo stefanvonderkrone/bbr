@@ -26,6 +26,9 @@ pub const BuiltInGrammar = enum {
     ruby,
     swift,
     sql,
+    toml,
+    dockerfile,
+    make,
 
     pub fn name(self: BuiltInGrammar) []const u8 {
         return switch (self) {
