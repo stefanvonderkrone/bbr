@@ -123,6 +123,9 @@ pub const SqliteStore = struct {
 
     // --- migrations ---------------------------------------------------------
 
+    /// The `user_version` that the last step of `migrate` sets.
+    const schema_version: i64 = 10;
+
     fn migrate(self: *SqliteStore) SqliteError!void {
         if (try self.userVersion() < 1) {
             try self.exec(schema_v1);
@@ -2334,6 +2337,63 @@ test "SQLite carries final server guidance into a fresh Submission budget" {
     try testing.expect(retry.pending_wait);
 }
 
+/// The inverse of each migration. The SQL for `from` turns a `from` database
+/// into a `from - 1` database. Entries are contiguous and end at `schema_version`.
+const downgrades = [_]struct { from: i64, sql: [*:0]const u8 }{
+    .{ .from = 8, .sql = "DROP TABLE submission_run_items;" },
+    .{ .from = 9, .sql =
+    \\DROP TABLE submission_retry_carryovers;
+    \\ALTER TABLE submission_run_items DROP COLUMN retry_reason;
+    \\ALTER TABLE submission_run_items DROP COLUMN retry_after_ms;
+    \\ALTER TABLE submission_runs DROP COLUMN retry_phase;
+    \\ALTER TABLE submission_runs DROP COLUMN retry_attempt;
+    \\ALTER TABLE submission_runs DROP COLUMN retry_reason;
+    \\ALTER TABLE submission_runs DROP COLUMN retry_local_ms;
+    \\ALTER TABLE submission_runs DROP COLUMN retry_server_ms;
+    \\ALTER TABLE submission_runs DROP COLUMN retry_effective_ms;
+    \\ALTER TABLE submission_runs DROP COLUMN retry_pending_wait;
+    },
+    .{ .from = 10, .sql = "DROP TABLE file_read_receipts;" },
+};
+
+comptime {
+    for (downgrades[1..], downgrades[0 .. downgrades.len - 1]) |d, prev| {
+        if (d.from != prev.from + 1) @compileError(std.fmt.comptimePrint(
+            "`downgrades` in src/persist/sqlite_store.zig skips version {d}",
+            .{prev.from + 1},
+        ));
+    }
+    const last = downgrades[downgrades.len - 1].from;
+    if (last != SqliteStore.schema_version) @compileError(std.fmt.comptimePrint(
+        "add the inverse of migration {d} to `downgrades` in src/persist/sqlite_store.zig",
+        .{last + 1},
+    ));
+}
+
+/// Turns a freshly migrated database into a `version` database. A migration
+/// test fakes an old database only through this function.
+fn downgradeTo(sqlite: *SqliteStore, comptime version: i64) !void {
+    const oldest = downgrades[0].from - 1;
+    if (version < oldest) @compileError(std.fmt.comptimePrint(
+        "add the inverse of migration {d} to `downgrades` in src/persist/sqlite_store.zig",
+        .{oldest},
+    ));
+    const current = try sqlite.userVersion();
+    if (current != SqliteStore.schema_version) {
+        std.debug.print(
+            "migrate ends at version {d}: set `schema_version` in src/persist/sqlite_store.zig to {d} and add the inverse of migration {d} to `downgrades`\n",
+            .{ current, current, current },
+        );
+        return error.SchemaVersionStale;
+    }
+    var from = SqliteStore.schema_version;
+    while (from > version) : (from -= 1) {
+        try sqlite.exec(downgrades[@intCast(from - downgrades[0].from)].sql);
+        var buf: [40]u8 = undefined;
+        try sqlite.exec(try std.fmt.bufPrintZ(&buf, "PRAGMA user_version = {d};", .{from - 1}));
+    }
+}
+
 test "v8 migration preserves every authored Draft field and lifecycle state" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2360,19 +2420,7 @@ test "v8 migration preserves every authored Draft field and lifecycle state" {
             .body = "reply",
             .state = .outcome_unknown,
         });
-        try sqlite.exec(
-            \\DROP TABLE file_read_receipts;
-            \\DROP TABLE submission_run_items;
-            \\DROP TABLE submission_retry_carryovers;
-            \\ALTER TABLE submission_runs DROP COLUMN retry_phase;
-            \\ALTER TABLE submission_runs DROP COLUMN retry_attempt;
-            \\ALTER TABLE submission_runs DROP COLUMN retry_reason;
-            \\ALTER TABLE submission_runs DROP COLUMN retry_local_ms;
-            \\ALTER TABLE submission_runs DROP COLUMN retry_server_ms;
-            \\ALTER TABLE submission_runs DROP COLUMN retry_effective_ms;
-            \\ALTER TABLE submission_runs DROP COLUMN retry_pending_wait;
-            \\PRAGMA user_version = 7;
-        );
+        try downgradeTo(&sqlite, 7);
     }
 
     var upgraded = try SqliteStore.open(path);
@@ -2425,10 +2473,7 @@ test "M22 read a version 9 database migrates to version 10, keeps its Drafts, an
         var sqlite = try SqliteStore.open(path);
         defer sqlite.deinit();
         try sqlite.store().put(key, .{ .local_id = 1, .kind = .comment, .body = "kept across v10" });
-        try sqlite.exec(
-            \\DROP TABLE file_read_receipts;
-            \\PRAGMA user_version = 9;
-        );
+        try downgradeTo(&sqlite, 9);
     }
     {
         var upgraded = try SqliteStore.open(path);
