@@ -60,7 +60,8 @@ pub const RuntimePackage = struct {
     locals: ?PreparedQuery,
     injection: ?InjectionQuery = null,
     capture_names: []const []const u8,
-    captures: []const bbr.highlight.Capture,
+    /// Null for a hidden Capture, whose name starts with `_`. Only predicates use it.
+    captures: []const ?bbr.highlight.Capture,
     local_scope_id: ?u32 = null,
     local_definition_id: ?u32 = null,
     local_reference_id: ?u32 = null,
@@ -85,7 +86,7 @@ pub const RuntimePackage = struct {
             for (capture_names[0..names_initialized]) |name| allocator.free(name);
             allocator.free(capture_names);
         }
-        const captures = try allocator.alloc(bbr.highlight.Capture, capture_count);
+        const captures = try allocator.alloc(?bbr.highlight.Capture, capture_count);
         errdefer allocator.free(captures);
         for (capture_names) |*name| {
             var name_len: u32 = 0;
@@ -93,7 +94,9 @@ pub const RuntimePackage = struct {
             name.* = try allocator.dupe(u8, name_ptr[0..name_len]);
             names_initialized += 1;
         }
-        for (capture_names, 0..) |name, id| captures[id] = bbr.highlight.Capture.init(@intCast(id), name);
+        for (capture_names, captures, 0..) |name, *capture, id| {
+            capture.* = if (std.mem.startsWith(u8, name, "_")) null else bbr.highlight.Capture.init(@intCast(id), name);
+        }
 
         const locals = if (locals_source.len == 0) null else try PreparedQuery.init(allocator, language, locals_source, .locals, diagnostic);
         errdefer if (locals) |query| query.deinit(allocator);

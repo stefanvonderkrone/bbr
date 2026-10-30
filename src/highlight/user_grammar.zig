@@ -971,6 +971,17 @@ test "trusted native validation checks ABI queries predicates and regexes" {
     try testing.expectError(error.MissingLocalsQuery, validateLanguage(testing.allocator, language, manifest, &local_predicate, null));
 }
 
+test "M27 grammar UserGrammar validation accepts the new predicates and priority" {
+    const language = tree_sitter_javascript().?;
+    const files = [_]File{.{ .path = "highlights.scm", .bytes =
+        \\((identifier) @_x (#not-eq? @_x "a") (#not-match? @_x "^b") (#any-of? @_x "c" "d") (#not-any-of? @_x "e"))
+        \\((identifier) @y (#has-ancestor? @y program) (#not-has-ancestor? @y class_body) (#has-parent? @y expression_statement))
+        \\((identifier) @module (#not-has-parent? @module call_expression) (#set! priority 105) (#set! "priority" 90))
+    }};
+    const manifest: Manifest = .{ .tree_sitter_abi = c.ts_language_abi_version(language), .highlight_query = "highlights.scm" };
+    try validateLanguage(testing.allocator, language, manifest, &files, null);
+}
+
 test "canonical digest changes with any declared byte" {
     const first = [_]File{
         .{ .path = "grammar.toml", .bytes = "a" },

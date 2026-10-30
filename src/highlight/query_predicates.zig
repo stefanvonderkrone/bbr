@@ -38,10 +38,22 @@ pub const Diagnostic = struct {
     }
 };
 
-const Predicate = union(enum) {
+/// The precedence of a pattern without `#set! priority`, as in Neovim.
+pub const default_priority: u16 = 100;
+
+const Predicate = struct {
+    condition: Condition,
+    /// A `not-` operator and `#is-not? local` accept a match that the condition rejects.
+    negated: bool,
+};
+
+const Condition = union(enum) {
     match: struct { capture: u32, regex_index: usize },
     eq_string: struct { capture: u32, value: []const u8 },
     eq_capture: struct { left: u32, right: u32 },
+    any_of: struct { capture: u32, values: Range },
+    /// `values` are node types. `parent_only` checks only the direct parent.
+    ancestor: struct { capture: u32, values: Range, parent_only: bool },
     local,
 };
 
@@ -149,6 +161,10 @@ pub const Set = struct {
     predicates: []Predicate,
     ranges: []Range,
     regexes: []regex_mod.Regex,
+    /// The `#any-of?` values and the ancestor node types. They point into the query.
+    strings: [][]const u8,
+    /// One priority for each pattern, from `#set! priority N`.
+    priorities: []u16,
 
     pub fn validate(allocator: Allocator, query: *const c.TSQuery, source: []const u8, diagnostic: *Diagnostic) !Set {
         return validateKind(allocator, query, source, diagnostic, null);
@@ -165,8 +181,13 @@ pub const Set = struct {
         const pattern_count = c.ts_query_pattern_count(query);
         const ranges = try allocator.alloc(Range, pattern_count);
         errdefer allocator.free(ranges);
+        const priorities = try allocator.alloc(u16, pattern_count);
+        errdefer allocator.free(priorities);
+        @memset(priorities, default_priority);
         var predicates: std.ArrayList(Predicate) = .empty;
         errdefer predicates.deinit(allocator);
+        var strings: std.ArrayList([]const u8) = .empty;
+        errdefer strings.deinit(allocator);
         var regexes: std.ArrayList(regex_mod.Regex) = .empty;
         errdefer {
             for (regexes.items) |regex| regex.deinit();
@@ -191,16 +212,24 @@ pub const Set = struct {
                     const pattern_end = @min(c.ts_query_end_byte_for_pattern(query, pattern), source.len);
                     predicate_source_offset = findPredicateOffset(source, predicate_source_offset, pattern_end) orelse predicate_source_offset;
                     const injection = if (injections) |all| &all[pattern_usize] else null;
-                    try parsePredicate(allocator, query, source, steps[at..end], predicate_source_offset, &predicates, &regexes, &expressions, injection, diagnostic);
+                    try parsePredicate(allocator, query, source, steps[at..end], predicate_source_offset, &predicates, &regexes, &expressions, &strings, &priorities[pattern_usize], injection, diagnostic);
                     predicate_source_offset += 1;
                     at = end + 1;
                 }
             }
             ranges[pattern_usize].end = predicates.items.len;
         }
+        const owned_strings = try strings.toOwnedSlice(allocator);
+        errdefer allocator.free(owned_strings);
         const owned_predicates = try predicates.toOwnedSlice(allocator);
         errdefer allocator.free(owned_predicates);
-        return .{ .predicates = owned_predicates, .ranges = ranges, .regexes = try regexes.toOwnedSlice(allocator) };
+        return .{
+            .predicates = owned_predicates,
+            .ranges = ranges,
+            .regexes = try regexes.toOwnedSlice(allocator),
+            .strings = owned_strings,
+            .priorities = priorities,
+        };
     }
 
     pub fn deinit(self: Set, allocator: Allocator) void {
@@ -208,10 +237,12 @@ pub const Set = struct {
         allocator.free(self.predicates);
         allocator.free(self.ranges);
         allocator.free(self.regexes);
+        allocator.free(self.strings);
+        allocator.free(self.priorities);
     }
 
     pub fn requiresLocals(self: Set) bool {
-        for (self.predicates) |predicate| switch (predicate) {
+        for (self.predicates) |predicate| switch (predicate.condition) {
             .local => return true,
             else => {},
         };
@@ -222,17 +253,52 @@ pub const Set = struct {
         if (pattern >= self.ranges.len) return error.InvalidPatternIndex;
         const range = self.ranges[pattern];
         for (self.predicates[range.start..range.end]) |predicate| {
-            const accepted = switch (predicate) {
-                .match => |condition| try matchRegex(condition.capture, self.regexes[condition.regex_index], match, content),
-                .eq_string => |condition| try matchString(condition.capture, condition.value, match, content),
-                .eq_capture => |condition| try matchCaptures(condition.left, condition.right, match, content),
-                .local => !try matchIsLocal(match, content, locals),
-            };
-            if (!accepted) return false;
+            if (try self.holds(predicate.condition, match, content, locals) == predicate.negated) return false;
         }
         return true;
     }
+
+    /// Like Neovim, a condition holds for every node of its Capture, so it holds when the match has none.
+    fn holds(self: Set, condition: Condition, match: c.TSQueryMatch, content: []const u8, locals: Locals) !bool {
+        const capture_id = switch (condition) {
+            .local => return matchIsLocal(match, content, locals),
+            .eq_capture => |pair| return matchCaptures(pair.left, pair.right, match, content),
+            inline else => |operands| operands.capture,
+        };
+        for (match.captures[0..match.capture_count]) |capture| {
+            if (capture.index == capture_id and !try self.nodeHolds(condition, capture.node, content)) return false;
+        }
+        return true;
+    }
+
+    fn nodeHolds(self: Set, condition: Condition, node: c.TSNode, content: []const u8) !bool {
+        switch (condition) {
+            .match => |operands| return self.regexes[operands.regex_index].matches(try nodeText(node, content)),
+            .eq_string => |operands| return std.mem.eql(u8, try nodeText(node, content), operands.value),
+            .any_of => |operands| return containsString(self.strings[operands.values.start..operands.values.end], try nodeText(node, content)),
+            .ancestor => |operands| {
+                const types = self.strings[operands.values.start..operands.values.end];
+                var ancestor = c.ts_node_parent(node);
+                while (!c.ts_node_is_null(ancestor)) : (ancestor = c.ts_node_parent(ancestor)) {
+                    if (containsString(types, std.mem.span(c.ts_node_type(ancestor)))) return true;
+                    if (operands.parent_only) return false;
+                }
+                return false;
+            },
+            .eq_capture, .local => unreachable,
+        }
+    }
 };
+
+fn containsString(values: []const []const u8, text: []const u8) bool {
+    for (values) |value| if (std.mem.eql(u8, value, text)) return true;
+    return false;
+}
+
+fn nodeText(node: c.TSNode, content: []const u8) ![]const u8 {
+    const range = try nodeRange(node, content);
+    return content[range.start..range.end];
+}
 
 fn parsePredicate(
     allocator: Allocator,
@@ -243,33 +309,34 @@ fn parsePredicate(
     predicates: *std.ArrayList(Predicate),
     regexes: *std.ArrayList(regex_mod.Regex),
     expressions: *std.ArrayList([]const u8),
+    strings: *std.ArrayList([]const u8),
+    priority: *u16,
     injection: ?*Injection,
     diagnostic: *Diagnostic,
 ) !void {
     if (steps.len == 0 or steps[0].type != c.TSQueryPredicateStepTypeString)
         return failAt(source, diagnostic, .malformed_arguments, null, predicate_source_offset);
-    const operator = stringValue(query, steps[0].value_id) orelse
+    const full_operator = stringValue(query, steps[0].value_id) orelse
         return failAt(source, diagnostic, .malformed_arguments, null, predicate_source_offset);
+    const negated = std.mem.startsWith(u8, full_operator, "not-");
+    const operator = if (negated) full_operator["not-".len..] else full_operator;
 
     if (std.mem.eql(u8, operator, "match?")) {
         if (steps.len != 3 or steps[1].type != c.TSQueryPredicateStepTypeCapture or steps[2].type != c.TSQueryPredicateStepTypeString)
             return failAt(source, diagnostic, .malformed_arguments, null, predicate_source_offset);
         const expression = stringValue(query, steps[2].value_id) orelse
             return failAt(source, diagnostic, .malformed_arguments, null, predicate_source_offset);
-        for (expressions.items, 0..) |existing, regex_index| {
-            if (std.mem.eql(u8, existing, expression)) {
-                try predicates.append(allocator, .{ .match = .{ .capture = steps[1].value_id, .regex_index = regex_index } });
-                return;
-            }
-        }
-        switch (regex_mod.Regex.compile(expression)) {
-            .regex => |regex| {
+        const regex_index = for (expressions.items, 0..) |existing, index| {
+            if (std.mem.eql(u8, existing, expression)) break index;
+        } else switch (regex_mod.Regex.compile(expression)) {
+            .regex => |regex| index: {
                 try regexes.append(allocator, regex);
                 try expressions.append(allocator, expression);
-                try predicates.append(allocator, .{ .match = .{ .capture = steps[1].value_id, .regex_index = regexes.items.len - 1 } });
+                break :index regexes.items.len - 1;
             },
             .failure => |failure| return failAt(source, diagnostic, .invalid_regex, failure, predicate_source_offset),
-        }
+        };
+        try predicates.append(allocator, .{ .condition = .{ .match = .{ .capture = steps[1].value_id, .regex_index = regex_index } }, .negated = negated });
         return;
     }
     if (std.mem.eql(u8, operator, "eq?")) {
@@ -278,15 +345,41 @@ fn parsePredicate(
         if (steps[2].type == c.TSQueryPredicateStepTypeString) {
             const value = stringValue(query, steps[2].value_id) orelse
                 return failAt(source, diagnostic, .malformed_arguments, null, predicate_source_offset);
-            try predicates.append(allocator, .{ .eq_string = .{ .capture = steps[1].value_id, .value = value } });
+            try predicates.append(allocator, .{ .condition = .{ .eq_string = .{ .capture = steps[1].value_id, .value = value } }, .negated = negated });
             return;
         }
         if (steps[2].type == c.TSQueryPredicateStepTypeCapture) {
-            try predicates.append(allocator, .{ .eq_capture = .{ .left = steps[1].value_id, .right = steps[2].value_id } });
+            try predicates.append(allocator, .{ .condition = .{ .eq_capture = .{ .left = steps[1].value_id, .right = steps[2].value_id } }, .negated = negated });
             return;
         }
         return failAt(source, diagnostic, .malformed_arguments, null, predicate_source_offset);
     }
+    const list_kind: ?enum { any_of, ancestor, parent } = if (std.mem.eql(u8, operator, "any-of?"))
+        .any_of
+    else if (std.mem.eql(u8, operator, "has-ancestor?"))
+        .ancestor
+    else if (std.mem.eql(u8, operator, "has-parent?"))
+        .parent
+    else
+        null;
+    if (list_kind) |kind| {
+        if (steps.len < 3 or steps[1].type != c.TSQueryPredicateStepTypeCapture)
+            return failAt(source, diagnostic, .malformed_arguments, null, predicate_source_offset);
+        const values: Range = .{ .start = strings.items.len, .end = strings.items.len + steps.len - 2 };
+        for (steps[2..]) |step| {
+            const value = (if (step.type == c.TSQueryPredicateStepTypeString) stringValue(query, step.value_id) else null) orelse
+                return failAt(source, diagnostic, .malformed_arguments, null, predicate_source_offset);
+            try strings.append(allocator, value);
+        }
+        const capture = steps[1].value_id;
+        const condition: Condition = switch (kind) {
+            .any_of => .{ .any_of = .{ .capture = capture, .values = values } },
+            .ancestor, .parent => .{ .ancestor = .{ .capture = capture, .values = values, .parent_only = kind == .parent } },
+        };
+        try predicates.append(allocator, .{ .condition = condition, .negated = negated });
+        return;
+    }
+    if (negated) return failAt(source, diagnostic, .unknown_operator, null, predicate_source_offset);
     if (std.mem.eql(u8, operator, "is-not?")) {
         if (steps.len != 2 or steps[1].type != c.TSQueryPredicateStepTypeString)
             return failAt(source, diagnostic, .malformed_arguments, null, predicate_source_offset);
@@ -294,7 +387,15 @@ fn parsePredicate(
             return failAt(source, diagnostic, .malformed_arguments, null, predicate_source_offset);
         if (!std.mem.eql(u8, property, "local"))
             return failAt(source, diagnostic, .unsupported_property, null, predicate_source_offset);
-        try predicates.append(allocator, .local);
+        try predicates.append(allocator, .{ .condition = .local, .negated = true });
+        return;
+    }
+    if (std.mem.eql(u8, operator, "set!") and steps.len >= 2 and steps[1].type == c.TSQueryPredicateStepTypeString and
+        std.mem.eql(u8, stringValue(query, steps[1].value_id) orelse "", "priority"))
+    {
+        const text = if (steps.len == 3 and steps[2].type == c.TSQueryPredicateStepTypeString) stringValue(query, steps[2].value_id) else null;
+        priority.* = std.fmt.parseInt(u16, text orelse "", 10) catch
+            return failAt(source, diagnostic, .malformed_arguments, null, predicate_source_offset);
         return;
     }
     if (injection) |settings| {
@@ -444,19 +545,9 @@ fn findPredicateOffset(source: []const u8, start: usize, end: usize) ?usize {
     return null;
 }
 
-fn matchRegex(capture_id: u32, regex: regex_mod.Regex, match: c.TSQueryMatch, content: []const u8) !bool {
-    const text = try captureText(capture_id, match, content) orelse return error.MissingPredicateCapture;
-    return regex.matches(text);
-}
-
-fn matchString(capture_id: u32, value: []const u8, match: c.TSQueryMatch, content: []const u8) !bool {
-    const text = try captureText(capture_id, match, content) orelse return error.MissingPredicateCapture;
-    return std.mem.eql(u8, text, value);
-}
-
 fn matchCaptures(left: u32, right: u32, match: c.TSQueryMatch, content: []const u8) !bool {
-    const left_text = try captureText(left, match, content) orelse return error.MissingPredicateCapture;
-    const right_text = try captureText(right, match, content) orelse return error.MissingPredicateCapture;
+    const left_text = try captureText(left, match, content) orelse return true;
+    const right_text = try captureText(right, match, content) orelse return true;
     return std.mem.eql(u8, left_text, right_text);
 }
 
@@ -517,6 +608,42 @@ test "M27 injection directives validate only in an injection query" {
     }) |highlight_source| try expectInvalid(highlight_source, .unsupported_directive, false);
 }
 
+test "M27 grammar rejects malformed new predicates and priorities" {
+    for ([_][]const u8{
+        "((identifier) @x (#set! priority))",
+        "((identifier) @x (#set! priority high))",
+        "((identifier) @x (#set! priority -1))",
+        "((identifier) @x (#set! priority 1 2))",
+        "((identifier) @x (#any-of? @x))",
+        "((identifier) @x (#any-of? \"a\" @x))",
+        "((identifier) @x (#not-has-parent? @x @x))",
+        "((identifier) @x (#has-ancestor? @x))",
+        "((identifier) @x (#not-match? @x))",
+    }) |source| try expectInvalid(source, .malformed_arguments, false);
+    try expectInvalid("((identifier) @x (#not-is-not? local))", .unknown_operator, false);
+    try expectInvalid("((identifier) @x (#not-contains? @x \"a\"))", .unknown_operator, false);
+}
+
+test "M27 grammar RE2 compiles each translated Lua pattern and matches like Lua" {
+    const lua_patterns = @import("lua_pattern_cases.zig");
+    for (lua_patterns.cases) |case| {
+        const regex = switch (regex_mod.Regex.compile(case.re2)) {
+            .regex => |regex| regex,
+            .failure => |failure| {
+                std.debug.print("Lua pattern {s} gives RE2 {s}: {s}\n", .{ case.lua, case.re2, @tagName(failure.reason) });
+                return error.TranslatedPatternDoesNotCompile;
+            },
+        };
+        defer regex.deinit();
+        for (lua_patterns.samples, case.matches) |sample, lua_match| {
+            if (regex.matches(sample) != (lua_match == '1')) {
+                std.debug.print("Lua pattern {s} as RE2 {s} on sample {any}: Lua {c}\n", .{ case.lua, case.re2, sample, lua_match });
+                return error.TranslatedPatternDiffersFromLua;
+            }
+        }
+    }
+}
+
 test "M27 injection query rejects malformed and unknown directives" {
     try expectInvalid("((identifier) @injection.content (#offset! @injection.content 0 x 0 0))", .malformed_arguments, true);
     try expectInvalid("((identifier) @injection.content (#offset! @injection.content 0 0 0))", .malformed_arguments, true);
@@ -524,5 +651,5 @@ test "M27 injection query rejects malformed and unknown directives" {
     try expectInvalid("((identifier) @injection.content (#set! injection.language))", .malformed_arguments, true);
     try expectInvalid("((identifier) @injection.content (#set! injection.combined \"yes\"))", .malformed_arguments, true);
     try expectInvalid("((identifier) @injection.content (#set! injection.self))", .unsupported_directive, true);
-    try expectInvalid("((identifier) @injection.content (#set! \"priority\" 100))", .unsupported_directive, true);
+    try expectInvalid("((identifier) @injection.content (#set! conceal \"\"))", .unsupported_directive, true);
 }

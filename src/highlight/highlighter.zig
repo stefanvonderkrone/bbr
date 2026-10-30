@@ -22,7 +22,33 @@ pub const Capture = struct {
     id: u16,
     role: CaptureRole,
 
+    /// nvim-treesitter names that the root rules classify wrongly. The longest matching prefix wins.
+    const prefix_roles = [_]struct { []const u8, CaptureRole }{
+        .{ "variable.member", .property },
+        .{ "tag.attribute", .property },
+        .{ "tag.delimiter", .punctuation },
+        .{ "markup.heading", .keyword },
+        .{ "markup.raw", .string },
+        .{ "markup.link", .string },
+        .{ "markup.list", .punctuation },
+        .{ "markup.quote", .comment },
+        .{ "markup.math", .string },
+        .{ "module", .type },
+        .{ "character", .string },
+    };
+
     pub fn init(id: u16, name: []const u8) Capture {
+        var prefix_len: usize = 0;
+        var prefix_role: CaptureRole = .unknown;
+        for (prefix_roles) |entry| {
+            const prefix, const role = entry;
+            const at_boundary = name.len == prefix.len or name.len > prefix.len and name[prefix.len] == '.';
+            if (prefix.len > prefix_len and std.mem.startsWith(u8, name, prefix) and at_boundary) {
+                prefix_len = prefix.len;
+                prefix_role = role;
+            }
+        }
+        if (prefix_len != 0) return .{ .id = id, .role = prefix_role };
         const dot = std.mem.indexOfScalar(u8, name, '.') orelse name.len;
         const root = name[0..dot];
         const role: CaptureRole = if (std.mem.eql(u8, root, "comment"))
@@ -113,6 +139,42 @@ test "Capture classifies hierarchical names once" {
     try testing.expectEqual(CaptureRole.function, Capture.init(7, "function.call.builtin").role);
     try testing.expectEqual(CaptureRole.keyword, Capture.init(8, "operator").role);
     try testing.expectEqual(CaptureRole.unknown, Capture.init(9, "future.capture").role);
+}
+
+test "M27 grammar dotted prefixes map nvim-treesitter Captures to their roles" {
+    const cases = [_]struct { []const u8, CaptureRole }{
+        .{ "variable.member", .property },
+        .{ "variable.member.deep", .property },
+        .{ "variable.membership", .variable },
+        .{ "variable.parameter", .variable },
+        .{ "tag.attribute", .property },
+        .{ "tag.delimiter", .punctuation },
+        .{ "tag.builtin", .tag },
+        .{ "markup.heading", .keyword },
+        .{ "markup.heading.1", .keyword },
+        .{ "markup.raw.block", .string },
+        .{ "markup.link.url", .string },
+        .{ "markup.list.checked", .punctuation },
+        .{ "markup.quote", .comment },
+        .{ "markup.math", .string },
+        .{ "module", .type },
+        .{ "module.builtin", .type },
+        .{ "character", .string },
+        .{ "character.special", .string },
+        .{ "markup.strong", .unknown },
+        .{ "markup.italic", .unknown },
+        .{ "markup.strikethrough", .unknown },
+        .{ "markup.underline", .unknown },
+        .{ "none", .unknown },
+        .{ "diff.plus", .unknown },
+    };
+    for (cases) |case| {
+        const name, const role = case;
+        testing.expectEqual(role, Capture.init(0, name).role) catch |err| {
+            std.debug.print("Capture {s}\n", .{name});
+            return err;
+        };
+    }
 }
 
 test "Span uses compact offsets and Capture identity" {

@@ -42,7 +42,7 @@ const GrammarSource = struct {
 
 const BuiltInPackages = [std.meta.tags(grammar_match.BuiltInGrammar).len]RuntimePackage;
 const max_injection_depth = 4;
-const default_priority = 100;
+const default_priority = predicate_mod.default_priority;
 
 pub const TreeSitterHighlighter = struct {
     registry: ?*user_grammar.Registry = null,
@@ -211,8 +211,8 @@ fn collectLayerIntervals(allocator: Allocator, intervals: *std.ArrayList(Capture
             var interval: CaptureInterval = .{
                 .start = @intCast(range.start),
                 .end = @intCast(range.end),
-                .capture = package.captures[capture.index],
-                .priority = default_priority,
+                .capture = package.captures[capture.index] orelse continue,
+                .priority = package.highlight.predicates.priorities[match.pattern_index],
                 .depth = layer.depth,
                 .pattern_index = match.pattern_index,
                 .order = 0,
@@ -764,7 +764,7 @@ test "eq predicate filters one match and preserves later-pattern precedence" {
 test "Grammar validation atomically rejects unsupported predicate forms" {
     const cases = [_]struct { query: []const u8, kind: predicate_mod.Diagnostic.Kind }{
         .{ .query = "((identifier) @x (#unknown? @x \"x\"))", .kind = .unknown_operator },
-        .{ .query = "((identifier) @x (#set! \"priority\" 100))", .kind = .unsupported_directive },
+        .{ .query = "((identifier) @x (#set! conceal \"\"))", .kind = .unsupported_directive },
         .{ .query = "((identifier) @x (#match? \"x\" @x))", .kind = .malformed_arguments },
         .{ .query = "((identifier) @x (#match? @x \"(?=x)\"))", .kind = .invalid_regex },
         .{ .query = "((identifier) @x (#is-not? unsupported))", .kind = .unsupported_property },
@@ -864,6 +864,147 @@ test "eq predicate accepts Capture comparison" {
     try expectSpan(result, 1, 6, 7, "right");
     try expectSpan(result, 1, 9, 10, "variable");
     try expectSpan(result, 1, 15, 16, "variable");
+}
+
+test "M27 grammar each new predicate accepts and rejects a match" {
+    const cases = [_]struct { predicate: []const u8, source: []const u8, accepted: []const u8, rejected: []const u8 }{
+        .{ .predicate = "(#not-eq? @keyword \"alpha\")", .source = "alpha; beta;\n", .accepted = "beta", .rejected = "alpha" },
+        .{ .predicate = "(#not-match? @keyword \"^a\")", .source = "alpha; beta;\n", .accepted = "beta", .rejected = "alpha" },
+        .{ .predicate = "(#any-of? @keyword \"gamma\" \"beta\")", .source = "alpha; beta;\n", .accepted = "beta", .rejected = "alpha" },
+        .{ .predicate = "(#not-any-of? @keyword \"alpha\" \"gamma\")", .source = "alpha; beta;\n", .accepted = "beta", .rejected = "alpha" },
+        .{ .predicate = "(#has-ancestor? @keyword class_declaration function_declaration)", .source = "alpha;\nfunction f() { beta; }\n", .accepted = "beta", .rejected = "alpha" },
+        .{ .predicate = "(#not-has-ancestor? @keyword function_declaration)", .source = "alpha;\nfunction f() { beta; }\n", .accepted = "alpha", .rejected = "beta" },
+        .{ .predicate = "(#has-parent? @keyword call_expression)", .source = "alpha(beta);\n", .accepted = "alpha", .rejected = "beta" },
+        .{ .predicate = "(#not-has-parent? @keyword call_expression)", .source = "alpha(beta);\n", .accepted = "beta", .rejected = "alpha" },
+    };
+    for (cases) |case| {
+        const query = try std.fmt.allocPrint(testing.allocator, "((identifier) @keyword {s})", .{case.predicate});
+        defer testing.allocator.free(query);
+        const result = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?, query, "", case.source);
+        defer freeResult(result);
+        expectRoleAt(result, case.source, case.accepted, .keyword) catch |err| {
+            std.debug.print("{s} rejects {s}\n", .{ case.predicate, case.accepted });
+            return err;
+        };
+        if (captureOver(result, case.source, std.mem.indexOf(u8, case.source, case.rejected).?) != null) {
+            std.debug.print("{s} accepts {s}\n", .{ case.predicate, case.rejected });
+            return error.UnexpectedSpan;
+        }
+    }
+}
+
+test "M27 grammar set priority changes the winner between overlapping patterns" {
+    const source = "alpha;\n";
+    const later_wins = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?, "(identifier) @keyword\n(identifier) @variable", "", source);
+    defer freeResult(later_wins);
+    try expectRoleAt(later_wins, source, "alpha", .variable);
+
+    for ([_][]const u8{
+        "((identifier) @keyword (#set! priority 101))\n(identifier) @variable",
+        "((identifier) @keyword (#set! \"priority\" 101))\n(identifier) @variable",
+        "(identifier) @keyword\n((identifier) @variable (#set! priority 99))",
+    }) |query| {
+        const result = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?, query, "", source);
+        defer freeResult(result);
+        try expectRoleAt(result, source, "alpha", .keyword);
+    }
+}
+
+test "M27 grammar a hidden Capture produces no Span and still filters" {
+    const hidden_only = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?, "(identifier) @_name", "", "alpha;\n");
+    defer freeResult(hidden_only);
+    try testing.expectEqual(@as(usize, 0), hidden_only.spans.len);
+
+    const query =
+        \\(call_expression
+        \\  function: (identifier) @_callee
+        \\  arguments: (arguments (identifier) @keyword)
+        \\  (#eq? @_callee "alpha"))
+    ;
+    const source = "alpha(beta); gamma(delta);\n";
+    const result = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?, query, "", source);
+    defer freeResult(result);
+    try testing.expectEqual(@as(usize, 1), result.spans.len);
+    try expectRoleAt(result, source, "beta", .keyword);
+}
+
+test "M27 grammar a predicate on an absent optional Capture behaves like Neovim" {
+    const source = "alpha(); beta(y); gamma(x);\n";
+    const positive = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?,
+        \\(call_expression function: (identifier) @keyword arguments: (arguments (identifier)? @_arg) (#eq? @_arg "x"))
+    , "", source);
+    defer freeResult(positive);
+    try expectRoleAt(positive, source, "alpha", .keyword);
+    try testing.expectEqual(null, captureOver(positive, source, std.mem.indexOf(u8, source, "beta").?));
+    try expectRoleAt(positive, source, "gamma", .keyword);
+
+    const negated = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?,
+        \\(call_expression function: (identifier) @keyword arguments: (arguments (identifier)? @_arg) (#not-eq? @_arg "x"))
+    , "", source);
+    defer freeResult(negated);
+    try testing.expectEqual(null, captureOver(negated, source, std.mem.indexOf(u8, source, "alpha").?));
+    try expectRoleAt(negated, source, "beta", .keyword);
+    try testing.expectEqual(null, captureOver(negated, source, std.mem.indexOf(u8, source, "gamma").?));
+}
+
+test "M27 grammar every Capture name in the M13 queries keeps its role" {
+    // Generated from `Capture.init` before the M27 prefix rules.
+    const golden = [_]struct { []const u8, bbr.highlight.CaptureRole }{
+        .{ "attribute", .property },
+        .{ "boolean", .constant },
+        .{ "comment", .comment },
+        .{ "constant", .constant },
+        .{ "constant.builtin", .constant },
+        .{ "constructor", .function },
+        .{ "embedded", .unknown },
+        .{ "escape", .unknown },
+        .{ "function", .function },
+        .{ "function.builtin", .function },
+        .{ "function.method", .function },
+        .{ "keyword", .keyword },
+        .{ "label", .variable },
+        .{ "number", .constant },
+        .{ "operator", .keyword },
+        .{ "property", .property },
+        .{ "punctuation.bracket", .punctuation },
+        .{ "punctuation.delimiter", .punctuation },
+        .{ "punctuation.special", .punctuation },
+        .{ "string", .string },
+        .{ "string.special", .string },
+        .{ "string.special.key", .string },
+        .{ "tag", .tag },
+        .{ "type", .type },
+        .{ "type.builtin", .type },
+        .{ "variable", .variable },
+        .{ "variable.builtin", .variable },
+        .{ "variable.parameter", .variable },
+    };
+    var seen = [_]bool{false} ** golden.len;
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    for ([_]grammar_match.BuiltInGrammar{ .javascript, .typescript, .tsx, .css, .go, .bash, .json, .yaml }) |grammar| {
+        const package = &highlighter.packages[@intFromEnum(grammar)];
+        next_name: for (package.capture_names, package.captures) |name, capture| {
+            for (golden, &seen) |entry, *found| {
+                const golden_name, const role = entry;
+                if (!std.mem.eql(u8, name, golden_name)) continue;
+                found.* = true;
+                testing.expectEqual(role, capture.?.role) catch |err| {
+                    std.debug.print("{s} Capture {s}\n", .{ @tagName(grammar), name });
+                    return err;
+                };
+                continue :next_name;
+            }
+            std.debug.print("{s} Capture {s} is not in the golden list\n", .{ @tagName(grammar), name });
+            return error.MissingGoldenCapture;
+        }
+    }
+    for (golden, seen) |entry, found| {
+        if (!found) {
+            std.debug.print("golden Capture {s} is in no M13 query\n", .{entry[0]});
+            return error.StaleGoldenCapture;
+        }
+    }
 }
 
 fn freeResult(result: bbr.highlight.HighlightResult) void {
@@ -1246,7 +1387,7 @@ fn useJavaScriptQueries(highlighter: *TreeSitterHighlighter, highlight_query: []
 
 fn packageCapture(package: *const RuntimePackage, name: []const u8) bbr.highlight.Capture {
     for (package.capture_names, package.captures) |capture_name, capture| {
-        if (std.mem.eql(u8, capture_name, name)) return capture;
+        if (std.mem.eql(u8, capture_name, name)) return capture.?;
     }
     unreachable;
 }
