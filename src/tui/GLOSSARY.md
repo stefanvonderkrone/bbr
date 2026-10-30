@@ -17,6 +17,10 @@ _Avoid_: PullRequest header, comparison string, byline.
 The lazily acquired old/new full-file content and Highlighting attached to a File during a Session. Each side becomes available independently; failure on one side does not suppress usable content from the other.
 _Avoid_: blob load, highlight job, hydration.
 
+**Enrichment Range**:
+The Files whose File Enrichment Presentation keeps: every File with a row in the DiffPane viewport, plus a fixed number of overscan Files above and below them. An isolated File is the whole Enrichment Range.
+_Avoid_: prefetch window, focused File (for the whole range).
+
 **Selected Version**:
 The review-wide choice of old or new File content for version-specific inspection, source Actions, and clipboard eligibility.
 It defaults to new when both File versions exist.

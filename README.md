@@ -303,9 +303,11 @@ to restore ordinary terminal mouse handling, or configure `vertical_scroll_rows`
 count. Terminals commonly use Shift or Option as a terminal-dependent bypass for native selection
 while mouse reporting is enabled.
 
-Syntax highlighting is loaded lazily for the focused File. `max_file_bytes` limits each old/new
-file side independently; the 2 MiB default avoids expensive parsing of generated or minified
-files. Set it to `0` for no limit. Files above the limit remain readable as plain text.
+Syntax highlighting is loaded lazily for every File with a row in the DiffPane, and for one more
+File above and one more File below them. The File under the cursor loads first. `max_file_bytes`
+limits each old/new file side independently; the 2 MiB default avoids expensive parsing of
+generated or minified files. Set it to `0` for no limit. Files above the limit remain readable as
+plain text.
 
 ### Manage UserGrammars
 
@@ -362,18 +364,16 @@ An active missing, changed, or invalid UserGrammar stops a new `bbr` process. An
 UserGrammar appears as `invalid` in `bbr grammar list` and does not stop startup. If a UserGrammar
 fails during Highlighting, `bbr` uses a matching BuiltInGrammar or plain text.
 
-Full file content has no size limit. The focused File is always retained while it is being
-reviewed. Inactive file content uses a whole-File least-recently-used cache: it is enabled by
-default with a 256 MiB budget across the current review. Evicted Files are fetched again when
-revisited. The focused File is outside the budget and may exceed it. Set `max_bytes = 0` for
-unlimited inactive caching, or `enabled = false` to retain only the focused File. This cache limit
-controls retained inactive content; `[highlight].max_file_bytes` separately limits Highlighting
-work and never makes oversized content unreadable.
+Full file content has no size limit. The Files in the DiffPane and the one File above and below
+them are always retained. Other file content uses a whole-File least-recently-used cache: it is
+enabled by default with a 256 MiB budget across the current review. Evicted Files are fetched again
+when they come back into view. The retained Files are outside the budget and may exceed it. Set
+`max_bytes = 0` for unlimited caching, or `enabled = false` to retain only the Files in and next to
+the DiffPane. This cache limit controls retained content; `[highlight].max_file_bytes` separately
+limits Highlighting work and never makes oversized content unreadable.
 
-After an explicit move to the next File in a remote review, `bbr` prefetches only that File's
-immediate successor. Other File focus changes and LocalReviews use demand loading. Disabling the
-inactive File cache also disables prefetch. File content and Highlighting stay in memory and are
-never written to SQLite, the state directory, or the data directory.
+File content and Highlighting stay in memory and are never written to SQLite, the state directory,
+or the data directory.
 
 ## Reference
 

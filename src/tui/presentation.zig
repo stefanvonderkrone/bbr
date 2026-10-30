@@ -2529,7 +2529,7 @@ pub const DisclosureBuild = struct {
     cache_entries: []file_enrichment.CacheEntry = &.{},
     cache_victims: []const usize = &.{},
     cache_policy: file_enrichment.CachePolicy = .{},
-    cache_focused: ?usize = null,
+    cache_focused: file_enrichment.FileRange = .{},
     cache_request_id: u64 = 0,
     hold_enrichment: bool = false,
     tree: file_tree.Projection = .{},
@@ -2603,7 +2603,7 @@ pub const DisclosureBuild = struct {
             .active = active,
             .cache_revision = published.session.enrichment.revision,
             .cache_policy = published.session.enrichment.cache,
-            .cache_focused = published.session.enrichment.focused_file,
+            .cache_focused = published.session.enrichment.focused,
         };
         job.inputs.retain();
         _ = job.target.base.retain();
@@ -3973,7 +3973,7 @@ const Published = struct {
     pending_view: ?struct { request_id: u64, preferences: Preferences, isolated_file: ?usize, geometry: frame_mod.Geometry, navigation_policy: DisclosureBuild.NavigationPolicy, navigation_file: ?usize } = null,
     cache_update_generation: u64 = 0,
     pending_cache_update: ?u64 = null,
-    pending_cache_focus: ?usize = null,
+    pending_cache_focus: file_enrichment.FileRange = .{},
     search_corpus: ?*BufferSearchCorpus = null,
     review_search: ReviewSearchState,
     active_search: enum { none, buffer, review } = .none,
@@ -4079,7 +4079,7 @@ const Published = struct {
         published.pending_view = null;
         published.cache_update_generation = 0;
         published.pending_cache_update = null;
-        published.pending_cache_focus = null;
+        published.pending_cache_focus = .{};
         published.search_corpus = null;
         published.review_search = .{};
         published.active_search = .none;
@@ -4090,7 +4090,7 @@ const Published = struct {
         published.cell_metrics = cell_metrics;
         published.comments_collapsed_rows = comments_collapsed_rows;
         session.enrichment.configureCache(cache_policy);
-        if (session.enrichment.len() > 0) session.enrichment.focus(0);
+        if (session.enrichment.len() > 0) session.enrichment.focus(.single(0));
         return published;
     }
 
@@ -5062,9 +5062,13 @@ const VersionRestoration = struct {
 
 const VersionDestination = struct { row: ?usize = null, found: bool = false };
 
-const PrefetchArm = struct {
-    session_epoch: SessionEpoch,
-    file_index: usize,
+/// The Files above and the Files below the visible Files that File
+/// Enrichment also keeps.
+const enrichment_overscan_files: usize = 1;
+
+const EnrichmentRange = struct {
+    visible: file_enrichment.FileRange,
+    focused: file_enrichment.FileRange,
 };
 
 const SpeculativeEnrichment = struct {
@@ -5881,7 +5885,6 @@ pub const Presentation = struct {
     outstanding_loads: usize = 0,
     outstanding_picker_loads: usize = 0,
     issued_enrichments: std.ArrayList(IssuedEnrichment) = .empty,
-    prefetch_arm: ?PrefetchArm = null,
     speculative_enrichment: ?SpeculativeEnrichment = null,
     resolver: keymap_mod.Resolver = .{},
     list_overlay: ?ListOverlay = null,
@@ -6346,7 +6349,6 @@ pub const Presentation = struct {
 
     fn activateMouseTarget(self: *Presentation, target: frame_mod.HitTarget, time_ns: ?i96) void {
         if (target != .select_old_version and target != .select_new_version) {
-            self.prefetch_arm = null;
             self.version_restoration = null;
         }
         switch (target) {
@@ -7358,11 +7360,6 @@ pub const Presentation = struct {
             action == .focus_next_pane or action == .isolate or action == .cycle_scope or action == .open_file_finder or
             action == .scroll_row_up or action == .scroll_row_down)
             self.version_restoration = null;
-        if (keymap_mod.isMotion(action) or action == .next_file or action == .prev_file or
-            action == .open_file_finder or action == .focus_next_pane)
-        {
-            self.prefetch_arm = null;
-        }
         if (action == .quit) {
             self.requestShutdown();
             return;
@@ -7546,13 +7543,7 @@ pub const Presentation = struct {
             };
         }
         if (published.focus == .diff and active_before != published.activeFile()) self.revealActiveFile(published);
-        const active_after = published.activeFile();
         self.selectFocusedFileVersion(published);
-        if (active_before != active_after and action == .next_file and active_before != null and
-            active_after == active_before.? + 1 and published.key.isRemote() and self.dependencies.file_cache_enabled)
-        {
-            self.prefetch_arm = .{ .session_epoch = published.epoch, .file_index = active_after.? };
-        }
     }
 
     fn openReviewSearch(self: *Presentation) void {
@@ -7608,8 +7599,7 @@ pub const Presentation = struct {
         }
         if (state.query != null) holdReviewSearchFiles(published);
         state.open = true;
-        self.prefetch_arm = null;
-        self.pauseQueuedPrefetch(published);
+        self.pauseQueuedSpeculativeEnrichment(published);
         self.pumpReviewSearchAcquisition(published);
         self.maybeQueueReviewSourceScan(published);
         published.active_search = .review;
@@ -7796,7 +7786,7 @@ pub const Presentation = struct {
         }
     }
 
-    fn pauseQueuedPrefetch(self: *Presentation, published: *Published) void {
+    fn pauseQueuedSpeculativeEnrichment(self: *Presentation, published: *Published) void {
         var index: usize = 0;
         while (index < self.commands.items.len) {
             const queued = self.commands.items[index];
@@ -7894,7 +7884,7 @@ pub const Presentation = struct {
 
     fn stageReleasedSearchLeases(self: *Presentation, published: *Published) void {
         if (self.shutdown_requested) return;
-        const focused = if (published.pending_cache_update != null) published.pending_cache_focus else published.session.enrichment.focused_file;
+        const focused = if (published.pending_cache_update != null) published.pending_cache_focus else published.session.enrichment.focused;
         if (published.pending_cache_update == null and !published.session.enrichment.requiresCacheEnforcement(focused)) return;
         self.queueCacheBuild(published, focused) catch {
             self.action_error = .out_of_memory;
@@ -8962,7 +8952,7 @@ pub const Presentation = struct {
             };
         }
         if (job.kind == .cache_update) {
-            if (job.cache_focused) |index| published.session.enrichment.focusAdmitted(index);
+            if (!job.cache_focused.isEmpty()) published.session.enrichment.focusAdmitted(job.cache_focused);
             published.session.enrichment.stageCacheVictims(job.cache_victims);
         }
         if (job.completed_inputs) |inputs| {
@@ -9068,8 +9058,8 @@ pub const Presentation = struct {
             }
             const occurrence = job.review_snapshot.?.occurrences[job.review_selected.?];
             if (occurrence.location == .source) {
-                published.session.enrichment.focusAdmitted(occurrence.location.source.file_index);
-                published.pending_cache_focus = occurrence.location.source.file_index;
+                published.session.enrichment.focusAdmitted(.single(occurrence.location.source.file_index));
+                published.pending_cache_focus = .single(occurrence.location.source.file_index);
             }
             published.navigation.jumpTo(job.destination_row.?);
             published.focus = .diff;
@@ -9127,10 +9117,6 @@ pub const Presentation = struct {
             if (published.review_search.acquired) |acquired| acquired[index] = true;
             self.pumpReviewSearchAcquisition(published);
             self.maybeQueueReviewSourceScan(published);
-            if (job.source_active_file != null and job.source_active_file.? == index)
-                self.maybeQueuePrefetch(published, index) catch {
-                    self.prefetch_arm = null;
-                };
             if (self.version_restoration) |target| if (job.preferences.scope == .whole and target.selected_version == job.preferences.selected_version and
                 target.session_epoch == published.epoch and target.file_index == index and
                 job.version_restoration != null and std.meta.eql(target, job.version_restoration.?) and
@@ -9176,7 +9162,7 @@ pub const Presentation = struct {
         self.commands.appendAssumeCapacity(.{ .build_buffer_disclosure = job });
     }
 
-    fn queueCacheBuild(self: *Presentation, published: *Published, focused: ?usize) !void {
+    fn queueCacheBuild(self: *Presentation, published: *Published, focused: file_enrichment.FileRange) !void {
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
         const job = try DisclosureBuild.create(published, self.preferences, .{ .base = published.disclosure_keys }, published.search_generation, published.buffer_search.active);
         job.kind = .cache_update;
@@ -9678,7 +9664,6 @@ pub const Presentation = struct {
     }
 
     fn focusFile(self: *Presentation, published: *Published, file_index: usize) void {
-        self.prefetch_arm = null;
         if (file_index >= published.session.diff.files.len) return;
         var candidate = if (published.pending_view) |desired| desired.preferences else self.preferences;
         candidate.selected_version = fileVersion(published.session.diff.files[file_index], candidate.selected_version);
@@ -11117,27 +11102,79 @@ pub const Presentation = struct {
         }
     }
 
+    /// Keep File Enrichment for the Enrichment Range. The active File is
+    /// demand work. Once it is terminal, each other File in the range follows
+    /// as speculative work, one at a time: the visible Files from top to
+    /// bottom, then the overscan Files above, then the overscan Files below.
     fn ensureFocusedEnrichment(self: *Presentation) !void {
         if (self.shutdown_requested) return;
         const published = self.published orelse return;
-        const file_index = published.isolated_file orelse published.buffer.fileIndexForRow(published.cursorBufferIndex()) orelse return;
-        if (file_index >= published.session.diff.files.len or file_index >= published.session.enrichment.len()) return;
+        const files = @min(published.session.diff.files.len, published.session.enrichment.len());
+        const active = if (published.activeFile()) |index| if (index < files) index else null else null;
+        const range = enrichmentRange(published, active, files);
+        if (range.focused.isEmpty()) return;
         if (published.pending_cache_update != null) {
-            if (published.pending_cache_focus != file_index) try self.queueCacheBuild(published, file_index);
+            if (!std.meta.eql(published.pending_cache_focus, range.focused)) try self.queueCacheBuild(published, range.focused);
             return;
         }
-        if (published.session.enrichment.requiresCacheEnforcement(file_index)) {
-            try self.queueCacheBuild(published, file_index);
+        if (published.session.enrichment.requiresCacheEnforcement(range.focused)) {
+            try self.queueCacheBuild(published, range.focused);
             return;
         }
-        published.session.enrichment.focusAdmitted(file_index);
+        const enrichment = &published.session.enrichment;
+        enrichment.focusAdmitted(range.focused);
         if (published.review_search.open) return;
-        self.promoteSpeculativeEnrichment(published.epoch, file_index);
-        if (!published.session.enrichment.needsEnrichment(file_index)) {
-            try self.maybeQueuePrefetch(published, file_index);
-            return;
+        if (active) |file_index| {
+            self.promoteSpeculativeEnrichment(published.epoch, file_index);
+            if (enrichment.needsEnrichment(file_index)) return self.queueFileEnrichment(published, file_index, false);
+            if (!enrichment.isTerminal(file_index)) return;
         }
-        try self.queueFileEnrichment(published, file_index, false);
+        if (self.speculative_enrichment != null) return;
+        for (range.visible.first..range.visible.end) |file_index| {
+            if (enrichment.needsEnrichment(file_index)) return self.queueFileEnrichment(published, file_index, true);
+        }
+        var above = range.visible.first;
+        while (above > range.focused.first) {
+            above -= 1;
+            if (enrichment.needsEnrichment(above)) return self.queueFileEnrichment(published, above, true);
+        }
+        for (range.visible.end..range.focused.end) |file_index| {
+            if (enrichment.needsEnrichment(file_index)) return self.queueFileEnrichment(published, file_index, true);
+        }
+    }
+
+    /// The Files with a row in the DiffPane viewport, and the focused range:
+    /// those Files plus `enrichment_overscan_files` Files above and below.
+    /// It always holds the active File. An isolated File is the whole range.
+    fn enrichmentRange(published: *const Published, active: ?usize, files: usize) EnrichmentRange {
+        if (published.isolated_file) |isolated| {
+            const range: file_enrichment.FileRange = if (isolated < files) .single(isolated) else .{};
+            return .{ .visible = range, .focused = range };
+        }
+        var visible: file_enrichment.FileRange = if (active) |index| .single(index) else .{};
+        const buffer = published.buffer;
+        const rows = published.visual_rows;
+        const top = @min(published.navigation.scroll, rows.len);
+        const bottom = @min(top +| published.navigation.viewport, rows.len);
+        if (buffer.file_rows.len > 0 and top < bottom) {
+            const top_row = rows[top].buffer_index;
+            const bottom_row = rows[bottom - 1].buffer_index;
+            if (bottom_row >= buffer.file_rows[0].first_row and top_row < buffer.file_rows_end) {
+                const first = buffer.fileIndexForRow(top_row) orelse buffer.file_rows[0].file_index;
+                const last = buffer.fileIndexForRow(bottom_row) orelse buffer.file_rows[buffer.file_rows.len - 1].file_index;
+                visible = if (visible.isEmpty())
+                    .{ .first = first, .end = last + 1 }
+                else
+                    .{ .first = @min(visible.first, first), .end = @max(visible.end, last + 1) };
+            }
+        }
+        visible.end = @min(visible.end, files);
+        visible.first = @min(visible.first, visible.end);
+        if (visible.isEmpty()) return .{ .visible = visible, .focused = visible };
+        return .{ .visible = visible, .focused = .{
+            .first = visible.first -| enrichment_overscan_files,
+            .end = @min(visible.end +| enrichment_overscan_files, files),
+        } };
     }
 
     fn queueFileEnrichment(self: *Presentation, published: *Published, file_index: usize, speculative: bool) !void {
@@ -11209,19 +11246,6 @@ pub const Presentation = struct {
             .file_index = file_index,
         };
         self.action_error = null;
-    }
-
-    fn maybeQueuePrefetch(self: *Presentation, published: *Published, focused_file: usize) !void {
-        if (published.review_search.open) return;
-        const arm = self.prefetch_arm orelse return;
-        if (arm.session_epoch != published.epoch or arm.file_index != focused_file) return;
-        if (!published.session.enrichment.isTerminal(focused_file)) return;
-        self.prefetch_arm = null;
-        if (!published.key.isRemote() or !self.dependencies.file_cache_enabled) return;
-        const successor = focused_file + 1;
-        if (successor >= published.session.diff.files.len) return;
-        if (!published.session.enrichment.needsEnrichment(successor)) return;
-        try self.queueFileEnrichment(published, successor, true);
     }
 
     fn promoteSpeculativeEnrichment(self: *Presentation, epoch: SessionEpoch, file_index: usize) void {
@@ -11836,7 +11860,6 @@ pub const Presentation = struct {
     }
 
     fn choosePullRequest(self: *Presentation, key: OwnedReviewIdentity) !void {
-        self.prefetch_arm = null;
         self.unknown_resolution = null;
         self.help_visible = false;
         if (self.published) |published| {
@@ -11879,7 +11902,6 @@ pub const Presentation = struct {
     }
 
     fn queueReconciliation(self: *Presentation, key: OwnedReviewIdentity) void {
-        self.prefetch_arm = null;
         const intent = self.next_intent + 1;
         self.removeQueuedSessionLoads();
         self.commands.appendAssumeCapacity(.{ .load_session = .{ .intent = intent, .key = key, .cause = .reconciliation } });
@@ -11889,7 +11911,6 @@ pub const Presentation = struct {
     }
 
     fn queueRefresh(self: *Presentation, key: OwnedReviewIdentity) void {
-        self.prefetch_arm = null;
         const intent = self.next_intent + 1;
         self.commands.ensureTotalCapacity(self.allocator, self.commands.items.len + 1) catch {
             self.action_error = .out_of_memory;
@@ -14565,7 +14586,7 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
     for (0..3) |change| for (0..9) |sample| {
         // Restore cache content and the complete Frame outside the timed stages.
         storage.configureCache(.{ .max_retained_bytes = 0 });
-        storage.focusAdmitted(0);
+        storage.focusAdmitted(.single(0));
         for (published.session.diff.files, 0..) |file, index| {
             if (storage.needsEnrichment(index)) {
                 var result = try file_enrichment.enrich(std.heap.page_allocator, client, plain.highlighter(), .{
@@ -14605,7 +14626,7 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
             else => unreachable,
         }
         times[change][0][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-        if (published.visual_rows.ptr != before or !storage.requiresCacheEnforcement(target)) return error.CachePublishedBeforeWorker;
+        if (published.visual_rows.ptr != before or !storage.requiresCacheEnforcement(.single(target))) return error.CachePublishedBeforeWorker;
         var job = (presentation.takeCommand() orelse return error.MissingCacheBuild).build_buffer_disclosure;
         start = std.Io.Clock.awake.now(io);
         job.build();
@@ -14618,7 +14639,7 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
             start = std.Io.Clock.awake.now(io);
             try presentation.dispatch(.{ .buffer_disclosure_built = job });
             input_times[1][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-            if (published.visual_rows.ptr != before or !storage.requiresCacheEnforcement(target)) return error.StaleCachePublished;
+            if (published.visual_rows.ptr != before or !storage.requiresCacheEnforcement(.single(target))) return error.StaleCachePublished;
             var scan = presentation.takeCommand() orelse return error.MissingScan;
             defer scan.deinit();
             if (scan != .scan_buffer_search) return error.UnexpectedCommand;
@@ -14632,7 +14653,7 @@ fn benchmarkCacheFrames(presentation: *Presentation, io: std.Io, body: []const u
         start = std.Io.Clock.awake.now(io);
         try presentation.dispatch(.{ .buffer_disclosure_built = job });
         times[change][2][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
-        if (published.worker_frame != job or storage.requiresCacheEnforcement(target)) return error.CacheNotPublished;
+        if (published.worker_frame != job or storage.requiresCacheEnforcement(.single(target))) return error.CacheNotPublished;
         const victim: usize = if (change == 0) 0 else 1;
         if (storage.file(victim).new != .pending or published.disclosure_inputs.blobs[victim].new != null) return error.CacheVictimRetained;
         if (change == 0 and (!std.mem.eql(u8, published.buffer_search.input.?.query.?.text, "needl") or
@@ -14968,7 +14989,7 @@ fn disclosureWorkerFailureCase(allocator: Allocator, kind: DisclosureBuild.Kind,
             .outcome = .{ .completed = result },
         } });
     } else if (kind == .cache_update) {
-        try presentation.queueCacheBuild(presentation.published.?, 0);
+        try presentation.queueCacheBuild(presentation.published.?, .single(0));
     } else if (kind == .draft_save) {
         try presentation.dispatch(.{ .action = .review_comment });
         try presentation.dispatch(.{ .composer = .{ .insert = try TextChunk.init("new Draft") } });
@@ -16085,7 +16106,7 @@ test "M21 authored source Fold reveal is temporary when Buffer Search starts" {
     try presentation.dispatch(.{ .review_source_scanned = other_scan });
     try testing.expectEqual(@as(usize, 1), presentation.projection().review_search.?.results.len);
     const before_destination = presentation.projection().review.?.frame;
-    const before_focus = session.enrichment.focused_file;
+    const before_focus = session.enrichment.focused;
     try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
     try testing.expectEqual(before_destination.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
     try testing.expectEqual(@as(?usize, 1), presentation.projection().review.?.isolated_file);
@@ -16101,7 +16122,7 @@ test "M21 authored source Fold reveal is temporary when Buffer Search starts" {
     failing.fail_index = std.math.maxInt(usize);
     try testing.expectEqual(ActionError.out_of_memory, presentation.projection().action_error.?);
     try testing.expectEqual(before_destination.visual_rows.ptr, presentation.projection().review.?.frame.visual_rows.ptr);
-    try testing.expectEqual(before_focus, session.enrichment.focused_file);
+    try testing.expectEqual(before_focus, session.enrichment.focused);
     try testing.expectEqual(@as(?usize, 1), presentation.projection().review.?.isolated_file);
     try testing.expect(presentation.published.?.review_search.saved_disclosures == null);
     try presentation.dispatch(.{ .action = .open_search_occurrence });
@@ -18791,7 +18812,7 @@ const PersistenceTestHighlighter = struct {
             .line = 1,
             .start = 0,
             .end = 8,
-            .capture = bbr.highlight.Capture.init(0, "prefetch-capture-sentinel"),
+            .capture = bbr.highlight.Capture.init(0, "speculative-capture-sentinel"),
         };
         return .{ .spans = spans };
     }
@@ -18804,7 +18825,7 @@ fn expectNoPersistenceSentinels(dir: std.Io.Dir) !void {
         if (entry.kind != .file) continue;
         const bytes = try dir.readFileAlloc(testing.io, entry.path, testing.allocator, .unlimited);
         defer testing.allocator.free(bytes);
-        inline for (.{ "prefetch-old-content-sentinel", "prefetch-new-content-sentinel", "prefetch-capture-sentinel" }) |sentinel|
+        inline for (.{ "speculative-old-content-sentinel", "speculative-new-content-sentinel", "speculative-capture-sentinel" }) |sentinel|
             try testing.expect(std.mem.indexOf(u8, bytes, sentinel) == null);
     }
 }
@@ -26487,40 +26508,88 @@ test "focused File Enrichment emits one Session Epoch command while in flight" {
     try testing.expect(presentation.takeCommand() == null);
 }
 
-test "explicit forward File traversal prefetches only after focused enrichment completes" {
+fn takeTestEnrichment(presentation: *Presentation) !EnrichFile {
+    try presentation.dispatch(.ensure_focused_enrichment);
+    var command = presentation.takeCommand() orelse return error.MissingEnrichment;
+    if (command != .enrich_file) {
+        command.deinit();
+        return error.UnexpectedCommand;
+    }
+    return command.enrich_file;
+}
+
+fn expectNoTestEnrichment(presentation: *Presentation) !void {
+    try presentation.dispatch(.ensure_focused_enrichment);
+    try testing.expect(presentation.takeCommand() == null);
+}
+
+test "File Enrichment covers the visible Files and the overscan Files, with the active File first" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{
-            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
-            .session = try testManyFileSession(testing.allocator, 1, 3),
-        },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 8) },
         .viewport_rows = 8,
     });
     defer presentation.deinit();
+    const published = presentation.published.?;
 
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const initial = presentation.takeCommand().?.enrich_file;
-    try testing.expect(!initial.speculative);
-    try completeTestEnrichment(&presentation, initial);
-    try testing.expect(presentation.takeCommand() == null);
+    const active = try takeTestEnrichment(&presentation);
+    try testing.expectEqual(@as(usize, 0), active.file_index);
+    try testing.expect(!active.speculative);
+    try expectNoTestEnrichment(&presentation);
+    try completeTestEnrichment(&presentation, active);
 
-    try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const focused = presentation.takeCommand().?.enrich_file;
-    try testing.expectEqual(@as(usize, 1), focused.file_index);
-    try testing.expect(!focused.speculative);
-    try testing.expect(presentation.takeCommand() == null);
-
-    try completeTestEnrichment(&presentation, focused);
-    const successor = presentation.takeCommand().?.enrich_file;
-    try testing.expectEqual(@as(usize, 2), successor.file_index);
-    try testing.expect(successor.speculative);
-    try completeTestEnrichment(&presentation, successor);
+    const range = Presentation.enrichmentRange(published, 0, 8);
+    try testing.expectEqual(@as(usize, 0), range.visible.first);
+    try testing.expect(range.visible.end > 1 and range.visible.end < 7);
+    try testing.expectEqual(range.visible.end + enrichment_overscan_files, range.focused.end);
+    for (1..range.focused.end) |file_index| {
+        const speculative = try takeTestEnrichment(&presentation);
+        try testing.expectEqual(file_index, speculative.file_index);
+        try testing.expect(speculative.speculative);
+        try expectNoTestEnrichment(&presentation);
+        try completeTestEnrichment(&presentation, speculative);
+    }
+    try expectNoTestEnrichment(&presentation);
+    try testing.expectEqual(range.focused, published.session.enrichment.focused);
     try testing.expectEqual(@as(usize, 0), store.entries.items.len);
 }
 
-test "M21 authored Review Search pauses a queued successor prefetch before it starts" {
+test "File Enrichment takes the visible Files top to bottom, then the overscan File above, then below" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 8) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    for (0..4) |_| try presentation.dispatch(.{ .action = .next_file });
+    const active_file = published.activeFile().?;
+    const range = Presentation.enrichmentRange(published, active_file, 8);
+    try testing.expect(range.visible.first > 1);
+
+    const active = try takeTestEnrichment(&presentation);
+    try testing.expectEqual(active_file, active.file_index);
+    try testing.expect(!active.speculative);
+    try completeTestEnrichment(&presentation, active);
+
+    var expected: std.ArrayList(usize) = .empty;
+    defer expected.deinit(testing.allocator);
+    for (range.visible.first..range.visible.end) |file_index| if (file_index != active_file) try expected.append(testing.allocator, file_index);
+    try expected.append(testing.allocator, range.visible.first - 1);
+    for (range.visible.end..range.focused.end) |file_index| try expected.append(testing.allocator, file_index);
+    for (expected.items) |file_index| {
+        const speculative = try takeTestEnrichment(&presentation);
+        try testing.expectEqual(file_index, speculative.file_index);
+        try testing.expect(speculative.speculative);
+        try completeTestEnrichment(&presentation, speculative);
+    }
+    try expectNoTestEnrichment(&presentation);
+    try testing.expect(published.session.enrichment.needsEnrichment(range.focused.first - 1));
+}
+
+test "an isolated File is the whole Enrichment Range" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -26528,11 +26597,25 @@ test "M21 authored Review Search pauses a queued successor prefetch before it st
         .viewport_rows = 8,
     });
     defer presentation.deinit();
-    try presentation.dispatch(.ensure_focused_enrichment);
-    try completeTestEnrichment(&presentation, presentation.takeCommand().?.enrich_file);
     try presentation.dispatch(.{ .action = .next_file });
+    try dispatchView(&presentation, .{ .action = .isolate });
+    const range = Presentation.enrichmentRange(presentation.published.?, 1, 3);
+    try testing.expectEqual(file_enrichment.FileRange.single(1), range.visible);
+    try testing.expectEqual(file_enrichment.FileRange.single(1), range.focused);
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    try expectNoTestEnrichment(&presentation);
+}
+
+test "M21 authored Review Search pauses a queued speculative File Enrichment before it starts" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 3) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
     try presentation.dispatch(.ensure_focused_enrichment);
-    try completeTestEnrichment(&presentation, presentation.takeCommand().?.enrich_file);
     try testing.expect(presentation.commands.items.len > 0);
     try testing.expect(presentation.commands.items[0].enrich_file.speculative);
     try presentation.dispatch(.{ .action = .open_review_search });
@@ -26543,161 +26626,42 @@ test "M21 authored Review Search pauses a queued successor prefetch before it st
     try testing.expect(command.enrich_file.search_acquisition);
 }
 
-test "focusing speculative File promotes its WorkId and prefetches its successor" {
+test "focusing a speculative File promotes its WorkId, and its failure then reports" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{
-            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
-            .session = try testManyFileSession(testing.allocator, 1, 4),
-        },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 4) },
         .viewport_rows = 8,
     });
     defer presentation.deinit();
-
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const first = presentation.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&presentation, first);
-    try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const second = presentation.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&presentation, second);
-    const speculative = presentation.takeCommand().?.enrich_file;
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    const speculative = try takeTestEnrichment(&presentation);
+    try testing.expect(speculative.speculative);
 
     try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.ensure_focused_enrichment);
-    try testing.expect(presentation.takeCommand() == null);
-    try completeTestEnrichment(&presentation, speculative);
-
-    const successor = presentation.takeCommand().?.enrich_file;
-    try testing.expectEqual(@as(usize, 3), successor.file_index);
-    try testing.expect(successor.speculative);
-}
-
-test "disabled cache and LocalReview never prefetch" {
-    var store = bbr.review.InMemoryStore.init(testing.allocator);
-    defer store.deinit();
-    var disabled = try Presentation.init(testing.allocator, .{
-        .reviews = store.store(),
-        .file_cache_enabled = false,
-    }, .{
-        .initial = .{
-            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
-            .session = try testManyFileSession(testing.allocator, 1, 3),
-        },
-        .viewport_rows = 8,
-    });
-    defer disabled.deinit();
-    try disabled.dispatch(.{ .action = .next_file });
-    try disabled.dispatch(.ensure_focused_enrichment);
-    const remote = disabled.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&disabled, remote);
-    try testing.expect(disabled.takeCommand() == null);
-
-    const key = try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
-    var local = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{ .key = key, .session = try testManyLocalFileSession(testing.allocator, 3) },
-        .viewport_rows = 8,
-    });
-    defer local.deinit();
-    try local.dispatch(.{ .action = .next_file });
-    try local.dispatch(.ensure_focused_enrichment);
-    const local_command = local.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&local, local_command);
-    try testing.expect(local.takeCommand() == null);
-}
-
-test "backward File traversal disarms a pending successor prefetch" {
-    var store = bbr.review.InMemoryStore.init(testing.allocator);
-    defer store.deinit();
-    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{
-            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
-            .session = try testManyFileSession(testing.allocator, 1, 3),
-        },
-        .viewport_rows = 8,
-    });
-    defer presentation.deinit();
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const first = presentation.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&presentation, first);
-    try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const second = presentation.takeCommand().?.enrich_file;
-
-    try presentation.dispatch(.{ .action = .prev_file });
-    while (presentation.published.?.activeFile().? < 1) try presentation.dispatch(.{ .action = .down });
-    try completeTestEnrichment(&presentation, second);
-    try testing.expect(presentation.takeCommand() == null);
-}
-
-test "jump within focused File disarms a pending successor prefetch" {
-    var store = bbr.review.InMemoryStore.init(testing.allocator);
-    defer store.deinit();
-    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{
-            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
-            .session = try testManyFileSession(testing.allocator, 1, 3),
-        },
-        .viewport_rows = 8,
-    });
-    defer presentation.deinit();
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const first = presentation.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&presentation, first);
-    try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const second = presentation.takeCommand().?.enrich_file;
-
-    try presentation.dispatch(.{ .action = .center });
-    try completeTestEnrichment(&presentation, second);
-    try testing.expect(presentation.takeCommand() == null);
-}
-
-test "non-navigation Action keeps a pending successor prefetch" {
-    var store = bbr.review.InMemoryStore.init(testing.allocator);
-    defer store.deinit();
-    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{
-            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
-            .session = try testManyFileSession(testing.allocator, 1, 3),
-        },
-        .viewport_rows = 8,
-    });
-    defer presentation.deinit();
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const first = presentation.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&presentation, first);
-    try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const second = presentation.takeCommand().?.enrich_file;
-
-    try presentation.dispatch(.{ .action = .clear_selection });
-    try dispatchView(&presentation, .{ .action = .select_new_version });
-    try completeTestEnrichment(&presentation, second);
-    try testing.expect(presentation.takeCommand().?.enrich_file.speculative);
+    try testing.expectEqual(speculative.file_index, presentation.published.?.activeFile().?);
+    try expectNoTestEnrichment(&presentation);
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = speculative.command_id,
+        .work_id = speculative.work_id,
+        .session_epoch = speculative.session_epoch,
+        .file_index = speculative.file_index,
+        .outcome = .{ .failed = .launch_failed },
+    } });
+    try testing.expectEqual(ActionError.file_enrichment_launch_failed, presentation.projection().action_error.?);
 }
 
 test "speculative failure stays silent and focus retries it as demand" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
-        .initial = .{
-            .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
-            .session = try testManyFileSession(testing.allocator, 1, 3),
-        },
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 3) },
         .viewport_rows = 8,
     });
     defer presentation.deinit();
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const first = presentation.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&presentation, first);
-    try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const second = presentation.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&presentation, second);
-    const speculative = presentation.takeCommand().?.enrich_file;
-
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    const speculative = try takeTestEnrichment(&presentation);
+    try testing.expect(speculative.speculative);
     try presentation.dispatch(.{ .file_enrichment_completed = .{
         .command_id = speculative.command_id,
         .work_id = speculative.work_id,
@@ -26708,8 +26672,7 @@ test "speculative failure stays silent and focus retries it as demand" {
     try testing.expect(presentation.projection().action_error == null);
 
     try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const retry = presentation.takeCommand().?.enrich_file;
+    const retry = try takeTestEnrichment(&presentation);
     try testing.expectEqual(speculative.file_index, retry.file_index);
     try testing.expect(!retry.speculative);
     try presentation.dispatch(.{ .file_enrichment_completed = .{
@@ -26720,6 +26683,31 @@ test "speculative failure stays silent and focus retries it as demand" {
         .outcome = .{ .failed = .launch_failed },
     } });
     try testing.expectEqual(ActionError.file_enrichment_launch_failed, presentation.projection().action_error.?);
+}
+
+test "a disabled File cache and a LocalReview keep the whole Enrichment Range" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var disabled = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_cache_enabled = false }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 3) },
+        .viewport_rows = 8,
+    });
+    defer disabled.deinit();
+    const key = try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature");
+    var local = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testManyLocalFileSession(testing.allocator, 3) },
+        .viewport_rows = 8,
+    });
+    defer local.deinit();
+    for ([_]*Presentation{ &disabled, &local }) |presentation| {
+        for (0..3) |file_index| {
+            const command = try takeTestEnrichment(presentation);
+            try testing.expectEqual(file_index, command.file_index);
+            try completeTestEnrichment(presentation, command);
+        }
+        try expectNoTestEnrichment(presentation);
+        for (0..3) |file_index| try testing.expect(presentation.published.?.session.enrichment.file(file_index).new == .content);
+    }
 }
 
 test "speculative request metadata failure stays silent" {
@@ -26737,19 +26725,13 @@ test "speculative request metadata failure stays silent" {
         .viewport_rows = 8,
     });
     defer presentation.deinit();
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const first = presentation.takeCommand().?.enrich_file;
-    try completeTestEnrichment(&presentation, first);
-    try presentation.dispatch(.{ .action = .next_file });
-    try presentation.dispatch(.ensure_focused_enrichment);
-    const second = presentation.takeCommand().?.enrich_file;
-
-    try completeTestEnrichment(&presentation, second);
-    try testing.expect(presentation.takeCommand() == null);
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    try expectNoTestEnrichment(&presentation);
     try testing.expect(presentation.projection().action_error == null);
 }
 
-test "prefetch writes no File content or Highlighting to persistence" {
+test "speculative File Enrichment writes no File content or Highlighting to persistence" {
     const sqlite_store = @import("../persist/sqlite_store.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -26774,18 +26756,13 @@ test "prefetch writes no File content or Highlighting to persistence" {
             .viewport_rows = 8,
         });
         defer presentation.deinit();
-        try presentation.dispatch(.ensure_focused_enrichment);
-        const first = presentation.takeCommand().?.enrich_file;
-        try completeTestEnrichment(&presentation, first);
-        try presentation.dispatch(.{ .action = .next_file });
-        try presentation.dispatch(.ensure_focused_enrichment);
-        const second = presentation.takeCommand().?.enrich_file;
-        try completeTestEnrichment(&presentation, second);
-        const speculative = presentation.takeCommand().?.enrich_file;
+        try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+        const speculative = try takeTestEnrichment(&presentation);
+        try testing.expect(speculative.speculative);
 
         const responses = [_]bbr.http.Canned{
-            .{ .status = 200, .body = "prefetch-old-content-sentinel\n" },
-            .{ .status = 200, .body = "prefetch-new-content-sentinel\n" },
+            .{ .status = 200, .body = "speculative-old-content-sentinel\n" },
+            .{ .status = 200, .body = "speculative-new-content-sentinel\n" },
         };
         var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
         const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
@@ -26972,7 +26949,7 @@ test "disabled File cache discards an inactive completion and revisiting refetch
     }, .{
         .initial = .{
             .key = try OwnedReviewIdentity.init("workspace", "repo", 1),
-            .session = try testTwoFileSession(testing.allocator, 1),
+            .session = try testManyFileSession(testing.allocator, 1, 5),
         },
         .viewport_rows = 8,
     });
@@ -26981,9 +26958,10 @@ test "disabled File cache discards an inactive completion and revisiting refetch
     try presentation.dispatch(.ensure_focused_enrichment);
     const first = presentation.takeCommand().?.enrich_file;
     try testing.expectEqual(@as(usize, 0), first.file_index);
-    try presentation.dispatch(.{ .action = .next_file });
+    for (0..3) |_| try presentation.dispatch(.{ .action = .next_file });
     try presentation.dispatch(.ensure_focused_enrichment);
     _ = presentation.takeCommand().?.enrich_file;
+    try testing.expect(!presentation.published.?.session.enrichment.focused.contains(0));
 
     const responses = [_]bbr.http.Canned{
         .{ .status = 200, .body = "old a\n" },
@@ -27000,8 +26978,9 @@ test "disabled File cache discards an inactive completion and revisiting refetch
         .outcome = .{ .completed = result },
     } });
     try completeDisclosureBuild(&presentation);
+    try testing.expect(presentation.published.?.session.enrichment.file(0).new == .pending);
 
-    try presentation.dispatch(.{ .action = .prev_file });
+    for (0..3) |_| try presentation.dispatch(.{ .action = .prev_file });
     try presentation.dispatch(.ensure_focused_enrichment);
     try testing.expectEqual(@as(usize, 0), presentation.takeCommand().?.enrich_file.file_index);
 }
@@ -27019,10 +26998,10 @@ const TestNoopHighlighter = struct {
 };
 
 fn testCacheSession(hold_inactive: bool) !*Session {
-    const session = try testTwoFileSession(testing.allocator, 1);
+    const session = try testManyFileSession(testing.allocator, 1, 3);
     errdefer session.destroy();
-    session.enrichment.focus(0);
-    for (0..if (hold_inactive) @as(usize, 2) else 1) |index| {
+    session.enrichment.focus(.single(0));
+    for (([_]usize{ 0, 2 })[0..if (hold_inactive) 2 else 1]) |index| {
         const responses = [_]bbr.http.Canned{
             .{ .status = 200, .body = "old\ncached old\n" },
             .{ .status = 200, .body = "new\ncached needle\n" },
@@ -27040,7 +27019,7 @@ fn testCacheSession(hold_inactive: bool) !*Session {
             .max_file_bytes = 0,
         });
         defer result.deinit();
-        if (index == 1) session.enrichment.hold(index);
+        if (index == 2) session.enrichment.hold(index);
         try session.enrichment.admit(index, &result);
     }
     return session;
@@ -27056,25 +27035,25 @@ test "M21 kernel cache focus keeps eviction and Frame private until admission" {
     const published = presentation.published.?;
     try dispatchView(&presentation, .{ .action = .cycle_scope });
     try dispatchView(&presentation, .{ .action = .cycle_scope });
-    try presentation.dispatch(.{ .action = .next_file });
+    try presentation.dispatch(.{ .action = .to_bottom });
     const before = presentation.projection().review.?.frame;
     try presentation.dispatch(.ensure_focused_enrichment);
     try presentation.dispatch(.ensure_focused_enrichment);
     const worker = presentation.takeCommand().?.build_buffer_disclosure;
     try testing.expect(presentation.takeCommand() == null);
     try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
-    try testing.expectEqual(@as(?usize, 0), published.session.enrichment.focused_file);
+    try testing.expectEqual(file_enrichment.FileRange.single(0), published.session.enrichment.focused);
     worker.build();
     try testing.expect(!worker.failed);
     try testing.expect(published.session.enrichment.file(0).new == .content);
     try testing.expectEqual(before.buffer.rows.ptr, published.buffer.rows.ptr);
     try presentation.dispatch(.{ .buffer_disclosure_built = worker });
-    try testing.expectEqual(@as(?usize, 1), published.session.enrichment.focused_file);
+    try testing.expect(!published.session.enrichment.focused.contains(0) and published.session.enrichment.focused.contains(2));
     try testing.expect(published.session.enrichment.file(0).new == .pending);
     try testing.expect(before.visual_rows.ptr != published.visual_rows.ptr);
     try testing.expect(published.disclosure_inputs.blobs[0].new == null);
     try presentation.dispatch(.ensure_focused_enrichment);
-    try testing.expectEqual(@as(usize, 1), presentation.takeCommand().?.enrich_file.file_index);
+    try testing.expectEqual(@as(usize, 2), presentation.takeCommand().?.enrich_file.file_index);
 }
 
 test "M21 kernel cache focus failure preserves content and focus before retry" {
@@ -27085,7 +27064,7 @@ test "M21 kernel cache focus failure preserves content and focus before retry" {
         .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(false) },
     });
     defer presentation.deinit();
-    try presentation.dispatch(.{ .action = .next_file });
+    try presentation.dispatch(.{ .action = .to_bottom });
     const published = presentation.published.?;
     const before = published.frameProjection();
     // Force the handoff to allocate command storage.
@@ -27095,14 +27074,14 @@ test "M21 kernel cache focus failure preserves content and focus before retry" {
     try testing.expectError(error.OutOfMemory, presentation.dispatch(.ensure_focused_enrichment));
     failing.fail_index = std.math.maxInt(usize);
     try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
-    try testing.expectEqual(@as(?usize, 0), published.session.enrichment.focused_file);
+    try testing.expectEqual(file_enrichment.FileRange.single(0), published.session.enrichment.focused);
     try testing.expect(published.session.enrichment.file(0).new == .content);
     try presentation.dispatch(.ensure_focused_enrichment);
     const failed = presentation.takeCommand().?.build_buffer_disclosure;
     failed.failed = true;
     try presentation.dispatch(.{ .buffer_disclosure_built = failed });
     try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
-    try testing.expectEqual(@as(?usize, 0), published.session.enrichment.focused_file);
+    try testing.expectEqual(file_enrichment.FileRange.single(0), published.session.enrichment.focused);
     try testing.expect(published.session.enrichment.file(0).new == .content);
     try testing.expect(published.pending_cache_update == null);
     try presentation.dispatch(.ensure_focused_enrichment);
@@ -27119,10 +27098,10 @@ test "M21 kernel cache focus supersedes queued and issued focus changes" {
         });
         defer presentation.deinit();
         const published = presentation.published.?;
-        try presentation.dispatch(.{ .action = .next_file });
+        try presentation.dispatch(.{ .action = .to_bottom });
         try presentation.dispatch(.ensure_focused_enrichment);
         const old = if (issued) presentation.takeCommand().?.build_buffer_disclosure else null;
-        try presentation.dispatch(.{ .action = .prev_file });
+        try presentation.dispatch(.{ .action = .to_top });
         try presentation.dispatch(.ensure_focused_enrichment);
         const before = published.frameProjection();
         if (old) |worker| {
@@ -27131,7 +27110,7 @@ test "M21 kernel cache focus supersedes queued and issued focus changes" {
             try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
         }
         try completeDisclosureBuild(&presentation);
-        try testing.expectEqual(@as(?usize, 0), published.session.enrichment.focused_file);
+        try testing.expectEqual(file_enrichment.FileRange{ .first = 0, .end = 2 }, published.session.enrichment.focused);
         try testing.expect(published.session.enrichment.file(0).new == .content);
         try testing.expect(presentation.takeCommand() == null);
     }
@@ -27143,11 +27122,11 @@ test "M21 kernel cache worker retries changed Query geometry File Tree and lease
         defer store.deinit();
         var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_cache_enabled = false }, .{
             .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(false) },
-            .geometry = .{ .cols = 100, .rows = 25 },
+            .geometry = .{ .cols = 100, .rows = 5 },
         });
         defer presentation.deinit();
         const published = presentation.published.?;
-        try presentation.dispatch(.{ .action = .next_file });
+        try presentation.dispatch(.{ .action = .to_bottom });
         try presentation.dispatch(.ensure_focused_enrichment);
         const old = presentation.takeCommand().?.build_buffer_disclosure;
         var owned = true;
@@ -27159,7 +27138,7 @@ test "M21 kernel cache worker retries changed Query geometry File Tree and lease
                 try presentation.dispatch(.{ .key = .{ .codepoint = 'n', .text = "new" } });
             },
             .geometry => {
-                try presentation.dispatch(.{ .resize = .{ .cols = 100, .rows = 24 } });
+                try presentation.dispatch(.{ .resize = .{ .cols = 100, .rows = 4 } });
             },
             .tree => published.tree.scroll += 1,
             .lease => published.session.enrichment.hold(0),
@@ -27175,7 +27154,7 @@ test "M21 kernel cache worker retries changed Query geometry File Tree and lease
             try presentation.dispatch(.{ .buffer_search_scanned = executeBufferSearchScan(testing.allocator, &scan.scan_buffer_search) });
         }
         try completeDisclosureBuild(&presentation);
-        try testing.expectEqual(@as(?usize, 1), published.session.enrichment.focused_file);
+        try testing.expect(!published.session.enrichment.focused.contains(0) and published.session.enrichment.focused.contains(2));
         if (change == .lease) {
             try testing.expect(published.session.enrichment.file(0).new == .content);
             presentation.finishSearchLease(published, 0);
@@ -27205,20 +27184,20 @@ test "M21 kernel search lease release and Review Search hold release stage evict
         try completeBufferSearchScan(&presentation);
         try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
         const before = published.frameProjection();
-        var lease = published.session.enrichment.snapshot(1);
+        var lease = published.session.enrichment.snapshot(2);
         defer lease.release();
-        if (release == .source) presentation.finishSearchLease(published, 1) else {
-            published.review_search.held = try presentation.allocator.alloc(bool, 2);
+        if (release == .source) presentation.finishSearchLease(published, 2) else {
+            published.review_search.held = try presentation.allocator.alloc(bool, 3);
             @memset(published.review_search.held.?, false);
-            published.review_search.held.?[1] = true;
+            published.review_search.held.?[2] = true;
             published.review_search.open = true;
             if (release == .close) presentation.closeReviewSearch() else presentation.replaceReviewSearchQuery("");
         }
         try testing.expectEqual(before.visual_rows.ptr, published.visual_rows.ptr);
-        try testing.expect(published.session.enrichment.file(1).new == .content);
+        try testing.expect(published.session.enrichment.file(2).new == .content);
         try testing.expectEqual(@as(usize, 1), presentation.commands.items.len);
         try completeDisclosureBuild(&presentation);
-        try testing.expect(published.session.enrichment.file(1).new == .pending);
+        try testing.expect(published.session.enrichment.file(2).new == .pending);
         try testing.expect(published.session.enrichment.file(0).new == .content);
         try testing.expectEqualStrings("new\ncached needle\n", lease.view.new.content.blob);
         try testing.expectEqual(@as(usize, 1), lease.new.?.references.load(.acquire));
@@ -27236,7 +27215,7 @@ test "M21 kernel cache worker rejects Session replacement and shutdown" {
             .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testCacheSession(false) },
         });
         defer presentation.deinit();
-        try presentation.dispatch(.{ .action = .next_file });
+        try presentation.dispatch(.{ .action = .to_bottom });
         if (issued or replacement == .shutdown) try presentation.dispatch(.ensure_focused_enrichment);
         const old = if (issued) presentation.takeCommand().?.build_buffer_disclosure else null;
         switch (replacement) {
