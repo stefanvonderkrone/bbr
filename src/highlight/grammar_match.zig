@@ -33,6 +33,7 @@ pub const BuiltInGrammar = enum {
     xml,
     markdown_inline,
     markdown,
+    php,
 
     pub fn name(self: BuiltInGrammar) []const u8 {
         return switch (self) {

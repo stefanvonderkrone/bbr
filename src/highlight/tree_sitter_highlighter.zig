@@ -740,6 +740,9 @@ test "interval merge matches byte planes for every BuiltInGrammar fixture" {
         .{ .path = "index.html", .source = html_fixture },
         .{ .path = "logo.svg", .source = xml_fixture },
         .{ .path = "README.md", .source = markdown_fixture },
+        .{ .path = "index.php", .source = php_fixture },
+        .{ .path = "page.php", .source = php_heredoc_fixture },
+        .{ .path = "link.php", .source = php_split_tag_fixture },
     };
     var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
     defer highlighter.deinit();
@@ -2498,4 +2501,113 @@ test "M27 injection Markdown fenced js block uses the JavaScript BuiltInGrammar 
     const javascript = &highlighter.packages[@intFromEnum(BuiltInGrammar.javascript)];
     try expectSpan(result, 15, 0, 3, "keyword");
     try testing.expectEqual(packageCapture(javascript, "keyword"), markdownCaptureAt(result, 15, 0).?);
+}
+
+// M27 ticket 11 fixtures
+
+const php_fixture =
+    \\<div class="greeting">
+    \\<?php
+    \\// Greets a name.
+    \\function greet($name) {
+    \\    return "<b>Hello</b> " . $name;
+    \\}
+    \\?>
+    \\<p>Done</p>
+    \\<script>let a = 1;</script>
+    \\
+;
+
+const php_heredoc_fixture =
+    \\<?php
+    \\$page = <<<HTML
+    \\<em class="note">Hi</em>
+    \\HTML;
+    \\
+;
+
+const php_split_tag_fixture =
+    \\<a href="<?php echo $url; ?>">Go</a>
+    \\
+;
+
+test "M27 grammar GrammarMatch selects PHP" {
+    const cases = [_]struct { path: []const u8, grammar: ?BuiltInGrammar }{
+        .{ .path = "web/index.php", .grammar = .php },
+        .{ .path = "web/INDEX.PHP", .grammar = null },
+        .{ .path = "web/index.phtml", .grammar = null },
+    };
+    for (cases) |case| try testing.expectEqual(case.grammar, grammar_match.selectBuiltIn(case.path, ""));
+}
+
+test "M27 grammar PHP fixture has comment, string, keyword, function, and variable roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.php", php_fixture);
+    defer freeResult(result);
+
+    try expectSpan(result, 3, 0, 17, "comment");
+    try expectSpan(result, 4, 0, 8, "keyword");
+    try expectSpan(result, 4, 9, 14, "function");
+    try expectSpan(result, 4, 15, 20, "variable");
+    try expectSpan(result, 5, 4, 10, "keyword");
+    try expectSpan(result, 5, 11, 26, "string");
+    try expectSpan(result, 5, 29, 34, "variable");
+}
+
+test "M27 injection PHP text around the PHP code gets HTML Spans and the PHP code gets none" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.php", php_fixture);
+    defer freeResult(result);
+    const html = &highlighter.packages[@intFromEnum(BuiltInGrammar.html)];
+    const php = &highlighter.packages[@intFromEnum(BuiltInGrammar.php)];
+
+    try expectSpan(result, 1, 1, 4, "tag");
+    try testing.expectEqual(packageCapture(html, "tag"), captureOver(result, php_fixture, std.mem.indexOf(u8, php_fixture, "div").?).?);
+    try expectSpan(result, 8, 1, 2, "tag");
+    try testing.expectEqual(packageCapture(html, "tag"), captureOver(result, php_fixture, std.mem.indexOf(u8, php_fixture, "p>Done").?).?);
+    try expectSpan(result, 5, 11, 26, "string");
+    try testing.expectEqual(packageCapture(php, "string"), captureOver(result, php_fixture, std.mem.indexOf(u8, php_fixture, "<b>").?).?);
+    for (result.spans) |span| {
+        if (span.line >= 2 and span.line <= 7) try testing.expect(span.capture.role != .tag);
+    }
+}
+
+test "M27 injection PHP script reaches JavaScript through the HTML Injection" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.php", php_fixture);
+    defer freeResult(result);
+    const javascript = &highlighter.packages[@intFromEnum(BuiltInGrammar.javascript)];
+
+    try expectSpan(result, 9, 8, 11, "keyword");
+    try testing.expectEqual(packageCapture(javascript, "keyword"), captureOver(result, php_fixture, std.mem.indexOf(u8, php_fixture, "let").?).?);
+}
+
+test "M27 injection PHP heredoc with the closing name HTML gets HTML Spans" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.php", php_heredoc_fixture);
+    defer freeResult(result);
+    const html = &highlighter.packages[@intFromEnum(BuiltInGrammar.html)];
+
+    try expectSpan(result, 3, 1, 3, "tag");
+    try testing.expectEqual(packageCapture(html, "tag"), captureOver(result, php_heredoc_fixture, std.mem.indexOf(u8, php_heredoc_fixture, "em").?).?);
+    try expectSpan(result, 3, 4, 9, "tag.attribute");
+    try testing.expectEqual(packageCapture(html, "tag.attribute"), captureOver(result, php_heredoc_fixture, std.mem.indexOf(u8, php_heredoc_fixture, "class").?).?);
+}
+
+test "M27 injection PHP joins the HTML text around PHP code into one combined HTML tree" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.php", php_split_tag_fixture);
+    defer freeResult(result);
+    const html = &highlighter.packages[@intFromEnum(BuiltInGrammar.html)];
+
+    try expectSpan(result, 1, 15, 19, "keyword");
+    try expectSpan(result, 1, 28, 29, "string");
+    try testing.expectEqual(packageCapture(html, "string"), captureOver(result, php_split_tag_fixture, 28).?);
+    try expectSpan(result, 1, 34, 35, "tag");
+    try testing.expectEqual(packageCapture(html, "tag"), captureOver(result, php_split_tag_fixture, 34).?);
 }
