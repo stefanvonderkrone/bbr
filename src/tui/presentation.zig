@@ -5071,11 +5071,8 @@ const EnrichmentRange = struct {
     focused: file_enrichment.FileRange,
 };
 
-const SpeculativeEnrichment = struct {
-    work_id: WorkId,
-    session_epoch: SessionEpoch,
-    file_index: usize,
-};
+/// The speculative File Enrichments that may be queued or in flight at once.
+const max_speculative_enrichments: usize = 4;
 
 const SubmissionPhase = enum {
     post_queued,
@@ -5885,7 +5882,6 @@ pub const Presentation = struct {
     outstanding_loads: usize = 0,
     outstanding_picker_loads: usize = 0,
     issued_enrichments: std.ArrayList(IssuedEnrichment) = .empty,
-    speculative_enrichment: ?SpeculativeEnrichment = null,
     resolver: keymap_mod.Resolver = .{},
     list_overlay: ?ListOverlay = null,
     configured_theme: ThemeId,
@@ -7793,9 +7789,6 @@ pub const Presentation = struct {
             if (queued == .enrich_file and queued.enrich_file.speculative and queued.enrich_file.session_epoch == published.epoch) {
                 _ = self.commands.orderedRemove(index);
                 published.session.enrichment.resetLoading(queued.enrich_file.file_index);
-                if (self.speculative_enrichment) |speculative| {
-                    if (speculative.work_id == queued.enrich_file.work_id) self.speculative_enrichment = null;
-                }
             } else index += 1;
         }
     }
@@ -11103,9 +11096,10 @@ pub const Presentation = struct {
     }
 
     /// Keep File Enrichment for the Enrichment Range. The active File is
-    /// demand work. Once it is terminal, each other File in the range follows
-    /// as speculative work, one at a time: the visible Files from top to
-    /// bottom, then the overscan Files above, then the overscan Files below.
+    /// demand work. Once it is terminal, the other Files in the range follow
+    /// as speculative work, up to `max_speculative_enrichments` at once: the
+    /// visible Files from top to bottom, then the overscan Files above, then
+    /// the overscan Files below.
     fn ensureFocusedEnrichment(self: *Presentation) !void {
         if (self.shutdown_requested) return;
         const published = self.published orelse return;
@@ -11129,17 +11123,16 @@ pub const Presentation = struct {
             if (enrichment.needsEnrichment(file_index)) return self.queueFileEnrichment(published, file_index, false);
             if (!enrichment.isTerminal(file_index)) return;
         }
-        if (self.speculative_enrichment != null) return;
         for (range.visible.first..range.visible.end) |file_index| {
-            if (enrichment.needsEnrichment(file_index)) return self.queueFileEnrichment(published, file_index, true);
+            if (enrichment.needsEnrichment(file_index)) try self.queueFileEnrichment(published, file_index, true);
         }
         var above = range.visible.first;
         while (above > range.focused.first) {
             above -= 1;
-            if (enrichment.needsEnrichment(above)) return self.queueFileEnrichment(published, above, true);
+            if (enrichment.needsEnrichment(above)) try self.queueFileEnrichment(published, above, true);
         }
         for (range.visible.end..range.focused.end) |file_index| {
-            if (enrichment.needsEnrichment(file_index)) return self.queueFileEnrichment(published, file_index, true);
+            if (enrichment.needsEnrichment(file_index)) try self.queueFileEnrichment(published, file_index, true);
         }
     }
 
@@ -11179,7 +11172,7 @@ pub const Presentation = struct {
 
     fn queueFileEnrichment(self: *Presentation, published: *Published, file_index: usize, speculative: bool) !void {
         if (speculative and published.review_search.open) return;
-        if (speculative and self.speculative_enrichment != null) return;
+        if (speculative and self.speculativeEnrichments(published.epoch) >= max_speculative_enrichments) return;
         const previous_action_error = self.action_error;
         defer if (speculative) {
             self.action_error = previous_action_error;
@@ -11240,25 +11233,28 @@ pub const Presentation = struct {
         }
         self.next_work_id = work_id;
         published.session.enrichment.markLoading(file_index);
-        if (speculative) self.speculative_enrichment = .{
-            .work_id = work_id,
-            .session_epoch = published.epoch,
-            .file_index = file_index,
-        };
         self.action_error = null;
     }
 
+    fn speculativeEnrichments(self: *const Presentation, epoch: SessionEpoch) usize {
+        var count: usize = 0;
+        for (self.commands.items) |queued| {
+            if (queued == .enrich_file and queued.enrich_file.speculative and queued.enrich_file.session_epoch == epoch) count += 1;
+        }
+        for (self.issued_enrichments.items) |issued| {
+            if (issued.speculative and issued.session_epoch == epoch) count += 1;
+        }
+        return count;
+    }
+
     fn promoteSpeculativeEnrichment(self: *Presentation, epoch: SessionEpoch, file_index: usize) void {
-        const speculative = self.speculative_enrichment orelse return;
-        if (speculative.session_epoch != epoch or speculative.file_index != file_index) return;
         for (self.commands.items) |*queued| {
-            if (queued.* == .enrich_file and queued.enrich_file.work_id == speculative.work_id)
+            if (queued.* == .enrich_file and queued.enrich_file.session_epoch == epoch and queued.enrich_file.file_index == file_index)
                 queued.enrich_file.speculative = false;
         }
         for (self.issued_enrichments.items) |*issued| {
-            if (issued.work_id == speculative.work_id) issued.speculative = false;
+            if (issued.session_epoch == epoch and issued.file_index == file_index) issued.speculative = false;
         }
-        self.speculative_enrichment = null;
     }
 
     fn acceptFileEnrichment(self: *Presentation, completed: FileEnrichmentCompleted) void {
@@ -11287,9 +11283,6 @@ pub const Presentation = struct {
         }
         const issued = self.issued_enrichments.items[issued_index.?];
         _ = self.issued_enrichments.orderedRemove(issued_index.?);
-        if (self.speculative_enrichment) |speculative| {
-            if (speculative.work_id == completed.work_id) self.speculative_enrichment = null;
-        }
         const published = self.published;
         const applies = if (published) |current|
             !self.shutdown_requested and issued.session_epoch == completed.session_epoch and issued.file_index == completed.file_index and
@@ -26518,6 +26511,40 @@ fn takeTestEnrichment(presentation: *Presentation) !EnrichFile {
     return command.enrich_file;
 }
 
+/// Takes every File Enrichment that one focus check queues.
+fn takeTestEnrichments(presentation: *Presentation, buffer: []EnrichFile) ![]EnrichFile {
+    try presentation.dispatch(.ensure_focused_enrichment);
+    var count: usize = 0;
+    while (presentation.takeCommand()) |next| {
+        var command = next;
+        if (command != .enrich_file or count == buffer.len) {
+            command.deinit();
+            return error.UnexpectedCommand;
+        }
+        buffer[count] = command.enrich_file;
+        count += 1;
+    }
+    return buffer[0..count];
+}
+
+/// Completes the speculative File Enrichments batch by batch. Each batch
+/// starts at once and holds `max_speculative_enrichments` Files or the rest.
+fn expectSpeculativeOrder(presentation: *Presentation, expected: []const usize) !void {
+    var next: usize = 0;
+    while (next < expected.len) {
+        var buffer: [max_speculative_enrichments]EnrichFile = undefined;
+        const batch = try takeTestEnrichments(presentation, &buffer);
+        try testing.expectEqual(@min(max_speculative_enrichments, expected.len - next), batch.len);
+        for (batch) |command| {
+            try testing.expectEqual(expected[next], command.file_index);
+            try testing.expect(command.speculative);
+            next += 1;
+        }
+        for (batch) |command| try completeTestEnrichment(presentation, command);
+    }
+    try expectNoTestEnrichment(presentation);
+}
+
 fn expectNoTestEnrichment(presentation: *Presentation) !void {
     try presentation.dispatch(.ensure_focused_enrichment);
     try testing.expect(presentation.takeCommand() == null);
@@ -26543,14 +26570,10 @@ test "File Enrichment covers the visible Files and the overscan Files, with the 
     try testing.expectEqual(@as(usize, 0), range.visible.first);
     try testing.expect(range.visible.end > 1 and range.visible.end < 7);
     try testing.expectEqual(range.visible.end + enrichment_overscan_files, range.focused.end);
-    for (1..range.focused.end) |file_index| {
-        const speculative = try takeTestEnrichment(&presentation);
-        try testing.expectEqual(file_index, speculative.file_index);
-        try testing.expect(speculative.speculative);
-        try expectNoTestEnrichment(&presentation);
-        try completeTestEnrichment(&presentation, speculative);
-    }
-    try expectNoTestEnrichment(&presentation);
+    var expected: std.ArrayList(usize) = .empty;
+    defer expected.deinit(testing.allocator);
+    for (1..range.focused.end) |file_index| try expected.append(testing.allocator, file_index);
+    try expectSpeculativeOrder(&presentation, expected.items);
     try testing.expectEqual(range.focused, published.session.enrichment.focused);
     try testing.expectEqual(@as(usize, 0), store.entries.items.len);
 }
@@ -26579,13 +26602,7 @@ test "File Enrichment takes the visible Files top to bottom, then the overscan F
     for (range.visible.first..range.visible.end) |file_index| if (file_index != active_file) try expected.append(testing.allocator, file_index);
     try expected.append(testing.allocator, range.visible.first - 1);
     for (range.visible.end..range.focused.end) |file_index| try expected.append(testing.allocator, file_index);
-    for (expected.items) |file_index| {
-        const speculative = try takeTestEnrichment(&presentation);
-        try testing.expectEqual(file_index, speculative.file_index);
-        try testing.expect(speculative.speculative);
-        try completeTestEnrichment(&presentation, speculative);
-    }
-    try expectNoTestEnrichment(&presentation);
+    try expectSpeculativeOrder(&presentation, expected.items);
     try testing.expect(published.session.enrichment.needsEnrichment(range.focused.first - 1));
 }
 
@@ -26626,7 +26643,7 @@ test "M21 authored Review Search pauses a queued speculative File Enrichment bef
     try testing.expect(command.enrich_file.search_acquisition);
 }
 
-test "focusing a speculative File promotes its WorkId, and its failure then reports" {
+test "speculative Files start together, and focusing one promotes it so its failure reports" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
@@ -26635,12 +26652,21 @@ test "focusing a speculative File promotes its WorkId, and its failure then repo
     });
     defer presentation.deinit();
     try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
-    const speculative = try takeTestEnrichment(&presentation);
+    var buffer: [max_speculative_enrichments]EnrichFile = undefined;
+    const batch = try takeTestEnrichments(&presentation, &buffer);
+    try testing.expect(batch.len > 1);
+    const speculative = batch[0];
     try testing.expect(speculative.speculative);
 
     try presentation.dispatch(.{ .action = .next_file });
     try testing.expectEqual(speculative.file_index, presentation.published.?.activeFile().?);
-    try expectNoTestEnrichment(&presentation);
+    try presentation.dispatch(.ensure_focused_enrichment);
+    for (presentation.issued_enrichments.items) |issued| {
+        try testing.expectEqual(issued.file_index != speculative.file_index, issued.speculative);
+    }
+    for (presentation.commands.items) |queued| {
+        if (queued == .enrich_file) try testing.expect(queued.enrich_file.file_index != speculative.file_index);
+    }
     try presentation.dispatch(.{ .file_enrichment_completed = .{
         .command_id = speculative.command_id,
         .work_id = speculative.work_id,
@@ -26700,12 +26726,10 @@ test "a disabled File cache and a LocalReview keep the whole Enrichment Range" {
     });
     defer local.deinit();
     for ([_]*Presentation{ &disabled, &local }) |presentation| {
-        for (0..3) |file_index| {
-            const command = try takeTestEnrichment(presentation);
-            try testing.expectEqual(file_index, command.file_index);
-            try completeTestEnrichment(presentation, command);
-        }
-        try expectNoTestEnrichment(presentation);
+        const command = try takeTestEnrichment(presentation);
+        try testing.expectEqual(@as(usize, 0), command.file_index);
+        try completeTestEnrichment(presentation, command);
+        try expectSpeculativeOrder(presentation, &.{ 1, 2 });
         for (0..3) |file_index| try testing.expect(presentation.published.?.session.enrichment.file(file_index).new == .content);
     }
 }
@@ -26757,7 +26781,10 @@ test "speculative File Enrichment writes no File content or Highlighting to pers
         });
         defer presentation.deinit();
         try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
-        const speculative = try takeTestEnrichment(&presentation);
+        var buffer: [max_speculative_enrichments]EnrichFile = undefined;
+        const batch = try takeTestEnrichments(&presentation, &buffer);
+        try testing.expect(batch.len > 0);
+        const speculative = batch[0];
         try testing.expect(speculative.speculative);
 
         const responses = [_]bbr.http.Canned{
@@ -26776,6 +26803,7 @@ test "speculative File Enrichment writes no File content or Highlighting to pers
             .outcome = .{ .completed = result },
         } });
         try completeDisclosureBuild(&presentation);
+        for (batch[1..]) |command| try completeTestEnrichment(&presentation, command);
 
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
