@@ -265,7 +265,7 @@ pub const Set = struct {
             .eq_capture => |pair| return matchCaptures(pair.left, pair.right, match, content),
             inline else => |operands| operands.capture,
         };
-        for (match.captures[0..match.capture_count]) |capture| {
+        for (capturesOf(match)) |capture| {
             if (capture.index == capture_id and !try self.nodeHolds(condition, capture.node, content)) return false;
         }
         return true;
@@ -490,7 +490,7 @@ fn captureText(capture_id: u32, match: c.TSQueryMatch, content: []const u8) !?[]
 }
 
 fn captureRange(capture_id: u32, match: c.TSQueryMatch, content: []const u8) !?Range {
-    for (match.captures[0..match.capture_count]) |capture| {
+    for (capturesOf(match)) |capture| {
         if (capture.index != capture_id) continue;
         return try nodeRange(capture.node, content);
     }
@@ -552,10 +552,16 @@ fn matchCaptures(left: u32, right: u32, match: c.TSQueryMatch, content: []const 
 }
 
 fn matchIsLocal(match: c.TSQueryMatch, content: []const u8, locals: Locals) !bool {
-    for (match.captures[0..match.capture_count]) |capture| {
+    for (capturesOf(match)) |capture| {
         if (locals.contains(try nodeRange(capture.node, content))) return true;
     }
     return false;
+}
+
+/// The runtime gives a null capture pointer to a match of a pattern without Captures.
+pub fn capturesOf(match: c.TSQueryMatch) []const c.TSQueryCapture {
+    if (match.capture_count == 0) return &.{};
+    return match.captures[0..match.capture_count];
 }
 
 pub fn utf8Boundary(content: []const u8, index: usize) bool {

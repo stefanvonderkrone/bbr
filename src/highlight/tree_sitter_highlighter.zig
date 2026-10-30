@@ -202,7 +202,7 @@ fn collectLayerIntervals(allocator: Allocator, intervals: *std.ArrayList(Capture
     var match: c.TSQueryMatch = undefined;
     while (c.ts_query_cursor_next_match(cursor, &match)) {
         if (!try package.highlight.predicates.accepts(match.pattern_index, match, content, locals)) continue;
-        const captures = match.captures[0..match.capture_count];
+        const captures = predicate_mod.capturesOf(match);
         for (captures) |capture| {
             const range = try predicate_mod.checkedRange(c.ts_node_start_byte(capture.node), c.ts_node_end_byte(capture.node), content);
             if (range.start == range.end) continue;
@@ -270,7 +270,7 @@ fn collectInjectionLayers(
         const settings = injection.prepared.injections[match.pattern_index];
         var content_node: ?c.TSNode = null;
         var name = settings.language;
-        for (match.captures[0..match.capture_count]) |capture| {
+        for (predicate_mod.capturesOf(match)) |capture| {
             if (capture.index == injection.content_id) {
                 content_node = capture.node;
             } else if (injection.language_id != null and capture.index == injection.language_id.?) {
@@ -737,6 +737,8 @@ test "interval merge matches byte planes for every BuiltInGrammar fixture" {
         .{ .path = "Cargo.toml", .source = toml_fixture },
         .{ .path = "docker/Dockerfile", .source = dockerfile_fixture },
         .{ .path = "Makefile", .source = make_fixture },
+        .{ .path = "index.html", .source = html_fixture },
+        .{ .path = "logo.svg", .source = xml_fixture },
     };
     var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
     defer highlighter.deinit();
@@ -2150,4 +2152,120 @@ test "M27 grammar docker and make ReviewBody fences highlight with the new Built
     const toml = try highlighter.highlighter().highlight(testing.allocator, "review.toml", toml_fixture);
     defer freeResult(toml);
     try expectSpan(toml, 3, 7, 12, "string");
+}
+
+// M27 ticket 09 fixtures
+const html_fixture =
+    \\<!-- note -->
+    \\<a href="x" style="color: red">hi</a>
+    \\<script>let n = 1;</script>
+    \\<style>p { color: blue; }</style>
+    \\
+;
+
+const xml_fixture =
+    \\<?xml version="1.0"?>
+    \\<!-- note -->
+    \\<svg width="10"><rect/></svg>
+    \\
+;
+
+test "M27 grammar GrammarMatch selects HTML and XML" {
+    const cases = [_]struct { path: []const u8, grammar: ?BuiltInGrammar }{
+        .{ .path = "web/index.html", .grammar = .html },
+        .{ .path = "web/index.htm", .grammar = .html },
+        .{ .path = "data/feed.xml", .grammar = .xml },
+        .{ .path = "assets/logo.svg", .grammar = .xml },
+        .{ .path = "web/index.xhtml", .grammar = null },
+    };
+    for (cases) |case| try testing.expectEqual(case.grammar, grammar_match.selectBuiltIn(case.path, ""));
+}
+
+test "M27 grammar HTML fixture has tag, property, string, and comment roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.html", html_fixture);
+    defer freeResult(result);
+
+    try expectSpan(result, 1, 0, 13, "comment");
+    try expectSpan(result, 2, 1, 2, "tag");
+    try expectSpan(result, 2, 3, 7, "tag.attribute");
+    try expectSpan(result, 2, 8, 9, "string");
+    try expectSpan(result, 2, 9, 10, "string.special.url");
+    try expectSpan(result, 2, 35, 36, "tag");
+}
+
+test "M27 grammar XML fixture has tag, property, string, and comment roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "assets/logo.svg", xml_fixture);
+    defer freeResult(result);
+
+    try expectSpan(result, 2, 0, 13, "comment");
+    try expectSpan(result, 3, 1, 4, "tag");
+    try expectSpan(result, 3, 5, 10, "tag.attribute");
+    try expectSpan(result, 3, 12, 14, "string");
+    try expectSpan(result, 3, 17, 21, "tag");
+}
+
+test "M27 injection HTML script and style content get JavaScript and CSS Spans" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.html", html_fixture);
+    defer freeResult(result);
+    const javascript = &highlighter.packages[@intFromEnum(BuiltInGrammar.javascript)];
+    const css = &highlighter.packages[@intFromEnum(BuiltInGrammar.css)];
+
+    try expectSpan(result, 3, 8, 11, "keyword");
+    try testing.expectEqual(packageCapture(javascript, "keyword"), captureOver(result, html_fixture, std.mem.indexOf(u8, html_fixture, "let").?).?);
+    try expectSpan(result, 4, 7, 8, "tag");
+    try expectSpan(result, 4, 11, 16, "property");
+    try testing.expectEqual(packageCapture(css, "property"), captureOver(result, html_fixture, std.mem.indexOf(u8, html_fixture, "color: blue").?).?);
+}
+
+test "M27 injection HTML style attribute value gets CSS Spans" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.html", html_fixture);
+    defer freeResult(result);
+    const css = &highlighter.packages[@intFromEnum(BuiltInGrammar.css)];
+
+    // tree-sitter-css parses a bare declaration as a selector, so `color` gets the CSS tag Capture, as in Neovim.
+    try expectSpan(result, 2, 19, 24, "tag");
+    try testing.expectEqual(packageCapture(css, "tag"), captureOver(result, html_fixture, std.mem.indexOf(u8, html_fixture, "color: red").?).?);
+}
+
+test "M27 injection HTML script type selects JavaScript or JSON" {
+    const source =
+        \\<script type="text/javascript">let a = 1;</script>
+        \\<script type="module">let b = 2;</script>
+        \\<script type="importmap">{"imports": {}}</script>
+        \\
+    ;
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "web/index.html", source);
+    defer freeResult(result);
+    const javascript = &highlighter.packages[@intFromEnum(BuiltInGrammar.javascript)];
+    const json = &highlighter.packages[@intFromEnum(BuiltInGrammar.json)];
+
+    try expectSpan(result, 1, 31, 34, "keyword");
+    try testing.expectEqual(packageCapture(javascript, "keyword"), captureOver(result, source, std.mem.indexOf(u8, source, "let a").?).?);
+    try expectSpan(result, 2, 22, 25, "keyword");
+    try testing.expectEqual(packageCapture(javascript, "keyword"), captureOver(result, source, std.mem.indexOf(u8, source, "let b").?).?);
+    try testing.expect(!std.meta.eql(packageCapture(json, "string"), packageCapture(javascript, "string")));
+    try expectSpan(result, 3, 26, 35, "string");
+    try testing.expectEqual(packageCapture(json, "string"), captureOver(result, source, std.mem.indexOf(u8, source, "\"imports\"").?).?);
+}
+
+test "M27 grammar a highlight pattern without Captures produces no Span and no failure" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    try useJavaScriptQueries(&highlighter, "(identifier)\n(number) @number", "", "");
+    const source = "let n = 1;\n";
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
+    defer freeResult(result);
+
+    try testing.expectEqual(@as(usize, 1), result.spans.len);
+    try expectSpan(result, 1, 8, 9, "number");
 }

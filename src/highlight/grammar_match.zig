@@ -29,6 +29,8 @@ pub const BuiltInGrammar = enum {
     toml,
     dockerfile,
     make,
+    html,
+    xml,
 
     pub fn name(self: BuiltInGrammar) []const u8 {
         return switch (self) {
