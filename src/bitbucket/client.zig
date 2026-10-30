@@ -290,6 +290,101 @@ pub const Client = struct {
         return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, buf.items, page_opts, null, false);
     }
 
+    /// Every Repository Summary of the Workspace, newest update first. A failed page fails the whole list.
+    /// Free the result with `deinitRepositorySummaries`.
+    pub fn listRepositorySummaries(self: Client, allocator: Allocator) ![]types.RepositorySummary {
+        const url = try self.repositorySummariesUrl(allocator);
+        defer allocator.free(url);
+        return self.listPages(allocator, types.RepositorySummary, RepositorySummaryPage, dupeRepositorySummary, deinitRepositorySummary, .{}, url, .{}, null, false);
+    }
+
+    /// Every open PullRequest Summary of one Repository, with approval and changes-requested counts.
+    /// A failed page fails the whole list. Free the result with `deinitSummaries`.
+    pub fn listOpenPullRequestSummaries(self: Client, allocator: Allocator, repo_slug: []const u8) ![]PullRequestSummary {
+        const url = try self.repositoryEndpoint(allocator, repo_slug, open_pull_request_summaries_query);
+        defer allocator.free(url);
+        return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, url, .{}, null, false);
+    }
+
+    fn repositorySummariesUrl(self: Client, allocator: Allocator) ![]u8 {
+        var url: std.ArrayList(u8) = .empty;
+        defer url.deinit(allocator);
+        try url.appendSlice(allocator, base_url ++ "/repositories/");
+        try percentEncodeInto(allocator, &url, self.cred.workspace);
+        try url.appendSlice(allocator, repository_summaries_query);
+        return url.toOwnedSlice(allocator);
+    }
+
+    /// The live shape check behind `bbr check-browser`. It reads the raw pages of both Browser lists,
+    /// names the first required field that a value lacks, and then decodes the lists.
+    /// Without `repo_slug`, it checks the first Repository of the list.
+    pub fn checkBrowserShape(self: Client, allocator: Allocator, repo_slug: ?[]const u8) !BrowserShape {
+        var shape: BrowserShape = .{ .repository = try allocator.dupe(u8, repo_slug orelse "") };
+        errdefer shape.deinit(allocator);
+        const repositories_url = try self.repositorySummariesUrl(allocator);
+        defer allocator.free(repositories_url);
+        if (try self.missingShapeField(allocator, repositories_url, &repository_summary_fields, null)) |field| {
+            shape.missing = .{ .list = .repositories, .field = field };
+            return shape;
+        }
+        const repositories = try self.listRepositorySummaries(allocator);
+        defer deinitRepositorySummaries(allocator, repositories);
+        shape.repositories = repositories.len;
+        if (repo_slug == null) {
+            if (repositories.len == 0) return error.NoRepositories;
+            allocator.free(shape.repository);
+            shape.repository = try allocator.dupe(u8, repositories[0].slug);
+        }
+        const pull_requests_url = try self.repositoryEndpoint(allocator, shape.repository, open_pull_request_summaries_query);
+        defer allocator.free(pull_requests_url);
+        if (try self.missingShapeField(allocator, pull_requests_url, &pull_request_summary_fields, &shape.participants)) |field| {
+            shape.missing = .{ .list = .pull_requests, .field = field };
+            return shape;
+        }
+        const pull_requests = try self.listOpenPullRequestSummaries(allocator, shape.repository);
+        defer deinitSummaries(allocator, pull_requests);
+        shape.pull_requests = pull_requests.len;
+        for (pull_requests) |pull_request| {
+            shape.approvals += pull_request.approval_count;
+            shape.changes_requested += pull_request.changes_requested_count;
+        }
+        return shape;
+    }
+
+    /// Walk every raw page and return the first required path that a value lacks.
+    /// A JSON null counts as present. `participants` also checks each participant.
+    fn missingShapeField(self: Client, allocator: Allocator, first_url: []const u8, comptime fields: []const []const u8, participants: ?*usize) !?[]const u8 {
+        var url = try allocator.dupe(u8, first_url);
+        defer allocator.free(url);
+        while (true) {
+            const body = try self.requestJson(allocator, .GET, url, null);
+            defer allocator.free(body);
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch |err|
+                return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedResponse;
+            defer parsed.deinit();
+            const values = jsonPath(parsed.value, "values") orelse return "values";
+            if (values != .array) return "values";
+            for (values.array.items) |value| {
+                inline for (fields) |field| if (jsonPath(value, field) == null) return field;
+                const count = participants orelse continue;
+                const list = jsonPath(value, "participants") orelse return "participants";
+                if (list != .array) return "participants";
+                for (list.array.items) |participant| {
+                    count.* += 1;
+                    inline for (participant_fields) |field| {
+                        if (jsonPath(participant, field) == null) return "participants." ++ field;
+                    }
+                }
+            }
+            const next = jsonPath(parsed.value, "next") orelse break;
+            if (next != .string) break;
+            const next_url = try allocator.dupe(u8, next.string);
+            allocator.free(url);
+            url = next_url;
+        }
+        return null;
+    }
+
     /// GET /repositories/{workspace}/{repo}/pullrequests/{id}/diff.
     /// Returns the raw unified diff text (owned by `allocator`) exactly as
     /// Bitbucket serves it — the authoritative line model (ADR-0001). Feed it to
@@ -2193,12 +2288,140 @@ const PrSummaryJson = struct {
     source: struct { branch: struct { name: []const u8 } },
     destination: struct { branch: struct { name: []const u8 } },
     draft: bool = false,
+    updated_on: ?[]const u8 = null,
+    participants: []const struct { approved: bool = false, state: ?[]const u8 = null } = &.{},
 };
 
 const PrListPage = struct {
     values: []PrSummaryJson,
     next: ?[]const u8 = null,
 };
+
+// Without `next` in a `fields` filter, Bitbucket drops the page link and the list stops after one page.
+const repository_summary_fields = [_][]const u8{ "slug", "name", "updated_on" };
+const repository_summaries_query = "?pagelen=100&sort=-updated_on&fields=next" ++ fieldsFilter(&repository_summary_fields, &.{});
+const pull_request_summary_fields = [_][]const u8{
+    "id",                  "title",              "state",                   "draft", "updated_on",
+    "author.display_name", "source.branch.name", "destination.branch.name",
+};
+const participant_fields = [_][]const u8{ "approved", "state" };
+const open_pull_request_summaries_query = "/pullrequests?pagelen=50&state=OPEN&fields=next" ++
+    fieldsFilter(&pull_request_summary_fields, &participant_fields);
+
+fn fieldsFilter(comptime fields: []const []const u8, comptime participant: []const []const u8) []const u8 {
+    var filter: []const u8 = "";
+    for (fields) |field| filter = filter ++ ",values." ++ field;
+    for (participant) |field| filter = filter ++ ",values.participants." ++ field;
+    return filter;
+}
+
+/// The result of `Client.checkBrowserShape`. `repository` names the checked Repository.
+pub const BrowserShape = struct {
+    repository: []u8,
+    repositories: usize = 0,
+    pull_requests: usize = 0,
+    participants: usize = 0,
+    approvals: usize = 0,
+    changes_requested: usize = 0,
+    missing: ?MissingField = null,
+
+    pub const MissingField = struct {
+        list: enum { repositories, pull_requests },
+        /// A static dotted path, such as `participants.state`.
+        field: []const u8,
+    };
+
+    pub fn deinit(self: BrowserShape, allocator: Allocator) void {
+        allocator.free(self.repository);
+    }
+};
+
+fn jsonPath(root: std.json.Value, comptime path: []const u8) ?std.json.Value {
+    var value = root;
+    var parts = std.mem.splitScalar(u8, path, '.');
+    while (parts.next()) |part| {
+        if (value != .object) return null;
+        value = value.object.get(part) orelse return null;
+    }
+    return value;
+}
+
+const RepositorySummaryJson = struct {
+    slug: []const u8,
+    name: []const u8,
+    updated_on: ?[]const u8 = null,
+};
+
+const RepositorySummaryPage = struct {
+    values: []RepositorySummaryJson,
+    next: ?[]const u8 = null,
+};
+
+fn dupeRepositorySummary(allocator: Allocator, wire: RepositorySummaryJson) !types.RepositorySummary {
+    const slug = try allocator.dupe(u8, wire.slug);
+    errdefer allocator.free(slug);
+    return .{ .slug = slug, .name = try allocator.dupe(u8, wire.name), .updated_on = parseUpdatedOn(wire.updated_on) };
+}
+
+fn deinitRepositorySummary(allocator: Allocator, summary: types.RepositorySummary) void {
+    allocator.free(summary.slug);
+    allocator.free(summary.name);
+}
+
+/// Free a batch returned by `listRepositorySummaries`.
+pub fn deinitRepositorySummaries(allocator: Allocator, summaries: []types.RepositorySummary) void {
+    for (summaries) |summary| deinitRepositorySummary(allocator, summary);
+    allocator.free(summaries);
+}
+
+fn parseUpdatedOn(text: ?[]const u8) ?i64 {
+    return parseIso8601(text orelse return null) catch null;
+}
+
+/// `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)` to Unix seconds. Bitbucket always sends a zone.
+fn parseIso8601(text: []const u8) !i64 {
+    if (text.len < 20 or text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return error.Malformed;
+    const year = try decimal(text[0..4]);
+    const month = try decimal(text[5..7]);
+    const day = try decimal(text[8..10]);
+    const hour = try decimal(text[11..13]);
+    const minute = try decimal(text[14..16]);
+    const second = try decimal(text[17..19]);
+    if (month < 1 or month > 12 or day < 1 or hour > 23 or minute > 59 or second > 59) return error.Malformed;
+    if (day > std.time.epoch.getDaysInMonth(year, @enumFromInt(month))) return error.Malformed;
+    var rest = text[19..];
+    if (rest[0] == '.') {
+        var digits: usize = 1;
+        while (digits < rest.len and std.ascii.isDigit(rest[digits])) digits += 1;
+        if (digits == 1) return error.Malformed;
+        rest = rest[digits..];
+    }
+    const offset: i64 = if (std.mem.eql(u8, rest, "Z")) 0 else offset: {
+        if (rest.len != 6 or (rest[0] != '+' and rest[0] != '-') or rest[3] != ':') return error.Malformed;
+        const offset_hours = try decimal(rest[1..3]);
+        const offset_minutes = try decimal(rest[4..6]);
+        if (offset_hours > 23 or offset_minutes > 59) return error.Malformed;
+        const magnitude = @as(i64, offset_hours) * 3600 + @as(i64, offset_minutes) * 60;
+        break :offset if (rest[0] == '-') -magnitude else magnitude;
+    };
+    // Days from 1970-01-01 in the proleptic Gregorian calendar, after Howard Hinnant's days_from_civil.
+    const y: i64 = @as(i64, year) - @intFromBool(month <= 2);
+    const era = @divFloor(y, 400);
+    const year_of_era = y - era * 400;
+    const day_of_year = @divFloor(153 * (@as(i64, month) + (if (month > 2) @as(i64, -3) else 9)) + 2, 5) + day - 1;
+    const day_of_era = year_of_era * 365 + @divFloor(year_of_era, 4) - @divFloor(year_of_era, 100) + day_of_year;
+    const days = era * 146097 + day_of_era - 719468;
+    return days * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second - offset;
+}
+
+fn decimal(text: []const u8) !u16 {
+    var value: u16 = 0;
+    for (text) |c| {
+        if (!std.ascii.isDigit(c)) return error.Malformed;
+        value = value * 10 + (c - '0');
+    }
+    return value;
+}
 
 fn dupeSummary(allocator: Allocator, pj: PrSummaryJson) !PullRequestSummary {
     const author = if (pj.author) |a| (a.display_name orelse "") else "";
@@ -2210,6 +2433,12 @@ fn dupeSummary(allocator: Allocator, pj: PrSummaryJson) !PullRequestSummary {
     errdefer allocator.free(author_owned);
     const source_branch = try allocator.dupe(u8, pj.source.branch.name);
     errdefer allocator.free(source_branch);
+    var approval_count: u32 = 0;
+    var changes_requested_count: u32 = 0;
+    for (pj.participants) |participant| {
+        approval_count += @intFromBool(participant.approved);
+        changes_requested_count += @intFromBool(std.mem.eql(u8, participant.state orelse "", "changes_requested"));
+    }
     return .{
         .id = pj.id,
         .title = title,
@@ -2218,6 +2447,9 @@ fn dupeSummary(allocator: Allocator, pj: PrSummaryJson) !PullRequestSummary {
         .source_branch = source_branch,
         .destination_branch = try allocator.dupe(u8, pj.destination.branch.name),
         .draft = pj.draft,
+        .updated_on = parseUpdatedOn(pj.updated_on),
+        .approval_count = approval_count,
+        .changes_requested_count = changes_requested_count,
     };
 }
 
@@ -4912,4 +5144,237 @@ test "review followups commits prefer linked display name and retain raw-only au
     try testing.expectEqualStrings("External Author <author@example.test>", items[0].author);
     try testing.expectEqualStrings("Linked Author", items[1].author);
     try testing.expectEqualStrings("Display Author", items[2].author);
+}
+
+const m24_repositories_url = "https://api.bitbucket.org/2.0/repositories/check24?pagelen=100&sort=-updated_on&fields=next,values.slug,values.name,values.updated_on";
+const m24_pull_requests_url = "https://api.bitbucket.org/2.0/repositories/check24/pr-webapp/pullrequests?pagelen=50&state=OPEN" ++
+    "&fields=next,values.id,values.title,values.state,values.draft,values.updated_on,values.author.display_name," ++
+    "values.source.branch.name,values.destination.branch.name,values.participants.approved,values.participants.state";
+const m24_repository_pages = [_]@import("../http/fake_client.zig").Canned{
+    .{ .body =
+    \\{"values":[{"slug":"pr-webapp","name":"PR Webapp","updated_on":"2026-10-29T09:26:40+00:00"},{"slug":"api","name":"API","updated_on":"2024-02-29T23:59:59Z"}],"next":"https://api.bitbucket.org/2.0/repositories/check24?page=2"}
+    },
+    .{ .body =
+    \\{"values":[{"slug":"docs","name":"Docs","updated_on":"1969-12-31T23:00:00-01:30"}],"next":"https://api.bitbucket.org/2.0/repositories/check24?page=3"}
+    },
+    .{ .body =
+    \\{"values":[{"slug":"infra","name":"Infra","updated_on":"2026-10-29T11:26:40.123456+02:00"},{"slug":"old","name":"Old"}]}
+    },
+};
+const m24_pull_request_page =
+    \\{"id":7,"title":"Fix the cart","state":"OPEN","draft":false,"updated_on":"2026-10-29T09:26:40+00:00","author":{"display_name":"Ada"},"source":{"branch":{"name":"feature/cart"}},"destination":{"branch":{"name":"main"}},"participants":[{"approved":true,"state":"approved"},{"approved":false,"state":"changes_requested"},{"approved":false,"state":null},{"approved":true,"state":"approved"},{"approved":false,"state":"changes_requested"},{"approved":false,"state":"changes_requested"}]}
+;
+const m24_pull_request_pages = [_]@import("../http/fake_client.zig").Canned{
+    .{ .body = "{\"values\":[" ++ m24_pull_request_page ++ "],\"next\":\"https://api.bitbucket.org/2.0/repositories/check24/pr-webapp/pullrequests?page=2\"}" },
+    .{ .body =
+    \\{"values":[{"id":3,"title":"Docs","state":"OPEN","draft":true,"updated_on":null,"author":{"display_name":"Grace"},"source":{"branch":{"name":"docs"}},"destination":{"branch":{"name":"main"}},"participants":[]}]}
+    },
+};
+
+test "M24 acquisition Repository Summaries follow every page in order with the Browser filter" {
+    var fake: FakeHttpClient = .{ .responses = &m24_repository_pages };
+    const items = try Client.init(fake.httpClient(), testCredential()).listRepositorySummaries(testing.allocator);
+    defer deinitRepositorySummaries(testing.allocator, items);
+    try testing.expectEqual(@as(usize, 3), fake.call_count);
+    try testing.expectEqualStrings(m24_repositories_url, fake.urlAt(0).?);
+    try testing.expectEqualStrings("https://api.bitbucket.org/2.0/repositories/check24?page=3", fake.urlAt(2).?);
+    const expected = [_]types.RepositorySummary{
+        .{ .slug = "pr-webapp", .name = "PR Webapp", .updated_on = 1793266000 },
+        .{ .slug = "api", .name = "API", .updated_on = 1709251199 },
+        .{ .slug = "docs", .name = "Docs", .updated_on = 1800 },
+        .{ .slug = "infra", .name = "Infra", .updated_on = 1793266000 },
+        .{ .slug = "old", .name = "Old", .updated_on = null },
+    };
+    try testing.expectEqual(expected.len, items.len);
+    for (expected, items) |want, got| {
+        try testing.expectEqualStrings(want.slug, got.slug);
+        try testing.expectEqualStrings(want.name, got.name);
+        try testing.expectEqual(want.updated_on, got.updated_on);
+    }
+}
+
+test "M24 acquisition open PullRequest Summaries count approvals and changes-requested participants" {
+    var fake: FakeHttpClient = .{ .responses = &m24_pull_request_pages };
+    const items = try Client.init(fake.httpClient(), testCredential()).listOpenPullRequestSummaries(testing.allocator, "pr-webapp");
+    defer deinitSummaries(testing.allocator, items);
+    try testing.expectEqual(@as(usize, 2), fake.call_count);
+    try testing.expectEqualStrings(m24_pull_requests_url, fake.urlAt(0).?);
+    try testing.expectEqual(@as(usize, 2), items.len);
+    try testing.expectEqual(@as(u64, 7), items[0].id);
+    try testing.expectEqualStrings("Fix the cart", items[0].title);
+    try testing.expectEqualStrings("Ada", items[0].author_display_name);
+    try testing.expectEqualStrings("feature/cart", items[0].source_branch);
+    try testing.expectEqualStrings("main", items[0].destination_branch);
+    try testing.expectEqual(@as(?i64, 1793266000), items[0].updated_on);
+    try testing.expectEqual(@as(u32, 2), items[0].approval_count);
+    try testing.expectEqual(@as(u32, 3), items[0].changes_requested_count);
+    try testing.expectEqual(@as(u64, 3), items[1].id);
+    try testing.expect(items[1].draft);
+    try testing.expectEqual(@as(?i64, null), items[1].updated_on);
+    try testing.expectEqual(@as(u32, 0), items[1].approval_count);
+    try testing.expectEqual(@as(u32, 0), items[1].changes_requested_count);
+}
+
+test "M24 acquisition a missing or malformed update time gives null" {
+    const cases = [_]struct { field: []const u8, expected: ?i64 }{
+        .{ .field = "", .expected = null },
+        .{ .field = ",\"updated_on\":null", .expected = null },
+        .{ .field = ",\"updated_on\":\"yesterday\"", .expected = null },
+        .{ .field = ",\"updated_on\":\"2026-13-01T00:00:00+00:00\"", .expected = null },
+        .{ .field = ",\"updated_on\":\"2025-02-29T00:00:00+00:00\"", .expected = null },
+        .{ .field = ",\"updated_on\":\"2026-10-29T24:00:00+00:00\"", .expected = null },
+        .{ .field = ",\"updated_on\":\"2026-10-29T09:26:40\"", .expected = null },
+        .{ .field = ",\"updated_on\":\"2026-10-29T09:26:40.+00:00\"", .expected = null },
+        .{ .field = ",\"updated_on\":\"2_26-10-29T09:26:40+00:00\"", .expected = null },
+        .{ .field = ",\"updated_on\":\"2026-10-29T09:26:40+0000\"", .expected = null },
+        .{ .field = ",\"updated_on\":\"2026-10-29T09:26:40.5Z\"", .expected = 1793266000 },
+        .{ .field = ",\"updated_on\":\"2026-10-29T05:56:40-03:30\"", .expected = 1793266000 },
+    };
+    for (cases) |case| {
+        const repository = try std.fmt.allocPrint(testing.allocator, "{{\"values\":[{{\"slug\":\"r\",\"name\":\"R\"{s}}}]}}", .{case.field});
+        defer testing.allocator.free(repository);
+        const pull_request = try std.fmt.allocPrint(testing.allocator, "{{\"values\":[{{\"id\":1,\"title\":\"T\",\"state\":\"OPEN\",\"source\":{{\"branch\":{{\"name\":\"a\"}}}},\"destination\":{{\"branch\":{{\"name\":\"b\"}}}}{s}}}]}}", .{case.field});
+        defer testing.allocator.free(pull_request);
+        const responses = [_]@import("../http/fake_client.zig").Canned{ .{ .body = repository }, .{ .body = pull_request } };
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        const bb = Client.init(fake.httpClient(), testCredential());
+        const repositories = try bb.listRepositorySummaries(testing.allocator);
+        defer deinitRepositorySummaries(testing.allocator, repositories);
+        const pull_requests = try bb.listOpenPullRequestSummaries(testing.allocator, "r");
+        defer deinitSummaries(testing.allocator, pull_requests);
+        try testing.expectEqual(case.expected, repositories[0].updated_on);
+        try testing.expectEqual(case.expected, pull_requests[0].updated_on);
+    }
+}
+
+const M24List = enum { repositories, pull_requests };
+
+fn m24ListCount(allocator: Allocator, bb: Client, list: M24List) !usize {
+    switch (list) {
+        .repositories => {
+            const items = try bb.listRepositorySummaries(allocator);
+            defer deinitRepositorySummaries(allocator, items);
+            return items.len;
+        },
+        .pull_requests => {
+            const items = try bb.listOpenPullRequestSummaries(allocator, "pr-webapp");
+            defer deinitSummaries(allocator, items);
+            return items.len;
+        },
+    }
+}
+
+test "M24 acquisition a failed page returns the classified ApiError and no partial list" {
+    const cases = [_]struct { status: u16, expected: ApiError }{
+        .{ .status = 401, .expected = error.Unauthorized },
+        .{ .status = 403, .expected = error.Forbidden },
+        .{ .status = 404, .expected = error.NotFound },
+        .{ .status = 429, .expected = error.RateLimited },
+        .{ .status = 500, .expected = error.ServerError },
+    };
+    for (std.enums.values(M24List)) |list| {
+        const first = switch (list) {
+            .repositories => m24_repository_pages[0],
+            .pull_requests => m24_pull_request_pages[0],
+        };
+        for (cases) |case| {
+            for ([_]bool{ false, true }) |on_page_two| {
+                const failure: @import("../http/fake_client.zig").Canned = .{ .status = case.status, .body = "{\"error\":{\"message\":\"no\"}}" };
+                const responses = [_]@import("../http/fake_client.zig").Canned{ if (on_page_two) first else failure, failure };
+                var fake: FakeHttpClient = .{ .responses = &responses };
+                try testing.expectError(case.expected, m24ListCount(testing.allocator, Client.init(fake.httpClient(), testCredential()), list));
+                try testing.expectEqual(@as(usize, if (on_page_two) 2 else 1), fake.call_count);
+            }
+        }
+    }
+}
+
+fn m24ListAllocations(allocator: Allocator, list: M24List) !void {
+    var fake: FakeHttpClient = .{ .responses = switch (list) {
+        .repositories => &m24_repository_pages,
+        .pull_requests => &m24_pull_request_pages,
+    } };
+    const count = try m24ListCount(allocator, Client.init(fake.httpClient(), testCredential()), list);
+    try testing.expectEqual(@as(usize, if (list == .repositories) 5 else 2), count);
+}
+
+test "M24 acquisition allocation failures release every page" {
+    for (std.enums.values(M24List)) |list| {
+        try testing.checkAllAllocationFailures(testing.allocator, m24ListAllocations, .{list});
+    }
+}
+
+test "M24 acquisition the Browser shape check passes a complete response and counts participants" {
+    const repository: @import("../http/fake_client.zig").Canned = .{ .body =
+        \\{"values":[{"slug":"pr-webapp","name":"PR Webapp","updated_on":"2026-10-29T09:26:40+00:00"},{"slug":"api","name":"API","updated_on":null}]}
+    };
+    const responses = [_]@import("../http/fake_client.zig").Canned{ repository, repository } ++ m24_pull_request_pages ++ m24_pull_request_pages;
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const shape = try Client.init(fake.httpClient(), testCredential()).checkBrowserShape(testing.allocator, null);
+    defer shape.deinit(testing.allocator);
+    try testing.expectEqual(@as(?BrowserShape.MissingField, null), shape.missing);
+    try testing.expectEqualStrings("pr-webapp", shape.repository);
+    try testing.expectEqual(@as(usize, 2), shape.repositories);
+    try testing.expectEqual(@as(usize, 2), shape.pull_requests);
+    try testing.expectEqual(@as(usize, 6), shape.participants);
+    try testing.expectEqual(@as(usize, 2), shape.approvals);
+    try testing.expectEqual(@as(usize, 3), shape.changes_requested);
+    try testing.expectEqualStrings(m24_pull_requests_url, fake.urlAt(2).?);
+}
+
+test "M24 acquisition the Browser shape check names the first missing required field" {
+    const complete_repository = "{\"values\":[{\"slug\":\"pr-webapp\",\"name\":\"PR Webapp\",\"updated_on\":\"2026-10-29T09:26:40+00:00\"}]}";
+    const cases = [_]struct { repository: []const u8, pull_request: []const u8, list: @FieldType(BrowserShape.MissingField, "list"), field: []const u8 }{
+        .{ .repository = "{\"values\":[{\"slug\":\"r\",\"name\":\"R\"}]}", .pull_request = "", .list = .repositories, .field = "updated_on" },
+        .{ .repository = "{\"values\":[{\"name\":\"R\",\"updated_on\":null}]}", .pull_request = "", .list = .repositories, .field = "slug" },
+        .{ .repository = "{\"next\":null}", .pull_request = "", .list = .repositories, .field = "values" },
+        .{
+            .repository = complete_repository,
+            .pull_request = "{\"values\":[{\"id\":1,\"title\":\"T\",\"state\":\"OPEN\",\"draft\":false,\"updated_on\":null,\"author\":{\"display_name\":\"Ada\"},\"source\":{\"branch\":{\"name\":\"a\"}},\"destination\":{\"branch\":{\"name\":\"b\"}},\"participants\":[{\"approved\":true}]}]}",
+            .list = .pull_requests,
+            .field = "participants.state",
+        },
+        .{
+            .repository = complete_repository,
+            .pull_request = "{\"values\":[{\"id\":1,\"title\":\"T\",\"state\":\"OPEN\",\"draft\":false,\"updated_on\":null,\"author\":{\"display_name\":\"Ada\"},\"source\":{\"branch\":{\"name\":\"a\"}},\"destination\":{\"branch\":{\"name\":\"b\"}},\"participants\":[{\"state\":null}]}]}",
+            .list = .pull_requests,
+            .field = "participants.approved",
+        },
+        .{
+            .repository = complete_repository,
+            .pull_request = "{\"values\":[{\"id\":1,\"title\":\"T\",\"state\":\"OPEN\",\"draft\":false,\"updated_on\":null,\"author\":{\"display_name\":\"Ada\"},\"source\":{\"branch\":{\"name\":\"a\"}},\"destination\":{\"branch\":{\"name\":\"b\"}}}]}",
+            .list = .pull_requests,
+            .field = "participants",
+        },
+        .{
+            .repository = complete_repository,
+            .pull_request = "{\"values\":[{\"id\":1,\"title\":\"T\",\"state\":\"OPEN\",\"draft\":false,\"updated_on\":null,\"author\":null,\"source\":{\"branch\":{\"name\":\"a\"}},\"destination\":{\"branch\":{\"name\":\"b\"}},\"participants\":[]}]}",
+            .list = .pull_requests,
+            .field = "author.display_name",
+        },
+    };
+    for (cases) |case| {
+        const responses = [_]@import("../http/fake_client.zig").Canned{ .{ .body = case.repository }, .{ .body = case.repository }, .{ .body = case.pull_request } };
+        var fake: FakeHttpClient = .{ .responses = &responses };
+        const shape = try Client.init(fake.httpClient(), testCredential()).checkBrowserShape(testing.allocator, null);
+        defer shape.deinit(testing.allocator);
+        const missing = shape.missing orelse return error.TestExpectedMissingField;
+        try testing.expectEqual(case.list, missing.list);
+        try testing.expectEqualStrings(case.field, missing.field);
+    }
+}
+
+test "M24 acquisition the Browser shape check uses the named Repository" {
+    const responses = [_]@import("../http/fake_client.zig").Canned{
+        .{ .body = "{\"values\":[]}" }, .{ .body = "{\"values\":[]}" }, .{ .body = "{\"values\":[]}" }, .{ .body = "{\"values\":[]}" },
+    };
+    var fake: FakeHttpClient = .{ .responses = &responses };
+    const bb = Client.init(fake.httpClient(), testCredential());
+    const shape = try bb.checkBrowserShape(testing.allocator, "pr-webapp");
+    defer shape.deinit(testing.allocator);
+    try testing.expectEqualStrings("pr-webapp", shape.repository);
+    try testing.expectEqual(@as(?BrowserShape.MissingField, null), shape.missing);
+    try testing.expectEqualStrings(m24_pull_requests_url, fake.urlAt(2).?);
+    var empty: FakeHttpClient = .{ .body = "{\"values\":[]}" };
+    try testing.expectError(error.NoRepositories, Client.init(empty.httpClient(), testCredential()).checkBrowserShape(testing.allocator, null));
 }

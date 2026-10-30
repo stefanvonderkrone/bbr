@@ -154,6 +154,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, f, "check-acquisition")) return checkAcquisitionRun(init, gpa, cred);
         if (std.mem.eql(u8, f, "check-mutation")) return checkMutationRun(init, gpa, cred, &rest);
         if (std.mem.eql(u8, f, "check-verdict")) return checkVerdictRun(init, gpa, cred, &rest);
+        if (std.mem.eql(u8, f, "check-browser")) return checkBrowserRun(init, gpa, cred, &rest);
         // Print startup resolution (branch/remote/PR list) without the TUI.
         if (std.mem.eql(u8, f, "detect")) return detectRun(init, gpa, cred, &rest);
     }
@@ -587,6 +588,36 @@ fn runAcquisitionSample(
     defer candidate.destroy();
     max_connections.* = @max(max_connections.*, transport.maxConnectionCount());
     return @intCast(@divFloor(start.untilNow(init.io, .awake).toNanoseconds(), std.time.ns_per_ms));
+}
+
+fn checkBrowserRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
+    const repo = it.next();
+    if (it.next() != null) return usage();
+    var client = bbr.http.StdHttpClient.init(gpa, init.io);
+    defer client.deinit();
+    try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
+    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred);
+    const shape = try bb.checkBrowserShape(gpa, repo);
+    defer shape.deinit(gpa);
+    var buffer: [1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &buffer);
+    const complete = try printBrowserShape(&stdout.interface, shape);
+    try stdout.interface.flush();
+    if (!complete) std.process.exit(1);
+}
+
+/// Print the `bbr check-browser` report. Return false when a required field is missing.
+fn printBrowserShape(writer: *std.Io.Writer, shape: bbr.bitbucket.BrowserShape) !bool {
+    if (shape.missing) |missing| {
+        try writer.print("missing: {s} {s}\n", .{ @tagName(missing.list), missing.field });
+        return false;
+    }
+    try writer.print("ok: {d} Repositories\n{s}: {d} open PullRequests\n", .{ shape.repositories, shape.repository, shape.pull_requests });
+    try writer.print("participants: {d} seen with approved and state, {d} approvals, {d} changes requested\n", .{
+        shape.participants, shape.approvals, shape.changes_requested,
+    });
+    if (shape.participants == 0) try writer.writeAll("note: no participant seen, so the participant fields are unproven\n");
+    return true;
 }
 
 fn checkMutationRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
@@ -1250,6 +1281,7 @@ fn usage() void {
         \\  bbr check-acquisition             opt-in Candidate Session acquisition gate
         \\  bbr check-mutation <repo> <pr-id> destructive live Comment lifecycle check
         \\  bbr check-verdict <repo> <pr-id>  destructive live Reviewer Verdict check
+        \\  bbr check-browser [<repo-slug>]   live Browser list shape check
         \\  bbr external-edit-smoke          interactive PTY External Edit check
         \\  bbr demo                         open the TUI with synthetic data (no network)
         \\  bbr grammar <command> ...        manage trusted local UserGrammars
@@ -1455,6 +1487,21 @@ test "pending.db and submission locks live under an absolute XDG_STATE_HOME, els
         opened.close(testing.io);
     }
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, "relative/state", .{}));
+}
+
+test "M24 acquisition check-browser fails when a required field is missing" {
+    var repository = "pr-webapp".*;
+    var output: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&output);
+    try std.testing.expect(!try printBrowserShape(&writer, .{ .repository = &repository, .missing = .{ .list = .pull_requests, .field = "participants.state" } }));
+    try std.testing.expectEqualStrings("missing: pull_requests participants.state\n", writer.buffered());
+
+    writer = .fixed(&output);
+    try std.testing.expect(try printBrowserShape(&writer, .{ .repository = &repository, .repositories = 3, .pull_requests = 2, .participants = 4, .approvals = 1, .changes_requested = 2 }));
+    try std.testing.expectEqualStrings(
+        "ok: 3 Repositories\npr-webapp: 2 open PullRequests\nparticipants: 4 seen with approved and state, 1 approvals, 2 changes requested\n",
+        writer.buffered(),
+    );
 }
 
 test "File Enrichment OOM has a distinct fatal message" {

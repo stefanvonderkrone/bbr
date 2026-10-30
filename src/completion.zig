@@ -15,7 +15,8 @@ const cli = @import("api/cli.zig");
 pub const top_commands = [_][]const u8{
     "api",               "completion",     "auth",          "local",
     "grammar",           "demo",           "check",         "check-blobs",
-    "check-acquisition", "check-mutation", "check-verdict", "detect",
+    "check-acquisition", "check-mutation", "check-verdict", "check-browser",
+    "detect",
 };
 
 pub const usage =

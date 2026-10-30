@@ -335,6 +335,13 @@ pub fn build(b: *std.Build) void {
     const acceptance_step = b.step("test-m23-acceptance", "Run combined M23 acceptance tests");
     acceptance_step.dependOn(&b.addRunArtifact(acceptance_tests).step);
 
+    // M24 tests live in both the `bbr` module and the executable module.
+    const browser_step = b.step("test-browser", "Run M24 Browser tests");
+    for ([_]*std.Build.Module{ mod, exe.root_module }) |module| {
+        const browser_tests = b.addTest(.{ .name = "browser-tests", .root_module = module, .filters = &.{"M24"} });
+        browser_step.dependOn(&b.addRunArtifact(browser_tests).step);
+    }
+
     const fixture_mod = b.createModule(.{
         .root_source_file = b.path("tests/user_grammar_fixture.zig"),
         .target = target,

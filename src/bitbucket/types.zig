@@ -111,6 +111,19 @@ pub const PullRequestSummary = struct {
     source_branch: []const u8,
     destination_branch: []const u8,
     draft: bool = false,
+    /// Unix seconds, or null when Bitbucket omits the field or sends a malformed time.
+    updated_on: ?i64 = null,
+    approval_count: u32 = 0,
+    changes_requested_count: u32 = 0,
+};
+
+/// The Browser facts of one Repository. It holds no PullRequest data.
+/// All slices are owned by the allocator that produced the value.
+pub const RepositorySummary = struct {
+    slug: []const u8,
+    name: []const u8,
+    /// Unix seconds, or null when Bitbucket omits the field or sends a malformed time.
+    updated_on: ?i64,
 };
 
 /// The commit pair identifying a PR's current diff revision. A comment whose
