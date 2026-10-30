@@ -36,6 +36,7 @@ pub const diff = struct {
 pub const highlight = struct {
     pub const highlighter = @import("highlight/highlighter.zig");
     pub const decoration = @import("highlight/decoration.zig");
+    pub const grammar_name = @import("highlight/grammar_name.zig");
     pub const Highlighter = highlighter.Highlighter;
     pub const PlainHighlighter = highlighter.PlainHighlighter;
     pub const Capture = highlighter.Capture;

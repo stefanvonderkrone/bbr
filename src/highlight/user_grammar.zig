@@ -283,6 +283,7 @@ pub const Registry = struct {
                 language,
                 findFile(inspection.files, inspection.manifest.highlight_query).?.bytes,
                 if (inspection.manifest.locals_query) |path| findFile(inspection.files, path).?.bytes else "",
+                "",
                 &diagnostic,
             ) catch |err| {
                 if (err == error.InvalidHighlightQuery or err == error.InvalidLocalsQuery or err == error.InvalidPredicate) diagnostic.report();

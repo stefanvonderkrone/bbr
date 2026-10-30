@@ -7,6 +7,7 @@ const predicate_mod = @import("query_predicates.zig");
 const grammar_match = @import("grammar_match.zig");
 const user_grammar = @import("user_grammar.zig");
 const RuntimePackage = @import("runtime_package.zig").RuntimePackage;
+const InjectionQuery = @import("runtime_package.zig").InjectionQuery;
 const c = predicate_mod.c;
 
 extern fn tree_sitter_javascript() callconv(.c) ?*const c.TSLanguage;
@@ -36,11 +37,16 @@ const GrammarSource = struct {
     language: *const c.TSLanguage,
     query: []const u8,
     locals_query: []const u8 = "",
+    injections_query: []const u8 = "",
 };
+
+const BuiltInPackages = [std.meta.tags(grammar_match.BuiltInGrammar).len]RuntimePackage;
+const max_injection_depth = 4;
+const default_priority = 100;
 
 pub const TreeSitterHighlighter = struct {
     registry: ?*user_grammar.Registry = null,
-    packages: [std.meta.tags(grammar_match.BuiltInGrammar).len]RuntimePackage = undefined,
+    packages: BuiltInPackages = undefined,
     package_count: usize = 0,
 
     pub fn init(allocator: Allocator, registry: ?*user_grammar.Registry) !TreeSitterHighlighter {
@@ -49,8 +55,8 @@ pub const TreeSitterHighlighter = struct {
         inline for (std.meta.tags(grammar_match.BuiltInGrammar)) |grammar| {
             const source = grammarSource(grammar) orelse return error.MissingBuiltInGrammar;
             var diagnostic: predicate_mod.Diagnostic = undefined;
-            self.packages[self.package_count] = RuntimePackage.init(allocator, source.language, source.query, source.locals_query, &diagnostic) catch |err| {
-                if (err == error.InvalidHighlightQuery or err == error.InvalidLocalsQuery or err == error.InvalidPredicate) diagnostic.report();
+            self.packages[self.package_count] = RuntimePackage.init(allocator, source.language, source.query, source.locals_query, source.injections_query, &diagnostic) catch |err| {
+                if (err == error.InvalidHighlightQuery or err == error.InvalidLocalsQuery or err == error.InvalidInjectionQuery or err == error.InvalidPredicate) diagnostic.report();
                 return err;
             };
             self.package_count += 1;
@@ -75,7 +81,7 @@ pub const TreeSitterHighlighter = struct {
             if (registry.matchName(path, content) != null) {
                 const grammar = registry.grammar(path, content) catch return self.highlightBuiltIn(result_allocator, scratch_allocator, path, content) catch .{ .spans = &.{} };
                 if (grammar) |selected| {
-                    return highlightWithPackage(result_allocator, scratch_allocator, selected.package, content, null) catch
+                    return highlightWithPackage(result_allocator, scratch_allocator, selected.package, null, content, null) catch
                         self.highlightBuiltIn(result_allocator, scratch_allocator, path, content) catch .{ .spans = &.{} };
                 }
             }
@@ -85,7 +91,7 @@ pub const TreeSitterHighlighter = struct {
 
     fn highlightBuiltIn(self: *TreeSitterHighlighter, result_allocator: Allocator, scratch_allocator: Allocator, path: []const u8, content: []const u8) !bbr.highlight.HighlightResult {
         const selected = grammar_match.selectBuiltIn(path, content) orelse return .{ .spans = &.{} };
-        return highlightWithPackage(result_allocator, scratch_allocator, &self.packages[@intFromEnum(selected)], content, null);
+        return highlightWithPackage(result_allocator, scratch_allocator, &self.packages[@intFromEnum(selected)], &self.packages, content, null);
     }
 };
 
@@ -112,15 +118,15 @@ fn highlightWithQuery(allocator: Allocator, grammar_language: *const c.TSLanguag
 
 fn highlightWithQueryLimit(allocator: Allocator, grammar_language: *const c.TSLanguage, query_source: []const u8, locals_query_source: []const u8, content: []const u8, match_limit: ?u32) !bbr.highlight.HighlightResult {
     var diagnostic: predicate_mod.Diagnostic = undefined;
-    var package = try RuntimePackage.init(allocator, grammar_language, query_source, locals_query_source, &diagnostic);
+    var package = try RuntimePackage.init(allocator, grammar_language, query_source, locals_query_source, "", &diagnostic);
     defer package.deinit();
-    return highlightWithPackage(allocator, allocator, &package, content, match_limit);
+    return highlightWithPackage(allocator, allocator, &package, null, content, match_limit);
 }
 
-fn highlightWithPackage(result_allocator: Allocator, scratch_allocator: Allocator, package: *const RuntimePackage, content: []const u8, match_limit: ?u32) !bbr.highlight.HighlightResult {
-    const intervals = try collectCaptureIntervals(scratch_allocator, package, content, match_limit);
+fn highlightWithPackage(result_allocator: Allocator, scratch_allocator: Allocator, package: *const RuntimePackage, built_ins: ?*const BuiltInPackages, content: []const u8, match_limit: ?u32) !bbr.highlight.HighlightResult {
+    const intervals = try collectCaptureIntervals(scratch_allocator, package, built_ins, content, match_limit);
     defer scratch_allocator.free(intervals);
-    const spans = try mergeCaptureIntervals(scratch_allocator, package, content, intervals);
+    const spans = try mergeCaptureIntervals(scratch_allocator, content, intervals);
     defer scratch_allocator.free(spans);
     return .{ .spans = try result_allocator.dupe(bbr.highlight.Span, spans) };
 }
@@ -128,20 +134,56 @@ fn highlightWithPackage(result_allocator: Allocator, scratch_allocator: Allocato
 const CaptureInterval = struct {
     start: u32,
     end: u32,
-    capture_id: u16,
+    capture: bbr.highlight.Capture,
+    priority: u16,
+    /// The Injection layer depth. The host layer has depth 0.
+    depth: u8,
     pattern_index: u32,
     order: usize,
 };
 
-fn collectCaptureIntervals(allocator: Allocator, package: *const RuntimePackage, content: []const u8, match_limit: ?u32) ![]CaptureInterval {
+/// One parse of the content. A layer with no ranges parses the full content.
+const Layer = struct {
+    package: *const RuntimePackage,
+    ranges: []c.TSRange,
+    depth: u8,
+};
+
+/// `built_ins` is null for a UserGrammar, so it never hosts an Injection.
+fn collectCaptureIntervals(allocator: Allocator, package: *const RuntimePackage, built_ins: ?*const BuiltInPackages, content: []const u8, match_limit: ?u32) ![]CaptureInterval {
     if (content.len > std.math.maxInt(u32)) return error.FileTooLarge;
     if (!std.unicode.utf8ValidateSlice(content)) return error.InvalidUtf8;
     const parser = c.ts_parser_new() orelse return error.ParserInitFailed;
     defer c.ts_parser_delete(parser);
-    if (!c.ts_parser_set_language(parser, package.language)) return error.IncompatibleGrammar;
-    const tree = c.ts_parser_parse_string(parser, null, content.ptr, @intCast(content.len)) orelse return error.ParseFailed;
-    defer c.ts_tree_delete(tree);
 
+    const lines: LineStarts = if (built_ins != null and package.injection != null) try .init(allocator, content) else .{ .starts = &.{} };
+    defer allocator.free(lines.starts);
+    var layers: std.ArrayList(Layer) = .empty;
+    defer {
+        for (layers.items) |layer| allocator.free(layer.ranges);
+        layers.deinit(allocator);
+    }
+    try layers.append(allocator, .{ .package = package, .ranges = &.{}, .depth = 0 });
+    var intervals: std.ArrayList(CaptureInterval) = .empty;
+    errdefer intervals.deinit(allocator);
+    var index: usize = 0;
+    while (index < layers.items.len) : (index += 1) {
+        const layer = layers.items[index];
+        if (!c.ts_parser_set_language(parser, layer.package.language)) return error.IncompatibleGrammar;
+        if (!c.ts_parser_set_included_ranges(parser, layer.ranges.ptr, @intCast(layer.ranges.len))) return error.InvalidInjectionRanges;
+        const tree = c.ts_parser_parse_string(parser, null, content.ptr, @intCast(content.len)) orelse return error.ParseFailed;
+        defer c.ts_tree_delete(tree);
+        try collectLayerIntervals(allocator, &intervals, layer, tree, content, match_limit);
+        const packages = built_ins orelse continue;
+        const injection = layer.package.injection orelse continue;
+        if (layer.depth == max_injection_depth) continue;
+        try collectInjectionLayers(allocator, &layers, packages, injection, layer, tree, content, lines, match_limit);
+    }
+    return intervals.toOwnedSlice(allocator);
+}
+
+fn collectLayerIntervals(allocator: Allocator, intervals: *std.ArrayList(CaptureInterval), layer: Layer, tree: *c.TSTree, content: []const u8, match_limit: ?u32) !void {
+    const package = layer.package;
     const locals = if (package.locals) |locals_query| try predicate_mod.Locals.collectPrepared(
         allocator,
         tree,
@@ -158,34 +200,207 @@ fn collectCaptureIntervals(allocator: Allocator, package: *const RuntimePackage,
     c.ts_query_cursor_set_match_limit(cursor, match_limit orelse std.math.maxInt(u32));
     c.ts_query_cursor_exec(cursor, package.highlight.query, c.ts_tree_root_node(tree));
 
-    var intervals: std.ArrayList(CaptureInterval) = .empty;
-    errdefer intervals.deinit(allocator);
-    var order: usize = 0;
     var match: c.TSQueryMatch = undefined;
     while (c.ts_query_cursor_next_match(cursor, &match)) {
         if (!try package.highlight.predicates.accepts(match.pattern_index, match, content, locals)) continue;
         const captures = match.captures[0..match.capture_count];
         for (captures) |capture| {
             const range = try predicate_mod.checkedRange(c.ts_node_start_byte(capture.node), c.ts_node_end_byte(capture.node), content);
-            const start = range.start;
-            const end = range.end;
-            if (start == end) continue;
+            if (range.start == range.end) continue;
             if (capture.index >= package.captures.len) return error.InvalidCapture;
-            try intervals.append(allocator, .{
-                .start = @intCast(start),
-                .end = @intCast(end),
-                .capture_id = @intCast(capture.index),
+            var interval: CaptureInterval = .{
+                .start = @intCast(range.start),
+                .end = @intCast(range.end),
+                .capture = package.captures[capture.index],
+                .priority = default_priority,
+                .depth = layer.depth,
                 .pattern_index = match.pattern_index,
-                .order = order,
-            });
-            order += 1;
+                .order = 0,
+            };
+            if (layer.ranges.len == 0) {
+                interval.order = intervals.items.len;
+                try intervals.append(allocator, interval);
+                continue;
+            }
+            for (layer.ranges) |included| {
+                const start = @max(interval.start, included.start_byte);
+                const end = @min(interval.end, included.end_byte);
+                if (start >= end) continue;
+                var clipped = interval;
+                clipped.start = start;
+                clipped.end = end;
+                clipped.order = intervals.items.len;
+                try intervals.append(allocator, clipped);
+            }
         }
     }
     if (c.ts_query_cursor_did_exceed_match_limit(cursor)) return error.QueryMatchLimitExceeded;
-    return intervals.toOwnedSlice(allocator);
 }
 
-fn mergeCaptureIntervals(allocator: Allocator, package: *const RuntimePackage, content: []const u8, intervals: []CaptureInterval) ![]bbr.highlight.Span {
+const CombinedRanges = struct {
+    grammar: grammar_match.BuiltInGrammar,
+    ranges: std.ArrayList(c.TSRange) = .empty,
+};
+
+fn collectInjectionLayers(
+    allocator: Allocator,
+    layers: *std.ArrayList(Layer),
+    packages: *const BuiltInPackages,
+    injection: InjectionQuery,
+    parent: Layer,
+    tree: *c.TSTree,
+    content: []const u8,
+    lines: LineStarts,
+    match_limit: ?u32,
+) !void {
+    const cursor = c.ts_query_cursor_new() orelse return error.QueryCursorInitFailed;
+    defer c.ts_query_cursor_delete(cursor);
+    c.ts_query_cursor_set_match_limit(cursor, match_limit orelse std.math.maxInt(u32));
+    c.ts_query_cursor_exec(cursor, injection.prepared.query, c.ts_tree_root_node(tree));
+    var combined: std.ArrayList(CombinedRanges) = .empty;
+    defer {
+        for (combined.items) |*group| group.ranges.deinit(allocator);
+        combined.deinit(allocator);
+    }
+    var ranges: std.ArrayList(c.TSRange) = .empty;
+    defer ranges.deinit(allocator);
+
+    var match: c.TSQueryMatch = undefined;
+    while (c.ts_query_cursor_next_match(cursor, &match)) {
+        if (!try injection.prepared.predicates.accepts(match.pattern_index, match, content, .{ .ranges = &.{} })) continue;
+        const settings = injection.prepared.injections[match.pattern_index];
+        var content_node: ?c.TSNode = null;
+        var name = settings.language;
+        for (match.captures[0..match.capture_count]) |capture| {
+            if (capture.index == injection.content_id) {
+                content_node = capture.node;
+            } else if (injection.language_id != null and capture.index == injection.language_id.?) {
+                const range = try predicate_mod.checkedRange(c.ts_node_start_byte(capture.node), c.ts_node_end_byte(capture.node), content);
+                name = content[range.start..range.end];
+            }
+        }
+        const node = content_node orelse continue;
+        const grammar = grammar_match.selectInjection(name orelse continue) orelse continue;
+        if (settings.combined) {
+            const group = for (combined.items) |*group| {
+                if (group.grammar == grammar) break group;
+            } else new: {
+                try combined.append(allocator, .{ .grammar = grammar });
+                break :new &combined.items[combined.items.len - 1];
+            };
+            try appendContentRanges(allocator, &group.ranges, node, settings, parent, content, lines);
+        } else {
+            ranges.clearRetainingCapacity();
+            try appendContentRanges(allocator, &ranges, node, settings, parent, content, lines);
+            try appendLayer(allocator, layers, &packages[@intFromEnum(grammar)], ranges.items, parent.depth + 1);
+        }
+    }
+    if (c.ts_query_cursor_did_exceed_match_limit(cursor)) return error.QueryMatchLimitExceeded;
+    for (combined.items) |group| try appendLayer(allocator, layers, &packages[@intFromEnum(group.grammar)], group.ranges.items, parent.depth + 1);
+}
+
+/// Sorts and joins the ranges, because a combined layer can collect them out of order.
+fn appendLayer(allocator: Allocator, layers: *std.ArrayList(Layer), package: *const RuntimePackage, ranges: []c.TSRange, depth: u8) !void {
+    if (ranges.len == 0) return;
+    std.mem.sort(c.TSRange, ranges, {}, rangeLessThan);
+    var count: usize = 1;
+    for (ranges[1..]) |range| {
+        const last = &ranges[count - 1];
+        if (range.start_byte <= last.end_byte) {
+            if (range.end_byte > last.end_byte) {
+                last.end_byte = range.end_byte;
+                last.end_point = range.end_point;
+            }
+        } else {
+            ranges[count] = range;
+            count += 1;
+        }
+    }
+    const owned = try allocator.dupe(c.TSRange, ranges[0..count]);
+    errdefer allocator.free(owned);
+    try layers.append(allocator, .{ .package = package, .ranges = owned, .depth = depth });
+}
+
+fn rangeLessThan(_: void, a: c.TSRange, b: c.TSRange) bool {
+    return a.start_byte < b.start_byte;
+}
+
+/// Appends the content ranges of one match, clipped to the parent layer ranges.
+fn appendContentRanges(
+    allocator: Allocator,
+    ranges: *std.ArrayList(c.TSRange),
+    node: c.TSNode,
+    settings: predicate_mod.Injection,
+    parent: Layer,
+    content: []const u8,
+    lines: LineStarts,
+) !void {
+    var start: u32 = c.ts_node_start_byte(node);
+    var end: u32 = c.ts_node_end_byte(node);
+    if (settings.offset) |offset| {
+        start = lines.offsetByte(content, c.ts_node_start_point(node), offset[0], offset[1]) orelse return;
+        end = lines.offsetByte(content, c.ts_node_end_point(node), offset[2], offset[3]) orelse return;
+        if (start >= end or !predicate_mod.utf8Boundary(content, start) or !predicate_mod.utf8Boundary(content, end)) return;
+    }
+    if (settings.include_children) return appendClipped(allocator, ranges, start, end, parent, lines);
+    var at = start;
+    for (0..c.ts_node_named_child_count(node)) |child_index| {
+        const child = c.ts_node_named_child(node, @intCast(child_index));
+        const child_start = c.ts_node_start_byte(child);
+        const child_end = c.ts_node_end_byte(child);
+        if (child_start >= end) break;
+        if (child_start > at) try appendClipped(allocator, ranges, at, child_start, parent, lines);
+        at = @max(at, child_end);
+    }
+    if (at < end) try appendClipped(allocator, ranges, at, end, parent, lines);
+}
+
+fn appendClipped(allocator: Allocator, ranges: *std.ArrayList(c.TSRange), start: u32, end: u32, parent: Layer, lines: LineStarts) !void {
+    if (parent.ranges.len == 0) return ranges.append(allocator, lines.range(start, end));
+    for (parent.ranges) |included| {
+        const clipped_start = @max(start, included.start_byte);
+        const clipped_end = @min(end, included.end_byte);
+        if (clipped_start < clipped_end) try ranges.append(allocator, lines.range(clipped_start, clipped_end));
+    }
+}
+
+/// The byte offset of each line start, for the row and column points of a range.
+const LineStarts = struct {
+    starts: []u32,
+
+    fn init(allocator: Allocator, content: []const u8) !LineStarts {
+        var starts: std.ArrayList(u32) = .empty;
+        errdefer starts.deinit(allocator);
+        try starts.append(allocator, 0);
+        for (content, 0..) |byte, index| if (byte == '\n') try starts.append(allocator, @intCast(index + 1));
+        return .{ .starts = try starts.toOwnedSlice(allocator) };
+    }
+
+    fn point(self: LineStarts, byte: u32) c.TSPoint {
+        const row = std.sort.upperBound(u32, self.starts, byte, orderU32) - 1;
+        return .{ .row = @intCast(row), .column = byte - self.starts[row] };
+    }
+
+    fn range(self: LineStarts, start: u32, end: u32) c.TSRange {
+        return .{ .start_point = self.point(start), .end_point = self.point(end), .start_byte = start, .end_byte = end };
+    }
+
+    /// Moves a point by rows and byte columns. A point outside its line gives null.
+    fn offsetByte(self: LineStarts, content: []const u8, at: c.TSPoint, rows: i32, columns: i32) ?u32 {
+        const row = std.math.cast(usize, @as(i64, at.row) + rows) orelse return null;
+        const column = std.math.cast(u32, @as(i64, at.column) + columns) orelse return null;
+        if (row >= self.starts.len) return null;
+        const line_end = if (row + 1 < self.starts.len) self.starts[row + 1] - 1 else content.len;
+        if (column > line_end - self.starts[row]) return null;
+        return self.starts[row] + column;
+    }
+
+    fn orderU32(key: u32, item: u32) std.math.Order {
+        return std.math.order(key, item);
+    }
+};
+
+fn mergeCaptureIntervals(allocator: Allocator, content: []const u8, intervals: []CaptureInterval) ![]bbr.highlight.Span {
     if (!std.sort.isSorted(CaptureInterval, intervals, {}, intervalLessThan)) {
         std.mem.sort(CaptureInterval, intervals, {}, intervalLessThan);
     }
@@ -214,7 +429,7 @@ fn mergeCaptureIntervals(allocator: Allocator, package: *const RuntimePackage, c
             }
             if (winner) |selected| {
                 const end = @min(selected.end, next_start);
-                try appendIntervalSpans(allocator, &spans, package, content, &line_state, position, end, selected.capture_id);
+                try appendIntervalSpans(allocator, &spans, content, &line_state, position, end, selected.capture);
                 position = end;
             } else {
                 position = next_start;
@@ -234,12 +449,11 @@ const LineState = struct {
 fn appendIntervalSpans(
     allocator: Allocator,
     spans: *std.ArrayList(bbr.highlight.Span),
-    package: *const RuntimePackage,
     content: []const u8,
     state: *LineState,
     absolute_start: u32,
     absolute_end: u32,
-    capture_id: u16,
+    capture: bbr.highlight.Capture,
 ) !void {
     const start: usize = absolute_start;
     const end: usize = absolute_end;
@@ -259,13 +473,13 @@ fn appendIntervalSpans(
             const relative_end = part_end - state.line_start;
             if (spans.items.len != 0) {
                 const previous = &spans.items[spans.items.len - 1];
-                if (previous.line == state.line and previous.end == relative_start and previous.capture.id == capture_id) {
+                if (previous.line == state.line and previous.end == relative_start and std.meta.eql(previous.capture, capture)) {
                     previous.end = @intCast(relative_end);
                 } else {
-                    try spans.append(allocator, .{ .line = state.line, .start = @intCast(relative_start), .end = @intCast(relative_end), .capture = package.captures[capture_id] });
+                    try spans.append(allocator, .{ .line = state.line, .start = @intCast(relative_start), .end = @intCast(relative_end), .capture = capture });
                 }
             } else {
-                try spans.append(allocator, .{ .line = state.line, .start = @intCast(relative_start), .end = @intCast(relative_end), .capture = package.captures[capture_id] });
+                try spans.append(allocator, .{ .line = state.line, .start = @intCast(relative_start), .end = @intCast(relative_end), .capture = capture });
             }
         }
         if (newline == null or newline.? >= end) break;
@@ -282,6 +496,8 @@ fn intervalLessThan(_: void, a: CaptureInterval, b: CaptureInterval) bool {
 }
 
 fn higherPrecedence(_: void, a: CaptureInterval, b: CaptureInterval) std.math.Order {
+    if (a.priority != b.priority) return std.math.order(b.priority, a.priority);
+    if (a.depth != b.depth) return std.math.order(b.depth, a.depth);
     if (a.pattern_index != b.pattern_index) return std.math.order(b.pattern_index, a.pattern_index);
     return std.math.order(b.order, a.order);
 }
@@ -511,11 +727,11 @@ test "interval merge matches byte planes for every BuiltInGrammar fixture" {
     for (cases) |case| {
         const grammar = grammar_match.selectBuiltIn(case.path, case.source).?;
         const package = &highlighter.packages[@intFromEnum(grammar)];
-        const intervals = try collectCaptureIntervals(testing.allocator, package, case.source, null);
+        const intervals = try collectCaptureIntervals(testing.allocator, package, &highlighter.packages, case.source, null);
         defer testing.allocator.free(intervals);
-        const expected = try spansFromBytePlanes(testing.allocator, package, case.source, intervals);
+        const expected = try spansFromBytePlanes(testing.allocator, case.source, intervals);
         defer testing.allocator.free(expected);
-        const actual = try mergeCaptureIntervals(testing.allocator, package, case.source, intervals);
+        const actual = try mergeCaptureIntervals(testing.allocator, case.source, intervals);
         defer testing.allocator.free(actual);
         try testing.expectEqualDeep(expected, actual);
     }
@@ -687,20 +903,21 @@ fn expectNoCapture(result: bbr.highlight.HighlightResult, source: []const u8, ab
     }
 }
 
-fn spansFromBytePlanes(allocator: Allocator, package: *const RuntimePackage, content: []const u8, intervals: []const CaptureInterval) ![]bbr.highlight.Span {
-    const none = std.math.maxInt(u32);
-    const labels = try allocator.alloc(u32, content.len);
-    defer allocator.free(labels);
-    @memset(labels, none);
-    const priorities = try allocator.alloc(u32, content.len);
-    defer allocator.free(priorities);
-    @memset(priorities, 0);
+/// The precedence of each byte from its own plane: priority, then depth, then pattern, then order.
+fn spansFromBytePlanes(allocator: Allocator, content: []const u8, intervals: []const CaptureInterval) ![]bbr.highlight.Span {
+    const winners = try allocator.alloc(?bbr.highlight.Capture, content.len);
+    defer allocator.free(winners);
+    @memset(winners, null);
+    const keys = try allocator.alloc(u128, content.len);
+    defer allocator.free(keys);
+    @memset(keys, 0);
 
     for (intervals) |interval| {
+        const key = @as(u128, interval.priority) << 112 | @as(u128, interval.depth) << 104 | @as(u128, interval.pattern_index) << 64 | interval.order;
         for (interval.start..interval.end) |byte| {
-            if (labels[byte] == none or interval.pattern_index >= priorities[byte]) {
-                labels[byte] = interval.capture_id;
-                priorities[byte] = interval.pattern_index;
+            if (winners[byte] == null or key > keys[byte]) {
+                winners[byte] = interval.capture;
+                keys[byte] = key;
             }
         }
     }
@@ -717,18 +934,17 @@ fn spansFromBytePlanes(allocator: Allocator, package: *const RuntimePackage, con
         }
         var at = line_start;
         while (at < i) {
-            if (labels[at] == none) {
+            const capture = winners[at] orelse {
                 at += 1;
                 continue;
-            }
-            const capture_id = labels[at];
+            };
             var end = at + 1;
-            while (end < i and labels[end] == capture_id) end += 1;
+            while (end < i and winners[end] != null and std.meta.eql(winners[end].?, capture)) end += 1;
             try spans.append(allocator, .{
                 .line = line,
                 .start = @intCast(at - line_start),
                 .end = @intCast(end - line_start),
-                .capture = package.captures[capture_id],
+                .capture = capture,
             });
             at = end;
         }
@@ -755,4 +971,312 @@ fn expectInvalidLocalsQuery(locals_query: []const u8, expected_error: anyerror, 
     try testing.expectEqual(expected_kind, diagnostic.kind);
     try testing.expectEqual(@as(u32, 1), diagnostic.line);
     try testing.expect(diagnostic.column > 1);
+}
+
+const template_css_injection =
+    \\((template_string (string_fragment) @injection.content) (#set! injection.language "css"))
+;
+const template_javascript_injection =
+    \\((template_string (string_fragment) @injection.content) (#set! injection.language "javascript"))
+;
+const argument_name_injection =
+    \\((arguments (string (string_fragment) @injection.language) (template_string (string_fragment) @injection.content)))
+;
+
+test "M27 injection highlights CSS in a JavaScript template string" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    try useJavaScriptQueries(&highlighter, javascript_query, javascript_locals_query, template_css_injection);
+    const source = "const s = `a { color: red; }`;\n";
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
+    defer freeResult(result);
+
+    try expectRoleAt(result, source, "a {", .tag);
+    try expectRoleAt(result, source, "color", .property);
+    try expectRoleAt(result, source, "`", .string);
+    try expectRoleAt(result, source, "const", .keyword);
+}
+
+test "M27 injection combined ranges form one injected tree" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const source = "[`a`, `{}`];\n";
+
+    try useJavaScriptQueries(&highlighter, javascript_query, javascript_locals_query,
+        \\((template_string (string_fragment) @injection.content) (#set! injection.language "css") (#set! injection.combined))
+    );
+    const combined = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
+    defer freeResult(combined);
+    try expectRoleAt(combined, source, "a", .tag);
+
+    try useJavaScriptQueries(&highlighter, javascript_query, javascript_locals_query, template_css_injection);
+    const separate = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
+    defer freeResult(separate);
+    try expectRoleAt(separate, source, "a", .string);
+}
+
+test "M27 injection without include-children leaves child node ranges to the host" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const host_number = packageCapture(&highlighter.packages[@intFromEnum(grammar_match.BuiltInGrammar.javascript)], "number");
+    const json_number = packageCapture(&highlighter.packages[@intFromEnum(grammar_match.BuiltInGrammar.json)], "number");
+    try testing.expect(!std.meta.eql(host_number, json_number));
+    const source = "const a = [1];\n";
+    const array_injection =
+        \\((array) @injection.content (#set! injection.language "json"))
+    ;
+
+    try useJavaScriptQueries(&highlighter, javascript_query, javascript_locals_query, array_injection);
+    const without_children = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
+    defer freeResult(without_children);
+    try testing.expectEqual(host_number, captureOver(without_children, source, std.mem.indexOf(u8, source, "1").?).?);
+
+    try useJavaScriptQueries(&highlighter, javascript_query, javascript_locals_query, array_injection[0 .. array_injection.len - 1] ++ " (#set! injection.include-children))");
+    const with_children = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
+    defer freeResult(with_children);
+    try testing.expectEqual(json_number, captureOver(with_children, source, std.mem.indexOf(u8, source, "1").?).?);
+}
+
+test "M27 injection offset moves the range and an invalid offset drops only its Injection" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    try useJavaScriptQueries(&highlighter, javascript_query, javascript_locals_query,
+        \\((string) @injection.content (#set! injection.language "css") (#set! injection.include-children) (#offset! @injection.content 0 1 0 -1))
+        \\((template_string) @injection.content (#set! injection.language "css") (#set! injection.include-children) (#offset! @injection.content 0 2 0 -1))
+        \\((call_expression) @injection.content (#set! injection.language "css") (#set! injection.include-children) (#offset! @injection.content 0 0 3 0))
+    );
+    const source = "f(\"a { color: red; }\", \"\", `éb`);\n";
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
+    defer freeResult(result);
+
+    try expectRoleAt(result, source, "color", .property);
+    try expectRoleAt(result, source, "\"a", .string);
+    try expectRoleAt(result, source, "b`", .string);
+    try expectRoleAt(result, source, "f(", .function);
+}
+
+test "M27 injection depth stops at 4 for a self-injecting query" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    try useJavaScriptQueries(&highlighter,
+        \\(program (expression_statement (parenthesized_expression "(" @keyword)))
+    , "",
+        \\((program (expression_statement (parenthesized_expression) @injection.content))
+        \\  (#set! injection.language "javascript")
+        \\  (#set! injection.include-children)
+        \\  (#offset! @injection.content 0 1 0 -1))
+    );
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", "((((((x))))))\n");
+    defer freeResult(result);
+
+    try testing.expectEqual(@as(usize, 1), result.spans.len);
+    try testing.expectEqual(@as(u32, 0), result.spans[0].start);
+    try testing.expectEqual(@as(u32, 5), result.spans[0].end);
+    try testing.expectEqual(bbr.highlight.CaptureRole.keyword, result.spans[0].capture.role);
+}
+
+test "M27 injection a deeper layer wins at equal priority" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    try useJavaScriptQueries(&highlighter,
+        \\(identifier) @variable
+        \\(template_string) @string
+    , "", template_javascript_injection);
+    const source = "`x`;\n";
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
+    defer freeResult(result);
+
+    try expectRoleAt(result, source, "x", .variable);
+    try expectRoleAt(result, source, "`", .string);
+}
+
+test "M27 injection a higher host priority wins over a deeper layer" {
+    const host: bbr.highlight.Capture = .init(0, "keyword");
+    const injected: bbr.highlight.Capture = .init(0, "variable");
+    var intervals = [_]CaptureInterval{
+        .{ .start = 0, .end = 3, .capture = host, .priority = default_priority + 1, .depth = 0, .pattern_index = 0, .order = 0 },
+        .{ .start = 1, .end = 2, .capture = injected, .priority = default_priority, .depth = 1, .pattern_index = 9, .order = 1 },
+        .{ .start = 4, .end = 7, .capture = host, .priority = default_priority, .depth = 0, .pattern_index = 9, .order = 2 },
+        .{ .start = 5, .end = 6, .capture = injected, .priority = default_priority, .depth = 1, .pattern_index = 0, .order = 3 },
+    };
+    const source = "abc def\n";
+    const expected = try spansFromBytePlanes(testing.allocator, source, &intervals);
+    defer testing.allocator.free(expected);
+    const actual = try mergeCaptureIntervals(testing.allocator, source, &intervals);
+    defer testing.allocator.free(actual);
+    try testing.expectEqualDeep(expected, actual);
+    try testing.expectEqualDeep(&[_]bbr.highlight.Span{
+        .{ .line = 1, .start = 0, .end = 3, .capture = host },
+        .{ .line = 1, .start = 4, .end = 5, .capture = host },
+        .{ .line = 1, .start = 5, .end = 6, .capture = injected },
+        .{ .line = 1, .start = 6, .end = 7, .capture = host },
+    }, actual);
+}
+
+test "M27 injection resolves a captured Grammar name" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    try useJavaScriptQueries(&highlighter, javascript_query, javascript_locals_query, argument_name_injection);
+    const source = "f(\"text/javascript\", `x(1)`);\n";
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
+    defer freeResult(result);
+
+    try expectRoleAt(result, source, "x(", .function);
+}
+
+test "M27 injection an unknown Grammar name gives no Injection and no failure" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const source = "f(\"nope\", `a { color: red; }`);\nconst s = `b { }`;\n";
+    const plain = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
+    defer freeResult(plain);
+
+    try useJavaScriptQueries(&highlighter, javascript_query, javascript_locals_query, argument_name_injection ++
+        \\
+        \\((template_string (string_fragment) @injection.content) (#set! injection.language "unknown"))
+    );
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
+    defer freeResult(result);
+    try testing.expectEqualDeep(plain.spans, result.spans);
+}
+
+test "M27 injection ignores UserGrammars" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    try tmp.dir.createDir(io, "fixture", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fixture/payload", .data = "not a library" });
+    const manifest = try std.fmt.allocPrint(testing.allocator,
+        \\name = "fixture"
+        \\version = "1.0.0"
+        \\os = "{s}"
+        \\arch = "{s}"
+        \\tree_sitter_abi = 15
+        \\symbol = "tree_sitter_fixture"
+        \\library = "payload"
+        \\highlight_query = "payload"
+        \\[[payload]]
+        \\path = "payload"
+        \\sha256 = "{s}"
+        \\[matches]
+        \\extensions = [".css"]
+        \\
+    , .{ @tagName(@import("builtin").os.tag), @tagName(@import("builtin").cpu.arch), digestHex("not a library") });
+    defer testing.allocator.free(manifest);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fixture/grammar.toml", .data = manifest });
+    const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/fixture", .{&tmp.sub_path});
+    defer testing.allocator.free(path);
+    var inspection = try user_grammar.inspect(testing.allocator, io, path);
+    const digest = inspection.report.digest;
+    inspection.deinit();
+    const entries = [_]user_grammar.RegistryEntry{.{
+        .name = "fixture",
+        .path = path,
+        .enabled = true,
+        .trusted_digest = digest,
+        .receipt = .{ .bundle_digest = digest, .bbr_identity = "test-build", .tree_sitter_identity = c.TREE_SITTER_LANGUAGE_VERSION },
+    }};
+    var registry = try user_grammar.Registry.init(testing.allocator, io, &entries, &.{}, "test-build");
+    defer registry.deinit();
+    try testing.expectEqualStrings("fixture", registry.matchName("injection.css", "").?);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, &registry);
+    defer highlighter.deinit();
+    try useJavaScriptQueries(&highlighter, javascript_query, javascript_locals_query, template_css_injection);
+
+    const source = "const s = `a { color: red; }`;\n";
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/a.js", source);
+    defer freeResult(result);
+    try expectRoleAt(result, source, "color", .property);
+    try testing.expectEqual(
+        packageCapture(&highlighter.packages[@intFromEnum(grammar_match.BuiltInGrammar.css)], "property"),
+        captureOver(result, source, std.mem.indexOf(u8, source, "color").?).?,
+    );
+}
+
+test "M27 injection Spans stay ordered and inside their layer ranges" {
+    const cases = [_]struct { injections: []const u8, source: []const u8 }{
+        .{ .injections = template_css_injection, .source = "const s = `\n.é { color: red; }\nb { }`;\nconst t = `p {}`;\n" },
+        .{ .injections = template_javascript_injection ++ "\n((template_string (string_fragment) @injection.content) (#set! injection.language \"css\") (#set! injection.combined))", .source = "[`a`, `{}`];\n[`é`, `y\n{ color: red }`];\n" },
+        .{ .injections = "((template_string) @injection.content (#set! injection.language \"css\") (#set! injection.include-children) (#offset! @injection.content 0 1 0 -1))", .source = "f(`a { color: red; }`, `é {}`);\n" },
+    };
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    for (cases) |case| {
+        try useJavaScriptQueries(&highlighter, javascript_query, javascript_locals_query, case.injections);
+        const package = &highlighter.packages[@intFromEnum(grammar_match.BuiltInGrammar.javascript)];
+        const intervals = try collectCaptureIntervals(testing.allocator, package, &highlighter.packages, case.source, null);
+        defer testing.allocator.free(intervals);
+        var injected: usize = 0;
+        for (intervals) |interval| {
+            if (interval.depth == 0) continue;
+            injected += 1;
+            try testing.expect(insideTemplateString(case.source, interval.start, interval.end));
+        }
+        try testing.expect(injected > 0);
+
+        const expected = try spansFromBytePlanes(testing.allocator, case.source, intervals);
+        defer testing.allocator.free(expected);
+        const actual = try mergeCaptureIntervals(testing.allocator, case.source, intervals);
+        defer testing.allocator.free(actual);
+        try testing.expectEqualDeep(expected, actual);
+
+        const line_starts = try LineStarts.init(testing.allocator, case.source);
+        defer testing.allocator.free(line_starts.starts);
+        for (actual, 0..) |span, index| {
+            try testing.expect(span.start < span.end);
+            const line_start = line_starts.starts[span.line - 1];
+            const line_end = std.mem.indexOfScalarPos(u8, case.source, line_start, '\n') orelse case.source.len;
+            try testing.expect(line_start + span.end <= line_end);
+            try testing.expect(predicate_mod.utf8Boundary(case.source, line_start + span.start));
+            try testing.expect(predicate_mod.utf8Boundary(case.source, line_start + span.end));
+            if (index == 0) continue;
+            const previous = actual[index - 1];
+            try testing.expect(previous.line < span.line or previous.end <= span.start);
+        }
+    }
+}
+
+fn useJavaScriptQueries(highlighter: *TreeSitterHighlighter, highlight_query: []const u8, locals_query: []const u8, injections_query: []const u8) !void {
+    var diagnostic: predicate_mod.Diagnostic = undefined;
+    const replacement = try RuntimePackage.init(testing.allocator, tree_sitter_javascript().?, highlight_query, locals_query, injections_query, &diagnostic);
+    const package = &highlighter.packages[@intFromEnum(grammar_match.BuiltInGrammar.javascript)];
+    package.deinit();
+    package.* = replacement;
+}
+
+fn packageCapture(package: *const RuntimePackage, name: []const u8) bbr.highlight.Capture {
+    for (package.capture_names, package.captures) |capture_name, capture| {
+        if (std.mem.eql(u8, capture_name, name)) return capture;
+    }
+    unreachable;
+}
+
+fn captureOver(result: bbr.highlight.HighlightResult, source: []const u8, byte: usize) ?bbr.highlight.Capture {
+    var line: u32 = 1;
+    var line_start: usize = 0;
+    for (source[0..byte], 0..) |character, index| if (character == '\n') {
+        line += 1;
+        line_start = index + 1;
+    };
+    for (result.spans) |span| {
+        if (span.line == line and line_start + span.start <= byte and byte < line_start + span.end) return span.capture;
+    }
+    return null;
+}
+
+fn expectRoleAt(result: bbr.highlight.HighlightResult, source: []const u8, needle: []const u8, role: bbr.highlight.CaptureRole) !void {
+    const capture = captureOver(result, source, std.mem.indexOf(u8, source, needle).?) orelse return error.ExpectedSpanNotFound;
+    try testing.expectEqual(role, capture.role);
+}
+
+fn insideTemplateString(source: []const u8, start: usize, end: usize) bool {
+    var open: ?usize = null;
+    for (source, 0..) |byte, index| {
+        if (byte != '`') continue;
+        if (open) |first| {
+            if (start > first and end <= index) return true;
+            open = null;
+        } else open = index;
+    }
+    return false;
 }

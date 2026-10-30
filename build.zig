@@ -295,6 +295,10 @@ pub fn build(b: *std.Build) void {
     const code_step = b.step("test-code-highlighting", "Run fenced-code Highlighting tests");
     code_step.dependOn(&b.addRunArtifact(code_tests).step);
 
+    const builtin_grammar_tests = b.addTest(.{ .name = "builtin-grammar-tests", .root_module = exe.root_module, .filters = &.{"M27"} });
+    const builtin_grammar_step = b.step("test-builtin-grammars", "Run M27 BuiltInGrammar and Injection tests");
+    builtin_grammar_step.dependOn(&b.addRunArtifact(builtin_grammar_tests).step);
+
     const container_tests = b.addTest(.{
         .name = "container-tests",
         .root_module = exe.root_module,

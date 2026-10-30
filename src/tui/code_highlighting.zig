@@ -14,17 +14,7 @@ pub fn fencePath(a: Allocator, identifier: []const u8) !?[]const u8 {
     for (normalized) |*byte| if (byte.* >= 'A' and byte.* <= 'Z') {
         byte.* += 'a' - 'A';
     };
-    const aliases = .{
-        .{ "tsx", "tsx" },       .{ "typescript", "ts" }, .{ "ts", "ts" },     .{ "mts", "ts" },    .{ "cts", "ts" },
-        .{ "javascript", "js" }, .{ "js", "js" },         .{ "jsx", "js" },    .{ "mjs", "js" },    .{ "cjs", "js" },
-        .{ "css", "css" },       .{ "go", "go" },         .{ "golang", "go" }, .{ "bash", "sh" },   .{ "sh", "sh" },
-        .{ "shell", "sh" },      .{ "json", "json" },     .{ "yaml", "yaml" }, .{ "yml", "yaml" },  .{ "python", "py" },
-        .{ "py", "py" },         .{ "ruby", "rb" },       .{ "rb", "rb" },     .{ "rust", "rs" },   .{ "rs", "rs" },
-        .{ "c", "c" },           .{ "cpp", "cpp" },       .{ "c++", "cpp" },   .{ "cxx", "cpp" },   .{ "csharp", "cs" },
-        .{ "c#", "cs" },         .{ "cs", "cs" },         .{ "java", "java" }, .{ "html", "html" }, .{ "xml", "xml" },
-        .{ "sql", "sql" },       .{ "zig", "zig" },
-    };
-    inline for (aliases) |alias| if (std.mem.eql(u8, normalized, alias[0])) return try std.fmt.allocPrint(a, "review.{s}", .{alias[1]});
+    if (bbr.highlight.grammar_name.extension(normalized)) |extension| return try std.fmt.allocPrint(a, "review.{s}", .{extension});
     for (normalized, 0..) |byte, index| {
         const alphanumeric = (byte >= 'a' and byte <= 'z') or (byte >= '0' and byte <= '9');
         if (!alphanumeric and (index == 0 or (byte != '_' and byte != '+' and byte != '-'))) return null;
@@ -372,7 +362,7 @@ test "M23 highlighting approved fence aliases and invalid identifiers" {
         .{ .identifier = "sql", .path = "review.sql" },
         .{ .identifier = "zig", .path = "review.zig" },
         .{ .identifier = "golang", .path = "review.go" },
-        .{ .identifier = "kOtLiN", .path = "review.kotlin" },
+        .{ .identifier = "kOtLiN", .path = "review.kt" },
         .{ .identifier = "A9_+-", .path = "review.a9_+-" },
         .{ .identifier = "text/x-python", .path = null },
         .{ .identifier = "src/main.go", .path = null },

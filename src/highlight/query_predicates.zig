@@ -14,7 +14,7 @@ pub const Diagnostic = struct {
     regex_failure: ?regex_mod.CompileFailure = null,
     query_kind: QueryKind = .highlight,
 
-    pub const QueryKind = enum { highlight, locals };
+    pub const QueryKind = enum { highlight, locals, injections };
 
     pub const Kind = enum {
         unknown_operator,
@@ -46,6 +46,15 @@ const Predicate = union(enum) {
 };
 
 const Range = struct { start: usize, end: usize };
+
+/// The directives of one injection query pattern.
+pub const Injection = struct {
+    language: ?[]const u8 = null,
+    combined: bool = false,
+    include_children: bool = false,
+    /// Start row, start column, end row, and end column deltas for `@injection.content`.
+    offset: ?[4]i32 = null,
+};
 
 pub const Locals = struct {
     ranges: []Range,
@@ -142,6 +151,17 @@ pub const Set = struct {
     regexes: []regex_mod.Regex,
 
     pub fn validate(allocator: Allocator, query: *const c.TSQuery, source: []const u8, diagnostic: *Diagnostic) !Set {
+        return validateKind(allocator, query, source, diagnostic, null);
+    }
+
+    /// Accepts the injection directives too, and writes them to one `Injection` for each pattern.
+    pub fn validateInjections(allocator: Allocator, query: *const c.TSQuery, source: []const u8, diagnostic: *Diagnostic, injections: []Injection) !Set {
+        std.debug.assert(injections.len == c.ts_query_pattern_count(query));
+        @memset(injections, .{});
+        return validateKind(allocator, query, source, diagnostic, injections);
+    }
+
+    fn validateKind(allocator: Allocator, query: *const c.TSQuery, source: []const u8, diagnostic: *Diagnostic, injections: ?[]Injection) !Set {
         const pattern_count = c.ts_query_pattern_count(query);
         const ranges = try allocator.alloc(Range, pattern_count);
         errdefer allocator.free(ranges);
@@ -170,7 +190,8 @@ pub const Set = struct {
                     if (end == steps.len) return fail(source, query, pattern, diagnostic, .malformed_arguments, null);
                     const pattern_end = @min(c.ts_query_end_byte_for_pattern(query, pattern), source.len);
                     predicate_source_offset = findPredicateOffset(source, predicate_source_offset, pattern_end) orelse predicate_source_offset;
-                    try parsePredicate(allocator, query, source, steps[at..end], predicate_source_offset, &predicates, &regexes, &expressions, diagnostic);
+                    const injection = if (injections) |all| &all[pattern_usize] else null;
+                    try parsePredicate(allocator, query, source, steps[at..end], predicate_source_offset, &predicates, &regexes, &expressions, injection, diagnostic);
                     predicate_source_offset += 1;
                     at = end + 1;
                 }
@@ -222,6 +243,7 @@ fn parsePredicate(
     predicates: *std.ArrayList(Predicate),
     regexes: *std.ArrayList(regex_mod.Regex),
     expressions: *std.ArrayList([]const u8),
+    injection: ?*Injection,
     diagnostic: *Diagnostic,
 ) !void {
     if (steps.len == 0 or steps[0].type != c.TSQueryPredicateStepTypeString)
@@ -275,8 +297,53 @@ fn parsePredicate(
         try predicates.append(allocator, .local);
         return;
     }
+    if (injection) |settings| {
+        if (try parseInjectionDirective(query, source, steps, operator, predicate_source_offset, settings, diagnostic)) return;
+    }
     const kind: Diagnostic.Kind = if (std.mem.endsWith(u8, operator, "!")) .unsupported_directive else .unknown_operator;
     return failAt(source, diagnostic, kind, null, predicate_source_offset);
+}
+
+fn parseInjectionDirective(
+    query: *const c.TSQuery,
+    source: []const u8,
+    steps: []const c.TSQueryPredicateStep,
+    operator: []const u8,
+    predicate_source_offset: usize,
+    injection: *Injection,
+    diagnostic: *Diagnostic,
+) !bool {
+    if (std.mem.eql(u8, operator, "offset!")) {
+        const content_id = captureId(query, "injection.content") orelse std.math.maxInt(u32);
+        if (steps.len != 6 or steps[1].type != c.TSQueryPredicateStepTypeCapture or steps[1].value_id != content_id)
+            return failAt(source, diagnostic, .malformed_arguments, null, predicate_source_offset);
+        var offset: [4]i32 = undefined;
+        for (steps[2..], &offset) |step, *delta| {
+            const text = if (step.type == c.TSQueryPredicateStepTypeString) stringValue(query, step.value_id) else null;
+            delta.* = std.fmt.parseInt(i32, text orelse "", 10) catch
+                return failAt(source, diagnostic, .malformed_arguments, null, predicate_source_offset);
+        }
+        injection.offset = offset;
+        return true;
+    }
+    if (!std.mem.eql(u8, operator, "set!") or steps.len < 2 or steps[1].type != c.TSQueryPredicateStepTypeString) return false;
+    const key = stringValue(query, steps[1].value_id) orelse return false;
+    if (std.mem.eql(u8, key, "injection.language")) {
+        if (steps.len != 3 or steps[2].type != c.TSQueryPredicateStepTypeString)
+            return failAt(source, diagnostic, .malformed_arguments, null, predicate_source_offset);
+        injection.language = stringValue(query, steps[2].value_id) orelse
+            return failAt(source, diagnostic, .malformed_arguments, null, predicate_source_offset);
+        return true;
+    }
+    const flag = if (std.mem.eql(u8, key, "injection.combined"))
+        &injection.combined
+    else if (std.mem.eql(u8, key, "injection.include-children"))
+        &injection.include_children
+    else
+        return false;
+    if (steps.len != 2) return failAt(source, diagnostic, .malformed_arguments, null, predicate_source_offset);
+    flag.* = true;
+    return true;
 }
 
 fn fail(source: []const u8, query: *const c.TSQuery, pattern: u32, diagnostic: *Diagnostic, kind: Diagnostic.Kind, regex_failure: ?regex_mod.CompileFailure) error{InvalidPredicate} {
@@ -402,4 +469,60 @@ fn matchIsLocal(match: c.TSQueryMatch, content: []const u8, locals: Locals) !boo
 
 pub fn utf8Boundary(content: []const u8, index: usize) bool {
     return index == content.len or index < content.len and content[index] & 0xc0 != 0x80;
+}
+
+const testing = std.testing;
+extern fn tree_sitter_javascript() callconv(.c) ?*const c.TSLanguage;
+
+fn expectInvalid(source: []const u8, kind: Diagnostic.Kind, injection_query: bool) !void {
+    var error_offset: u32 = 0;
+    var error_type: c.TSQueryError = undefined;
+    const query = c.ts_query_new(tree_sitter_javascript().?, source.ptr, @intCast(source.len), &error_offset, &error_type).?;
+    defer c.ts_query_delete(query);
+    var injections: [1]Injection = undefined;
+    var diagnostic: Diagnostic = undefined;
+    const result = if (injection_query)
+        Set.validateInjections(testing.allocator, query, source, &diagnostic, &injections)
+    else
+        Set.validate(testing.allocator, query, source, &diagnostic);
+    try testing.expectError(error.InvalidPredicate, result);
+    try testing.expectEqual(kind, diagnostic.kind);
+}
+
+test "M27 injection directives validate only in an injection query" {
+    const source =
+        \\((template_string) @injection.content
+        \\  (#set! injection.language "css")
+        \\  (#set! injection.combined)
+        \\  (#set! injection.include-children)
+        \\  (#offset! @injection.content 0 1 0 -1))
+    ;
+    var error_offset: u32 = 0;
+    var error_type: c.TSQueryError = undefined;
+    const query = c.ts_query_new(tree_sitter_javascript().?, source.ptr, source.len, &error_offset, &error_type).?;
+    defer c.ts_query_delete(query);
+    var injections: [1]Injection = undefined;
+    var diagnostic: Diagnostic = undefined;
+    const predicates = try Set.validateInjections(testing.allocator, query, source, &diagnostic, &injections);
+    defer predicates.deinit(testing.allocator);
+    try testing.expectEqualStrings("css", injections[0].language.?);
+    try testing.expect(injections[0].combined and injections[0].include_children);
+    try testing.expectEqual([4]i32{ 0, 1, 0, -1 }, injections[0].offset.?);
+
+    for ([_][]const u8{
+        "((identifier) @x (#set! injection.language \"css\"))",
+        "((identifier) @x (#set! injection.combined))",
+        "((identifier) @x (#set! injection.include-children))",
+        "((identifier) @injection.content (#offset! @injection.content 0 0 0 0))",
+    }) |highlight_source| try expectInvalid(highlight_source, .unsupported_directive, false);
+}
+
+test "M27 injection query rejects malformed and unknown directives" {
+    try expectInvalid("((identifier) @injection.content (#offset! @injection.content 0 x 0 0))", .malformed_arguments, true);
+    try expectInvalid("((identifier) @injection.content (#offset! @injection.content 0 0 0))", .malformed_arguments, true);
+    try expectInvalid("((identifier) @injection.content @x (#offset! @x 0 0 0 0))", .malformed_arguments, true);
+    try expectInvalid("((identifier) @injection.content (#set! injection.language))", .malformed_arguments, true);
+    try expectInvalid("((identifier) @injection.content (#set! injection.combined \"yes\"))", .malformed_arguments, true);
+    try expectInvalid("((identifier) @injection.content (#set! injection.self))", .unsupported_directive, true);
+    try expectInvalid("((identifier) @injection.content (#set! \"priority\" 100))", .unsupported_directive, true);
 }
