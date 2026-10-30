@@ -29817,6 +29817,59 @@ test "M22 read a refresh keeps unchanged Files read and makes only a changed Fil
     try testing.expectEqual(@as(usize, 2), reads.writes);
 }
 
+fn m22BinaryDiff(comptime index_line: []const u8) []const u8 {
+    return "diff --git a/logo.png b/logo.png\n" ++ index_line ++
+        \\Binary files a/logo.png and b/logo.png differ
+        \\diff --git a/b.zig b/b.zig
+        \\--- a/b.zig
+        \\+++ b/b.zig
+        \\@@ -1 +1 @@
+        \\-old b
+        \\+new b
+        \\
+    ;
+}
+
+test "M22 read m marks a binary File with blob ids read and a later blob change makes it unread after a refresh" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    const first = m22BinaryDiff("index 1111111..2222222 100644\n");
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, first) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expect(presentation.projection().action_error == null);
+    try testing.expect(!try testFileUnread(&presentation, 0));
+    try testing.expectEqual(@as(usize, 1), try testReceiptCount(reads.store(), m22_remote));
+
+    try presentation.dispatch(.{ .action = .refresh });
+    try testLoadNextSession(&presentation, try testFileReadSession(testing.allocator, 1, first));
+    try testing.expect(!try testFileUnread(&presentation, 0));
+
+    try presentation.dispatch(.{ .action = .refresh });
+    try testLoadNextSession(&presentation, try testFileReadSession(testing.allocator, 1, m22BinaryDiff("index 1111111..3333333 100644\n")));
+    try testing.expect(try testFileUnread(&presentation, 0));
+    try testing.expectEqual(@as(usize, 1), reads.writes);
+}
+
+test "M22 read m on a binary File without blob ids reports file_read_unverifiable and writes nothing" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22BinaryDiff("")) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expectEqual(ActionError.file_read_unverifiable, presentation.projection().action_error.?);
+    try testing.expect(try testFileUnread(&presentation, 0));
+    try testing.expectEqual(@as(usize, 0), reads.writes);
+}
+
 test "M22 read a refresh that only shifts Hunk line numbers keeps every File read" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();

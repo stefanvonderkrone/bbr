@@ -286,7 +286,7 @@ pub const ShellGitClient = struct {
 
     fn diff(ptr: *anyopaque, allocator: Allocator, base_commit: []const u8, source_commit: []const u8) anyerror![]u8 {
         const self: *ShellGitClient = @ptrCast(@alignCast(ptr));
-        return self.runRaw(allocator, &.{ "git", "diff", "--find-renames", "--no-ext-diff", "--no-color", base_commit, source_commit }, error.UnknownRef);
+        return self.runRaw(allocator, &.{ "git", "diff", "--find-renames", "--full-index", "--no-ext-diff", "--no-color", base_commit, source_commit }, error.UnknownRef);
     }
 
     fn blob(ptr: *anyopaque, allocator: Allocator, commit: []const u8, path: []const u8) anyerror![]u8 {
@@ -553,6 +553,56 @@ test "shell client resolves refs and acquires committed review material" {
 
     try runTestProcess(repo_path, &.{ "git", "config", "branch.feature.remote", "." });
     try testing.expectError(error.NoDefaultBaseRef, client.defaultBaseRef(testing.allocator, source.canonical));
+}
+
+test "M22 read shell client diff gives full binary blob ids whatever core.abbrev is" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer testing.allocator.free(repo_path);
+
+    try runTestProcess(repo_path, &.{ "git", "init", "-b", "main" });
+    try runTestProcess(repo_path, &.{ "git", "config", "user.email", "reviewer@example.test" });
+    try runTestProcess(repo_path, &.{ "git", "config", "user.name", "Reviewer" });
+    try runTestProcess(repo_path, &.{ "git", "config", "core.abbrev", "4" });
+    try runTestProcess(repo_path, &.{ "sh", "-c", "printf 'old\\000' > logo.bin" });
+    try runTestProcess(repo_path, &.{ "git", "add", "logo.bin" });
+    try runTestProcess(repo_path, &.{ "git", "commit", "-m", "base" });
+    try runTestProcess(repo_path, &.{ "sh", "-c", "printf 'new\\000' > logo.bin" });
+    try runTestProcess(repo_path, &.{ "git", "commit", "-am", "feature" });
+
+    var shell = ShellGitClient.init(testing.allocator, testing.io);
+    shell.cwd = .{ .path = repo_path };
+    const client = shell.gitClient();
+    const base = try client.resolveRef(testing.allocator, "main~1");
+    defer testing.allocator.free(base.canonical);
+    defer testing.allocator.free(base.commit);
+    const source = try client.resolveRef(testing.allocator, "main");
+    defer testing.allocator.free(source.canonical);
+    defer testing.allocator.free(source.commit);
+
+    const raw = try client.diff(testing.allocator, base.commit, source.commit);
+    defer testing.allocator.free(raw);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const parsed = try @import("../diff/parser.zig").parse(arena.allocator(), raw);
+    try testing.expectEqual(@as(usize, 1), parsed.files.len);
+    try testing.expect(parsed.files[0].content.new.? == .binary);
+    const ids = parsed.files[0].blob_ids.?;
+    // `git hash-object` names the same blobs, so the ids are the full ids.
+    try expectBlobId(repo_path, "old\x00", ids.old);
+    try expectBlobId(repo_path, "new\x00", ids.new);
+}
+
+fn expectBlobId(cwd: []const u8, contents: []const u8, id: []const u8) !void {
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/blob", .{cwd});
+    defer testing.allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = contents });
+    const result = try std.process.run(testing.allocator, testing.io, .{ .argv = &.{ "git", "hash-object", "blob" }, .cwd = .{ .path = cwd } });
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqual(@as(usize, 40), id.len);
+    try testing.expectEqualStrings(std.mem.trimEnd(u8, result.stdout, "\n"), id);
 }
 
 fn runTestProcess(cwd: []const u8, argv: []const []const u8) !void {

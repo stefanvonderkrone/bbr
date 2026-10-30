@@ -23,7 +23,8 @@ pub const FileReviewFingerprint = struct {
 /// is unverifiable. Hunk headers and line numbers do not participate, so a
 /// pure line shift keeps the fingerprint.
 pub fn fingerprint(file: diff.File) ?FileReviewFingerprint {
-    if (isBinary(file.content.old) or isBinary(file.content.new)) return null;
+    const binary = isBinary(file.content.old) or isBinary(file.content.new);
+    if (binary and file.blob_ids == null) return null;
     var hash = Sha256.init(.{});
     hash.update(&.{1}); // encoding version
     putText(&hash, file.old_path);
@@ -36,6 +37,11 @@ pub fn fingerprint(file: diff.File) ?FileReviewFingerprint {
         .renamed => 3,
     }});
     hash.update(&.{ sideTag(file.content.old), sideTag(file.content.new) });
+    // A binary File has no Lines, so its blob ids describe the change.
+    if (binary) {
+        putText(&hash, file.blob_ids.?.old);
+        putText(&hash, file.blob_ids.?.new);
+    }
     for (file.hunks) |hunk| {
         hash.update(&.{0}); // Hunk marker
         for (hunk.lines) |line| {
@@ -423,25 +429,77 @@ test "M22 read an added File, a removed File, and a pure rename each have a fing
     try testing.expect(!removed.eql(renamed));
 }
 
-test "M22 read a binary File is unverifiable until its blob ids participate" {
+const binary_diff =
+    \\diff --git a/logo.png b/logo.png
+    \\index 1111111..2222222 100644
+    \\Binary files a/logo.png and b/logo.png differ
+    \\
+;
+
+test "M22 read a binary File with blob ids has a fingerprint that follows each blob id" {
+    try expectSame(binary_diff, binary_diff);
+    try expectDifferent(binary_diff,
+        \\diff --git a/logo.png b/logo.png
+        \\index 3333333..2222222 100644
+        \\Binary files a/logo.png and b/logo.png differ
+        \\
+    );
+    try expectDifferent(binary_diff,
+        \\diff --git a/logo.png b/logo.png
+        \\index 1111111..3333333 100644
+        \\Binary files a/logo.png and b/logo.png differ
+        \\
+    );
+    // The length prefix keeps the boundary between the two ids.
+    try expectDifferent(binary_diff,
+        \\diff --git a/logo.png b/logo.png
+        \\index 111111..12222222 100644
+        \\Binary files a/logo.png and b/logo.png differ
+        \\
+    );
+}
+
+test "M22 read a binary File without blob ids is unverifiable" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const parsed = try parser.parse(arena.allocator(),
         \\diff --git a/logo.png b/logo.png
-        \\index 111..222 100644
         \\Binary files a/logo.png and b/logo.png differ
         \\
     );
     try testing.expectEqual(@as(?FileReviewFingerprint, null), fingerprint(parsed.files[0]));
 }
 
-test "M22 read a refined text byte size keeps the fingerprint" {
+test "M22 read a text File fingerprint ignores its index blob ids" {
+    try expectSame(base_diff,
+        \\diff --git a/src/a.zig b/src/a.zig
+        \\index 1111111..2222222 100644
+        \\--- a/src/a.zig
+        \\+++ b/src/a.zig
+        \\@@ -1,2 +1,2 @@ fn main
+        \\ keep
+        \\-old
+        \\+new
+        \\@@ -10,2 +10,2 @@
+        \\ tail
+        \\-before
+        \\+after
+        \\
+    );
+}
+
+test "M22 read a refined byte size keeps the text and binary fingerprints" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const parsed = try parser.parse(arena.allocator(), base_diff);
-    var refined = parsed.files[0];
-    refined.content = .{ .old = .{ .text = 120 }, .new = .{ .text = 140 } };
-    try testing.expect(fingerprint(parsed.files[0]).?.eql(fingerprint(refined).?));
+    const text = (try parser.parse(arena.allocator(), base_diff)).files[0];
+    var refined_text = text;
+    refined_text.content = .{ .old = .{ .text = 120 }, .new = .{ .text = 140 } };
+    try testing.expect(fingerprint(text).?.eql(fingerprint(refined_text).?));
+
+    const binary = (try parser.parse(arena.allocator(), binary_diff)).files[0];
+    var refined_binary = binary;
+    refined_binary.content = .{ .old = .{ .binary = 120 }, .new = .{ .binary = 140 } };
+    try testing.expect(fingerprint(binary).?.eql(fingerprint(refined_binary).?));
 }
 
 test "M22 read InMemoryFileReadStore keeps the FileReadStore contract" {

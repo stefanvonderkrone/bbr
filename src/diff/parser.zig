@@ -42,6 +42,7 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
     var binary_old_size: ?usize = null;
     var binary_block_count: usize = 0;
     var binary_expects_block = false;
+    var blob_ids: ?model.BlobIds = null;
     var hunks: std.ArrayList(Hunk) = .empty;
 
     // Accumulators for the hunk currently being built.
@@ -86,6 +87,7 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
                     .status = status,
                     .hunks = try hunks.toOwnedSlice(allocator),
                     .content = fileContent(status, binary, binary_old_size, binary_new_size, old_path_valid, new_path_valid),
+                    .blob_ids = blob_ids,
                 });
                 hunks = .empty;
             }
@@ -96,6 +98,7 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
             binary_old_size = null;
             binary_block_count = 0;
             binary_expects_block = false;
+            blob_ids = null;
             old_path_valid = true;
             new_path_valid = true;
             // Best-effort path guess from the `a/… b/…` operands; the `---`/`+++`
@@ -125,6 +128,10 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
             }
             if (std.mem.startsWith(u8, line, "rename ")) {
                 status = .renamed;
+                continue;
+            }
+            if (std.mem.startsWith(u8, line, "index ")) {
+                blob_ids = parseBlobIds(line["index ".len..]);
                 continue;
             }
             if (std.mem.startsWith(u8, line, "--- ")) {
@@ -234,10 +241,21 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) ParseError!Diff {
             .status = status,
             .hunks = try hunks.toOwnedSlice(allocator),
             .content = fileContent(status, binary, binary_old_size, binary_new_size, old_path_valid, new_path_valid),
+            .blob_ids = blob_ids,
         });
     }
 
     return .{ .files = try files.toOwnedSlice(allocator) };
+}
+
+/// Reads `<old>..<new>` and ignores an optional ` <mode>` after the ids.
+fn parseBlobIds(rest: []const u8) ?model.BlobIds {
+    const ids = rest[0 .. std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len];
+    const separator = std.mem.indexOf(u8, ids, "..") orelse return null;
+    const old = ids[0..separator];
+    const new = ids[separator + 2 ..];
+    if (old.len == 0 or new.len == 0) return null;
+    return .{ .old = old, .new = new };
 }
 
 fn fileContent(status: FileStatus, binary: bool, old_size: ?usize, new_size: ?usize, old_path_valid: bool, new_path_valid: bool) model.FileContent {
@@ -691,4 +709,55 @@ test "Git binary stubs classify present File sides without Lines" {
     try testing.expectEqual(@as(?usize, null), diff.files[4].content.new.?.binary);
     try testing.expectEqual(@as(?usize, 9), diff.files[5].content.old.?.binary);
     try testing.expectEqual(@as(?usize, null), diff.files[5].content.new.?.binary);
+}
+
+test "M22 read the parser reads short and full index blob ids with and without a trailing mode" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const full_old = "1111111111111111111111111111111111111111";
+    const full_new = "2222222222222222222222222222222222222222";
+    const raw =
+        \\diff --git a/short.bin b/short.bin
+        \\index 111abc..222def 100644
+        \\Binary files a/short.bin and b/short.bin differ
+        \\diff --git a/added.bin b/added.bin
+        \\new file mode 100644
+        \\index 000000..333aaa
+        \\Binary files /dev/null and b/added.bin differ
+        \\diff --git a/full.zig b/full.zig
+    ++ "\nindex " ++ full_old ++ ".." ++ full_new ++ " 100755\n" ++
+        \\--- a/full.zig
+        \\+++ b/full.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\diff --git a/plain.zig b/plain.zig
+    ++ "\nindex " ++ full_old ++ ".." ++ full_new ++ "\n" ++
+        \\--- a/plain.zig
+        \\+++ b/plain.zig
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\diff --git a/none.bin b/none.bin
+        \\Binary files a/none.bin and b/none.bin differ
+        \\diff --git a/old.zig b/new.zig
+        \\similarity index 100%
+        \\rename from old.zig
+        \\rename to new.zig
+        \\
+    ;
+
+    const diff = try parseInArena(&arena, raw);
+    try testing.expectEqual(@as(usize, 6), diff.files.len);
+    try testing.expectEqualStrings("111abc", diff.files[0].blob_ids.?.old);
+    try testing.expectEqualStrings("222def", diff.files[0].blob_ids.?.new);
+    try testing.expectEqualStrings("000000", diff.files[1].blob_ids.?.old);
+    try testing.expectEqualStrings("333aaa", diff.files[1].blob_ids.?.new);
+    for (diff.files[2..4]) |file| {
+        try testing.expectEqualStrings(full_old, file.blob_ids.?.old);
+        try testing.expectEqualStrings(full_new, file.blob_ids.?.new);
+        try testing.expectEqual(@as(usize, 1), file.hunks.len);
+    }
+    try testing.expectEqual(@as(?model.BlobIds, null), diff.files[4].blob_ids);
+    try testing.expectEqual(@as(?model.BlobIds, null), diff.files[5].blob_ids);
 }

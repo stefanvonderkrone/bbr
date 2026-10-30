@@ -87,6 +87,13 @@ pub const FileContent = struct {
     new: ?FileContentStatus = null,
 };
 
+/// The old and new blob ids from the `index <old>..<new>` diff header line,
+/// borrowed from the raw diff. Their length follows the diff producer.
+pub const BlobIds = struct {
+    old: []const u8,
+    new: []const u8,
+};
+
 /// One changed path within a `Diff`. `old_path`/`new_path` are borrowed from the
 /// raw diff and differ only for renames; for adds `old_path` and for removes
 /// `new_path` may be `"/dev/null"`.
@@ -98,6 +105,8 @@ pub const File = struct {
     /// File Content Status known from the RawDiff. File Enrichment refines text
     /// sizes and failures but must preserve binary sides.
     content: FileContent = .{ .old = .{ .text = null }, .new = .{ .text = null } },
+    /// Null when the diff has no `index` line for this File.
+    blob_ids: ?BlobIds = null,
 
     /// The path to show a reviewer. For a removed file the new side is
     /// `/dev/null`, so the real name lives on `old_path`; every other status
