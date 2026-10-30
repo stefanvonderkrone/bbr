@@ -14,7 +14,7 @@ The complete set of changed Files from one DiffSource. The aggregate the whole U
 _Avoid_: changeset, patch.
 
 **File**:
-One changed path within a Diff, carrying distinct old/new paths, its change status (added / modified / removed / renamed), and its Hunks. Old-side Anchors match the old path and new-side Anchors match the new path; the displayed path is the surviving side, or the old path for a removed File. Full old/new file text is fetched lazily and held in a Session-side table index-aligned with the Files.
+One changed path within a Diff, carrying distinct old/new paths, its change status (added / modified / removed / renamed), and its Hunks. Old-side Anchors match the old path and new-side Anchors match the new path; the displayed path is the surviving side, or the old path for a removed File. A File can carry the old and new blob ids from its `index` diff header. Full old/new file text is fetched lazily and held in a Session-side table index-aligned with the Files.
 _Avoid_: buffer (that's the render-side term), document, blob.
 
 **File Content Status**:

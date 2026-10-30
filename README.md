@@ -213,6 +213,7 @@ Pending reviews persist in `$XDG_STATE_HOME/bbr/pending.db`, and submission lock
 `$XDG_STATE_HOME/bbr/submission-locks`. When `XDG_STATE_HOME` is unset, empty, or relative, the
 state directory is `$HOME/.local/state/bbr`. If you change `XDG_STATE_HOME`, move the existing
 `pending.db` to the new directory, because bbr does not look for it in the old one.
+File Read Receipts also persist in `pending.db`. They stay on your machine and never go to Bitbucket.
 
 ```toml
 theme = "system"
@@ -283,6 +284,17 @@ open PullRequests, accepts input while loading, shows a small spinner, and repla
 only after Enter confirms a result; Escape dismisses either Overlay. Unavailable Actions remain
 visible but subdued in help and explain why they cannot run—for example, remote-only Actions in a
 local review or source-only Actions away from a source row.
+
+The File Tree shows each unread File in bold and each read File at regular weight.
+A Directory row is bold while any File below it is unread, also when the Directory is collapsed.
+To mark the focused File read, press `m` on a File row in the Sidebar or in the DiffPane.
+Press `m` on a read File to make it unread again. The Action name for `[keymap]` is `toggle_file_read`.
+A File stays read across `R`, a PullRequest switch, and a restart while its Hunk Lines stay the same.
+A change in Hunk line numbers alone keeps the File read. A changed File becomes bold again.
+A binary File stays read only while its blob ids stay the same.
+A binary File without blob ids in its diff header always stays unread.
+If bbr cannot save a change, the File keeps its weight and the status shows a message.
+If bbr cannot load the read state, every File shows unread and the status shows a warning.
 
 Inside any Composer, `Ctrl-E` hands the exact current body to the first non-empty `GIT_EDITOR`,
 `VISUAL`, or `EDITOR`. External Edit returns to the same open Composer without saving or publishing.

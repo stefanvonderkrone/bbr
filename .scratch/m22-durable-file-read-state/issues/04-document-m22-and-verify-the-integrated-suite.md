@@ -1,6 +1,6 @@
 # 04: Document M22 and verify the integrated suite
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: 02, 03
 Spec: [M22 spec](../SPEC.md)
 
@@ -25,14 +25,14 @@ The integrated hermetic suite passes with every M22 test.
 
 ## Acceptance criteria
 
-- [ ] The glossary entries match the spec and use the glossary terms exactly.
-- [ ] `docs/code-navigation.md` names `FileReadStore`, its SQLite adapter, and its in-memory fake.
-- [ ] `AGENTS.md` has the two M22 rules, and each named test exists.
-- [ ] `README.md` documents the `m` binding, the Action name, and the local-only storage.
-- [ ] `TODO.md` matches decision 3 of the brief.
-- [ ] `python3 tools/check_agent_docs.py` passes.
-- [ ] `zig fmt --check build.zig src`, `zig build`, and `zig build test-file-read` pass.
-- [ ] `zig build test --summary all` passes, and the reported test count is higher than before M22.
+- [x] The glossary entries match the spec and use the glossary terms exactly.
+- [x] `docs/code-navigation.md` names `FileReadStore`, its SQLite adapter, and its in-memory fake.
+- [x] `AGENTS.md` has the two M22 rules, and each named test exists.
+- [x] `README.md` documents the `m` binding, the Action name, and the local-only storage.
+- [x] `TODO.md` matches decision 3 of the brief.
+- [x] `python3 tools/check_agent_docs.py` passes.
+- [x] `zig fmt --check build.zig src`, `zig build`, and `zig build test-file-read` pass.
+- [x] `zig build test --summary all` passes, and the reported test count is higher than before M22.
 
 ## Required checks
 
@@ -41,3 +41,44 @@ The integrated hermetic suite passes with every M22 test.
 - `zig build`
 - `zig build test-file-read`
 - `zig build test --summary all`
+
+## Completion
+
+The Review glossary gives the exact basis of the File Review Fingerprint.
+It also states that the store holds one File Read Receipt for each ReviewIdentity and canonical path.
+The Presentation glossary adds the bold Directory row and the unverifiable File to File Read State.
+The Diff glossary adds the `index` blob ids to File.
+`GLOSSARY-MAP.md` is unchanged.
+
+`docs/code-navigation.md` names the `FileReadStore` seam, `SqliteStore.fileReadStore()`, and `InMemoryFileReadStore`.
+`AGENTS.md` has the two M22 rules.
+Both named tests exist with those exact names.
+`Published.toggleFileRead` holds the only `put` and `delete` call on a `FileReadStore` in `src/tui/presentation.zig`.
+No other `AGENTS.md` rule needed a change.
+
+`README.md` documents `m`, `toggle_file_read`, bold unread Files, bold Directory rows, and the failure messages.
+It states that File Read Receipts persist in `pending.db` and never go to Bitbucket.
+
+`TODO.md` now states that preparation only reads receipts and that the next mark replaces a stale receipt.
+I checked all seven M22 lines.
+The last M22 line asks for Presentation coverage of the rename and removal cases.
+The test "M22 read a refresh with a rename or a removal makes that File unread" in `src/tui/presentation.zig` gives this coverage.
+It marks three Files read and refreshes with a renamed File, a removed File, and an unchanged File.
+After publication, the renamed File and the removed File are unread, and the unchanged File stays read.
+The refresh writes no File Read Receipt.
+Two mutations make this test fail.
+The first mutation marks a File read when a receipt has its path, without a fingerprint compare.
+The second mutation matches receipts by fingerprint only and removes the paths and the change kind from the fingerprint.
+Only the new test catches the second mutation in Presentation.
+
+The ADRs do not contradict M22.
+ADR-0003 and ADR-0006 still describe the seam and the SQLite store correctly.
+
+Checks, run in `/Volumes/Work/t3-code/m22-durable-file-read-state`:
+
+- `python3 tools/check_agent_docs.py` passed.
+- `zig fmt --check build.zig src tests` passed.
+- `zig build` passed.
+- `zig build test-file-read --summary all` passed with 50 of 50 tests.
+- `zig build test --summary all` passed with 24 of 24 steps and 1423 of 1423 tests.
+  The count before M22 was 1378.

@@ -29827,6 +29827,78 @@ test "M22 read a refresh keeps unchanged Files read and makes only a changed Fil
     try testing.expectEqual(@as(usize, 2), reads.writes);
 }
 
+test "M22 read a refresh with a rename or a removal makes that File unread" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1,
+            \\diff --git a/a.zig b/a.zig
+            \\--- a/a.zig
+            \\+++ b/a.zig
+            \\@@ -1 +1 @@
+            \\-old a
+            \\+new a
+            \\diff --git a/b.zig b/b.zig
+            \\--- a/b.zig
+            \\+++ b/b.zig
+            \\@@ -1 +1 @@
+            \\-old b
+            \\+new b
+            \\diff --git a/c.zig b/c.zig
+            \\--- a/c.zig
+            \\+++ b/c.zig
+            \\@@ -1 +1 @@
+            \\-old c
+            \\+new c
+            \\
+        ) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_m });
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .key = test_m });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .key = test_m });
+    for (0..3) |file_index| try testing.expect(!try testFileUnread(&presentation, file_index));
+    try testing.expectEqual(@as(usize, 3), reads.writes);
+
+    try presentation.dispatch(.{ .action = .refresh });
+    try testLoadNextSession(&presentation, try testFileReadSession(testing.allocator, 1,
+        \\diff --git a/a.zig b/a2.zig
+        \\similarity index 50%
+        \\rename from a.zig
+        \\rename to a2.zig
+        \\--- a/a.zig
+        \\+++ b/a2.zig
+        \\@@ -1 +1 @@
+        \\-old a
+        \\+new a
+        \\diff --git a/b.zig b/b.zig
+        \\deleted file mode 100644
+        \\--- a/b.zig
+        \\+++ /dev/null
+        \\@@ -1 +0,0 @@
+        \\-new b
+        \\diff --git a/c.zig b/c.zig
+        \\--- a/c.zig
+        \\+++ b/c.zig
+        \\@@ -1 +1 @@
+        \\-old c
+        \\+new c
+        \\
+    ));
+    const files = presentation.published.?.session.diff.files;
+    try testing.expectEqual(bbr.diff.FileStatus.renamed, files[0].status);
+    try testing.expectEqual(bbr.diff.FileStatus.removed, files[1].status);
+    try testing.expect(try testFileUnread(&presentation, 0));
+    try testing.expect(try testFileUnread(&presentation, 1));
+    try testing.expect(!try testFileUnread(&presentation, 2));
+    try testing.expectEqual(@as(usize, 3), reads.writes);
+}
+
 fn m22BinaryDiff(comptime index_line: []const u8) []const u8 {
     return "diff --git a/logo.png b/logo.png\n" ++ index_line ++
         \\Binary files a/logo.png and b/logo.png differ

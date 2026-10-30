@@ -22,5 +22,6 @@ These paths identify implementation entry points in the current checkout.
 - `HttpClient` is the concurrent-send vtable seam under Bitbucket. Production uses `StdHttpClient`. Tests use `FakeHttpClient`. Another adapter requires a measured proxy need.
 - `GitClient` is the seam under Git. It uses the `git` binary and supports test fixtures.
 - `PendingReviewStore` is the repository seam under Review. Production uses SQLite or libSQL. Tests use an in-memory fake.
+- `FileReadStore` is the File Read Receipt seam under Review. Production uses `SqliteStore.fileReadStore()`, which shares the `pending.db` connection with `SqliteStore.store()`. Tests use `InMemoryFileReadStore`.
 - `SubmissionLocks` is the live local ownership seam under Review. Production uses OS advisory locks. Deterministic tests use an in-memory lock table.
 - `Highlighter` is the seam under Highlighting. It has plain and tree-sitter implementations and supports user-managed Grammars.

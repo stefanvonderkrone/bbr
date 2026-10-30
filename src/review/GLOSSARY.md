@@ -11,11 +11,11 @@ The durable identity of one Review: either a Workspace/Repository/PullRequestId 
 _Avoid_: ReviewKey, Session identity, commit pair.
 
 **File Review Fingerprint**:
-A deterministic digest of one File's review-visible change: its old/new paths, change kind, side availability, and canonical old/new diff content. It identifies what the reviewer inspected without using the Review's SourceCommit as a coarse proxy, so an update to one File does not invalidate read state for unrelated Files.
+A deterministic digest of one File's review-visible change. It covers the old and new paths, the change kind, the side availability, and each Hunk's Lines. It excludes the Hunk header, so `@@` line numbers do not participate. A binary File adds the old and new blob ids from its `index` diff header. A binary File without those ids has no fingerprint, so it is unverifiable. A text File does not use its blob ids. The fingerprint identifies what the reviewer inspected without using the Review's SourceCommit as a coarse proxy, so an update to one File does not invalidate read state for unrelated Files.
 _Avoid_: commit hash (too broad), blob hash (does not describe both sides of the reviewed change), Session identity.
 
 **File Read Receipt**:
-The reviewer-local durable fact that a File Review Fingerprint was explicitly marked read within one ReviewIdentity. It is current only while the loaded File has the same fingerprint; missing, mismatched, or unverifiable receipts project as unread. Receipts live in local persistence for both RemoteReview and LocalReview and never synchronize to Bitbucket.
+The reviewer-local durable fact that a File Review Fingerprint was explicitly marked read within one ReviewIdentity. It is current only while the loaded File has the same fingerprint; missing, mismatched, or unverifiable receipts project as unread. Receipts live in local persistence for both RemoteReview and LocalReview and never synchronize to Bitbucket. The store holds one receipt for each ReviewIdentity and canonical path. The canonical path is the new path when present, otherwise the old path. A mark replaces the receipt. Candidate Session preparation only reads receipts and never deletes a stale receipt.
 _Avoid_: read File (conflates the File with the decision), viewed state (does not imply explicit completion), Session state (the receipt survives replacement).
 
 **Anchor**:
