@@ -10,28 +10,23 @@ const RuntimePackage = @import("runtime_package.zig").RuntimePackage;
 const InjectionQuery = @import("runtime_package.zig").InjectionQuery;
 const c = predicate_mod.c;
 
-extern fn tree_sitter_javascript() callconv(.c) ?*const c.TSLanguage;
-extern fn tree_sitter_typescript() callconv(.c) ?*const c.TSLanguage;
-extern fn tree_sitter_tsx() callconv(.c) ?*const c.TSLanguage;
-extern fn tree_sitter_css() callconv(.c) ?*const c.TSLanguage;
-extern fn tree_sitter_go() callconv(.c) ?*const c.TSLanguage;
-extern fn tree_sitter_bash() callconv(.c) ?*const c.TSLanguage;
-extern fn tree_sitter_json() callconv(.c) ?*const c.TSLanguage;
-extern fn tree_sitter_yaml() callconv(.c) ?*const c.TSLanguage;
+const BuiltInGrammar = grammar_match.BuiltInGrammar;
 
-const javascript_query = @embedFile("javascript_highlights");
-const typescript_query = @embedFile("typescript_highlights");
-const tsx_query = @embedFile("tsx_highlights");
-const css_query = @embedFile("css_highlights");
-const go_query = @embedFile("go_highlights");
-const bash_query = @embedFile("bash_highlights");
-const json_query = @embedFile("json_highlights");
-const yaml_query = @embedFile("yaml_highlights");
-const javascript_locals_query = @embedFile("javascript_locals");
-const typescript_locals_query = @embedFile("typescript_locals");
-const combined_typescript_query = javascript_query ++ "\n" ++ typescript_query;
-const combined_tsx_query = javascript_query ++ "\n" ++ tsx_query;
-const combined_typescript_locals_query = javascript_locals_query ++ "\n" ++ typescript_locals_query;
+/// `addTreeSitter` in `build.zig` compiles `.sources` and embeds `<tag>_highlights`,
+/// `<tag>_injections`, and `<tag>_locals` for every manifest entry.
+inline fn embeddedQuery(comptime grammar: BuiltInGrammar, comptime kind: []const u8) []const u8 {
+    const path: ?[]const u8 = comptime @field(grammar.entry(), kind);
+    return if (path == null) "" else @embedFile(@tagName(grammar) ++ "_" ++ kind);
+}
+
+fn language(comptime grammar: BuiltInGrammar) ?*const c.TSLanguage {
+    const function = @extern(*const fn () callconv(.c) ?*const c.TSLanguage, .{ .name = grammar.entry().symbol });
+    return function();
+}
+
+const javascript_query = embeddedQuery(.javascript, "highlights");
+const javascript_locals_query = embeddedQuery(.javascript, "locals");
+const combined_typescript_locals_query = javascript_locals_query ++ "\n" ++ embeddedQuery(.typescript, "locals");
 
 const GrammarSource = struct {
     language: *const c.TSLanguage,
@@ -95,16 +90,20 @@ pub const TreeSitterHighlighter = struct {
     }
 };
 
-fn grammarSource(selected: grammar_match.BuiltInGrammar) ?GrammarSource {
+fn grammarSource(selected: BuiltInGrammar) ?GrammarSource {
     return switch (selected) {
-        .tsx => .{ .language = tree_sitter_tsx() orelse return null, .query = combined_tsx_query, .locals_query = combined_typescript_locals_query },
-        .typescript => .{ .language = tree_sitter_typescript() orelse return null, .query = combined_typescript_query, .locals_query = combined_typescript_locals_query },
-        .javascript => .{ .language = tree_sitter_javascript() orelse return null, .query = javascript_query, .locals_query = javascript_locals_query },
-        .css => .{ .language = tree_sitter_css() orelse return null, .query = css_query },
-        .go => .{ .language = tree_sitter_go() orelse return null, .query = go_query },
-        .bash => .{ .language = tree_sitter_bash() orelse return null, .query = bash_query },
-        .json => .{ .language = tree_sitter_json() orelse return null, .query = json_query },
-        .yaml => .{ .language = tree_sitter_yaml() orelse return null, .query = yaml_query },
+        // The upstream TypeScript and TSX queries extend the JavaScript queries.
+        inline .tsx, .typescript => |grammar| .{
+            .language = language(grammar) orelse return null,
+            .query = javascript_query ++ "\n" ++ embeddedQuery(grammar, "highlights"),
+            .locals_query = combined_typescript_locals_query,
+        },
+        inline else => |grammar| .{
+            .language = language(grammar) orelse return null,
+            .query = embeddedQuery(grammar, "highlights"),
+            .locals_query = embeddedQuery(grammar, "locals"),
+            .injections_query = embeddedQuery(grammar, "injections"),
+        },
     };
 }
 
@@ -508,7 +507,7 @@ test "BuiltInGrammar selection covers JavaScript TypeScript and TSX" {
     try testing.expect(grammar_match.selectBuiltIn("src/a.js", "") != null);
     try testing.expect(grammar_match.selectBuiltIn("src/a.mts", "") != null);
     try testing.expect(grammar_match.selectBuiltIn("src/a.tsx", "") != null);
-    try testing.expect(grammar_match.selectBuiltIn("src/a.zig", "") == null);
+    try testing.expectEqual(BuiltInGrammar.zig, grammar_match.selectBuiltIn("src/a.zig", "").?);
     try testing.expect(grammar_match.selectBuiltIn("scripts/release", "#!/usr/bin/env bash\n") != null);
 }
 
@@ -721,6 +720,7 @@ test "interval merge matches byte planes for every BuiltInGrammar fixture" {
         .{ .path = "run.sh", .source = "#!/bin/bash\nname=world\necho \"hello ${name}\"\n" },
         .{ .path = "data.json", .source = "{\"nested\": {\"ready\": true}, \"items\": [1, 2]}\n" },
         .{ .path = "config.yaml", .source = "service:\n  enabled: true\n  ports: [80, 443]\n" },
+        .{ .path = "main.zig", .source = zig_fixture },
     };
     var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
     defer highlighter.deinit();
@@ -737,12 +737,113 @@ test "interval merge matches byte planes for every BuiltInGrammar fixture" {
     }
 }
 
+test "M27 grammar every BuiltInGrammar loads its queries" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    try testing.expectEqual(std.meta.tags(BuiltInGrammar).len, highlighter.package_count);
+    inline for (comptime std.meta.tags(BuiltInGrammar)) |grammar| {
+        const package = &highlighter.packages[@intFromEnum(grammar)];
+        try testing.expect(c.ts_query_pattern_count(package.highlight.query) > 0);
+        const injections: ?[]const u8 = grammar.entry().injections;
+        try testing.expectEqual(injections != null, package.injection != null);
+    }
+}
+
+test "M27 grammar every BuiltInGrammar ABI is compatible with the vendored runtime" {
+    inline for (comptime std.meta.tags(BuiltInGrammar)) |grammar| {
+        const abi = c.ts_language_abi_version(language(grammar).?);
+        try testing.expect(abi >= c.TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION and abi <= c.TREE_SITTER_LANGUAGE_VERSION);
+        try testing.expectEqual(@as(u32, grammar.entry().abi), abi);
+    }
+}
+
+test "M27 grammar the GrammarMatch table equals the manifest" {
+    const fields = comptime std.meta.fields(@TypeOf(grammar_match.manifest.grammars));
+    try testing.expectEqual(fields.len, grammar_match.table.len);
+    inline for (fields, grammar_match.table) |field, row| {
+        const grammar = @field(BuiltInGrammar, field.name);
+        const matches = @field(grammar_match.manifest.grammars, field.name).matches;
+        try testing.expectEqual(grammar, row.grammar);
+        inline for (.{ "filenames", "extensions", "shebangs" }) |kind| {
+            const expected: []const []const u8 = &@field(matches, kind);
+            try testing.expectEqual(expected.len, @field(row, kind).len);
+            for (expected, @field(row, kind)) |want, have| try testing.expectEqualStrings(want, have);
+        }
+        inline for (matches.filenames) |filename| try testing.expectEqual(grammar, grammar_match.selectBuiltIn("dir/" ++ filename, "").?);
+        inline for (matches.extensions) |extension| try testing.expectEqual(grammar, grammar_match.selectBuiltIn("src/a" ++ extension, "").?);
+        inline for (matches.shebangs) |shebang| {
+            try testing.expectEqual(grammar, grammar_match.selectBuiltIn("scripts/run", "#!/usr/bin/env " ++ shebang ++ "\n").?);
+            try testing.expectEqual(grammar, grammar_match.selectBuiltIn("scripts/run", "#!/usr/bin/" ++ shebang ++ " -e\n").?);
+        }
+    }
+}
+
+test "M27 grammar GrammarMatch keeps every M13 case and selects Zig and Bash" {
+    const cases = [_]struct { path: []const u8, content: []const u8 = "", grammar: ?BuiltInGrammar }{
+        .{ .path = "src/a.tsx", .grammar = .tsx },
+        .{ .path = "src/a.ts", .grammar = .typescript },
+        .{ .path = "src/a.mts", .grammar = .typescript },
+        .{ .path = "src/a.cts", .grammar = .typescript },
+        .{ .path = "src/a.js", .grammar = .javascript },
+        .{ .path = "src/a.jsx", .grammar = .javascript },
+        .{ .path = "src/a.mjs", .grammar = .javascript },
+        .{ .path = "src/a.cjs", .grammar = .javascript },
+        .{ .path = "src/a.css", .grammar = .css },
+        .{ .path = "main.go", .grammar = .go },
+        .{ .path = "data.json", .grammar = .json },
+        .{ .path = "config.yaml", .grammar = .yaml },
+        .{ .path = "config.yml", .grammar = .yaml },
+        .{ .path = "run.sh", .grammar = .bash },
+        .{ .path = "run.bash", .grammar = .bash },
+        .{ .path = "home/.bashrc", .grammar = .bash },
+        .{ .path = "Bashfile", .grammar = .bash },
+        .{ .path = "scripts/release", .content = "#!/usr/bin/env bash\n", .grammar = .bash },
+        .{ .path = "scripts/release", .content = "#!/bin/bash\n", .grammar = .bash },
+        .{ .path = "scripts/release", .content = "#!/bin/sh\n", .grammar = .bash },
+        .{ .path = "scripts/release", .content = "#!/bin/sh -e\n", .grammar = .bash },
+        .{ .path = "scripts/release", .content = "#!/usr/bin/env -S bash -eu\n", .grammar = .bash },
+        .{ .path = "scripts/release", .content = "#!/usr/bin/env zsh\n", .grammar = null },
+        .{ .path = "notes/a.json.txt", .content = "#!/usr/bin/env node\n", .grammar = null },
+        .{ .path = "README", .grammar = null },
+        .{ .path = "SRC/A.JS", .grammar = null },
+        .{ .path = "src/a.zig", .grammar = .zig },
+        .{ .path = "build.zig.zon", .grammar = .zig },
+        .{ .path = "src/a.ziggy", .grammar = null },
+    };
+    for (cases) |case| try testing.expectEqual(case.grammar, grammar_match.selectBuiltIn(case.path, case.content));
+}
+
+const zig_fixture =
+    \\// Adds one.
+    \\const Point = struct { x: u32 };
+    \\fn add(a: u32) u32 {
+    \\    return a + 1;
+    \\}
+    \\const name = "zig";
+    \\
+;
+
+test "M27 grammar Zig fixture has comment, string, keyword, function, and type roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/main.zig", zig_fixture);
+    defer freeResult(result);
+
+    try expectRoleAt(result, zig_fixture, "// Adds one.", .comment);
+    try expectRoleAt(result, zig_fixture, "\"zig\"", .string);
+    try expectRoleAt(result, zig_fixture, "const", .keyword);
+    try expectRoleAt(result, zig_fixture, "return", .keyword);
+    try expectRoleAt(result, zig_fixture, "add", .function);
+    try expectRoleAt(result, zig_fixture, "Point", .type);
+    try expectRoleAt(result, zig_fixture, "u32", .type);
+}
+
 test "match predicate filters one match and preserves fallback Capture" {
     const query =
         \\(identifier) @variable
         \\((identifier) @constructor (#match? @constructor "^[A-Z]"))
     ;
-    const result = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?, query, "", "lower Upper\n");
+    const result = try highlightWithQuery(testing.allocator, language(.javascript).?, query, "", "lower Upper\n");
     defer freeResult(result);
 
     try expectSpan(result, 1, 0, 5, "variable");
@@ -754,7 +855,7 @@ test "eq predicate filters one match and preserves later-pattern precedence" {
         \\(identifier) @variable
         \\((identifier) @function.builtin (#eq? @function.builtin "require"))
     ;
-    const result = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?, query, "", "require other\n");
+    const result = try highlightWithQuery(testing.allocator, language(.javascript).?, query, "", "require other\n");
     defer freeResult(result);
 
     try expectSpan(result, 1, 0, 7, "function.builtin");
@@ -772,7 +873,7 @@ test "Grammar validation atomically rejects unsupported predicate forms" {
     for (cases) |case| {
         var query_error_offset: u32 = 0;
         var query_error_type: c.TSQueryError = undefined;
-        const grammar_language = tree_sitter_javascript().?;
+        const grammar_language = language(.javascript).?;
         const query = c.ts_query_new(grammar_language, case.query.ptr, @intCast(case.query.len), &query_error_offset, &query_error_type).?;
         defer c.ts_query_delete(query);
         var diagnostic: predicate_mod.Diagnostic = undefined;
@@ -794,7 +895,7 @@ test "Grammar validation rejects malformed locals query syntax" {
 
 test "zero-width Capture produces no Span" {
     const query = "(function_declaration name: (identifier) @zero)";
-    const result = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?, query, "", "function () {}\n");
+    const result = try highlightWithQuery(testing.allocator, language(.javascript).?, query, "", "function () {}\n");
     defer freeResult(result);
 
     try testing.expectEqual(@as(usize, 0), result.spans.len);
@@ -809,7 +910,7 @@ test "invalid Capture ranges fail Highlighting" {
 test "query cursor match loss fails Highlighting" {
     try testing.expectError(error.QueryMatchLimitExceeded, highlightWithQueryLimit(
         testing.allocator,
-        tree_sitter_javascript().?,
+        language(.javascript).?,
         "(identifier) @variable",
         "",
         "one two\n",
@@ -821,7 +922,7 @@ test "invalid regex diagnostic points to the expression" {
     const source = "((identifier) @x (#match? @x \"(?=x)\"))";
     var query_error_offset: u32 = 0;
     var query_error_type: c.TSQueryError = undefined;
-    const query = c.ts_query_new(tree_sitter_javascript().?, source.ptr, @intCast(source.len), &query_error_offset, &query_error_type).?;
+    const query = c.ts_query_new(language(.javascript).?, source.ptr, @intCast(source.len), &query_error_offset, &query_error_type).?;
     defer c.ts_query_delete(query);
     var diagnostic: predicate_mod.Diagnostic = undefined;
     try testing.expectError(error.InvalidPredicate, predicate_mod.Set.validate(testing.allocator, query, source, &diagnostic));
@@ -835,7 +936,7 @@ test "validation locates later predicates and compiles duplicate expressions onc
     const invalid_source = "((identifier) @x (#eq? @x \"#not-a-predicate\") (#match? @x \"(?=x)\"))";
     var query_error_offset: u32 = 0;
     var query_error_type: c.TSQueryError = undefined;
-    const invalid_query = c.ts_query_new(tree_sitter_javascript().?, invalid_source.ptr, @intCast(invalid_source.len), &query_error_offset, &query_error_type).?;
+    const invalid_query = c.ts_query_new(language(.javascript).?, invalid_source.ptr, @intCast(invalid_source.len), &query_error_offset, &query_error_type).?;
     defer c.ts_query_delete(invalid_query);
     var diagnostic: predicate_mod.Diagnostic = undefined;
     try testing.expectError(error.InvalidPredicate, predicate_mod.Set.validate(testing.allocator, invalid_query, invalid_source, &diagnostic));
@@ -845,7 +946,7 @@ test "validation locates later predicates and compiles duplicate expressions onc
         \\((identifier) @x (#match? @x "^x"))
         \\((identifier) @y (#match? @y "^x"))
     ;
-    const duplicate_query = c.ts_query_new(tree_sitter_javascript().?, duplicate_source.ptr, @intCast(duplicate_source.len), &query_error_offset, &query_error_type).?;
+    const duplicate_query = c.ts_query_new(language(.javascript).?, duplicate_source.ptr, @intCast(duplicate_source.len), &query_error_offset, &query_error_type).?;
     defer c.ts_query_delete(duplicate_query);
     const predicates = try predicate_mod.Set.validate(testing.allocator, duplicate_query, duplicate_source, &diagnostic);
     defer predicates.deinit(testing.allocator);
@@ -857,7 +958,7 @@ test "eq predicate accepts Capture comparison" {
         \\(identifier) @variable
         \\((binary_expression left: (identifier) @same right: (identifier) @right) (#eq? @same @right))
     ;
-    const result = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?, query, "", "a === a; b === c;\n");
+    const result = try highlightWithQuery(testing.allocator, language(.javascript).?, query, "", "a === a; b === c;\n");
     defer freeResult(result);
 
     try expectSpan(result, 1, 0, 1, "same");
@@ -880,7 +981,7 @@ test "M27 grammar each new predicate accepts and rejects a match" {
     for (cases) |case| {
         const query = try std.fmt.allocPrint(testing.allocator, "((identifier) @keyword {s})", .{case.predicate});
         defer testing.allocator.free(query);
-        const result = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?, query, "", case.source);
+        const result = try highlightWithQuery(testing.allocator, language(.javascript).?, query, "", case.source);
         defer freeResult(result);
         expectRoleAt(result, case.source, case.accepted, .keyword) catch |err| {
             std.debug.print("{s} rejects {s}\n", .{ case.predicate, case.accepted });
@@ -895,7 +996,7 @@ test "M27 grammar each new predicate accepts and rejects a match" {
 
 test "M27 grammar set priority changes the winner between overlapping patterns" {
     const source = "alpha;\n";
-    const later_wins = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?, "(identifier) @keyword\n(identifier) @variable", "", source);
+    const later_wins = try highlightWithQuery(testing.allocator, language(.javascript).?, "(identifier) @keyword\n(identifier) @variable", "", source);
     defer freeResult(later_wins);
     try expectRoleAt(later_wins, source, "alpha", .variable);
 
@@ -904,14 +1005,14 @@ test "M27 grammar set priority changes the winner between overlapping patterns" 
         "((identifier) @keyword (#set! \"priority\" 101))\n(identifier) @variable",
         "(identifier) @keyword\n((identifier) @variable (#set! priority 99))",
     }) |query| {
-        const result = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?, query, "", source);
+        const result = try highlightWithQuery(testing.allocator, language(.javascript).?, query, "", source);
         defer freeResult(result);
         try expectRoleAt(result, source, "alpha", .keyword);
     }
 }
 
 test "M27 grammar a hidden Capture produces no Span and still filters" {
-    const hidden_only = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?, "(identifier) @_name", "", "alpha;\n");
+    const hidden_only = try highlightWithQuery(testing.allocator, language(.javascript).?, "(identifier) @_name", "", "alpha;\n");
     defer freeResult(hidden_only);
     try testing.expectEqual(@as(usize, 0), hidden_only.spans.len);
 
@@ -922,7 +1023,7 @@ test "M27 grammar a hidden Capture produces no Span and still filters" {
         \\  (#eq? @_callee "alpha"))
     ;
     const source = "alpha(beta); gamma(delta);\n";
-    const result = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?, query, "", source);
+    const result = try highlightWithQuery(testing.allocator, language(.javascript).?, query, "", source);
     defer freeResult(result);
     try testing.expectEqual(@as(usize, 1), result.spans.len);
     try expectRoleAt(result, source, "beta", .keyword);
@@ -930,7 +1031,7 @@ test "M27 grammar a hidden Capture produces no Span and still filters" {
 
 test "M27 grammar a predicate on an absent optional Capture behaves like Neovim" {
     const source = "alpha(); beta(y); gamma(x);\n";
-    const positive = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?,
+    const positive = try highlightWithQuery(testing.allocator, language(.javascript).?,
         \\(call_expression function: (identifier) @keyword arguments: (arguments (identifier)? @_arg) (#eq? @_arg "x"))
     , "", source);
     defer freeResult(positive);
@@ -938,7 +1039,7 @@ test "M27 grammar a predicate on an absent optional Capture behaves like Neovim"
     try testing.expectEqual(null, captureOver(positive, source, std.mem.indexOf(u8, source, "beta").?));
     try expectRoleAt(positive, source, "gamma", .keyword);
 
-    const negated = try highlightWithQuery(testing.allocator, tree_sitter_javascript().?,
+    const negated = try highlightWithQuery(testing.allocator, language(.javascript).?,
         \\(call_expression function: (identifier) @keyword arguments: (arguments (identifier)? @_arg) (#not-eq? @_arg "x"))
     , "", source);
     defer freeResult(negated);
@@ -1098,16 +1199,16 @@ fn spansFromBytePlanes(allocator: Allocator, content: []const u8, intervals: []c
 }
 
 fn expectInvalidLocalsQuery(locals_query: []const u8, expected_error: anyerror, expected_kind: predicate_mod.Diagnostic.Kind) !void {
-    const language = tree_sitter_javascript().?;
+    const javascript = language(.javascript).?;
     const parser = c.ts_parser_new() orelse return error.ParserInitFailed;
     defer c.ts_parser_delete(parser);
-    if (!c.ts_parser_set_language(parser, language)) return error.IncompatibleGrammar;
+    if (!c.ts_parser_set_language(parser, javascript)) return error.IncompatibleGrammar;
     const source = "x\n";
     const tree = c.ts_parser_parse_string(parser, null, source.ptr, source.len) orelse return error.ParseFailed;
     defer c.ts_tree_delete(tree);
 
     var diagnostic: predicate_mod.Diagnostic = undefined;
-    try testing.expectError(expected_error, predicate_mod.Locals.collect(testing.allocator, language, tree, locals_query, source, &diagnostic));
+    try testing.expectError(expected_error, predicate_mod.Locals.collect(testing.allocator, javascript, tree, locals_query, source, &diagnostic));
     try testing.expectEqual(.locals, diagnostic.query_kind);
     try testing.expectEqual(expected_kind, diagnostic.kind);
     try testing.expectEqual(@as(u32, 1), diagnostic.line);
@@ -1379,7 +1480,7 @@ test "M27 injection Spans stay ordered and inside their layer ranges" {
 
 fn useJavaScriptQueries(highlighter: *TreeSitterHighlighter, highlight_query: []const u8, locals_query: []const u8, injections_query: []const u8) !void {
     var diagnostic: predicate_mod.Diagnostic = undefined;
-    const replacement = try RuntimePackage.init(testing.allocator, tree_sitter_javascript().?, highlight_query, locals_query, injections_query, &diagnostic);
+    const replacement = try RuntimePackage.init(testing.allocator, language(.javascript).?, highlight_query, locals_query, injections_query, &diagnostic);
     const package = &highlighter.packages[@intFromEnum(grammar_match.BuiltInGrammar.javascript)];
     package.deinit();
     package.* = replacement;

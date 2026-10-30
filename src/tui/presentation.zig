@@ -480,6 +480,23 @@ test "M23 highlighting uses real GrammarMatch shebang fallback and retains autho
     try testing.expect(state.takeCommand() == null);
 }
 
+test "M27 grammar a fenced zig block in a ReviewBody gets Zig Spans" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try codeTestPresentation(testing.allocator, store.store(), &.{"```zig\nconst x = \"y\"; // why\n```"}, 0, 40);
+    defer state.deinit();
+    var highlighter = try @import("../highlight/tree_sitter_highlighter.zig").TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const job = state.takeCommand().?.highlight_code;
+    try testing.expectEqualStrings("review.zig", job.path);
+    try state.dispatch(.{ .code_highlight_completed = job.execute(highlighter.highlighter()) });
+    const highlights = state.projection().review.?.frame.code_highlights;
+    try testing.expectEqual(@as(usize, 1), highlights.len);
+    var roles: std.EnumSet(bbr.highlight.CaptureRole) = .initEmpty();
+    for (highlights[0].spans) |span| roles.insert(span.capture.role);
+    for ([_]bbr.highlight.CaptureRole{ .keyword, .string, .comment }) |role| try testing.expect(roles.contains(role));
+}
+
 test "M23 highlighting skips offscreen work and accepts started work after the card leaves" {
     var store = bbr.review.InMemoryStore.init(testing.allocator);
     defer store.deinit();

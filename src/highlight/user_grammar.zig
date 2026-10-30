@@ -1103,6 +1103,51 @@ test "registry reuses exact receipts and loads a matching UserGrammar on first u
     try testing.expect(!statuses[1].valid);
 }
 
+test "M27 grammar a UserGrammar for .zig takes precedence over the Zig BuiltInGrammar" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try writeRegistryBundle(&tmp, "fixture", ".zig", "not a library");
+    defer testing.allocator.free(path);
+    var inspection = try inspect(testing.allocator, testing.io, path);
+    const digest = inspection.report.digest;
+    inspection.deinit();
+    const entries = [_]RegistryEntry{.{
+        .name = "fixture",
+        .path = path,
+        .enabled = true,
+        .trusted_digest = digest,
+        .receipt = .{ .bundle_digest = digest, .bbr_identity = "test-build", .tree_sitter_identity = c.TREE_SITTER_LANGUAGE_VERSION },
+    }};
+    var registry = try Registry.init(testing.allocator, testing.io, &entries, &.{}, "test-build");
+    defer registry.deinit();
+    // Unit tests have no native UserGrammar library, so a JavaScript package stands in for the loaded one.
+    const installation = &registry.installations[0];
+    var diagnostic: predicate_mod.Diagnostic = undefined;
+    const package = try RuntimePackage.init(testing.allocator, tree_sitter_javascript().?, "(identifier) @constant", "", "", &diagnostic);
+    installation.loaded = .{ .library = undefined, .language = tree_sitter_javascript().?, .package = package };
+    installation.load_error = null;
+    defer {
+        installation.loaded.?.package.deinit();
+        installation.loaded = null;
+    }
+    const TreeSitterHighlighter = @import("tree_sitter_highlighter.zig").TreeSitterHighlighter;
+    const source = "const answer = 1;\n";
+
+    var built_in = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer built_in.deinit();
+    const zig_result = try built_in.highlighter().highlight(testing.allocator, "src/a.zig", source);
+    defer testing.allocator.free(zig_result.spans);
+    try testing.expectEqual(.keyword, zig_result.spans[0].capture.role);
+
+    var preferred = try TreeSitterHighlighter.init(testing.allocator, &registry);
+    defer preferred.deinit();
+    const user_result = try preferred.highlighter().highlight(testing.allocator, "src/a.zig", source);
+    defer testing.allocator.free(user_result.spans);
+    try testing.expectEqual(@as(usize, 1), user_result.spans.len);
+    try testing.expectEqual(.constant, user_result.spans[0].capture.role);
+    try testing.expectEqual(@as(u32, 6), user_result.spans[0].start);
+}
+
 test "registry rejects stale active receipts but lists invalid inactive installations" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

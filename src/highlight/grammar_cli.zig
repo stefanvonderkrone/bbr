@@ -467,3 +467,40 @@ test "grammar configuration ignores a relative XDG_CONFIG_HOME" {
     try std.testing.expectEqualStrings("fixture", overrides[0].name);
     try std.testing.expectError(error.UserGrammarReferencedByConfiguration, refuseConfiguredReference(std.testing.allocator, io, &env, "fixture"));
 }
+
+test "M27 grammar bbr grammar check reports Zig as an affected BuiltInGrammar" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "bundle");
+    try tmp.dir.writeFile(io, .{ .sub_path = "bundle/payload", .data = "native bytes" });
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("native bytes", &digest, .{});
+    const manifest = try std.fmt.allocPrint(std.testing.allocator,
+        \\name = "fixture"
+        \\version = "1.0.0"
+        \\os = "{s}"
+        \\arch = "{s}"
+        \\tree_sitter_abi = 15
+        \\symbol = "tree_sitter_fixture"
+        \\library = "payload"
+        \\highlight_query = "payload"
+        \\[[payload]]
+        \\path = "payload"
+        \\sha256 = "{x}"
+        \\[matches]
+        \\extensions = [".zig"]
+        \\
+    , .{ @tagName(@import("builtin").os.tag), @tagName(@import("builtin").cpu.arch), digest });
+    defer std.testing.allocator.free(manifest);
+    try tmp.dir.writeFile(io, .{ .sub_path = "bundle/grammar.toml", .data = manifest });
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/bundle", .{&tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try run(std.testing.allocator, io, &env, &.{ "check", path }, null, &output.writer);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "Affected BuiltInGrammars: Zig\n") != null);
+}

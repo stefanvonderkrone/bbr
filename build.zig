@@ -1,5 +1,6 @@
 const std = @import("std");
 const version_identity = @import("build/version.zig");
+const tree_sitter_manifest = @import("vendors/tree-sitter/manifest.zig.zon");
 
 pub fn build(b: *std.Build) void {
     var target = b.standardTargetOptions(.{});
@@ -213,6 +214,12 @@ pub fn build(b: *std.Build) void {
     const adapt_queries = b.addSystemCommand(&.{"python3"});
     adapt_queries.addFileArg(b.path("tests/adapt_queries_test.py"));
     adapt_queries.setCwd(b.path("."));
+    const vendored_grammars = b.addSystemCommand(&.{"python3"});
+    vendored_grammars.addFileArg(b.path("tools/check_vendored_grammars.py"));
+    vendored_grammars.addDirectoryArg(b.path("."));
+    const vendored_grammars_test = b.addSystemCommand(&.{"python3"});
+    vendored_grammars_test.addFileArg(b.path("tests/check_vendored_grammars_test.py"));
+    vendored_grammars_test.setCwd(b.path("."));
 
     const cli_test_step = b.step("test-cli", "Run hermetic Python CLI checks (requires python3)");
     for ([_][]const u8{
@@ -394,6 +401,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&xdg_reads.step);
     test_step.dependOn(&box_glyphs.step);
     test_step.dependOn(&adapt_queries.step);
+    test_step.dependOn(&vendored_grammars.step);
+    test_step.dependOn(&vendored_grammars_test.step);
     test_step.dependOn(&run_lifecycle_test.step);
     test_step.dependOn(cli_test_step);
 }
@@ -446,32 +455,24 @@ fn runGit(b: *std.Build, arguments: []const []const u8) ?[]const u8 {
     return b.runAllowFail(argv.items, &exit_code, .ignore) catch null;
 }
 
+/// Compiles the vendored runtime and every BuiltInGrammar in the manifest into `mod`, and embeds
+/// each Grammar query as `<tag>_highlights`, `<tag>_injections`, or `<tag>_locals`.
 fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
-    mod.addAnonymousImport("javascript_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/javascript/queries/highlights.scm") });
-    mod.addAnonymousImport("typescript_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/typescript/queries/highlights.scm") });
-    mod.addAnonymousImport("tsx_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/tsx/queries/highlights.scm") });
-    mod.addAnonymousImport("css_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/css/queries/highlights.scm") });
-    mod.addAnonymousImport("go_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/go/queries/highlights.scm") });
-    mod.addAnonymousImport("bash_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/bash/queries/highlights.scm") });
-    mod.addAnonymousImport("json_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/json/queries/highlights.scm") });
-    mod.addAnonymousImport("yaml_highlights", .{ .root_source_file = b.path("vendors/tree-sitter/yaml/queries/highlights.scm") });
-    mod.addAnonymousImport("javascript_locals", .{ .root_source_file = b.path("vendors/tree-sitter/javascript/queries/locals.scm") });
-    mod.addAnonymousImport("typescript_locals", .{ .root_source_file = b.path("vendors/tree-sitter/typescript/queries/locals.scm") });
+    mod.addAnonymousImport("builtin_grammar_manifest", .{ .root_source_file = b.path("vendors/tree-sitter/manifest.zig.zon") });
     mod.addIncludePath(b.path("vendors/tree-sitter/runtime/include"));
     mod.addIncludePath(b.path("vendors/tree-sitter/runtime/src"));
     mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/runtime/src/lib.c"), .flags = &.{ "-std=c11", "-D_DEFAULT_SOURCE", "-fno-sanitize=undefined" } });
 
-    inline for (.{ "javascript", "typescript", "tsx" }) |grammar| {
-        mod.addIncludePath(b.path("vendors/tree-sitter/" ++ grammar ++ "/src"));
-        mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/" ++ grammar ++ "/src/parser.c"), .flags = &.{"-std=c11"} });
-        mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/" ++ grammar ++ "/src/scanner.c"), .flags = &.{"-std=c11"} });
-    }
-    inline for (.{ "css", "go", "bash", "json", "yaml" }) |grammar| {
-        mod.addIncludePath(b.path("vendors/tree-sitter/" ++ grammar ++ "/src"));
-        mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/" ++ grammar ++ "/src/parser.c"), .flags = &.{"-std=c11"} });
-    }
-    inline for (.{ "css", "bash", "yaml" }) |grammar| {
-        mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/" ++ grammar ++ "/src/scanner.c"), .flags = &.{"-std=c11"} });
+    inline for (@typeInfo(@TypeOf(tree_sitter_manifest.grammars)).@"struct".fields) |field| {
+        const grammar = @field(tree_sitter_manifest.grammars, field.name);
+        inline for (grammar.sources) |source| {
+            mod.addIncludePath(b.path("vendors/tree-sitter/" ++ comptime std.fs.path.dirname(source).?));
+            mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/" ++ source), .flags = &.{"-std=c11"} });
+        }
+        inline for (.{ "highlights", "injections", "locals" }) |kind| {
+            const query: ?[]const u8 = @field(grammar, kind);
+            if (query) |path| mod.addAnonymousImport(field.name ++ "_" ++ kind, .{ .root_source_file = b.path("vendors/tree-sitter/" ++ path) });
+        }
     }
 }
 
