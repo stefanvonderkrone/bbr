@@ -14,7 +14,7 @@ const aliases = [_]struct { []const u8, []const u8 }{
     .{ "c_sharp", "cs" },  .{ "java", "java" },         .{ "kotlin", "kt" },             .{ "html", "html" },
     .{ "xml", "xml" },     .{ "sql", "sql" },           .{ "zig", "zig" },               .{ "make", "mk" },
     .{ "makefile", "mk" }, .{ "docker", "dockerfile" }, .{ "dockerfile", "dockerfile" }, .{ "markdown", "md" },
-    .{ "md", "md" },
+    .{ "md", "md" },       .{ "python3", "py" },
 };
 
 /// The file extension, without its dot, for a lower-case Grammar name.

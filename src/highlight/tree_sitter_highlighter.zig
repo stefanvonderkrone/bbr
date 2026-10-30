@@ -730,6 +730,8 @@ test "interval merge matches byte planes for every BuiltInGrammar fixture" {
         .{ .path = "Greeter.kt", .source = kotlin_fixture },
         .{ .path = "build.gradle", .source = groovy_fixture },
         .{ .path = "Greeter.cs", .source = c_sharp_fixture },
+        .{ .path = "scripts/run", .source = python_fixture },
+        .{ .path = "lib/add.rb", .source = ruby_fixture },
     };
     var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
     defer highlighter.deinit();
@@ -1868,4 +1870,84 @@ test "M27 grammar C# namespace module Capture has the type role" {
     defer freeResult(result);
 
     try expectSpan(result, 2, 10, 14, "module");
+}
+
+// M27 ticket 06 fixtures
+
+test "M27 grammar GrammarMatch selects Python and Ruby by name, extension, and shebang" {
+    const cases = [_]struct { path: []const u8, content: []const u8 = "", grammar: ?BuiltInGrammar }{
+        .{ .path = "src/a.py", .grammar = .python },
+        .{ .path = "stubs/a.pyi", .grammar = .python },
+        .{ .path = "lib/a.rb", .grammar = .ruby },
+        .{ .path = "bbr.gemspec", .grammar = .ruby },
+        .{ .path = "Gemfile", .grammar = .ruby },
+        .{ .path = "app/Rakefile", .grammar = .ruby },
+        .{ .path = "scripts/run", .content = "#!/usr/bin/env python3\n", .grammar = .python },
+        .{ .path = "scripts/run", .content = "#!/usr/bin/python3.12\n", .grammar = .python },
+        .{ .path = "scripts/run", .content = "#!/usr/bin/env -S python3 -u\n", .grammar = .python },
+        .{ .path = "scripts/run", .content = "#!/usr/bin/ruby\n", .grammar = .ruby },
+        .{ .path = "Gemfile.lock", .grammar = null },
+    };
+    for (cases) |case| try testing.expectEqual(case.grammar, grammar_match.selectBuiltIn(case.path, case.content));
+}
+
+test "M27 grammar Python and Ruby fence and Injection names select their BuiltInGrammars" {
+    const cases = [_]struct { []const u8, BuiltInGrammar }{
+        .{ "python", .python }, .{ "py", .python }, .{ "python3", .python },
+        .{ "Python", .python }, .{ "ruby", .ruby }, .{ "rb", .ruby },
+    };
+    for (cases) |case| try testing.expectEqual(case[1], grammar_match.selectInjection(case[0]).?);
+}
+
+const python_fixture =
+    \\#!/usr/bin/env python3
+    \\# Adds one.
+    \\def add(a):
+    \\    return a + MAX
+    \\name = "py"
+    \\flag = None
+    \\
+;
+
+test "M27 grammar Python fixture has shebang, comment, string, keyword, function, and constant roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "scripts/run", python_fixture);
+    defer freeResult(result);
+
+    try expectSpan(result, 1, 0, 22, "keyword");
+    try expectSpan(result, 2, 0, 11, "comment");
+    try expectSpan(result, 3, 0, 3, "keyword");
+    try expectSpan(result, 3, 4, 7, "function");
+    try expectSpan(result, 4, 4, 10, "keyword");
+    try expectSpan(result, 4, 15, 18, "constant");
+    try expectSpan(result, 5, 7, 11, "string");
+    try expectSpan(result, 6, 7, 11, "constant");
+}
+
+const ruby_fixture =
+    \\#!/usr/bin/ruby
+    \\# Adds one.
+    \\def add(a)
+    \\  a + MAX
+    \\end
+    \\name = "rb"
+    \\flag = nil
+    \\
+;
+
+test "M27 grammar Ruby fixture has comment, string, keyword, function, and constant roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "lib/add.rb", ruby_fixture);
+    defer freeResult(result);
+
+    try expectSpan(result, 1, 0, 15, "keyword");
+    try expectSpan(result, 2, 0, 11, "comment");
+    try expectSpan(result, 3, 0, 3, "keyword");
+    try expectSpan(result, 3, 4, 7, "function");
+    try expectSpan(result, 4, 6, 9, "constant");
+    try expectSpan(result, 5, 0, 3, "keyword");
+    try expectSpan(result, 6, 7, 11, "string");
+    try expectSpan(result, 7, 7, 10, "constant");
 }
