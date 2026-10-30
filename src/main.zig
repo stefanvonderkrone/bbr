@@ -2,10 +2,10 @@
 //! `io` (a `std.Io.Threaded`-backed runtime), `environ_map`, and args — so we do
 //! not construct any of that ourselves.
 //!
-//! Startup resolves what to open (design §startup): a pasted PR URL, an explicit
-//! `<repo> <id>`, or auto-detection from the current worktree (the tracking
-//! remote + the branch's open PRs). The TUI then loads that PR and lets the
-//! reviewer switch with the fuzzy Picker.
+//! Startup chooses what to open (design §startup): a pasted PR URL, an explicit
+//! `<repo> <id>`, or Startup Detection. The local step of Startup Detection
+//! reads Git before the TUI starts. The TUI then shows the Detecting Frame,
+//! one review Session, or the Browser.
 
 const std = @import("std");
 const bbr = @import("bbr");
@@ -155,12 +155,12 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, f, "check-mutation")) return checkMutationRun(init, gpa, cred, &rest);
         if (std.mem.eql(u8, f, "check-verdict")) return checkVerdictRun(init, gpa, cred, &rest);
         if (std.mem.eql(u8, f, "check-browser")) return checkBrowserRun(init, gpa, cred, &rest);
-        // Print startup resolution (branch/remote/PR list) without the TUI.
+        // Print the Startup Detection outcome without the TUI.
         if (std.mem.eql(u8, f, "detect")) return detectRun(init, gpa, cred, &rest);
     }
 
     // Build the startup input from the remaining args: a URL, an explicit
-    // `<repo> <id>`, a bare `<repo>` (detect within it), or nothing (detect all).
+    // `<repo> <id>`, a bare `<repo>` (detect within it), or nothing.
     var input: bbr.startup.Input = .{};
     if (first) |f| {
         if (looksLikeUrl(f)) {
@@ -218,8 +218,9 @@ fn containsTrustArgument(args: []const []const u8) bool {
     return false;
 }
 
-/// Resolve the startup entry and hand off to the TUI. One StdHttpClient serves
-/// startup and every remote worker so its connection pool lives for the TUI.
+/// Run the local step of Startup Detection and hand off to the TUI. One
+/// StdHttpClient serves every remote worker so its connection pool lives for
+/// the TUI.
 fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, input: bbr.startup.Input, configuration: *const config.Configuration) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -232,36 +233,11 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
     try client.initDefaultProxies(a, init.environ_map);
     const bb = bbr.bitbucket.Client.init(client.httpClient(), cred);
 
-    const entry = bbr.startup.resolve(a, git.gitClient(), bb, input) catch |err| {
+    // The arena outlives `app.run`, so the Start strings stay valid.
+    const start = bbr.startup.start(a, git.gitClient(), cred.workspace, input) catch |err| {
         std.debug.print("bbr: could not resolve a PR to open: {s}\n", .{@errorName(err)});
         return;
     };
-
-    // The repo and the id to open. A picker/empty result has no single id, so we
-    // fall back to the first listed PR (the reviewer switches with `p`).
-    const target: struct { repo: []const u8, id: u64 } = switch (entry) {
-        .open => |t| .{ .repo = t.repo_slug, .id = t.id },
-        .pick => |p| blk: {
-            if (p.prs.len == 0) break :blk .{ .repo = p.repo_slug, .id = 0 };
-            std.debug.print("bbr: {d} open PRs; opening #{d}. Press 'p' to switch.\n", .{ p.prs.len, p.prs[0].id });
-            break :blk .{ .repo = p.repo_slug, .id = p.prs[0].id };
-        },
-        .empty => |repo| {
-            std.debug.print("bbr: no open pull requests in {s}.\n", .{repo});
-            return;
-        },
-    };
-
-    // The initial PR is loaded on a worker thread inside `app.run` (it shows a
-    // "Loading PR #N…" frame meanwhile), so we don't block here — `run` is told
-    // which id to open and passes `initial = null`.
-
-    // `repo` must outlive the TUI (worker loads copy it), so dupe it into a
-    // buffer the run owns via the session-independent gpa arena above… but that
-    // arena is freed on return. Copy into a stable stack buffer instead.
-    var repo_buf: [256]u8 = undefined;
-    const repo_len = @min(target.repo.len, repo_buf.len);
-    @memcpy(repo_buf[0..repo_len], target.repo[0..repo_len]);
 
     // Global-tier pending-review store (design §11): opened once, lives until exit.
     var store = openStore(gpa, init.io, init.environ_map);
@@ -293,7 +269,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .gpa = gpa,
         .env_map = init.environ_map,
         .bitbucket = bb,
-        .repo = repo_buf[0..repo_len],
+        .start = .{ .remote = start },
         .store = store.store(),
         .theme = configuration.theme,
         .keymap = configuration.keymap.keymap(),
@@ -307,7 +283,7 @@ fn openTui(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.C
         .external_edit_max_bytes = configuration.external_edit_max_bytes,
         .submission_locks = os_locks.locks(),
         .summary_cache_path = summary_cache_path,
-    }, null, try presentation.OwnedReviewIdentity.init(cred.workspace, target.repo, target.id)) catch |err| {
+    }, null) catch |err| {
         if (tuiFatalMessage(err)) |message| {
             std.debug.print("{s}\n", .{message});
             return;
@@ -393,7 +369,7 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
         .io = init.io,
         .gpa = gpa,
         .env_map = init.environ_map,
-        .repo = "",
+        .start = .{ .review = key },
         .store = store.store(),
         .theme = configuration.theme,
         .keymap = configuration.keymap.keymap(),
@@ -406,7 +382,7 @@ fn localRun(init: std.process.Init, gpa: std.mem.Allocator, it: anytype) !void {
         .mouse_vertical_scroll_rows = configuration.mouse_vertical_scroll_rows,
         .external_edit_max_bytes = configuration.external_edit_max_bytes,
         .online = false,
-    }, null, key);
+    }, null);
 }
 
 fn tuiFatalMessage(err: anyerror) ?[]const u8 {
@@ -813,8 +789,9 @@ fn verifyLiveCommentDeleted(
     }
 }
 
-/// `detect [<repo>]`: run startup resolution and print the outcome, no TUI. A
-/// scriptable way to verify the GitClient + list pipeline against live data.
+/// `detect [<repo>]`: run Startup Detection and print the outcome, no TUI. A
+/// scriptable way to verify the GitClient and list pipeline against live data.
+/// It exits 0 for every outcome and never touches the Summary Cache.
 fn detectRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket.Credential, it: anytype) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -833,28 +810,19 @@ fn detectRun(init: std.process.Init, gpa: std.mem.Allocator, cred: bbr.bitbucket
         std.debug.print("remote: {s}/{s}\n", .{ r.workspace, r.repo_slug });
     } else |err| std.debug.print("remote: <{s}>\n", .{@errorName(err)});
 
-    var client = bbr.http.StdHttpClient.init(gpa, init.io);
-    defer client.deinit();
-    try client.initDefaultProxies(a, init.environ_map);
-    const bb = bbr.bitbucket.Client.init(client.httpClient(), cred);
-
-    const entry = try bbr.startup.resolve(a, git.gitClient(), bb, input);
-    switch (entry) {
-        .open => |t| std.debug.print("resolved: open {s} #{d}\n", .{ t.repo_slug, t.id }),
-        .pick => |p| {
-            std.debug.print("resolved: pick {s} ({s}, {d} PRs)\n", .{
-                p.repo_slug, if (p.prefiltered) "branch-filtered" else "all open", p.prs.len,
-            });
-            for (p.prs, 0..) |pr, i| {
-                if (i == 10) {
-                    std.debug.print("  … and {d} more\n", .{p.prs.len - 10});
-                    break;
-                }
-                std.debug.print("  #{d} {s} ({s} → {s})\n", .{ pr.id, pr.title, pr.source_branch, pr.destination_branch });
-            }
+    const outcome: bbr.startup.Outcome = switch (bbr.startup.inspect(a, git.gitClient(), cred.workspace, input)) {
+        .browse => |browse| .{ .browse = browse },
+        .detect => |detection| blk: {
+            var client = bbr.http.StdHttpClient.init(gpa, init.io);
+            defer client.deinit();
+            try client.initDefaultProxies(a, init.environ_map);
+            break :blk bbr.startup.detect(a, bbr.bitbucket.Client.init(client.httpClient(), cred), detection);
         },
-        .empty => |repo| std.debug.print("resolved: no open PRs in {s}\n", .{repo}),
-    }
+    };
+    var buffer: [512]u8 = undefined;
+    var stderr = std.Io.File.stderr().writer(init.io, &buffer);
+    try bbr.startup.describe(outcome, &stderr.interface);
+    try stderr.interface.flush();
 }
 
 /// Read one interactive line: print the prompt, read through newline, trim
@@ -1279,9 +1247,9 @@ fn authRun(init: std.process.Init, gpa: std.mem.Allocator, rest: *ArgSlice, flag
 fn usage() void {
     std.debug.print(
         \\usage:
-        \\  bbr                              auto-detect the PR for the current branch
+        \\  bbr                              open the current branch's PR, else the Browser
         \\  bbr [--profile <name>] <pr-url>  open a pasted Bitbucket PR URL
-        \\  bbr [--profile <name>] <repo-slug>  detect the current branch's PR in <repo>
+        \\  bbr [--profile <name>] <repo-slug>  detect the current branch's PR in <repo>, else the Browser
         \\  bbr [--profile <name>] <repo-slug> <pr-id>  open a specific PR in the TUI
         \\  bbr auth login [profile] [--email E] [--workspace W] [--stdin]
         \\  bbr auth status [profile]       prove the Credential live (never prints the token)
@@ -1293,6 +1261,7 @@ fn usage() void {
         \\  bbr check-mutation <repo> <pr-id> destructive live Comment lifecycle check
         \\  bbr check-verdict <repo> <pr-id>  destructive live Reviewer Verdict check
         \\  bbr check-browser [<repo-slug>]   live Browser list shape check
+        \\  bbr detect [<repo-slug>]         print the Startup Detection outcome (no TUI)
         \\  bbr external-edit-smoke          interactive PTY External Edit check
         \\  bbr demo                         open the TUI with synthetic data (no network)
         \\  bbr grammar <command> ...        manage trusted local UserGrammars
@@ -1393,7 +1362,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
         .io = io,
         .gpa = gpa,
         .env_map = env_map,
-        .repo = "",
+        .start = .{ .review = try presentation.OwnedReviewIdentity.init("", "", pr.id) },
         .store = store.store(),
         .theme = configuration.theme,
         .keymap = configuration.keymap.keymap(),
@@ -1407,7 +1376,7 @@ fn demoRun(io: std.Io, gpa: std.mem.Allocator, env_map: *std.process.Environ.Map
         .external_edit_max_bytes = configuration.external_edit_max_bytes,
         .online = false,
         .persist_theme = false,
-    }, s, try presentation.OwnedReviewIdentity.init("", "", pr.id));
+    }, s);
 }
 
 // Test discovery only follows `_ = @import(...)` chains rooted in the *test

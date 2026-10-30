@@ -903,6 +903,9 @@ pub const OwnedInput = union(enum) {
     choose_pull_request: OwnedReviewIdentity,
     /// Starts the Browser once per process and shows it.
     start_browser: BrowserStart,
+    /// Shows the Detecting Frame and runs Startup Detection on a worker.
+    detect_startup: StartupDetection,
+    adjacent_detected: AdjacentDetected,
     key: keymap_mod.KeyStroke,
     mouse: MouseInput,
     session_loaded: SessionLoaded,
@@ -1082,8 +1085,35 @@ pub const ListPullRequests = struct {
 pub const BrowserStart = browser_mod.Start;
 pub const BrowserProjection = browser_mod.Projection;
 
-/// Which surface fills the content region.
-pub const Surface = enum { review, browser };
+/// Which surface fills the content region. The Detecting Frame names the
+/// current branch.
+pub const Surface = union(enum) { review, browser, detecting: browser_mod.Name };
+
+/// Startup Detection in one Repository after the TUI starts.
+pub const StartupDetection = struct {
+    workspace: browser_mod.Name,
+    repository: browser_mod.Name,
+    branch: browser_mod.Name,
+    /// True when `<repo-slug>` named the Repository.
+    named: bool,
+};
+
+pub const DetectAdjacentPullRequests = struct {
+    command_id: CommandId = 0,
+    detection: StartupDetection,
+};
+
+/// One AdjacentPullRequest opens its review Session. Every other result,
+/// a failed detection included, starts the Browser.
+pub const AdjacentOutcome = union(enum) {
+    open: OwnedReviewIdentity,
+    browse: BrowserStart,
+};
+
+pub const AdjacentDetected = struct {
+    command_id: CommandId = 0,
+    outcome: AdjacentOutcome,
+};
 
 pub const ListBrowserRepositories = struct {
     command_id: CommandId = 0,
@@ -1523,6 +1553,7 @@ pub const OwnedCommand = union(enum) {
     check_recovery: CheckRecovery,
     find_duplicate: *PostDraft,
     list_pull_requests: ListPullRequests,
+    detect_adjacent_pull_requests: DetectAdjacentPullRequests,
     list_browser_repositories: ListBrowserRepositories,
     list_browser_pull_requests: ListBrowserPullRequests,
     load_summary_cache: LoadSummaryCache,
@@ -1547,7 +1578,7 @@ pub const OwnedCommand = union(enum) {
             .scan_buffer_search => |*command| command.deinit(),
             .build_buffer_disclosure => |command| command.destroy(),
             .scan_review_source => |*command| command.deinit(),
-            .load_session, .enrich_file, .change_reviewer_verdict, .wait_submission, .check_recovery, .list_pull_requests, .list_browser_repositories, .list_browser_pull_requests, .load_summary_cache, .persist_theme => {},
+            .load_session, .enrich_file, .change_reviewer_verdict, .wait_submission, .check_recovery, .list_pull_requests, .detect_adjacent_pull_requests, .list_browser_repositories, .list_browser_pull_requests, .load_summary_cache, .persist_theme => {},
         }
         self.* = undefined;
     }
@@ -1628,6 +1659,10 @@ pub const OwnedCommand = union(enum) {
                 .work_id = list.work_id,
                 .outcome = .failed,
             } },
+            .detect_adjacent_pull_requests => |detect| .{ .adjacent_detected = .{
+                .command_id = detect.command_id,
+                .outcome = .{ .browse = .{ .workspace = detect.detection.workspace } },
+            } },
             .list_browser_repositories => |list| .{ .browser_repositories_loaded = .{
                 .command_id = list.command_id,
                 .work_id = list.work_id,
@@ -1693,6 +1728,7 @@ fn setCommandId(command: *OwnedCommand, command_id: CommandId) void {
         .wait_submission => |*value| value.command_id = command_id,
         .check_recovery => |*value| value.command_id = command_id,
         .list_pull_requests => |*value| value.command_id = command_id,
+        .detect_adjacent_pull_requests => |*value| value.command_id = command_id,
         .list_browser_repositories => |*value| value.command_id = command_id,
         .list_browser_pull_requests => |*value| value.command_id = command_id,
         .load_summary_cache => |*value| value.command_id = command_id,
@@ -1776,6 +1812,12 @@ const LaunchFailureFixture = struct {
             .wait_submission => .{ .wait_submission = .{ .operation_id = operation_id, .identity = try remote(), .temp_id = temp_id, .ms = 1000 } },
             .check_recovery => .{ .check_recovery = .{ .operation_id = operation_id, .identity = try remote(), .source_commit = undefined } },
             .list_pull_requests => .{ .list_pull_requests = .{ .work_id = work_id, .repository = undefined } },
+            .detect_adjacent_pull_requests => .{ .detect_adjacent_pull_requests = .{ .detection = .{
+                .workspace = try browser_mod.Name.init("workspace"),
+                .repository = try browser_mod.Name.init("repo"),
+                .branch = try browser_mod.Name.init("feature/x"),
+                .named = true,
+            } } },
             .list_browser_repositories => .{ .list_browser_repositories = .{ .work_id = work_id } },
             .list_browser_pull_requests => .{ .list_browser_pull_requests = .{ .work_id = work_id, .repository = try browser_mod.Name.init("repo") } },
             .load_summary_cache => .{ .load_summary_cache = .{ .workspace = try browser_mod.Name.init("workspace") } },
@@ -1882,6 +1924,12 @@ const LaunchFailureFixture = struct {
                 try testing.expectEqual(command_id, loaded.command_id);
                 try testing.expectEqual(work_id, loaded.work_id);
                 try testing.expect(loaded.outcome == .failed);
+            },
+            .adjacent_detected => |detected| {
+                try testing.expectEqual(command_id, detected.command_id);
+                try testing.expectEqualStrings("workspace", detected.outcome.browse.workspace.slice());
+                try testing.expect(detected.outcome.browse.repository == null);
+                try testing.expect(detected.outcome.browse.pull_request_id == null);
             },
             inline .browser_repositories_loaded, .browser_pull_requests_loaded => |loaded| {
                 try testing.expectEqual(command_id, loaded.command_id);
@@ -3356,6 +3404,8 @@ pub const Projection = struct {
     list_overlay: ?*const ListOverlay,
     /// Set while the Browser fills the content region.
     browser: ?BrowserProjection,
+    /// The current branch while the Detecting Frame fills the content region.
+    detecting: ?[]const u8,
     picker_tick_scope: ?WorkId,
     /// The Theme to paint this frame.
     theme: ThemeId,
@@ -6169,6 +6219,8 @@ pub const Presentation = struct {
         switch (input) {
             .choose_pull_request => |key| if (!self.shutdown_requested) try self.choosePullRequest(key),
             .start_browser => |start| if (!self.shutdown_requested) self.startBrowser(start),
+            .detect_startup => |detection| if (!self.shutdown_requested) self.detectStartup(detection),
+            .adjacent_detected => |detected| try self.acceptAdjacentDetected(detected),
             .key => |key| try self.applyKey(key),
             .mouse => |mouse| self.applyMouse(mouse),
             .session_loaded => |completed| self.acceptLoadedSession(completed),
@@ -6273,6 +6325,7 @@ pub const Presentation = struct {
                     durable.phase = .awaiting_duplicate;
             },
             .list_pull_requests => self.outstanding_picker_loads += 1,
+            .detect_adjacent_pull_requests => {},
             .list_browser_repositories, .list_browser_pull_requests => {},
             .load_summary_cache, .save_summary_cache => {},
             .copy_clipboard => {},
@@ -6341,6 +6394,10 @@ pub const Presentation = struct {
             } else null,
             .list_overlay = if (self.list_overlay) |*overlay| overlay else null,
             .browser = if (self.surface == .browser) if (self.browser) |state| state.projection() else null else null,
+            .detecting = switch (self.surface) {
+                .detecting => |*branch| branch.slice(),
+                .review, .browser => null,
+            },
             .picker_tick_scope = if (self.shutdown_requested) null else if (self.list_overlay) |*overlay| overlay.tickScope() else null,
             .theme = self.activeTheme(),
             .configured_theme = self.configured_theme,
@@ -6385,7 +6442,7 @@ pub const Presentation = struct {
     pub fn readyToExit(self: *const Presentation) bool {
         if (builtin.is_test) for (self.issued_commands.items) |issued| {
             if (issued.target == .scan_buffer_search or issued.target == .scan_review_source or issued.target == .build_buffer_disclosure or issued.target == .prepare_session or
-                issued.target == .list_browser_repositories or issued.target == .list_browser_pull_requests) return false;
+                issued.target == .list_browser_repositories or issued.target == .list_browser_pull_requests or issued.target == .detect_adjacent_pull_requests) return false;
         };
         if (builtin.is_test) return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.durable_reviewer_verdict == null and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.outstanding_picker_loads == 0 and self.issued_enrichments.items.len == 0;
         return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.durable_reviewer_verdict == null and self.commands.items.len == 0 and self.issued_commands.items.len == 0;
@@ -6852,6 +6909,7 @@ pub const Presentation = struct {
     }
 
     fn paneContext(self: *const Presentation) keymap_mod.InteractionContext {
+        if (self.surface == .detecting) return .detecting;
         if (self.surface == .browser) if (self.browser) |state| return browserContext(state);
         const published = self.published orelse return .diff;
         if (published.composer != null) return .composer;
@@ -12286,6 +12344,24 @@ pub const Presentation = struct {
         }
         self.surface = .browser;
         self.action_error = null;
+    }
+
+    /// Shows the Detecting Frame and queues the AdjacentPullRequest list.
+    fn detectStartup(self: *Presentation, detection: StartupDetection) void {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch return self.startBrowser(.{ .workspace = detection.workspace });
+        self.commands.appendAssumeCapacity(.{ .detect_adjacent_pull_requests = .{ .detection = detection } });
+        self.surface = .{ .detecting = detection.branch };
+    }
+
+    /// A failed detection shows no note: its outcome is a Browser Start.
+    fn acceptAdjacentDetected(self: *Presentation, detected: AdjacentDetected) !void {
+        if (!self.consumeCommand(detected.command_id, .detect_adjacent_pull_requests)) return;
+        if (self.shutdown_requested) return;
+        self.surface = .review;
+        switch (detected.outcome) {
+            .open => |key| try self.choosePullRequest(key),
+            .browse => |start| self.startBrowser(start),
+        }
     }
 
     /// The first `open_browser` starts the Browser on the published Session's
@@ -30664,5 +30740,103 @@ test "M24 cache a null Summary Cache path issues no Summary Cache command" {
     try expectNoCommand(&presentation);
     try completeBrowserRepositories(&presentation, repositories, &.{"repo"});
     try completeBrowserPullRequests(&presentation, pull_requests, &.{1});
+    try expectNoCommand(&presentation);
+}
+
+fn startupTestPresentation(store: *bbr.review.InMemoryStore) !Presentation {
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{ .geometry = browser_test_geometry });
+    errdefer presentation.deinit();
+    try presentation.dispatch(.{ .detect_startup = .{
+        .workspace = try browser_mod.Name.init("check24"),
+        .repository = try browser_mod.Name.init("repo"),
+        .branch = try browser_mod.Name.init("feature/x"),
+        .named = false,
+    } });
+    return presentation;
+}
+
+fn takeDetectCommand(presentation: *Presentation) !DetectAdjacentPullRequests {
+    const command = presentation.takeCommand() orelse return error.MissingCommand;
+    if (command != .detect_adjacent_pull_requests) return error.UnexpectedCommand;
+    return command.detect_adjacent_pull_requests;
+}
+
+test "M24 startup detect_startup shows the Detecting Frame, and only q resolves in it" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try startupTestPresentation(&store);
+    defer presentation.deinit();
+
+    const detect = try takeDetectCommand(&presentation);
+    try testing.expectEqualStrings("repo", detect.detection.repository.slice());
+    try testing.expectEqualStrings("feature/x", detect.detection.branch.slice());
+    try expectNoCommand(&presentation);
+    try testing.expectEqualStrings("feature/x", presentation.projection().detecting.?);
+    try testing.expect(presentation.projection().browser == null);
+    try testing.expectEqual(keymap_mod.InteractionContext.detecting, presentation.interactionContext());
+
+    for ("bpRj?") |key| try browserKey(&presentation, key);
+    try expectNoCommand(&presentation);
+    try testing.expectEqualStrings("feature/x", presentation.projection().detecting.?);
+    try testing.expect(!presentation.help_visible);
+
+    try browserKey(&presentation, 'q');
+    try testing.expect(presentation.projection().shutting_down);
+    try testing.expect(!presentation.readyToExit());
+    try presentation.dispatch(.{ .adjacent_detected = .{ .command_id = detect.command_id, .outcome = .{ .open = try OwnedReviewIdentity.init("check24", "repo", 7) } } });
+    try expectNoCommand(&presentation);
+    try testing.expect(presentation.readyToExit());
+}
+
+test "M24 startup an open outcome loads its review Session, and a browse outcome starts the Browser with its Browser Start" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var opened = try startupTestPresentation(&store);
+    defer opened.deinit();
+    const open_detect = try takeDetectCommand(&opened);
+    const key = try OwnedReviewIdentity.init("check24", "repo", 7);
+    try opened.dispatch(.{ .adjacent_detected = .{ .command_id = open_detect.command_id, .outcome = .{ .open = key } } });
+    try testing.expect(opened.projection().detecting == null);
+    try testing.expect(opened.projection().browser == null);
+    try testing.expectEqual(@as(?u64, 7), opened.projection().loading_pull_request_id);
+    const load = opened.takeCommand().?;
+    try testing.expect(OwnedReviewIdentity.eql(key, load.load_session.key));
+    try testing.expectEqual(keymap_mod.InteractionContext.diff, opened.interactionContext());
+
+    var browsed = try startupTestPresentation(&store);
+    defer browsed.deinit();
+    const browse_detect = try takeDetectCommand(&browsed);
+    try browsed.dispatch(.{ .adjacent_detected = .{ .command_id = browse_detect.command_id, .outcome = .{ .browse = .{
+        .workspace = try browser_mod.Name.init("check24"),
+        .repository = try browser_mod.Name.init("repo"),
+        .pull_request_id = 2,
+    } } } });
+    try testing.expect(browsed.projection().detecting == null);
+    try testing.expect(browsed.projection().action_error == null);
+    try testing.expect(browsed.projection().replacement_error == null);
+    try testing.expectEqualStrings("check24", browsed.projection().browser.?.workspace);
+    try testing.expect(browsed.browser.?.nodes.items[0].expanded);
+    try testing.expectEqualStrings("repo", browsed.browser.?.pending_focus.?.pull_request.repository.slice());
+    try testing.expectEqual(@as(u64, 2), browsed.browser.?.pending_focus.?.pull_request.id);
+    _ = try takeBrowserRepositoriesCommand(&browsed);
+    _ = try takeBrowserPullRequestsCommand(&browsed, "repo");
+    try expectNoCommand(&browsed);
+}
+
+test "M24 startup a failed launch of the detection opens the plain Browser with no note" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try startupTestPresentation(&store);
+    defer presentation.deinit();
+    var command: OwnedCommand = .{ .detect_adjacent_pull_requests = try takeDetectCommand(&presentation) };
+    try presentation.dispatch(try command.launchFailed());
+
+    const projection = presentation.projection();
+    try testing.expect(projection.detecting == null);
+    try testing.expect(projection.action_error == null);
+    try testing.expect(projection.replacement_error == null);
+    try testing.expectEqual(@as(usize, 0), presentation.browser.?.nodes.items.len);
+    try testing.expect(presentation.browser.?.pending_focus == null);
+    _ = try takeBrowserRepositoriesCommand(&presentation);
     try expectNoCommand(&presentation);
 }

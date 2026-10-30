@@ -299,6 +299,56 @@ pub fn executeReviewerVerdict(
     } };
 }
 
+/// Runs the remote step of Startup Detection. A failed detection and a name
+/// that does not fit give a plain Browser.
+pub fn detectAdjacentPullRequests(allocator: std.mem.Allocator, client: bbr.bitbucket.Client, command: presentation.DetectAdjacentPullRequests) presentation.OwnedInput {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const detection = command.detection;
+    const outcome = bbr.startup.detect(arena.allocator(), client, .{
+        .repository = detection.repository.slice(),
+        .branch = detection.branch.slice(),
+        .named = detection.named,
+    });
+    return .{ .adjacent_detected = .{
+        .command_id = command.command_id,
+        .outcome = adjacentOutcome(detection.workspace, outcome) catch .{ .browse = .{ .workspace = detection.workspace } },
+    } };
+}
+
+fn adjacentOutcome(workspace: browser.Name, outcome: bbr.startup.Outcome) !presentation.AdjacentOutcome {
+    return switch (outcome) {
+        .open => |target| .{ .open = try presentation.OwnedReviewIdentity.init(workspace.slice(), target.repository, target.id) },
+        .browse => |browse| .{ .browse = try browserStart(workspace, browse) },
+        .failed => |failed| .{ .browse = try browserStart(workspace, failed.browse) },
+    };
+}
+
+/// The Browser Start for a Startup Detection result.
+pub fn browserStart(workspace: browser.Name, browse: bbr.startup.Browse) !presentation.BrowserStart {
+    return .{
+        .workspace = workspace,
+        .repository = if (browse.repository) |repository| try browser.Name.init(repository) else null,
+        .pull_request_id = browse.pull_request_id,
+    };
+}
+
+/// The first input of a remote run. A Repository or branch name that does
+/// not fit gives a plain Browser.
+pub fn startInput(workspace: []const u8, start: bbr.startup.Start) !presentation.OwnedInput {
+    const name = try browser.Name.init(workspace);
+    return switch (start) {
+        .open => |target| .{ .choose_pull_request = try presentation.OwnedReviewIdentity.init(workspace, target.repository, target.id) },
+        .detect => |detection| .{ .detect_startup = .{
+            .workspace = name,
+            .repository = browser.Name.init(detection.repository) catch return .{ .start_browser = .{ .workspace = name } },
+            .branch = browser.Name.init(detection.branch) catch return .{ .start_browser = .{ .workspace = name } },
+            .named = detection.named,
+        } },
+        .browse => |browse| .{ .start_browser = browserStart(name, browse) catch .{ .workspace = name } },
+    };
+}
+
 /// Lists the Repository Summaries of the Workspace. The completion owns them.
 pub fn listBrowserRepositories(allocator: std.mem.Allocator, client: bbr.bitbucket.Client, command: presentation.ListBrowserRepositories) presentation.OwnedInput {
     return .{ .browser_repositories_loaded = .{
@@ -711,4 +761,27 @@ test "M24 cache a failed save reports the failure and consumes the command" {
     defer failed.deinit();
     try testing.expectEqual(@as(presentation.CommandId, 6), failed.summary_cache_saved.command_id);
     try testing.expect(!failed.summary_cache_saved.saved);
+}
+
+test "M24 startup the detection worker opens one AdjacentPullRequest and turns a failure into a plain Browser" {
+    const credential: bbr.bitbucket.Credential = .{ .username = "u", .token = "t", .workspace = "check24" };
+    const command: presentation.DetectAdjacentPullRequests = .{ .command_id = 6, .detection = .{
+        .workspace = try browser.Name.init("check24"),
+        .repository = try browser.Name.init("pr-webapp"),
+        .branch = try browser.Name.init("feature/x"),
+        .named = true,
+    } };
+    var one: bbr.http.FakeHttpClient = .{ .body =
+        \\{"values":[{"id":99,"title":"t","state":"OPEN","source":{"branch":{"name":"feature/x"}},"destination":{"branch":{"name":"main"}}}]}
+    };
+    const opened = detectAdjacentPullRequests(testing.allocator, bbr.bitbucket.Client.init(one.httpClient(), credential), command);
+    try testing.expectEqual(@as(presentation.CommandId, 6), opened.adjacent_detected.command_id);
+    try testing.expect(presentation.OwnedReviewIdentity.eql(try .init("check24", "pr-webapp", 99), opened.adjacent_detected.outcome.open));
+
+    var failing: bbr.http.FakeHttpClient = .{ .status = 404, .body = "{}" };
+    const failed = detectAdjacentPullRequests(testing.allocator, bbr.bitbucket.Client.init(failing.httpClient(), credential), command);
+    const start = failed.adjacent_detected.outcome.browse;
+    try testing.expectEqualStrings("check24", start.workspace.slice());
+    try testing.expectEqualStrings("pr-webapp", start.repository.?.slice());
+    try testing.expect(start.pull_request_id == null);
 }

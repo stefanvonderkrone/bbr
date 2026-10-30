@@ -92,6 +92,8 @@ pub const InteractionContext = enum {
     help,
     unknown_resolution,
     delete_confirmation,
+    /// The Detecting Frame. Only `quit` resolves in it.
+    detecting,
     /// The Browser with no selectable Browser Entry under the cursor.
     browser,
     browser_repository,

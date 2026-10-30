@@ -1,23 +1,19 @@
-//! Startup resolution: decide what the reviewer lands on when `bbr` launches.
-//! The precedence (design doc §startup) is
+//! Startup Detection: the lookup that plain `bbr`, `bbr <repo-slug>`, and
+//! `bbr detect` run.
 //!
-//!   pasted PR URL  →  explicit repo+id arg  →  auto-detect from the worktree.
+//! It has two steps. `inspect` reads only the GitClient, so it runs before the
+//! TUI starts and never waits for the network. `detect` lists the
+//! AdjacentPullRequests and runs on a worker after the TUI starts. Exactly one
+//! AdjacentPullRequest opens its review Session. Every other result opens the
+//! Browser with a Browser Start.
 //!
-//! Auto-detect resolves the repo from the tracking Remote and lists the open
-//! PRs opened from the current branch (the AdjacentPullRequest): exactly one
-//! opens straight away, several raise a pre-filtered Picker, none falls back to
-//! a Picker over *all* open PRs (the no-PR chooser). An empty repo yields
-//! `empty`. The orchestration talks only to the GitClient and Bitbucket Client
-//! seams, so it is exercised end to end with fakes — no git, no network.
+//! The pasted URL path and the `<repo> <id>` path skip Startup Detection.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const bitbucket = @import("bitbucket/client.zig");
-const Client = bitbucket.Client;
-const PullRequestSummary = @import("bitbucket/types.zig").PullRequestSummary;
+const Client = @import("bitbucket/client.zig").Client;
 const gitmod = @import("git/client.zig");
 const GitClient = gitmod.GitClient;
-const GitError = gitmod.GitError;
 const url = @import("bitbucket/url.zig");
 
 /// What the caller passes through from argv.
@@ -30,139 +26,122 @@ pub const Input = struct {
     id: ?u64 = null,
 };
 
-/// The resolved landing point. All owned strings/slices belong to the allocator
-/// passed to `resolve`; pass a session-scoped arena and none of it needs freeing.
-pub const Entry = union(enum) {
-    /// Open this PR directly.
-    open: Target,
-    /// Present a Picker; `prefiltered` distinguishes "PRs from your branch"
-    /// from "all open PRs" (the no-PR fallback).
-    pick: Picker,
-    /// No open PRs in the repo at all; the field is the repo slug.
-    empty: []const u8,
-};
-
+/// One PullRequest to open.
 pub const Target = struct {
-    repo_slug: []const u8,
+    repository: []const u8,
     id: u64,
 };
 
-pub const Picker = struct {
-    repo_slug: []const u8,
-    /// True: filtered to the current branch. False: every open PR (fallback).
-    prefiltered: bool,
-    /// The current branch, or "" when detached/unknown (for the picker header).
+/// The Repository that `detect` searches and the branch it searches for.
+pub const Detection = struct {
+    repository: []const u8,
     branch: []const u8,
-    prs: []PullRequestSummary,
+    /// True when `<repo-slug>` named the Repository. A failed list then keeps
+    /// that Repository expanded.
+    named: bool,
 };
 
-/// Resolve the startup entry. `git` and `bb` are seams; in tests they are fakes.
-pub fn resolve(allocator: Allocator, git: GitClient, bb: Client, input: Input) !Entry {
-    // 1. A pasted URL wins. We open by (repo, id); the URL's workspace must
-    //    match the configured credential's workspace (cross-workspace review is
-    //    out of scope for the MVP), which the caller's Client enforces on fetch.
-    if (input.url) |u| {
-        const ref = try url.parse(u);
-        return .{ .open = .{
-            .repo_slug = try allocator.dupe(u8, ref.repo_slug),
-            .id = ref.id,
-        } };
+/// A Browser Start: the expanded Repository and the focused PullRequest. The
+/// Browser focuses an expanded Repository until its PullRequest row appears.
+pub const Browse = struct {
+    repository: ?[]const u8 = null,
+    pull_request_id: ?u64 = null,
+};
+
+/// The local step: a Repository and branch to search, or a Browser Start.
+pub const Inspection = union(enum) {
+    detect: Detection,
+    browse: Browse,
+};
+
+/// The remote step.
+pub const Outcome = union(enum) {
+    /// Exactly one AdjacentPullRequest.
+    open: Target,
+    browse: Browse,
+    /// The list request failed. The Browser starts with `browse`.
+    failed: struct { reason: anyerror, browse: Browse },
+};
+
+/// What the TUI starts with.
+pub const Start = union(enum) {
+    /// The URL path and the `<repo> <id>` path.
+    open: Target,
+    /// The TUI shows the Detecting Frame and runs `detect` on a worker.
+    detect: Detection,
+    browse: Browse,
+};
+
+/// The Start for argv. Only plain `bbr` and `bbr <repo-slug>` inspect Git.
+/// The URL Workspace must match the Credential Workspace; the Client enforces
+/// that on fetch.
+pub fn start(allocator: Allocator, git: GitClient, workspace: []const u8, input: Input) !Start {
+    if (input.url) |text| {
+        const ref = try url.parse(text);
+        return .{ .open = .{ .repository = try allocator.dupe(u8, ref.repo_slug), .id = ref.id } };
     }
-
-    // 2. Explicit repo + id opens directly.
-    if (input.id) |id| {
-        const repo = try resolveRepo(allocator, git, input.repo_slug);
-        return .{ .open = .{ .repo_slug = repo, .id = id } };
-    }
-
-    // 3. Auto-detect from the worktree.
-    const repo = try resolveRepo(allocator, git, input.repo_slug);
-
-    // The current branch drives the AdjacentPullRequest lookup. A detached HEAD
-    // (or any branch error) just means "no branch to filter by" — fall through
-    // to the all-open picker rather than failing.
-    const branch: []const u8 = git.currentBranch(allocator) catch |err| switch (err) {
-        GitError.DetachedHead => "",
-        else => return err,
+    if (input.id) |id| return .{ .open = .{ .repository = input.repo_slug orelse return error.MissingRepository, .id = id } };
+    return switch (inspect(allocator, git, workspace, input)) {
+        .detect => |detection| .{ .detect = detection },
+        .browse => |browse| .{ .browse = browse },
     };
-
-    if (branch.len > 0) {
-        const matches = try bb.listPullRequests(allocator, repo, .{ .source_branch = branch });
-        switch (matches.len) {
-            0 => {}, // fall through to the all-open picker
-            1 => return .{ .open = .{ .repo_slug = repo, .id = matches[0].id } },
-            else => return .{ .pick = .{
-                .repo_slug = repo,
-                .prefiltered = true,
-                .branch = branch,
-                .prs = matches,
-            } },
-        }
-    }
-
-    // 0 adjacent PRs (or detached HEAD): offer every open PR.
-    const all = try bb.listPullRequests(allocator, repo, .{});
-    if (all.len == 0) return .{ .empty = repo };
-    return .{ .pick = .{
-        .repo_slug = repo,
-        .prefiltered = false,
-        .branch = branch,
-        .prs = all,
-    } };
 }
 
-/// The repo slug: the explicit arg if given, else the tracking Remote's slug.
-fn resolveRepo(allocator: Allocator, git: GitClient, explicit: ?[]const u8) ![]const u8 {
-    if (explicit) |r| return allocator.dupe(u8, r);
-    const remote = try git.remote(allocator);
-    // We only need the slug here; free the workspace copy the seam handed us.
-    allocator.free(remote.workspace);
-    return remote.repo_slug;
+/// Reads the current branch and the Remote. It takes no Client, so it sends
+/// no request. Every Git error gives a Browser Start. The strings belong to
+/// `allocator`.
+pub fn inspect(allocator: Allocator, git: GitClient, workspace: []const u8, input: Input) Inspection {
+    if (input.repo_slug) |repository| {
+        const branch = git.currentBranch(allocator) catch return .{ .browse = .{ .repository = repository } };
+        return .{ .detect = .{ .repository = repository, .branch = branch, .named = true } };
+    }
+    const remote = git.remote(allocator) catch return .{ .browse = .{} };
+    if (!std.ascii.eqlIgnoreCase(remote.workspace, workspace)) return .{ .browse = .{} };
+    const branch = git.currentBranch(allocator) catch return .{ .browse = .{ .repository = remote.repo_slug } };
+    return .{ .detect = .{ .repository = remote.repo_slug, .branch = branch, .named = false } };
+}
+
+/// Lists the open PullRequests whose source Branch is `detection.branch`. The
+/// newest AdjacentPullRequest has the highest PullRequestId, because Bitbucket
+/// assigns ids in creation order. The strings belong to `allocator`.
+pub fn detect(allocator: Allocator, bb: Client, detection: Detection) Outcome {
+    const matches = bb.listPullRequests(allocator, detection.repository, .{ .source_branch = detection.branch }) catch |err|
+        return .{ .failed = .{
+            .reason = err,
+            .browse = if (detection.named) .{ .repository = detection.repository } else .{},
+        } };
+    if (matches.len == 1) return .{ .open = .{ .repository = detection.repository, .id = matches[0].id } };
+    var newest: ?u64 = null;
+    for (matches) |pr| newest = @max(newest orelse pr.id, pr.id);
+    return .{ .browse = .{ .repository = detection.repository, .pull_request_id = newest } };
+}
+
+/// Prints the `bbr detect` outcome line. A failure adds its reason above it.
+pub fn describe(outcome: Outcome, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const browse = switch (outcome) {
+        .open => |target| return writer.print("resolved: open {s} #{d}\n", .{ target.repository, target.id }),
+        .browse => |browse| browse,
+        .failed => |failed| blk: {
+            try writer.print("reason: {s}\n", .{@errorName(failed.reason)});
+            break :blk failed.browse;
+        },
+    };
+    const repository = browse.repository orelse return writer.writeAll("resolved: browser\n");
+    if (browse.pull_request_id) |id| return writer.print("resolved: browser {s} expanded, focus #{d}\n", .{ repository, id });
+    try writer.print("resolved: browser {s} expanded\n", .{repository});
 }
 
 // ---------------------------------------------------------------------------
-// Tests — FakeGitClient + FakeHttpClient drive every resolution branch.
+// Tests: FakeGitClient and FakeHttpClient drive every Startup Detection path.
 // ---------------------------------------------------------------------------
 const testing = std.testing;
 const FakeGitClient = gitmod.FakeGitClient;
+const GitError = gitmod.GitError;
 const FakeHttpClient = @import("http/fake_client.zig").FakeHttpClient;
 const Credential = @import("bitbucket/credential.zig").Credential;
 
 fn testCred() Credential {
     return .{ .username = "u", .token = "t", .workspace = "check24" };
-}
-
-test "a pasted URL opens that PR directly" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var git: FakeGitClient = .{}; // untouched by the URL path
-    var http: FakeHttpClient = .{};
-    const bb = Client.init(http.httpClient(), testCred());
-
-    const entry = try resolve(a, git.gitClient(), bb, .{
-        .url = "https://bitbucket.org/check24/pr-webapp/pull-requests/1726",
-    });
-    try testing.expect(entry == .open);
-    try testing.expectEqualStrings("pr-webapp", entry.open.repo_slug);
-    try testing.expectEqual(@as(u64, 1726), entry.open.id);
-    try testing.expectEqual(@as(usize, 0), http.call_count); // no listing needed
-}
-
-test "explicit repo + id opens directly without touching the remote" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var git: FakeGitClient = .{ .remote_result = GitError.NoRemote };
-    var http: FakeHttpClient = .{};
-    const bb = Client.init(http.httpClient(), testCred());
-
-    const entry = try resolve(a, git.gitClient(), bb, .{ .repo_slug = "myrepo", .id = 7 });
-    try testing.expect(entry == .open);
-    try testing.expectEqualStrings("myrepo", entry.open.repo_slug);
-    try testing.expectEqual(@as(u64, 7), entry.open.id);
 }
 
 const one_match =
@@ -173,109 +152,129 @@ const one_match =
 ;
 const two_matches =
     \\{ "values": [
-    \\  { "id": 99, "title": "a", "state": "OPEN",
+    \\  { "id": 100, "title": "a", "state": "OPEN",
     \\    "source": { "branch": { "name": "feature/x" } },
     \\    "destination": { "branch": { "name": "main" } } },
-    \\  { "id": 100, "title": "b", "state": "OPEN",
+    \\  { "id": 104, "title": "b", "state": "OPEN",
+    \\    "source": { "branch": { "name": "feature/x" } },
+    \\    "destination": { "branch": { "name": "main" } } },
+    \\  { "id": 99, "title": "c", "state": "OPEN",
     \\    "source": { "branch": { "name": "feature/x" } },
     \\    "destination": { "branch": { "name": "main" } } } ] }
 ;
 const no_values = "{ \"values\": [] }";
 
-test "one adjacent PR opens directly, repo from the remote" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var git: FakeGitClient = .{
-        .branch = "feature/x",
-        .remote_result = .{ .workspace = "check24", .repo_slug = "pr-webapp" },
-    };
-    var http: FakeHttpClient = .{ .status = 200, .body = one_match };
-    const bb = Client.init(http.httpClient(), testCred());
-
-    const entry = try resolve(a, git.gitClient(), bb, .{});
-    try testing.expect(entry == .open);
-    try testing.expectEqualStrings("pr-webapp", entry.open.repo_slug);
-    try testing.expectEqual(@as(u64, 99), entry.open.id);
+fn expectBrowse(expected: Browse, actual: Browse) !void {
+    if (expected.repository) |repository| try testing.expectEqualStrings(repository, actual.repository.?) else try testing.expect(actual.repository == null);
+    try testing.expectEqual(expected.pull_request_id, actual.pull_request_id);
 }
 
-test "several adjacent PRs raise a pre-filtered picker" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var git: FakeGitClient = .{
-        .branch = "feature/x",
-        .remote_result = .{ .workspace = "check24", .repo_slug = "pr-webapp" },
-    };
-    var http: FakeHttpClient = .{ .status = 200, .body = two_matches };
-    const bb = Client.init(http.httpClient(), testCred());
-
-    const entry = try resolve(a, git.gitClient(), bb, .{});
-    try testing.expect(entry == .pick);
-    try testing.expect(entry.pick.prefiltered);
-    try testing.expectEqualStrings("feature/x", entry.pick.branch);
-    try testing.expectEqual(@as(usize, 2), entry.pick.prs.len);
+fn expectDetect(repository: []const u8, named: bool, inspection: Inspection) !void {
+    try testing.expectEqualStrings(repository, inspection.detect.repository);
+    try testing.expectEqualStrings("feature/x", inspection.detect.branch);
+    try testing.expectEqual(named, inspection.detect.named);
 }
 
-test "no adjacent PR falls back to a picker over all open PRs" {
+test "M24 startup every Inspection and Outcome" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    const remote: @import("git/remote.zig").Remote = .{ .workspace = "check24", .repo_slug = "pr-webapp" };
 
-    var git: FakeGitClient = .{
-        .branch = "feature/x",
-        .remote_result = .{ .workspace = "check24", .repo_slug = "pr-webapp" },
-    };
-    // 1st list (filtered) is empty; 2nd list (all open) returns two.
-    const Canned = @import("http/fake_client.zig").Canned;
-    const responses = [_]Canned{
-        .{ .status = 200, .body = no_values },
-        .{ .status = 200, .body = two_matches },
-    };
-    var http: FakeHttpClient = .{ .responses = &responses };
-    const bb = Client.init(http.httpClient(), testCred());
+    // Inspection: a named Repository with a branch, then with each Git error.
+    var git: FakeGitClient = .{ .branch = "feature/x" };
+    try expectDetect("named", true, inspect(a, git.gitClient(), "check24", .{ .repo_slug = "named" }));
+    for ([_]anyerror{ GitError.DetachedHead, GitError.NotAGitRepo, error.GitFailed }) |err| {
+        git = .{ .branch = err, .remote_result = remote };
+        try expectBrowse(.{ .repository = "named" }, (inspect(a, git.gitClient(), "check24", .{ .repo_slug = "named" })).browse);
+    }
+    // No argument: the Remote Repository, a detached HEAD, and no Remote.
+    git = .{ .branch = "feature/x", .remote_result = remote };
+    try expectDetect("pr-webapp", false, inspect(a, git.gitClient(), "check24", .{}));
+    git = .{ .branch = GitError.DetachedHead, .remote_result = remote };
+    try expectBrowse(.{ .repository = "pr-webapp" }, (inspect(a, git.gitClient(), "check24", .{})).browse);
+    for ([_]anyerror{ GitError.NotAGitRepo, GitError.NoRemote }) |err| {
+        git = .{ .branch = "feature/x", .remote_result = err };
+        try expectBrowse(.{}, (inspect(a, git.gitClient(), "check24", .{})).browse);
+    }
 
-    const entry = try resolve(a, git.gitClient(), bb, .{});
-    try testing.expect(entry == .pick);
-    try testing.expect(!entry.pick.prefiltered);
-    try testing.expectEqual(@as(usize, 2), entry.pick.prs.len);
-    try testing.expectEqual(@as(usize, 2), http.call_count);
+    // Outcome: one, several, and no AdjacentPullRequest.
+    const detection: Detection = .{ .repository = "pr-webapp", .branch = "feature/x", .named = false };
+    var http: FakeHttpClient = .{ .body = one_match };
+    var outcome = detect(a, Client.init(http.httpClient(), testCred()), detection);
+    try testing.expectEqualStrings("pr-webapp", outcome.open.repository);
+    try testing.expectEqual(@as(u64, 99), outcome.open.id);
+
+    http = .{ .body = two_matches };
+    outcome = detect(a, Client.init(http.httpClient(), testCred()), detection);
+    try expectBrowse(.{ .repository = "pr-webapp", .pull_request_id = 104 }, outcome.browse);
+
+    http = .{ .body = no_values };
+    outcome = detect(a, Client.init(http.httpClient(), testCred()), detection);
+    try expectBrowse(.{ .repository = "pr-webapp" }, outcome.browse);
+
+    // A failed list request: plain without an argument, expanded with one.
+    http = .{ .status = 404, .body = "{}" };
+    outcome = detect(a, Client.init(http.httpClient(), testCred()), detection);
+    try testing.expectEqual(@as(anyerror, error.NotFound), outcome.failed.reason);
+    try expectBrowse(.{}, outcome.failed.browse);
+    var named = detection;
+    named.named = true;
+    outcome = detect(a, Client.init(http.httpClient(), testCred()), named);
+    try expectBrowse(.{ .repository = "pr-webapp" }, outcome.failed.browse);
 }
 
-test "detached HEAD skips the branch filter and lists all open PRs" {
+test "M24 startup a Remote in another Workspace gives a plain Browser, and ASCII case does not matter" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    var git: FakeGitClient = .{
-        .branch = GitError.DetachedHead,
-        .remote_result = .{ .workspace = "check24", .repo_slug = "pr-webapp" },
-    };
-    var http: FakeHttpClient = .{ .status = 200, .body = two_matches };
-    const bb = Client.init(http.httpClient(), testCred());
+    var git: FakeGitClient = .{ .branch = "feature/x", .remote_result = .{ .workspace = "elsewhere", .repo_slug = "pr-webapp" } };
+    try expectBrowse(.{}, (inspect(a, git.gitClient(), "check24", .{})).browse);
+    git.branch = GitError.DetachedHead;
+    try expectBrowse(.{}, (inspect(a, git.gitClient(), "check24", .{})).browse);
 
-    const entry = try resolve(a, git.gitClient(), bb, .{});
-    try testing.expect(entry == .pick);
-    try testing.expect(!entry.pick.prefiltered);
-    try testing.expectEqualStrings("", entry.pick.branch);
-    try testing.expectEqual(@as(usize, 1), http.call_count); // only the all-open list
+    git = .{ .branch = "feature/x", .remote_result = .{ .workspace = "Check24", .repo_slug = "pr-webapp" } };
+    try expectDetect("pr-webapp", false, inspect(a, git.gitClient(), "CHECK24", .{}));
 }
 
-test "an empty repo yields empty" {
+test "M24 startup the URL and the <repo> <id> paths open directly without Git" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    var git: FakeGitClient = .{ .branch = GitError.NotAGitRepo };
 
-    var git: FakeGitClient = .{
-        .branch = "feature/x",
-        .remote_result = .{ .workspace = "check24", .repo_slug = "pr-webapp" },
-    };
-    var http: FakeHttpClient = .{ .status = 200, .body = no_values };
-    const bb = Client.init(http.httpClient(), testCred());
+    const pasted = try start(a, git.gitClient(), "check24", .{ .url = "https://bitbucket.org/check24/pr-webapp/pull-requests/1726" });
+    try testing.expectEqualStrings("pr-webapp", pasted.open.repository);
+    try testing.expectEqual(@as(u64, 1726), pasted.open.id);
 
-    const entry = try resolve(a, git.gitClient(), bb, .{});
-    try testing.expect(entry == .empty);
-    try testing.expectEqualStrings("pr-webapp", entry.empty);
+    const explicit = try start(a, git.gitClient(), "check24", .{ .repo_slug = "myrepo", .id = 7 });
+    try testing.expectEqualStrings("myrepo", explicit.open.repository);
+    try testing.expectEqual(@as(u64, 7), explicit.open.id);
+
+    try expectBrowse(.{}, (try start(a, git.gitClient(), "check24", .{})).browse);
+    git = .{ .branch = "feature/x" };
+    try testing.expectEqualStrings("feature/x", (try start(a, git.gitClient(), "check24", .{ .repo_slug = "myrepo" })).detect.branch);
+}
+
+test "M24 startup describe prints each bbr detect line" {
+    var buffer: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try describe(.{ .open = .{ .repository = "pr-webapp", .id = 99 } }, &writer);
+    try describe(.{ .browse = .{ .repository = "pr-webapp", .pull_request_id = 104 } }, &writer);
+    try describe(.{ .browse = .{ .repository = "pr-webapp" } }, &writer);
+    try describe(.{ .browse = .{} }, &writer);
+    try describe(.{ .failed = .{ .reason = error.NotFound, .browse = .{ .repository = "named" } } }, &writer);
+    try describe(.{ .failed = .{ .reason = error.Unauthorized, .browse = .{} } }, &writer);
+    try testing.expectEqualStrings(
+        \\resolved: open pr-webapp #99
+        \\resolved: browser pr-webapp expanded, focus #104
+        \\resolved: browser pr-webapp expanded
+        \\resolved: browser
+        \\reason: NotFound
+        \\resolved: browser named expanded
+        \\reason: Unauthorized
+        \\resolved: browser
+        \\
+    , writer.buffered());
 }

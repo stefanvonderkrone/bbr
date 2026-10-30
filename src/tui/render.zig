@@ -2461,6 +2461,16 @@ pub fn drawLoading(scratch: std.mem.Allocator, win: vaxis.Window, id: ?u64, them
     _ = childRect(win, rects.get(.line).content).printSegment(.{ .text = text, .style = theme.picker_query }, .{ .wrap = .none });
 }
 
+/// The Detecting Frame: the loading dialog that names the current branch
+/// while Startup Detection lists the AdjacentPullRequests.
+pub fn drawDetecting(scratch: std.mem.Allocator, win: vaxis.Window, branch: []const u8, theme: Theme) void {
+    if (win.height == 0 or win.width == 0) return;
+    win.clear();
+    const rects = view_paint.paint(layouts.LoadingSlot, layouts.loading, {}, win, theme);
+    const text = std.fmt.allocPrint(scratch, " Detecting PR for {s}…", .{branch}) catch " Detecting PR…";
+    _ = childRect(win, rects.get(.line).content).printSegment(.{ .text = text, .style = theme.picker_query }, .{ .wrap = .none });
+}
+
 fn drawUnifiedGutter(win: vaxis.Window, row: u16, old_no: ?u32, new_no: ?u32, style: vaxis.Style) void {
     var text: [32]u8 = undefined;
     var length = formatNumCol(&text, old_no);
@@ -5623,6 +5633,22 @@ const browser_test_entries = [_]browser.Entry{
     .{ .repository = 1 },
     .{ .message = .{ .pull_requests_failed = .{ .repository = 1, .reason = error.Forbidden } } },
 };
+
+test "M24 startup the Detecting Frame names the branch in the loading dialog" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+
+    drawDetecting(a, win, "feature/x", theme_dark);
+
+    // The dialog matches the "Loading PR #N…" frame: 48×3 at x=16, y=10.
+    try testing.expectEqualStrings("╭", win.readCell(16, 10).?.char.grapheme);
+    const line = try browserRowText(a, win, 11);
+    try testing.expect(std.mem.indexOf(u8, line, "│ Detecting PR for feature/x…") != null);
+}
 
 test "M24 browser the Browser Pane has rounded corners and the Workspace Title" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

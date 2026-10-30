@@ -36,7 +36,7 @@ pub const RunCtx = struct {
     gpa: std.mem.Allocator,
     env_map: *std.process.Environ.Map,
     bitbucket: ?bbr.bitbucket.Client = null,
-    repo: []const u8,
+    start: Start,
     store: PendingReviewStore,
     theme: ThemeId,
     /// False for the demo, which must not change the reviewer's config.toml.
@@ -55,6 +55,14 @@ pub const RunCtx = struct {
     /// `$XDG_STATE_HOME/bbr/browser-cache.json`, or null to disable the
     /// Summary Cache. `src/main.zig` builds it.
     summary_cache_path: ?[]const u8 = null,
+};
+
+/// What the TUI opens first.
+pub const Start = union(enum) {
+    /// A LocalReview or the demo. The demo passes its Session to `run`.
+    review: presentation.OwnedReviewIdentity,
+    /// A remote run. The Credential Workspace completes each identity.
+    remote: bbr.startup.Start,
 };
 
 /// Terminal events plus the single typed completion channel used by every
@@ -99,7 +107,7 @@ const PickerTickTransition = union(enum) {
 
 const picker_tick_interval_ms = 250;
 
-fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.OwnedReviewIdentity) !void {
+fn runPresentation(ctx: RunCtx, initial: ?*Session) !void {
     var anchor_git = bbr.git.ShellGitClient.init(ctx.gpa, ctx.io);
     var git_anchor_resolver = bbr.review.GitAnchorResolver.init(ctx.gpa, anchor_git.gitClient());
     defer git_anchor_resolver.deinit();
@@ -124,13 +132,16 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         .summary_cache = ctx.summary_cache_path != null,
     }, .{
         .initial = if (initial) |loaded| .{
-            .key = initial_key,
+            .key = ctx.start.review,
             .session = loaded,
         } else null,
         .viewport_rows = 1,
     });
     defer state.deinit();
-    if (initial == null) try state.dispatch(.{ .choose_pull_request = initial_key });
+    if (initial == null) try state.dispatch(switch (ctx.start) {
+        .review => |key| .{ .choose_pull_request = key },
+        .remote => |start| try presentation_adapter.startInput(ctx.bitbucket.?.cred.workspace, start),
+    });
 
     var write_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(ctx.io, &write_buf);
@@ -205,7 +216,9 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         const regions = windowRegions(win, statusRows(&status_items, win));
         const content_win = childRect(win, regions.get(.content).content);
         drawStatus(childRect(win, regions.get(.status).content), &status_items);
-        if (projection.browser) |browser_projection| {
+        if (projection.detecting) |branch| {
+            render.drawDetecting(frame, content_win, branch, active_theme);
+        } else if (projection.browser) |browser_projection| {
             render.drawBrowser(frame, content_win, browser_projection, active_theme);
         } else if (projection.review) |review_projection| {
             const visual_cursor = review_projection.frame.navigation.cursor;
@@ -641,13 +654,13 @@ fn submissionAbortName(completion: bbr.review.SubmissionCompletion) ?[]const u8 
     };
 }
 
-/// Run the viewer. `initial` is a pre-built Session (the offline demo) or null,
-/// in which case PR `initial_id` is loaded on a worker thread while a "Loading
-/// PR #N…" frame shows — the TUI never blocks the alt-screen on the first fetch.
-/// Takes ownership of the current Session and destroys it (and any it switches
-/// to) before returning.
-pub fn run(ctx: RunCtx, initial: ?*Session, initial_key: presentation.OwnedReviewIdentity) !void {
-    return runPresentation(ctx, initial, initial_key);
+/// Run the viewer. `initial` is a pre-built Session (the offline demo) or null.
+/// With null, `ctx.start` decides the first frame: "Loading PR #N…", the
+/// Detecting Frame, or the Browser. The TUI never blocks the alt-screen on the
+/// network. Takes ownership of the current Session and destroys it (and any it
+/// switches to) before returning.
+pub fn run(ctx: RunCtx, initial: ?*Session) !void {
+    return runPresentation(ctx, initial);
 }
 
 /// Opt-in interactive PTY check for the terminal behavior deterministic fakes
@@ -1008,6 +1021,11 @@ fn loadPullRequestSummaries(
     summaries.prs = try client.listPullRequests(summaries.arena.allocator(), repository, .{});
 }
 
+fn presentationDetectWorker(loop: *Loop, work_id: u64, client: bbr.bitbucket.Client, command: presentation.DetectAdjacentPullRequests) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.detectAdjacentPullRequests(std.heap.page_allocator, client, command));
+}
+
 fn presentationBrowserRepositoriesWorker(loop: *Loop, work_id: u64, client: bbr.bitbucket.Client, command: presentation.ListBrowserRepositories) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.listBrowserRepositories(std.heap.page_allocator, client, command));
@@ -1106,6 +1124,7 @@ fn drainPresentationCommands(
             .check_recovery => |check| ctx.io.concurrent(presentationRecoveryCheckWorker, .{ loop, work_id, ctx.bitbucket.?, check }),
             .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, ctx.bitbucket.?, check }),
             .list_pull_requests => |list| ctx.io.concurrent(presentationListPullRequestsWorker, .{ loop, work_id, ctx.bitbucket.?, list }),
+            .detect_adjacent_pull_requests => |detect| ctx.io.concurrent(presentationDetectWorker, .{ loop, work_id, ctx.bitbucket.?, detect }),
             .list_browser_repositories => |list| ctx.io.concurrent(presentationBrowserRepositoriesWorker, .{ loop, work_id, ctx.bitbucket.?, list }),
             .list_browser_pull_requests => |list| ctx.io.concurrent(presentationBrowserPullRequestsWorker, .{ loop, work_id, ctx.bitbucket.?, list }),
             .load_summary_cache => |load| ctx.io.concurrent(presentationSummaryCacheLoadWorker, .{ loop, work_id, ctx.io, ctx.summary_cache_path.?, load }),
@@ -1241,6 +1260,7 @@ const StatusFacts = struct {
 
 fn projectionStatusItems(frame: std.mem.Allocator, projection: presentation.Projection) StatusItems {
     const active_theme = theme.value(projection.theme);
+    if (projection.detecting != null) return detectingStatusItems(frame, active_theme, projection);
     if (projection.browser != null) return browserStatusItems(frame, active_theme, projection);
     const review = projection.review orelse return loadingStatusItems(active_theme, presentationStatus(frame, projection, null));
     const visual_cursor = review.navigation.cursor;
@@ -1335,6 +1355,13 @@ fn browserStatusItems(frame: std.mem.Allocator, active_theme: theme.Theme, proje
         items.hint(.help, "?", " help");
         items.hint(.quit, "q", " quit");
     }
+    return items;
+}
+
+/// The Detecting Frame status: a message, or the only hint, `q quit`.
+fn detectingStatusItems(frame: std.mem.Allocator, active_theme: theme.Theme, projection: presentation.Projection) StatusItems {
+    var items: StatusItems = .init(active_theme);
+    if (presentationStatus(frame, projection, null)) |message| items.add(.message, message, .message) else items.hint(.quit, "q", " quit");
     return items;
 }
 

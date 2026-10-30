@@ -486,6 +486,7 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             => true,
             else => false,
         },
+        .detecting => action == .quit,
         .browser => switch (action) {
             .quit, .help, .refresh, .close_browser, .cycle_browser_sort => true,
             else => false,
@@ -908,6 +909,13 @@ test "M24 browser Actions resolve only in their contexts and remain configurable
     try testing.expect(resolver.feed(configured.keymap(), .browser, plain(special.escape)) == .none);
     try testing.expect(resolver.feed(configured.keymap(), .browser_repository, plain(special.enter)) == .none);
     try testing.expectEqual(Action.open_browser_entry, resolver.feed(configured.keymap(), .browser_pull_request, plain('o')).action);
+}
+
+test "M24 startup only quit resolves in the Detecting Frame" {
+    for (std.enums.values(Action)) |action| try testing.expectEqual(action == .quit, supportsContext(action, .detecting));
+    var resolver: Resolver = .{};
+    try testing.expectEqual(Action.quit, resolver.feed(.default, .detecting, plain('q')).action);
+    for ("bjkpR?") |key| try testing.expect(resolver.feed(.default, .detecting, plain(key)) == .none);
 }
 
 test "M24 browser s cycles the Browser Sort only in the Browser contexts" {

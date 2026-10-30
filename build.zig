@@ -216,6 +216,7 @@ pub fn build(b: *std.Build) void {
         "tests/auth_cli_test.py",
         "tests/api_auth_cli_test.py",
         "tests/completion_cli_test.py",
+        "tests/detect_cli_test.py",
     }) |script| {
         const cli_test = b.addSystemCommand(&.{"python3"});
         cli_test.addFileArg(b.path(script));
