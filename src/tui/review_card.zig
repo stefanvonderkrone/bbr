@@ -291,7 +291,7 @@ pub fn projectInto(allocator: std.mem.Allocator, scratch_allocator: std.mem.Allo
     }
     // A collapsed card adds a hidden-row indicator, so it collapses only when
     // it hides at least two rows and ends shorter than the expanded card.
-    const collapsible = options.collapsed_rows > 0 and body_rows.items.len > options.collapsed_rows + 1;
+    const collapsible = options.collapsed_rows > 0 and body_rows.items.len > options.collapsed_rows +| 1;
     const visible_count = if (collapsible and !options.expanded) options.collapsed_rows else body_rows.items.len;
     var header = makeRow(options, .header, 0, .literal, .{ .start = 0, .end = 0 }, try oneSegment(allocator, .{
         .text = options.header,
@@ -1340,6 +1340,23 @@ test "a ReviewCard collapses only to hide two rows or more, and marks the hidden
         try testing.expectEqual(Part.disclosure_footer, last.part);
         try testing.expectEqual(@as(usize, 2), last.hidden_rows);
     }
+}
+
+test "the largest collapsed_rows keeps every card expanded" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = "```\na\nb\nc\n```" };
+    const rows = try project(allocator, try ReviewBody.parse(allocator, comment.body), .{
+        .owner = .{ .comment = 1 },
+        .source = .{ .comment = &comment },
+        .role = .comment,
+        .header = "Ada",
+        .content_width = 20,
+        .metrics = TestMetrics.value,
+        .collapsed_rows = std.math.maxInt(usize),
+    });
+    try testing.expectEqual(Part.bottom, rows[rows.len - 1].part);
 }
 
 test "the hidden-row indicator drops its hint, then clips its marker, to fit the card" {

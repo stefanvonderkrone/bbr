@@ -441,6 +441,49 @@ test "Enter on the hidden-row indicator expands its ReviewCard" {
     };
 }
 
+fn jumpToBufferRow(published: *Published, buffer_index: usize) !void {
+    for (published.visual_rows, 0..) |visual, index| if (visual.buffer_index == buffer_index) {
+        published.navigation.jumpTo(index);
+        return;
+    };
+    return error.MissingRow;
+}
+
+test "Enter on the hidden-row indicator of a resolved Thread root expands only the ReviewCard" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .viewport_rows = 60,
+    });
+    defer state.deinit();
+    const thread_key: buffer_mod.DisclosureKey = .{ .resolved_thread = 1 };
+    try jumpToBufferRow(state.published.?, findDisclosureRow(state.published.?.buffer.rows, thread_key).?);
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try completeNextDisclosureBuild(&state);
+
+    var indicator: ?usize = null;
+    for (state.published.?.buffer.rows, 0..) |row, index| {
+        if (row == .comment and row.comment.owner.comment == 1 and row.comment.hidden_indicator) indicator = index;
+    }
+    try jumpToBufferRow(state.published.?, indicator.?);
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try completeNextDisclosureBuild(&state);
+
+    const published = state.published.?;
+    var thread_expanded = false;
+    var card_expanded = false;
+    for (published.expanded_disclosures.items) |key| {
+        thread_expanded = thread_expanded or std.meta.eql(key, thread_key);
+        card_expanded = card_expanded or std.meta.eql(key, buffer_mod.DisclosureKey{ .review_card = .{ .comment = 1 } });
+    }
+    try testing.expect(thread_expanded);
+    try testing.expect(card_expanded);
+    for (published.buffer.rows) |row| {
+        if (row == .comment and row.comment.owner.comment == 1) try testing.expect(!row.comment.hidden_indicator);
+    }
+}
+
 test "M23 highlighting complete structural code qualifies exactly at the byte limit and zero is unlimited" {
     const raw = "> ```TS extra\n>   a\tb\n> ```";
     for ([_]usize{ 0, 6, 5 }) |limit| {
@@ -2079,7 +2122,8 @@ const SearchProjection = struct {
             owners[0] = root.id;
             for (thread.replies, owners[1..]) |reply, *id| id.* = reply.id;
             for (owners) |id| {
-                try comment_chains.put(a, id, chain);
+                // A Draft Reply hides with a collapsed resolved Thread too.
+                try comment_chains.put(a, id, required);
                 var keys = required;
                 keys.append(.{ .review_card = .{ .comment = id } });
                 try self.body_disclosures.put(a, .{ .comment = id }, keys);
@@ -7328,8 +7372,17 @@ pub const Presentation = struct {
             if (draftFileIndex(published, temp_id) == index) index else null
         else
             null;
-        self.queueDraftDestination(published, temp_id, required, isolated, 0) catch {
-            self.action_error = .out_of_memory;
+        self.queueDraftDestination(published, temp_id, required, isolated, 0) catch
+            self.failDraftDestination(published, .out_of_memory);
+    }
+
+    /// A failed Draft jump reports its error and shows the Submission Overlay
+    /// that the jump hid.
+    fn failDraftDestination(self: *Presentation, published: *Published, err: ActionError) void {
+        published.pending_draft_destination = null;
+        self.action_error = err;
+        if (self.submission_tree) |tree| if (OwnedReviewIdentity.eql(tree.key, published.key)) {
+            tree.hidden = false;
         };
     }
 
@@ -7355,6 +7408,13 @@ pub const Presentation = struct {
     }
 
     fn landOnDraftCard(self: *Presentation, published: *Published, row: usize) void {
+        // The cursor leaves the Buffer Search match. A restore of the saved
+        // disclosures could hide the Draft again, so the current ones stay.
+        if (published.buffer_search.active != null) {
+            published.buffer_search.active = null;
+            if (published.buffer_search.saved_disclosures) |baseline| baseline.release();
+            published.buffer_search.saved_disclosures = null;
+        }
         published.navigation.clearMark();
         published.navigation.jumpTo(row);
         published.focus = .diff;
@@ -9010,7 +9070,7 @@ pub const Presentation = struct {
             if (job.kind == .view) published.pending_view = null;
             if (job.kind == .draft_save) published.pending_draft_save = null;
             if (job.kind == .draft_mutation) published.pending_draft_mutation = null;
-            if (job.kind == .draft_destination) published.pending_draft_destination = null;
+            if (job.kind == .draft_destination) return self.failDraftDestination(published, .buffer_build_failed);
             if (!job.enrichment_speculative) self.action_error = .buffer_build_failed;
             if (job.enrichment_file) |index| published.session.enrichment.resetLoading(index);
             return;
@@ -9044,17 +9104,13 @@ pub const Presentation = struct {
                     // card, such as the outdated section of a File that
                     // isolation left out. Build once more with it.
                     const required = job.projection.?.body_disclosures.get(.{ .draft = job.destination_draft.? }) orelse SearchDisclosureSet{};
-                    self.queueDraftDestination(published, job.destination_draft.?, required, null, 1) catch {
-                        self.action_error = .out_of_memory;
-                    };
-                } else self.action_error = .no_review_item;
+                    self.queueDraftDestination(published, job.destination_draft.?, required, null, 1) catch
+                        self.failDraftDestination(published, .out_of_memory);
+                } else self.failDraftDestination(published, .no_review_item);
                 return;
             }
-            disclosures.appendSlice(self.allocator, job.disclosures) catch {
-                published.pending_draft_destination = null;
-                self.action_error = .out_of_memory;
-                return;
-            };
+            disclosures.appendSlice(self.allocator, job.disclosures) catch
+                return self.failDraftDestination(published, .out_of_memory);
         }
         if (job.new_draft) |draft| published.persistPreparedDraft(self.dependencies.reviews, draft) catch |err| {
             published.pending_draft_save = null;
@@ -9299,10 +9355,8 @@ pub const Presentation = struct {
                 published.pending_draft_mutation = null;
                 self.action_error = .out_of_memory;
             },
-            .draft_destination => self.queueDraftDestination(published, job.destination_draft.?, job.target.add, job.isolated_file, job.destination_attempt) catch {
-                published.pending_draft_destination = null;
-                self.action_error = .out_of_memory;
-            },
+            .draft_destination => self.queueDraftDestination(published, job.destination_draft.?, job.target.add, job.isolated_file, job.destination_attempt) catch
+                self.failDraftDestination(published, .out_of_memory),
             else => self.retryViewBuild(published, job),
         }
     }
@@ -23184,6 +23238,7 @@ test "M21 kernel search indexes cover Draft chains and release every failed allo
     try store.store().put(key.storeKey(), .{ .local_id = 12, .kind = .comment, .parent = .{ .draft = 11 }, .body = "nested draft" });
     try store.store().put(key.storeKey(), .{ .local_id = 13, .kind = .comment, .parent = .{ .draft = 12 }, .body = "deep draft" });
     try store.store().put(key.storeKey(), .{ .local_id = 14, .kind = .comment, .parent = .{ .comment = 3 }, .body = "outdated reply" });
+    try store.store().put(key.storeKey(), .{ .local_id = 15, .kind = .comment, .parent = .{ .comment = 2 }, .body = "resolved reply" });
     var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
         .initial = .{ .key = key, .session = try testDisclosureSession(testing.allocator, 1) },
     });
@@ -23197,6 +23252,10 @@ test "M21 kernel search indexes cover Draft chains and release every failed allo
     try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .outdated_file = &published.session.diff.files[0] }, outdated.items[0]);
     const reply = index.body_disclosures.get(.{ .comment = 2 }).?;
     try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .resolved_thread = 1 }, reply.items[0]);
+    const resolved_reply = index.body_disclosures.get(.{ .draft = 15 }).?;
+    try testing.expectEqual(@as(usize, 2), resolved_reply.len);
+    try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .resolved_thread = 1 }, resolved_reply.items[0]);
+    try testing.expectEqualDeep(buffer_mod.DisclosureKey{ .review_card = .{ .draft = 15 } }, resolved_reply.items[1]);
     try testing.checkAllAllocationFailures(testing.allocator, exerciseSearchIndexAllocationFailure, .{published});
     var preferences = presentation.preferences;
     preferences.scope = .whole;
@@ -28522,6 +28581,103 @@ test "Enter reveals a Draft that File isolation hides before it jumps" {
     const owner = cursorOwner(&presentation);
     try testing.expect(owner == .draft and owner.draft.id == 1 and owner.draft.part == .header);
     try testing.expectEqual(@as(?usize, 1), review.buffer.fileIndexForRow(review.frame.visual_rows[review.navigation.cursor].buffer_index));
+}
+
+test "a Draft jump clears the accepted Buffer Search match" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "failed root" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') } });
+    defer presentation.deinit();
+    try failSoleDraftSubmission(&presentation, key, try testSession(testing.allocator, 1, 'a'));
+    // Enter hides the Overlay. X shows it again after the search.
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    while (presentation.takeCommand()) |command| {
+        var discarded = command;
+        discarded.deinit();
+    }
+    const published = presentation.published.?;
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.replaceBufferSearchQuery("root");
+    try completeBufferSearchScan(&presentation);
+    while (presentation.takeCommand()) |command| {
+        if (command == .build_buffer_disclosure) {
+            command.build_buffer_disclosure.build();
+            try presentation.dispatch(.{ .buffer_disclosure_built = command.build_buffer_disclosure });
+        } else {
+            var discarded = command;
+            discarded.deinit();
+        }
+    }
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(published.buffer_search.active != null);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'X', .text = "X" } });
+    try testing.expect(presentation.projection().submission_tree != null);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(published.buffer_search.active == null);
+    try testing.expect(published.buffer_search.saved_disclosures == null);
+    const owner = cursorOwner(&presentation);
+    try testing.expect(owner == .draft and owner.draft.id == 1 and owner.draft.part == .header);
+}
+
+test "Enter jumps to a failed Draft Reply under a collapsed resolved Thread" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .parent = .{ .comment = 2 }, .body = "resolved reply" });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{ .initial = .{ .key = key, .session = try testDisclosureSession(testing.allocator, 1) } });
+    defer presentation.deinit();
+    try failSoleDraftSubmission(&presentation, key, try testDisclosureSession(testing.allocator, 1));
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try completeNextDisclosureBuild(&presentation);
+    try testing.expect(presentation.projection().action_error == null);
+    const owner = cursorOwner(&presentation);
+    try testing.expect(owner == .draft and owner.draft.id == 1 and owner.draft.part == .header);
+}
+
+test "a failed Draft jump shows the Submission Overlay again and reports the failure" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var locks = bbr.review.InMemorySubmissionLocks.init(testing.allocator);
+    defer locks.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "on b", .scope = .{ .@"inline" = .{ .path = "b.zig", .to = 1, .commit = "source" } } });
+    var presentation = try Presentation.init(testing.allocator, .{
+        .reviews = store.store(),
+        .submission_locks = locks.locks(),
+    }, .{
+        .initial = .{ .key = key, .session = try testTwoFileSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer presentation.deinit();
+    try failSoleDraftSubmission(&presentation, key, try testTwoFileSession(testing.allocator, 1));
+    try presentation.dispatch(.{ .action = .isolate });
+    try completeNextDisclosureBuild(&presentation);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try testing.expect(presentation.projection().submission_tree == null);
+    while (presentation.commands.items.len > 0 and presentation.commands.items[0] != .build_buffer_disclosure) {
+        var other = presentation.takeCommand().?;
+        other.deinit();
+    }
+    var command = presentation.takeCommand().?;
+    try presentation.dispatch(try command.launchFailed());
+    try testing.expectEqual(ActionError.buffer_build_failed, presentation.projection().action_error.?);
+    try testing.expect(presentation.projection().submission_tree != null);
+    try testing.expect(presentation.published.?.pending_draft_destination == null);
 }
 
 test "help scroll keys move within the help lines and any other key closes the help" {

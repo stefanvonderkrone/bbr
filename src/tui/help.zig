@@ -213,6 +213,31 @@ pub const fixed_sections = [_]FixedSection{
         .{ .keys = "⏎", .description = "link Draft to Comment" },
         .{ .keys = "esc ctrl-c", .description = "cancel" },
     } },
+    // The Composer branch of `applyKey`
+    .{ .title = "Composer", .entries = &.{
+        .{ .keys = "⏎", .description = "insert newline" },
+        .{ .keys = "⌫ ctrl-w ctrl-u", .description = "erase scalar, word, or to line start" },
+        .{ .keys = "ctrl-d ctrl-s", .description = "save" },
+        .{ .keys = "esc ctrl-c", .description = "cancel" },
+    } },
+    // The List Overlay branch of `applyKey`
+    .{ .title = "Pickers and Command Palette", .entries = &.{
+        .{ .keys = "↑ ↓ ctrl-p ctrl-n", .description = "select entry" },
+        .{ .keys = "⌫", .description = "erase scalar" },
+        .{ .keys = "⏎", .description = "confirm entry" },
+        .{ .keys = "esc ctrl-c", .description = "close" },
+    } },
+    // The Buffer Search input branch of `applyKey`
+    .{ .title = "Buffer Search Input", .entries = &.{
+        .{ .keys = "⌫ ctrl-w ctrl-u", .description = "erase scalar, word, or query" },
+        .{ .keys = "⏎", .description = "accept search" },
+        .{ .keys = "esc ctrl-c", .description = "cancel search" },
+    } },
+    // The Review Search branch of `applyKey`
+    .{ .title = "Review Search Input", .entries = &.{
+        .{ .keys = "⌫ ctrl-w ctrl-k", .description = "erase scalar, word, or query" },
+        .{ .keys = "esc ctrl-c", .description = "close Review Search" },
+    } },
     .{ .title = "Help", .entries = &.{
         .{ .keys = "/", .description = "search help with an empty query" },
         .{ .keys = "⌫ ctrl-w ctrl-u", .description = "erase scalar, word, or query during search" },
@@ -233,11 +258,11 @@ pub const fixed_sections = [_]FixedSection{
 };
 
 /// Build the help lines: one heading per section, one entry per Action with
-/// all of its chords, and a blank line between sections.
+/// all of its chords, and a blank line between sections. An Action without a
+/// chord follows the bound Actions of its section as `unbound`.
 fn build(scratch: std.mem.Allocator, km: keymap.Keymap) ![]Line {
     var lines: std.ArrayList(Line) = .empty;
     for (std.enums.values(keymap.HelpSection)) |section| {
-        if (actionCount(km, section) == 0) continue;
         if (lines.items.len > 0) try lines.append(scratch, .blank);
         try lines.append(scratch, .{ .heading = section.title() });
         for (km.bindings, 0..) |binding, index| {
@@ -250,6 +275,10 @@ fn build(scratch: std.mem.Allocator, km: keymap.Keymap) ![]Line {
             }
             try lines.append(scratch, .{ .entry = .{ .keys = keys.items, .description = binding.help, .action = binding.action } });
         }
+        for (std.enums.values(keymap.Action)) |action| {
+            if (keymap.helpSection(action) != section or bound(km, action)) continue;
+            try lines.append(scratch, .{ .entry = .{ .keys = "unbound", .description = try actionHelp(scratch, action), .action = action } });
+        }
     }
     for (fixed_sections) |section| {
         if (lines.items.len > 0) try lines.append(scratch, .blank);
@@ -259,12 +288,18 @@ fn build(scratch: std.mem.Allocator, km: keymap.Keymap) ![]Line {
     return lines.items;
 }
 
-fn actionCount(km: keymap.Keymap, section: keymap.HelpSection) usize {
-    var count: usize = 0;
-    for (km.bindings, 0..) |binding, index| {
-        if (keymap.helpSection(binding.action) == section and firstBinding(km, index)) count += 1;
-    }
-    return count;
+fn bound(km: keymap.Keymap, action: keymap.Action) bool {
+    for (km.bindings) |binding| if (binding.action == action) return true;
+    return false;
+}
+
+/// The help label of the Action's default binding, or its name in words when
+/// no default binding exists.
+fn actionHelp(scratch: std.mem.Allocator, action: keymap.Action) ![]const u8 {
+    for (keymap.default_bindings) |binding| if (binding.action == action) return binding.help;
+    const name = try scratch.dupe(u8, @tagName(action));
+    std.mem.replaceScalar(u8, name, '_', ' ');
+    return name;
 }
 
 fn firstBinding(km: keymap.Keymap, index: usize) bool {
@@ -344,6 +379,35 @@ test "help lists each Action once with all of its chords in its section" {
         },
     };
     try testing.expect(down_found);
+    for (std.enums.values(keymap.Action)) |action| {
+        var count: usize = 0;
+        for (lines) |line| {
+            if (line == .entry and line.entry.action == action) count += 1;
+        }
+        try testing.expectEqual(@as(usize, 1), count);
+    }
+}
+
+test "help lists an Action without a chord as unbound in its section" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var bindings: std.ArrayList(keymap.Binding) = .empty;
+    for (keymap.default_bindings) |binding| if (binding.action != .quit) try bindings.append(arena.allocator(), binding);
+    const lines = try build(arena.allocator(), .{ .bindings = bindings.items });
+    var section: []const u8 = "";
+    var found = false;
+    for (lines) |line| switch (line) {
+        .heading => |title| section = title,
+        .blank, .no_matches => {},
+        .entry => |entry| if (entry.action == .quit) {
+            found = true;
+            try testing.expectEqualStrings("General", section);
+            try testing.expectEqualStrings("unbound", entry.keys);
+            try testing.expectEqualStrings(actionHelp(arena.allocator(), .quit) catch unreachable, entry.description);
+        },
+    };
+    try testing.expect(found);
+    try testing.expectEqualStrings("open theme overlay", try actionHelp(arena.allocator(), .open_theme_overlay));
 }
 
 test "help names the keys of the Submission Overlay and the confirmations" {
@@ -421,9 +485,12 @@ test "help keeps only nonempty headings and separators and includes fixed keys" 
     try testing.expectEqualStrings("needle general", lines[4].entry.description);
     _ = try state.applyKey(km, .{ .codepoint = keymap.special.escape }, 3);
     try typeQuery(&state, km, "ctrl-w");
-    try testing.expectEqual(@as(usize, 2), state.view().lines.len);
-    try testing.expectEqualStrings("Help", state.view().lines[0].heading);
-    try testing.expectEqualStrings("⌫ ctrl-w ctrl-u", state.view().lines[1].entry.keys);
+    const fixed = state.view().lines;
+    try testing.expectEqual(@as(usize, 11), fixed.len);
+    for ([_][]const u8{ "Composer", "Buffer Search Input", "Review Search Input", "Help" }, 0..) |title, index| {
+        try testing.expectEqualStrings(title, fixed[index * 3].heading);
+        try testing.expect(std.mem.indexOf(u8, fixed[index * 3 + 1].entry.keys, "ctrl-w") != null);
+    }
     _ = try state.applyKey(km, .{ .codepoint = keymap.special.escape }, 3);
     try typeQuery(&state, km, "Motions");
     try testing.expectEqual(@as(usize, 1), state.view().lines.len);

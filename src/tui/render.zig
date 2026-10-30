@@ -2271,6 +2271,21 @@ const help_key_gap: u16 = 3;
 /// The widest key column. A longer key list pushes only its own description.
 const help_key_column_max: u16 = 24;
 
+/// A key label that fits `width` cells. A longer label ends in `…`, so its
+/// description keeps the shared column.
+fn fitHelpKeys(scratch: std.mem.Allocator, keys: []const u8, width: u16) []const u8 {
+    if (vaxis.gwidth.gwidth(keys, .unicode) <= width) return keys;
+    var end: usize = 0;
+    var cells: usize = 0;
+    while (end < keys.len) {
+        const next = terminal_cell_metrics.next(keys[end..]);
+        if (next.byte_len == 0 or cells + next.cell_width + 1 > width) break;
+        cells += next.cell_width;
+        end += next.byte_len;
+    }
+    return std.fmt.allocPrint(scratch, "{s}…", .{keys[0..end]}) catch keys[0..end];
+}
+
 pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, help: help_mod.View, availability: presentation.ActionAvailability) void {
     const rows = help.lines;
     var params = help.layout();
@@ -2308,9 +2323,9 @@ pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, hel
                 const row = helpEntry(scratch, entry, availability);
                 var key_style = if (row.available) theme.helpKeyStyle() else theme.gutter;
                 key_style.bold = true;
-                const keys_width: u16 = @intCast(@min(vaxis.gwidth.gwidth(entry.keys, .unicode), std.math.maxInt(u16)));
-                _ = body.printSegment(.{ .text = entry.keys, .style = key_style }, .{ .row_offset = line_row, .col_offset = indent, .wrap = .none });
-                const description_column = indent + @max(key_column, keys_width) + help_key_gap;
+                const keys = fitHelpKeys(scratch, entry.keys, key_column);
+                _ = body.printSegment(.{ .text = keys, .style = key_style }, .{ .row_offset = line_row, .col_offset = indent, .wrap = .none });
+                const description_column = indent + key_column + help_key_gap;
                 _ = body.printSegment(.{ .text = row.text, .style = if (row.available) theme.picker else theme.gutter }, .{ .row_offset = line_row, .col_offset = description_column, .wrap = .none });
             },
         }
@@ -5493,6 +5508,27 @@ test "the help overlay floats a centered Keybindings modal from the Keymap" {
     const keys_end = body.x + 1 + 3;
     for (keys_end..keys_end + 3) |col| try testing.expectEqualStrings(" ", win.readCell(@intCast(col), body.y + 1).?.char.grapheme);
     try testing.expect(rows.len > body.height);
+}
+
+test "a long help key label ends in an ellipsis and keeps its description in the shared column" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    var lines = [_]help_mod.Line{
+        .{ .heading = "Motions" },
+        .{ .entry = .{ .keys = "ctrl-a ctrl-b ctrl-c ctrl-d ctrl-e ctrl-f", .description = "long keys", .action = .down } },
+        .{ .entry = .{ .keys = "k", .description = "short keys", .action = .up } },
+    };
+    const help_view: help_mod.View = .{ .lines = &lines, .query = .none, .scroll = 0 };
+    drawHelp(a, win, theme_dark, help_view, .{ .remote = true });
+    const body = view_mod.solve(layouts.HelpSlot, layouts.help, help_view.layout(), .{ .width = 80, .height = 24 }).get(.body).content;
+    const column = body.x + 1 + help_key_column_max + help_key_gap;
+    try testing.expectEqualStrings("…", win.readCell(body.x + help_key_column_max, body.y + 1).?.char.grapheme);
+    try testing.expectEqualStrings("l", win.readCell(column, body.y + 1).?.char.grapheme);
+    try testing.expectEqualStrings("s", win.readCell(column, body.y + 2).?.char.grapheme);
 }
 
 test "the help overlay scrolls its lines and clamps the scroll at the end" {
