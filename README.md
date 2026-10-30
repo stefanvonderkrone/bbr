@@ -203,6 +203,75 @@ bbr completion zsh > "${fpath[1]}/_bbr"                        # then `compinit`
 bbr completion fish > ~/.config/fish/completions/bbr.fish
 ```
 
+## Start a review
+
+```sh
+bbr                          # open the current branch's PullRequest, else the Browser
+bbr <repo-slug>              # detect the current branch's PullRequest in <repo-slug>, else the Browser
+bbr <repo-slug> <pr-id>      # open one PullRequest
+bbr <pr-url>                 # open a pasted Bitbucket PullRequest URL
+bbr detect [<repo-slug>]     # print the Startup Detection outcome, with no TUI
+bbr check-browser [<repo-slug>]  # live check of the Browser list fields
+```
+
+Plain `bbr` starts the TUI at once and runs Startup Detection.
+When the current branch is known, the TUI shows "Detecting PR for <branch>…".
+In this frame, only `q` is available, and it quits.
+Startup Detection lists the open PullRequests whose source Branch is the current branch.
+These are the AdjacentPullRequests of the branch.
+
+- Exactly one AdjacentPullRequest opens its review Session.
+- Two or more AdjacentPullRequests open the Browser with the Repository expanded and the highest PullRequestId focused.
+- No AdjacentPullRequest, or a detached HEAD, opens the Browser with the Repository expanded and focused.
+- No Git repository, no Bitbucket Remote, a Remote in another Workspace, or a failed request opens the plain Browser with no note.
+
+`bbr <repo-slug>` runs the same Startup Detection, but the Repository comes from the argument.
+When it finds no single AdjacentPullRequest, the Browser opens with that Repository expanded.
+The URL path and the `<repo-slug> <pr-id>` path open their PullRequest directly.
+
+`bbr detect` prints the `branch:` and `remote:` lines and one `resolved:` line to stderr.
+The `resolved:` line is `open <repo> #<id>`, `browser <repo> expanded, focus #<id>`, `browser <repo> expanded`, or `browser`.
+A failed PullRequest list request also prints a `reason:` line.
+`bbr detect` exits `0` for every outcome and never reads or writes the Summary Cache.
+
+`bbr check-browser` lists the Repository Summaries and the PullRequest Summaries of one Repository from the live Workspace.
+It prints the counts and the participant fields that it saw.
+It exits `1` when a required field is missing.
+It only reads, so it needs no opt-in variable.
+
+### The Browser
+
+The Browser is a tree of the Repositories of the Workspace.
+Under each expanded Repository, it lists the open PullRequests of that Repository.
+A Repository row shows its name, its slug, its update date, and its open-PullRequest count.
+The count is `?` until bbr loads the PullRequests of that Repository.
+A PullRequest row shows `#<id>`, the title, the author, the update date, `<source> → <destination>`, the approval count, and the changes-requested count.
+bbr loads the PullRequests of a Repository only when you expand it.
+At most two PullRequest list requests run at one time.
+
+| Key | Action |
+|---|---|
+| `b` in a review Session | Open the Browser. The first time, it expands the Session's Repository and focuses its PullRequest. |
+| `b` or Escape in the Browser | Go back to the review Session. The Browser keeps its state. |
+| Enter | Expand or collapse a Repository, or open the review Session of a PullRequest. |
+| `l` or Right Arrow | Expand a Repository. |
+| `h` or Left Arrow | Collapse a Repository, or move from a PullRequest to its Repository. |
+| `j`, `k`, `gg`, `G`, `ctrl-d`, `ctrl-u` | Move the cursor. |
+| `s` | Sort by update time, newest first, or by name. The cursor stays on its row. |
+| `R` | Reload the Repository list and the PullRequests of every expanded Repository. |
+| `q` | Quit. |
+
+A click selects a row, and a click on the selected row opens it.
+Each Action name in `[keymap]` can rebind or unbind its key: `open_browser`, `close_browser`, `open_browser_entry`, and `cycle_browser_sort`.
+
+The Browser shows the Summary Cache at once and refreshes it in the background.
+The Summary Cache is `$XDG_STATE_HOME/bbr/browser-cache.json`, with mode `0600`.
+It holds the Repository Summaries and PullRequest Summaries of one Workspace.
+It holds no Credential, no PullRequest description, and no Comment.
+bbr writes it only after the first successful Repository list of a process.
+After that, bbr writes it after each successful Repository list and PullRequest list.
+bbr ignores a broken file or a file for another Workspace, and the next write replaces it.
+
 ## Configuration
 
 The TUI reads `$XDG_CONFIG_HOME/bbr/config.toml`, falling back to
@@ -210,7 +279,8 @@ The TUI reads `$XDG_CONFIG_HOME/bbr/config.toml`, falling back to
 all detected diagnostics and stops before entering the alternate screen.
 
 Pending reviews persist in `$XDG_STATE_HOME/bbr/pending.db`, and submission locks live in
-`$XDG_STATE_HOME/bbr/submission-locks`. When `XDG_STATE_HOME` is unset, empty, or relative, the
+`$XDG_STATE_HOME/bbr/submission-locks`. The Browser Summary Cache is
+`$XDG_STATE_HOME/bbr/browser-cache.json`. When `XDG_STATE_HOME` is unset, empty, or relative, the
 state directory is `$HOME/.local/state/bbr`. If you change `XDG_STATE_HOME`, move the existing
 `pending.db` to the new directory, because bbr does not look for it in the old one.
 
@@ -275,7 +345,7 @@ rejected with the source line. Configuration names are exact; superseded Action 
 are not retained as compatibility aliases.
 
 The default workflow keys are `F` for the Session-local File finder, `p` for the PullRequest
-Picker, `i`/`I`/`C` for inline/File-level/Review-level Comments, `gC` for recovery linking,
+Picker, `b` for the Browser, `i`/`I`/`C` for inline/File-level/Review-level Comments, `gC` for recovery linking,
 `g a`/`g c`/`g n` for Approved/Changes Requested/No Verdict, `ctrl-y`/`ctrl-e` for one-row
 scrolling, and `y` for OSC 52 source-text yank.
 The File finder focuses a changed File in the current Session. The PullRequest Picker opens all

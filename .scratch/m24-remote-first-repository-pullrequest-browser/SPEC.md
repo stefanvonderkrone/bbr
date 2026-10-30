@@ -1,6 +1,6 @@
 # M24 Remote-first Repository and PullRequest Browser
 
-Status: ready-for-agent
+Status: claimed
 Milestone: M24
 
 The [M24 brief](brief.md) records the approved decisions.
@@ -813,3 +813,48 @@ It does not gate the hermetic suite.
 - ADR-0012 holds: every Browser request is a typed command with a typed completion.
 - ADR-0013 holds: the Browser is one View tree, and only `view_paint.zig` paints its decoration.
 - ADR-0003 holds: every Bitbucket call goes through the `HttpClient` seam.
+
+## Completion
+
+Tickets 01 to 06 are resolved.
+Ticket 07 is `ready-for-human` and unresolved.
+The spec stays `claimed`, because the live participant field check of ticket 07 has not run.
+After ticket 07 resolves, set this spec to `resolved`.
+
+### Commits
+
+- 2b00132 `bitbucket: list Repository and PullRequest Summaries` (ticket 01).
+- d76bebe `tui: open the Browser from a review Session` (ticket 02).
+- cf33afc `tui: sort the Browser by update time or name` (ticket 03).
+- 58898e3 `tui: show the Summary Cache at Browser start` (ticket 04).
+- ac9fb85 `startup: detect the startup target inside the TUI` (ticket 05).
+- The ticket 06 commit adds the documentation and this section.
+
+### Integrated checks
+
+The checks ran on the integrated branch with every M24 slice merged.
+
+- `zig fmt --check build.zig src`: pass.
+- `zig build`: pass.
+- `zig build test-browser`: "9/9 steps succeeded; 74/74 tests passed".
+- `zig build test-cli`: "10/10 steps succeeded". It runs `tests/detect_cli_test.py`.
+- `zig build test --summary all`: "25/25 steps succeeded; 1440/1440 tests passed", exit code 0. The baseline before M24 was 1378.
+- `python3 tools/check_agent_docs.py`: pass.
+
+The full suite log shows two "failed command" lines for test runners that print warnings to stderr.
+The same lines appear at ac9fb85 without the ticket 06 changes, and every step succeeds.
+
+### Shipped deviations from this spec
+
+- `Outcome` has a third arm, `failed`, with the reason and the Browser Start. The TUI treats it like `browse`.
+- `startup.start` keeps the URL and `<repo> <id>` paths and calls `startup.inspect` for the other paths.
+- `app.Start` wraps a `startup.Start` in its `remote` arm. Its `review` arm holds a LocalReview or the demo.
+- `bbr detect` writes its lines to stderr.
+- The Detecting Frame text has no backticks: " Detecting PR for <branch>…".
+- The bound of two PullRequest list commands counts queued and issued commands.
+- Presentation saves the Summary Cache only after the first Repository list success of a process.
+
+### Open item
+
+The live shape of `participants.approved` and `participants.state` in the PullRequest list is unproven.
+[The Bitbucket implementation notes](../../src/bitbucket/IMPLEMENTATION.md) mark it as unproven until ticket 07.

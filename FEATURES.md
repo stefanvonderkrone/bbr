@@ -9,7 +9,8 @@ The feature set of **bbr**, grouped by area and tagged with the milestone that d
 ## Navigation & PR management
 - [x] **Open PR by id** — load a PullRequest from the workspace by integer id. `M0`
 - [x] **Open PR by URL** — parse a `bitbucket.org/check24/<repo>/pull-requests/<id>` link. `M4`
-- [x] **Auto-detect PR from CWD** — on launch, read the git branch + remote and open the matching open PR; no-PR chooser / pre-filtered picker otherwise. `M4`
+- [x] **Auto-detect PR from CWD** — on launch, read the git branch + remote and open the matching open PR. `M4` · Startup Detection inside the TUI, and the Browser when no single AdjacentPullRequest exists `M24`
+- [x] **Browser**. A Workspace-wide tree of Repositories and their open PullRequests, opened by `b` or at startup, with a Summary Cache. `M24`
 - [x] **PR Picker** — fuzzy-find a PullRequest by id or title (zf) and switch. `M4`
 - [x] **Epoch isolation** — switching PRs / files rejects stale Session and File Enrichment results. Started Candidate Session branches still finish. `M4` (Session) · `M9`/`M13` (File Enrichment)
 

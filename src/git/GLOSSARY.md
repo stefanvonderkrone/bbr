@@ -5,7 +5,7 @@ The vocabulary of local Git review, repository identity, and Ref resolution.
 ## Language
 
 **GitClient**:
-The seam over the local `git` binary: current branch, the tracking Remote, worktree list, ref resolution, diff between refs, and file content at a ref. Shells out now; fakeable with fixtures in tests. Its read-only inspection subset (branch + Remote) powers startup PR detection; its diffing subset powers local review.
+The seam over the local `git` binary: current branch, the tracking Remote, worktree list, ref resolution, diff between refs, and file content at a ref. Shells out now; fakeable with fixtures in tests. Its read-only inspection subset (branch + Remote) powers Startup Detection; its diffing subset powers local review.
 _Avoid_: repo, libgit, vcs.
 
 **Remote**:
@@ -47,5 +47,13 @@ A review identified by a ReviewRepository, BaseRef, and SourceRef. It remains th
 _Avoid_: local session, commit-pair review, offline PR.
 
 **AdjacentPullRequest**:
-The open Bitbucket PullRequest whose source branch matches the WorkingCopy's current branch, in the Bitbucket Repository identified by its Remote — the primary startup entry to remote review. Zero matches → the no-PR chooser; more than one → a pre-filtered Picker.
+The open Bitbucket PullRequest whose source branch matches the WorkingCopy's current branch, in the Bitbucket Repository identified by its Remote — the primary startup entry to remote review.
+Exactly one match opens its review Session.
+Zero or several matches open the Browser.
 _Avoid_: linked PR, matching PR, my PR.
+
+**Startup Detection**:
+The lookup that plain `bbr`, `bbr <repo-slug>`, and `bbr detect` run.
+It reads the current branch and the Remote, and it lists the AdjacentPullRequests.
+Its outcome is one review Session or a Browser Start.
+_Avoid_: auto-detect, resolve.

@@ -43,6 +43,23 @@ _Avoid_: Changes Requested, No Verdict, delete PullRequest.
 The Bitbucket account that opened the PullRequest. This account cannot set a Reviewer Verdict on its own PullRequest.
 _Avoid_: reviewer, owner (the Workspace owns the Repository).
 
+**Repository Summary**:
+The Browser facts of one Repository: slug, name, and Repository update time.
+It holds no PullRequest data.
+_Avoid_: Repository (the Bitbucket entity), repo row.
+
+**PullRequest Summary**:
+The Browser facts of one open PullRequest: PullRequestId, title, PullRequest Author, update time, source and destination Branches, approval count, and changes-requested count.
+It holds no description and no Comment.
+_Avoid_: PullRequest (the aggregate root), PR row.
+
+**Summary Cache**:
+The local file of Repository Summaries and PullRequest Summaries for one Workspace.
+bbr shows it at Browser start and replaces it after each refresh.
+It holds no Credential and no PullRequest description.
+bbr rebuilds it after any parse error.
+_Avoid_: cache (alone), offline copy, database.
+
 **SourceCommit**:
 The head commit hash of the PR's source branch at the moment we loaded it. Captured so we can detect that the PR "moved under us" before submitting.
 _Avoid_: head, tip, revision.

@@ -29,7 +29,7 @@ It also does not select a SideBySide column as an Anchor target.
 _Avoid_: selected side, active side, Anchor side.
 
 **Pane**:
-A tiled region of the screen with a defined role (Sidebar, DiffPane, ThreadPane). Panes tile; they do not overlap.
+A tiled region of the screen with a defined role (Sidebar, DiffPane, ThreadPane, Browser). Panes tile; they do not overlap.
 A View lays out each Pane, but a Pane is the role, not the View.
 _Avoid_: window (reserved for vaxis's surface), view, panel.
 
@@ -56,6 +56,27 @@ _Avoid_: file navigation, go to file.
 **File Read State**:
 The current Presentation projection of a File Read Receipt against its File Review Fingerprint. An unread File is bold in the File Tree; a read File uses regular weight. It is derived from durable review state and the current Session rather than persisted as a bare boolean.
 _Avoid_: File Read Receipt (the durable evidence), viewed state, bold flag.
+
+**Browser**:
+The Workspace-wide tree of Repositories and, under each expanded Repository, its open PullRequests.
+It fills the content region in place of the Sidebar and the DiffPane.
+Its state belongs to the process, not to the Session, so Session replacement never resets it.
+_Avoid_: dashboard, chooser, Picker (switches PullRequests in one Repository).
+
+**Browser Entry**:
+One row of the Browser: a Repository entry, a PullRequest entry, or a message entry.
+A message entry shows a loading, empty, or failure state and never takes the cursor.
+_Avoid_: node, item, line.
+
+**Browser Start**:
+The expanded Repository and the focused PullRequest that a new Browser begins with.
+Startup Detection or the first `open_browser` chooses it.
+_Avoid_: initial state, landing.
+
+**Detecting Frame**:
+The loading frame that names the current branch while Startup Detection lists AdjacentPullRequests.
+Only `quit` is available in it.
+_Avoid_: splash, spinner.
 
 **Overlay**:
 A floating surface drawn over the Panes — keybinding help, the PR picker, a comment composer. Dismissible; captures input while open.
@@ -188,7 +209,7 @@ The semantic operation input resolves to in the current Interaction Context: a M
 _Avoid_: command, handler, event.
 
 **Interaction Context**:
-The active input surface and semantic target from the current Presentation Frame: an Overlay when one captures input, otherwise the focused Pane and its cursor target. It determines Action resolution and ActionAvailability without becoming Review state.
+The active input surface and semantic target from the current Presentation Frame: an Overlay when one captures input, otherwise the focused Pane and its cursor target. The Detecting Frame and the Browser Entry under the cursor are also input surfaces. It determines Action resolution and ActionAvailability without becoming Review state.
 _Avoid_: mode (too broad), focus alone (omits the target), input state.
 
 **ActionAvailability**:

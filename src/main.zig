@@ -1273,6 +1273,8 @@ fn usage() void {
         \\
         \\Credentials come from `$XDG_DATA_HOME/bbr/auth.toml` (see `bbr auth login`).
         \\Pending reviews persist in `$XDG_STATE_HOME/bbr/pending.db`.
+        \\The Browser Summary Cache is `$XDG_STATE_HOME/bbr/browser-cache.json`.
+        \\In a review, b opens the Browser. In the Browser, b or Escape goes back, Enter opens, s sorts, R refreshes.
         \\Each XDG base falls back under $HOME when unset, empty, or relative.
         \\`--profile <name>` (or BBR_PROFILE) selects a saved profile.
         \\BITBUCKET_USERNAME, BITBUCKET_TOKEN, BITBUCKET_WORKSPACE override the file per field.

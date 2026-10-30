@@ -16,6 +16,7 @@ The [Presentation glossary](./GLOSSARY.md) defines the domain terms used here.
 | Key input and Actions | [`keymap.zig`](./keymap.zig) resolves input. [`action.zig`](./action.zig) defines Actions. [`presentation.zig`](./presentation.zig) dispatches them. |
 | List Overlays and the Command Palette | [`list_overlay.zig`](./list_overlay.zig) owns ranking, selection, per-Overlay policy, and the curated Command Palette table. [`presentation.zig`](./presentation.zig) acts on the confirmed choice. [`render.zig`](./render.zig) draws every List Overlay. |
 | Theme selection and persistence | [`theme_id.zig`](./theme_id.zig) names the built-in Themes without vaxis. [`theme.zig`](./theme.zig) maps each one to styles. [`config.zig`](./config.zig) reads the Configured Theme and writes it back to config.toml. |
+| Browser and Startup Detection | [`browser.zig`](./browser.zig) owns the Browser model, the Browser Start, the cursor `Selection`, the `Sort`, and the pure `entries` projection. It imports neither vaxis nor `theme.zig`. [`presentation.zig`](./presentation.zig) holds `Presentation.browser` outside `Published` and owns the Browser commands. [`presentation_adapter.zig`](./presentation_adapter.zig) runs `startup.detect`, the two Browser lists, and the Summary Cache load and save on workers. `startInput` turns a `startup.Start` into the first input. [`app.zig`](./app.zig) takes an `app.Start` with a `review` or `remote` arm. [`../bitbucket/summary_cache.zig`](../bitbucket/summary_cache.zig) encodes and decodes the Summary Cache. |
 | Session lifetime and owned commands | [`presentation.zig`](./presentation.zig) owns state transitions, command production, and completion admission under [ADR-0012](../../docs/adr/0012-presentation-is-a-typed-command-producing-state-machine.md). |
 | Command execution and terminal events | [`presentation_adapter.zig`](./presentation_adapter.zig) executes commands. [`presentation_runtime.zig`](./presentation_runtime.zig) transfers worker completions. [`app.zig`](./app.zig) connects Presentation to the terminal loop. |
 
@@ -35,3 +36,9 @@ Comments wait for PullRequest commit data and take priority over RawDiff when bo
 Remote File Enrichment fetches its old and new sides concurrently, with at most two requests per File.
 All started branches complete without branch cancellation.
 LocalReview acquisition and LocalReview File Enrichment remain sequential.
+The Browser keeps at most two `list_browser_pull_requests` commands outstanding, queued or issued.
+Other PullRequest loads wait in a FIFO and start in arrival order as loads complete.
+A collapse removes a waiting Repository from the FIFO.
+A `refresh` replaces the waiting loads with new loads.
+A `rate_limited` failure empties the FIFO.
+At most one Summary Cache save runs at a time, and a newer Snapshot replaces a waiting one.

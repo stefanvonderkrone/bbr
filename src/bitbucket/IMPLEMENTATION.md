@@ -43,6 +43,16 @@ Selection, editing, and Submission keep the authored account ID, not the display
 
 Sources: [Atlassian's mention API guide](https://support.atlassian.com/bitbucket-cloud/kb/how-to-mention-users-in-pull-request-comments-through-the-bitbucket-cloud-rest-api/) and a live account-ID and UUID lookup.
 
+### Browser list participant fields
+
+This shape is unproven. No live check has run yet.
+`Client.listOpenPullRequestSummaries` asks for `participants.approved` and `participants.state` in the `fields` filter of the PullRequest list.
+The adapter counts an approval for each participant with `approved = true`.
+It counts a changes-requested state for each participant with `state = "changes_requested"`.
+The Comment list ignores some `fields` additions, as the Outdated Comments section shows, so the PullRequest list can do the same.
+Ticket 07 of M24 runs `bbr check-browser` against the live Workspace to prove or disprove these fields.
+Until that check passes, treat the approval and changes-requested counts as unverified.
+
 ### Emoji metadata
 
 Atlassian's Bitbucket serializer can emit `:pray:{: data-emoji-id='1f64f' data-emoji-text='🙏' }`.

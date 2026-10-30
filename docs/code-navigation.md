@@ -7,11 +7,12 @@ These paths identify implementation entry points in the current checkout.
 
 | Work | Entry points |
 |---|---|
-| Top-level commands and review startup | [`src/main.zig`](../src/main.zig) dispatches commands. [`src/startup.zig`](../src/startup.zig) selects the review source. |
+| Top-level commands and review startup | [`src/main.zig`](../src/main.zig) dispatches commands. [`src/startup.zig`](../src/startup.zig) owns Startup Detection. `startup.start` keeps the URL and `<repo> <id>` paths and calls `startup.inspect` for the other paths. `startup.inspect` reads only the GitClient before the TUI starts. `startup.detect` lists the AdjacentPullRequests on a worker. `startup.describe` prints the `bbr detect` outcome line. |
 | Profiles and Credential selection | [`src/bitbucket/auth.zig`](../src/bitbucket/auth.zig) stores Profiles and resolves Credentials. [`src/main.zig`](../src/main.zig) handles login and logout. |
-| Config, data, and state directories | [`src/xdg.zig`](../src/xdg.zig) resolves the config home, the data home, the state home, and the `config.toml` path. [`src/main.zig`](../src/main.zig) puts `pending.db` and the submission locks under the state home. |
+| Config, data, and state directories | [`src/xdg.zig`](../src/xdg.zig) resolves the config home, the data home, the state home, and the `config.toml` path. [`src/main.zig`](../src/main.zig) puts `pending.db`, the submission locks, and the Summary Cache file `bbr/browser-cache.json` under the state home. |
 | `bbr api` verbs and flags | [`src/api/cli.zig`](../src/api/cli.zig) holds the verb table and global parser. [`src/api/args.zig`](../src/api/args.zig) holds argument helpers. Resource files in [`src/api/`](../src/api/) handle each verb. |
 | API output and endpoint behavior | [`src/api/output.zig`](../src/api/output.zig) formats CLI output. [`src/bitbucket/client.zig`](../src/bitbucket/client.zig) implements the Bitbucket adapter. [Bitbucket implementation notes](../src/bitbucket/IMPLEMENTATION.md) record verified API quirks. |
+| Repository and PullRequest Browser | [`src/tui/browser.zig`](../src/tui/browser.zig) owns the Browser model and its Browser Entries. [`src/bitbucket/summary_cache.zig`](../src/bitbucket/summary_cache.zig) encodes and decodes the Summary Cache. [Presentation entry points](../src/tui/IMPLEMENTATION.md#code-entry-points) name the other owners. |
 | Shell completions | [`src/completion.zig`](../src/completion.zig) generates completion scripts from the API registry. |
 | Markdown, search, Selection, and terminal rendering | [Presentation entry points](../src/tui/IMPLEMENTATION.md#code-entry-points) map the semantic model, row projection, interaction owner, and terminal adapters. |
 | Specifications and tickets | [Issue discovery](./agents/issue-tracker.md#when-a-skill-says-fetch-the-relevant-ticket) explains how to search `.scratch/` and follow feature maps. |

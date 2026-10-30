@@ -25,7 +25,8 @@ bbr reviews changes from one of two sources, sharing all rendering and comment m
 ## Relationships
 
 - **Bitbucket / Git → Diff**: both produce unified diff text via a common **DiffSource**; Diff parses either into the same Line model. For remote review, Bitbucket's line numbers are authoritative for anchoring.
-- **Git → Bitbucket**: from the current branch/worktree, Git finds the *adjacent* open PullRequest (source branch match) so a local checkout can open its remote review.
+- **Git → Bitbucket**: Startup Detection finds the AdjacentPullRequests and opens one review Session or the Browser.
+- **Bitbucket → Presentation**: the Browser projects Repository Summaries and PullRequest Summaries. It never projects a Session.
 - **Bitbucket → Review**: Bitbucket returns existing comment threads (with resolved state and outdated verdicts); on submit, Review hands Bitbucket a topologically-ordered sequence of Drafts to POST.
 - **Diff ↔ Review**: a root Comment's **CommentScope** is Review-level, File-level, or inline. File and inline scopes retain their authored path/revision; Review computes ScopeState (current/moved/outdated) — trusting Bitbucket for remote comments and diff-walking via Git for local comments and drafts.
 - **Review → Presentation**: Review retains reviewer-local File Read Receipts keyed by ReviewIdentity and File Review Fingerprint; Presentation projects matching receipts as regular-weight Files and missing, changed, or unverifiable receipts as bold unread Files.
