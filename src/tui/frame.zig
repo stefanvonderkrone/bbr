@@ -9,6 +9,7 @@ pub const file_tree = @import("file_tree.zig");
 pub const CellMetrics = @import("cell_metrics.zig").CellMetrics;
 const view = @import("view.zig");
 const layouts = @import("layouts.zig");
+const browser = @import("browser.zig");
 
 pub const Revision = u64;
 
@@ -114,7 +115,21 @@ pub const OverlayTarget = struct {
     review_search: ?ReviewSearchGeometry = null,
 };
 
+/// The Browser surface: the rows of its Pane and the Browser Entries they
+/// show from `scroll`.
+pub const BrowserTarget = struct {
+    entries: Rect,
+    scroll: usize = 0,
+    rows: []const browser.Entry = &.{},
+};
+
+/// The content rect of the Browser Pane.
+pub fn browserEntries(geometry: Geometry) Rect {
+    return view.solve(layouts.BrowserSlot, layouts.browser, layouts.Browser{}, area(geometry)).get(.entries).content;
+}
+
 pub const HitTarget = union(enum) {
+    browser_entry: usize,
     select_old_version,
     select_new_version,
     sidebar,
@@ -220,6 +235,8 @@ pub const Projection = struct {
     geometry: Geometry,
     panes: PaneRects,
     overlay: ?OverlayTarget = null,
+    /// Set while the Browser replaces the Panes.
+    browser: ?BrowserTarget = null,
     visual_rows: []const VisualRow,
     buffer: buffer_mod.Buffer,
     navigation: Nav,
@@ -253,6 +270,16 @@ pub fn hitTest(frame: Projection, col: u16, row: u16) ?HitTarget {
         const index = overlay.scroll + row - overlay.entries.y;
         if (index >= overlay.row_count) return null;
         return .{ .list_entry = index };
+    }
+
+    if (frame.browser) |target| {
+        if (!target.entries.contains(col, row)) return null;
+        const index = target.scroll + row - target.entries.y;
+        if (index >= target.rows.len) return null;
+        return switch (target.rows[index]) {
+            .repository, .pull_request => .{ .browser_entry = index },
+            .message => null,
+        };
     }
 
     if (frame.version_title_targets.old) |rect| if (rect.contains(col, row)) return .select_old_version;
@@ -1398,4 +1425,32 @@ test "M21 kernel indexed navigation preserves Selection Count and viewport after
     try testing.expectEqual(@as(?usize, 0), visualIndexForBufferIndex(new_rows, 0));
     try testing.expectEqual(@as(?usize, null), visualIndexForBufferIndex(new_rows, 1));
     try testing.expectEqual(@as(?usize, null), visualIndexForBufferIndex(&.{}, 0));
+}
+
+test "M24 browser hit testing targets Repository and PullRequest entries and skips message entries" {
+    const geometry: Geometry = .{ .cols = 40, .rows = 10 };
+    const rows = [_]browser.Entry{
+        .{ .message = .loading_repositories },
+        .{ .repository = 0 },
+        .{ .repository = 1 },
+        .{ .pull_request = .{ .repository = 1, .index = 0 } },
+    };
+    const entries = browserEntries(geometry);
+    const frame: Projection = .{
+        .revision = 1,
+        .visual_rows_revision = 1,
+        .geometry = geometry,
+        .panes = paneRects(geometry),
+        .visual_rows = &.{},
+        .buffer = .{ .rows = &.{}, .layout = .unified },
+        .navigation = Nav.init(0, 8),
+        .browser = .{ .entries = entries, .scroll = 1, .rows = &rows },
+    };
+    try testing.expectEqual(HitTarget{ .browser_entry = 1 }, hitTest(frame, entries.x, entries.y).?);
+    try testing.expectEqual(HitTarget{ .browser_entry = 3 }, hitTest(frame, entries.x + 5, entries.y + 2).?);
+    try testing.expect(hitTest(frame, entries.x, entries.y + 3) == null);
+    try testing.expect(hitTest(frame, 0, 0) == null);
+    var scrolled = frame;
+    scrolled.browser.?.scroll = 0;
+    try testing.expect(hitTest(scrolled, entries.x, entries.y) == null);
 }

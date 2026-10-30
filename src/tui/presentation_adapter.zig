@@ -8,6 +8,7 @@ const bbr = @import("bbr");
 const std = @import("std");
 const vaxis = @import("vaxis");
 const presentation = @import("presentation.zig");
+const browser = @import("browser.zig");
 
 pub const TerminalHandoff = struct {
     ptr: *anyopaque,
@@ -298,6 +299,39 @@ pub fn executeReviewerVerdict(
     } };
 }
 
+/// Lists the Repository Summaries of the Workspace. The completion owns them.
+pub fn listBrowserRepositories(allocator: std.mem.Allocator, client: bbr.bitbucket.Client, command: presentation.ListBrowserRepositories) presentation.OwnedInput {
+    return .{ .browser_repositories_loaded = .{
+        .command_id = command.command_id,
+        .work_id = command.work_id,
+        .outcome = loadRepositories(allocator, client) catch |err| .{ .failed = browser.failure(err) },
+    } };
+}
+
+fn loadRepositories(allocator: std.mem.Allocator, client: bbr.bitbucket.Client) !browser.RepositoriesOutcome {
+    const summaries = try browser.RepositorySummaries.create(allocator);
+    errdefer summaries.destroy();
+    summaries.repositories = try client.listRepositorySummaries(summaries.arena.allocator());
+    return .{ .loaded = summaries };
+}
+
+/// Lists the open PullRequest Summaries of one Repository. The completion
+/// owns them.
+pub fn listBrowserPullRequests(allocator: std.mem.Allocator, client: bbr.bitbucket.Client, command: presentation.ListBrowserPullRequests) presentation.OwnedInput {
+    return .{ .browser_pull_requests_loaded = .{
+        .command_id = command.command_id,
+        .work_id = command.work_id,
+        .outcome = loadPullRequests(allocator, client, command.repositoryName()) catch |err| .{ .failed = browser.failure(err) },
+    } };
+}
+
+fn loadPullRequests(allocator: std.mem.Allocator, client: bbr.bitbucket.Client, repository: []const u8) !browser.PullRequestsOutcome {
+    const summaries = try browser.PullRequestSummaries.create(allocator);
+    errdefer summaries.destroy();
+    summaries.prs = try client.listOpenPullRequestSummaries(summaries.arena.allocator(), repository);
+    return .{ .loaded = summaries };
+}
+
 const testing = std.testing;
 
 test "editor resolution uses first non-empty configured value" {
@@ -511,4 +545,31 @@ test "executePost returns correlated ambiguity when execution errors" {
     try testing.expectEqual(@as(bbr.review.OperationId, 23), input.post_draft_completed.operation_id);
     try testing.expectEqual(@as(bbr.review.TempId, 41), input.post_draft_completed.temp_id);
     try testing.expect(input.post_draft_completed.outcome == .ambiguous);
+}
+
+test "M24 browser list workers return correlated Summaries and classified failures" {
+    const repositories = [_]bbr.http.Canned{.{ .status = 200, .body =
+        \\{"values":[{"slug":"api","name":"API","updated_on":"2026-10-30T00:00:00Z"}]}
+    }};
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &repositories };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "check24" });
+    var loaded = listBrowserRepositories(testing.allocator, client, .{ .command_id = 4, .work_id = 9 });
+    defer loaded.deinit();
+    try testing.expectEqual(@as(presentation.CommandId, 4), loaded.browser_repositories_loaded.command_id);
+    try testing.expectEqual(@as(presentation.WorkId, 9), loaded.browser_repositories_loaded.work_id);
+    const items = loaded.browser_repositories_loaded.outcome.loaded.repositories;
+    try testing.expectEqual(@as(usize, 1), items.len);
+    try testing.expectEqualStrings("api", items[0].slug);
+    try testing.expectEqual(@as(?i64, 1793318400), items[0].updated_on);
+
+    var forbidden: bbr.http.FakeHttpClient = .{ .status = 403, .body = "{}" };
+    var failed = listBrowserPullRequests(testing.allocator, bbr.bitbucket.Client.init(forbidden.httpClient(), .{ .username = "u", .token = "t", .workspace = "check24" }), .{
+        .command_id = 5,
+        .work_id = 10,
+        .repository = try browser.Name.init("api"),
+    });
+    defer failed.deinit();
+    try testing.expectEqual(@as(presentation.WorkId, 10), failed.browser_pull_requests_loaded.work_id);
+    try testing.expectEqual(@as(browser.Failure, error.Forbidden), failed.browser_pull_requests_loaded.outcome.failed);
+    try testing.expect(std.mem.indexOf(u8, forbidden.lastUrl().?, "/repositories/check24/api/pullrequests") != null);
 }

@@ -46,6 +46,8 @@ pub const StatusSlot = enum {
     submit,
     comment,
     file,
+    open_entry,
+    refresh,
     switch_review,
     help,
     quit,
@@ -155,6 +157,26 @@ pub fn panes(params: Panes, area: Rect, visitor: anytype) void {
         },
     };
     view.walk(PaneSlot, &root, area, visitor);
+}
+
+/// The Browser: one Pane with a rounded border and the Workspace slug as
+/// its Title. Its scroll bar sits in the right border.
+pub const BrowserSlot = enum { entries };
+
+pub const Browser = struct {
+    title: []const u8 = "",
+    scroll: Scroll = .{},
+};
+
+pub fn browser(params: Browser, area: Rect, visitor: anytype) void {
+    const stroke: view.Stroke = .{ .focused = true };
+    const root: view.View(BrowserSlot) = .{
+        .slot = .entries,
+        .border = .{ .stroke = stroke },
+        .title = .{ .text = params.title },
+        .scrollbar = bar(params.scroll, .border, stroke),
+    };
+    view.walk(BrowserSlot, &root, area, visitor);
 }
 
 pub const Box = struct { width: u16, height: u16 };
@@ -367,6 +389,7 @@ test "every layout places each of its Slots" {
         _ = view.solve(AppSlot, app, @as(u16, 3), area);
         _ = view.solve(StatusSlot, status, Status.initFill(9), area);
         _ = view.solve(PaneSlot, panes, Panes{ .diff_scroll = .{ .total = 100, .offset = 3 } }, area);
+        _ = view.solve(BrowserSlot, browser, Browser{ .title = "check24", .scroll = .{ .total = 100, .offset = 3 } }, area);
         _ = view.solve(ListSlot, listOverlay, ListOverlay{ .box = .{ .width = 60, .height = 16 } }, area);
         _ = view.solve(DialogSlot, dialog, composer, area);
         _ = view.solve(LoadingSlot, loading, {}, area);
@@ -423,4 +446,10 @@ test "the Help columns start at column 2 and one cell after the middle" {
     try testing.expectEqual(surface.x + 2, rects.get(.motions).content.x);
     try testing.expectEqual(surface.x + surface.width / 2 + 1, rects.get(.commands).content.x);
     try testing.expectEqual(surface.y + 1, rects.get(.motions).content.y);
+}
+
+test "M24 browser the Browser is one Pane whose content sits inside its border" {
+    const rects = view.solve(BrowserSlot, browser, Browser{ .title = "check24" }, .{ .width = 80, .height = 24 });
+    try testing.expectEqual(Rect{ .x = 0, .y = 0, .width = 80, .height = 24 }, rects.get(.entries).border);
+    try testing.expectEqual(Rect{ .x = 1, .y = 1, .width = 78, .height = 22 }, rects.get(.entries).content);
 }

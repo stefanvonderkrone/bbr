@@ -216,6 +216,10 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one('y'), .action = .yank, .help = "yank text" },
     .{ .chord = Chord.one('?'), .action = .help, .help = "toggle this help" },
     .{ .chord = Chord.one(vaxis.Key.tab), .action = .focus_next_pane, .help = "switch Pane" },
+    .{ .chord = Chord.one('b'), .action = .open_browser, .help = "open Browser" },
+    .{ .chord = Chord.one('b'), .action = .close_browser, .help = "back to the review" },
+    .{ .chord = Chord.one(vaxis.Key.escape), .action = .close_browser, .help = "back to the review" },
+    .{ .chord = Chord.one(vaxis.Key.enter), .action = .open_browser_entry, .help = "toggle Repository / open PullRequest" },
 };
 
 pub const Keymap = struct {
@@ -405,6 +409,7 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .scroll_row_up,
             .scroll_row_down,
             .quit,
+            .open_browser,
             .open_file_finder,
             .open_pull_request_picker,
             .open_command_palette,
@@ -436,6 +441,7 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .scroll_row_up,
             .scroll_row_down,
             .quit,
+            .open_browser,
             .open_file_finder,
             .open_pull_request_picker,
             .open_command_palette,
@@ -464,6 +470,7 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .left,
             .right,
             .quit,
+            .open_browser,
             .open_file_finder,
             .open_pull_request_picker,
             .open_command_palette,
@@ -477,6 +484,23 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .focus_next_pane,
             => true,
             else => false,
+        },
+        .browser => switch (action) {
+            .quit, .help, .refresh, .close_browser => true,
+            else => false,
+        },
+        .browser_repository, .browser_pull_request => switch (action) {
+            .down,
+            .up,
+            .left,
+            .right,
+            .to_top,
+            .to_bottom,
+            .half_page_down,
+            .half_page_up,
+            .open_browser_entry,
+            => true,
+            else => supportsContext(action, .browser),
         },
         .diff_disclosure => switch (action) {
             .toggle_disclosure => true,
@@ -510,6 +534,7 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .select_down,
             .select_up,
             .quit,
+            .open_browser,
             .open_file_finder,
             .open_buffer_search,
             .open_review_search,
@@ -834,4 +859,52 @@ test "M21 Buffer Search Actions resolve in every DiffPane context and remain con
     try testing.expect(resolver.feed(configured.keymap(), .diff, plain('/')) == .none);
     try testing.expect(resolver.feed(configured.keymap(), .diff, plain(' ')) == .none);
     try testing.expectEqual(Action.open_buffer_search, resolver.feed(configured.keymap(), .diff, plain('s')).action);
+}
+
+test "M24 browser Actions resolve only in their contexts and remain configurable" {
+    var resolver: Resolver = .{};
+    inline for (.{ InteractionContext.sidebar, .sidebar_directory, .sidebar_file, .diff, .diff_source, .diff_disclosure, .diff_review_card }) |context| {
+        try testing.expectEqual(Action.open_browser, resolver.feed(.default, context, plain('b')).action);
+    }
+    inline for (.{ InteractionContext.browser, .browser_repository, .browser_pull_request }) |context| {
+        try testing.expectEqual(Action.close_browser, resolver.feed(.default, context, plain('b')).action);
+        try testing.expectEqual(Action.close_browser, resolver.feed(.default, context, plain(special.escape)).action);
+        try testing.expectEqual(Action.refresh, resolver.feed(.default, context, plain('R')).action);
+        try testing.expect(resolver.feed(.default, context, plain('p')) == .none);
+        try testing.expect(resolver.feed(.default, context, .{ .codepoint = 'p', .mods = .{ .ctrl = true } }) == .none);
+    }
+    try testing.expect(resolver.feed(.default, .browser, plain(special.enter)) == .none);
+    try testing.expect(resolver.feed(.default, .browser, plain('j')) == .none);
+    inline for (.{ InteractionContext.browser_repository, .browser_pull_request }) |context| {
+        try testing.expectEqual(Action.open_browser_entry, resolver.feed(.default, context, plain(special.enter)).action);
+        try testing.expectEqual(Action.down, resolver.feed(.default, context, plain('j')).action);
+        try testing.expectEqual(Action.left, resolver.feed(.default, context, plain('h')).action);
+        try testing.expectEqual(Action.right, resolver.feed(.default, context, plain('l')).action);
+    }
+    for (std.enums.values(InteractionContext)) |context| {
+        const pane = switch (context) {
+            .sidebar, .sidebar_directory, .sidebar_file, .diff, .diff_source, .diff_disclosure, .diff_review_card => true,
+            else => false,
+        };
+        const browser = context == .browser or context == .browser_repository or context == .browser_pull_request;
+        try testing.expectEqual(pane, supportsContext(.open_browser, context));
+        try testing.expectEqual(browser, supportsContext(.close_browser, context));
+        try testing.expectEqual(browser and context != .browser, supportsContext(.open_browser_entry, context));
+    }
+
+    const overrides = [_]Override{
+        .{ .action = "open_browser", .sequences = &.{"space b"} },
+        .{ .action = "close_browser", .sequences = &.{} },
+        .{ .action = "open_browser_entry", .sequences = &.{"o"} },
+    };
+    var configured = try Keymap.fromOverrides(testing.allocator, &overrides);
+    defer configured.deinit(testing.allocator);
+    resolver = .{};
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain('b')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain(' ')) == .none);
+    try testing.expectEqual(Action.open_browser, resolver.feed(configured.keymap(), .diff, plain('b')).action);
+    try testing.expect(resolver.feed(configured.keymap(), .browser, plain('b')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .browser, plain(special.escape)) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .browser_repository, plain(special.enter)) == .none);
+    try testing.expectEqual(Action.open_browser_entry, resolver.feed(configured.keymap(), .browser_pull_request, plain('o')).action);
 }

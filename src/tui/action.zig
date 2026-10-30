@@ -65,6 +65,9 @@ pub const Action = enum {
     confirm_picker,
     yank,
     focus_next_pane,
+    open_browser,
+    close_browser,
+    open_browser_entry,
 };
 
 /// The terminal-independent input surface and semantic cursor target used to
@@ -88,4 +91,8 @@ pub const InteractionContext = enum {
     help,
     unknown_resolution,
     delete_confirmation,
+    /// The Browser with no selectable Browser Entry under the cursor.
+    browser,
+    browser_repository,
+    browser_pull_request,
 };

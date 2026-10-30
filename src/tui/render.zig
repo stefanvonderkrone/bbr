@@ -32,6 +32,7 @@ const keymap = @import("keymap.zig");
 const buffer_mod = @import("buffer.zig");
 const layouts = @import("layouts.zig");
 const view_paint = @import("view_paint.zig");
+const browser = @import("browser.zig");
 
 pub const sidebar_width: u16 = 28;
 
@@ -2320,6 +2321,126 @@ pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, km:
         _ = mouse.printSegment(.{ .text = " Shift/Option: native selection · [input.mouse] enabled=false", .style = theme.gutter }, .{ .row_offset = 2, .col_offset = 1, .wrap = .none });
     }
     _ = childRect(win, rects.get(.hint).content).printSegment(.{ .text = " press any key to dismiss", .style = theme.picker_query }, .{ .wrap = .none });
+}
+
+/// The Browser. view_paint.zig paints its Pane, Title, and scroll bar, and
+/// this paints only the Browser Entries into the content rect.
+pub fn drawBrowser(scratch: std.mem.Allocator, win: vaxis.Window, projection: browser.Projection, theme: Theme) void {
+    win.clear();
+    const rects = view_paint.paint(layouts.BrowserSlot, layouts.browser, layouts.Browser{
+        .title = projection.workspace,
+        .scroll = .{ .total = projection.entries.len, .offset = projection.scroll },
+    }, win, theme);
+    const content = childRect(win, rects.get(.entries).content);
+    var row: u16 = 0;
+    while (row < content.height) : (row += 1) {
+        const index = projection.scroll + row;
+        if (index >= projection.entries.len) break;
+        const style = if (projection.cursor == index) theme.sidebar_selected else theme.sidebar_item;
+        fillRow(content, row, style);
+        const entry = projection.entries[index];
+        switch (entry) {
+            .repository => |node| drawBrowserRepository(scratch, content, row, projection.nodes[node], style),
+            .pull_request => drawBrowserPullRequest(scratch, content, row, projection.pullRequest(entry).?, style),
+            .message => |message| drawBrowserMessage(scratch, content, row, message, style),
+        }
+    }
+}
+
+const BrowserPart = struct {
+    text: []const u8,
+    style: vaxis.Style,
+    /// The one part that shrinks, with `…`, when the row does not fit.
+    flexible: bool = false,
+};
+
+fn dimmed(style: vaxis.Style) vaxis.Style {
+    var result = style;
+    result.dim = true;
+    return result;
+}
+
+fn drawBrowserRepository(scratch: std.mem.Allocator, win: vaxis.Window, row: u16, node: browser.RepositoryNode, style: vaxis.Style) void {
+    const date_buf = scratch.create([10]u8) catch return;
+    const date = browser.formatDate(date_buf, node.summary.updated_on) orelse "";
+    const count = if (node.count()) |n| std.fmt.allocPrint(scratch, "{d}", .{n}) catch "?" else "?";
+    const count_style = if (node.pull_requests.settled == .cached) dimmed(style) else style;
+    const differs = !std.mem.eql(u8, node.summary.name, node.summary.slug);
+    drawBrowserParts(scratch, win, row, 0, &.{
+        .{ .text = if (node.expanded) "▾ " else "▸ ", .style = style },
+        .{ .text = node.summary.name, .style = style, .flexible = true },
+        .{ .text = if (differs) "  " else "", .style = style },
+        .{ .text = if (differs) node.summary.slug else "", .style = dimmed(style) },
+    }, &.{
+        .{ .text = date, .style = style },
+        .{ .text = "  ", .style = style },
+        .{ .text = count, .style = count_style },
+    });
+}
+
+fn drawBrowserPullRequest(scratch: std.mem.Allocator, win: vaxis.Window, row: u16, pr: browser.PullRequestSummary, style: vaxis.Style) void {
+    const date_buf = scratch.create([10]u8) catch return;
+    const date = browser.formatDate(date_buf, pr.updated_on) orelse "";
+    const right = std.fmt.allocPrint(scratch, "{s}  {s}  {s} → {s}  ✓{d} ✗{d}", .{
+        pr.author_display_name,
+        date,
+        pr.source_branch,
+        pr.destination_branch,
+        pr.approval_count,
+        pr.changes_requested_count,
+    }) catch return;
+    drawBrowserParts(scratch, win, row, 2, &.{
+        .{ .text = std.fmt.allocPrint(scratch, "#{d} ", .{pr.id}) catch return, .style = style },
+        .{ .text = pr.title, .style = style, .flexible = true },
+    }, &.{.{ .text = right, .style = style }});
+}
+
+fn drawBrowserMessage(scratch: std.mem.Allocator, win: vaxis.Window, row: u16, message: browser.Message, style: vaxis.Style) void {
+    const indent: u16, const text: []const u8 = switch (message) {
+        .loading_repositories => .{ 0, "Loading Repositories…" },
+        .repositories_failed => |reason| .{ 0, std.fmt.allocPrint(scratch, "Repositories not loaded: {s}", .{@errorName(reason)}) catch "Repositories not loaded" },
+        .no_repositories => .{ 0, "No Repositories in this Workspace" },
+        .loading_pull_requests => .{ 2, "Loading PullRequests…" },
+        .pull_requests_failed => |failed| .{ 2, std.fmt.allocPrint(scratch, "PullRequests not loaded: {s}", .{@errorName(failed.reason)}) catch "PullRequests not loaded" },
+        .no_pull_requests => .{ 2, "No open PullRequests" },
+    };
+    drawBrowserParts(scratch, win, row, indent, &.{.{ .text = text, .style = dimmed(style), .flexible = true }}, &.{});
+}
+
+/// Paints `left` from `indent` and `right` against the right edge, one cell
+/// apart at least. The flexible part shrinks first.
+fn drawBrowserParts(scratch: std.mem.Allocator, win: vaxis.Window, row: u16, indent: u16, left: []const BrowserPart, right: []const BrowserPart) void {
+    var fixed: usize = indent;
+    for (left) |part| if (!part.flexible) {
+        fixed += vaxis.gwidth.gwidth(part.text, .unicode);
+    };
+    var right_width: usize = 0;
+    for (right) |part| right_width += vaxis.gwidth.gwidth(part.text, .unicode);
+    if (right_width > 0) fixed += right_width + 1;
+    const flexible_width = @as(usize, win.width) -| fixed;
+    var col: u16 = indent;
+    for (left) |part| {
+        if (col >= win.width) break;
+        const text = if (part.flexible) fitText(scratch, part.text, flexible_width) else part.text;
+        col = win.printSegment(.{ .text = text, .style = part.style }, .{ .row_offset = row, .col_offset = col, .wrap = .none }).col;
+    }
+    if (right_width == 0 or right_width + 1 > win.width -| col) return;
+    col = win.width - @as(u16, @intCast(right_width));
+    for (right) |part| col = win.printSegment(.{ .text = part.text, .style = part.style }, .{ .row_offset = row, .col_offset = col, .wrap = .none }).col;
+}
+
+/// `text` cut to `width` cells, ending in `…` when it had to be cut.
+fn fitText(scratch: std.mem.Allocator, text: []const u8, width: usize) []const u8 {
+    if (vaxis.gwidth.gwidth(text, .unicode) <= width) return text;
+    if (width == 0) return "";
+    var end: usize = 0;
+    var it = std.unicode.Utf8View.initUnchecked(text).iterator();
+    while (it.nextCodepointSlice()) |codepoint| {
+        const next = end + codepoint.len;
+        if (vaxis.gwidth.gwidth(text[0..next], .unicode) + 1 > width) break;
+        end = next;
+    }
+    return std.fmt.allocPrint(scratch, "{s}…", .{text[0..end]}) catch "…";
 }
 
 /// The boot/switch frame shown until a Session arrives: a centered floating
@@ -5419,8 +5540,8 @@ test "local help projection marks remote-only commands unavailable" {
     for (rows.commands) |row| {
         if (!row.available) unavailable += 1;
     }
-    // Remote-only commands, plus edit, re-anchor, and delete, stay visible.
-    try testing.expectEqual(@as(usize, 11), unavailable);
+    // Remote-only commands, the Browser, plus edit, re-anchor, and delete, stay visible.
+    try testing.expectEqual(@as(usize, 12), unavailable);
     for (rows.motions) |row| try testing.expect(row.available);
 }
 
@@ -5469,4 +5590,106 @@ test "edit stays discoverable in the help Overlay when it is refused" {
 fn helpRowAvailable(rows: []const HelpRow, help: []const u8) ?bool {
     for (rows) |row| if (std.mem.indexOf(u8, row.text, help) != null) return row.available;
     return null;
+}
+
+fn browserRowText(a: std.mem.Allocator, win: vaxis.Window, row: u16) ![]const u8 {
+    var text: std.ArrayList(u8) = .empty;
+    for (0..win.width) |col| try text.appendSlice(a, win.readCell(@intCast(col), row).?.char.grapheme);
+    return std.mem.trimEnd(u8, text.items, " ");
+}
+
+fn browserTestNodes(a: std.mem.Allocator, title: []const u8) ![2]browser.RepositoryNode {
+    const prs = try browser.PullRequestSummaries.create(a);
+    prs.prs = try prs.arena.allocator().dupe(browser.PullRequestSummary, &.{.{
+        .id = 7,
+        .title = title,
+        .state = "OPEN",
+        .author_display_name = "Ada",
+        .source_branch = "feature/cart",
+        .destination_branch = "main",
+        .updated_on = 1793318400,
+        .approval_count = 2,
+        .changes_requested_count = 1,
+    }});
+    return .{
+        .{ .summary = .{ .slug = "pr-webapp", .name = "PR Webapp", .updated_on = 1793318400 }, .expanded = true, .pull_requests = .{ .settled = .{ .loaded = prs } } },
+        .{ .summary = .{ .slug = "api", .name = "api", .updated_on = null } },
+    };
+}
+
+const browser_test_entries = [_]browser.Entry{
+    .{ .repository = 0 },
+    .{ .pull_request = .{ .repository = 0, .index = 0 } },
+    .{ .repository = 1 },
+    .{ .message = .{ .pull_requests_failed = .{ .repository = 1, .reason = error.Forbidden } } },
+};
+
+test "M24 browser the Browser Pane has rounded corners and the Workspace Title" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 8, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const nodes = try browserTestNodes(a, "Fix the cart");
+    defer nodes[0].pull_requests.settled.loaded.destroy();
+    drawBrowser(a, win, .{ .workspace = "check24", .nodes = &nodes, .entries = &browser_test_entries, .cursor = 1, .scroll = 0 }, theme_dark);
+
+    try testing.expectEqualStrings("╭", win.readCell(0, 0).?.char.grapheme);
+    try testing.expectEqualStrings("╮", win.readCell(79, 0).?.char.grapheme);
+    try testing.expectEqualStrings("╰", win.readCell(0, 7).?.char.grapheme);
+    try testing.expectEqualStrings("╯", win.readCell(79, 7).?.char.grapheme);
+    const top = try browserRowText(a, win, 0);
+    const title = std.mem.indexOf(u8, top, " check24 ").?;
+    try testing.expect(title > 0);
+    try testing.expectEqualStrings("│", win.readCell(0, 1).?.char.grapheme);
+
+    drawBrowser(a, win, .{ .workspace = "check24", .nodes = &nodes, .entries = &(browser_test_entries ++ browser_test_entries ++ browser_test_entries), .cursor = 1, .scroll = 0 }, theme_dark);
+    try testing.expectEqualStrings("┃", win.readCell(79, 1).?.char.grapheme);
+    try testing.expectEqualStrings("│", win.readCell(79, 6).?.char.grapheme);
+}
+
+test "M24 browser entries show their facts and truncate the title first" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 8, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    var nodes = try browserTestNodes(a, "Fix the cart");
+    defer nodes[0].pull_requests.settled.loaded.destroy();
+    drawBrowser(a, win, .{ .workspace = "check24", .nodes = &nodes, .entries = &browser_test_entries, .cursor = 1, .scroll = 0 }, theme_dark);
+
+    const content = childRect(win, @import("frame.zig").browserEntries(.{ .cols = 80, .rows = 8 }));
+    const repository = try browserRowText(a, content, 0);
+    try testing.expect(std.mem.startsWith(u8, repository, "▾ PR Webapp  pr-webapp"));
+    try testing.expect(std.mem.endsWith(u8, repository, "2026-10-30  1"));
+    const pull_request = try browserRowText(a, content, 1);
+    try testing.expect(std.mem.startsWith(u8, pull_request, "  #7 Fix the cart"));
+    try testing.expect(std.mem.endsWith(u8, pull_request, "Ada  2026-10-30  feature/cart → main  ✓2 ✗1"));
+    try testing.expectEqual(theme_dark.sidebar_selected.bg, content.readCell(0, 1).?.style.bg);
+    const unknown = try browserRowText(a, content, 2);
+    try testing.expect(std.mem.startsWith(u8, unknown, "▸ api"));
+    try testing.expect(std.mem.indexOf(u8, unknown, "api  api") == null);
+    try testing.expect(std.mem.endsWith(u8, unknown, "?"));
+    try testing.expectEqualStrings("  PullRequests not loaded: Forbidden", try browserRowText(a, content, 3));
+    try testing.expect(!content.readCell(content.width - 1, 0).?.style.dim);
+
+    const summaries = nodes[0].pull_requests.settled.loaded;
+    nodes[0].pull_requests.settled = .{ .cached = summaries };
+    drawBrowser(a, win, .{ .workspace = "check24", .nodes = &nodes, .entries = &browser_test_entries, .cursor = 1, .scroll = 0 }, theme_dark);
+    try testing.expect(content.readCell(content.width - 1, 0).?.style.dim);
+    nodes[0].pull_requests.settled = .{ .loaded = summaries };
+
+    var narrow_screen = try vaxis.Screen.init(a, .{ .rows = 8, .cols = 60, .x_pixel = 0, .y_pixel = 0 });
+    defer narrow_screen.deinit(a);
+    const narrow = headlessWindow(&narrow_screen);
+    const long = try browserTestNodes(a, "Fix the cart so that every checkout keeps its coupon");
+    defer long[0].pull_requests.settled.loaded.destroy();
+    drawBrowser(a, narrow, .{ .workspace = "check24", .nodes = &long, .entries = &browser_test_entries, .cursor = null, .scroll = 0 }, theme_dark);
+    const narrow_content = childRect(narrow, @import("frame.zig").browserEntries(.{ .cols = 60, .rows = 8 }));
+    const truncated = try browserRowText(a, narrow_content, 1);
+    try testing.expect(std.mem.startsWith(u8, truncated, "  #7 Fix"));
+    try testing.expect(std.mem.indexOf(u8, truncated, "…") != null);
+    try testing.expect(std.mem.endsWith(u8, truncated, "Ada  2026-10-30  feature/cart → main  ✓2 ✗1"));
 }

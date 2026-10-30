@@ -20,6 +20,7 @@ const buffer_mod = @import("buffer.zig");
 const search = @import("search.zig");
 const review_card = @import("review_card.zig");
 const code_highlighting = @import("code_highlighting.zig");
+const browser_mod = @import("browser.zig");
 
 test "M23 highlighting Suggestions inherit authored inline context after LocalReview rename" {
     const Resolver = struct {
@@ -898,6 +899,8 @@ pub const SessionLoaded = struct {
 
 pub const OwnedInput = union(enum) {
     choose_pull_request: OwnedReviewIdentity,
+    /// Starts the Browser once per process and shows it.
+    start_browser: BrowserStart,
     key: keymap_mod.KeyStroke,
     mouse: MouseInput,
     session_loaded: SessionLoaded,
@@ -926,6 +929,8 @@ pub const OwnedInput = union(enum) {
     duplicate_checked: DuplicateChecked,
     pull_requests_loaded: PullRequestsLoaded,
     picker_tick: WorkId,
+    browser_repositories_loaded: BrowserRepositoriesLoaded,
+    browser_pull_requests_loaded: BrowserPullRequestsLoaded,
     clipboard_completed: ClipboardCompleted,
     theme_persisted: ThemePersisted,
     external_edit_completed: *ExternalEditCompleted,
@@ -947,6 +952,8 @@ pub const OwnedInput = union(enum) {
                 result.deinit();
             },
             .pull_requests_loaded => |loaded| if (loaded.outcome == .loaded) loaded.outcome.loaded.destroy(),
+            .browser_repositories_loaded => |loaded| if (loaded.outcome == .loaded) loaded.outcome.loaded.destroy(),
+            .browser_pull_requests_loaded => |loaded| if (loaded.outcome == .loaded) loaded.outcome.loaded.destroy(),
             .external_edit_completed => |completed| completed.destroy(),
             .buffer_search_scanned => |*completed| completed.deinit(),
             .buffer_disclosure_built => |completed| completed.destroy(),
@@ -1066,6 +1073,42 @@ pub const ListPullRequests = struct {
         return self.repository.slice();
     }
 };
+
+pub const BrowserStart = browser_mod.Start;
+pub const BrowserProjection = browser_mod.Projection;
+
+/// Which surface fills the content region.
+pub const Surface = enum { review, browser };
+
+pub const ListBrowserRepositories = struct {
+    command_id: CommandId = 0,
+    work_id: WorkId,
+};
+
+pub const BrowserRepositoriesLoaded = struct {
+    command_id: CommandId = 0,
+    work_id: WorkId,
+    outcome: browser_mod.RepositoriesOutcome,
+};
+
+pub const ListBrowserPullRequests = struct {
+    command_id: CommandId = 0,
+    work_id: WorkId,
+    repository: browser_mod.Name,
+
+    pub fn repositoryName(self: *const ListBrowserPullRequests) []const u8 {
+        return self.repository.slice();
+    }
+};
+
+pub const BrowserPullRequestsLoaded = struct {
+    command_id: CommandId = 0,
+    work_id: WorkId,
+    outcome: browser_mod.PullRequestsOutcome,
+};
+
+/// The most `list_browser_pull_requests` commands outstanding at one time.
+const browser_pull_request_bound = 2;
 
 pub fn recoveryCheckSucceeded(command_id: CommandId, operation_id: bbr.review.OperationId, identity: ?OwnedRemoteReviewIdentity, source_commit: []const u8) OwnedInput {
     const source = BoundedText(64).init(source_commit) catch return .{ .recovery_checked = .{
@@ -1434,6 +1477,8 @@ pub const OwnedCommand = union(enum) {
     check_recovery: CheckRecovery,
     find_duplicate: *PostDraft,
     list_pull_requests: ListPullRequests,
+    list_browser_repositories: ListBrowserRepositories,
+    list_browser_pull_requests: ListBrowserPullRequests,
     copy_clipboard: *ClipboardCopy,
     persist_theme: PersistTheme,
     external_edit: *ExternalEdit,
@@ -1453,7 +1498,7 @@ pub const OwnedCommand = union(enum) {
             .scan_buffer_search => |*command| command.deinit(),
             .build_buffer_disclosure => |command| command.destroy(),
             .scan_review_source => |*command| command.deinit(),
-            .load_session, .enrich_file, .change_reviewer_verdict, .wait_submission, .check_recovery, .list_pull_requests, .persist_theme => {},
+            .load_session, .enrich_file, .change_reviewer_verdict, .wait_submission, .check_recovery, .list_pull_requests, .list_browser_repositories, .list_browser_pull_requests, .persist_theme => {},
         }
         self.* = undefined;
     }
@@ -1534,6 +1579,16 @@ pub const OwnedCommand = union(enum) {
                 .work_id = list.work_id,
                 .outcome = .failed,
             } },
+            .list_browser_repositories => |list| .{ .browser_repositories_loaded = .{
+                .command_id = list.command_id,
+                .work_id = list.work_id,
+                .outcome = .{ .failed = error.WorkerLaunchFailed },
+            } },
+            .list_browser_pull_requests => |list| .{ .browser_pull_requests_loaded = .{
+                .command_id = list.command_id,
+                .work_id = list.work_id,
+                .outcome = .{ .failed = error.WorkerLaunchFailed },
+            } },
             .copy_clipboard => |copy| .{ .clipboard_completed = .{ .command_id = copy.command_id, .success = false } },
             .persist_theme => |persist| .{ .theme_persisted = .{ .command_id = persist.command_id, .outcome = .write_failed } },
             .external_edit => |edit| blk: {
@@ -1587,6 +1642,8 @@ fn setCommandId(command: *OwnedCommand, command_id: CommandId) void {
         .wait_submission => |*value| value.command_id = command_id,
         .check_recovery => |*value| value.command_id = command_id,
         .list_pull_requests => |*value| value.command_id = command_id,
+        .list_browser_repositories => |*value| value.command_id = command_id,
+        .list_browser_pull_requests => |*value| value.command_id = command_id,
         .copy_clipboard => |value| value.command_id = command_id,
         .persist_theme => |*value| value.command_id = command_id,
         .external_edit => |value| value.command_id = command_id,
@@ -1666,6 +1723,8 @@ const LaunchFailureFixture = struct {
             .wait_submission => .{ .wait_submission = .{ .operation_id = operation_id, .identity = try remote(), .temp_id = temp_id, .ms = 1000 } },
             .check_recovery => .{ .check_recovery = .{ .operation_id = operation_id, .identity = try remote(), .source_commit = undefined } },
             .list_pull_requests => .{ .list_pull_requests = .{ .work_id = work_id, .repository = undefined } },
+            .list_browser_repositories => .{ .list_browser_repositories = .{ .work_id = work_id } },
+            .list_browser_pull_requests => .{ .list_browser_pull_requests = .{ .work_id = work_id, .repository = try browser_mod.Name.init("repo") } },
             .copy_clipboard => blk: {
                 const copy = try a.create(ClipboardCopy);
                 copy.* = .{ .allocator = a, .text = try a.dupe(u8, "copy") };
@@ -1768,6 +1827,11 @@ const LaunchFailureFixture = struct {
                 try testing.expectEqual(command_id, loaded.command_id);
                 try testing.expectEqual(work_id, loaded.work_id);
                 try testing.expect(loaded.outcome == .failed);
+            },
+            inline .browser_repositories_loaded, .browser_pull_requests_loaded => |loaded| {
+                try testing.expectEqual(command_id, loaded.command_id);
+                try testing.expectEqual(work_id, loaded.work_id);
+                try testing.expectEqual(@as(browser_mod.Failure, error.WorkerLaunchFailed), loaded.outcome.failed);
             },
             .clipboard_completed => |completed| {
                 try testing.expectEqual(command_id, completed.command_id);
@@ -3227,6 +3291,8 @@ pub const Projection = struct {
     reanchor: ?ReanchorProjection,
     delete_confirmation: ?DeleteConfirmationProjection,
     list_overlay: ?*const ListOverlay,
+    /// Set while the Browser fills the content region.
+    browser: ?BrowserProjection,
     picker_tick_scope: ?WorkId,
     /// The Theme to paint this frame.
     theme: ThemeId,
@@ -3379,6 +3445,8 @@ pub const ActionAvailability = struct {
     /// null means the ReviewCard under the cursor — and its complete Draft
     /// Reply-descendant closure — can be deleted.
     delete_refusal: ?MutationRefusal = .no_review_item,
+    /// False for the demo, which has no Workspace to browse.
+    browser: bool = true,
     approved_refusal: ?ReviewerVerdictRefusal = .local_review,
     changes_requested_refusal: ?ReviewerVerdictRefusal = .local_review,
     no_verdict_refusal: ?ReviewerVerdictRefusal = .local_review,
@@ -3392,6 +3460,12 @@ pub const ActionAvailability = struct {
     }
 
     pub fn available(self: ActionAvailability, action: Action) bool {
+        switch (self.context) {
+            .browser, .browser_repository, .browser_pull_request => return keymap_mod.supportsContext(action, self.context) and
+                (action != .close_browser or self.has_review),
+            else => {},
+        }
+        if (action == .open_browser) return self.remote and self.browser;
         if (!self.has_review) return switch (action) {
             .quit, .help, .open_pull_request_picker => self.remote,
             .open_command_palette, .open_theme_overlay => true,
@@ -3612,6 +3686,10 @@ pub const ActionError = enum {
     anchor_candidate_ambiguous,
     anchor_range_too_long,
     suggestion_anchor_not_new_side,
+    local_review_no_browser,
+    no_review_open,
+    browser_rate_limited,
+    browser_repositories_failed,
 };
 
 const BufferSearchInput = struct {
@@ -5885,6 +5963,12 @@ pub const Presentation = struct {
     speculative_enrichment: ?SpeculativeEnrichment = null,
     resolver: keymap_mod.Resolver = .{},
     list_overlay: ?ListOverlay = null,
+    /// The Browser lives outside `Published`, so a Session replacement, a
+    /// failed replacement, and `close_browser` keep it unchanged.
+    browser: ?*browser_mod.Browser = null,
+    surface: Surface = .review,
+    /// Queued and issued `list_browser_pull_requests` commands.
+    browser_pull_request_commands: usize = 0,
     configured_theme: ThemeId,
     help_visible: bool = false,
     durable_submission: ?*DurableSubmission = null,
@@ -5975,6 +6059,7 @@ pub const Presentation = struct {
         if (self.durable_comment_edit) |edit| edit.destroy();
         if (self.durable_comment_delete) |delete| delete.destroy();
         if (self.list_overlay) |*overlay| overlay.deinit();
+        if (self.browser) |state| state.destroy();
         if (self.published) |published| published.destroy();
         self.commands.deinit(self.allocator);
         self.issued_commands.deinit(self.allocator);
@@ -6017,6 +6102,7 @@ pub const Presentation = struct {
         }
         switch (input) {
             .choose_pull_request => |key| if (!self.shutdown_requested) try self.choosePullRequest(key),
+            .start_browser => |start| if (!self.shutdown_requested) self.startBrowser(start),
             .key => |key| try self.applyKey(key),
             .mouse => |mouse| self.applyMouse(mouse),
             .session_loaded => |completed| self.acceptLoadedSession(completed),
@@ -6045,6 +6131,8 @@ pub const Presentation = struct {
             .duplicate_checked => |checked| self.acceptDuplicateCheck(checked),
             .pull_requests_loaded => |loaded| self.acceptPullRequests(loaded),
             .picker_tick => |scope| if (!self.shutdown_requested) if (self.list_overlay) |*overlay| overlay.tick(scope),
+            .browser_repositories_loaded => |loaded| self.acceptBrowserRepositories(loaded),
+            .browser_pull_requests_loaded => |loaded| self.acceptBrowserPullRequests(loaded),
             .theme_persisted => |persisted| self.acceptThemePersisted(persisted),
             .clipboard_completed => |completed| {
                 if (!self.consumeCommand(completed.command_id, .copy_clipboard)) return;
@@ -6117,6 +6205,7 @@ pub const Presentation = struct {
                     durable.phase = .awaiting_duplicate;
             },
             .list_pull_requests => self.outstanding_picker_loads += 1,
+            .list_browser_repositories, .list_browser_pull_requests => {},
             .copy_clipboard => {},
             .persist_theme => {},
             .external_edit => {},
@@ -6182,6 +6271,7 @@ pub const Presentation = struct {
                 .root_has_replies = confirmation.root_has_replies,
             } else null,
             .list_overlay = if (self.list_overlay) |*overlay| overlay else null,
+            .browser = if (self.surface == .browser) if (self.browser) |state| state.projection() else null else null,
             .picker_tick_scope = if (self.shutdown_requested) null else if (self.list_overlay) |*overlay| overlay.tickScope() else null,
             .theme = self.activeTheme(),
             .configured_theme = self.configured_theme,
@@ -6225,7 +6315,8 @@ pub const Presentation = struct {
 
     pub fn readyToExit(self: *const Presentation) bool {
         if (builtin.is_test) for (self.issued_commands.items) |issued| {
-            if (issued.target == .scan_buffer_search or issued.target == .scan_review_source or issued.target == .build_buffer_disclosure or issued.target == .prepare_session) return false;
+            if (issued.target == .scan_buffer_search or issued.target == .scan_review_source or issued.target == .build_buffer_disclosure or issued.target == .prepare_session or
+                issued.target == .list_browser_repositories or issued.target == .list_browser_pull_requests) return false;
         };
         if (builtin.is_test) return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.durable_reviewer_verdict == null and self.commands.items.len == 0 and self.outstanding_loads == 0 and self.outstanding_picker_loads == 0 and self.issued_enrichments.items.len == 0;
         return self.shutdown_requested and self.durable_submission == null and self.durable_comment_edit == null and self.durable_comment_delete == null and self.durable_reviewer_verdict == null and self.commands.items.len == 0 and self.issued_commands.items.len == 0;
@@ -6255,6 +6346,9 @@ pub const Presentation = struct {
             };
         frame.revision = self.interaction_revision;
         frame.overlay = self.overlayTarget();
+        if (self.surface == .browser) if (self.browser) |state| {
+            frame.browser = .{ .entries = frame_mod.browserEntries(self.geometry), .scroll = state.scroll, .rows = state.entries };
+        };
         return frame;
     }
 
@@ -6349,6 +6443,7 @@ pub const Presentation = struct {
             self.version_restoration = null;
         }
         switch (target) {
+            .browser_entry => |index| return self.clickBrowserEntry(index),
             .select_old_version => return self.applyAction(.select_old_version),
             .select_new_version => return self.applyAction(.select_new_version),
             .list_entry => |row| if (self.list_overlay) |*overlay| overlay.selectRow(row) else return,
@@ -6412,6 +6507,7 @@ pub const Presentation = struct {
         if (rows == 0) return;
         if (target != .select_old_version and target != .select_new_version) self.version_restoration = null;
         switch (target) {
+            .browser_entry => (self.browser orelse return).scrollBy(if (down) @as(isize, @intCast(rows)) else -@as(isize, @intCast(rows))),
             .select_old_version, .select_new_version => return,
             .review_search_entry, .review_search_list => {
                 const published = self.published orelse return;
@@ -6655,6 +6751,7 @@ pub const Presentation = struct {
         self.closeListOverlay();
         self.help_visible = false;
         self.unknown_resolution = null;
+        if (self.browser != null) self.dropQueuedBrowserCommands();
         var write: usize = 0;
         for (self.commands.items) |command_value| {
             var command = command_value;
@@ -6671,7 +6768,7 @@ pub const Presentation = struct {
     }
 
     fn pushCountDigit(self: *Presentation, digit: u8) void {
-        if (self.shutdown_requested or self.replacement != null) return;
+        if (self.shutdown_requested or self.replacement != null or self.surface == .browser) return;
         if (self.published) |published| published.navigation.pushDigit(digit);
     }
 
@@ -6686,6 +6783,7 @@ pub const Presentation = struct {
     }
 
     fn paneContext(self: *const Presentation) keymap_mod.InteractionContext {
+        if (self.surface == .browser) if (self.browser) |state| return browserContext(state);
         const published = self.published orelse return .diff;
         if (published.composer != null) return .composer;
         if (published.focus == .sidebar) {
@@ -6707,6 +6805,7 @@ pub const Presentation = struct {
             .remote = self.dependencies.remote_enabled,
             .has_review = false,
             .context = context,
+            .browser = self.dependencies.remote_enabled,
         };
         const source = context == .diff_source or published.navigation.count > 0 or blk: {
             const selection = published.navigation.selection() orelse break :blk false;
@@ -6717,6 +6816,7 @@ pub const Presentation = struct {
         };
         return .{
             .remote = published.key.isRemote(),
+            .browser = self.dependencies.remote_enabled,
             .context = context,
             .selected_version = published.selected_version,
             .yank_refusal = yankRefusal(published),
@@ -7313,6 +7413,7 @@ pub const Presentation = struct {
     }
 
     fn resize(self: *Presentation, geometry: frame_mod.Geometry) void {
+        if (self.browser) |state| state.setViewport(frame_mod.browserEntries(geometry).height);
         if (std.meta.eql(self.geometry, geometry) and (self.published == null or self.published.?.pending_view == null)) return;
         const published = self.published orelse {
             self.geometry = geometry;
@@ -7383,6 +7484,8 @@ pub const Presentation = struct {
         if (visible_key != null and !availability.available(action)) {
             self.action_error = switch (action) {
                 .open_pull_request_picker => .local_review_no_picker,
+                .open_browser => if (availability.remote) .action_refused else .local_review_no_browser,
+                .close_browser => .no_review_open,
                 .submit => .local_review_no_submission,
                 .inline_comment => inlineCommentRefusalError(availability.inline_comment_refusal, selected_version),
                 .suggest => suggestionRefusalError(availability.suggestion_refusal, selected_version),
@@ -7409,6 +7512,14 @@ pub const Presentation = struct {
         }
         if (action == .help) {
             self.help_visible = true;
+            return;
+        }
+        if (self.surface == .browser) {
+            self.applyBrowserAction(action);
+            return;
+        }
+        if (action == .open_browser) {
+            self.openBrowser();
             return;
         }
         if (action == .open_pull_request_picker) {
@@ -7533,7 +7644,8 @@ pub const Presentation = struct {
             .resolve_unpublished => self.resolveSelectedUnknownAsUnpublished(published),
             .link_existing_comment => self.openUnknownResolutionEditor(published),
             .yank => self.yank(published, yank_count),
-            .open_file_finder, .open_pull_request_picker, .open_command_palette, .open_theme_overlay, .confirm_picker, .help => unreachable,
+            .open_file_finder, .open_pull_request_picker, .open_command_palette, .open_theme_overlay, .confirm_picker, .help, .open_browser => unreachable,
+            .close_browser, .open_browser_entry => {},
             .quit => unreachable,
         }
         clampSelectionAtUnavailableRow(published, selection_cursor_before, self.preferences.scope);
@@ -12044,6 +12156,7 @@ pub const Presentation = struct {
         if (self.list_overlay) |*overlay| if (overlay.closesOnReplacement()) self.closeListOverlay();
         self.published = candidate;
         self.preferences = job.preferences;
+        if (replacement.cause == .picker) self.surface = .review;
         self.discardQueuedBufferSearchScans(null);
         if (self.stale_repair) |*gate| if (OwnedReviewIdentity.eql(gate.key, candidate.key)) {
             gate.observed_source_commit = BoundedText(64).init(candidate.session.header.source_commit) catch gate.observed_source_commit;
@@ -12082,12 +12195,225 @@ pub const Presentation = struct {
         self.refreshStaleRepairTree();
     }
 
+    /// The first start creates the Browser and queues its loads. A later
+    /// start only shows it.
+    fn startBrowser(self: *Presentation, start: BrowserStart) void {
+        if (self.browser == null) {
+            self.commands.ensureUnusedCapacity(self.allocator, 1) catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
+            const state = browser_mod.Browser.create(self.allocator, start, frame_mod.browserEntries(self.geometry).height) catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
+            self.browser = state;
+            self.next_work_id += 1;
+            state.repositories.work = self.next_work_id;
+            self.commands.appendAssumeCapacity(.{ .list_browser_repositories = .{ .work_id = self.next_work_id } });
+            self.pumpBrowserLoads(state);
+            self.rebuildBrowser(state);
+        }
+        self.surface = .browser;
+        self.action_error = null;
+    }
+
+    /// The first `open_browser` starts the Browser on the published Session's
+    /// Repository and PullRequest.
+    fn openBrowser(self: *Presentation) void {
+        if (self.browser != null) {
+            self.surface = .browser;
+            self.action_error = null;
+            return;
+        }
+        const published = self.published orelse {
+            self.action_error = .action_refused;
+            return;
+        };
+        const key = published.key;
+        self.startBrowser(.{
+            .workspace = browser_mod.Name.init(key.workspace()) catch return self.refuse(.action_refused),
+            .repository = browser_mod.Name.init(key.repository()) catch return self.refuse(.action_refused),
+            .pull_request_id = key.pull_request_id,
+        });
+    }
+
+    fn refuse(self: *Presentation, err: ActionError) void {
+        self.action_error = err;
+    }
+
+    fn applyBrowserAction(self: *Presentation, action: Action) void {
+        const state = self.browser orelse return;
+        self.action_error = null;
+        switch (action) {
+            .down => state.move(.down),
+            .up => state.move(.up),
+            .half_page_down => state.move(.half_page_down),
+            .half_page_up => state.move(.half_page_up),
+            .to_top => state.move(.to_top),
+            .to_bottom => state.move(.to_bottom),
+            .left => switch (state.cursorEntry() orelse return) {
+                .repository => |node| if (state.nodes.items[node].expanded) {
+                    state.collapse(node);
+                    self.rebuildBrowser(state);
+                },
+                .pull_request => |pr| state.selectRepository(pr.repository),
+                .message => {},
+            },
+            .right => switch (state.cursorEntry() orelse return) {
+                .repository => |node| self.expandBrowserRepository(state, node),
+                .pull_request, .message => {},
+            },
+            .open_browser_entry => self.openBrowserEntry(state),
+            .refresh => self.refreshBrowser(state),
+            .close_browser => if (self.published == null) {
+                self.action_error = .no_review_open;
+            } else {
+                self.surface = .review;
+            },
+            else => {},
+        }
+    }
+
+    fn clickBrowserEntry(self: *Presentation, index: usize) void {
+        const state = self.browser orelse return;
+        if (state.cursor_index == index) return self.applyBrowserAction(.open_browser_entry);
+        state.select(index);
+        self.interaction_revision +%= 1;
+    }
+
+    fn openBrowserEntry(self: *Presentation, state: *browser_mod.Browser) void {
+        const entry = state.cursorEntry() orelse return;
+        switch (entry) {
+            .repository => |node| if (state.nodes.items[node].expanded) {
+                state.collapse(node);
+                self.rebuildBrowser(state);
+            } else self.expandBrowserRepository(state, node),
+            .pull_request => |pr| {
+                const key = OwnedReviewIdentity.init(state.workspace.slice(), state.nodes.items[pr.repository].summary.slug, state.pullRequest(entry).?.id) catch
+                    return self.refuse(.action_refused);
+                self.choosePullRequest(key) catch return self.refuse(.out_of_memory);
+                if (self.published) |published| if (OwnedReviewIdentity.eql(published.key, key)) {
+                    self.surface = .review;
+                };
+            },
+            .message => {},
+        }
+    }
+
+    fn expandBrowserRepository(self: *Presentation, state: *browser_mod.Browser, node: usize) void {
+        if (state.expand(node)) self.pumpBrowserLoads(state);
+        self.rebuildBrowser(state);
+    }
+
+    /// Reloads the Repository list and every expanded Repository. Each new
+    /// WorkId supersedes the load in flight.
+    fn refreshBrowser(self: *Presentation, state: *browser_mod.Browser) void {
+        self.commands.ensureUnusedCapacity(self.allocator, 1) catch return self.refuse(.out_of_memory);
+        self.dropQueuedBrowserCommands();
+        self.next_work_id += 1;
+        state.repositories.work = self.next_work_id;
+        self.commands.appendAssumeCapacity(.{ .list_browser_repositories = .{ .work_id = self.next_work_id } });
+        state.refreshExpanded();
+        self.pumpBrowserLoads(state);
+        self.rebuildBrowser(state);
+    }
+
+    /// Removes the Browser commands that no worker took yet. Each removed
+    /// PullRequest load releases its request, so a later expansion or
+    /// refresh can queue it again.
+    fn dropQueuedBrowserCommands(self: *Presentation) void {
+        var write: usize = 0;
+        for (self.commands.items) |command| switch (command) {
+            .list_browser_repositories => {},
+            .list_browser_pull_requests => |list| {
+                self.browser_pull_request_commands -= 1;
+                const state = self.browser.?;
+                if (state.nodeForRequest(list.work_id)) |node| state.nodes.items[node].pull_requests.request = null;
+            },
+            else => {
+                self.commands.items[write] = command;
+                write += 1;
+            },
+        };
+        self.commands.shrinkRetainingCapacity(write);
+    }
+
+    /// Issues waiting PullRequest loads in FIFO order up to the bound.
+    fn pumpBrowserLoads(self: *Presentation, state: *browser_mod.Browser) void {
+        if (self.shutdown_requested) return;
+        while (self.browser_pull_request_commands < browser_pull_request_bound) {
+            const index = state.nextWaiting() orelse return;
+            const load = &state.nodes.items[index].pull_requests;
+            const repository = browser_mod.Name.init(state.nodes.items[index].summary.slug) catch {
+                load.request = null;
+                continue;
+            };
+            self.commands.ensureUnusedCapacity(self.allocator, 1) catch return self.refuse(.out_of_memory);
+            self.next_work_id += 1;
+            load.request = .{ .issued = self.next_work_id };
+            self.commands.appendAssumeCapacity(.{ .list_browser_pull_requests = .{ .work_id = self.next_work_id, .repository = repository } });
+            self.browser_pull_request_commands += 1;
+        }
+    }
+
+    fn rebuildBrowser(self: *Presentation, state: *browser_mod.Browser) void {
+        state.rebuild() catch self.refuse(.out_of_memory);
+    }
+
+    fn acceptBrowserRepositories(self: *Presentation, loaded: BrowserRepositoriesLoaded) void {
+        var input: OwnedInput = .{ .browser_repositories_loaded = loaded };
+        if (!self.consumeCommand(loaded.command_id, .list_browser_repositories)) return input.deinit();
+        const state = self.browser orelse return input.deinit();
+        if (state.repositories.work != loaded.work_id) return input.deinit();
+        state.repositories.work = null;
+        switch (loaded.outcome) {
+            .loaded => |list| state.replaceRepositories(list) catch {
+                list.destroy();
+                self.action_error = .out_of_memory;
+            },
+            .failed => |reason| if (state.repositories.loaded != null) {
+                self.action_error = .browser_repositories_failed;
+            } else {
+                state.repositories.failure = reason;
+            },
+        }
+        self.rebuildBrowser(state);
+    }
+
+    fn acceptBrowserPullRequests(self: *Presentation, loaded: BrowserPullRequestsLoaded) void {
+        var input: OwnedInput = .{ .browser_pull_requests_loaded = loaded };
+        if (!self.consumeCommand(loaded.command_id, .list_browser_pull_requests)) return input.deinit();
+        self.browser_pull_request_commands -|= 1;
+        const state = self.browser orelse return input.deinit();
+        const node = state.nodeForRequest(loaded.work_id) orelse {
+            input.deinit();
+            return self.pumpBrowserLoads(state);
+        };
+        state.storePullRequests(node, loaded.outcome);
+        if (loaded.outcome == .failed and loaded.outcome.failed == error.RateLimited) {
+            state.dropWaiting();
+            self.action_error = .browser_rate_limited;
+        }
+        self.pumpBrowserLoads(state);
+        self.rebuildBrowser(state);
+    }
+
     fn finishReviewerVerdictReconciliation(self: *Presentation, key: OwnedReviewIdentity) void {
         if (self.durable_reviewer_verdict) |durable| {
             if (OwnedReviewIdentity.eql(durable.key, key)) self.durable_reviewer_verdict = null;
         }
     }
 };
+
+/// A new Browser Entry kind needs its Interaction Context here.
+fn browserContext(state: *const browser_mod.Browser) keymap_mod.InteractionContext {
+    return switch (state.cursorEntry() orelse return .browser) {
+        .repository => .browser_repository,
+        .pull_request => .browser_pull_request,
+        .message => .browser,
+    };
+}
 
 fn recoveryMatches(notice: RecoveryNotice, active: bbr.review.ActiveSubmissionRun) bool {
     return notice.operation_id == active.operation_id and
@@ -29417,4 +29743,519 @@ test "Sidebar mouse click toggles a Directory and focuses a child File" {
     try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
     try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 0 }));
     try testing.expectEqual(@as(usize, 0), frame.navigation.cursor);
+}
+
+const browser_test_geometry: frame_mod.Geometry = .{ .cols = 100, .rows = 30 };
+
+fn browserTestPresentation(store: *bbr.review.InMemoryStore, dependencies: Dependencies) !Presentation {
+    var with_store = dependencies;
+    with_store.reviews = store.store();
+    return Presentation.init(testing.allocator, with_store, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("check24", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        .geometry = browser_test_geometry,
+    });
+}
+
+fn browserKey(presentation: *Presentation, codepoint: u21) !void {
+    try presentation.dispatch(.{ .key = .{ .codepoint = codepoint, .text = if (codepoint < 128) &[_]u8{@intCast(codepoint)} else null } });
+}
+
+fn takeBrowserRepositoriesCommand(presentation: *Presentation) !ListBrowserRepositories {
+    const command = presentation.takeCommand() orelse return error.MissingCommand;
+    if (command != .list_browser_repositories) return error.UnexpectedCommand;
+    return command.list_browser_repositories;
+}
+
+fn takeBrowserPullRequestsCommand(presentation: *Presentation, repository: []const u8) !ListBrowserPullRequests {
+    const command = presentation.takeCommand() orelse return error.MissingCommand;
+    if (command != .list_browser_pull_requests) return error.UnexpectedCommand;
+    try testing.expectEqualStrings(repository, command.list_browser_pull_requests.repositoryName());
+    return command.list_browser_pull_requests;
+}
+
+fn browserRepositoryList(items: []const browser_mod.RepositorySummary) !*browser_mod.RepositorySummaries {
+    const list = try browser_mod.RepositorySummaries.create(testing.allocator);
+    errdefer list.destroy();
+    list.repositories = try list.arena.allocator().dupe(browser_mod.RepositorySummary, items);
+    return list;
+}
+
+fn browserPullRequestList(ids: []const u64) !*PullRequestSummaries {
+    const list = try PullRequestSummaries.create(testing.allocator);
+    errdefer list.destroy();
+    const items = try list.arena.allocator().alloc(bbr.bitbucket.PullRequestSummary, ids.len);
+    for (items, ids, 0..) |*item, id, index| item.* = .{
+        .id = id,
+        .title = "title",
+        .state = "OPEN",
+        .author_display_name = "Ada",
+        .source_branch = "feature",
+        .destination_branch = "main",
+        .updated_on = @intCast(1000 - index),
+    };
+    list.prs = items;
+    return list;
+}
+
+fn completeBrowserRepositories(presentation: *Presentation, command: ListBrowserRepositories, slugs: []const []const u8) !void {
+    var items: [8]browser_mod.RepositorySummary = undefined;
+    for (slugs, 0..) |slug, index| items[index] = .{ .slug = slug, .name = slug, .updated_on = @intCast(1000 - index) };
+    try presentation.dispatch(.{ .browser_repositories_loaded = .{
+        .command_id = command.command_id,
+        .work_id = command.work_id,
+        .outcome = .{ .loaded = try browserRepositoryList(items[0..slugs.len]) },
+    } });
+}
+
+fn completeBrowserPullRequests(presentation: *Presentation, command: ListBrowserPullRequests, ids: []const u64) !void {
+    try presentation.dispatch(.{ .browser_pull_requests_loaded = .{
+        .command_id = command.command_id,
+        .work_id = command.work_id,
+        .outcome = .{ .loaded = try browserPullRequestList(ids) },
+    } });
+}
+
+fn failBrowserPullRequests(presentation: *Presentation, command: ListBrowserPullRequests, reason: browser_mod.Failure) !void {
+    try presentation.dispatch(.{ .browser_pull_requests_loaded = .{
+        .command_id = command.command_id,
+        .work_id = command.work_id,
+        .outcome = .{ .failed = reason },
+    } });
+}
+
+/// Opens the Browser from the Session and loads the Repository list and the
+/// PullRequests of the Session Repository.
+fn openLoadedBrowser(presentation: *Presentation, slugs: []const []const u8, ids: []const u64) !void {
+    try browserKey(presentation, 'b');
+    const repositories = try takeBrowserRepositoriesCommand(presentation);
+    const pull_requests = try takeBrowserPullRequestsCommand(presentation, "repo");
+    try completeBrowserRepositories(presentation, repositories, slugs);
+    try completeBrowserPullRequests(presentation, pull_requests, ids);
+}
+
+fn browserCursor(presentation: *const Presentation) ?browser_mod.Selection {
+    return presentation.browser.?.cursor;
+}
+
+fn browserRows(presentation: *const Presentation) []const browser_mod.Entry {
+    return presentation.projection().browser.?.entries;
+}
+
+/// Moves the cursor to the Repository row of `slug` with `j` and `k`.
+fn browserCursorTo(presentation: *Presentation, slug: []const u8) !void {
+    for (0..2) |_| for (0..browserRows(presentation).len) |_| {
+        const cursor = browserCursor(presentation).?;
+        if (cursor == .repository and cursor.repository.eql(slug)) return;
+        try browserKey(presentation, 'j');
+    } else {
+        for (0..browserRows(presentation).len) |_| try browserKey(presentation, 'k');
+    };
+    return error.RepositoryRowNotFound;
+}
+
+fn expectBrowserPullRequests(presentation: *const Presentation, slug: []const u8, ids: []const u64) !void {
+    const view = presentation.projection().browser.?;
+    var found: std.ArrayList(u64) = .empty;
+    defer found.deinit(testing.allocator);
+    for (view.entries) |entry| if (entry == .pull_request and std.mem.eql(u8, view.nodes[entry.pull_request.repository].summary.slug, slug))
+        try found.append(testing.allocator, view.pullRequest(entry).?.id);
+    try testing.expectEqualSlices(u64, ids, found.items);
+}
+
+fn expectNoCommand(presentation: *Presentation) !void {
+    if (presentation.takeCommand()) |command| {
+        var value = command;
+        defer value.deinit();
+        std.debug.print("unexpected command {s}\n", .{@tagName(value)});
+        return error.UnexpectedCommand;
+    }
+}
+
+test "M24 browser the first open_browser expands the Session Repository and focuses its PullRequest" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined });
+    defer presentation.deinit();
+
+    try browserKey(&presentation, 'b');
+    try testing.expect(presentation.projection().browser != null);
+    try testing.expectEqualStrings("check24", presentation.projection().browser.?.workspace);
+    const repositories = try takeBrowserRepositoriesCommand(&presentation);
+    const pull_requests = try takeBrowserPullRequestsCommand(&presentation, "repo");
+    try expectNoCommand(&presentation);
+    try testing.expectEqualSlices(browser_mod.Entry, &.{
+        .{ .repository = 0 },
+        .{ .message = .{ .loading_pull_requests = 0 } },
+        .{ .message = .loading_repositories },
+    }, browserRows(&presentation));
+    try testing.expect(browserCursor(&presentation).? == .repository);
+
+    try completeBrowserRepositories(&presentation, repositories, &.{ "other", "repo" });
+    try completeBrowserPullRequests(&presentation, pull_requests, &.{ 2, 1 });
+    try testing.expectEqual(@as(u64, 1), browserCursor(&presentation).?.pull_request.id);
+    try testing.expectEqual(keymap_mod.InteractionContext.browser_pull_request, presentation.projection().action_availability.context);
+}
+
+test "M24 browser a cursor Motion before the row appears clears the pending focus" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined });
+    defer presentation.deinit();
+
+    try browserKey(&presentation, 'b');
+    const repositories = try takeBrowserRepositoriesCommand(&presentation);
+    const pull_requests = try takeBrowserPullRequestsCommand(&presentation, "repo");
+    try browserKey(&presentation, 'j');
+    try completeBrowserRepositories(&presentation, repositories, &.{"repo"});
+    try completeBrowserPullRequests(&presentation, pull_requests, &.{ 2, 1 });
+    try testing.expect(browserCursor(&presentation).? == .repository);
+}
+
+test "M24 browser Session replacement and return keep the Browser state" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined });
+    defer presentation.deinit();
+    try openLoadedBrowser(&presentation, &.{ "repo", "other" }, &.{ 1, 2 });
+    try browserKey(&presentation, 'j');
+    try testing.expectEqual(@as(u64, 2), browserCursor(&presentation).?.pull_request.id);
+
+    try browserKey(&presentation, keymap_mod.special.escape);
+    try testing.expect(presentation.projection().browser == null);
+    try testing.expectEqual(@as(u64, 1), presentation.projection().review.?.key.pull_request_id);
+    try browserKey(&presentation, 'b');
+    try expectNoCommand(&presentation);
+    try testing.expectEqual(@as(u64, 2), browserCursor(&presentation).?.pull_request.id);
+    const rows_before = browserRows(&presentation).len;
+    const scroll_before = presentation.projection().browser.?.scroll;
+
+    try browserKey(&presentation, keymap_mod.special.enter);
+    try testing.expect(presentation.projection().browser != null);
+    try testing.expect(presentation.projection().replacing);
+    const load = presentation.takeCommand().?.load_session;
+    try testing.expectEqual(@as(u64, 2), load.key.pull_request_id);
+    try testing.expectEqualStrings("repo", load.key.repository());
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') } } });
+    try testing.expect(presentation.projection().browser == null);
+    try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.key.pull_request_id);
+
+    try browserKey(&presentation, 'b');
+    try expectNoCommand(&presentation);
+    try testing.expectEqual(@as(u64, 2), browserCursor(&presentation).?.pull_request.id);
+    try testing.expectEqual(rows_before, browserRows(&presentation).len);
+    try testing.expectEqual(scroll_before, presentation.projection().browser.?.scroll);
+    try expectBrowserPullRequests(&presentation, "repo", &.{ 1, 2 });
+
+    try browserKey(&presentation, 'k');
+    try browserKey(&presentation, keymap_mod.special.enter);
+    const failing = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{ .command_id = failing.command_id, .intent = failing.intent, .outcome = .{ .failed = error.ConnectionResetByPeer } } });
+    try testing.expect(presentation.projection().browser != null);
+    try testing.expect(presentation.projection().replacement_error != null);
+    try testing.expectEqual(@as(u64, 1), browserCursor(&presentation).?.pull_request.id);
+    try testing.expectEqual(rows_before, browserRows(&presentation).len);
+    try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.key.pull_request_id);
+
+    try browserKey(&presentation, 'b');
+    try testing.expect(presentation.projection().browser == null);
+}
+
+test "M24 browser a stale completion changes nothing and frees its payload" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined });
+    defer presentation.deinit();
+
+    try browserKey(&presentation, 'b');
+    const stale_repositories = try takeBrowserRepositoriesCommand(&presentation);
+    const stale_pull_requests = try takeBrowserPullRequestsCommand(&presentation, "repo");
+    try browserKey(&presentation, 'R');
+    const repositories = try takeBrowserRepositoriesCommand(&presentation);
+    const pull_requests = try takeBrowserPullRequestsCommand(&presentation, "repo");
+    try expectNoCommand(&presentation);
+    const rows = try testing.allocator.dupe(browser_mod.Entry, browserRows(&presentation));
+    defer testing.allocator.free(rows);
+
+    try completeBrowserRepositories(&presentation, stale_repositories, &.{ "repo", "stale" });
+    try completeBrowserPullRequests(&presentation, stale_pull_requests, &.{9});
+    try testing.expectEqualSlices(browser_mod.Entry, rows, browserRows(&presentation));
+    try testing.expect(presentation.action_error == null);
+
+    try completeBrowserRepositories(&presentation, repositories, &.{"repo"});
+    try completeBrowserPullRequests(&presentation, pull_requests, &.{1});
+    try expectBrowserPullRequests(&presentation, "repo", &.{1});
+    try testing.expect(presentation.browser.?.findNode("stale") == null);
+}
+
+test "M24 browser keeps at most two PullRequest list requests outstanding" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined });
+    defer presentation.deinit();
+    try openLoadedBrowser(&presentation, &.{ "repo", "a", "b", "c", "d" }, &.{1});
+
+    for ([_][]const u8{ "a", "b", "c", "d" }) |slug| {
+        try browserCursorTo(&presentation, slug);
+        try browserKey(&presentation, 'l');
+    }
+    const first = try takeBrowserPullRequestsCommand(&presentation, "a");
+    const second = try takeBrowserPullRequestsCommand(&presentation, "b");
+    try expectNoCommand(&presentation);
+
+    try browserCursorTo(&presentation, "c");
+    try browserKey(&presentation, 'h');
+    try expectNoCommand(&presentation);
+
+    try completeBrowserPullRequests(&presentation, first, &.{5});
+    const third = try takeBrowserPullRequestsCommand(&presentation, "d");
+    try expectNoCommand(&presentation);
+    try completeBrowserPullRequests(&presentation, second, &.{6});
+    try completeBrowserPullRequests(&presentation, third, &.{7});
+    try expectNoCommand(&presentation);
+    try expectBrowserPullRequests(&presentation, "a", &.{5});
+    try expectBrowserPullRequests(&presentation, "d", &.{7});
+
+    try browserCursorTo(&presentation, "a");
+    try browserKey(&presentation, 'h');
+    try browserKey(&presentation, 'l');
+    try browserKey(&presentation, keymap_mod.special.enter);
+    try browserKey(&presentation, keymap_mod.special.enter);
+    try expectNoCommand(&presentation);
+    try expectBrowserPullRequests(&presentation, "a", &.{5});
+}
+
+test "M24 browser the Repository list shows its loading, empty, and failure states" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{ .geometry = browser_test_geometry });
+    defer presentation.deinit();
+
+    try presentation.dispatch(.{ .start_browser = .{ .workspace = try browser_mod.Name.init("check24") } });
+    try testing.expectEqualSlices(browser_mod.Entry, &.{.{ .message = .loading_repositories }}, browserRows(&presentation));
+    try testing.expectEqual(keymap_mod.InteractionContext.browser, presentation.projection().action_availability.context);
+    const failing = try takeBrowserRepositoriesCommand(&presentation);
+    try presentation.dispatch(.{ .browser_repositories_loaded = .{ .command_id = failing.command_id, .work_id = failing.work_id, .outcome = .{ .failed = error.Unauthorized } } });
+    try testing.expectEqualSlices(browser_mod.Entry, &.{.{ .message = .{ .repositories_failed = error.Unauthorized } }}, browserRows(&presentation));
+
+    try browserKey(&presentation, 'R');
+    try completeBrowserRepositories(&presentation, try takeBrowserRepositoriesCommand(&presentation), &.{});
+    try testing.expectEqualSlices(browser_mod.Entry, &.{.{ .message = .no_repositories }}, browserRows(&presentation));
+
+    try browserKey(&presentation, 'R');
+    try completeBrowserRepositories(&presentation, try takeBrowserRepositoriesCommand(&presentation), &.{ "kept", "lost" });
+    try testing.expectEqual(@as(usize, 2), browserRows(&presentation).len);
+    try browserKey(&presentation, 'R');
+    const refused = try takeBrowserRepositoriesCommand(&presentation);
+    try presentation.dispatch(.{ .browser_repositories_loaded = .{ .command_id = refused.command_id, .work_id = refused.work_id, .outcome = .{ .failed = error.ServerError } } });
+    try testing.expectEqual(@as(usize, 2), browserRows(&presentation).len);
+    try testing.expectEqual(@as(?ActionError, .browser_repositories_failed), presentation.projection().action_error);
+
+    try browserKey(&presentation, 'R');
+    try completeBrowserRepositories(&presentation, try takeBrowserRepositoriesCommand(&presentation), &.{"kept"});
+    try testing.expectEqualSlices(browser_mod.Entry, &.{.{ .repository = 0 }}, browserRows(&presentation));
+    try testing.expect(presentation.browser.?.findNode("lost") == null);
+
+    try browserKey(&presentation, keymap_mod.special.escape);
+    try testing.expectEqual(@as(?ActionError, .no_review_open), presentation.projection().action_error);
+    try testing.expect(presentation.projection().browser != null);
+}
+
+test "M24 browser one failed Repository keeps the others, and only forbidden and not_found drop the previous list" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined });
+    defer presentation.deinit();
+    try openLoadedBrowser(&presentation, &.{ "repo", "a", "b" }, &.{1});
+    for ([_][]const u8{ "a", "b" }) |slug| {
+        try browserCursorTo(&presentation, slug);
+        try browserKey(&presentation, 'l');
+    }
+    try completeBrowserPullRequests(&presentation, try takeBrowserPullRequestsCommand(&presentation, "a"), &.{ 3, 4 });
+    try completeBrowserPullRequests(&presentation, try takeBrowserPullRequestsCommand(&presentation, "b"), &.{5});
+
+    try browserKey(&presentation, 'R');
+    const repositories = try takeBrowserRepositoriesCommand(&presentation);
+    const repo = try takeBrowserPullRequestsCommand(&presentation, "repo");
+    const a = try takeBrowserPullRequestsCommand(&presentation, "a");
+    try failBrowserPullRequests(&presentation, a, error.ServerError);
+    const b = try takeBrowserPullRequestsCommand(&presentation, "b");
+    try failBrowserPullRequests(&presentation, b, error.Forbidden);
+    try completeBrowserPullRequests(&presentation, repo, &.{});
+    try completeBrowserRepositories(&presentation, repositories, &.{ "repo", "a", "b" });
+
+    try expectBrowserPullRequests(&presentation, "a", &.{ 3, 4 });
+    try expectBrowserPullRequests(&presentation, "b", &.{});
+    try expectBrowserPullRequests(&presentation, "repo", &.{});
+    var messages: usize = 0;
+    for (browserRows(&presentation)) |entry| if (entry == .message) switch (entry.message) {
+        .pull_requests_failed => |failed| {
+            messages += 1;
+            try testing.expect(failed.reason == error.ServerError or failed.reason == error.Forbidden);
+        },
+        .no_pull_requests => messages += 1,
+        else => return error.UnexpectedMessage,
+    };
+    try testing.expectEqual(@as(usize, 3), messages);
+
+    for (0..3) |_| try browserKey(&presentation, 'h');
+    try browserCursorTo(&presentation, "a");
+    try browserKey(&presentation, 'l');
+    try expectNoCommand(&presentation);
+}
+
+test "M24 browser a rate_limited failure empties the FIFO and shows its status" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined });
+    defer presentation.deinit();
+    try openLoadedBrowser(&presentation, &.{ "repo", "a", "b", "c" }, &.{1});
+    for ([_][]const u8{ "a", "b", "c" }) |slug| {
+        try browserCursorTo(&presentation, slug);
+        try browserKey(&presentation, 'l');
+    }
+    const a = try takeBrowserPullRequestsCommand(&presentation, "a");
+    const b = try takeBrowserPullRequestsCommand(&presentation, "b");
+    try failBrowserPullRequests(&presentation, a, error.RateLimited);
+    try expectNoCommand(&presentation);
+    try testing.expectEqual(@as(?ActionError, .browser_rate_limited), presentation.projection().action_error);
+    for (browserRows(&presentation)) |entry| if (entry == .message and entry.message == .loading_pull_requests) {
+        try testing.expectEqualStrings("b", presentation.browser.?.nodes.items[entry.message.loading_pull_requests].summary.slug);
+    };
+    try completeBrowserPullRequests(&presentation, b, &.{2});
+    try expectNoCommand(&presentation);
+}
+
+test "M24 browser a refreshed list removes a closed PullRequest and moves the cursor to its Repository row" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined });
+    defer presentation.deinit();
+    try openLoadedBrowser(&presentation, &.{"repo"}, &.{ 1, 2 });
+    try browserKey(&presentation, 'j');
+    try testing.expectEqual(@as(u64, 2), browserCursor(&presentation).?.pull_request.id);
+
+    try browserKey(&presentation, 'R');
+    try completeBrowserRepositories(&presentation, try takeBrowserRepositoriesCommand(&presentation), &.{"repo"});
+    try completeBrowserPullRequests(&presentation, try takeBrowserPullRequestsCommand(&presentation, "repo"), &.{1});
+    try expectBrowserPullRequests(&presentation, "repo", &.{1});
+    try testing.expect(browserCursor(&presentation).? == .repository);
+}
+
+test "M24 browser b is refused in a LocalReview and in the demo" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var local = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.initLocal(1, "main", "feature"), .session = try testLocalSession(testing.allocator) },
+        .geometry = browser_test_geometry,
+    });
+    defer local.deinit();
+    try browserKey(&local, 'b');
+    try testing.expectEqual(@as(?ActionError, .local_review_no_browser), local.projection().action_error);
+    try testing.expect(local.projection().browser == null);
+    try expectNoCommand(&local);
+
+    var demo = try browserTestPresentation(&store, .{ .reviews = undefined, .remote_enabled = false });
+    defer demo.deinit();
+    try browserKey(&demo, 'b');
+    try testing.expectEqual(@as(?ActionError, .action_refused), demo.projection().action_error);
+    try testing.expect(demo.projection().browser == null);
+}
+
+test "M24 browser a click selects an entry, a second click opens it, and a message click does nothing" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined });
+    defer presentation.deinit();
+    try browserKey(&presentation, 'b');
+    const repositories = try takeBrowserRepositoriesCommand(&presentation);
+    const pull_requests = try takeBrowserPullRequestsCommand(&presentation, "repo");
+    const click = struct {
+        fn at(target: *Presentation, row: u16) !void {
+            const content = frame_mod.browserEntries(browser_test_geometry);
+            for ([_]MouseType{ .press, .release }) |kind|
+                try target.dispatch(.{ .mouse = .{ .col = content.x + 2, .row = content.y + row, .button = .left, .type = kind } });
+        }
+    };
+    const loading_row = browserRows(&presentation).len - 1;
+    try testing.expect(browserRows(&presentation)[loading_row] == .message);
+    try click.at(&presentation, @intCast(loading_row));
+    try testing.expectEqual(@as(?usize, 0), presentation.browser.?.cursor_index);
+
+    try completeBrowserRepositories(&presentation, repositories, &.{"repo"});
+    try completeBrowserPullRequests(&presentation, pull_requests, &.{ 1, 2 });
+    try click.at(&presentation, 2);
+    try testing.expectEqual(@as(u64, 2), browserCursor(&presentation).?.pull_request.id);
+    try expectNoCommand(&presentation);
+    try click.at(&presentation, 2);
+    try testing.expectEqual(@as(u64, 2), presentation.takeCommand().?.load_session.key.pull_request_id);
+
+    try click.at(&presentation, 0);
+    try click.at(&presentation, 0);
+    try testing.expect(!presentation.browser.?.nodes.items[0].expanded);
+}
+
+test "M24 browser a refresh replaces queued loads and a collapsed queued Repository loads again" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined });
+    defer presentation.deinit();
+    try openLoadedBrowser(&presentation, &.{ "repo", "a" }, &.{1});
+    try browserCursorTo(&presentation, "a");
+    try browserKey(&presentation, 'l');
+    try browserKey(&presentation, 'h');
+    try browserKey(&presentation, 'R');
+    const repositories = try takeBrowserRepositoriesCommand(&presentation);
+    const repo = try takeBrowserPullRequestsCommand(&presentation, "repo");
+    try expectNoCommand(&presentation);
+
+    try browserKey(&presentation, 'l');
+    const a = try takeBrowserPullRequestsCommand(&presentation, "a");
+    try expectNoCommand(&presentation);
+    try completeBrowserRepositories(&presentation, repositories, &.{ "repo", "a" });
+    try completeBrowserPullRequests(&presentation, repo, &.{1});
+    try completeBrowserPullRequests(&presentation, a, &.{4});
+    try expectBrowserPullRequests(&presentation, "a", &.{4});
+}
+
+test "M24 browser shutdown starts no Browser load and waits for the loads in flight" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try browserTestPresentation(&store, .{ .reviews = undefined });
+    defer presentation.deinit();
+    try openLoadedBrowser(&presentation, &.{ "repo", "a", "b", "c" }, &.{1});
+    for ([_][]const u8{ "a", "b", "c" }) |slug| {
+        try browserCursorTo(&presentation, slug);
+        try browserKey(&presentation, 'l');
+    }
+    const a = try takeBrowserPullRequestsCommand(&presentation, "a");
+    try browserKey(&presentation, 'q');
+    try testing.expect(!presentation.readyToExit());
+    try completeBrowserPullRequests(&presentation, a, &.{2});
+    try expectNoCommand(&presentation);
+    try testing.expect(presentation.readyToExit());
+}
+
+test "M24 browser Session replacement keeps the Browser scroll" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("check24", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        .geometry = .{ .cols = 100, .rows = 8 },
+    });
+    defer presentation.deinit();
+    try openLoadedBrowser(&presentation, &.{ "repo", "b", "c", "d", "e", "f", "g" }, &.{1});
+    try browserKey(&presentation, 'G');
+    const scroll = presentation.projection().browser.?.scroll;
+    const cursor = presentation.projection().browser.?.cursor;
+    try testing.expect(scroll > 0);
+    try browserKey(&presentation, keymap_mod.special.escape);
+
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("check24", "repo", 2) });
+    const load = presentation.takeCommand().?.load_session;
+    try dispatchSessionLoadForTest(&presentation, .{ .session_loaded = .{ .command_id = load.command_id, .intent = load.intent, .outcome = .{ .loaded = try testSession(testing.allocator, 2, 'b') } } });
+    try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.key.pull_request_id);
+    try browserKey(&presentation, 'b');
+    try expectNoCommand(&presentation);
+    try testing.expectEqual(scroll, presentation.projection().browser.?.scroll);
+    try testing.expectEqual(cursor, presentation.projection().browser.?.cursor);
 }

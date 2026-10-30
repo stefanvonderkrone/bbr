@@ -195,23 +195,7 @@ pub const Query = struct {
 };
 
 /// Owned PullRequest summaries for a populated Picker.
-pub const PullRequestSummaries = struct {
-    arena: std.heap.ArenaAllocator,
-    prs: []const PullRequestSummary,
-
-    pub fn create(backing: Allocator) !*PullRequestSummaries {
-        const summaries = try backing.create(PullRequestSummaries);
-        summaries.arena = std.heap.ArenaAllocator.init(backing);
-        summaries.prs = &.{};
-        return summaries;
-    }
-
-    pub fn destroy(self: *PullRequestSummaries) void {
-        const backing = self.arena.child_allocator;
-        self.arena.deinit();
-        backing.destroy(self);
-    }
-};
+pub const PullRequestSummaries = @import("browser.zig").PullRequestSummaries;
 
 /// The Repository a Picker lists, copied when the Picker opens. Enter builds
 /// its identity from this copy, so it needs no published or loading Session.
@@ -335,6 +319,7 @@ pub const CommandPalette = struct {
         .{ .action = .open_review_search, .title = "Search Review", .description = "Search every File version and Comment in this Review" },
         .{ .action = .open_buffer_search, .title = "Search Buffer", .description = "Search the text of the DiffPane" },
         .{ .action = .open_pull_request_picker, .title = "Switch Pull Request", .description = "Open another PullRequest in this Repository" },
+        .{ .action = .open_browser, .title = "Open Browser", .description = "Browse the Repositories and PullRequests of the Workspace" },
         .{ .action = .refresh, .title = "Refresh Review", .description = "Reload the current Review" },
         .{ .action = .toggle_layout, .title = "Toggle Layout", .description = "Switch between unified and side-by-side" },
         .{ .action = .cycle_scope, .title = "Cycle Diff Scope", .description = "Show changes, fetched context, or the whole File" },
@@ -824,4 +809,21 @@ test "scroll top keeps the selected row inside the viewport" {
     p.moveDown();
     try testing.expectEqual(@as(usize, 1), p.list().scrollTop(2));
     try testing.expectEqual(@as(usize, 0), p.list().scrollTop(0));
+}
+
+test "M24 browser the Command Palette lists Open Browser from the Panes" {
+    for ([_]InteractionContext{ .sidebar, .sidebar_directory, .sidebar_file, .diff, .diff_source, .diff_disclosure, .diff_review_card }) |context| {
+        var overlay = try ListOverlay.openCommandPalette(testing.allocator, context);
+        defer overlay.deinit();
+        const palette = &overlay.command_palette;
+        var found = false;
+        for (overlay.list().matches()) |item| {
+            const command = palette.command(item);
+            if (command.action != .open_browser) continue;
+            try testing.expectEqualStrings("Open Browser", command.title);
+            try testing.expectEqualStrings("Browse the Repositories and PullRequests of the Workspace", command.description);
+            found = true;
+        }
+        try testing.expect(found);
+    }
 }

@@ -201,7 +201,9 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         const regions = windowRegions(win, statusRows(&status_items, win));
         const content_win = childRect(win, regions.get(.content).content);
         drawStatus(childRect(win, regions.get(.status).content), &status_items);
-        if (projection.review) |review_projection| {
+        if (projection.browser) |browser_projection| {
+            render.drawBrowser(frame, content_win, browser_projection, active_theme);
+        } else if (projection.review) |review_projection| {
             const visual_cursor = review_projection.frame.navigation.cursor;
             const buffer_cursor = if (visual_cursor < review_projection.frame.visual_rows.len) review_projection.frame.visual_rows[visual_cursor].buffer_index else 0;
             const selected_file = review_projection.frame.buffer.fileIndexForRow(buffer_cursor) orelse 0;
@@ -482,6 +484,10 @@ fn reviewerVerdictOutcomeLabel(outcome: presentation.ReviewerVerdictCommandOutco
 fn actionErrorText(err: presentation.ActionError) []const u8 {
     return switch (err) {
         .local_review_no_picker => "Pull Request Picker is unavailable for a local review",
+        .local_review_no_browser => "Browser is unavailable for a local review",
+        .no_review_open => "No review is open",
+        .browser_rate_limited => "Bitbucket rate limit reached, press R to retry",
+        .browser_repositories_failed => "Repositories not refreshed",
         .theme_not_saved => "Theme applied, but config.toml could not be written",
         .theme_not_saved_invalid_config => "Theme applied, but config.toml is invalid and was not changed",
         .local_review_no_submission => "Submit is unavailable for a local review; drafts remain local",
@@ -998,6 +1004,16 @@ fn loadPullRequestSummaries(
     summaries.prs = try client.listPullRequests(summaries.arena.allocator(), repository, .{});
 }
 
+fn presentationBrowserRepositoriesWorker(loop: *Loop, work_id: u64, client: bbr.bitbucket.Client, command: presentation.ListBrowserRepositories) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.listBrowserRepositories(std.heap.page_allocator, client, command));
+}
+
+fn presentationBrowserPullRequestsWorker(loop: *Loop, work_id: u64, client: bbr.bitbucket.Client, command: presentation.ListBrowserPullRequests) void {
+    var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
+    presentation_runtime.deliver(presentationSink(&sink_context), presentation_adapter.listBrowserPullRequests(std.heap.page_allocator, client, command));
+}
+
 fn presentationCodeHighlightWorker(loop: *Loop, work_id: u64, highlighter: bbr.highlight.Highlighter, command: *@import("code_highlighting.zig").Analyze) void {
     var sink_context: PresentationSinkContext = .{ .loop = loop, .work_id = work_id };
     presentation_runtime.deliver(presentationSink(&sink_context), .{ .code_highlight_completed = command.execute(highlighter) });
@@ -1076,6 +1092,8 @@ fn drainPresentationCommands(
             .check_recovery => |check| ctx.io.concurrent(presentationRecoveryCheckWorker, .{ loop, work_id, ctx.bitbucket.?, check }),
             .find_duplicate => |check| ctx.io.concurrent(presentationDuplicateCheckWorker, .{ loop, work_id, ctx.bitbucket.?, check }),
             .list_pull_requests => |list| ctx.io.concurrent(presentationListPullRequestsWorker, .{ loop, work_id, ctx.bitbucket.?, list }),
+            .list_browser_repositories => |list| ctx.io.concurrent(presentationBrowserRepositoriesWorker, .{ loop, work_id, ctx.bitbucket.?, list }),
+            .list_browser_pull_requests => |list| ctx.io.concurrent(presentationBrowserPullRequestsWorker, .{ loop, work_id, ctx.bitbucket.?, list }),
             .copy_clipboard, .persist_theme => unreachable,
             .external_edit => unreachable,
             .scan_buffer_search => |scan| ctx.io.concurrent(presentationBufferSearchWorker, .{ loop, work_id, scan }),
@@ -1207,6 +1225,7 @@ const StatusFacts = struct {
 
 fn projectionStatusItems(frame: std.mem.Allocator, projection: presentation.Projection) StatusItems {
     const active_theme = theme.value(projection.theme);
+    if (projection.browser != null) return browserStatusItems(frame, active_theme, projection);
     const review = projection.review orelse return loadingStatusItems(active_theme, presentationStatus(frame, projection, null));
     const visual_cursor = review.navigation.cursor;
     return statusItems(frame, active_theme, .{
@@ -1278,6 +1297,24 @@ fn statusItems(frame: std.mem.Allocator, active_theme: theme.Theme, facts: Statu
         items.hint(.comment, "c/i", " comment");
         items.hint(.file, "[ ]", " file");
         items.hint(.switch_review, "p", " switch");
+        items.hint(.help, "?", " help");
+        items.hint(.quit, "q", " quit");
+    }
+    return items;
+}
+
+/// The Browser status: a message, the Candidate Session load, or the hints.
+fn browserStatusItems(frame: std.mem.Allocator, active_theme: theme.Theme, projection: presentation.Projection) StatusItems {
+    var items: StatusItems = .init(active_theme);
+    if (presentationStatus(frame, projection, null)) |message| {
+        items.add(.message, message, .message);
+    } else if (projection.replacing) {
+        const text = if (projection.loading_pull_request_id) |id| std.fmt.allocPrint(frame, "Loading PR #{d}…", .{id}) catch "loading…" else "loading…";
+        items.add(.message, text, .busy);
+    } else {
+        items.hint(.open_entry, "Enter", " open");
+        items.hint(.refresh, "R", " refresh");
+        items.hint(.switch_review, "b", " review");
         items.hint(.help, "?", " help");
         items.hint(.quit, "q", " quit");
     }
@@ -1381,6 +1418,7 @@ fn reviewerVerdictLabel(verdict: ?bbr.bitbucket.ReviewerVerdict) []const u8 {
 // Force the presentation modules' tests into the exe test binary.
 test {
     _ = @import("cell_metrics.zig");
+    _ = @import("browser.zig");
     _ = @import("buffer.zig");
     _ = @import("frame.zig");
     _ = @import("view.zig");
@@ -1697,4 +1735,28 @@ test "stopping a Picker tick cancels and reaps its sleeping future" {
     cancelPresentationWork(&work, io, 19);
 
     try std.testing.expectEqual(@as(usize, 0), work.items.len);
+}
+
+test "M24 browser the status shows the Browser hints, the Candidate Session load, and the Browser texts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var store = bbr.review.InMemoryStore.init(std.testing.allocator);
+    defer store.deinit();
+    var state = try presentation.Presentation.init(std.testing.allocator, .{ .reviews = store.store() }, .{});
+    defer state.deinit();
+    try state.dispatch(.{ .start_browser = .{ .workspace = try @import("browser.zig").Name.init("check24") } });
+    const hints = projectionStatusItems(arena.allocator(), state.projection());
+    try std.testing.expectEqualStrings("Enter", hints.lines.get(.open_entry).items()[0].text);
+    try std.testing.expectEqualStrings("b", hints.lines.get(.switch_review).items()[0].text);
+
+    try state.dispatch(.{ .choose_pull_request = try presentation.OwnedReviewIdentity.init("check24", "repo", 7) });
+    try std.testing.expect(state.projection().browser != null);
+    const loading = projectionStatusItems(arena.allocator(), state.projection());
+    try std.testing.expectEqualStrings("Loading PR #7…", loading.lines.get(.message).items()[0].text);
+    try std.testing.expectEqual(@as(usize, 0), loading.lines.get(.open_entry).items().len);
+
+    try std.testing.expectEqualStrings("Browser is unavailable for a local review", actionErrorText(.local_review_no_browser));
+    try std.testing.expectEqualStrings("No review is open", actionErrorText(.no_review_open));
+    try std.testing.expectEqualStrings("Bitbucket rate limit reached, press R to retry", actionErrorText(.browser_rate_limited));
+    try std.testing.expectEqualStrings("Repositories not refreshed", actionErrorText(.browser_repositories_failed));
 }
