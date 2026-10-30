@@ -732,6 +732,8 @@ test "interval merge matches byte planes for every BuiltInGrammar fixture" {
         .{ .path = "Greeter.cs", .source = c_sharp_fixture },
         .{ .path = "scripts/run", .source = python_fixture },
         .{ .path = "lib/add.rb", .source = ruby_fixture },
+        .{ .path = "App.swift", .source = swift_fixture },
+        .{ .path = "query.sql", .source = sql_fixture },
     };
     var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
     defer highlighter.deinit();
@@ -1950,4 +1952,64 @@ test "M27 grammar Ruby fixture has comment, string, keyword, function, and const
     try expectSpan(result, 5, 0, 3, "keyword");
     try expectSpan(result, 6, 7, 11, "string");
     try expectSpan(result, 7, 7, 10, "constant");
+}
+
+// M27 ticket 07 fixtures
+
+const swift_fixture =
+    \\// Greets a user.
+    \\struct Point { let x: Int }
+    \\func greet(name: String) -> String {
+    \\    return "hello"
+    \\}
+    \\
+;
+
+test "M27 grammar Swift fixture has comment, string, keyword, function, and type roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "Sources/App.swift", swift_fixture);
+    defer freeResult(result);
+
+    try expectRoleAt(result, swift_fixture, "// Greets a user.", .comment);
+    try expectRoleAt(result, swift_fixture, "\"hello\"", .string);
+    try expectRoleAt(result, swift_fixture, "struct", .keyword);
+    try expectRoleAt(result, swift_fixture, "func", .keyword);
+    try expectRoleAt(result, swift_fixture, "return", .keyword);
+    try expectRoleAt(result, swift_fixture, "greet", .function);
+    try expectRoleAt(result, swift_fixture, "Point", .type);
+    try expectRoleAt(result, swift_fixture, "String", .type);
+}
+
+const sql_fixture =
+    \\-- Lists active users.
+    \\CREATE TABLE users (id INT);
+    \\SELECT count(id) FROM users WHERE name = 'bob';
+    \\
+;
+
+test "M27 grammar SQL fixture has comment, string, keyword, function, and type roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "db/migrations/001_users.sql", sql_fixture);
+    defer freeResult(result);
+
+    try expectRoleAt(result, sql_fixture, "-- Lists active users.", .comment);
+    try expectRoleAt(result, sql_fixture, "'bob'", .string);
+    try expectRoleAt(result, sql_fixture, "CREATE", .keyword);
+    try expectRoleAt(result, sql_fixture, "SELECT", .keyword);
+    try expectRoleAt(result, sql_fixture, "WHERE", .keyword);
+    try expectRoleAt(result, sql_fixture, "count", .function);
+    try expectRoleAt(result, sql_fixture, "INT", .type);
+}
+
+test "M27 grammar GrammarMatch selects Swift and SQL" {
+    const cases = [_]struct { path: []const u8, grammar: ?BuiltInGrammar }{
+        .{ .path = "Sources/App/App.swift", .grammar = .swift },
+        .{ .path = "Package.swift", .grammar = .swift },
+        .{ .path = "db/migrations/001_users.sql", .grammar = .sql },
+        .{ .path = "db/schema.SQL", .grammar = null },
+        .{ .path = "notes/a.swiftinterface", .grammar = null },
+    };
+    for (cases) |case| try testing.expectEqual(case.grammar, grammar_match.selectBuiltIn(case.path, ""));
 }

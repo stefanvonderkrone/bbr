@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 import adapt_queries
 import check_vendored_grammars as check
@@ -85,14 +86,14 @@ def include_closure(repository, sources, include_dirs):
 
 
 def generate(grammar_root, cli, cli_version):
-    """Run the pinned tree-sitter CLI in the temporary checkout and return the .generated record."""
+    """Run the pinned tree-sitter CLI in a temporary copy of the checkout and return the .generated record."""
     version = subprocess.run([cli, "--version"], capture_output=True, text=True, check=True).stdout.split()
     if version[:2] != ["tree-sitter", cli_version]:
         raise VendorError(f"{cli} is {' '.join(version)}, but the manifest pins tree-sitter {cli_version}")
     node = subprocess.run(["node", "--version"], capture_output=True, text=True, check=True).stdout.strip()
     result = subprocess.run([cli, *GENERATE], cwd=grammar_root, capture_output=True, text=True)
     if result.returncode != 0:
-        raise VendorError(f"tree-sitter {' '.join(GENERATE)} failed in {grammar_root}. Install its npm packages there first.\n{result.stderr}")
+        raise VendorError(f"tree-sitter {' '.join(GENERATE)} failed in a copy of the Grammar checkout. Install its npm packages in the checkout first.\n{result.stderr}")
     return {"cli": cli_version, "command": f"tree-sitter {' '.join(GENERATE)}", "js_runtime": f"node {node}"}
 
 
@@ -124,7 +125,13 @@ def vendor(nvim_root, repository, name, repo_root, *, display_name, matches, inj
     if not (repository / "LICENSE").is_file():
         raise VendorError(f"{repository} has no LICENSE file at {commit}")
     generated = None
+    scratch = tempfile.TemporaryDirectory()
     if info.get("generate") is True or not (grammar_root / "src/parser.c").is_file():
+        # Generation writes into src/, so it runs in a copy and leaves the given checkout unchanged.
+        copy_root = Path(scratch.name) / "repository"
+        shutil.copytree(repository, copy_root, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+        repository = copy_root
+        grammar_root = repository / location if location else repository
         generated = generate(grammar_root, cli, manifest["tree_sitter_cli"]["version"])
     sources = [grammar_root / "src/parser.c"] + [path for path in [grammar_root / "src/scanner.c"] if path.is_file()]
     copied = include_closure(repository, sources + sorted((grammar_root / "src/tree_sitter").glob("*.h")), [grammar_root / "src"])

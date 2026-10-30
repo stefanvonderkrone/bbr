@@ -24,6 +24,8 @@ pub const BuiltInGrammar = enum {
     c_sharp,
     python,
     ruby,
+    swift,
+    sql,
 
     pub fn name(self: BuiltInGrammar) []const u8 {
         return switch (self) {
