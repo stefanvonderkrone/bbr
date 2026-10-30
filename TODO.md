@@ -331,17 +331,21 @@ Research checked 2026-08-23: [OpenCode CLI auth](https://opencode.ai/docs/cli/#a
 [GitHub CLI logout](https://cli.github.com/manual/gh_auth_logout), and
 [Bitbucket Cloud authentication](https://developer.atlassian.com/cloud/bitbucket/rest/intro/#authentication).
 
-## M27 - UserGrammar sandbox research  ·  M  ·  needs M17
-Decide whether bbr can run a UserGrammar without giving its code bbr's memory and the user's
-permissions. M17 keeps trusted native UserGrammars in process. This milestone researches a safer
-replacement. It does not implement one before the evidence supports a design.
+## M27 - BuiltInGrammar expansion  ·  L  ·  needs M17
+Highlight common languages without a UserGrammar. Add Zig, C, C++, C#, PHP, Python, Rust, Odin, Swift,
+Kotlin, Java, Groovy, TOML, Dockerfile, Make, Ruby, HTML, XML, Markdown, and SQL as BuiltInGrammars
+with the same hermetic delivery as the M13 Grammars (ADR-0009).
 
-- [ ] Define the threat model. Include File content, Credentials, environment variables, config and data files, process memory, network access, denial of service, and native-library initialization.
-- [ ] Evaluate Wasm Grammars with the current tree-sitter runtime. Verify the Grammar build format, Highlighting and query compatibility, memory and execution limits, supported targets, runtime dependency cost, and migration from M17 bundles.
-- [ ] Evaluate a helper process with native Grammars. Compare crash isolation with real confinement on Linux, macOS, and Windows. Identify which filesystem, network, process, and memory restrictions each supported target can enforce.
-- [ ] Build only the minimum prototypes needed to test feasibility. Measure install validation, first-use load, steady-state Highlighting, memory use, and failure containment against the M17 native baseline.
-- [ ] Test hostile fixtures for filesystem and network access, infinite work, excessive memory, crashes, malformed Spans, and protocol corruption. Do not call an unconfined helper process a sandbox.
-- [ ] Record the decision in an ADR. Specify the bundle and trust migration, target support, fallback behavior, and removal policy for native UserGrammars. If neither option gives useful confinement at acceptable cost, retain M17's explicit native-code warning.
+- [ ] Vendor each Grammar from the upstream repository that nvim-treesitter pins, at a pinned commit under `vendors/tree-sitter/<name>`. Record the repository, commit, and checksums in `manifest.zig.zon`. Commit generated `parser.c` sources; a Grammar that needs generation is generated once during vendoring, never during the build.
+- [ ] Vendor the highlight and injection queries from nvim-treesitter at one pinned commit. Resolve `; inherits:` lines, and rewrite or remove Neovim-only predicates. A test fails on every unsupported predicate.
+- [ ] Add language injection to `TreeSitterHighlighter` for BuiltInGrammars: Markdown inline content and fenced code, HTML `<script>` and `<style>`, and PHP with embedded HTML. Injected Spans must stay ordered and line-relative, and the `Highlighter` seam must not change.
+- [ ] Check that every Grammar ABI is compatible with the vendored tree-sitter runtime.
+- [ ] Add GrammarMatch rules for each new Grammar, including exact filenames such as `Dockerfile`, `Makefile`, and `Gemfile`. Confirm that an active UserGrammar still takes precedence.
+- [ ] Map the new Captures to existing Theme Captures. Add no new Theme color unless a Capture has no reasonable existing match.
+- [ ] Add a Capture fixture test for each Grammar, injection fixtures, and GrammarMatch tests.
+- [ ] Record the binary size before and after. No Grammar is dropped for size.
+
+_Deferred:_ the UserGrammar sandbox research (threat model, Wasm runtime, confined helper process, ADR) is deferred without a milestone. M17's native-code warning stays.
 
 ## M28 - Full-Review File cache evaluation  ·  M/L  ·  needs M17/M21
 Decide whether large Reviews need a full-Review File cache in memory or on disk. M17 keeps a
@@ -424,7 +428,7 @@ M0 ─ M1 ─ M2 ─┬─ M3 ─ M6 ─ M10    (authoring → submission)
               ├─ M15 ─ M23 ─ M32 (ReviewBody image rendering investigation)
               ├─ M4 ─ M15 ─ M24 ─ M25 (remote-first Browser and navigation)
               ├─ M19 ─ M26       (Credential login and logout)
-              ├─ M13 ─ M17 ─ M27 (UserGrammar sandbox research)
+              ├─ M13 ─ M17 ─ M27 (BuiltInGrammar expansion)
               ├─ M17 ─ M21 ─ M28 (full-Review File cache evaluation)
               ├─ M15 ─ M21 ─ M29 (Comment Overview)
               └─ M15 ─ M30       (viewer scrollbars)
