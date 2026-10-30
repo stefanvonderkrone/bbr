@@ -3241,8 +3241,7 @@ pub const Projection = struct {
     /// The Theme to paint this frame.
     theme: ThemeId,
     configured_theme: ThemeId,
-    help_visible: bool,
-    help_scroll: usize,
+    help: ?help_mod.View,
     action_availability: ActionAvailability,
     loading_pull_request_id: ?u64,
     composer: ?ComposerProjection,
@@ -5901,9 +5900,7 @@ pub const Presentation = struct {
     resolver: keymap_mod.Resolver = .{},
     list_overlay: ?ListOverlay = null,
     configured_theme: ThemeId,
-    help_visible: bool = false,
-    /// The first help line on screen. `applyHelpKey` keeps it in range.
-    help_scroll: usize = 0,
+    help: ?help_mod.State = null,
     durable_submission: ?*DurableSubmission = null,
     submission_tree: ?*SubmissionTree = null,
     durable_comment_edit: ?*DurableCommentEdit = null,
@@ -5986,6 +5983,7 @@ pub const Presentation = struct {
     }
 
     pub fn deinit(self: *Presentation) void {
+        self.closeHelp();
         for (self.commands.items) |*command| command.deinit();
         if (self.durable_submission) |durable| durable.destroy();
         if (self.submission_tree) |tree| tree.destroy();
@@ -6203,8 +6201,7 @@ pub const Presentation = struct {
             .picker_tick_scope = if (self.shutdown_requested) null else if (self.list_overlay) |*overlay| overlay.tickScope() else null,
             .theme = self.activeTheme(),
             .configured_theme = self.configured_theme,
-            .help_visible = self.help_visible,
-            .help_scroll = self.help_scroll,
+            .help = if (self.help) |*help| help.view() else null,
             .action_availability = self.actionAvailability(),
             .loading_pull_request_id = if (self.replacement) |replacement|
                 if (replacement.key.isRemote()) replacement.key.pull_request_id else null
@@ -6278,7 +6275,7 @@ pub const Presentation = struct {
     }
 
     fn overlayTarget(self: *const Presentation) ?frame_mod.OverlayTarget {
-        if (self.help_visible or self.unknown_resolution != null or self.delete_confirmation != null or self.visibleSubmissionOverlay())
+        if (self.help != null or self.unknown_resolution != null or self.delete_confirmation != null or self.visibleSubmissionOverlay())
             return frame_mod.screenOverlayTarget(self.geometry);
         if (self.list_overlay) |*overlay| {
             var target = frame_mod.listOverlayTarget(self.geometry, overlay.box()) orelse return null;
@@ -6302,7 +6299,7 @@ pub const Presentation = struct {
     }
 
     fn submissionRepairInteractionActive(self: *const Presentation) bool {
-        if (self.help_visible or self.unknown_resolution != null or self.delete_confirmation != null or self.reanchor != null) return true;
+        if (self.help != null or self.unknown_resolution != null or self.delete_confirmation != null or self.reanchor != null) return true;
         if (self.list_overlay != null) return true;
         if (self.published) |published| return published.composer != null;
         return false;
@@ -6671,7 +6668,7 @@ pub const Presentation = struct {
         self.shutdown_requested = true;
         if (self.published) |published| if (published.review_search.open) self.closeReviewSearch();
         self.closeListOverlay();
-        self.help_visible = false;
+        self.closeHelp();
         self.unknown_resolution = null;
         var write: usize = 0;
         for (self.commands.items) |command_value| {
@@ -6694,7 +6691,7 @@ pub const Presentation = struct {
     }
 
     fn interactionContext(self: *const Presentation) keymap_mod.InteractionContext {
-        if (self.help_visible) return .help;
+        if (self.help != null) return .help;
         if (self.unknown_resolution != null) return .unknown_resolution;
         if (self.delete_confirmation != null) return .delete_confirmation;
         if (self.list_overlay) |*overlay| return overlay.interactionContext();
@@ -6719,7 +6716,7 @@ pub const Presentation = struct {
     }
 
     fn actionAvailability(self: *const Presentation) ActionAvailability {
-        const pane_under_overlay = self.help_visible or if (self.list_overlay) |*overlay| overlay.availabilityContext() == .pane else false;
+        const pane_under_overlay = self.help != null or if (self.list_overlay) |*overlay| overlay.availabilityContext() == .pane else false;
         const context = if (pane_under_overlay) self.paneContext() else self.interactionContext();
         const published = self.published orelse return .{
             .remote = self.dependencies.remote_enabled,
@@ -7108,7 +7105,7 @@ pub const Presentation = struct {
             self.applySubmissionTreeKey(key);
             return;
         }
-        if (self.help_visible) {
+        if (self.help != null) {
             self.applyHelpKey(key);
             return;
         }
@@ -7266,28 +7263,24 @@ pub const Presentation = struct {
         }
     }
 
-    /// Scroll keys move the help lines. Every other key closes the help.
     fn applyHelpKey(self: *Presentation, key: keymap_mod.KeyStroke) void {
-        const total = help_mod.lineCount(self.dependencies.keymap);
-        const page = frame_mod.helpBodyRows(self.geometry, total);
-        const last = total -| page;
-        const half = @max(page / 2, 1);
-        if (key.matches('j', .{}) or key.matches(keymap_mod.special.down, .{})) {
-            self.help_scroll = @min(self.help_scroll + 1, last);
-        } else if (key.matches('k', .{}) or key.matches(keymap_mod.special.up, .{})) {
-            self.help_scroll -|= 1;
-        } else if (key.matches('d', .{ .ctrl = true }) or key.matches(keymap_mod.special.page_down, .{})) {
-            self.help_scroll = @min(self.help_scroll + half, last);
-        } else if (key.matches('u', .{ .ctrl = true }) or key.matches(keymap_mod.special.page_up, .{})) {
-            self.help_scroll -|= half;
-        } else if (key.matches('g', .{})) {
-            self.help_scroll = 0;
-        } else if (key.matches('G', .{})) {
-            self.help_scroll = last;
-        } else {
-            self.help_visible = false;
-            self.help_scroll = 0;
-        }
+        const state = if (self.help) |*state| state else return;
+        const page = frame_mod.helpBodyRows(self.geometry, state.view().layout());
+        const result = state.applyKey(self.dependencies.keymap, key, page) catch |err| {
+            self.action_error = switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                error.TooLong => .buffer_search_query_too_long,
+                else => .buffer_search_invalid_query,
+            };
+            return;
+        };
+        self.action_error = null;
+        if (result == .close) self.closeHelp();
+    }
+
+    fn closeHelp(self: *Presentation) void {
+        if (self.help) |*state| state.deinit();
+        self.help = null;
     }
 
     /// Hide the terminal Submission Overlay and put the DiffPane cursor on the
@@ -7503,8 +7496,12 @@ pub const Presentation = struct {
             return;
         }
         if (action == .help) {
-            self.help_visible = true;
-            self.help_scroll = 0;
+            const next = help_mod.State.init(self.allocator, self.dependencies.keymap) catch {
+                self.action_error = .out_of_memory;
+                return;
+            };
+            self.closeHelp();
+            self.help = next;
             return;
         }
         if (action == .open_pull_request_picker) {
@@ -7767,8 +7764,8 @@ pub const Presentation = struct {
         const state = &((self.published orelse return).review_search);
         const text = if (state.query) |query| query.text else return;
         const end = switch (edit) {
-            .backspace => lastScalarStart(text),
-            .delete_word => searchWordStart(text),
+            .backspace => search.lastScalarStart(text),
+            .delete_word => search.wordStart(text),
             .delete_all => 0,
         };
         self.replaceReviewSearchQuery(text[0..end]);
@@ -8523,8 +8520,8 @@ pub const Presentation = struct {
         const input = &(published.buffer_search.input orelse return);
         const text = if (input.query) |query| query.text else return;
         const end = switch (edit) {
-            .backspace => lastScalarStart(text),
-            .delete_word => searchWordStart(text),
+            .backspace => search.lastScalarStart(text),
+            .delete_word => search.wordStart(text),
             .delete_all => 0,
         };
         try self.replaceBufferSearchQuery(text[0..end]);
@@ -12002,7 +11999,7 @@ pub const Presentation = struct {
 
     fn choosePullRequest(self: *Presentation, key: OwnedReviewIdentity) !void {
         self.unknown_resolution = null;
-        self.help_visible = false;
+        self.closeHelp();
         if (self.published) |published| {
             if (OwnedReviewIdentity.eql(published.key, key)) {
                 self.next_intent += 1; // invalidate a candidate already in flight
@@ -13099,33 +13096,6 @@ fn searchLocationEql(a: search.Location, b: search.Location) bool {
                 std.mem.eql(u8, source.old_path, other.old_path) and std.mem.eql(u8, source.new_path, other.new_path);
         },
         .review_body => |body| std.meta.eql(body, b.review_body),
-    };
-}
-
-fn lastScalarStart(text: []const u8) usize {
-    var result: usize = 0;
-    var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
-    while (iterator.nextCodepointSlice()) |scalar| result = @intFromPtr(scalar.ptr) - @intFromPtr(text.ptr);
-    return result;
-}
-
-fn searchWordStart(text: []const u8) usize {
-    var word_start: usize = 0;
-    var previous_whitespace = true;
-    var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
-    while (iterator.nextCodepointSlice()) |bytes| {
-        const scalar = std.unicode.utf8Decode(bytes) catch unreachable;
-        const whitespace = isSearchWhitespace(scalar);
-        if (!whitespace and previous_whitespace) word_start = @intFromPtr(bytes.ptr) - @intFromPtr(text.ptr);
-        previous_whitespace = whitespace;
-    }
-    return word_start;
-}
-
-fn isSearchWhitespace(scalar: u21) bool {
-    return switch (scalar) {
-        0x0009...0x000D, 0x0020, 0x0085, 0x00A0, 0x1680, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000 => true,
-        else => false,
     };
 }
 
@@ -19914,7 +19884,7 @@ test "the Command Palette works with no Session" {
     try testing.expect(testListOverlay(&presentation, .command_palette) != null);
     try testType(&presentation, "keybindings");
     try presentation.dispatch(.{ .key = test_enter });
-    try testing.expect(presentation.projection().help_visible);
+    try testing.expect(presentation.projection().help != null);
 }
 
 test "a Session replacement closes the Command Palette" {
@@ -23639,7 +23609,7 @@ test "M21 kernel initial Session Frame stays private until worker admission" {
         try testing.expect(presentation.published == previous);
         try testing.expectEqual(epoch, presentation.next_session_epoch);
         try presentation.dispatch(.{ .key = .{ .codepoint = '?', .text = "?" } });
-        try testing.expect(presentation.help_visible);
+        try testing.expect(presentation.help != null);
         job.build();
         try testing.expect(job.ready);
         try testing.expect(presentation.published == previous);
@@ -28535,26 +28505,117 @@ test "help scroll keys move within the help lines and any other key closes the h
         .geometry = .{ .cols = 100, .rows = 20 },
     });
     defer presentation.deinit();
-    const total = help_mod.lineCount(presentation.dependencies.keymap);
-    const last = total - frame_mod.helpBodyRows(presentation.geometry, total);
-
     try presentation.dispatch(.{ .action = .help });
+    const help = presentation.projection().help.?;
+    const last = help.lines.len - frame_mod.helpBodyRows(presentation.geometry, help.layout());
     try presentation.dispatch(.{ .key = .{ .codepoint = 'k', .text = "k" } });
-    try testing.expectEqual(@as(usize, 0), presentation.projection().help_scroll);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().help.?.scroll);
     try presentation.dispatch(.{ .key = .{ .codepoint = 'j', .text = "j" } });
-    try testing.expectEqual(@as(usize, 1), presentation.projection().help_scroll);
+    try testing.expectEqual(@as(usize, 1), presentation.projection().help.?.scroll);
     try presentation.dispatch(.{ .key = .{ .codepoint = 'G', .text = "G" } });
-    try testing.expectEqual(last, presentation.projection().help_scroll);
+    try testing.expectEqual(last, presentation.projection().help.?.scroll);
     try presentation.dispatch(.{ .key = .{ .codepoint = 'j', .text = "j" } });
-    try testing.expectEqual(last, presentation.projection().help_scroll);
+    try testing.expectEqual(last, presentation.projection().help.?.scroll);
     try presentation.dispatch(.{ .key = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
-    try testing.expect(presentation.projection().help_scroll < last);
+    try testing.expect(presentation.projection().help.?.scroll < last);
     try presentation.dispatch(.{ .key = .{ .codepoint = 'g', .text = "g" } });
-    try testing.expectEqual(@as(usize, 0), presentation.projection().help_scroll);
-    try testing.expect(presentation.projection().help_visible);
+    try testing.expectEqual(@as(usize, 0), presentation.projection().help.?.scroll);
+    try testing.expect(presentation.projection().help != null);
 
     try presentation.dispatch(.{ .key = .{ .codepoint = 'x', .text = "x" } });
-    try testing.expect(!presentation.projection().help_visible);
+    try testing.expect(presentation.projection().help == null);
+}
+
+test "help search leaves the accepted DiffPane Buffer Search unchanged" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_buffer_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 0, .text = "new" } });
+    try completeBufferSearchScan(&presentation);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    const published = presentation.published.?;
+    const query = published.buffer_search.accepted_query.?.text.ptr;
+    const occurrences = published.buffer_search.accepted_batch.?.occurrences.ptr;
+    const ranges = published.buffer_search.accepted_ranges.?.ptr;
+    const before = presentation.projection().buffer_search.?;
+    const navigation = presentation.projection().review.?.navigation;
+    try presentation.dispatch(.{ .action = .help });
+    try presentation.dispatch(.{ .key = .{ .codepoint = '/', .text = "/" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 0, .text = "Draft" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = '/', .text = "/" } });
+    try testing.expectEqualStrings("", presentation.projection().help.?.query.input);
+    try presentation.dispatch(.{ .key = .{ .codepoint = 0, .text = "absent-query" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expectEqualStrings("Draft", presentation.projection().help.?.query.kept);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expect(presentation.projection().help.?.query == .none);
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.escape } });
+    try testing.expect(presentation.projection().help == null);
+    try testing.expectEqualDeep(before, presentation.projection().buffer_search.?);
+    try testing.expectEqualDeep(navigation, presentation.projection().review.?.navigation);
+    try testing.expectEqual(query, published.buffer_search.accepted_query.?.text.ptr);
+    try testing.expectEqual(occurrences, published.buffer_search.accepted_batch.?.occurrences.ptr);
+    try testing.expectEqual(ranges, published.buffer_search.accepted_ranges.?.ptr);
+}
+
+test "help close reopen shutdown and Review choice release input and saved snapshots" {
+    for ([_]enum { close, reopen, shutdown, review_choice }{ .close, .reopen, .shutdown, .review_choice }) |ending| {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        });
+        defer presentation.deinit();
+        try presentation.dispatch(.{ .action = .help });
+        try presentation.dispatch(.{ .key = .{ .codepoint = '/' } });
+        try presentation.dispatch(.{ .key = .{ .codepoint = 0, .text = "old" } });
+        try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+        if (ending != .close) {
+            try presentation.dispatch(.{ .key = .{ .codepoint = '/' } });
+            try presentation.dispatch(.{ .key = .{ .codepoint = 0, .text = "new" } });
+        }
+        switch (ending) {
+            .close => {
+                try presentation.dispatch(.{ .key = .{ .codepoint = 'x', .text = "x" } });
+                try testing.expect(presentation.projection().help == null);
+                try presentation.dispatch(.{ .action = .help });
+            },
+            .reopen => try presentation.dispatch(.{ .action = .help }),
+            .shutdown => try presentation.dispatch(.request_shutdown),
+            .review_choice => try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 1) }),
+        }
+        if (ending == .close or ending == .reopen) {
+            const help = presentation.projection().help.?;
+            try testing.expect(help.query == .none);
+            try testing.expectEqual(@as(usize, 0), help.scroll);
+            try testing.expect(help.lines.len > 1);
+        } else try testing.expect(presentation.projection().help == null);
+    }
+}
+
+test "help movement clamps stored filtered scroll after a terminal resize" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testSession(testing.allocator, 1, 'a') },
+        .geometry = .{ .cols = 80, .rows = 12 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .help });
+    try presentation.dispatch(.{ .key = .{ .codepoint = '/' } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 0, .text = "o" } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'G' } });
+    try testing.expect(presentation.projection().help.?.scroll > 0);
+    const height: u16 = @intCast(presentation.projection().help.?.lines.len + 30);
+    try presentation.dispatch(.{ .resize = .{ .cols = 80, .rows = height } });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'k' } });
+    try testing.expectEqual(@as(usize, 0), presentation.projection().help.?.scroll);
 }
 
 test "stale repair reload evaluates each root scope independently and checks the refreshed source again" {
@@ -28732,13 +28793,13 @@ test "portable key input owns help overlay capture" {
     defer presentation.deinit();
 
     try presentation.dispatch(.{ .key = .{ .codepoint = '?', .text = "?" } });
-    try testing.expect(presentation.projection().help_visible);
+    try testing.expect(presentation.projection().help != null);
     const cursor = presentation.published.?.navigation.cursor;
     try presentation.dispatch(.{ .key = .{ .codepoint = 'j', .text = "j" } });
-    try testing.expect(presentation.projection().help_visible);
+    try testing.expect(presentation.projection().help != null);
     try testing.expectEqual(cursor, presentation.published.?.navigation.cursor);
     try presentation.dispatch(.{ .key = .{ .codepoint = 'q', .text = "q" } });
-    try testing.expect(!presentation.projection().help_visible);
+    try testing.expect(presentation.projection().help == null);
     try testing.expect(!presentation.projection().shutting_down);
 }
 

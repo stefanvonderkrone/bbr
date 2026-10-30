@@ -225,7 +225,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
         if (projection.submission_tree) |tree| if (projection.review) |review_projection|
             if (presentation.OwnedReviewIdentity.eql(tree.key, review_projection.key))
                 render.drawSubmissionTree(frame, content_win, active_theme, tree);
-        if (projection.help_visible) render.drawHelp(frame, content_win, active_theme, ctx.keymap, projection.action_availability, projection.help_scroll);
+        if (projection.help) |help| render.drawHelp(frame, content_win, active_theme, help, projection.action_availability);
         try vx.render(writer);
         painted_revision = projection.revision;
         _ = frame_arena.reset(.{ .retain_with_limit = frame_arena_retained_limit });

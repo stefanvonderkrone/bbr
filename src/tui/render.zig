@@ -2229,26 +2229,14 @@ fn drawSubmissionDetail(
     }
 }
 
-/// One help line with the availability of its Action. A refused Action keeps
-/// its reason after the description.
-const HelpRow = struct { line: help_mod.Line, text: []const u8 = "", available: bool = true };
-
-fn buildHelpRows(scratch: std.mem.Allocator, km: keymap.Keymap, availability: presentation.ActionAvailability) []HelpRow {
-    const lines = help_mod.build(scratch, km) catch return &.{};
-    const rows = scratch.alloc(HelpRow, lines.len) catch return &.{};
-    for (lines, rows) |line, *row| {
-        row.* = .{ .line = line };
-        const entry = switch (line) {
-            .entry => |entry| entry,
-            else => continue,
-        };
-        row.text = entry.description;
-        const action = entry.action orelse continue;
-        row.available = availability.available(action);
+fn helpEntry(scratch: std.mem.Allocator, entry: help_mod.Entry, availability: presentation.ActionAvailability) struct { text: []const u8, available: bool } {
+    var result: struct { text: []const u8, available: bool } = .{ .text = entry.description, .available = true };
+    if (entry.action) |action| {
+        result.available = availability.available(action);
         if (sourceRefusalLabel(availability, action)) |label|
-            row.text = std.fmt.allocPrint(scratch, "{s} ({s})", .{ entry.description, label }) catch entry.description;
+            result.text = std.fmt.allocPrint(scratch, "{s} ({s})", .{ entry.description, label }) catch entry.description;
     }
-    return rows;
+    return .{ .text = result.text, .available = result.available };
 }
 
 fn sourceRefusalLabel(availability: presentation.ActionAvailability, action: keymap.Action) ?[]const u8 {
@@ -2283,30 +2271,41 @@ const help_key_gap: u16 = 3;
 /// The widest key column. A longer key list pushes only its own description.
 const help_key_column_max: u16 = 24;
 
-/// Draw the keybinding-help Overlay: a centered modal that lists the help
-/// lines from `help.zig`, scrolled by `scroll`. Keys are bold in the accent
-/// color, and a refused Action is grey. `scratch` outlives render for the
-/// synthesized rows.
-pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, km: keymap.Keymap, availability: presentation.ActionAvailability, scroll: usize) void {
-    const rows = buildHelpRows(scratch, km, availability);
-    const body_rows = view_mod.solve(layouts.HelpSlot, layouts.help, layouts.Help{ .rows = rows.len }, .{ .width = win.width, .height = win.height }).get(.body).content.height;
-    const offset = @min(scroll, rows.len -| body_rows);
-    const rects = view_paint.paint(layouts.HelpSlot, layouts.help, layouts.Help{ .rows = rows.len, .scroll = .{ .total = rows.len, .offset = offset } }, win, theme);
+pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, help: help_mod.View, availability: presentation.ActionAvailability) void {
+    const rows = help.lines;
+    var params = help.layout();
+    const body_rows = view_mod.solve(layouts.HelpSlot, layouts.help, params, .{ .width = win.width, .height = win.height }).get(.body).content.height;
+    const offset = @min(help.scroll, rows.len -| body_rows);
+    params.scroll.offset = offset;
+    const rects = view_paint.paint(layouts.HelpSlot, layouts.help, params, win, theme);
     if (rects.get(.surface).border.isEmpty()) return;
 
+    switch (help.query) {
+        .none => {},
+        .input, .kept => |text| {
+            const query_win = childRect(win, rects.get(.query).content);
+            const query = std.fmt.allocPrint(scratch, "/{s}{s}", .{ text, if (help.query == .input) "▏" else "" }) catch text;
+            var start: usize = 0;
+            while (start < query.len and query_win.gwidth(query[start..]) > query_win.width) start += terminal_cell_metrics.next(query[start..]).byte_len;
+            _ = query_win.printSegment(.{ .text = query[start..], .style = theme.picker_query }, .{ .wrap = .none });
+        },
+    }
+
     var key_column: u16 = 0;
-    for (rows) |row| if (row.line == .entry) {
-        key_column = @max(key_column, @as(u16, @intCast(@min(vaxis.gwidth.gwidth(row.line.entry.keys, .unicode), help_key_column_max))));
+    for (rows) |line| if (line == .entry) {
+        key_column = @max(key_column, @as(u16, @intCast(@min(vaxis.gwidth.gwidth(line.entry.keys, .unicode), help_key_column_max))));
     };
     const indent: u16 = 1;
     const body = childRect(win, rects.get(.body).content);
-    for (rows[offset..], 0..) |row, index| {
+    for (rows[offset..], 0..) |line, index| {
         if (index >= body.height) break;
         const line_row: u16 = @intCast(index);
-        switch (row.line) {
+        switch (line) {
             .blank => {},
+            .no_matches => _ = body.printSegment(.{ .text = "No matches", .style = theme.gutter }, .{ .row_offset = line_row, .wrap = .none }),
             .heading => |title| _ = body.printSegment(.{ .text = title, .style = theme.picker_query }, .{ .row_offset = line_row, .wrap = .none }),
             .entry => |entry| {
+                const row = helpEntry(scratch, entry, availability);
                 var key_style = if (row.available) theme.helpKeyStyle() else theme.gutter;
                 key_style.bold = true;
                 const keys_width: u16 = @intCast(@min(vaxis.gwidth.gwidth(entry.keys, .unicode), std.math.maxInt(u16)));
@@ -2316,7 +2315,11 @@ pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, km:
             },
         }
     }
-    const hint = if (rows.len > body.height) " j k scroll · ctrl-d ctrl-u half page · g G top / bottom · other key closes" else " press any key to close";
+    const hint = switch (help.query) {
+        .input => " Enter keeps filter · Esc restores · ⌫ ctrl-w ctrl-u erase",
+        .kept => " / search · Esc clears filter · j k scroll · g G top / bottom",
+        .none => " / search · j k scroll · ctrl-d ctrl-u half page · other key closes",
+    };
     _ = childRect(win, rects.get(.hint).content).printSegment(.{ .text = hint, .style = theme.picker_query }, .{ .wrap = .none });
 }
 
@@ -3941,9 +3944,10 @@ test "every Overlay paints the Theme base background" {
         try Check.surface(win, view.solve(layouts.DialogSlot, layouts.dialog, layouts.submit_result, area).get(.surface).border, base, .{});
 
         win.fill(.{ .style = .{ .bg = backdrop } });
-        drawHelp(a, win, theme, keymap.Keymap.default, .{ .remote = true }, 0);
-        const help_rows = buildHelpRows(a, keymap.Keymap.default, .{ .remote = true });
-        try Check.surface(win, view.solve(layouts.HelpSlot, layouts.help, layouts.Help{ .rows = help_rows.len }, area).get(.surface).border, base, .{});
+        var help = try help_mod.State.init(a, .default);
+        defer help.deinit();
+        drawHelp(a, win, theme, help.view(), .{ .remote = true });
+        try Check.surface(win, view.solve(layouts.HelpSlot, layouts.help, help.view().layout(), area).get(.surface).border, base, .{});
 
         win.fill(.{ .style = .{ .bg = backdrop } });
         drawLoading(a, win, 42, theme, null);
@@ -5464,9 +5468,11 @@ test "the help overlay floats a centered Keybindings modal from the Keymap" {
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
 
-    drawHelp(a, win, theme_dark, keymap.Keymap.default, .{ .remote = true }, 0);
+    var help = try help_mod.State.init(a, .default);
+    defer help.deinit();
+    drawHelp(a, win, theme_dark, help.view(), .{ .remote = true });
 
-    const rows = buildHelpRows(a, keymap.Keymap.default, .{ .remote = true });
+    const rows = help.view().lines;
     const rects = view_mod.solve(layouts.HelpSlot, layouts.help, layouts.Help{ .rows = rows.len }, .{ .width = 80, .height = 24 });
     const modal = rects.get(.surface).border;
     try testing.expectEqualStrings("╭", win.readCell(modal.x, modal.y).?.char.grapheme);
@@ -5495,38 +5501,45 @@ test "the help overlay scrolls its lines and clamps the scroll at the end" {
     var screen = try vaxis.Screen.init(a, .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
     const win = headlessWindow(&screen);
-    const rows = buildHelpRows(a, keymap.Keymap.default, .{ .remote = true });
+    var help = try help_mod.State.init(a, .default);
+    defer help.deinit();
+    const rows = help.view().lines;
     const body = view_mod.solve(layouts.HelpSlot, layouts.help, layouts.Help{ .rows = rows.len }, .{ .width = 80, .height = 24 }).get(.body).content;
 
     // Scrolled one line, the body starts with the first `j ↓` entry.
-    drawHelp(a, win, theme_dark, keymap.Keymap.default, .{ .remote = true }, 1);
+    var help_view = help.view();
+    help_view.scroll = 1;
+    drawHelp(a, win, theme_dark, help_view, .{ .remote = true });
     try testing.expectEqualStrings("j", win.readCell(body.x + 1, body.y).?.char.grapheme);
 
     // A scroll past the end shows the last line on the last body row.
     win.clear();
-    drawHelp(a, win, theme_dark, keymap.Keymap.default, .{ .remote = true }, std.math.maxInt(usize));
-    const last = rows[rows.len - 1].line.entry.keys;
+    help_view.scroll = std.math.maxInt(usize);
+    drawHelp(a, win, theme_dark, help_view, .{ .remote = true });
+    const last = rows[rows.len - 1].entry.keys;
     try testing.expectEqualStrings(last[0..1], win.readCell(body.x + 1, body.y + body.height - 1).?.char.grapheme);
 }
 
 test "Selected Version help names horizontal keys and the absent File version" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const rows = buildHelpRows(arena.allocator(), .default, .{ .remote = true, .old_version = false });
+    var help = try help_mod.State.init(arena.allocator(), .default);
+    defer help.deinit();
     var old_found = false;
     var new_found = false;
-    for (rows) |row| {
-        if (row.line != .entry) continue;
+    for (help.view().lines) |line| {
+        if (line != .entry) continue;
+        const row = helpEntry(arena.allocator(), line.entry, .{ .remote = true, .old_version = false });
         if (std.mem.indexOf(u8, row.text, "select old File version") != null) {
             old_found = true;
             try testing.expect(!row.available);
-            try testing.expectEqualStrings("h ←", row.line.entry.keys);
+            try testing.expectEqualStrings("h ←", line.entry.keys);
             try testing.expect(std.mem.indexOf(u8, row.text, "old File version absent") != null);
         }
         if (std.mem.indexOf(u8, row.text, "select new File version") != null) {
             new_found = true;
             try testing.expect(row.available);
-            try testing.expectEqualStrings("l →", row.line.entry.keys);
+            try testing.expectEqualStrings("l →", line.entry.keys);
         }
     }
     try testing.expect(old_found and new_found);
@@ -5535,11 +5548,14 @@ test "Selected Version help names horizontal keys and the absent File version" {
 test "local help projection marks remote-only commands unavailable" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const rows = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = false });
+    var help = try help_mod.State.init(arena.allocator(), .default);
+    defer help.deinit();
     var unavailable: usize = 0;
-    for (rows) |row| {
+    for (help.view().lines) |line| {
+        if (line != .entry) continue;
+        const row = helpEntry(arena.allocator(), line.entry, .{ .remote = false });
         if (!row.available) unavailable += 1;
-        if (row.line == .entry) if (row.line.entry.action) |action| if (keymap.isMotion(action)) try testing.expect(row.available);
+        if (line.entry.action) |action| if (keymap.isMotion(action)) try testing.expect(row.available);
     }
     // Remote-only commands, plus edit, re-anchor, and delete, stay visible.
     try testing.expectEqual(@as(usize, 11), unavailable);
@@ -5548,46 +5564,122 @@ test "local help projection marks remote-only commands unavailable" {
 test "help keeps refused source Actions visible with typed reasons" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const rows = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{
+    const availability: presentation.ActionAvailability = .{
         .remote = true,
         .selected_version = .old,
         .yank_refusal = .selected_content_unavailable,
         .inline_comment_refusal = .not_hunk_line,
         .suggestion_refusal = .old_version,
-    });
-    try testing.expect(!helpRowAvailable(rows, "yank text (old content unavailable)").?);
-    try testing.expect(!helpRowAvailable(rows, "inline comment (not a Hunk Line)").?);
-    try testing.expect(!helpRowAvailable(rows, "suggestion (requires new File version)").?);
+    };
+    try testing.expect(!try helpRowAvailable(arena.allocator(), availability, "yank text (old content unavailable)"));
+    try testing.expect(!try helpRowAvailable(arena.allocator(), availability, "inline comment (not a Hunk Line)"));
+    try testing.expect(!try helpRowAvailable(arena.allocator(), availability, "suggestion (requires new File version)"));
 }
 
 test "delete stays discoverable in the help Overlay when it is refused" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const refused = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .delete_refusal = .descendant_locked });
-    const deletable = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .delete_refusal = null });
-    try testing.expect(!helpRowAvailable(refused, "delete Comment or Draft").?);
-    try testing.expect(helpRowAvailable(deletable, "delete Comment or Draft").?);
+    try testing.expect(!try helpRowAvailable(arena.allocator(), .{ .remote = true, .delete_refusal = .descendant_locked }, "delete Comment or Draft"));
+    try testing.expect(try helpRowAvailable(arena.allocator(), .{ .remote = true, .delete_refusal = null }, "delete Comment or Draft"));
 }
 
 test "re-anchor stays discoverable in the help Overlay when it is refused" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const refused = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .reanchor_refusal = .reply_inherits_scope });
-    const anchorable = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .reanchor_refusal = null });
-    try testing.expect(!helpRowAvailable(refused, "re-anchor local root Draft").?);
-    try testing.expect(helpRowAvailable(anchorable, "re-anchor local root Draft").?);
+    try testing.expect(!try helpRowAvailable(arena.allocator(), .{ .remote = true, .reanchor_refusal = .reply_inherits_scope }, "re-anchor local root Draft"));
+    try testing.expect(try helpRowAvailable(arena.allocator(), .{ .remote = true, .reanchor_refusal = null }, "re-anchor local root Draft"));
 }
 
 test "edit stays discoverable in the help Overlay when it is refused" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const refused = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .edit_refusal = .submission_owns_draft });
-    const editable = buildHelpRows(arena.allocator(), keymap.Keymap.default, .{ .remote = true, .edit_refusal = null });
-    try testing.expect(!helpRowAvailable(refused, "edit local Draft").?);
-    try testing.expect(helpRowAvailable(editable, "edit local Draft").?);
+    try testing.expect(!try helpRowAvailable(arena.allocator(), .{ .remote = true, .edit_refusal = .submission_owns_draft }, "edit local Draft"));
+    try testing.expect(try helpRowAvailable(arena.allocator(), .{ .remote = true, .edit_refusal = null }, "edit local Draft"));
 }
 
-fn helpRowAvailable(rows: []const HelpRow, help: []const u8) ?bool {
-    for (rows) |row| if (row.line == .entry and std.mem.indexOf(u8, row.text, help) != null) return row.available;
-    return null;
+fn helpRowAvailable(allocator: std.mem.Allocator, availability: presentation.ActionAvailability, description: []const u8) !bool {
+    var help = try help_mod.State.init(allocator, .default);
+    defer help.deinit();
+    for (help.view().lines) |line| if (line == .entry) {
+        const row = helpEntry(allocator, line.entry, availability);
+        if (std.mem.indexOf(u8, row.text, description) != null) return row.available;
+    };
+    return error.MissingHelpEntry;
+}
+
+test "help search paints rounded input boxes query and no matches from the same lines" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var help = try help_mod.State.init(testing.allocator, .default);
+    defer help.deinit();
+    _ = try help.applyKey(.default, .{ .codepoint = '/' }, 3);
+    _ = try help.applyKey(.default, .{ .codepoint = 0, .text = "no-such-help-entry" }, 3);
+    for ([_]u16{ 24, 40, 80 }) |width| {
+        var screen = try vaxis.Screen.init(a, .{ .rows = 16, .cols = width, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(a);
+        const win = headlessWindow(&screen);
+        const projected = help.view();
+        const rects = view_mod.solve(layouts.HelpSlot, layouts.help, projected.layout(), .{ .width = width, .height = 16 });
+        drawHelp(a, win, theme_dark, projected, .{ .remote = true });
+        try testing.expectEqual(@as(usize, 1), projected.lines.len);
+        const query = rects.get(.query);
+        const body = rects.get(.body).content;
+        try testing.expectEqualStrings("╭", win.readCell(query.border.x, query.border.y).?.char.grapheme);
+        try testing.expectEqualStrings("╭", win.readCell(query.border.x, body.y - 1).?.char.grapheme);
+        try testing.expectEqualStrings("/", win.readCell(query.content.x, query.content.y).?.char.grapheme);
+        var text: std.ArrayList(u8) = .empty;
+        for (body.x..body.x + body.width) |col| try text.appendSlice(a, win.readCell(@intCast(col), body.y).?.char.grapheme);
+        try testing.expect(std.mem.startsWith(u8, text.items, "No matches"));
+    }
+    _ = try help.applyKey(.default, .{ .codepoint = keymap.special.enter }, 3);
+    try testing.expect(help.view().layout().query);
+}
+
+test "help clips long queries on grapheme boundaries and keeps the input tail visible" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 12, .cols = 24, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    var help = try help_mod.State.init(testing.allocator, .default);
+    defer help.deinit();
+    _ = try help.applyKey(.default, .{ .codepoint = '/' }, 3);
+    _ = try help.applyKey(.default, .{ .codepoint = 0, .text = "👩‍💻" ** 20 ++ "needle" }, 3);
+    const rect = view_mod.solve(layouts.HelpSlot, layouts.help, help.view().layout(), .{ .width = 24, .height = 12 }).get(.query).content;
+    drawHelp(a, win, theme_dark, help.view(), .{ .remote = true });
+    var text: std.ArrayList(u8) = .empty;
+    for (rect.x..rect.x + rect.width) |col| {
+        const grapheme = win.readCell(@intCast(col), rect.y).?.char.grapheme;
+        try testing.expect(std.unicode.utf8ValidateSlice(grapheme));
+        try text.appendSlice(a, grapheme);
+    }
+    try testing.expect(std.mem.indexOf(u8, text.items, "needle▏") != null);
+}
+
+test "help filtering keeps unavailable entries and paints their refusal after matching" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 16, .cols = 100, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    var help = try help_mod.State.init(testing.allocator, .default);
+    defer help.deinit();
+    _ = try help.applyKey(.default, .{ .codepoint = '/' }, 3);
+    _ = try help.applyKey(.default, .{ .codepoint = 0, .text = "select old File version" }, 3);
+    try testing.expectEqual(@as(usize, 2), help.view().lines.len);
+    const projected = help.view();
+    const body = view_mod.solve(layouts.HelpSlot, layouts.help, projected.layout(), .{ .width = 100, .height = 16 }).get(.body).content;
+    drawHelp(a, win, theme_dark, projected, .{ .remote = true, .old_version = false });
+    const key = win.readCell(body.x + 1, body.y + 1).?;
+    try testing.expectEqualStrings("h", key.char.grapheme);
+    try testing.expectEqual(theme_dark.gutter.fg, key.style.fg);
+    var text: std.ArrayList(u8) = .empty;
+    for (body.x..body.x + body.width) |col| try text.appendSlice(a, win.readCell(@intCast(col), body.y + 1).?.char.grapheme);
+    try testing.expect(std.mem.indexOf(u8, text.items, "old File version absent") != null);
+    _ = try help.applyKey(.default, .{ .codepoint = 'u', .mods = .{ .ctrl = true } }, 3);
+    _ = try help.applyKey(.default, .{ .codepoint = 0, .text = "absent" }, 3);
+    try testing.expect(help.view().lines[0] == .no_matches);
 }

@@ -253,28 +253,39 @@ pub fn loading(_: void, area: Rect, visitor: anytype) void {
 
 /// The keybinding help: the Title in the top border, the scrolled help lines,
 /// and the hint row.
-pub const HelpSlot = enum { surface, body, hint };
+pub const HelpSlot = enum { surface, query, body, hint };
 
 pub const Help = struct {
     /// The count of help lines. The box grows to show them all when the area
     /// is tall enough.
     rows: usize = 0,
     scroll: Scroll = .{},
+    query: bool = false,
 };
 
 pub fn help(params: Help, area: Rect, visitor: anytype) void {
     const height: u16 = @intCast(@min(params.rows +| 1, std.math.maxInt(u16) - 2));
-    const root: view.View(HelpSlot) = .{
-        .composition = .{ .center = .{} },
-        .children = &.{overlaySurface(HelpSlot, .{ .width = 76, .height = height }, .{
+    const contents = [_]view.View(HelpSlot){
+        .{ .slot = .body, .padding = .{ .left = 1, .right = 1 }, .scrollbar = bar(params.scroll, .padding, overlay_stroke) },
+        .{ .slot = .hint, .height = .cells(1) },
+    };
+    var boxes = [_]view.View(HelpSlot){
+        .{ .slot = .query, .padding = .{ .left = 1, .right = 1 }, .title = .{ .text = "Keybindings", .@"align" = .center, .inset = 1 } },
+        .{ .composition = .{ .flow = .{} }, .children = &contents },
+    };
+    const plain_contents = [_]view.View(HelpSlot){.{ .slot = .query, .height = .cells(0) }} ++ contents;
+    const surface = if (params.query)
+        inputSurface(HelpSlot, .surface, .cells(78), .cells(height +| 5), &boxes)
+    else
+        overlaySurface(HelpSlot, .{ .width = 76, .height = height }, .{
             .slot = .surface,
             .title = .{ .text = "Keybindings", .@"align" = .center, .inset = 1 },
             .composition = .{ .flow = .{} },
-            .children = &.{
-                .{ .slot = .body, .padding = .{ .left = 1, .right = 1 }, .scrollbar = bar(params.scroll, .padding, overlay_stroke) },
-                .{ .slot = .hint, .height = .cells(1) },
-            },
-        })},
+            .children = &plain_contents,
+        });
+    const root: view.View(HelpSlot) = .{
+        .composition = .{ .center = .{} },
+        .children = &.{surface},
     };
     view.walk(HelpSlot, &root, area, visitor);
 }
@@ -375,6 +386,7 @@ test "every layout places each of its Slots" {
         _ = view.solve(DialogSlot, dialog, composer, area);
         _ = view.solve(LoadingSlot, loading, {}, area);
         _ = view.solve(HelpSlot, help, Help{ .rows = 20, .scroll = .{ .total = 20, .offset = 4 } }, area);
+        _ = view.solve(HelpSlot, help, Help{ .rows = 20, .query = true, .scroll = .{ .total = 20, .offset = 4 } }, area);
         _ = view.solve(SubmissionSlot, submission, {}, area);
         _ = view.solve(SearchSlot, reviewSearch, ReviewSearch{ .list_scroll = .{ .total = 50, .offset = 0 } }, area);
     }

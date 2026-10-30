@@ -107,8 +107,8 @@ fn area(geometry: Geometry) Rect {
 }
 
 /// The help lines that the help Overlay shows at once.
-pub fn helpBodyRows(geometry: Geometry, rows: usize) u16 {
-    return view.solve(layouts.HelpSlot, layouts.help, layouts.Help{ .rows = rows }, area(geometry)).get(.body).content.height;
+pub fn helpBodyRows(geometry: Geometry, params: layouts.Help) u16 {
+    return view.solve(layouts.HelpSlot, layouts.help, params, area(geometry)).get(.body).content.height;
 }
 
 pub const OverlayTarget = struct {
