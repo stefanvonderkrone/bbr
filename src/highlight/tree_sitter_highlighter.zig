@@ -721,6 +721,11 @@ test "interval merge matches byte planes for every BuiltInGrammar fixture" {
         .{ .path = "data.json", .source = "{\"nested\": {\"ready\": true}, \"items\": [1, 2]}\n" },
         .{ .path = "config.yaml", .source = "service:\n  enabled: true\n  ports: [80, 443]\n" },
         .{ .path = "main.zig", .source = zig_fixture },
+        .{ .path = "point.c", .source = c_fixture },
+        .{ .path = "box.cpp", .source = cpp_fixture },
+        .{ .path = "point.h", .source = c_header_fixture },
+        .{ .path = "main.rs", .source = rust_fixture },
+        .{ .path = "main.odin", .source = odin_fixture },
     };
     var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
     defer highlighter.deinit();
@@ -1521,4 +1526,192 @@ fn insideTemplateString(source: []const u8, start: usize, end: usize) bool {
         } else open = index;
     }
     return false;
+}
+
+// M27 ticket 04 fixtures
+
+const c_fixture =
+    \\// Adds one.
+    \\#include <stdio.h>
+    \\struct Point { int x; int (*cb)(int); int run(int); };
+    \\static int add(int a) {
+    \\    return a + 1;
+    \\}
+    \\const char *name = "c";
+    \\
+;
+
+const cpp_fixture =
+    \\// Adds one.
+    \\#include <vector>
+    \\namespace demo {
+    \\class Box {
+    \\public:
+    \\    int value;
+    \\};
+    \\auto add(int a) -> int { return a + 1; }
+    \\}
+    \\const char *name = "cpp";
+    \\
+;
+
+const c_header_fixture =
+    \\#ifndef POINT_H
+    \\#define POINT_H
+    \\/* A point. */
+    \\typedef struct { int x; } Point;
+    \\int add(int a);
+    \\#endif
+    \\
+;
+
+const rust_fixture =
+    \\// Adds one.
+    \\struct Point { x: u32 }
+    \\fn add(a: u32) -> u32 {
+    \\    a + 1
+    \\}
+    \\const NAME: &str = "rust";
+    \\
+;
+
+const odin_fixture =
+    \\// Adds one.
+    \\package main
+    \\Point :: struct { x: int }
+    \\add :: proc(a: int) -> int {
+    \\    return a + 1
+    \\}
+    \\name := "odin"
+    \\
+;
+
+test "M27 grammar GrammarMatch selects C for .c and C++ for headers" {
+    const cases = [_]struct { path: []const u8, grammar: ?BuiltInGrammar }{
+        .{ .path = "src/point.c", .grammar = .c },
+        .{ .path = "include/point.h", .grammar = .cpp },
+        .{ .path = "src/point.cpp", .grammar = .cpp },
+        .{ .path = "src/point.cc", .grammar = .cpp },
+        .{ .path = "src/point.cxx", .grammar = .cpp },
+        .{ .path = "include/point.hpp", .grammar = .cpp },
+        .{ .path = "include/point.hh", .grammar = .cpp },
+        .{ .path = "include/point.hxx", .grammar = .cpp },
+        .{ .path = "src/main.rs", .grammar = .rust },
+        .{ .path = "src/main.odin", .grammar = .odin },
+        .{ .path = "SRC/POINT.C", .grammar = null },
+    };
+    for (cases) |case| try testing.expectEqual(case.grammar, grammar_match.selectBuiltIn(case.path, ""));
+}
+
+test "M27 grammar C fixture has comment, string, keyword, function, and type roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/point.c", c_fixture);
+    defer freeResult(result);
+
+    try expectSpan(result, 1, 0, 12, "comment");
+    try expectSpan(result, 2, 0, 8, "keyword.import");
+    try expectSpan(result, 2, 9, 18, "string.special.path");
+    try expectSpan(result, 3, 0, 6, "keyword.type");
+    try expectSpan(result, 3, 7, 12, "type");
+    try expectSpan(result, 4, 0, 6, "keyword.modifier");
+    try expectSpan(result, 4, 7, 10, "type.builtin");
+    try expectSpan(result, 4, 11, 14, "function");
+    try expectSpan(result, 5, 4, 10, "keyword.return");
+    try expectSpan(result, 7, 19, 22, "string");
+}
+
+test "M27 grammar C field declaration proves has-ancestor and not-has-ancestor" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/point.c", c_fixture);
+    defer freeResult(result);
+
+    try expectSpan(result, 3, 19, 20, "property");
+    try expectSpan(result, 3, 28, 30, "function");
+    try testing.expectEqualStrings("run", c_fixture[74..77]);
+    try testing.expectEqual(@as(?bbr.highlight.Capture, null), captureOver(result, c_fixture, 74));
+}
+
+test "M27 grammar C++ fixture has comment, string, keyword, function, and type roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/box.cpp", cpp_fixture);
+    defer freeResult(result);
+
+    try expectSpan(result, 3, 0, 9, "keyword");
+    try expectSpan(result, 4, 0, 5, "keyword.type");
+    try expectSpan(result, 4, 6, 9, "type");
+    try expectSpan(result, 6, 8, 13, "property");
+    try expectSpan(result, 8, 5, 8, "function");
+    try expectSpan(result, 8, 25, 31, "keyword.return");
+    try expectSpan(result, 10, 19, 24, "string");
+}
+
+test "M27 grammar C++ gets the include and comment Captures from the inherited C query" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/box.cpp", cpp_fixture);
+    defer freeResult(result);
+
+    try expectSpan(result, 1, 0, 12, "comment");
+    try expectSpan(result, 2, 0, 8, "keyword.import");
+    try expectSpan(result, 2, 9, 17, "string.special.path");
+}
+
+test "M27 grammar C++ gives a pure C header the roles that C gives a .c File" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const header = try highlighter.highlighter().highlight(testing.allocator, "include/point.h", c_header_fixture);
+    defer freeResult(header);
+    const source = try highlighter.highlighter().highlight(testing.allocator, "src/point.c", c_header_fixture);
+    defer freeResult(source);
+
+    const expected = [_]struct { u32, usize, usize, bbr.highlight.CaptureRole }{
+        .{ 1, 0, 7, .keyword },       .{ 1, 8, 15, .constant },     .{ 2, 0, 7, .keyword },       .{ 2, 8, 15, .constant },
+        .{ 3, 0, 14, .comment },      .{ 4, 0, 7, .keyword },       .{ 4, 8, 14, .keyword },      .{ 4, 15, 16, .punctuation },
+        .{ 4, 17, 20, .type },        .{ 4, 21, 22, .property },    .{ 4, 22, 23, .punctuation }, .{ 4, 24, 25, .punctuation },
+        .{ 4, 26, 31, .type },        .{ 4, 31, 32, .punctuation }, .{ 5, 0, 3, .type },          .{ 5, 4, 7, .function },
+        .{ 5, 7, 8, .punctuation },   .{ 5, 8, 11, .type },         .{ 5, 12, 13, .variable },    .{ 5, 13, 14, .punctuation },
+        .{ 5, 14, 15, .punctuation }, .{ 6, 0, 6, .keyword },
+    };
+    for ([_]bbr.highlight.HighlightResult{ header, source }) |result| {
+        try testing.expectEqual(expected.len, result.spans.len);
+        for (expected, result.spans) |want, span| {
+            try testing.expectEqual(want[0], span.line);
+            try testing.expectEqual(want[1], span.start);
+            try testing.expectEqual(want[2], span.end);
+            try testing.expectEqual(want[3], span.capture.role);
+        }
+    }
+}
+
+test "M27 grammar Rust fixture has comment, string, keyword, function, and type roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/main.rs", rust_fixture);
+    defer freeResult(result);
+
+    try expectSpan(result, 1, 0, 12, "comment");
+    try expectSpan(result, 2, 0, 6, "keyword.type");
+    try expectSpan(result, 2, 7, 12, "type");
+    try expectSpan(result, 3, 0, 2, "keyword.function");
+    try expectSpan(result, 3, 3, 6, "function");
+    try expectSpan(result, 3, 10, 13, "type.builtin");
+    try expectSpan(result, 6, 19, 25, "string");
+}
+
+test "M27 grammar Odin fixture has comment, string, keyword, function, and type roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "src/main.odin", odin_fixture);
+    defer freeResult(result);
+
+    try expectSpan(result, 1, 0, 12, "comment");
+    try expectSpan(result, 3, 0, 5, "type");
+    try expectSpan(result, 3, 9, 15, "keyword.type");
+    try expectSpan(result, 4, 0, 3, "function");
+    try expectSpan(result, 4, 7, 11, "keyword.function");
+    try expectSpan(result, 5, 4, 10, "keyword.return");
+    try expectSpan(result, 7, 8, 14, "string");
 }

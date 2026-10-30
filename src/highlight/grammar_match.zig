@@ -14,6 +14,10 @@ pub const BuiltInGrammar = enum {
     json,
     yaml,
     zig,
+    c,
+    cpp,
+    rust,
+    odin,
 
     pub fn name(self: BuiltInGrammar) []const u8 {
         return switch (self) {

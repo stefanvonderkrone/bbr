@@ -466,7 +466,7 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
     inline for (@typeInfo(@TypeOf(tree_sitter_manifest.grammars)).@"struct".fields) |field| {
         const grammar = @field(tree_sitter_manifest.grammars, field.name);
         inline for (grammar.sources) |source| {
-            mod.addIncludePath(b.path("vendors/tree-sitter/" ++ comptime std.fs.path.dirname(source).?));
+            mod.addIncludePath(b.path(b.pathJoin(&.{ "vendors/tree-sitter", std.fs.path.dirname(source).? })));
             mod.addCSourceFile(.{ .file = b.path("vendors/tree-sitter/" ++ source), .flags = &.{"-std=c11"} });
         }
         inline for (.{ "highlights", "injections", "locals" }) |kind| {
