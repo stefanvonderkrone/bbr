@@ -228,7 +228,7 @@ select_new_version = ["l", "right"]
 max_file_bytes = 2097152
 
 [comments]
-collapsed_rows = 6
+collapsed_rows = 9
 
 [files.cache]
 enabled = true
@@ -291,7 +291,9 @@ to 1 MiB and must be greater than zero.
 
 Enter also opens and closes the disclosure at the cursor: resolved Threads, context Folds,
 Outdated sections, and over-limit ReviewCards retain independent disclosure state within the
-current Session. Comments and Drafts show six rendered body rows when collapsed by default.
+current Session. Comments and Drafts show nine rendered body rows when collapsed by default,
+followed by a `[...] (enter to expand)` row. Enter on that row expands the card. A card
+collapses only when it would hide at least two rows.
 Set `[comments].collapsed_rows = 0` to disable automatic ReviewCard collapse. Root Comments can
 target the Review (`C`), the focused File (`I`), or an inline source location (`i`); Replies keep
 their root Comment's scope.

@@ -401,10 +401,8 @@ test "M23 highlighting retains successful results through layouts and disclosure
         const spans = state.projection().review.?.frame.code_highlights[0].spans.ptr;
         for ([_]Action{ .toggle_layout, .toggle_review_card }) |action| {
             try visitCodeCard(&state, 1);
-            if (action == .toggle_review_card) {
-                try state.dispatch(.{ .action = .down });
-                try state.dispatch(.{ .action = .down });
-            }
+            // Header, one body row, and the hidden-row indicator precede the footer.
+            if (action == .toggle_review_card) for (0..3) |_| try state.dispatch(.{ .action = .down });
             try state.dispatch(.{ .action = action });
             const build = state.takeCommand().?.build_buffer_disclosure;
             build.build();
@@ -413,6 +411,34 @@ test "M23 highlighting retains successful results through layouts and disclosure
             try testing.expect(state.takeCommand() == null);
         }
     }
+}
+
+test "Enter on the hidden-row indicator expands its ReviewCard" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .target = .bitbucket, .scope = .review, .body = "x\n\ny\n\nz" });
+    var state = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 1 }, .{
+        .initial = .{ .key = key, .session = try testSession(testing.allocator, 1, 'a') },
+        .viewport_rows = 40,
+    });
+    defer state.deinit();
+    try visitCodeCard(&state, 1);
+    for (0..2) |_| try state.dispatch(.{ .action = .down });
+    const indicator = state.published.?.cursorRow().?.draft;
+    try testing.expect(indicator.hidden_indicator);
+    try state.dispatch(.{ .key = .{ .codepoint = keymap_mod.special.enter } });
+    const build = state.takeCommand().?.build_buffer_disclosure;
+    build.build();
+    try state.dispatch(.{ .buffer_disclosure_built = build });
+    const published = state.published.?;
+    const cursor = published.cursorRow().?.draft;
+    try testing.expectEqual(indicator.source_range.start, cursor.source_range.start);
+    try testing.expect(!cursor.hidden_indicator);
+    for (published.buffer.rows) |row| if (row == .draft) {
+        try testing.expect(!row.draft.hidden_indicator);
+        if (row.draft.part == .disclosure_footer) try testing.expectEqual(@as(usize, 0), row.draft.hidden_rows);
+    };
 }
 
 test "M23 highlighting complete structural code qualifies exactly at the byte limit and zero is unlimited" {
@@ -861,7 +887,7 @@ pub const Dependencies = struct {
     highlight_max_file_bytes: usize = 0,
     file_cache_enabled: bool = true,
     inactive_file_cache_max_bytes: usize = 256 * 1024 * 1024,
-    comments_collapsed_rows: usize = 6,
+    comments_collapsed_rows: usize = 9,
     mouse_enabled: bool = true,
     mouse_vertical_scroll_rows: usize = 3,
     external_edit_max_bytes: usize = 1024 * 1024,
@@ -11688,7 +11714,8 @@ pub const Presentation = struct {
     }
 
     fn toggleDisclosure(self: *Presentation, published: *Published) void {
-        const key = buffer_mod.disclosureKey(published.cursorRow() orelse return) orelse return;
+        const row = published.cursorRow() orelse return;
+        const key = buffer_mod.disclosureKey(row) orelse buffer_mod.hiddenIndicatorKey(row) orelse return;
         var saved: ?[]buffer_mod.DisclosureKey = null;
         if (published.review_search.saved_disclosures) |baseline| {
             var updated: std.ArrayList(buffer_mod.DisclosureKey) = .empty;

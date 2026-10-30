@@ -4143,7 +4143,7 @@ test "M23 ancestry renders shared offsets and visible capped depth with search c
             .id = index + 1,
             .parent_id = if (index == 0) null else index,
             .author = "author with a name longer than the available header width at the indentation cap",
-            .body = "bodyabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+            .body = "bodyabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz" ** 3,
         };
         const threads = try bbr.review.buildThreads(a, comments[0 .. case.depth + 1]);
         const diff: bbr.diff.Diff = .{ .files = &.{} };
@@ -4155,6 +4155,7 @@ test "M23 ancestry renders shared offsets and visible capped depth with search c
             draw(a, win, diff, buf, builtin.value, Nav.init(buf.rows.len, 120), 0, threads, &.{});
             for (buf.rows, 0..) |row, index| if (row == .comment and row.comment.owner.comment == case.depth + 1) {
                 const card = row.comment;
+                if (card.hidden_indicator) continue;
                 const left = 29 + case.indent;
                 const start = left + 2;
                 if (card.part == .header and (case.indent == 1 or case.depth == 20)) {

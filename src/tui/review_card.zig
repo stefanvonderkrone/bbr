@@ -120,6 +120,8 @@ pub const ReviewCardRow = struct {
     plain_label: ?[]const u8 = null,
     /// This header toggles the whole resolved Thread, not its ReviewBody.
     resolved_thread: bool = false,
+    /// The `[...]` row of a collapsed card. Enter on it expands the card.
+    hidden_indicator: bool = false,
     /// Code-block rectangle relative to this row's content column.
     code_area: ?struct { column: usize, width: usize } = null,
 
@@ -168,11 +170,22 @@ pub const Options = struct {
     resolved_thread: bool = false,
     content_width: usize,
     metrics: CellMetrics,
-    collapsed_rows: usize = 6,
+    collapsed_rows: usize = 9,
     expanded: bool = false,
     depth: usize = 0,
     indent: usize = 0,
 };
+
+/// The body row that follows the visible rows of a collapsed ReviewCard.
+pub const hidden_indicator = "[...] (enter to expand)";
+const hidden_marker = "[...]";
+
+/// The indicator text that fits the content width. A narrow card drops the
+/// hint first, then clips the marker.
+fn hiddenIndicatorText(content_width: usize) []const u8 {
+    if (content_width >= hidden_indicator.len) return hidden_indicator;
+    return hidden_marker[0..@min(hidden_marker.len, @max(content_width, 1))];
+}
 
 pub fn projectPreview(allocator: std.mem.Allocator, body: ReviewBody, options: Options, scroll: usize, height: usize) ![]const ReviewCardRow {
     var start: usize = 0;
@@ -276,7 +289,9 @@ pub fn projectInto(allocator: std.mem.Allocator, scratch_allocator: std.mem.Allo
         for (body_rows.items[start..end]) |*row| row.code_area.?.width = @min(width, writer.width -| row.code_area.?.column);
         start = end;
     }
-    const collapsible = options.collapsed_rows > 0 and body_rows.items.len > options.collapsed_rows;
+    // A collapsed card adds a hidden-row indicator, so it collapses only when
+    // it hides at least two rows and ends shorter than the expanded card.
+    const collapsible = options.collapsed_rows > 0 and body_rows.items.len > options.collapsed_rows + 1;
     const visible_count = if (collapsible and !options.expanded) options.collapsed_rows else body_rows.items.len;
     var header = makeRow(options, .header, 0, .literal, .{ .start = 0, .end = 0 }, try oneSegment(allocator, .{
         .text = options.header,
@@ -286,6 +301,18 @@ pub fn projectInto(allocator: std.mem.Allocator, scratch_allocator: std.mem.Allo
     header.resolved_thread = options.resolved_thread;
     try sink.append(header);
     for (body_rows.items[0..visible_count]) |row| try sink.append(row);
+    if (visible_count < body_rows.items.len) {
+        const first_hidden = body_rows.items[visible_count].source_range.start;
+        const at: SourceRange = .{ .start = first_hidden, .end = first_hidden };
+        var indicator = makeRow(options, .body, body_rows.items.len, .literal, at, try oneSegment(allocator, .{
+            .text = hiddenIndicatorText(options.content_width),
+            .source = at,
+            .marks = .{ .divider = true },
+            .authored = false,
+        }));
+        indicator.hidden_indicator = true;
+        try sink.append(indicator);
+    }
     const body_end: SourceRange = .{ .start = body.source.len, .end = body.source.len };
     if (!collapsible) {
         try sink.append(makeRow(options, .bottom, body_rows.items.len, .literal, body_end, &.{}));
@@ -1265,14 +1292,61 @@ test "collapsed row budget is hard across Suggestions and spacers" {
         .metrics = TestMetrics.value,
         .collapsed_rows = 3,
     });
-    try testing.expectEqual(@as(usize, 5), rows.len); // header + 3 body + footer
-    try testing.expect(rows[4].part == .disclosure_footer);
-    try testing.expect(rows[4].hidden_rows > 0);
-    try testing.expect(rows[4].total_rows > 3);
+    try testing.expectEqual(@as(usize, 6), rows.len); // header + 3 body + indicator + footer
+    try testing.expectEqualStrings("[...]", rows[4].text()); // too narrow for the hint
+    try testing.expect(rows[5].part == .disclosure_footer);
+    try testing.expect(rows[5].hidden_rows > 0);
+    try testing.expect(rows[5].total_rows > 3);
     for (rows) |row| switch (row.owner) {
         .draft => |id| try testing.expectEqual(draft.local_id, id),
         else => return error.WrongOwner,
     };
+}
+
+test "a ReviewCard collapses only to hide two rows or more, and marks the hidden rows" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    for ([_]struct { body: []const u8, collapsed: bool }{
+        .{ .body = "```\na\nb\nc\nd\n```", .collapsed = false },
+        .{ .body = "```\na\nb\nc\nd\ne\n```", .collapsed = true },
+    }) |case| {
+        const comment: bbr.review.Comment = .{ .id = 1, .author = "Ada", .body = case.body };
+        const rows = try project(allocator, try ReviewBody.parse(allocator, comment.body), .{
+            .owner = .{ .comment = 1 },
+            .source = .{ .comment = &comment },
+            .role = .comment,
+            .header = "Ada",
+            .content_width = 30,
+            .metrics = TestMetrics.value,
+            .collapsed_rows = 3,
+        });
+        const last = rows[rows.len - 1];
+        if (!case.collapsed) {
+            try testing.expectEqual(@as(usize, 6), rows.len); // header + 4 body + bottom
+            try testing.expectEqual(Part.bottom, last.part);
+            for (rows) |row| try testing.expect(!row.hidden_indicator);
+            continue;
+        }
+        try testing.expectEqual(@as(usize, 6), rows.len); // header + 3 body + indicator + footer
+        try testing.expectEqualStrings("c", rows[3].text());
+        const indicator = rows[4];
+        try testing.expectEqual(Part.body, indicator.part);
+        try testing.expect(indicator.hidden_indicator);
+        try testing.expectEqualStrings("[...] (enter to expand)", indicator.text());
+        try testing.expect(!indicator.segments[0].authored);
+        try testing.expect(indicator.segments[0].marks.divider);
+        try testing.expectEqual(std.mem.indexOfScalar(u8, case.body, 'd').?, indicator.source_range.start);
+        try testing.expectEqual(Part.disclosure_footer, last.part);
+        try testing.expectEqual(@as(usize, 2), last.hidden_rows);
+    }
+}
+
+test "the hidden-row indicator drops its hint, then clips its marker, to fit the card" {
+    try testing.expectEqualStrings("[...] (enter to expand)", hiddenIndicatorText(23));
+    try testing.expectEqualStrings("[...]", hiddenIndicatorText(22));
+    try testing.expectEqualStrings("[..", hiddenIndicatorText(3));
+    try testing.expectEqualStrings("[", hiddenIndicatorText(0));
 }
 
 test "zero and narrow widths preserve invalid bytes and complete graphemes" {
