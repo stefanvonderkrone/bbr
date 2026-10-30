@@ -322,7 +322,9 @@ fn drawFileTree(win: vaxis.Window, tree: @import("file_tree.zig").Projection, th
         const index = tree.scroll + screen_row;
         if (index >= tree.entries.len) break;
         const entry = tree.entries[index];
-        const style = if (entry.active or index == tree.cursor) theme.sidebar_selected else theme.sidebar_item;
+        var style = if (entry.active or index == tree.cursor) theme.sidebar_selected else theme.sidebar_item;
+        // File Read State decides the weight, also on the cursor and active rows.
+        style.bold = entry.unread;
         fillRow(win, screen_row, style);
         var col: u16 = @intCast(@min(entry.depth * 2, win.width));
         if (col < win.width) {
@@ -334,7 +336,7 @@ fn drawFileTree(win: vaxis.Window, tree: @import("file_tree.zig").Projection, th
             if (col < win.width) win.writeCell(col, screen_row, .{ .char = .{ .grapheme = if (entry.expanded) "▾" else "▸", .width = 1 }, .style = style });
             col +|= 1;
         } else if (entry.status) |status| {
-            if (col < win.width) win.writeCell(col, screen_row, .{ .char = .{ .grapheme = statusChar(status), .width = 1 }, .style = .{ .fg = theme.statusColor(status), .bg = style.bg } });
+            if (col < win.width) win.writeCell(col, screen_row, .{ .char = .{ .grapheme = statusChar(status), .width = 1 }, .style = .{ .fg = theme.statusColor(status), .bg = style.bg, .bold = style.bold } });
             col +|= 1;
         }
         col +|= 1;
@@ -4059,6 +4061,37 @@ test "focused Pane frames and File Tree tallies use Frame-owned geometry" {
     drawFileTree(content, .{ .entries = &entries, .cursor = 0, .scroll = 0, .viewport = content.height }, theme_dark);
     try testing.expectEqualStrings("1", content.readCell(content.width - 1, 0).?.char.grapheme);
     try testing.expectEqualStrings("●", content.readCell(content.width - 5, 0).?.char.grapheme);
+}
+
+test "M22 read the File Tree weight follows File Read State on every row" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var screen = try vaxis.Screen.init(a, .{ .rows = 4, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win = headlessWindow(&screen);
+    const Entry = @import("file_tree.zig").Entry;
+    for (@import("theme.zig").builtins) |builtin| for ([_]bool{ false, true }) |unread| {
+        const theme = builtin.value;
+        // Row 0 is the active row, row 1 the cursor row, and row 2 a plain row with the opposite state.
+        const entries = [_]Entry{
+            .{ .identity = .{ .file = 0 }, .parent = null, .depth = 0, .label = "a.zig", .active = true, .unread = unread, .status = .modified, .tally = "●1", .tally_width = 2 },
+            .{ .identity = .{ .file = 1 }, .parent = null, .depth = 0, .label = "b.zig", .unread = unread, .status = .added },
+            .{ .identity = .{ .file = 2 }, .parent = null, .depth = 0, .label = "c.zig", .unread = !unread, .status = .removed },
+        };
+        win.clear();
+        drawFileTree(win, .{ .entries = &entries, .cursor = 1, .scroll = 0, .viewport = 4 }, theme);
+        for (entries, 0..) |entry, row| {
+            const row_style = if (row < 2) theme.sidebar_selected else theme.sidebar_item;
+            for (0..win.width) |col| {
+                const cell = win.readCell(@intCast(col), @intCast(row)).?;
+                try testing.expectEqual(entry.unread, cell.style.bold);
+                try testing.expectEqual(row_style.bg, cell.style.bg);
+            }
+            try testing.expectEqual(row_style.fg, win.readCell(3, @intCast(row)).?.style.fg);
+            try testing.expectEqual(theme.statusColor(entry.status.?), win.readCell(1, @intCast(row)).?.style.fg);
+        }
+    };
 }
 
 test "File header junctions keep the DiffPane border style" {

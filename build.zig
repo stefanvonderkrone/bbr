@@ -251,6 +251,13 @@ pub fn build(b: *std.Build) void {
     const search_kernel_test_step = b.step("test-search-kernel", "Run M21 search kernel and reachable-source tests");
     search_kernel_test_step.dependOn(&run_search_kernel_tests.step);
 
+    // The fingerprint and the fake live in the `bbr` module, Presentation and SQLite in the executable.
+    const file_read_step = b.step("test-file-read", "Run M22 File read state tests");
+    for ([_]*std.Build.Module{ mod, exe.root_module }) |root_module| {
+        const file_read_tests = b.addTest(.{ .name = "file-read-tests", .root_module = root_module, .filters = &.{"M22 read"} });
+        file_read_step.dependOn(&b.addRunArtifact(file_read_tests).step);
+    }
+
     const authored_search_tests = b.addTest(.{
         .name = "authored-search-tests",
         .root_module = exe.root_module,

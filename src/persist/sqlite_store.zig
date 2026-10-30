@@ -40,6 +40,10 @@ const DraftReanchor = bbr.review.DraftReanchor;
 const DraftSubtreeDelete = bbr.review.DraftSubtreeDelete;
 const parentEql = bbr.review.parentEql;
 const SubmissionCompletion = bbr.review.SubmissionCompletion;
+const ReviewIdentity = bbr.review.ReviewIdentity;
+const FileReadStore = bbr.review.FileReadStore;
+const FileReadReceipt = bbr.review.FileReadReceipt;
+const FileReviewFingerprint = bbr.review.FileReviewFingerprint;
 
 pub const SqliteError = error{ Open, Exec, Prepare, Step };
 
@@ -110,6 +114,11 @@ pub const SqliteStore = struct {
 
     pub fn store(self: *SqliteStore) PendingReviewStore {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// File Read Receipts share this connection with `store()`.
+    pub fn fileReadStore(self: *SqliteStore) FileReadStore {
+        return .{ .ptr = self, .vtable = &file_read_vtable };
     }
 
     // --- migrations ---------------------------------------------------------
@@ -268,6 +277,28 @@ pub const SqliteStore = struct {
                 \\COMMIT;
             );
         }
+        // v10 (M22): File Read Receipts, one per ReviewIdentity and canonical
+        // path. The table is independent of every PendingReview table.
+        if (try self.userVersion() < 10) {
+            try self.exec(
+                \\BEGIN;
+                \\CREATE TABLE file_read_receipts (
+                \\  review_kind   INTEGER NOT NULL,
+                \\  workspace     TEXT NOT NULL,
+                \\  repository    TEXT NOT NULL,
+                \\  pr_id         INTEGER NOT NULL,
+                \\  repository_id INTEGER NOT NULL,
+                \\  base_ref      TEXT NOT NULL,
+                \\  source_ref    TEXT NOT NULL,
+                \\  path          TEXT NOT NULL,
+                \\  fingerprint   BLOB NOT NULL,
+                \\  PRIMARY KEY (review_kind, workspace, repository, pr_id,
+                \\               repository_id, base_ref, source_ref, path)
+                \\) WITHOUT ROWID;
+                \\PRAGMA user_version = 10;
+                \\COMMIT;
+            );
+        }
     }
 
     fn userVersion(self: *SqliteStore) SqliteError!i64 {
@@ -303,6 +334,75 @@ pub const SqliteStore = struct {
         .resolve_repository = resolveRepositoryImpl,
         .reserve_temp_id = reserveTempIdImpl,
     };
+
+    const file_read_vtable: FileReadStore.VTable = .{
+        .load = loadFileReadsImpl,
+        .put = putFileReadImpl,
+        .delete = deleteFileReadImpl,
+    };
+
+    fn loadFileReadsImpl(ptr: *anyopaque, allocator: std.mem.Allocator, identity: ReviewIdentity) anyerror![]FileReadReceipt {
+        const self: *SqliteStore = @ptrCast(@alignCast(ptr));
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db,
+            \\SELECT path, fingerprint FROM file_read_receipts
+            \\ WHERE review_kind=?1 AND workspace=?2 AND repository=?3 AND pr_id=?4
+            \\   AND repository_id=?5 AND base_ref=?6 AND source_ref=?7;
+        , -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(stmt);
+        bindReviewIdentity(stmt, identity);
+        var receipts: std.ArrayList(FileReadReceipt) = .empty;
+        errdefer {
+            for (receipts.items) |receipt| allocator.free(receipt.path);
+            receipts.deinit(allocator);
+        }
+        while (true) {
+            switch (c.sqlite3_step(stmt)) {
+                c.SQLITE_ROW => {
+                    // A malformed fingerprint makes its receipt absent, so the File stays unread.
+                    const blob: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 1) orelse continue);
+                    if (c.sqlite3_column_bytes(stmt, 1) != 32) continue;
+                    var value: FileReviewFingerprint = .{ .bytes = undefined };
+                    @memcpy(&value.bytes, blob[0..32]);
+                    try receipts.ensureUnusedCapacity(allocator, 1);
+                    const path = (try columnTextDup(allocator, stmt, 0)) orelse continue;
+                    receipts.appendAssumeCapacity(.{ .path = path, .fingerprint = value });
+                },
+                c.SQLITE_DONE => break,
+                else => return error.Step,
+            }
+        }
+        return receipts.toOwnedSlice(allocator);
+    }
+
+    fn putFileReadImpl(ptr: *anyopaque, identity: ReviewIdentity, path: []const u8, value: FileReviewFingerprint) anyerror!void {
+        const self: *SqliteStore = @ptrCast(@alignCast(ptr));
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db,
+            \\INSERT OR REPLACE INTO file_read_receipts
+            \\ (review_kind, workspace, repository, pr_id, repository_id, base_ref, source_ref, path, fingerprint)
+            \\ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);
+        , -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(stmt);
+        bindReviewIdentity(stmt, identity);
+        bindText(stmt, 8, path);
+        _ = c.sqlite3_bind_blob(stmt, 9, &value.bytes, value.bytes.len, null);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
+    }
+
+    fn deleteFileReadImpl(ptr: *anyopaque, identity: ReviewIdentity, path: []const u8) anyerror!void {
+        const self: *SqliteStore = @ptrCast(@alignCast(ptr));
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db,
+            \\DELETE FROM file_read_receipts
+            \\ WHERE review_kind=?1 AND workspace=?2 AND repository=?3 AND pr_id=?4
+            \\   AND repository_id=?5 AND base_ref=?6 AND source_ref=?7 AND path=?8;
+        , -1, &stmt, null) != c.SQLITE_OK) return error.Prepare;
+        defer _ = c.sqlite3_finalize(stmt);
+        bindReviewIdentity(stmt, identity);
+        bindText(stmt, 8, path);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
+    }
 
     fn resolveRepositoryImpl(ptr: *anyopaque, aliases: []const []const u8) anyerror!bbr.review.ReviewRepositoryId {
         const self: *SqliteStore = @ptrCast(@alignCast(ptr));
@@ -1398,6 +1498,30 @@ fn bindText(stmt: ?*c.sqlite3_stmt, idx: c_int, s: []const u8) void {
     // stays valid through the `step` that reads it, before we finalize/return.
     _ = c.sqlite3_bind_text(stmt, idx, s.ptr, @intCast(s.len), null);
 }
+/// Binds `?1` to `?7` in the column order of `file_read_receipts`. The
+/// columns of the other review kind hold zero and empty text.
+fn bindReviewIdentity(stmt: ?*c.sqlite3_stmt, identity: ReviewIdentity) void {
+    switch (identity) {
+        .remote => |remote| {
+            bindInt(stmt, 1, 0);
+            bindText(stmt, 2, remote.workspace);
+            bindText(stmt, 3, remote.repository);
+            bindInt(stmt, 4, @intCast(remote.pull_request_id));
+            bindInt(stmt, 5, 0);
+            bindText(stmt, 6, "");
+            bindText(stmt, 7, "");
+        },
+        .local => |local| {
+            bindInt(stmt, 1, 1);
+            bindText(stmt, 2, "");
+            bindText(stmt, 3, "");
+            bindInt(stmt, 4, 0);
+            bindInt(stmt, 5, @intCast(local.repository_id));
+            bindText(stmt, 6, local.base_ref);
+            bindText(stmt, 7, local.source_ref);
+        },
+    }
+}
 fn bindOptText(stmt: ?*c.sqlite3_stmt, idx: c_int, s: ?[]const u8) void {
     if (s) |v| bindText(stmt, idx, v) else bindNull(stmt, idx);
 }
@@ -2237,6 +2361,7 @@ test "v8 migration preserves every authored Draft field and lifecycle state" {
             .state = .outcome_unknown,
         });
         try sqlite.exec(
+            \\DROP TABLE file_read_receipts;
             \\DROP TABLE submission_run_items;
             \\DROP TABLE submission_retry_carryovers;
             \\ALTER TABLE submission_runs DROP COLUMN retry_phase;
@@ -2264,4 +2389,66 @@ test "v8 migration preserves every authored Draft field and lifecycle state" {
     try testing.expectEqual(ApiError.ServerError, drafts[0].state.failed);
     try testing.expect(drafts[1].parent.? == .draft and drafts[1].parent.?.draft == 4);
     try testing.expect(drafts[1].state == .outcome_unknown);
+}
+
+test "M22 read SqliteStore keeps the FileReadStore contract" {
+    var sqlite = try SqliteStore.open(":memory:");
+    defer sqlite.deinit();
+    try bbr.review.file_read.expectStoreContract(sqlite.fileReadStore());
+}
+
+test "M22 read SqliteStore drops a receipt whose fingerprint is not 32 bytes" {
+    var sqlite = try SqliteStore.open(":memory:");
+    defer sqlite.deinit();
+    const review: ReviewIdentity = .{ .remote = .{ .workspace = "workspace", .repository = "repo", .pull_request_id = 7 } };
+    try sqlite.fileReadStore().put(review, "src/a.zig", .{ .bytes = @splat(3) });
+    try sqlite.exec(
+        \\INSERT INTO file_read_receipts VALUES (0, 'workspace', 'repo', 7, 0, '', '', 'src/short.zig', x'0102');
+    );
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try sqlite.fileReadStore().load(arena.allocator(), review);
+    try testing.expectEqual(@as(usize, 1), loaded.len);
+    try testing.expectEqualStrings("src/a.zig", loaded[0].path);
+}
+
+test "M22 read a version 9 database migrates to version 10, keeps its Drafts, and reopens once" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = try std.fmt.allocPrintSentinel(arena.allocator(), ".zig-cache/tmp/{s}/v9.db", .{&tmp.sub_path}, 0);
+    const key = testReviewKey(61);
+    const review: ReviewIdentity = .{ .remote = key };
+
+    {
+        var sqlite = try SqliteStore.open(path);
+        defer sqlite.deinit();
+        try sqlite.store().put(key, .{ .local_id = 1, .kind = .comment, .body = "kept across v10" });
+        try sqlite.exec(
+            \\DROP TABLE file_read_receipts;
+            \\PRAGMA user_version = 9;
+        );
+    }
+    {
+        var upgraded = try SqliteStore.open(path);
+        defer upgraded.deinit();
+        try testing.expectEqual(@as(i64, 10), try upgraded.userVersion());
+        const drafts = try upgraded.store().load(arena.allocator(), key);
+        try testing.expectEqual(@as(usize, 1), drafts.len);
+        try testing.expectEqualStrings("kept across v10", drafts[0].body);
+        try upgraded.fileReadStore().put(review, "src/a.zig", .{ .bytes = @splat(9) });
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        try testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(upgraded.db, "PRAGMA foreign_key_list(file_read_receipts);", -1, &stmt, null));
+        defer _ = c.sqlite3_finalize(stmt);
+        try testing.expectEqual(c.SQLITE_DONE, c.sqlite3_step(stmt));
+    }
+    // A second migration would fail on the existing table.
+    var reopened = try SqliteStore.open(path);
+    defer reopened.deinit();
+    try testing.expectEqual(@as(i64, 10), try reopened.userVersion());
+    const receipts = try reopened.fileReadStore().load(arena.allocator(), review);
+    try testing.expectEqual(@as(usize, 1), receipts.len);
+    try testing.expectEqual(@as(usize, 1), (try reopened.store().load(arena.allocator(), key)).len);
 }

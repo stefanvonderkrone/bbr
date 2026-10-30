@@ -142,7 +142,9 @@ pub fn main(init: std.process.Init) !void {
     const visual_rows_wide_context: p1_actions.VisualRowsContext = .{ .rows = navigation_context.buffer.rows };
     const visual_rows_narrow_context: p1_actions.VisualRowsContext = .{ .rows = navigation_context.buffer.rows, .width = 24 };
     const file_tree_tallies = try tui.buffer.fileTallies(comment_arena.allocator(), parsed, comment_contexts[2].threads, comment_contexts[2].drafts, .{ .drafts = comment_contexts[2].drafts });
-    const file_tree_context: p1_actions.FileTreeContext = .{ .diff = parsed, .tallies = file_tree_tallies };
+    const file_tree_reads = try comment_arena.allocator().alloc(tui.file_tree.FileReadEntry, parsed.files.len);
+    @memset(file_tree_reads, .{});
+    const file_tree_context: p1_actions.FileTreeContext = .{ .diff = parsed, .tallies = file_tree_tallies, .reads = file_tree_reads };
     var matched = false;
     if (selected == null or std.mem.eql(u8, selected.?, frame_paint.name)) {
         matched = true;

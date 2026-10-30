@@ -38,6 +38,7 @@ pub const RunCtx = struct {
     bitbucket: ?bbr.bitbucket.Client = null,
     repo: []const u8,
     store: PendingReviewStore,
+    file_reads: ?bbr.review.FileReadStore = null,
     theme: ThemeId,
     /// False for the demo, which must not change the reviewer's config.toml.
     persist_theme: bool = true,
@@ -102,6 +103,7 @@ fn runPresentation(ctx: RunCtx, initial: ?*Session, initial_key: presentation.Ow
     defer git_anchor_resolver.deinit();
     var state = try presentation.Presentation.init(ctx.gpa, .{
         .reviews = ctx.store,
+        .file_reads = ctx.file_reads,
         .anchor_resolver = git_anchor_resolver.resolver(),
         .scope_resolver = git_anchor_resolver.scopeResolver(),
         .submission_locks = ctx.submission_locks,
@@ -536,6 +538,8 @@ fn actionErrorText(err: presentation.ActionError) []const u8 {
         .buffer_search_no_matches => "No matches",
         .buffer_search_hit_bottom => "Search hit BOTTOM, continuing at TOP",
         .buffer_search_hit_top => "Search hit TOP, continuing at BOTTOM",
+        .file_read_save_failed => "File read state not saved",
+        .file_read_unverifiable => "File cannot be verified, so it stays unread",
         else => @tagName(err),
     };
 }

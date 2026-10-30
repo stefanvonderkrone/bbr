@@ -62,6 +62,7 @@ pub const Action = enum {
     toggle_review_card,
     toggle_directory,
     focus_file,
+    toggle_file_read,
     confirm_picker,
     yank,
     focus_next_pane,

@@ -341,6 +341,7 @@ pub const CommandPalette = struct {
         .{ .action = .isolate, .title = "Isolate File", .description = "Show only the current File, or show every File again" },
         .{ .action = .next_file, .title = "Next File", .description = "Move to the next changed File" },
         .{ .action = .prev_file, .title = "Previous File", .description = "Move to the previous changed File" },
+        .{ .action = .toggle_file_read, .title = "Toggle File Read", .description = "Mark the current File read or unread" },
         .{ .action = .select_old_version, .title = "Select Old Version", .description = "Inspect the old File version" },
         .{ .action = .select_new_version, .title = "Select New Version", .description = "Inspect the new File version" },
         .{ .action = .toggle_select, .title = "Toggle Selection", .description = "Start or end a visual Line selection" },
@@ -824,4 +825,21 @@ test "scroll top keeps the selected row inside the viewport" {
     p.moveDown();
     try testing.expectEqual(@as(usize, 1), p.list().scrollTop(2));
     try testing.expectEqual(@as(usize, 0), p.list().scrollTop(0));
+}
+
+test "M22 read the Command Palette lists Toggle File Read from the Sidebar File and the DiffPane" {
+    for ([_]InteractionContext{ .sidebar_file, .diff, .diff_source, .sidebar_directory }) |context| {
+        var overlay = try ListOverlay.openCommandPalette(std.testing.allocator, context);
+        defer overlay.deinit();
+        const palette = &overlay.command_palette;
+        var listed = false;
+        for (0..palette.row_count) |row| {
+            const command = palette.command(row);
+            if (command.action != .toggle_file_read) continue;
+            try std.testing.expectEqualStrings("Toggle File Read", command.title);
+            try std.testing.expectEqualStrings("Mark the current File read or unread", command.description);
+            listed = true;
+        }
+        try std.testing.expectEqual(context != .sidebar_directory, listed);
+    }
 }

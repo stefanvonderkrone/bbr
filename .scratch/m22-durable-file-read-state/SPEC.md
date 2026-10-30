@@ -1,6 +1,6 @@
 # M22 Durable File read state
 
-Status: ready-for-agent
+Status: claimed
 Milestone: M22
 
 The [M22 brief](brief.md) records the approved decisions.

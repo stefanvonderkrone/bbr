@@ -16,6 +16,7 @@ const ListOverlay = list_overlay_mod.ListOverlay;
 const ThemeId = @import("theme_id.zig").ThemeId;
 const frame_mod = @import("frame.zig");
 const file_tree = frame_mod.file_tree;
+const FileReadEntry = file_tree.FileReadEntry;
 const buffer_mod = @import("buffer.zig");
 const search = @import("search.zig");
 const review_card = @import("review_card.zig");
@@ -854,6 +855,8 @@ pub const OwnedRemoteReviewIdentity = struct {
 
 pub const Dependencies = struct {
     reviews: bbr.review.PendingReviewStore,
+    /// Null means every File stays unread and a toggle reports `file_read_save_failed`.
+    file_reads: ?bbr.review.FileReadStore = null,
     anchor_resolver: ?bbr.review.AnchorResolver = null,
     scope_resolver: ?bbr.review.ScopeResolver = null,
     submission_locks: ?bbr.review.SubmissionLocks = null,
@@ -2393,6 +2396,7 @@ const DisclosureInputs = struct {
     drafts: []const bbr.review.Draft = &.{},
     scopes: []const bbr.review.ScopeProjectionEntry = &.{},
     collapsed_directories: []const []const u8 = &.{},
+    file_reads: []const FileReadEntry = &.{},
     content_owner: ?*DisclosureInputs = null,
     blobs: []const bbr.diff.FileBlob = &.{},
     highlights: []const bbr.highlight.FileHighlights = &.{},
@@ -2401,7 +2405,7 @@ const DisclosureInputs = struct {
     leased: usize = 0,
 
     fn create(published: *Published) !*DisclosureInputs {
-        const self = try clone(std.heap.page_allocator, published.review.drafts.items, published.scope_projection.items, published.collapsed_directories.items, published.session.enrichment.projection());
+        const self = try clone(std.heap.page_allocator, published.review.drafts.items, published.scope_projection.items, published.collapsed_directories.items, published.file_reads, published.session.enrichment.projection());
         errdefer self.release();
         self.leases = try self.arena.allocator().alloc(file_enrichment.ReadLease, published.session.enrichment.len());
         for (self.leases) |*lease| {
@@ -2411,7 +2415,7 @@ const DisclosureInputs = struct {
         return self;
     }
 
-    fn clone(backing: Allocator, drafts: []const bbr.review.Draft, scopes: []const bbr.review.ScopeProjectionEntry, directories: []const []const u8, enrichment: file_enrichment.Projection) !*DisclosureInputs {
+    fn clone(backing: Allocator, drafts: []const bbr.review.Draft, scopes: []const bbr.review.ScopeProjectionEntry, directories: []const []const u8, file_reads: []const FileReadEntry, enrichment: file_enrichment.Projection) !*DisclosureInputs {
         const self = try backing.create(DisclosureInputs);
         self.* = .{ .arena = std.heap.ArenaAllocator.init(backing) };
         errdefer self.release();
@@ -2427,6 +2431,7 @@ const DisclosureInputs = struct {
         const paths = try a.alloc([]const u8, directories.len);
         for (directories, paths) |path, *copy| copy.* = try a.dupe(u8, path);
         self.collapsed_directories = paths;
+        self.file_reads = try a.dupe(FileReadEntry, file_reads);
         self.blobs = try a.dupe(bbr.diff.FileBlob, enrichment.blobs);
         self.highlights = try a.dupe(bbr.highlight.FileHighlights, enrichment.highlights);
         self.content_statuses = try a.dupe(bbr.diff.FileContent, enrichment.content_statuses);
@@ -2437,7 +2442,7 @@ const DisclosureInputs = struct {
         _ = self.references.fetchAdd(1, .acq_rel);
     }
 
-    fn withDirectories(self: *DisclosureInputs, directories: []const []const u8) !*DisclosureInputs {
+    fn withFileTree(self: *DisclosureInputs, directories: []const []const u8, file_reads: []const FileReadEntry) !*DisclosureInputs {
         const backing = self.arena.child_allocator;
         const copy = try backing.create(DisclosureInputs);
         // Retain the content owner directly. Repeated Directory changes must not
@@ -2459,6 +2464,7 @@ const DisclosureInputs = struct {
         const paths = try a.alloc([]const u8, directories.len);
         for (directories, paths) |path, *item| item.* = try a.dupe(u8, path);
         copy.collapsed_directories = paths;
+        copy.file_reads = try a.dupe(FileReadEntry, file_reads);
         return copy;
     }
 
@@ -2518,6 +2524,7 @@ pub const DisclosureBuild = struct {
     scopes: []const bbr.review.ScopeProjectionEntry = &.{},
     disclosures: []const buffer_mod.DisclosureKey = &.{},
     collapsed_directories: []const []const u8 = &.{},
+    file_reads: []const FileReadEntry = &.{},
     wanted_cursor: ?file_tree.Identity = null,
     tree_scroll: usize = 0,
     active_file: ?usize = null,
@@ -2615,6 +2622,7 @@ pub const DisclosureBuild = struct {
         job.drafts = job.inputs.drafts;
         job.scopes = job.inputs.scopes;
         job.collapsed_directories = job.inputs.collapsed_directories;
+        job.file_reads = job.inputs.file_reads;
         job.tree_scroll = published.tree.scroll;
         job.active_file = if (published.session.diff.files.len == 0) null else published.isolated_file orelse published.buffer.fileIndexForRow(published.cursorBufferIndex());
         job.source_active_file = job.active_file;
@@ -2742,7 +2750,7 @@ pub const DisclosureBuild = struct {
             }
         }
         if (self.kind == .enrichment or self.kind == .cache_update or self.kind == .draft_save or self.kind == .draft_mutation) {
-            const inputs = try DisclosureInputs.clone(self.arena.child_allocator, self.drafts, self.scopes, self.collapsed_directories, .{
+            const inputs = try DisclosureInputs.clone(self.arena.child_allocator, self.drafts, self.scopes, self.collapsed_directories, self.file_reads, .{
                 .blobs = self.blobs,
                 .highlights = self.highlights,
                 .content_statuses = self.content_statuses,
@@ -2763,6 +2771,7 @@ pub const DisclosureBuild = struct {
                 self.drafts = inputs.drafts;
                 self.scopes = inputs.scopes;
                 self.collapsed_directories = inputs.collapsed_directories;
+                self.file_reads = inputs.file_reads;
                 self.blobs = inputs.blobs;
                 self.highlights = inputs.highlights;
                 self.content_statuses = inputs.content_statuses;
@@ -2833,7 +2842,7 @@ pub const DisclosureBuild = struct {
         if (self.version_restoration) |target| self.version_destination = versionNavigationDestination(self.session, self.buffer, self.visual_rows, target, self.preferences.selected_version);
         if (self.deletion_origin) |origin| self.surviving_row = survivingRowAfterDeletion(origin.deletion_rows, self.deleted_ids);
         const panes = frame_mod.paneRects(self.geometry);
-        self.tree = try file_tree.build(a, self.session.diff, self.buffer.file_tallies, self.collapsed_directories, self.active_file, panes.sidebar_content.width, panes.sidebar_content.height, self.wanted_cursor, self.tree_scroll, self.cell_metrics);
+        self.tree = try file_tree.build(a, self.session.diff, self.buffer.file_tallies, self.file_reads, self.collapsed_directories, self.active_file, panes.sidebar_content.width, panes.sidebar_content.height, self.wanted_cursor, self.tree_scroll, self.cell_metrics);
         self.projection = try SearchProjection.create(self.buffer, self.visual_rows, .{
             .session = self.session,
             .drafts = self.drafts,
@@ -3371,6 +3380,8 @@ pub const ActionAvailability = struct {
     suggestion_refusal: ?SuggestionRefusal = null,
     selection: bool = true,
     buffer_search: bool = true,
+    /// False when the focused Pane names no File, such as a DiffPane row outside every File.
+    file_read_target: bool = true,
     /// null means the ReviewCard under the cursor is editable.
     edit_refusal: ?MutationRefusal = .no_review_item,
     /// null means the ReviewCard under the cursor — or, while re-anchor is
@@ -3409,6 +3420,7 @@ pub const ActionAvailability = struct {
             .yank => self.yank_refusal == null,
             .toggle_select => self.selection,
             .open_buffer_search => self.buffer_search,
+            .toggle_file_read => self.file_read_target,
             .edit_review_item => self.edit_refusal == null,
             .reanchor_review_item => self.reanchor_refusal == null,
             .delete_review_item => self.delete_refusal == null,
@@ -3557,6 +3569,8 @@ pub const ActionError = enum {
     theme_not_saved,
     theme_not_saved_invalid_config,
     persistence_failed,
+    file_read_save_failed,
+    file_read_unverifiable,
     submission_already_active,
     submission_launch_failed,
     submission_owned_elsewhere,
@@ -3814,6 +3828,34 @@ fn activeNumber(index: ?usize) ?usize {
 }
 
 const BufferTransactionError = error{ BufferBuildFailed, SearchFailed, OutOfMemory };
+const FileReadToggleError = error{ FileUnverifiable, PersistenceFailed, OutOfMemory };
+
+/// Reads File Read Receipts and never writes them. A File is read only when a
+/// receipt has its canonical path and its current fingerprint.
+fn loadFileReads(
+    allocator: Allocator,
+    scratch_backing: Allocator,
+    store: ?bbr.review.FileReadStore,
+    identity: bbr.review.ReviewIdentity,
+    diff: bbr.diff.Diff,
+) error{ OutOfMemory, FileReadLoadFailed }![]FileReadEntry {
+    const entries = try allocator.alloc(FileReadEntry, diff.files.len);
+    for (entries, diff.files) |*entry, file| entry.* = .{ .fingerprint = bbr.review.file_read.fingerprint(file) };
+    const reads = store orelse return entries;
+    var scratch = std.heap.ArenaAllocator.init(scratch_backing);
+    defer scratch.deinit();
+    const receipts = reads.load(scratch.allocator(), identity) catch |err|
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.FileReadLoadFailed;
+    var by_path: std.StringHashMapUnmanaged(bbr.review.FileReviewFingerprint) = .empty;
+    try by_path.ensureTotalCapacity(scratch.allocator(), @intCast(receipts.len));
+    for (receipts) |receipt| by_path.putAssumeCapacity(receipt.path, receipt.fingerprint);
+    for (entries, diff.files) |*entry, file| {
+        const current = entry.fingerprint orelse continue;
+        const stored = by_path.get(file.displayPath()) orelse continue;
+        entry.read = stored.eql(current);
+    }
+    return entries;
+}
 const SaveDraftError = BufferTransactionError || error{ PersistenceFailed, AnchorRangeTooLong, InvalidDraftScope };
 
 pub const ReplacementError = enum {
@@ -3939,6 +3981,8 @@ const Published = struct {
     review_arena: std.heap.ArenaAllocator,
     review: bbr.review.PendingReview,
     scope_projection: std.ArrayList(bbr.review.ScopeProjectionEntry),
+    /// Index-aligned with `session.diff.files`, in `review_arena`.
+    file_reads: []FileReadEntry,
     emphasis_cache: buffer_mod.EmphasisCache,
     buffers: ArenaRing(2),
     trees: ArenaRing(2),
@@ -3981,6 +4025,7 @@ const Published = struct {
     fn create(
         allocator: Allocator,
         store: bbr.review.PendingReviewStore,
+        file_reads: ?bbr.review.FileReadStore,
         anchor_resolver: ?bbr.review.AnchorResolver,
         scope_resolver: ?bbr.review.ScopeResolver,
         key: OwnedReviewIdentity,
@@ -3992,7 +4037,7 @@ const Published = struct {
         cell_metrics: frame_mod.CellMetrics,
         comments_collapsed_rows: usize,
     ) !*Published {
-        const candidate = try createInputs(allocator, store, anchor_resolver, scope_resolver, key, epoch, session, geometry, preferences, cache_policy, cell_metrics, comments_collapsed_rows);
+        const candidate = try createInputs(allocator, store, file_reads, anchor_resolver, scope_resolver, key, epoch, session, geometry, preferences, cache_policy, cell_metrics, comments_collapsed_rows);
         errdefer candidate.destroyInputs();
         try candidate.finishCreate(preferences);
         return candidate;
@@ -4001,6 +4046,7 @@ const Published = struct {
     fn createInputs(
         allocator: Allocator,
         store: bbr.review.PendingReviewStore,
+        file_reads: ?bbr.review.FileReadStore,
         anchor_resolver: ?bbr.review.AnchorResolver,
         scope_resolver: ?bbr.review.ScopeResolver,
         key: OwnedReviewIdentity,
@@ -4055,6 +4101,7 @@ const Published = struct {
                 .unavailable;
             try published.scope_projection.append(published.review_arena.allocator(), .{ .temp_id = draft.local_id, .resolution = resolution });
         }
+        published.file_reads = try loadFileReads(published.review_arena.allocator(), allocator, file_reads, published.key.identity(), session.diff);
         published.buffers = ArenaRing(2).init(allocator);
         published.trees = ArenaRing(2).init(allocator);
         errdefer published.trees.deinit();
@@ -4157,6 +4204,7 @@ const Published = struct {
             buffer_allocator,
             session.diff,
             published.buffer.file_tallies,
+            published.file_reads,
             published.collapsed_directories.items,
             if (session.diff.files.len == 0) null else 0,
             panes.sidebar_content.width,
@@ -4477,6 +4525,7 @@ const Published = struct {
             allocator,
             self.session.diff,
             candidate.file_tallies,
+            self.file_reads,
             self.collapsed_directories.items,
             active_file,
             panes.sidebar_content.width,
@@ -4795,6 +4844,13 @@ const Published = struct {
         return self.isolated_file orelse self.buffer.fileIndexForRow(self.cursorBufferIndex());
     }
 
+    /// The File of the Sidebar cursor entry in the Sidebar, else the active File.
+    fn focusedFile(self: *const Published) ?usize {
+        if (self.focus == .diff) return self.activeFile();
+        const entry = self.sidebarEntry() orelse return null;
+        return if (entry.identity == .file) entry.identity.file else null;
+    }
+
     fn resizeHeight(self: *Published, geometry: frame_mod.Geometry) void {
         self.geometry = geometry;
         frame_mod.resizeViewports(&self.navigation, &self.tree, geometry);
@@ -4832,16 +4888,57 @@ const Published = struct {
     }
 
     fn rebuildFileTree(self: *Published) !void {
+        const staged = try self.stageFileTree(self.file_reads);
+        staged.publish(self);
+    }
+
+    const StagedFileTree = struct {
+        tree: file_tree.Projection,
+        inputs: *DisclosureInputs,
+
+        fn discard(self: StagedFileTree, published: *Published) void {
+            self.inputs.release();
+            published.trees.abort();
+        }
+
+        fn publish(self: StagedFileTree, published: *Published) void {
+            published.trees.commit();
+            published.tree = self.tree;
+            published.disclosure_inputs.release();
+            published.disclosure_inputs = self.inputs;
+            published.frame_revision += 1;
+        }
+    };
+
+    /// The new File Tree and the Frame inputs of a later worker build. In-flight
+    /// builds see other inputs and retry, so they cannot publish an older tree.
+    fn stageFileTree(self: *Published, file_reads: []const FileReadEntry) !StagedFileTree {
         const a = self.trees.begin();
         errdefer self.trees.abort();
         const panes = frame_mod.paneRects(self.geometry);
-        const tree = try file_tree.build(a, self.session.diff, self.buffer.file_tallies, self.collapsed_directories.items, self.activeFile(), panes.sidebar_content.width, panes.sidebar_content.height, if (self.sidebarEntry()) |entry| entry.identity else null, self.tree.scroll, self.cell_metrics);
-        const inputs = try self.disclosure_inputs.withDirectories(self.collapsed_directories.items);
-        self.trees.commit();
-        self.tree = tree;
-        self.disclosure_inputs.release();
-        self.disclosure_inputs = inputs;
-        self.frame_revision += 1;
+        const tree = try file_tree.build(a, self.session.diff, self.buffer.file_tallies, file_reads, self.collapsed_directories.items, self.activeFile(), panes.sidebar_content.width, panes.sidebar_content.height, if (self.sidebarEntry()) |entry| entry.identity else null, self.tree.scroll, self.cell_metrics);
+        return .{ .tree = tree, .inputs = try self.disclosure_inputs.withFileTree(self.collapsed_directories.items, file_reads) };
+    }
+
+    /// Stages the File Tree, persists the receipt change, and then publishes
+    /// through an infallible step. A failure leaves the previous Frame.
+    fn toggleFileRead(self: *Published, store: ?bbr.review.FileReadStore, file_index: usize) FileReadToggleError!void {
+        const entry = self.file_reads[file_index];
+        const value = entry.fingerprint orelse return error.FileUnverifiable;
+        const reads = store orelse return error.PersistenceFailed;
+        const staged_reads = try self.allocator.dupe(FileReadEntry, self.file_reads);
+        defer self.allocator.free(staged_reads);
+        staged_reads[file_index].read = !entry.read;
+        const staged = try self.stageFileTree(staged_reads);
+        const identity = self.key.identity();
+        const path = self.session.diff.files[file_index].displayPath();
+        const persisted = if (entry.read) reads.delete(identity, path) else reads.put(identity, path, value);
+        persisted catch {
+            staged.discard(self);
+            return error.PersistenceFailed;
+        };
+        self.file_reads[file_index].read = !entry.read;
+        staged.publish(self);
     }
 
     fn sidebarVertical(self: *Published, direction: i2) void {
@@ -5946,6 +6043,7 @@ pub const Presentation = struct {
             self.published = try Published.create(
                 allocator,
                 dependencies.reviews,
+                dependencies.file_reads,
                 dependencies.anchor_resolver,
                 dependencies.scope_resolver,
                 initial.key,
@@ -6726,6 +6824,7 @@ pub const Presentation = struct {
             .suggestion_refusal = if (self.preferences.scope == .whole) wholeFileSuggestionRefusal(published) else if (source) null else .no_source,
             .selection = published.navigation.hasSelection() or canStartSelection(self.preferences.scope, published.cursorRow()),
             .buffer_search = !published.navigation.hasSelection(),
+            .file_read_target = published.focusedFile() != null,
             .edit_refusal = self.editRefusal(published),
             .reanchor_refusal = self.reanchorRefusal(published),
             .delete_refusal = self.deleteRefusal(published),
@@ -7389,6 +7488,7 @@ pub const Presentation = struct {
                 .yank => yankRefusalError(availability.yank_refusal, selected_version),
                 .toggle_select => .source_action_unavailable,
                 .open_buffer_search => .buffer_search_selection_active,
+                .toggle_file_read => .target_action_unavailable,
                 .edit_review_item => mutationRefusalError(availability.edit_refusal),
                 .reanchor_review_item => mutationRefusalError(availability.reanchor_refusal),
                 .delete_review_item => mutationRefusalError(availability.delete_refusal),
@@ -7516,6 +7616,13 @@ pub const Presentation = struct {
             .toggle_review_card => self.toggleDisclosure(published),
             .toggle_directory, .focus_file => self.activateSidebarEntry(published),
             .focus_next_pane => self.togglePaneFocus(published),
+            .toggle_file_read => published.toggleFileRead(self.dependencies.file_reads, published.focusedFile().?) catch |err| {
+                self.action_error = switch (err) {
+                    error.FileUnverifiable => .file_read_unverifiable,
+                    error.PersistenceFailed => .file_read_save_failed,
+                    error.OutOfMemory => .out_of_memory,
+                };
+            },
             .review_comment => self.openComposer(published, .{ .kind = .comment, .label = "New comment", .scope = .review }),
             .file_comment => self.openFileComposer(published),
             .reply => self.openReplyComposer(published),
@@ -11990,6 +12097,7 @@ pub const Presentation = struct {
         const candidate = try Published.createInputs(
             allocator,
             self.dependencies.reviews,
+            self.dependencies.file_reads,
             self.dependencies.anchor_resolver,
             self.dependencies.scope_resolver,
             key,
@@ -13899,7 +14007,7 @@ fn benchmarkInitialSession(allocator: Allocator, io: std.Io, store: bbr.review.P
     for (0..9) |sample| {
         session.retain();
         var start = std.Io.Clock.awake.now(io);
-        const candidate = try Published.create(allocator, store, null, null, key, 1, session, .{ .cols = 100, .rows = 30 }, .{}, .{}, .bytes, 8);
+        const candidate = try Published.create(allocator, store, null, null, null, key, 1, session, .{ .cols = 100, .rows = 30 }, .{}, .{}, .bytes, 8);
         times[0][sample] = @intCast(start.untilNow(io, .awake).toNanoseconds());
         if (candidate.visual_rows.len == 0 or candidate.search_corpus.?.candidates.len == 0) return error.MissingInitialFrame;
         const expected_rows = candidate.visual_rows.len;
@@ -23527,7 +23635,7 @@ fn checkCandidatePreparationAllocations(allocator: Allocator) !void {
     defer store.deinit();
     const key = try OwnedReviewIdentity.init("workspace", "repo", 2);
     try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .body = "retained body" });
-    const candidate = try Published.createInputs(allocator, store.store(), null, null, key, 1, try testDisclosureSession(allocator, 2), .{ .cols = 45, .rows = 12 }, .{}, .{}, .bytes, 2);
+    const candidate = try Published.createInputs(allocator, store.store(), null, null, null, key, 1, try testDisclosureSession(allocator, 2), .{ .cols = 45, .rows = 12 }, .{}, .{}, .bytes, 2);
     var job: PrepareSession = .{ .allocator = allocator, .intent = 1, .preferences = .{}, .review_revision = 0, .candidate = candidate };
     defer if (job.ready) candidate.destroy() else candidate.destroyInputs();
     job.build();
@@ -29417,4 +29525,457 @@ test "Sidebar mouse click toggles a Directory and focuses a child File" {
     try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
     try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 0 }));
     try testing.expectEqual(@as(usize, 0), frame.navigation.cursor);
+}
+
+const m22_two_files =
+    \\diff --git a/a.zig b/a.zig
+    \\--- a/a.zig
+    \\+++ b/a.zig
+    \\@@ -1 +1 @@
+    \\-old a
+    \\+new a
+    \\diff --git a/b.zig b/b.zig
+    \\--- a/b.zig
+    \\+++ b/b.zig
+    \\@@ -1 +1 @@
+    \\-old b
+    \\+new b
+    \\
+;
+
+fn testFileReadSession(backing: std.mem.Allocator, id: u64, raw: []const u8) !*session_mod.Session {
+    const s = try testTwoFileSession(backing, id);
+    errdefer s.destroy();
+    s.diff = try bbr.diff.parse(s.arena.allocator(), try s.arena.allocator().dupe(u8, raw));
+    try s.initializeEnrichment();
+    return s;
+}
+
+fn testLocalFileReadSession(backing: std.mem.Allocator, source_commit: []const u8, raw: []const u8) !*session_mod.Session {
+    const s = try testLocalSession(backing);
+    errdefer s.destroy();
+    const a = s.arena.allocator();
+    s.header.source_commit = try a.dupe(u8, source_commit);
+    s.diff = try bbr.diff.parse(a, try a.dupe(u8, raw));
+    try s.initializeEnrichment();
+    return s;
+}
+
+const test_m: keymap_mod.KeyStroke = .{ .codepoint = 'm', .text = "m" };
+
+fn testFileUnread(presentation: *const Presentation, file_index: usize) !bool {
+    for (presentation.projection().review.?.frame.file_tree.entries) |entry| {
+        if (entry.identity.eql(.{ .file = file_index })) return entry.unread;
+    }
+    return error.FileNotInTree;
+}
+
+/// Delivers `session` for the next `load_session` Command and publishes its Candidate Session.
+fn testLoadNextSession(presentation: *Presentation, session: *session_mod.Session) !void {
+    while (presentation.takeCommand()) |taken| {
+        var command = taken;
+        if (command == .load_session) {
+            const load = command.load_session;
+            return dispatchSessionLoadForTest(presentation, .{ .session_loaded = .{
+                .command_id = load.command_id,
+                .intent = load.intent,
+                .outcome = .{ .loaded = session },
+            } });
+        }
+        command.deinit();
+    }
+    session.destroy();
+    return error.MissingSessionLoad;
+}
+
+fn testReceiptCount(reads: bbr.review.FileReadStore, identity: bbr.review.ReviewIdentity) !usize {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    return (try reads.load(arena.allocator(), identity)).len;
+}
+
+const m22_remote: bbr.review.ReviewIdentity = .{ .remote = .{ .workspace = "workspace", .repository = "repo", .pull_request_id = 1 } };
+
+test "M22 read an initial Session with no receipts shows every File unread" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+    });
+    defer presentation.deinit();
+    try testing.expect(try testFileUnread(&presentation, 0));
+    try testing.expect(try testFileUnread(&presentation, 1));
+    try testing.expectEqual(@as(usize, 0), reads.writes);
+}
+
+test "M22 read m in the DiffPane and on a Sidebar File row marks the focused File read and stores one receipt" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer presentation.deinit();
+
+    try testing.expectEqual(keymap_mod.InteractionContext.diff, presentation.paneContext());
+    const cursor = presentation.projection().review.?.navigation.cursor;
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expect(presentation.projection().action_error == null);
+    try testing.expect(!try testFileUnread(&presentation, 0));
+    try testing.expect(try testFileUnread(&presentation, 1));
+    try testing.expectEqual(cursor, presentation.projection().review.?.navigation.cursor);
+    try testing.expectEqual(@as(usize, 1), try testReceiptCount(reads.store(), m22_remote));
+
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try presentation.dispatch(.{ .action = .down });
+    try testing.expectEqual(keymap_mod.InteractionContext.sidebar_file, presentation.paneContext());
+    const tree_cursor = presentation.projection().review.?.frame.file_tree.cursor;
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expect(!try testFileUnread(&presentation, 1));
+    try testing.expectEqual(tree_cursor, presentation.projection().review.?.frame.file_tree.cursor);
+    try testing.expectEqual(frame_mod.PaneFocus.sidebar, presentation.projection().review.?.frame.focus);
+    try testing.expectEqual(@as(usize, 2), try testReceiptCount(reads.store(), m22_remote));
+    try testing.expectEqual(@as(usize, 2), reads.writes);
+}
+
+test "M22 read m on a read File deletes its receipt and shows the File unread" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_m });
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expect(presentation.projection().action_error == null);
+    try testing.expect(try testFileUnread(&presentation, 0));
+    try testing.expectEqual(@as(usize, 0), try testReceiptCount(reads.store(), m22_remote));
+}
+
+test "M22 read a failed receipt write keeps the previous weight and reports file_read_save_failed" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+    });
+    defer presentation.deinit();
+
+    reads.fail_put = true;
+    var before = presentation.projection().revision.frame;
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expectEqual(ActionError.file_read_save_failed, presentation.projection().action_error.?);
+    try testing.expect(try testFileUnread(&presentation, 0));
+    try testing.expectEqual(before, presentation.projection().revision.frame);
+    try testing.expectEqual(@as(usize, 0), try testReceiptCount(reads.store(), m22_remote));
+
+    reads.fail_put = false;
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expect(!try testFileUnread(&presentation, 0));
+
+    reads.fail_delete = true;
+    before = presentation.projection().revision.frame;
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expectEqual(ActionError.file_read_save_failed, presentation.projection().action_error.?);
+    try testing.expect(!try testFileUnread(&presentation, 0));
+    try testing.expectEqual(before, presentation.projection().revision.frame);
+    try testing.expectEqual(@as(usize, 1), try testReceiptCount(reads.store(), m22_remote));
+}
+
+test "M22 read without a FileReadStore m reports file_read_save_failed and keeps the File unread" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expectEqual(ActionError.file_read_save_failed, presentation.projection().action_error.?);
+    try testing.expect(try testFileUnread(&presentation, 0));
+}
+
+test "M22 read an allocation failure while staging the toggle preserves the previous Frame and writes nothing" {
+    var offset: usize = 0;
+    while (true) : (offset += 1) {
+        var store = bbr.review.InMemoryStore.init(testing.allocator);
+        defer store.deinit();
+        var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+        defer reads.deinit();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+            .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+        });
+        defer presentation.deinit();
+        const before = presentation.projection().review.?.frame;
+        const before_revision = presentation.projection().revision.frame;
+        failing.fail_index = failing.alloc_index + offset;
+        try presentation.dispatch(.{ .key = test_m });
+        failing.fail_index = std.math.maxInt(usize);
+        if (presentation.projection().action_error) |err| {
+            try testing.expectEqual(ActionError.out_of_memory, err);
+            try testing.expectEqual(before_revision, presentation.projection().revision.frame);
+            try testing.expectEqual(before.file_tree.entries.ptr, presentation.projection().review.?.frame.file_tree.entries.ptr);
+            try testing.expect(try testFileUnread(&presentation, 0));
+            try testing.expectEqual(@as(usize, 0), reads.writes);
+            continue;
+        }
+        try testing.expect(!try testFileUnread(&presentation, 0));
+        try testing.expectEqual(@as(usize, 1), reads.writes);
+        break;
+    }
+    try testing.expect(offset > 0);
+}
+
+test "M22 read m is refused on a DiffPane row without a File and does nothing on a Directory row" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 1);
+    try store.store().put(key.storeKey(), .{ .local_id = 1, .kind = .comment, .scope = .review, .body = "Review-level note" });
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = key, .session = try testFileReadSession(testing.allocator, 1,
+            \\diff --git a/src/a.zig b/src/a.zig
+            \\--- a/src/a.zig
+            \\+++ b/src/a.zig
+            \\@@ -1 +1 @@
+            \\-old a
+            \\+new a
+            \\diff --git a/src/b.zig b/src/b.zig
+            \\--- a/src/b.zig
+            \\+++ b/src/b.zig
+            \\@@ -1 +1 @@
+            \\-old b
+            \\+new b
+            \\
+        ) },
+        .geometry = .{ .cols = 100, .rows = 30 },
+    });
+    defer presentation.deinit();
+
+    try testing.expect(presentation.published.?.activeFile() == null);
+    try testing.expect(!presentation.projection().action_availability.available(.toggle_file_read));
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expectEqual(ActionError.target_action_unavailable, presentation.projection().action_error.?);
+    try testing.expectEqual(@as(usize, 0), reads.writes);
+
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try presentation.dispatch(.{ .action = .up });
+    try testing.expectEqual(keymap_mod.InteractionContext.sidebar_directory, presentation.paneContext());
+    const before = presentation.projection();
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expectEqual(before.revision.frame, presentation.projection().revision.frame);
+    try testing.expectEqual(@as(usize, 0), reads.writes);
+    try testing.expect(try testFileUnread(&presentation, 0));
+    try testing.expect(try testFileUnread(&presentation, 1));
+}
+
+test "M22 read a refresh keeps unchanged Files read and makes only a changed File unread" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_m });
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .key = test_m });
+
+    try presentation.dispatch(.{ .action = .refresh });
+    try testLoadNextSession(&presentation, try testFileReadSession(testing.allocator, 1, m22_two_files));
+    try testing.expect(!try testFileUnread(&presentation, 0));
+    try testing.expect(!try testFileUnread(&presentation, 1));
+
+    try presentation.dispatch(.{ .action = .refresh });
+    try testLoadNextSession(&presentation, try testFileReadSession(testing.allocator, 1,
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -40 +44 @@ fn moved
+        \\-old a
+        \\+new a
+        \\diff --git a/b.zig b/b.zig
+        \\--- a/b.zig
+        \\+++ b/b.zig
+        \\@@ -1 +1 @@
+        \\-old b
+        \\+newer b
+        \\
+    ));
+    try testing.expect(!try testFileUnread(&presentation, 0));
+    try testing.expect(try testFileUnread(&presentation, 1));
+    try testing.expectEqual(@as(usize, 2), reads.writes);
+}
+
+test "M22 read a refresh that only shifts Hunk line numbers keeps every File read" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_m });
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .key = test_m });
+
+    try presentation.dispatch(.{ .action = .refresh });
+    try testLoadNextSession(&presentation, try testFileReadSession(testing.allocator, 1,
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -7 +9 @@
+        \\-old a
+        \\+new a
+        \\diff --git a/b.zig b/b.zig
+        \\--- a/b.zig
+        \\+++ b/b.zig
+        \\@@ -30 +28 @@ section
+        \\-old b
+        \\+new b
+        \\
+    ));
+    try testing.expect(!try testFileUnread(&presentation, 0));
+    try testing.expect(!try testFileUnread(&presentation, 1));
+}
+
+test "M22 read a PullRequest switch and a switch back restore the read state" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_m });
+
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    try testLoadNextSession(&presentation, try testFileReadSession(testing.allocator, 2, m22_two_files));
+    try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.pull_request.?.id);
+    try testing.expect(try testFileUnread(&presentation, 0));
+
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 1) });
+    try testLoadNextSession(&presentation, try testFileReadSession(testing.allocator, 1, m22_two_files));
+    try testing.expectEqual(@as(u64, 1), presentation.projection().review.?.pull_request.?.id);
+    try testing.expect(!try testFileUnread(&presentation, 0));
+    try testing.expect(try testFileUnread(&presentation, 1));
+}
+
+test "M22 read two Reviews with equal paths and PullRequestIds in other Repositories do not share read state" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_m });
+
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "other", 1) });
+    try testLoadNextSession(&presentation, try testFileReadSession(testing.allocator, 1, m22_two_files));
+    try testing.expectEqualStrings("other", presentation.projection().review.?.key.repository());
+    try testing.expect(try testFileUnread(&presentation, 0));
+    try testing.expect(try testFileUnread(&presentation, 1));
+}
+
+test "M22 read a LocalReview Ref refresh to a new SourceRef commit keeps unchanged Files read" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.initLocal(42, "refs/remotes/origin/main", "refs/heads/feature"), .session = try testLocalFileReadSession(testing.allocator, "source-1", m22_two_files) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .key = test_m });
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .key = test_m });
+
+    try presentation.dispatch(.{ .action = .refresh });
+    try testLoadNextSession(&presentation, try testLocalFileReadSession(testing.allocator, "source-2",
+        \\diff --git a/a.zig b/a.zig
+        \\--- a/a.zig
+        \\+++ b/a.zig
+        \\@@ -1 +1 @@
+        \\-old a
+        \\+new a
+        \\diff --git a/b.zig b/b.zig
+        \\--- a/b.zig
+        \\+++ b/b.zig
+        \\@@ -1 +1 @@
+        \\-old b
+        \\+second b
+        \\
+    ));
+    try testing.expectEqualStrings("source-2", presentation.projection().review.?.header.source_commit);
+    try testing.expect(!try testFileUnread(&presentation, 0));
+    try testing.expect(try testFileUnread(&presentation, 1));
+}
+
+test "M22 read Candidate Session preparation never writes File Read Receipts" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    try reads.store().put(m22_remote, "a.zig", .{ .bytes = @splat(7) });
+    try reads.store().put(m22_remote, "gone.zig", .{ .bytes = @splat(8) });
+    const writes = reads.writes;
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+    });
+    defer presentation.deinit();
+    try testing.expect(try testFileUnread(&presentation, 0));
+
+    try presentation.dispatch(.{ .action = .refresh });
+    try testLoadNextSession(&presentation, try testFileReadSession(testing.allocator, 1, m22_two_files));
+    try testing.expect(try testFileUnread(&presentation, 0));
+
+    try presentation.dispatch(.{ .action = .refresh });
+    const load = presentation.takeCommand().?.load_session;
+    try presentation.dispatch(.{ .session_loaded = .{
+        .command_id = load.command_id,
+        .intent = load.intent,
+        .outcome = .{ .loaded = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+    } });
+    const superseded = presentation.takeCommand().?.prepare_session;
+    try presentation.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    superseded.build();
+    try presentation.dispatch(.{ .session_prepared = superseded });
+    try testLoadNextSession(&presentation, try testFileReadSession(testing.allocator, 2, m22_two_files));
+    try testing.expectEqual(@as(u64, 2), presentation.projection().review.?.pull_request.?.id);
+
+    try testing.expectEqual(writes, reads.writes);
+    try testing.expectEqual(@as(usize, 2), try testReceiptCount(reads.store(), m22_remote));
+}
+
+test "M22 read a worker Frame started before a toggle publishes the new File Read State" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var reads = bbr.review.InMemoryFileReadStore.init(testing.allocator);
+    defer reads.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .file_reads = reads.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testFileReadSession(testing.allocator, 1, m22_two_files) },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .toggle_layout });
+    try presentation.dispatch(.{ .key = test_m });
+    try testing.expect(!try testFileUnread(&presentation, 0));
+    while (presentation.commands.items.len > 0) try completeDisclosureBuild(&presentation);
+    try testing.expectEqual(buffer_mod.Layout.side_by_side, presentation.projection().review.?.buffer.layout);
+    try testing.expect(!try testFileUnread(&presentation, 0));
 }

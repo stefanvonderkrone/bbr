@@ -18,6 +18,13 @@ pub const Identity = union(enum) {
     }
 };
 
+/// The File Read State of one File, index-aligned with `Diff.files`. A null
+/// fingerprint marks an unverifiable File, which is never read.
+pub const FileReadEntry = struct {
+    fingerprint: ?bbr.review.FileReviewFingerprint = null,
+    read: bool = false,
+};
+
 pub const Entry = struct {
     identity: Identity,
     parent: ?Identity,
@@ -26,6 +33,8 @@ pub const Entry = struct {
     expanded: bool = false,
     active: bool = false,
     active_descendant: bool = false,
+    /// Only File entries follow File Read State.
+    unread: bool = false,
     status: ?bbr.diff.FileStatus = null,
     comments: usize = 0,
     drafts: usize = 0,
@@ -52,6 +61,7 @@ pub fn build(
     allocator: std.mem.Allocator,
     diff: bbr.diff.Diff,
     tallies: []const buffer_mod.FileTally,
+    reads: []const FileReadEntry,
     collapsed: []const []const u8,
     active_file: ?usize,
     content_width: usize,
@@ -66,7 +76,7 @@ pub fn build(
     sortChildren(&nodes, 0);
 
     var entries: std.ArrayList(Entry) = .empty;
-    for (nodes.items[0].children.items) |child| try emit(allocator, &nodes, child, null, 0, diff, tallies, collapsed, active_file, content_width, metrics, &entries);
+    for (nodes.items[0].children.items) |child| try emit(allocator, &nodes, child, null, 0, diff, tallies, reads, collapsed, active_file, content_width, metrics, &entries);
 
     var cursor: usize = 0;
     if (wanted_cursor) |wanted| cursor = findVisible(entries.items, wanted) orelse nearestVisibleAncestor(entries.items, nodes.items, wanted) orelse 0;
@@ -128,6 +138,7 @@ fn emit(
     depth: usize,
     diff: bbr.diff.Diff,
     tallies: []const buffer_mod.FileTally,
+    reads: []const FileReadEntry,
     collapsed: []const []const u8,
     active_file: ?usize,
     content_width: usize,
@@ -148,6 +159,7 @@ fn emit(
             .depth = indent / 2,
             .label = try truncate(allocator, leaf(start.path), available, metrics),
             .active = active_file != null and active_file.? == start.file_index,
+            .unread = !reads[start.file_index].read,
             .status = file.status,
             .comments = file_tally.comments,
             .drafts = file_tally.drafts,
@@ -182,7 +194,7 @@ fn emit(
         .active_descendant = if (active_file) |index| pathDescends(diff.files[index].displayPath(), end.path) else false,
     });
     if (!expanded) return;
-    for (end.children.items) |child| try emit(allocator, nodes, child, identity, depth + 1, diff, tallies, collapsed, active_file, content_width, metrics, entries);
+    for (end.children.items) |child| try emit(allocator, nodes, child, identity, depth + 1, diff, tallies, reads, collapsed, active_file, content_width, metrics, entries);
 }
 
 fn truncate(allocator: std.mem.Allocator, text: []const u8, width: usize, metrics: CellMetrics) ![]const u8 {
@@ -239,7 +251,7 @@ test "empty File Tree is a valid stable projection" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const empty_diff: bbr.diff.Diff = .{ .files = &.{} };
-    const tree = try build(arena.allocator(), empty_diff, &.{}, &.{}, null, 0, 0, null, 0, .bytes);
+    const tree = try build(arena.allocator(), empty_diff, &.{}, &.{}, &.{}, null, 0, 0, null, 0, .bytes);
     try testing.expectEqual(@as(usize, 0), tree.entries.len);
     try testing.expectEqual(@as(usize, 0), tree.cursor);
     try testing.expectEqual(@as(usize, 0), tree.scroll);
@@ -250,7 +262,7 @@ test "compacted File Tree is deterministic and keeps stable identities" {
     defer arena.deinit();
     const diff = try bbr.diff.parse(arena.allocator(), "diff --git a/docs/adr/a.md b/docs/adr/a.md\n--- a/docs/adr/a.md\n+++ b/docs/adr/a.md\n@@ -1 +1 @@\n-a\n+b\n" ++
         "diff --git a/src/z.zig b/src/z.zig\n--- a/src/z.zig\n+++ b/src/z.zig\n@@ -1 +1 @@\n-a\n+b\n");
-    const tree = try build(arena.allocator(), diff, &.{ .{}, .{} }, &.{}, 0, 28, 8, .{ .file = 0 }, 0, .bytes);
+    const tree = try build(arena.allocator(), diff, &.{ .{}, .{} }, &.{ .{}, .{} }, &.{}, 0, 28, 8, .{ .file = 0 }, 0, .bytes);
     try testing.expectEqual(@as(usize, 4), tree.entries.len);
     try testing.expectEqualStrings("docs/adr/", tree.entries[0].label);
     try testing.expect(tree.entries[0].identity.eql(.{ .directory = "docs/adr" }));
@@ -272,9 +284,20 @@ test "File Tree truncation respects injected grapheme boundaries and fixed talli
     const metrics_vtable: CellMetrics.VTable = .{ .next = Metrics.next };
     const metrics_context: u8 = 0;
     const metrics: CellMetrics = .{ .ptr = &metrics_context, .vtable = &metrics_vtable };
-    const tree = try build(a, diff, &.{.{ .comments = 1 }}, &.{}, 0, 12, 4, .{ .file = 0 }, 0, metrics);
+    const tree = try build(a, diff, &.{.{ .comments = 1 }}, &.{.{}}, &.{}, 0, 12, 4, .{ .file = 0 }, 0, metrics);
     try testing.expectEqualStrings("●1", tree.entries[0].tally);
     try testing.expect(std.mem.endsWith(u8, tree.entries[0].label, "…"));
     try testing.expect(std.unicode.utf8ValidateSlice(tree.entries[0].label));
     try testing.expectEqualStrings("ab🙂…", try truncate(a, "ab🙂xy", 5, metrics));
+}
+
+test "M22 read File entries follow File Read State" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const diff = try bbr.diff.parse(arena.allocator(), "diff --git a/a.zig b/a.zig\n--- a/a.zig\n+++ b/a.zig\n@@ -1 +1 @@\n-a\n+b\n" ++
+        "diff --git a/b.zig b/b.zig\n--- a/b.zig\n+++ b/b.zig\n@@ -1 +1 @@\n-a\n+b\n");
+    const tree = try build(arena.allocator(), diff, &.{ .{}, .{} }, &.{ .{ .read = true }, .{} }, &.{}, 0, 28, 8, .{ .file = 0 }, 0, .bytes);
+    try testing.expect(tree.entries[0].identity.eql(.{ .file = 0 }));
+    try testing.expect(!tree.entries[0].unread);
+    try testing.expect(tree.entries[1].unread);
 }

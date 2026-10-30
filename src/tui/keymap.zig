@@ -195,6 +195,7 @@ pub const default_bindings = [_]Binding{
     .{ .chord = Chord.one('S'), .action = .suggest, .help = "suggestion" },
     .{ .chord = Chord.one('o'), .action = .isolate, .help = "isolate / exit file" },
     .{ .chord = Chord.one(']'), .action = .next_file, .help = "next file" },
+    .{ .chord = Chord.one('m'), .action = .toggle_file_read, .help = "toggle File read" },
     .{ .chord = Chord.one('['), .action = .prev_file, .help = "previous file" },
     .{ .chord = Chord.one('r'), .action = .reply, .help = "reply" },
     .{ .chord = Chord.one('e'), .action = .edit_review_item, .help = "edit local Draft" },
@@ -454,6 +455,7 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .toggle_layout,
             .cycle_scope,
             .focus_file,
+            .toggle_file_read,
             .focus_next_pane,
             => true,
             else => false,
@@ -541,6 +543,7 @@ pub fn supportsContext(action: Action, context: InteractionContext) bool {
             .isolate,
             .next_file,
             .prev_file,
+            .toggle_file_read,
             .focus_next_pane,
             => true,
             else => false,
@@ -834,4 +837,28 @@ test "M21 Buffer Search Actions resolve in every DiffPane context and remain con
     try testing.expect(resolver.feed(configured.keymap(), .diff, plain('/')) == .none);
     try testing.expect(resolver.feed(configured.keymap(), .diff, plain(' ')) == .none);
     try testing.expectEqual(Action.open_buffer_search, resolver.feed(configured.keymap(), .diff, plain('s')).action);
+}
+
+test "M22 read m toggles File read in File contexts and stays configurable" {
+    var resolver: Resolver = .{};
+    for ([_]InteractionContext{ .sidebar_file, .diff, .diff_source, .diff_disclosure, .diff_review_card }) |context| {
+        try testing.expectEqual(Action.toggle_file_read, resolver.feed(.default, context, plain('m')).action);
+    }
+    try testing.expect(resolver.feed(.default, .sidebar_directory, plain('m')) == .none);
+    try testing.expect(resolver.feed(.default, .sidebar, plain('m')) == .none);
+
+    const rebound = [_]Override{.{ .action = "toggle_file_read", .sequences = &.{"space m"} }};
+    var configured = try Keymap.fromOverrides(testing.allocator, &rebound);
+    defer configured.deinit(testing.allocator);
+    resolver = .{};
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain('m')) == .none);
+    try testing.expect(resolver.feed(configured.keymap(), .diff, plain(' ')) == .none);
+    try testing.expectEqual(Action.toggle_file_read, resolver.feed(configured.keymap(), .diff, plain('m')).action);
+    try testing.expectEqualStrings("toggle File read", helpFor(.toggle_file_read));
+
+    const unbound = [_]Override{.{ .action = "toggle_file_read", .sequences = &.{} }};
+    var without = try Keymap.fromOverrides(testing.allocator, &unbound);
+    defer without.deinit(testing.allocator);
+    resolver = .{};
+    try testing.expect(resolver.feed(without.keymap(), .sidebar_file, plain('m')) == .none);
 }

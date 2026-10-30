@@ -100,6 +100,7 @@ pub fn visualRowsChecksum(rows: []const tui.frame.VisualRow) u64 {
 pub const FileTreeContext = struct {
     diff: bbr.diff.Diff,
     tallies: []const tui.buffer.FileTally,
+    reads: []const tui.file_tree.FileReadEntry,
 };
 
 pub fn fileTree(allocator: std.mem.Allocator, context: *const FileTreeContext) !tui.file_tree.Projection {
@@ -107,6 +108,7 @@ pub fn fileTree(allocator: std.mem.Allocator, context: *const FileTreeContext) !
         allocator,
         context.diff,
         context.tallies,
+        context.reads,
         &.{},
         null,
         40,
