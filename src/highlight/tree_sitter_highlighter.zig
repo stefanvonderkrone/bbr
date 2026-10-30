@@ -739,6 +739,7 @@ test "interval merge matches byte planes for every BuiltInGrammar fixture" {
         .{ .path = "Makefile", .source = make_fixture },
         .{ .path = "index.html", .source = html_fixture },
         .{ .path = "logo.svg", .source = xml_fixture },
+        .{ .path = "README.md", .source = markdown_fixture },
     };
     var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
     defer highlighter.deinit();
@@ -2268,4 +2269,233 @@ test "M27 grammar a highlight pattern without Captures produces no Span and no f
 
     try testing.expectEqual(@as(usize, 1), result.spans.len);
     try expectSpan(result, 1, 8, 9, "number");
+}
+
+// M27 ticket 10 fixtures
+const markdown_fixture =
+    \\---
+    \\title: x
+    \\---
+    \\# Title
+    \\
+    \\Use `code` and [link](https://a.b) and *em*.
+    \\
+    \\- item
+    \\
+    \\```zig
+    \\const a = 1;
+    \\```
+    \\
+    \\```js
+    \\let b = 2;
+    \\```
+    \\
+    \\```nope
+    \\let c = 3;
+    \\```
+    \\
+    \\> ```zig
+    \\> const d = 4;
+    \\> ```
+    \\
+    \\<div class="x">
+    \\</div>
+    \\
+    \\Text <b>bold</b> end.
+    \\
+    \\| h |
+    \\| --- |
+    \\| `b` |
+    \\
+;
+
+fn markdownCaptureAt(result: bbr.highlight.HighlightResult, line: u32, column: usize) ?bbr.highlight.Capture {
+    var line_start: usize = 0;
+    for (1..line) |_| line_start = std.mem.indexOfScalarPos(u8, markdown_fixture, line_start, '\n').? + 1;
+    return captureOver(result, markdown_fixture, line_start + column);
+}
+
+test "M27 grammar GrammarMatch selects Markdown and no path selects Markdown inline" {
+    const cases = [_]struct { path: []const u8, grammar: ?BuiltInGrammar }{
+        .{ .path = "README.md", .grammar = .markdown },
+        .{ .path = "docs/guide.markdown", .grammar = .markdown },
+        .{ .path = "docs/inline.markdown_inline", .grammar = null },
+        .{ .path = "markdown_inline", .grammar = null },
+        .{ .path = "docs/page.mdx", .grammar = null },
+    };
+    for (cases) |case| try testing.expectEqual(case.grammar, grammar_match.selectBuiltIn(case.path, ""));
+    try testing.expectEqual(@as(?BuiltInGrammar, null), grammar_match.selectBuiltIn("notes", "#!/usr/bin/env markdown_inline\n"));
+}
+
+test "M27 grammar Markdown fixture has keyword, punctuation, and string roles" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
+    defer freeResult(result);
+    const markdown = &highlighter.packages[@intFromEnum(BuiltInGrammar.markdown)];
+
+    try expectSpan(result, 4, 0, 7, "keyword");
+    try testing.expectEqual(packageCapture(markdown, "markup.heading.1"), markdownCaptureAt(result, 4, 0).?);
+    try expectSpan(result, 8, 0, 2, "punctuation");
+    try testing.expectEqual(packageCapture(markdown, "markup.list"), markdownCaptureAt(result, 8, 0).?);
+    try expectSpan(result, 10, 0, 3, "string");
+    try expectSpan(result, 22, 0, 2, "punctuation");
+    try expectSpan(result, 32, 0, 1, "punctuation");
+}
+
+test "M27 injection Markdown inline gives inline code and links the string role and keeps emphasis default" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
+    defer freeResult(result);
+    const inline_package = &highlighter.packages[@intFromEnum(BuiltInGrammar.markdown_inline)];
+
+    try expectSpan(result, 6, 4, 10, "string");
+    try testing.expectEqual(packageCapture(inline_package, "markup.raw"), markdownCaptureAt(result, 6, 4).?);
+    try expectSpan(result, 6, 16, 20, "string");
+    try testing.expectEqual(packageCapture(inline_package, "markup.link.label"), markdownCaptureAt(result, 6, 16).?);
+    try expectSpan(result, 6, 22, 33, "string");
+    try testing.expectEqual(packageCapture(inline_package, "markup.link.url"), markdownCaptureAt(result, 6, 22).?);
+    try expectSpan(result, 6, 39, 43, "markup.italic");
+    try testing.expectEqual(bbr.highlight.CaptureRole.unknown, markdownCaptureAt(result, 6, 39).?.role);
+}
+
+test "M27 injection Markdown pipe table cells get Markdown inline Spans" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
+    defer freeResult(result);
+    const inline_package = &highlighter.packages[@intFromEnum(BuiltInGrammar.markdown_inline)];
+
+    try expectSpan(result, 33, 2, 5, "string");
+    try testing.expectEqual(packageCapture(inline_package, "markup.raw"), markdownCaptureAt(result, 33, 2).?);
+}
+
+test "M27 injection Markdown fenced zig and js blocks get Zig and JavaScript Spans" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
+    defer freeResult(result);
+    const zig = &highlighter.packages[@intFromEnum(BuiltInGrammar.zig)];
+    const javascript = &highlighter.packages[@intFromEnum(BuiltInGrammar.javascript)];
+
+    try expectSpan(result, 11, 0, 5, "keyword");
+    try testing.expectEqual(packageCapture(zig, "keyword"), markdownCaptureAt(result, 11, 0).?);
+    try expectSpan(result, 15, 0, 3, "keyword");
+    try testing.expectEqual(packageCapture(javascript, "keyword"), markdownCaptureAt(result, 15, 0).?);
+}
+
+test "M27 injection Markdown fenced block with an unknown info string has no injected Spans" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
+    defer freeResult(result);
+    const markdown = &highlighter.packages[@intFromEnum(BuiltInGrammar.markdown)];
+
+    var line_spans: usize = 0;
+    for (result.spans) |span| if (span.line == 19) {
+        line_spans += 1;
+        try testing.expectEqual(@as(u32, 0), span.start);
+        try testing.expectEqual(@as(u32, 10), span.end);
+        try testing.expectEqual(packageCapture(markdown, "markup.raw.block"), span.capture);
+    };
+    try testing.expectEqual(@as(usize, 1), line_spans);
+}
+
+test "M27 injection Markdown fenced block in a block quote has no injected Span on the quote marker" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
+    defer freeResult(result);
+    const markdown = &highlighter.packages[@intFromEnum(BuiltInGrammar.markdown)];
+    const zig = &highlighter.packages[@intFromEnum(BuiltInGrammar.zig)];
+
+    try expectSpan(result, 23, 0, 2, "punctuation");
+    try testing.expectEqual(packageCapture(markdown, "punctuation.special"), markdownCaptureAt(result, 23, 0).?);
+    try testing.expectEqual(packageCapture(markdown, "punctuation.special"), markdownCaptureAt(result, 23, 1).?);
+    try expectSpan(result, 23, 2, 7, "keyword");
+    try testing.expectEqual(packageCapture(zig, "keyword"), markdownCaptureAt(result, 23, 2).?);
+}
+
+test "M27 injection Markdown HTML block and inline HTML get HTML Spans" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
+    defer freeResult(result);
+    const html = &highlighter.packages[@intFromEnum(BuiltInGrammar.html)];
+
+    try expectSpan(result, 26, 1, 4, "tag");
+    try testing.expectEqual(packageCapture(html, "tag"), markdownCaptureAt(result, 26, 1).?);
+    try expectSpan(result, 26, 5, 10, "property");
+    try expectSpan(result, 29, 6, 7, "tag");
+    try testing.expectEqual(packageCapture(html, "tag"), markdownCaptureAt(result, 29, 6).?);
+    try expectSpan(result, 29, 14, 15, "tag");
+}
+
+test "M27 injection Markdown YAML and TOML front matter get YAML and TOML Spans" {
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, null);
+    defer highlighter.deinit();
+    const yaml_result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
+    defer freeResult(yaml_result);
+    const yaml = &highlighter.packages[@intFromEnum(BuiltInGrammar.yaml)];
+    const toml = &highlighter.packages[@intFromEnum(BuiltInGrammar.toml)];
+
+    try expectSpan(yaml_result, 2, 0, 5, "property");
+    try testing.expectEqual(packageCapture(yaml, "property"), markdownCaptureAt(yaml_result, 2, 0).?);
+
+    const toml_source = "+++\ntitle = \"x\"\n+++\n# Title\n";
+    const toml_result = try highlighter.highlighter().highlight(testing.allocator, "README.md", toml_source);
+    defer freeResult(toml_result);
+    try expectSpan(toml_result, 2, 0, 5, "property");
+    try testing.expectEqual(packageCapture(toml, "property"), captureOver(toml_result, toml_source, 4).?);
+    try expectSpan(toml_result, 2, 8, 11, "string");
+}
+
+test "M27 injection Markdown fenced js block uses the JavaScript BuiltInGrammar when a UserGrammar claims .js" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    try tmp.dir.createDir(io, "fixture", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fixture/payload", .data = "not a library" });
+    const manifest = try std.fmt.allocPrint(testing.allocator,
+        \\name = "fixture"
+        \\version = "1.0.0"
+        \\os = "{s}"
+        \\arch = "{s}"
+        \\tree_sitter_abi = 15
+        \\symbol = "tree_sitter_fixture"
+        \\library = "payload"
+        \\highlight_query = "payload"
+        \\[[payload]]
+        \\path = "payload"
+        \\sha256 = "{s}"
+        \\[matches]
+        \\extensions = [".js"]
+        \\
+    , .{ @tagName(@import("builtin").os.tag), @tagName(@import("builtin").cpu.arch), digestHex("not a library") });
+    defer testing.allocator.free(manifest);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fixture/grammar.toml", .data = manifest });
+    const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/fixture", .{&tmp.sub_path});
+    defer testing.allocator.free(path);
+    var inspection = try user_grammar.inspect(testing.allocator, io, path);
+    const digest = inspection.report.digest;
+    inspection.deinit();
+    const entries = [_]user_grammar.RegistryEntry{.{
+        .name = "fixture",
+        .path = path,
+        .enabled = true,
+        .trusted_digest = digest,
+        .receipt = .{ .bundle_digest = digest, .bbr_identity = "test-build", .tree_sitter_identity = c.TREE_SITTER_LANGUAGE_VERSION },
+    }};
+    var registry = try user_grammar.Registry.init(testing.allocator, io, &entries, &.{}, "test-build");
+    defer registry.deinit();
+    try testing.expectEqualStrings("fixture", registry.matchName("injection.js", "").?);
+    var highlighter = try TreeSitterHighlighter.init(testing.allocator, &registry);
+    defer highlighter.deinit();
+
+    const result = try highlighter.highlighter().highlight(testing.allocator, "README.md", markdown_fixture);
+    defer freeResult(result);
+    const javascript = &highlighter.packages[@intFromEnum(BuiltInGrammar.javascript)];
+    try expectSpan(result, 15, 0, 3, "keyword");
+    try testing.expectEqual(packageCapture(javascript, "keyword"), markdownCaptureAt(result, 15, 0).?);
 }

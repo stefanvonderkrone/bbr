@@ -102,6 +102,8 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(highlight_json_2m);
     const highlight_yaml_2m = try sourceFixture(init.gpa, 2 * 1024 * 1024, "service:\n  enabled: true\n  ports: [80, 443]\n");
     defer init.gpa.free(highlight_yaml_2m);
+    const highlight_markdown_1m = try sourceFixture(init.gpa, 1024 * 1024, "## Part\n\nA paragraph with `code`, [a link](https://example.com), and *emphasis*.\n\n");
+    defer init.gpa.free(highlight_markdown_1m);
     const cell_width_content = try asciiFixture(init.gpa, 1024 * 1024);
     defer init.gpa.free(cell_width_content);
     const search_query = try sourceFixture(init.gpa, 256, "a");
@@ -130,6 +132,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "highlight_bash_2m", .context = .{ .highlighter = &tree_sitter_highlighter, .path = "benchmark.sh", .content = highlight_bash_2m } },
         .{ .name = "highlight_json_2m", .context = .{ .highlighter = &tree_sitter_highlighter, .path = "benchmark.json", .content = highlight_json_2m } },
         .{ .name = "highlight_yaml_2m", .context = .{ .highlighter = &tree_sitter_highlighter, .path = "benchmark.yaml", .content = highlight_yaml_2m } },
+        .{ .name = "highlight_markdown_1m", .context = .{ .highlighter = &tree_sitter_highlighter, .path = "benchmark.md", .content = highlight_markdown_1m } },
     };
     const whole_file_blob = try sourceFixture(init.gpa, 100 * 1024, "const value = 1;\n");
     defer init.gpa.free(whole_file_blob);

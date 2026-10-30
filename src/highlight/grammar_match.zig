@@ -31,6 +31,8 @@ pub const BuiltInGrammar = enum {
     make,
     html,
     xml,
+    markdown_inline,
+    markdown,
 
     pub fn name(self: BuiltInGrammar) []const u8 {
         return switch (self) {
