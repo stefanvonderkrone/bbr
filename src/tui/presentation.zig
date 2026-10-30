@@ -11107,6 +11107,9 @@ pub const Presentation = struct {
         const active = if (published.activeFile()) |index| if (index < files) index else null else null;
         const range = enrichmentRange(published, active, files);
         if (range.focused.isEmpty()) return;
+        // A promoted read reports its failure even when a cache update defers
+        // the rest of this check.
+        if (active) |file_index| self.promoteSpeculativeEnrichment(published.epoch, file_index);
         if (published.pending_cache_update != null) {
             if (!std.meta.eql(published.pending_cache_focus, range.focused)) try self.queueCacheBuild(published, range.focused);
             return;
@@ -11119,20 +11122,21 @@ pub const Presentation = struct {
         enrichment.focusAdmitted(range.focused);
         if (published.review_search.open) return;
         if (active) |file_index| {
-            self.promoteSpeculativeEnrichment(published.epoch, file_index);
             if (enrichment.needsEnrichment(file_index)) return self.queueFileEnrichment(published, file_index, false);
             if (!enrichment.isTerminal(file_index)) return;
         }
+        // Speculative work fails silently. A File that fails to queue stays
+        // pending, and a later check queues it again.
         for (range.visible.first..range.visible.end) |file_index| {
-            if (enrichment.needsEnrichment(file_index)) try self.queueFileEnrichment(published, file_index, true);
+            if (enrichment.needsEnrichment(file_index)) self.queueFileEnrichment(published, file_index, true) catch return;
         }
         var above = range.visible.first;
         while (above > range.focused.first) {
             above -= 1;
-            if (enrichment.needsEnrichment(above)) try self.queueFileEnrichment(published, above, true);
+            if (enrichment.needsEnrichment(above)) self.queueFileEnrichment(published, above, true) catch return;
         }
         for (range.visible.end..range.focused.end) |file_index| {
-            if (enrichment.needsEnrichment(file_index)) try self.queueFileEnrichment(published, file_index, true);
+            if (enrichment.needsEnrichment(file_index)) self.queueFileEnrichment(published, file_index, true) catch return;
         }
     }
 
@@ -11172,7 +11176,7 @@ pub const Presentation = struct {
 
     fn queueFileEnrichment(self: *Presentation, published: *Published, file_index: usize, speculative: bool) !void {
         if (speculative and published.review_search.open) return;
-        if (speculative and self.speculativeEnrichments(published.epoch) >= max_speculative_enrichments) return;
+        if (speculative and self.speculativeEnrichments() >= max_speculative_enrichments) return;
         const previous_action_error = self.action_error;
         defer if (speculative) {
             self.action_error = previous_action_error;
@@ -11236,13 +11240,14 @@ pub const Presentation = struct {
         self.action_error = null;
     }
 
-    fn speculativeEnrichments(self: *const Presentation, epoch: SessionEpoch) usize {
+    /// Reads of a replaced Session also count. They run until they finish.
+    fn speculativeEnrichments(self: *const Presentation) usize {
         var count: usize = 0;
         for (self.commands.items) |queued| {
-            if (queued == .enrich_file and queued.enrich_file.speculative and queued.enrich_file.session_epoch == epoch) count += 1;
+            if (queued == .enrich_file and queued.enrich_file.speculative) count += 1;
         }
         for (self.issued_enrichments.items) |issued| {
-            if (issued.speculative and issued.session_epoch == epoch) count += 1;
+            if (issued.speculative) count += 1;
         }
         return count;
     }
@@ -26732,6 +26737,82 @@ test "a disabled File cache and a LocalReview keep the whole Enrichment Range" {
         try expectSpeculativeOrder(presentation, &.{ 1, 2 });
         for (0..3) |file_index| try testing.expect(presentation.published.?.session.enrichment.file(file_index).new == .content);
     }
+}
+
+test "a speculative queueing failure stays silent and leaves the File pending" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var presentation = try Presentation.init(failing.allocator(), .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 3) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    // Force the speculative handoff to allocate command storage.
+    presentation.commands.deinit(presentation.allocator);
+    presentation.commands = .empty;
+    failing.fail_index = failing.alloc_index;
+    try presentation.dispatch(.ensure_focused_enrichment);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(presentation.projection().action_error == null);
+    try testing.expect(presentation.published.?.session.enrichment.needsEnrichment(1));
+    const retry = try takeTestEnrichment(&presentation);
+    try testing.expectEqual(@as(usize, 1), retry.file_index);
+    try testing.expect(retry.speculative);
+}
+
+test "speculative reads of a replaced Session count against the speculative limit" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 3) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    const stale_epoch = presentation.published.?.epoch +% 1;
+    for (0..max_speculative_enrichments) |index| try presentation.issued_enrichments.append(testing.allocator, .{
+        .command_id = 0,
+        .work_id = 1000 + index,
+        .session_epoch = stale_epoch,
+        .file_index = index,
+        .speculative = true,
+    });
+    try expectNoTestEnrichment(&presentation);
+}
+
+test "a File that becomes active during a cache update promotes its speculative read" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testManyFileSession(testing.allocator, 1, 4) },
+        .viewport_rows = 8,
+    });
+    defer presentation.deinit();
+    const published = presentation.published.?;
+    try completeTestEnrichment(&presentation, try takeTestEnrichment(&presentation));
+    var buffer: [max_speculative_enrichments]EnrichFile = undefined;
+    const speculative = (try takeTestEnrichments(&presentation, &buffer))[0];
+    try testing.expectEqual(@as(usize, 1), speculative.file_index);
+
+    try presentation.dispatch(.{ .action = .next_file });
+    try testing.expectEqual(@as(?usize, 1), published.activeFile());
+    published.pending_cache_update = 1;
+    defer published.pending_cache_update = null;
+    published.pending_cache_focus = Presentation.enrichmentRange(published, 1, 4).focused;
+    try presentation.dispatch(.ensure_focused_enrichment);
+    for (presentation.issued_enrichments.items) |issued| {
+        if (issued.file_index == 1) try testing.expect(!issued.speculative);
+    }
+    try presentation.dispatch(.{ .file_enrichment_completed = .{
+        .command_id = speculative.command_id,
+        .work_id = speculative.work_id,
+        .session_epoch = speculative.session_epoch,
+        .file_index = speculative.file_index,
+        .outcome = .{ .failed = .launch_failed },
+    } });
+    try testing.expectEqual(ActionError.file_enrichment_launch_failed, presentation.projection().action_error.?);
 }
 
 test "speculative request metadata failure stays silent" {
