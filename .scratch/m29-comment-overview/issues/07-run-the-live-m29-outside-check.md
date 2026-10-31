@@ -51,3 +51,52 @@ LocalReview:
 - [ ] `R` shows the DiffPane and resets the Comment Overview.
 - [ ] On the LocalReview, mine only shows every Draft.
 - [ ] The results, the PullRequest, and the bbr commit are recorded under `## Completion` in this ticket.
+
+## Comments
+
+### Runner notes for the human (2026-10-31)
+
+Tickets 01 to 06 are resolved on the branch `m29-comment-overview`.
+The hermetic suite passes: `zig build test --summary all` reports 1453/1453 tests.
+The count before M29 was 1378.
+No agent ran this check, because it needs a Bitbucket Credential and a real PullRequest.
+
+Build and start:
+
+```sh
+cd /Volumes/Work/t3-code/m29-comment-overview
+git log --oneline -1            # record this commit under ## Completion
+zig build
+bbr auth status                 # make sure that the Profile is valid
+zig build run -- <PullRequest URL>
+```
+
+For the LocalReview part, run `zig build run -- local <base-ref> <source-ref>` in a Git repository with at least two changed Files.
+
+Keys in the Comment Overview:
+
+- `g o` shows the Comment Overview. `g d` shows the DiffPane.
+- `/` edits the query. Enter keeps the query. Escape restores the query from before `/`.
+- `u` is unresolved only, `d` is Drafts only, and `a` is mine only.
+- `o` switches between Review order and newest first.
+- Enter opens the selected entry in the DiffPane.
+- Tab moves focus between the Sidebar and the Comment Overview.
+- `g f` opens Review Search. The File Finder also works from the Comment Overview.
+
+What to look for:
+
+- The Title shows `Comment Overview <matches>/<records>`. Use `<records>` for step 4.
+  `<records>` counts every Comment, Reply, and Draft that the DiffPane shows as a ReviewCard.
+  A Draft in the `submitting` state is not counted.
+- A dim entry is a context entry. It is the parent of a matching entry, and the Title count does not include it.
+- The File Tree starts with "All Files" only while the Comment Overview shows.
+  A File Tree cursor move narrows the list at once. Enter on a File moves focus to the Comment Overview and does not jump.
+- The filter row is narrow at 80 columns. Its chips drop from the end, so the order chip can hide. Use a terminal of at least 100 columns, or check the order by the entry order.
+- Newest first uses no timestamp, because Bitbucket Comments carry none in the Session. A Draft is newer than every Comment. A larger CommentId is newer.
+  So "newest" means the Thread with the newest member by CommentId. Compare it with the web UI on that basis.
+- When a Review Search route clears a filter, the status shows "Comment Overview filters cleared to show the entry".
+- When an entry has no ReviewCard any more, the status shows "The entry is no longer in the Review".
+
+Record under `## Completion`: the PullRequest URL, the commit hash, each count, and each step result.
+If a step fails, write the step, the expected result, and the actual result under `## Comments`.
+Then set this ticket to `resolved`, and set the M29 spec to `resolved`.
