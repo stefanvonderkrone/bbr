@@ -33,12 +33,12 @@ pub const verbs = [_]Verb{
     .{ .name = "get-workspace", .summary = "get one workspace", .help = workspaces.get_help, .example = "bbr api get-workspace --workspace demo", .handler = workspaces.runGet },
     .{ .name = "list-workspace-members", .summary = "list Workspace Member names and UUIDs", .help = workspaces.members_help, .example = "bbr api list-workspace-members --json", .value_flags = &.{ "pagelen", "page", "limit" }, .switch_flags = &.{"no-follow"}, .handler = workspaces.runListMembers },
     .{ .name = "search-workspace-members", .summary = "find Workspace Member UUIDs by name", .help = workspaces.search_members_help, .example = "bbr api search-workspace-members --name 'Ada Lovelace' --json", .value_flags = &.{ "name", "pagelen", "concurrency", "limit" }, .handler = workspaces.runSearchMembers },
-    .{ .name = "list-repositories", .summary = "list repositories in a workspace", .help = repositories.list_help, .example = "bbr api list-repositories --workspace demo --limit 10", .value_flags = &.{ "pagelen", "page", "query", "sort", "limit" }, .switch_flags = &.{"no-follow"}, .handler = repositories.runList },
+    .{ .name = "list-repositories", .summary = "list repositories in a workspace", .help = repositories.list_help, .example = "bbr api list-repositories --workspace demo --limit 10", .value_flags = &.{ "pagelen", "page", "query", "sort", "concurrency", "limit" }, .switch_flags = &.{"no-follow"}, .handler = repositories.runList },
     .{ .name = "get-repository", .summary = "get one repository", .help = repositories.get_help, .example = "bbr api get-repository --workspace demo --repository sample", .value_flags = &.{"repository"}, .handler = repositories.runGet },
     .{ .name = "create-branch", .summary = "create a branch from a commit or branch", .help = branches.create_help, .example = "bbr api create-branch --repository sample --name feature/example --target main", .value_flags = &.{ "repository", "name", "target" }, .handler = branches.runCreate },
-    .{ .name = "list-branches", .summary = "list branches in a repository", .help = branches.list_help, .example = "bbr api list-branches --repository sample --sort name --limit 10", .value_flags = &.{ "repository", "pagelen", "page", "query", "sort", "limit" }, .switch_flags = &.{"no-follow"}, .handler = branches.runList },
+    .{ .name = "list-branches", .summary = "list branches in a repository", .help = branches.list_help, .example = "bbr api list-branches --repository sample --sort name --limit 10", .value_flags = &.{ "repository", "pagelen", "page", "query", "sort", "concurrency", "limit" }, .switch_flags = &.{"no-follow"}, .handler = branches.runList },
     .{ .name = "get-branch", .summary = "get a branch and its target commit", .help = branches.get_help, .example = "bbr api get-branch --repository sample --name feature/example", .value_flags = &.{ "repository", "name" }, .handler = branches.runGet },
-    .{ .name = "list-pull-requests", .summary = "list pull requests in a repository", .help = pullrequests.list_help, .example = "bbr api list-pull-requests --repository sample --state OPEN --pagelen 10 --page 2 --no-follow", .value_flags = &.{ "repository", "state", "source-branch", "pagelen", "page", "query", "sort", "limit" }, .switch_flags = &.{"no-follow"}, .handler = pullrequests.runList },
+    .{ .name = "list-pull-requests", .summary = "list pull requests in a repository", .help = pullrequests.list_help, .example = "bbr api list-pull-requests --repository sample --state OPEN --pagelen 10 --page 2 --no-follow", .value_flags = &.{ "repository", "state", "source-branch", "pagelen", "page", "query", "sort", "concurrency", "limit" }, .switch_flags = &.{"no-follow"}, .handler = pullrequests.runList },
     .{ .name = "list-workspace-pull-requests", .summary = "list Workspace pull requests by author or reviewer", .help = pullrequests.workspace_list_help, .example = "bbr api list-workspace-pull-requests --reviewer '{reviewer}' --repository sample --repository other --state OPEN --state MERGED --limit 20", .value_flags = &.{ "author", "reviewer", "repository", "state", "query", "concurrency", "limit" }, .handler = pullrequests.runListWorkspace },
     .{ .name = "get-pull-request", .summary = "get one pull request", .help = pullrequests.get_help, .example = "bbr api get-pull-request --repository sample --pull-request-id 42", .value_flags = &.{ "repository", "pull-request-id" }, .handler = pullrequests.runGet },
     .{ .name = "create-pull-request", .summary = "create a ready or draft pull request", .help = pullrequests.create_help, .example = "bbr api create-pull-request --repository sample --title 'Example change' --source-branch feature/example --draft true", .value_flags = &.{ "repository", "title", "source-branch", "source-repository", "destination-branch", "description", "description-file", "reviewer", "draft", "close-source-branch" }, .switch_flags = &.{"clear-reviewers"}, .handler = pullrequests.runCreate },
@@ -1055,6 +1055,54 @@ test "Workspace Member search failure on any page produces no partial success ou
                 try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
                 try std.testing.expectEqual(@as(usize, if (later) 2 else 1), fake.call_count);
             }
+        }
+    }
+}
+
+test "a failed later page of a Repository, branch, or PullRequest list produces no stdout" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for ([_][]const u8{ "list-repositories", "list-branches", "list-pull-requests" }, [_][]const u8{
+        "{\"slug\":\"r\"}",
+        "{\"name\":\"b\",\"target\":{\"hash\":\"h\"}}",
+        "{\"id\":1,\"title\":\"t\",\"state\":\"OPEN\",\"source\":{\"branch\":{\"name\":\"s\"}},\"destination\":{\"branch\":{\"name\":\"d\"}}}",
+    }, [_][]const u8{ "/repositories/demo", "/repositories/demo/sample/refs/branches", "/repositories/demo/sample/pullrequests" }) |verb, value, path| {
+        const first = try std.fmt.allocPrint(arena.allocator(), "{{\"values\":[{s}],\"page\":1,\"pagelen\":1,\"size\":3,\"next\":\"{s}{s}?pagelen=1&page=2\"}}", .{ value, bbr.bitbucket.base_url, path });
+        const responses = [_]bbr.http.Canned{ .{ .body = first }, .{ .request_key = "&page=2", .status = 500 } };
+        for ([_]bool{ false, true }) |json| {
+            var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+            const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+            var output: TestOutput = .{};
+            const args = [_][]const u8{ "--pagelen=1", "--repository=sample" };
+            const verb_args = if (std.mem.eql(u8, verb, "list-repositories")) args[0..1] else &args;
+            try std.testing.expectError(error.ServerError, findVerb(verb).?.handler(output.init(&env, &arena), bb, verb_args, json));
+            try std.testing.expectEqual(@as(usize, 0), output.stdout_len);
+            try std.testing.expectEqual(@as(usize, 2), fake.call_count);
+        }
+    }
+}
+
+test "Repository, branch, and PullRequest lists reject an invalid --concurrency before HTTP" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for ([_][]const u8{ "list-repositories", "list-branches", "list-pull-requests" }) |verb| {
+        for ([_][]const []const u8{
+            &.{ "--repository=sample", "--concurrency=0" },
+            &.{ "--repository=sample", "--concurrency=x" },
+            &.{ "--repository=sample", "--concurrency=1", "--concurrency=2" },
+        }, [_]anyerror{ error.InvalidNumber, error.InvalidNumber, error.BadRequest }) |args, expected| {
+            var fake: bbr.http.FakeHttpClient = .{};
+            const bb = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "demo" });
+            var output: TestOutput = .{};
+            const verb_args = if (std.mem.eql(u8, verb, "list-repositories")) args[1..] else args;
+            try std.testing.expectError(expected, findVerb(verb).?.handler(output.init(&env, &arena), bb, verb_args, true));
+            try std.testing.expectEqual(@as(usize, 0), fake.call_count);
         }
     }
 }

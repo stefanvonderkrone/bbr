@@ -178,10 +178,12 @@ pub const Client = struct {
         return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, url, largestPage(opts, max_pagelen.commit_pull_requests), null, true);
     }
 
-    pub fn listBranches(self: Client, allocator: Allocator, repo_slug: []const u8, opts: PageOptions) ![]types.Branch {
+    /// See `followPages` for `io` and `concurrency`.
+    pub fn listBranches(self: Client, io: std.Io, allocator: Allocator, repo_slug: []const u8, opts: PageOptions, concurrency: usize) ![]types.Branch {
         const url = try self.repositoryEndpoint(allocator, repo_slug, "/refs/branches");
         defer allocator.free(url);
-        return self.listPages(allocator, types.Branch, BranchPage, dupeBranch, deinitBranch, .{}, url, largestPage(opts, max_pagelen.branches), null, false);
+        const page = largestPage(opts, max_pagelen.branches);
+        return self.followPages(io, allocator, types.Branch, BranchJson, dupeBranch, deinitBranch, url, page, page.pagelen.?, concurrency);
     }
 
     pub fn getBranch(self: Client, allocator: Allocator, repo_slug: []const u8, name: []const u8) !types.Branch {
@@ -252,22 +254,32 @@ pub const Client = struct {
         repo_slug: []const u8,
         opts: ListOptions,
     ) ![]PullRequestSummary {
-        return self.listPullRequestsPage(allocator, repo_slug, opts, .{});
+        const list = try self.repositoryPullRequestList(allocator, repo_slug, opts, .{});
+        defer allocator.free(list.url);
+        return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, list.url, list.page, null, false);
     }
 
     /// List PullRequests with page controls and combined source-branch/query filters.
+    /// See `followPages` for `io` and `concurrency`.
     pub fn listPullRequestsPage(
         self: Client,
+        io: std.Io,
         allocator: Allocator,
         repo_slug: []const u8,
         filter: ListOptions,
         opts: PageOptions,
+        concurrency: usize,
     ) ![]PullRequestSummary {
+        const page = largestPage(opts, max_pagelen.pull_requests);
+        const list = try self.repositoryPullRequestList(allocator, repo_slug, filter, opts);
+        defer allocator.free(list.url);
+        return self.followPages(io, allocator, PullRequestSummary, PrSummaryJson, dupeSummary, deinitSummary, list.url, list.page, page.pagelen.?, concurrency);
+    }
+
+    fn repositoryPullRequestList(self: Client, allocator: Allocator, repo_slug: []const u8, filter: ListOptions, opts: PageOptions) !PullRequestListUrl {
         const endpoint = try self.repositoryEndpoint(allocator, repo_slug, "/pullrequests");
         defer allocator.free(endpoint);
-        const list = try pullRequestListUrl(allocator, endpoint, .{ .states = .initOne(filter.state), .source_branch = filter.source_branch }, largestPage(opts, max_pagelen.pull_requests));
-        defer allocator.free(list.url);
-        return self.listPages(allocator, PullRequestSummary, PrListPage, dupeSummary, deinitSummary, .{}, list.url, list.page, null, false);
+        return pullRequestListUrl(allocator, endpoint, .{ .states = .initOne(filter.state), .source_branch = filter.source_branch }, largestPage(opts, max_pagelen.pull_requests));
     }
 
     /// GET /repositories/{workspace}/{repo}/pullrequests/{id}/diff.
@@ -1033,19 +1045,44 @@ pub const Client = struct {
 
     /// GET /repositories/{workspace}: repositories in a workspace.
     /// `workspace_override` selects the workspace (defaults to credential).
-    /// Follows `next` unless `opts.follow` is false.
+    /// See `followPages` for `io` and `concurrency`.
     pub fn listRepositories(
         self: Client,
+        io: std.Io,
         allocator: Allocator,
         workspace_override: ?[]const u8,
         opts: PageOptions,
+        concurrency: usize,
     ) ![]types.Repository {
         var first: std.ArrayList(u8) = .empty;
         defer first.deinit(allocator);
         try first.appendSlice(allocator, base_url ++ "/repositories/");
         try percentEncodeInto(allocator, &first, workspace_override orelse self.cred.workspace);
         try first.appendSlice(allocator, "?fields=" ++ comptime partialFields(RepositoryPage));
-        return self.listPages(allocator, types.Repository, RepositoryPage, dupeRepository, deinitRepository, .{}, first.items, largestPage(opts, max_pagelen.repositories), null, false);
+        const page = largestPage(opts, max_pagelen.repositories);
+        return self.followPages(io, allocator, types.Repository, RepositoryJson, dupeRepository, deinitRepository, first.items, page, page.pagelen.?, concurrency);
+    }
+
+    /// One list through `listPagesConcurrent` with at most `concurrency` active requests.
+    /// `opts.page` is the first page, and `opts.limit` caps the result. With `opts.follow`
+    /// false, the list reads one page. `pagelen` is the page size that `first` or `opts` requests.
+    fn followPages(
+        self: Client,
+        io: std.Io,
+        allocator: Allocator,
+        comptime Item: type,
+        comptime Value: type,
+        comptime decode: anytype,
+        comptime deinit: fn (Allocator, Item) void,
+        first: []const u8,
+        opts: PageOptions,
+        pagelen: u32,
+        concurrency: usize,
+    ) ![]Item {
+        if (!opts.follow) return self.listPages(allocator, Item, NumberedPage(Value), decode, deinit, .{}, first, opts, null, false);
+        const url = try pageUrlWithBase(allocator, first, .{ .pagelen = opts.pagelen, .query = opts.query, .sort = opts.sort });
+        defer allocator.free(url);
+        return self.listPagesConcurrent(io, allocator, Item, Value, decode, deinit, &.{url}, .{ .pagelen = pagelen, .concurrency = concurrency, .limit = opts.limit, .first_page = opts.page orelse 1 });
     }
 
     /// GET /repositories/{workspace}/{repo}. Owned by `allocator`.
@@ -1691,6 +1728,8 @@ const PagedListOptions = struct {
     concurrency: usize,
     /// Caps the merged result.
     limit: ?usize = null,
+    /// The Bitbucket page number of the first request of each list.
+    first_page: u32 = 1,
 };
 
 const PageCompletion = union(enum) { page: usize };
@@ -1819,14 +1858,20 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
             return null;
         }
 
+        /// The Bitbucket page number of `number`, which counts the pages of a list from 1.
+        fn pageNumber(self: *const Self, number: u32) u32 {
+            return self.options.first_page + number - 1;
+        }
+
         fn pageUrl(self: *Self, position: PagePosition) ![]u8 {
             const list = &self.lists[position.list];
-            if (position.number == 1) return self.allocator.dupe(u8, list.first);
+            const number = self.pageNumber(position.number);
+            if (number == 1) return self.allocator.dupe(u8, list.first);
             if (list.link) |link| {
                 list.link = null;
                 return link;
             }
-            return std.fmt.allocPrint(self.allocator, "{s}&page={d}", .{ list.first, position.number });
+            return std.fmt.allocPrint(self.allocator, "{s}&page={d}", .{ list.first, number });
         }
 
         fn complete(self: *Self, slot: *Slot) !void {
@@ -1845,13 +1890,15 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
             const page = slot.page.?;
             const list = &self.lists[slot.position.list];
             const number = slot.position.number;
-            if (page.page orelse number != number) return error.MalformedResponse;
+            const page_number = self.pageNumber(number);
+            if (page.page orelse page_number != page_number) return error.MalformedResponse;
             if (number == 1) {
                 list.pagelen = page.pagelen orelse self.options.pagelen;
                 if (list.pagelen == 0 or list.pagelen > self.options.pagelen) return error.MalformedResponse;
                 if (self.options.limit) |limit| list.last = std.math.cast(u32, std.math.divCeil(usize, limit, list.pagelen) catch unreachable) orelse std.math.maxInt(u32);
-                if (page.next) |next| if (page.size) |size| if (numberedNext(next, list.first, 2)) {
-                    list.known = std.math.cast(u32, @max(1, std.math.divCeil(usize, size, list.pagelen) catch unreachable)) orelse return error.MalformedResponse;
+                if (page.next) |next| if (page.size) |size| if (numberedNext(next, list.first, page_number + 1)) {
+                    const total = std.math.cast(u32, std.math.divCeil(usize, size, list.pagelen) catch unreachable) orelse return error.MalformedResponse;
+                    list.known = @max(1, total -| (self.options.first_page - 1));
                 };
             } else if (page.pagelen orelse list.pagelen != list.pagelen) return error.MalformedResponse;
             const items = try self.allocator.alloc(Item, page.values.len);
@@ -1866,7 +1913,7 @@ fn PagedLists(comptime Item: type, comptime Value: type, comptime decode: anytyp
             }
             if (page.next) |next| {
                 if (number < list.known) {
-                    if (!numberedNext(next, list.first, number + 1)) return error.MalformedResponse;
+                    if (!numberedNext(next, list.first, page_number + 1)) return error.MalformedResponse;
                 } else if (number < list.last orelse std.math.maxInt(u32)) {
                     list.link = try self.allocator.dupe(u8, next);
                     list.known = number + 1;
@@ -2017,10 +2064,7 @@ const RepositoryJson = struct {
     is_private: bool = false,
 };
 
-const RepositoryPage = struct {
-    values: []RepositoryJson,
-    next: ?[]const u8 = null,
-};
+const RepositoryPage = NumberedPage(RepositoryJson);
 
 fn dupeRepository(allocator: Allocator, rj: RepositoryJson) !types.Repository {
     const slug = try allocator.dupe(u8, rj.slug);
@@ -2096,11 +2140,6 @@ const BranchJson = struct {
     links: ?struct { html: ?struct { href: []const u8 } = null } = null,
     merge_strategies: []const []const u8 = &.{},
     default_merge_strategy: []const u8 = "",
-};
-
-const BranchPage = struct {
-    values: []BranchJson,
-    next: ?[]const u8 = null,
 };
 
 fn validateBranchName(name: []const u8) !void {
@@ -2870,7 +2909,7 @@ test "API lifecycle branch pagination keeps filters and stops at a limit" {
         opts.page = 2;
         opts.pagelen = 10;
         var fake: FakeHttpClient = .{ .responses = &responses };
-        const branches = try Client.init(fake.httpClient(), testCredential()).listBranches(a, "myrepo", opts);
+        const branches = try Client.init(fake.httpClient(), testCredential()).listBranches(testing.io, a, "myrepo", opts, 1);
         defer deinitBranches(a, branches);
         try testing.expectEqual(count, branches.len);
         try testing.expectEqual(calls, fake.call_count);
@@ -3002,7 +3041,7 @@ test "API lifecycle errors classify failures without retrying writes" {
         try testing.expectError(expected, bb.createPullRequest(a, "myrepo", .{ .title = "New", .source_branch = "feature" }));
         try testing.expectError(expected, bb.updatePullRequest(a, "myrepo", 42, .{ .draft = false }));
         try testing.expectError(expected, bb.declinePullRequest(a, "myrepo", 42));
-        try testing.expectError(expected, bb.listBranches(a, "myrepo", .{}));
+        try testing.expectError(expected, bb.listBranches(testing.io, a, "myrepo", .{}, 1));
         try testing.expectError(expected, bb.listCommitPullRequests(a, "myrepo", "abc123", .{}));
         try testing.expectEqual(@as(usize, 7), fake.call_count);
     }
@@ -3014,7 +3053,7 @@ fn lifecycleAllocations(a: Allocator) !void {
     const branch = try bb.createBranch(a, "myrepo", "new", "main");
     defer deinitBranch(a, branch);
     fake.body = "{\"values\":[" ++ lifecycle_branch ++ "]}";
-    const branches = try bb.listBranches(a, "myrepo", .{});
+    const branches = try bb.listBranches(testing.io, a, "myrepo", .{}, 1);
     defer deinitBranches(a, branches);
     fake.body = lifecycle_pr;
     const pr = try bb.createPullRequest(a, "myrepo", .{
@@ -3480,7 +3519,7 @@ test "PullRequest lists send the states as parameters without q and inside q wit
         .{ .filter = .{ .source_branch = "x" }, .opts = .{ .pagelen = 50 }, .url = repo ++ "?pagelen=50&q=state%3D%22OPEN%22%20AND%20source.branch.name%3D%22x%22" ++ pull_request_fields },
     }) |case| {
         var fake: FakeHttpClient = .{ .body = "{\"values\":[]}" };
-        const items = try Client.init(fake.httpClient(), testCredential()).listPullRequestsPage(testing.allocator, "repo", case.filter, case.opts);
+        const items = try Client.init(fake.httpClient(), testCredential()).listPullRequestsPage(testing.io, testing.allocator, "repo", case.filter, case.opts, 1);
         defer deinitSummaries(testing.allocator, items);
         try testing.expectEqualStrings(case.url, fake.lastUrl().?);
     }
@@ -4997,6 +5036,116 @@ test "Repository PullRequest pages share one bound on active requests" {
     }
 }
 
+/// A Repository list command whose pages `followPages` reads.
+const PagedVerb = enum {
+    repositories,
+    branches,
+    pull_requests,
+
+    fn endpoint(verb: PagedVerb) []const u8 {
+        return switch (verb) {
+            .repositories => base_url ++ "/repositories/check24",
+            .branches => base_url ++ "/repositories/check24/repo/refs/branches",
+            .pull_requests => base_url ++ "/repositories/check24/repo/pullrequests",
+        };
+    }
+
+    /// Page N of `count` pages holds the rows 2N-1 and 2N.
+    fn pages(verb: PagedVerb, a: Allocator, count: usize, include_size: bool) ![]httpc_fixture.Canned {
+        const responses = try a.alloc(httpc_fixture.Canned, count);
+        for (responses, 1..) |*response, number| {
+            var values: [2][]const u8 = undefined;
+            for (&values, [_]usize{ 2 * number - 1, 2 * number }) |*value, row| value.* = switch (verb) {
+                .repositories => try std.fmt.allocPrint(a, "{{\"slug\":\"r{d}\"}}", .{row}),
+                .branches => try std.fmt.allocPrint(a, "{{\"name\":\"b{d}\",\"target\":{{\"hash\":\"h\"}}}}", .{row}),
+                .pull_requests => try std.fmt.allocPrint(a, "{{\"id\":{d},\"title\":\"t\",\"state\":\"OPEN\",\"source\":{{\"branch\":{{\"name\":\"s\"}}}},\"destination\":{{\"branch\":{{\"name\":\"d\"}}}}}}", .{row}),
+            };
+            const next = if (number < count) try std.fmt.allocPrint(a, ",\"next\":\"{s}?pagelen=2&page={d}\"", .{ verb.endpoint(), number + 1 }) else "";
+            const size = if (include_size) try std.fmt.allocPrint(a, ",\"size\":{d}", .{2 * count}) else "";
+            response.* = .{
+                .request_key = if (number == 1) null else try std.fmt.allocPrint(a, "&page={d}", .{number}),
+                .body = try std.fmt.allocPrint(a, "{{\"values\":[{s},{s}],\"page\":{d},\"pagelen\":2{s}{s}}}", .{ values[0], values[1], number, size, next }),
+            };
+        }
+        return responses;
+    }
+
+    /// The row numbers of the listed items, in result order.
+    fn list(verb: PagedVerb, a: Allocator, bb: Client, opts: PageOptions, concurrency: usize) ![]u64 {
+        var page = opts;
+        page.pagelen = 2;
+        var rows: std.ArrayList(u64) = .empty;
+        switch (verb) {
+            .repositories => for (try bb.listRepositories(testing.io, a, "check24", page, concurrency)) |item| try rows.append(a, try std.fmt.parseInt(u64, item.slug[1..], 10)),
+            .branches => for (try bb.listBranches(testing.io, a, "repo", page, concurrency)) |item| try rows.append(a, try std.fmt.parseInt(u64, item.name[1..], 10)),
+            .pull_requests => for (try bb.listPullRequestsPage(testing.io, a, "repo", .{}, page, concurrency)) |item| try rows.append(a, item.id),
+        }
+        return rows.items;
+    }
+
+    fn listForTest(verb: PagedVerb, a: Allocator, bb: Client, concurrency: usize, done: *std.atomic.Value(bool)) ![]u64 {
+        defer done.store(true, .release);
+        return verb.list(a, bb, .{}, concurrency);
+    }
+};
+
+test "Repository, branch, and PullRequest lists overlap at most the concurrency and keep page order" {
+    for (std.enums.values(PagedVerb)) |verb| {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const responses = try verb.pages(a, 5, true);
+        var released: std.atomic.Value(bool) = .init(false);
+        for (responses[1..]) |*response| response.released = &released;
+        var fake: FakeHttpClient = .{ .responses = responses };
+        var done: std.atomic.Value(bool) = .init(false);
+        var future = try testing.io.concurrent(PagedVerb.listForTest, .{ verb, a, Client.init(fake.httpClient(), testCredential()), 2, &done });
+        defer {
+            released.store(true, .release);
+            _ = future.await(testing.io) catch {};
+        }
+        try waitMemberCalls(&fake, 3);
+        try testing.expectEqual(@as(usize, 2), fake.activeRequestCount());
+        try testing.expect(!done.load(.acquire));
+        released.store(true, .release);
+        const rows = try future.await(testing.io);
+        try testing.expectEqual(@as(usize, 5), fake.callCount());
+        try testing.expectEqual(@as(usize, 2), fake.maxActiveRequests());
+        try testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, rows);
+    }
+}
+
+test "Repository, branch, and PullRequest lists honor no-follow, limit, and a start page" {
+    for (std.enums.values(PagedVerb)) |verb| {
+        for ([_]struct { opts: PageOptions, rows: []const u64, calls: usize, first: []const u8 }{
+            .{ .opts = .{ .follow = false, .page = 2 }, .rows = &.{ 3, 4 }, .calls = 1, .first = "page=2" },
+            .{ .opts = .{ .limit = 3 }, .rows = &.{ 1, 2, 3 }, .calls = 2, .first = "pagelen=2" },
+            .{ .opts = .{ .page = 2 }, .rows = &.{ 3, 4, 5, 6, 7, 8 }, .calls = 3, .first = "&page=2" },
+            .{ .opts = .{ .page = 3, .limit = 3 }, .rows = &.{ 5, 6, 7 }, .calls = 2, .first = "&page=3" },
+        }) |case| {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            var fake: FakeHttpClient = .{ .responses = try verb.pages(arena.allocator(), 4, true) };
+            const rows = try verb.list(arena.allocator(), Client.init(fake.httpClient(), testCredential()), case.opts, 8);
+            try testing.expectEqualSlices(u64, case.rows, rows);
+            try testing.expectEqual(case.calls, fake.callCount());
+            try testing.expect(std.mem.indexOf(u8, fake.urlAt(0).?, case.first) != null);
+        }
+    }
+}
+
+test "Repository, branch, and PullRequest lists without a size follow next links one page at a time" {
+    for (std.enums.values(PagedVerb)) |verb| {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        var fake: FakeHttpClient = .{ .responses = try verb.pages(arena.allocator(), 3, false) };
+        const rows = try verb.list(arena.allocator(), Client.init(fake.httpClient(), testCredential()), .{}, 8);
+        try testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4, 5, 6 }, rows);
+        try testing.expectEqual(@as(usize, 3), fake.callCount());
+        try testing.expectEqual(@as(usize, 1), fake.maxActiveRequests());
+    }
+}
+
 fn repositoryPullRequestAllocations(a: Allocator) !void {
     const responses = repositoryResponses(.{ .body = "{\"values\":[" ++ comptime workspacePr("beta", "3") ++ "]}" }, null);
     var fake: FakeHttpClient = .{ .responses = &responses };
@@ -5074,7 +5223,7 @@ test "listRepositories parses slugs" {
         \\] }
     };
     const bb = Client.init(fake.httpClient(), testCredential());
-    const items = try bb.listRepositories(a, "acme", .{});
+    const items = try bb.listRepositories(testing.io, a, "acme", .{}, 1);
     defer deinitRepositories(a, items);
     try testing.expectEqual(@as(usize, 1), items.len);
     try testing.expectEqualStrings("acme/api", items[0].full_name);
@@ -5255,7 +5404,7 @@ fn pagedCount(allocator: Allocator, bb: Client, kind: PagingKind, opts: PageOpti
             return items.len;
         },
         .repositories => {
-            const items = try bb.listRepositories(allocator, "acme", opts);
+            const items = try bb.listRepositories(testing.io, allocator, "acme", opts, 1);
             defer deinitRepositories(allocator, items);
             return items.len;
         },
@@ -5270,7 +5419,7 @@ fn pagedCount(allocator: Allocator, bb: Client, kind: PagingKind, opts: PageOpti
             return items.len;
         },
         .pullrequests => {
-            const items = try bb.listPullRequestsPage(allocator, "repo", .{ .source_branch = "feature" }, opts);
+            const items = try bb.listPullRequestsPage(testing.io, allocator, "repo", .{ .source_branch = "feature" }, opts, 1);
             defer deinitSummaries(allocator, items);
             return items.len;
         },
@@ -5349,7 +5498,7 @@ test "a list without a requested pagelen requests the largest page of its endpoi
     const a = testing.allocator;
     var fake: FakeHttpClient = .{ .body = "{\"values\":[]}" };
     const bb = Client.init(fake.httpClient(), testCredential());
-    a.free(try bb.listBranches(a, "repo", .{}));
+    a.free(try bb.listBranches(testing.io, a, "repo", .{}, 1));
     try testing.expectEqualStrings(base_url ++ "/repositories/check24/repo/refs/branches?pagelen=100", fake.lastUrl().?);
     a.free(try bb.listWorkspaceMembers(a, .{}));
     try testing.expectEqualStrings(base_url ++ "/workspaces/check24/members?pagelen=100", fake.lastUrl().?);
@@ -5390,7 +5539,7 @@ test "review fixes comments Attempt retains Retry-After after a successful page"
 
 test "review fixes PullRequest source branch and query combine in one encoded filter" {
     var fake: FakeHttpClient = .{ .body = "{\"values\":[]}" };
-    const items = try Client.init(fake.httpClient(), testCredential()).listPullRequestsPage(testing.allocator, "repo", .{ .source_branch = "feature/\"x\\y" }, .{ .query = "id=1 OR id=2", .sort = "-id", .follow = false });
+    const items = try Client.init(fake.httpClient(), testCredential()).listPullRequestsPage(testing.io, testing.allocator, "repo", .{ .source_branch = "feature/\"x\\y" }, .{ .query = "id=1 OR id=2", .sort = "-id", .follow = false }, 1);
     defer deinitSummaries(testing.allocator, items);
     try testing.expectEqualStrings(
         "https://api.bitbucket.org/2.0/repositories/check24/repo/pullrequests?pagelen=50&q=state%3D%22OPEN%22%20AND%20source.branch.name%3D%22feature%2F%5C%22x%5C%5Cy%22%20AND%20%28id%3D1%20OR%20id%3D2%29" ++ pull_request_fields ++ "&sort=-id",
@@ -5492,5 +5641,5 @@ test "partial responses request exactly the decoded PullRequest and Repository f
             "values.destination.branch.name,values.destination.repository.full_name,values.draft,next,page,pagelen,size",
         partialFields(PrListPage),
     );
-    try testing.expectEqualStrings("values.slug,values.full_name,values.name,values.uuid,values.is_private,next", partialFields(RepositoryPage));
+    try testing.expectEqualStrings("values.slug,values.full_name,values.name,values.uuid,values.is_private,next,page,pagelen,size", partialFields(RepositoryPage));
 }

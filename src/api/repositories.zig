@@ -7,12 +7,13 @@ const out = @import("output.zig");
 const ws = @import("workspaces.zig");
 
 pub const list_help =
-    \\usage: bbr api list-repositories [--workspace SLUG] [--pagelen N] [--page N] [--query Q] [--sort S] [--no-follow] [--limit N] [--json]
+    \\usage: bbr api list-repositories [--workspace SLUG] [--pagelen N] [--page N] [--query Q] [--sort S]
+    \\      [--no-follow] [--concurrency N] [--limit N] [--json]
     \\
     \\List repositories in a workspace (GET /repositories/{workspace}).
     \\Workspace defaults to BITBUCKET_WORKSPACE.
     \\
-;
+++ ws.pagingHelp(bbr.bitbucket.max_pagelen.repositories);
 
 pub const get_help =
     \\usage: bbr api get-repository --repository SLUG [--workspace SLUG] [--json]
@@ -24,29 +25,34 @@ pub const get_help =
 const ListArgs = struct {
     workspace: ?[]const u8,
     page: bbr.bitbucket.PageOptions,
+    concurrency: usize,
 };
 
 fn parseList(args: []const []const u8) !ListArgs {
     var cur: arg.Cursor = .{ .args = args };
     var workspace: ?[]const u8 = null;
     var page: bbr.bitbucket.PageOptions = .{};
+    var concurrency: ?usize = null;
     while (cur.peek()) |a| {
         const f = arg.splitFlag(a) orelse break;
         if (try ws.takePageFlag(&cur, f, &page)) continue;
         if (std.mem.eql(u8, f.name, "workspace")) {
             _ = cur.next();
             workspace = try arg.takeValue(&cur, f);
+        } else if (std.mem.eql(u8, f.name, "concurrency")) {
+            _ = cur.next();
+            try ws.takeConcurrency(&cur, f, &concurrency);
         } else break;
     }
     if (!cur.done()) return error.UnknownFlag;
-    return .{ .workspace = workspace, .page = page };
+    return .{ .workspace = workspace, .page = page, .concurrency = concurrency orelse ws.default_concurrency };
 }
 
 pub fn runList(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
     const parsed = try parseList(args);
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
-    const items = try bb.listRepositories(arena.allocator(), parsed.workspace, parsed.page);
+    const items = try bb.listRepositories(init.io, arena.allocator(), parsed.workspace, parsed.page, ws.effectiveConcurrency(parsed.concurrency, std.Thread.getCpuCount()));
     if (json) {
         try out.printJson(init, items);
     } else {

@@ -15,12 +15,12 @@ pub const create_help =
 ;
 
 pub const list_help =
-    \\usage: bbr api list-branches --repository SLUG [--pagelen N] [--page N] [--query Q] [--sort S] [--no-follow] [--limit N] [--json]
+    \\usage: bbr api list-branches --repository SLUG [--pagelen N] [--page N] [--query Q] [--sort S]
+    \\      [--no-follow] [--concurrency N] [--limit N] [--json]
     \\
-    \\List branches. Follow pages by default. --limit caps the total.
-    \\--query filters branches. --sort name uses Bitbucket's natural name order.
+    \\List branches. --query filters branches. --sort name uses Bitbucket's natural name order.
     \\
-;
+++ pages.pagingHelp(bbr.bitbucket.max_pagelen.branches);
 
 pub const get_help =
     \\usage: bbr api get-branch --repository SLUG --name NAME [--json]
@@ -36,6 +36,7 @@ const Parsed = struct {
     name: ?[]const u8 = null,
     target: ?[]const u8 = null,
     page: bbr.bitbucket.PageOptions = .{},
+    concurrency: ?usize = null,
 };
 
 fn parse(args: []const []const u8, kind: Kind) !Parsed {
@@ -49,6 +50,8 @@ fn parse(args: []const []const u8, kind: Kind) !Parsed {
             try arg.setOption([]const u8, &p.repository, try arg.takeValue(&cur, f));
         } else if (kind != .list and std.mem.eql(u8, f.name, "name")) {
             try arg.setOption([]const u8, &p.name, try arg.takeValue(&cur, f));
+        } else if (kind == .list and std.mem.eql(u8, f.name, "concurrency")) {
+            try pages.takeConcurrency(&cur, f, &p.concurrency);
         } else if (kind == .create and std.mem.eql(u8, f.name, "target")) {
             try arg.setOption([]const u8, &p.target, try arg.takeValue(&cur, f));
         } else return error.UnknownFlag;
@@ -101,7 +104,8 @@ pub fn runList(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const [
     const p = try parse(args, .list);
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
-    const branches = try bb.listBranches(arena.allocator(), p.repository.?, p.page);
+    const concurrency = pages.effectiveConcurrency(p.concurrency orelse pages.default_concurrency, std.Thread.getCpuCount());
+    const branches = try bb.listBranches(init.io, arena.allocator(), p.repository.?, p.page, concurrency);
     if (json) return out.printJson(init, branches);
     for (branches) |branch| try out.printLine(init, "{s} {s}", .{ branch.name, branch.target.hash });
     try out.printLine(init, "ok: {d} branch(es)", .{branches.len});

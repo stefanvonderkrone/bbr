@@ -81,6 +81,25 @@ fn searchOptions(allocator: std.mem.Allocator, args: []const []const u8) !Search
 
 pub const default_concurrency: usize = 8;
 
+/// The help of a command that pages with `--concurrency`.
+pub const concurrency_help = std.fmt.comptimePrint(
+    \\--concurrency bounds the parallel page requests of the whole command.
+    \\It defaults to {d} and accepts a positive integer, capped by logical CPUs.
+    \\
+, .{default_concurrency});
+
+/// The paging help of a list command with `--concurrency`. `max` is its largest page.
+pub fn pagingHelp(comptime max: u32) []const u8 {
+    return std.fmt.comptimePrint(
+        \\Follow pages by default. --no-follow returns one page. --page N starts at page N.
+        \\--limit caps the total. Without --pagelen, a page holds {d} rows, the maximum.
+        \\
+    , .{max}) ++ concurrency_help ++
+        \\A failed request fails the complete list. HTTP 429 is not retried.
+        \\
+    ;
+}
+
 /// The cursor points past the flag. A value must be positive and appear once.
 pub fn takeConcurrency(cur: *arg.Cursor, f: arg.Flag, slot: *?usize) !void {
     const value = try arg.parseUsize(try arg.takeValue(cur, f));
