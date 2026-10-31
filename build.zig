@@ -295,6 +295,14 @@ pub fn build(b: *std.Build) void {
     const code_step = b.step("test-code-highlighting", "Run fenced-code Highlighting tests");
     code_step.dependOn(&b.addRunArtifact(code_tests).step);
 
+    const scrollbar_tests = b.addTest(.{
+        .name = "scrollbar-tests",
+        .root_module = exe.root_module,
+        .filters = &.{"M30 scrollbar"},
+    });
+    const scrollbar_step = b.step("test-scrollbars", "Run M30 scroll bar tests");
+    scrollbar_step.dependOn(&b.addRunArtifact(scrollbar_tests).step);
+
     const container_tests = b.addTest(.{
         .name = "container-tests",
         .root_module = exe.root_module,

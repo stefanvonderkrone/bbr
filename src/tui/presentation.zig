@@ -3279,6 +3279,8 @@ pub const ReviewSearchProjection = struct {
     geometry: frame_mod.ReviewSearchGeometry,
     source_preview: ?file_enrichment.FileView = null,
     files: []const bbr.diff.File = &.{},
+    /// The rows of the list, from `Published.reviewSearchListTotal`.
+    list_total: usize,
     content_statuses: []const bbr.diff.FileContent = &.{},
     highlight_statuses: []const bbr.highlight.FileHighlightStatus = &.{},
     status_preview: ?file_enrichment.FileView = null,
@@ -3774,9 +3776,10 @@ const ReviewSearchState = struct {
         if (self.source_scanned) |scanned| @memset(scanned, false);
     }
 
-    fn projection(self: *const ReviewSearchState, geometry: frame_mod.Geometry) ?ReviewSearchProjection {
+    fn projection(self: *const ReviewSearchState, geometry: frame_mod.Geometry, list_total: usize) ?ReviewSearchProjection {
         if (!self.open) return null;
         return .{
+            .list_total = list_total,
             .query = if (self.query) |query| query.text else "",
             .occurrences = if (self.pending) &.{} else if (self.batch) |batch| batch.occurrences else &.{},
             .results = if (self.pending) &.{} else self.results orelse &.{},
@@ -4223,6 +4226,14 @@ const Published = struct {
             .isolated_file = self.isolated_file,
             .frame = self.frameProjection(),
         };
+    }
+
+    /// The rows of the Review Search list: the shown results, or the Files
+    /// while no result shows. Paint, the wheel, and hit testing all use it.
+    fn reviewSearchListTotal(self: *const Published) usize {
+        const state = &self.review_search;
+        const results = if (state.pending) 0 else if (state.results) |results| results.len else 0;
+        return if (results > 0) results else self.session.diff.files.len;
     }
 
     fn frameProjection(self: *const Published) frame_mod.Projection {
@@ -6202,7 +6213,7 @@ pub const Presentation = struct {
             .action_error = self.action_error,
             .buffer_search = if (self.published) |published| if (published.active_search == .buffer) published.buffer_search.projection() else null else null,
             .review_search = if (self.published) |published| blk: {
-                var search_view = published.review_search.projection(self.geometry) orelse break :blk null;
+                var search_view = published.review_search.projection(self.geometry, published.reviewSearchListTotal()) orelse break :blk null;
                 search_view.cell_metrics = published.cell_metrics;
                 search_view.code_highlights = published.code_highlighting.views.items;
                 search_view.files = published.session.diff.files;
@@ -6270,7 +6281,14 @@ pub const Presentation = struct {
         if (self.published) |published| if (published.composer != null) return frame_mod.screenOverlayTarget(self.geometry);
         if (self.published) |published| if (published.review_search.open) {
             const geometry = frame_mod.reviewSearchGeometry(self.geometry) orelse return null;
-            return .{ .kind = .review_search, .rect = geometry.rect, .review_search = geometry, .row_count = if (published.review_search.pending) 0 else if (published.review_search.batch) |batch| batch.occurrences.len else 0, .scroll = published.review_search.list_scroll };
+            return .{
+                .kind = .review_search,
+                .rect = geometry.rect,
+                .review_search = geometry,
+                .row_count = if (published.review_search.pending) 0 else if (published.review_search.batch) |batch| batch.occurrences.len else 0,
+                .list_total = published.reviewSearchListTotal(),
+                .scroll = published.review_search.list_scroll,
+            };
         };
         return null;
     }
@@ -6416,10 +6434,8 @@ pub const Presentation = struct {
             .review_search_entry, .review_search_list => {
                 const published = self.published orelse return;
                 const state = &published.review_search;
-                const matches = if (state.batch) |batch| batch.occurrences.len else 0;
-                const total = if (matches == 0) published.session.diff.files.len else matches;
                 const viewport = (frame_mod.reviewSearchGeometry(self.geometry) orelse return).list.height;
-                const max_scroll = total -| viewport;
+                const max_scroll = published.reviewSearchListTotal() -| viewport;
                 state.list_scroll = if (down) @min(state.list_scroll +| rows, max_scroll) else state.list_scroll -| rows;
             },
             .review_search_preview => {
@@ -8039,8 +8055,7 @@ pub const Presentation = struct {
         const height = (frame_mod.reviewSearchGeometry(self.geometry) orelse return).list.height;
         if (height == 0) return;
         const matches = if (state.pending) 0 else if (state.batch) |batch| batch.occurrences.len else 0;
-        const total = if (matches > 0) matches else published.session.diff.files.len;
-        const max_scroll = total -| height;
+        const max_scroll = published.reviewSearchListTotal() -| height;
         const step = @max(@as(usize, 1), height / 2);
         state.list_scroll = if (delta > 0) @min(state.list_scroll +| step, max_scroll) else state.list_scroll -| step;
         if (matches > 0) {
@@ -8141,7 +8156,7 @@ pub const Presentation = struct {
         state.selected = selected;
         state.previous_selection = null;
         state.pending = false;
-        state.list_scroll = @min(state.list_scroll, (if (batch.occurrences.len > 0) batch.occurrences.len else published.session.diff.files.len) -| 1);
+        state.list_scroll = @min(state.list_scroll, published.reviewSearchListTotal() -| 1);
         if (state.rollback_query) |*old| old.deinit(self.allocator);
         state.rollback_query = null;
         if (selected) |index| {
@@ -11026,7 +11041,7 @@ pub const Presentation = struct {
     }
 
     fn codePreviewBody(self: *Presentation, published: *Published) ?*code_highlighting.Body {
-        const view = published.review_search.projection(self.geometry) orelse return null;
+        const view = published.review_search.projection(self.geometry, published.reviewSearchListTotal()) orelse return null;
         const selected = view.selected orelse return null;
         if (selected >= view.results.len) return null;
         const occurrence = view.results[selected].occurrence;
@@ -29417,4 +29432,373 @@ test "Sidebar mouse click toggles a Directory and focuses a child File" {
     try testing.expectEqual(frame_mod.PaneFocus.diff, frame.focus);
     try testing.expect(frame.file_tree.entries[frame.file_tree.cursor].identity.eql(.{ .file = 0 }));
     try testing.expectEqual(@as(usize, 0), frame.navigation.cursor);
+}
+
+const m30_scroll_diff =
+    \\diff --git a/src/long.zig b/src/long.zig
+    \\--- a/src/long.zig
+    \\+++ b/src/long.zig
+    \\@@ -1,22 +1,30 @@
+    \\-a
+    \\+A
+    \\ c1
+    \\ c2
+    \\ c3
+    \\ c4
+    \\ c5
+    \\ c6
+    \\ c7
+    \\ c8
+    \\ c9
+    \\ c10
+    \\ c11
+    \\ c12
+    \\ c13
+    \\ c14
+    \\ c15
+    \\ c16
+    \\ c17
+    \\ c18
+    \\ c19
+    \\ c20
+    \\-b
+    \\+B
+    \\+n1
+    \\+n2
+    \\+n3
+    \\+n4
+    \\+n5
+    \\+n6
+    \\+n7
+    \\+n8
+    \\diff --git a/src/x/one.zig b/src/x/one.zig
+    \\--- a/src/x/one.zig
+    \\+++ b/src/x/one.zig
+    \\@@ -1 +1 @@
+    \\-old one
+    \\+new one
+    \\diff --git a/src/y/two.zig b/src/y/two.zig
+    \\--- a/src/y/two.zig
+    \\+++ b/src/y/two.zig
+    \\@@ -1 +1 @@
+    \\-old two
+    \\+new two
+;
+
+fn testScrollBarSession(backing: std.mem.Allocator, id: u64, raw: []const u8) !*session_mod.Session {
+    const s = try testSession(backing, id, 's');
+    errdefer s.destroy();
+    s.diff = try bbr.diff.parse(s.arena.allocator(), raw);
+    try s.initializeEnrichment();
+    return s;
+}
+
+/// Each Pane track is as tall as its content and its viewport, the offset
+/// stays in range, and the DiffPane thumb covers the cursor row.
+fn expectScrollBarNumbers(frame: frame_mod.Projection) !void {
+    const diff = frame_mod.scrollState(frame, .diff_pane).?;
+    try testing.expectEqual(frame.panes.diff_content.height, diff.track.height);
+    if (diff.track.height > 0) try testing.expectEqual(@as(usize, diff.track.height), frame.navigation.viewport);
+    try testing.expect(diff.offset <= diff.total -| diff.track.height);
+    const sidebar = frame_mod.scrollState(frame, .sidebar).?;
+    try testing.expectEqual(frame.panes.sidebar_content.height, sidebar.track.height);
+    try testing.expectEqual(@as(usize, sidebar.track.height), frame.file_tree.viewport);
+    try testing.expect(sidebar.offset <= sidebar.total -| sidebar.track.height);
+    const thumb = diff.thumb() orelse return;
+    const cursor = frame.navigation.cursor;
+    if (cursor < diff.offset or cursor >= diff.offset + diff.track.height) return;
+    const cell = @import("view.zig").trackCell(diff.track.height, diff.total, cursor);
+    try testing.expect(cell >= thumb.first and cell < thumb.first + thumb.len);
+}
+
+fn m30VisualIndexOf(frame: frame_mod.Projection, comptime kind: enum { fold, added_n3 }) ?usize {
+    for (frame.visual_rows, 0..) |visual, index| switch (kind) {
+        .fold => {
+            const row = frame.buffer.rows[visual.buffer_index];
+            if (row == .disclosure and row.disclosure.kind == .fold and !row.disclosure.expanded) return index;
+        },
+        .added_n3 => if (visual.yank_candidates.new) |line| if (std.mem.eql(u8, line.text, "n3")) return index,
+    };
+    return null;
+}
+
+test "M30 scrollbar a closed Fold counts one row and opening it grows the total under the cursor" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testScrollBarSession(testing.allocator, 1, m30_scroll_diff) },
+        .geometry = .{ .cols = 100, .rows = 8 },
+    });
+    defer presentation.deinit();
+    const closed = presentation.projection().review.?.frame;
+    const fold = m30VisualIndexOf(closed, .fold) orelse return error.MissingFold;
+    presentation.published.?.navigation.jumpTo(fold);
+    const before = presentation.projection().review.?.frame;
+    try expectScrollBarNumbers(before);
+    const closed_thumb = frame_mod.scrollState(before, .diff_pane).?.thumb().?;
+    try presentation.dispatch(.{ .action = .toggle_disclosure });
+    try completeDisclosureBuild(&presentation);
+    const opened = presentation.projection().review.?.frame;
+    try expectScrollBarNumbers(opened);
+    try testing.expect(m30VisualIndexOf(opened, .fold) == null);
+    try testing.expect(opened.visual_rows.len > before.visual_rows.len);
+    try testing.expect(frame_mod.scrollState(opened, .diff_pane).?.thumb().?.len < closed_thumb.len);
+    try testing.expectEqual(before.navigation.cursor, opened.navigation.cursor);
+    try testing.expectEqual(before.navigation.cursor - before.navigation.scroll, opened.navigation.cursor - opened.navigation.scroll);
+}
+
+test "M30 scrollbar a width change that rewraps the rows changes the total at once" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    const raw = "diff --git a/w.zig b/w.zig\n--- a/w.zig\n+++ b/w.zig\n@@ -0,0 +1,8 @@\n" ++
+        ("+alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron\n" ** 8);
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testScrollBarSession(testing.allocator, 1, raw) },
+        .geometry = .{ .cols = 160, .rows = 8 },
+    });
+    defer presentation.deinit();
+    const wide = presentation.projection().review.?.frame;
+    try expectScrollBarNumbers(wide);
+    try presentation.dispatch(.{ .resize = .{ .cols = 70, .rows = 8 } });
+    try expectScrollBarNumbers(presentation.projection().review.?.frame);
+    try completeDisclosureBuild(&presentation);
+    const narrow = presentation.projection().review.?.frame;
+    try expectScrollBarNumbers(narrow);
+    try testing.expect(narrow.visual_rows.len > wide.visual_rows.len);
+    try testing.expectEqual(narrow.visual_rows.len, frame_mod.scrollState(narrow, .diff_pane).?.total);
+}
+
+test "M30 scrollbar a Layout switch counts the paired rows and keeps the cursor row" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testScrollBarSession(testing.allocator, 1, m30_scroll_diff) },
+        .geometry = .{ .cols = 120, .rows = 8 },
+    });
+    defer presentation.deinit();
+    presentation.published.?.navigation.jumpTo(m30VisualIndexOf(presentation.projection().review.?.frame, .added_n3).?);
+    const unified = presentation.projection().review.?.frame;
+    const line = unified.visual_rows[unified.navigation.cursor].yank_candidates.new.?;
+    try dispatchView(&presentation, .{ .action = .toggle_layout });
+    const side = presentation.projection().review.?.frame;
+    try testing.expectEqual(buffer_mod.Layout.side_by_side, side.buffer.layout);
+    try expectScrollBarNumbers(side);
+    try testing.expect(side.visual_rows.len < unified.visual_rows.len);
+    try testing.expectEqual(line, side.visual_rows[side.navigation.cursor].yank_candidates.new.?);
+    try dispatchView(&presentation, .{ .action = .toggle_layout });
+    const back = presentation.projection().review.?.frame;
+    try expectScrollBarNumbers(back);
+    try testing.expectEqual(unified.visual_rows.len, back.visual_rows.len);
+    try testing.expectEqual(line, back.visual_rows[back.navigation.cursor].yank_candidates.new.?);
+}
+
+test "M30 scrollbar an isolated File counts only its rows and ending the isolation restores the total" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testScrollBarSession(testing.allocator, 1, m30_scroll_diff) },
+        .geometry = .{ .cols = 100, .rows = 8 },
+    });
+    defer presentation.deinit();
+    const whole = presentation.projection().review.?.frame;
+    presentation.published.?.navigation.jumpTo(m30VisualIndexOf(whole, .added_n3).?);
+    try dispatchView(&presentation, .{ .action = .isolate });
+    const isolated = presentation.projection().review.?;
+    try testing.expectEqual(@as(?usize, 0), isolated.isolated_file);
+    try expectScrollBarNumbers(isolated.frame);
+    try testing.expect(isolated.frame.visual_rows.len < whole.visual_rows.len);
+    for (isolated.frame.visual_rows) |visual| if (isolated.frame.buffer.fileIndexForRow(visual.buffer_index)) |file|
+        try testing.expectEqual(@as(usize, 0), file);
+    try dispatchView(&presentation, .{ .action = .isolate });
+    const restored = presentation.projection().review.?;
+    try testing.expectEqual(@as(?usize, null), restored.isolated_file);
+    try expectScrollBarNumbers(restored.frame);
+    try testing.expectEqual(whole.visual_rows.len, restored.frame.visual_rows.len);
+}
+
+test "M30 scrollbar a collapse near the end of the File Tree clamps the scroll to the last cell" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(testing.allocator);
+    for ("abcde") |dir| for (0..2) |index| try raw.print(
+        testing.allocator,
+        "diff --git a/{c}/f{d}.zig b/{c}/f{d}.zig\n--- a/{c}/f{d}.zig\n+++ b/{c}/f{d}.zig\n@@ -1 +1 @@\n-old\n+new\n",
+        .{ dir, index, dir, index, dir, index, dir, index },
+    );
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testScrollBarSession(testing.allocator, 1, raw.items) },
+        .geometry = .{ .cols = 100, .rows = 8 },
+    });
+    defer presentation.deinit();
+    const expanded = presentation.projection().review.?.frame;
+    try testing.expectEqual(@as(usize, 15), expanded.file_tree.entries.len);
+    try presentation.dispatch(.{ .action = .focus_next_pane });
+    for (0..expanded.file_tree.entries.len) |_| try presentation.dispatch(.{ .action = .down });
+    try presentation.dispatch(.{ .action = .up });
+    try presentation.dispatch(.{ .action = .up });
+    const bottom = presentation.projection().review.?.frame;
+    try testing.expect(bottom.file_tree.entries[bottom.file_tree.cursor].identity == .directory);
+    try testing.expectEqual(bottom.file_tree.entries.len - bottom.file_tree.viewport, bottom.file_tree.scroll);
+    try presentation.dispatch(.{ .action = .toggle_directory });
+    const collapsed = presentation.projection().review.?.frame;
+    try expectScrollBarNumbers(collapsed);
+    try testing.expectEqual(@as(usize, 13), collapsed.file_tree.entries.len);
+    try testing.expectEqual(collapsed.file_tree.entries.len - collapsed.file_tree.viewport, collapsed.file_tree.scroll);
+    const state = frame_mod.scrollState(collapsed, .sidebar).?;
+    const thumb = state.thumb().?;
+    try testing.expectEqual(state.track.height, thumb.first + thumb.len);
+}
+
+test "M30 scrollbar each track is as tall as Nav.viewport after every resize" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testScrollBarSession(testing.allocator, 1, m30_scroll_diff) },
+        .geometry = .{ .cols = 80, .rows = 8 },
+    });
+    defer presentation.deinit();
+    presentation.published.?.navigation.jumpTo(m30VisualIndexOf(presentation.projection().review.?.frame, .added_n3).?);
+    for ([_]frame_mod.Geometry{
+        .{ .cols = 80, .rows = 7 },   .{ .cols = 80, .rows = 6 },  .{ .cols = 40, .rows = 4 },  .{ .cols = 30, .rows = 3 },
+        .{ .cols = 200, .rows = 60 }, .{ .cols = 120, .rows = 9 }, .{ .cols = 120, .rows = 5 }, .{ .cols = 5, .rows = 3 },
+    }) |geometry| {
+        try dispatchView(&presentation, .{ .resize = geometry });
+        const frame = presentation.projection().review.?.frame;
+        try testing.expectEqualDeep(geometry, frame.geometry);
+        try expectScrollBarNumbers(frame);
+    }
+}
+
+test "M30 scrollbar the next Frame has the new total after each content change" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+
+    var disclosure = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .comments_collapsed_rows = 2 }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 100, .rows = 8 },
+    });
+    defer disclosure.deinit();
+    const collapsed = disclosure.projection().review.?.frame;
+    const row = findDisclosureRow(collapsed.buffer.rows, .{ .resolved_thread = 1 }).?;
+    disclosure.published.?.navigation.jumpTo(disclosure.published.?.visualIndexForBufferIndex(row).?);
+    try disclosure.dispatch(.{ .action = .toggle_disclosure });
+    try completeDisclosureBuild(&disclosure);
+    const expanded = disclosure.projection().review.?.frame;
+    try expectScrollBarNumbers(expanded);
+    try testing.expect(expanded.visual_rows.len > collapsed.visual_rows.len);
+
+    try disclosure.dispatch(.{ .choose_pull_request = try OwnedReviewIdentity.init("workspace", "repo", 2) });
+    const load = disclosure.takeCommand().?.load_session;
+    try dispatchSessionLoadForTest(&disclosure, .{ .session_loaded = .{ .intent = load.intent, .outcome = .{ .loaded = try testScrollBarSession(testing.allocator, 2, m30_scroll_diff) } } });
+    const replaced = disclosure.projection().review.?.frame;
+    try expectScrollBarNumbers(replaced);
+    try testing.expect(replaced.visual_rows.len != expanded.visual_rows.len);
+    try testing.expectEqual(@as(usize, 0), frame_mod.scrollState(replaced, .diff_pane).?.offset);
+
+    const key = try OwnedReviewIdentity.init("workspace", "repo", 3);
+    var drafts = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = key, .session = try testScrollBarSession(testing.allocator, 3, m30_scroll_diff) },
+        .geometry = .{ .cols = 100, .rows = 8 },
+    });
+    defer drafts.deinit();
+    const without = drafts.projection().review.?.frame;
+    try drafts.dispatch(.{ .action = .review_comment });
+    try drafts.dispatch(.{ .composer = .{ .insert = try TextChunk.init("new Draft") } });
+    try drafts.dispatch(.{ .composer = .save });
+    try completeDisclosureBuild(&drafts);
+    const with = drafts.projection().review.?.frame;
+    try testing.expectEqual(@as(usize, 1), drafts.projection().review.?.drafts.len);
+    try expectScrollBarNumbers(with);
+    try testing.expect(with.visual_rows.len > without.visual_rows.len);
+
+    var enriched = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 4), .session = try testSession(testing.allocator, 4, 'a') },
+        .geometry = .{ .cols = 100, .rows = 6 },
+    });
+    defer enriched.deinit();
+    try dispatchView(&enriched, .{ .action = .cycle_scope });
+    try dispatchView(&enriched, .{ .action = .cycle_scope });
+    const pending = enriched.projection().review.?.frame;
+    try enriched.dispatch(.ensure_focused_enrichment);
+    const command = enriched.takeCommand().?.enrich_file;
+    const responses = [_]bbr.http.Canned{
+        .{ .status = 200, .body = "p1\np2\np3\np4\np5\np6\nold\ns1\ns2\ns3\ns4\ns5\ns6\n" },
+        .{ .status = 200, .body = "p1\np2\np3\np4\np5\np6\nnew\ns1\ns2\ns3\ns4\ns5\ns6\n" },
+    };
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    const client = bbr.bitbucket.Client.init(fake.httpClient(), .{ .username = "u", .token = "t", .workspace = "workspace" });
+    var highlighter = TestNoopHighlighter{};
+    const result = try @import("file_enrichment.zig").enrich(testing.allocator, client, highlighter.highlighter(), command.request());
+    try enriched.dispatch(.{ .file_enrichment_completed = .{
+        .work_id = command.work_id,
+        .session_epoch = command.session_epoch,
+        .file_index = command.file_index,
+        .outcome = .{ .completed = result },
+    } });
+    try completeDisclosureBuild(&enriched);
+    const whole_file = enriched.projection().review.?.frame;
+    try expectScrollBarNumbers(whole_file);
+    try testing.expect(whole_file.visual_rows.len > pending.visual_rows.len);
+    try testing.expect(frame_mod.scrollState(whole_file, .diff_pane).?.thumb() != null);
+}
+
+test "M30 scrollbar an empty Buffer and the loading state have no thumb" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var loading = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{ .geometry = .{ .cols = 80, .rows = 10 } });
+    defer loading.deinit();
+    const boot = loading.frameProjection();
+    try testing.expect(frame_mod.scrollState(boot, .diff_pane).?.thumb() == null);
+    try testing.expect(frame_mod.scrollState(boot, .sidebar).?.thumb() == null);
+
+    var empty = try Presentation.init(testing.allocator, .{ .reviews = store.store() }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testScrollBarSession(testing.allocator, 1, "") },
+        .geometry = .{ .cols = 80, .rows = 4 },
+    });
+    defer empty.deinit();
+    const frame = empty.projection().review.?.frame;
+    try expectScrollBarNumbers(frame);
+    try testing.expectEqual(@as(usize, 0), frame.file_tree.entries.len);
+    try testing.expect(frame_mod.scrollState(frame, .diff_pane).?.thumb() == null);
+    try testing.expect(frame_mod.scrollState(frame, .sidebar).?.thumb() == null);
+}
+
+test "M30 scrollbar paint, the wheel, and hit testing share the Review Search list total while results are pending" {
+    var store = bbr.review.InMemoryStore.init(testing.allocator);
+    defer store.deinit();
+    var presentation = try Presentation.init(testing.allocator, .{ .reviews = store.store(), .mouse_vertical_scroll_rows = 50 }, .{
+        .initial = .{ .key = try OwnedReviewIdentity.init("workspace", "repo", 1), .session = try testDisclosureSession(testing.allocator, 1) },
+        .geometry = .{ .cols = 45, .rows = 9 },
+    });
+    defer presentation.deinit();
+    try presentation.dispatch(.{ .action = .open_review_search });
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+    try completeBufferSearchScan(&presentation);
+    const settled = presentation.projection();
+    const results = settled.review_search.?.results.len;
+    const files = presentation.published.?.session.diff.files.len;
+    try testing.expect(results > settled.review_search.?.geometry.list.height);
+    try testing.expect(files < results);
+    try expectReviewSearchListTotal(&presentation, results);
+
+    try presentation.dispatch(.{ .key = .{ .codepoint = 'e', .text = "e" } });
+    try testing.expect(presentation.projection().review_search.?.pending);
+    try expectReviewSearchListTotal(&presentation, files);
+    const list = presentation.projection().review_search.?.geometry.list;
+    try presentation.dispatch(.{ .mouse = .{ .col = list.x, .row = list.y, .button = .wheel_down, .type = .press } });
+    const scrolled = presentation.projection().review_search.?;
+    try testing.expectEqual(files -| list.height, scrolled.list_scroll);
+    try expectReviewSearchListTotal(&presentation, files);
+}
+
+fn expectReviewSearchListTotal(presentation: *const Presentation, total: usize) !void {
+    const projection = presentation.projection();
+    try testing.expectEqual(total, projection.review_search.?.list_total);
+    const frame = projection.review.?.frame;
+    try testing.expectEqual(total, frame.overlay.?.list_total);
+    const state = frame_mod.scrollState(frame, .review_search_list).?;
+    try testing.expectEqual(total, state.total);
+    try testing.expectEqual(projection.review_search.?.list_scroll, state.offset);
+    try testing.expectEqual(projection.review_search.?.geometry.list.height, state.track.height);
 }
