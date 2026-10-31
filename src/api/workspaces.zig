@@ -70,18 +70,25 @@ fn searchOptions(allocator: std.mem.Allocator, args: []const []const u8) !Search
             try names.append(allocator, name);
         } else if (std.mem.eql(u8, f.name, "concurrency")) {
             _ = cur.next();
-            const value = try arg.parseUsize(try arg.takeValue(&cur, f));
-            if (value == 0) return error.InvalidNumber;
-            try arg.setOption(usize, &concurrency, value);
+            try takeConcurrency(&cur, f, &concurrency);
         } else if (std.mem.eql(u8, f.name, "pagelen") or std.mem.eql(u8, f.name, "limit")) {
             _ = try takePageFlag(&cur, f, &page);
         } else return error.UnknownFlag;
     }
     if (names.items.len == 0) return error.MissingRequired;
-    return .{ .names = names, .page = page, .concurrency = concurrency orelse 8 };
+    return .{ .names = names, .page = page, .concurrency = concurrency orelse default_concurrency };
 }
 
-fn effectiveConcurrency(requested: usize, cpu_count: std.Thread.CpuCountError!usize) usize {
+pub const default_concurrency: usize = 8;
+
+/// The cursor points past the flag. A value must be positive and appear once.
+pub fn takeConcurrency(cur: *arg.Cursor, f: arg.Flag, slot: *?usize) !void {
+    const value = try arg.parseUsize(try arg.takeValue(cur, f));
+    if (value == 0) return error.InvalidNumber;
+    try arg.setOption(usize, slot, value);
+}
+
+pub fn effectiveConcurrency(requested: usize, cpu_count: std.Thread.CpuCountError!usize) usize {
     return @max(1, @min(requested, cpu_count catch 1));
 }
 

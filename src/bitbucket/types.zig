@@ -111,6 +111,18 @@ pub const PullRequestSummary = struct {
     source_branch: []const u8,
     destination_branch: []const u8,
     draft: bool = false,
+    /// The `full_name` of the Repository that owns the PullRequest, or empty when Bitbucket omits it.
+    destination_repository: []const u8 = "",
+};
+
+/// A PullRequest lifecycle state, named as Bitbucket's `state` filter names it.
+pub const PullRequestState = enum { OPEN, MERGED, DECLINED, SUPERSEDED };
+
+/// The account roles that select Workspace PullRequests. Each value is an account UUID.
+pub const PullRequestParty = union(enum) {
+    author: []const u8,
+    reviewer: []const u8,
+    author_and_reviewer: struct { author: []const u8, reviewer: []const u8 },
 };
 
 /// The commit pair identifying a PR's current diff revision. A comment whose

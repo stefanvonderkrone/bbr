@@ -1,6 +1,6 @@
 ---
 name: bbr
-description: Bitbucket Cloud work through bbr api. Use for account ID or UUID lookup, member UUID lookup by name, reviewer assignment, Branches, PullRequest creation, draft-to-ready updates, decline, commit lookup, and Reviewer Verdicts. Also use for Workspaces, Repositories, diffs, file bytes, Comments, Tasks, and the Authenticated Account.
+description: Bitbucket Cloud work through bbr api. Use for account ID or UUID lookup, member UUID lookup by name, reviewer assignment, Branches, PullRequest creation, draft-to-ready updates, decline, PullRequests by author or reviewer, commit lookup, and Reviewer Verdicts. Also use for Workspaces, Repositories, diffs, file bytes, Comments, Tasks, and the Authenticated Account.
 ---
 
 # bbr api — Bitbucket Cloud CLI
@@ -100,6 +100,10 @@ Use `update-pull-request --draft false` to make a Draft PullRequest ready. Use `
 Repeated `--reviewer UUID` options replace the complete reviewer list. `--clear-reviewers` sends an empty list. Omitted reviewers use Bitbucket defaults on creation and stay unchanged on update. Do not combine `--reviewer` with `--clear-reviewers`.
 
 Approval uses `set-verdict --verdict approved` with the expected SourceCommit. `decline-pull-request` closes the PullRequest without merging. Decline is not a Reviewer Verdict.
+
+## PullRequests by author or reviewer
+
+`list-workspace-pull-requests` lists the PullRequests in the Workspace that one account authored (`--author UUID`) or reviews (`--reviewer UUID`). Use `whoami` for the Authenticated Account, or resolve a name to a UUID first. Only `--reviewer` reads every Repository, so it sends one request or more for each Repository. Each row names its Repository by `full_name`.
 
 ## Commit lookup
 

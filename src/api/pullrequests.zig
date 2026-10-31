@@ -14,6 +14,23 @@ pub const list_help =
     \\
 ;
 
+pub const workspace_list_help =
+    \\usage: bbr api list-workspace-pull-requests (--author UUID | --reviewer UUID | --author UUID --reviewer UUID)
+    \\      [--state OPEN|MERGED|DECLINED|SUPERSEDED ...] [--query Q] [--concurrency N] [--limit N] [--json]
+    \\
+    \\List PullRequests in the selected Workspace that one account authored or reviews.
+    \\--author and --reviewer take account UUIDs. Supply at least one.
+    \\With --author, read the Workspace author endpoint. --reviewer then filters its results.
+    \\With only --reviewer, list every Repository and filter the PullRequests of each one.
+    \\Repeat --state to select several states. The default is OPEN.
+    \\--query is a Bitbucket q expression. The command joins it to its own filter with AND.
+    \\Concurrency bounds the parallel Repository requests with only --reviewer.
+    \\It defaults to 8. --concurrency accepts a positive integer, capped by logical CPUs.
+    \\Rows follow Repository slug order, then the Bitbucket order in each Repository.
+    \\--limit caps the total. A failed request fails the complete list. HTTP 429 is not retried.
+    \\
+;
+
 pub const get_help =
     \\usage: bbr api get-pull-request --repository SLUG --pull-request-id N [--json]
     \\
@@ -145,6 +162,67 @@ fn printSummaries(init: std.process.Init, items: []const bbr.bitbucket.PullReque
         });
         try out.printLine(init, "ok: {d} pull request(s)", .{items.len});
     }
+}
+
+const WorkspaceListArgs = struct {
+    filter: bbr.bitbucket.WorkspacePullRequestFilter,
+    limit: ?usize,
+    concurrency: usize,
+};
+
+fn parseWorkspaceList(args: []const []const u8) !WorkspaceListArgs {
+    var cur: arg.Cursor = .{ .args = args };
+    var author: ?[]const u8 = null;
+    var reviewer: ?[]const u8 = null;
+    var states: std.EnumSet(bbr.bitbucket.PullRequestState) = .empty;
+    var query: ?[]const u8 = null;
+    var limit: ?usize = null;
+    var concurrency: ?usize = null;
+    while (cur.next()) |text| {
+        const f = arg.splitFlag(text) orelse return error.UnknownFlag;
+        if (std.mem.eql(u8, f.name, "author")) {
+            try arg.setOption([]const u8, &author, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "reviewer")) {
+            try arg.setOption([]const u8, &reviewer, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "state")) {
+            states.insert(std.meta.stringToEnum(bbr.bitbucket.PullRequestState, try arg.takeValue(&cur, f)) orelse return error.BadRequest);
+        } else if (std.mem.eql(u8, f.name, "query")) {
+            try arg.setOption([]const u8, &query, try arg.takeValue(&cur, f));
+        } else if (std.mem.eql(u8, f.name, "limit")) {
+            try arg.setOption(usize, &limit, try arg.parseUsize(try arg.takeValue(&cur, f)));
+        } else if (std.mem.eql(u8, f.name, "concurrency")) {
+            try ws.takeConcurrency(&cur, f, &concurrency);
+        } else return error.UnknownFlag;
+    }
+    for ([_]?[]const u8{ author, reviewer, query }) |value| if (value) |text| if (text.len == 0) return error.BadRequest;
+    const party: bbr.bitbucket.PullRequestParty = if (author) |author_uuid|
+        if (reviewer) |reviewer_uuid| .{ .author_and_reviewer = .{ .author = author_uuid, .reviewer = reviewer_uuid } } else .{ .author = author_uuid }
+    else
+        .{ .reviewer = reviewer orelse return error.MissingRequired };
+    return .{
+        .filter = .{ .party = party, .states = if (states.count() == 0) .initOne(.OPEN) else states, .query = query },
+        .limit = limit,
+        .concurrency = concurrency orelse ws.default_concurrency,
+    };
+}
+
+fn listWorkspacePullRequests(allocator: std.mem.Allocator, io: std.Io, bb: bbr.bitbucket.Client, args: []const []const u8) ![]bbr.bitbucket.PullRequestSummary {
+    const parsed = try parseWorkspaceList(args);
+    return bb.listWorkspacePullRequests(io, allocator, parsed.filter, .{
+        .limit = parsed.limit,
+        .concurrency = ws.effectiveConcurrency(parsed.concurrency, std.Thread.getCpuCount()),
+    });
+}
+
+pub fn runListWorkspace(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    const items = try listWorkspacePullRequests(arena.allocator(), init.io, bb, args);
+    if (json) return out.printJson(init, items);
+    for (items) |pr| try out.printLine(init, "{s}#{d} [{s}{s}] {s} ({s} -> {s})", .{
+        pr.destination_repository, pr.id, pr.state, if (pr.draft) " draft" else "", pr.title, pr.source_branch, pr.destination_branch,
+    });
+    try out.printLine(init, "ok: {d} pull request(s)", .{items.len});
 }
 
 pub fn runGet(init: std.process.Init, bb: bbr.bitbucket.Client, args: []const []const u8, json: bool) !void {
@@ -562,6 +640,30 @@ test "list-pull-requests limit stops HTTP paging and defaults still follow next"
         bbr.bitbucket.base_url ++ "/repositories/workspace/repository/pullrequests?page=4",
         following.urlAt(1).?,
     );
+}
+
+test "list-workspace-pull-requests rejects invalid options before HTTP" {
+    var fake: bbr.http.FakeHttpClient = .{ .body = "{\"values\":[]}" };
+    const bb = testClient(&fake);
+    for ([_]struct { args: []const []const u8, err: anyerror }{
+        .{ .args = &.{}, .err = error.MissingRequired },
+        .{ .args = &.{ "--state=OPEN", "--limit=2" }, .err = error.MissingRequired },
+        .{ .args = &.{ "--author={a}", "--state=open" }, .err = error.BadRequest },
+        .{ .args = &.{ "--author={a}", "--state", "CLOSED" }, .err = error.BadRequest },
+        .{ .args = &.{ "--author={a}", "--author={b}" }, .err = error.BadRequest },
+        .{ .args = &.{ "--reviewer={a}", "--reviewer", "{b}" }, .err = error.BadRequest },
+        .{ .args = &.{"--reviewer="}, .err = error.BadRequest },
+        .{ .args = &.{ "--reviewer={a}", "--concurrency=0" }, .err = error.InvalidNumber },
+        .{ .args = &.{ "--reviewer={a}", "--limit=bad" }, .err = error.InvalidNumber },
+        .{ .args = &.{ "--reviewer={a}", "--page=2" }, .err = error.UnknownFlag },
+        .{ .args = &.{ "--reviewer={a}", "--no-follow" }, .err = error.UnknownFlag },
+        .{ .args = &.{ "--reviewer={a}", "--repository=sample" }, .err = error.UnknownFlag },
+        .{ .args = &.{ "--reviewer={a}", "--state" }, .err = error.MissingValue },
+    }) |case| try std.testing.expectError(case.err, listWorkspacePullRequests(std.testing.allocator, std.Io.failing, bb, case.args));
+    try std.testing.expectEqual(@as(usize, 0), fake.call_count);
+    const repeated = try listWorkspacePullRequests(std.testing.allocator, std.Io.failing, bb, &.{ "--author={a}", "--author={a}", "--state=MERGED", "--state=MERGED", "--state=OPEN" });
+    defer bbr.bitbucket.deinitSummaries(std.testing.allocator, repeated);
+    try std.testing.expectEqualStrings(bbr.bitbucket.base_url ++ "/workspaces/workspace/pullrequests/%7Ba%7D?pagelen=50&state=OPEN&state=MERGED", fake.lastUrl().?);
 }
 
 test "set-verdict rejects a spoofed uuid before HTTP" {

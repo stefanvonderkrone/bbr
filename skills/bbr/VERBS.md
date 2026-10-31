@@ -23,6 +23,7 @@ Run `bbr api VERB --help` for flags. No flag tables here.
 ## PullRequests
 
 - `list-pull-requests` — list PullRequests in a Repository. Example: `bbr api list-pull-requests --repository sample --state OPEN --pagelen 10 --page 2 --no-follow`
+- `list-workspace-pull-requests`. List PullRequests across the Workspace by author or reviewer UUID. Example: `bbr api list-workspace-pull-requests --reviewer '{reviewer}' --state OPEN --state MERGED --limit 20`
 - `get-pull-request` — get one PullRequest. Example: `bbr api get-pull-request --repository sample --pull-request-id 42`
 - `create-pull-request`. Create a Ready PullRequest or a Draft PullRequest. Example: `bbr api create-pull-request --repository sample --title 'Example change' --source-branch feature/example --draft true`
 - `update-pull-request`. Update supplied fields on an open PullRequest. Example: `bbr api update-pull-request --repository sample --pull-request-id 42 --draft false`
