@@ -161,6 +161,7 @@ pub const Traffic = struct {
     rate_limited: usize = 0,
     request_median_ns: u64 = 0,
     request_p95_ns: u64 = 0,
+    paused_ns: u64 = 0,
 };
 
 pub const ScenarioReport = struct {
@@ -174,6 +175,7 @@ pub const ScenarioReport = struct {
     full_review_bytes: usize,
     peak_rss_bytes: usize,
     candidate_session_ns: u64 = 0,
+    paced_samples: usize = 0,
 
     pub fn write(self: ScenarioReport, out: *std.Io.Writer) !void {
         const s = self.stats;
@@ -190,6 +192,7 @@ pub const ScenarioReport = struct {
         try out.print(" requests={d} src_requests={d} failures={d} rate_limited={d} request_median_ms={d:.1} request_p95_ms={d:.1}", .{
             t.requests, t.src_requests, t.failures, t.rate_limited, ms(t.request_median_ns), ms(t.request_p95_ns),
         });
+        try out.print(" paused_ms={d:.1} paced_samples={d}", .{ ms(t.paused_ns), self.paced_samples });
         try out.print(" peak_retained_bytes={d} retained_bytes={d} full_review_bytes={d} peak_rss_bytes={d}", .{
             self.peak_retained_bytes, self.retained_bytes, self.full_review_bytes, self.peak_rss_bytes,
         });
@@ -205,22 +208,34 @@ fn ms(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / std.time.ns_per_ms;
 }
 
-/// The time seam for latencies, request timestamps, the dwell, and the request budget.
+/// The time seam. `now` is awake time for latencies. `wall` is Unix time for the request window.
 pub const Clock = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
         now: *const fn (*anyopaque) u64,
+        wall: *const fn (*anyopaque) u64,
         sleep: *const fn (*anyopaque, u64) void,
+        /// A virtual test clock reads the request state of the client, so it can
+        /// advance only while every request sleeps.
+        watch: ?*const fn (*anyopaque, ?*MeasuringHttpClient) void = null,
     };
 
     pub fn now(self: Clock) u64 {
         return self.vtable.now(self.ptr);
     }
 
+    pub fn wall(self: Clock) u64 {
+        return self.vtable.wall(self.ptr);
+    }
+
     pub fn sleep(self: Clock, ns: u64) void {
         self.vtable.sleep(self.ptr, ns);
+    }
+
+    fn watch(self: Clock, measuring: ?*MeasuringHttpClient) void {
+        if (self.vtable.watch) |watch_fn| watch_fn(self.ptr, measuring);
     }
 };
 
@@ -228,12 +243,17 @@ pub const IoClock = struct {
     io: std.Io,
 
     pub fn clock(self: *IoClock) Clock {
-        return .{ .ptr = self, .vtable = &.{ .now = now, .sleep = sleep } };
+        return .{ .ptr = self, .vtable = &.{ .now = now, .wall = wall, .sleep = sleep } };
     }
 
     fn now(ptr: *anyopaque) u64 {
         const self: *IoClock = @ptrCast(@alignCast(ptr));
         return @intCast(std.Io.Clock.awake.now(self.io).toNanoseconds());
+    }
+
+    fn wall(ptr: *anyopaque) u64 {
+        const self: *IoClock = @ptrCast(@alignCast(ptr));
+        return @intCast(std.Io.Clock.real.now(self.io).toNanoseconds());
     }
 
     fn sleep(ptr: *anyopaque, ns: u64) void {
@@ -242,63 +262,172 @@ pub const IoClock = struct {
     }
 };
 
-/// Keeps the request timestamps of the last hour. The harness calls
-/// `waitBefore` only between scenarios, never inside a measured span.
-pub const RequestBudget = struct {
-    clock: Clock,
-    hourly: usize,
-    timestamps: std.ArrayList(u64) = .empty,
+/// The `key=value` lines on stderr. They never hold a URL, a path, a header, a body, or the token.
+const Notes = struct {
+    writer: *std.Io.Writer,
     mutex: std.atomic.Mutex = .unlocked,
 
-    pub fn deinit(self: *RequestBudget) void {
-        self.timestamps.deinit(std.heap.page_allocator);
-    }
-
-    pub fn record(self: *RequestBudget, at: u64) Allocator.Error!void {
+    fn print(self: *Notes, comptime format: []const u8, args: anytype) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
-        try self.timestamps.append(std.heap.page_allocator, at);
+        self.writer.print(format ++ "\n", args) catch {};
+        self.writer.flush() catch {};
     }
 
-    /// Waits until the hour log and `estimate` fit in the budget. An estimate
-    /// above the budget waits for an empty hour.
-    pub fn waitBefore(self: *RequestBudget, estimate: usize) void {
-        while (true) {
-            const now = self.clock.now();
-            const until = self.expiryNeeded(now, estimate) orelse return;
-            self.clock.sleep(@max(until -| now, 1));
-        }
-    }
-
-    fn expiryNeeded(self: *RequestBudget, now: u64, estimate: usize) ?u64 {
-        lock(&self.mutex);
-        defer self.mutex.unlock();
-        var kept: usize = 0;
-        for (self.timestamps.items) |at| if (at + hour_ns > now) {
-            self.timestamps.items[kept] = at;
-            kept += 1;
-        };
-        self.timestamps.shrinkRetainingCapacity(kept);
-        const log = self.timestamps.items;
-        std.mem.sort(u64, log, {}, std.sort.asc(u64));
-        if (estimate > self.hourly) return if (log.len == 0) null else log[log.len - 1] + hour_ns;
-        if (log.len + estimate <= self.hourly) return null;
-        return log[log.len + estimate - self.hourly - 1] + hour_ns;
+    /// Notes a wait of `ns` that starts now. `what` is the reason and its details.
+    fn wait(self: *Notes, clock: Clock, ns: u64, comptime what: []const u8, args: anytype) void {
+        self.print("wait " ++ what ++ " seconds={d:.1} resume={f}", args ++ .{ seconds(ns), Utc{ .ns = clock.wall() +| ns } });
     }
 };
 
-/// Wraps an `HttpClient` and counts its traffic. It never stores a URL, a
-/// header, or a body. File Enrichments send from many threads at once.
+fn seconds(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
+}
+
+/// Formats Unix nanoseconds as `YYYY-MM-DDTHH:MM:SSZ`.
+const Utc = struct {
+    ns: u64,
+
+    pub fn format(self: Utc, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = self.ns / std.time.ns_per_s };
+        const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+        const day = epoch_seconds.getDaySeconds();
+        try writer.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+            year_day.year,         month_day.month.numeric(), month_day.day_index + 1,
+            day.getHoursIntoDay(), day.getMinutesIntoHour(),  day.getSecondsIntoMinute(),
+        });
+    }
+};
+
+/// The rolling request window of the last hour. It persists one decimal Unix
+/// nanosecond timestamp per line in `requests.log`, so a restart keeps it.
+/// Lines go to the page cache without a sync: a process kill keeps them, but
+/// a power loss can lose the last lines.
+pub const RequestWindow = struct {
+    io: std.Io,
+    clock: Clock,
+    notes: *Notes,
+    hourly: usize,
+    file: std.Io.File,
+    offset: u64,
+    entries: std.ArrayList(u64) = .empty,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    const file_name = "requests.log";
+
+    /// Reads the log, keeps the entries of the last hour, and rewrites the log atomically.
+    fn open(io: std.Io, dir: std.Io.Dir, clock: Clock, notes: *Notes, hourly: usize) !RequestWindow {
+        const allocator = std.heap.page_allocator;
+        const text = dir.readFileAlloc(io, file_name, allocator, .unlimited) catch |err| switch (err) {
+            error.FileNotFound => try allocator.alloc(u8, 0),
+            else => return err,
+        };
+        defer allocator.free(text);
+        var entries: std.ArrayList(u64) = .empty;
+        errdefer entries.deinit(allocator);
+        var kept: std.ArrayList(u8) = .empty;
+        defer kept.deinit(allocator);
+        const wall_now = clock.wall();
+        // The text after the last newline is a partial line.
+        const complete = text[0..if (std.mem.lastIndexOfScalar(u8, text, '\n')) |end| end + 1 else 0];
+        var lines = std.mem.tokenizeScalar(u8, complete, '\n');
+        // An entry in the future stays: a wall clock that goes back keeps the window conservative.
+        while (lines.next()) |line| {
+            const at = std.fmt.parseInt(u64, line, 10) catch continue;
+            if (at +| hour_ns <= wall_now) continue;
+            try entries.append(allocator, at);
+            try kept.print(allocator, "{d}\n", .{at});
+        }
+        var atomic = try dir.createFileAtomic(io, file_name, .{ .replace = true });
+        defer atomic.deinit(io);
+        try atomic.file.writePositionalAll(io, kept.items, 0);
+        try atomic.file.sync(io);
+        try atomic.replace(io);
+        return .{
+            .io = io,
+            .clock = clock,
+            .notes = notes,
+            .hourly = hourly,
+            .file = try dir.openFile(io, file_name, .{ .mode = .write_only }),
+            .offset = kept.items.len,
+            .entries = entries,
+        };
+    }
+
+    fn deinit(self: *RequestWindow) void {
+        self.file.close(self.io);
+        self.entries.deinit(std.heap.page_allocator);
+    }
+
+    /// The wall time when `need` more requests fit, or null when they fit now.
+    fn deadline(self: *RequestWindow, need: usize) ?u64 {
+        const wall_now = self.clock.wall();
+        var kept: usize = 0;
+        for (self.entries.items) |at| if (at +| hour_ns > wall_now) {
+            self.entries.items[kept] = at;
+            kept += 1;
+        };
+        self.entries.shrinkRetainingCapacity(kept);
+        const sorted = self.entries.items;
+        std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
+        if (sorted.len + need <= self.hourly) return null;
+        std.debug.assert(need <= self.hourly);
+        return sorted[sorted.len + need - self.hourly - 1] +| hour_ns;
+    }
+
+    fn append(self: *RequestWindow, at: u64) !void {
+        var buffer: [24]u8 = undefined;
+        const line = std.fmt.bufPrint(&buffer, "{d}\n", .{at}) catch unreachable;
+        try self.entries.append(std.heap.page_allocator, at);
+        try self.file.writePositionalAll(self.io, line, self.offset);
+        self.offset += line.len;
+    }
+
+    /// Records one request now and returns null, or returns the deadline and records nothing.
+    /// One check and one record under one lock, so threads never overshoot the budget.
+    fn tryAcquire(self: *RequestWindow) !?u64 {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.deadline(1)) |until| return until;
+        try self.append(self.clock.wall());
+        return null;
+    }
+
+    /// Waits until `estimate` requests fit. The harness calls it only between scenarios.
+    fn reserve(self: *RequestWindow, scenario: Scenario, estimate: usize) void {
+        while (true) {
+            const until = blk: {
+                lock(&self.mutex);
+                defer self.mutex.unlock();
+                break :blk self.deadline(estimate) orelse return;
+            };
+            const ns = @max(until -| self.clock.wall(), 1);
+            self.notes.wait(self.clock, ns, "reason=scenario scenario={s}", .{@tagName(scenario)});
+            self.clock.sleep(ns);
+        }
+    }
+};
+
+/// Wraps an `HttpClient`, gates each request on the request window, and counts
+/// its traffic. It never stores a URL, a header, or a body. File Enrichments
+/// send from many threads at once.
 pub const MeasuringHttpClient = struct {
     inner: bbr.http.HttpClient,
     clock: Clock,
-    budget: *RequestBudget,
+    window: *RequestWindow,
+    notes: *Notes,
     traffic: Traffic = .{},
     latencies: std.ArrayList(u64) = .empty,
     out_of_memory: bool = false,
+    in_flight: usize = 0,
+    sleeping: usize = 0,
+    stalled_since: u64 = 0,
+    excluded_ns: u64 = 0,
     mutex: std.atomic.Mutex = .unlocked,
 
-    const Mark = struct { traffic: Traffic, latency_count: usize };
+    const Mark = struct { traffic: Traffic, latency_count: usize, excluded_ns: u64 };
+    const Counter = enum { in_flight, sleeping };
 
     pub fn deinit(self: *MeasuringHttpClient) void {
         self.latencies.deinit(std.heap.page_allocator);
@@ -310,13 +439,17 @@ pub const MeasuringHttpClient = struct {
 
     fn send(ptr: *anyopaque, allocator: Allocator, request: bbr.http.client.Request) anyerror!bbr.http.client.Response {
         const self: *MeasuringHttpClient = @ptrCast(@alignCast(ptr));
+        self.change(.in_flight, true);
+        defer self.change(.in_flight, false);
+        while (try self.window.tryAcquire()) |until| {
+            const ns = @max(until -| self.clock.wall(), 1);
+            self.notes.wait(self.clock, ns, "reason=window", .{});
+            self.pause(ns);
+        }
         const start = self.clock.now();
         const result = self.inner.send(allocator, request);
         const elapsed = self.clock.now() -| start;
         const src = std.mem.indexOf(u8, request.url, "/src/") != null;
-        self.budget.record(start) catch {
-            self.out_of_memory = true;
-        };
         lock(&self.mutex);
         defer self.mutex.unlock();
         self.traffic.requests += 1;
@@ -333,10 +466,48 @@ pub const MeasuringHttpClient = struct {
         return result;
     }
 
+    fn pause(self: *MeasuringHttpClient, ns: u64) void {
+        self.change(.sleeping, true);
+        defer self.change(.sleeping, false);
+        self.clock.sleep(ns);
+    }
+
+    /// Every request in flight sleeps, so the reviewer waits only for the harness.
+    /// A backoff of one request while others progress does not block the reviewer.
+    fn stalled(self: *const MeasuringHttpClient) bool {
+        return self.in_flight > 0 and self.sleeping == self.in_flight;
+    }
+
+    fn change(self: *MeasuringHttpClient, counter: Counter, up: bool) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        const was = self.stalled();
+        const value = switch (counter) {
+            .in_flight => &self.in_flight,
+            .sleeping => &self.sleeping,
+        };
+        if (up) value.* += 1 else value.* -= 1;
+        const is = self.stalled();
+        if (!was and is) self.stalled_since = self.clock.now();
+        if (was and !is) self.excluded_ns += self.clock.now() -| self.stalled_since;
+    }
+
+    /// The stalled time so far. CPU work that overlaps a stall is also excluded.
+    fn excludedNs(self: *MeasuringHttpClient) u64 {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.excludedLocked();
+    }
+
+    fn excludedLocked(self: *MeasuringHttpClient) u64 {
+        if (!self.stalled()) return self.excluded_ns;
+        return self.excluded_ns + (self.clock.now() -| self.stalled_since);
+    }
+
     fn mark(self: *MeasuringHttpClient) Mark {
         lock(&self.mutex);
         defer self.mutex.unlock();
-        return .{ .traffic = self.traffic, .latency_count = self.latencies.items.len };
+        return .{ .traffic = self.traffic, .latency_count = self.latencies.items.len, .excluded_ns = self.excludedLocked() };
     }
 
     fn since(self: *MeasuringHttpClient, allocator: Allocator, start: Mark) !Traffic {
@@ -352,6 +523,7 @@ pub const MeasuringHttpClient = struct {
             .rate_limited = self.traffic.rate_limited - start.traffic.rate_limited,
             .request_median_ns = median(latencies),
             .request_p95_ns = p95(latencies),
+            .paused_ns = self.excludedLocked() - start.excluded_ns,
         };
     }
 };
@@ -413,6 +585,7 @@ pub const Options = struct {
     hourly_request_budget: usize = 900,
     run_label: []const u8 = "",
     network_label: []const u8 = "",
+    output_dir: []const u8 = "",
     scenarios: std.EnumSet(Scenario) = .initFull(),
 
     const Flag = enum {
@@ -424,6 +597,7 @@ pub const Options = struct {
         @"--hourly-request-budget",
         @"--run-label",
         @"--network-label",
+        @"--output-dir",
         @"--scenarios",
     };
 
@@ -442,6 +616,7 @@ pub const Options = struct {
                 .@"--hourly-request-budget" => options.hourly_request_budget = try number(usize, value),
                 .@"--run-label" => options.run_label = try label(value),
                 .@"--network-label" => options.network_label = try label(value),
+                .@"--output-dir" => options.output_dir = value,
                 .@"--scenarios" => {
                     options.scenarios = .initEmpty();
                     var ids = std.mem.splitScalar(u8, value, ',');
@@ -449,7 +624,7 @@ pub const Options = struct {
                 },
             }
         }
-        if (options.hourly_request_budget == 0) return error.InvalidArguments;
+        if (options.hourly_request_budget == 0 or options.run_label.len == 0 or options.output_dir.len == 0) return error.InvalidArguments;
         try requireDependencies(options.scenarios);
         return options;
     }
@@ -486,6 +661,7 @@ pub const Environment = struct {
     highlighter: bbr.highlight.Highlighter,
     bbr_version: []const u8,
     out: *std.Io.Writer,
+    notes: *std.Io.Writer,
 };
 
 pub fn main(init: std.process.Init, highlighter: bbr.highlight.Highlighter, bbr_version: []const u8) !void {
@@ -495,6 +671,8 @@ pub fn main(init: std.process.Init, highlighter: bbr.highlight.Highlighter, bbr_
     var output_buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(init.io, &output_buffer);
     const out = &stdout.interface;
+    var notes_buffer: [1024]u8 = undefined;
+    var stderr = std.Io.File.stderr().writer(init.io, &notes_buffer);
 
     if (std.mem.eql(u8, args[1], "summarize")) {
         if (args.len < 3) return usage();
@@ -534,6 +712,7 @@ pub fn main(init: std.process.Init, highlighter: bbr.highlight.Highlighter, bbr_
         .highlighter = highlighter,
         .bbr_version = bbr_version,
         .out = out,
+        .notes = &stderr.interface,
     }, options, repository, pull_request_id);
 }
 
@@ -548,7 +727,8 @@ fn usage() error{InvalidArguments} {
             "  --query TEXT               Review Search query (default return)\n" ++
             "  --second-query TEXT        replacement query in S5 (default const)\n" ++
             "  --hourly-request-budget N  requests in one hour (default 900)\n" ++
-            "  --run-label LABEL          run label in every line\n" ++
+            "  --run-label LABEL          run label in every line (required)\n" ++
+            "  --output-dir DIR           directory of the run files (required)\n" ++
             "  --network-label LABEL      network label in the header\n" ++
             "  --scenarios s1,...,s8      scenario subset (default all)\n" ++
             "                             s2 needs s1. s7 and s8 need s1 or s4.\n",
@@ -560,11 +740,26 @@ fn usage() error{InvalidArguments} {
 /// Runs the scenario chain for one PullRequest and prints the header, one line
 /// for each scenario, and the merged PullRequest check.
 pub fn run(env: Environment, options: Options, repository: []const u8, pull_request_id: u64) !void {
-    var budget: RequestBudget = .{ .clock = env.clock, .hourly = options.hourly_request_budget };
-    defer budget.deinit();
-    var measuring: MeasuringHttpClient = .{ .inner = try env.transport.open(), .clock = env.clock, .budget = &budget };
+    var notes: Notes = .{ .writer = env.notes };
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(env.io, options.output_dir);
+    const dir = try cwd.openDir(env.io, options.output_dir, .{});
+    defer dir.close(env.io);
+    const lock_file = dir.createFile(env.io, "lock", .{ .lock = .exclusive, .lock_nonblocking = true, .truncate = false }) catch |err| switch (err) {
+        error.WouldBlock => {
+            notes.print("another harness uses this output directory", .{});
+            return error.RunInProgress;
+        },
+        else => return err,
+    };
+    defer lock_file.close(env.io);
+    var window: RequestWindow = try .open(env.io, dir, env.clock, &notes, options.hourly_request_budget);
+    defer window.deinit();
+    var measuring: MeasuringHttpClient = .{ .inner = try env.transport.open(), .clock = env.clock, .window = &window, .notes = &notes };
     defer measuring.deinit();
     defer env.transport.close();
+    env.clock.watch(&measuring);
+    defer env.clock.watch(null);
 
     const probe_ns = try probe(env, &measuring, repository, pull_request_id);
     var driver: Driver = undefined;
@@ -582,7 +777,9 @@ pub fn run(env: Environment, options: Options, repository: []const u8, pull_requ
     try out.flush();
 
     for (std.enums.values(Scenario)) |scenario| if (options.scenarios.contains(scenario)) {
-        budget.waitBefore(scenario.requestEstimate(driver.file_count));
+        // An estimate above the budget gets no upfront wait. The request gate paces it.
+        const estimate = scenario.requestEstimate(driver.file_count);
+        if (estimate <= options.hourly_request_budget) window.reserve(scenario, estimate);
         const start = measuring.mark();
         driver.peak_retained = driver.retainedBytes();
         var recorder: Recorder = .{};
@@ -603,6 +800,7 @@ pub fn run(env: Environment, options: Options, repository: []const u8, pull_requ
             .full_review_bytes = driver.fullReviewBytes(),
             .peak_rss_bytes = peakRssBytes(),
             .candidate_session_ns = median(recorder.candidate_session_ns.items),
+            .paced_samples = recorder.paced,
         };
         try report.write(out);
     };
@@ -618,9 +816,9 @@ fn probe(env: Environment, measuring: *MeasuringHttpClient, repository: []const 
     const client = bbr.bitbucket.Client.init(measuring.httpClient(), env.credential);
     var latencies: [probe_count]u64 = undefined;
     for (&latencies) |*latency| {
-        const start = env.clock.now();
+        const span: Span = .begin(env.clock, measuring);
         _ = try client.getPullRequest(arena.allocator(), repository, pull_request_id);
-        latency.* = env.clock.now() -| start;
+        latency.* = span.end(env.clock, measuring).latency_ns;
     }
     return median(&latencies);
 }
@@ -634,10 +832,29 @@ fn peakRssBytes() usize {
 const Recorder = struct {
     samples: std.ArrayList(Sample) = .empty,
     candidate_session_ns: std.ArrayList(u64) = .empty,
+    /// The Visible Actions whose span held a harness wait.
+    paced: usize = 0,
 
     fn deinit(self: *Recorder, allocator: Allocator) void {
         self.samples.deinit(allocator);
         self.candidate_session_ns.deinit(allocator);
+    }
+};
+
+/// A measured span. Its latency excludes the time when every request waited for the harness.
+const Span = struct {
+    begin_ns: u64,
+    excluded_ns: u64,
+
+    const End = struct { latency_ns: u64, paced: bool };
+
+    fn begin(clock: Clock, measuring: *MeasuringHttpClient) Span {
+        return .{ .begin_ns = clock.now(), .excluded_ns = measuring.excludedNs() };
+    }
+
+    fn end(self: Span, clock: Clock, measuring: *MeasuringHttpClient) End {
+        const excluded = measuring.excludedNs() - self.excluded_ns;
+        return .{ .latency_ns = (clock.now() -| self.begin_ns) -| excluded, .paced = excluded > 0 };
     }
 };
 
@@ -718,7 +935,7 @@ const Driver = struct {
 
     /// Loads a Candidate Session as the production startup does and returns its time.
     fn start(self: *Driver) !u64 {
-        const begin = self.env.clock.now();
+        const span: Span = .begin(self.env.clock, self.measuring);
         const loaded = try session_mod.loadWith(self.env.io, std.heap.page_allocator, self.client(), self.repository, self.pull_request_id);
         self.state = presentation.Presentation.init(self.env.gpa, .{
             .reviews = self.store.store(),
@@ -736,7 +953,7 @@ const Driver = struct {
             loaded.destroy();
             return err;
         };
-        const elapsed = self.env.clock.now() -| begin;
+        const elapsed = span.end(self.env.clock, self.measuring).latency_ns;
         const files = loaded.diff.files.len;
         if (self.file_count == 0) {
             const gpa = self.env.gpa;
@@ -927,9 +1144,13 @@ const Driver = struct {
         self.focus_tick[file] = self.tick;
     }
 
-    fn beginSpan(self: *Driver) u64 {
+    fn beginSpan(self: *Driver) Span {
         self.span_fetches.clearRetainingCapacity();
-        return self.env.clock.now();
+        return .begin(self.env.clock, self.measuring);
+    }
+
+    fn endSpan(self: *Driver, span: Span) Span.End {
+        return span.end(self.env.clock, self.measuring);
     }
 
     /// A refetch wins over a cold fetch. `file` limits the span to one File.
@@ -967,16 +1188,17 @@ const Driver = struct {
         try self.waitUntil(SearchComplete{});
     }
 
-    fn recordSearch(self: *Driver, recorder: *Recorder, begin: u64, first_result: bool) !void {
+    fn recordSearch(self: *Driver, recorder: *Recorder, span: Span, first_result: bool) !void {
         if (first_result) {
             try self.waitUntil(SearchFirst{});
-            try recorder.samples.append(self.env.gpa, .{ .kind = .search_first, .latency_ns = self.env.clock.now() -| begin, .class = .hit });
+            try recorder.samples.append(self.env.gpa, .{ .kind = .search_first, .latency_ns = self.endSpan(span).latency_ns, .class = .hit });
         }
         try self.waitUntil(SearchComplete{});
         const class = self.classify(null);
-        const latency = self.env.clock.now() -| begin;
+        const ended = self.endSpan(span);
         if (first_result) recorder.samples.items[recorder.samples.items.len - 1].class = class;
-        try recorder.samples.append(self.env.gpa, .{ .kind = .search_complete, .latency_ns = latency, .class = class });
+        try recorder.samples.append(self.env.gpa, .{ .kind = .search_complete, .latency_ns = ended.latency_ns, .class = class });
+        recorder.paced += @intFromBool(ended.paced);
     }
 
     /// Jumps through the File Finder. A null `recorder` keeps the jump out of the samples.
@@ -984,26 +1206,29 @@ const Driver = struct {
         try self.closeReviewSearch();
         try self.send(.{ .action = .open_file_finder });
         for (0..file) |_| try self.ui().dispatch(.{ .key = .{ .codepoint = keymap.special.down } });
-        const begin = self.beginSpan();
+        const span = self.beginSpan();
         try self.send(.{ .key = .{ .codepoint = keymap.special.enter } });
         try self.waitUntil(FileShown{ .file = file });
-        try self.finishJump(recorder, begin, file);
+        try self.finishJump(recorder, span, file);
     }
 
     /// Returns false when `next_file` finds no next File.
     fn nextFileJump(self: *Driver, recorder: *Recorder) !bool {
         const before = self.activeFile();
-        const begin = self.beginSpan();
+        const span = self.beginSpan();
         try self.send(.{ .action = .next_file });
         if (self.ui().published.?.pending_view == null and self.activeFile() == before) return false;
         try self.waitUntil(MovedFrom{ .before = before });
-        try self.finishJump(recorder, begin, self.activeFile().?);
+        try self.finishJump(recorder, span, self.activeFile().?);
         return true;
     }
 
-    fn finishJump(self: *Driver, recorder: ?*Recorder, begin: u64, file: usize) !void {
-        const latency = self.env.clock.now() -| begin;
-        if (recorder) |target| try target.samples.append(self.env.gpa, .{ .kind = .file_jump, .latency_ns = latency, .class = self.classify(file) });
+    fn finishJump(self: *Driver, recorder: ?*Recorder, span: Span, file: usize) !void {
+        const ended = self.endSpan(span);
+        if (recorder) |target| {
+            try target.samples.append(self.env.gpa, .{ .kind = .file_jump, .latency_ns = ended.latency_ns, .class = self.classify(file) });
+            target.paced += @intFromBool(ended.paced);
+        }
         self.noteFocus();
         try self.dwell();
     }
@@ -1116,9 +1341,9 @@ fn nonSequentialNavigation(driver: *Driver, recorder: *Recorder) !void {
 }
 
 fn firstReviewSearch(driver: *Driver, recorder: *Recorder) !void {
-    const begin = driver.beginSpan();
+    const span = driver.beginSpan();
     try driver.openReviewSearch();
-    try driver.recordSearch(recorder, begin, true);
+    try driver.recordSearch(recorder, span, true);
 }
 
 fn queryEdits(driver: *Driver, recorder: *Recorder) !void {
@@ -1132,9 +1357,9 @@ fn queryEdits(driver: *Driver, recorder: *Recorder) !void {
         },
     };
     for (edits) |inputs| {
-        const begin = driver.beginSpan();
+        const span = driver.beginSpan();
         for (inputs) |input| try driver.send(input);
-        try driver.recordSearch(recorder, begin, false);
+        try driver.recordSearch(recorder, span, false);
     }
 }
 
@@ -1143,9 +1368,9 @@ fn overlayReopen(driver: *Driver, recorder: *Recorder) !void {
     try driver.closeReviewSearch();
     var prng = std.Random.DefaultPrng.init(driver.options.seed);
     for (0..10) |_| try driver.finderJump(null, prng.random().uintLessThan(usize, driver.file_count));
-    const begin = driver.beginSpan();
+    const span = driver.beginSpan();
     try driver.openReviewSearch();
-    try driver.recordSearch(recorder, begin, false);
+    try driver.recordSearch(recorder, span, false);
 }
 
 fn sessionReplacement(driver: *Driver, recorder: *Recorder) !void {
@@ -1394,12 +1619,17 @@ fn writeCauses(out: *std.Io.Writer, causes: std.EnumSet(Cause)) !void {
 
 const testing = std.testing;
 
+/// A virtual clock. Time moves only by `step_ns` on each `now` and by each sleep.
 const FakeClock = struct {
     time: std.atomic.Value(u64) = .init(0),
     step_ns: u64 = 0,
+    measuring: std.atomic.Value(?*MeasuringHttpClient) = .init(null),
+    sleeps: [64]u64 = undefined,
+    sleep_count: usize = 0,
+    mutex: std.atomic.Mutex = .unlocked,
 
     fn clock(self: *FakeClock) Clock {
-        return .{ .ptr = self, .vtable = &.{ .now = now, .sleep = sleep } };
+        return .{ .ptr = self, .vtable = &.{ .now = now, .wall = wall, .sleep = sleep, .watch = watch } };
     }
 
     fn now(ptr: *anyopaque) u64 {
@@ -1407,9 +1637,42 @@ const FakeClock = struct {
         return self.time.fetchAdd(self.step_ns, .monotonic);
     }
 
+    fn wall(ptr: *anyopaque) u64 {
+        const self: *FakeClock = @ptrCast(@alignCast(ptr));
+        return self.time.load(.monotonic);
+    }
+
+    fn watch(ptr: *anyopaque, measuring: ?*MeasuringHttpClient) void {
+        const self: *FakeClock = @ptrCast(@alignCast(ptr));
+        self.measuring.store(measuring, .release);
+    }
+
+    /// A sleep waits until every request in flight sleeps, as if each request took no time.
+    /// Else a request in flight would see the jump and count it as latency.
     fn sleep(ptr: *anyopaque, ns: u64) void {
         const self: *FakeClock = @ptrCast(@alignCast(ptr));
-        _ = self.time.fetchAdd(ns, .monotonic);
+        {
+            lock(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.sleep_count < self.sleeps.len) self.sleeps[self.sleep_count] = ns;
+            self.sleep_count += 1;
+        }
+        const measuring = self.measuring.load(.acquire) orelse {
+            _ = self.time.fetchAdd(ns, .monotonic);
+            return;
+        };
+        while (true) {
+            lock(&measuring.mutex);
+            defer measuring.mutex.unlock();
+            if (measuring.in_flight == measuring.sleeping) {
+                _ = self.time.fetchAdd(ns, .monotonic);
+                return;
+            }
+        }
+    }
+
+    fn recordedSleeps(self: *FakeClock) []const u64 {
+        return self.sleeps[0..@min(self.sleep_count, self.sleeps.len)];
     }
 };
 
@@ -1478,13 +1741,18 @@ const matching_b: bbr.http.Canned = .{ .request_key = "/src/aaaa/PATHSENTINEL/b.
 
 const fixture_options: Options = .{ .dwell_ms = 0, .query = "qrysentinel", .second_query = "qrytwo", .run_label = "fixture" };
 
-/// Runs the chain on the fixture and returns the printed output.
-fn runFixture(responses: []const bbr.http.Canned, options: Options, clock: *FakeClock) ![]u8 {
-    var fake: bbr.http.FakeHttpClient = .{ .responses = responses };
-    var transport: FakeTransport = .{ .fake = &fake };
+/// The path of a test directory, relative to the working directory of the test.
+fn tmpPath(tmp: *const testing.TmpDir) ![]u8 {
+    return std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+}
+
+/// Runs the chain with the run files in `output_dir` and returns the printed output.
+fn runIn(transport: *FakeTransport, output_dir: []const u8, options: Options, clock: *FakeClock, notes: *std.Io.Writer) ![]u8 {
     var plain: bbr.highlight.PlainHighlighter = .{};
     var output: std.Io.Writer.Allocating = .init(testing.allocator);
     errdefer output.deinit();
+    var with_dir = options;
+    with_dir.output_dir = output_dir;
     try run(.{
         .gpa = testing.allocator,
         .io = testing.io,
@@ -1494,8 +1762,22 @@ fn runFixture(responses: []const bbr.http.Canned, options: Options, clock: *Fake
         .highlighter = plain.highlighter(),
         .bbr_version = "test",
         .out = &output.writer,
-    }, options, "repo", 7);
+        .notes = notes,
+    }, with_dir, "repo", 7);
     return output.toOwnedSlice();
+}
+
+/// Runs the chain on the fixture in a new output directory and returns the printed output.
+fn runFixture(responses: []const bbr.http.Canned, options: Options, clock: *FakeClock) ![]u8 {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(&tmp);
+    defer testing.allocator.free(path);
+    var fake: bbr.http.FakeHttpClient = .{ .responses = responses };
+    var transport: FakeTransport = .{ .fake = &fake };
+    var notes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer notes.deinit();
+    return runIn(&transport, path, options, clock, &notes.writer);
 }
 
 /// The value of `key` in the line that starts with `prefix`.
@@ -1658,39 +1940,132 @@ test "M28 cache merged PullRequest check counts Hunk mismatch Files" {
     try testing.expectEqual(@as(usize, 1), try intField(mismatch, "check", "hunk_mismatch_files"));
 }
 
+/// Runs the fixture in a new output directory and returns the output and the notes.
+fn runWithNotes(responses: []const bbr.http.Canned, options: Options, clock: *FakeClock, notes: *std.Io.Writer.Allocating) ![]u8 {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(&tmp);
+    defer testing.allocator.free(path);
+    var fake: bbr.http.FakeHttpClient = .{ .responses = responses };
+    var transport: FakeTransport = .{ .fake = &fake };
+    return runIn(&transport, path, options, clock, &notes.writer);
+}
+
+fn floatField(output: []const u8, prefix: []const u8, key: []const u8) !f64 {
+    return std.fmt.parseFloat(f64, try field(output, prefix, key));
+}
+
 test "M28 cache the request budget waits before a scenario and never inside a measured span" {
     const responses = fixtureResponses(matching_b);
     // The clock moves only when the harness sleeps, so a wait inside a span would show as latency.
     var clock: FakeClock = .{};
     var options = fixture_options;
-    options.hourly_request_budget = 20;
+    // S2 estimates 100 requests. The window holds the earlier requests, so S2 waits before it starts.
+    options.hourly_request_budget = 100;
     options.scenarios = .initMany(&.{ .s1, .s2 });
-    const output = try runFixture(&responses, withBudget(options, 1), &clock);
+    var notes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer notes.deinit();
+    const output = try runWithNotes(&responses, withBudget(options, 1), &clock, &notes);
     defer testing.allocator.free(output);
     try testing.expect(clock.time.load(.monotonic) >= hour_ns);
+    try testing.expect(std.mem.indexOf(u8, notes.written(), "wait reason=scenario scenario=s2 seconds=") != null);
+    try testing.expect(std.mem.indexOf(u8, notes.written(), "reason=window") == null);
     for ([_][]const u8{ "scenario=s1 ", "scenario=s2 " }) |prefix| {
         try testing.expect(try intField(output, prefix, "samples") > 0);
         try testing.expectEqualStrings("0.0", try field(output, prefix, "latency_p95_ms"));
+        try testing.expectEqualStrings("0.0", try field(output, prefix, "paused_ms"));
+        try testing.expectEqual(@as(usize, 0), try intField(output, prefix, "paced_samples"));
     }
+}
+
+test "M28 cache a harness wait inside a span is not latency" {
+    const responses = fixtureResponses(matching_b);
+    var clock: FakeClock = .{};
+    var options = fixture_options;
+    // Each scenario estimates more requests than the budget, so the request gate waits inside its spans.
+    options.hourly_request_budget = 4;
+    options.scenarios = .initMany(&.{ .s1, .s2 });
+    var notes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer notes.deinit();
+    const output = try runWithNotes(&responses, withBudget(options, 1), &clock, &notes);
+    defer testing.allocator.free(output);
+    try testing.expect(std.mem.indexOf(u8, notes.written(), "wait reason=window seconds=") != null);
+    try testing.expect(std.mem.indexOf(u8, notes.written(), "reason=scenario") == null);
+    for ([_][]const u8{ "scenario=s1 ", "scenario=s2 " }) |prefix| {
+        try testing.expect(try intField(output, prefix, "samples") > 0);
+        try testing.expectEqualStrings("0.0", try field(output, prefix, "latency_p95_ms"));
+        try testing.expect(try intField(output, prefix, "paced_samples") > 0);
+        try testing.expect(try floatField(output, prefix, "paused_ms") > 0);
+    }
+}
+
+test "M28 cache the request window survives a restart and never exceeds the budget in any hour" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(&tmp);
+    defer testing.allocator.free(path);
+    const responses = fixtureResponses(matching_b);
+    var clock: FakeClock = .{};
+    var options = withBudget(fixture_options, 1);
+    options.hourly_request_budget = 30;
+    options.scenarios = .initMany(&.{ .s1, .s2, .s3 });
+    var notes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer notes.deinit();
+    for ([_][]const u8{ "first", "second" }) |run_label| {
+        notes.clearRetainingCapacity();
+        var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+        var transport: FakeTransport = .{ .fake = &fake };
+        options.run_label = run_label;
+        const output = try runIn(&transport, path, options, &clock, &notes.writer);
+        testing.allocator.free(output);
+    }
+    // The first run left a full window, so the second run waits before its first request.
+    try testing.expect(std.mem.startsWith(u8, notes.written(), "wait reason=window seconds="));
+    const log = try tmp.dir.readFileAlloc(testing.io, "requests.log", testing.allocator, .unlimited);
+    defer testing.allocator.free(log);
+    var entries: std.ArrayList(u64) = .empty;
+    defer entries.deinit(testing.allocator);
+    var lines = std.mem.tokenizeScalar(u8, log, '\n');
+    while (lines.next()) |line| try entries.append(testing.allocator, try std.fmt.parseInt(u64, line, 10));
+    try testing.expect(entries.items.len > options.hourly_request_budget);
+    std.mem.sort(u64, entries.items, {}, std.sort.asc(u64));
+    for (entries.items, 0..) |at, first| {
+        var count: usize = 0;
+        for (entries.items[first..]) |later| count += @intFromBool(later < at + hour_ns);
+        try testing.expect(count <= options.hourly_request_budget);
+    }
+}
+
+test "M28 cache a second harness on the same output directory fails" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(&tmp);
+    defer testing.allocator.free(path);
+    const held = try tmp.dir.createFile(testing.io, "lock", .{ .lock = .exclusive, .truncate = false });
+    defer held.close(testing.io);
+    const responses = fixtureResponses(matching_b);
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    var transport: FakeTransport = .{ .fake = &fake };
+    var clock: FakeClock = .{};
+    var notes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer notes.deinit();
+    try testing.expectError(error.RunInProgress, runIn(&transport, path, fixture_options, &clock, &notes.writer));
+    try testing.expectEqualStrings("another harness uses this output directory\n", notes.written());
+    try testing.expectEqual(@as(usize, 0), fake.callCount());
 }
 
 test "M28 cache a scenario subset keeps the scenarios that it depends on" {
     for ([_][]const u8{ "s1,s2,s3", "s4,s5,s6,s7,s8", "s1,s7", "s3", "s5,s6" }) |subset|
-        _ = try Options.parse(&.{ "--scenarios", subset });
+        _ = try Options.parse(&.{ "--run-label", "a", "--output-dir", "out", "--scenarios", subset });
     for ([_][]const u8{ "s2", "s2,s3", "s7", "s8", "s5,s6,s7,s8" }) |subset|
-        try testing.expectError(error.InvalidArguments, Options.parse(&.{ "--scenarios", subset }));
+        try testing.expectError(error.InvalidArguments, Options.parse(&.{ "--run-label", "a", "--output-dir", "out", "--scenarios", subset }));
 }
 
-test "M28 cache an estimate above the budget waits for an empty hour" {
-    var clock: FakeClock = .{};
-    var budget: RequestBudget = .{ .clock = clock.clock(), .hourly = 5 };
-    defer budget.deinit();
-    for ([_]u64{ 0, 10, 20 }) |at| try budget.record(at);
-    clock.time.store(30, .monotonic);
-    budget.waitBefore(2);
-    try testing.expectEqual(@as(u64, 30), clock.time.load(.monotonic));
-    budget.waitBefore(6);
-    try testing.expectEqual(20 + hour_ns, clock.time.load(.monotonic));
+test "M28 cache a remote run needs a run label and an output directory" {
+    _ = try Options.parse(&.{ "--run-label", "a", "--output-dir", "out" });
+    try testing.expectError(error.InvalidArguments, Options.parse(&.{ "--output-dir", "out" }));
+    try testing.expectError(error.InvalidArguments, Options.parse(&.{ "--run-label", "", "--output-dir", "out" }));
+    try testing.expectError(error.InvalidArguments, Options.parse(&.{ "--run-label", "a" }));
 }
 
 test "M28 cache an unsupported command kind fails the run and names the kind" {
@@ -1699,9 +2074,14 @@ test "M28 cache an unsupported command kind fails the run and names the kind" {
     var transport: FakeTransport = .{ .fake = &fake };
     var plain: bbr.highlight.PlainHighlighter = .{};
     var clock: FakeClock = .{};
-    var budget: RequestBudget = .{ .clock = clock.clock(), .hourly = 900 };
-    defer budget.deinit();
-    var measuring: MeasuringHttpClient = .{ .inner = try transport.transport().open(), .clock = clock.clock(), .budget = &budget };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var notes_text: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer notes_text.deinit();
+    var notes: Notes = .{ .writer = &notes_text.writer };
+    var window: RequestWindow = try .open(testing.io, tmp.dir, clock.clock(), &notes, 900);
+    defer window.deinit();
+    var measuring: MeasuringHttpClient = .{ .inner = try transport.transport().open(), .clock = clock.clock(), .window = &window, .notes = &notes };
     defer measuring.deinit();
     const env: Environment = .{
         .gpa = testing.allocator,
@@ -1712,6 +2092,7 @@ test "M28 cache an unsupported command kind fails the run and names the kind" {
         .highlighter = plain.highlighter(),
         .bbr_version = "test",
         .out = undefined,
+        .notes = undefined,
     };
     var driver: Driver = undefined;
     try driver.init(env, fixture_options, &measuring, "repo", 7);
