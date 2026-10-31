@@ -35,6 +35,33 @@ Live checks on Workspace `check24` measured these wall times:
 
 The JSON output of both commands did not change.
 
+### Page size
+
+A list request without `pagelen` gets 10 items a page.
+With that default, `list-repositories` needed 56 requests for 553 Repositories and took 20.7 s.
+So each list method sends the largest page of its endpoint unless the caller requests a size.
+`max_pagelen` in `client.zig` holds one value for each endpoint.
+
+Live checks on Workspace `check24` and Repository `pr-webapp` on 31 October 2026 found these maximums:
+
+| Endpoint | Maximum | Evidence |
+| --- | --- | --- |
+| `/repositories/{ws}` | 100 | `pagelen=101` returned HTTP 400 "Invalid pagelen". |
+| `/repositories/{ws}/{repo}/refs/branches` | 100 | `pagelen=101` returned HTTP 400. |
+| `/repositories/{ws}/{repo}/pullrequests` | 50 | `pagelen=51` returned HTTP 400. |
+| `.../pullrequests/{id}/comments` | 100 | `pagelen=101` returned HTTP 400. |
+| `.../commits/{revision}` | 100 | `pagelen=101` and `pagelen=1000` returned HTTP 400. |
+| `/workspaces/{ws}/members` | 100 | `pagelen=101` and `pagelen=1000` returned HTTP 400. |
+| `.../pullrequests/{id}/tasks` | 100 | `pagelen=1000` returned HTTP 200 with `pagelen` 1000. |
+| `.../commit/{commit}/pullrequests` | 100 | `pagelen=1000` returned HTTP 200 with `pagelen` 1000. |
+| `/user/workspaces` | 100 | `pagelen=1000` returned HTTP 200 with `pagelen` 1000. |
+
+The last three endpoints accepted every size, and the test lists were too short to show a clamp.
+They use 100, the largest `--pagelen` that the commands accept and the maximum that the Bitbucket API reference states for most lists.
+A clamp would not break a list, because the commands follow the `next` links.
+
+The commit list has no `size` or `page`. Its `next` link carries an opaque `ctx` parameter.
+
 ### Numbered pages
 
 A PullRequest list page reports `size`, `page`, and `pagelen` when `fields` selects them.

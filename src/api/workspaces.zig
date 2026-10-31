@@ -42,7 +42,7 @@ pub const search_members_help =
     \\Results have one group per name in input order, including repeated names.
     \\JSON is an array of groups, including for one name. Human output labels each name.
     \\Search always follows all pages. --limit caps ranked results per name, not requests.
-    \\Page size defaults to 100, the maximum. --pagelen overrides it.
+++ std.fmt.comptimePrint("\nPage size defaults to {d}, the maximum. --pagelen overrides it.\n", .{bbr.bitbucket.max_pagelen.members}) ++
     \\Concurrency defaults to 8. --concurrency accepts a positive integer, capped by logical CPUs.
     \\Fetch the next page as a request finishes. Unknown page counts can cause extra empty-page requests.
     \\A failed page fails the complete search. HTTP 429 is not retried.
@@ -122,7 +122,7 @@ pub fn runSearchMembers(init: std.process.Init, bb: bbr.bitbucket.Client, args: 
     const a = arena.allocator();
     var opts = try searchOptions(a, args);
     defer opts.names.deinit(a);
-    const members = try bb.listWorkspaceMembersConcurrent(init.io, a, opts.page.pagelen orelse 100, effectiveConcurrency(opts.concurrency, std.Thread.getCpuCount()));
+    const members = try bb.listWorkspaceMembersConcurrent(init.io, a, opts.page.pagelen orelse bbr.bitbucket.max_pagelen.members, effectiveConcurrency(opts.concurrency, std.Thread.getCpuCount()));
     const groups = try a.alloc(SearchGroup, opts.names.items.len);
     for (opts.names.items, groups) |name, *group| {
         const result = try member_search.search(a, members, name, opts.page.limit);

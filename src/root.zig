@@ -148,6 +148,7 @@ pub const bitbucket = struct {
     pub const deinitSummaries = client_mod.deinitSummaries;
     pub const ListOptions = client_mod.ListOptions;
     pub const PageOptions = client_mod.PageOptions;
+    pub const max_pagelen = client_mod.max_pagelen;
     pub const WorkspacePullRequestFilter = client_mod.WorkspacePullRequestFilter;
     pub const WorkspacePullRequestOptions = client_mod.WorkspacePullRequestOptions;
     pub const deinitWorkspaces = client_mod.deinitWorkspaces;
