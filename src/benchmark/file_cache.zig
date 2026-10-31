@@ -303,7 +303,7 @@ const Utc = struct {
 
 /// The rolling request window of the last hour. It persists one decimal Unix
 /// nanosecond timestamp per line in `requests.log`, so a restart keeps it.
-/// Lines go to the page cache without a sync: a process kill keeps them, but
+/// Lines go to the page cache without a sync. A process kill keeps them, but
 /// a power loss can lose the last lines.
 pub const RequestWindow = struct {
     io: std.Io,
@@ -333,7 +333,7 @@ pub const RequestWindow = struct {
         // The text after the last newline is a partial line.
         const complete = text[0..if (std.mem.lastIndexOfScalar(u8, text, '\n')) |end| end + 1 else 0];
         var lines = std.mem.tokenizeScalar(u8, complete, '\n');
-        // An entry in the future stays: a wall clock that goes back keeps the window conservative.
+        // An entry in the future stays. Then a wall clock that goes back keeps the window conservative.
         while (lines.next()) |line| {
             const at = std.fmt.parseInt(u64, line, 10) catch continue;
             if (at +| hour_ns <= wall_now) continue;
@@ -533,7 +533,7 @@ pub const MeasuringHttpClient = struct {
         };
     }
 
-    /// Full jitter: a uniform wait up to the ceiling of the retry.
+    /// Full jitter is a uniform wait up to the ceiling of the retry.
     fn jitter(self: *MeasuringHttpClient, attempt: usize) u64 {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -707,6 +707,8 @@ pub const Options = struct {
             }
         }
         if (options.hourly_request_budget == 0 or options.run_label.len == 0 or options.output_dir.len == 0) return error.InvalidArguments;
+        // The run label names the checkpoint file in the output directory.
+        if (std.mem.indexOfAny(u8, options.run_label, "/\\") != null) return error.InvalidArguments;
         try requireDependencies(options.scenarios);
         return options;
     }
@@ -823,7 +825,8 @@ fn usage() error{InvalidArguments} {
 }
 
 /// Runs the scenario chain for one PullRequest and prints the header, one line
-/// for each scenario, and the merged PullRequest check.
+/// for each scenario, and the merged PullRequest check. A rerun with the same
+/// options resumes at the first unfinished segment.
 pub fn run(env: Environment, options: Options, repository: []const u8, pull_request_id: u64) !void {
     var notes: Notes = .{ .writer = env.notes };
     const cwd = std.Io.Dir.cwd();
@@ -845,61 +848,235 @@ pub fn run(env: Environment, options: Options, repository: []const u8, pull_requ
     defer env.transport.close();
     env.clock.watch(&measuring);
     defer env.clock.watch(null);
-    chain(env, options, &measuring, &window, repository, pull_request_id) catch |err| {
-        // A request that gave up fails its caller with an error of the caller's own choice.
-        return if (measuring.gaveUp()) error.RetriesExhausted else err;
+    chain(env, options, .{ .measuring = &measuring, .window = &window, .notes = &notes, .dir = dir }, repository, pull_request_id) catch |err| {
+        // The bbr Client can turn RetriesExhausted into its own error. The flag keeps the cause.
+        if (!measuring.gaveUp()) return err;
+        notes.print("checkpoint kept; rerun the same command to resume", .{});
+        return error.RetriesExhausted;
     };
 }
 
-fn chain(env: Environment, options: Options, measuring: *MeasuringHttpClient, window: *RequestWindow, repository: []const u8, pull_request_id: u64) !void {
-    const probe_ns = try probe(env, measuring, repository, pull_request_id);
-    var driver: Driver = undefined;
-    try driver.init(env, options, measuring, repository, pull_request_id);
-    defer driver.deinit();
-    _ = try driver.start();
+/// The run resources that `run` owns for the length of the chain.
+const RunFiles = struct {
+    measuring: *MeasuringHttpClient,
+    window: *RequestWindow,
+    notes: *Notes,
+    dir: std.Io.Dir,
+};
 
+/// A resume unit. The selected scenarios among S1 to S6 measure the state that
+/// the scenario before them left in memory, so they run as one segment. S7 and
+/// S8 each start with a Session replacement and need only the admitted flags.
+const segments = [_]std.EnumSet(Scenario){
+    .initMany(&.{ .s1, .s2, .s3, .s4, .s5, .s6 }),
+    .initOne(.s7),
+    .initOne(.s8),
+};
+
+fn chain(env: Environment, options: Options, files: RunFiles, repository: []const u8, pull_request_id: u64) !void {
+    const gpa = env.gpa;
     const out = env.out;
-    try out.print("header run_label={s} network_label={s} bbr_version={s} cache_max_bytes={d} pull_request={d} state={s} files={d} probe_ms={d:.1}", .{
-        options.run_label, options.network_label, env.bbr_version, options.cache_max_bytes, pull_request_id, driver.stateText(), driver.file_count, ms(probe_ns),
-    });
-    try out.print(" dwell_ms={d} seed={d} query_bytes={d} second_query_bytes={d} hourly_request_budget={d}\n", .{
-        options.dwell_ms, options.seed, options.query.len, options.second_query.len, options.hourly_request_budget,
-    });
+    var name_buffer: [256]u8 = undefined;
+    var checkpoint: Checkpoint = try .load(gpa, env.io, files.dir, try Checkpoint.name(&name_buffer, options, pull_request_id));
+    defer checkpoint.deinit(gpa);
+    if (checkpoint.progress != null) {
+        if (checkpoint.mismatch(env, options)) |key| {
+            files.notes.print("checkpoint mismatch key={s}", .{key});
+            return error.CheckpointMismatch;
+        }
+        if (checkpoint.check.items.len > 0) {
+            try out.writeAll(checkpoint.header.items);
+            try out.writeAll(checkpoint.lines.items);
+            try out.writeAll(checkpoint.check.items);
+            return out.flush();
+        }
+    }
+
+    var driver: Driver = undefined;
+    try driver.init(env, options, files.measuring, repository, pull_request_id);
+    defer driver.deinit();
+    if (checkpoint.progress) |progress| {
+        try driver.restore(progress, lineValue(checkpoint.header.items, "state") orelse return error.InvalidCheckpoint);
+        _ = try driver.start();
+        files.notes.print("resume skip={f}", .{ScenarioList{ .set = checkpoint.done }});
+    } else {
+        const probe_ns = try probe(env, files.measuring, repository, pull_request_id);
+        _ = try driver.start();
+        try checkpoint.header.print(gpa, "header run_label={s} network_label={s} bbr_version={s} cache_max_bytes={d} pull_request={d} state={s} files={d} probe_ms={d:.1}", .{
+            options.run_label, options.network_label, env.bbr_version, options.cache_max_bytes, pull_request_id, driver.stateText(), driver.file_count, ms(probe_ns),
+        });
+        try checkpoint.header.print(gpa, " dwell_ms={d} seed={d} query_bytes={d} second_query_bytes={d} hourly_request_budget={d}\n", .{
+            options.dwell_ms, options.seed, options.query.len, options.second_query.len, options.hourly_request_budget,
+        });
+        try checkpoint.write(gpa, env.io, files.dir, &driver);
+    }
+    try out.writeAll(checkpoint.header.items);
+    try out.writeAll(checkpoint.lines.items);
     try out.flush();
 
-    for (std.enums.values(Scenario)) |scenario| if (options.scenarios.contains(scenario)) {
-        // An estimate above the budget gets no upfront wait. The request gate paces it.
-        const estimate = scenario.requestEstimate(driver.file_count);
-        if (estimate <= options.hourly_request_budget) window.reserve(scenario, estimate);
-        const start = measuring.mark();
-        driver.peak_retained = driver.retainedBytes();
-        var recorder: Recorder = .{};
-        defer recorder.deinit(env.gpa);
-        scenario.spec().steps(&driver, &recorder) catch |err| {
-            if (driver.unsupported) |kind| try out.print("error=unsupported_command scenario={s} kind={s}\n", .{ @tagName(scenario), @tagName(kind) });
-            try out.flush();
-            return err;
-        };
-        const report: ScenarioReport = .{
-            .scenario = scenario,
-            .run_label = options.run_label,
-            .pull_request = pull_request_id,
-            .stats = try stats(env.gpa, recorder.samples.items),
-            .traffic = try measuring.since(env.gpa, start),
-            .peak_retained_bytes = driver.peak_retained,
-            .retained_bytes = driver.retainedBytes(),
-            .full_review_bytes = driver.fullReviewBytes(),
-            .peak_rss_bytes = peakRssBytes(),
-            .candidate_session_ns = median(recorder.candidate_session_ns.items),
-            .paced_samples = recorder.paced,
-        };
-        try report.write(out);
-    };
-    try out.print("check run_label={s} pull_request={d} state={s} not_found_sides={d} hunk_mismatch_files={d}\n", .{
+    for (segments) |all| {
+        const segment = all.intersectWith(options.scenarios);
+        if (segment.count() == 0 or checkpoint.done.supersetOf(segment)) continue;
+        var lines: std.Io.Writer.Allocating = .init(gpa);
+        defer lines.deinit();
+        var scenarios = segment.iterator();
+        while (scenarios.next()) |scenario| try runScenario(env, options, files, &driver, scenario, pull_request_id, &lines.writer);
+        if (files.measuring.gaveUp()) return error.RetriesExhausted;
+        try checkpoint.lines.appendSlice(gpa, lines.written());
+        checkpoint.done.setUnion(segment);
+        try checkpoint.write(gpa, env.io, files.dir, &driver);
+        files.notes.print("segment done={f}", .{ScenarioList{ .set = segment }});
+        try out.writeAll(lines.written());
+        try out.flush();
+    }
+    try checkpoint.check.print(gpa, "check run_label={s} pull_request={d} state={s} not_found_sides={d} hunk_mismatch_files={d}\n", .{
         options.run_label, pull_request_id, driver.stateText(), driver.not_found_sides, driver.hunk_mismatch_files,
     });
+    try checkpoint.write(gpa, env.io, files.dir, &driver);
+    try out.writeAll(checkpoint.check.items);
     try out.flush();
 }
+
+fn runScenario(env: Environment, options: Options, files: RunFiles, driver: *Driver, scenario: Scenario, pull_request_id: u64, lines: *std.Io.Writer) !void {
+    // An estimate above the budget gets no upfront wait. The request gate paces it.
+    const estimate = scenario.requestEstimate(driver.file_count);
+    if (estimate <= options.hourly_request_budget) files.window.reserve(scenario, estimate);
+    const start = files.measuring.mark();
+    driver.peak_retained = driver.retainedBytes();
+    var recorder: Recorder = .{};
+    defer recorder.deinit(env.gpa);
+    scenario.spec().steps(driver, &recorder) catch |err| {
+        if (driver.unsupported) |kind| {
+            try env.out.print("error=unsupported_command scenario={s} kind={s}\n", .{ @tagName(scenario), @tagName(kind) });
+            try env.out.flush();
+        }
+        return err;
+    };
+    const report: ScenarioReport = .{
+        .scenario = scenario,
+        .run_label = options.run_label,
+        .pull_request = pull_request_id,
+        .stats = try stats(env.gpa, recorder.samples.items),
+        .traffic = try files.measuring.since(env.gpa, start),
+        .peak_retained_bytes = driver.peak_retained,
+        .retained_bytes = driver.retainedBytes(),
+        .full_review_bytes = driver.fullReviewBytes(),
+        .peak_rss_bytes = peakRssBytes(),
+        .candidate_session_ns = median(recorder.candidate_session_ns.items),
+        .paced_samples = recorder.paced,
+    };
+    try report.write(lines);
+}
+
+/// Formats a scenario set as ids joined by commas.
+const ScenarioList = struct {
+    set: std.EnumSet(Scenario),
+    separator: []const u8 = ",",
+
+    pub fn format(self: ScenarioList, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        var iterator = self.set.iterator();
+        var first = true;
+        while (iterator.next()) |scenario| {
+            if (!first) try writer.writeAll(self.separator);
+            first = false;
+            try writer.writeAll(@tagName(scenario));
+        }
+    }
+};
+
+/// The value of `key` in one `key=value` line.
+fn lineValue(line: []const u8, key: []const u8) ?[]const u8 {
+    var tokens = std.mem.tokenizeAny(u8, line, " \n");
+    while (tokens.next()) |token| if (std.mem.startsWith(u8, token, key) and token.len > key.len and token[key.len] == '=')
+        return token[key.len + 1 ..];
+    return null;
+}
+
+/// The result file of one run. It holds the header, the lines of the committed
+/// segments, the per-file state after the last committed segment, and the
+/// check line when every segment is done.
+const Checkpoint = struct {
+    file_name: []const u8,
+    text: []u8 = &.{},
+    header: std.ArrayList(u8) = .empty,
+    lines: std.ArrayList(u8) = .empty,
+    check: std.ArrayList(u8) = .empty,
+    done: std.EnumSet(Scenario) = .initEmpty(),
+    /// The progress line of a loaded checkpoint. It points into `text`.
+    progress: ?[]const u8 = null,
+
+    /// The settings that a resumed run must share with the stored header.
+    const settings = [_][]const u8{ "network_label", "bbr_version", "cache_max_bytes", "dwell_ms", "seed", "query_bytes", "second_query_bytes", "hourly_request_budget" };
+
+    /// `<run-label>-<pull-request>-<selection>.txt`, with selection `all` or the scenario ids joined by `-`.
+    fn name(buffer: []u8, options: Options, pull_request_id: u64) ![]const u8 {
+        const selection: ScenarioList = .{ .set = options.scenarios, .separator = "-" };
+        if (options.scenarios.eql(.initFull())) return std.fmt.bufPrint(buffer, "{s}-{d}-all.txt", .{ options.run_label, pull_request_id });
+        return std.fmt.bufPrint(buffer, "{s}-{d}-{f}.txt", .{ options.run_label, pull_request_id, selection });
+    }
+
+    fn load(gpa: Allocator, io: std.Io, dir: std.Io.Dir, file_name: []const u8) !Checkpoint {
+        var result: Checkpoint = .{ .file_name = file_name };
+        errdefer result.deinit(gpa);
+        result.text = dir.readFileAlloc(io, file_name, gpa, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => return result,
+            else => return err,
+        };
+        var start: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, result.text, start, '\n')) |end| : (start = end + 1) {
+            const line = result.text[start .. end + 1];
+            if (std.mem.startsWith(u8, line, "header ")) {
+                try result.header.appendSlice(gpa, line);
+            } else if (std.mem.startsWith(u8, line, "scenario=")) {
+                try result.lines.appendSlice(gpa, line);
+            } else if (std.mem.startsWith(u8, line, "check ")) {
+                try result.check.appendSlice(gpa, line);
+            } else if (std.mem.startsWith(u8, line, "progress ")) {
+                result.progress = line;
+                var ids = std.mem.tokenizeScalar(u8, lineValue(line, "done") orelse "", ',');
+                while (ids.next()) |id| result.done.insert(std.meta.stringToEnum(Scenario, id) orelse return error.InvalidCheckpoint);
+            } else return error.InvalidCheckpoint;
+        }
+        if (result.progress == null or result.header.items.len == 0) return error.InvalidCheckpoint;
+        return result;
+    }
+
+    fn deinit(self: *Checkpoint, gpa: Allocator) void {
+        gpa.free(self.text);
+        self.header.deinit(gpa);
+        self.lines.deinit(gpa);
+        self.check.deinit(gpa);
+    }
+
+    /// The first setting whose stored value differs from the current options.
+    fn mismatch(self: *const Checkpoint, env: Environment, options: Options) ?[]const u8 {
+        var buffer: [512]u8 = undefined;
+        const current = std.fmt.bufPrint(&buffer, "network_label={s} bbr_version={s} cache_max_bytes={d} dwell_ms={d} seed={d} query_bytes={d} second_query_bytes={d} hourly_request_budget={d}", .{
+            options.network_label, env.bbr_version, options.cache_max_bytes, options.dwell_ms, options.seed, options.query.len, options.second_query.len, options.hourly_request_budget,
+        }) catch return "bbr_version";
+        for (settings) |key| {
+            const stored = lineValue(self.header.items, key) orelse return key;
+            if (!std.mem.eql(u8, stored, lineValue(current, key).?)) return key;
+        }
+        return null;
+    }
+
+    /// Rewrites the file atomically, so a crash keeps the last committed segment.
+    fn write(self: *const Checkpoint, gpa: Allocator, io: std.Io, dir: std.Io.Dir, driver: *const Driver) !void {
+        var text: std.Io.Writer.Allocating = .init(gpa);
+        defer text.deinit();
+        const writer = &text.writer;
+        try writer.writeAll(self.header.items);
+        try writer.writeAll(self.lines.items);
+        try driver.writeProgress(writer, self.done);
+        try writer.writeAll(self.check.items);
+        var atomic = try dir.createFileAtomic(io, self.file_name, .{ .replace = true });
+        defer atomic.deinit(io);
+        try atomic.file.writePositionalAll(io, text.written(), 0);
+        try atomic.file.sync(io);
+        try atomic.replace(io);
+    }
+};
 
 fn probe(env: Environment, measuring: *MeasuringHttpClient, repository: []const u8, pull_request_id: u64) !u64 {
     var arena = std.heap.ArenaAllocator.init(env.gpa);
@@ -1216,6 +1393,43 @@ const Driver = struct {
         var total: usize = 0;
         for (self.largest_result) |bytes| total +|= bytes;
         return total;
+    }
+
+    /// The per-file state that a later segment needs. It holds only bits and numbers.
+    fn writeProgress(self: *const Driver, writer: *std.Io.Writer, done: std.EnumSet(Scenario)) !void {
+        try writer.print("progress done={f} admitted=", .{ScenarioList{ .set = done }});
+        for (self.admitted) |bit| try writer.writeByte(if (bit) '1' else '0');
+        try writer.writeAll(" checked=");
+        for (self.checked) |bit| try writer.writeByte(if (bit) '1' else '0');
+        try writer.writeAll(" largest=");
+        for (self.largest_result, 0..) |bytes, index| try writer.print("{s}{d}", .{ if (index == 0) "" else ",", bytes });
+        try writer.print(" not_found_sides={d} hunk_mismatch_files={d}\n", .{ self.not_found_sides, self.hunk_mismatch_files });
+    }
+
+    /// Restores the state of `writeProgress` before `start`. Then `start` fails on another File count.
+    fn restore(self: *Driver, progress: []const u8, state_text: []const u8) !void {
+        const gpa = self.env.gpa;
+        const admitted = lineValue(progress, "admitted") orelse return error.InvalidCheckpoint;
+        const checked = lineValue(progress, "checked") orelse return error.InvalidCheckpoint;
+        if (admitted.len == 0 or checked.len != admitted.len) return error.InvalidCheckpoint;
+        self.file_count = admitted.len;
+        self.admitted = try gpa.alloc(bool, admitted.len);
+        self.checked = try gpa.alloc(bool, admitted.len);
+        self.largest_result = try gpa.alloc(usize, admitted.len);
+        self.focus_tick = try gpa.alloc(u64, admitted.len);
+        @memset(self.focus_tick, 0);
+        for (admitted, checked, self.admitted, self.checked) |a, c, *admitted_bit, *checked_bit| {
+            if (a != '0' and a != '1' or c != '0' and c != '1') return error.InvalidCheckpoint;
+            admitted_bit.* = a == '1';
+            checked_bit.* = c == '1';
+        }
+        var largest = std.mem.splitScalar(u8, lineValue(progress, "largest") orelse return error.InvalidCheckpoint, ',');
+        for (self.largest_result) |*bytes| bytes.* = std.fmt.parseInt(usize, largest.next() orelse return error.InvalidCheckpoint, 10) catch return error.InvalidCheckpoint;
+        if (largest.next() != null) return error.InvalidCheckpoint;
+        self.not_found_sides = std.fmt.parseInt(usize, lineValue(progress, "not_found_sides") orelse return error.InvalidCheckpoint, 10) catch return error.InvalidCheckpoint;
+        self.hunk_mismatch_files = std.fmt.parseInt(usize, lineValue(progress, "hunk_mismatch_files") orelse return error.InvalidCheckpoint, 10) catch return error.InvalidCheckpoint;
+        self.state_len = @min(state_text.len, self.state_buffer.len);
+        @memcpy(self.state_buffer[0..self.state_len], state_text[0..self.state_len]);
     }
 
     fn activeFile(self: *Driver) ?usize {
@@ -1792,7 +2006,24 @@ const FlakyHttpClient = struct {
     healthy_calls: ?usize = null,
     calls: usize = 0,
     scripted: usize = 0,
+    failed_urls: std.ArrayList([]u8) = .empty,
     mutex: std.atomic.Mutex = .unlocked,
+
+    fn deinit(self: *FlakyHttpClient) void {
+        for (self.failed_urls.items) |url| testing.allocator.free(url);
+        self.failed_urls.deinit(testing.allocator);
+    }
+
+    /// The most failed calls of one URL.
+    fn mostFailuresOfOneUrl(self: *const FlakyHttpClient) usize {
+        var most: usize = 0;
+        for (self.failed_urls.items) |url| {
+            var count: usize = 0;
+            for (self.failed_urls.items) |other| count += @intFromBool(std.mem.eql(u8, url, other));
+            most = @max(most, count);
+        }
+        return most;
+    }
 
     fn httpClient(self: *FlakyHttpClient) bbr.http.HttpClient {
         return .{ .ptr = self, .vtable = &.{ .send = send } };
@@ -1804,7 +2035,10 @@ const FlakyHttpClient = struct {
             lock(&self.mutex);
             defer self.mutex.unlock();
             self.calls += 1;
-            if (self.healthy_calls) |healthy| if (self.calls > healthy) return error.ConnectionResetByPeer;
+            if (self.healthy_calls) |healthy| if (self.calls > healthy) {
+                try self.failed_urls.append(testing.allocator, try testing.allocator.dupe(u8, request.url));
+                return error.ConnectionResetByPeer;
+            };
             const key = self.key orelse break :blk null;
             if (self.scripted == self.script.len or std.mem.indexOf(u8, request.url, key) == null) break :blk null;
             self.scripted += 1;
@@ -1897,7 +2131,7 @@ fn runIn(transport: *FakeTransport, output_dir: []const u8, options: Options, cl
         .io = testing.io,
         .clock = clock.clock(),
         .transport = transport.transport(),
-        .credential = .{ .username = "u", .token = "t", .workspace = "ws" },
+        .credential = .{ .username = "u", .token = "TOKENSENTINEL", .workspace = "ws" },
         .highlighter = plain.highlighter(),
         .bbr_version = "test",
         .out = &output.writer,
@@ -2298,6 +2532,7 @@ test "M28 cache a remote run needs a run label and an output directory" {
     try testing.expectError(error.InvalidArguments, Options.parse(&.{ "--output-dir", "out" }));
     try testing.expectError(error.InvalidArguments, Options.parse(&.{ "--run-label", "", "--output-dir", "out" }));
     try testing.expectError(error.InvalidArguments, Options.parse(&.{ "--run-label", "a" }));
+    try testing.expectError(error.InvalidArguments, Options.parse(&.{ "--run-label", "a/b", "--output-dir", "out" }));
 }
 
 test "M28 cache an unsupported command kind fails the run and names the kind" {
@@ -2340,16 +2575,221 @@ test "M28 cache an unsupported command kind fails the run and names the kind" {
     try testing.expectEqual(std.meta.Tag(OwnedCommand).copy_clipboard, driver.unsupported.?);
 }
 
+/// Fails when a forbidden text is in `text`.
+fn expectNone(text: []const u8, forbidden: []const []const u8) !void {
+    for (forbidden) |needle| if (std.mem.indexOf(u8, text, needle) != null) {
+        std.debug.print("forbidden text {s} in:\n{s}\n", .{ needle, text });
+        return error.ForbiddenText;
+    };
+}
+
+/// Fails when a forbidden text is in a file of `dir`. Returns the file count.
+fn expectNoneInFiles(dir: std.Io.Dir, forbidden: []const []const u8) !usize {
+    var files: usize = 0;
+    var entries = dir.iterate();
+    while (try entries.next(testing.io)) |entry| if (entry.kind == .file) {
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .unlimited);
+        defer testing.allocator.free(bytes);
+        try expectNone(bytes, forbidden);
+        files += 1;
+    };
+    return files;
+}
+
 test "M28 cache benchmark output holds no source, path, query, or Comment text" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const path = try tmpPath(&tmp);
+    defer testing.allocator.free(path);
     const responses = fixtureResponses(matching_b);
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    var transport: FakeTransport = .{ .client = fake.httpClient() };
     var clock: FakeClock = .{ .step_ns = 1000 };
+    var notes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer notes.deinit();
     var options = withBudget(fixture_options, 1);
     options.network_label = "office";
-    const output = try runFixture(&responses, options, &clock);
+    const output = try runIn(&transport, path, options, &clock, &notes.writer);
     defer testing.allocator.free(output);
     try testing.expect(try intField(output, "scenario=s4 ", "samples") > 0);
-    for ([_][]const u8{ "SRCSENTINEL", "PATHSENTINEL", "qrysentinel", "qrytwo", "CMTSENTINEL", "TITLESENTINEL", "/src/", "repo" }) |forbidden|
-        try testing.expect(std.mem.indexOf(u8, output, forbidden) == null);
+    const forbidden = [_][]const u8{ "SRCSENTINEL", "PATHSENTINEL", "qrysentinel", "qrytwo", "CMTSENTINEL", "TITLESENTINEL", "/src/", "repo" };
+    try expectNone(output, &forbidden);
+    try expectNone(notes.written(), &forbidden);
+    // The lock, the request log, and the checkpoint.
+    try testing.expectEqual(@as(usize, 3), try expectNoneInFiles(tmp.dir, &forbidden));
+}
+
+test "M28 cache the Credential token never reaches the output, the notes, or the run files" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const path = try tmpPath(&tmp);
+    defer testing.allocator.free(path);
+    const responses = fixtureResponses(matching_b);
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    var flaky: FlakyHttpClient = .{ .fake = &fake, .key = "/src/aaaa/PATHSENTINEL/b.zig", .script = &.{.{ .status = 503 }} };
+    defer flaky.deinit();
+    var transport: FakeTransport = .{ .client = flaky.httpClient() };
+    var clock: FakeClock = .{};
+    var notes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer notes.deinit();
+    var options = fixture_options;
+    options.hourly_request_budget = 4;
+    options.scenarios = .initMany(&.{ .s1, .s2 });
+    const output = try runIn(&transport, path, options, &clock, &notes.writer);
+    defer testing.allocator.free(output);
+    try testing.expect(std.mem.indexOf(u8, notes.written(), "wait reason=window") != null);
+    try testing.expect(std.mem.indexOf(u8, notes.written(), "wait reason=retry status=503") != null);
+    try testing.expectEqual(@as(usize, 1), try intField(output, "scenario=s1 ", "retries"));
+    const forbidden = [_][]const u8{"TOKENSENTINEL"};
+    try expectNone(output, &forbidden);
+    try expectNone(notes.written(), &forbidden);
+    try testing.expectEqual(@as(usize, 3), try expectNoneInFiles(tmp.dir, &forbidden));
+}
+
+/// The number of transport calls in a healthy run of `scenarios`.
+fn healthyCalls(base: Options, scenarios: []const Scenario) !usize {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(&tmp);
+    defer testing.allocator.free(path);
+    const responses = fixtureResponses(matching_b);
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    var transport: FakeTransport = .{ .client = fake.httpClient() };
+    var clock: FakeClock = .{};
+    var notes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer notes.deinit();
+    var options = base;
+    options.scenarios = .initMany(scenarios);
+    const output = try runIn(&transport, path, options, &clock, &notes.writer);
+    testing.allocator.free(output);
+    return fake.callCount();
+}
+
+/// Runs every scenario in `path` and fails each transport call after `healthy_calls`.
+fn failingRun(path: []const u8, options: Options, healthy_calls: usize, notes: *std.Io.Writer.Allocating) !usize {
+    const responses = fixtureResponses(matching_b);
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    var flaky: FlakyHttpClient = .{ .fake = &fake, .healthy_calls = healthy_calls };
+    defer flaky.deinit();
+    var transport: FakeTransport = .{ .client = flaky.httpClient() };
+    var clock: FakeClock = .{};
+    try testing.expectError(error.RetriesExhausted, runIn(&transport, path, options, &clock, &notes.writer));
+    return flaky.mostFailuresOfOneUrl();
+}
+
+/// Runs every scenario in `path` on a healthy fake and returns the output.
+fn healthyRun(path: []const u8, options: Options, notes: *std.Io.Writer.Allocating) ![]u8 {
+    const responses = fixtureResponses(matching_b);
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    var transport: FakeTransport = .{ .client = fake.httpClient() };
+    var clock: FakeClock = .{};
+    return runIn(&transport, path, options, &clock, &notes.writer);
+}
+
+fn scenarioLineCount(text: []const u8) usize {
+    return std.mem.count(u8, text, "\nscenario=") + @intFromBool(std.mem.startsWith(u8, text, "scenario="));
+}
+
+test "M28 cache gives up after 8 attempts and a rerun resumes at the first unfinished segment" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(&tmp);
+    defer testing.allocator.free(path);
+    var notes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer notes.deinit();
+    // Each call after S6 fails, so the first failure is inside S7.
+    const through_s6 = try healthyCalls(fixture_options, &.{ .s1, .s2, .s3, .s4, .s5, .s6 });
+    try testing.expectEqual(@as(usize, 8), try failingRun(path, fixture_options, through_s6, &notes));
+    // Another request can note its own wait between the two notes.
+    const give_up = std.mem.indexOf(u8, notes.written(), "give_up attempts=8 error=ConnectionResetByPeer\n") orelse return error.MissingNote;
+    try testing.expect(std.mem.indexOfPos(u8, notes.written(), give_up, "\ncheckpoint kept; rerun the same command to resume\n") != null);
+    const kept = try tmp.dir.readFileAlloc(testing.io, "fixture-7-all.txt", testing.allocator, .unlimited);
+    defer testing.allocator.free(kept);
+    try testing.expectEqual(@as(usize, 6), scenarioLineCount(kept));
+    try testing.expect(std.mem.indexOf(u8, kept, "scenario=s7 ") == null);
+    try testing.expect(std.mem.indexOf(u8, kept, "\ncheck ") == null);
+
+    notes.clearRetainingCapacity();
+    const output = try healthyRun(path, fixture_options, &notes);
+    defer testing.allocator.free(output);
+    try testing.expect(std.mem.startsWith(u8, notes.written(), "resume skip=s1,s2,s3,s4,s5,s6\n"));
+    // The rerun repeats the header and the S1 to S6 lines byte for byte.
+    const progress_at = std.mem.indexOf(u8, kept, "progress ") orelse return error.MissingProgress;
+    try testing.expect(std.mem.startsWith(u8, output, kept[0..progress_at]));
+    try testing.expectEqual(@as(usize, 8), scenarioLineCount(output));
+    try testing.expect(std.mem.indexOf(u8, output, "progress ") == null);
+    // The restored admitted flags make every S7 fetch a refetch.
+    try testing.expectEqual(@as(usize, 0), try intField(output, "scenario=s7 ", "cold_fetches"));
+    try testing.expect(try intField(output, "scenario=s7 ", "refetches") > 0);
+    try testing.expect(try intField(output, "scenario=s8 ", "refetches") > 0);
+}
+
+test "M28 cache a rerun of a finished run sends no request" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(&tmp);
+    defer testing.allocator.free(path);
+    var notes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer notes.deinit();
+    const first = try healthyRun(path, fixture_options, &notes);
+    defer testing.allocator.free(first);
+    const responses = fixtureResponses(matching_b);
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    var transport: FakeTransport = .{ .client = fake.httpClient() };
+    var clock: FakeClock = .{};
+    const second = try runIn(&transport, path, fixture_options, &clock, &notes.writer);
+    defer testing.allocator.free(second);
+    try testing.expectEqual(@as(usize, 0), fake.callCount());
+    try testing.expectEqualStrings(first, second);
+    try testing.expectEqual(@as(usize, 8), scenarioLineCount(second));
+}
+
+test "M28 cache a failure inside S1 to S6 restarts that segment from S1" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(&tmp);
+    defer testing.allocator.free(path);
+    var notes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer notes.deinit();
+    // The budget evicts each File, so S4 fetches again. Each call after S3 fails, so the first failure is inside S4.
+    const options = withBudget(fixture_options, 1);
+    const through_s3 = try healthyCalls(options, &.{ .s1, .s2, .s3 });
+    try testing.expectEqual(@as(usize, 8), try failingRun(path, options, through_s3, &notes));
+    const kept = try tmp.dir.readFileAlloc(testing.io, "fixture-7-all.txt", testing.allocator, .unlimited);
+    defer testing.allocator.free(kept);
+    try testing.expectEqual(@as(usize, 0), scenarioLineCount(kept));
+
+    notes.clearRetainingCapacity();
+    const output = try healthyRun(path, options, &notes);
+    defer testing.allocator.free(output);
+    try testing.expect(std.mem.startsWith(u8, notes.written(), "resume skip=\n"));
+    try testing.expectEqual(@as(usize, 8), scenarioLineCount(output));
+    // S1 starts again from the state after the header, so its fetches are cold.
+    try testing.expectEqual(@as(usize, 0), try intField(output, "scenario=s1 ", "refetches"));
+    try testing.expect(try intField(output, "scenario=s1 ", "cold_fetches") > 0);
+}
+
+test "M28 cache a rerun with other options fails on the checkpoint" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpPath(&tmp);
+    defer testing.allocator.free(path);
+    const responses = fixtureResponses(matching_b);
+    var fake: bbr.http.FakeHttpClient = .{ .responses = &responses };
+    var transport: FakeTransport = .{ .client = fake.httpClient() };
+    var clock: FakeClock = .{};
+    var notes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer notes.deinit();
+    var options = fixture_options;
+    options.scenarios = .initOne(.s1);
+    const output = try runIn(&transport, path, options, &clock, &notes.writer);
+    testing.allocator.free(output);
+    const calls = fake.callCount();
+    notes.clearRetainingCapacity();
+    options.seed = 29;
+    try testing.expectError(error.CheckpointMismatch, runIn(&transport, path, options, &clock, &notes.writer));
+    try testing.expectEqualStrings("checkpoint mismatch key=seed\n", notes.written());
+    try testing.expectEqual(calls, fake.callCount());
 }
 
 fn summaryText(input: []const u8) ![]u8 {
