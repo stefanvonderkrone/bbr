@@ -6,11 +6,17 @@ const keymap = @import("keymap.zig");
 const search = @import("search.zig");
 const layouts = @import("layouts.zig");
 
+/// The widest key label in cells. Longer chord lists continue on more lines.
+pub const key_column_max: usize = 24;
+
 pub const Entry = struct {
     keys: []const u8,
     description: []const u8,
     /// The Keymap Action, or null for a fixed Overlay key.
     action: ?keymap.Action = null,
+    /// The chords of the entry above that do not fit its key column. A
+    /// continued entry has no description.
+    continued: bool = false,
 };
 
 pub const Line = union(enum) {
@@ -149,29 +155,42 @@ pub const State = struct {
     }
 };
 
+/// Keep the entries that match, with their continued lines, under their
+/// headings. A match in any line of an entry keeps the whole entry.
 fn filter(lines: []Line, query: search.Query) []Line {
     if (query.text.len == 0) return lines;
     var title: []const u8 = "";
     var emitted = false;
     var written: usize = 0;
-    for (lines) |line| switch (line) {
+    var index: usize = 0;
+    while (index < lines.len) : (index += 1) switch (lines[index]) {
         .heading => |heading| {
             title = heading;
             emitted = false;
         },
-        .entry => |entry| {
-            if (!search.containsLiteral(query, entry.keys) and !search.containsLiteral(query, entry.description)) continue;
-            if (!emitted) {
-                if (written > 0) {
-                    lines[written] = .blank;
+        .entry => {
+            var end = index + 1;
+            while (end < lines.len and lines[end] == .entry and lines[end].entry.continued) end += 1;
+            var matched = false;
+            for (lines[index..end]) |line| {
+                matched = matched or search.containsLiteral(query, line.entry.keys) or search.containsLiteral(query, line.entry.description);
+            }
+            if (matched) {
+                if (!emitted) {
+                    if (written > 0) {
+                        lines[written] = .blank;
+                        written += 1;
+                    }
+                    lines[written] = .{ .heading = title };
+                    written += 1;
+                    emitted = true;
+                }
+                for (lines[index..end]) |line| {
+                    lines[written] = line;
                     written += 1;
                 }
-                lines[written] = .{ .heading = title };
-                written += 1;
-                emitted = true;
             }
-            lines[written] = line;
-            written += 1;
+            index = end - 1;
         },
         .blank, .no_matches => {},
     };
@@ -268,12 +287,19 @@ fn build(scratch: std.mem.Allocator, km: keymap.Keymap) ![]Line {
         for (km.bindings, 0..) |binding, index| {
             if (keymap.helpSection(binding.action) != section or !firstBinding(km, index)) continue;
             var keys: std.ArrayList(u8) = .empty;
+            var continued = false;
             for (km.bindings) |other| {
                 if (other.action != binding.action) continue;
+                const label = try chordLabel(scratch, other.chord);
+                if (keys.items.len > 0 and vaxis.gwidth.gwidth(keys.items, .unicode) + 1 + vaxis.gwidth.gwidth(label, .unicode) > key_column_max) {
+                    try lines.append(scratch, .{ .entry = .{ .keys = keys.items, .description = if (continued) "" else binding.help, .action = binding.action, .continued = continued } });
+                    keys = .empty;
+                    continued = true;
+                }
                 if (keys.items.len > 0) try keys.append(scratch, ' ');
-                try keys.appendSlice(scratch, try chordLabel(scratch, other.chord));
+                try keys.appendSlice(scratch, label);
             }
-            try lines.append(scratch, .{ .entry = .{ .keys = keys.items, .description = binding.help, .action = binding.action } });
+            try lines.append(scratch, .{ .entry = .{ .keys = keys.items, .description = if (continued) "" else binding.help, .action = binding.action, .continued = continued } });
         }
         for (std.enums.values(keymap.Action)) |action| {
             if (keymap.helpSection(action) != section or bound(km, action)) continue;
@@ -382,10 +408,47 @@ test "help lists each Action once with all of its chords in its section" {
     for (std.enums.values(keymap.Action)) |action| {
         var count: usize = 0;
         for (lines) |line| {
-            if (line == .entry and line.entry.action == action) count += 1;
+            if (line == .entry and !line.entry.continued and line.entry.action == action) count += 1;
         }
         try testing.expectEqual(@as(usize, 1), count);
     }
+}
+
+test "help continues a long chord list on more lines and keeps it whole in a search" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const chords = "abcdefghijklmnop";
+    var bindings: [chords.len]keymap.Binding = undefined;
+    for (&bindings, chords) |*binding, cp| binding.* = .{ .chord = keymap.Chord.modified(cp, .{ .ctrl = true }), .action = .down, .help = "needle motion" };
+    const km: keymap.Keymap = .{ .bindings = &bindings };
+    const lines = try build(a, km);
+    var keys: std.ArrayList(u8) = .empty;
+    var entries: usize = 0;
+    for (lines) |line| if (line == .entry and line.entry.action == .down) {
+        try testing.expect(vaxis.gwidth.gwidth(line.entry.keys, .unicode) <= key_column_max);
+        try testing.expectEqual(entries > 0, line.entry.continued);
+        try testing.expectEqualStrings(if (entries > 0) "" else "needle motion", line.entry.description);
+        if (keys.items.len > 0) try keys.append(a, ' ');
+        try keys.appendSlice(a, line.entry.keys);
+        entries += 1;
+    };
+    try testing.expect(entries > 1);
+    var expected: std.ArrayList(u8) = .empty;
+    for (bindings) |binding| {
+        if (expected.items.len > 0) try expected.append(a, ' ');
+        try expected.appendSlice(a, try chordLabel(a, binding.chord));
+    }
+    try testing.expectEqualStrings(expected.items, keys.items);
+
+    // A match on a continued line keeps the whole entry.
+    var state = try State.init(testing.allocator, km);
+    defer state.deinit();
+    try typeQuery(&state, km, "ctrl-o");
+    const found = state.view().lines;
+    try testing.expectEqualStrings("Motions", found[0].heading);
+    try testing.expectEqualStrings("needle motion", found[1].entry.description);
+    try testing.expectEqual(entries + 1, found.len);
 }
 
 test "help lists an Action without a chord as unbound in its section" {

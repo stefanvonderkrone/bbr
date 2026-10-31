@@ -2269,9 +2269,10 @@ fn sourceRefusalLabel(availability: presentation.ActionAvailability, action: key
 /// The cells between the key column and the description column.
 const help_key_gap: u16 = 3;
 /// The widest key column. A longer key list pushes only its own description.
-const help_key_column_max: u16 = 24;
+const help_key_column_max: u16 = help_mod.key_column_max;
 
-/// A key label that fits `width` cells. A longer label ends in `…`, so its
+/// A key label that fits `width` cells. Help continues a long chord list on
+/// more lines, so only one chord wider than the column ends in `…`. Its
 /// description keeps the shared column.
 fn fitHelpKeys(scratch: std.mem.Allocator, keys: []const u8, width: u16) []const u8 {
     if (vaxis.gwidth.gwidth(keys, .unicode) <= width) return keys;
@@ -2325,6 +2326,7 @@ pub fn drawHelp(scratch: std.mem.Allocator, win: vaxis.Window, theme: Theme, hel
                 key_style.bold = true;
                 const keys = fitHelpKeys(scratch, entry.keys, key_column);
                 _ = body.printSegment(.{ .text = keys, .style = key_style }, .{ .row_offset = line_row, .col_offset = indent, .wrap = .none });
+                if (entry.continued) continue;
                 const description_column = indent + key_column + help_key_gap;
                 _ = body.printSegment(.{ .text = row.text, .style = if (row.available) theme.picker else theme.gutter }, .{ .row_offset = line_row, .col_offset = description_column, .wrap = .none });
             },
@@ -5510,7 +5512,7 @@ test "the help overlay floats a centered Keybindings modal from the Keymap" {
     try testing.expect(rows.len > body.height);
 }
 
-test "a long help key label ends in an ellipsis and keeps its description in the shared column" {
+test "a wide help chord ends in an ellipsis, and a continued line has no description" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -5521,6 +5523,7 @@ test "a long help key label ends in an ellipsis and keeps its description in the
         .{ .heading = "Motions" },
         .{ .entry = .{ .keys = "ctrl-a ctrl-b ctrl-c ctrl-d ctrl-e ctrl-f", .description = "long keys", .action = .down } },
         .{ .entry = .{ .keys = "k", .description = "short keys", .action = .up } },
+        .{ .entry = .{ .keys = "K", .description = "", .action = .up, .continued = true } },
     };
     const help_view: help_mod.View = .{ .lines = &lines, .query = .none, .scroll = 0 };
     drawHelp(a, win, theme_dark, help_view, .{ .remote = true });
@@ -5529,6 +5532,8 @@ test "a long help key label ends in an ellipsis and keeps its description in the
     try testing.expectEqualStrings("…", win.readCell(body.x + help_key_column_max, body.y + 1).?.char.grapheme);
     try testing.expectEqualStrings("l", win.readCell(column, body.y + 1).?.char.grapheme);
     try testing.expectEqualStrings("s", win.readCell(column, body.y + 2).?.char.grapheme);
+    try testing.expectEqualStrings("K", win.readCell(body.x + 1, body.y + 3).?.char.grapheme);
+    try testing.expectEqualStrings(" ", win.readCell(column, body.y + 3).?.char.grapheme);
 }
 
 test "the help overlay scrolls its lines and clamps the scroll at the end" {

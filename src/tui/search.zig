@@ -494,11 +494,22 @@ test "literal text matching shares Buffer Search Unicode smart case without sour
     }
 }
 
+/// The start of the last scalar. A last byte that ends no valid sequence is a
+/// scalar of its own, so invalid text loses one byte at a time.
 pub fn lastScalarStart(text: []const u8) usize {
-    var result: usize = 0;
-    var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
-    while (iterator.nextCodepointSlice()) |scalar| result = @intFromPtr(scalar.ptr) - @intFromPtr(text.ptr);
-    return result;
+    if (text.len == 0) return 0;
+    var start = text.len - 1;
+    while (start > 0 and text.len - start < 4 and text[start] & 0xC0 == 0x80) start -= 1;
+    const len = std.unicode.utf8ByteSequenceLength(text[start]) catch return text.len - 1;
+    return if (start + len == text.len) start else text.len - 1;
+}
+
+test "lastScalarStart steps back one scalar, or one byte of invalid text" {
+    try std.testing.expectEqual(@as(usize, 0), lastScalarStart(""));
+    try std.testing.expectEqual(@as(usize, 1), lastScalarStart("aä"));
+    try std.testing.expectEqual(@as(usize, 1), lastScalarStart("a😀"));
+    try std.testing.expectEqual(@as(usize, 1), lastScalarStart("a\xc3"));
+    try std.testing.expectEqual(@as(usize, 2), lastScalarStart("a\x80\x80"));
 }
 
 pub fn wordStart(text: []const u8) usize {
